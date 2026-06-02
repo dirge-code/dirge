@@ -308,6 +308,67 @@ where
     run_phase(plan_prompt(request, &report), READONLY_PHASE_TOOLS).await
 }
 
+/// Outcome of the reviewer-runs-code loop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReviewOutcome {
+    /// The reviewer confirmed `DONE` with first-hand evidence.
+    Approved,
+    /// Still `NEEDS_FIX` (or unparseable) after `max_retries` fix cycles.
+    Exhausted,
+    /// A reviewer or implementer fork errored.
+    Error(String),
+}
+
+/// Run the reviewer-runs-code loop (P3d, port of vix `implement_and_review`).
+/// After the implementer executes, a *write-disabled* reviewer fork (run via
+/// `run_reviewer` with [`REVIEWER_TOOLS`] + [`reviewer_prompt`]) independently
+/// runs the code and emits a JSON verdict. On `NEEDS_FIX` the `missing`
+/// punch-list is fed back to the implementer (`run_implement_retry` with
+/// [`implement_retry_prompt`]) and the reviewer runs again — bounded by
+/// `max_retries` fix cycles.
+///
+/// Asymmetric-caution bias (from vix): a verdict that isn't a parseable `DONE`
+/// is treated as not-done, so an ambiguous or malformed review keeps the loop
+/// going rather than shipping. Parameterized by the runner closures so the loop
+/// is unit-testable without real forks.
+pub async fn run_review_loop<RV, RVFut, IM, IMFut>(
+    task: &str,
+    max_retries: usize,
+    run_reviewer: RV,
+    run_implement_retry: IM,
+) -> ReviewOutcome
+where
+    RV: Fn(String) -> RVFut,
+    RVFut: std::future::Future<Output = PhaseOutput>,
+    IM: Fn(String) -> IMFut,
+    IMFut: std::future::Future<Output = PhaseOutput>,
+{
+    for attempt in 0..=max_retries {
+        let review = match run_reviewer(reviewer_prompt(task)).await {
+            Ok(t) => t,
+            Err(e) => return ReviewOutcome::Error(e),
+        };
+        let verdict = parse_review_verdict(&review);
+        if matches!(&verdict, Some(v) if v.verdict == Verdict::Done) {
+            return ReviewOutcome::Approved;
+        }
+        // NEEDS_FIX or unparseable → not done.
+        if attempt == max_retries {
+            return ReviewOutcome::Exhausted;
+        }
+        // Feed the punch-list (or the raw review when unparseable) to the
+        // implementer for a targeted retry.
+        let feedback = verdict
+            .map(|v| v.missing)
+            .filter(|m| !m.trim().is_empty())
+            .unwrap_or(review);
+        if let Err(e) = run_implement_retry(implement_retry_prompt(&feedback)).await {
+            return ReviewOutcome::Error(e);
+        }
+    }
+    ReviewOutcome::Exhausted
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -444,5 +505,126 @@ mod tests {
             1,
             "empty explore report → no plan phase"
         );
+    }
+
+    fn done_review() -> String {
+        "looks complete\n```json\n{\"verdict\":\"DONE\",\"missing\":\"\"}\n```".to_string()
+    }
+    fn needs_fix_review(missing: &str) -> String {
+        format!("review\n```json\n{{\"verdict\":\"NEEDS_FIX\",\"missing\":\"{missing}\"}}\n```")
+    }
+
+    #[tokio::test]
+    async fn review_loop_approves_on_done_without_retry() {
+        let impl_calls = Arc::new(Mutex::new(0));
+        let ic = impl_calls.clone();
+        let reviewer = |_p: String| async { Ok(done_review()) };
+        let implementer = move |_p: String| {
+            let ic = ic.clone();
+            async move {
+                *ic.lock().unwrap() += 1;
+                Ok(String::new())
+            }
+        };
+        assert_eq!(
+            run_review_loop("task", 2, reviewer, implementer).await,
+            ReviewOutcome::Approved
+        );
+        assert_eq!(*impl_calls.lock().unwrap(), 0, "no retry when DONE");
+    }
+
+    #[tokio::test]
+    async fn review_loop_retries_with_punchlist_then_approves() {
+        let rcount = Arc::new(Mutex::new(0));
+        let rc = rcount.clone();
+        let feedbacks = Arc::new(Mutex::new(Vec::<String>::new()));
+        let fb = feedbacks.clone();
+        let reviewer = move |_p: String| {
+            let rc = rc.clone();
+            async move {
+                let n = {
+                    let mut c = rc.lock().unwrap();
+                    *c += 1;
+                    *c
+                };
+                Ok(if n == 1 {
+                    needs_fix_review("- add eviction tests")
+                } else {
+                    done_review()
+                })
+            }
+        };
+        let implementer = move |p: String| {
+            let fb = fb.clone();
+            async move {
+                fb.lock().unwrap().push(p);
+                Ok(String::new())
+            }
+        };
+        assert_eq!(
+            run_review_loop("task", 2, reviewer, implementer).await,
+            ReviewOutcome::Approved
+        );
+        let fb = feedbacks.lock().unwrap();
+        assert_eq!(fb.len(), 1, "one fix cycle");
+        assert!(
+            fb[0].contains("add eviction tests"),
+            "punch-list fed back: {}",
+            fb[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn review_loop_exhausts_when_always_needs_fix() {
+        let impl_calls = Arc::new(Mutex::new(0));
+        let ic = impl_calls.clone();
+        let reviewer = |_p: String| async { Ok(needs_fix_review("- still broken")) };
+        let implementer = move |_p: String| {
+            let ic = ic.clone();
+            async move {
+                *ic.lock().unwrap() += 1;
+                Ok(String::new())
+            }
+        };
+        assert_eq!(
+            run_review_loop("task", 2, reviewer, implementer).await,
+            ReviewOutcome::Exhausted
+        );
+        assert_eq!(
+            *impl_calls.lock().unwrap(),
+            2,
+            "exactly max_retries fix cycles"
+        );
+    }
+
+    #[tokio::test]
+    async fn review_loop_surfaces_reviewer_error() {
+        let reviewer = |_p: String| async { Err("reviewer fork crashed".to_string()) };
+        let implementer = |_p: String| async { Ok(String::new()) };
+        assert_eq!(
+            run_review_loop("task", 2, reviewer, implementer).await,
+            ReviewOutcome::Error("reviewer fork crashed".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn review_loop_unparseable_never_approves() {
+        // A malformed/missing verdict must NOT ship — treated as not-done, and
+        // the raw review is fed back since there's no punch-list to extract.
+        let fb = Arc::new(Mutex::new(Vec::<String>::new()));
+        let f = fb.clone();
+        let reviewer = |_p: String| async { Ok("looks fine to me, no json".to_string()) };
+        let implementer = move |p: String| {
+            let f = f.clone();
+            async move {
+                f.lock().unwrap().push(p);
+                Ok(String::new())
+            }
+        };
+        assert_eq!(
+            run_review_loop("task", 1, reviewer, implementer).await,
+            ReviewOutcome::Exhausted
+        );
+        assert!(fb.lock().unwrap()[0].contains("looks fine to me"));
     }
 }
