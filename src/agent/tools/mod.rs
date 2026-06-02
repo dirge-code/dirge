@@ -6,6 +6,8 @@ pub(crate) mod cache;
 #[cfg(feature = "dap")]
 pub(crate) mod debug;
 pub(crate) mod edit;
+#[cfg(feature = "semantic")]
+mod edit_minified;
 mod find_files;
 mod glob;
 mod grep;
@@ -40,6 +42,8 @@ pub use cache::ToolCache;
 #[cfg(feature = "dap")]
 pub use debug::DebugTool;
 pub use edit::EditTool;
+#[cfg(feature = "semantic")]
+pub use edit_minified::EditMinifiedTool;
 pub use find_files::FindFilesTool;
 pub use glob::GlobTool;
 pub use grep::GrepTool;
@@ -88,6 +92,7 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "read_minified",
     "write",
     "edit",
+    "edit_minified",
     "bash",
     "grep",
     "find_files",
