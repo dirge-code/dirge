@@ -788,20 +788,27 @@ mod tests {
     #[test]
     fn dap_perm_check_roundtrips() {
         let perm = make_checker(SecurityMode::Standard);
-        *DAP_PERM_CHECK.lock().unwrap() = Some(perm.clone());
-        let read_back = DAP_PERM_CHECK.lock().unwrap().clone();
-        assert!(read_back.is_some());
-        // Clean up so other tests aren't contaminated.
-        *DAP_PERM_CHECK.lock().unwrap() = None;
+        // Hold the lock across set→read→cleanup as ONE critical section.
+        // `DAP_PERM_CHECK` is a process-global static that the sibling test
+        // (`no_perm_check_when_none`) also mutates; with per-statement locks the
+        // two race under parallel test execution — the sibling could set `None`
+        // between our write and read. Serializing on the global's own mutex
+        // (both tests hold it for their whole body) removes the race.
+        let mut guard = DAP_PERM_CHECK.lock_ignore_poison();
+        *guard = Some(perm.clone());
+        assert!(guard.is_some());
+        *guard = None; // clean up so other tests aren't contaminated
     }
 
     /// When DAP_PERM_CHECK is None, the guard should be skipped (no crash).
     #[test]
     fn no_perm_check_when_none() {
-        *DAP_PERM_CHECK.lock().unwrap() = None;
-        // Verify the guard in handle_dap_command's DAP_PERM_CHECK read
-        // gracefully returns None -> no check, no panic.
-        let guard = DAP_PERM_CHECK.lock().ok().and_then(|g| g.clone());
+        // Same single-critical-section discipline as `dap_perm_check_roundtrips`
+        // so the two DAP_PERM_CHECK tests can't interleave.
+        let mut guard = DAP_PERM_CHECK.lock_ignore_poison();
+        *guard = None;
+        // The guard in handle_dap_command's DAP_PERM_CHECK read gracefully
+        // returns None -> no check, no panic.
         assert!(
             guard.is_none(),
             "DAP_PERM_CHECK should be None after cleanup"
