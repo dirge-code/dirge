@@ -8,22 +8,23 @@
 //!
 //! ## Language gating (deliberate)
 //!
-//! [`language_for_ext`] returns a grammar ONLY for languages that are both
-//! compiled in (per the `semantic-*` cargo features) AND collapse-safe — i.e.
-//! mandatory-terminator languages with NO automatic-semicolon-insertion, NO
-//! preprocessor, and no significant whitespace (Rust, Java) — plus languages
-//! made safe by a per-language annotator (`annotate_*`) that re-inserts the
-//! separators the language relies on before the collapse: **Go** (auto-`;`).
+//! Two modes, chosen per language (`annotate`), both semantics-preserving:
 //!
-//! Excluded until their per-language annotators are ported (see dirge-8e27):
-//! Python (indentation), Ruby (newline-driven auto-semicolon), Bash
-//! (newlines), Clojure (whitespace-as-delimiter), Elixir, TypeScript/JavaScript
-//! (ASI), and C/C++ (newline-terminated preprocessor directives). For those
-//! (and any
-//! unsupported extension) `language_for_ext` returns `None`, and callers MUST
-//! fall back to a plain read. [`minify`] also returns `None` whenever the
-//! input doesn't parse cleanly or the minified output fails re-validation, so
-//! it never yields a half-minified / corrupted result.
+//! - **Aggressive collapse** — drop all whitespace, re-spacing only to keep
+//!   tokens from merging. Safe only for languages with mandatory terminators,
+//!   no ASI, no preprocessor, no significant whitespace: **Rust, Java**, and
+//!   **Go** (via `annotate_go`, which re-inserts Go's auto-`;`).
+//! - **Gap-preserving** — keep the source whitespace verbatim (collapse only
+//!   blank lines), strip comments. Universally safe; used for everything where
+//!   whitespace/newlines carry meaning: Bash, Python, Ruby, Elixir, C/C++,
+//!   TypeScript/JS, and Clojure (whitespace-as-delimiter; collapses to a single
+//!   space since its newlines are insignificant).
+//!
+//! [`language_for_ext`] returns a grammar only for compiled-in languages (per
+//! the `semantic-*` features); any other extension → `None` → callers fall
+//! back to a plain read. [`minify`] also returns `None` when the input doesn't
+//! parse cleanly or the minified output fails re-validation — never a
+//! half-minified / corrupted result.
 
 // The minify primitive is exercised by its own tests now; the production
 // callers (`read_minified` / `edit_minified`) land in dirge-759c / dirge-wxws.
@@ -32,16 +33,21 @@
 
 use tree_sitter::{Node, Parser};
 
-/// A collected leaf token plus its source line and the separator emitted
+/// A collected leaf token plus its source position and the separator emitted
 /// after it (set by per-language annotators).
 struct Token {
     text: String,
-    /// 0-based source line — annotators use line changes to decide where a
-    /// statement separator must be re-inserted before whitespace is collapsed.
+    /// 0-based source line — trigger-based annotators (Go/Ruby) use line
+    /// changes to decide where an auto-semicolon must be re-inserted.
     line: usize,
-    /// Separator emitted *after* this token, before the next one (e.g. `";"`
-    /// where a newline-significant language would auto-insert one).
-    separator: &'static str,
+    /// Source byte range — gap-preserving annotators (Bash/Clojure) inspect
+    /// the bytes between adjacent tokens to know whether the source had a
+    /// separator there.
+    byte_start: usize,
+    byte_end: usize,
+    /// Separator emitted *after* this token, before the next one. May be a
+    /// computed string (e.g. Bash preserves the source whitespace run).
+    separator: String,
 }
 
 fn is_word_char(c: u8) -> bool {
@@ -72,16 +78,27 @@ pub fn language_for_ext(ext: &str) -> Option<tree_sitter::Language> {
         // collapse).
         #[cfg(feature = "semantic-go")]
         "go" => Some(tree_sitter_go::LANGUAGE.into()),
-        // Intentionally NOT here (each needs newline-aware annotation in
-        // dirge-8e27 before it's safe):
-        //   - TypeScript/JavaScript: Automatic Semicolon Insertion — collapsing
-        //     newlines can change semantics in a way that still PARSES (e.g.
-        //     `a=b+c` <nl> `(d).foo()` → `a=b+c(d).foo()`), so re-validation
-        //     can't catch it.
-        //   - C/C++: the preprocessor (`#include`/`#define`) is newline-
-        //     terminated; collapsing merges directives with the next line.
-        //     (Re-validation catches it → safe fallback, but it means C/C++
-        //     rarely minify in practice, so we don't advertise them.)
+        // Gap-preserving (annotate_gap_preserve): newline/whitespace-
+        // significant languages, made safe by re-emitting the source
+        // whitespace between tokens (provably non-corrupting).
+        #[cfg(feature = "semantic-bash")]
+        "sh" | "bash" => Some(tree_sitter_bash::LANGUAGE.into()),
+        #[cfg(feature = "semantic-clojure")]
+        "clj" | "cljs" | "cljc" | "edn" | "bb" => Some(tree_sitter_clojure::LANGUAGE.into()),
+        #[cfg(feature = "semantic-python")]
+        "py" => Some(tree_sitter_python::LANGUAGE.into()),
+        #[cfg(feature = "semantic-ruby")]
+        "rb" | "rake" | "gemspec" => Some(tree_sitter_ruby::LANGUAGE.into()),
+        #[cfg(feature = "semantic-elixir")]
+        "ex" | "exs" => Some(tree_sitter_elixir::LANGUAGE.into()),
+        #[cfg(feature = "semantic-c")]
+        "c" | "h" => Some(tree_sitter_c::LANGUAGE.into()),
+        #[cfg(feature = "semantic-cpp")]
+        "cpp" | "cc" | "cxx" | "hpp" | "hh" => Some(tree_sitter_cpp::LANGUAGE.into()),
+        #[cfg(feature = "semantic-ts")]
+        "ts" => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
+        #[cfg(feature = "semantic-ts")]
+        "tsx" => Some(tree_sitter_typescript::LANGUAGE_TSX.into()),
         _ => None,
     }
 }
@@ -106,7 +123,7 @@ pub fn minify(ext: &str, source: &str) -> Option<String> {
     let src = source.as_bytes();
     let mut tokens: Vec<Token> = Vec::new();
     collect_leaves(root, src, &mut tokens);
-    annotate(ext, &mut tokens);
+    annotate(ext, &mut tokens, src);
     let out = render(&tokens);
     if out.is_empty() {
         return None;
@@ -142,7 +159,9 @@ fn collect_leaves(node: Node, src: &[u8], tokens: &mut Vec<Token>) {
                 tokens.push(Token {
                     text: text.to_string(),
                     line: node.start_position().row,
-                    separator: "",
+                    byte_start: node.start_byte(),
+                    byte_end: node.end_byte(),
+                    separator: String::new(),
                 });
             }
         }
@@ -158,10 +177,73 @@ fn collect_leaves(node: Node, src: &[u8], tokens: &mut Vec<Token>) {
 /// newline-significant language relies on, BEFORE whitespace is collapsed.
 /// Languages with no annotator (Rust, Java) are left as-is. Ported from vix's
 /// `annotate*` pass.
-fn annotate(ext: &str, tokens: &mut [Token]) {
+fn annotate(ext: &str, tokens: &mut [Token], source: &[u8]) {
     match ext.trim_start_matches('.').to_ascii_lowercase().as_str() {
+        // Aggressive collapse is safe (Rust/Java handled by render directly).
         "go" => annotate_go(tokens),
+        "clj" | "cljs" | "cljc" | "edn" | "bb" => annotate_clojure(tokens),
+        // Newline/whitespace-significant languages: preserve the source
+        // whitespace (keeps ASI/indentation/preprocessor structure intact),
+        // collapse only blank lines, strip comments. Provably non-corrupting.
+        "sh" | "bash" | "py" | "rb" | "rake" | "gemspec" | "ts" | "tsx" | "c" | "h" | "cpp"
+        | "cc" | "cxx" | "hpp" | "hh" | "ex" | "exs" => annotate_gap_preserve(tokens, source),
         _ => {}
+    }
+}
+
+/// Gap-preserving annotator (no silent-corruption risk): wherever the source
+/// had whitespace between two tokens, re-emit it verbatim (collapsing runs of
+/// blank lines to one). Keeping the source whitespace is the universally-safe
+/// transform — it preserves ASI (TS/JS), indentation (Python), newline command
+/// separators (Bash), and preprocessor line boundaries (C/C++) without needing
+/// language-specific rules. Savings come from stripped comments + collapsed
+/// blank lines. Ported from vix `annotateBash` (generalized).
+fn annotate_gap_preserve(tokens: &mut [Token], source: &[u8]) {
+    for i in 1..tokens.len() {
+        let (start, end) = (tokens[i - 1].byte_end, tokens[i].byte_start);
+        if start >= end || end > source.len() {
+            continue;
+        }
+        // Keep only whitespace from the gap (comments were dropped already).
+        let ws: Vec<u8> = source[start..end]
+            .iter()
+            .copied()
+            .filter(|&c| c == b' ' || c == b'\t' || c == b'\n')
+            .collect();
+        if ws.is_empty() {
+            continue;
+        }
+        // Collapse consecutive newlines to a single one.
+        let mut collapsed = Vec::with_capacity(ws.len());
+        let mut prev_nl = false;
+        for &c in &ws {
+            if c == b'\n' {
+                if prev_nl {
+                    continue;
+                }
+                prev_nl = true;
+            } else {
+                prev_nl = false;
+            }
+            collapsed.push(c);
+        }
+        tokens[i - 1].separator = String::from_utf8_lossy(&collapsed).into_owned();
+    }
+}
+
+/// Gap-preserving annotator for Clojure (and the EDN/cljs/cljc/bb family).
+/// Clojure is whitespace-as-delimiter: a symbol built from operator chars
+/// (`->`, `<=`, `my-fn`) adjacent to another atom MUST keep its space, or two
+/// atoms merge into one symbol (`-> x` => `->x`). The generic word-char
+/// spacing can't guarantee that, so we re-insert a single space wherever the
+/// source had any gap (whitespace or a stripped comment) between two tokens.
+/// Newlines are insignificant, so a single space is enough. Provably safe:
+/// never merges atoms, never adds a space the source didn't have.
+fn annotate_clojure(tokens: &mut [Token]) {
+    for i in 0..tokens.len().saturating_sub(1) {
+        if tokens[i].byte_end < tokens[i + 1].byte_start {
+            tokens[i].separator = " ".to_string();
+        }
     }
 }
 
@@ -178,7 +260,7 @@ fn annotate_go(tokens: &mut [Token]) {
             && go_semicolon_trigger(&tokens[i].text)
             && !is_closing_token(next_text)
         {
-            tokens[i].separator = ";";
+            tokens[i].separator = ";".to_string();
         }
     }
 }
@@ -212,7 +294,7 @@ fn render(tokens: &[Token]) -> String {
         if i > 0 {
             let prev = &tokens[i - 1];
             if !prev.separator.is_empty() {
-                out.push_str(prev.separator);
+                out.push_str(&prev.separator);
             }
             if let Some(&last) = out.as_bytes().last() {
                 let first = tok.text.as_bytes()[0];
@@ -241,17 +323,12 @@ mod tests {
     }
 
     #[test]
-    fn whitespace_significant_langs_are_gated_out() {
-        // These have grammars but are NOT collapse-safe — must stay None until
-        // their annotators land (dirge-8e27), so they fall back to plain read.
-        // ts/tsx: ASI; c/cpp/h/hpp: newline-terminated preprocessor.
-        // (go is NOT here — it's unlocked via annotate_go.)
-        for ext in [
-            "py", "sh", "rb", "clj", "ex", "ts", "tsx", "c", "h", "cpp", "cc", "hpp",
-        ] {
+    fn non_source_extensions_are_gated_out() {
+        // No tree-sitter grammar → None → caller falls back to a plain read.
+        for ext in ["md", "json", "txt", "toml", "yaml", "yml", "lock", "png"] {
             assert!(
                 language_for_ext(ext).is_none(),
-                "{ext} must be gated out of naive minify"
+                "{ext} has no grammar; must fall back"
             );
         }
     }
@@ -328,6 +405,93 @@ mod tests {
         assert!(!go_semicolon_trigger("+")); // bare operator: no ASI
         assert!(!go_semicolon_trigger("{"));
         assert!(!go_semicolon_trigger(""));
+    }
+
+    #[cfg(feature = "semantic-clojure")]
+    #[test]
+    fn clojure_keeps_operator_symbol_boundaries() {
+        // The hazard: `-> x` must NOT collapse to `->x` (which would read as a
+        // single symbol). The gap-preserving annotator keeps the space.
+        let src = "; a comment\n(defn f [x]\n  (-> x\n      inc\n      (+ 2)))\n";
+        let out = minify("clj", src).expect("clojure minifies");
+        assert!(!out.contains("comment"), "comment stripped: {out}");
+        assert!(out.contains("-> x"), "operator/atom boundary kept: {out}");
+        assert!(!out.contains("->x"), "must not merge symbols: {out}");
+        assert!(out.contains("defn f"), "atoms stay separated: {out}");
+        // Round-trips.
+        assert!(
+            minify("clj", &out).is_some(),
+            "minified clojure re-parses: {out}"
+        );
+    }
+
+    #[cfg(feature = "semantic-clojure")]
+    #[test]
+    fn clojure_no_space_around_delimiters() {
+        let src = "(list 1 2 3)\n";
+        let out = minify("clj", src).expect("minifies");
+        // No spurious space after `(` or before `)` (source had none there).
+        assert!(
+            out.contains("(list 1 2 3)"),
+            "delimiter adjacency preserved: {out}"
+        );
+    }
+
+    #[cfg(feature = "semantic-bash")]
+    #[test]
+    fn bash_preserves_command_newlines() {
+        // Bash newlines separate commands — gap preservation keeps them, so
+        // `echo a` / `echo b` don't merge into one command.
+        let src = "# comment\necho a\n\n\necho b\n";
+        let out = minify("sh", src).expect("bash minifies");
+        assert!(!out.contains("comment"), "comment stripped: {out}");
+        assert!(out.contains("echo a"), "{out}");
+        assert!(out.contains("echo b"), "{out}");
+        // The two commands remain newline-separated (not `echo aecho b`).
+        assert!(!out.contains("aecho"), "commands stay separated: {out:?}");
+        assert!(minify("sh", &out).is_some(), "re-parses: {out}");
+    }
+
+    #[cfg(feature = "semantic-ts")]
+    #[test]
+    fn typescript_gap_preserve_keeps_asi_newlines() {
+        // ASI hazard: `a = b` <nl> `(c).d()` must NOT become one statement.
+        // Gap-preserve keeps the newline, so ASI still fires.
+        let src = "// c\nconst a = 1\nconst b = 2\nconsole.log(a + b)\n";
+        let out = minify("ts", src).expect("ts minifies (gap-preserve)");
+        assert!(!out.contains("// c"), "comment stripped: {out}");
+        assert!(out.contains('\n'), "newlines preserved for ASI: {out:?}");
+        assert!(minify("ts", &out).is_some(), "re-parses: {out}");
+    }
+
+    #[cfg(feature = "semantic-c")]
+    #[test]
+    fn c_gap_preserve_keeps_preprocessor_lines() {
+        // The preprocessor is newline-terminated; gap-preserve keeps those
+        // newlines so `#include <stdio.h>` doesn't merge with the next line.
+        let src = "#include <stdio.h>\nint main(void) {\n    return 0; // ok\n}\n";
+        let out = minify("c", src).expect("c minifies (gap-preserve)");
+        assert!(
+            out.contains("#include <stdio.h>"),
+            "preproc intact: {out:?}"
+        );
+        assert!(out.contains('\n'), "preproc newline kept: {out:?}");
+        assert!(!out.contains("// ok"), "comment stripped: {out}");
+        assert!(minify("c", &out).is_some(), "re-parses: {out}");
+    }
+
+    #[cfg(feature = "semantic-python")]
+    #[test]
+    fn python_gap_preserve_keeps_indentation() {
+        let src = "# doc\ndef f(x):\n    if x:\n        return 1\n    return 0\n";
+        let out = minify("py", src).expect("python minifies (gap-preserve)");
+        assert!(!out.contains("# doc"), "comment stripped: {out}");
+        // Indentation is syntax in Python — it must survive verbatim.
+        assert!(
+            out.contains("        return 1"),
+            "indentation preserved: {out:?}"
+        );
+        assert!(minify("py", &out).is_some(), "re-parses: {out}");
     }
 
     #[cfg(feature = "semantic-rust")]
