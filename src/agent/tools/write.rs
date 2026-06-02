@@ -9,7 +9,7 @@ use rig::tool::Tool;
 
 use crate::agent::agent_loop::tool_input_repair::with_contract_hint;
 use crate::agent::tools::cache::ToolCache;
-use crate::agent::tools::{AskSender, PermCheck, ToolError, WriteArgs, check_perm_path_resolve};
+use crate::agent::tools::{AskSender, PermCheck, ToolError, WriteArgs, require_and_resolve};
 #[cfg(feature = "lsp")]
 use crate::lsp::diagnostic;
 #[cfg(feature = "lsp")]
@@ -91,13 +91,17 @@ impl Tool for WriteTool {
         // Without it the tool silently resolves "1" to "{cwd}/1" and
         // creates the file, confusing the model into thinking it wrote
         // to a real project path.
-        crate::agent::tools::require_absolute_path(&args.path, "the write path")
-            .map_err(ToolError::Msg)?;
-        // Audit H12: pin file operations to the canonical path the
-        // permission check ran against, so a symlink swap can't
+        // Audit H12: require absolute + pin file operations to the canonical
+        // path the permission check ran against, so a symlink swap can't
         // redirect the write to an unauthorized target.
-        let resolved_path =
-            check_perm_path_resolve(&self.permission, &self.ask_tx, "write", &args.path).await?;
+        let resolved_path = require_and_resolve(
+            &self.permission,
+            &self.ask_tx,
+            "write",
+            &args.path,
+            "the write path",
+        )
+        .await?;
 
         let path = Path::new(&resolved_path);
         // Phase-2 tree-sitter validation: refuse to write

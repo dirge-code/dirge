@@ -600,6 +600,22 @@ pub async fn check_perm_path_resolve(
     enforce(permission, ask_tx, tool, Scope::PathResolve(path)).await
 }
 
+/// The path-tool call preamble, in one place: require `path` be absolute, then
+/// run the permission check that resolves + pins it to its canonical form.
+/// Centralizes the canonicalize → permission-check ordering (the Audit-H12
+/// symlink-swap invariant) so a new tool physically can't get it wrong.
+/// `subject` names the path in the absolute-path error (e.g. "the write path").
+pub async fn require_and_resolve(
+    permission: &Option<PermCheck>,
+    ask_tx: &Option<AskSender>,
+    tool: &str,
+    path: &str,
+    subject: &str,
+) -> Result<String, ToolError> {
+    require_absolute_path(path, subject).map_err(ToolError::Msg)?;
+    check_perm_path_resolve(permission, ask_tx, tool, path).await
+}
+
 // `is_plan_file` and `canonicalize_or_parent` were removed when the
 // prompt-level PLAN.md gate moved into the permission checker via
 // `deny_tools` frontmatter. The few historical callers (WriteTool,

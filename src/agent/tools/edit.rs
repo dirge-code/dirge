@@ -6,7 +6,7 @@ use rig::tool::Tool;
 
 use crate::agent::agent_loop::tool_input_repair::with_contract_hint;
 use crate::agent::tools::cache::ToolCache;
-use crate::agent::tools::{AskSender, EditArgs, PermCheck, ToolError, check_perm_path_resolve};
+use crate::agent::tools::{AskSender, EditArgs, PermCheck, ToolError, require_and_resolve};
 #[cfg(feature = "lsp")]
 use crate::lsp::manager::LspManager;
 
@@ -134,12 +134,16 @@ impl Tool for EditTool {
 
         // Reject non-absolute paths immediately with a clear error
         // (shared guard; the schema requires an absolute path).
-        crate::agent::tools::require_absolute_path(&args.path, "the edit path")
-            .map_err(ToolError::Msg)?;
-        // Audit H12: pin file operations to the canonical path the
-        // permission check resolved.
-        let resolved_path =
-            check_perm_path_resolve(&self.permission, &self.ask_tx, "edit", &args.path).await?;
+        // Audit H12: require absolute + pin file operations to the canonical
+        // path the permission check resolved.
+        let resolved_path = require_and_resolve(
+            &self.permission,
+            &self.ask_tx,
+            "edit",
+            &args.path,
+            "the edit path",
+        )
+        .await?;
 
         // Read-before-edit gate (ported from vix session_read_gate.go): refuse
         // to edit a file the model hasn't read this session, so `old_text` is

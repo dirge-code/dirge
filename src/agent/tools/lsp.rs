@@ -172,13 +172,12 @@ impl Tool for LspTool {
         // pinning the path against a symlink-swap between check-time
         // and open-time.
         let abs_path = if let Some(p) = args.file_path.as_ref() {
-            crate::agent::tools::require_absolute_path(p, "the lsp file_path")
-                .map_err(ToolError::Msg)?;
-            let resolved = crate::agent::tools::check_perm_path_resolve(
+            let resolved = crate::agent::tools::require_and_resolve(
                 &self.permission,
                 &self.ask_tx,
                 "lsp",
                 p,
+                "the lsp file_path",
             )
             .await?;
             Some(std::path::PathBuf::from(resolved))

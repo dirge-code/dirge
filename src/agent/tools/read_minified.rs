@@ -18,8 +18,7 @@ use rig::tool::Tool;
 use crate::agent::agent_loop::tool_input_repair::with_contract_hint;
 use crate::agent::tools::cache::ToolCache;
 use crate::agent::tools::{
-    AskSender, PermCheck, ReadArgs, ReadTool, ToolError, check_perm_path_resolve,
-    require_absolute_path,
+    AskSender, PermCheck, ReadArgs, ReadTool, ToolError, require_and_resolve,
 };
 #[cfg(feature = "lsp")]
 use crate::lsp::manager::LspManager;
@@ -107,10 +106,16 @@ impl Tool for ReadMinifiedTool {
             .unwrap_or("");
 
         if whole_file && crate::semantic::minify::language_for_ext(ext).is_some() {
-            require_absolute_path(&args.path, "the read path").map_err(ToolError::Msg)?;
-            // Single permission resolve for the common (minify-success) path.
-            let resolved =
-                check_perm_path_resolve(&self.permission, &self.ask_tx, "read", &args.path).await?;
+            // Single absolute-check + permission resolve for the common
+            // (minify-success) path.
+            let resolved = require_and_resolve(
+                &self.permission,
+                &self.ask_tx,
+                "read",
+                &args.path,
+                "the read path",
+            )
+            .await?;
 
             let small_enough = tokio::fs::metadata(&resolved)
                 .await
@@ -152,7 +157,7 @@ mod tests {
         let path = dir.join("a.rs");
         std::fs::write(&path, "// header\nfn  main ( ) {\n    let  x = 1 ;\n}\n").unwrap();
         let abs = path.to_string_lossy().to_string();
-        let resolved = check_perm_path_resolve(&None, &None, "read", &abs)
+        let resolved = crate::agent::tools::check_perm_path_resolve(&None, &None, "read", &abs)
             .await
             .unwrap();
 

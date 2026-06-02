@@ -28,8 +28,6 @@
 //! to preserve them (chat markdown), others don't (chamber rows,
 //! single-line banners).
 
-use compact_str::CompactString;
-
 /// What whitespace-class controls to preserve. The "block all"
 /// posture is the safe default; consumers that need newline /
 /// tab pass-through opt in explicitly.
@@ -63,8 +61,7 @@ impl StripPolicy {
 
     /// Preserve both `\n` and `\t`. Use for chat content that
     /// flows through markdown rendering (tabs survive into the
-    /// rendered code-block).
-    #[allow(dead_code)]
+    /// rendered code-block) — e.g. `sanitize_output`.
     pub const KEEP_BOTH: Self = Self {
         keep_newline: true,
         keep_tab: true,
@@ -88,23 +85,6 @@ pub fn strip_controls(s: &str, policy: StripPolicy) -> String {
         return s.to_string();
     }
     s.chars().filter(|c| keep_char(*c, policy)).collect()
-}
-
-/// Same as `strip_controls` but returns a `CompactString` — used
-/// by `sanitize_output` callers that store the result in chamber
-/// row buffers. Currently unused at call sites (the MCP forwarder
-/// is the highest-throughput caller and uses `strip_controls`);
-/// kept as part of the deliberate API surface for the future
-/// `sanitize_output` migration.
-#[allow(dead_code)]
-pub fn strip_controls_compact(s: &str, policy: StripPolicy) -> CompactString {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        if keep_char(c, policy) {
-            out.push(c);
-        }
-    }
-    CompactString::from(out)
 }
 
 /// Strip full ANSI escape sequences AND control characters.

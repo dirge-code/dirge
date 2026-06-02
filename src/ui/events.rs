@@ -344,83 +344,19 @@ fn render_banner(renderer: &mut Renderer, provider: &str, model: &str) -> anyhow
 
 pub fn sanitize_output(text: &str) -> CompactString {
     // Two-pass: first strip orphan SGR mouse reports of the form
-    // `[<digits;digits;digits(M|m)` (no leading escape). These can
-    // leak into tool output when a shell command captures terminal
-    // input bytes, and without this guard they smear `[<65;79;32M…`
-    // through the chamber. Then run the regular ANSI/control-char
-    // sanitizer over the cleaned text.
+    // `[<digits;digits;digits(M|m)` (no leading escape). These can leak into
+    // tool output when a shell command captures terminal input bytes, and
+    // without this guard they smear `[<65;79;32M…` through the chamber. Then
+    // run the shared ANSI/control-char sanitizer over the cleaned text —
+    // `KEEP_BOTH` preserves `\n` + `\t` (this output flows through markdown).
+    //
+    // The escape-stripping state machine lives once in [`crate::ui::ansi`]
+    // ([`strip_escapes`]) so the two terminal-output guards (this and the
+    // bash/markdown/slash paths) can never drift apart — a security-relevant
+    // invariant, since both gate untrusted LLM / bash bytes to the terminal.
+    use crate::ui::ansi::{StripPolicy, strip_escapes};
     let stripped = strip_orphan_mouse_reports(text);
-
-    let mut result = String::with_capacity(stripped.len());
-    let mut chars = stripped.chars();
-    while let Some(c) = chars.next() {
-        if c == '\x1b' {
-            // Strip ALL escape sequences, not just CSI/OSC.
-            // CSI: ESC [ ... final-byte (0x40..=0x7E)
-            // OSC: ESC ] ... BEL or ESC \
-            // DCS/APC/PM/SOS: ESC P/X/^/_ ... ESC \
-            // Single-byte: ESC + any other char (reset, etc.)
-            match chars.next() {
-                Some('[') => {
-                    let mut n = 0;
-                    for next in &mut chars {
-                        let cp = next as u32;
-                        if (0x40..=0x7e).contains(&cp) {
-                            break;
-                        }
-                        n += 1;
-                        if n >= 256 {
-                            break;
-                        }
-                    }
-                }
-                Some(']') => {
-                    let mut n = 0;
-                    while let Some(next) = chars.next() {
-                        if next == '\x07' {
-                            break;
-                        }
-                        if next == '\x1b' {
-                            let mut peek = chars.clone();
-                            if peek.next() == Some('\\') {
-                                chars = peek;
-                                break;
-                            }
-                        }
-                        n += 1;
-                        if n >= 256 {
-                            break;
-                        }
-                    }
-                }
-                // DCS/APC/PM/SOS — consume until ST (ESC \). Cap at 4 KB.
-                Some('P') | Some('X') | Some('^') | Some('_') => {
-                    let mut prev = '\0';
-                    let mut n = 0;
-                    for next in &mut chars {
-                        if prev == '\x1b' && next == '\\' {
-                            break;
-                        }
-                        prev = next;
-                        n += 1;
-                        if n >= 4096 {
-                            break;
-                        }
-                    }
-                }
-                Some(_) => {} // Single-byte esc sequence — skip the second byte.
-                None => break,
-            }
-        } else if c.is_ascii_control() || (0x80..=0x9F).contains(&(c as u32)) {
-            if c != '\n' && c != '\t' {
-                continue;
-            }
-            result.push(c);
-        } else {
-            result.push(c);
-        }
-    }
-    CompactString::from(result)
+    CompactString::from(strip_escapes(&stripped, StripPolicy::KEEP_BOTH))
 }
 
 /// Strip orphan SGR mouse-report sequences (e.g. `[<65;79;32M`) that

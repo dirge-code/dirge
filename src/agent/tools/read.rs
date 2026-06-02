@@ -6,7 +6,7 @@ use rig::tool::Tool;
 
 use crate::agent::agent_loop::tool_input_repair::with_contract_hint;
 use crate::agent::tools::cache::ToolCache;
-use crate::agent::tools::{AskSender, PermCheck, ReadArgs, ToolError, check_perm_path_resolve};
+use crate::agent::tools::{AskSender, PermCheck, ReadArgs, ToolError, require_and_resolve};
 #[cfg(feature = "lsp")]
 use crate::lsp::manager::{LspManager, TouchMode};
 
@@ -181,14 +181,18 @@ impl Tool for ReadTool {
     async fn call(&self, args: ReadArgs) -> Result<String, ToolError> {
         // Reject non-absolute paths immediately with a clear error
         // (shared guard; the schema declares `semantic: absolute_path`).
-        crate::agent::tools::require_absolute_path(&args.path, "the read path")
-            .map_err(ToolError::Msg)?;
-        // Audit H12: pin the path we'll actually open to the same
-        // canonical form the permission check ran against, so a
-        // symlink swap between check and open can't land us on a
-        // different file than the user authorized.
-        let resolved_path =
-            check_perm_path_resolve(&self.permission, &self.ask_tx, "read", &args.path).await?;
+        // Audit H12: require absolute + pin the path we'll actually open to the
+        // same canonical form the permission check ran against, so a symlink
+        // swap between check and open can't land us on a different file than
+        // the user authorized.
+        let resolved_path = require_and_resolve(
+            &self.permission,
+            &self.ask_tx,
+            "read",
+            &args.path,
+            "the read path",
+        )
+        .await?;
 
         // Relational defaulting: when only one of offset/limit is
         // provided, fill the other with a sensible default and surface

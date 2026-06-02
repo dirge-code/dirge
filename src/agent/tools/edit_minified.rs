@@ -16,9 +16,7 @@ use rig::tool::Tool;
 
 use crate::agent::agent_loop::tool_input_repair::with_contract_hint;
 use crate::agent::tools::cache::ToolCache;
-use crate::agent::tools::{
-    AskSender, EditArgs, PermCheck, ToolError, check_perm_path_resolve, require_absolute_path,
-};
+use crate::agent::tools::{AskSender, EditArgs, PermCheck, ToolError, require_and_resolve};
 #[cfg(feature = "lsp")]
 use crate::lsp::manager::LspManager;
 use crate::semantic::minify::{MinifiedEditError, apply_minified_edit};
@@ -92,9 +90,14 @@ impl Tool for EditMinifiedTool {
                 "old_text must not be empty. Provide the exact minified text to replace.".into(),
             ));
         }
-        require_absolute_path(&args.path, "the edit path").map_err(ToolError::Msg)?;
-        let resolved =
-            check_perm_path_resolve(&self.permission, &self.ask_tx, "edit", &args.path).await?;
+        let resolved = require_and_resolve(
+            &self.permission,
+            &self.ask_tx,
+            "edit",
+            &args.path,
+            "the edit path",
+        )
+        .await?;
 
         // Read-before-edit gate (shared with `edit`): the model must have read
         // the file (read_minified satisfies it) so the match is against content
@@ -202,7 +205,7 @@ mod tests {
         let src = "fn main() {\n    let x = 1;\n    let y = 2;\n}\n";
         std::fs::write(&path, src).unwrap();
         let abs = path.to_string_lossy().to_string();
-        let resolved = check_perm_path_resolve(&None, &None, "read", &abs)
+        let resolved = crate::agent::tools::check_perm_path_resolve(&None, &None, "read", &abs)
             .await
             .unwrap();
 
