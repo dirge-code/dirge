@@ -11,10 +11,12 @@
 //! [`language_for_ext`] returns a grammar ONLY for languages that are both
 //! compiled in (per the `semantic-*` cargo features) AND collapse-safe — i.e.
 //! mandatory-terminator languages with NO automatic-semicolon-insertion, NO
-//! preprocessor, and no significant whitespace (Rust, Java).
+//! preprocessor, and no significant whitespace (Rust, Java) — plus languages
+//! made safe by a per-language annotator (`annotate_*`) that re-inserts the
+//! separators the language relies on before the collapse: **Go** (auto-`;`).
 //!
 //! Excluded until their per-language annotators are ported (see dirge-8e27):
-//! Python (indentation), Go/Ruby (newline-driven auto-semicolon), Bash
+//! Python (indentation), Ruby (newline-driven auto-semicolon), Bash
 //! (newlines), Clojure (whitespace-as-delimiter), Elixir, TypeScript/JavaScript
 //! (ASI), and C/C++ (newline-terminated preprocessor directives). For those
 //! (and any
@@ -30,12 +32,16 @@
 
 use tree_sitter::{Node, Parser};
 
-/// A collected leaf token plus the separator emitted before the NEXT token.
+/// A collected leaf token plus its source line and the separator emitted
+/// after it (set by per-language annotators).
 struct Token {
     text: String,
-    /// Separator to emit *after* this token, before the next one (e.g. `"\n"`
-    /// after a kept comment so it can't comment out following code).
-    trailing_sep: &'static str,
+    /// 0-based source line — annotators use line changes to decide where a
+    /// statement separator must be re-inserted before whitespace is collapsed.
+    line: usize,
+    /// Separator emitted *after* this token, before the next one (e.g. `";"`
+    /// where a newline-significant language would auto-insert one).
+    separator: &'static str,
 }
 
 fn is_word_char(c: u8) -> bool {
@@ -62,6 +68,10 @@ pub fn language_for_ext(ext: &str) -> Option<tree_sitter::Language> {
         "rs" => Some(tree_sitter_rust::LANGUAGE.into()),
         #[cfg(feature = "semantic-java")]
         "java" => Some(tree_sitter_java::LANGUAGE.into()),
+        // Go is safe via `annotate_go` (re-inserts auto-semicolons before the
+        // collapse).
+        #[cfg(feature = "semantic-go")]
+        "go" => Some(tree_sitter_go::LANGUAGE.into()),
         // Intentionally NOT here (each needs newline-aware annotation in
         // dirge-8e27 before it's safe):
         //   - TypeScript/JavaScript: Automatic Semicolon Insertion — collapsing
@@ -96,6 +106,7 @@ pub fn minify(ext: &str, source: &str) -> Option<String> {
     let src = source.as_bytes();
     let mut tokens: Vec<Token> = Vec::new();
     collect_leaves(root, src, &mut tokens);
+    annotate(ext, &mut tokens);
     let out = render(&tokens);
     if out.is_empty() {
         return None;
@@ -130,7 +141,8 @@ fn collect_leaves(node: Node, src: &[u8], tokens: &mut Vec<Token>) {
             if !text.is_empty() {
                 tokens.push(Token {
                     text: text.to_string(),
-                    trailing_sep: "",
+                    line: node.start_position().row,
+                    separator: "",
                 });
             }
         }
@@ -142,16 +154,65 @@ fn collect_leaves(node: Node, src: &[u8], tokens: &mut Vec<Token>) {
     }
 }
 
-/// Concatenate tokens, inserting a single space only where two tokens would
-/// otherwise merge (word-char/word-char) or an operator would swallow a
-/// leading `.`. Ported from vix `minifyTokens`.
+/// Per-language separator annotation: re-insert the statement separators a
+/// newline-significant language relies on, BEFORE whitespace is collapsed.
+/// Languages with no annotator (Rust, Java) are left as-is. Ported from vix's
+/// `annotate*` pass.
+fn annotate(ext: &str, tokens: &mut [Token]) {
+    match ext.trim_start_matches('.').to_ascii_lowercase().as_str() {
+        "go" => annotate_go(tokens),
+        _ => {}
+    }
+}
+
+/// Go auto-semicolon insertion: a newline after a "trigger" token (identifier,
+/// literal, `)`/`]`/`}`, `++`/`--`) terminates the statement. We re-insert
+/// that `;` wherever the next token is on a later line and isn't a closing
+/// token — making the subsequent whitespace-collapse semantics-preserving.
+/// Ported from vix `annotateGo` + `goSemicolonTrigger`/`isClosingToken`.
+fn annotate_go(tokens: &mut [Token]) {
+    for i in 0..tokens.len().saturating_sub(1) {
+        let next_line = tokens[i + 1].line;
+        let next_text = &tokens[i + 1].text;
+        if next_line > tokens[i].line
+            && go_semicolon_trigger(&tokens[i].text)
+            && !is_closing_token(next_text)
+        {
+            tokens[i].separator = ";";
+        }
+    }
+}
+
+fn go_semicolon_trigger(text: &str) -> bool {
+    let Some(&last) = text.as_bytes().last() else {
+        return false;
+    };
+    if is_word_char(last) {
+        return true;
+    }
+    match last {
+        b')' | b']' | b'}' | b'"' | b'\'' | b'`' => true,
+        b'+' => text == "++",
+        b'-' => text == "--",
+        _ => false,
+    }
+}
+
+fn is_closing_token(text: &str) -> bool {
+    matches!(text, "}" | ")" | "]" | ",")
+}
+
+/// Concatenate tokens, emitting each token's annotator separator, and inserting
+/// a single space only where two tokens would otherwise merge (word-char/
+/// word-char) or an operator would swallow a leading `.`. Ported from vix
+/// `minifyTokens`.
 fn render(tokens: &[Token]) -> String {
     let mut out = String::new();
     for (i, tok) in tokens.iter().enumerate() {
         if i > 0 {
             let prev = &tokens[i - 1];
-            if !prev.trailing_sep.is_empty() {
-                out.push_str(prev.trailing_sep);
+            if !prev.separator.is_empty() {
+                out.push_str(prev.separator);
             }
             if let Some(&last) = out.as_bytes().last() {
                 let first = tok.text.as_bytes()[0];
@@ -184,8 +245,9 @@ mod tests {
         // These have grammars but are NOT collapse-safe — must stay None until
         // their annotators land (dirge-8e27), so they fall back to plain read.
         // ts/tsx: ASI; c/cpp/h/hpp: newline-terminated preprocessor.
+        // (go is NOT here — it's unlocked via annotate_go.)
         for ext in [
-            "py", "sh", "rb", "go", "clj", "ex", "ts", "tsx", "c", "h", "cpp", "cc", "hpp",
+            "py", "sh", "rb", "clj", "ex", "ts", "tsx", "c", "h", "cpp", "cc", "hpp",
         ] {
             assert!(
                 language_for_ext(ext).is_none(),
@@ -228,6 +290,44 @@ mod tests {
             "string literal intact: {out}"
         );
         assert!(out.contains("class A"), "word boundary kept: {out}");
+    }
+
+    #[cfg(feature = "semantic-go")]
+    #[test]
+    fn go_minify_reinserts_auto_semicolons() {
+        // Two newline-terminated statements: without the annotator, collapse
+        // would merge them into invalid Go (`x:=1 y:=2`). annotate_go must
+        // re-insert the `;` Go's lexer would, so the collapsed output parses.
+        let src = "package main\nfunc main() {\n\tx := 1\n\ty := 2\n\t_ = x + y\n}\n";
+        let out = minify("go", src).expect("go minifies via annotate_go");
+        assert!(out.contains("x:=1;"), "auto-semicolon re-inserted: {out}");
+        assert!(!out.contains("comment"));
+        // Round-trips: the collapsed Go re-parses cleanly (minify revalidates).
+        assert!(minify("go", &out).is_some(), "minified Go re-parses: {out}");
+    }
+
+    #[cfg(feature = "semantic-go")]
+    #[test]
+    fn go_minify_round_trips_with_comments_and_blocks() {
+        let src = "package main\n// doc\nimport \"fmt\"\nfunc greet(n string) string {\n\tif n == \"\" {\n\t\treturn \"hi\"\n\t}\n\treturn fmt.Sprintf(\"hi %s\", n)\n}\n";
+        let out = minify("go", src).expect("go minifies");
+        assert!(!out.contains("doc"), "comment stripped: {out}");
+        assert!(out.contains("func greet"), "word boundary kept: {out}");
+        assert!(out.contains("\"hi %s\""), "string literal intact: {out}");
+        assert!(minify("go", &out).is_some(), "re-parses: {out}");
+    }
+
+    #[test]
+    fn go_semicolon_trigger_matches_spec() {
+        assert!(go_semicolon_trigger("x")); // identifier
+        assert!(go_semicolon_trigger("123")); // literal
+        assert!(go_semicolon_trigger(")"));
+        assert!(go_semicolon_trigger("}"));
+        assert!(go_semicolon_trigger("++"));
+        assert!(go_semicolon_trigger("--"));
+        assert!(!go_semicolon_trigger("+")); // bare operator: no ASI
+        assert!(!go_semicolon_trigger("{"));
+        assert!(!go_semicolon_trigger(""));
     }
 
     #[cfg(feature = "semantic-rust")]
