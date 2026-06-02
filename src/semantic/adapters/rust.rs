@@ -1,10 +1,9 @@
 use std::path::Path;
 
-use streaming_iterator::StreamingIterator;
-use tree_sitter::{Node, Parser, Query, QueryCursor};
+use tree_sitter::{Node, Parser};
 
 use crate::semantic::adapter::LanguageAdapter;
-use crate::semantic::common::{find_node_at_range, node_text, signature_up_to_body};
+use crate::semantic::common::{node_text, signature_up_to_body};
 use crate::semantic::types::{ByteRange, ExtractedFile, Import, ImportKind, Symbol, SymbolKind};
 
 /// Tree-sitter adapter for Rust. dirge itself is written in Rust;
@@ -427,17 +426,6 @@ impl LanguageAdapter for RustAdapter {
         range: ByteRange,
     ) -> Result<Vec<String>, String> {
         let lang: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
-        let mut parser = Parser::new();
-        parser
-            .set_language(&lang)
-            .map_err(|e| format!("Failed to set language: {e}"))?;
-        let tree = parser.parse(source, None).ok_or("Failed to parse source")?;
-        let root = tree.root_node();
-        let bytes = source.as_bytes();
-
-        let target = find_node_at_range(root, range.start_byte, range.end_byte)
-            .ok_or("Could not find node at given range")?;
-
         // Direct call: `foo(...)`. Method call: `obj.bar(...)` —
         // tree-sitter-rust models the call as `call_expression` with
         // function = `field_expression`; we capture the field name.
@@ -448,20 +436,7 @@ impl LanguageAdapter for RustAdapter {
             (call_expression function: (field_expression field: (field_identifier) @callee))
             (macro_invocation macro: (identifier) @callee)
         "#;
-        let query = Query::new(&lang, query_str).map_err(|e| format!("Query error: {e}"))?;
-        let mut cursor = QueryCursor::new();
-        let mut matches = cursor.matches(&query, target, bytes);
-
-        let mut callees = Vec::new();
-        while let Some(m) = matches.next() {
-            for capture in m.captures {
-                let name = capture.node.utf8_text(bytes).unwrap_or("");
-                callees.push(name.to_string());
-            }
-        }
-        callees.sort();
-        callees.dedup();
-        Ok(callees)
+        crate::semantic::common::run_callee_query(&lang, query_str, source, range)
     }
 }
 

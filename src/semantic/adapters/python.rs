@@ -1,10 +1,9 @@
 use std::path::Path;
 
-use streaming_iterator::StreamingIterator;
-use tree_sitter::{Node, Parser, Query};
+use tree_sitter::{Node, Parser};
 
 use crate::semantic::adapter::LanguageAdapter;
-use crate::semantic::common::{find_node_at_range, node_text};
+use crate::semantic::common::node_text;
 use crate::semantic::types::{ByteRange, ExtractedFile, Import, ImportKind, Symbol, SymbolKind};
 
 pub struct PythonAdapter;
@@ -256,19 +255,6 @@ impl LanguageAdapter for PythonAdapter {
         range: ByteRange,
     ) -> Result<Vec<String>, String> {
         let lang: tree_sitter::Language = tree_sitter_python::LANGUAGE.into();
-        let mut parser = Parser::new();
-        parser
-            .set_language(&lang)
-            .map_err(|e| format!("Failed to set language: {e}"))?;
-
-        let tree = parser.parse(source, None).ok_or("Failed to parse source")?;
-
-        let root = tree.root_node();
-        let source_bytes = source.as_bytes();
-
-        let target = find_node_at_range(root, range.start_byte, range.end_byte)
-            .ok_or("Could not find node at given range")?;
-
         // B3-7 (audit fix): two alternatives — direct identifier
         // calls AND attribute-access (method) calls. Previously only
         // the identifier form was captured, so `obj.method()`,
@@ -279,19 +265,6 @@ impl LanguageAdapter for PythonAdapter {
             (call function: (identifier) @callee)
             (call function: (attribute attribute: (identifier) @callee))
         "#;
-        let query = Query::new(&lang, query_str).map_err(|e| format!("Query error: {e}"))?;
-        let mut cursor = tree_sitter::QueryCursor::new();
-        let mut matches = cursor.matches(&query, target, source_bytes);
-
-        let mut callees = Vec::new();
-        while let Some(m) = matches.next() {
-            for capture in m.captures {
-                let name = capture.node.utf8_text(source_bytes).unwrap_or("");
-                callees.push(name.to_string());
-            }
-        }
-        callees.sort();
-        callees.dedup();
-        Ok(callees)
+        crate::semantic::common::run_callee_query(&lang, query_str, source, range)
     }
 }

@@ -105,6 +105,44 @@ pub fn signature_up_to_body(node: Node, source: &[u8]) -> String {
     signature_first_line(node, source)
 }
 
+/// Run a tree-sitter call-query over the node spanning `range` and return the
+/// sorted + de-duplicated callee names captured as `@callee`. Every language
+/// adapter's `find_callees_in_range` was this exact parser → query → collect
+/// envelope (10 byte-identical copies); they differ only in the `lang` and the
+/// `query_str`, which the caller supplies.
+#[allow(dead_code)] // unused with `semantic-bash` alone; used by every other adapter
+pub fn run_callee_query(
+    lang: &tree_sitter::Language,
+    query_str: &str,
+    source: &str,
+    range: crate::semantic::types::ByteRange,
+) -> Result<Vec<String>, String> {
+    use streaming_iterator::StreamingIterator;
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(lang)
+        .map_err(|e| format!("Failed to set language: {e}"))?;
+    let tree = parser.parse(source, None).ok_or("Failed to parse source")?;
+    let root = tree.root_node();
+    let source_bytes = source.as_bytes();
+    let target = find_node_at_range(root, range.start_byte, range.end_byte)
+        .ok_or("Could not find node at given range")?;
+    let query =
+        tree_sitter::Query::new(lang, query_str).map_err(|e| format!("Query error: {e}"))?;
+    let mut cursor = tree_sitter::QueryCursor::new();
+    let mut matches = cursor.matches(&query, target, source_bytes);
+    let mut callees = Vec::new();
+    while let Some(m) = matches.next() {
+        for capture in m.captures {
+            let name = capture.node.utf8_text(source_bytes).unwrap_or("");
+            callees.push(name.to_string());
+        }
+    }
+    callees.sort();
+    callees.dedup();
+    Ok(callees)
+}
+
 #[cfg(test)]
 mod tests {
     /// `ByteRange::from(Node)` produces the right line numbers
