@@ -266,8 +266,8 @@ pub async fn run_interactive(
     // launch the streamed implement run. `active_plan` then holds the reviewer
     // loop state across `Done` events until the reviewer approves or the
     // fix-cycle budget is spent.
-    let mut plan_kickoff: Option<crate::agent::phased_orchestrator::PlanKickoff> = None;
-    let mut active_plan: Option<crate::agent::phased_orchestrator::ActivePlan> = None;
+    let mut plan_kickoff: Option<crate::agent::plan::runtime::PlanKickoff> = None;
+    let mut active_plan: Option<crate::agent::plan::runtime::ActivePlan> = None;
     let mut agent_line_started = false;
     let mut response_buf = String::new();
     // Count of `AgentEvent::ToolCall` events observed during the

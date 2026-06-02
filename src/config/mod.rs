@@ -360,8 +360,8 @@ pub struct Config {
     /// explore → plan → reviewer-runs-code loop, each phase a fresh
     /// context-reset fork. `None`/`false` (default) keeps the normal
     /// single-agent path. The orchestration core lives in
-    /// `crate::agent::plan_workflow`; the runtime drain in
-    /// `crate::agent::phased_orchestrator`.
+    /// `crate::agent::plan::workflow`; the runtime drain in
+    /// `crate::agent::plan::runtime`.
     pub phased_workflow_enabled: Option<bool>,
     /// Max reviewer-runs-code fix cycles before the phased workflow gives
     /// up with `Exhausted`. `None` defaults to 2 (vix's default). Only

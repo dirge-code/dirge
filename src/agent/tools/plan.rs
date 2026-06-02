@@ -1,3 +1,12 @@
+//! Plan-**mode** tools (`plan_enter` / `plan_exit`): a user-confirmed,
+//! read-only lock the model can request for a turn (propose a plan before
+//! touching anything), toggled via the `PlanSwitchRequest` channel.
+//!
+//! NOTE: this is NOT the phased `/plan` workflow (explore→plan→implement→
+//! review) — that lives in [`crate::agent::plan`]. Unrelated feature, similar
+//! name; don't cross the wires (`plan_tx` here vs `plan_kickoff`/`active_plan`
+//! there).
+
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use serde::Deserialize;

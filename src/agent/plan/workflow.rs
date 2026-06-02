@@ -7,7 +7,7 @@
 //! via [`crate::provider::AnyAgent::spawn_phase_runner`], and the reviewer loop
 //! in `ui/run_handlers` drives [`next_review_step`] after each implement turn.
 //! The runtime glue (runner drain, reviewer fork) lives in
-//! [`crate::agent::phased_orchestrator`].
+//! [`crate::agent::plan::runtime`].
 
 /// Read-only tool allow-list for the explore + plan phases (no mutation).
 pub const READONLY_PHASE_TOOLS: &[&str] = &[
@@ -205,28 +205,65 @@ solution unless the underlying approach is actually wrong.
 
 Do not argue with the review in prose — just fix the gaps.";
 
+/// Substitute `{{KEY}}` placeholders in ONE left-to-right pass. A sequence of
+/// `.replace()` calls is unsafe here because the inputs are user-controlled: if
+/// the `request` contains the literal `{{FINDINGS}}`, a later
+/// `.replace("{{FINDINGS}}", …)` would clobber the user's own text. This pass
+/// never re-scans substituted values. Unknown / unclosed `{{…}}` are emitted
+/// verbatim.
+fn render_template(template: &str, vars: &[(&str, &str)]) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(open) = rest.find("{{") {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 2..];
+        match after.find("}}") {
+            Some(close) => {
+                let key = &after[..close];
+                match vars.iter().find(|(k, _)| *k == key) {
+                    Some((_, val)) => out.push_str(val),
+                    None => {
+                        out.push_str("{{");
+                        out.push_str(key);
+                        out.push_str("}}");
+                    }
+                }
+                rest = &after[close + 2..];
+            }
+            None => {
+                // Unclosed `{{` — emit the marker + remainder verbatim.
+                out.push_str("{{");
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// System prompt for the **explore** phase fork. `request` is the user's task.
 pub fn explore_prompt(request: &str) -> String {
-    EXPLORE_TEMPLATE.replace("{{REQUEST}}", request)
+    render_template(EXPLORE_TEMPLATE, &[("REQUEST", request)])
 }
 
 /// System prompt for the **plan** phase fork. `findings` is the explore phase's
 /// structured report (handed off via the fork).
 pub fn plan_prompt(request: &str, findings: &str) -> String {
-    PLAN_TEMPLATE
-        .replace("{{REQUEST}}", request)
-        .replace("{{FINDINGS}}", findings)
+    render_template(
+        PLAN_TEMPLATE,
+        &[("REQUEST", request), ("FINDINGS", findings)],
+    )
 }
 
 /// System prompt for the **reviewer** fork (P3d): run-the-code, asymmetric
 /// `NEEDS_FIX`, machine-parsed JSON verdict.
 pub fn reviewer_prompt(task: &str) -> String {
-    REVIEWER_TEMPLATE.replace("{{TASK}}", task)
+    render_template(REVIEWER_TEMPLATE, &[("TASK", task)])
 }
 
 /// Follow-up prompt fed to the implementer on a `NEEDS_FIX` verdict.
 pub fn implement_retry_prompt(feedback: &str) -> String {
-    IMPLEMENT_RETRY_TEMPLATE.replace("{{FEEDBACK}}", feedback)
+    render_template(IMPLEMENT_RETRY_TEMPLATE, &[("FEEDBACK", feedback)])
 }
 
 /// The reviewer's machine-parsed verdict.
@@ -411,5 +448,31 @@ mod tests {
             other => panic!("expected Retry, got {other:?}"),
         }
         assert_eq!(next_review_step("no json here", 0), ReviewStep::Exhausted);
+    }
+
+    #[test]
+    fn plan_prompt_substitution_is_injection_safe() {
+        // A request that contains a literal `{{FINDINGS}}` must NOT be clobbered
+        // by the findings substitution — single-pass render never re-scans
+        // substituted text.
+        let p = plan_prompt("add caching, then {{FINDINGS}}", "core.rs:42 is the map");
+        assert!(
+            p.contains("add caching, then {{FINDINGS}}"),
+            "user text preserved verbatim, not treated as a placeholder",
+        );
+        assert!(
+            p.contains("core.rs:42 is the map"),
+            "real findings still substituted at the template's placeholder",
+        );
+    }
+
+    #[test]
+    fn render_template_leaves_unknown_placeholders_verbatim() {
+        assert_eq!(
+            render_template("a {{X}} b {{Y}}", &[("X", "1")]),
+            "a 1 b {{Y}}",
+        );
+        // Unclosed marker is emitted verbatim, not dropped.
+        assert_eq!(render_template("a {{X", &[("X", "1")]), "a {{X");
     }
 }

@@ -71,7 +71,7 @@ pub(super) struct SlashCtx<'a> {
     /// `/plan` writes its post-fork kickoff here; the UI loop launches the
     /// streamed implement run from it (slash handlers can't touch the loop's
     /// `agent_rx`/`is_running` directly).
-    pub plan_kickoff: &'a mut Option<crate::agent::phased_orchestrator::PlanKickoff>,
+    pub plan_kickoff: &'a mut Option<crate::agent::plan::runtime::PlanKickoff>,
 }
 
 /// Walk `cut_idx` forward until the message at that index is a
@@ -419,7 +419,7 @@ pub async fn handle_slash(
     // build_agent. The user lost LSP silently after the first such
     // command. Thread the actual manager through.
     #[cfg(feature = "lsp")] lsp_manager: Option<&std::sync::Arc<crate::lsp::manager::LspManager>>,
-    plan_kickoff: &mut Option<crate::agent::phased_orchestrator::PlanKickoff>,
+    plan_kickoff: &mut Option<crate::agent::plan::runtime::PlanKickoff>,
 ) -> anyhow::Result<()> {
     let parts: SmallVec<[&str; 3]> = split_command_parts(text);
     let mut ctx = SlashCtx {

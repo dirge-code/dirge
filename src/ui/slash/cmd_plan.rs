@@ -8,8 +8,8 @@
 //! "separate-agent phases" model.
 
 use super::SlashCtx;
-use crate::agent::phased_orchestrator::{ActivePlan, PlanKickoff, collect_runner_text};
-use crate::agent::plan_workflow::{READONLY_PHASE_TOOLS, explore_prompt, plan_prompt};
+use crate::agent::plan::runtime::{ActivePlan, PlanKickoff, collect_runner_text};
+use crate::agent::plan::workflow::{READONLY_PHASE_TOOLS, explore_prompt, plan_prompt};
 use crate::ui::colors::{c_agent, c_error};
 
 pub(super) async fn cmd_plan(

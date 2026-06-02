@@ -2,10 +2,10 @@
 //!
 //! After a plan-driven implement turn finishes, this forks a *write-disabled*
 //! reviewer that independently runs the code and emits a verdict
-//! ([`crate::agent::phased_orchestrator::review_once`]). `DONE` ends the
+//! ([`crate::agent::plan::runtime::review_once`]). `DONE` ends the
 //! workflow; `NEEDS_FIX` feeds the punch-list back into another streamed
 //! implement turn, bounded by the cycle budget. The policy decision lives in
-//! [`crate::agent::plan_workflow::next_review_step`]; this module is the UI-side
+//! [`crate::agent::plan::workflow::next_review_step`]; this module is the UI-side
 //! orchestration (render phase lines, relaunch the implement run) that
 //! `handle_done` calls once it knows no plugin follow-up / loop iteration
 //! claimed the next turn.
@@ -16,8 +16,8 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::agent::phased_orchestrator::{ActivePlan, review_once};
-use crate::agent::plan_workflow::{ReviewStep, implement_retry_prompt};
+use crate::agent::plan::runtime::{ActivePlan, review_once};
+use crate::agent::plan::workflow::{ReviewStep, implement_retry_prompt};
 use crate::agent::tools::background::{BackgroundStore, prepend_pending_notifications};
 use crate::event::AgentEvent;
 use crate::provider::AnyAgent;

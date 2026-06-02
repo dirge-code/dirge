@@ -89,7 +89,7 @@ This gives the model one structured shot to self-correct (`turn_self_corrected`)
 
 ## Phased plan workflow (`/plan`)
 
-An opt-in, per-task workflow (ported from [vix](https://github.com/kirby88/vix)) that splits a complex request into separate, context-isolated phases instead of one long single-agent run. It is an **explicit command**, not a forced mode — regular chat is untouched, and the user decides which tasks warrant it. Gated by `phased_workflow_enabled` (default off; see [config.md](config.md)). The logic lives in `src/agent/plan_workflow.rs` (phase prompts + verdict parsing + the shared `next_review_step` policy) and `src/agent/phased_orchestrator.rs` (the runner-drain glue + reviewer fork); the entry is `src/ui/slash/cmd_plan.rs`.
+An opt-in, per-task workflow (ported from [vix](https://github.com/kirby88/vix)) that splits a complex request into separate, context-isolated phases instead of one long single-agent run. It is an **explicit command**, not a forced mode — regular chat is untouched, and the user decides which tasks warrant it. Gated by `phased_workflow_enabled` (default off; see [config.md](config.md)). The logic lives under `src/agent/plan/`: `workflow.rs` (phase prompts + verdict parsing + the shared `next_review_step` policy) and `runtime.rs` (the runner-drain glue + reviewer fork); the entry is `src/ui/slash/cmd_plan.rs` and the reviewer loop runs in `src/ui/run_handlers/plan_review.rs`.
 
 `/plan <request>` runs four phases:
 

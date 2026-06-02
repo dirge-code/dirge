@@ -42,7 +42,7 @@ pub struct AgentRunner {
 /// `.await` — rather than orphaning a task that keeps calling the model.
 ///
 /// Shared by every forked-runner consumer (`agent::review` background passes,
-/// `agent::phased_orchestrator` phase forks) so the cancel-safety contract
+/// `agent::plan::runtime` phase forks) so the cancel-safety contract
 /// lives in exactly one place.
 pub(crate) struct AbortRunnerOnDrop {
     pub task: JoinHandle<()>,

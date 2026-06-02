@@ -1,7 +1,7 @@
 //! Phase 3 (P3e): the runtime glue that turns a forked phase runner into final
 //! text. The phase *logic* (which prompt + tools each phase gets, the
 //! explore→plan handoff, the reviewer-runs-code loop) lives in
-//! [`crate::agent::plan_workflow`] and is unit-tested there without a runtime.
+//! [`crate::agent::plan::workflow`] and is unit-tested there without a runtime.
 //!
 //! This module supplies the missing half: [`collect_runner_text`] drains a
 //! real [`AgentRunner`]'s event stream into the final `String`, and
@@ -13,7 +13,7 @@
 //! launches the streamed implement run and `run_handlers/done.rs` drives the
 //! reviewer loop with `review_once`.
 
-use crate::agent::plan_workflow::{
+use crate::agent::plan::workflow::{
     PhaseOutput, REVIEWER_TOOLS, ReviewStep, next_review_step, reviewer_prompt,
 };
 use crate::agent::runner::{AbortRunnerOnDrop, AgentRunner};

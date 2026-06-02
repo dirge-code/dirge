@@ -218,7 +218,7 @@ struct State {
     tool_calls_this_run: u32,
     last_collapsed: Option<crate::ui::tool_display::CollapsedToolResult>,
     last_user_prompt: String,
-    active_plan: Option<crate::agent::phased_orchestrator::ActivePlan>,
+    active_plan: Option<crate::agent::plan::runtime::ActivePlan>,
 }
 
 impl State {
