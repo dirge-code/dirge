@@ -82,7 +82,7 @@ impl Tool for ReadMinifiedTool {
             name: "read_minified".to_string(),
             description: with_contract_hint(
                 "read_minified",
-                "Read a source file with comments and redundant whitespace stripped (via tree-sitter) for token efficiency. Supported languages: Rust, C, C++, Java, TypeScript. Other languages, ranged reads (offset/limit), or unparseable files transparently fall back to a normal read. Use plain `read` when you need exact line numbers.",
+                "Read a source file with comments and redundant whitespace stripped (via tree-sitter) for token efficiency. Supported languages: Rust, C, C++, Java. Other languages, ranged reads (offset/limit), or unparseable files transparently fall back to a normal read. Use plain `read` when you need exact line numbers.",
             ),
             parameters: serde_json::json!({
                 "type": "object",

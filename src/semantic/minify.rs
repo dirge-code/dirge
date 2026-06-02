@@ -10,13 +10,14 @@
 //!
 //! [`language_for_ext`] returns a grammar ONLY for languages that are both
 //! compiled in (per the `semantic-*` cargo features) AND collapse-safe — i.e.
-//! brace-delimited, semicolon-terminated languages where newlines/indentation
-//! are not syntactically significant (Rust, C, C++, Java, TypeScript).
+//! mandatory-terminator languages with NO automatic-semicolon-insertion, NO
+//! preprocessor, and no significant whitespace (Rust, Java).
 //!
-//! Whitespace/newline-significant languages — Python (indentation),
-//! Go/Ruby (newline-driven auto-semicolon), Bash (newlines), Clojure
-//! (whitespace-as-delimiter), Elixir — are deliberately EXCLUDED until their
-//! per-language annotators are ported (see dirge-8e27). For those (and any
+//! Excluded until their per-language annotators are ported (see dirge-8e27):
+//! Python (indentation), Go/Ruby (newline-driven auto-semicolon), Bash
+//! (newlines), Clojure (whitespace-as-delimiter), Elixir, TypeScript/JavaScript
+//! (ASI), and C/C++ (newline-terminated preprocessor directives). For those
+//! (and any
 //! unsupported extension) `language_for_ext` returns `None`, and callers MUST
 //! fall back to a plain read. [`minify`] also returns `None` whenever the
 //! input doesn't parse cleanly or the minified output fails re-validation, so
@@ -59,16 +60,18 @@ pub fn language_for_ext(ext: &str) -> Option<tree_sitter::Language> {
     match e.as_str() {
         #[cfg(feature = "semantic-rust")]
         "rs" => Some(tree_sitter_rust::LANGUAGE.into()),
-        #[cfg(feature = "semantic-c")]
-        "c" | "h" => Some(tree_sitter_c::LANGUAGE.into()),
-        #[cfg(feature = "semantic-cpp")]
-        "cc" | "cpp" | "cxx" | "hpp" | "hh" => Some(tree_sitter_cpp::LANGUAGE.into()),
         #[cfg(feature = "semantic-java")]
         "java" => Some(tree_sitter_java::LANGUAGE.into()),
-        #[cfg(feature = "semantic-ts")]
-        "ts" => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
-        #[cfg(feature = "semantic-ts")]
-        "tsx" => Some(tree_sitter_typescript::LANGUAGE_TSX.into()),
+        // Intentionally NOT here (each needs newline-aware annotation in
+        // dirge-8e27 before it's safe):
+        //   - TypeScript/JavaScript: Automatic Semicolon Insertion — collapsing
+        //     newlines can change semantics in a way that still PARSES (e.g.
+        //     `a=b+c` <nl> `(d).foo()` → `a=b+c(d).foo()`), so re-validation
+        //     can't catch it.
+        //   - C/C++: the preprocessor (`#include`/`#define`) is newline-
+        //     terminated; collapsing merges directives with the next line.
+        //     (Re-validation catches it → safe fallback, but it means C/C++
+        //     rarely minify in practice, so we don't advertise them.)
         _ => None,
     }
 }
@@ -180,7 +183,10 @@ mod tests {
     fn whitespace_significant_langs_are_gated_out() {
         // These have grammars but are NOT collapse-safe — must stay None until
         // their annotators land (dirge-8e27), so they fall back to plain read.
-        for ext in ["py", "sh", "rb", "go", "clj", "ex"] {
+        // ts/tsx: ASI; c/cpp/h/hpp: newline-terminated preprocessor.
+        for ext in [
+            "py", "sh", "rb", "go", "clj", "ex", "ts", "tsx", "c", "h", "cpp", "cc", "hpp",
+        ] {
             assert!(
                 language_for_ext(ext).is_none(),
                 "{ext} must be gated out of naive minify"
@@ -206,11 +212,79 @@ mod tests {
         assert!(minify("rs", &out).is_some(), "minified output still parses");
     }
 
+    #[cfg(feature = "semantic-java")]
+    #[test]
+    fn java_minify_preserves_string_literals_and_boundaries() {
+        let src = "// header\nclass A {\n    String s = \"hello  world\"; // keep spaces in string\n    int x = 1 ;\n}\n";
+        let out = minify("java", src).expect("java minifies");
+        assert!(!out.contains("header"), "comment stripped: {out}");
+        assert!(
+            !out.contains("keep spaces"),
+            "trailing comment stripped: {out}"
+        );
+        // String literal content is a single leaf token → preserved verbatim.
+        assert!(
+            out.contains("\"hello  world\""),
+            "string literal intact: {out}"
+        );
+        assert!(out.contains("class A"), "word boundary kept: {out}");
+    }
+
     #[cfg(feature = "semantic-rust")]
     #[test]
     fn syntactically_broken_input_is_not_minified() {
         // Pre-existing parse error → None (fall back to plain read), never a
         // corrupted minify.
         assert!(minify("rs", "fn broken( {{{ ").is_none());
+    }
+
+    /// Proof on REAL repo files across the collapse-safe languages: each must
+    /// minify (parse cleanly + re-validate → round-trip safe), shrink, and the
+    /// minified output must itself re-parse. Prints the savings (run with
+    /// `--nocapture`). Doubles as a real-code regression guard.
+    #[test]
+    fn minifies_real_repo_files() {
+        let root = env!("CARGO_MANIFEST_DIR");
+        let mut cases: Vec<(&str, &str)> = Vec::new();
+        #[cfg(feature = "semantic-rust")]
+        {
+            cases.push(("src/agent/agent_loop/run.rs", "rs"));
+            cases.push(("src/agent/tools/cache.rs", "rs"));
+            cases.push(("src/semantic/minify.rs", "rs"));
+        }
+
+        assert!(!cases.is_empty(), "no collapse-safe grammar compiled in");
+        let mut total_in = 0usize;
+        let mut total_out = 0usize;
+        for (rel, ext) in cases {
+            let path = std::path::Path::new(root).join(rel);
+            let src = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {rel}: {e}"));
+            let min = minify(ext, &src)
+                .unwrap_or_else(|| panic!("{rel} should minify (clean parse + revalidate)"));
+            assert!(
+                min.len() < src.len(),
+                "{rel}: minified ({}) not smaller than source ({})",
+                min.len(),
+                src.len()
+            );
+            // Round-trip: the minified output must itself re-parse cleanly.
+            assert!(
+                minify(ext, &min).is_some(),
+                "{rel}: minified output must re-parse"
+            );
+            let pct = 100.0 * (1.0 - min.len() as f64 / src.len() as f64);
+            eprintln!(
+                "minify {rel:50} {:>7} -> {:>7} bytes  ({pct:4.1}% saved)",
+                src.len(),
+                min.len()
+            );
+            total_in += src.len();
+            total_out += min.len();
+        }
+        let pct = 100.0 * (1.0 - total_out as f64 / total_in.max(1) as f64);
+        eprintln!(
+            "minify {:50} {:>7} -> {:>7} bytes  ({pct:4.1}% saved)",
+            "TOTAL", total_in, total_out
+        );
     }
 }
