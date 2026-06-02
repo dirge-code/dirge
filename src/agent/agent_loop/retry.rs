@@ -55,6 +55,20 @@ use super::stream::StreamFn;
 #[cfg(test)]
 use super::tool::AbortSignal;
 
+/// Graceful-recovery nudge reinjected (once per run) when a request times out
+/// mid-stream. dirge's `request_timeout` already aborts a stuck/hung stream and
+/// triggers a retry, but a blind retry can stall the same way (e.g. the model
+/// stuck in a long reasoning loop). Reinjecting a "conclude and act" directive
+/// gives it a chance to break out instead of repeating the stall.
+const STALL_RECOVERY_NUDGE: &str = "Your previous response did not complete in time — you may have been stuck in a long reasoning loop. Stop deliberating: state your conclusion concisely and take the next concrete action (a tool call, or your final answer) now.";
+
+/// Whether `msg` looks like a timeout (vs a generic transient network blip),
+/// used to gate the stall-recovery nudge so it doesn't fire on, say, a 503.
+fn is_timeout_error(msg: &str) -> bool {
+    let l = msg.to_ascii_lowercase();
+    l.contains("timeout") || l.contains("timed out")
+}
+
 /// Wrap an inner `StreamFn` with retry-on-transient-error
 /// semantics.
 ///
@@ -80,8 +94,13 @@ pub fn retrying_stream_fn(inner: StreamFn, policy: RecoveryPolicy) -> StreamFn {
         let inner = inner.clone();
         let policy = policy.clone();
         let signal_outer = opts.signal.clone();
+        // Mutable so the stall-recovery nudge can be appended to the context
+        // before a timeout retry.
+        let mut ctx = ctx;
         Box::pin(async_stream::stream! {
             let mut attempts: usize = 0;
+            // The stall-recovery nudge is reinjected at most once per run.
+            let mut stall_nudged = false;
             loop {
                 if signal_outer.is_cancelled() {
                     yield StreamEvent::Error {
@@ -168,6 +187,10 @@ pub fn retrying_stream_fn(inner: StreamFn, policy: RecoveryPolicy) -> StreamFn {
                             return;
                         }
                         attempts += 1;
+                        // If the previous attempt timed out, reinject a
+                        // one-time "conclude and act" nudge so the retry can
+                        // break out of a stall instead of repeating it.
+                        let was_timeout = is_timeout_error(&err_msg);
                         // PROV-2: surface the retry so the UI can
                         // show a banner instead of freezing.
                         yield StreamEvent::Retry {
@@ -175,6 +198,13 @@ pub fn retrying_stream_fn(inner: StreamFn, policy: RecoveryPolicy) -> StreamFn {
                             delay_ms: backoff.as_millis() as u64,
                             error: err_msg,
                         };
+                        if was_timeout && !stall_nudged {
+                            stall_nudged = true;
+                            ctx.messages.push(serde_json::json!({
+                                "role": "user",
+                                "content": STALL_RECOVERY_NUDGE,
+                            }));
+                        }
                         // Loop continues — next outer iteration
                         // calls the inner stream again.
                     }
@@ -601,5 +631,75 @@ mod tests {
         ] {
             assert!(!is_content_delta(phase), "{phase:?} should NOT be content");
         }
+    }
+
+    /// Records the `messages` each inner attempt was called with, so a test can
+    /// assert what the retry layer injected between attempts.
+    fn recording_factory(first_error: &str) -> (StreamFn, Arc<Mutex<Vec<Vec<serde_json::Value>>>>) {
+        let seen: Arc<Mutex<Vec<Vec<serde_json::Value>>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen2 = seen.clone();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let first_error = first_error.to_string();
+        let factory: StreamFn = Arc::new(move |ctx: LlmContext, _opts| {
+            seen2.lock().unwrap().push(ctx.messages.clone());
+            let n = counter.fetch_add(1, Ordering::SeqCst);
+            let events = if n == 0 {
+                vec![StreamEvent::Error {
+                    error: first_error.clone(),
+                }]
+            } else {
+                vec![StreamEvent::Done {
+                    reason: StopReason::Stop,
+                    message: empty_assistant(),
+                    usage: None,
+                }]
+            };
+            Box::pin(futures::stream::iter(events))
+        });
+        (factory, seen)
+    }
+
+    fn has_stall_nudge(msgs: &[serde_json::Value]) -> bool {
+        msgs.iter()
+            .any(|m| m.get("content").and_then(|c| c.as_str()) == Some(STALL_RECOVERY_NUDGE))
+    }
+
+    /// A timeout retry reinjects the stall-recovery nudge into the next
+    /// attempt's context (but not the first attempt's).
+    #[tokio::test]
+    async fn timeout_retry_injects_stall_nudge() {
+        let (factory, seen) = recording_factory("request timeout after 120s");
+        let wrapped = retrying_stream_fn(factory, RecoveryPolicy::default());
+        let _ = drain(wrapped(
+            ctx(),
+            crate::agent::agent_loop::StreamOptions::from_signal(AbortSignal::new()),
+        ))
+        .await;
+        let recorded = seen.lock().unwrap();
+        assert_eq!(recorded.len(), 2, "one timeout retry → two inner calls");
+        assert!(!has_stall_nudge(&recorded[0]), "no nudge on first attempt");
+        assert!(
+            has_stall_nudge(&recorded[1]),
+            "stall nudge reinjected on the timeout retry"
+        );
+    }
+
+    /// A non-timeout retryable error (e.g. 503) retries WITHOUT the nudge —
+    /// it's specific to stalls, not generic transient blips.
+    #[tokio::test]
+    async fn non_timeout_retry_does_not_nudge() {
+        let (factory, seen) = recording_factory("503 service unavailable");
+        let wrapped = retrying_stream_fn(factory, RecoveryPolicy::default());
+        let _ = drain(wrapped(
+            ctx(),
+            crate::agent::agent_loop::StreamOptions::from_signal(AbortSignal::new()),
+        ))
+        .await;
+        let recorded = seen.lock().unwrap();
+        assert_eq!(recorded.len(), 2);
+        assert!(
+            !has_stall_nudge(&recorded[1]),
+            "no nudge for a non-timeout error"
+        );
     }
 }
