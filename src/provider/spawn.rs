@@ -13,6 +13,22 @@ use super::{AnyAgent, AnyAgentInner};
 use crate::agent::runner::AgentRunner;
 use crate::agent::tools::ToolCache;
 
+/// Filter a loop-tool registry down to a caller-supplied allow-list, preserving
+/// registration order. Single tested place for the hard tool restriction every
+/// forked-agent path relies on — the background review/curator forks and the
+/// phased-plan phase agents (explore/plan/reviewer). A tool not in `allowed` is
+/// literally absent from the fork, so a prompt-level guard slip can't reach it.
+pub(crate) fn filter_loop_tools(
+    tools: &[std::sync::Arc<dyn crate::agent::agent_loop::LoopTool>],
+    allowed: &[&str],
+) -> Vec<std::sync::Arc<dyn crate::agent::agent_loop::LoopTool>> {
+    tools
+        .iter()
+        .filter(|t| allowed.contains(&t.name()))
+        .cloned()
+        .collect()
+}
+
 impl AnyAgent {
     pub fn spawn_runner(
         self,
@@ -197,6 +213,25 @@ impl AnyAgent {
         runner
     }
 
+    /// P3a (dirge-crrh): fork a phase agent for the phased-plan workflow — a
+    /// separate runner with a frozen `transcript`, the given phase `prompt`,
+    /// and ONLY the `allowed` tools (a hard whitelist: e.g. read-only for
+    /// explore/plan, read+bash for the reviewer). Isolated cache, same
+    /// retry/stream-fn machinery as the review fork. The cornerstone of the
+    /// explore→plan→review→execute orchestration (P3c) and the reviewer loop
+    /// (P3d).
+    #[allow(dead_code)] // wired by the phased-plan orchestrator (P3c/P3d)
+    pub fn spawn_phase_runner(
+        &self,
+        prompt: String,
+        transcript: String,
+        allowed: &[&str],
+    ) -> crate::agent::runner::AgentRunner {
+        let (runner, _isolated_cache) =
+            self.spawn_filtered_runner_with_cache(prompt, transcript, ToolCache::new(), allowed);
+        runner
+    }
+
     /// dirge-mo0w PR-2: memory-only forked runner for the memory
     /// curator's LLM consolidation pass. Inverse of
     /// `spawn_curator_runner` — same forked-runner pattern, but
@@ -270,13 +305,8 @@ impl AnyAgent {
             "spawn_filtered_runner_with_cache: review cache must not share storage with the main agent's cache (dirge-7ls)"
         );
 
-        // Filter to the caller-supplied allow-list.
-        let review_tools: Vec<std::sync::Arc<dyn crate::agent::agent_loop::LoopTool>> = self
-            .loop_tools
-            .iter()
-            .filter(|t| allowed_tools.contains(&t.name()))
-            .cloned()
-            .collect();
+        // Filter to the caller-supplied allow-list (shared, tested helper).
+        let review_tools = filter_loop_tools(&self.loop_tools, allowed_tools);
 
         let tool_defs: Vec<rig::completion::ToolDefinition> = review_tools
             .iter()

@@ -341,6 +341,45 @@ fn curator_runner_is_skill_only_dirge_yai1() {
     }
 }
 
+/// P3a (dirge-crrh): `filter_loop_tools` is the hard tool-allow-list every
+/// forked phase agent relies on. It keeps exactly the allowed tools in
+/// registration order and excludes everything else (so e.g. a reviewer fork
+/// literally cannot reach `write`).
+#[cfg(feature = "mcp")]
+#[test]
+fn filter_loop_tools_is_a_hard_allowlist() {
+    use crate::agent::agent_loop::LoopTool;
+    use std::sync::Arc;
+
+    let tools: Vec<Arc<dyn LoopTool>> = vec![
+        Arc::new(NamedTool("read")),
+        Arc::new(NamedTool("grep")),
+        Arc::new(NamedTool("write")),
+        Arc::new(NamedTool("bash")),
+    ];
+    let names = |kept: &[Arc<dyn LoopTool>]| {
+        kept.iter()
+            .map(|t| t.name().to_string())
+            .collect::<Vec<_>>()
+    };
+
+    // Read-only subset (explore/plan phase), order preserved.
+    let kept = crate::provider::spawn::filter_loop_tools(&tools, &["read", "grep"]);
+    assert_eq!(names(&kept), vec!["read", "grep"]);
+
+    // Reviewer set (read + bash, NO write/edit).
+    let kept = crate::provider::spawn::filter_loop_tools(&tools, &["read", "bash"]);
+    assert_eq!(names(&kept), vec!["read", "bash"]);
+    assert!(
+        !names(&kept).iter().any(|n| n == "write"),
+        "reviewer fork must not expose write"
+    );
+
+    // Unknown names and an empty allow-list both yield nothing.
+    assert!(crate::provider::spawn::filter_loop_tools(&tools, &["nonexistent"]).is_empty());
+    assert!(crate::provider::spawn::filter_loop_tools(&tools, &[]).is_empty());
+}
+
 /// dirge-z73i: `with_review_route` stashes the alternate stream_fn,
 /// provider alias, and model name on AnyAgent so
 /// `spawn_review_runner_with_cache` can pick them up. This is a pure
