@@ -2,6 +2,7 @@ mod adapter;
 pub mod adapters;
 pub(crate) mod common;
 mod index;
+pub mod minify;
 pub mod syntax_validator;
 pub mod types;
 
