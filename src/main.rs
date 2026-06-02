@@ -18,13 +18,16 @@ mod semantic;
 mod session;
 mod shell;
 mod skill;
+mod sync_util;
 mod text;
+mod time_util;
 mod timeout;
 mod ui;
 
 #[cfg(test)]
 mod tests;
 
+use crate::sync_util::LockExt;
 use clap::Parser;
 use compact_str::CompactString;
 use session::MessageRole;
@@ -599,7 +602,7 @@ async fn main() -> anyhow::Result<()> {
     let _lsp_responder: Option<tokio::task::JoinHandle<()>> = {
         let lsp_rx = plugin_manager
             .as_ref()
-            .and_then(|pm| pm.lock().unwrap_or_else(|e| e.into_inner()).take_lsp_rx());
+            .and_then(|pm| pm.lock_ignore_poison().take_lsp_rx());
         match (lsp_rx, lsp_manager.clone()) {
             (Some(rx), Some(mgr)) => Some(plugin::spawn_lsp_responder(rx, mgr)),
             // No manager (LSP off) or no receiver: drop `lsp_rx` here so the
@@ -667,7 +670,7 @@ async fn main() -> anyhow::Result<()> {
                 if cli.verbose {
                     eprintln!("loading plugin: {}", path.display());
                 }
-                let mut mgr = pm_arc.lock().unwrap_or_else(|e| e.into_inner());
+                let mut mgr = pm_arc.lock_ignore_poison();
                 mgr.set_loading_plugin_config(true, cfg.plugin_auto_start(&plugin_name));
                 match plugin::load_plugin(&mut mgr, &path) {
                     Ok(loaded) => {
@@ -701,7 +704,7 @@ async fn main() -> anyhow::Result<()> {
         // into the global provider resolver. Config-declared
         // custom_providers still take precedence on name collision.
         let plugin_providers: std::collections::HashMap<String, config::ProviderEntry> = {
-            let mut mgr = pm_arc.lock().unwrap_or_else(|e| e.into_inner());
+            let mut mgr = pm_arc.lock_ignore_poison();
             mgr.list_providers()
                 .into_iter()
                 .map(|(name, ptype, base_url, api_key_env)| {
@@ -1091,7 +1094,7 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|_| ".".into())
                 .display()
                 .to_string();
-            let mut pm = pm_arc.lock().unwrap_or_else(|e| e.into_inner());
+            let mut pm = pm_arc.lock_ignore_poison();
             if let Err(e) = pm.dispatch(
                 "on-init",
                 &format!(
@@ -1352,7 +1355,7 @@ async fn run_headless_loop(
         // line lands in the right narrative slot.
         #[cfg(feature = "plugin")]
         if let Some(pm_arc) = plugin_manager {
-            let mut mgr = pm_arc.lock().unwrap_or_else(|e| e.into_inner());
+            let mut mgr = pm_arc.lock_ignore_poison();
             if let Some(raw) = mgr.take_pending_next_model() {
                 let trimmed = raw.trim();
                 if !trimmed.is_empty() {

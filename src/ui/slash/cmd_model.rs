@@ -5,6 +5,7 @@
 //! pattern. Extracted from the original mega-match in slash.rs as
 //! part of the arch/split-large-modules refactor.
 
+use crate::sync_util::LockExt;
 use compact_str::CompactString;
 
 use super::{SlashCtx, c_agent, c_error, c_result};
@@ -78,7 +79,7 @@ pub(super) async fn cmd_mode(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyhow::
     let current_mode = ctx
         .permission
         .as_ref()
-        .map(|p| p.lock().unwrap_or_else(|e| e.into_inner()).mode())
+        .map(|p| p.lock_ignore_poison().mode())
         .unwrap_or(SecurityMode::Standard);
 
     if parts.len() < 2 {

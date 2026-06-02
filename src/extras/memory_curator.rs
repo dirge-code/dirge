@@ -29,7 +29,7 @@
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use crate::extras::dirge_paths::ProjectPaths;
 use crate::extras::memory_usage::{MemoryUsageStore, ReconcileReport, entry_id};
@@ -493,10 +493,7 @@ pub fn render_curator_input(
 // ── Helpers ───────────────────────────────────────────
 
 fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+    crate::time_util::now_unix_secs()
 }
 
 /// First-line snippet of an entry, capped at 80 chars. Used in

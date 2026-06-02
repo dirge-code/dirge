@@ -485,10 +485,7 @@ mod tests {
             let root = std::env::temp_dir().join(format!(
                 "dirge-lsp-test-{}-{}-{}",
                 std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos())
-                    .unwrap_or(0),
+                crate::time_util::now_unix_nanos(),
                 suffix,
             ));
             let _ = std::fs::remove_dir_all(&root);

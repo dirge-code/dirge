@@ -1,3 +1,4 @@
+use crate::sync_util::LockExt;
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use serde::Deserialize;
@@ -138,14 +139,14 @@ fn abort_registry() -> &'static Mutex<HashMap<String, AbortSignal>> {
 /// Idempotent — re-registering replaces the previous signal (which
 /// shouldn't happen in practice since ids are fresh UUIDs).
 pub fn register_subagent_abort(id: &str, signal: AbortSignal) {
-    let mut map = abort_registry().lock().unwrap_or_else(|e| e.into_inner());
+    let mut map = abort_registry().lock_ignore_poison();
     map.insert(id.to_string(), signal);
 }
 
 /// Remove a subagent's abort entry. Called at terminal lifecycle
 /// events so the registry doesn't accumulate stale ids.
 pub fn unregister_subagent_abort(id: &str) {
-    let mut map = abort_registry().lock().unwrap_or_else(|e| e.into_inner());
+    let mut map = abort_registry().lock_ignore_poison();
     map.remove(id);
 }
 
@@ -178,7 +179,7 @@ pub fn kill_subagent(id_prefix: &str) -> KillOutcome {
     if trimmed.is_empty() {
         return KillOutcome::NotFound;
     }
-    let map = abort_registry().lock().unwrap_or_else(|e| e.into_inner());
+    let map = abort_registry().lock_ignore_poison();
     // Exact match wins outright.
     if let Some(sig) = map.get(trimmed) {
         sig.cancel();
@@ -207,7 +208,7 @@ pub fn kill_subagent(id_prefix: &str) -> KillOutcome {
 /// full registry key) without exposing the mutex.
 #[allow(dead_code)]
 pub fn registered_subagent_ids() -> Vec<String> {
-    let map = abort_registry().lock().unwrap_or_else(|e| e.into_inner());
+    let map = abort_registry().lock_ignore_poison();
     map.keys().cloned().collect()
 }
 
@@ -216,7 +217,7 @@ pub fn registered_subagent_ids() -> Vec<String> {
 /// test invocations and corrupt prefix-resolution assertions.
 #[cfg(test)]
 pub fn clear_abort_registry_for_test() {
-    let mut map = abort_registry().lock().unwrap_or_else(|e| e.into_inner());
+    let mut map = abort_registry().lock_ignore_poison();
     map.clear();
 }
 

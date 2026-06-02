@@ -15,6 +15,7 @@
 //! plugins don't have a TypeBox-equivalent so they pass the schema as
 //! a JSON string that we parse once at construction.
 
+use crate::sync_util::LockExt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -88,7 +89,7 @@ pub fn resolve_custom_message_render(
         // — the Janet worker is single-threaded, so nothing else can
         // run on it while we wait — and avoids the lock-release-lock
         // dance the prior split incurred.
-        let mut mgr = pm_arc.lock().unwrap_or_else(|e| e.into_inner());
+        let mut mgr = pm_arc.lock_ignore_poison();
         let handler = mgr
             .list_message_renderers()
             .into_iter()

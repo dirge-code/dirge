@@ -1,3 +1,4 @@
+use crate::sync_util::LockExt;
 use indexmap::IndexMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -40,7 +41,7 @@ impl SymbolIndex {
     }
 
     fn cache_lock(&self) -> std::sync::MutexGuard<'_, FileCache> {
-        self.cache.lock().unwrap_or_else(|e| e.into_inner())
+        self.cache.lock_ignore_poison()
     }
 
     /// Populate or refresh the cache entry for `path` and return a

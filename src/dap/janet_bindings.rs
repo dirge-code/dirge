@@ -27,6 +27,7 @@
 //! the `UnboundedSender<DapCommand>` that the C functions read from the
 //! thread-local. The bridge runs until the sender is dropped (worker shutdown).
 
+use crate::sync_util::LockExt;
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -109,7 +110,7 @@ static PENDING_DAP_TX: std::sync::Mutex<Option<tmpsc::UnboundedSender<DapCommand
 /// Called by the plugin manager after spawning the bridge. Stores the
 /// sender so the worker thread can pick it up.
 pub fn store_dap_tx(tx: tmpsc::UnboundedSender<DapCommand>) {
-    *PENDING_DAP_TX.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
+    *PENDING_DAP_TX.lock_ignore_poison() = Some(tx);
 }
 
 /// Called by the worker thread during init. Takes ownership of the

@@ -40,6 +40,7 @@ mod tree;
 mod tui;
 mod wrap;
 
+use crate::sync_util::LockExt;
 use crossterm::event::{KeyCode, KeyModifiers};
 use crossterm::style::Color;
 use tokio::sync::mpsc;
@@ -1277,7 +1278,7 @@ pub async fn run_interactive(
                                 let spec = hit.spec.clone();
                                 if let Some(pm_arc) = crate::plugin::hook::global() {
                                     let result = {
-                                        let mut mgr = pm_arc.lock().unwrap_or_else(|e| e.into_inner());
+                                        let mut mgr = pm_arc.lock_ignore_poison();
                                         mgr.invoke_command(&handler, &spec)
                                     };
                                     if let Ok(Some(msg)) = result {
@@ -1655,7 +1656,7 @@ pub async fn run_interactive(
                                 let mut plugin_replace: Option<String> = None;
                                 #[cfg(feature = "plugin")]
                                 if let Some(pm) = plugin_manager {
-                                    let mut mgr = pm.lock().unwrap_or_else(|e| e.into_inner());
+                                    let mut mgr = pm.lock_ignore_poison();
                                     match mgr.dispatch(
                                         "on-prompt",
                                         &format!(

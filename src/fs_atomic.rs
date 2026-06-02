@@ -42,10 +42,7 @@ fn next_temp(target: &Path) -> PathBuf {
     let nonce = format!(
         "{}-{}-{}",
         std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0),
+        crate::time_util::now_unix_nanos(),
         NONCE.fetch_add(1, Ordering::Relaxed),
     );
     let name = format!(".{}.{}.tmp", stem, nonce);

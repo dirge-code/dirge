@@ -28,6 +28,7 @@
 //! inside `dispatch_tool_hook` bounds the hold time. This matches
 //! the existing `HookedToolDyn` lock pattern exactly.
 
+use crate::sync_util::LockExt;
 use std::sync::{Arc, Mutex};
 
 use crate::plugin::{PluginManager, escape_janet_string};
@@ -98,7 +99,7 @@ pub fn before_hook_from_plugin_manager(pm: Arc<Mutex<PluginManager>>) -> BeforeT
             let janet_ctx_clone = janet_ctx.clone();
             let tool_name = ctx.tool_call_name.clone();
             let dispatch_future = tokio::task::spawn_blocking(move || {
-                let mut mgr = pm_for_dispatch.lock().unwrap_or_else(|e| e.into_inner());
+                let mut mgr = pm_for_dispatch.lock_ignore_poison();
                 mgr.dispatch_tool_hook("on-tool-start", &janet_ctx_clone)
             });
             let dispatch_result = match tokio::time::timeout(HOOK_TIMEOUT, dispatch_future).await {
@@ -221,7 +222,7 @@ pub fn after_hook_from_plugin_manager(pm: Arc<Mutex<PluginManager>>) -> AfterToo
             let janet_ctx_clone = janet_ctx.clone();
             let tool_name = ctx.tool_call_name.clone();
             let dispatch_future = tokio::task::spawn_blocking(move || {
-                let mut mgr = pm_for_dispatch.lock().unwrap_or_else(|e| e.into_inner());
+                let mut mgr = pm_for_dispatch.lock_ignore_poison();
                 mgr.dispatch_tool_hook("on-tool-end", &janet_ctx_clone)
             });
             let dispatch_result = match tokio::time::timeout(HOOK_TIMEOUT, dispatch_future).await {
@@ -320,7 +321,7 @@ pub fn prepare_next_turn_from_plugin_manager(pm: Arc<Mutex<PluginManager>>) -> P
         let pm = pm.clone();
         Box::pin(async move {
             let thinking = {
-                let mut mgr = pm.lock().unwrap_or_else(|e| e.into_inner());
+                let mut mgr = pm.lock_ignore_poison();
                 mgr.take_pending_next_thinking_level()
             };
             let thinking_level = thinking.and_then(parse_thinking_level)?;
@@ -347,7 +348,7 @@ pub fn should_stop_after_turn_from_plugin_manager(
     Arc::new(move |_ctx| {
         let pm = pm.clone();
         Box::pin(async move {
-            let mut mgr = pm.lock().unwrap_or_else(|e| e.into_inner());
+            let mut mgr = pm.lock_ignore_poison();
             mgr.take_pending_stop_after_turn()
         })
     })
@@ -374,7 +375,7 @@ pub fn get_steering_messages_from_plugin_manager(
         let pm = pm.clone();
         Box::pin(async move {
             let (steering, custom) = {
-                let mut mgr = pm.lock().unwrap_or_else(|e| e.into_inner());
+                let mut mgr = pm.lock_ignore_poison();
                 (mgr.drain_steering_messages(), mgr.drain_custom_messages())
             };
             let mut out: Vec<LoopMessage> = Vec::with_capacity(steering.len() + custom.len());
@@ -413,7 +414,7 @@ pub fn get_followup_messages_from_plugin_manager(
         let pm = pm.clone();
         Box::pin(async move {
             let drained: Vec<String> = {
-                let mut mgr = pm.lock().unwrap_or_else(|e| e.into_inner());
+                let mut mgr = pm.lock_ignore_poison();
                 mgr.drain_followup_messages()
             };
             drained
@@ -447,7 +448,7 @@ pub fn transform_context_from_plugin_manager(
                 return messages; // un-serializable → passthrough
             };
             let replaced: Option<String> = {
-                let mut mgr = pm.lock().unwrap_or_else(|e| e.into_inner());
+                let mut mgr = pm.lock_ignore_poison();
                 let ctx = format!(
                     "@{{:messages \"{}\"}}",
                     crate::plugin::escape_janet_string(&messages_json)
@@ -496,7 +497,7 @@ pub fn compaction_hooks_from_plugin_manager(
     let on_before: super::types::OnBeforeCompactFn = Arc::new(move |count: usize, tokens: u64| {
         let pm = pm_before.clone();
         Box::pin(async move {
-            let mut mgr = pm.lock().unwrap_or_else(|e| e.into_inner());
+            let mut mgr = pm.lock_ignore_poison();
             let ctx = format!("@{{:message-count {count} :tokens {tokens}}}");
             if let Err(e) = mgr.dispatch("on-before-compact", &ctx) {
                 tracing::warn!(
@@ -514,7 +515,7 @@ pub fn compaction_hooks_from_plugin_manager(
             let Ok(middle_json) = serde_json::to_string(&middle) else {
                 return None;
             };
-            let mut mgr = pm.lock().unwrap_or_else(|e| e.into_inner());
+            let mut mgr = pm.lock_ignore_poison();
             let ctx = format!(
                 "@{{:messages \"{}\"}}",
                 crate::plugin::escape_janet_string(&middle_json)

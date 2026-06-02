@@ -5,6 +5,7 @@
 //! (`Reasoning`'s `show_reasoning` skip, the avatar-state set) inline.
 //! Behavior is identical to the inline code; pure refactor (dirge-4y4l).
 
+use crate::sync_util::LockExt;
 use std::time::Instant;
 
 use crossterm::style::Color;
@@ -87,7 +88,7 @@ pub(crate) fn handle_token(
     if let Some(pm) = plugin_manager {
         current_turn_text.push_str(text);
         if token_batcher.push(text).is_some() {
-            let mut mgr = pm.lock().unwrap_or_else(|e| e.into_inner());
+            let mut mgr = pm.lock_ignore_poison();
             let _ = mgr.dispatch(
                 "on-message-update",
                 &format!(

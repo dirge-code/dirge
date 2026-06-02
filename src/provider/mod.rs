@@ -10,6 +10,7 @@ pub use build::*;
 pub use dispatch::*;
 pub use resolve::*;
 
+use crate::sync_util::LockExt;
 use rig::agent::Agent;
 use rig::providers::{anthropic, gemini, ollama, openai, openrouter};
 
@@ -186,7 +187,7 @@ impl AnyAgent {
         more: Vec<std::sync::Arc<dyn crate::agent::agent_loop::LoopTool>>,
     ) {
         if let Some(registry) = &self.tool_search_registry {
-            let mut reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+            let mut reg = registry.lock_ignore_poison();
             for t in &more {
                 reg.push(crate::agent::tools::tool_search::meta_from_loop_tool(
                     t.as_ref(),

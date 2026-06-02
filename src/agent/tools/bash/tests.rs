@@ -7,6 +7,7 @@
 
 use super::check::*;
 use super::*;
+use crate::sync_util::LockExt;
 use tokio::process::Command;
 use tokio::time::Duration;
 
@@ -970,8 +971,7 @@ mod gating_corpus {
         let seen: Arc<Mutex<Option<(String, usize)>>> = Arc::new(Mutex::new(None));
         let seen2 = seen.clone();
         let stub: ApprovalFn = std::sync::Arc::new(move |req: ApprovalRequest| {
-            *seen2.lock().unwrap_or_else(|e| e.into_inner()) =
-                Some((req.command.clone(), req.resources.len()));
+            *seen2.lock_ignore_poison() = Some((req.command.clone(), req.resources.len()));
             Box::pin(async { Ok(ApprovalDecision::Allow) })
                 as Pin<Box<dyn Future<Output = anyhow::Result<ApprovalDecision>> + Send>>
         });

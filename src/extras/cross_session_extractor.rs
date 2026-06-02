@@ -28,7 +28,7 @@
 //! already captured + consolidated before this runs.
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use crate::extras::dirge_paths::ProjectPaths;
 
@@ -490,10 +490,7 @@ fn cap_snippet(s: &str) -> String {
 }
 
 fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+    crate::time_util::now_unix_secs()
 }
 
 #[cfg(test)]

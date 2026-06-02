@@ -23,6 +23,7 @@
 //! On `Drop`, every spawned client's `_guard` drops (which kills the child
 //! process via `kill_on_drop(true)` on the real spawner).
 
+use crate::sync_util::LockExt;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -240,7 +241,7 @@ impl LspManager {
 
             // Fast-path cache check.
             {
-                let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                let state = self.state.lock_ignore_poison();
                 // Broken servers stay skipped only while inside
                 // their backoff window. Once the window elapses we
                 // fall through to spawn fresh — `mark_broken`
@@ -280,7 +281,7 @@ impl LspManager {
             Spawn(Arc<Notify>),
         }
         let slot = {
-            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut state = self.state.lock_ignore_poison();
             // Re-check cache under the lock — could have landed between
             // the fast-path miss and now.
             if let Some(entry) = state.clients.get(key) {
@@ -308,7 +309,7 @@ impl LspManager {
                 // The cache is authoritative either way — re-check after the
                 // wait, regardless of how it terminated.
                 let _ = tokio::time::timeout(Duration::from_secs(60), notify.notified()).await;
-                let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                let state = self.state.lock_ignore_poison();
                 if let Some(entry) = state.clients.get(key) {
                     return Some(Arc::clone(entry));
                 }
@@ -337,7 +338,7 @@ impl LspManager {
         // Two-phase: update state under the lock, then log + signal outside.
         // Slot-disappeared warning is captured for emit after lock release.
         let outcome = {
-            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut state = self.state.lock_ignore_poison();
             let notify = state.spawning.remove(key);
             let slot_missing = notify.is_none();
             let notify = notify.unwrap_or_else(|| Arc::new(Notify::new()));
@@ -484,7 +485,7 @@ impl LspManager {
     /// where it's rooted. Includes both healthy and broken-but-cached
     /// clients (broken-set entries appear in `broken_servers`).
     pub fn active_servers(&self) -> Vec<(String, PathBuf)> {
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let state = self.state.lock_ignore_poison();
         state
             .clients
             .values()
@@ -496,7 +497,7 @@ impl LspManager {
     /// for the info panel to show degraded LSP status alongside the
     /// healthy ones.
     pub fn broken_servers(&self) -> Vec<(String, PathBuf)> {
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let state = self.state.lock_ignore_poison();
         // Only surface entries that are STILL inside their backoff
         // window. Entries past their backoff are conceptually
         // "eligible to retry" — the panel would mislead the user
@@ -522,7 +523,7 @@ impl LspManager {
     /// swallowed inside the client.
     pub async fn close_all_files(&self) {
         let entries: Vec<_> = {
-            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let state = self.state.lock_ignore_poison();
             state.clients.values().cloned().collect()
         };
         for entry in entries {
@@ -542,7 +543,7 @@ impl LspManager {
     #[allow(dead_code)]
     pub fn diagnostics_for(&self, file: &Path) -> Option<Vec<Diagnostic>> {
         let entries: Vec<_> = {
-            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let state = self.state.lock_ignore_poison();
             state.clients.values().cloned().collect()
         };
         let mut merged: Vec<Diagnostic> = Vec::new();
@@ -560,7 +561,7 @@ impl LspManager {
     /// Aggregated diagnostics across all attached clients. Same key/dedupe
     /// semantics as [`LspClient::all_diagnostics`].
     pub fn all_diagnostics(&self) -> HashMap<PathBuf, Vec<Diagnostic>> {
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let state = self.state.lock_ignore_poison();
         let entries: Vec<_> = state.clients.values().cloned().collect();
         drop(state);
 
@@ -744,7 +745,7 @@ impl LspManager {
                     );
                     if is_dead {
                         let key = (entry.root.clone(), entry.server_id.clone());
-                        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                        let mut state = self.state.lock_ignore_poison();
                         // Only evict if the still-cached entry is
                         // the same instance — concurrent calls
                         // might have already replaced it with a
@@ -809,7 +810,7 @@ impl Drop for SpawnSlotGuard {
             return;
         }
         {
-            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut state = self.state.lock_ignore_poison();
             state.spawning.remove(&self.key);
         }
         // Wake waiters AFTER releasing the lock — they re-check the cache,
@@ -955,10 +956,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "dirge-lsp-manager-test-{}-{}-{suffix}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0),
+            crate::time_util::now_unix_nanos(),
         ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("src")).unwrap();
@@ -1015,7 +1013,7 @@ mod tests {
 
         // The in-flight slot must be gone.
         {
-            let state = manager.state.lock().unwrap_or_else(|e| e.into_inner());
+            let state = manager.state.lock_ignore_poison();
             assert!(
                 state.spawning.is_empty(),
                 "cancelled spawn must release its in-flight slot, got {:?}",

@@ -20,7 +20,7 @@
 //! `curator.py:1369-1555` (the `run_curator_review` loop).
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, UNIX_EPOCH};
 
 use crate::extras::dirge_paths::ProjectPaths;
 
@@ -576,10 +576,7 @@ pub fn write_curator_report(
 // ── Helpers ───────────────────────────────────────────
 
 fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+    crate::time_util::now_unix_secs()
 }
 
 /// Fallback: compute file modification age in seconds.

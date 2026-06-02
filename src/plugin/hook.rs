@@ -18,6 +18,7 @@
 //! tool wrappers don't have to plumb it through. Tests construct
 //! `HookedToolDyn::with_manager(inner, pm)` directly to bypass the global.
 
+use crate::sync_util::LockExt;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use rig::tool::{ToolDyn, ToolError};
@@ -105,7 +106,7 @@ impl ToolDyn for HookedToolDyn {
                         escape_janet_string(&name),
                         escape_janet_string(&args),
                     );
-                    let mut mgr = pm.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut mgr = pm.lock_ignore_poison();
                     let result = mgr
                         .dispatch_tool_hook("on-tool-start", &ctx)
                         .unwrap_or_default();
@@ -144,7 +145,7 @@ impl ToolDyn for HookedToolDyn {
                         escape_janet_string(&name),
                         escape_janet_string(&output_for_ctx),
                     );
-                    let mut mgr = pm.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut mgr = pm.lock_ignore_poison();
                     mgr.dispatch_tool_hook("on-tool-end", &ctx)
                         .unwrap_or_default()
                         .replace_result

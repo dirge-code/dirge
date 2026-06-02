@@ -17,7 +17,6 @@
 //! - Fire-and-forget (daemon thread pattern)
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::agent::runner::{AbortRunnerOnDrop, summarize_actions};
 use crate::extras::dirge_paths::ProjectPaths;
@@ -134,10 +133,7 @@ pub(crate) async fn run_background_review(
     // open. The previous-value `prev` is captured so we can roll back
     // on early failure (otherwise an immediately-failing review would
     // silently suppress the next 15 minutes of attempts).
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let now = crate::time_util::now_unix_secs();
     let Some(prev) = claim_review_slot(now) else {
         tracing::debug!(
             target: "dirge::review",

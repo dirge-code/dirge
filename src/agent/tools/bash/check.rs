@@ -11,6 +11,7 @@
 use crate::agent::tools::{AskSender, PermCheck, ToolError, enforce_request};
 #[cfg(feature = "semantic-bash")]
 use crate::semantic::adapters::bash;
+use crate::sync_util::LockExt;
 
 /// dirge-sb2n: paths a bash command mutates — output-redirect targets
 /// (`> f`, `cat > f <<'EOF'`) plus the positional args of file-mutating
@@ -34,7 +35,7 @@ pub(super) fn bash_mutation_targets(command: &str) -> Vec<String> {
 #[cfg(feature = "semantic-bash")]
 pub(super) fn mark_bash_mutations(permission: Option<&PermCheck>, command: &str) {
     let base = permission.map(|p| {
-        let g = p.lock().unwrap_or_else(|e| e.into_inner());
+        let g = p.lock_ignore_poison();
         std::path::PathBuf::from(g.working_dir())
     });
     for target in bash_mutation_targets(command) {
@@ -135,7 +136,7 @@ pub(super) async fn check_bash_segments(
         return Ok(()); // no checker (ACP / --no-tools) → pass through
     };
     let mode = {
-        let g = perm.lock().unwrap_or_else(|e| e.into_inner());
+        let g = perm.lock_ignore_poison();
         g.mode()
     };
     use crate::permission::engine::types::{AccessRequest, Claim, Operation, Resource};
@@ -153,7 +154,7 @@ pub(super) async fn check_bash_segments(
     #[cfg(feature = "semantic-bash")]
     {
         let working_dir = {
-            let g = perm.lock().unwrap_or_else(|e| e.into_inner());
+            let g = perm.lock_ignore_poison();
             g.working_dir().to_string()
         };
         // /dev/null detection lives solely in `classify_path` (the Path
@@ -225,7 +226,7 @@ pub(super) async fn check_bash_segments(
             // matters and are caught). Skipped on `has_substitution` since
             // a whole-command claim already forces confirmation there.
             let working_dir = {
-                let g = perm.lock().unwrap_or_else(|e| e.into_inner());
+                let g = perm.lock_ignore_poison();
                 g.working_dir().to_string()
             };
             let path_claim = |target: &str| {

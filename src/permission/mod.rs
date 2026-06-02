@@ -13,11 +13,12 @@ pub mod pattern;
 /// `None` perm (e.g. `--no-tools` builds) is a no-op.
 pub fn apply_prompt_deny(perm: &Option<checker::PermCheck>, deny: &[String]) {
     if let Some(p) = perm {
-        let mut guard = p.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = p.lock_ignore_poison();
         guard.set_prompt_deny_tools(deny.to_vec());
     }
 }
 
+use crate::sync_util::LockExt;
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize)]

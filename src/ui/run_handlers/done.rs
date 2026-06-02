@@ -14,6 +14,7 @@
 //! Behavior is identical to the original inline body; only the
 //! lexical home moved.
 
+use crate::sync_util::LockExt;
 use compact_str::CompactString;
 use crossterm::style::Color;
 use tokio::sync::mpsc;
@@ -143,7 +144,7 @@ pub(crate) async fn handle_done(
     let mut plugin_followup: Option<String> = None;
     #[cfg(feature = "plugin")]
     if let Some(pm) = plugin_manager {
-        let mut mgr = pm.lock().unwrap_or_else(|e| e.into_inner());
+        let mut mgr = pm.lock_ignore_poison();
         match mgr.dispatch(
             "on-response",
             &format!(
@@ -292,7 +293,7 @@ pub(crate) async fn handle_done(
         // lock here since we released it above to satisfy
         // `clippy::await_holding_lock`.
         {
-            let mut mgr = pm.lock().unwrap_or_else(|e| e.into_inner());
+            let mut mgr = pm.lock_ignore_poison();
             let _ = mgr.eval("(set harness-response nil)");
         }
     }

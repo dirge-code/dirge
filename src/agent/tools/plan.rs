@@ -7,6 +7,7 @@
 //! name; don't cross the wires (`plan_tx` here vs `plan_kickoff`/`active_plan`
 //! there).
 
+use crate::sync_util::LockExt;
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use serde::Deserialize;
@@ -27,7 +28,7 @@ fn check_prompt_deny(perm: &Option<PermCheck>, tool_name: &str) -> Result<(), To
         return Ok(());
     };
     let denied = {
-        let guard = p.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = p.lock_ignore_poison();
         guard.any_prompt_denied(&[tool_name])
     };
     if denied {

@@ -1,4 +1,5 @@
 use super::*;
+use crate::sync_util::LockExt;
 
 #[test]
 fn test_plugin_manager_new() {
@@ -129,7 +130,7 @@ fn test_poisoned_mutex_recovery_pattern() {
     .join();
 
     assert!(m.is_poisoned(), "thread panic must poison the mutex");
-    let mut guard = m.lock().unwrap_or_else(|e| e.into_inner());
+    let mut guard = m.lock_ignore_poison();
     guard.push("ok".to_string());
     assert_eq!(guard.as_slice(), &["ok".to_string()]);
 }

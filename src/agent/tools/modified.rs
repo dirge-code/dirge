@@ -1,3 +1,4 @@
+use crate::sync_util::LockExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
@@ -39,7 +40,7 @@ const MAX_MODIFIED: usize = 256;
 /// doesn't exist yet or canonicalize fails.
 pub fn mark_modified(path: &Path) {
     let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let mut set = MODIFIED_FILES.lock().unwrap_or_else(|e| e.into_inner());
+    let mut set = MODIFIED_FILES.lock_ignore_poison();
     // IndexSet preserves insertion order and dedups; we want the most-recent
     // touch to surface at the end, so re-insert moves the entry.
     set.shift_remove(&canonical);
@@ -66,7 +67,7 @@ pub fn clear_modified() {
 /// path strings ready for display; entries already canonicalized when
 /// possible so the caller can shorten them relative to a working dir.
 pub fn recent(n: usize) -> Vec<PathBuf> {
-    let set = MODIFIED_FILES.lock().unwrap_or_else(|e| e.into_inner());
+    let set = MODIFIED_FILES.lock_ignore_poison();
     let len = set.len();
     let start = len.saturating_sub(n);
     set.iter().skip(start).cloned().collect()
@@ -84,7 +85,7 @@ mod tests {
     static TEST_GATE: Mutex<()> = Mutex::new(());
 
     fn with_isolated<R>(f: impl FnOnce() -> R) -> R {
-        let _guard = TEST_GATE.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = TEST_GATE.lock_ignore_poison();
         clear_modified();
         let r = f();
         clear_modified();

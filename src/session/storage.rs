@@ -110,10 +110,7 @@ pub fn save_session(session: &mut Session) -> anyhow::Result<()> {
         && let Ok(disk_mtime) = meta.modified()
         && disk_mtime > loaded_mtime
     {
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let ts = crate::time_util::now_unix_secs();
         let conflict_path = dir.join(format!("{}.conflict-{}.json", session.id, ts));
         crate::fs_atomic::atomic_write_sync(&conflict_path, json.as_bytes())?;
         anyhow::bail!(

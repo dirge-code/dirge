@@ -7,6 +7,7 @@
 //! the `AnyAgentInner` variants directly (privacy = defining module +
 //! descendants) — no `pub(crate)` field bumps or accessors needed.
 
+use crate::sync_util::LockExt;
 use rig::completion::Message;
 
 use super::{AnyAgent, AnyAgentInner};
@@ -114,7 +115,7 @@ impl AnyAgent {
         // model-identity + tool-docs preamble is preserved.
         #[cfg(feature = "plugin")]
         if let Some(pm) = crate::plugin::hook::global() {
-            let mut mgr = pm.lock().unwrap_or_else(|e| e.into_inner());
+            let mut mgr = pm.lock_ignore_poison();
             let ctx = format!(
                 "@{{:system-prompt \"{}\"}}",
                 crate::plugin::escape_janet_string(&system_prompt)

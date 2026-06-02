@@ -8,6 +8,7 @@
 //! repo — or `git` isn't installed — the snapshot is `None` and the panel
 //! section is hidden.
 
+use crate::sync_util::LockExt;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -25,11 +26,11 @@ impl SharedGit {
     /// Current snapshot, or `None` until the first successful poll / when
     /// the cwd isn't a repo.
     pub fn snapshot(&self) -> Option<GitSnapshot> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.0.lock_ignore_poison().clone()
     }
 
     fn store(&self, snap: Option<GitSnapshot>) {
-        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = snap;
+        *self.0.lock_ignore_poison() = snap;
     }
 }
 

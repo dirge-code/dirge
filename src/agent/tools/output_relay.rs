@@ -38,6 +38,8 @@
 //! permissions (which already trust paths beneath the user's
 //! cwd or `~/.dirge/`) accept reading them back.
 
+#[cfg(test)]
+use crate::sync_util::LockExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -182,10 +184,7 @@ fn build_transient_path(tool: &str) -> PathBuf {
     static SEQ: AtomicUsize = AtomicUsize::new(0);
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     let pid = std::process::id();
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let ts = crate::time_util::now_unix_secs();
     transient_base()
         .join(format!("{pid}"))
         .join(format!("{tool}-{ts}-{seq}.txt"))
@@ -439,7 +438,7 @@ mod tests {
     /// summary block.
     #[test]
     fn relay_prepends_header_note() {
-        let _guard = THRESHOLD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = THRESHOLD_LOCK.lock_ignore_poison();
         let payload: String = "x".repeat(inline_max_bytes_for("bash") + 1);
         let outcome = relay_if_large("bash", payload, "Exit code: 137");
         assert!(outcome.text.starts_with("Exit code: 137"));
@@ -452,7 +451,7 @@ mod tests {
     /// makes shorter outputs trip the relay.
     #[test]
     fn config_override_changes_threshold() {
-        let _guard = THRESHOLD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = THRESHOLD_LOCK.lock_ignore_poison();
         // Snapshot whatever the global was so we can restore
         // it for other parallel tests.
         let prev = BASH_INLINE_MAX.load(Ordering::Relaxed);

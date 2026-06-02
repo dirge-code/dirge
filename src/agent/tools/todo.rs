@@ -1,3 +1,4 @@
+use crate::sync_util::LockExt;
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use serde::{Deserialize, Serialize};
@@ -93,7 +94,7 @@ impl Tool for WriteTodoList {
             )));
         }
 
-        let mut list = TODO_LIST.lock().unwrap_or_else(|e| e.into_inner());
+        let mut list = TODO_LIST.lock_ignore_poison();
         *list = args.todos;
 
         if list.is_empty() {
@@ -143,7 +144,7 @@ mod nudge_tests {
             priority: "medium".into(),
         };
         {
-            let mut list = TODO_LIST.lock().unwrap_or_else(|e| e.into_inner());
+            let mut list = TODO_LIST.lock_ignore_poison();
             *list = vec![
                 item("completed"),
                 item("pending"),
@@ -153,11 +154,11 @@ mod nudge_tests {
         }
         assert_eq!(unfinished_count(), 2);
         {
-            let mut list = TODO_LIST.lock().unwrap_or_else(|e| e.into_inner());
+            let mut list = TODO_LIST.lock_ignore_poison();
             *list = vec![item("completed"), item("cancelled")];
         }
         assert_eq!(unfinished_count(), 0);
         // Leave the global clean for any other consumer.
-        TODO_LIST.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        TODO_LIST.lock_ignore_poison().clear();
     }
 }

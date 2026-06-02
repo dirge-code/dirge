@@ -1,3 +1,4 @@
+use crate::sync_util::LockExt;
 use crossterm::style::Color;
 use smallvec::SmallVec;
 
@@ -529,7 +530,7 @@ pub async fn handle_slash(
                 let cmd = parts[0].trim_start_matches('/');
                 let args = parts.get(1..).map(|p| p.join(" ")).unwrap_or_default();
                 let handler = {
-                    let mut mgr = pm_arc.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut mgr = pm_arc.lock_ignore_poison();
                     mgr.list_commands()
                         .into_iter()
                         .find(|(name, _)| name == cmd)
@@ -537,7 +538,7 @@ pub async fn handle_slash(
                 };
                 if let Some(handler_fn) = handler {
                     let result = {
-                        let mut mgr = pm_arc.lock().unwrap_or_else(|e| e.into_inner());
+                        let mut mgr = pm_arc.lock_ignore_poison();
                         mgr.invoke_command(&handler_fn, &args)
                     };
                     match result {

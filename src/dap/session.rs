@@ -3,6 +3,7 @@
 //! Manages a single active debug session. Launching a new session
 //! terminates any existing one (single-session enforcement).
 
+use crate::sync_util::LockExt;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex as StdMutex;
@@ -942,7 +943,7 @@ impl DapSessionManager {
             output_truncated: session.output_truncated,
             exit_code: session.exit_code,
         });
-        *self.last_snapshot.lock().unwrap_or_else(|e| e.into_inner()) = snapshot.clone();
+        *self.last_snapshot.lock_ignore_poison() = snapshot.clone();
         snapshot
     }
 

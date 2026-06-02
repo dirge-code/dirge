@@ -8,6 +8,7 @@
 use super::AnyAgent;
 use crate::agent::runner;
 use crate::event::AgentEvent;
+use crate::sync_util::LockExt;
 
 impl AnyAgent {
     pub async fn run_print(
@@ -32,7 +33,7 @@ impl AnyAgent {
             #[cfg(feature = "plugin")]
             {
                 if let Some(pm_arc) = crate::plugin::hook::global() {
-                    let mut mgr = pm_arc.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut mgr = pm_arc.lock_ignore_poison();
                     runner::resolve_prompt_with_hooks(prompt, &mut mgr)
                 } else {
                     prompt.to_string()
@@ -126,7 +127,7 @@ impl AnyAgent {
         // dispatch. Headless modes previously skipped these.
         #[cfg(feature = "plugin")]
         if let Some(pm_arc) = crate::plugin::hook::global() {
-            let mut mgr = pm_arc.lock().unwrap_or_else(|e| e.into_inner());
+            let mut mgr = pm_arc.lock_ignore_poison();
             let result = runner::apply_response_hooks(&full_response, &mut mgr);
             if let Some(replacement) = result.replacement {
                 if suppress_inline {

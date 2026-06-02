@@ -15,6 +15,7 @@
 //! - Drift detection before mutations
 //! - Deduplication on load
 
+use crate::sync_util::LockExt;
 use std::path::PathBuf;
 
 use regex::Regex;
@@ -394,10 +395,7 @@ impl MemoryStore {
             let entries_preserved = self.entries.iter().all(|e| disk_set.contains(e));
             if !snapshot_preserved || !entries_preserved {
                 // Genuine external divergence — snapshot the file and refuse.
-                let ts = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
+                let ts = crate::time_util::now_unix_secs();
                 let bak = self.file_path.with_extension(format!("bak.{}", ts));
                 std::fs::rename(&self.file_path, &bak)
                     .map_err(|e| format!("External drift detected but failed to snapshot: {e}"))?;
@@ -448,8 +446,8 @@ impl MemoryToolStore {
 
     /// Return the frozen snapshot formatted for system prompt injection.
     pub fn format_for_system_prompt(&self) -> String {
-        let mem = self.memory.lock().unwrap_or_else(|e| e.into_inner());
-        let pit = self.pitfalls.lock().unwrap_or_else(|e| e.into_inner());
+        let mem = self.memory.lock_ignore_poison();
+        let pit = self.pitfalls.lock_ignore_poison();
         let mut out = mem.format_for_system_prompt();
         out.push_str(&pit.format_for_system_prompt());
         out
@@ -465,7 +463,7 @@ impl MemoryToolStore {
 
     pub fn add(&self, target: &str, content: &str) -> Result<serde_json::Value, String> {
         let store = self.store_for(target);
-        let mut guard = store.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = store.lock_ignore_poison();
         let evicted = guard.add(content)?;
         let message = if evicted > 0 {
             format!(
@@ -485,21 +483,21 @@ impl MemoryToolStore {
         new_content: &str,
     ) -> Result<serde_json::Value, String> {
         let store = self.store_for(target);
-        let mut guard = store.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = store.lock_ignore_poison();
         guard.replace(old_text, new_content)?;
         Ok(self.success_response(&guard, target, "Entry replaced."))
     }
 
     pub fn remove(&self, target: &str, old_text: &str) -> Result<serde_json::Value, String> {
         let store = self.store_for(target);
-        let mut guard = store.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = store.lock_ignore_poison();
         guard.remove(old_text)?;
         Ok(self.success_response(&guard, target, "Entry removed."))
     }
 
     pub fn view(&self, target: &str) -> serde_json::Value {
         let store = self.store_for(target);
-        let guard = store.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = store.lock_ignore_poison();
         self.success_response(&guard, target, "")
     }
 

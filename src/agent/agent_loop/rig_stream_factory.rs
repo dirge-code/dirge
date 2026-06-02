@@ -46,6 +46,7 @@
 //! provider derives stop reason from its own stream). They're
 //! dropped in conversion.
 
+use crate::sync_util::LockExt;
 use std::sync::Arc;
 
 use rig::OneOrMany;
@@ -333,7 +334,7 @@ pub fn filter_tool_defs(
     match filter {
         None => tools.to_vec(),
         Some(arc) => {
-            let loaded = arc.lock().unwrap_or_else(|e| e.into_inner());
+            let loaded = arc.lock_ignore_poison();
             let always_on: std::collections::HashSet<&str> =
                 crate::agent::tools::tool_search::ALWAYS_ON_TOOLS
                     .iter()

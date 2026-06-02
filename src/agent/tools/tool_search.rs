@@ -26,6 +26,7 @@
 //! per request and surfaces those tools' definitions to the
 //! model on the NEXT turn.
 
+use crate::sync_util::LockExt;
 use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -115,7 +116,7 @@ impl ToolSearchTool {
     /// call). Tests use this directly to assert rank ordering.
     #[allow(dead_code)]
     pub fn rank(&self, query: &str, top_k: usize) -> Vec<ToolMeta> {
-        let reg = self.registry.lock().unwrap_or_else(|e| e.into_inner());
+        let reg = self.registry.lock_ignore_poison();
         rank_tools(&reg, query, top_k)
             .into_iter()
             .cloned()
@@ -196,7 +197,7 @@ impl LoopTool for ToolSearchTool {
             // or build the response — no nested locks, no lock held across
             // the await boundary.
             let ranked: Vec<ToolMeta> = {
-                let reg = self.registry.lock().unwrap_or_else(|e| e.into_inner());
+                let reg = self.registry.lock_ignore_poison();
                 rank_tools(&reg, &parsed.query, k)
                     .into_iter()
                     .cloned()
@@ -206,7 +207,7 @@ impl LoopTool for ToolSearchTool {
             // Mutate the loaded set BEFORE building the response so
             // the model can rely on next-turn availability.
             {
-                let mut guard = self.loaded.lock().unwrap_or_else(|e| e.into_inner());
+                let mut guard = self.loaded.lock_ignore_poison();
                 for meta in &ranked {
                     guard.insert(meta.name.clone());
                 }

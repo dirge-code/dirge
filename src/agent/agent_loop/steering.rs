@@ -23,6 +23,7 @@
 //! Mutex pattern matches `plugin_hooks` — sync lock, drain
 //! synchronously, release. No `.await` while held.
 
+use crate::sync_util::LockExt;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
@@ -58,7 +59,7 @@ pub fn steering_from_queue(
         Box::pin(async move {
             // Lock, drain per mode, release.
             let drained: Vec<String> = {
-                let mut q = queue.lock().unwrap_or_else(|e| e.into_inner());
+                let mut q = queue.lock_ignore_poison();
                 match mode {
                     QueueMode::All => q.drain(..).collect(),
                     QueueMode::OneAtATime => q.pop_front().into_iter().collect(),

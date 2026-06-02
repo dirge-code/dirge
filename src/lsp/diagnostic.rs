@@ -414,10 +414,7 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!(
             "dirge-diag-path-test-{}-{}.rs",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
+            crate::time_util::now_unix_nanos()
         ));
         std::fs::write(&tmp, "// test\n").unwrap();
         let canonical = tmp.canonicalize().unwrap();
@@ -447,10 +444,7 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!(
             "dirge-diagnostic-test-{}-{}.rs",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
+            crate::time_util::now_unix_nanos()
         ));
         std::fs::write(&tmp, "// test\n").unwrap();
         let canonical = tmp.canonicalize().unwrap();

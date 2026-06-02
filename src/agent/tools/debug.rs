@@ -8,6 +8,7 @@
 //! actions (`run_to_cursor`, `restart_frame`, `backtrace_diagnostics`,
 //! `error_analysis`) that coordinate the debugger with LSP code intelligence.
 
+use crate::sync_util::LockExt;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -75,8 +76,8 @@ impl DebugTool {
     #[allow(dead_code)] // used only via cfg path in loop_tools.rs
     pub fn new(permission: Option<PermCheck>, ask_tx: Option<AskSender>) -> Self {
         let session = Arc::new(DapSessionManager::new());
-        *DAP_MANAGER.lock().unwrap_or_else(|e| e.into_inner()) = Some(session.clone());
-        *DAP_PERM_CHECK.lock().unwrap_or_else(|e| e.into_inner()) = permission.clone();
+        *DAP_MANAGER.lock_ignore_poison() = Some(session.clone());
+        *DAP_PERM_CHECK.lock_ignore_poison() = permission.clone();
         Self {
             permission,
             ask_tx,
@@ -93,8 +94,8 @@ impl DebugTool {
         lsp_manager: Arc<LspManager>,
     ) -> Self {
         let session = Arc::new(DapSessionManager::new());
-        *DAP_MANAGER.lock().unwrap_or_else(|e| e.into_inner()) = Some(session.clone());
-        *DAP_PERM_CHECK.lock().unwrap_or_else(|e| e.into_inner()) = permission.clone();
+        *DAP_MANAGER.lock_ignore_poison() = Some(session.clone());
+        *DAP_PERM_CHECK.lock_ignore_poison() = permission.clone();
         Self {
             permission,
             ask_tx,

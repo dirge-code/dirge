@@ -11,6 +11,7 @@
 //! lives behind `LoopConfig.file_touch_tracker`; when `None`, the
 //! loop behaves byte-identically to today.
 
+use crate::sync_util::LockExt;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -71,7 +72,7 @@ impl FileTouchTracker {
     /// was touched).
     pub fn record_tool_call(&self, _tool_name: &str, args: &serde_json::Value) {
         let touched = extract_paths(args);
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut inner = self.inner.lock_ignore_poison();
 
         if touched.is_empty() {
             // No file touched this turn — break the streak.
@@ -113,7 +114,7 @@ impl FileTouchTracker {
     /// mention current files, keep the streak but still update
     /// `active_task`.
     pub fn record_user_message(&self, content: &str) {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut inner = self.inner.lock_ignore_poison();
 
         let mentions_current = !inner.last_files.is_empty()
             && inner.last_files.iter().any(|p| mentions_path(content, p));
@@ -133,7 +134,7 @@ impl FileTouchTracker {
     /// The returned message is wrapped with `MID_TURN_STEER_WRAPPER`
     /// so the model doesn't treat it as a new task.
     pub fn poll_reminder(&self) -> Vec<LoopMessage> {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut inner = self.inner.lock_ignore_poison();
         if inner.consecutive < self.threshold || inner.emitted_for_streak {
             return Vec::new();
         }
@@ -149,7 +150,7 @@ impl FileTouchTracker {
     /// doesn't strand it without the concrete file state
     /// (IMPROVEMENTS_PLAN #2).
     pub fn working_files(&self) -> Vec<PathBuf> {
-        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let inner = self.inner.lock_ignore_poison();
         let mut files: Vec<PathBuf> = inner.last_files.iter().cloned().collect();
         files.sort();
         files

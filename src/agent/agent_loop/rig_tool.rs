@@ -452,10 +452,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "dirge_rig_tool_test_{}_{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0),
+            crate::time_util::now_unix_nanos(),
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let target = dir.join("sample.txt");

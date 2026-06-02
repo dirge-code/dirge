@@ -16,6 +16,7 @@
 //! Bounded to fire at most once per run (can't loop). Self-contained;
 //! lives behind `LoopConfig.verifier` (None = off, byte-identical).
 
+use crate::sync_util::LockExt;
 use std::sync::{Arc, Mutex};
 
 use super::message::{LoopMessage, UserMessage};
@@ -64,7 +65,7 @@ impl VerifierGate {
         result: &LoopToolResult,
         is_error: bool,
     ) {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut inner = self.inner.lock_ignore_poison();
         match tool_name {
             "write" | "edit" | "apply_patch" => {
                 if touches_code_file(args) {
@@ -87,7 +88,7 @@ impl VerifierGate {
     /// and either a build/test failed or none ran. Empty when verified
     /// green (or nothing was edited). Fires at most once per run.
     pub fn check_before_finalize(&self) -> Vec<LoopMessage> {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut inner = self.inner.lock_ignore_poison();
         if inner.fired || !inner.edited_code {
             return Vec::new();
         }

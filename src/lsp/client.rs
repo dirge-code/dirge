@@ -13,6 +13,7 @@
 //! [`RpcClient`]. The constructor installs the `textDocument/publishDiagnostics`
 //! handler so push diagnostics are accumulated from that moment on.
 
+use crate::sync_util::LockExt;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -110,7 +111,7 @@ impl LspClient {
                     .map(|v| v as i32);
 
                 {
-                    let mut state = inner_for_handler.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut state = inner_for_handler.lock_ignore_poison();
                     // Drop if server sent a version older than what
                     // we last opened/modified.
                     let should_drop = if let Some(sv) = server_version {
@@ -172,7 +173,7 @@ impl LspClient {
         // either confuses incremental sync (rust-analyzer rejects the
         // mismatch) or, worse, silently de-syncs the in-server text.
         let path_lock = {
-            let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let mut state = self.inner.lock_ignore_poison();
             Arc::clone(
                 state
                     .per_path_locks
@@ -188,7 +189,7 @@ impl LspClient {
         let is_first_open;
         let version;
         {
-            let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let mut state = self.inner.lock_ignore_poison();
             is_first_open = !state.files.contains_key(&abs);
             let entry = state.files.entry(abs.clone()).or_default();
             if is_first_open {
@@ -253,7 +254,7 @@ impl LspClient {
         };
         let was_open;
         {
-            let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let mut state = self.inner.lock_ignore_poison();
             was_open = state.files.remove(&abs).is_some();
             state.push.remove(&abs);
             state.pull.remove(&abs);
@@ -281,7 +282,7 @@ impl LspClient {
     /// is best-effort.
     pub async fn close_all(&self) {
         let paths: Vec<PathBuf> = {
-            let state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let state = self.inner.lock_ignore_poison();
             state.files.keys().cloned().collect()
         };
         for p in paths {
@@ -292,7 +293,7 @@ impl LspClient {
     /// Merged + deduplicated diagnostics for a single file. Combines push
     /// (server-volunteered) and pull (server requested explicitly) state.
     pub fn diagnostics_for(&self, path: &Path) -> Vec<Diagnostic> {
-        let state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let state = self.inner.lock_ignore_poison();
         let push = state.push.get(path).cloned().unwrap_or_default();
         let pull = state.pull.get(path).cloned().unwrap_or_default();
         dedupe(push.into_iter().chain(pull))
@@ -302,7 +303,7 @@ impl LspClient {
     /// Empty entries are pruned. Useful for the write/edit tool's
     /// project-wide diagnostic block.
     pub fn all_diagnostics(&self) -> HashMap<PathBuf, Vec<Diagnostic>> {
-        let state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let state = self.inner.lock_ignore_poison();
         let mut paths: HashSet<PathBuf> = state.push.keys().cloned().collect();
         paths.extend(state.pull.keys().cloned());
         drop(state);
@@ -431,7 +432,7 @@ impl LspClient {
             .unwrap_or_default();
         let abs = path.to_path_buf();
         {
-            let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let mut state = self.inner.lock_ignore_poison();
             state.push.insert(abs.clone(), items);
             state.last_push_at.insert(abs, Instant::now());
         }
@@ -442,7 +443,7 @@ impl LspClient {
     }
 
     fn has_fresh_push(&self, path: &Path, after: Instant) -> bool {
-        let state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let state = self.inner.lock_ignore_poison();
         state
             .last_push_at
             .get(path)
@@ -543,10 +544,7 @@ mod tests {
         let p = std::env::temp_dir().join(format!(
             "dirge-lsp-client-test-{}-{}-{suffix}.rs",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0),
+            crate::time_util::now_unix_nanos(),
         ));
         std::fs::write(&p, contents).unwrap();
         p

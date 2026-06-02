@@ -20,6 +20,7 @@
 //! same scroll behaviour — so a message from an MCP server reads
 //! the same way as an agent error or a permission denial.
 
+use crate::sync_util::LockExt;
 use std::sync::{Mutex, RwLock};
 
 use tokio::sync::mpsc::{Receiver, Sender, channel};
@@ -85,7 +86,7 @@ pub fn install() {
         *slot = Some(tx);
     }
     {
-        let mut holder = RX_HOLDER.lock().unwrap_or_else(|e| e.into_inner());
+        let mut holder = RX_HOLDER.lock_ignore_poison();
         *holder = Some(rx);
     }
 }
@@ -96,7 +97,7 @@ pub fn install() {
 /// notification path available", and the caller should
 /// `std::future::pending()`-await as a no-op arm.
 pub fn take_receiver() -> Option<Receiver<Notification>> {
-    let mut holder = RX_HOLDER.lock().unwrap_or_else(|e| e.into_inner());
+    let mut holder = RX_HOLDER.lock_ignore_poison();
     holder.take()
 }
 
@@ -132,7 +133,7 @@ mod tests {
     /// `try_send` returns Err once the receiver is dropped.
     #[test]
     fn install_replaces_previous_channel() {
-        let _g = TEST_GATE.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = TEST_GATE.lock_ignore_poison();
         // Two installs in sequence — second wins.
         install();
         let rx1 = take_receiver().expect("first take");
@@ -154,7 +155,7 @@ mod tests {
     /// full instead of growing unboundedly.
     #[test]
     fn bounded_channel_drops_on_full() {
-        let _g = TEST_GATE.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = TEST_GATE.lock_ignore_poison();
         install();
         // Don't take_receiver — leave the rx in the holder so the
         // channel stays open but unread. Producers can fill it

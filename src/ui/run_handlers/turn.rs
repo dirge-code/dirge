@@ -4,6 +4,7 @@
 //! hooks — so the whole module is `cfg(feature = "plugin")`. Behavior is
 //! identical to the inline code; pure refactor (dirge-4y4l).
 
+use crate::sync_util::LockExt;
 use std::sync::{Arc, Mutex};
 
 use crate::plugin::PluginManager;
@@ -34,7 +35,7 @@ pub(crate) fn handle_turn_start(
     current_turn_text.clear();
     *current_turn_index = index;
     if let Some(pm) = plugin_manager {
-        let mut mgr = pm.lock().unwrap_or_else(|e| e.into_inner());
+        let mut mgr = pm.lock_ignore_poison();
         let _ = mgr.dispatch("on-turn-start", &format!("@{{:index {}}}", index));
         clear_tool_hook_slots(&mut mgr);
     }
@@ -54,7 +55,7 @@ pub(crate) fn handle_turn_end(
         // partial update lands. `current_turn_text` already covers them
         // (pushed in lockstep with the batcher).
         if token_batcher.flush_remaining().is_some() {
-            let mut mgr = pm.lock().unwrap_or_else(|e| e.into_inner());
+            let mut mgr = pm.lock_ignore_poison();
             let _ = mgr.dispatch(
                 "on-message-update",
                 &format!(
@@ -64,7 +65,7 @@ pub(crate) fn handle_turn_end(
                 ),
             );
         }
-        let mut mgr = pm.lock().unwrap_or_else(|e| e.into_inner());
+        let mut mgr = pm.lock_ignore_poison();
         let _ = mgr.dispatch(
             "on-turn-end",
             &format!(

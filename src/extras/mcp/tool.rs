@@ -1,3 +1,4 @@
+use crate::sync_util::LockExt;
 use std::borrow::Cow;
 use std::fmt;
 use std::sync::Arc;
@@ -161,7 +162,7 @@ impl ToolDyn for McpTool {
             if let Some(perm) = permission.as_ref() {
                 let qualified = format!("mcp_tool:{}:{}", server_name, tool_name);
                 let denied = {
-                    let guard = perm.lock().unwrap_or_else(|e| e.into_inner());
+                    let guard = perm.lock_ignore_poison();
                     guard.any_prompt_denied(&[tool_name.as_str(), qualified.as_str(), "mcp_tool"])
                 };
                 if denied {
@@ -515,7 +516,7 @@ pub(crate) fn first_external_path(
     if paths.is_empty() {
         return None;
     }
-    let guard = perm.lock().unwrap_or_else(|e| e.into_inner());
+    let guard = perm.lock_ignore_poison();
     paths.into_iter().find(|p| guard.is_external_path(p))
 }
 
@@ -675,10 +676,7 @@ mod tests {
         let cwd = std::env::temp_dir().join(format!(
             "dirge-mgub-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0),
+            crate::time_util::now_unix_nanos(),
         ));
         std::fs::create_dir_all(&cwd).expect("create temp cwd");
         let checker =

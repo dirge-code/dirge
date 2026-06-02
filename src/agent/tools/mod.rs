@@ -68,6 +68,7 @@ pub use webfetch::WebFetchTool;
 pub use websearch::WebSearchTool;
 pub use write::WriteTool;
 
+use crate::sync_util::LockExt;
 use std::io;
 
 use serde::Deserialize;
@@ -344,7 +345,7 @@ async fn try_auto_approve(
     // drop the lock BEFORE the await so we never hold it across the LLM
     // call. `None` evaluator → caller falls back to the human prompt.
     let (f, working_dir) = {
-        let g = perm.lock().unwrap_or_else(|e| e.into_inner());
+        let g = perm.lock_ignore_poison();
         match g.approval_fn() {
             Some(f) => (f, g.working_dir().to_string()),
             None => return None,
@@ -450,7 +451,7 @@ pub async fn enforce(
     // is no Scope-dispatched `check`/`check_path` split here.
     let is_path = matches!(scope, Scope::Path(_) | Scope::PathResolve(_));
     let (effect, reason, resolved) = {
-        let mut guard = perm.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = perm.lock_ignore_poison();
         let decision = guard.authorize_scope(tool, raw_scope, is_path);
         // Only PathResolve callers want the canonicalized path back
         // (to pin the file across the check→open window); Raw/Path
@@ -517,7 +518,7 @@ pub async fn enforce_request(
         return Ok(()); // no checker (ACP / --no-tools) → pass through
     };
     let (effect, reason) = {
-        let mut guard = perm.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = perm.lock_ignore_poison();
         let decision = guard.authorize_request(&req);
         (decision.effect, decision.reason())
     };
