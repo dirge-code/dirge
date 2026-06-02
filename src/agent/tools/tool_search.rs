@@ -26,6 +26,7 @@
 //! per request and surfaces those tools' definitions to the
 //! model on the NEXT turn.
 
+#[allow(unused_imports)]
 use crate::sync_util::LockExt;
 use std::collections::HashSet;
 use std::pin::Pin;

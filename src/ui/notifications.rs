@@ -20,6 +20,7 @@
 //! same scroll behaviour — so a message from an MCP server reads
 //! the same way as an agent error or a permission denial.
 
+#[allow(unused_imports)]
 use crate::sync_util::LockExt;
 use std::sync::{Mutex, RwLock};
 

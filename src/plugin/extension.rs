@@ -15,6 +15,7 @@
 //! plugins don't have a TypeBox-equivalent so they pass the schema as
 //! a JSON string that we parse once at construction.
 
+#[allow(unused_imports)]
 use crate::sync_util::LockExt;
 use std::future::Future;
 use std::pin::Pin;

@@ -23,6 +23,7 @@
 //! Mutex pattern matches `plugin_hooks` — sync lock, drain
 //! synchronously, release. No `.await` while held.
 
+#[allow(unused_imports)]
 use crate::sync_util::LockExt;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};

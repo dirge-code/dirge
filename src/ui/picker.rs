@@ -1,3 +1,4 @@
+#[allow(unused_imports)]
 use crate::sync_util::LockExt;
 use std::io::Write;
 use std::path::{Component, PathBuf};

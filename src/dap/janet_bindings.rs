@@ -27,6 +27,7 @@
 //! the `UnboundedSender<DapCommand>` that the C functions read from the
 //! thread-local. The bridge runs until the sender is dropped (worker shutdown).
 
+#[allow(unused_imports)]
 use crate::sync_util::LockExt;
 use std::sync::mpsc;
 use std::time::Duration;

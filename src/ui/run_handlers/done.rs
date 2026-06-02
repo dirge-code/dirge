@@ -14,6 +14,7 @@
 //! Behavior is identical to the original inline body; only the
 //! lexical home moved.
 
+#[allow(unused_imports)]
 use crate::sync_util::LockExt;
 use compact_str::CompactString;
 use crossterm::style::Color;

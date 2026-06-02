@@ -1,6 +1,7 @@
 //! Miscellaneous / smaller slash command handlers:
 //! /mcp, /btw, /cd, /panel, /display, /quit, /help, /allow, /loop.
 
+#[allow(unused_imports)]
 use crate::sync_util::LockExt;
 use crossterm::style::Color;
 

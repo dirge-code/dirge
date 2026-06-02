@@ -8,6 +8,7 @@
 //! repo — or `git` isn't installed — the snapshot is `None` and the panel
 //! section is hidden.
 
+#[allow(unused_imports)]
 use crate::sync_util::LockExt;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

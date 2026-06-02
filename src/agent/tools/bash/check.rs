@@ -11,6 +11,7 @@
 use crate::agent::tools::{AskSender, PermCheck, ToolError, enforce_request};
 #[cfg(feature = "semantic-bash")]
 use crate::semantic::adapters::bash;
+#[allow(unused_imports)]
 use crate::sync_util::LockExt;
 
 /// dirge-sb2n: paths a bash command mutates — output-redirect targets

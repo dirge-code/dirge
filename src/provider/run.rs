@@ -8,6 +8,7 @@
 use super::AnyAgent;
 use crate::agent::runner;
 use crate::event::AgentEvent;
+#[allow(unused_imports)]
 use crate::sync_util::LockExt;
 
 impl AnyAgent {

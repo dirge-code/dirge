@@ -68,6 +68,7 @@ pub use webfetch::WebFetchTool;
 pub use websearch::WebSearchTool;
 pub use write::WriteTool;
 
+#[allow(unused_imports)]
 use crate::sync_util::LockExt;
 use std::io;
 

@@ -5,6 +5,7 @@
 //! (`Reasoning`'s `show_reasoning` skip, the avatar-state set) inline.
 //! Behavior is identical to the inline code; pure refactor (dirge-4y4l).
 
+#[allow(unused_imports)]
 use crate::sync_util::LockExt;
 use std::time::Instant;
 

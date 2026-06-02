@@ -10,6 +10,7 @@ pub use build::*;
 pub use dispatch::*;
 pub use resolve::*;
 
+#[allow(unused_imports)]
 use crate::sync_util::LockExt;
 use rig::agent::Agent;
 use rig::providers::{anthropic, gemini, ollama, openai, openrouter};

@@ -8,6 +8,7 @@
 //! actions (`run_to_cursor`, `restart_frame`, `backtrace_diagnostics`,
 //! `error_analysis`) that coordinate the debugger with LSP code intelligence.
 
+#[allow(unused_imports)]
 use crate::sync_util::LockExt;
 use std::sync::Arc;
 use std::time::Duration;

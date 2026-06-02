@@ -1,3 +1,4 @@
+#[allow(unused_imports)]
 use crate::sync_util::LockExt;
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;

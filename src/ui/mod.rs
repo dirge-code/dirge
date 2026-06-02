@@ -40,6 +40,7 @@ mod tree;
 mod tui;
 mod wrap;
 
+#[allow(unused_imports)]
 use crate::sync_util::LockExt;
 use crossterm::event::{KeyCode, KeyModifiers};
 use crossterm::style::Color;

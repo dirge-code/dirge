@@ -1,3 +1,4 @@
+#[allow(unused_imports)]
 use crate::sync_util::LockExt;
 use std::borrow::Cow;
 use std::fmt;

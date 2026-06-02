@@ -7,6 +7,7 @@
 //! name; don't cross the wires (`plan_tx` here vs `plan_kickoff`/`active_plan`
 //! there).
 
+#[allow(unused_imports)]
 use crate::sync_util::LockExt;
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;

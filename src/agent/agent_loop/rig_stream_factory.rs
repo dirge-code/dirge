@@ -46,6 +46,7 @@
 //! provider derives stop reason from its own stream). They're
 //! dropped in conversion.
 
+#[allow(unused_imports)]
 use crate::sync_util::LockExt;
 use std::sync::Arc;
 

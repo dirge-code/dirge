@@ -16,6 +16,7 @@
 //! Bounded to fire at most once per run (can't loop). Self-contained;
 //! lives behind `LoopConfig.verifier` (None = off, byte-identical).
 
+#[allow(unused_imports)]
 use crate::sync_util::LockExt;
 use std::sync::{Arc, Mutex};
 

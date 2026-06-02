@@ -15,6 +15,7 @@
 //! buffer small; an unread buffer is hard-capped so a never-read flood
 //! can't OOM.
 
+#[allow(unused_imports)]
 use crate::sync_util::LockExt;
 use indexmap::IndexMap;
 use rig::completion::ToolDefinition;

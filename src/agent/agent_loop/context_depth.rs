@@ -11,6 +11,7 @@
 //! lives behind `LoopConfig.file_touch_tracker`; when `None`, the
 //! loop behaves byte-identically to today.
 
+#[allow(unused_imports)]
 use crate::sync_util::LockExt;
 use std::collections::HashSet;
 use std::path::PathBuf;

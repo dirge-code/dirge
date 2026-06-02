@@ -1,3 +1,4 @@
+#[allow(unused_imports)]
 use crate::sync_util::LockExt;
 use indexmap::IndexMap;
 use std::path::{Path, PathBuf};

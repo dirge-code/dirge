@@ -28,6 +28,7 @@
 //! inside `dispatch_tool_hook` bounds the hold time. This matches
 //! the existing `HookedToolDyn` lock pattern exactly.
 
+#[allow(unused_imports)]
 use crate::sync_util::LockExt;
 use std::sync::{Arc, Mutex};
 

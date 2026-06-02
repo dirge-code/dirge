@@ -5,6 +5,7 @@
 //! pattern. Extracted from the original mega-match in slash.rs as
 //! part of the arch/split-large-modules refactor.
 
+#[allow(unused_imports)]
 use crate::sync_util::LockExt;
 use compact_str::CompactString;
 

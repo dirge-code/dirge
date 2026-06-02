@@ -18,6 +18,7 @@
 //! tool wrappers don't have to plumb it through. Tests construct
 //! `HookedToolDyn::with_manager(inner, pm)` directly to bypass the global.
 
+#[allow(unused_imports)]
 use crate::sync_util::LockExt;
 use std::sync::{Arc, Mutex, OnceLock};
 

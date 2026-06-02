@@ -27,6 +27,7 @@ mod ui;
 #[cfg(test)]
 mod tests;
 
+#[allow(unused_imports)]
 use crate::sync_util::LockExt;
 use clap::Parser;
 use compact_str::CompactString;

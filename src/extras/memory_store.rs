@@ -15,6 +15,7 @@
 //! - Drift detection before mutations
 //! - Deduplication on load
 
+#[allow(unused_imports)]
 use crate::sync_util::LockExt;
 use std::path::PathBuf;
 

@@ -7,6 +7,7 @@
 
 use super::check::*;
 use super::*;
+#[allow(unused_imports)]
 use crate::sync_util::LockExt;
 use tokio::process::Command;
 use tokio::time::Duration;

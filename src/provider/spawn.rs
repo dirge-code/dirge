@@ -7,6 +7,7 @@
 //! the `AnyAgentInner` variants directly (privacy = defining module +
 //! descendants) — no `pub(crate)` field bumps or accessors needed.
 
+#[allow(unused_imports)]
 use crate::sync_util::LockExt;
 use rig::completion::Message;
 

@@ -13,6 +13,7 @@
 //! [`RpcClient`]. The constructor installs the `textDocument/publishDiagnostics`
 //! handler so push diagnostics are accumulated from that moment on.
 
+#[allow(unused_imports)]
 use crate::sync_util::LockExt;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};

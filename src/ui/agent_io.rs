@@ -7,6 +7,7 @@
 //! state. They're grouped here because they're the I/O surface the
 //! event loop reaches for on every turn.
 
+#[allow(unused_imports)]
 use crate::sync_util::LockExt;
 use compact_str::CompactString;
 use crossterm::style::Color;

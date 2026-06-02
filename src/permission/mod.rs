@@ -18,6 +18,7 @@ pub fn apply_prompt_deny(perm: &Option<checker::PermCheck>, deny: &[String]) {
     }
 }
 
+#[allow(unused_imports)]
 use crate::sync_util::LockExt;
 use serde::Deserialize;
 

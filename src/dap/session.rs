@@ -3,6 +3,7 @@
 //! Manages a single active debug session. Launching a new session
 //! terminates any existing one (single-session enforcement).
 
+#[allow(unused_imports)]
 use crate::sync_util::LockExt;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

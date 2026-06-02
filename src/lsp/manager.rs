@@ -23,6 +23,7 @@
 //! On `Drop`, every spawned client's `_guard` drops (which kills the child
 //! process via `kill_on_drop(true)` on the real spawner).
 
+#[allow(unused_imports)]
 use crate::sync_util::LockExt;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

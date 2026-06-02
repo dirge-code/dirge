@@ -4,6 +4,7 @@
 //! hooks — so the whole module is `cfg(feature = "plugin")`. Behavior is
 //! identical to the inline code; pure refactor (dirge-4y4l).
 
+#[allow(unused_imports)]
 use crate::sync_util::LockExt;
 use std::sync::{Arc, Mutex};
 

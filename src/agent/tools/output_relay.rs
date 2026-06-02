@@ -39,6 +39,7 @@
 //! cwd or `~/.dirge/`) accept reading them back.
 
 #[cfg(test)]
+#[allow(unused_imports)]
 use crate::sync_util::LockExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
