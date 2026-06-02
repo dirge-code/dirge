@@ -47,6 +47,14 @@ pub type SummarizeFn = Arc<
 
 /// Filter-safe preamble injected before the summary so the model
 /// treats it as reference, not active instructions.
+///
+/// Leading sentinel of [`SUMMARY_PREFIX`]. Stable + filter-safe so other
+/// subsystems can detect (and exclude) the compaction-summary block inside a
+/// merged system prompt — notably the critic, which must NOT treat a summary's
+/// already-completed `## Active Task` as an outstanding requirement
+/// (`agent_loop::critic`). [`SUMMARY_PREFIX`] must keep starting with this.
+pub(crate) const COMPACTION_MARKER: &str = "[CONTEXT COMPACTION — REFERENCE ONLY]";
+
 /// Port of Hermes's SUMMARY_PREFIX (context_compressor.py:37-51).
 const SUMMARY_PREFIX: &str = "\
 [CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were compacted \
@@ -759,6 +767,14 @@ pub fn rotate_session_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `COMPACTION_MARKER` is the sentinel other subsystems (the critic) use to
+    /// detect + strip the summary block. It MUST stay the prefix of the full
+    /// `SUMMARY_PREFIX`, or those strippers silently stop working.
+    #[test]
+    fn summary_prefix_starts_with_compaction_marker() {
+        assert!(SUMMARY_PREFIX.starts_with(COMPACTION_MARKER));
+    }
 
     // IMPROVEMENTS_PLAN #3: the per-result cap tightens above 60% ctx.
     #[test]

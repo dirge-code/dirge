@@ -55,6 +55,9 @@ forbid or defer (e.g. if it was told not to push/commit/deploy, do NOT ask it to
 the instructions place out of scope as correctly omitted.\n\
 - Block only on CONCRETE, in-scope incompleteness with evidence (e.g. the user asked for X and X \
 is missing; a change was made but never built/tested when verification was expected).\n\
+- A block marked `[CONTEXT COMPACTION — REFERENCE ONLY]` (or a `## Active Task` lifted from one) \
+describes ALREADY-COMPLETED prior work — never treat it as an outstanding requirement. Judge only \
+the latest request and the transcript.\n\
 - Do NOT invent new requirements, scope, or \"nice to haves\". If you are unsure, PASS — a false \
 block wastes a whole turn.";
 
@@ -71,12 +74,29 @@ If INCOMPLETE, follow with a short bullet list of the specific, concrete, in-sco
 /// rules) sit early; a truncation note tells the critic more was elided.
 const MAX_RULES_CHARS: usize = 16_000;
 
+/// Drop the context-compaction summary from the critic's `rules`. The rules
+/// are the agent's merged system prompt, built as `preamble + "\n\n" + history`
+/// (`provider::spawn`), so the summary — a `[CONTEXT COMPACTION — REFERENCE
+/// ONLY]` System message — always lands AFTER the genuine constraints.
+/// Truncating at the marker keeps the real rules (identity, tool docs,
+/// AGENTS.md, prompt-mode scope) and discards the stale summary, whose
+/// `## Active Task` describes already-completed work the critic would
+/// otherwise demand again (the stale-state bug). Returns the input unchanged
+/// when no summary is present.
+fn strip_compaction_summary(rules: &str) -> &str {
+    match rules.find(crate::agent::compression::COMPACTION_MARKER) {
+        Some(idx) => rules[..idx].trim_end(),
+        None => rules,
+    }
+}
+
 /// Build the critic prompt. `rules` is the assistant's own system prompt /
 /// instructions (so the critic judges against the SAME constraints the
-/// agent had — dirge-bedj); `transcript` is what the agent did. The role
+/// agent had — dirge-bedj), minus any compaction summary (see
+/// [`strip_compaction_summary`]); `transcript` is what the agent did. The role
 /// lives in [`CRITIC_PREAMBLE`]; this carries the format + both bodies.
 pub fn build_prompt(rules: &str, transcript: &str) -> String {
-    let rules = rules.trim();
+    let rules = strip_compaction_summary(rules).trim();
     let rules_block = if rules.is_empty() {
         "(no special constraints provided)".to_string()
     } else if rules.len() > MAX_RULES_CHARS {
@@ -195,6 +215,47 @@ mod tests {
     fn empty_rules_render_a_placeholder_not_blank() {
         let p = build_prompt("", "did stuff");
         assert!(p.contains("no special constraints"));
+    }
+
+    /// dirge: the critic's `rules` is the agent's merged system prompt, which
+    /// after a compaction carries the `[CONTEXT COMPACTION — REFERENCE ONLY]`
+    /// summary describing ALREADY-COMPLETED prior work. The critic must judge
+    /// against the agent's real constraints, not a stale summary's
+    /// `## Active Task` — else it blocks finalization on superseded work
+    /// (e.g. demanding an old "Phase 3" that's already done).
+    #[test]
+    fn build_prompt_drops_the_compaction_summary_from_rules() {
+        let rules = format!(
+            "RULE: never push to remote.\n\n{} \
+             ## Active Task\nFinish Phase 3: wire the Janet loader and add tests.",
+            crate::agent::compression::COMPACTION_MARKER,
+        );
+        let p = build_prompt(&rules, "user asked X; assistant edited foo.rs");
+        // The agent's genuine constraint (it precedes the summary) survives…
+        assert!(
+            p.contains("never push to remote"),
+            "real rules must survive"
+        );
+        // …but the stale summary's contents must NOT reach the critic.
+        assert!(
+            !p.contains("Active Task") && !p.contains("Phase 3") && !p.contains("Janet"),
+            "the compaction summary must be stripped from the critic's rules",
+        );
+        assert!(
+            !p.contains(crate::agent::compression::COMPACTION_MARKER),
+            "the compaction marker itself must be stripped",
+        );
+    }
+
+    /// Defense-in-depth: even if a summary block reaches the critic by some
+    /// other path, the preamble tells it to discount reference-only material.
+    #[test]
+    fn preamble_discounts_reference_only_blocks() {
+        let lower = CRITIC_PREAMBLE.to_ascii_lowercase();
+        assert!(
+            lower.contains("reference") || lower.contains("compaction"),
+            "preamble must tell the critic to ignore reference-only/compaction blocks",
+        );
     }
 
     #[test]
