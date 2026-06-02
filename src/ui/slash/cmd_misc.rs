@@ -643,6 +643,10 @@ pub(super) async fn cmd_help(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     renderer.write_line("  /undo                  undo last exchange", c_result())?;
     renderer.write_line("  /retry                 retry last prompt", c_result())?;
     renderer.write_line(
+        "  /plan <request>        phased workflow: explore→plan→implement→review",
+        c_result(),
+    )?;
+    renderer.write_line(
         "  /compress [/compact]   compress conversation history",
         c_result(),
     )?;

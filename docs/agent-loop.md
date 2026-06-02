@@ -87,6 +87,19 @@ The intervention is deliberately *not* a bare "don't repeat yourself". Research 
 
 This gives the model one structured shot to self-correct (`turn_self_corrected`). If it keeps producing only suppressed calls afterward, the inner loop exits rather than spinning. The outermost backstop is the `max_turns` cap (see [config.md](config.md)), which stops the run and surfaces a `<system>` notice.
 
+## Phased plan workflow (`/plan`)
+
+An opt-in, per-task workflow (ported from [vix](https://github.com/kirby88/vix)) that splits a complex request into separate, context-isolated phases instead of one long single-agent run. It is an **explicit command**, not a forced mode — regular chat is untouched, and the user decides which tasks warrant it. Gated by `phased_workflow_enabled` (default off; see [config.md](config.md)). The logic lives in `src/agent/plan_workflow.rs` (phase prompts + verdict parsing + the shared `next_review_step` policy) and `src/agent/phased_orchestrator.rs` (the runner-drain glue + reviewer fork); the entry is `src/ui/slash/cmd_plan.rs`.
+
+`/plan <request>` runs four phases:
+
+1. **Explore** — a read-only fork (`READONLY_PHASE_TOOLS`: read/grep/glob/lsp/semantic navigation, no mutation) that builds a frugal understanding of the codebase and emits a structured findings report. A genuine context reset: it starts from a frozen transcript snapshot.
+2. **Plan** — a second read-only fork. The **only** thing carried over from Explore is its findings report (true context reset between phases, vix's `fork_from` discipline). It produces a specificity-forced implementation plan against a quality rubric.
+3. **Implement** — the plan seeds a normal **streamed** agent turn through the main UI loop, so edits, build/test runs, permission prompts, and interjection all behave exactly as in a regular run. You watch it work.
+4. **Review** — after the implement turn completes, a **write-disabled reviewer** fork (`REVIEWER_TOOLS`: read/grep + `bash`, but no `write`/`edit`/`apply_patch`) independently *runs the code* and emits a machine-parsed JSON verdict. A `DONE` verdict ends the workflow; `NEEDS_FIX` feeds the reviewer's punch-list back into another implement turn. Bounded by `phased_workflow_max_review_cycles` (default 2).
+
+The review gate is **asymmetrically cautious**: anything that isn't a parseable `DONE` is treated as not-done, so an ambiguous or malformed verdict triggers another fix cycle rather than shipping — a false `DONE` ships a broken result, a false `NEEDS_FIX` only costs one retry. The reviewer loop is driven event-by-event across `Done` events (in `src/ui/run_handlers/done.rs`) because the implement turn streams through the UI loop and can't be awaited inline; the same per-step policy (`next_review_step`) backs the headless `run_review_loop` so both paths stay in lockstep.
+
 ## Cancellation
 
 A single `AbortSignal` is shared end-to-end:

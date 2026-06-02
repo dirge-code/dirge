@@ -6,6 +6,36 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **Phased plan workflow** (`/plan <request>`, opt-in via
+  `phased_workflow_enabled`): an explicit per-task command that runs
+  explore → plan → implement → reviewer-runs-code loop. The explore and
+  plan phases are context-isolated read-only forks; the implement phase
+  is a normal streamed turn; a write-disabled reviewer fork then runs the
+  code and emits a machine-parsed verdict, with `NEEDS_FIX` feeding a
+  punch-list back for a bounded re-implement (`phased_workflow_max_review_cycles`,
+  default 2). Ported from [vix](https://github.com/kirby88/vix). See
+  [docs/agent-loop.md](docs/agent-loop.md#phased-plan-workflow-plan).
+- **Minified tree-sitter read/edit** (`read_minified` / `edit_minified`):
+  token-efficient file I/O that collapses a file to its structural
+  skeleton — aggressive collapse for Rust/Java/Go, gap-preserving collapse
+  for whitespace/ASI-sensitive grammars (Bash, Python, Ruby, Elixir, C/C++,
+  TS, Clojure). Each gated on its `semantic-<lang>` feature.
+- **Hard read-before-edit gate**: `edit`/`apply_patch` to a file never
+  read this session is refused mechanically.
+- **Thinking-stall watchdog**: the request-timeout backstop now injects a
+  summary-reinjection nudge for graceful recovery from a stalled run.
+- **Mandatory reason/intent fields** on the read/grep/glob/find/lsp tools
+  (and bash anti-misuse fields), plus a **todo-completion nudge** that
+  blocks a premature `end_turn` while todo items remain pending.
+- Config keys `phased_workflow_enabled`, `phased_workflow_max_review_cycles`,
+  and documentation for the pre-existing `dynamic_tool_search` and
+  `context_depth_reminder_threshold` keys.
+
+### Acknowledgements
+- Added [vix](https://github.com/kirby88/vix) — the battle-tested Go coding
+  agent the above agentic-loop features were ported from.
+
 ## [0.2.3] - 2026-06-02
 
 ### Added
