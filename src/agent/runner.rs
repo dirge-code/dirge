@@ -35,6 +35,42 @@ pub struct AgentRunner {
     pub cancel_tx: mpsc::Sender<()>,
 }
 
+/// Abort-on-drop guard for a forked [`AgentRunner`]. Holding it while draining
+/// the runner's events ensures a cancelled/early-returning drain actually stops
+/// the fork — cooperative `cancel_tx` first (so an in-flight consumer can
+/// surface a clean cancelled event), then a hard `task.abort()` at the next
+/// `.await` — rather than orphaning a task that keeps calling the model.
+///
+/// Shared by every forked-runner consumer (`agent::review` background passes,
+/// `agent::phased_orchestrator` phase forks) so the cancel-safety contract
+/// lives in exactly one place.
+pub(crate) struct AbortRunnerOnDrop {
+    pub task: JoinHandle<()>,
+    pub cancel_tx: mpsc::Sender<()>,
+}
+
+impl Drop for AbortRunnerOnDrop {
+    fn drop(&mut self) {
+        let _ = self.cancel_tx.try_send(());
+        self.task.abort();
+    }
+}
+
+/// Summarize a forked runner's tool-call names into a compact, de-duplicated
+/// ` · `-joined line (first-occurrence order preserved). Port of Hermes's
+/// action summary (`background_review.py`); shared by the review/curator passes.
+pub(crate) fn summarize_actions(actions: &[String]) -> String {
+    actions
+        .iter()
+        .fold(Vec::<&str>::new(), |mut acc, a| {
+            if !acc.contains(&a.as_str()) {
+                acc.push(a.as_str());
+            }
+            acc
+        })
+        .join(" · ")
+}
+
 pub fn convert_history(session: &Session) -> Vec<Message> {
     use rig::OneOrMany;
     use rig::completion::message::AssistantContent;
@@ -320,6 +356,20 @@ mod plugin_hook_tests {
         let mut mgr = PluginManager::try_new().unwrap();
         let out = resolve_prompt_with_hooks("just this", &mut mgr);
         assert_eq!(out, "just this");
+    }
+
+    #[test]
+    fn summarize_actions_dedups_preserving_first_occurrence_order() {
+        let actions = [
+            "read".to_string(),
+            "grep".to_string(),
+            "read".to_string(),
+            "bash".to_string(),
+            "grep".to_string(),
+        ];
+        assert_eq!(summarize_actions(&actions), "read · grep · bash");
+        assert_eq!(summarize_actions(&[]), "");
+        assert_eq!(summarize_actions(&["edit".to_string()]), "edit");
     }
 
     /// on-response can mutate the final response via

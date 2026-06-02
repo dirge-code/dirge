@@ -16,7 +16,7 @@
 use crate::agent::plan_workflow::{
     PhaseOutput, REVIEWER_TOOLS, ReviewStep, next_review_step, reviewer_prompt,
 };
-use crate::agent::runner::AgentRunner;
+use crate::agent::runner::{AbortRunnerOnDrop, AgentRunner};
 use crate::event::AgentEvent;
 use crate::provider::AnyAgent;
 
@@ -38,24 +38,6 @@ pub(crate) struct PlanKickoff {
     pub impl_prompt: String,
     /// Becomes the live [`ActivePlan`] when the implement run launches.
     pub active: ActivePlan,
-}
-
-/// Drop guard so a cancelled `collect_runner_text` future (an orchestrator
-/// timeout or a caller abort) actually stops the forked runner rather than
-/// orphaning a task that keeps calling the model in the background. Mirrors
-/// the background-review guard in `review.rs`.
-struct AbortRunnerOnDrop {
-    task: tokio::task::JoinHandle<()>,
-    cancel_tx: tokio::sync::mpsc::Sender<()>,
-}
-
-impl Drop for AbortRunnerOnDrop {
-    fn drop(&mut self) {
-        // Cooperative cancel first (lets an in-flight consumer surface a clean
-        // cancelled event), then hard abort at the next `.await`.
-        let _ = self.cancel_tx.try_send(());
-        self.task.abort();
-    }
 }
 
 /// Drain a forked phase runner to completion and return its final assistant

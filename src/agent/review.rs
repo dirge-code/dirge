@@ -19,6 +19,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::agent::runner::{AbortRunnerOnDrop, summarize_actions};
 use crate::extras::dirge_paths::ProjectPaths;
 use crate::provider::AnyAgent;
 
@@ -102,38 +103,13 @@ Target shape of the library: CLASS-LEVEL skills with a rich SKILL.md. Not a long
 
 "Nothing to save." is valid but should NOT be the default. Most coding sessions produce at least one learning."#;
 
-/// dirge-ba0m: RAII guard that hard-aborts a forked runner's task
-/// on drop. The forked review/curator runners are SEPARATE tokio
-/// tasks; a core that only holds the runner's `event_rx` channel
-/// does NOT stop the runner when its own future is cancelled —
-/// dropping the channel just makes the runner's event sends no-op
-/// (`let _ = .send`), and its `loop_future` (the live LLM call +
-/// tool execution writing MEMORY.md / .usage.json / skills) keeps
-/// running to completion in the background.
-///
-/// Without this guard, the post-session orchestrator's per-stage
-/// `tokio::time::timeout` firing on a hung provider would abandon
-/// the stage future but leave its runner orphaned and writing
-/// files CONCURRENTLY with the next stage — re-introducing the
-/// exact cross-pass races the orchestrator exists to eliminate
-/// (dirge-ba0m review HIGH). Holding `task` + `cancel_tx` in this
-/// guard means any cancellation path (timeout, future drop, panic)
-/// stops the runner. On normal completion the task is already
-/// finished, so `abort()` is a harmless no-op.
-struct AbortRunnerOnDrop {
-    task: tokio::task::JoinHandle<()>,
-    cancel_tx: tokio::sync::mpsc::Sender<()>,
-}
-
-impl Drop for AbortRunnerOnDrop {
-    fn drop(&mut self) {
-        // Cooperative cancel first (lets an in-flight consumer
-        // surface a clean cancelled-event), then hard abort at the
-        // next .await. Mirrors the UI's Ctrl+C handling.
-        let _ = self.cancel_tx.try_send(());
-        self.task.abort();
-    }
-}
+// dirge-ba0m: the abort-on-drop guard for these forked review/curator
+// runners now lives in `agent::runner` ([`AbortRunnerOnDrop`]) so the
+// cancel-safety contract is shared with the phased-workflow forks. Without
+// it, the post-session orchestrator's per-stage `tokio::time::timeout` firing
+// on a hung provider would abandon the stage future but leave its runner
+// orphaned and writing MEMORY.md / .usage.json / skills CONCURRENTLY with the
+// next stage — the exact cross-pass races the orchestrator exists to prevent.
 
 /// dirge-ba0m: awaitable core of the background review pass.
 /// Runs to completion — claims the rate-limit slot, drains the
@@ -216,16 +192,7 @@ pub(crate) async fn run_background_review(
 
     if !had_error && !tool_actions.is_empty() {
         // Surface action summary so the user knows what was learned.
-        // Port of Hermes's `_safe_print` (background_review.py:514-516).
-        let summary = tool_actions
-            .iter()
-            .fold(Vec::<&str>::new(), |mut acc, a| {
-                if !acc.contains(&a.as_str()) {
-                    acc.push(a.as_str());
-                }
-                acc
-            })
-            .join(" · ");
+        let summary = summarize_actions(&tool_actions);
         tracing::info!(
             target: "dirge::review",
             actions = %summary,
@@ -320,15 +287,7 @@ pub(crate) async fn run_curator_review(
     }
 
     if error_msg.is_none() && !tool_actions.is_empty() {
-        let summary = tool_actions
-            .iter()
-            .fold(Vec::<&str>::new(), |mut acc, a| {
-                if !acc.contains(&a.as_str()) {
-                    acc.push(a.as_str());
-                }
-                acc
-            })
-            .join(" · ");
+        let summary = summarize_actions(&tool_actions);
         tracing::info!(
             target: "dirge::curator",
             actions = %summary,
@@ -457,15 +416,7 @@ pub(crate) async fn run_memory_curator_review(
         let summary = if tool_actions.is_empty() {
             "no-op".to_string()
         } else {
-            tool_actions
-                .iter()
-                .fold(Vec::<&str>::new(), |mut acc, a| {
-                    if !acc.contains(&a.as_str()) {
-                        acc.push(a.as_str());
-                    }
-                    acc
-                })
-                .join(" · ")
+            summarize_actions(&tool_actions)
         };
         tracing::info!(
             target: "dirge::memory_curator",
