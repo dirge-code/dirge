@@ -728,8 +728,7 @@ mod gating_corpus {
     async fn grant_then_recheck(cmd: &str) -> bool {
         let perm = checker();
         let pat = crate::ui::permission_ui::suggest_pattern("bash", cmd);
-        perm.lock()
-            .unwrap_or_else(|e| e.into_inner())
+        perm.lock_ignore_poison()
             .add_session_allowlist("bash".to_string(), &pat);
         check_bash_segments(&Some(perm), &None, cmd).await.is_ok()
     }
@@ -980,8 +979,7 @@ mod gating_corpus {
         // Two prompting segments → aggregate Ask → evaluator sees both.
         let _ = check_bash_segments(&Some(perm), &None, "npx foo && mycli bar").await;
         let (cmd, n) = seen
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .lock_ignore_poison()
             .clone()
             .expect("evaluator should have been called");
         assert_eq!(cmd, "npx foo && mycli bar");

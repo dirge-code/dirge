@@ -57,10 +57,7 @@ pub fn mark_modified(path: &Path) {
 /// Clear the tracked list. Hooked into /clear so the panel resets along
 /// with the conversation.
 pub fn clear_modified() {
-    MODIFIED_FILES
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clear();
+    MODIFIED_FILES.lock_ignore_poison().clear();
     VERSION.fetch_add(1, Ordering::Release);
 }
 

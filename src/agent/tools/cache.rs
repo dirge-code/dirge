@@ -1,3 +1,5 @@
+#[allow(unused_imports)]
+use crate::sync_util::LockExt;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -78,18 +80,14 @@ impl ToolCache {
     /// mutation leaves the model with accurate knowledge of on-disk content).
     pub fn mark_read(&self, path: &Path) {
         self.read_files
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .lock_ignore_poison()
             .insert(path.to_path_buf());
     }
 
     /// Whether `path` (canonical) has been read this session. The edit gate
     /// blocks when this is false.
     pub fn has_been_read(&self, path: &Path) -> bool {
-        self.read_files
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains(path)
+        self.read_files.lock_ignore_poison().contains(path)
     }
 
     pub fn get(&self, key: &str) -> Option<String> {

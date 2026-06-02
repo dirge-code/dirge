@@ -746,8 +746,7 @@ mod tests {
     fn registry_test_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
         LOCK.get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .lock_ignore_poison()
     }
 
     /// `/kill` against an empty registry or a never-spawned prefix

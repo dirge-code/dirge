@@ -551,11 +551,9 @@ async fn main() -> anyhow::Result<()> {
     // take_dialog_rx again returns None — single owner by design. Always
     // an Option so the UI signature is uniform across feature flags.
     #[cfg(feature = "plugin")]
-    let mut dialog_rx = plugin_manager.as_ref().and_then(|pm| {
-        pm.lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take_dialog_rx()
-    });
+    let mut dialog_rx = plugin_manager
+        .as_ref()
+        .and_then(|pm| pm.lock_ignore_poison().take_dialog_rx());
     #[cfg(not(feature = "plugin"))]
     let dialog_rx: Option<tokio::sync::mpsc::UnboundedReceiver<plugin::DialogRequest>> = None;
     // Headless modes (--print, --loop) have no UI to render plugin
@@ -834,9 +832,7 @@ async fn main() -> anyhow::Result<()> {
             .iter()
             .map(|e| (e.tool.clone(), e.pattern.clone()))
             .collect();
-        perm.lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .load_session_allowlist(&allowlist);
+        perm.lock_ignore_poison().load_session_allowlist(&allowlist);
     }
     // Push the active prompt's `deny_tools` into the freshly-built
     // checker. `context.current_prompt_deny_tools` was populated by
@@ -856,9 +852,7 @@ async fn main() -> anyhow::Result<()> {
                 match provider::build_approval_fn(&alias, &entry, &cfg.providers_map()) {
                     Ok(f) => {
                         if let Some(perm) = &permission {
-                            perm.lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .set_approval_fn(f);
+                            perm.lock_ignore_poison().set_approval_fn(f);
                             eprintln!(
                                 "info: approval_provider '{alias}' enabled — permission prompts will be auto-evaluated by the LLM"
                             );
@@ -909,10 +903,7 @@ async fn main() -> anyhow::Result<()> {
         // author can see why their model swap didn't take effect.
         #[cfg(feature = "plugin")]
         if let Some(pm_arc) = plugin_manager.as_ref()
-            && let Some(m) = pm_arc
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .take_pending_next_model()
+            && let Some(m) = pm_arc.lock_ignore_poison().take_pending_next_model()
         {
             let t = m.trim();
             if !t.is_empty() {
@@ -1113,9 +1104,7 @@ async fn main() -> anyhow::Result<()> {
             && let Some(perm) = &permission
         {
             let mode = resolve_mode(&cli, &cfg);
-            perm.lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .set_mode(mode);
+            perm.lock_ignore_poison().set_mode(mode);
         }
 
         let initial_msg = cli.message.join(" ");

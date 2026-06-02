@@ -440,22 +440,15 @@ pub async fn run_interactive(
     #[cfg(feature = "plugin")]
     let mut plugin_shortcuts: Vec<crate::plugin::extension::ParsedShortcut> = {
         let metas = crate::plugin::hook::global()
-            .map(|pm| {
-                pm.lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .list_shortcuts()
-            })
+            .map(|pm| pm.lock_ignore_poison().list_shortcuts())
             .unwrap_or_default();
         crate::plugin::extension::parse_shortcuts(metas)
     };
 
     let perm_mode = || -> Option<String> {
-        permission.as_ref().map(|p| {
-            p.lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .mode()
-                .to_string()
-        })
+        permission
+            .as_ref()
+            .map(|p| p.lock_ignore_poison().mode().to_string())
     };
 
     // Populate the right-hand info panel *before* the initial paint so

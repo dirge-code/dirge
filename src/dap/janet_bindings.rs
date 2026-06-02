@@ -119,10 +119,7 @@ pub fn store_dap_tx(tx: tmpsc::UnboundedSender<DapCommand>) {
 /// context or non-plugin builds) — in that case the worker skips
 /// DAP Janet init and plugins that call (dap/available?) get false.
 pub fn take_dap_tx_for_worker() -> Option<tmpsc::UnboundedSender<DapCommand>> {
-    PENDING_DAP_TX
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .take()
+    PENDING_DAP_TX.lock_ignore_poison().take()
 }
 
 /// Install the command sender on this thread. Must be called once before

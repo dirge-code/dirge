@@ -6,9 +6,11 @@
 //! MODIFIED_FILES) under their own mutexes is fine from the UI loop
 //! tick — they're all short-lived locks.
 
-#[cfg(feature = "mcp")]
 use crate::extras::mcp::McpClientManager;
 use crate::session::Session;
+#[cfg(feature = "mcp")]
+#[allow(unused_imports)]
+use crate::sync_util::LockExt;
 use crate::ui::panel_data::{ContextGauge, GitSnapshot, LeftPanelInfo};
 use crate::ui::renderer::PanelData;
 use crate::ui::sysload::SharedSysLoad;
@@ -56,9 +58,7 @@ static PANEL_MODIFIED_CACHE: std::sync::Mutex<Option<(u64, std::path::PathBuf, V
 pub(crate) fn panel_modified_cached(cwd: &std::path::Path) -> Vec<String> {
     let v = crate::agent::tools::modified::version();
     {
-        let guard = PANEL_MODIFIED_CACHE
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let guard = PANEL_MODIFIED_CACHE.lock_ignore_poison();
         if let Some((cached_v, cached_cwd, cached_data)) = guard.as_ref()
             && *cached_v == v
             && cached_cwd.as_path() == cwd
@@ -82,9 +82,7 @@ pub(crate) fn panel_modified_cached(cwd: &std::path::Path) -> Vec<String> {
                 })
         })
         .collect();
-    let mut guard = PANEL_MODIFIED_CACHE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut guard = PANEL_MODIFIED_CACHE.lock_ignore_poison();
     *guard = Some((v, cwd_buf, rendered.clone()));
     rendered
 }
@@ -141,9 +139,7 @@ pub(crate) fn build_panel_data(
     let lsp: Vec<(String, String, bool)> = Vec::new();
 
     let todos: Vec<(String, String)> = {
-        let list = crate::agent::tools::todo::TODO_LIST
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let list = crate::agent::tools::todo::TODO_LIST.lock_ignore_poison();
         list.iter()
             .take(8)
             .map(|t| {

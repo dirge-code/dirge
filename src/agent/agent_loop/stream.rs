@@ -25,6 +25,8 @@
 //! mock streams in tests; phase 4 will substitute a rig-backed
 //! implementation that yields actual provider events.
 
+#[allow(unused_imports)]
+use crate::sync_util::LockExt;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -189,10 +191,7 @@ pub async fn stream_assistant_response(
     // BEFORE any `.await` — guards aren't `Send` and would taint
     // the future's Send-ness otherwise.
     let pending_reason: Option<super::message::EscalationReason> = {
-        let mut pending = config
-            .escalation_pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut pending = config.escalation_pending.lock_ignore_poison();
         pending.take()
     };
     let use_escalation = pending_reason.is_some() && config.escalation_stream_fn.is_some();

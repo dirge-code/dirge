@@ -924,11 +924,7 @@ impl DapSessionManager {
         let active = match self.active.try_lock() {
             Ok(active) => active,
             Err(_) => {
-                return self
-                    .last_snapshot
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clone();
+                return self.last_snapshot.lock_ignore_poison().clone();
             }
         };
         let snapshot = active.as_ref().map(|session| DebugPanelData {

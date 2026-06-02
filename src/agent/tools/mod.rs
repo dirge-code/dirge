@@ -316,8 +316,7 @@ async fn handle_ask_inner(
         Ok(UserDecision::AllowOnce) => Ok(()),
         Ok(UserDecision::AllowAlways(pattern)) => {
             permission
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .lock_ignore_poison()
                 .add_session_allowlist(tool.to_string(), &pattern);
             Ok(())
         }
@@ -476,8 +475,7 @@ pub async fn enforce(
             // dirge-0g6i: optional LLM auto-approval before the human prompt.
             if let Some(outcome) = try_auto_approve(perm, tool, raw_scope, Vec::new()).await {
                 outcome?; // Deny → propagate; Allow → fall through.
-                perm.lock()
-                    .unwrap_or_else(|e| e.into_inner())
+                perm.lock_ignore_poison()
                     .note_allowed_scope(tool, raw_scope, is_path);
                 return Ok(resolved);
             }
@@ -490,8 +488,7 @@ pub async fn enforce(
             // Approved → clear the loop-guard counter so a repeated call
             // the user keeps allowing never trips the doom-loop hard-deny
             // (only repeatedly-denied prompts accumulate).
-            perm.lock()
-                .unwrap_or_else(|e| e.into_inner())
+            perm.lock_ignore_poison()
                 .note_allowed_scope(tool, raw_scope, is_path);
             Ok(resolved)
         }
@@ -535,9 +532,7 @@ pub async fn enforce_request(
                 try_auto_approve(perm, &req.tool, &req.display_input, resources).await
             {
                 outcome?; // Deny → propagate; Allow → fall through.
-                perm.lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .note_allowed_request(&req);
+                perm.lock_ignore_poison().note_allowed_request(&req);
                 return Ok(());
             }
             let Some(tx) = ask_tx else {
@@ -547,9 +542,7 @@ pub async fn enforce_request(
             };
             handle_ask_inner(tx, perm, &req.tool, &req.display_input).await?;
             // Approved → clear the loop-guard counter (see `enforce`).
-            perm.lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .note_allowed_request(&req);
+            perm.lock_ignore_poison().note_allowed_request(&req);
             Ok(())
         }
     }
