@@ -261,6 +261,13 @@ pub async fn run_interactive(
     // and surface a clean "cancelled" event before the task is
     // killed at its next `.await`.
     let mut agent_cancel: Option<mpsc::Sender<()>> = None;
+    // Phased `/plan` workflow (P3e-b). `plan_kickoff` is set by the `/plan`
+    // slash command after its explore→plan forks finish; the loop drains it to
+    // launch the streamed implement run. `active_plan` then holds the reviewer
+    // loop state across `Done` events until the reviewer approves or the
+    // fix-cycle budget is spent.
+    let mut plan_kickoff: Option<crate::agent::phased_orchestrator::PlanKickoff> = None;
+    let mut active_plan: Option<crate::agent::phased_orchestrator::ActivePlan> = None;
     let mut agent_line_started = false;
     let mut response_buf = String::new();
     // Count of `AgentEvent::ToolCall` events observed during the
@@ -508,6 +515,7 @@ pub async fn run_interactive(
                 last_user_prompt: &mut last_user_prompt,
                 cli,
                 cfg,
+                active_plan: &mut active_plan,
             }
         };
     }
@@ -1448,7 +1456,7 @@ pub async fn run_interactive(
                                 // /help) have no UserMessage event, so we keep the echo.
                                 write_user_lines(&mut renderer, &text)?;
                                 renderer.write_line("", Color::White)?;
-                                let result = handle_slash(&text, &mut agent, &client, &mut renderer, session, cli, cfg, context, &mut show_reasoning, &mut is_running, &mut input, &permission, &ask_tx, &question_tx, &plan_tx, &mut todo_tools_enabled, &bg_store, &sandbox, #[cfg(feature = "loop")] &mut loop_state, #[cfg(feature = "mcp")] mcp_manager.as_ref(), #[cfg(feature = "semantic")] semantic_manager, #[cfg(feature = "lsp")] lsp_manager.as_ref()).await;
+                                let result = handle_slash(&text, &mut agent, &client, &mut renderer, session, cli, cfg, context, &mut show_reasoning, &mut is_running, &mut input, &permission, &ask_tx, &question_tx, &plan_tx, &mut todo_tools_enabled, &bg_store, &sandbox, #[cfg(feature = "loop")] &mut loop_state, #[cfg(feature = "mcp")] mcp_manager.as_ref(), #[cfg(feature = "semantic")] semantic_manager, #[cfg(feature = "lsp")] lsp_manager.as_ref(), &mut plan_kickoff).await;
                                 match result {
                                 Err(e) if e.to_string().starts_with("DEFER_COMPRESS:") => {
                                     let err_msg = e.to_string();
@@ -1607,6 +1615,28 @@ pub async fn run_interactive(
                                         &format!("warning: failed to save session: {}", e),
                                         c_error(),
                                     )?;
+                                }
+                                // Phased `/plan` kickoff: the slash handler ran
+                                // its explore→plan forks and stashed the implement
+                                // prompt + reviewer-loop budget. Launch the streamed
+                                // implement run here (slash handlers can't touch
+                                // agent_rx / is_running) and arm the reviewer loop.
+                                if let Some(kickoff) = plan_kickoff.take() {
+                                    session.add_message(MessageRole::User, &kickoff.impl_prompt);
+                                    last_user_prompt.clone_from(&kickoff.impl_prompt);
+                                    let history = crate::agent::runner::convert_history(session);
+                                    renderer.set_avatar_state(avatar::AvatarState::Idle);
+                                    let runner = agent.clone().spawn_runner(
+                                        crate::agent::tools::background::prepend_pending_notifications(&kickoff.impl_prompt, bg_store.as_ref()),
+                                        history,
+                                        Some(interjection_queue.clone()),
+                                    );
+                                    agent_rx = Some(runner.event_rx);
+                                    agent_abort = Some(runner.task);
+                                    agent_interject = Some(runner.interject_tx);
+                                    agent_cancel = Some(runner.cancel_tx);
+                                    is_running = true;
+                                    active_plan = Some(kickoff.active);
                                 }
                             } else if is_running {
                                 // Agent busy — queue the message. The loop polls

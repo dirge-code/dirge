@@ -525,6 +525,71 @@ pub(crate) async fn handle_done(
         crate::plugin::PostDoneAction::Idle => {}
     }
 
+    // Phased `/plan` reviewer loop (P3e-b). If this `Done` closed a plan-driven
+    // implement run and nothing else (plugin follow-up / loop iteration) claimed
+    // the next turn, fork a write-disabled reviewer to *run the code* and act on
+    // its verdict. Driven event-by-event (not via `run_review_loop`) because the
+    // implement run streams through this UI loop and can't be awaited inline.
+    if !*is_running && let Some(active) = ctx.active_plan.take() {
+        // Transcript reflects the just-committed implement turn (the assistant
+        // response was added to the session earlier in this handler).
+        let transcript = crate::agent::review::build_transcript(ctx.session);
+        ctx.renderer
+            .write_line("Phase: Review — reviewer runs the code…", c_agent())?;
+        match crate::agent::phased_orchestrator::review_once(
+            agent,
+            &active.plan,
+            transcript,
+            active.cycles_left,
+        )
+        .await
+        {
+            Ok(crate::agent::plan_workflow::ReviewStep::Approved) => {
+                ctx.renderer
+                    .write_line("Phase: Review — ✓ reviewer approved", c_agent())?;
+            }
+            Ok(crate::agent::plan_workflow::ReviewStep::Exhausted) => {
+                ctx.renderer.write_line(
+                    "Phase: Review — fix-cycle budget spent; stopping. Continue manually if needed.",
+                    c_agent(),
+                )?;
+            }
+            Ok(crate::agent::plan_workflow::ReviewStep::Retry { feedback }) => {
+                ctx.renderer.write_line(
+                    "Phase: Review — changes needed; re-implementing…",
+                    c_agent(),
+                )?;
+                let retry_prompt = crate::agent::plan_workflow::implement_retry_prompt(&feedback);
+                ctx.last_user_prompt.clone_from(&retry_prompt);
+                ctx.session.add_message(MessageRole::User, &retry_prompt);
+                let runner = agent.clone().spawn_runner(
+                    crate::agent::tools::background::prepend_pending_notifications(
+                        &retry_prompt,
+                        bg_store.as_ref(),
+                    ),
+                    crate::agent::runner::convert_history(ctx.session),
+                    Some(interjection_queue.clone()),
+                );
+                *agent_rx = Some(runner.event_rx);
+                *agent_abort = Some(runner.task);
+                *agent_interject = Some(runner.interject_tx);
+                *agent_cancel = Some(runner.cancel_tx);
+                *is_running = true;
+                // One cycle consumed; the next `Done` reviews again.
+                *ctx.active_plan = Some(crate::agent::phased_orchestrator::ActivePlan {
+                    plan: active.plan,
+                    cycles_left: active.cycles_left - 1,
+                });
+            }
+            Err(e) => {
+                ctx.renderer.write_line(
+                    &format!("Phase: Review — reviewer error: {e}; stopping"),
+                    c_error(),
+                )?;
+            }
+        }
+    }
+
     // Phase 4: spawn background review when the
     // session is truly idle (no plugin followup,
     // loop iteration, or worktree cleanup claimed

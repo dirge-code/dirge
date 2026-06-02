@@ -22,6 +22,7 @@ use crate::ui::theme;
 mod cmd_debug;
 mod cmd_misc;
 mod cmd_model;
+mod cmd_plan;
 mod cmd_session;
 #[cfg(feature = "git-worktree")]
 mod cmd_worktree;
@@ -67,6 +68,10 @@ pub(super) struct SlashCtx<'a> {
     pub semantic_manager: Option<&'a SemanticManager>,
     #[cfg(feature = "lsp")]
     pub lsp_manager: Option<&'a std::sync::Arc<crate::lsp::manager::LspManager>>,
+    /// `/plan` writes its post-fork kickoff here; the UI loop launches the
+    /// streamed implement run from it (slash handlers can't touch the loop's
+    /// `agent_rx`/`is_running` directly).
+    pub plan_kickoff: &'a mut Option<crate::agent::phased_orchestrator::PlanKickoff>,
 }
 
 /// Walk `cut_idx` forward until the message at that index is a
@@ -414,6 +419,7 @@ pub async fn handle_slash(
     // build_agent. The user lost LSP silently after the first such
     // command. Thread the actual manager through.
     #[cfg(feature = "lsp")] lsp_manager: Option<&std::sync::Arc<crate::lsp::manager::LspManager>>,
+    plan_kickoff: &mut Option<crate::agent::phased_orchestrator::PlanKickoff>,
 ) -> anyhow::Result<()> {
     let parts: SmallVec<[&str; 3]> = split_command_parts(text);
     let mut ctx = SlashCtx {
@@ -442,6 +448,7 @@ pub async fn handle_slash(
         semantic_manager,
         #[cfg(feature = "lsp")]
         lsp_manager,
+        plan_kickoff,
     };
     match parts[0] {
         "/model" => cmd_model::cmd_model(&mut ctx, &parts).await?,
@@ -466,6 +473,7 @@ pub async fn handle_slash(
         }
         "/loop" => cmd_misc::cmd_loop(&mut ctx, &parts, text).await?,
         "/prompt" => cmd_model::cmd_prompt(&mut ctx, &parts).await?,
+        "/plan" => cmd_plan::cmd_plan(&mut ctx, &parts, text).await?,
         #[cfg(feature = "git-worktree")]
         "/worktree" => cmd_worktree::cmd_worktree(&mut ctx, &parts).await?,
         #[cfg(feature = "git-worktree")]
@@ -687,6 +695,7 @@ pub fn slash_command_names() -> Vec<&'static str> {
         "/mode",
         "/model",
         "/panel",
+        "/plan",
         "/prompt",
         "/quit",
         "/reasoning",

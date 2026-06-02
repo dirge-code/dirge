@@ -83,6 +83,10 @@ pub(super) struct RunCtx<'a> {
     pub last_user_prompt: &'a mut String,
     pub cli: &'a Cli,
     pub cfg: &'a Config,
+    /// In-flight `/plan` workflow state (P3e-b). `Some` while a phased run is
+    /// mid-flight so the `Done` handler runs the reviewer loop after the
+    /// implement turn; `None` on the normal single-agent path.
+    pub active_plan: &'a mut Option<crate::agent::phased_orchestrator::ActivePlan>,
 }
 
 /// Shared immutable inputs to [`crate::provider::build_agent`], bundled so

@@ -512,18 +512,14 @@ impl Config {
         self.dynamic_tool_search.unwrap_or(false)
     }
 
-    /// Phased plan workflow opt-in (vix port). Default off — preserves the
-    /// normal single-agent path.
-    // Consulted at the UI session-loop call site in P3e-b.
-    #[allow(dead_code)]
+    /// Phased plan workflow opt-in (vix port). Default off — `/plan` is gated
+    /// on this as a master kill-switch.
     pub fn resolve_phased_workflow_enabled(&self) -> bool {
         self.phased_workflow_enabled.unwrap_or(false)
     }
 
     /// Reviewer-runs-code fix-cycle budget for the phased workflow.
     /// Default 2 (vix's default).
-    // Consulted at the UI session-loop call site in P3e-b.
-    #[allow(dead_code)]
     pub fn resolve_phased_workflow_max_review_cycles(&self) -> usize {
         self.phased_workflow_max_review_cycles.unwrap_or(2)
     }

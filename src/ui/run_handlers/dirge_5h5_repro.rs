@@ -197,6 +197,7 @@ fn make_ctx<'a>(
         last_user_prompt: &mut state.last_user_prompt,
         cli,
         cfg,
+        active_plan: &mut state.active_plan,
     }
 }
 
@@ -217,6 +218,7 @@ struct State {
     tool_calls_this_run: u32,
     last_collapsed: Option<crate::ui::tool_display::CollapsedToolResult>,
     last_user_prompt: String,
+    active_plan: Option<crate::agent::phased_orchestrator::ActivePlan>,
 }
 
 impl State {
@@ -236,6 +238,7 @@ impl State {
             tool_calls_this_run: 0,
             last_collapsed: None,
             last_user_prompt: String::new(),
+            active_plan: None,
         }
     }
 }

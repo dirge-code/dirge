@@ -319,18 +319,52 @@ pub enum ReviewOutcome {
     Error(String),
 }
 
+/// One step of the reviewer-runs-code policy, factored out so the headless
+/// [`run_review_loop`] and the event-driven UI loop (the `/plan` command, which
+/// can't block on a streamed implement run) share a single source of truth.
+/// Given the reviewer's raw output and how many fix cycles remain, decide what
+/// happens next.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReviewStep {
+    /// Reviewer confirmed `DONE`.
+    Approved,
+    /// Not done and a cycle remains: feed `feedback` (the punch-list, or the
+    /// raw review when the verdict was unparseable) to the implementer.
+    Retry { feedback: String },
+    /// Not done and no cycles remain.
+    Exhausted,
+}
+
+/// Decide the next move from a reviewer's output. Asymmetric-caution bias (from
+/// vix): anything that isn't a parseable `DONE` is treated as not-done, so an
+/// ambiguous or malformed review keeps the loop going rather than shipping.
+pub fn next_review_step(review_text: &str, cycles_left: usize) -> ReviewStep {
+    let verdict = parse_review_verdict(review_text);
+    if matches!(&verdict, Some(v) if v.verdict == Verdict::Done) {
+        return ReviewStep::Approved;
+    }
+    if cycles_left == 0 {
+        return ReviewStep::Exhausted;
+    }
+    let feedback = verdict
+        .map(|v| v.missing)
+        .filter(|m| !m.trim().is_empty())
+        .unwrap_or_else(|| review_text.to_string());
+    ReviewStep::Retry { feedback }
+}
+
 /// Run the reviewer-runs-code loop (P3d, port of vix `implement_and_review`).
 /// After the implementer executes, a *write-disabled* reviewer fork (run via
 /// `run_reviewer` with [`REVIEWER_TOOLS`] + [`reviewer_prompt`]) independently
 /// runs the code and emits a JSON verdict. On `NEEDS_FIX` the `missing`
 /// punch-list is fed back to the implementer (`run_implement_retry` with
 /// [`implement_retry_prompt`]) and the reviewer runs again — bounded by
-/// `max_retries` fix cycles.
+/// `max_retries` fix cycles. The per-step policy is [`next_review_step`].
 ///
-/// Asymmetric-caution bias (from vix): a verdict that isn't a parseable `DONE`
-/// is treated as not-done, so an ambiguous or malformed review keeps the loop
-/// going rather than shipping. Parameterized by the runner closures so the loop
-/// is unit-testable without real forks.
+/// Parameterized by the runner closures so the loop is unit-testable without
+/// real forks. The interactive `/plan` path drives the same policy event-by-
+/// event via [`next_review_step`] instead, because its implement run streams
+/// through the UI loop and can't be `await`ed inline here.
 pub async fn run_review_loop<RV, RVFut, IM, IMFut>(
     task: &str,
     max_retries: usize,
@@ -348,22 +382,14 @@ where
             Ok(t) => t,
             Err(e) => return ReviewOutcome::Error(e),
         };
-        let verdict = parse_review_verdict(&review);
-        if matches!(&verdict, Some(v) if v.verdict == Verdict::Done) {
-            return ReviewOutcome::Approved;
-        }
-        // NEEDS_FIX or unparseable → not done.
-        if attempt == max_retries {
-            return ReviewOutcome::Exhausted;
-        }
-        // Feed the punch-list (or the raw review when unparseable) to the
-        // implementer for a targeted retry.
-        let feedback = verdict
-            .map(|v| v.missing)
-            .filter(|m| !m.trim().is_empty())
-            .unwrap_or(review);
-        if let Err(e) = run_implement_retry(implement_retry_prompt(&feedback)).await {
-            return ReviewOutcome::Error(e);
+        match next_review_step(&review, max_retries - attempt) {
+            ReviewStep::Approved => return ReviewOutcome::Approved,
+            ReviewStep::Exhausted => return ReviewOutcome::Exhausted,
+            ReviewStep::Retry { feedback } => {
+                if let Err(e) = run_implement_retry(implement_retry_prompt(&feedback)).await {
+                    return ReviewOutcome::Error(e);
+                }
+            }
         }
     }
     ReviewOutcome::Exhausted
@@ -512,6 +538,34 @@ mod tests {
     }
     fn needs_fix_review(missing: &str) -> String {
         format!("review\n```json\n{{\"verdict\":\"NEEDS_FIX\",\"missing\":\"{missing}\"}}\n```")
+    }
+
+    #[test]
+    fn next_review_step_policy() {
+        // DONE → Approved regardless of remaining cycles.
+        assert_eq!(next_review_step(&done_review(), 0), ReviewStep::Approved);
+        assert_eq!(next_review_step(&done_review(), 3), ReviewStep::Approved);
+
+        // NEEDS_FIX with budget → Retry carrying the punch-list.
+        assert_eq!(
+            next_review_step(&needs_fix_review("- add tests"), 2),
+            ReviewStep::Retry {
+                feedback: "- add tests".to_string()
+            }
+        );
+        // NEEDS_FIX with no budget → Exhausted.
+        assert_eq!(
+            next_review_step(&needs_fix_review("- add tests"), 0),
+            ReviewStep::Exhausted
+        );
+
+        // Unparseable never approves: with budget the raw text is the feedback,
+        // with none it exhausts.
+        match next_review_step("no json here", 1) {
+            ReviewStep::Retry { feedback } => assert!(feedback.contains("no json here")),
+            other => panic!("expected Retry, got {other:?}"),
+        }
+        assert_eq!(next_review_step("no json here", 0), ReviewStep::Exhausted);
     }
 
     #[tokio::test]

@@ -3,16 +3,42 @@
 //! explore→plan handoff, the reviewer-runs-code loop) lives in
 //! [`crate::agent::plan_workflow`] and is unit-tested there without a runtime.
 //!
-//! This module supplies the missing half: draining a real [`AgentRunner`]'s
-//! event stream into the `String` those orchestration cores expect from their
-//! `run_phase` / `run_reviewer` / `run_implement_retry` closures. The
-//! UI-side `run_phased_workflow` entry + call-site wiring (behind
-//! `phased_workflow_enabled`) is P3e-b — it composes `collect_runner_text`
-//! below with `agent.spawn_phase_runner(..)` and a live session.
+//! This module supplies the missing half: [`collect_runner_text`] drains a
+//! real [`AgentRunner`]'s event stream into the final `String`, and
+//! [`review_once`] forks a write-disabled reviewer and turns its verdict into a
+//! [`ReviewStep`]. It also defines the live `/plan` workflow state
+//! ([`ActivePlan`] / [`PlanKickoff`]). The interactive entry is the `/plan`
+//! slash command (`ui/slash/cmd_plan.rs`): it runs the explore→plan forks via
+//! `collect_runner_text` + `agent.spawn_phase_runner(..)`, then the UI loop
+//! launches the streamed implement run and `run_handlers/done.rs` drives the
+//! reviewer loop with `review_once`.
 
-use crate::agent::plan_workflow::PhaseOutput;
+use crate::agent::plan_workflow::{
+    PhaseOutput, REVIEWER_TOOLS, ReviewStep, next_review_step, reviewer_prompt,
+};
 use crate::agent::runner::AgentRunner;
 use crate::event::AgentEvent;
+use crate::provider::AnyAgent;
+
+/// Runtime state for an in-flight `/plan` workflow, carried across `Done`
+/// events so the reviewer loop can drive successive implement retries without
+/// blocking on the streamed implement run.
+pub(crate) struct ActivePlan {
+    /// The plan text, reused as the reviewer's task each cycle.
+    pub plan: String,
+    /// Remaining reviewer-runs-code fix cycles.
+    pub cycles_left: usize,
+}
+
+/// Kickoff payload the `/plan` command produces once its explore→plan forks
+/// finish. The UI loop turns this into the first (streamed) implement run and
+/// seeds the [`ActivePlan`] that the reviewer loop then drives.
+pub(crate) struct PlanKickoff {
+    /// Seeds the implement run (the original request + the plan).
+    pub impl_prompt: String,
+    /// Becomes the live [`ActivePlan`] when the implement run launches.
+    pub active: ActivePlan,
+}
 
 /// Drop guard so a cancelled `collect_runner_text` future (an orchestrator
 /// timeout or a caller abort) actually stops the forked runner rather than
@@ -38,7 +64,6 @@ impl Drop for AbortRunnerOnDrop {
 /// first `Error` surfaces as `Err`. Everything else (tool calls/results, turn
 /// boundaries, reasoning) is consumed silently — phases communicate through
 /// their final report, not their intermediate chatter.
-#[allow(dead_code)] // composed into the UI session loop in P3e-b
 pub(crate) async fn collect_runner_text(runner: AgentRunner) -> PhaseOutput {
     let AgentRunner {
         event_rx,
@@ -63,6 +88,22 @@ pub(crate) async fn collect_runner_text(runner: AgentRunner) -> PhaseOutput {
         }
     }
     Ok(text)
+}
+
+/// Fork a write-disabled reviewer that runs the just-written code and decide
+/// the next step. `transcript` must reflect the implementation that just
+/// completed (build it from the post-implement session). On a reviewer fork
+/// error the error surfaces as `Err` — the caller ends the loop rather than
+/// silently shipping.
+pub(crate) async fn review_once(
+    agent: &AnyAgent,
+    plan: &str,
+    transcript: String,
+    cycles_left: usize,
+) -> Result<ReviewStep, String> {
+    let runner = agent.spawn_phase_runner(reviewer_prompt(plan), transcript, REVIEWER_TOOLS);
+    let review = collect_runner_text(runner).await?;
+    Ok(next_review_step(&review, cycles_left))
 }
 
 #[cfg(test)]
