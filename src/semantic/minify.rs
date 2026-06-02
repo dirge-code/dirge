@@ -26,10 +26,9 @@
 //! parse cleanly or the minified output fails re-validation — never a
 //! half-minified / corrupted result.
 
-// The minify primitive is exercised by its own tests now; the production
-// callers (`read_minified` / `edit_minified`) land in dirge-759c / dirge-wxws.
-// Until then this is a deliberately-exported-but-not-yet-integrated surface.
-#![allow(dead_code)]
+//! Wired into the agent via the `read_minified` / `edit_minified` tools
+//! ([`crate::agent::tools::read_minified`], [`crate::agent::tools::edit_minified`]),
+//! which call [`minify`] / [`apply_minified_edit`] / [`language_for_ext`].
 
 use tree_sitter::{Node, Parser};
 
@@ -288,14 +287,6 @@ fn go_semicolon_trigger(text: &str) -> bool {
 
 fn is_closing_token(text: &str) -> bool {
     matches!(text, "}" | ")" | "]" | ",")
-}
-
-/// Concatenate tokens, emitting each token's annotator separator, and inserting
-/// a single space only where two tokens would otherwise merge (word-char/
-/// word-char) or an operator would swallow a leading `.`. Ported from vix
-/// `minifyTokens`.
-fn render(tokens: &[Token]) -> String {
-    render_with_spans(tokens).0
 }
 
 /// Maps a token's range in the minified output back to its original source

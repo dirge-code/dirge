@@ -1,13 +1,13 @@
-//! Phased plan workflow (Phase 3): the phase prompts + the machine-parsed
-//! reviewer verdict. Ported from vix (`plan_workflow/*`, `implement_and_review/*`,
-//! `agents/reviewer.md`) and adapted to dirge's tool names. The orchestration
-//! (P3c, `dirge-rjmm`) and reviewer-runs-code loop (P3d, `dirge-rori`) fork
-//! agents via [`crate::provider::AnyAgent::spawn_phase_runner`] with these
-//! prompts + the matching tool allow-lists, and parse the reviewer's verdict
-//! with [`parse_review_verdict`].
-
-// Wired by the orchestrator (P3c) / reviewer loop (P3d); exercised by tests now.
-#![allow(dead_code)]
+//! Phased plan workflow (Phase 3): the phase prompts, the tool allow-lists, the
+//! machine-parsed reviewer verdict, and the per-step review policy
+//! ([`next_review_step`]). Ported from vix (`plan_workflow/*`,
+//! `implement_and_review/*`, `agents/reviewer.md`) and adapted to dirge's tool
+//! names. This module is pure logic (no runtime); the `/plan` command wires it
+//! up — `ui/slash/cmd_plan.rs` runs the explore→plan forks with these prompts
+//! via [`crate::provider::AnyAgent::spawn_phase_runner`], and the reviewer loop
+//! in `ui/run_handlers` drives [`next_review_step`] after each implement turn.
+//! The runtime glue (runner drain, reviewer fork) lives in
+//! [`crate::agent::phased_orchestrator`].
 
 /// Read-only tool allow-list for the explore + plan phases (no mutation).
 pub const READONLY_PHASE_TOOLS: &[&str] = &[
@@ -286,44 +286,11 @@ fn last_json_block(text: &str) -> Option<String> {
 /// Final output of a phase fork: the assistant's final text, or an error.
 pub type PhaseOutput = Result<String, String>;
 
-/// Orchestrate the **explore → plan** phases. Each phase is run by `run_phase`,
-/// which the runtime (P3e) implements by forking a *fresh* agent via
-/// [`crate::provider::AnyAgent::spawn_phase_runner`] with the given system
-/// prompt + tool allow-list — a genuine context reset per phase. The explore
-/// phase's structured report is handed into the plan phase's prompt (the only
-/// thing carried across the reset). Returns the plan text for the review gate,
-/// or an error if a phase failed or explore produced nothing.
-///
-/// Parameterized by the runner closure so the orchestration is unit-testable
-/// without a real agent/runtime.
-pub async fn run_explore_plan<R, Fut>(request: &str, run_phase: R) -> PhaseOutput
-where
-    R: Fn(String, &'static [&'static str]) -> Fut,
-    Fut: std::future::Future<Output = PhaseOutput>,
-{
-    let report = run_phase(explore_prompt(request), READONLY_PHASE_TOOLS).await?;
-    if report.trim().is_empty() {
-        return Err("explore phase produced no findings".to_string());
-    }
-    run_phase(plan_prompt(request, &report), READONLY_PHASE_TOOLS).await
-}
-
-/// Outcome of the reviewer-runs-code loop.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ReviewOutcome {
-    /// The reviewer confirmed `DONE` with first-hand evidence.
-    Approved,
-    /// Still `NEEDS_FIX` (or unparseable) after `max_retries` fix cycles.
-    Exhausted,
-    /// A reviewer or implementer fork errored.
-    Error(String),
-}
-
-/// One step of the reviewer-runs-code policy, factored out so the headless
-/// [`run_review_loop`] and the event-driven UI loop (the `/plan` command, which
-/// can't block on a streamed implement run) share a single source of truth.
-/// Given the reviewer's raw output and how many fix cycles remain, decide what
-/// happens next.
+/// One step of the reviewer-runs-code policy. The interactive `/plan` command
+/// can't block on its streamed implement run, so the live reviewer loop in
+/// `ui/run_handlers` drives the policy event-by-event through this single
+/// function. Given the reviewer's raw output and how many fix cycles remain,
+/// decide what happens next.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReviewStep {
     /// Reviewer confirmed `DONE`.
@@ -351,48 +318,6 @@ pub fn next_review_step(review_text: &str, cycles_left: usize) -> ReviewStep {
         .filter(|m| !m.trim().is_empty())
         .unwrap_or_else(|| review_text.to_string());
     ReviewStep::Retry { feedback }
-}
-
-/// Run the reviewer-runs-code loop (P3d, port of vix `implement_and_review`).
-/// After the implementer executes, a *write-disabled* reviewer fork (run via
-/// `run_reviewer` with [`REVIEWER_TOOLS`] + [`reviewer_prompt`]) independently
-/// runs the code and emits a JSON verdict. On `NEEDS_FIX` the `missing`
-/// punch-list is fed back to the implementer (`run_implement_retry` with
-/// [`implement_retry_prompt`]) and the reviewer runs again — bounded by
-/// `max_retries` fix cycles. The per-step policy is [`next_review_step`].
-///
-/// Parameterized by the runner closures so the loop is unit-testable without
-/// real forks. The interactive `/plan` path drives the same policy event-by-
-/// event via [`next_review_step`] instead, because its implement run streams
-/// through the UI loop and can't be `await`ed inline here.
-pub async fn run_review_loop<RV, RVFut, IM, IMFut>(
-    task: &str,
-    max_retries: usize,
-    run_reviewer: RV,
-    run_implement_retry: IM,
-) -> ReviewOutcome
-where
-    RV: Fn(String) -> RVFut,
-    RVFut: std::future::Future<Output = PhaseOutput>,
-    IM: Fn(String) -> IMFut,
-    IMFut: std::future::Future<Output = PhaseOutput>,
-{
-    for attempt in 0..=max_retries {
-        let review = match run_reviewer(reviewer_prompt(task)).await {
-            Ok(t) => t,
-            Err(e) => return ReviewOutcome::Error(e),
-        };
-        match next_review_step(&review, max_retries - attempt) {
-            ReviewStep::Approved => return ReviewOutcome::Approved,
-            ReviewStep::Exhausted => return ReviewOutcome::Exhausted,
-            ReviewStep::Retry { feedback } => {
-                if let Err(e) = run_implement_retry(implement_retry_prompt(&feedback)).await {
-                    return ReviewOutcome::Error(e);
-                }
-            }
-        }
-    }
-    ReviewOutcome::Exhausted
 }
 
 #[cfg(test)]
@@ -453,86 +378,6 @@ mod tests {
         assert!(parse_review_verdict("```json\n{\"verdict\":\"MAYBE\"}\n```").is_none());
     }
 
-    use std::sync::{Arc, Mutex};
-
-    /// The orchestrator runs explore then plan, gives each the right prompt +
-    /// read-only tool allow-list, and hands the explore report into the plan.
-    #[tokio::test]
-    async fn orchestrates_explore_then_plan_with_handoff() {
-        let calls: Arc<Mutex<Vec<(String, Vec<&'static str>)>>> = Arc::new(Mutex::new(Vec::new()));
-        let calls2 = calls.clone();
-        let run_phase = move |prompt: String, tools: &'static [&'static str]| {
-            let calls = calls2.clone();
-            async move {
-                let n = {
-                    let mut c = calls.lock().unwrap();
-                    c.push((prompt, tools.to_vec()));
-                    c.len()
-                };
-                Ok(if n == 1 {
-                    "core.rs:42 holds the cache map".to_string() // explore report
-                } else {
-                    "### Name\nLRU cache\n### Steps\n...".to_string() // plan
-                })
-            }
-        };
-
-        let plan = run_explore_plan("Add an LRU cache", run_phase)
-            .await
-            .expect("orchestration succeeds");
-        assert!(plan.contains("LRU cache"));
-
-        let calls = calls.lock().unwrap();
-        assert_eq!(calls.len(), 2, "explore then plan");
-        // Explore: explore prompt + read-only tools (no write).
-        assert!(calls[0].0.contains("**Explore**") && calls[0].0.contains("Add an LRU cache"));
-        assert!(calls[0].1.contains(&"read") && !calls[0].1.contains(&"write"));
-        // Plan: plan prompt WITH the explore report handed off.
-        assert!(
-            calls[1].0.contains("**Plan**")
-                && calls[1].0.contains("core.rs:42 holds the cache map")
-        );
-        assert!(calls[1].1.contains(&"read") && !calls[1].1.contains(&"edit"));
-    }
-
-    #[tokio::test]
-    async fn explore_failure_aborts_before_plan() {
-        let count = Arc::new(Mutex::new(0));
-        let count2 = count.clone();
-        let run_phase = move |_p: String, _t: &'static [&'static str]| {
-            let count = count2.clone();
-            async move {
-                *count.lock().unwrap() += 1;
-                Err::<String, String>("explore failed".to_string())
-            }
-        };
-        assert!(run_explore_plan("x", run_phase).await.is_err());
-        assert_eq!(
-            *count.lock().unwrap(),
-            1,
-            "plan phase must not run after explore fails"
-        );
-    }
-
-    #[tokio::test]
-    async fn empty_explore_report_is_rejected_before_plan() {
-        let count = Arc::new(Mutex::new(0));
-        let count2 = count.clone();
-        let run_phase = move |_p: String, _t: &'static [&'static str]| {
-            let count = count2.clone();
-            async move {
-                *count.lock().unwrap() += 1;
-                Ok::<String, String>("   ".to_string())
-            }
-        };
-        assert!(run_explore_plan("x", run_phase).await.is_err());
-        assert_eq!(
-            *count.lock().unwrap(),
-            1,
-            "empty explore report → no plan phase"
-        );
-    }
-
     fn done_review() -> String {
         "looks complete\n```json\n{\"verdict\":\"DONE\",\"missing\":\"\"}\n```".to_string()
     }
@@ -566,119 +411,5 @@ mod tests {
             other => panic!("expected Retry, got {other:?}"),
         }
         assert_eq!(next_review_step("no json here", 0), ReviewStep::Exhausted);
-    }
-
-    #[tokio::test]
-    async fn review_loop_approves_on_done_without_retry() {
-        let impl_calls = Arc::new(Mutex::new(0));
-        let ic = impl_calls.clone();
-        let reviewer = |_p: String| async { Ok(done_review()) };
-        let implementer = move |_p: String| {
-            let ic = ic.clone();
-            async move {
-                *ic.lock().unwrap() += 1;
-                Ok(String::new())
-            }
-        };
-        assert_eq!(
-            run_review_loop("task", 2, reviewer, implementer).await,
-            ReviewOutcome::Approved
-        );
-        assert_eq!(*impl_calls.lock().unwrap(), 0, "no retry when DONE");
-    }
-
-    #[tokio::test]
-    async fn review_loop_retries_with_punchlist_then_approves() {
-        let rcount = Arc::new(Mutex::new(0));
-        let rc = rcount.clone();
-        let feedbacks = Arc::new(Mutex::new(Vec::<String>::new()));
-        let fb = feedbacks.clone();
-        let reviewer = move |_p: String| {
-            let rc = rc.clone();
-            async move {
-                let n = {
-                    let mut c = rc.lock().unwrap();
-                    *c += 1;
-                    *c
-                };
-                Ok(if n == 1 {
-                    needs_fix_review("- add eviction tests")
-                } else {
-                    done_review()
-                })
-            }
-        };
-        let implementer = move |p: String| {
-            let fb = fb.clone();
-            async move {
-                fb.lock().unwrap().push(p);
-                Ok(String::new())
-            }
-        };
-        assert_eq!(
-            run_review_loop("task", 2, reviewer, implementer).await,
-            ReviewOutcome::Approved
-        );
-        let fb = feedbacks.lock().unwrap();
-        assert_eq!(fb.len(), 1, "one fix cycle");
-        assert!(
-            fb[0].contains("add eviction tests"),
-            "punch-list fed back: {}",
-            fb[0]
-        );
-    }
-
-    #[tokio::test]
-    async fn review_loop_exhausts_when_always_needs_fix() {
-        let impl_calls = Arc::new(Mutex::new(0));
-        let ic = impl_calls.clone();
-        let reviewer = |_p: String| async { Ok(needs_fix_review("- still broken")) };
-        let implementer = move |_p: String| {
-            let ic = ic.clone();
-            async move {
-                *ic.lock().unwrap() += 1;
-                Ok(String::new())
-            }
-        };
-        assert_eq!(
-            run_review_loop("task", 2, reviewer, implementer).await,
-            ReviewOutcome::Exhausted
-        );
-        assert_eq!(
-            *impl_calls.lock().unwrap(),
-            2,
-            "exactly max_retries fix cycles"
-        );
-    }
-
-    #[tokio::test]
-    async fn review_loop_surfaces_reviewer_error() {
-        let reviewer = |_p: String| async { Err("reviewer fork crashed".to_string()) };
-        let implementer = |_p: String| async { Ok(String::new()) };
-        assert_eq!(
-            run_review_loop("task", 2, reviewer, implementer).await,
-            ReviewOutcome::Error("reviewer fork crashed".to_string())
-        );
-    }
-
-    #[tokio::test]
-    async fn review_loop_unparseable_never_approves() {
-        // A malformed/missing verdict must NOT ship — treated as not-done, and
-        // the raw review is fed back since there's no punch-list to extract.
-        let fb = Arc::new(Mutex::new(Vec::<String>::new()));
-        let f = fb.clone();
-        let reviewer = |_p: String| async { Ok("looks fine to me, no json".to_string()) };
-        let implementer = move |p: String| {
-            let f = f.clone();
-            async move {
-                f.lock().unwrap().push(p);
-                Ok(String::new())
-            }
-        };
-        assert_eq!(
-            run_review_loop("task", 1, reviewer, implementer).await,
-            ReviewOutcome::Exhausted
-        );
-        assert!(fb.lock().unwrap()[0].contains("looks fine to me"));
     }
 }
