@@ -82,6 +82,11 @@ pub struct Theme {
     pub banner_primary: Color,
     /// Welcome-banner secondary stroke (border, decorations).
     pub banner_secondary: Color,
+    /// Terminal background fill. Painted behind every cell (foregrounds
+    /// preserved). `Color::Reset` keeps the terminal's own default background
+    /// (no fill) — the right choice for `plain` and for users on a custom
+    /// terminal palette who don't want dirge overriding it.
+    pub background: Color,
     /// Human-readable name surfaced in the banner ("PHOSPHOR", "PLAIN").
     pub label: &'static str,
 }
@@ -208,6 +213,13 @@ impl Theme {
                 g: 116,
                 b: 96,
             },
+            // Near-black charcoal (#222) instead of pure terminal black — gives
+            // the phosphor green a touch of CRT-bezel depth without washing out.
+            background: Color::Rgb {
+                r: 0x22,
+                g: 0x22,
+                b: 0x22,
+            },
             label: "PHOSPHOR",
         }
     }
@@ -238,6 +250,8 @@ impl Theme {
             divider: Color::DarkGrey,
             banner_primary: Color::Cyan,
             banner_secondary: Color::DarkGrey,
+            // Keep the terminal's own background — `plain` shouldn't override it.
+            background: Color::Reset,
             label: "PLAIN",
         }
     }
@@ -266,6 +280,7 @@ struct ThemeJson {
     divider: Option<ColorValue>,
     banner_primary: Option<ColorValue>,
     banner_secondary: Option<ColorValue>,
+    background: Option<ColorValue>,
     label: Option<String>,
 }
 
@@ -373,6 +388,7 @@ impl ThemeJson {
             divider: pick(self.divider, base.divider),
             banner_primary: pick(self.banner_primary, base.banner_primary),
             banner_secondary: pick(self.banner_secondary, base.banner_secondary),
+            background: pick(self.background, base.background),
             label,
         })
     }
@@ -490,6 +506,9 @@ pub fn banner_primary() -> Color {
 }
 pub fn banner_secondary() -> Color {
     current().banner_secondary
+}
+pub fn background() -> Color {
+    current().background
 }
 
 /// Whether the given color should render with the Bold attribute to

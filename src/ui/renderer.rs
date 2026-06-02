@@ -677,6 +677,7 @@ impl Renderer {
             show_left_panel,
             show_right_panel,
             frame_color,
+            background: crate::ui::theme::background(),
             right_panel_mode: *right_panel_mode,
             #[cfg(feature = "dap")]
             debug_panel_data: self.debug_panel_data.as_ref(),

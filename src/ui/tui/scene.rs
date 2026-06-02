@@ -72,6 +72,9 @@ pub struct Scene<'a> {
     pub show_right_panel: bool,
     /// Header / frame color.
     pub frame_color: crossterm::style::Color,
+    /// Terminal background fill (theme-configurable). `Color::Reset` = no fill
+    /// (keep the terminal's own background).
+    pub background: crossterm::style::Color,
 }
 
 /// Paint the entire UI into `f`. Computes layout from the frame's
@@ -150,6 +153,18 @@ pub fn render_frame(scene: &Scene, f: &mut Frame<'_>) {
         });
     }
     f.render_widget(strip, area);
+
+    // Theme background fill. Every widget above sets foreground only (selection
+    // uses the REVERSED modifier, never an explicit bg), so patching the whole
+    // area with `bg` sets each cell's background while leaving foregrounds — and
+    // REVERSED swaps — intact. `Color::Reset` (plain theme / opt-out) skips the
+    // fill so the terminal's own background shows through.
+    if scene.background != crossterm::style::Color::Reset {
+        f.buffer_mut().set_style(
+            area,
+            Style::default().bg(crossterm_to_ratatui(scene.background)),
+        );
+    }
 
     // Show the hardware cursor at the editor's (row, col). The
     // terminal blinks it naturally.
@@ -231,6 +246,7 @@ pub fn empty_scene<'a>(
         show_left_panel: true,
         show_right_panel: true,
         frame_color: crossterm::style::Color::Green,
+        background: crossterm::style::Color::Reset,
     }
 }
 
@@ -301,6 +317,40 @@ mod tests {
         assert!(status_row.starts_with("ready"));
     }
 
+    /// A configured (non-Reset) theme background fills every cell's bg;
+    /// `Color::Reset` leaves the terminal default untouched.
+    #[test]
+    fn theme_background_fills_cells_only_when_set() {
+        let buf: Vec<LineEntry> = Vec::new();
+        let pd = PanelData::default();
+        let info = LeftPanelInfo::default();
+        let subs: Vec<SubagentStatusRow> = Vec::new();
+        let mut scene = empty_scene(&buf, &pd, &info, &subs, "ready");
+
+        let bg = crossterm::style::Color::Rgb {
+            r: 0x22,
+            g: 0x22,
+            b: 0x22,
+        };
+        scene.background = bg;
+        let mut t = Terminal::new(TestBackend::new(160, 30)).unwrap();
+        t.draw(|f| render_frame(&scene, f)).unwrap();
+        assert_eq!(
+            t.backend().buffer().cell((5, 5)).unwrap().bg,
+            crossterm_to_ratatui(bg),
+            "configured background must fill cells",
+        );
+
+        scene.background = crossterm::style::Color::Reset;
+        let mut t2 = Terminal::new(TestBackend::new(160, 30)).unwrap();
+        t2.draw(|f| render_frame(&scene, f)).unwrap();
+        assert_eq!(
+            t2.backend().buffer().cell((5, 5)).unwrap().bg,
+            RColor::Reset,
+            "Reset background must NOT fill — terminal default shows through",
+        );
+    }
+
     /// When an overlay is active, the editor is REPLACED inside
     /// the bottom frame — no second box anywhere.
     #[test]
@@ -335,6 +385,7 @@ mod tests {
             show_left_panel: true,
             show_right_panel: true,
             frame_color: crossterm::style::Color::Green,
+            background: crossterm::style::Color::Reset,
         };
 
         let mut backend = TestBackend::new(160, 30);
@@ -523,6 +574,7 @@ mod tests {
             show_left_panel: true,
             show_right_panel: true,
             frame_color: crossterm::style::Color::Green,
+            background: crossterm::style::Color::Reset,
         };
         terminal.draw(|f| render_frame(&s1, f)).unwrap();
 
@@ -553,6 +605,7 @@ mod tests {
             show_left_panel: true,
             show_right_panel: true,
             frame_color: crossterm::style::Color::Green,
+            background: crossterm::style::Color::Reset,
         };
         terminal.draw(|f| render_frame(&s2, f)).unwrap();
         backend = terminal.backend().clone();

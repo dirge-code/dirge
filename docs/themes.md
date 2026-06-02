@@ -97,6 +97,7 @@ Each color field accepts three forms:
 | `divider` | Horizontal divider line |
 | `banner_primary` | Welcome banner primary stroke |
 | `banner_secondary` | Welcome banner border / decorations |
+| `background` | Terminal background fill, painted behind every cell (foregrounds preserved). Use `"reset"` to keep the terminal's own background — that's the `plain` default; `phosphor` uses a near-black `#222222`. |
 | `label` | Human-readable name shown in the banner |
 
 ### Activating
