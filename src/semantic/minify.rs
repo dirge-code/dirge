@@ -109,6 +109,12 @@ pub fn language_for_ext(ext: &str) -> Option<tree_sitter::Language> {
 /// minified output fails re-validation. A `None` means "fall back to a plain
 /// read" — never a corrupted result.
 pub fn minify(ext: &str, source: &str) -> Option<String> {
+    minify_with_spans(ext, source).map(|(out, _)| out)
+}
+
+/// Core minify that also returns the token→source span map (for
+/// [`apply_minified_edit`]). See [`minify`] for the `None` semantics.
+fn minify_with_spans(ext: &str, source: &str) -> Option<(String, Vec<Span>)> {
     let language = language_for_ext(ext)?;
     let mut parser = Parser::new();
     parser.set_language(&language).ok()?;
@@ -124,7 +130,7 @@ pub fn minify(ext: &str, source: &str) -> Option<String> {
     let mut tokens: Vec<Token> = Vec::new();
     collect_leaves(root, src, &mut tokens);
     annotate(ext, &mut tokens, src);
-    let out = render(&tokens);
+    let (out, spans) = render_with_spans(&tokens);
     if out.is_empty() {
         return None;
     }
@@ -134,7 +140,7 @@ pub fn minify(ext: &str, source: &str) -> Option<String> {
     if reparsed.root_node().has_error() {
         return None;
     }
-    Some(out)
+    Some((out, spans))
 }
 
 /// Recursively collect leaf tokens, dropping whitespace and comments.
@@ -289,7 +295,31 @@ fn is_closing_token(text: &str) -> bool {
 /// word-char) or an operator would swallow a leading `.`. Ported from vix
 /// `minifyTokens`.
 fn render(tokens: &[Token]) -> String {
+    render_with_spans(tokens).0
+}
+
+/// Maps a token's range in the minified output back to its original source
+/// byte range. Used by [`apply_minified_edit`] to edit the original file from
+/// a match against the minified form (no formatter needed).
+struct Span {
+    min_start: usize,
+    min_end: usize,
+    orig_start: usize,
+    orig_end: usize,
+}
+
+/// Like [`render`] but also records, for each token, its byte range in the
+/// minified output and in the original source. Separators (annotator-inserted
+/// `;`/whitespace, word-boundary spaces) belong to no token and are therefore
+/// not mappable — an edit match must align to token boundaries.
+///
+/// No trailing `trim`: the first token is emitted at offset 0 (separators only
+/// appear *between* tokens) and nothing follows the last token, so the output
+/// has no leading/trailing whitespace to trim — and trimming would invalidate
+/// the recorded offsets.
+fn render_with_spans(tokens: &[Token]) -> (String, Vec<Span>) {
     let mut out = String::new();
+    let mut spans = Vec::with_capacity(tokens.len());
     for (i, tok) in tokens.iter().enumerate() {
         if i > 0 {
             let prev = &tokens[i - 1];
@@ -305,9 +335,83 @@ fn render(tokens: &[Token]) -> String {
                 }
             }
         }
+        let min_start = out.len();
         out.push_str(&tok.text);
+        spans.push(Span {
+            min_start,
+            min_end: out.len(),
+            orig_start: tok.byte_start,
+            orig_end: tok.byte_end,
+        });
     }
-    out.trim().to_string()
+    (out, spans)
+}
+
+/// Why a minified edit could not be applied. The tool turns these into
+/// model-facing guidance.
+#[derive(Debug, PartialEq, Eq)]
+pub enum MinifiedEditError {
+    /// The file's language isn't minifiable (use the plain `edit` tool), or it
+    /// doesn't parse cleanly.
+    Unsupported,
+    /// `old_text` wasn't found in the minified form.
+    NotFound,
+    /// `old_text` matched more than once — not unique.
+    NotUnique,
+    /// The match doesn't start/end on token boundaries (e.g. it begins at an
+    /// annotator-inserted separator or splits a token). Include more context.
+    NotAligned,
+}
+
+/// Apply an edit expressed against the file's MINIFIED form to the ORIGINAL
+/// source: locate `old_minified` in the minified text, map its (unique,
+/// token-aligned) span back to the original byte range, and splice `new_text`
+/// in there — leaving all surrounding original formatting untouched and
+/// needing no formatter. The caller is responsible for syntax-checking and
+/// writing the result.
+pub fn apply_minified_edit(
+    ext: &str,
+    source: &str,
+    old_minified: &str,
+    new_text: &str,
+) -> Result<String, MinifiedEditError> {
+    if old_minified.is_empty() {
+        return Err(MinifiedEditError::NotFound);
+    }
+    let (minified, spans) = minify_with_spans(ext, source).ok_or(MinifiedEditError::Unsupported)?;
+
+    match minified.matches(old_minified).count() {
+        0 => return Err(MinifiedEditError::NotFound),
+        1 => {}
+        _ => return Err(MinifiedEditError::NotUnique),
+    }
+    let m_start = minified.find(old_minified).unwrap();
+    let m_end = m_start + old_minified.len();
+
+    let orig_start = spans
+        .iter()
+        .find(|s| s.min_start == m_start)
+        .ok_or(MinifiedEditError::NotAligned)?
+        .orig_start;
+    let orig_end = spans
+        .iter()
+        .find(|s| s.min_end == m_end)
+        .ok_or(MinifiedEditError::NotAligned)?
+        .orig_end;
+
+    if orig_start > orig_end
+        || orig_end > source.len()
+        || !source.is_char_boundary(orig_start)
+        || !source.is_char_boundary(orig_end)
+    {
+        return Err(MinifiedEditError::NotAligned);
+    }
+
+    let mut result = String::with_capacity(source.len() - (orig_end - orig_start) + new_text.len());
+    result.push_str(&source[..orig_start]);
+    result.push_str(new_text);
+    result.push_str(&source[orig_end..]);
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -500,6 +604,53 @@ mod tests {
         // Pre-existing parse error → None (fall back to plain read), never a
         // corrupted minify.
         assert!(minify("rs", "fn broken( {{{ ").is_none());
+    }
+
+    #[cfg(feature = "semantic-rust")]
+    #[test]
+    fn minified_edit_maps_back_to_original_preserving_formatting() {
+        let src = "fn main() {\n    let x = 1;\n    let y = 2;\n}\n";
+        // Sanity on the minified shape the model would match against.
+        assert_eq!(minify("rs", src).unwrap(), "fn main(){let x=1;let y=2;}");
+
+        // Edit expressed against the minified form; only the matched original
+        // span changes, surrounding indentation/newlines are untouched.
+        let out = apply_minified_edit("rs", src, "let x=1", "let x = 42").unwrap();
+        assert_eq!(out, "fn main() {\n    let x = 42;\n    let y = 2;\n}\n");
+        // The edited file still parses.
+        assert!(minify("rs", &out).is_some());
+    }
+
+    #[cfg(feature = "semantic-rust")]
+    #[test]
+    fn minified_edit_rejects_not_found_not_unique_and_misaligned() {
+        let src = "fn main() {\n    let x = 1;\n    let y = 2;\n}\n";
+        assert_eq!(
+            apply_minified_edit("rs", src, "nonexistent", "x"),
+            Err(MinifiedEditError::NotFound)
+        );
+        // "let " (with the word-boundary space) occurs twice → not unique.
+        assert_eq!(
+            apply_minified_edit("rs", src, "let ", "x"),
+            Err(MinifiedEditError::NotUnique)
+        );
+        // Starts mid-token ("ain(" is inside "main(") → not token-aligned.
+        assert_eq!(
+            apply_minified_edit("rs", src, "ain(", "x"),
+            Err(MinifiedEditError::NotAligned)
+        );
+        assert_eq!(
+            apply_minified_edit("rs", src, "", "x"),
+            Err(MinifiedEditError::NotFound)
+        );
+    }
+
+    #[test]
+    fn minified_edit_unsupported_language() {
+        assert_eq!(
+            apply_minified_edit("md", "# hi\n", "hi", "bye"),
+            Err(MinifiedEditError::Unsupported)
+        );
     }
 
     /// Proof on REAL repo files across the collapse-safe languages: each must
