@@ -3,6 +3,7 @@ pub mod builder;
 pub mod compression;
 pub mod exemplars;
 pub mod model_family;
+pub mod phased_orchestrator;
 pub mod plan_workflow;
 pub mod post_session;
 pub mod prompt;

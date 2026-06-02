@@ -356,6 +356,17 @@ pub struct Config {
     /// re-focusing; higher to silence the reminder for routine
     /// multi-step refactors.
     pub context_depth_reminder_threshold: Option<usize>,
+    /// Phase 3 (`dirge-phyi`, vix port): opt-in phased plan workflow —
+    /// explore → plan → reviewer-runs-code loop, each phase a fresh
+    /// context-reset fork. `None`/`false` (default) keeps the normal
+    /// single-agent path. The orchestration core lives in
+    /// `crate::agent::plan_workflow`; the runtime drain in
+    /// `crate::agent::phased_orchestrator`.
+    pub phased_workflow_enabled: Option<bool>,
+    /// Max reviewer-runs-code fix cycles before the phased workflow gives
+    /// up with `Exhausted`. `None` defaults to 2 (vix's default). Only
+    /// consulted when `phased_workflow_enabled` is on.
+    pub phased_workflow_max_review_cycles: Option<usize>,
     /// dirge-onlr / dirge-4xgd: per-operation timeout overrides. Unset
     /// fields fall back to `crate::timeout::Timeouts::DEFAULT`. Merged in
     /// `resolve_timeouts()` and installed process-wide at startup.
@@ -499,6 +510,22 @@ impl Config {
     /// Phase-3: dynamic-tool-search opt-in. Default off.
     pub fn resolve_dynamic_tool_search(&self) -> bool {
         self.dynamic_tool_search.unwrap_or(false)
+    }
+
+    /// Phased plan workflow opt-in (vix port). Default off — preserves the
+    /// normal single-agent path.
+    // Consulted at the UI session-loop call site in P3e-b.
+    #[allow(dead_code)]
+    pub fn resolve_phased_workflow_enabled(&self) -> bool {
+        self.phased_workflow_enabled.unwrap_or(false)
+    }
+
+    /// Reviewer-runs-code fix-cycle budget for the phased workflow.
+    /// Default 2 (vix's default).
+    // Consulted at the UI session-loop call site in P3e-b.
+    #[allow(dead_code)]
+    pub fn resolve_phased_workflow_max_review_cycles(&self) -> usize {
+        self.phased_workflow_max_review_cycles.unwrap_or(2)
     }
 
     pub fn resolve_tool_result_max_chars(&self) -> usize {
@@ -790,6 +817,22 @@ pub fn load() -> Config {
 #[cfg(all(test, feature = "lsp"))]
 mod tests {
     use super::*;
+
+    /// Phased workflow is opt-in and off by default; the review-cycle
+    /// budget defaults to vix's 2 and is honored when set.
+    #[test]
+    fn phased_workflow_defaults_off_with_two_cycles() {
+        let cfg: Config = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(!cfg.resolve_phased_workflow_enabled());
+        assert_eq!(cfg.resolve_phased_workflow_max_review_cycles(), 2);
+
+        let cfg: Config = serde_json::from_str(
+            r#"{ "phased_workflow_enabled": true, "phased_workflow_max_review_cycles": 4 }"#,
+        )
+        .unwrap();
+        assert!(cfg.resolve_phased_workflow_enabled());
+        assert_eq!(cfg.resolve_phased_workflow_max_review_cycles(), 4);
+    }
 
     /// dirge-4xgd: `[timeouts]` overrides merge onto Timeouts::DEFAULT;
     /// unset fields keep their defaults.
