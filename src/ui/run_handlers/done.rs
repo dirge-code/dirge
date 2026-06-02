@@ -477,11 +477,13 @@ pub(crate) async fn handle_done(
                 crate::agent::runner::convert_history(ctx.session),
                 Some(interjection_queue.clone()),
             );
-            *agent_rx = Some(runner.event_rx);
-            *agent_abort = Some(runner.task);
-            *agent_interject = Some(runner.interject_tx);
-            *agent_cancel = Some(runner.cancel_tx);
-            *is_running = true;
+            runner.install_into(
+                agent_rx,
+                agent_abort,
+                agent_interject,
+                agent_cancel,
+                is_running,
+            );
         }
         crate::plugin::PostDoneAction::LoopStop =>
         {
@@ -512,11 +514,13 @@ pub(crate) async fn handle_done(
                     Vec::new(),
                     Some(interjection_queue.clone()),
                 );
-                *agent_rx = Some(runner.event_rx);
-                *agent_abort = Some(runner.task);
-                *agent_interject = Some(runner.interject_tx);
-                *agent_cancel = Some(runner.cancel_tx);
-                *is_running = true;
+                runner.install_into(
+                    agent_rx,
+                    agent_abort,
+                    agent_interject,
+                    agent_cancel,
+                    is_running,
+                );
                 *loop_bits.label = Some(ls.iteration_label());
                 ctx.renderer.write_line(
                     &format!("[loop] launching {}", ls.iteration_label()),
@@ -662,11 +666,13 @@ pub(crate) async fn handle_done(
             history,
             Some(interjection_queue.clone()),
         );
-        *agent_rx = Some(runner.event_rx);
-        *agent_abort = Some(runner.task);
-        *agent_interject = Some(runner.interject_tx);
-        *agent_cancel = Some(runner.cancel_tx);
-        *is_running = true;
+        runner.install_into(
+            agent_rx,
+            agent_abort,
+            agent_interject,
+            agent_cancel,
+            is_running,
+        );
     }
     Ok(())
 }

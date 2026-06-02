@@ -35,6 +35,29 @@ pub struct AgentRunner {
     pub cancel_tx: mpsc::Sender<()>,
 }
 
+impl AgentRunner {
+    /// Move this runner into the interactive loop's run-state slots and mark the
+    /// run active. Consuming `self` makes the install atomic — every channel /
+    /// handle is transferred together, so a spawn site can't forget one slot
+    /// (which would leak the runner task or strand the UI) or reuse a moved-out
+    /// field. Used at every `spawn_runner` site in `ui/mod.rs` and
+    /// `ui/run_handlers/*`.
+    pub(crate) fn install_into(
+        self,
+        rx: &mut Option<mpsc::Receiver<AgentEvent>>,
+        abort: &mut Option<JoinHandle<()>>,
+        interject: &mut Option<mpsc::Sender<()>>,
+        cancel: &mut Option<mpsc::Sender<()>>,
+        is_running: &mut bool,
+    ) {
+        *rx = Some(self.event_rx);
+        *abort = Some(self.task);
+        *interject = Some(self.interject_tx);
+        *cancel = Some(self.cancel_tx);
+        *is_running = true;
+    }
+}
+
 /// Abort-on-drop guard for a forked [`AgentRunner`]. Holding it while draining
 /// the runner's events ensures a cancelled/early-returning drain actually stops
 /// the fork — cooperative `cancel_tx` first (so an in-flight consumer can
@@ -356,6 +379,31 @@ mod plugin_hook_tests {
         let mut mgr = PluginManager::try_new().unwrap();
         let out = resolve_prompt_with_hooks("just this", &mut mgr);
         assert_eq!(out, "just this");
+    }
+
+    #[tokio::test]
+    async fn install_into_populates_every_slot_and_marks_running() {
+        let (_tx, event_rx) = mpsc::channel(1);
+        let (interject_tx, _) = mpsc::channel(1);
+        let (cancel_tx, _) = mpsc::channel(1);
+        let runner = AgentRunner {
+            event_rx,
+            task: tokio::spawn(async {}),
+            interject_tx,
+            cancel_tx,
+        };
+        let (mut rx, mut abort, mut interject, mut cancel) = (None, None, None, None);
+        let mut is_running = false;
+        runner.install_into(
+            &mut rx,
+            &mut abort,
+            &mut interject,
+            &mut cancel,
+            &mut is_running,
+        );
+        // Every slot must be filled — the whole point is "can't forget one".
+        assert!(rx.is_some() && abort.is_some() && interject.is_some() && cancel.is_some());
+        assert!(is_running);
     }
 
     #[test]

@@ -1379,11 +1379,7 @@ pub async fn run_interactive(
                                                     history,
                                                     Some(interjection_queue.clone()),
                                                 );
-                                                agent_rx = Some(runner.event_rx);
-                                                agent_abort = Some(runner.task);
-                                                agent_interject = Some(runner.interject_tx);
-                                                agent_cancel = Some(runner.cancel_tx);
-                                                is_running = true;
+                                                runner.install_into(&mut agent_rx, &mut agent_abort, &mut agent_interject, &mut agent_cancel, &mut is_running);
                                             }
                                             Err(e) => {
                                                 renderer.write_line(&format!("shell error: {}", e), c_error())?;
@@ -1508,11 +1504,7 @@ pub async fn run_interactive(
                                                 history,
                                                 Some(interjection_queue.clone()),
                                             );
-                                            agent_rx = Some(runner.event_rx);
-                                                agent_abort = Some(runner.task);
-                                                agent_interject = Some(runner.interject_tx);
-                                                agent_cancel = Some(runner.cancel_tx);
-                                            is_running = true;
+                                            runner.install_into(&mut agent_rx, &mut agent_abort, &mut agent_interject, &mut agent_cancel, &mut is_running);
                                             wt_return_path = Some(main_path);
                                         }
                                     }
@@ -1599,11 +1591,7 @@ pub async fn run_interactive(
                                                 Vec::new(),
                                                 Some(interjection_queue.clone()),
                                             );
-                                            agent_rx = Some(runner.event_rx);
-                                                agent_abort = Some(runner.task);
-                                                agent_interject = Some(runner.interject_tx);
-                                                agent_cancel = Some(runner.cancel_tx);
-                                            is_running = true;
+                                            runner.install_into(&mut agent_rx, &mut agent_abort, &mut agent_interject, &mut agent_cancel, &mut is_running);
                                             loop_label = Some(ls.iteration_label());
                                         }
                                     }
@@ -1631,11 +1619,7 @@ pub async fn run_interactive(
                                         history,
                                         Some(interjection_queue.clone()),
                                     );
-                                    agent_rx = Some(runner.event_rx);
-                                    agent_abort = Some(runner.task);
-                                    agent_interject = Some(runner.interject_tx);
-                                    agent_cancel = Some(runner.cancel_tx);
-                                    is_running = true;
+                                    runner.install_into(&mut agent_rx, &mut agent_abort, &mut agent_interject, &mut agent_cancel, &mut is_running);
                                     active_plan = Some(kickoff.active);
                                 }
                             } else if is_running {
@@ -1793,11 +1777,7 @@ pub async fn run_interactive(
                                     history,
                                     Some(interjection_queue.clone()),
                                 );
-                                agent_rx = Some(runner.event_rx);
-                                                agent_abort = Some(runner.task);
-                                                agent_interject = Some(runner.interject_tx);
-                                                agent_cancel = Some(runner.cancel_tx);
-                                is_running = true;
+                                runner.install_into(&mut agent_rx, &mut agent_abort, &mut agent_interject, &mut agent_cancel, &mut is_running);
 
                                 session.add_message(MessageRole::User, &text);
                                 renderer.set_avatar_state(avatar::AvatarState::Idle);
@@ -3009,11 +2989,7 @@ pub async fn run_interactive(
                         );
                     last_user_prompt.clone_from(&synth_prompt);
                     let runner = agent.clone().spawn_runner(composed, history, Some(interjection_queue.clone()));
-                    agent_rx = Some(runner.event_rx);
-                    agent_abort = Some(runner.task);
-                    agent_interject = Some(runner.interject_tx);
-                    agent_cancel = Some(runner.cancel_tx);
-                    is_running = true;
+                    runner.install_into(&mut agent_rx, &mut agent_abort, &mut agent_interject, &mut agent_cancel, &mut is_running);
                     renderer.draw_bottom(
                         &input,
                         &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), interjection_queue.lock().unwrap().len()),

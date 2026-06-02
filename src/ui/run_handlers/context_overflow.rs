@@ -181,11 +181,13 @@ pub(crate) async fn handle_context_overflow(
                 history,
                 Some(interjection_queue.clone()),
             );
-            *agent_rx = Some(runner.event_rx);
-            *agent_abort = Some(runner.task);
-            *agent_interject = Some(runner.interject_tx);
-            *agent_cancel = Some(runner.cancel_tx);
-            *is_running = true;
+            runner.install_into(
+                agent_rx,
+                agent_abort,
+                agent_interject,
+                agent_cancel,
+                is_running,
+            );
             // Review #4: collapsed result from the
             // failed run is stale — the user will
             // care about results from the new

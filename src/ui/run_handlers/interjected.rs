@@ -144,11 +144,13 @@ pub(crate) async fn handle_interjected(
             history,
             Some(interjection_queue.clone()),
         );
-        *agent_rx = Some(runner.event_rx);
-        *agent_abort = Some(runner.task);
-        *agent_interject = Some(runner.interject_tx);
-        *agent_cancel = Some(runner.cancel_tx);
-        *is_running = true;
+        runner.install_into(
+            agent_rx,
+            agent_abort,
+            agent_interject,
+            agent_cancel,
+            is_running,
+        );
     }
     Ok(())
 }
