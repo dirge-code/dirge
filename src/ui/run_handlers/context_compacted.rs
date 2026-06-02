@@ -48,10 +48,7 @@ pub(crate) async fn handle_context_compacted(
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
     let paths = crate::extras::dirge_paths::ProjectPaths::new(&cwd);
     if let Ok(db) = crate::extras::session_db::SessionDb::open(&paths.session_db_path()) {
-        let old_sid = format!(
-            "dirge-{}",
-            ctx.session.id.as_str().chars().take(8).collect::<String>()
-        );
+        let old_sid = format!("dirge-{}", crate::text::short_id(ctx.session.id.as_str()));
         let _ = db.end_session(&old_sid, "compression");
         let now = chrono::Utc::now().to_rfc3339();
         let _ = db.insert_session(

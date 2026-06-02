@@ -1166,7 +1166,7 @@ pub async fn run_interactive(
                                             active,
                                             &format!(
                                                 "(/kill triggered — aborting {})",
-                                                id.chars().take(8).collect::<String>()
+                                                crate::text::short_id(&id)
                                             ),
                                             theme::dim(),
                                         );
@@ -2684,11 +2684,11 @@ pub async fn run_interactive(
                 };
                 let (label, color) = match &lifecycle_evt {
                     LifecycleEvent::Started { id } => {
-                        let short: String = id.chars().take(8).collect();
+                        let short = crate::text::short_id(&id);
                         (format!("[task {} started]", short), c_tool())
                     }
                     LifecycleEvent::Finished(notif) => {
-                        let short: String = notif.id.chars().take(8).collect();
+                        let short = crate::text::short_id(&notif.id);
                         match &notif.state {
                             TS::Completed(_) => {
                                 (format!("[task {} completed]", short), Color::Green)
@@ -2798,7 +2798,7 @@ pub async fn run_interactive(
                             .take(40)
                             .collect();
                         let name = if short.is_empty() {
-                            format!("subagent {}", id.chars().take(8).collect::<String>())
+                            format!("subagent {}", crate::text::short_id(&id))
                         } else {
                             format!("task: {}", short)
                         };

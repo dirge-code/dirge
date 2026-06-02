@@ -11,7 +11,7 @@ use crate::session::{MessageRole, Session, TreeNode};
 /// noisy in chat output; the prefix is uniquely-identifiable in any
 /// realistic session size.
 pub fn short_id(id: &CompactString) -> String {
-    id.chars().take(8).collect()
+    crate::text::short_id(id)
 }
 
 /// Resolve a short id prefix the user typed (e.g. "abc12345") to a
@@ -164,7 +164,7 @@ mod tests {
         let mut s = Session::new("p", "m", 0);
         s.add_message(MessageRole::User, "msg");
         let full_id = s.messages[0].id.clone();
-        let prefix: String = full_id.chars().take(8).collect();
+        let prefix = crate::text::short_id(&full_id);
         let resolved = resolve_id_prefix(&s, &prefix).unwrap();
         assert_eq!(resolved, full_id);
     }

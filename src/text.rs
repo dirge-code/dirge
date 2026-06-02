@@ -29,6 +29,14 @@ pub(crate) fn tail(s: &str, max_bytes: usize) -> &str {
     &s[start..]
 }
 
+/// Short display prefix of an id — its first 8 characters. Used across the UI
+/// to compact session / subagent / notification / plugin ids for display.
+/// Char-based (UTF-8 safe) and consistent everywhere, replacing the ~9
+/// scattered `id.chars().take(8).collect()` copies.
+pub(crate) fn short_id(id: &str) -> String {
+    id.chars().take(8).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

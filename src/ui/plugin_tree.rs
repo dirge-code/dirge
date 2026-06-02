@@ -210,7 +210,7 @@ pub fn apply_tree_op(
 }
 
 fn short(s: &str) -> String {
-    s.chars().take(8).collect()
+    crate::text::short_id(s)
 }
 
 #[cfg(test)]

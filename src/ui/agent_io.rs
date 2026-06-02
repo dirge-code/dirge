@@ -218,10 +218,7 @@ pub(crate) fn persist_turn_to_db(
         }
     };
     let now = chrono::Utc::now().to_rfc3339();
-    let sid = format!(
-        "dirge-{}",
-        session.id.as_str().chars().take(8).collect::<String>()
-    );
+    let sid = format!("dirge-{}", crate::text::short_id(session.id.as_str()));
     let _ = db.insert_session(&sid, "cli", &session.model, &session.provider, &now);
 
     if !user_prompt.is_empty() {

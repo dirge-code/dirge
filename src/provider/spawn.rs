@@ -30,6 +30,31 @@ pub(crate) fn filter_loop_tools(
 }
 
 impl AnyAgent {
+    /// Map a tool slice to rig `ToolDefinition`s for the per-turn request
+    /// builder. Shared by the main (`spawn_runner`) and fork
+    /// (`spawn_filtered_runner_with_cache`) builders, which built this
+    /// identically.
+    fn tool_defs_for(
+        tools: &[std::sync::Arc<dyn crate::agent::agent_loop::LoopTool>],
+    ) -> Vec<rig::completion::ToolDefinition> {
+        tools
+            .iter()
+            .map(|t| crate::agent::agent_loop::loop_tool_to_rig_definition(t.as_ref()))
+            .collect()
+    }
+
+    /// `model_name` as an `Option`, treating empty as "unset" — the
+    /// normalization both spawn builders need for `LoopSpawnConfig.model_name`.
+    /// Takes the field by ref (not `&self`) so it's callable after `self` is
+    /// partially moved (`cfg.tools = self.loop_tools`).
+    fn model_name_opt(model_name: &str) -> Option<String> {
+        if model_name.is_empty() {
+            None
+        } else {
+            Some(model_name.to_string())
+        }
+    }
+
     pub fn spawn_runner(
         self,
         prompt: String,
@@ -39,8 +64,8 @@ impl AnyAgent {
         >,
     ) -> AgentRunner {
         use crate::agent::agent_loop::{
-            LoopSpawnConfig, loop_tool_to_rig_definition, retrying_stream_fn,
-            rig_history_system_prompt, rig_history_to_loop_messages, spawn_loop_runner,
+            LoopSpawnConfig, retrying_stream_fn, rig_history_system_prompt,
+            rig_history_to_loop_messages, spawn_loop_runner,
         };
         use crate::agent::recovery::RecoveryPolicy;
 
@@ -51,11 +76,7 @@ impl AnyAgent {
         // Convert tool registry → rig ToolDefinitions for the
         // request builder, and keep the registry itself for the
         // loop's dispatch.
-        let tool_defs: Vec<rig::completion::ToolDefinition> = self
-            .loop_tools
-            .iter()
-            .map(|t| loop_tool_to_rig_definition(t.as_ref()))
-            .collect();
+        let tool_defs = Self::tool_defs_for(&self.loop_tools);
 
         // Phase-3: per-session loaded-tool set was allocated at
         // `build_agent` time (when `dynamic_tool_search` is on)
@@ -126,11 +147,7 @@ impl AnyAgent {
         cfg.history = loop_history;
         cfg.tools = self.loop_tools;
         cfg.provider_name = Some(provider_name);
-        cfg.model_name = if self.model_name.is_empty() {
-            None
-        } else {
-            Some(self.model_name.clone())
-        };
+        cfg.model_name = Self::model_name_opt(&self.model_name);
         cfg.steering_queue = steering_queue;
         cfg.tool_def_filter = tool_def_filter;
         cfg.dynamic_tool_search = self.dynamic_tool_search;
@@ -291,9 +308,7 @@ impl AnyAgent {
         review_cache: ToolCache,
         allowed_tools: &[&str],
     ) -> (crate::agent::runner::AgentRunner, ToolCache) {
-        use crate::agent::agent_loop::{
-            LoopSpawnConfig, loop_tool_to_rig_definition, retrying_stream_fn, spawn_loop_runner,
-        };
+        use crate::agent::agent_loop::{LoopSpawnConfig, retrying_stream_fn, spawn_loop_runner};
         use crate::agent::recovery::RecoveryPolicy;
 
         // Hard guard against accidental sharing: if a caller
@@ -308,10 +323,7 @@ impl AnyAgent {
         // Filter to the caller-supplied allow-list (shared, tested helper).
         let review_tools = filter_loop_tools(&self.loop_tools, allowed_tools);
 
-        let tool_defs: Vec<rig::completion::ToolDefinition> = review_tools
-            .iter()
-            .map(|t| loop_tool_to_rig_definition(t.as_ref()))
-            .collect();
+        let tool_defs = Self::tool_defs_for(&review_tools);
 
         // dirge-z73i: prefer the explicit review_stream_fn when the
         // user configured `review_provider` to point at a different
@@ -331,11 +343,7 @@ impl AnyAgent {
                 (
                     self.build_stream_fn(tool_defs),
                     self.provider_name().to_string(),
-                    if self.model_name.is_empty() {
-                        None
-                    } else {
-                        Some(self.model_name.clone())
-                    },
+                    Self::model_name_opt(&self.model_name),
                 )
             };
         let stream_fn = retrying_stream_fn(inner_stream_fn, RecoveryPolicy::default());
