@@ -18,6 +18,8 @@ pub(crate) mod output_relay;
 pub(crate) mod plan;
 pub(crate) mod question;
 mod read;
+#[cfg(feature = "semantic")]
+mod read_minified;
 mod repo_overview;
 #[cfg(feature = "semantic")]
 pub mod semantic;
@@ -48,6 +50,8 @@ pub use memory::MemoryTool;
 pub use plan::{PlanEnterTool, PlanExitTool};
 pub use question::QuestionTool;
 pub use read::ReadTool;
+#[cfg(feature = "semantic")]
+pub use read_minified::ReadMinifiedTool;
 pub use repo_overview::RepoOverviewTool;
 pub use session_search::SessionSearchTool;
 pub use skill::SkillTool;
@@ -81,6 +85,7 @@ pub const MAX_FIND_RESULTS: usize = 200;
 /// batch #7 unified them so adding a new tool only requires one edit.
 pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "read",
+    "read_minified",
     "write",
     "edit",
     "bash",

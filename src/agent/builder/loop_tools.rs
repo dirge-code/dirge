@@ -189,6 +189,23 @@ pub async fn build_loop_tools(
         .await,
     );
 
+    // Token-efficient minified read (falls back to a plain read for
+    // unsupported languages / ranged reads). Read-only — parallel-safe.
+    #[cfg(feature = "semantic")]
+    tools.push(
+        wrap(
+            tools::ReadMinifiedTool::with_cache(
+                permission.clone(),
+                ask_tx.clone(),
+                cache.clone(),
+                #[cfg(feature = "lsp")]
+                lsp_manager.clone(),
+            ),
+            None,
+        )
+        .await,
+    );
+
     // Mutating — Sequential.
     tools.push(
         wrap(
