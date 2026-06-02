@@ -363,38 +363,14 @@ fn truncate_with_head_tail(s: &str, max_chars: usize) -> String {
     let content_budget = max_chars - MARKER_OVERHEAD;
     let tail_budget = std::cmp::min(1024, content_budget / 10);
     let head_budget = content_budget.saturating_sub(tail_budget);
-    let head_end = char_boundary_at_or_before(s, head_budget);
-    let tail_start = char_boundary_at_or_after(s, s.len().saturating_sub(tail_budget));
+    let head_end = crate::text::char_boundary_at_or_before(s, head_budget);
+    let tail_start = crate::text::char_boundary_at_or_after(s, s.len().saturating_sub(tail_budget));
     let head = &s[..head_end];
     let tail = &s[tail_start..];
     let dropped = s.len().saturating_sub(head.len() + tail.len());
     format!(
         "{head}\n\n[…truncated {dropped} chars — call the tool with a narrower scope (filter, head, pagination) if you need more…]\n\n{tail}"
     )
-}
-
-/// Largest byte index `<= n` that's on a UTF-8 char boundary.
-fn char_boundary_at_or_before(s: &str, n: usize) -> usize {
-    if n >= s.len() {
-        return s.len();
-    }
-    let mut i = n;
-    while i > 0 && !s.is_char_boundary(i) {
-        i -= 1;
-    }
-    i
-}
-
-/// Smallest byte index `>= n` that's on a UTF-8 char boundary.
-fn char_boundary_at_or_after(s: &str, n: usize) -> usize {
-    if n >= s.len() {
-        return s.len();
-    }
-    let mut i = n;
-    while i < s.len() && !s.is_char_boundary(i) {
-        i += 1;
-    }
-    i
 }
 
 /// Prune large tool outputs in the middle section before

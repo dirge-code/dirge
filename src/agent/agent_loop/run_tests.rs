@@ -1388,6 +1388,48 @@ fn transcript_from_value_slice_renders_role_prefixes() {
     );
 }
 
+/// The critic transcript feeds a LOAD-BEARING critic prompt (the F6 in-loop
+/// critic just had a stale-summary bug fixed). Pin its exact output byte-for-
+/// byte so a refactor can't silently shift the `USER:`/`ASSISTANT:` labels, the
+/// `ASSISTANT called name(args)` tool-call rendering, the `TOOL name [tag]: …`
+/// result line, or the trimming — none of which the `.contains()` tests catch.
+#[test]
+fn build_critic_transcript_pins_the_exact_critic_facing_format() {
+    use crate::agent::agent_loop::message::ToolResultMessage;
+    let msgs = vec![
+        user("do the thing"),
+        LoopMessage::Assistant(AssistantMessage::new(
+            vec![
+                ContentBlock::Text {
+                    text: "  on it  ".to_string(),
+                },
+                ContentBlock::ToolCall {
+                    id: "c1".to_string(),
+                    name: "read".to_string(),
+                    arguments: serde_json::json!({"path": "/x"}),
+                },
+            ],
+            StopReason::Stop,
+        )),
+        LoopMessage::ToolResult(ToolResultMessage {
+            tool_call_id: "c1".to_string(),
+            tool_name: "read".to_string(),
+            content: vec![ContentBlock::Text {
+                text: "file contents".to_string(),
+            }],
+            details: serde_json::json!({}),
+            is_error: false,
+        }),
+    ];
+    assert_eq!(
+        super::build_critic_transcript(&msgs),
+        "USER: do the thing\n\
+         ASSISTANT: on it\n\
+         ASSISTANT called read({\"path\":\"/x\"})\n\
+         TOOL read [result]: file contents\n",
+    );
+}
+
 // =====================================================================
 // dirge-ngic — scavenge must inspect both Thinking AND Text blocks.
 // Reasonix combines both at `loop.ts:910-913` →

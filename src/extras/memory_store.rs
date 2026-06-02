@@ -592,11 +592,7 @@ fn scan_for_threats(content: &str) -> Result<(), String> {
 
 /// Truncate a string for error messages.
 fn truncate_for_error(s: &str) -> String {
-    if s.len() <= 60 {
-        s.to_string()
-    } else {
-        format!("{}…", crate::text::head(s, 57))
-    }
+    crate::text::ellipsize(s, 60)
 }
 
 // ── File locking ─────────────────────────────────────────

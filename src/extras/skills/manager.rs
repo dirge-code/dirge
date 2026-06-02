@@ -275,11 +275,7 @@ fn parse_skill_spec(content: &str, dir_name: &str) -> Option<SkillSpec> {
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}…", crate::text::head(s, max.saturating_sub(1)))
-    }
+    crate::text::ellipsize(s, max)
 }
 
 #[cfg(test)]

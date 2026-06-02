@@ -29,6 +29,44 @@ pub(crate) fn tail(s: &str, max_bytes: usize) -> &str {
     &s[start..]
 }
 
+/// Largest byte index `<= n` that's on a UTF-8 char boundary. Use to floor a
+/// head-cut so slicing never panics on a multibyte split.
+pub(crate) fn char_boundary_at_or_before(s: &str, n: usize) -> usize {
+    if n >= s.len() {
+        return s.len();
+    }
+    let mut i = n;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// Smallest byte index `>= n` that's on a UTF-8 char boundary. Use to ceil a
+/// tail-cut so slicing never panics on a multibyte split.
+pub(crate) fn char_boundary_at_or_after(s: &str, n: usize) -> usize {
+    if n >= s.len() {
+        return s.len();
+    }
+    let mut i = n;
+    while i < s.len() && !s.is_char_boundary(i) {
+        i += 1;
+    }
+    i
+}
+
+/// Cap `s` to at most `max_bytes` bytes (UTF-8-safe), appending `…` when it had
+/// to truncate. The `…` (3 bytes) fits within the budget. Returns `s` unchanged
+/// when already within budget. For DISPLAY / error text only — not model-facing
+/// (use the head/tail truncators for prompt context, which carry instructive
+/// markers).
+pub(crate) fn ellipsize(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    format!("{}…", head(s, max_bytes.saturating_sub('…'.len_utf8())))
+}
+
 /// Short display prefix of an id — its first 8 characters. Used across the UI
 /// to compact session / subagent / notification / plugin ids for display.
 /// Char-based (UTF-8 safe) and consistent everywhere, replacing the ~9
@@ -84,5 +122,23 @@ mod tests {
         let cjk = "日本語";
         assert_eq!(tail(cjk, 4), "語"); // last 4 bytes start mid-'本' -> ceil to '語'
         assert_eq!(tail(cjk, 0), "");
+    }
+
+    #[test]
+    fn ellipsize_caps_and_appends_marker_utf8_safe() {
+        assert_eq!(ellipsize("short", 100), "short"); // within budget → unchanged
+        // 3-byte '…' reserved within the budget.
+        assert_eq!(ellipsize("abcdefgh", 6), "abc…");
+        // Never splits a multibyte char: budget 7 reserves 3 for '…', leaves 4
+        // bytes → one full CJK char (3 bytes), floored off the 2nd.
+        assert_eq!(ellipsize("日本語", 7), "日…");
+    }
+
+    #[test]
+    fn char_boundary_helpers_floor_and_ceil() {
+        let cjk = "日本語"; // each char is 3 bytes
+        assert_eq!(char_boundary_at_or_before(cjk, 4), 3); // mid-'本' → floor to 3
+        assert_eq!(char_boundary_at_or_after(cjk, 4), 6); // mid-'本' → ceil to 6
+        assert_eq!(char_boundary_at_or_before(cjk, 99), cjk.len());
     }
 }

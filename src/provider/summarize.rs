@@ -120,25 +120,19 @@ pub(crate) fn head_tail_truncate(prompt: &str, budget: usize) -> String {
     let head_budget = budget * 4 / 10;
     let tail_budget = budget - head_budget - 128; // leave room for the marker
 
-    // Find a newline-aligned head boundary at or before head_budget.
+    // Find a newline-aligned head boundary at or before head_budget, floored to
+    // a UTF-8 char boundary so slicing never panics.
     let head_end = prompt[..head_budget.min(prompt.len())]
         .rfind('\n')
         .unwrap_or(head_budget.min(prompt.len()));
-    // Walk back to a UTF-8 char boundary.
-    let mut head_end = head_end;
-    while head_end > 0 && !prompt.is_char_boundary(head_end) {
-        head_end -= 1;
-    }
+    let head_end = crate::text::char_boundary_at_or_before(prompt, head_end);
 
     let tail_start_target = prompt.len().saturating_sub(tail_budget);
     let tail_start = prompt[tail_start_target..]
         .find('\n')
         .map(|i| tail_start_target + i + 1)
         .unwrap_or(tail_start_target);
-    let mut tail_start = tail_start;
-    while tail_start < prompt.len() && !prompt.is_char_boundary(tail_start) {
-        tail_start += 1;
-    }
+    let tail_start = crate::text::char_boundary_at_or_after(prompt, tail_start);
 
     if tail_start <= head_end {
         // The two halves overlap — prompt is already short enough
