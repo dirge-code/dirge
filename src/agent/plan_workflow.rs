@@ -283,6 +283,31 @@ fn last_json_block(text: &str) -> Option<String> {
     Some(after[..end].trim().to_string())
 }
 
+/// Final output of a phase fork: the assistant's final text, or an error.
+pub type PhaseOutput = Result<String, String>;
+
+/// Orchestrate the **explore → plan** phases. Each phase is run by `run_phase`,
+/// which the runtime (P3e) implements by forking a *fresh* agent via
+/// [`crate::provider::AnyAgent::spawn_phase_runner`] with the given system
+/// prompt + tool allow-list — a genuine context reset per phase. The explore
+/// phase's structured report is handed into the plan phase's prompt (the only
+/// thing carried across the reset). Returns the plan text for the review gate,
+/// or an error if a phase failed or explore produced nothing.
+///
+/// Parameterized by the runner closure so the orchestration is unit-testable
+/// without a real agent/runtime.
+pub async fn run_explore_plan<R, Fut>(request: &str, run_phase: R) -> PhaseOutput
+where
+    R: Fn(String, &'static [&'static str]) -> Fut,
+    Fut: std::future::Future<Output = PhaseOutput>,
+{
+    let report = run_phase(explore_prompt(request), READONLY_PHASE_TOOLS).await?;
+    if report.trim().is_empty() {
+        return Err("explore phase produced no findings".to_string());
+    }
+    run_phase(plan_prompt(request, &report), READONLY_PHASE_TOOLS).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -339,5 +364,85 @@ mod tests {
         assert!(parse_review_verdict("```json\n{not valid json}\n```").is_none());
         // Unknown verdict value → None (caller must not treat as DONE).
         assert!(parse_review_verdict("```json\n{\"verdict\":\"MAYBE\"}\n```").is_none());
+    }
+
+    use std::sync::{Arc, Mutex};
+
+    /// The orchestrator runs explore then plan, gives each the right prompt +
+    /// read-only tool allow-list, and hands the explore report into the plan.
+    #[tokio::test]
+    async fn orchestrates_explore_then_plan_with_handoff() {
+        let calls: Arc<Mutex<Vec<(String, Vec<&'static str>)>>> = Arc::new(Mutex::new(Vec::new()));
+        let calls2 = calls.clone();
+        let run_phase = move |prompt: String, tools: &'static [&'static str]| {
+            let calls = calls2.clone();
+            async move {
+                let n = {
+                    let mut c = calls.lock().unwrap();
+                    c.push((prompt, tools.to_vec()));
+                    c.len()
+                };
+                Ok(if n == 1 {
+                    "core.rs:42 holds the cache map".to_string() // explore report
+                } else {
+                    "### Name\nLRU cache\n### Steps\n...".to_string() // plan
+                })
+            }
+        };
+
+        let plan = run_explore_plan("Add an LRU cache", run_phase)
+            .await
+            .expect("orchestration succeeds");
+        assert!(plan.contains("LRU cache"));
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 2, "explore then plan");
+        // Explore: explore prompt + read-only tools (no write).
+        assert!(calls[0].0.contains("**Explore**") && calls[0].0.contains("Add an LRU cache"));
+        assert!(calls[0].1.contains(&"read") && !calls[0].1.contains(&"write"));
+        // Plan: plan prompt WITH the explore report handed off.
+        assert!(
+            calls[1].0.contains("**Plan**")
+                && calls[1].0.contains("core.rs:42 holds the cache map")
+        );
+        assert!(calls[1].1.contains(&"read") && !calls[1].1.contains(&"edit"));
+    }
+
+    #[tokio::test]
+    async fn explore_failure_aborts_before_plan() {
+        let count = Arc::new(Mutex::new(0));
+        let count2 = count.clone();
+        let run_phase = move |_p: String, _t: &'static [&'static str]| {
+            let count = count2.clone();
+            async move {
+                *count.lock().unwrap() += 1;
+                Err::<String, String>("explore failed".to_string())
+            }
+        };
+        assert!(run_explore_plan("x", run_phase).await.is_err());
+        assert_eq!(
+            *count.lock().unwrap(),
+            1,
+            "plan phase must not run after explore fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_explore_report_is_rejected_before_plan() {
+        let count = Arc::new(Mutex::new(0));
+        let count2 = count.clone();
+        let run_phase = move |_p: String, _t: &'static [&'static str]| {
+            let count = count2.clone();
+            async move {
+                *count.lock().unwrap() += 1;
+                Ok::<String, String>("   ".to_string())
+            }
+        };
+        assert!(run_explore_plan("x", run_phase).await.is_err());
+        assert_eq!(
+            *count.lock().unwrap(),
+            1,
+            "empty explore report → no plan phase"
+        );
     }
 }
