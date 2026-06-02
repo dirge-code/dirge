@@ -184,7 +184,7 @@ debug run_to_cursor { file: "src/auth.py", line: 87 }
 
 ```
 debug set_breakpoints {
-  file: "src/loop.rs",
+  file: "src/extras/loop/transcript.rs",
   line: 128,
   condition: "i > 1000"
 }

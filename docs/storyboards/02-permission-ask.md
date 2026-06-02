@@ -22,9 +22,9 @@ short-circuits before the prompt fires.
 
 ## Implementation
 
-- `src/agent/tools/bash.rs::BashTool::call` — splits the command into
+- `src/agent/tools/bash/mod.rs::BashTool::call` — splits the command into
   segments and submits each to `check_bash_segments`.
-- `src/agent/tools/bash.rs::check_bash_segments` — calls `enforce`
+- `src/agent/tools/bash/check.rs::check_bash_segments` — calls `enforce`
   per segment and per extracted mutation path.
 - `src/agent/tools/mod.rs::enforce` — public entry point; runs
   `PermissionChecker::check` / `check_path` and routes `Ask`
@@ -38,7 +38,7 @@ short-circuits before the prompt fires.
 - `src/permission/checker.rs::track_doom_loop` — per-key counter
   via `repeat_counts`.
 - `src/permission/ask.rs` — `AskRequest`, `UserDecision`, key bindings.
-- `src/permission/engine.rs` — high-risk-tool list that Accept mode
+- `src/permission/engine/classify.rs` — high-risk-tool list that Accept mode
   still asks for (bash, webfetch, task, memory, skill, apply_patch).
 
 ## Edge cases

@@ -113,7 +113,7 @@ When all repairs fail, the raw `serde_json::Error` is not surfaced to the model.
 
 ## Where it lives
 
-The repair layer lives in `src/agent/agent_loop/tool_input_repair.rs`:
+The repair layer lives in `src/agent/agent_loop/tool_input_repair/`:
 
 | Symbol | Role |
 |---|---|

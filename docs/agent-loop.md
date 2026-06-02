@@ -132,7 +132,7 @@ The agent loop lives in `src/agent/agent_loop/`:
 | `retry.rs` | `retrying_stream_fn` — transient-error recovery around a `StreamFn` |
 | `steering.rs` | `steering_from_queue` — shared queue → `GetSteeringMessagesFn` |
 | `plugin_hooks.rs` | Factories that adapt Janet plugin hooks to the loop hook surface |
-| `tool_input_repair.rs` | Validate-then-repair pass for malformed tool-call arguments |
+| `tool_input_repair/` | Validate-then-repair pass for malformed tool-call arguments |
 | `context_manager.rs` | Compaction policy and dispatch for `transform_context` |
 
 ## Production wiring
