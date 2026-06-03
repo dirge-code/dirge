@@ -39,8 +39,13 @@ impl std::io::Write for BackendWriter {
     }
 }
 
-fn build_tui_terminal()
--> Option<ratatui::Terminal<ratatui::backend::CrosstermBackend<BackendWriter>>> {
+/// Build the ratatui terminal and report whether its backend writer is a real
+/// terminal (so synchronized-update brackets are worth emitting). `true` for a
+/// `/dev/tty` handle; for the stdout fallback, follows `IsTerminal(stdout)`.
+fn build_tui_terminal() -> Option<(
+    ratatui::Terminal<ratatui::backend::CrosstermBackend<BackendWriter>>,
+    bool,
+)> {
     // Never open /dev/tty or stdout for painting during tests.
     // cargo test captures stdout but /dev/tty still points at the
     // real terminal.  Multiple test threads calling tui_redraw
@@ -55,11 +60,17 @@ fn build_tui_terminal()
     }
     #[cfg(not(test))]
     {
-        let writer = match crate::ui::terminal::open_tty_for_write() {
-            Some(f) => BackendWriter::Tty(f),
-            None => BackendWriter::Stdout(std::io::stdout()),
+        let (writer, sync_capable) = match crate::ui::terminal::open_tty_for_write() {
+            Some(f) => (BackendWriter::Tty(f), true),
+            None => {
+                let stdout = std::io::stdout();
+                let sync = std::io::IsTerminal::is_terminal(&stdout);
+                (BackendWriter::Stdout(stdout), sync)
+            }
         };
-        ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(writer)).ok()
+        ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(writer))
+            .ok()
+            .map(|t| (t, sync_capable))
     }
 }
 
@@ -360,6 +371,10 @@ pub struct Renderer {
     /// no terminal handle either — this preserves the same testable
     /// shape).
     tui_terminal: Option<ratatui::Terminal<ratatui::backend::CrosstermBackend<BackendWriter>>>,
+    /// Whether the `tui_terminal` backend writes to a real terminal — gates
+    /// the synchronized-update brackets (dirge-wk7m). `false` in tests and when
+    /// painting to a non-tty stdout fallback.
+    tui_sync_capable: bool,
     /// Cached input editor snapshot used when `write_line` / `write`
     /// trigger a redraw — they don't have the editor reference at
     /// hand, but the last `draw_bottom` did. Stored as pre-wrapped
@@ -420,6 +435,10 @@ pub struct Renderer {
 
 impl Renderer {
     pub fn new() -> io::Result<Self> {
+        let (tui_terminal, tui_sync_capable) = match build_tui_terminal() {
+            Some((t, sync)) => (Some(t), sync),
+            None => (None, false),
+        };
         Ok(Renderer {
             lines: 0,
             col: 0,
@@ -459,7 +478,8 @@ impl Renderer {
             // println!, panic, or child-process output can reach
             // the TTY anymore. Falls back to stdout when /dev/tty
             // isn't available (CI tests, headless).
-            tui_terminal: build_tui_terminal(),
+            tui_terminal,
+            tui_sync_capable,
             cached_input_rows: vec![String::new()],
             cached_input_cursor_row: 0,
             cached_input_cursor_col: 0,
@@ -540,6 +560,7 @@ impl Renderer {
             modified_offset,
             cached_modified_rect,
             tui_terminal,
+            tui_sync_capable,
             selection_active,
             selection_start,
             selection_end,
@@ -704,19 +725,23 @@ impl Renderer {
         // ?2026), so the bracket is harmless backwards-compat.
         use crossterm::ExecutableCommand as _;
         use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
-        let mut stdout = std::io::stdout();
-        // Guard synchronization brackets so they never leak escape
-        // codes into non-TTY stdout (e.g. `cargo test`, CI logs,
-        // redirected output). Terminals ignore unsupported DECSET
-        // sequences, but the raw bytes in test output / logs are
-        // noise.
-        let sync = std::io::IsTerminal::is_terminal(&stdout);
+        // dirge-wk7m: emit the brackets through the SAME backend writer
+        // ratatui draws to (`/dev/tty`), NOT process stdout. `TerminalGuard`
+        // redirects fd 1 to the log, so brackets sent to stdout would land in
+        // the log while the frame went to the tty — the synchronized-update
+        // never wrapped the draw and the anti-flicker was dead. Gated on a real
+        // terminal so non-tty paints (CI / redirected) don't accrue escape
+        // noise. Mirrors the OSC-title write below.
+        let sync = *tui_sync_capable;
         if sync {
-            let _ = stdout.execute(BeginSynchronizedUpdate);
+            let _ = terminal.backend_mut().execute(BeginSynchronizedUpdate);
         }
-        let draw_result = terminal.draw(|f| render_frame(&scene, f));
+        // `.map(|_| ())` drops the returned `CompletedFrame` (which borrows
+        // `terminal`) right away, so the End bracket below can re-borrow the
+        // backend.
+        let draw_result = terminal.draw(|f| render_frame(&scene, f)).map(|_| ());
         if sync {
-            let _ = stdout.execute(EndSynchronizedUpdate);
+            let _ = terminal.backend_mut().execute(EndSynchronizedUpdate);
         }
         draw_result?;
 
