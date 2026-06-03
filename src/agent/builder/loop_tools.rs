@@ -27,6 +27,27 @@ use crate::skill::{self, Skill};
 
 use super::build_session_search_tool;
 
+/// Built-in tool names take precedence over externally-sourced tools: an MCP
+/// server or plugin may not shadow `read`/`bash`/etc. — rig's builder and the
+/// LoopTool registry would otherwise prefer the last-added tool, letting an
+/// arbitrary external tool replace a core dirge tool. Returns `true` when
+/// `name` collides with a built-in (emitting a warning that names `source`,
+/// e.g. `"MCP server 'foo'"` or `"plugin"`) so the caller can skip it.
+///
+/// Single source of truth for the collision policy, previously inlined
+/// verbatim at three sites (MCP eager + MCP background + plugin) [dirge-p99h].
+#[cfg(any(feature = "mcp", feature = "plugin"))]
+fn shadows_builtin(name: &str, source: &str) -> bool {
+    if tools::BUILTIN_TOOL_NAMES.contains(&name) {
+        eprintln!(
+            "warning: {source} exports tool '{name}' which collides with a dirge built-in; skipping it",
+        );
+        true
+    } else {
+        false
+    }
+}
+
 /// dirge-x949: wrap a batch of freshly-collected MCP tools into the
 /// `LoopTool` adapters the agent loop dispatches against, applying the
 /// same built-in-name collision filter `build_loop_tools` uses. Pulled
@@ -38,15 +59,10 @@ pub async fn wrap_mcp_tools(
     mcp_tools: Vec<crate::extras::mcp::tool::McpTool>,
 ) -> Vec<Arc<dyn crate::agent::agent_loop::LoopTool>> {
     use crate::agent::agent_loop::RigToolAdapter;
-    let builtin_names: &[&str] = tools::BUILTIN_TOOL_NAMES;
     let mut out: Vec<Arc<dyn crate::agent::agent_loop::LoopTool>> = Vec::new();
     for mcp_tool in mcp_tools {
         let name = mcp_tool.definition.name.to_string();
-        if builtin_names.contains(&name.as_str()) {
-            eprintln!(
-                "warning: MCP server '{}' exports tool '{}' which collides with a dirge built-in; skipping MCP version",
-                mcp_tool.server_name, name,
-            );
+        if shadows_builtin(&name, &format!("MCP server '{}'", mcp_tool.server_name)) {
             continue;
         }
         let adapter = RigToolAdapter::new(Box::new(mcp_tool)).await;
@@ -88,13 +104,10 @@ pub struct DynamicToolSearch {
 /// default (Parallel) — batches of all-read-only tools dispatch
 /// concurrently.
 ///
-/// Note: tool construction is temporarily duplicated between
-/// `build_agent_inner` (rig path, retained for the rig Agent's
-/// preamble + model only) and `build_loop_tools` (new path,
-/// active dispatch). The rig Agent's tools are no longer
-/// invoked after phase 4.5h-6 — the loop dispatches through
-/// the LoopTool registry returned here. A follow-up commit can
-/// strip the unused tool list from `build_agent_inner`.
+/// This is the single source of truth for the agent's tool set: the loop
+/// dispatches through the `LoopTool` registry returned here. `build_agent_inner`
+/// builds only the rig Agent's preamble + model (it no longer constructs tools
+/// as of dirge-tfip).
 #[allow(clippy::too_many_arguments)]
 pub async fn build_loop_tools(
     cache: ToolCache,
@@ -479,14 +492,9 @@ pub async fn build_loop_tools(
         let mcp_tools = manager
             .collect_tools(permission.clone(), ask_tx.clone())
             .await;
-        let builtin_names: &[&str] = tools::BUILTIN_TOOL_NAMES;
         for mcp_tool in mcp_tools {
             let name = mcp_tool.definition.name.to_string();
-            if builtin_names.contains(&name.as_str()) {
-                eprintln!(
-                    "warning: MCP server '{}' exports tool '{}' which collides with a dirge built-in; skipping MCP version",
-                    mcp_tool.server_name, name,
-                );
+            if shadows_builtin(&name, &format!("MCP server '{}'", mcp_tool.server_name)) {
                 continue;
             }
             tools.push(wrap(mcp_tool, None).await);
@@ -517,13 +525,8 @@ pub async fn build_loop_tools(
             Ok(mut guard) => guard.list_plugin_tools(),
             Err(_) => Vec::new(),
         };
-        let builtin_names: &[&str] = tools::BUILTIN_TOOL_NAMES;
         for meta in metas {
-            if builtin_names.contains(&meta.name.as_str()) {
-                eprintln!(
-                    "warning: plugin tool '{}' collides with a dirge built-in; skipping plugin version",
-                    meta.name,
-                );
+            if shadows_builtin(&meta.name, "plugin") {
                 continue;
             }
             if let Some(adapter) =
@@ -566,4 +569,22 @@ pub async fn build_loop_tools(
     };
 
     (tools, tool_def_filter)
+}
+
+#[cfg(all(test, any(feature = "mcp", feature = "plugin")))]
+mod tests {
+    use super::shadows_builtin;
+
+    /// Locks the collision policy the MCP + plugin registration sites share:
+    /// a name matching a dirge built-in is rejected (so external tools can't
+    /// shadow `read`/`bash`/etc.); any other name is accepted.
+    #[test]
+    fn shadows_builtin_rejects_only_builtins() {
+        // "read" / "bash" are core built-ins → must be rejected.
+        assert!(shadows_builtin("read", "MCP server 'x'"));
+        assert!(shadows_builtin("bash", "plugin"));
+        // A name no built-in uses → accepted.
+        assert!(!shadows_builtin("totally_custom_tool", "plugin"));
+        assert!(!shadows_builtin("acme_search", "MCP server 'acme'"));
+    }
 }
