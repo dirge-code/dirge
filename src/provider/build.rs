@@ -85,27 +85,11 @@ pub async fn build_agent(
             #[cfg(feature = "lsp")]
             let lsp_for_loop = lsp_manager.clone();
 
-            let (agent, cache, memory_provider) = builder::build_agent_inner(
-                $m,
-                cli,
-                cfg,
-                context,
-                permission,
-                ask_tx,
-                question_tx.clone(),
-                plan_tx.clone(),
-                bg_store.clone(),
-                #[cfg(feature = "lsp")]
-                lsp_manager.clone(),
-                sandbox.clone(),
-                Some(parent_model.clone()),
-                #[cfg(feature = "mcp")]
-                mcp_manager,
-                #[cfg(feature = "semantic")]
-                semantic_manager,
-                session_id.clone(),
-            )
-            .await;
+            // build_agent_inner now only needs model + cli/cfg/context for the
+            // preamble — all tool wiring flows to build_loop_tools below
+            // [dirge-tfip].
+            let (agent, cache, memory_provider) =
+                builder::build_agent_inner($m, cli, cfg, context).await;
 
             // Phase 4.5h-6: also build the LoopTool registry the
             // new agent_loop path dispatches against. Tools share

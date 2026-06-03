@@ -409,29 +409,8 @@ async fn build_agent_inner_emits_assembled_preamble() {
         .expect("openai client builds")
         .completions_api();
     let model = client.completion_model("gpt-4o");
-    let sandbox = Sandbox::new(false);
 
-    let (agent, _cache, _provider) = build_agent_inner(
-        model,
-        &cli,
-        &cfg,
-        &context,
-        None, // permission
-        None, // ask_tx
-        None, // question_tx
-        None, // plan_tx
-        None, // bg_store
-        #[cfg(feature = "lsp")]
-        None,
-        sandbox,
-        None, // parent_model
-        #[cfg(feature = "mcp")]
-        None,
-        #[cfg(feature = "semantic")]
-        None,
-        None, // session_id
-    )
-    .await;
+    let (agent, _cache, _provider) = build_agent_inner(model, &cli, &cfg, &context).await;
 
     let preamble = agent.preamble.unwrap_or_default();
 

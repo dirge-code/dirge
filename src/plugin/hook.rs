@@ -55,7 +55,12 @@ impl HookedToolDyn {
     /// Wrap `inner` and read the PluginManager from the process-global
     /// slot set by `init_global`. If no global is installed, the wrapper
     /// is a transparent passthrough.
-    #[cfg_attr(not(feature = "plugin"), allow(dead_code))]
+    ///
+    /// Retained (like `with_manager`) but currently uncalled: post phase
+    /// 4.5h-6 the rig `Agent` attaches no tools, so the old rig-path
+    /// `hookify` that wrapped each tool here is gone. The live loop hooks
+    /// plugins via `agent_loop::plugin_hooks` instead [dirge-tfip].
+    #[allow(dead_code)]
     pub fn wrap_global(inner: Box<dyn ToolDyn>) -> Box<dyn ToolDyn> {
         let pm = global();
         if pm.is_none() {
