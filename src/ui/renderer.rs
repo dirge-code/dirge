@@ -351,6 +351,16 @@ pub struct Renderer {
     /// (text, color); painter centers text horizontally within the
     /// frame's inner band.
     alert_overlay: Option<Vec<(String, Color)>>,
+    /// Picker candidate-list overlay fed to the scene each frame (file
+    /// completion or rewind list). Recomputed by `draw_bottom` from the input
+    /// editor's file picker, falling back to `rewind_overlay`; cached so
+    /// `render_viewport` (which has no editor handle) repaints it too
+    /// [dirge-92em].
+    picker_overlay: Option<crate::ui::picker::PickerOverlay>,
+    /// Rewind-mode list-picker overlay. Set/cleared explicitly by the rewind
+    /// flow (it lives outside the input editor); folded into `picker_overlay`
+    /// by `draw_bottom` when no file picker is active.
+    rewind_overlay: Option<crate::ui::picker::PickerOverlay>,
     /// ui-redesign: title shown in the bottom-frame's top border
     /// when the alert overlay is active. Empty when no overlay (the
     /// idle input has no title, per the mockup). Caller of
@@ -467,6 +477,8 @@ impl Renderer {
             #[cfg(feature = "dap")]
             debug_panel_data: None,
             alert_overlay: None,
+            picker_overlay: None,
+            rewind_overlay: None,
             alert_title: String::new(),
             avatar_state: crate::ui::avatar::AvatarState::Idle,
             avatar_tick: false,
@@ -546,6 +558,7 @@ impl Renderer {
             left_panel_info,
             subagent_status,
             alert_overlay,
+            picker_overlay,
             alert_title,
             avatar_state,
             avatar_tick,
@@ -710,6 +723,7 @@ impl Renderer {
             show_right_panel,
             frame_color,
             background: crate::ui::theme::background(),
+            picker: picker_overlay.as_ref(),
             right_panel_mode: *right_panel_mode,
             #[cfg(feature = "dap")]
             debug_panel_data: self.debug_panel_data.as_ref(),
@@ -1032,6 +1046,14 @@ impl Renderer {
         self.alert_title.clear();
     }
 
+    /// Set (or clear, with `None`) the rewind-mode list-picker overlay. The
+    /// file-completion picker syncs itself from the input editor in
+    /// `draw_bottom`; the rewind picker lives outside the editor, so its flow
+    /// sets this explicitly on enter/update and clears it on exit [dirge-92em].
+    pub fn set_rewind_overlay(&mut self, overlay: Option<crate::ui::picker::PickerOverlay>) {
+        self.rewind_overlay = overlay;
+    }
+
     pub fn set_panel_data(&mut self, data: PanelData) {
         // dirge-b11: when the MODIFIED list GROWS (a new file
         // modification just entered the tracker) reset the user's
@@ -1186,19 +1208,6 @@ impl Renderer {
     pub fn visible_lines(&self) -> usize {
         let (_, rows) = self.terminal_size();
         rows.saturating_sub(self.input_rows + 1 + ALERT_FRAME_ROWS + CHAT_FRAME_ROWS) as usize
-    }
-
-    /// The screen row index where the input box starts. Overlays that need
-    /// to anchor *above* the input box (e.g. the file picker) should treat
-    /// this as their bottom limit.
-    pub fn input_top_row(&self) -> u16 {
-        let (_, rows) = self.terminal_size();
-        // ui-redesign: input_top sits BELOW the [ALERT] top border
-        // and ABOVE the bottom border + status row. Reserve
-        // input_rows for input + 1 for status + (ALERT_FRAME_ROWS - 1)
-        // for the bottom border; subtracting (input_rows +
-        // ALERT_FRAME_ROWS) puts us right after the top border row.
-        rows.saturating_sub(self.input_rows + ALERT_FRAME_ROWS)
     }
 
     /// Map a screen `(row, col)` to a `(line_idx, char_col)` anchor for
@@ -1663,6 +1672,17 @@ impl Renderer {
             self.spinner_tick = !self.spinner_tick;
             self.avatar_tick = !self.avatar_tick;
         }
+
+        // Sync the picker overlay from the editor's file picker (the source of
+        // truth — auto-clears when it deactivates), falling back to a
+        // rewind-mode overlay set externally. Cached so `render_viewport`
+        // (no editor handle) repaints it too [dirge-92em].
+        self.picker_overlay = editor
+            .picker
+            .as_ref()
+            .filter(|p| p.active)
+            .map(|p| p.overlay())
+            .or_else(|| self.rewind_overlay.clone());
 
         self.tui_redraw()
     }

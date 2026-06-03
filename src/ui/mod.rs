@@ -821,6 +821,7 @@ pub async fn run_interactive(
                         if is_ctrl_c || is_ctrl_d {
                             if rewind_picker.active {
                                 rewind_picker.deactivate();
+                                renderer.set_rewind_overlay(None);
                                 renderer.render_viewport()?;
                                 renderer.draw_bottom(
                                     &input,
@@ -992,14 +993,17 @@ pub async fn run_interactive(
                             if rewind_picker.active {
                                 renderer.render_viewport()?;
                             }
+                            // Reflect the picker's post-handle_key state into the
+                            // scene overlay (Some while active, None once a
+                            // selection deactivated it) [dirge-92em].
+                            renderer.set_rewind_overlay(
+                                rewind_picker.active.then(|| rewind_picker.overlay()),
+                            );
                             renderer.draw_bottom(
                                 &input,
                                 &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), interjection_queue.lock().unwrap().len()),
                                 is_running,
                             )?;
-                            if rewind_picker.active {
-                                rewind_picker.draw()?;
-                            }
                             continue;
                         }
 
@@ -1019,7 +1023,7 @@ pub async fn run_interactive(
                                 && now.duration_since(prev) < std::time::Duration::from_millis(1500) {
                                     last_esc = None;
                                     open_rewind_picker(session, &mut rewind_picker);
-                                    rewind_picker.draw()?;
+                                    renderer.set_rewind_overlay(Some(rewind_picker.overlay()));
                                     renderer.draw_bottom(
                                         &input,
                                         &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), interjection_queue.lock().unwrap().len()),
@@ -1262,9 +1266,6 @@ pub async fn run_interactive(
                                     &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), interjection_queue.lock().unwrap().len()),
                                     is_running,
                                 )?;
-                                if let Some(ref picker) = input.picker {
-                                    picker.draw(renderer.input_top_row())?;
-                                }
                                 continue;
                             }
 
@@ -1825,9 +1826,6 @@ pub async fn run_interactive(
                             &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), interjection_queue.lock().unwrap().len()),
                             is_running,
                         )?;
-                        if let Some(ref picker) = input.picker {
-                            picker.draw(renderer.input_top_row())?;
-                        }
                     }
                 }
             }
@@ -2136,9 +2134,6 @@ pub async fn run_interactive(
                     &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), interjection_queue.lock().unwrap().len()),
                     is_running,
                 )?;
-                if let Some(ref picker) = input.picker {
-                    picker.draw(renderer.input_top_row())?;
-                }
             }
             Some(ask_req) = async {
                 if let Some(rx) = &mut ask_rx {
@@ -2616,9 +2611,6 @@ pub async fn run_interactive(
                     &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), interjection_queue.lock().unwrap().len()),
                     is_running,
                 )?;
-                if let Some(ref picker) = input.picker {
-                    picker.draw(renderer.input_top_row())?;
-                }
             }
             Some(notif) = async {
                 if let Some(rx) = &mut notify_rx {
@@ -3350,9 +3342,6 @@ pub async fn run_interactive(
                     &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), interjection_queue.lock().unwrap().len()),
                     is_running,
                 )?;
-                if let Some(ref picker) = input.picker {
-                    picker.draw(renderer.input_top_row())?;
-                }
             }
             Some(dialog_req) = async {
                 if let Some(rx) = dialog_rx.as_mut() {
@@ -3643,9 +3632,6 @@ pub async fn run_interactive(
                     &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), interjection_queue.lock().unwrap().len()),
                     is_running,
                 )?;
-                if let Some(ref picker) = input.picker {
-                    picker.draw(renderer.input_top_row())?;
-                }
             }
             _ = tokio::time::sleep(tokio::time::Duration::from_millis(200)), if is_running => {
                 renderer.draw_bottom(
@@ -3653,9 +3639,6 @@ pub async fn run_interactive(
                     &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), interjection_queue.lock().unwrap().len()),
                     is_running,
                 )?;
-                if let Some(ref picker) = input.picker {
-                    picker.draw(renderer.input_top_row())?;
-                }
             }
             else => {
                 tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;

@@ -1,15 +1,24 @@
 #[allow(unused_imports)]
 use crate::sync_util::LockExt;
-use std::io::Write;
 use std::path::{Component, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use crossterm::ExecutableCommand;
-use crossterm::cursor::MoveTo;
-use crossterm::style::{Color, ResetColor, SetForegroundColor};
-use crossterm::terminal::Clear;
-
-use super::resolve_color;
+/// Owned snapshot of a picker's display state, handed to the renderer so its
+/// candidate list is painted through the ratatui scene — visible on `/dev/tty`,
+/// diff-safe, and inheriting the theme background. Previously the pickers wrote
+/// raw cursor-positioned escapes to `std::io::stdout()`, which `TerminalGuard`
+/// redirects to the log, so the overlay never reached the screen [dirge-92em].
+#[derive(Clone, Default)]
+pub struct PickerOverlay {
+    /// Header line (the `ListPicker` prompt); `None` for the file picker.
+    pub title: Option<String>,
+    /// Candidate rows as pre-formatted display strings.
+    pub rows: Vec<String>,
+    /// Index of the highlighted row into `rows`.
+    pub selected: usize,
+    /// Shown when `rows` is empty (e.g. `"no matches"`).
+    pub empty_hint: Option<String>,
+}
 
 pub struct ListPicker {
     pub active: bool,
@@ -32,10 +41,6 @@ impl ListPicker {
 
     pub fn set_monochrome(&mut self, monochrome: bool) {
         self.monochrome = monochrome;
-    }
-
-    fn color(&self, color: Color) -> Color {
-        resolve_color(color, self.monochrome)
     }
 
     pub fn activate(&mut self, prompt: &str, items: Vec<String>) {
@@ -82,34 +87,14 @@ impl ListPicker {
         }
     }
 
-    pub fn draw(&self) -> std::io::Result<()> {
-        use std::io::Write;
-        let mut stdout = std::io::stdout();
-        crossterm::execute!(
-            stdout,
-            SetForegroundColor(self.color(crate::ui::theme::accent())),
-        )?;
-        writeln!(stdout, "  {}", self.prompt)?;
-        writeln!(stdout)?;
-
-        for (i, item) in self.items.iter().enumerate() {
-            let truncated: String = item.chars().take(60).collect();
-            if i == self.selected {
-                crossterm::execute!(
-                    stdout,
-                    SetForegroundColor(self.color(crate::ui::theme::accent())),
-                )?;
-                writeln!(stdout, " ▸ {}", truncated)?;
-            } else {
-                crossterm::execute!(
-                    stdout,
-                    SetForegroundColor(self.color(crate::ui::theme::dim())),
-                )?;
-                writeln!(stdout, "   {}", truncated)?;
-            }
+    /// Snapshot for the renderer to paint through the ratatui scene.
+    pub fn overlay(&self) -> PickerOverlay {
+        PickerOverlay {
+            title: (!self.prompt.is_empty()).then(|| self.prompt.clone()),
+            rows: self.items.clone(),
+            selected: self.selected,
+            empty_hint: None,
         }
-        crossterm::execute!(stdout, ResetColor)?;
-        Ok(())
     }
 }
 
@@ -138,10 +123,6 @@ impl FilePicker {
 
     pub fn set_monochrome(&mut self, monochrome: bool) {
         self.monochrome = monochrome;
-    }
-
-    fn color(&self, color: Color) -> Color {
-        resolve_color(color, self.monochrome)
     }
 
     pub fn activate(&mut self) {
@@ -235,81 +216,20 @@ impl FilePicker {
         *self.file_cache.lock_ignore_poison() = files;
     }
 
-    /// Draw the picker overlay just above the input box.
-    ///
-    /// `input_top` is the screen row where the input box begins — the picker
-    /// stops one row above it. With the multi-line input feature, the input
-    /// box can be several rows tall, so we can't hardcode `rows - 2` here
-    /// anymore.
-    pub fn draw(&self, input_top: u16) -> std::io::Result<()> {
-        if !self.active {
-            return Ok(());
+    /// Snapshot for the renderer to paint above the input box through the
+    /// ratatui scene. Rows are the matched paths; an empty match set surfaces
+    /// the `"no matches"` hint.
+    pub fn overlay(&self) -> PickerOverlay {
+        PickerOverlay {
+            title: None,
+            rows: self
+                .matches
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect(),
+            selected: self.selected,
+            empty_hint: Some("no matches".to_string()),
         }
-        let (cols, _rows) = crate::ui::terminal::tty_size();
-        let mut stdout = std::io::stdout();
-
-        // Bottom anchor row for the picker — one above the input box.
-        let bottom_anchor = input_top.saturating_sub(1);
-        // Cap list height so we don't run off the top of the screen.
-        let max_items = (bottom_anchor as usize).min(10);
-
-        if self.matches.is_empty() {
-            stdout.execute(MoveTo(0, bottom_anchor))?;
-            write!(
-                stdout,
-                "{}",
-                SetForegroundColor(self.color(crate::ui::theme::dim()))
-            )?;
-            write!(stdout, "no matches")?;
-            write!(stdout, "{}", ResetColor)?;
-            stdout.flush()?;
-            return Ok(());
-        }
-
-        let list_height = max_items.min(self.matches.len());
-        let start_idx = self
-            .selected
-            .saturating_sub(list_height / 2)
-            .min(self.matches.len().saturating_sub(list_height));
-        let end_idx = (start_idx + list_height).min(self.matches.len());
-
-        let top_row = bottom_anchor.saturating_sub(list_height as u16);
-
-        for i in start_idx..end_idx {
-            let render_row = top_row + (i - start_idx) as u16;
-            stdout.execute(MoveTo(0, render_row))?;
-            write!(
-                stdout,
-                "{}",
-                Clear(crossterm::terminal::ClearType::CurrentLine)
-            )?;
-
-            let path = &self.matches[i];
-            let display = path.to_string_lossy();
-            let truncated: String = display
-                .chars()
-                .take(cols.saturating_sub(3) as usize)
-                .collect();
-
-            if i == self.selected {
-                write!(
-                    stdout,
-                    "{}",
-                    SetForegroundColor(self.color(crate::ui::theme::accent()))
-                )?;
-                write!(stdout, "▸ {}", truncated)?;
-            } else {
-                write!(
-                    stdout,
-                    "{}",
-                    SetForegroundColor(self.color(crate::ui::theme::dim()))
-                )?;
-                write!(stdout, "  {}", truncated)?;
-            }
-            write!(stdout, "{}", ResetColor)?;
-        }
-        stdout.flush()?;
-        Ok(())
     }
 }
 

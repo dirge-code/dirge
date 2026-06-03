@@ -75,6 +75,10 @@ pub struct Scene<'a> {
     /// Terminal background fill (theme-configurable). `Color::Reset` = no fill
     /// (keep the terminal's own background).
     pub background: crossterm::style::Color,
+    /// Active picker overlay (file completion / rewind list), painted over the
+    /// bottom rows of the chat region just above the input box. `None` when no
+    /// picker is open [dirge-92em].
+    pub picker: Option<&'a crate::ui::picker::PickerOverlay>,
 }
 
 /// Paint the entire UI into `f`. Computes layout from the frame's
@@ -154,6 +158,14 @@ pub fn render_frame(scene: &Scene, f: &mut Frame<'_>) {
     }
     f.render_widget(strip, area);
 
+    // Picker overlay (file completion / rewind list) — painted over the bottom
+    // rows of the chat content area, just above the input box. Rendered here
+    // (after the chat + strip, before the bg fill) so it overlays chat content
+    // and still inherits the theme background fill below [dirge-92em].
+    if let Some(picker) = scene.picker {
+        paint_picker_overlay(f, &layout, picker);
+    }
+
     // Theme background fill. Every widget above sets foreground only (selection
     // uses the REVERSED modifier, never an explicit bg), so patching the whole
     // area with `bg` sets each cell's background while leaving foregrounds — and
@@ -203,6 +215,73 @@ pub fn render_frame(scene: &Scene, f: &mut Frame<'_>) {
     }
 }
 
+/// Paint a picker's candidate list over the bottom rows of the chat content
+/// area (anchored just above the input box). Each painted row is space-padded
+/// to the full chat width so it fully covers the chat text underneath; the
+/// theme background fill in `render_frame` then colors every cell. The
+/// highlighted row uses the accent color with a `▸` marker, others use dim.
+fn paint_picker_overlay(
+    f: &mut Frame<'_>,
+    layout: &Layout,
+    picker: &crate::ui::picker::PickerOverlay,
+) {
+    let chat = layout.chat;
+    if chat.width == 0 || chat.height == 0 {
+        return;
+    }
+    let accent = Style::default().fg(crossterm_to_ratatui(crate::ui::theme::accent()));
+    let dim = Style::default().fg(crossterm_to_ratatui(crate::ui::theme::dim()));
+    let width = chat.width as usize;
+
+    // Build the (text, style) lines bottom-up: candidate rows, then an optional
+    // title header above them.
+    let mut lines: Vec<(String, Style)> = Vec::new();
+
+    if picker.rows.is_empty() {
+        let hint = picker.empty_hint.as_deref().unwrap_or("");
+        if !hint.is_empty() {
+            lines.push((hint.to_string(), dim));
+        }
+    } else {
+        // Reserve a row for the title (if any) within the height budget.
+        let title_rows = usize::from(picker.title.is_some());
+        let max_list = (chat.height as usize).min(10).saturating_sub(title_rows);
+        if max_list > 0 {
+            let n = max_list.min(picker.rows.len());
+            // Window the visible slice so `selected` stays in view.
+            let start = picker
+                .selected
+                .saturating_sub(n / 2)
+                .min(picker.rows.len().saturating_sub(n));
+            for i in start..(start + n) {
+                let marker = if i == picker.selected { "▸ " } else { "  " };
+                let style = if i == picker.selected { accent } else { dim };
+                lines.push((format!("{marker}{}", picker.rows[i]), style));
+            }
+        }
+        if let Some(title) = &picker.title {
+            lines.push((format!("  {title}"), accent));
+        }
+    }
+
+    if lines.is_empty() {
+        return;
+    }
+    // Anchor the block at the bottom of the chat area; `lines` is bottom-up.
+    let block_h = (lines.len() as u16).min(chat.height);
+    let buf = f.buffer_mut();
+    for (offset, (text, style)) in lines.iter().take(block_h as usize).enumerate() {
+        let y = chat.bottom().saturating_sub(1 + offset as u16);
+        // Truncate to width, then pad with spaces so the whole row is overwritten.
+        let mut padded: String = text.chars().take(width).collect();
+        let cells = padded.chars().count();
+        if cells < width {
+            padded.push_str(&" ".repeat(width - cells));
+        }
+        buf.set_stringn(chat.x, y, &padded, width, *style);
+    }
+}
+
 // `BottomBody` is Copy so `render_frame` can pass it to BottomStrip
 // directly without a clone helper.
 
@@ -247,6 +326,7 @@ pub fn empty_scene<'a>(
         show_right_panel: true,
         frame_color: crossterm::style::Color::Green,
         background: crossterm::style::Color::Reset,
+        picker: None,
     }
 }
 
@@ -386,6 +466,7 @@ mod tests {
             show_right_panel: true,
             frame_color: crossterm::style::Color::Green,
             background: crossterm::style::Color::Reset,
+            picker: None,
         };
 
         let mut backend = TestBackend::new(160, 30);
@@ -424,6 +505,73 @@ mod tests {
             "got body {:?}",
             body_row
         );
+    }
+
+    /// Read the whole TestBackend buffer into one newline-joined string.
+    fn dump(backend: &TestBackend, w: u16, h: u16) -> String {
+        let mut s = String::new();
+        for y in 0..h {
+            for x in 0..w {
+                s.push_str(backend.buffer().cell((x, y)).unwrap().symbol());
+            }
+            s.push('\n');
+        }
+        s
+    }
+
+    /// dirge-92em: an active picker paints its candidate list (with the `▸`
+    /// marker on the selected row) through the scene, so it actually reaches
+    /// the screen instead of the redirected stdout fd.
+    #[test]
+    fn picker_overlay_paints_candidate_list() {
+        let buf: Vec<LineEntry> = Vec::new();
+        let pd = PanelData::default();
+        let info = LeftPanelInfo::default();
+        let subs: Vec<SubagentStatusRow> = Vec::new();
+        let overlay = crate::ui::picker::PickerOverlay {
+            title: None,
+            rows: vec![
+                "src/main.rs".into(),
+                "src/lib.rs".into(),
+                "Cargo.toml".into(),
+            ],
+            selected: 1,
+            empty_hint: Some("no matches".into()),
+        };
+        let mut scene = empty_scene(&buf, &pd, &info, &subs, "ready");
+        scene.picker = Some(&overlay);
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|f| render_frame(&scene, f)).unwrap();
+        let dumped = dump(terminal.backend(), 120, 30);
+
+        assert!(dumped.contains("src/main.rs"), "non-selected row missing");
+        assert!(dumped.contains("Cargo.toml"), "non-selected row missing");
+        assert!(
+            dumped.contains("▸ src/lib.rs"),
+            "selected row + marker missing"
+        );
+    }
+
+    /// An empty match set surfaces the "no matches" hint.
+    #[test]
+    fn picker_overlay_empty_shows_hint() {
+        let buf: Vec<LineEntry> = Vec::new();
+        let pd = PanelData::default();
+        let info = LeftPanelInfo::default();
+        let subs: Vec<SubagentStatusRow> = Vec::new();
+        let overlay = crate::ui::picker::PickerOverlay {
+            title: None,
+            rows: vec![],
+            selected: 0,
+            empty_hint: Some("no matches".into()),
+        };
+        let mut scene = empty_scene(&buf, &pd, &info, &subs, "ready");
+        scene.picker = Some(&overlay);
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|f| render_frame(&scene, f)).unwrap();
+        assert!(dump(terminal.backend(), 120, 30).contains("no matches"));
     }
 
     /// Side panel suppression: a narrow terminal (line_w ≤
@@ -575,6 +723,7 @@ mod tests {
             show_right_panel: true,
             frame_color: crossterm::style::Color::Green,
             background: crossterm::style::Color::Reset,
+            picker: None,
         };
         terminal.draw(|f| render_frame(&s1, f)).unwrap();
 
@@ -606,6 +755,7 @@ mod tests {
             show_right_panel: true,
             frame_color: crossterm::style::Color::Green,
             background: crossterm::style::Color::Reset,
+            picker: None,
         };
         terminal.draw(|f| render_frame(&s2, f)).unwrap();
         backend = terminal.backend().clone();
