@@ -1422,6 +1422,13 @@ impl Renderer {
         }
     }
 
+    /// True when the chat is scrolled up off the newest content
+    /// (`scroll_offset > 0`). Lets the input loop snap back to the bottom the
+    /// moment the user starts interacting with the input.
+    pub fn is_scrolled_up(&self) -> bool {
+        self.scroll_offset > 0
+    }
+
     pub fn scroll_page_up(&mut self) {
         let visible = self.visible_lines();
         let page = visible.saturating_sub(2).max(1);

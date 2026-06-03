@@ -1290,6 +1290,36 @@ pub async fn run_interactive(
                                 continue;
                             }
 
+                        // Snap the chat back to the newest content the instant
+                        // the user starts interacting with the input — typing a
+                        // character or pressing Down — so they don't have to
+                        // hand-scroll all the way down from deep in the history.
+                        // (Picker / plugin-shortcut / scroll keys were already
+                        // handled-and-`continue`d above, so anything here is
+                        // headed for the input editor.)
+                        if renderer.is_scrolled_up() {
+                            match scroll_snap_for(&key) {
+                                Some(ScrollSnap::Jump) => {
+                                    // The jump IS the action — snap to the
+                                    // bottom and consume the key (don't also
+                                    // move the input cursor).
+                                    renderer.scroll_to_bottom()?;
+                                    renderer.draw_bottom(
+                                        &input,
+                                        &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), interjection_queue.lock().unwrap().len()),
+                                        is_running,
+                                    )?;
+                                    continue;
+                                }
+                                Some(ScrollSnap::TypeThrough) => {
+                                    // Snap to the bottom, then fall through so
+                                    // the editor still inserts the character.
+                                    renderer.scroll_to_bottom()?;
+                                }
+                                None => {}
+                            }
+                        }
+
                         // Keep the editor's wrap width in sync with the
                         // rendered box so Up/Down move by wrapped display
                         // rows (dirge-5w9v).
@@ -3676,6 +3706,37 @@ fn is_safe_during_agent(text: &str) -> bool {
         ("/memory", Some("list")) | ("/skill", Some("list"))
     );
     always_safe || safe_when_no_arg || safe_when_list
+}
+
+/// When the chat is scrolled up off the newest content, what a key that's about
+/// to reach the input editor should do to the scroll position. `None` leaves
+/// the scroll alone.
+#[derive(Debug, PartialEq, Eq)]
+enum ScrollSnap {
+    /// Down was pressed — snap to the bottom and CONSUME the key (the jump is
+    /// the whole action; don't also move the input cursor).
+    Jump,
+    /// A character was typed — snap to the bottom but still let the editor
+    /// insert the character.
+    TypeThrough,
+}
+
+/// Decide the scroll-snap behavior for a key headed to the input editor. Plain
+/// typing and a plain Down snap back to the newest content; modified combos
+/// (Ctrl/Alt/Super — those are commands) and every other key leave the scroll
+/// where it is. Pure so the modifier rules are unit-testable.
+fn scroll_snap_for(key: &crossterm::event::KeyEvent) -> Option<ScrollSnap> {
+    let modified = key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER);
+    if modified {
+        return None;
+    }
+    match key.code {
+        KeyCode::Down => Some(ScrollSnap::Jump),
+        KeyCode::Char(_) => Some(ScrollSnap::TypeThrough),
+        _ => None,
+    }
 }
 
 #[cfg(test)]

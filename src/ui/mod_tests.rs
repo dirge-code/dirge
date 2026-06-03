@@ -620,3 +620,41 @@ fn memory_skill_list_safe_during_agent() {
     assert!(!is_safe_during_agent("/memory add key value"));
     assert!(!is_safe_during_agent("/skill load foo"));
 }
+
+// ============================================================
+// scroll_snap_for — typing / Down jump the scrolled-up chat to bottom
+// ============================================================
+
+#[test]
+fn scroll_snap_typing_and_down_snap_but_command_combos_dont() {
+    use crossterm::event::KeyEvent;
+    let none = KeyModifiers::NONE;
+
+    // Plain typing → snap to bottom AND still insert the char.
+    assert_eq!(
+        scroll_snap_for(&KeyEvent::new(KeyCode::Char('a'), none)),
+        Some(ScrollSnap::TypeThrough)
+    );
+    // Shift+char (a capital) is still typing.
+    assert_eq!(
+        scroll_snap_for(&KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT)),
+        Some(ScrollSnap::TypeThrough)
+    );
+    // Plain Down → jump to bottom and consume the key.
+    assert_eq!(
+        scroll_snap_for(&KeyEvent::new(KeyCode::Down, none)),
+        Some(ScrollSnap::Jump)
+    );
+
+    // Command combos (Ctrl/Alt/Super) and other keys leave the scroll alone.
+    assert_eq!(
+        scroll_snap_for(&KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+        None
+    );
+    assert_eq!(
+        scroll_snap_for(&KeyEvent::new(KeyCode::Down, KeyModifiers::ALT)),
+        None
+    );
+    assert_eq!(scroll_snap_for(&KeyEvent::new(KeyCode::Up, none)), None);
+    assert_eq!(scroll_snap_for(&KeyEvent::new(KeyCode::Enter, none)), None);
+}
