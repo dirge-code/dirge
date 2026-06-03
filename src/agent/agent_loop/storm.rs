@@ -114,23 +114,13 @@ impl StormBreaker {
         {
             return StormVerdict::pass();
         }
-        // serde_json::Map is a BTreeMap — key order is already
-        // canonical. to_string produces compact form so integer/
-        // float differences (1 vs 1.0) are handled by serde's
-        // number serialisation.
-        //
-        // dirge-7bwx review-fix #6 (LOW): canonical key order
-        // depends on `serde_json` being built WITHOUT the
-        // `preserve_order` feature. If a future transitive
-        // dependency enables that feature via Cargo feature
-        // unification, Map becomes IndexMap and key order
-        // follows insertion — two parses of `{"a":1,"b":2}`
-        // vs `{"b":2,"a":1}` would yield different signatures
-        // and storm dedupe would silently regress. If that
-        // happens, switch this to a sort-keys serializer (or
-        // reuse `run::canonical_json`). Reasonix has the same
-        // implicit dependency at `repair/index.ts:127`.
-        let args = serde_json::to_string(&call.arguments).unwrap_or_default();
+        // Canonical signature shared with the scavenge dedup (run.rs):
+        // `canonical_json` explicitly sorts object keys and normalizes numeric
+        // reprs (`1` ≡ `1.0`), so the repeat detector isn't silently dependent
+        // on `serde_json`'s `preserve_order` feature staying off (dirge-ark9,
+        // closing dirge-7bwx review-fix #6) and matches the scavenger's
+        // dedup exactly.
+        let args = super::message::canonical_json(&call.arguments);
 
         let mutating = self.is_mutating.as_ref().map(|f| f(call)).unwrap_or(false);
         let read_only = !mutating;

@@ -312,6 +312,62 @@ pub fn loop_message_to_value(msg: &LoopMessage) -> Value {
     }
 }
 
+/// Canonical string form of a JSON value, for stable tool-call dedup
+/// signatures. Sorts object keys and normalizes integers-stored-as-floats
+/// (`1.0` ≡ `1`) so two encodings of the same logical call hash equal,
+/// regardless of key order or numeric representation.
+///
+/// Single source of truth for tool-call signatures — used by the scavenge
+/// dedup (run.rs) and the storm repeat-loop detector (storm.rs), which
+/// previously diverged: storm relied on `serde_json::to_string` (sorted only
+/// while `serde_json`'s `preserve_order` feature stays off, and not normalizing
+/// `1` vs `1.0`) [dirge-ark9].
+pub fn canonical_json(v: &Value) -> String {
+    match v {
+        Value::Object(m) => {
+            let mut keys: Vec<&String> = m.keys().collect();
+            keys.sort();
+            let mut s = String::from("{");
+            for (i, k) in keys.iter().enumerate() {
+                if i > 0 {
+                    s.push(',');
+                }
+                s.push_str(&serde_json::to_string(k).unwrap_or_default());
+                s.push(':');
+                s.push_str(&canonical_json(&m[*k]));
+            }
+            s.push('}');
+            s
+        }
+        Value::Array(a) => {
+            let mut s = String::from("[");
+            for (i, e) in a.iter().enumerate() {
+                if i > 0 {
+                    s.push(',');
+                }
+                s.push_str(&canonical_json(e));
+            }
+            s.push(']');
+            s
+        }
+        Value::Number(n) => {
+            // Normalize integers-stored-as-floats (`1.0` ≡ `1`) so reps match.
+            if let Some(i) = n.as_i64() {
+                i.to_string()
+            } else if let Some(f) = n.as_f64() {
+                if f.fract() == 0.0 && f.is_finite() {
+                    (f as i64).to_string()
+                } else {
+                    f.to_string()
+                }
+            } else {
+                n.to_string()
+            }
+        }
+        other => serde_json::to_string(other).unwrap_or_default(),
+    }
+}
+
 /// Pi's `AgentEvent` is plain JSON-serializable in TypeScript;
 /// here we keep `LoopEvent` as a Rust-only enum. The fields hold
 /// in-memory `AssistantMessage` instances, not their JSON form,
@@ -575,6 +631,31 @@ mod tests {
         assert_eq!(
             loop_message_to_value(&LoopMessage::Custom(custom.clone())),
             custom
+        );
+    }
+
+    /// `canonical_json` produces the same signature regardless of object key
+    /// order and numeric representation — the property storm + scavenge dedup
+    /// both rely on (dirge-ark9).
+    #[test]
+    fn canonical_json_is_order_and_number_stable() {
+        // Key order doesn't matter.
+        let a = serde_json::json!({"a": 1, "b": 2});
+        let b = serde_json::json!({"b": 2, "a": 1});
+        assert_eq!(canonical_json(&a), canonical_json(&b));
+        assert_eq!(canonical_json(&a), "{\"a\":1,\"b\":2}");
+
+        // `1` and `1.0` collapse to the same signature (the storm/run
+        // divergence this unifies).
+        let int = serde_json::json!({"limit": 1});
+        let float = serde_json::json!({"limit": 1.0});
+        assert_eq!(canonical_json(&int), canonical_json(&float));
+
+        // Genuine fractionals are preserved; nested objects/arrays recurse.
+        let nested = serde_json::json!({"z": [{"y": 2.5, "x": 1}], "a": "s"});
+        assert_eq!(
+            canonical_json(&nested),
+            "{\"a\":\"s\",\"z\":[{\"x\":1,\"y\":2.5}]}"
         );
     }
 
