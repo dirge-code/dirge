@@ -47,7 +47,7 @@ kill-subagent) are **rebindable** via the `keybindings` config — see
 | Ctrl+O | Expand collapsed tool result |
 | Ctrl+R | Toggle reasoning visibility |
 | PgUp/PgDn | Scroll chat history |
-| Home/End | Jump to top/bottom |
+| Ctrl+Home/End | Jump chat to top/bottom |
 | `! cmd` | Run shell command (visible, injected into chat) |
 | `!! cmd` | Run shell command (invisible) |
 | Mouse drag | Select text (copies to clipboard on release) |

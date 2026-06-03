@@ -759,7 +759,10 @@ pub(super) async fn cmd_help(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     }
     renderer.write_line("keys:", c_agent())?;
     renderer.write_line("  PgUp/PgDn / wheel      scroll chat history", c_result())?;
-    renderer.write_line("  Home/End               jump to top/bottom", c_result())?;
+    renderer.write_line(
+        "  Ctrl+Home/End          jump chat to top/bottom",
+        c_result(),
+    )?;
     renderer.write_line(
         "  @<query>               file picker (Tab/Enter select, Esc cancel)",
         c_result(),

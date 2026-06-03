@@ -24,7 +24,6 @@ use crate::ui::colors::{c_agent, c_error};
 /// Flipping `is_running` + repainting here makes a blocking phase look exactly
 /// as busy as a normal streamed run, and blanks the stale input text.
 fn set_busy(ctx: &mut SlashCtx<'_>, busy: bool) -> anyhow::Result<()> {
-    *ctx.is_running = busy;
     ctx.renderer.set_avatar_state(if busy {
         AvatarState::Thinking
     } else {
@@ -42,6 +41,9 @@ fn set_busy(ctx: &mut SlashCtx<'_>, busy: bool) -> anyhow::Result<()> {
     );
     ctx.renderer.draw_bottom(ctx.input, &status, busy)?;
     ctx.renderer.render_viewport()?;
+    // Flip the flag only after the paint succeeded, so a failed draw can't
+    // strand the UI in a busy state the user can't get out of.
+    *ctx.is_running = busy;
     Ok(())
 }
 
@@ -72,9 +74,17 @@ pub(super) async fn cmd_plan(
     // keeps the run busy through the implement phase.
     set_busy(ctx, true)?;
 
-    match run_phases(ctx, &request).await? {
-        Some(kickoff) => *ctx.plan_kickoff = Some(kickoff),
-        None => set_busy(ctx, false)?, // aborted — release the busy indicator
+    // Reset the busy indicator on EVERY exit except a successful kickoff (where
+    // the loop keeps the run busy). Crucially that includes the error path: a
+    // bubbled io error must not strand the UI showing "running" with no run
+    // active — the user would then have their typing silently queued forever.
+    match run_phases(ctx, &request).await {
+        Ok(Some(kickoff)) => *ctx.plan_kickoff = Some(kickoff),
+        Ok(None) => set_busy(ctx, false)?, // aborted — release the busy indicator
+        Err(e) => {
+            let _ = set_busy(ctx, false);
+            return Err(e);
+        }
     }
     Ok(())
 }

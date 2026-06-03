@@ -62,15 +62,18 @@ impl KeyAction {
             "scroll_page_down",
             &[(KeyCode::PageDown, KeyModifiers::NONE)],
         ),
+        // Ctrl+Home/End scroll the CHAT to its extremes. Bare Home/End are left
+        // for the input editor (cursor to line start / end) — binding them to
+        // scroll shadowed those editor handlers entirely.
         (
             KeyAction::ScrollToTop,
             "scroll_to_top",
-            &[(KeyCode::Home, KeyModifiers::NONE)],
+            &[(KeyCode::Home, KeyModifiers::CONTROL)],
         ),
         (
             KeyAction::ScrollToBottom,
             "scroll_to_bottom",
-            &[(KeyCode::End, KeyModifiers::NONE)],
+            &[(KeyCode::End, KeyModifiers::CONTROL)],
         ),
         (
             KeyAction::NextChat,
@@ -253,6 +256,24 @@ mod tests {
         assert_eq!(
             km.resolve(&ev(KeyCode::Char('a'), KeyModifiers::NONE)),
             None
+        );
+    }
+
+    /// Bare Home/End are LEFT for the input editor (cursor to line start/end);
+    /// chat scroll-to-extremes is on Ctrl+Home/End. Pin it so the editor
+    /// handlers can't get silently shadowed again.
+    #[test]
+    fn home_end_scroll_is_ctrl_only() {
+        let km = Keymap::defaults();
+        assert_eq!(km.resolve(&ev(KeyCode::Home, KeyModifiers::NONE)), None);
+        assert_eq!(km.resolve(&ev(KeyCode::End, KeyModifiers::NONE)), None);
+        assert_eq!(
+            km.resolve(&ev(KeyCode::Home, KeyModifiers::CONTROL)),
+            Some(KeyAction::ScrollToTop)
+        );
+        assert_eq!(
+            km.resolve(&ev(KeyCode::End, KeyModifiers::CONTROL)),
+            Some(KeyAction::ScrollToBottom)
         );
     }
 

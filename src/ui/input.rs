@@ -822,8 +822,10 @@ impl InputEditor {
         // Ctrl+J is a portable newline trigger — many terminals never send
         // Shift+Enter as a distinct keystroke, but Ctrl+J always arrives.
         // Handled here before the Enter arm so it works even when the
-        // terminal collapses Ctrl+J onto KeyCode::Enter.
-        if ctrl && matches!(key.code, KeyCode::Char('j')) {
+        // terminal collapses Ctrl+J onto KeyCode::Enter. NOT in reverse-i-search
+        // — there `self.buffer` holds the displayed match, so inserting a raw
+        // `\n` would corrupt it and desync the search; let search-mode handle it.
+        if ctrl && matches!(key.code, KeyCode::Char('j')) && !self.search_mode {
             if !self.picker.as_ref().is_some_and(|p| p.active) {
                 self.buffer.insert(self.cursor, '\n');
                 self.cursor += 1;

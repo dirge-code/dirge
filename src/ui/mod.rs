@@ -912,6 +912,18 @@ pub async fn run_interactive(
                                     &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), interjection_queue.lock().unwrap().len()),
                                     is_running,
                                 )?;
+                            } else if !input.expanded().is_empty() {
+                                // Idle Ctrl+C/D with a typed draft: clear the
+                                // line instead of quitting, so an accidental
+                                // Ctrl+C doesn't end the session and discard the
+                                // draft (readline/bash behavior). Only an EMPTY
+                                // input line exits.
+                                input.set_text("");
+                                renderer.draw_bottom(
+                                    &input,
+                                    &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), interjection_queue.lock().unwrap().len()),
+                                    is_running,
+                                )?;
                             } else {
                                 // dirge-bx4g: clean exit via Ctrl+C / Ctrl+D
                                 // while idle — fire on_session_end so plugin

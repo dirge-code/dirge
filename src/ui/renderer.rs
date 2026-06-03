@@ -491,6 +491,17 @@ impl Renderer {
         use crate::ui::tui::bottom::{AvatarSpec, BottomBody};
         use crate::ui::tui::scene::{Scene, render_frame};
 
+        // Re-clamp the scroll offset to the CURRENT geometry every frame. The
+        // scroll mutators clamp at mutation time, but a terminal RESIZE changes
+        // `visible_lines()` (hence `max_offset`) without going through any of
+        // them — leaving a stale `scroll_offset > max_offset`. The chat would
+        // then render a short window with blank rows below it and the newest
+        // output unreachable until the user manually scrolls.
+        let max_offset = self.buffer.len().saturating_sub(self.visible_lines());
+        if self.scroll_offset > max_offset {
+            self.scroll_offset = max_offset;
+        }
+
         #[cfg(feature = "experimental-ui-terminal-tab")]
         let new_title = {
             let tool = self.last_tool_name.as_deref();
