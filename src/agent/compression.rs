@@ -137,10 +137,15 @@ pub const PROTECT_TAIL_DEFAULT: usize = 5;
 // ── Public API ───────────────────────────────────────────
 
 /// Should compression be attempted?
-/// True when prompt_tokens exceeds 75% of context_window.
-/// Port of Hermes's threshold check.
+/// True when prompt_tokens exceeds the history-fold threshold fraction of
+/// context_window. Shares [`HISTORY_FOLD_THRESHOLD`] with the post-usage fold
+/// decision so the compression gate and the fold gate can't silently drift
+/// apart (dirge-95gl) — both fire at the same point in the context window.
+///
+/// [`HISTORY_FOLD_THRESHOLD`]: crate::agent::agent_loop::context_manager::HISTORY_FOLD_THRESHOLD
 pub fn should_compress(prompt_tokens: u64, context_window: u64) -> bool {
-    let threshold = (0.75 * context_window as f64) as u64;
+    use crate::agent::agent_loop::context_manager::HISTORY_FOLD_THRESHOLD;
+    let threshold = (HISTORY_FOLD_THRESHOLD * context_window as f64) as u64;
     prompt_tokens > threshold
 }
 
@@ -858,6 +863,17 @@ mod tests {
     fn above_threshold_compress() {
         // Just above 75% threshold.
         assert!(should_compress(96_001, 128_000));
+    }
+
+    /// dirge-95gl: the compression gate tracks the post-usage fold constant —
+    /// they must flip at the same fraction so the two decisions can't drift.
+    #[test]
+    fn should_compress_tracks_history_fold_threshold() {
+        use crate::agent::agent_loop::context_manager::HISTORY_FOLD_THRESHOLD;
+        let win = 200_000u64;
+        let at = (HISTORY_FOLD_THRESHOLD * win as f64) as u64;
+        assert!(!should_compress(at, win)); // exactly at the shared threshold → no
+        assert!(should_compress(at + 1, win)); // just over → yes
     }
 
     #[test]
