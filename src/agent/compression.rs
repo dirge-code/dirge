@@ -88,6 +88,10 @@ pub const TURN_END_RESULT_CAP_TOKENS: u64 = 3000;
 /// to head off an overflow BEFORE the (reactive, post-response) fold
 /// trigger fires. Intentionally below the 75% fold threshold so the
 /// tighter cap has room to work first (IMPROVEMENTS_PLAN #3).
+///
+/// This is the lowest (0.60) rung of the context-budget ladder; the full
+/// ladder is documented in
+/// [`crate::agent::agent_loop::context_manager`].
 pub const AGGRESSIVE_CAP_THRESHOLD: f64 = 0.60;
 
 /// Per-result token cap in the aggressive tier — still enough to see an
@@ -122,6 +126,12 @@ pub fn snip_bought_enough(freed: u64, ctx_max: u64, aggressive: bool) -> bool {
 }
 
 /// Chars-per-token rough estimate. Port of Hermes's _CHARS_PER_TOKEN.
+///
+/// This is the project's single token estimator (see
+/// [`estimate_messages_tokens`]); it backs the *pre-send* measurement point of
+/// the context-budget ladder, while the *post-response* decision uses the
+/// API's exact `prompt_tokens`. The two are different measurement points, not
+/// two estimators — see [`crate::agent::agent_loop::context_manager`].
 const CHARS_PER_TOKEN: u64 = 4;
 
 /// Hard floor for a compression model's context window (64K).

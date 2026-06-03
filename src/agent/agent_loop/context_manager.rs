@@ -1,23 +1,70 @@
-//! Multi-tier auto-compaction decision engine.
+//! Multi-tier auto-compaction decision engine — and the **canonical reference
+//! for the whole context-budget ladder** (dirge-w5iy). The budget policy is
+//! split across two cohesive modules by concern, and this is the one place
+//! that documents the complete picture:
+//!
+//!   - **decision** (when/whether/how-hard to fold) lives here.
+//!   - **mechanism** (the token estimator, per-result caps, the summarizer,
+//!     and the snip override) lives in [`crate::agent::compression`].
 //!
 //! Faithful port of `DeepSeek-Reasonix/src/context-manager.ts` (345 lines).
 //!
-//! Five threshold tiers govern when and how aggressively the loop
-//! folds older context into a summary:
+//! # The budget ladder
 //!
-//!   1. Turn-start fold (90%) — before first API call, catches terminal
-//!      prior turn, session restore, huge user paste
-//!   2. Post-response fold (75%) — normal growth → fold into summary
-//!   3. Aggressive fold (78%) — normal fold didn't buy enough headroom
-//!      → use half the tail budget
-//!   4. Exit-with-summary (80%) — defense in depth: force final summary
-//!      and end the turn
-//!   5. Min-savings check (30%) — skip fold if head wouldn't shrink log
-//!      enough
+//! Every threshold is a **fraction of the model's context window** (`ctx_max`),
+//! compared against the current token count. In ascending order of pressure:
 //!
-//! Each threshold is a fraction of the model's context window
-//! (`ctx_max`). The decision is made against `prompt_tokens` from
-//! the API usage response, or a local estimate before the call.
+//! | Fraction | Tier | Owner | Action |
+//! |----------|------|-------|--------|
+//! | 0.60 | Aggressive per-result cap | compression: [`AGGRESSIVE_CAP_THRESHOLD`] | tighten each tool-result cap (3000→1000 tok) to head off overflow *before* a fold is needed |
+//! | 0.75 | Post-response fold | [`HISTORY_FOLD_THRESHOLD`] | fold older history into a summary, keep a 20% tail. Also gates the summarizer LLM call ([`should_compress`]) |
+//! | 0.78 | Aggressive fold | [`HISTORY_FOLD_AGGRESSIVE_THRESHOLD`] | the normal fold didn't buy enough headroom → halve the tail budget (10%) |
+//! | 0.80 | Exit-with-summary | [`FORCE_SUMMARY_THRESHOLD`] | defense in depth: force a final summary and end the turn |
+//! | 0.90 | Turn-start fold | [`TURN_START_FOLD_THRESHOLD`] | before the first API call — catches a terminal prior turn, session restore, or a huge user paste |
+//!
+//! Plus a guard (not a pressure tier): the **min-savings check** (0.30,
+//! `HISTORY_FOLD_MIN_SAVINGS_FRACTION`) skips a fold whose head wouldn't
+//! shrink the log by at least that fraction.
+//!
+//! # One estimator, two measurement points
+//!
+//! There is a **single** token estimator —
+//! [`compression::estimate_messages_tokens`] (`chars / CHARS_PER_TOKEN`). What
+//! differs is *when* the count is taken, not *how*:
+//!
+//!   - **pre-send** (turn-start fold, the per-result cap tier): the local
+//!     estimate, since the API hasn't been called yet;
+//!   - **post-response** ([`decide_after_usage`]): the API's exact
+//!     `prompt_tokens` from the usage response.
+//!
+//! These two numbers can legitimately disagree (the estimate is approximate);
+//! that's inherent to measuring before vs. after the call, not a duplicated
+//! estimator.
+//!
+//! # The snip override
+//!
+//! A pre-send "snip" ([`compression::cap_oversized_tool_results`]) can free
+//! enough tokens that a *normal* post-response fold is unnecessary; the
+//! suppression lives in `run.rs` via [`compression::snip_bought_enough`]
+//! (a snip freeing ≥10% of the window skips a normal fold; aggressive /
+//! force-summary folds always proceed). It is intentionally *not* baked into
+//! [`decide_after_usage`] so the decision stays a pure function of the token
+//! ratio; run.rs composes the two.
+//!
+//! # Tail protection: two strategies
+//!
+//! Recent messages are protected by **message count**
+//! ([`compression::PROTECT_TAIL_DEFAULT`]) at the pruning layer, while the
+//! fold tiers above express the tail as a **token fraction** of the window
+//! (20% / 10%). They are not equivalent (5 messages may be 100 or 50 000
+//! tokens); run.rs picks the `protect_tail` count per fold kind.
+//!
+//! [`AGGRESSIVE_CAP_THRESHOLD`]: crate::agent::compression::AGGRESSIVE_CAP_THRESHOLD
+//! [`should_compress`]: crate::agent::compression::should_compress
+//! [`compression::estimate_messages_tokens`]: crate::agent::compression::estimate_messages_tokens
+//! [`compression::cap_oversized_tool_results`]: crate::agent::compression::cap_oversized_tool_results
+//! [`compression::snip_bought_enough`]: crate::agent::compression::snip_bought_enough
+//! [`compression::PROTECT_TAIL_DEFAULT`]: crate::agent::compression::PROTECT_TAIL_DEFAULT
 
 use serde::Serialize;
 

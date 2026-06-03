@@ -1193,6 +1193,9 @@ pub async fn run_loop(
                         // IMPROVEMENTS_PLAN #4: if the pre-send snip
                         // already freed enough headroom, skip a NORMAL
                         // fold this turn (aggressive folds still fire).
+                        // This is the "snip override" composed here rather
+                        // than inside the decision engine — see the budget
+                        // ladder doc in agent_loop::context_manager.
                         if crate::agent::compression::snip_bought_enough(
                             snip_tokens_freed,
                             ctx_max,
