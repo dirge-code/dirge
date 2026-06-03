@@ -2354,3 +2354,65 @@ async fn context_compacted_reports_compaction_kind() {
         CompactionKind::PruneSummarizerDisabled
     );
 }
+
+// ── dirge-vcsn: unified finalization interjection authority ──────────
+
+/// The unfinished-todo nudge wording agrees in number with the count.
+#[test]
+fn todo_nudge_message_pluralizes() {
+    let one = match todo_nudge_message(1) {
+        LoopMessage::User(u) => u.content,
+        _ => panic!("expected a user message"),
+    };
+    assert!(one.contains("1 unfinished todo "), "singular: {one}");
+    let many = match todo_nudge_message(3) {
+        LoopMessage::User(u) => u.content,
+        _ => panic!("expected a user message"),
+    };
+    assert!(many.contains("3 unfinished todos "), "plural: {many}");
+}
+
+/// Highest-priority gate (the caller hook) short-circuits the lower gates:
+/// when it yields a follow-up, the critic is never consulted (`critic_done`
+/// stays false) and the todo gate isn't reached. This locks the precedence.
+#[tokio::test]
+async fn finalization_hook_short_circuits_lower_gates() {
+    let mut config = build_config();
+    config.get_followup_messages = Some(std::sync::Arc::new(|| {
+        Box::pin(async {
+            vec![LoopMessage::User(
+                crate::agent::agent_loop::message::UserMessage {
+                    content: "hook follow-up".into(),
+                },
+            )]
+        })
+    }));
+
+    let mut critic_done = false;
+    let mut todo_nudges = 0u8;
+    let (msgs, source) =
+        poll_finalization_follow_up(&config, "sys", &[], &mut critic_done, &mut todo_nudges).await;
+
+    assert_eq!(source, FollowUpSource::Hook);
+    assert_eq!(msgs.len(), 1);
+    assert!(
+        !critic_done,
+        "hook must short-circuit before the critic runs"
+    );
+    assert_eq!(todo_nudges, 0, "todo gate must not be reached");
+}
+
+/// With no hook/verifier/critic and the todo gate exhausted, the authority
+/// reports `None` so the run finalizes. (`todo_nudges = MAX` keeps this
+/// deterministic regardless of the process-global todo list.)
+#[tokio::test]
+async fn finalization_all_gates_silent_yields_none() {
+    let config = build_config(); // hook/verifier/critic all None
+    let mut critic_done = false;
+    let mut todo_nudges = MAX_TODO_NUDGES; // todo gate bounded out
+    let (msgs, source) =
+        poll_finalization_follow_up(&config, "sys", &[], &mut critic_done, &mut todo_nudges).await;
+
+    assert!(msgs.is_empty());
+    assert_eq!(source, FollowUpSource::None);
+}

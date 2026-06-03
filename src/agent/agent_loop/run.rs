@@ -107,6 +107,104 @@ fn storm_for_config(config: &LoopConfig) -> StormBreaker {
     StormBreaker::new(6, 3, mutating, exempt)
 }
 
+/// Upper bound on consecutive unfinished-todo nudges, so a deliberately
+/// abandoned todo list can't trap the loop in an endless "finish your todos"
+/// cycle.
+const MAX_TODO_NUDGES: u8 = 3;
+
+/// Which finalization gate produced the interjection this turn. The loop
+/// injects at most ONE follow-up per finalization, chosen in strict priority
+/// order — see [`poll_finalization_follow_up`]. Centralizing the precedence
+/// into a single enum + function replaced four scattered
+/// `if follow_up.is_empty()` blocks that each implicitly encoded their rank
+/// [dirge-vcsn].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FollowUpSource {
+    /// Caller-supplied `get_followup_messages` hook (e.g. the `/plan`
+    /// reviewer loop). Highest priority.
+    Hook,
+    /// Verifier gate: code was edited but nothing was run to check it.
+    Verifier,
+    /// Bounded LLM critic judgment (at most once per run).
+    Critic,
+    /// Unfinished-todo nudge (bounded by [`MAX_TODO_NUDGES`]).
+    Todo,
+    /// No gate fired — the run may finalize.
+    None,
+}
+
+/// The unfinished-todo nudge message. Pure (no globals) so the singular/plural
+/// wording is unit-testable independent of the todo store.
+fn todo_nudge_message(unfinished: usize) -> LoopMessage {
+    LoopMessage::User(super::message::UserMessage {
+        content: format!(
+            "You still have {unfinished} unfinished todo{} (pending or in progress). \
+             Finish the remaining work, or if it's genuinely done or no longer needed, \
+             update the todo list (mark items completed/cancelled) before stopping.",
+            if unfinished == 1 { "" } else { "s" }
+        ),
+    })
+}
+
+/// Poll the finalization gates in strict priority order and return the first
+/// non-empty source's messages (plus which source fired, for tracing/tests).
+///
+/// At most ONE source contributes per finalization. The lower-priority gates
+/// (verifier, critic, todo) are each one-shot or bounded, so deferring one by
+/// a turn is intentional: e.g. a red build surfaces the verifier nudge now and
+/// the critic runs at the *next* finalization once the build is fixed (the
+/// verifier won't fire twice). This is the single authority for finalization
+/// precedence — previously four separate `if follow_up.is_empty()` blocks
+/// inline in the outer loop [dirge-vcsn].
+async fn poll_finalization_follow_up(
+    config: &LoopConfig,
+    system_prompt: &str,
+    new_messages: &[LoopMessage],
+    critic_done: &mut bool,
+    todo_nudges: &mut u8,
+) -> (Vec<LoopMessage>, FollowUpSource) {
+    // 1. Caller hook (pi lines 256-262) — highest priority.
+    if let Some(get) = &config.get_followup_messages {
+        let msgs = get().await;
+        if !msgs.is_empty() {
+            return (msgs, FollowUpSource::Hook);
+        }
+    }
+    // 2. F6 verifier gate — one-time "verify before done" when code was edited
+    //    but nothing was run to check it.
+    if let Some(verifier) = &config.verifier {
+        let msgs = verifier.check_before_finalize();
+        if !msgs.is_empty() {
+            return (msgs, FollowUpSource::Verifier);
+        }
+    }
+    // 3. F6 tier 3 — bounded LLM critic, once per run, only if the run did real
+    //    work. `critic_done` flips unconditionally so it fires at most once
+    //    regardless of verdict.
+    if !*critic_done && config.critic_fn.is_some() && run_made_tool_calls(new_messages) {
+        *critic_done = true;
+        if let Some(critic) = &config.critic_fn {
+            let transcript = build_critic_transcript(new_messages);
+            // dirge-bedj: judge within the agent's own system prompt so the
+            // critic never demands a forbidden action.
+            let msgs = super::critic::run_critic(critic, system_prompt, &transcript).await;
+            if !msgs.is_empty() {
+                return (msgs, FollowUpSource::Critic);
+            }
+        }
+    }
+    // 4. vix-port — final gate: nudge the model to finish or clear unfinished
+    //    todos before stopping. Bounded by MAX_TODO_NUDGES.
+    if *todo_nudges < MAX_TODO_NUDGES {
+        let unfinished = crate::agent::tools::todo::unfinished_count();
+        if unfinished > 0 {
+            *todo_nudges += 1;
+            return (vec![todo_nudge_message(unfinished)], FollowUpSource::Todo);
+        }
+    }
+    (Vec::new(), FollowUpSource::None)
+}
+
 /// LOOP-9 — context-compaction worker. Runs the cheap pruning pass
 /// first; when a summarizer callback is wired AND pruning alone
 /// didn't free enough headroom (compressed token count is still
@@ -659,9 +757,7 @@ pub async fn run_loop(
     let mut critic_done = false;
 
     // vix-port: don't let the model end a turn while it still has unfinished
-    // todos. Nudge it to finish or clear the list, bounded so a stuck list
-    // can't loop forever (vix caps at 3 nudges; session.go:1551).
-    const MAX_TODO_NUDGES: u8 = 3;
+    // todos (bounded by MAX_TODO_NUDGES; vix caps at 3, session.go:1551).
     let mut todo_nudges: u8 = 0;
 
     'outer: loop {
@@ -1324,59 +1420,19 @@ pub async fn run_loop(
             break;
         }
 
-        // Pi lines 256-262: outer-loop follow-up poll.
-        let mut follow_up = match &config.get_followup_messages {
-            Some(get) => get().await,
-            None => Vec::new(),
-        };
-        // F6: before finalizing, let the verifier gate inject a one-time
-        // "verify before done" nudge when code was edited but nothing was
-        // run to check it. Runs only when no other follow-up is pending,
-        // and is bounded to fire at most once per run.
-        if follow_up.is_empty()
-            && let Some(verifier) = &config.verifier
-        {
-            follow_up = verifier.check_before_finalize();
-        }
-        // F6 tier 3: if a critic is configured and the run did real work,
-        // run one bounded LLM critique before finalizing. `critic_done`
-        // is set unconditionally so it fires at most once per run
-        // regardless of the verdict.
-        if follow_up.is_empty()
-            && !critic_done
-            && config.critic_fn.is_some()
-            && run_made_tool_calls(&new_messages)
-        {
-            critic_done = true;
-            if let Some(critic) = &config.critic_fn {
-                let transcript = build_critic_transcript(&new_messages);
-                // dirge-bedj: pass the agent's own system prompt as the
-                // constraint set so the critic judges within the same rules
-                // the agent had (and never demands a forbidden action).
-                follow_up =
-                    super::critic::run_critic(critic, &current_context.system_prompt, &transcript)
-                        .await;
-            }
-        }
-        // vix-port: final gate — if nothing else is pending and the model is
-        // about to stop with unfinished todos, nudge it to finish or clear
-        // them. Bounded by MAX_TODO_NUDGES so a deliberately-abandoned list
-        // can't trap the loop.
-        if follow_up.is_empty() && todo_nudges < MAX_TODO_NUDGES {
-            let unfinished = crate::agent::tools::todo::unfinished_count();
-            if unfinished > 0 {
-                todo_nudges += 1;
-                follow_up = vec![LoopMessage::User(super::message::UserMessage {
-                    content: format!(
-                        "You still have {unfinished} unfinished todo{} (pending or in progress). \
-                         Finish the remaining work, or if it's genuinely done or no longer needed, \
-                         update the todo list (mark items completed/cancelled) before stopping.",
-                        if unfinished == 1 { "" } else { "s" }
-                    ),
-                })];
-            }
-        }
+        // Outer-loop finalization poll (pi lines 256-262): the single
+        // priority-ordered authority for follow-up interjections —
+        // hook → verifier → critic → todo, at most one per finalization.
+        let (follow_up, source) = poll_finalization_follow_up(
+            &config,
+            &current_context.system_prompt,
+            &new_messages,
+            &mut critic_done,
+            &mut todo_nudges,
+        )
+        .await;
         if !follow_up.is_empty() {
+            tracing::trace!(target: "dirge::loop", ?source, "finalization follow-up interjected");
             pending_messages = follow_up;
             continue 'outer;
         }
