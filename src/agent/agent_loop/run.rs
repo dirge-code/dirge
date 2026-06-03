@@ -48,6 +48,7 @@ use super::context_manager::{self, PostUsageDecisionKind};
 use super::inflight::InflightSet;
 use super::message::{
     AssistantMessage, ContentBlock, LoopEvent, LoopMessage, StopReason, ToolResultMessage,
+    loop_message_to_value, tool_result_to_value,
 };
 use super::storm::StormBreaker;
 use super::stream::{StreamFn, stream_assistant_response};
@@ -1474,40 +1475,6 @@ fn build_critic_transcript(new_messages: &[LoopMessage]) -> String {
         }
     }
     s.chars().take(MAX_CHARS).collect()
-}
-
-/// Convert a `LoopMessage` to the placeholder `Value` shape used
-/// in `Context.messages`. Mirrors `serialize_assistant` from
-/// stream.rs but covers every variant.
-///
-/// Phase 4 placeholder — phase ??? swaps the Vec<Value> for typed
-/// messages and this helper goes away.
-fn loop_message_to_value(msg: &LoopMessage) -> Value {
-    match msg {
-        LoopMessage::User(u) => serde_json::json!({
-            "role": "user",
-            "content": u.content,
-        }),
-        LoopMessage::Assistant(a) => serde_json::json!({
-            "role": "assistant",
-            "content": a.content,
-            "stopReason": a.stop_reason,
-            "errorMessage": a.error_message,
-        }),
-        LoopMessage::ToolResult(t) => tool_result_to_value(t),
-        LoopMessage::Custom(v) => v.clone(),
-    }
-}
-
-fn tool_result_to_value(t: &ToolResultMessage) -> Value {
-    serde_json::json!({
-        "role": "toolResult",
-        "toolCallId": t.tool_call_id,
-        "toolName": t.tool_name,
-        "content": t.content,
-        "details": t.details,
-        "isError": t.is_error,
-    })
 }
 
 /// dirge-ngic: build the merged source the scavenger inspects from

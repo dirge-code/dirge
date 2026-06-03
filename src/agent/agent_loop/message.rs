@@ -270,6 +270,48 @@ impl LoopMessage {
     }
 }
 
+/// Serialise an [`AssistantMessage`] to the placeholder `Value` shape used in
+/// `Context.messages`. The `Vec<Value>` transcript is a phase-1 stopgap that
+/// phase 7 swaps for typed messages; until then this is the single source of
+/// truth for the assistant JSON shape (previously copied into stream.rs,
+/// run.rs, and integration.rs).
+pub fn assistant_to_value(a: &AssistantMessage) -> Value {
+    serde_json::json!({
+        "role": "assistant",
+        "content": a.content,
+        "stopReason": a.stop_reason,
+        "errorMessage": a.error_message,
+    })
+}
+
+/// Serialise a [`ToolResultMessage`] to its `Value` transcript shape. Single
+/// source of truth (was duplicated in run.rs and integration.rs).
+pub fn tool_result_to_value(t: &ToolResultMessage) -> Value {
+    serde_json::json!({
+        "role": "toolResult",
+        "toolCallId": t.tool_call_id,
+        "toolName": t.tool_name,
+        "content": t.content,
+        "details": t.details,
+        "isError": t.is_error,
+    })
+}
+
+/// Serialise any [`LoopMessage`] to the placeholder `Value` shape. `Custom`
+/// values pass through verbatim (the application chose their shape). Single
+/// source of truth (was copied verbatim in run.rs and integration.rs).
+pub fn loop_message_to_value(msg: &LoopMessage) -> Value {
+    match msg {
+        LoopMessage::User(u) => serde_json::json!({
+            "role": "user",
+            "content": u.content,
+        }),
+        LoopMessage::Assistant(a) => assistant_to_value(a),
+        LoopMessage::ToolResult(t) => tool_result_to_value(t),
+        LoopMessage::Custom(v) => v.clone(),
+    }
+}
+
 /// Pi's `AgentEvent` is plain JSON-serializable in TypeScript;
 /// here we keep `LoopEvent` as a Rust-only enum. The fields hold
 /// in-memory `AssistantMessage` instances, not their JSON form,
@@ -487,6 +529,54 @@ impl LoopEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Locks the `Value` transcript shape for every `LoopMessage` variant.
+    /// This is the single source of truth that stream.rs / run.rs /
+    /// integration.rs all route through — a shape change here is a
+    /// transcript-format change for `convertToLlm`, so it must be deliberate.
+    #[test]
+    fn loop_message_to_value_shapes() {
+        let user = loop_message_to_value(&LoopMessage::User(UserMessage {
+            content: "hello".to_string(),
+        }));
+        assert_eq!(
+            user,
+            serde_json::json!({"role": "user", "content": "hello"})
+        );
+
+        let asst = AssistantMessage {
+            content: vec![ContentBlock::Text {
+                text: "hi".to_string(),
+            }],
+            stop_reason: StopReason::Stop,
+            error_message: None,
+        };
+        let asst_val = loop_message_to_value(&LoopMessage::Assistant(asst.clone()));
+        assert_eq!(asst_val, assistant_to_value(&asst));
+        assert_eq!(asst_val["role"], "assistant");
+        assert_eq!(asst_val["stopReason"], "stop");
+        assert!(asst_val.get("errorMessage").is_some());
+
+        let tr = ToolResultMessage {
+            tool_call_id: "c1".to_string(),
+            tool_name: "read".to_string(),
+            content: vec![],
+            details: serde_json::json!({"k": "v"}),
+            is_error: false,
+        };
+        let tr_val = loop_message_to_value(&LoopMessage::ToolResult(tr.clone()));
+        assert_eq!(tr_val, tool_result_to_value(&tr));
+        assert_eq!(tr_val["role"], "toolResult");
+        assert_eq!(tr_val["toolCallId"], "c1");
+        assert_eq!(tr_val["isError"], false);
+
+        // Custom passes through verbatim.
+        let custom = serde_json::json!({"role": "custom", "x": 1});
+        assert_eq!(
+            loop_message_to_value(&LoopMessage::Custom(custom.clone())),
+            custom
+        );
+    }
 
     /// `StopReason` round-trips at pi's exact wire format.
     /// `ToolUse` is camelCase (one word in wire form). Caught

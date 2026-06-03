@@ -34,7 +34,9 @@ use futures::Stream;
 use futures::stream::StreamExt;
 use tokio::sync::mpsc;
 
-use super::message::{AssistantMessage, LoopEvent, LoopMessage, StopReason, StreamEvent};
+use super::message::{
+    AssistantMessage, LoopEvent, LoopMessage, StopReason, StreamEvent, assistant_to_value,
+};
 use super::tool::AbortSignal;
 use super::types::{Context, LoopConfig};
 
@@ -223,7 +225,7 @@ pub async fn stream_assistant_response(
     while let Some(event) = stream.next().await {
         match event {
             StreamEvent::Start { partial } => {
-                context.messages.push(serialize_assistant(&partial));
+                context.messages.push(assistant_to_value(&partial));
                 added_partial = true;
                 let _ = emit
                     .send(LoopEvent::MessageStart {
@@ -238,7 +240,7 @@ pub async fn stream_assistant_response(
                     // context.messages.length - 1] =
                     // partialMessage` (line 333).
                     if let Some(last) = context.messages.last_mut() {
-                        *last = serialize_assistant(&partial);
+                        *last = assistant_to_value(&partial);
                     }
                 }
                 let _ = emit
@@ -330,10 +332,10 @@ async fn finalize(
 ) {
     if added_partial {
         if let Some(last) = context.messages.last_mut() {
-            *last = serialize_assistant(final_msg);
+            *last = assistant_to_value(final_msg);
         }
     } else {
-        context.messages.push(serialize_assistant(final_msg));
+        context.messages.push(assistant_to_value(final_msg));
         let _ = emit
             .send(LoopEvent::MessageStart {
                 message: LoopMessage::Assistant(final_msg.clone()),
@@ -345,23 +347,6 @@ async fn finalize(
             message: LoopMessage::Assistant(final_msg.clone()),
         })
         .await;
-}
-
-/// Serialise an `AssistantMessage` to the placeholder `Value`
-/// shape used in `Context.messages`. Phase 1's `Vec<Value>`
-/// transcript is a stopgap; phase 4 swaps in typed messages and
-/// this helper goes away.
-fn serialize_assistant(msg: &AssistantMessage) -> serde_json::Value {
-    // Minimal shape that downstream consumers (convertToLlm)
-    // can pattern-match on. Pi's AssistantMessage carries
-    // role/content/stopReason etc.; phase 1 ports just enough
-    // to round-trip through tests.
-    serde_json::json!({
-        "role": "assistant",
-        "content": msg.content,
-        "stopReason": msg.stop_reason,
-        "errorMessage": msg.error_message,
-    })
 }
 
 // =====================================================================

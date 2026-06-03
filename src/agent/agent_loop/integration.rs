@@ -68,7 +68,7 @@ use crate::event::AgentEvent;
 
 use super::bridge::EventBridge;
 use super::heal;
-use super::message::{LoopMessage, UserMessage};
+use super::message::{LoopMessage, UserMessage, loop_message_to_value};
 use super::run::run_agent_loop;
 use super::steering::steering_from_queue;
 use super::stream::StreamFn;
@@ -687,42 +687,6 @@ pub fn spawn_loop_runner(cfg: LoopSpawnConfig) -> LoopRunner {
         event_rx,
         task,
         signal,
-    }
-}
-
-/// Convert a `LoopMessage` into the placeholder `Value` shape
-/// `Context.messages` carries. Duplicated from `run.rs`'s
-/// internal helper because that one is private. Phase 4 plans
-/// to swap `Vec<Value>` for a typed message list across the
-/// module — when that lands this helper goes away.
-fn loop_message_to_value(msg: &LoopMessage) -> Value {
-    use super::message::{AssistantMessage, ToolResultMessage};
-    fn assistant_to_value(a: &AssistantMessage) -> Value {
-        serde_json::json!({
-            "role": "assistant",
-            "content": a.content,
-            "stopReason": a.stop_reason,
-            "errorMessage": a.error_message,
-        })
-    }
-    fn tool_result_to_value(t: &ToolResultMessage) -> Value {
-        serde_json::json!({
-            "role": "toolResult",
-            "toolCallId": t.tool_call_id,
-            "toolName": t.tool_name,
-            "content": t.content,
-            "details": t.details,
-            "isError": t.is_error,
-        })
-    }
-    match msg {
-        LoopMessage::User(u) => serde_json::json!({
-            "role": "user",
-            "content": u.content,
-        }),
-        LoopMessage::Assistant(a) => assistant_to_value(a),
-        LoopMessage::ToolResult(t) => tool_result_to_value(t),
-        LoopMessage::Custom(v) => v.clone(),
     }
 }
 
