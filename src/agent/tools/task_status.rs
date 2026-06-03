@@ -1,3 +1,10 @@
+//! `task_status` — poll a background [`task`](crate::agent::tools::task) by id
+//! (optionally waiting), reporting its [`TaskState`]. The read side of the
+//! background-subagent surface.
+//!
+//! See the canonical map of the four work-tracking concepts in
+//! [`crate::agent::plan`].
+
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use serde::Deserialize;

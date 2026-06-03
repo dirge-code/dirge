@@ -1,3 +1,12 @@
+//! `task` — spawn a background **subagent** to carry out an independent piece
+//! of work, tracked in the [`BackgroundStore`] with an abort registry;
+//! `task_status` polls it. For long/parallel work the main loop shouldn't
+//! block on.
+//!
+//! One of four similarly-named work-tracking surfaces — NOT the phased
+//! `/plan` workflow, plan-**mode**, or the in-session `write_todo_list`. See
+//! the canonical map in [`crate::agent::plan`].
+
 #[allow(unused_imports)]
 use crate::sync_util::LockExt;
 use rig::completion::ToolDefinition;

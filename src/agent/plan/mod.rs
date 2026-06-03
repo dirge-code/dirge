@@ -16,8 +16,24 @@
 //! explore→plan forks; the UI loop launches the streamed implement run; and
 //! `ui/run_handlers/plan_review.rs` drives the reviewer loop after each turn.
 //!
-//! NOTE: distinct from plan-**mode** (`agent::tools::plan`, the
-//! `plan_enter`/`plan_exit` read-only lock) — unrelated feature, similar name.
+//! # Four work-tracking concepts — don't cross the wires
+//!
+//! dirge has four independently-scoped surfaces with overlapping vocabulary
+//! ("plan", "task", "todo"). This is the canonical map; the sibling modules
+//! link here. They share **no state**.
+//!
+//! | Concept | Where | What it is | Trigger | Lifetime | State |
+//! |---------|-------|-----------|---------|----------|-------|
+//! | **Phased `/plan` workflow** | `agent::plan` (this module) | explore→plan→implement→review for one complex request | user runs `/plan <req>` (needs `phased_workflow_enabled`) | one request | [`runtime::ActivePlan`] / [`runtime::PlanKickoff`] (ephemeral) |
+//! | **Plan *mode*** | [`crate::agent::tools::plan`] (`plan_enter`/`plan_exit`) | a read-only session lock: the model proposes before touching anything | model calls `plan_enter`, or a prompt's `deny_tools` | until `plan_exit` | `PlanSwitchRequest` channel → session mode |
+//! | **Todo list** | `crate::agent::tools::todo` (`write_todo_list`) | an in-session checklist the model maintains and is nudged to finish | model calls `write_todo_list` | the session | a process-global `TODO_LIST` |
+//! | **Task / subagent** | `crate::agent::tools::task` (`task` + `task_status`) | spawn a background subagent for independent work | model calls `task` | per background job | `BackgroundStore` + abort registry |
+//!
+//! **Plan-mode × phased `/plan`:** orthogonal and composable. Plan-mode is a
+//! read-only lock enforced at the *permission layer*; the phased workflow's
+//! implement phase issues ordinary (writing) tool calls. So if plan-mode is
+//! active, those writes are denied like any other write — the two don't share
+//! code, they compose through the permission checker.
 
 pub mod runtime;
 pub mod workflow;

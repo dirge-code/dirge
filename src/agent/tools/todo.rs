@@ -1,3 +1,11 @@
+//! `write_todo_list` — the model's in-session checklist of discrete work
+//! items, kept in a process-global `TODO_LIST`; the loop nudges the model to
+//! finish or clear pending items before stopping.
+//!
+//! One of four similarly-named work-tracking surfaces — NOT the phased
+//! `/plan` workflow, plan-**mode**, or background `task`s. See the canonical
+//! map in [`crate::agent::plan`].
+
 #[allow(unused_imports)]
 use crate::sync_util::LockExt;
 use rig::completion::ToolDefinition;
