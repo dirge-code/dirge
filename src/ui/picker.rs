@@ -25,7 +25,6 @@ pub struct ListPicker {
     pub items: Vec<String>,
     pub selected: usize,
     prompt: String,
-    monochrome: bool,
 }
 
 impl ListPicker {
@@ -35,12 +34,7 @@ impl ListPicker {
             items: Vec::new(),
             selected: 0,
             prompt: String::new(),
-            monochrome: false,
         }
-    }
-
-    pub fn set_monochrome(&mut self, monochrome: bool) {
-        self.monochrome = monochrome;
     }
 
     pub fn activate(&mut self, prompt: &str, items: Vec<String>) {
@@ -105,7 +99,6 @@ pub struct FilePicker {
     pub matches: Vec<PathBuf>,
     pub selected: usize,
     file_cache: Arc<Mutex<Vec<PathBuf>>>,
-    monochrome: bool,
 }
 
 impl FilePicker {
@@ -117,12 +110,7 @@ impl FilePicker {
             matches: Vec::new(),
             selected: 0,
             file_cache: Arc::new(Mutex::new(Vec::new())),
-            monochrome: false,
         }
-    }
-
-    pub fn set_monochrome(&mut self, monochrome: bool) {
-        self.monochrome = monochrome;
     }
 
     pub fn activate(&mut self) {

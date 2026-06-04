@@ -305,7 +305,6 @@ pub struct Renderer {
     /// up to MAX_INPUT_VISIBLE_LINES as the user adds newlines or types past
     /// the wrap width). The chat viewport shrinks by the same amount.
     input_rows: u16,
-    monochrome: bool,
     pub selection_active: bool,
     /// Selection anchor as `(buffer_line_index, char_offset_in_line)`.
     /// Char offset is in *chars* (not bytes) so multi-byte UTF-8 glyphs
@@ -463,7 +462,6 @@ impl Renderer {
             chats: vec![ChatSnapshot::empty("main")],
             active_chat: 0,
             input_rows: 1,
-            monochrome: false,
             selection_active: false,
             selection_start: None,
             selection_end: None,
@@ -1118,10 +1116,6 @@ impl Renderer {
 
     pub fn right_panel_visible(&self) -> bool {
         self.side_panel_visible(self.right_panel_mode)
-    }
-
-    pub fn set_monochrome(&mut self, monochrome: bool) {
-        self.monochrome = monochrome;
     }
 
     fn terminal_size(&self) -> (u16, u16) {

@@ -224,7 +224,6 @@ pub struct InputEditor {
     /// the live buffer IS the draft (not navigating history).
     history_draft: Option<(CompactString, usize)>,
     pub picker: Option<FilePicker>,
-    monochrome: bool,
     kill_ring: Vec<CompactString>,
     last_action_was_kill: bool,
     yank_state: Option<YankState>,
@@ -393,7 +392,6 @@ impl InputEditor {
             history_pos: None,
             history_draft: None,
             picker: None,
-            monochrome: false,
             kill_ring: Vec::new(),
             last_action_was_kill: false,
             yank_state: None,
@@ -650,16 +648,8 @@ impl InputEditor {
         (out, display_cursor)
     }
 
-    pub fn set_monochrome(&mut self, monochrome: bool) {
-        self.monochrome = monochrome;
-        if let Some(picker) = self.picker.as_mut() {
-            picker.set_monochrome(monochrome);
-        }
-    }
-
     pub fn start_picker(&mut self) {
         let picker = self.picker.get_or_insert_with(FilePicker::new);
-        picker.set_monochrome(self.monochrome);
         picker.activate();
     }
 

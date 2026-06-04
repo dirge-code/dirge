@@ -187,7 +187,6 @@ pub async fn run_interactive(
     let _guard = TerminalGuard::new()?;
 
     let mut renderer = Renderer::new()?;
-    renderer.set_monochrome(cli.no_color);
     // Apply the preferred pane layout from config (`display`). An invalid
     // spec is surfaced as a warning and ignored (panels keep their
     // automatic width-based default); the `/display` command overrides
@@ -199,7 +198,6 @@ pub async fn run_interactive(
         }
     }
     let mut input = InputEditor::new();
-    input.set_monochrome(cli.no_color);
     // Left-panel vitals: a background git-status poller (follows `/cd`)
     // and a ring of the most recent tool actions for the [ACTIVITY]
     // ticker. Both feed `build_left_panel_info` each loop tick.
@@ -425,7 +423,6 @@ pub async fn run_interactive(
     #[cfg(feature = "git-worktree")]
     let mut wt_return_path: Option<String> = None;
     let mut rewind_picker = ListPicker::new();
-    rewind_picker.set_monochrome(cli.no_color);
     let mut last_esc: Option<std::time::Instant> = None;
 
     // Snapshot plugin-registered shortcuts (P9c). Seeded at UI
