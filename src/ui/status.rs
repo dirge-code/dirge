@@ -49,6 +49,32 @@ fn find_git_head(start: &Path) -> Option<PathBuf> {
     }
 }
 
+/// Cached wrapper around [`git_branch`]. `StatusLine::render` runs on every
+/// keystroke, and the raw `.git/HEAD` directory walk it did there is
+/// synchronous filesystem I/O — repeated per painted frame, it froze the UI on
+/// slow storage / large repos (dirge-vuzz). The branch only changes on
+/// checkout, so cache it per working-dir for a few seconds: the FS walk now
+/// runs at most once every `TTL`, not once per frame. (The background
+/// `gitstatus` poller already refreshes on its own cadence; this just keeps the
+/// status line's own lookup off the hot path.)
+fn cached_git_branch(start: &Path) -> Option<String> {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    const TTL: Duration = Duration::from_secs(3);
+    static CACHE: Mutex<Option<(Instant, PathBuf, Option<String>)>> = Mutex::new(None);
+
+    let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((at, dir, branch)) = guard.as_ref()
+        && dir.as_path() == start
+        && at.elapsed() < TTL
+    {
+        return branch.clone();
+    }
+    let fresh = git_branch(start);
+    *guard = Some((Instant::now(), start.to_path_buf(), fresh.clone()));
+    fresh
+}
+
 impl StatusLine {
     #[allow(clippy::too_many_arguments)]
     pub fn render(
@@ -70,7 +96,7 @@ impl StatusLine {
         // Append `:branch` when the working dir is inside a git
         // working tree. Detached HEAD / non-git dirs show just the
         // project name.
-        let project_label = match git_branch(wd_path) {
+        let project_label = match cached_git_branch(wd_path) {
             Some(b) => format!("{}:{}", dir, b),
             None => dir.to_string(),
         };
@@ -147,10 +173,23 @@ impl StatusLine {
 
 #[cfg(test)]
 mod tests {
-    use super::StatusLine;
+    use super::{StatusLine, cached_git_branch, git_branch};
     use crate::agent::tools::background::BackgroundStore;
     use crate::agent::tools::bg_shell::BackgroundShellStore;
     use crate::session::Session;
+    use std::path::Path;
+
+    /// The cache returns the same branch as the direct lookup (whatever it is —
+    /// a branch name, or `None` under a detached HEAD in CI), and a second
+    /// call within the TTL returns the same value (cache hit) [dirge-vuzz].
+    #[test]
+    fn cached_git_branch_matches_direct_and_caches() {
+        let p = Path::new(".");
+        let direct = git_branch(p);
+        let cached = cached_git_branch(p);
+        assert_eq!(direct, cached);
+        assert_eq!(cached_git_branch(p), cached);
+    }
 
     /// A subagent store with `agents` running subagents (each needs a
     /// live handle to count, so attach a never-ending spawned task).
