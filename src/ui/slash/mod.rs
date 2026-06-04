@@ -159,6 +159,10 @@ pub enum CompressOutcome {
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_compress(
     instructions: Option<&str>,
+    // `true` for an explicit user `/compact` — force the pass regardless of the
+    // current context fraction. Auto-compaction passes `false` so it stays
+    // gated by the "context within limits" check [dirge-fgtj].
+    forced: bool,
     agent: &mut AnyAgent,
     client: &AnyClient,
     renderer: &mut Renderer,
@@ -189,7 +193,10 @@ pub async fn handle_compress(
     let keep_recent = cfg.resolve_keep_recent_tokens();
     let max_tokens = session.context_window.saturating_sub(reserve);
 
-    if session.total_estimated_tokens <= max_tokens {
+    // Auto-compaction skips when context is within limits; an explicit
+    // `/compact` (forced) compacts anyway. The downstream gates (nothing to
+    // compress, summary-larger-than-savings) still apply to both [dirge-fgtj].
+    if !forced && session.total_estimated_tokens <= max_tokens {
         renderer.write_line("context within limits, no compression needed", c_agent())?;
         return Ok(CompressOutcome::NoOp {
             reason: "context within limits",

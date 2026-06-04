@@ -289,6 +289,7 @@ async fn compress(
 ) -> anyhow::Result<CompressOutcome> {
     handle_compress(
         None,
+        false, // forced: auto-compaction stays threshold-gated [dirge-fgtj]
         agent,
         client,
         renderer,

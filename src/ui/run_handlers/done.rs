@@ -368,6 +368,7 @@ pub(crate) async fn handle_done(
             .write_line("▒░ auto-compacting context ░▒", theme::accent())?;
         let compress_result = handle_compress(
             None,
+            false, // forced: auto-compaction stays threshold-gated [dirge-fgtj]
             agent,
             client,
             ctx.renderer,

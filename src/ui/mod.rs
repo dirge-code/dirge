@@ -1500,6 +1500,7 @@ pub async fn run_interactive(
                                     });
                                         let compress_result = handle_compress(
                                             instructions.as_deref(),
+                                            true, // forced: explicit /compact [dirge-fgtj]
                                             &mut agent, &client, &mut renderer, session, cli, cfg, context,
                                             &permission, &ask_tx, &question_tx, &plan_tx, &bg_store, &sandbox,
                                             #[cfg(feature = "mcp")] mcp_manager.as_ref(),
@@ -1786,6 +1787,7 @@ pub async fn run_interactive(
                                     )?;
                                     let compact_result = handle_compress(
                                         None,
+                                        false, // forced: auto-compaction stays threshold-gated
                                         &mut agent, &client, &mut renderer, session, cli, cfg, context,
                                         &permission, &ask_tx, &question_tx, &plan_tx, &bg_store, &sandbox,
                                         #[cfg(feature = "mcp")] mcp_manager.as_ref(),
