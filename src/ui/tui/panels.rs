@@ -505,14 +505,25 @@ pub fn compute_modified_rect(data: &PanelData, area: Rect) -> Option<Rect> {
     let natural = (2 + data.modified.len().max(1)) as u16;
     let height = natural.min(remaining);
     let inner_w = area.width.saturating_sub(RIGHT_PANEL_TRAILING_PAD);
-    Some(Rect::new(area.x, y, inner_w, height))
+    // Must match the rendered box position in `RightPanel::render` (shifted
+    // right by the divider-side pad, dirge-c5u7) so mouse hit-testing of the
+    // MODIFIED scroll region stays aligned with what's painted.
+    Some(Rect::new(
+        area.x + RIGHT_PANEL_TRAILING_PAD,
+        y,
+        inner_w,
+        height,
+    ))
 }
 
 /// Right-panel top padding (rows). Mirrors LEFT_PANEL_TOP_PAD so
 /// the two sides line up against the unified top frame.
 const RIGHT_PANEL_TOP_PAD: u16 = 1;
-/// One cell of trailing padding inside sub-panel content so it
-/// doesn't run flush against the right │ border.
+/// One cell of padding on the *chat-divider* side of each right-panel box, so
+/// the boxes hug the screen's outer (right) edge — mirroring the left panel,
+/// whose boxes hug the screen's outer (left) edge with their gap on the divider
+/// side. (Before dirge-c5u7 this was a *trailing* pad, leaving the boxes flush
+/// against the chat divider — reflected the wrong way vs. the left.)
 const RIGHT_PANEL_TRAILING_PAD: u16 = 1;
 /// Amber tone — used for the [SYSTEM] title in the unified top
 /// frame and for all body text inside the right panel.
@@ -576,12 +587,13 @@ impl<'a> Widget for RightPanel<'a> {
         // MODIFIED is built below with knowledge of the remaining
         // row budget — keep it out of the fixed-height stack.
 
-        // Stack vertically with one blank row between. Top padding
-        // pushes the first sub-panel down by RIGHT_PANEL_TOP_PAD
-        // rows, and `inner_w = area.width - RIGHT_PANEL_TRAILING_PAD`
-        // leaves a one-cell margin so content doesn't run into the
-        // outer divider on the right edge.
+        // Stack vertically with one blank row between. Top padding pushes the
+        // first sub-panel down by RIGHT_PANEL_TOP_PAD rows. The boxes are
+        // shifted right by `RIGHT_PANEL_TRAILING_PAD` (gap on the divider side)
+        // and sized to `area.width - PAD`, so they hug the screen's outer
+        // right edge — mirroring the left panel (dirge-c5u7).
         let mut y = area.y + RIGHT_PANEL_TOP_PAD;
+        let box_x = area.x + RIGHT_PANEL_TRAILING_PAD;
         let inner_w = area.width.saturating_sub(RIGHT_PANEL_TRAILING_PAD);
         // First four sub-panels get their natural height. MODIFIED
         // grows to fill the remaining vertical space (with a
@@ -593,7 +605,7 @@ impl<'a> Widget for RightPanel<'a> {
             if y + h > area.y + area.height {
                 break;
             }
-            let rect = Rect::new(area.x, y, inner_w, h);
+            let rect = Rect::new(box_x, y, inner_w, h);
             panel.render(rect, buf);
             y += h + 1; // blank spacer
         }
@@ -609,7 +621,7 @@ impl<'a> Widget for RightPanel<'a> {
             // overflows does `height == remaining` and the scroll-footer
             // path below take over.
             let height = ((2 + total.max(1)) as u16).min(remaining);
-            let rect = Rect::new(area.x, modified_top, inner_w, height);
+            let rect = Rect::new(box_x, modified_top, inner_w, height);
             let inner_rows = (height as usize).saturating_sub(2);
             let mut p = SubPanel::new("MODIFIED").border_style(self.style);
             if total == 0 {
@@ -692,6 +704,8 @@ pub mod debug {
             let body_color = AMBER;
 
             let mut y = area.y + RIGHT_PANEL_TOP_PAD;
+            // Same divider-side shift as the normal right panel (dirge-c5u7).
+            let box_x = area.x + RIGHT_PANEL_TRAILING_PAD;
             let inner_w = area.width.saturating_sub(RIGHT_PANEL_TRAILING_PAD);
 
             let summary = self.data.session_summary.as_ref();
@@ -715,7 +729,7 @@ pub mod debug {
             };
             let h = debug_panel.height();
             if y + h <= area.y + area.height {
-                debug_panel.render(Rect::new(area.x, y, inner_w, h), buf);
+                debug_panel.render(Rect::new(box_x, y, inner_w, h), buf);
                 y += h + 1;
             }
 
@@ -733,7 +747,7 @@ pub mod debug {
             };
             let h = threads_panel.height();
             if y + h <= area.y + area.height {
-                threads_panel.render(Rect::new(area.x, y, inner_w, h), buf);
+                threads_panel.render(Rect::new(box_x, y, inner_w, h), buf);
                 y += h + 1;
             }
 
@@ -759,7 +773,7 @@ pub mod debug {
             };
             let h = frames_panel.height();
             if y + h <= area.y + area.height {
-                frames_panel.render(Rect::new(area.x, y, inner_w, h), buf);
+                frames_panel.render(Rect::new(box_x, y, inner_w, h), buf);
                 y += h + 1;
             }
 
@@ -783,7 +797,7 @@ pub mod debug {
             };
             let h = variables_panel.height();
             if y + h <= area.y + area.height {
-                variables_panel.render(Rect::new(area.x, y, inner_w, h), buf);
+                variables_panel.render(Rect::new(box_x, y, inner_w, h), buf);
                 y += h + 1;
             }
 
@@ -798,14 +812,14 @@ pub mod debug {
                 .border_style(self.style);
             let h = bp_panel.height();
             if y + h <= area.y + area.height {
-                bp_panel.render(Rect::new(area.x, y, inner_w, h), buf);
+                bp_panel.render(Rect::new(box_x, y, inner_w, h), buf);
                 y += h + 1;
             }
 
             // [OUTPUT] — grow to fill remaining vertical space.
             let remaining = (area.y + area.height).saturating_sub(y);
             if remaining >= 3 {
-                let rect = Rect::new(area.x, y, inner_w, remaining);
+                let rect = Rect::new(box_x, y, inner_w, remaining);
                 let inner_rows = (remaining as usize).saturating_sub(2);
                 let mut p = SubPanel::new("OUTPUT").border_style(self.style);
                 let output = &self.data.output;
@@ -951,6 +965,46 @@ mod tests {
             Some(magenta),
             "right panel border should follow caller style"
         );
+    }
+
+    /// dirge-c5u7: right-panel boxes hug the OUTER (screen) edge — the 1-col
+    /// gap sits on the chat-divider side — mirroring the left panel. So in a
+    /// pane offset from x=0, the box's left border is at `area.x + 1` and its
+    /// right border reaches the pane's outer edge; the divider-side column
+    /// (`area.x`) is empty.
+    #[test]
+    fn right_panel_boxes_hug_outer_edge() {
+        let pd = PanelData::default();
+        // A right pane that does NOT start at the screen's left edge.
+        let area = Rect::new(10, 0, 14, 24);
+        let mut terminal = Terminal::new(TestBackend::new(24, 24)).unwrap();
+        terminal
+            .draw(|f| f.render_widget(RightPanel::new(&pd), area))
+            .unwrap();
+        let backend = terminal.backend();
+        let has = |x: u16, y: u16| {
+            matches!(
+                backend.buffer().cell((x, y)).unwrap().symbol(),
+                "╭" | "╮" | "╰" | "╯" | "│"
+            )
+        };
+        let mut found = false;
+        for y in area.y..area.y + area.height {
+            if has(area.x + 1, y) {
+                found = true;
+                assert!(
+                    !has(area.x, y),
+                    "divider-side col {} must be the gap (row {y})",
+                    area.x
+                );
+                assert!(
+                    has(area.x + area.width - 1, y),
+                    "box should reach the outer edge col {} (row {y})",
+                    area.x + area.width - 1
+                );
+            }
+        }
+        assert!(found, "expected at least one right-panel box");
     }
 
     /// Sub-panel content is LEFT-aligned per user feedback (not centered).
