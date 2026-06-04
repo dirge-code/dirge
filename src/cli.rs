@@ -63,7 +63,10 @@ pub struct Cli {
     #[arg(short = 'r', long = "resume", help = "Browse and select a session")]
     pub resume: bool,
 
-    #[arg(long = "session", help = "Use specific session file or ID")]
+    #[arg(
+        long = "session",
+        help = "Resume a session by id/prefix, or create one with this exact id if none exists (stable id for scripts / the shell plugin)"
+    )]
     pub session: Option<String>,
 
     #[arg(long = "no-session", help = "Ephemeral mode, do not save")]

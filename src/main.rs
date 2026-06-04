@@ -481,7 +481,15 @@ async fn main() -> anyhow::Result<()> {
             Err(_) => {
                 let matches = session::storage::find_sessions_by_prefix(session_id)?;
                 match matches.len() {
-                    0 => anyhow::bail!("no session matching id or prefix {:?}", session_id),
+                    // No existing session — treat `--session <id>` as
+                    // resume-or-CREATE: start a fresh session under this exact
+                    // id (validated for path safety) so scripts and the shell
+                    // plugin can pin a stable conversation id that's created on
+                    // first use and resumed thereafter [dirge-ysqh].
+                    0 => {
+                        session::storage::validate_session_id(session_id)?;
+                        session.id = CompactString::new(session_id);
+                    }
                     1 => session = matches.into_iter().next().expect("len == 1"),
                     n => {
                         let ids: Vec<String> =

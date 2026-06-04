@@ -48,7 +48,7 @@ pub(crate) fn config_path() -> PathBuf {
 /// through JSON on disk so a tampered-with file could carry an id like
 /// `../../etc/passwd`. Reject anything that isn't strictly
 /// `[A-Za-z0-9._-]+` so a malicious id can't escape the session dir.
-fn validate_session_id(id: &str) -> anyhow::Result<()> {
+pub(crate) fn validate_session_id(id: &str) -> anyhow::Result<()> {
     if id.is_empty() {
         anyhow::bail!("session id is empty");
     }
