@@ -23,6 +23,12 @@ use std::sync::{Arc, Mutex};
 use super::message::{LoopMessage, UserMessage};
 use super::result::LoopToolResult;
 
+/// Display tag prefixing both verifier nudges. The UI keys on this to attribute
+/// the message to the system/critic rather than the user (it's injected as a
+/// user-role message so the model responds) [dirge-i75f]. The `*_NUDGE`
+/// constants below embed it literally.
+pub const VERIFY_TAG: &str = "[verify-before-done]";
+
 /// Nudge when code was edited but no build/test command ran.
 const VERIFY_NUDGE: &str = "[verify-before-done] You changed code this run but didn't run the tests or build to check it. Verify it works before reporting done — or, if there's nothing to run or you verified another way, say so briefly and finish. Don't re-edit just to look busy.";
 

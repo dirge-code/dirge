@@ -133,12 +133,18 @@ enum FollowUpSource {
     None,
 }
 
+/// Display tag prefixing the unfinished-todo nudge. The UI keys on this to
+/// attribute the message to the system/critic rather than the user — it's
+/// injected as a user-role message so the model responds, but it isn't user
+/// input [dirge-i75f].
+pub(crate) const TODO_NUDGE_TAG: &str = "[todo]";
+
 /// The unfinished-todo nudge message. Pure (no globals) so the singular/plural
 /// wording is unit-testable independent of the todo store.
 fn todo_nudge_message(unfinished: usize) -> LoopMessage {
     LoopMessage::User(super::message::UserMessage {
         content: format!(
-            "You still have {unfinished} unfinished todo{} (pending or in progress). \
+            "{TODO_NUDGE_TAG} You still have {unfinished} unfinished todo{} (pending or in progress). \
              Finish the remaining work, or if it's genuinely done or no longer needed, \
              update the todo list (mark items completed/cancelled) before stopping.",
             if unfinished == 1 { "" } else { "s" }

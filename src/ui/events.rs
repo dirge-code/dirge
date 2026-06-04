@@ -133,6 +133,20 @@ pub fn format_time(rfc3339: &str) -> CompactString {
     }
 }
 
+/// Internal finalization nudges (critic / verifier / todo) are injected as
+/// user-role messages so the model acts on them, but they are NOT the user's
+/// input. If `content` is one of these tagged nudges, return its body with the
+/// tag stripped (to be shown under the `<critic>` handle); otherwise `None`.
+/// Single source of truth for both the live view (`run_handlers::notices`) and
+/// scrollback (`render_session`) [dirge-i75f].
+pub(crate) fn finalization_nudge_body(content: &str) -> Option<&str> {
+    use crate::agent::agent_loop::{critic::CRITIC_TAG, run::TODO_NUDGE_TAG, verifier::VERIFY_TAG};
+    let trimmed = content.trim_start();
+    [CRITIC_TAG, VERIFY_TAG, TODO_NUDGE_TAG]
+        .into_iter()
+        .find_map(|tag| trimmed.strip_prefix(tag).map(str::trim_start))
+}
+
 pub fn render_session(
     renderer: &mut Renderer,
     session: &Session,
@@ -187,15 +201,16 @@ pub fn render_session(
         // to 8 columns so multi-role chats stay visually aligned.
         // Continuation lines are indented to that same width so the
         // handle isn't repeated on every wrap.
-        // dirge-vg9e: a persisted critic follow-up is a User-role message
-        // tagged with `[critic]`; render it under its own handle/color in
-        // scrollback too, matching the live view.
-        let is_critic = msg.role == MessageRole::User
-            && msg
-                .content
-                .trim_start()
-                .starts_with(crate::agent::agent_loop::critic::CRITIC_TAG);
-        let (handle, line_color) = if is_critic {
+        // dirge-i75f: the finalization nudges (critic / verifier / todo) are
+        // persisted as User-role messages so the model acts on them, but
+        // they're system steering, not user input — render them under the
+        // `<critic>` handle/color in scrollback too, matching the live view.
+        let nudge_body = if msg.role == MessageRole::User {
+            finalization_nudge_body(&msg.content)
+        } else {
+            None
+        };
+        let (handle, line_color) = if nudge_body.is_some() {
             ("<critic> ", theme::critic())
         } else {
             match msg.role {
@@ -204,17 +219,8 @@ pub fn render_session(
                 MessageRole::System => ("<sys> ", theme::system()),
             }
         };
-        // Strip the `[critic]` tag from the displayed body (the handle
-        // already conveys the role).
-        let body: &str = if is_critic {
-            msg.content
-                .trim_start()
-                .strip_prefix(crate::agent::agent_loop::critic::CRITIC_TAG)
-                .map(str::trim_start)
-                .unwrap_or(&msg.content)
-        } else {
-            &msg.content
-        };
+        // Strip the tag from the displayed body (the handle conveys the role).
+        let body: &str = nudge_body.unwrap_or(&msg.content);
         let cont_indent = " ".repeat(handle.chars().count());
 
         if msg.role == MessageRole::Assistant {
@@ -406,6 +412,34 @@ fn strip_orphan_mouse_reports(text: &str) -> String {
 mod tests {
     use super::*;
     use crate::session::{MessageRole, Session};
+
+    /// All three finalization nudges (critic / verifier / todo) are recognized
+    /// and their tags stripped; a genuine user message is left as-is so it
+    /// still renders under `<you>` [dirge-i75f].
+    #[test]
+    fn finalization_nudge_body_recognizes_all_tags() {
+        use crate::agent::agent_loop::{
+            critic::CRITIC_TAG, run::TODO_NUDGE_TAG, verifier::VERIFY_TAG,
+        };
+        assert_eq!(
+            finalization_nudge_body(&format!("{CRITIC_TAG} not done yet")),
+            Some("not done yet")
+        );
+        assert_eq!(
+            finalization_nudge_body(&format!("{VERIFY_TAG} run the tests")),
+            Some("run the tests")
+        );
+        assert_eq!(
+            finalization_nudge_body(&format!(
+                "{TODO_NUDGE_TAG} You still have 6 unfinished todos"
+            )),
+            Some("You still have 6 unfinished todos")
+        );
+        // Genuine user input is not a nudge.
+        assert_eq!(finalization_nudge_body("fix the parser bug"), None);
+        // A bracketed-but-unknown prefix is not a nudge either.
+        assert_eq!(finalization_nudge_body("[note] just a note"), None);
+    }
 
     fn make_session() -> Session {
         Session::new("openrouter", "gpt-5", 200_000)

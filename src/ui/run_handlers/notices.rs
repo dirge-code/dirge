@@ -21,11 +21,12 @@ use crate::ui::theme;
 /// to the session at submit time.
 pub(crate) fn handle_user_message(renderer: &mut Renderer, content: &str) -> std::io::Result<()> {
     let visible = strip_leading_system_reminder(content);
-    // dirge-vg9e: the in-loop critic re-enters as a user-role message so the
-    // model acts on it; surface it under a distinct `<critic>` handle/color
-    // rather than the user's `<you>`. The tag is stripped from the display.
-    if let Some(body) = visible.strip_prefix(crate::agent::agent_loop::critic::CRITIC_TAG) {
-        write_critic_lines(renderer, body.trim_start())?;
+    // dirge-i75f: the in-loop finalization nudges (critic / verifier / todo)
+    // re-enter as user-role messages so the model acts on them; surface them
+    // under the `<critic>` handle/color rather than the user's `<you>`. The tag
+    // is stripped from the display.
+    if let Some(body) = crate::ui::events::finalization_nudge_body(visible) {
+        write_critic_lines(renderer, body)?;
         return renderer.write_line("", Color::White);
     }
     write_user_lines(renderer, visible)?;
