@@ -40,6 +40,27 @@ pub(crate) struct PlanKickoff {
     pub active: ActivePlan,
 }
 
+/// Events emitted by the async explore→plan task and drained by the UI loop, so
+/// the (minutes-long) forks no longer park the event loop [dirge-vuzz]. The
+/// loop renders `Progress` lines, launches the implement run on `Ready`, and
+/// drops the busy state on `Aborted`.
+pub(crate) enum PlanPhaseEvent {
+    /// A status line to render. `error` selects the color.
+    Progress { text: String, error: bool },
+    /// Both forks succeeded — launch the streamed implement run from this.
+    Ready(Box<PlanKickoff>),
+    /// A phase produced nothing or errored (a `Progress` line already said why).
+    Aborted,
+}
+
+/// Handle to the spawned explore→plan task: the event stream the UI loop drains
+/// plus the task itself, so Ctrl+C can `abort()` it (which drops the in-flight
+/// `collect_runner_text` guard and cancels the inner phase runner too).
+pub(crate) struct PlanPhaseHandle {
+    pub rx: tokio::sync::mpsc::Receiver<PlanPhaseEvent>,
+    pub task: tokio::task::JoinHandle<()>,
+}
+
 /// Drain a forked phase runner to completion and return its final assistant
 /// text. `Token`s accumulate; the authoritative `Done { response }` payload is
 /// preferred once it arrives (but an empty `Done` keeps the streamed text); the

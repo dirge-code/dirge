@@ -70,10 +70,11 @@ pub(super) struct SlashCtx<'a> {
     pub semantic_manager: Option<&'a SemanticManager>,
     #[cfg(feature = "lsp")]
     pub lsp_manager: Option<&'a std::sync::Arc<crate::lsp::manager::LspManager>>,
-    /// `/plan` writes its post-fork kickoff here; the UI loop launches the
-    /// streamed implement run from it (slash handlers can't touch the loop's
-    /// `agent_rx`/`is_running` directly).
-    pub plan_kickoff: &'a mut Option<crate::agent::plan::runtime::PlanKickoff>,
+    /// `/plan` spawns its explore→plan forks on a task and writes the handle
+    /// here; the UI loop drains its events, launches the streamed implement run
+    /// on `Ready`, and can Ctrl+C-abort it (slash handlers can't touch the
+    /// loop's `agent_rx`/`is_running`/`select!` directly) [dirge-vuzz].
+    pub plan_phase: &'a mut Option<crate::agent::plan::runtime::PlanPhaseHandle>,
 }
 
 /// Walk `cut_idx` forward until the message at that index is a
@@ -428,7 +429,7 @@ pub async fn handle_slash(
     // build_agent. The user lost LSP silently after the first such
     // command. Thread the actual manager through.
     #[cfg(feature = "lsp")] lsp_manager: Option<&std::sync::Arc<crate::lsp::manager::LspManager>>,
-    plan_kickoff: &mut Option<crate::agent::plan::runtime::PlanKickoff>,
+    plan_phase: &mut Option<crate::agent::plan::runtime::PlanPhaseHandle>,
 ) -> anyhow::Result<()> {
     let parts: SmallVec<[&str; 3]> = split_command_parts(text);
     let mut ctx = SlashCtx {
@@ -457,7 +458,7 @@ pub async fn handle_slash(
         semantic_manager,
         #[cfg(feature = "lsp")]
         lsp_manager,
-        plan_kickoff,
+        plan_phase,
     };
     match parts[0] {
         "/model" => cmd_model::cmd_model(&mut ctx, &parts).await?,

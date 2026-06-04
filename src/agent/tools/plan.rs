@@ -4,7 +4,7 @@
 //!
 //! NOTE: this is NOT the phased `/plan` workflow (explore→plan→implement→
 //! review) — that lives in [`crate::agent::plan`]. Unrelated feature, similar
-//! name; don't cross the wires (`plan_tx` here vs `plan_kickoff`/`active_plan`
+//! name; don't cross the wires (`plan_tx` here vs `plan_phase`/`active_plan`
 //! there). For how this relates to the phased workflow, the `write_todo_list`
 //! checklist, and background `task`s, see the canonical map of all four
 //! work-tracking concepts in [`crate::agent::plan`].

@@ -1,28 +1,32 @@
 //! `/plan <request>` — the phased plan workflow entry (vix port, P3e-b).
 //!
-//! Runs the two read-only forks (explore → plan) inline here, exactly like
-//! `/compress` does its heavy work in the slash handler, then hands a
-//! [`PlanKickoff`] back to the UI loop, which launches the *streamed* implement
-//! run and seeds the reviewer loop (driven in `run_handlers/done.rs`). The
-//! phases are separate forks → genuine context resets, per the chosen
-//! "separate-agent phases" model.
+//! The two read-only forks (explore → plan) run on a SPAWNED task, not inline,
+//! so the UI event loop stays responsive (paints, scrolls, Ctrl+C) while the
+//! minutes-long LLM calls run [dirge-vuzz]. The task streams
+//! [`PlanPhaseEvent`]s back over a channel; the UI loop renders progress lines,
+//! launches the streamed implement run on `Ready`, and seeds the reviewer loop
+//! (driven in `run_handlers/done.rs`). The phases are separate forks → genuine
+//! context resets, per the chosen "separate-agent phases" model.
+
+use tokio::sync::mpsc;
 
 use super::SlashCtx;
-use crate::agent::plan::runtime::{ActivePlan, PlanKickoff, collect_runner_text};
+use crate::agent::plan::runtime::{
+    ActivePlan, PlanKickoff, PlanPhaseEvent, PlanPhaseHandle, collect_runner_text,
+};
 use crate::agent::plan::workflow::{READONLY_PHASE_TOOLS, explore_prompt, plan_prompt};
+use crate::provider::AnyAgent;
 use crate::ui::avatar::AvatarState;
-use crate::ui::colors::{c_agent, c_error};
+use crate::ui::colors::c_error;
 
-/// Switch the bottom bar between the busy and idle presentations and repaint.
+/// Switch the bottom bar into the busy presentation and repaint.
 ///
-/// The standard busy indicator is keyed off a single `is_running` flag that the
-/// prompt glyph (`░▌` vs `> `), the status word (`running`/`ready`), and the
-/// avatar all read. Blocking slash handlers (the `/plan` explore/plan forks
-/// here) run with the UI event loop parked, so the indicator only updates if
-/// the handler repaints — without this, `/plan` deceptively looks idle and the
-/// just-submitted command still appears in the (already-cleared) input box.
-/// Flipping `is_running` + repainting here makes a blocking phase look exactly
-/// as busy as a normal streamed run, and blanks the stale input text.
+/// The standard busy indicator is keyed off the single `is_running` flag that
+/// the prompt glyph (`░▌` vs `> `), the status word (`running`/`ready`), and
+/// the avatar read. We flip it on here (and blank the just-submitted `/plan …`
+/// line) the instant the phases are spawned; the UI loop flips it back off when
+/// the phase task reports `Aborted`, or keeps it on through the implement run on
+/// `Ready`.
 fn set_busy(ctx: &mut SlashCtx<'_>, busy: bool) -> anyhow::Result<()> {
     ctx.renderer.set_avatar_state(if busy {
         AvatarState::Thinking
@@ -41,8 +45,6 @@ fn set_busy(ctx: &mut SlashCtx<'_>, busy: bool) -> anyhow::Result<()> {
     );
     ctx.renderer.draw_bottom(ctx.input, &status, busy)?;
     ctx.renderer.render_viewport()?;
-    // Flip the flag only after the paint succeeded, so a failed draw can't
-    // strand the UI in a busy state the user can't get out of.
     *ctx.is_running = busy;
     Ok(())
 }
@@ -67,101 +69,130 @@ pub(super) async fn cmd_plan(
         return Ok(());
     }
 
-    // Enter the busy state up front: the explore/plan forks below block the UI
-    // event loop, so without an immediate repaint the bar would stay idle and
-    // the typed `/plan …` line would linger in the box. `run_phases` drops back
-    // to idle on any abort; on success the kickoff hands off to the loop, which
-    // keeps the run busy through the implement phase.
-    set_busy(ctx, true)?;
+    // Snapshot everything the forks need OFF the UI thread: a frozen transcript,
+    // the review-cycle budget, and a cheap clone of the agent (Arc bumps). The
+    // session/renderer/config stay on the UI thread.
+    let transcript = crate::agent::review::build_transcript(ctx.session);
+    let cycles = ctx.cfg.resolve_phased_workflow_max_review_cycles();
+    let agent = ctx.agent.clone();
 
-    // Reset the busy indicator on EVERY exit except a successful kickoff (where
-    // the loop keeps the run busy). Crucially that includes the error path: a
-    // bubbled io error must not strand the UI showing "running" with no run
-    // active — the user would then have their typing silently queued forever.
-    match run_phases(ctx, &request).await {
-        Ok(Some(kickoff)) => *ctx.plan_kickoff = Some(kickoff),
-        Ok(None) => set_busy(ctx, false)?, // aborted — release the busy indicator
-        Err(e) => {
-            let _ = set_busy(ctx, false);
-            return Err(e);
-        }
+    // Channel capacity is small — the task emits a handful of progress lines
+    // plus one terminal event; the UI loop drains it promptly.
+    let (tx, rx) = mpsc::channel::<PlanPhaseEvent>(8);
+    let task = tokio::spawn(run_phases_task(agent, request, transcript, cycles, tx));
+
+    // Show busy immediately (the typed line is already cleared), then hand the
+    // handle to the loop, which drives the rest from its `select!`. Defensive:
+    // abort any prior phase task we're replacing so it can't keep running
+    // orphaned (shouldn't happen — /plan is gated while a run is active).
+    set_busy(ctx, true)?;
+    if let Some(old) = ctx.plan_phase.take() {
+        old.task.abort();
     }
+    *ctx.plan_phase = Some(PlanPhaseHandle { rx, task });
     Ok(())
 }
 
-/// Run the explore → plan forks. Returns the kickoff on success, or `None` when
-/// a phase aborts (having already printed why). Split out so `cmd_plan` can
-/// bracket it with the busy-indicator transitions.
-async fn run_phases(ctx: &mut SlashCtx<'_>, request: &str) -> anyhow::Result<Option<PlanKickoff>> {
-    // A frozen snapshot of the conversation so far — the same view every phase
-    // fork explores from.
-    let transcript = crate::agent::review::build_transcript(ctx.session);
+/// Send a progress line; returns `false` (caller should bail) if the UI loop
+/// dropped the receiver (e.g. Ctrl+C aborted the phases).
+async fn progress(tx: &mpsc::Sender<PlanPhaseEvent>, text: impl Into<String>, error: bool) -> bool {
+    tx.send(PlanPhaseEvent::Progress {
+        text: text.into(),
+        error,
+    })
+    .await
+    .is_ok()
+}
 
+/// The explore → plan forks, run on a spawned task. Streams progress lines and a
+/// terminal `Ready`/`Aborted` back over `tx`. Aborting the task (Ctrl+C) drops
+/// the in-flight `collect_runner_text` future, whose `AbortRunnerOnDrop` guard
+/// cancels the inner phase runner too — so no orphaned LLM call survives.
+async fn run_phases_task(
+    agent: AnyAgent,
+    request: String,
+    transcript: String,
+    cycles: usize,
+    tx: mpsc::Sender<PlanPhaseEvent>,
+) {
     // Phase 1: Explore (read-only fork, fresh context).
-    ctx.renderer.write_line(
+    if !progress(
+        &tx,
         "Phase: Explore — mapping the codebase (read-only)…",
-        c_agent(),
-    )?;
-    let explore_runner = ctx.agent.spawn_phase_runner(
-        explore_prompt(request),
+        false,
+    )
+    .await
+    {
+        return;
+    }
+    let explore_runner = agent.spawn_phase_runner(
+        explore_prompt(&request),
         transcript.clone(),
         READONLY_PHASE_TOOLS,
     );
     let findings = match collect_runner_text(explore_runner).await {
         Ok(t) if !t.trim().is_empty() => t,
         Ok(_) => {
-            ctx.renderer
-                .write_line("Phase: Explore — produced no findings; aborting", c_error())?;
-            return Ok(None);
+            progress(&tx, "Phase: Explore — produced no findings; aborting", true).await;
+            let _ = tx.send(PlanPhaseEvent::Aborted).await;
+            return;
         }
         Err(e) => {
-            ctx.renderer
-                .write_line(&format!("Phase: Explore — error: {e}; aborting"), c_error())?;
-            return Ok(None);
+            progress(&tx, format!("Phase: Explore — error: {e}; aborting"), true).await;
+            let _ = tx.send(PlanPhaseEvent::Aborted).await;
+            return;
         }
     };
 
-    // Phase 2: Plan (read-only fork; the ONLY thing carried over is the
-    // findings report — a true context reset between phases).
-    ctx.renderer.write_line(
+    // Phase 2: Plan (read-only fork; the ONLY thing carried over is the findings
+    // report — a true context reset between phases).
+    if !progress(
+        &tx,
         "Phase: Plan — turning findings into an implementation plan…",
-        c_agent(),
-    )?;
-    let plan_runner = ctx.agent.spawn_phase_runner(
-        plan_prompt(request, &findings),
+        false,
+    )
+    .await
+    {
+        return;
+    }
+    let plan_runner = agent.spawn_phase_runner(
+        plan_prompt(&request, &findings),
         transcript,
         READONLY_PHASE_TOOLS,
     );
     let plan = match collect_runner_text(plan_runner).await {
         Ok(t) if !t.trim().is_empty() => t,
         Ok(_) => {
-            ctx.renderer
-                .write_line("Phase: Plan — produced no plan; aborting", c_error())?;
-            return Ok(None);
+            progress(&tx, "Phase: Plan — produced no plan; aborting", true).await;
+            let _ = tx.send(PlanPhaseEvent::Aborted).await;
+            return;
         }
         Err(e) => {
-            ctx.renderer
-                .write_line(&format!("Phase: Plan — error: {e}; aborting"), c_error())?;
-            return Ok(None);
+            progress(&tx, format!("Phase: Plan — error: {e}; aborting"), true).await;
+            let _ = tx.send(PlanPhaseEvent::Aborted).await;
+            return;
         }
     };
 
-    // Hand off to the UI loop: it launches the streamed implement run and
-    // arms the reviewer loop.
-    let cycles = ctx.cfg.resolve_phased_workflow_max_review_cycles();
+    // Hand off to the UI loop: it launches the streamed implement run and arms
+    // the reviewer loop.
     let impl_prompt = format!(
         "{request}\n\n--- Implementation plan (from the planning phase) ---\n{plan}\n\n\
          Implement this plan now. Make the edits and run the build/tests to verify.",
     );
-    ctx.renderer.write_line(
+    progress(
+        &tx,
         "Phase: Implement — executing the plan (you'll watch it run)…",
-        c_agent(),
-    )?;
-    Ok(Some(PlanKickoff {
-        impl_prompt,
-        active: ActivePlan {
-            plan,
-            cycles_left: cycles,
-        },
-    }))
+        false,
+    )
+    .await;
+    let _ = tx
+        .send(PlanPhaseEvent::Ready(Box::new(PlanKickoff {
+            impl_prompt,
+            active: ActivePlan {
+                plan,
+                cycles_left: cycles,
+            },
+        })))
+        .await;
 }

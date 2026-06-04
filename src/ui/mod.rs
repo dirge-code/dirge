@@ -261,12 +261,13 @@ pub async fn run_interactive(
     // and surface a clean "cancelled" event before the task is
     // killed at its next `.await`.
     let mut agent_cancel: Option<mpsc::Sender<()>> = None;
-    // Phased `/plan` workflow (P3e-b). `plan_kickoff` is set by the `/plan`
-    // slash command after its explore→plan forks finish; the loop drains it to
-    // launch the streamed implement run. `active_plan` then holds the reviewer
-    // loop state across `Done` events until the reviewer approves or the
-    // fix-cycle budget is spent.
-    let mut plan_kickoff: Option<crate::agent::plan::runtime::PlanKickoff> = None;
+    // Phased `/plan` workflow (P3e-b). `plan_phase` holds the handle to the
+    // spawned explore→plan task; the loop drains its events in a `select!` arm
+    // (so the forks don't park the loop — dirge-vuzz), launching the streamed
+    // implement run on `Ready`. `active_plan` then holds the reviewer loop state
+    // across `Done` events until the reviewer approves or the fix-cycle budget
+    // is spent.
+    let mut plan_phase: Option<crate::agent::plan::runtime::PlanPhaseHandle> = None;
     let mut active_plan: Option<crate::agent::plan::runtime::ActivePlan> = None;
     let mut agent_line_started = false;
     let mut response_buf = String::new();
@@ -839,6 +840,14 @@ pub async fn run_interactive(
                             }
                             if is_running {
                                 is_running = false;
+                                // Abort an in-flight phased `/plan` explore/plan
+                                // task. Aborting it drops the in-flight
+                                // `collect_runner_text` future, whose
+                                // `AbortRunnerOnDrop` guard cancels the inner
+                                // phase runner too (dirge-vuzz).
+                                if let Some(ph) = plan_phase.take() {
+                                    ph.task.abort();
+                                }
                                 // Cooperative cancel first: lets the
                                 // retry loop and rig stream observe
                                 // `signal.is_cancelled()` and exit
@@ -946,6 +955,10 @@ pub async fn run_interactive(
                                 continue;
                             }
                             is_running = false;
+                            // Abort an in-flight phased `/plan` task too (dirge-vuzz).
+                            if let Some(ph) = plan_phase.take() {
+                                ph.task.abort();
+                            }
                             if let Some(tx) = agent_cancel.take() {
                                 let _ = tx.try_send(());
                             }
@@ -1487,7 +1500,7 @@ pub async fn run_interactive(
                                 // /help) have no UserMessage event, so we keep the echo.
                                 write_user_lines(&mut renderer, &text)?;
                                 renderer.write_line("", Color::White)?;
-                                let result = handle_slash(&text, &mut agent, &client, &mut renderer, session, cli, cfg, context, &mut show_reasoning, &mut is_running, &mut input, &permission, &ask_tx, &question_tx, &plan_tx, &mut todo_tools_enabled, &bg_store, &sandbox, #[cfg(feature = "loop")] &mut loop_state, #[cfg(feature = "mcp")] mcp_manager.as_ref(), #[cfg(feature = "semantic")] semantic_manager, #[cfg(feature = "lsp")] lsp_manager.as_ref(), &mut plan_kickoff).await;
+                                let result = handle_slash(&text, &mut agent, &client, &mut renderer, session, cli, cfg, context, &mut show_reasoning, &mut is_running, &mut input, &permission, &ask_tx, &question_tx, &plan_tx, &mut todo_tools_enabled, &bg_store, &sandbox, #[cfg(feature = "loop")] &mut loop_state, #[cfg(feature = "mcp")] mcp_manager.as_ref(), #[cfg(feature = "semantic")] semantic_manager, #[cfg(feature = "lsp")] lsp_manager.as_ref(), &mut plan_phase).await;
                                 match result {
                                 Err(e) if e.to_string().starts_with("DEFER_COMPRESS:") => {
                                     let err_msg = e.to_string();
@@ -1640,24 +1653,10 @@ pub async fn run_interactive(
                                         c_error(),
                                     )?;
                                 }
-                                // Phased `/plan` kickoff: the slash handler ran
-                                // its explore→plan forks and stashed the implement
-                                // prompt + reviewer-loop budget. Launch the streamed
-                                // implement run here (slash handlers can't touch
-                                // agent_rx / is_running) and arm the reviewer loop.
-                                if let Some(kickoff) = plan_kickoff.take() {
-                                    session.add_message(MessageRole::User, &kickoff.impl_prompt);
-                                    last_user_prompt.clone_from(&kickoff.impl_prompt);
-                                    let history = crate::agent::runner::convert_history(session);
-                                    renderer.set_avatar_state(avatar::AvatarState::Idle);
-                                    let runner = agent.clone().spawn_runner(
-                                        crate::agent::tools::background::prepend_pending_notifications(&kickoff.impl_prompt, bg_store.as_ref()),
-                                        history,
-                                        Some(interjection_queue.clone()),
-                                    );
-                                    runner.install_into(&mut agent_rx, &mut agent_abort, &mut agent_interject, &mut agent_cancel, &mut is_running);
-                                    active_plan = Some(kickoff.active);
-                                }
+                                // The phased `/plan` kickoff is no longer consumed
+                                // here: cmd_plan spawns the explore→plan forks on a
+                                // task and the `plan_phase` select! arm launches the
+                                // implement run on `Ready` (dirge-vuzz).
                             } else if is_running {
                                 // Agent busy — queue the message. The loop polls
                                 // the steering queue at turn boundaries and injects
@@ -2133,6 +2132,62 @@ pub async fn run_interactive(
                     &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), interjection_queue.lock().unwrap().len()),
                     is_running,
                 )?;
+            }
+            // Phased `/plan` explore→plan task events. Drained here so the forks
+            // run off the event loop (dirge-vuzz): progress lines paint as they
+            // arrive, `Ready` launches the implement run, `Aborted`/channel-close
+            // drops the busy state. Binds the `Option` directly (not `Some(..)`)
+            // so a closed channel is handled instead of busy-looping the select.
+            ev = async {
+                if let Some(ph) = &mut plan_phase {
+                    ph.rx.recv().await
+                } else {
+                    std::future::pending().await
+                }
+            } => {
+                use crate::agent::plan::runtime::PlanPhaseEvent;
+                match ev {
+                    Some(PlanPhaseEvent::Progress { text, error }) => {
+                        renderer.write_line(&text, if error { c_error() } else { c_agent() })?;
+                        renderer.render_viewport()?;
+                        renderer.draw_bottom(
+                            &input,
+                            &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), interjection_queue.lock().unwrap().len()),
+                            is_running,
+                        )?;
+                    }
+                    Some(PlanPhaseEvent::Ready(kickoff)) => {
+                        // explore→plan finished: launch the streamed implement run
+                        // and arm the reviewer loop (the old inline kickoff path,
+                        // now event-driven so the loop stayed responsive).
+                        plan_phase = None;
+                        let kickoff = *kickoff;
+                        session.add_message(MessageRole::User, &kickoff.impl_prompt);
+                        last_user_prompt.clone_from(&kickoff.impl_prompt);
+                        let history = crate::agent::runner::convert_history(session);
+                        renderer.set_avatar_state(avatar::AvatarState::Idle);
+                        let runner = agent.clone().spawn_runner(
+                            crate::agent::tools::background::prepend_pending_notifications(&kickoff.impl_prompt, bg_store.as_ref()),
+                            history,
+                            Some(interjection_queue.clone()),
+                        );
+                        runner.install_into(&mut agent_rx, &mut agent_abort, &mut agent_interject, &mut agent_cancel, &mut is_running);
+                        active_plan = Some(kickoff.active);
+                    }
+                    Some(PlanPhaseEvent::Aborted) | None => {
+                        // A phase produced nothing / errored (a Progress line said
+                        // why), or the task ended without a terminal event. Release
+                        // the busy state.
+                        plan_phase = None;
+                        is_running = false;
+                        renderer.set_avatar_state(avatar::AvatarState::Idle);
+                        renderer.draw_bottom(
+                            &input,
+                            &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), interjection_queue.lock().unwrap().len()),
+                            is_running,
+                        )?;
+                    }
+                }
             }
             Some(ask_req) = async {
                 if let Some(rx) = &mut ask_rx {
