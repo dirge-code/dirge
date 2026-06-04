@@ -17,6 +17,11 @@ use crate::session::SessionMessage;
 
 use super::summarize;
 
+/// `Clone` is cheap — each inner rig client holds an `Arc`'d reqwest client +
+/// config. Used to stash a copy in the process-global subagent client
+/// (`task::set_subagent_client`) so the `task` tool can build per-profile
+/// models without threading the client through every `build_agent` call site.
+#[derive(Clone)]
 pub enum AnyClient {
     OpenRouter(openrouter::Client),
     OpenAI(openai::CompletionsClient),
@@ -138,7 +143,20 @@ pub enum AnyModel {
 
 impl AnyModel {
     pub async fn btw_query(&self, prompt: String) -> anyhow::Result<String> {
-        let preamble = "Answer the user's question concisely.";
+        self.btw_query_with(prompt, None).await
+    }
+
+    /// One-shot, tool-less query with an optional system-prompt override.
+    /// `preamble = None` uses the default concise-answer preamble; the `task`
+    /// tool passes an agent profile's prompt here so a subagent can run with a
+    /// specialized persona (dirge-ykeu Phase 4). Same recovery policy as
+    /// `btw_query`.
+    pub async fn btw_query_with(
+        &self,
+        prompt: String,
+        preamble: Option<&str>,
+    ) -> anyhow::Result<String> {
+        let preamble = preamble.unwrap_or("Answer the user's question concisely.");
         // PROV-3: wrap the bare one-shot prompt in the same recovery
         // policy used for the main turn loop. Previously a single
         // 503 from the provider killed every `/btw` and subagent

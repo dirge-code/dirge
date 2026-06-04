@@ -160,6 +160,56 @@ pub fn unregister_subagent_abort(id: &str) {
     map.remove(id);
 }
 
+/// dirge-ykeu Phase 4: a pre-resolved subagent routing for one agent profile.
+/// Built once at startup (in `main`, where the client + config + registry are
+/// all available) so `TaskTool` needs neither the client nor the config to
+/// route a `task(agent="<name>")` call to a profile's model + system prompt.
+#[derive(Clone)]
+pub struct SubagentRoute {
+    /// Model to run the subagent on. `None` → use the default subagent model
+    /// (the profile didn't pin a model).
+    pub model: Option<AnyModel>,
+    /// System prompt override for the subagent. `None` → default preamble.
+    pub preamble: Option<String>,
+}
+
+/// Process-global map of profile name → routing. Set once at interactive
+/// startup; unset on tool-less / test paths (where `task(agent=…)` simply
+/// reports the feature isn't available). Mirrors the `set_subagent_chat_sink`
+/// process-global pattern to keep the diff off every `build_agent` call site.
+static SUBAGENT_ROUTES: std::sync::OnceLock<HashMap<String, SubagentRoute>> =
+    std::sync::OnceLock::new();
+
+/// Install the subagent routing table. First writer wins (a no-op re-set is
+/// logged, not fatal, matching the chat-sink global).
+pub fn set_subagent_routes(routes: HashMap<String, SubagentRoute>) {
+    if SUBAGENT_ROUTES.set(routes).is_err() {
+        tracing::debug!("subagent routes already set; ignoring re-set");
+    }
+}
+
+/// Look up a profile's routing by name. `None` distinguishes "no routing table
+/// installed" from "name not in table" only at the call site (both are errors
+/// for an explicit `agent=` arg).
+fn subagent_route(name: &str) -> Option<SubagentRoute> {
+    SUBAGENT_ROUTES.get()?.get(name).cloned()
+}
+
+/// Whether any routing table is installed (profiles feature active).
+fn subagent_routes_available() -> bool {
+    SUBAGENT_ROUTES.get().is_some_and(|m| !m.is_empty())
+}
+
+/// Sorted profile names, for the `task` tool definition's `agent` enum.
+fn subagent_route_names() -> Vec<String> {
+    let Some(map) = SUBAGENT_ROUTES.get() else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = map.keys().cloned().collect();
+    names.sort();
+    names
+}
+
 /// Outcome of a `/kill <id-prefix>` resolution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KillOutcome {
@@ -294,6 +344,11 @@ pub struct Args {
     pub prompt: String,
     #[serde(default)]
     pub background: Option<bool>,
+    /// dirge-ykeu Phase 4: optional agent-profile name. When set, the subagent
+    /// runs on that profile's model + system prompt (defined in `.dirge/agents/`
+    /// or `config.json` `agents`). Omit for the default subagent.
+    #[serde(default)]
+    pub agent: Option<String>,
 }
 
 impl Tool for TaskTool {
@@ -304,10 +359,10 @@ impl Tool for TaskTool {
     type Output = String;
 
     async fn definition(&self, _prompt: String) -> ToolDefinition {
-        let description = "Spawn a subagent to handle a specific subtask. The subagent runs as a one-shot query (no tools) and returns its result inline. Use for research, analysis, or planning subtasks that don't require file access. Set background=true to run asynchronously — completion is delivered to you automatically as a <system-reminder> at the start of your next turn. Do NOT poll task_status in a loop or sleep waiting; continue with other work."
+        let mut description = "Spawn a subagent to handle a specific subtask. The subagent runs as a one-shot query (no tools) and returns its result inline. Use for research, analysis, or planning subtasks that don't require file access. Set background=true to run asynchronously — completion is delivered to you automatically as a <system-reminder> at the start of your next turn. Do NOT poll task_status in a loop or sleep waiting; continue with other work."
             .to_string();
 
-        let properties = serde_json::json!({
+        let mut properties = serde_json::json!({
             "type": "object",
             "properties": {
                 "prompt": {
@@ -322,6 +377,30 @@ impl Tool for TaskTool {
             "required": ["prompt"]
         });
 
+        // dirge-ykeu Phase 4: advertise the `agent` param only when profiles
+        // are installed, with the available names as an enum so the model
+        // can't invent one.
+        let names = subagent_route_names();
+        if !names.is_empty() {
+            description.push_str(&format!(
+                " Optionally set agent=<name> to run the subagent under a defined profile (its own model + system prompt). Available profiles: {}.",
+                names.join(", ")
+            ));
+            if let Some(props) = properties
+                .get_mut("properties")
+                .and_then(|p| p.as_object_mut())
+            {
+                props.insert(
+                    "agent".to_string(),
+                    serde_json::json!({
+                        "type": "string",
+                        "enum": names,
+                        "description": "Agent profile to run this subagent under (model + system prompt). Omit for the default subagent."
+                    }),
+                );
+            }
+        }
+
         ToolDefinition {
             name: "task".to_string(),
             description,
@@ -331,6 +410,34 @@ impl Tool for TaskTool {
 
     async fn call(&self, args: Args) -> Result<String, ToolError> {
         check_perm(&self.permission, &self.ask_tx, "task", &args.prompt).await?;
+
+        // dirge-ykeu Phase 4: resolve an optional agent profile to a model +
+        // system-prompt override. An explicit `agent=` that can't be resolved
+        // is an error (don't silently fall back to the default subagent —
+        // the model asked for a specific persona).
+        let (route_model, route_preamble) = match args.agent.as_deref() {
+            None => (None, None),
+            Some(name) => {
+                if !subagent_routes_available() {
+                    return Err(ToolError::Msg(format!(
+                        "agent profile '{}' requested but no profiles are defined. Add .dirge/agents/<name>.md or a config.json \"agents\" entry, or omit `agent`.",
+                        name
+                    )));
+                }
+                match subagent_route(name) {
+                    Some(r) => (r.model, r.preamble),
+                    None => {
+                        return Err(ToolError::Msg(format!(
+                            "unknown agent profile '{}'. Available: {}.",
+                            name,
+                            subagent_route_names().join(", ")
+                        )));
+                    }
+                }
+            }
+        };
+        // The profile's model (when it pinned one) else the default subagent.
+        let model = route_model.unwrap_or_else(|| self.model.clone());
 
         let background = args.background.unwrap_or(false);
 
@@ -365,12 +472,12 @@ impl Tool for TaskTool {
             let abort = AbortSignal::new();
             register_subagent_abort(&task_id, abort.clone());
 
-            let model = self.model.clone();
             let prompt = args.prompt;
             let store = self.bg_store.clone();
             let tid = task_id.clone();
             let chat_sink = self.chat_sink.clone();
             let abort_for_task = abort.clone();
+            let preamble_for_task = route_preamble.clone();
 
             // Cap the background subagent at 10 minutes. Without a
             // timeout, a stuck subagent (provider hang, runaway
@@ -384,10 +491,13 @@ impl Tool for TaskTool {
             let store_for_task = store.clone();
             let tid_for_task = tid.clone();
             let handle = tokio::spawn(async move {
-                let fut = model.btw_query(format!(
-                    "You are a subagent working on a specific subtask. Complete it thoroughly.\n\nTask: {}",
-                    prompt
-                ));
+                let fut = model.btw_query_with(
+                    format!(
+                        "You are a subagent working on a specific subtask. Complete it thoroughly.\n\nTask: {}",
+                        prompt
+                    ),
+                    preamble_for_task.as_deref(),
+                );
                 // dirge-781c: race btw_query against the abort signal.
                 // `btw_query` is one-shot so we can't propagate the
                 // signal into the provider; instead we poll the flag
@@ -501,10 +611,13 @@ impl Tool for TaskTool {
             let abort = AbortSignal::new();
             register_subagent_abort(&task_id, abort.clone());
 
-            let fut = self.model.btw_query(format!(
-                "You are a subagent working on a specific subtask. Complete it thoroughly.\n\nTask: {}",
-                args.prompt
-            ));
+            let fut = model.btw_query_with(
+                format!(
+                    "You are a subagent working on a specific subtask. Complete it thoroughly.\n\nTask: {}",
+                    args.prompt
+                ),
+                route_preamble.as_deref(),
+            );
             let abort_check = abort.clone();
             let raced = async {
                 tokio::pin!(fut);
@@ -641,13 +754,17 @@ mod tests {
         let _tool: TaskTool = mock_tool();
 
         // The btw_query path lives in provider/dispatch.rs. The build
-        // inside it is `AgentBuilder::new(m).preamble(...).build()`
-        // with no `.tool(...)` calls — verify by source inspection
-        // that no tool-attaching call has crept in.
+        // inside `btw_query_with` (which `btw_query` delegates to) is
+        // `AgentBuilder::new(m).preamble(...).build()` with no `.tool(...)`
+        // calls — verify by source inspection that no tool-attaching call
+        // has crept in. We pin on `btw_query_with` because that's where the
+        // real AgentBuilder lives (dirge-ykeu Phase 4 added the profile
+        // preamble override there); the bare `btw_query` is now a thin
+        // delegate.
         let provider_src = include_str!("../../provider/dispatch.rs");
         let btw_idx = provider_src
-            .find("pub async fn btw_query")
-            .expect("btw_query must exist in provider/dispatch.rs");
+            .find("pub async fn btw_query_with")
+            .expect("btw_query_with must exist in provider/dispatch.rs");
         let btw_end = provider_src[btw_idx..]
             .find("\n    }\n")
             .map(|i| btw_idx + i)
@@ -655,15 +772,53 @@ mod tests {
         let btw_body = &provider_src[btw_idx..btw_end];
         assert!(
             !btw_body.contains(".tool("),
-            "btw_query must not attach tools to the subagent — that would \
+            "btw_query_with must not attach tools to the subagent — that would \
              require auditing session_id propagation per dirge-mifq. \
              Source snippet:\n{btw_body}"
         );
         assert!(
             !btw_body.contains(".tools("),
-            "btw_query must not attach tools to the subagent — that would \
+            "btw_query_with must not attach tools to the subagent — that would \
              require auditing session_id propagation per dirge-mifq."
         );
+    }
+
+    // dirge-ykeu Phase 4: with a routing table installed, the `task` tool
+    // advertises an `agent` enum and resolves/rejects profile names. NOTE:
+    // SUBAGENT_ROUTES is a set-once OnceLock, so this is the only test in the
+    // binary that installs it; other tests' assertions are substring/key
+    // checks robust to the extra `agent` property it adds.
+    #[tokio::test]
+    async fn subagent_routing_advertises_and_validates() {
+        let mut routes = HashMap::new();
+        routes.insert(
+            "reviewer".to_string(),
+            SubagentRoute {
+                model: None,
+                preamble: Some("You are a reviewer.".to_string()),
+            },
+        );
+        set_subagent_routes(routes);
+
+        assert!(subagent_routes_available());
+        assert_eq!(subagent_route_names(), vec!["reviewer".to_string()]);
+        assert!(subagent_route("reviewer").is_some());
+        assert!(subagent_route("ghost").is_none());
+
+        let tool = mock_tool();
+        let def = tool.definition(String::new()).await;
+        assert!(
+            def.description.contains("Available profiles: reviewer"),
+            "definition must list installed profiles: {}",
+            def.description
+        );
+        let props = def
+            .parameters
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .expect("properties present");
+        let agent_prop = props.get("agent").expect("agent property advertised");
+        assert_eq!(agent_prop["enum"][0], "reviewer");
     }
 
     #[tokio::test]

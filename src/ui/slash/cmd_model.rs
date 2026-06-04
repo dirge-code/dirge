@@ -368,25 +368,7 @@ async fn rebuild_agent(ctx: &mut SlashCtx<'_>) {
     .await;
 }
 
-/// Resolve an agent's `model` field to a model string for the current client.
-/// If it names a `providers` alias carrying a `model`, use that model; else
-/// treat the value itself as the model name. `None` → keep the current model.
-///
-/// NOTE (dirge-ykeu): this is a *same-client* resolution. If the alias points
-/// at a different backend (provider_type/base_url/api_key), only its model
-/// string is taken — cross-provider client switching is a later phase. The
-/// built-in role routing (critic/escalation) already does full per-role
-/// clients and is unaffected.
-fn resolve_agent_model(cfg: &crate::config::Config, model: Option<&str>) -> Option<String> {
-    let m = model?;
-    if let Some(providers) = &cfg.providers
-        && let Some(entry) = providers.get(m)
-        && let Some(model_str) = &entry.model
-    {
-        return Some(model_str.clone());
-    }
-    Some(m.to_string())
-}
+use crate::context::agent_defs::resolve_model_alias as resolve_agent_model;
 
 /// `/agent` — list / switch / clear the active agent profile (dirge-ykeu).
 ///

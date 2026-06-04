@@ -30,6 +30,24 @@ pub fn project_agents_dir(cwd: &Path) -> PathBuf {
     cwd.join(".dirge").join("agents")
 }
 
+/// Resolve a profile's `model` field to a model string for the active client.
+/// If it names a `providers` alias carrying a `model`, that model is used; else
+/// the value is treated as the model name. `None` → keep the current model.
+///
+/// Same-client resolution: only the model string is taken even when the alias
+/// implies a different backend (`provider_type`/`base_url`). Shared by `/agent`
+/// switching and the `task` tool's per-profile subagent routing.
+pub fn resolve_model_alias(cfg: &crate::config::Config, model: Option<&str>) -> Option<String> {
+    let m = model?;
+    if let Some(providers) = &cfg.providers
+        && let Some(entry) = providers.get(m)
+        && let Some(model_str) = &entry.model
+    {
+        return Some(model_str.clone());
+    }
+    Some(m.to_string())
+}
+
 /// Which tools an agent may call. Enforced (in a later phase) through the same
 /// permission-layer mechanism that backs prompt `deny_tools`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -406,6 +424,35 @@ mod tests {
         let mut got = ToolPolicy::Allow(vec!["read".into()]).to_deny_list(&builtins);
         got.sort();
         assert_eq!(got, vec!["bash", "edit", "write"]);
+    }
+
+    #[test]
+    fn resolve_model_alias_prefers_provider_entry() {
+        use crate::config::{Config, ProviderEntry};
+        let mut providers = HashMap::new();
+        providers.insert(
+            "fast".to_string(),
+            ProviderEntry {
+                model: Some("anthropic/haiku".to_string()),
+                ..Default::default()
+            },
+        );
+        let cfg = Config {
+            providers: Some(providers),
+            ..Default::default()
+        };
+        // Alias with a model → that model string.
+        assert_eq!(
+            resolve_model_alias(&cfg, Some("fast")).as_deref(),
+            Some("anthropic/haiku")
+        );
+        // Unknown alias → used verbatim as a model name.
+        assert_eq!(
+            resolve_model_alias(&cfg, Some("openai/gpt-4o")).as_deref(),
+            Some("openai/gpt-4o")
+        );
+        // None → None (keep current model).
+        assert_eq!(resolve_model_alias(&cfg, None), None);
     }
 
     #[test]

@@ -807,6 +807,31 @@ async fn main() -> anyhow::Result<()> {
 
     let client = provider::create_client(&provider, resolved_key.as_deref(), &cfg.providers_map())?;
 
+    // dirge-ykeu Phase 4: pre-resolve user agent profiles into subagent
+    // routes (model + system prompt) and install them process-globally so the
+    // `task` tool can spawn `task(agent="<name>")` subagents under a profile.
+    // Resolved here because this is the one place the client + config +
+    // registry coexist. Empty registry → no routes installed (the `agent`
+    // param simply isn't advertised). No effect on the built-in critic/roles.
+    if !context.agent_defs.is_empty() {
+        let routes = context
+            .agent_defs
+            .iter()
+            .map(|def| {
+                let model = context::agent_defs::resolve_model_alias(&cfg, def.model.as_deref())
+                    .map(|m| client.completion_model(m));
+                (
+                    def.name.clone(),
+                    agent::tools::task::SubagentRoute {
+                        model,
+                        preamble: def.prompt.clone(),
+                    },
+                )
+            })
+            .collect();
+        agent::tools::task::set_subagent_routes(routes);
+    }
+
     // MCP connection. `connect_all` can take seconds — an `npx -y <pkg>`
     // cold start, ×N servers — so blocking on it before the UI draws was
     // the dominant time-to-first-frame cost. The non-interactive paths
