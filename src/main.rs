@@ -403,6 +403,21 @@ async fn main() -> anyhow::Result<()> {
     // applies across LSP / MCP / bash / the stream loop from one place.
     timeout::Timeouts::init(cfg.resolve_timeouts());
     let mut context = context::load(cli.resolve_no_context_files(&cfg));
+    // dirge-ykeu: load user-defined agent profiles. Done here (not in
+    // context::load) because the lowest-precedence tier is `config.json`
+    // `agents`, which needs `cfg`. File tiers override it: global
+    // (`~/.config/dirge/agents/`) then project (`.dirge/agents/`). Empty
+    // unless the user opts in — no behavior change otherwise.
+    if !cli.resolve_no_context_files(&cfg) {
+        let cwd = std::env::current_dir().ok();
+        context.agent_defs = context::agent_defs::AgentRegistry::load(
+            cfg.agents.as_ref(),
+            Some(context::agent_defs::global_agents_dir().as_path()),
+            cwd.as_deref()
+                .map(context::agent_defs::project_agents_dir)
+                .as_deref(),
+        );
+    }
 
     let default_prompt = cli
         .prompt

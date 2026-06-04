@@ -5,11 +5,17 @@ use smallvec::SmallVec;
 
 use crate::session::storage;
 
+pub mod agent_defs;
 pub mod prompts;
 
 pub struct ContextFiles {
     pub agents: Option<String>,
     pub prompts: HashMap<String, prompts::Prompt>,
+    /// User-defined agent profiles (dirge-ykeu). Empty unless the user opts
+    /// in via `.dirge/agents/*.md` or `config.json` `agents`. Populated by
+    /// `main` after config load (it needs `config.agents` for the lowest-
+    /// precedence tier); `context::load` leaves it default-empty.
+    pub agent_defs: agent_defs::AgentRegistry,
     pub current_prompt: Option<String>,
     pub current_prompt_name: Option<String>,
     /// Tools that are denied while `current_prompt_name` is active.
@@ -49,6 +55,7 @@ pub fn load(no_context_files: bool) -> ContextFiles {
     ContextFiles {
         agents,
         prompts: prompt_map,
+        agent_defs: agent_defs::AgentRegistry::default(),
         current_prompt: None,
         current_prompt_name: None,
         current_prompt_deny_tools: Vec::new(),

@@ -268,6 +268,12 @@ pub struct Config {
     /// Each entry's `provider_type` defaults to the alias key
     /// when omitted.
     pub providers: Option<HashMap<String, ProviderEntry>>,
+    /// User-defined agent profiles (dirge-ykeu), keyed by name. Each is a
+    /// `{ prompt, model, allow_tools/deny_tools, reasoning, temperature }`
+    /// bundle. Lowest-precedence source — `.dirge/agents/*.md` and
+    /// `~/.config/dirge/agents/*.md` files override same-named entries here.
+    /// Absent = no profiles (fully opt-in; today's behavior unchanged).
+    pub agents: Option<HashMap<String, crate::context::agent_defs::AgentConfig>>,
     /// Per-plugin settings, keyed by plugin name (the directory name or
     /// the `.janet` file stem under a plugin search dir). Absent entry =
     /// enabled, not auto-started (backward compatible).

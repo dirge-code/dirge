@@ -483,6 +483,7 @@ pub async fn handle_slash(
         }
         "/loop" => cmd_misc::cmd_loop(&mut ctx, &parts, text).await?,
         "/prompt" => cmd_model::cmd_prompt(&mut ctx, &parts).await?,
+        "/agents" => cmd_misc::cmd_agents(&mut ctx, &parts).await?,
         "/plan" => cmd_plan::cmd_plan(&mut ctx, &parts, text).await?,
         #[cfg(feature = "git-worktree")]
         "/worktree" => cmd_worktree::cmd_worktree(&mut ctx, &parts).await?,
@@ -691,6 +692,7 @@ pub fn try_complete(buffer: &str, cursor: usize) -> Option<CompletionResult> {
 /// feature.
 pub fn slash_command_names() -> Vec<&'static str> {
     let mut cmds = vec![
+        "/agents",
         "/allow",
         "/btw",
         "/cd",
@@ -1131,6 +1133,7 @@ mod tests {
         // therefore must always be present. Cross-checked by hand
         // against the `match parts[0]` arms in `handle_slash`.
         const ALWAYS_ON: &[&str] = &[
+            "/agents",
             "/allow",
             "/btw",
             "/cd",

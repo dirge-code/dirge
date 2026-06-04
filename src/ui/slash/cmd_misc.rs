@@ -6,8 +6,51 @@ use crate::sync_util::LockExt;
 use crossterm::style::Color;
 
 use super::{SlashCtx, c_agent, c_error, c_result};
+use crate::context::agent_defs::ToolPolicy;
 use crate::ui::events::render_session;
 use crate::ui::theme;
+
+/// `/agents` — list user-defined agent profiles (dirge-ykeu). Read-only.
+///
+/// Surfaces what's been loaded from `.dirge/agents/*.md`,
+/// `~/.config/dirge/agents/*.md`, and `config.json` `agents` so users can
+/// confirm their profiles are picked up (and at what precedence). Switching
+/// the active agent (`/agent <name>`) lands in a later phase.
+pub(super) async fn cmd_agents(ctx: &mut SlashCtx<'_>, _parts: &[&str]) -> anyhow::Result<()> {
+    let reg = &ctx.context.agent_defs;
+    if reg.is_empty() {
+        ctx.renderer.write_line(
+            "no agent profiles defined — add .dirge/agents/<name>.md or a config.json \"agents\" entry",
+            c_agent(),
+        )?;
+        return Ok(());
+    }
+    ctx.renderer
+        .write_line(&format!("agent profiles ({}):", reg.len()), c_agent())?;
+    for a in reg.iter() {
+        let model = a.model.as_deref().unwrap_or("(default model)");
+        let tools = match &a.tools {
+            ToolPolicy::All => "all tools".to_string(),
+            ToolPolicy::Allow(v) => format!("allow: {}", v.join(", ")),
+            ToolPolicy::Deny(v) => format!("deny: {}", v.join(", ")),
+        };
+        ctx.renderer.write_line(
+            &format!(
+                "  {}  [{}]  {}  ·  {}",
+                a.name,
+                a.source.label(),
+                model,
+                tools
+            ),
+            c_result(),
+        )?;
+        if let Some(d) = &a.description {
+            ctx.renderer
+                .write_line(&format!("      {}", d), c_result())?;
+        }
+    }
+    Ok(())
+}
 
 #[cfg(feature = "mcp")]
 pub(super) async fn cmd_mcp(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyhow::Result<()> {
@@ -709,6 +752,10 @@ pub(super) async fn cmd_help(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     )?;
     renderer.write_line(
         "  /regen-prompts        restore built-in prompts to global dir",
+        c_result(),
+    )?;
+    renderer.write_line(
+        "  /agents                list user-defined agent profiles",
         c_result(),
     )?;
     #[cfg(feature = "git-worktree")]
