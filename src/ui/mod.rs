@@ -70,7 +70,7 @@ use crate::shell;
 use crate::ui::agent_io::render_plugin_entry;
 use crate::ui::agent_io::{apply_subagent_panel_event, capture_partial_on_abort};
 use crate::ui::chat_state::{ChatUiState, load_chat_ui_state, save_chat_ui_state};
-use crate::ui::colors::{c_agent, c_error, c_perm, c_tool, resolve_color};
+use crate::ui::colors::{c_agent, c_error, c_perm, c_tool};
 use crate::ui::events::{render_session, sanitize_output};
 use crate::ui::input::InputEditor;
 use crate::ui::keymap::{KeyAction, Keymap};
@@ -2748,7 +2748,7 @@ pub async fn run_interactive(
                                     &mut chamber_top_start,
                                     &mut chamber_top_end,
                     &label,
-                    resolve_color(color, cli.no_color),
+                    color, // theme accessors honor --no-color now [dirge-zrda]
                 )?;
                 renderer.render_viewport()?;
                 renderer.draw_bottom(
@@ -3618,7 +3618,7 @@ pub async fn run_interactive(
                         && let Err(e) = render_session(&mut renderer, session, cli, cfg, context) {
                             renderer.write_line(
                                 &format!("render error: {}", e),
-                                resolve_color(c_error(), cli.no_color),
+                                c_error(), // honors --no-color via theme now [dirge-zrda]
                             )?;
                         }
                 } else {

@@ -455,60 +455,96 @@ pub fn current() -> &'static Theme {
     THEME.get_or_init(Theme::phosphor)
 }
 
+/// Global `--no-color` flag (https://no-color.org). Set once at startup next
+/// to [`init`]; when on, every accessor below collapses to `Color::Reset` so
+/// the *entire* TUI — scene, panels, chat, banner, tool output — paints in the
+/// terminal's default foreground, not just the two legacy write_line sites that
+/// used to honor it [dirge-zrda].
+static NO_COLOR: OnceLock<bool> = OnceLock::new();
+
+/// Initialize the no-color flag (set-once, like [`init`]). Call from `main`
+/// right after `theme::init`.
+pub fn init_no_color(enabled: bool) {
+    let _ = NO_COLOR.set(enabled);
+}
+
+/// Whether `--no-color` is active. Defaults to `false` when never set (tests,
+/// library use).
+#[inline]
+pub fn no_color() -> bool {
+    NO_COLOR.get().copied().unwrap_or(false)
+}
+
+/// Pure no-color collapse — split from [`themed`] so it's testable without the
+/// set-once global. `Color::Reset` is the terminal's default foreground.
+#[inline]
+fn apply_no_color(c: Color, no_color: bool) -> Color {
+    if no_color { Color::Reset } else { c }
+}
+
+/// Collapse a themed color to the terminal default when `--no-color` is on.
+/// Standard NO_COLOR semantics suppress *all* color; error/warning text stays
+/// legible via its own prefix/glyph, so they don't need to stay loud.
+#[inline]
+fn themed(c: Color) -> Color {
+    apply_no_color(c, no_color())
+}
+
 // Convenience accessors. Call sites use these instead of touching the
 // struct so renaming/restructuring fields in `Theme` doesn't ripple
-// across the codebase.
+// across the codebase. Each routes through `themed()` so `--no-color`
+// is honored at this single chokepoint.
 
 pub fn agent() -> Color {
-    current().agent
+    themed(current().agent)
 }
 pub fn user() -> Color {
-    current().user
+    themed(current().user)
 }
 pub fn system() -> Color {
-    current().system
+    themed(current().system)
 }
 pub fn tool() -> Color {
-    current().tool
+    themed(current().tool)
 }
 pub fn perm() -> Color {
-    current().perm
+    themed(current().perm)
 }
 pub fn result() -> Color {
-    current().result
+    themed(current().result)
 }
 pub fn critic() -> Color {
-    current().critic
+    themed(current().critic)
 }
 pub fn thinking() -> Color {
-    current().thinking
+    themed(current().thinking)
 }
 pub fn error() -> Color {
-    current().error
+    themed(current().error)
 }
 pub fn warn() -> Color {
-    current().warn
+    themed(current().warn)
 }
 pub fn accent() -> Color {
-    current().accent
+    themed(current().accent)
 }
 pub fn dim() -> Color {
-    current().dim
+    themed(current().dim)
 }
 pub fn header() -> Color {
-    current().header
+    themed(current().header)
 }
 pub fn divider() -> Color {
-    current().divider
+    themed(current().divider)
 }
 pub fn banner_primary() -> Color {
-    current().banner_primary
+    themed(current().banner_primary)
 }
 pub fn banner_secondary() -> Color {
-    current().banner_secondary
+    themed(current().banner_secondary)
 }
 pub fn background() -> Color {
-    current().background
+    themed(current().background)
 }
 
 /// Whether the given color should render with the Bold attribute to
@@ -565,6 +601,23 @@ pub fn is_bright(c: Color) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// dirge-zrda: `--no-color` collapses every themed color to the terminal
+    /// default; without it, colors pass through untouched. This is the single
+    /// chokepoint every theme accessor routes through.
+    #[test]
+    fn apply_no_color_collapses_only_when_enabled() {
+        assert_eq!(apply_no_color(Color::Green, true), Color::Reset);
+        assert_eq!(
+            apply_no_color(Color::Rgb { r: 1, g: 2, b: 3 }, true),
+            Color::Reset
+        );
+        assert_eq!(apply_no_color(Color::Green, false), Color::Green);
+        assert_eq!(
+            apply_no_color(Color::Rgb { r: 1, g: 2, b: 3 }, false),
+            Color::Rgb { r: 1, g: 2, b: 3 }
+        );
+    }
 
     /// `phosphor` and `plain` differ in their agent color — quick
     /// sanity check that the presets aren't accidentally identical.

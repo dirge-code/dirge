@@ -394,6 +394,9 @@ async fn main() -> anyhow::Result<()> {
     // theme is global state; setting it once at boot keeps every
     // render site from having to thread it explicitly.
     ui::theme::init(cfg.theme.as_deref().unwrap_or("phosphor"));
+    // dirge-zrda: honor --no-color across the whole TUI by collapsing every
+    // theme accessor to the terminal default — set once here, like the theme.
+    ui::theme::init_no_color(cli.no_color);
     // dirge-4xgd: install the resolved per-operation timeouts process-wide
     // (same set-once-at-boot rationale as the theme). Every consumer reads
     // them via `timeout::Timeouts::get()` so a `[timeouts]` config override

@@ -55,13 +55,3 @@ pub(crate) fn parse_plugin_color(name: &str) -> Color {
         _ => Color::DarkGrey,
     }
 }
-
-#[inline]
-pub(crate) fn resolve_color(color: Color, monochrome: bool) -> Color {
-    if monochrome {
-        let _ = color;
-        Color::Reset
-    } else {
-        color
-    }
-}
