@@ -80,7 +80,7 @@ impl Tool for GrepTool {
             name: "grep".to_string(),
             description: with_contract_hint(
                 "grep",
-                "Search file contents using a regex pattern (Rust regex syntax). Respects .gitignore. Skips binary files, node_modules, and target.",
+                "Search FILE CONTENTS for a regex pattern (Rust regex syntax) and return matching lines as file:line. Use this to find where text or code appears across the project. NOT for matching FILENAMES — use `glob` (path patterns) or `find_files` (filename regex); NOT for locating a symbol's definition — use `find_definition`. Respects .gitignore; skips binary files, node_modules, and target.",
             ),
             parameters: serde_json::json!({
                 "type": "object",

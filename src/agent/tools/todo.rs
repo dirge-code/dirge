@@ -63,7 +63,7 @@ impl Tool for WriteTodoList {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: "write_todo_list".to_string(),
-            description: "Create or update a structured task list to track progress in the current coding session. Use this for complex multi-step tasks. Replaces any existing todo list.".to_string(),
+            description: "Create or update a structured todo list to track progress on a COMPLEX, MULTI-STEP task in the current session. Each call REPLACES the whole list. Keep statuses current (pending / in_progress / completed / cancelled) — the loop nudges you to finish or clear pending items before ending a turn. Skip this for trivial single-step work. To delegate independent work to a background subagent instead, use `task`.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {

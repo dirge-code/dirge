@@ -182,6 +182,47 @@ async fn build_loop_tools_produces_core_registry() {
     }
 }
 
+/// dirge-88p9: tool descriptions must be substantive but within the LLM-API
+/// constraint. Adopts Forge's enforced standard (docs/tool-guidelines.md):
+/// every tool carries a non-trivial description, capped at 1024 chars so it
+/// stays compatible with provider tool-schema limits. Guards against both an
+/// empty/placeholder description and one that grows unbounded.
+#[tokio::test]
+async fn tool_descriptions_meet_quality_bar() {
+    let cli = Cli::parse_from::<_, &str>(["dirge"]);
+    let cfg = Config::default();
+    let (tools, _) = build_loop_tools(
+        ToolCache::new(),
+        None,
+        None,
+        None,
+        None,
+        None,
+        #[cfg(feature = "lsp")]
+        None,
+        Sandbox::new(false),
+        None,
+        #[cfg(feature = "mcp")]
+        None,
+        #[cfg(feature = "semantic")]
+        None,
+        &cli,
+        &cfg,
+        None,
+    )
+    .await;
+
+    for tool in &tools {
+        let desc = tool.description();
+        let len = desc.chars().count();
+        assert!(
+            (16..=1024).contains(&len),
+            "tool `{}` description is {len} chars; must be a substantive 16..=1024 (Forge tool-guidelines): {desc:?}",
+            tool.name()
+        );
+    }
+}
+
 /// dirge-xxun — the always-on base preamble includes the in-session
 /// skill creation/patch guidance, so the model sees the trigger
 /// every turn (not just at post-session review).

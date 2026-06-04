@@ -58,27 +58,21 @@ impl Tool for SkillTool {
     type Output = String;
 
     async fn definition(&self, _prompt: String) -> ToolDefinition {
-        let mut description = String::from(
-            "Manage and load skills — reusable procedural knowledge for this project.\n\n\
-             ACTIONS:\n\
-             - load: read a skill's full content by name (for use during a session)\n\
-             - create: create a new skill (needs name + content — full SKILL.md with YAML frontmatter)\n\
-             - edit: full SKILL.md rewrite of an existing skill (needs name + content)\n\
-             - patch: targeted find-and-replace within a skill's SKILL.md (needs name + old_string + new_string)\n\
-             - delete: remove a skill entirely (needs name)\n\
-             - list: list all skill names\n\n\
-             When to CREATE: complex task succeeded (5+ tool calls), errors overcome, \
-             user-corrected approach worked, non-trivial workflow discovered.\n\
-             When to PATCH: instructions became stale/wrong, missing steps or pitfalls found during use.\n\
-             When to EDIT: major overhaul of a skill (use patch for small fixes).\n\n\
-             Good skills: trigger conditions, numbered steps with exact commands, pitfalls section, verification steps.\n\
-             Skills live in .dirge/skills/<name>/SKILL.md. Use `load` to see existing skill format.",
+        // The available-skills catalog (name + description) is already injected
+        // into the system preamble, so it is NOT duplicated here — doing so
+        // bloated the tool schema on every request and pushed the description
+        // past the 1024-char tool-guidelines cap (dirge-88p9).
+        let description = String::from(
+            "Manage and load skills — reusable procedural knowledge for this project. \
+             ACTIONS: load (read a skill's full content by name), create (new skill: name + \
+             full SKILL.md with YAML frontmatter), edit (full rewrite: name + content), patch \
+             (find-and-replace in a skill's SKILL.md: name + old_string + new_string), delete \
+             (name), list (all skill names). When to CREATE: a non-trivial workflow succeeded \
+             (5+ tool calls), errors were overcome, or a user correction worked. When to PATCH: \
+             instructions went stale or you found a missing step/pitfall during use; use EDIT \
+             only for a major overhaul. The available skills are listed in your system context — \
+             `load` one by name to read its full content. Skills live in .dirge/skills/<name>/SKILL.md.",
         );
-
-        let list = skill::build_skill_list_description(&self.skills);
-        if !list.is_empty() {
-            description.push_str(&list);
-        }
 
         ToolDefinition {
             name: "skill".to_string(),
@@ -520,17 +514,28 @@ mod tests {
 
     // ── definition ─────────────────────────────────────
 
+    /// dirge-88p9: the description documents the actions but NO LONGER embeds
+    /// the available-skills catalog — that's injected into the system preamble
+    /// instead, keeping the tool schema small and under the 1024-char cap.
     #[test]
-    fn test_definition_includes_available_skills() {
+    fn test_definition_documents_actions_without_catalog() {
         let skills = make_skills();
         let (mgr, _dir) = temp_skills_dir();
         let tool = SkillTool::new(skills, mgr, None, None, None);
         let rt = make_runtime();
         let def = rt.block_on(tool.definition(String::new()));
-        assert!(def.description.contains("test-skill"));
-        assert!(def.description.contains("load"));
-        assert!(def.description.contains("create"));
-        assert!(def.description.contains("patch"));
+        for action in ["load", "create", "edit", "patch", "delete", "list"] {
+            assert!(
+                def.description.contains(action),
+                "description should document the `{action}` action"
+            );
+        }
+        // The per-skill catalog lives in the preamble now, not the tool schema.
+        assert!(
+            !def.description.contains("test-skill"),
+            "the available-skills catalog must not be duplicated in the tool description"
+        );
+        assert!(def.description.chars().count() <= 1024);
     }
 
     // ── security scanning ──────────────────────────────

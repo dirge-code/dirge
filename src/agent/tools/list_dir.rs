@@ -72,7 +72,7 @@ impl Tool for ListDirTool {
             name: "list_dir".to_string(),
             description: with_contract_hint(
                 "list_dir",
-                "List files and directories in a directory. Respects .gitignore. Shows type, size, entry count for subdirectories. Sorted: directories first, then alphabetical.",
+                "List the immediate files and directories in ONE directory (non-recursive). Shows type, size, and subdirectory entry counts; sorted directories-first then alphabetically. Respects .gitignore. Use `repo_overview` for a whole-project tree, `glob`/`find_files` to locate files by pattern, and `grep` to search contents.",
             ),
             parameters: serde_json::json!({
                 "type": "object",

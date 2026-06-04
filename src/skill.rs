@@ -199,18 +199,6 @@ pub(crate) fn parse_frontmatter(frontmatter: &str, default_name: &str) -> (Strin
     (name, description)
 }
 
-pub fn build_skill_list_description(skills: &[Skill]) -> String {
-    if skills.is_empty() {
-        return String::new();
-    }
-    let mut desc = String::from("\n<available_skills>\n");
-    for skill in skills {
-        desc.push_str(&format!("- {}: {}\n", skill.name, skill.description));
-    }
-    desc.push_str("</available_skills>\n");
-    desc
-}
-
 pub fn find_skill<'a>(name: &str, skills: &'a [Skill]) -> Option<&'a Skill> {
     skills.iter().find(|s| s.name == name)
 }
@@ -258,25 +246,6 @@ mod tests {
     fn test_parse_skill_rejects_empty_body() {
         let skill = parse_skill("---\nname: test\n---\n   \n", Path::new("/tmp/test-skill"));
         assert!(skill.is_none());
-    }
-
-    #[test]
-    fn test_build_skill_list_description() {
-        let skills = vec![Skill {
-            name: "git-release".into(),
-            description: "Create releases".into(),
-            content: "...".into(),
-            location: PathBuf::from("/tmp"),
-        }];
-        let desc = build_skill_list_description(&skills);
-        assert!(desc.contains("git-release"));
-        assert!(desc.contains("Create releases"));
-    }
-
-    #[test]
-    fn test_build_skill_list_description_empty() {
-        let desc = build_skill_list_description(&[]);
-        assert!(desc.is_empty());
     }
 
     #[test]

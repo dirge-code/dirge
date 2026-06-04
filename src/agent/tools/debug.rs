@@ -30,38 +30,18 @@ use crate::dap::types::SourceBreakpoint;
 use crate::lsp::manager::LspManager;
 
 const DESCRIPTION: &str = "\
-Debug a program using the Debug Adapter Protocol (DAP). \
-Supports launching, attaching, setting breakpoints, stepping, evaluating expressions, \
-and inspecting stack frames, scopes, variables, and threads.\n\
+Debug a program at runtime via the Debug Adapter Protocol (DAP). Use this instead of \
+printf debugging to diagnose crashes, inspect runtime state, and trace execution — it \
+stops at breakpoints, steps through code, and shows variable values without editing source.\n\
 \n\
-Use this instead of printf debugging or adding temporary print statements to \
-diagnose crashes, inspect runtime state, and trace execution flow. \
-The debugger can stop at breakpoints, step through code, and show variable values \
-without modifying source code.\n\
+Actions (pass via `action`): launch (start a program) / attach (to a running process); \
+set_breakpoints / remove_breakpoints (per file); continue, step_over, step_in, step_out, \
+pause; evaluate (an expression in the debuggee); stack_trace, threads, scopes, variables \
+(inspect state); restart_frame (re-run the current frame); terminate, sessions; \
+run_to_cursor (break at a line + LSP hover there); backtrace_diagnostics / error_analysis \
+(stack trace annotated with LSP diagnostics + suggested breakpoints).\n\
 \n\
-Actions:\n\
-- launch: start a new debug session by launching a program\n\
-- attach: attach to a running process\n\
-- set_breakpoints: set breakpoints in a file\n\
-- remove_breakpoints: clear all breakpoints from a file\n\
-- continue: resume execution until next breakpoint or exit\n\
-- step_over: execute the next line, stepping over function calls\n\
-- step_in: step into the next function call\n\
-- step_out: step out of the current function\n\
-- pause: pause execution of a running program\n\
-- evaluate: evaluate an expression in the debuggee\n\
-- stack_trace: get the call stack for a thread\n\
-- threads: list all threads\n\
-- scopes: get variable scopes for a stack frame\n\
-- variables: get variables within a scope\n\
-- terminate: terminate the debuggee\n\
-- sessions: show active debug session info\n\
-- run_to_cursor: set breakpoint at cursor, continue, and show LSP hover info at the stop location\n\
-- restart_frame: re-execute the current stack frame (edit-and-continue)\n\
-- backtrace_diagnostics: get stack trace with LSP diagnostics for each frame\n\
-- error_analysis: get stack trace with LSP error diagnostics and suggested breakpoints\n\
-\n\
-Timeouts in seconds (default 30, min 5, max 300).";
+Timeouts are in seconds (default 30, min 5, max 300).";
 
 const MAX_OUTPUT_BYTES: usize = 128 * 1024;
 
