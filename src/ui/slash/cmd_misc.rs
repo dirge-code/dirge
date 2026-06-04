@@ -10,12 +10,16 @@ use crate::context::agent_defs::ToolPolicy;
 use crate::ui::events::render_session;
 use crate::ui::theme;
 
-/// `/agents` — list user-defined agent profiles (dirge-ykeu). Read-only.
+/// `/agent` / `/agents` — list agent profiles + built-in role routing
+/// (dirge-ykeu). Read-only; switching is handled by `cmd_model::cmd_agent`.
 ///
-/// Surfaces what's been loaded from `.dirge/agents/*.md`,
-/// `~/.config/dirge/agents/*.md`, and `config.json` `agents` so users can
-/// confirm their profiles are picked up (and at what precedence). Switching
-/// the active agent (`/agent <name>`) lands in a later phase.
+/// Two sections:
+///   1. User profiles loaded from `.dirge/agents/*.md`,
+///      `~/.config/dirge/agents/*.md`, and `config.json` `agents` — with the
+///      active one marked `*`.
+///   2. Built-in role routing (default/critic/review/…) showing which provider
+///      each resolves to — the "unified mechanism" view. Derived from config;
+///      no wiring change.
 pub(super) async fn cmd_agents(ctx: &mut SlashCtx<'_>, _parts: &[&str]) -> anyhow::Result<()> {
     let reg = &ctx.context.agent_defs;
     if reg.is_empty() {
@@ -23,41 +27,89 @@ pub(super) async fn cmd_agents(ctx: &mut SlashCtx<'_>, _parts: &[&str]) -> anyho
             "no agent profiles defined — add .dirge/agents/<name>.md or a config.json \"agents\" entry",
             c_agent(),
         )?;
-        return Ok(());
+    } else {
+        let active = ctx.context.current_agent.clone();
+        ctx.renderer
+            .write_line(&format!("agent profiles ({}):", reg.len()), c_agent())?;
+        for a in reg.iter() {
+            let model = a.model.as_deref().unwrap_or("(default model)");
+            let tools = match &a.tools {
+                ToolPolicy::All => "all tools".to_string(),
+                ToolPolicy::Allow(v) => format!("allow: {}", v.join(", ")),
+                ToolPolicy::Deny(v) => format!("deny: {}", v.join(", ")),
+            };
+            let marker = if active.as_deref() == Some(a.name.as_str()) {
+                "* "
+            } else {
+                "  "
+            };
+            ctx.renderer.write_line(
+                &format!(
+                    "{}{}  [{}]  {}  ·  {}",
+                    marker,
+                    a.name,
+                    a.source.label(),
+                    model,
+                    tools
+                ),
+                c_result(),
+            )?;
+            if let Some(d) = &a.description {
+                ctx.renderer
+                    .write_line(&format!("      {}", d), c_result())?;
+            }
+        }
+        ctx.renderer
+            .write_line("usage: /agent <name>  |  /agent off", c_agent())?;
     }
-    let active = ctx.context.current_agent.clone();
-    ctx.renderer
-        .write_line(&format!("agent profiles ({}):", reg.len()), c_agent())?;
-    for a in reg.iter() {
-        let model = a.model.as_deref().unwrap_or("(default model)");
-        let tools = match &a.tools {
-            ToolPolicy::All => "all tools".to_string(),
-            ToolPolicy::Allow(v) => format!("allow: {}", v.join(", ")),
-            ToolPolicy::Deny(v) => format!("deny: {}", v.join(", ")),
-        };
-        let marker = if active.as_deref() == Some(a.name.as_str()) {
-            "* "
-        } else {
-            "  "
-        };
+
+    // Built-in role routing — the unified view. Only roles with an explicit
+    // provider override are shown (everything else runs on the default model).
+    use crate::config::ConfigRole;
+    let roles: [(&str, ConfigRole); 6] = [
+        ("review", ConfigRole::Review),
+        ("escalation", ConfigRole::Escalation),
+        ("summarization", ConfigRole::Summarization),
+        ("subagent", ConfigRole::Subagent),
+        ("critic", ConfigRole::Critic),
+        ("approval", ConfigRole::Approval),
+    ];
+    let configured: Vec<(&str, String, Option<String>)> = roles
+        .iter()
+        .filter_map(|(label, role)| {
+            // Only surface roles the user explicitly pointed elsewhere; the
+            // default fallback in resolve_role would otherwise list every row.
+            let explicit = match role {
+                ConfigRole::Review => ctx.cfg.review_provider.is_some(),
+                ConfigRole::Escalation => ctx.cfg.escalation_provider.is_some(),
+                ConfigRole::Summarization => ctx.cfg.summarization_provider.is_some(),
+                ConfigRole::Subagent => ctx.cfg.subagent_provider.is_some(),
+                ConfigRole::Critic => ctx.cfg.critic_provider.is_some(),
+                ConfigRole::Approval => ctx.cfg.approval_provider.is_some(),
+                ConfigRole::Default => true,
+            };
+            if !explicit {
+                return None;
+            }
+            ctx.cfg
+                .resolve_role(*role)
+                .map(|(alias, entry)| (*label, alias, entry.model))
+        })
+        .collect();
+    if configured.is_empty() {
         ctx.renderer.write_line(
-            &format!(
-                "{}{}  [{}]  {}  ·  {}",
-                marker,
-                a.name,
-                a.source.label(),
-                model,
-                tools
-            ),
-            c_result(),
+            "built-in roles: all on the default model (set *_provider in config.json to route a role elsewhere)",
+            c_agent(),
         )?;
-        if let Some(d) = &a.description {
+    } else {
+        ctx.renderer
+            .write_line("built-in role routing:", c_agent())?;
+        for (label, alias, model) in configured {
+            let model = model.as_deref().unwrap_or("(provider default)");
             ctx.renderer
-                .write_line(&format!("      {}", d), c_result())?;
+                .write_line(&format!("  {label:<14} → {alias}  ·  {model}"), c_result())?;
         }
     }
-    ctx.renderer
-        .write_line("usage: /agent <name>  |  /agent off", c_agent())?;
     Ok(())
 }
 
