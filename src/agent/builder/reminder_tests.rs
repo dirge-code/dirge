@@ -440,6 +440,7 @@ async fn build_agent_inner_emits_assembled_preamble() {
         agents: None,
         prompts: std::collections::HashMap::new(),
         agent_defs: Default::default(),
+        current_agent: None,
         current_prompt: None,
         current_prompt_name: None,
         current_prompt_deny_tools: Vec::new(),

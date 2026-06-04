@@ -43,6 +43,30 @@ pub enum ToolPolicy {
     Deny(Vec<String>),
 }
 
+impl ToolPolicy {
+    /// Convert to the deny-list shape consumed by the permission layer
+    /// (`current_prompt_deny_tools` / `apply_prompt_deny`). `Allow` is
+    /// realized as "deny every built-in not in the allow-list" over
+    /// `builtins` — best-effort for built-in tools; MCP/plugin tools are not
+    /// enumerable here, so an `allow` list does not restrict them (use `deny`
+    /// for a hard cap). Names are lowercased to match the permission layer.
+    #[allow(dead_code)] // consumed by `/agent` switching
+    pub fn to_deny_list(&self, builtins: &[&str]) -> Vec<String> {
+        match self {
+            ToolPolicy::All => Vec::new(),
+            ToolPolicy::Deny(names) => names.clone(),
+            ToolPolicy::Allow(allow) => {
+                let allow: Vec<String> = allow.iter().map(|s| s.to_ascii_lowercase()).collect();
+                builtins
+                    .iter()
+                    .map(|b| b.to_ascii_lowercase())
+                    .filter(|b| !allow.contains(b))
+                    .collect()
+            }
+        }
+    }
+}
+
 /// Where a definition came from — drives precedence and the `/agents` listing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentSource {
@@ -368,6 +392,20 @@ mod tests {
         assert_eq!(reg.get("rev").unwrap().source, AgentSource::ProjectFile);
         assert_eq!(reg.get("only-config").unwrap().model.as_deref(), Some("c"));
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn tool_policy_to_deny_list() {
+        let builtins = ["read", "write", "edit", "bash"];
+        assert!(ToolPolicy::All.to_deny_list(&builtins).is_empty());
+        assert_eq!(
+            ToolPolicy::Deny(vec!["bash".into()]).to_deny_list(&builtins),
+            vec!["bash".to_string()]
+        );
+        // Allow(read) → deny every other built-in.
+        let mut got = ToolPolicy::Allow(vec!["read".into()]).to_deny_list(&builtins);
+        got.sort();
+        assert_eq!(got, vec!["bash", "edit", "write"]);
     }
 
     #[test]

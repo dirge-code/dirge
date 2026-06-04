@@ -342,6 +342,143 @@ pub(super) async fn cmd_prompt(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyhow
     Ok(())
 }
 
+/// Rebuild the active agent in place from current `session.model` + `context`
+/// state. Mirrors the `build_agent` rebuild used by `/model` and `/prompt`.
+async fn rebuild_agent(ctx: &mut SlashCtx<'_>) {
+    let model = ctx.client.completion_model(ctx.session.model.to_string());
+    *ctx.agent = crate::provider::build_agent(
+        model,
+        ctx.cli,
+        ctx.cfg,
+        ctx.context,
+        ctx.permission.clone(),
+        ctx.ask_tx.clone(),
+        ctx.question_tx.clone(),
+        ctx.plan_tx.clone(),
+        ctx.bg_store.clone(),
+        #[cfg(feature = "lsp")]
+        ctx.lsp_manager.cloned(),
+        ctx.sandbox.clone(),
+        #[cfg(feature = "mcp")]
+        ctx.mcp_manager,
+        #[cfg(feature = "semantic")]
+        ctx.semantic_manager,
+        Some(ctx.session.id.to_string()),
+    )
+    .await;
+}
+
+/// Resolve an agent's `model` field to a model string for the current client.
+/// If it names a `providers` alias carrying a `model`, use that model; else
+/// treat the value itself as the model name. `None` → keep the current model.
+///
+/// NOTE (dirge-ykeu): this is a *same-client* resolution. If the alias points
+/// at a different backend (provider_type/base_url/api_key), only its model
+/// string is taken — cross-provider client switching is a later phase. The
+/// built-in role routing (critic/escalation) already does full per-role
+/// clients and is unaffected.
+fn resolve_agent_model(cfg: &crate::config::Config, model: Option<&str>) -> Option<String> {
+    let m = model?;
+    if let Some(providers) = &cfg.providers
+        && let Some(entry) = providers.get(m)
+        && let Some(model_str) = &entry.model
+    {
+        return Some(model_str.clone());
+    }
+    Some(m.to_string())
+}
+
+/// `/agent` — list / switch / clear the active agent profile (dirge-ykeu).
+///
+///   /agent              list profiles, marking the active one
+///   /agent <name>       activate a profile (its prompt + model + tool policy)
+///   /agent off          deactivate (clear the profile's prompt + tool deny)
+///
+/// Applying a profile reuses the `/prompt` machinery (system prompt +
+/// `deny_tools` enforced at the permission layer) and the `/model` machinery
+/// (same-client model swap + agent rebuild). The built-in critic / role
+/// routing is untouched — this only drives the main loop's active persona.
+pub(super) async fn cmd_agent(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyhow::Result<()> {
+    // Bare `/agent`, or the `/agents` alias → list (delegated to cmd_misc).
+    if parts.len() < 2 || parts[0] == "/agents" {
+        return super::cmd_misc::cmd_agents(ctx, parts).await;
+    }
+
+    let arg = parts[1].trim();
+    if matches!(arg, "off" | "none" | "default") {
+        if ctx.context.current_agent.is_none() {
+            ctx.renderer
+                .write_line("no active agent to clear", c_agent())?;
+            return Ok(());
+        }
+        ctx.context.current_agent = None;
+        ctx.context.current_prompt = None;
+        ctx.context.current_prompt_name = None;
+        ctx.context.current_prompt_deny_tools.clear();
+        crate::permission::apply_prompt_deny(
+            ctx.permission,
+            &ctx.context.current_prompt_deny_tools,
+        );
+        rebuild_agent(ctx).await;
+        ctx.renderer.write_line(
+            "agent deactivated (model unchanged — use /model to switch back)",
+            c_agent(),
+        )?;
+        return Ok(());
+    }
+
+    let Some(def) = ctx.context.agent_defs.get(arg).cloned() else {
+        ctx.renderer
+            .write_line(&format!("unknown agent: '{}'", arg), c_error())?;
+        if !ctx.context.agent_defs.is_empty() {
+            ctx.renderer.write_line("available agents:", c_agent())?;
+            for a in ctx.context.agent_defs.iter() {
+                ctx.renderer
+                    .write_line(&format!("  {}", a.name), c_result())?;
+            }
+        }
+        return Ok(());
+    };
+
+    // Prompt: only override when the profile defines one (otherwise keep the
+    // user's active prompt — the profile may only change model/tools).
+    if let Some(body) = &def.prompt {
+        ctx.context.current_prompt = Some(body.clone());
+        ctx.context.current_prompt_name = Some(def.name.clone());
+    }
+    // Tool policy → deny-list at the permission layer.
+    ctx.context.current_prompt_deny_tools = def
+        .tools
+        .to_deny_list(crate::agent::tools::BUILTIN_TOOL_NAMES);
+    crate::permission::apply_prompt_deny(ctx.permission, &ctx.context.current_prompt_deny_tools);
+    // Model: same-client swap (see resolve_agent_model).
+    let resolved_model = resolve_agent_model(ctx.cfg, def.model.as_deref());
+    if let Some(model) = &resolved_model {
+        ctx.session.model = CompactString::new(model.as_str());
+        ctx.session.provider = ctx.cli.resolve_provider(ctx.cfg);
+        ctx.session.context_window = ctx.cfg.resolve_context_window(ctx.session.model.as_str());
+    }
+    ctx.context.current_agent = Some(def.name.clone());
+    rebuild_agent(ctx).await;
+
+    // Report what changed.
+    let mut summary = format!("active agent: {}", def.name);
+    if let Some(m) = &resolved_model {
+        summary.push_str(&format!("  · model {}", m));
+    }
+    ctx.renderer.write_line(&summary, c_agent())?;
+    if !ctx.context.current_prompt_deny_tools.is_empty() {
+        ctx.renderer.write_line(
+            &format!(
+                "  denied tools: {}",
+                ctx.context.current_prompt_deny_tools.join(", ")
+            ),
+            c_result(),
+        )?;
+    }
+    Ok(())
+}
+
 pub(super) async fn cmd_regen_prompts(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     match crate::context::prompts::regen() {
         Ok(()) => {

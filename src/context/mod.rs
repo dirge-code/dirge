@@ -16,6 +16,10 @@ pub struct ContextFiles {
     /// `main` after config load (it needs `config.agents` for the lowest-
     /// precedence tier); `context::load` leaves it default-empty.
     pub agent_defs: agent_defs::AgentRegistry,
+    /// Name of the active agent profile (set by `/agent <name>`), or `None`
+    /// when no profile is active. Transient (not persisted); purely for the
+    /// `/agent` listing's active marker and the status display.
+    pub current_agent: Option<String>,
     pub current_prompt: Option<String>,
     pub current_prompt_name: Option<String>,
     /// Tools that are denied while `current_prompt_name` is active.
@@ -56,6 +60,7 @@ pub fn load(no_context_files: bool) -> ContextFiles {
         agents,
         prompts: prompt_map,
         agent_defs: agent_defs::AgentRegistry::default(),
+        current_agent: None,
         current_prompt: None,
         current_prompt_name: None,
         current_prompt_deny_tools: Vec::new(),

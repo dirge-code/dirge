@@ -25,6 +25,7 @@ pub(super) async fn cmd_agents(ctx: &mut SlashCtx<'_>, _parts: &[&str]) -> anyho
         )?;
         return Ok(());
     }
+    let active = ctx.context.current_agent.clone();
     ctx.renderer
         .write_line(&format!("agent profiles ({}):", reg.len()), c_agent())?;
     for a in reg.iter() {
@@ -34,9 +35,15 @@ pub(super) async fn cmd_agents(ctx: &mut SlashCtx<'_>, _parts: &[&str]) -> anyho
             ToolPolicy::Allow(v) => format!("allow: {}", v.join(", ")),
             ToolPolicy::Deny(v) => format!("deny: {}", v.join(", ")),
         };
+        let marker = if active.as_deref() == Some(a.name.as_str()) {
+            "* "
+        } else {
+            "  "
+        };
         ctx.renderer.write_line(
             &format!(
-                "  {}  [{}]  {}  ·  {}",
+                "{}{}  [{}]  {}  ·  {}",
+                marker,
                 a.name,
                 a.source.label(),
                 model,
@@ -49,6 +56,8 @@ pub(super) async fn cmd_agents(ctx: &mut SlashCtx<'_>, _parts: &[&str]) -> anyho
                 .write_line(&format!("      {}", d), c_result())?;
         }
     }
+    ctx.renderer
+        .write_line("usage: /agent <name>  |  /agent off", c_agent())?;
     Ok(())
 }
 
@@ -755,7 +764,7 @@ pub(super) async fn cmd_help(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
         c_result(),
     )?;
     renderer.write_line(
-        "  /agents                list user-defined agent profiles",
+        "  /agent [name|off]      list/switch agent profile (model+prompt+tools)",
         c_result(),
     )?;
     #[cfg(feature = "git-worktree")]
