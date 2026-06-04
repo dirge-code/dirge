@@ -11,7 +11,7 @@ What sets dirge apart from other agentic editors:
 - **Tiny and fast.** ~8 MB RAM idle, ~15 MB working, ~36 MB binary (speed-optimized: `opt-level=3` + LTO) — versus ~300 MB for JS-based agents. Native Rust, no runtime.
 - **Built to keep weaker/cheaper models on the rails.** A [robust agent loop](docs/features.md#robust-agent-loop) repairs malformed tool calls, validates every write through tree-sitter *before* it touches disk, escalates to a stronger model on repeated failure, and trips circuit breakers on non-progressing loops.
 - **One explainable permission engine.** All authorization flows through a single Policy Decision Point with four modes, op-based rules, session allowlists, and a `/why` command that traces exactly which policy decided and why. See [docs/permissions.md](docs/permissions.md).
-- **Role-based multi-provider routing.** Point the main loop, review, escalation, summarization, and subagent roles at different models — mix DeepSeek, GLM, Anthropic, OpenAI, Ollama, and any OpenAI-compatible endpoint in one session.
+- **Role-based multi-provider routing.** Point the main loop, review, escalation, summarization, and subagent roles at different models — mix DeepSeek, GLM, Anthropic, OpenAI, Ollama, and any OpenAI-compatible endpoint in one session. Define your own opt-in [agent profiles](docs/agents.md) (a named model + prompt + tool-policy bundle) and switch personas mid-session with `/agent`.
 - **Self-improving project memory.** Persistent per-project memory plus a post-session orchestrator that extracts learnings, curates memory + skills, and promotes patterns recurring across sessions.
 - **Code intelligence baked in.** Tree-sitter [semantic tools](docs/semantic.md) and [LSP diagnostics](docs/lsp.md) for 10+ languages, surfaced inline so the agent fixes compile errors on the same turn.
 - **Extensible at runtime.** A [Janet plugin system](docs/plugins.md) hooks the full lifecycle, and [Claude-compatible skills](docs/skills.md) load instructions on demand.
@@ -104,6 +104,7 @@ pass openai-key | dirge --provider openai --api-key-stdin
 |---------|-------------|
 | `/model [name]` | Show or switch model |
 | `/prompt [name]` | List or activate prompts (`code`, `plan`, `review`, etc.) |
+| `/agent [name\|off]` | List or switch [agent profiles](docs/agents.md) — a named model + prompt + tool-policy bundle |
 | `/clear` | Clear conversation |
 | `/cd [path]` | Change working directory |
 | `/undo` | Undo last exchange |
@@ -171,6 +172,7 @@ provider aliases, role-assignment table, permission rules, and MCP setup.
 | [docs/features.md](docs/features.md) | Full feature catalog, robust agent loop, performance |
 | [docs/permissions.md](docs/permissions.md) | Authorization engine, security modes, `/why` |
 | [docs/prompts.md](docs/prompts.md) | Prompts system, per-prompt tool restrictions, context files |
+| [docs/agents.md](docs/agents.md) | Agent profiles — named model + prompt + tool-policy bundles, `/agent` switching |
 | [docs/skills.md](docs/skills.md) | Claude-compatible skills |
 | [docs/semantic.md](docs/semantic.md) | Tree-sitter semantic code tools |
 | [docs/lsp.md](docs/lsp.md) | LSP integration and built-in server set |

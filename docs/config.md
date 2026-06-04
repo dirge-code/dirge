@@ -67,6 +67,7 @@ Accepted top-level keys:
 | `summarization_provider`  | string  | Provider alias for context compaction. Falls back to `provider`. |
 | `subagent_provider`       | string  | Provider alias for `task` tool subagents. Falls back to `provider`. |
 | `critic_provider`         | string  | Provider alias for the F6 in-loop critic (tier 3). When set, the verifier escalates to a bounded LLM critique at finalization on substantive runs (one call per run). **No fallback** — unset means no critic and no cost. |
+| `agents`                  | object  | Optional user-defined [agent profiles](agents.md), keyed by name. Each is a `{ prompt, model, deny_tools/allow_tools, reasoning, temperature, description }` bundle activated at runtime with `/agent <name>`. Lowest-precedence source — `.dirge/agents/*.md` and `~/.config/dirge/agents/*.md` override same-named entries. Absent = no profiles (opt-in). |
 | `max_tokens`              | integer | Maximum response tokens. Default: `8192`.                                                                                                                                   |
 | `max_agent_turns`         | integer | Maximum agent turns per response. Default: `100`.                                                                                                                           |
 | `temperature`             | number  | Model sampling temperature in `0.0`–`2.0`. `--temperature` CLI flag overrides this. Values outside the range are clamped with a stderr warning.                            |
