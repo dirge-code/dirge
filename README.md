@@ -68,6 +68,13 @@ dirge -p "Explain this project"
 # Continue last session
 dirge -c
 
+# Resume a specific session by id/prefix — or create one with that exact id
+# if it doesn't exist yet (a stable id for scripting and the shell plugin)
+dirge --session my-refactor
+
+# Browse and pick a session interactively
+dirge -r
+
 # Explicit provider/model
 dirge --provider openrouter --model openai/gpt-4o
 
@@ -100,7 +107,7 @@ pass openai-key | dirge --provider openai --api-key-stdin
 | `/clear` | Clear conversation |
 | `/cd [path]` | Change working directory |
 | `/undo` | Undo last exchange |
-| `/compress` | Compress conversation history |
+| `/compress` (or `/compact`) | Force an LLM-summarization compaction pass now — unlike automatic compaction, an explicit `/compress` runs even when the context is still within limits |
 | `/mode [mode]` | Set security mode (`standard`, `restrictive`, `accept`, `yolo`) |
 | `/reasoning` | Toggle reasoning visibility |
 | `/btw <question>` | Ask a quick question (no tools, doesn't affect session) |
@@ -124,6 +131,26 @@ pass openai-key | dirge --provider openai --api-key-stdin
 | `/help` | Show all commands |
 
 For key bindings, the inline avatar, and tool-output display, see [docs/tui.md](docs/tui.md).
+
+## Shell integration (the `:` prefix)
+
+An optional zsh plugin lets you talk to dirge **without leaving your shell**.
+Type `:<prompt>` at your normal prompt and press Enter — the prompt runs
+through dirge headlessly, the answer prints, and you're back at the shell.
+Every `:` command in a shell shares one dirge session, so follow-ups keep
+context. `:resume` opens the full TUI on that session; `:new` starts a fresh
+one.
+
+```bash
+$ : what does this repo's build pipeline do?   # asks dirge, prints the answer
+$ git status                                    # normal shell — unaffected
+$ : now add a clippy step to CI                 # same session → has context
+```
+
+Install by sourcing it from `~/.zshrc`; see
+[shell-plugin/README.md](shell-plugin/README.md). (It's built on
+`dirge --session <id>`, which creates the session on first use and resumes it
+thereafter.)
 
 ## Supported providers
 
