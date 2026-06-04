@@ -1,0 +1,15 @@
+# Beads issue tracker export.
+#
+# `.beads/issues.jsonl` is beads' git-native sync artifact: one JSON object per
+# issue, re-serialized by the `pre-commit` hook on every commit and reconciled
+# back into the local Dolt DB by the `post-merge` hook (`bd import`, upsert
+# semantics) after a pull/merge.
+#
+# Use git's built-in `union` merge driver so concurrent edits on different
+# branches COMBINE both sides' lines instead of producing conflict markers
+# (which block the merge and the post-merge import). Because `bd import` upserts
+# by issue id and Dolt holds the authoritative three-way-merged history (synced
+# via `bd dolt push`/`pull`), taking both sides at the git layer is safe — the
+# importer dedups/reconciles. This removes the recurring text-merge conflicts on
+# this file without dropping git-native issue tracking.
+.beads/issues.jsonl merge=union
