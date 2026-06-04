@@ -108,8 +108,30 @@ models).
 > backend (its own `provider_type` / `base_url` / API key) — is not yet wired
 > for `/agent`; only the model string is taken. The built-in roles
 > (critic/escalation) already build full per-role clients and are unaffected.
-> Routing the `task`/subagent tool and `/plan` phases to named profiles is
-> planned as a follow-up.
+
+## Running a subagent under a profile
+
+The `task` tool — which spawns a one-shot subagent for an independent subtask —
+can run that subagent under a profile. When any profiles are defined, the tool
+advertises an `agent` parameter (an enum of your profile names); the model calls
+it like:
+
+```
+task(prompt="Review the auth changes for security issues", agent="reviewer")
+```
+
+The subagent then runs on the profile's **model** and **system prompt**, so you
+can fan work out to specialized personas (a cheap fast reviewer, a stronger
+planner) from a single session. Omitting `agent` uses the default subagent,
+exactly as before — the parameter only appears when profiles exist, and naming a
+profile that isn't defined is a hard error (no silent fallback).
+
+Profiles are resolved into subagent routes once at startup. Two current limits:
+subagents are **tool-less** (a profile's `deny_tools`/`allow_tools` doesn't
+apply to a subagent, which has no tools to begin with), and the profile's
+`reasoning`/`temperature` aren't applied on the subagent path — only the model
+and system prompt are. Routing `/plan` phases to named profiles, and
+cross-provider client switching, remain follow-ups.
 
 ## Relationship to the built-in critic and roles
 
