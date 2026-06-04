@@ -10,6 +10,7 @@ use crate::sync_util::LockExt;
 use compact_str::CompactString;
 
 use super::{SlashCtx, c_agent, c_error, c_result};
+use crate::context::agent_defs::resolve_model_alias as resolve_agent_model;
 use crate::permission::SecurityMode;
 
 pub(super) async fn cmd_model(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyhow::Result<()> {
@@ -367,8 +368,6 @@ async fn rebuild_agent(ctx: &mut SlashCtx<'_>) {
     )
     .await;
 }
-
-use crate::context::agent_defs::resolve_model_alias as resolve_agent_model;
 
 /// `/agent` — list / switch / clear the active agent profile (dirge-ykeu).
 ///

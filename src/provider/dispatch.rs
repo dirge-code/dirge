@@ -17,11 +17,6 @@ use crate::session::SessionMessage;
 
 use super::summarize;
 
-/// `Clone` is cheap — each inner rig client holds an `Arc`'d reqwest client +
-/// config. Used to stash a copy in the process-global subagent client
-/// (`task::set_subagent_client`) so the `task` tool can build per-profile
-/// models without threading the client through every `build_agent` call site.
-#[derive(Clone)]
 pub enum AnyClient {
     OpenRouter(openrouter::Client),
     OpenAI(openai::CompletionsClient),
