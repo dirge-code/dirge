@@ -144,6 +144,41 @@ pub(crate) enum InputMode {
         /// Human label for the confirmation/result lines.
         label: &'static str,
     },
+    /// `question` tool: walk the questionnaire one option-picker at a time.
+    Question(QuestionState),
+}
+
+/// In-flight state for the `question` tool modal — replaces the former
+/// triple-nested blocking loop (questions → option-select → custom-text).
+/// The dispatcher drives one keystroke at a time against these fields and
+/// re-renders the option block in place.
+pub(crate) struct QuestionState {
+    /// The request (questions + the reply channel).
+    pub(crate) req: crate::agent::tools::question::QuestionRequest,
+    /// Confirmed answers, one inner Vec per already-answered question.
+    pub(crate) answers: Vec<Vec<String>>,
+    /// Index of the question currently being answered.
+    pub(crate) qi: usize,
+    /// Cursor row within the current question's options (`num_options`
+    /// itself addresses the "(custom)" row when the question allows it).
+    pub(crate) cursor: usize,
+    /// Per-option toggle state (multi-select).
+    pub(crate) selected: Vec<bool>,
+    /// Pending custom answer for the current question, if typed.
+    pub(crate) custom_text: Option<String>,
+    /// Buffer line index where the current question's option block starts
+    /// (so re-renders `replace_from` here on every keystroke).
+    pub(crate) anchor: usize,
+    /// `Some` while the user is typing a free-form custom answer.
+    pub(crate) entry: Option<CustomEntry>,
+}
+
+/// Free-form custom-answer text entry, the innermost former loop.
+pub(crate) struct CustomEntry {
+    /// Text typed so far.
+    pub(crate) buf: String,
+    /// Buffer line index where the typed answer renders.
+    pub(crate) input_anchor: usize,
 }
 
 /// Copy discriminant of [`InputMode`]. The dispatcher routes on this so it
@@ -154,6 +189,7 @@ pub(crate) enum InputMode {
 pub(crate) enum ModalKind {
     Compose,
     PlanSwitch,
+    Question,
 }
 
 impl InputMode {
@@ -167,6 +203,7 @@ impl InputMode {
         match self {
             InputMode::Compose => ModalKind::Compose,
             InputMode::PlanSwitch { .. } => ModalKind::PlanSwitch,
+            InputMode::Question(_) => ModalKind::Question,
         }
     }
 }

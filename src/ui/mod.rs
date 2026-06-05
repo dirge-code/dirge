@@ -607,6 +607,213 @@ pub async fn run_interactive(
                         }
                         _ => {}
                     },
+                    state::ModalKind::Question => {
+                        // Phase 1: mutate the QuestionState behind `&mut`,
+                        // recording what to do next. The reply channel can
+                        // only be taken via `mem::replace` once this borrow
+                        // ends, hence the two-phase shape.
+                        let step = {
+                            let state::InputMode::Question(q) = &mut ui.input_mode else {
+                                unreachable!()
+                            };
+                            let question = &q.req.questions[q.qi];
+                            let multi = question.multi_select.unwrap_or(false);
+                            let custom = question.custom;
+                            let num_options = question.options.len();
+
+                            if let Some(entry) = &mut q.entry {
+                                // Innermost former loop: free-form text entry.
+                                match key.code {
+                                    KeyCode::Enter => {
+                                        q.custom_text = if entry.buf.is_empty() {
+                                            None
+                                        } else {
+                                            Some(std::mem::take(&mut entry.buf))
+                                        };
+                                        q.entry = None;
+                                        if !multi {
+                                            if let Some(ct) = q.custom_text.take() {
+                                                q.answers.push(vec![ct]);
+                                            }
+                                            QStep::Next
+                                        } else {
+                                            // Multi: keep going; Enter again confirms.
+                                            QStep::Stay
+                                        }
+                                    }
+                                    KeyCode::Esc => {
+                                        // Discard the typed text, back to options.
+                                        q.entry = None;
+                                        QStep::Stay
+                                    }
+                                    KeyCode::Backspace => {
+                                        entry.buf.pop();
+                                        QStep::Stay
+                                    }
+                                    KeyCode::Char(c) => {
+                                        entry.buf.push(c);
+                                        QStep::Stay
+                                    }
+                                    _ => QStep::Stay,
+                                }
+                            } else {
+                                // Option-select.
+                                match key.code {
+                                    KeyCode::Up | KeyCode::Char('k') => {
+                                        q.cursor = q.cursor.saturating_sub(1);
+                                        QStep::Stay
+                                    }
+                                    KeyCode::Down | KeyCode::Char('j') => {
+                                        let max = if custom {
+                                            num_options
+                                        } else {
+                                            num_options.saturating_sub(1)
+                                        };
+                                        if q.cursor < max {
+                                            q.cursor += 1;
+                                        }
+                                        QStep::Stay
+                                    }
+                                    KeyCode::Enter => {
+                                        if custom && q.cursor == num_options {
+                                            // Enter free-form custom-text entry.
+                                            renderer
+                                                .write_line("  enter your answer:", c_perm())?;
+                                            let input_anchor = renderer.buffer_len();
+                                            q.entry = Some(state::CustomEntry {
+                                                buf: String::new(),
+                                                input_anchor,
+                                            });
+                                            QStep::Stay
+                                        } else if multi {
+                                            let mut picked: Vec<String> = question
+                                                .options
+                                                .iter()
+                                                .enumerate()
+                                                .filter(|(i, _)| q.selected[*i])
+                                                .map(|(_, o)| o.label.clone())
+                                                .collect();
+                                            if let Some(ct) = q.custom_text.take() {
+                                                picked.push(ct);
+                                            }
+                                            if picked.is_empty() {
+                                                renderer.write_line(
+                                                    "  select at least one option",
+                                                    c_perm(),
+                                                )?;
+                                                QStep::Stay
+                                            } else {
+                                                q.answers.push(picked);
+                                                QStep::Next
+                                            }
+                                        } else {
+                                            let label = question.options[q.cursor].label.clone();
+                                            q.answers.push(vec![label]);
+                                            QStep::Next
+                                        }
+                                    }
+                                    KeyCode::Char(' ') => {
+                                        if multi && q.cursor < num_options {
+                                            q.selected[q.cursor] = !q.selected[q.cursor];
+                                            QStep::Stay
+                                        } else if !multi && q.cursor < num_options {
+                                            let label = question.options[q.cursor].label.clone();
+                                            q.answers.push(vec![label]);
+                                            QStep::Next
+                                        } else {
+                                            QStep::Stay
+                                        }
+                                    }
+                                    KeyCode::Esc => QStep::Rejected,
+                                    _ => QStep::Stay,
+                                }
+                            }
+                        };
+
+                        // Phase 2: act on the step (borrow on `q` released).
+                        match step {
+                            QStep::Stay => {
+                                let state::InputMode::Question(q) = &ui.input_mode else {
+                                    unreachable!()
+                                };
+                                if let Some(entry) = &q.entry {
+                                    render_custom_entry(
+                                        &mut renderer,
+                                        &entry.buf,
+                                        entry.input_anchor,
+                                    );
+                                } else {
+                                    render_question_options(
+                                        &mut renderer,
+                                        &q.req.questions[q.qi],
+                                        q.cursor,
+                                        &q.selected,
+                                        &q.custom_text,
+                                        q.anchor,
+                                    );
+                                }
+                            }
+                            QStep::Next => {
+                                // Advance; reset per-question state if more
+                                // questions remain, else finish.
+                                let next = {
+                                    let state::InputMode::Question(q) = &mut ui.input_mode else {
+                                        unreachable!()
+                                    };
+                                    q.qi += 1;
+                                    if q.qi >= q.req.questions.len() {
+                                        None
+                                    } else {
+                                        let qi = q.qi;
+                                        let question = q.req.questions[qi].clone();
+                                        q.cursor = 0;
+                                        q.selected = vec![false; question.options.len()];
+                                        q.custom_text = None;
+                                        q.entry = None;
+                                        Some((question, qi))
+                                    }
+                                };
+                                match next {
+                                    None => {
+                                        let state::InputMode::Question(q) = std::mem::replace(
+                                            &mut ui.input_mode,
+                                            state::InputMode::Compose,
+                                        ) else {
+                                            unreachable!()
+                                        };
+                                        let _ =
+                                            q.req.reply.send(QuestionResponse::Answered(q.answers));
+                                        renderer.write_line("", Color::White)?;
+                                    }
+                                    Some((question, qi)) => {
+                                        let anchor =
+                                            render_question_stem(&mut renderer, &question, qi)?;
+                                        if let state::InputMode::Question(q) = &mut ui.input_mode {
+                                            q.anchor = anchor;
+                                        }
+                                        render_question_options(
+                                            &mut renderer,
+                                            &question,
+                                            0,
+                                            &vec![false; question.options.len()],
+                                            &None,
+                                            anchor,
+                                        );
+                                    }
+                                }
+                            }
+                            QStep::Rejected => {
+                                let state::InputMode::Question(q) = std::mem::replace(
+                                    &mut ui.input_mode,
+                                    state::InputMode::Compose,
+                                ) else {
+                                    unreachable!()
+                                };
+                                let _ = q.req.reply.send(QuestionResponse::Rejected);
+                                renderer.write_line("", Color::White)?;
+                            }
+                        }
+                    }
                 }
                 continue;
             }
@@ -3027,278 +3234,29 @@ pub async fn run_interactive(
                     Color::White,
                 )?;
 
-                let mut answers: Vec<Vec<String>> = Vec::new();
-                let mut rejected = false;
-
-                for (qi, question) in question_req.questions.iter().enumerate() {
-                    if let Some(header) = &question.header {
-                        renderer.write_line(
-                            &format!("\n--- {} ---", header),
-                            c_perm(),
-                        )?;
-                    }
-                    // Soft-wrap the question stem so a long prompt
-                    // doesn't get char-broken mid-word. Continuation
-                    // lines indent under the text past `[question N] `
-                    // so wrapped tail aligns visually with the first
-                    // word of the question.
-                    let prefix = format!("[question {}] ", qi + 1);
-                    let prefix_w = prefix.chars().count();
-                    let cont_indent = " ".repeat(prefix_w);
-                    let stem = format!("{}{}", prefix, question.question);
-                    let width = renderer.content_width().saturating_sub(2).max(20);
-                    renderer.write_line("", c_perm())?;
-                    for row in wrap::soft_wrap(&stem, width, &cont_indent) {
-                        renderer.write_line(&row, c_perm())?;
-                    }
-
-                    let multi = question.multi_select.unwrap_or(false);
-                    let custom = question.custom;
-                    let num_options = question.options.len();
-                    let mut cursor: usize = 0;
-                    let mut selected: Vec<bool> = vec![false; num_options];
-                    let mut custom_text: Option<String> = None;
-
-                    // Anchor point — options rendered below will be replaced on each keystroke
-                    let anchor = renderer.buffer_len();
-
-                    loop {
-                        // Build option lines as Vec<LineEntry>. Each
-                        // option's full text gets soft-wrapped through
-                        // the central `wrap::soft_wrap` helper so a
-                        // long description doesn't fall off the right
-                        // edge or hard-break mid-word.
-                        let width = renderer.content_width().saturating_sub(2).max(20);
-                        let mut lines: Vec<LineEntry> =
-                            Vec::with_capacity(num_options + if custom { 2 } else { 1 });
-                        for (i, opt) in question.options.iter().enumerate() {
-                            // Review #11: keep every marker in a
-                            // question at equal display width so
-                            // continuation indents (computed from
-                            // head_w) line up across rows. Without
-                            // this, single-select cursor (`▶`, w=1)
-                            // and non-cursor (`  `, w=2) differ by
-                            // one column, and the wrapped tails of
-                            // adjacent options misalign by 1.
-                            let marker = if i == cursor {
-                                if multi {
-                                    if selected[i] { "▶ [x]" } else { "▶ [ ]" }
-                                } else {
-                                    "▶ "
-                                }
-                            } else if multi {
-                                if selected[i] { "  [x]" } else { "  [ ]" }
-                            } else {
-                                "  "
-                            };
-                            // Layout: `  <marker> <label> — <description>`.
-                            // Continuation rows align under the label
-                            // start (past the leading spaces + marker
-                            // + space) so the eye keeps the option
-                            // grouping visually.
-                            let head = format!("  {} ", marker);
-                            // Review #10: display-width not chars.
-                            // Future markers using CJK arrows / emoji
-                            // (wide glyphs) would otherwise under-pad
-                            // the continuation indent — wrapped tails
-                            // would drift one column left of the
-                            // label.
-                            let head_w =
-                                unicode_width::UnicodeWidthStr::width(head.as_str());
-                            let body = format!("{} — {}", opt.label, opt.description);
-                            let cont_indent = " ".repeat(head_w);
-                            let full = format!("{}{}", head, body);
-                            for row in wrap::soft_wrap(&full, width, &cont_indent) {
-                                lines.push(LineEntry {
-                                    text: compact_str::CompactString::new(&row),
-                                    color: c_perm(),
-                                });
-                            }
-                        }
-                        if custom {
-                            let custom_marker = if cursor == num_options { "▶" } else { "  " };
-                            let custom_label = if let Some(ref t) = custom_text {
-                                format!("  {} (custom) \"{}\"", custom_marker, t)
-                            } else {
-                                format!("  {} (custom) type your own answer...", custom_marker)
-                            };
-                            // Same wrap treatment as the option rows
-                            // so a long custom-answer string doesn't
-                            // also fall off the edge.
-                            let cont = "        ";
-                            for row in wrap::soft_wrap(&custom_label, width, cont) {
-                                lines.push(LineEntry {
-                                    text: compact_str::CompactString::new(&row),
-                                    color: c_perm(),
-                                });
-                            }
-                        }
-                        lines.push(LineEntry {
-                            text: compact_str::CompactString::new(if multi {
-                                "  ↑↓ navigate  Space toggle  Enter confirm  Esc reject all"
-                            } else {
-                                "  ↑↓ navigate  Enter select  Esc reject all"
-                            }),
-                            color: c_perm(),
-                        });
-
-                        // Replace previous render with updated options
-                        renderer.replace_from(anchor, lines);
-                        render_frame!();
-
-                        // Wait for user input. Selection events
-                        // (drag, mouse-up, `y`/`Esc` while active)
-                        // are handled before the question's own
-                        // key handling so the user can still copy
-                        // chat text behind the question.
-                        let user_ev = user_rx.recv().await;
-                        let Some(ev) = user_ev else { continue; };
-                        match crate::ui::selection::handle(&ev, &mut renderer) {
-                            crate::ui::selection::Outcome::Repaint
-                            | crate::ui::selection::Outcome::RepaintAndCopied => {
-                                continue;
-                            }
-                            crate::ui::selection::Outcome::NotHandled => {}
-                        }
-                        let UserEvent::Key(key) = ev else {
-                            continue;
-                        };
-
-                        match key.code {
-                            KeyCode::Up | KeyCode::Char('k') => {
-                                cursor = cursor.saturating_sub(1);
-                            }
-                            KeyCode::Down | KeyCode::Char('j') => {
-                                let max = if custom { num_options } else { num_options.saturating_sub(1) };
-                                if cursor < max { cursor += 1; }
-                            }
-                            KeyCode::Enter => {
-                                if custom && cursor == num_options {
-                                    // Custom text input (works for both single and multi)
-                                    let mut buf = String::new();
-                                    renderer.write_line("  enter your answer:", c_perm())?;
-                                    let input_anchor = renderer.buffer_len();
-                                    loop {
-                                        // Soft-wrap the typed answer to the
-                                        // available width (reusing the compose
-                                        // box's wrap helper) so a long custom
-                                        // answer flows onto new lines and the
-                                        // tail stays visible instead of running
-                                        // off the right edge (dirge-0dqe). The
-                                        // "  > " / "    " prefixes are 4 cols.
-                                        let wrap_w =
-                                            renderer.content_width().saturating_sub(4).max(1);
-                                        let (rows, _, _) = crate::ui::renderer::wrap_editor(
-                                            &buf,
-                                            buf.len(),
-                                            wrap_w,
-                                        );
-                                        let lines: Vec<LineEntry> = if rows.is_empty() {
-                                            vec![LineEntry {
-                                                text: compact_str::CompactString::new("  > "),
-                                                color: c_perm(),
-                                            }]
-                                        } else {
-                                            rows.iter()
-                                                .enumerate()
-                                                .map(|(i, row)| LineEntry {
-                                                    text: compact_str::CompactString::new(
-                                                        if i == 0 {
-                                                            format!("  > {row}")
-                                                        } else {
-                                                            format!("    {row}")
-                                                        },
-                                                    ),
-                                                    color: c_perm(),
-                                                })
-                                                .collect()
-                                        };
-                                        renderer.replace_from(input_anchor, lines);
-                                        render_frame!();
-                                        let ev = user_rx.recv().await;
-                                        if let Some(UserEvent::Key(k)) = ev {
-                                            match k.code {
-                                                KeyCode::Enter => break,
-                                                KeyCode::Esc => {
-                                                    buf = String::new();
-                                                    break;
-                                                }
-                                                KeyCode::Backspace => { buf.pop(); }
-                                                KeyCode::Char(c) => { buf.push(c); }
-                                                _ => {}
-                                            }
-                                        }
-                                    }
-                                    if buf.is_empty() {
-                                        custom_text = None;
-                                    } else {
-                                        custom_text = Some(buf);
-                                    }
-                                    if !multi {
-                                        // Single select: confirm immediately
-                                        if let Some(ct) = custom_text.take() {
-                                            answers.push(vec![ct]);
-                                        }
-                                        break;
-                                    }
-                                    // Multi select: continue, user presses Enter again to confirm
-                                } else if multi {
-                                    // Confirm multi-select
-                                    let mut picked: Vec<String> = question
-                                        .options
-                                        .iter()
-                                        .enumerate()
-                                        .filter(|(i, _)| selected[*i])
-                                        .map(|(_, o)| o.label.clone())
-                                        .collect();
-                                    if let Some(ct) = custom_text.take() {
-                                        picked.push(ct);
-                                    }
-                                    if picked.is_empty() {
-                                        renderer.write_line(
-                                            "  select at least one option",
-                                            c_perm(),
-                                        )?;
-                                    } else {
-                                        answers.push(picked);
-                                        break;
-                                    }
-                                } else {
-                                    // Single select
-                                    let opt = &question.options[cursor];
-                                    answers.push(vec![opt.label.clone()]);
-                                    break;
-                                }
-                            }
-                            KeyCode::Char(' ') => {
-                                if multi && cursor < num_options {
-                                    selected[cursor] = !selected[cursor];
-                                } else if !multi && cursor < num_options {
-                                    // Space acts like Enter for single-select
-                                    let opt = &question.options[cursor];
-                                    answers.push(vec![opt.label.clone()]);
-                                    break;
-                                }
-                            }
-                            KeyCode::Esc => {
-                                rejected = true;
-                                break;
-                            }
-                            _ => {}
-                        }
-                    };
-                    if rejected {
-                        break;
-                    }
-                }
-
-                if rejected {
-                    let _ = question_req.reply.send(QuestionResponse::Rejected);
+                // #387 follow-up: hand the questionnaire to the unified input
+                // dispatcher instead of the former triple-nested blocking loop
+                // (questions -> option-select -> custom-text), which could park
+                // the UI. Render question 0 now; the dispatcher walks the rest one
+                // keystroke at a time and sends the reply on confirm/reject.
+                if question_req.questions.is_empty() {
+                    let _ = question_req.reply.send(QuestionResponse::Answered(Vec::new()));
                 } else {
-                    let _ = question_req.reply.send(QuestionResponse::Answered(answers));
+                    let q0 = &question_req.questions[0];
+                    let anchor = render_question_stem(&mut renderer, q0, 0)?;
+                    let selected = vec![false; q0.options.len()];
+                    render_question_options(&mut renderer, q0, 0, &selected, &None, anchor);
+                    ui.input_mode = state::InputMode::Question(state::QuestionState {
+                        req: question_req,
+                        answers: Vec::new(),
+                        qi: 0,
+                        cursor: 0,
+                        selected,
+                        custom_text: None,
+                        anchor,
+                        entry: None,
+                    });
                 }
-
-                renderer.write_line("", Color::White)?;
                 renderer.request_repaint();
             }
             Some(dialog_req) = async {
@@ -3535,6 +3493,140 @@ pub async fn run_interactive(
     }
 
     Ok(())
+}
+
+/// #387 follow-up: what the question dispatcher should do after handling
+/// one keystroke. Computed while the `QuestionState` is borrowed `&mut`,
+/// then acted on once the borrow is released (resolution needs to
+/// `mem::replace` `input_mode` to take ownership of the reply channel).
+enum QStep {
+    /// Stay on the current question; re-render its option/entry block.
+    Stay,
+    /// Current question answered — advance (or finish the questionnaire).
+    Next,
+    /// User rejected the whole questionnaire (Esc).
+    Rejected,
+}
+
+/// #387 follow-up: write a question's header + soft-wrapped stem and
+/// return the buffer index where its option block begins (the `anchor`
+/// the dispatcher `replace_from`s on every keystroke). Extracted from the
+/// former in-loop rendering so it can run both at modal setup and when
+/// advancing to the next question.
+fn render_question_stem(
+    renderer: &mut Renderer,
+    question: &crate::agent::tools::question::QuestionItem,
+    qi: usize,
+) -> std::io::Result<usize> {
+    if let Some(header) = &question.header {
+        renderer.write_line(&format!("\n--- {} ---", header), c_perm())?;
+    }
+    let prefix = format!("[question {}] ", qi + 1);
+    let prefix_w = prefix.chars().count();
+    let cont_indent = " ".repeat(prefix_w);
+    let stem = format!("{}{}", prefix, question.question);
+    let width = renderer.content_width().saturating_sub(2).max(20);
+    renderer.write_line("", c_perm())?;
+    for row in wrap::soft_wrap(&stem, width, &cont_indent) {
+        renderer.write_line(&row, c_perm())?;
+    }
+    Ok(renderer.buffer_len())
+}
+
+/// #387 follow-up: (re)render the option block for the current question in
+/// place at `anchor`. Mirrors the former inline render: soft-wrapped option
+/// rows with aligned markers, an optional "(custom)" row, and the key-hint
+/// footer. Called on every keystroke that changes cursor/selection/custom.
+fn render_question_options(
+    renderer: &mut Renderer,
+    question: &crate::agent::tools::question::QuestionItem,
+    cursor: usize,
+    selected: &[bool],
+    custom_text: &Option<String>,
+    anchor: usize,
+) {
+    let multi = question.multi_select.unwrap_or(false);
+    let custom = question.custom;
+    let num_options = question.options.len();
+    let width = renderer.content_width().saturating_sub(2).max(20);
+    let mut lines: Vec<LineEntry> = Vec::with_capacity(num_options + if custom { 2 } else { 1 });
+    for (i, opt) in question.options.iter().enumerate() {
+        // Keep every marker at equal display width so continuation
+        // indents line up across rows (Review #10/#11).
+        let marker = if i == cursor {
+            if multi {
+                if selected[i] { "▶ [x]" } else { "▶ [ ]" }
+            } else {
+                "▶ "
+            }
+        } else if multi {
+            if selected[i] { "  [x]" } else { "  [ ]" }
+        } else {
+            "  "
+        };
+        let head = format!("  {} ", marker);
+        let head_w = unicode_width::UnicodeWidthStr::width(head.as_str());
+        let body = format!("{} — {}", opt.label, opt.description);
+        let cont_indent = " ".repeat(head_w);
+        let full = format!("{}{}", head, body);
+        for row in wrap::soft_wrap(&full, width, &cont_indent) {
+            lines.push(LineEntry {
+                text: compact_str::CompactString::new(&row),
+                color: c_perm(),
+            });
+        }
+    }
+    if custom {
+        let custom_marker = if cursor == num_options { "▶" } else { "  " };
+        let custom_label = if let Some(t) = custom_text {
+            format!("  {} (custom) \"{}\"", custom_marker, t)
+        } else {
+            format!("  {} (custom) type your own answer...", custom_marker)
+        };
+        let cont = "        ";
+        for row in wrap::soft_wrap(&custom_label, width, cont) {
+            lines.push(LineEntry {
+                text: compact_str::CompactString::new(&row),
+                color: c_perm(),
+            });
+        }
+    }
+    lines.push(LineEntry {
+        text: compact_str::CompactString::new(if multi {
+            "  ↑↓ navigate  Space toggle  Enter confirm  Esc reject all"
+        } else {
+            "  ↑↓ navigate  Enter select  Esc reject all"
+        }),
+        color: c_perm(),
+    });
+    renderer.replace_from(anchor, lines);
+}
+
+/// #387 follow-up: (re)render the in-progress custom-answer text at
+/// `input_anchor`, soft-wrapped to the content width. Mirrors the former
+/// innermost loop's render.
+fn render_custom_entry(renderer: &mut Renderer, buf: &str, input_anchor: usize) {
+    let wrap_w = renderer.content_width().saturating_sub(4).max(1);
+    let (rows, _, _) = crate::ui::renderer::wrap_editor(buf, buf.len(), wrap_w);
+    let lines: Vec<LineEntry> = if rows.is_empty() {
+        vec![LineEntry {
+            text: compact_str::CompactString::new("  > "),
+            color: c_perm(),
+        }]
+    } else {
+        rows.iter()
+            .enumerate()
+            .map(|(i, row)| LineEntry {
+                text: compact_str::CompactString::new(if i == 0 {
+                    format!("  > {row}")
+                } else {
+                    format!("    {row}")
+                }),
+                color: c_perm(),
+            })
+            .collect()
+    };
+    renderer.replace_from(input_anchor, lines);
 }
 
 /// dirge-b11: hit-test a `(row, col)` terminal cell against an
