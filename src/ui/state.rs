@@ -146,6 +146,16 @@ pub(crate) enum InputMode {
     },
     /// `question` tool: walk the questionnaire one option-picker at a time.
     Question(QuestionState),
+    /// Plugin `harness/confirm` dialog: y/n (Esc / Ctrl+C = no).
+    DialogConfirm {
+        reply: std::sync::mpsc::Sender<crate::plugin::DialogReply>,
+    },
+    /// Plugin `harness/select` dialog: pick option 1-9 (Esc / Ctrl+C = none).
+    DialogSelect {
+        reply: std::sync::mpsc::Sender<crate::plugin::DialogReply>,
+        /// The selectable option labels, in display order.
+        options: Vec<String>,
+    },
 }
 
 /// In-flight state for the `question` tool modal — replaces the former
@@ -190,6 +200,8 @@ pub(crate) enum ModalKind {
     Compose,
     PlanSwitch,
     Question,
+    DialogConfirm,
+    DialogSelect,
 }
 
 impl InputMode {
@@ -204,6 +216,8 @@ impl InputMode {
             InputMode::Compose => ModalKind::Compose,
             InputMode::PlanSwitch { .. } => ModalKind::PlanSwitch,
             InputMode::Question(_) => ModalKind::Question,
+            InputMode::DialogConfirm { .. } => ModalKind::DialogConfirm,
+            InputMode::DialogSelect { .. } => ModalKind::DialogSelect,
         }
     }
 }

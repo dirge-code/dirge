@@ -814,6 +814,73 @@ pub async fn run_interactive(
                             }
                         }
                     }
+                    state::ModalKind::DialogConfirm => {
+                        // y / n / Esc / Ctrl+C — anything else is ignored.
+                        let answer = match key.code {
+                            KeyCode::Char('y') | KeyCode::Char('Y') => Some(true),
+                            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Some(false),
+                            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                Some(false)
+                            }
+                            _ => None,
+                        };
+                        if let Some(answer) = answer {
+                            let state::InputMode::DialogConfirm { reply } =
+                                std::mem::replace(&mut ui.input_mode, state::InputMode::Compose)
+                            else {
+                                unreachable!()
+                            };
+                            let _ = reply.send(crate::plugin::DialogReply::Confirm(answer));
+                            renderer.write_line(
+                                &format!("  -> {}", if answer { "yes" } else { "no" }),
+                                theme::dim(),
+                            )?;
+                        }
+                    }
+                    state::ModalKind::DialogSelect => {
+                        // 1-9 selects (if in range); Esc / Ctrl+C cancels.
+                        // Compute the picked label (or cancel) without holding
+                        // the borrow across the resolving `mem::replace`.
+                        enum Pick {
+                            None_,
+                            Cancel,
+                            Label(String),
+                        }
+                        let pick = match key.code {
+                            KeyCode::Char(c) if c.is_ascii_digit() => {
+                                let state::InputMode::DialogSelect { options, .. } = &ui.input_mode
+                                else {
+                                    unreachable!()
+                                };
+                                let idx = (c as u8 - b'0') as usize;
+                                if idx >= 1 && idx <= options.len() {
+                                    Pick::Label(options[idx - 1].clone())
+                                } else {
+                                    Pick::None_
+                                }
+                            }
+                            KeyCode::Esc => Pick::Cancel,
+                            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                Pick::Cancel
+                            }
+                            _ => Pick::None_,
+                        };
+                        let resolved = match pick {
+                            Pick::None_ => None,
+                            Pick::Cancel => Some(None),
+                            Pick::Label(l) => Some(Some(l)),
+                        };
+                        if let Some(answer) = resolved {
+                            let state::InputMode::DialogSelect { reply, .. } =
+                                std::mem::replace(&mut ui.input_mode, state::InputMode::Compose)
+                            else {
+                                unreachable!()
+                            };
+                            let label = answer.as_deref().unwrap_or("(cancelled)").to_string();
+                            let _ = reply.send(crate::plugin::DialogReply::Select(answer));
+                            renderer.write_line(&format!("  -> {}", label), theme::dim())?;
+                        }
+                    }
                 }
                 continue;
             }
@@ -3266,26 +3333,18 @@ pub async fn run_interactive(
                     std::future::pending().await
                 }
             } => {
-                // Plugin asked the user a question via harness/confirm or
-                // harness/select. The Janet worker thread is blocked on
-                // the reply channel; render the dialog, drive a synchronous
-                // key-read loop, then send the answer back. Other agent
-                // events keep queuing in their channels — they'll process
-                // after this arm returns.
-                use crate::plugin::{DialogReply, DialogRequest};
-                // Events that arrived during the dialog but didn't match
-                // its accepted keys are stashed here, then pushed back into
-                // user_rx after the dialog ends. Without this, a paste or
-                // unrelated key during a confirm dialog would be lost.
-                let mut deferred: Vec<UserEvent> = Vec::new();
-                // Close any open tool chamber FIRST. A plugin hook
-                // can fire from inside on-tool-start which runs
-                // while a tool chamber is open — without this the
-                // confirm/select dialog renders INSIDE the chamber.
+                // Plugin asked the user via harness/confirm or harness/select.
+                // #387 follow-up: render the dialog and hand the reply channel to
+                // the unified input dispatcher instead of spinning a nested
+                // blocking select! loop (which parked every other arm). The Janet
+                // worker thread stays blocked on the reply channel until the
+                // dispatcher resolves the keystroke. Close any open tool chamber
+                // FIRST so the dialog never renders inside an in-flight chamber.
+                use crate::plugin::DialogRequest;
                 match dialog_req {
                     DialogRequest::Confirm { title, question, reply } => {
-                        // Strip ANSI escapes from plugin-controlled strings
-                        // to prevent repaint/screen-manipulation attacks.
+                        // Strip ANSI escapes from plugin-controlled strings to
+                        // prevent repaint/screen-manipulation attacks.
                         let safe_title = crate::ui::ansi::strip_escapes(
                             &title,
                             crate::ui::ansi::StripPolicy::KEEP_NEWLINE,
@@ -3298,127 +3357,30 @@ pub async fn run_interactive(
                             &mut renderer,
                             &mut ui.last_tool_name,
                             &mut ui.tool_chamber_open,
-                                    &mut ui.chamber_top_start,
-                                    &mut ui.chamber_top_end,
+                            &mut ui.chamber_top_start,
+                            &mut ui.chamber_top_end,
                             &format!("[plugin {}] {}", safe_title, safe_question),
                             c_perm(),
                         )?;
-                        renderer.write_line(
-                            "  (y) yes  (n) no  (ESC) cancel = no",
-                            c_perm(),
-                        )?;
-                        let answer = loop {
-                            tokio::select! {
-                                Some(ev) = user_rx.recv() => {
-                                    match crate::ui::selection::handle(&ev, &mut renderer) {
-                                        crate::ui::selection::Outcome::Repaint
-                                        | crate::ui::selection::Outcome::RepaintAndCopied => {
-                                            render_frame!();
-                                            continue;
-                                        }
-                                        crate::ui::selection::Outcome::NotHandled => {}
-                                    }
-                                    if let UserEvent::Key(key) = ev {
-                                        match key.code {
-                                            KeyCode::Char('y') | KeyCode::Char('Y') => break true,
-                                            KeyCode::Char('n')
-                                            | KeyCode::Char('N')
-                                            | KeyCode::Esc => break false,
-                                            // Treat Ctrl+C as cancel (same
-                                            // as Esc / no), not as
-                                            // "interrupt the agent" — the
-                                            // agent isn't running this code
-                                            // path, the dialog is.
-                                            KeyCode::Char('c')
-                                                if key.modifiers
-                                                    .contains(KeyModifiers::CONTROL) =>
-                                            {
-                                                break false;
-                                            }
-                                            _ => deferred.push(UserEvent::Key(key)),
-                                        }
-                                    } else {
-                                        // Paste, Resize, etc. Hand them back after
-                                        // the dialog so the main loop arms
-                                        // can handle them as usual.
-                                        deferred.push(ev);
-                                    }
-                                }
-                            }
-                        };
-                        let _ = reply.send(DialogReply::Confirm(answer));
-                        renderer.write_line(
-                            &format!("  -> {}", if answer { "yes" } else { "no" }),
-                            theme::dim(),
-                        )?;
+                        renderer.write_line("  (y) yes  (n) no  (ESC) cancel = no", c_perm())?;
+                        ui.input_mode = state::InputMode::DialogConfirm { reply };
                     }
                     DialogRequest::Select { title, options, reply } => {
                         write_outside_chamber(
                             &mut renderer,
                             &mut ui.last_tool_name,
                             &mut ui.tool_chamber_open,
-                                    &mut ui.chamber_top_start,
-                                    &mut ui.chamber_top_end,
+                            &mut ui.chamber_top_start,
+                            &mut ui.chamber_top_end,
                             &format!("[plugin {}] pick one:", title),
                             c_perm(),
                         )?;
                         for (i, opt) in options.iter().enumerate() {
-                            renderer.write_line(
-                                &format!("  {}: {}", i + 1, opt),
-                                c_perm(),
-                            )?;
+                            renderer.write_line(&format!("  {}: {}", i + 1, opt), c_perm())?;
                         }
-                        renderer.write_line(
-                            "  (1-9) select  (ESC) cancel",
-                            c_perm(),
-                        )?;
-                        let answer: Option<String> = loop {
-                            tokio::select! {
-                                Some(ev) = user_rx.recv() => {
-                                    match crate::ui::selection::handle(&ev, &mut renderer) {
-                                        crate::ui::selection::Outcome::Repaint
-                                        | crate::ui::selection::Outcome::RepaintAndCopied => {
-                                            render_frame!();
-                                            continue;
-                                        }
-                                        crate::ui::selection::Outcome::NotHandled => {}
-                                    }
-                                    if let UserEvent::Key(key) = ev {
-                                        match key.code {
-                                            KeyCode::Char(c) if c.is_ascii_digit() => {
-                                                let idx = (c as u8 - b'0') as usize;
-                                                if idx >= 1 && idx <= options.len() {
-                                                    break Some(options[idx - 1].clone());
-                                                }
-                                            }
-                                            KeyCode::Esc => break None,
-                                            KeyCode::Char('c')
-                                                if key.modifiers
-                                                    .contains(KeyModifiers::CONTROL) =>
-                                            {
-                                                break None;
-                                            }
-                                            _ => deferred.push(UserEvent::Key(key)),
-                                        }
-                                    } else {
-                                        deferred.push(ev);
-                                    }
-                                }
-                            }
-                        };
-                        let label = answer.as_deref().unwrap_or("(cancelled)").to_string();
-                        let _ = reply.send(DialogReply::Select(answer));
-                        renderer.write_line(
-                            &format!("  -> {}", label),
-                            theme::dim(),
-                        )?;
+                        renderer.write_line("  (1-9) select  (ESC) cancel", c_perm())?;
+                        ui.input_mode = state::InputMode::DialogSelect { reply, options };
                     }
-                }
-                // Replay deferred events into user_rx so the outer select!
-                // arms see them next iteration. Best-effort: a full channel
-                // (very unlikely, capacity 64) silently drops the tail.
-                for ev in deferred {
-                    let _ = user_tx.send(ev).await;
                 }
                 renderer.request_repaint();
             }
