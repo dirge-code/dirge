@@ -156,6 +156,23 @@ pub(crate) enum InputMode {
         /// The selectable option labels, in display order.
         options: Vec<String>,
     },
+    /// Tool permission prompt: y (allow once) / a (allow always) / n / Esc.
+    /// The `(O_O)` alert overlay is already painted; the dispatcher reads
+    /// the keystroke, replies, and runs the chamber-reopen / cascade-deny
+    /// / allowlist-save post-work.
+    Permission(PermissionState),
+}
+
+/// In-flight state for the tool-permission modal — replaces the former
+/// nested `loop { select! { user_rx … } }`. Holds the request (tool +
+/// input + reply) and the chamber that must be reopened if the user
+/// allows the tool.
+pub(crate) struct PermissionState {
+    /// The permission request (tool, input, and the decision reply).
+    pub(crate) req: crate::permission::ask::AskRequest,
+    /// If a tool chamber was closed to make room for the alert, the name
+    /// to reopen it under once the user allows (`None` = nothing to reopen).
+    pub(crate) pending_chamber_tool: Option<String>,
 }
 
 /// In-flight state for the `question` tool modal — replaces the former
@@ -202,6 +219,7 @@ pub(crate) enum ModalKind {
     Question,
     DialogConfirm,
     DialogSelect,
+    Permission,
 }
 
 impl InputMode {
@@ -218,6 +236,7 @@ impl InputMode {
             InputMode::Question(_) => ModalKind::Question,
             InputMode::DialogConfirm { .. } => ModalKind::DialogConfirm,
             InputMode::DialogSelect { .. } => ModalKind::DialogSelect,
+            InputMode::Permission(_) => ModalKind::Permission,
         }
     }
 }

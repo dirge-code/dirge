@@ -881,6 +881,169 @@ pub async fn run_interactive(
                             renderer.write_line(&format!("  -> {}", label), theme::dim())?;
                         }
                     }
+                    state::ModalKind::Permission => {
+                        // Phase 1: map the keystroke to a decision. Ctrl+C /
+                        // Ctrl+D = "I want out" → Deny. The `a` branch also
+                        // prints the will-allow line (or downgrades to allow-
+                        // once when the input yields no useful pattern).
+                        let is_ctrl_c = key.code == KeyCode::Char('c')
+                            && key.modifiers.contains(KeyModifiers::CONTROL);
+                        let is_ctrl_d = key.code == KeyCode::Char('d')
+                            && key.modifiers.contains(KeyModifiers::CONTROL);
+                        let decision: Option<UserDecision> = if is_ctrl_c || is_ctrl_d {
+                            Some(UserDecision::Deny)
+                        } else {
+                            match key.code {
+                                KeyCode::Char('y') => Some(UserDecision::AllowOnce),
+                                KeyCode::Char('a') => {
+                                    let state::InputMode::Permission(p) = &ui.input_mode else {
+                                        unreachable!()
+                                    };
+                                    let pattern =
+                                        suggest_pattern(&p.req.tool, &p.req.input);
+                                    if is_placeholder_pattern(&pattern) {
+                                        renderer.write_line(
+                                            "  -> can't derive a useful pattern from empty input; allowing once only",
+                                            theme::dim(),
+                                        )?;
+                                        Some(UserDecision::AllowOnce)
+                                    } else {
+                                        renderer.write_line(
+                                            &format!(
+                                                "  -> will allow: {}",
+                                                sanitize_output(&pattern),
+                                            ),
+                                            Color::Green,
+                                        )?;
+                                        Some(UserDecision::AllowAlways(pattern))
+                                    }
+                                }
+                                KeyCode::Char('n') | KeyCode::Esc => Some(UserDecision::Deny),
+                                _ => None,
+                            }
+                        };
+
+                        // Phase 2: decision made — run the post-decision work
+                        // (overlay clear, reply, avatar, cascade-deny, allow-
+                        // list save, chamber reopen). Borrow on the state is
+                        // released by the `mem::replace`.
+                        if let Some(decision) = decision {
+                            let state::InputMode::Permission(p) = std::mem::replace(
+                                &mut ui.input_mode,
+                                state::InputMode::Compose,
+                            ) else {
+                                unreachable!()
+                            };
+                            let ask_req = p.req;
+                            let pending_chamber_tool = p.pending_chamber_tool;
+
+                            let allow_pattern = match &decision {
+                                UserDecision::AllowAlways(p) => Some(p.clone()),
+                                _ => None,
+                            };
+                            let was_denied = matches!(decision, UserDecision::Deny);
+                            // Alert decided — clear the overlay so the [ALERT]
+                            // frame swaps back to the input editor.
+                            renderer.clear_alert_overlay();
+                            let _ = ask_req.reply.send(decision);
+
+                            // On allow, reset the avatar to the tool's working
+                            // face (it was stuck on the Alert face). Deny path
+                            // leaves it for the turn's Done/Error/Idle handler.
+                            if !was_denied {
+                                renderer.set_avatar_state(avatar::AvatarState::from_tool_name(
+                                    &ask_req.tool,
+                                ));
+                            }
+
+                            // Cascading reject: deny any sibling requests
+                            // already queued in `ask_rx` from the same run,
+                            // then interject so the runner halts at the next
+                            // tool-result boundary.
+                            if was_denied {
+                                if let Some(rx) = ask_rx.as_mut() {
+                                    let mut cascaded = 0usize;
+                                    while let Ok(stale) = rx.try_recv() {
+                                        let _ = stale.reply.send(UserDecision::Deny);
+                                        cascaded += 1;
+                                    }
+                                    if cascaded > 0 {
+                                        renderer.write_line(
+                                            &format!(
+                                                "  ↳ also denied {} queued tool request{}",
+                                                cascaded,
+                                                if cascaded == 1 { "" } else { "s" },
+                                            ),
+                                            theme::dim(),
+                                        )?;
+                                    }
+                                }
+                                if let Some(tx) = ui.agent_interject.as_ref() {
+                                    let _ = tx.try_send(());
+                                }
+                            }
+
+                            // Allow-always: persist the pattern to the session
+                            // allowlist + install it into the live checker now
+                            // (so queued siblings coalesce). The confirmation
+                            // line must precede any chamber reopen below.
+                            if let Some(pattern) = allow_pattern {
+                                session.permission_allowlist.push(PermissionAllowEntry {
+                                    tool: ask_req.tool.clone(),
+                                    pattern: pattern.clone(),
+                                });
+                                if let Some(perm) = &permission
+                                    && let Ok(mut guard) = perm.lock()
+                                {
+                                    guard.add_session_allowlist(ask_req.tool.clone(), &pattern);
+                                }
+                                if !cli.no_session
+                                    && let Err(e) =
+                                        crate::session::storage::save_session(session)
+                                {
+                                    renderer.write_line(
+                                        &format!("warning: failed to save session: {}", e),
+                                        c_error(),
+                                    )?;
+                                }
+                                renderer.write_line("", Color::White)?;
+                                renderer.write_line(
+                                    &format!(
+                                        "  allowed {} {} (saved to session)",
+                                        sanitize_output(&ask_req.tool),
+                                        pattern,
+                                    ),
+                                    Color::Green,
+                                )?;
+                            }
+
+                            // Reopen the in-flight chamber (allow) or write a
+                            // dim "(denied)" trailer (deny).
+                            if let Some(reopen_name) = pending_chamber_tool {
+                                renderer.write_line("", Color::White)?;
+                                if was_denied {
+                                    renderer.write_line(
+                                        &format!(
+                                            "  ↳ denied: {} {}",
+                                            sanitize_output(&ask_req.tool),
+                                            sanitize_output(&ask_req.input),
+                                        ),
+                                        theme::dim(),
+                                    )?;
+                                } else {
+                                    let upper = reopen_name.to_ascii_uppercase();
+                                    let raw_value =
+                                        sanitize_output(&ask_req.input).into_string();
+                                    let (frame_w, _) = chamber_widths(&renderer);
+                                    let header =
+                                        fit_banner_header(&upper, &raw_value, frame_w);
+                                    renderer.write_line(&header, c_tool())?;
+                                    ui.last_tool_name = Some(reopen_name);
+                                    ui.tool_chamber_open = true;
+                                }
+                            }
+                        }
+                    }
                 }
                 continue;
             }
@@ -2461,7 +2624,7 @@ pub async fn run_interactive(
                 } else {
                     std::future::pending().await
                 }
-            } => {
+            }, if !ui.input_mode.is_modal() => {
                 // Coalesce parallel-tool prompts. When the agent fires
                 // several tool calls at once, each that needs permission
                 // queues its own AskRequest. If the user picked "allow
@@ -2632,262 +2795,17 @@ pub async fn run_interactive(
                     renderer.request_repaint();
                 }
 
-                let decision = loop {
-                    tokio::select! {
-                        Some(ev) = user_rx.recv() => {
-                            // Selection works through the alert: drag
-                            // anywhere over the chat behind, mouse-up
-                            // copies. `y` and `Esc` are reserved for
-                            // the alert's own keys when no selection
-                            // is active — selection::handle only
-                            // claims them while active.
-                            match crate::ui::selection::handle(&ev, &mut renderer) {
-                                crate::ui::selection::Outcome::Repaint
-                                | crate::ui::selection::Outcome::RepaintAndCopied => {
-                                    render_frame!();
-                                    continue;
-                                }
-                                crate::ui::selection::Outcome::NotHandled => {}
-                            }
-                            // `match` form is kept (vs the lint's `if let`
-                            // suggestion) so we can later route MouseDown /
-                            // Paste / Resize without restructuring the body.
-                            #[allow(clippy::single_match)]
-                            match ev {
-                                UserEvent::Key(key) => {
-                                    // Ctrl+C / Ctrl+D in the alert
-                                    // = "I want out" → treat as
-                                    // Deny. Without this the loop
-                                    // fell through to `_ => {}` and
-                                    // the tool hung waiting for an
-                                    // answer that never came; the
-                                    // user had to keyboard-mash to
-                                    // discover that only y/a/n/Esc
-                                    // worked.
-                                    let is_ctrl_c = key.code == KeyCode::Char('c')
-                                        && key.modifiers.contains(KeyModifiers::CONTROL);
-                                    let is_ctrl_d = key.code == KeyCode::Char('d')
-                                        && key.modifiers.contains(KeyModifiers::CONTROL);
-                                    if is_ctrl_c || is_ctrl_d {
-                                        break UserDecision::Deny;
-                                    }
-                                    match key.code {
-                                    KeyCode::Char('y') => break UserDecision::AllowOnce,
-                                    KeyCode::Char('a') => {
-                                        let pattern = suggest_pattern(&ask_req.tool, &ask_req.input);
-                                        // Refuse to store the empty-
-                                        // input placeholder as a real
-                                        // pattern. Without this, an "a"
-                                        // press on a tool call with
-                                        // empty/whitespace args would
-                                        // pin "<edit this pattern>" as
-                                        // a literal allowlist entry —
-                                        // useless and confusing.
-                                        // Fall back to AllowOnce so the
-                                        // tool still runs, but no
-                                        // permanent rule is added.
-                                        if is_placeholder_pattern(&pattern) {
-                                            renderer.write_line(
-                                                "  -> can't derive a useful pattern from empty input; allowing once only",
-                                                theme::dim(),
-                                            )?;
-                                            break UserDecision::AllowOnce;
-                                        }
-                                        renderer.write_line(
-                                            &format!(
-                                                "  -> will allow: {}",
-                                                sanitize_output(&pattern),
-                                            ),
-                                            Color::Green,
-                                        )?;
-                                        break UserDecision::AllowAlways(pattern);
-                                    }
-                                    KeyCode::Char('n') | KeyCode::Esc => break UserDecision::Deny,
-                                    _ => {}
-                                    }
-                                }
-                                // Keep scroll responsive while the
-                                // alert is up — previously these
-                                // events were dropped on the floor
-                                // inside this loop, locking the chat
-                                // viewport.
-                                _ => {}
-                            }
-                        }
-                    }
-                };
-
-                let allow_pattern = match &decision {
-                    UserDecision::AllowAlways(p) => Some(p.clone()),
-                    _ => None,
-                };
-                let was_denied = matches!(decision, UserDecision::Deny);
-                // ui-redesign Phase 6: alert decided — clear the
-                // overlay so the [ALERT] frame swaps back to the
-                // input editor for the next user interaction.
-                renderer.clear_alert_overlay();
-                let _ = ask_req.reply.send(decision);
-
-                // Avatar bugfix: when the user lets the tool proceed
-                // (Allow / AllowAlways), the avatar is still stuck on
-                // the Alert face `(O_O)` that was set at prompt time
-                // (see set_avatar_state(Alert) above). Reset it to the
-                // tool's working face (Reading/Writing/Bash) so the
-                // bottom-row avatar matches the tool that's now
-                // running again. The deny path intentionally leaves
-                // this alone — the tool isn't going to run, and the
-                // turn's own Done/Error/Idle handlers own the next
-                // transition.
-                if !was_denied {
-                    renderer.set_avatar_state(avatar::AvatarState::from_tool_name(&ask_req.tool));
-                }
-
-                // Audit H10: cascading reject. When the user denies
-                // one tool, any other tool requests already queued
-                // in `ask_rx` belong to the same agent run and the
-                // user almost certainly doesn't want to be asked
-                // about them serially. Drain whatever's already
-                // enqueued and auto-deny each. New requests that
-                // arrive after this drain still go through the
-                // normal alert flow on the next iteration.
-                if was_denied {
-                    if let Some(rx) = ask_rx.as_mut() {
-                        let mut cascaded = 0usize;
-                        while let Ok(stale) = rx.try_recv() {
-                            let _ = stale.reply.send(UserDecision::Deny);
-                            cascaded += 1;
-                        }
-                        if cascaded > 0 {
-                            renderer.write_line(
-                                &format!(
-                                    "  ↳ also denied {} queued tool request{}",
-                                    cascaded,
-                                    if cascaded == 1 { "" } else { "s" },
-                                ),
-                                theme::dim(),
-                            )?;
-                        }
-                    }
-                    // Audit H10 (extended): the drain above only
-                    // covers requests already in `ask_rx` at this
-                    // moment. The agent may still emit MORE tool
-                    // calls in the current run — without an
-                    // interject signal, the user would keep seeing
-                    // fresh permission dialogs for the same denied
-                    // intent. Send an interject so the runner halts
-                    // at the next tool-result boundary; the partial
-                    // response is preserved via the Interjected
-                    // event. try_send so a full channel is a no-op.
-                    if let Some(tx) = ui.agent_interject.as_ref() {
-                        let _ = tx.try_send(());
-                    }
-                }
-
-                // Reopen / mark the chamber depending on outcome:
-                //
-                // - **Allow**: write a fresh chamber TOP banner so
-                //   the about-to-arrive ToolResult body has a
-                //   chamber to land inside. This gives the user a
-                //   clear "permission granted, tool running" visual
-                //   pair (closed chamber for the pause, fresh
-                //   chamber for the result).
-                //
-                // - **Deny**: chamber stayed closed; render a
-                //   single dim "(denied)" trailer line so it's
-                //   clear no result is coming.
-                // The "allowed … (saved to session)" confirmation
-                // line MUST be emitted before any chamber-reopen
-                // below, otherwise it lands inside the freshly-
-                // painted chamber TOP and reads as if it's part of
-                // the tool's output. Same shape of bug as the
-                // earlier alert-inside-chamber fix — visible
-                // affordance order: confirmation → blank → chamber
-                // TOP → (incoming tool result body) → chamber bottom.
-                if let Some(pattern) = allow_pattern {
-                    session.permission_allowlist.push(PermissionAllowEntry {
-                        tool: ask_req.tool.clone(),
-                        pattern: pattern.clone(),
-                    });
-                    // Install into the LIVE checker now, synchronously,
-                    // so queued sibling asks from the same parallel batch
-                    // see it on the next loop iteration and get coalesced
-                    // (see the auto-allow fast-path at the top of this
-                    // arm). The tool-side handler also adds it on reply
-                    // receipt, but that runs asynchronously and would
-                    // race the next queued ask; add::dedup makes the
-                    // double-add a no-op.
-                    if let Some(perm) = &permission
-                        && let Ok(mut guard) = perm.lock()
-                    {
-                        guard.add_session_allowlist(ask_req.tool.clone(), &pattern);
-                    }
-                    if !cli.no_session
-                        && let Err(e) = crate::session::storage::save_session(session) {
-                            renderer.write_line(
-                                &format!("warning: failed to save session: {}", e),
-                                c_error(),
-                            )?;
-                        }
-                    // Review #9: blank-line breathing room between
-                    // the alert's `╰─╯` and this green confirmation.
-                    // Without it the alert bottom and the "allowed"
-                    // line read as adjacent rows of one block.
-                    renderer.write_line("", Color::White)?;
-                    renderer.write_line(
-                        &format!(
-                            "  allowed {} {} (saved to session)",
-                            sanitize_output(&ask_req.tool),
-                            pattern,
-                        ),
-                        Color::Green,
-                    )?;
-                }
-
-                if let Some(reopen_name) = pending_chamber_tool {
-                    // Visual breathing room between the alert box's
-                    // bottom border and whatever follows (reopened
-                    // chamber OR denied trailer). Without this, the
-                    // alert's `╰─╯` sits flush against the next
-                    // line which reads as continuous output.
-                    renderer.write_line("", Color::White)?;
-                    if was_denied {
-                        // Same sanitization as the ALERT rows above:
-                        // tool name + args can carry attacker-shaped
-                        // bytes; don't paint them raw even on the
-                        // deny path.
-                        renderer.write_line(
-                            &format!(
-                                "  ↳ denied: {} {}",
-                                sanitize_output(&ask_req.tool),
-                                sanitize_output(&ask_req.input),
-                            ),
-                            theme::dim(),
-                        )?;
-                    } else {
-                        // Reopen with the same banner shape the
-                        // ToolCall handler uses. `ask_req.input` is
-                        // the value that the original banner would
-                        // have rendered (path for read/write/edit,
-                        // command for bash, etc.) so we can pass it
-                        // directly without re-parsing the JSON args.
-                        //
-                        // Note for `apply_patch`: the initial chamber
-                        // showed "N ops" (overview); the reopened
-                        // chamber here shows the specific path the
-                        // user just permitted. Intentional — the
-                        // user is approving per-op, so per-op
-                        // identification is more useful at the
-                        // reopen point.
-                        let upper = reopen_name.to_ascii_uppercase();
-                        let raw_value = sanitize_output(&ask_req.input).into_string();
-                        let (frame_w, _) = chamber_widths(&renderer);
-                        let header = fit_banner_header(&upper, &raw_value, frame_w);
-                        renderer.write_line(&header, c_tool())?;
-                        ui.last_tool_name = Some(reopen_name);
-                        ui.tool_chamber_open = true;
-                    }
-                }
-
+                // #387 follow-up: the alert overlay is painted; hand the request
+                // to the unified input dispatcher instead of spinning a nested
+                // blocking select! loop. The y/a/n/Esc decision and all the
+                // post-decision work (reply, avatar reset, cascade-deny, allowlist
+                // save, chamber reopen) now run in dispatch_modal! when the
+                // keystroke arrives — so Ctrl+C, chat selection, and scroll stay
+                // live while the prompt is up.
+                ui.input_mode = state::InputMode::Permission(state::PermissionState {
+                    req: ask_req,
+                    pending_chamber_tool,
+                });
                 renderer.request_repaint();
             }
             Some(notif) = async {
@@ -3279,7 +3197,7 @@ pub async fn run_interactive(
                 } else {
                     std::future::pending().await
                 }
-            } => {
+            }, if !ui.input_mode.is_modal() => {
                 ui.was_reasoning = false;
                 // Single chokepoint: close any open tool chamber
                 // (and clear the agent-line state) before painting
@@ -3332,7 +3250,7 @@ pub async fn run_interactive(
                 } else {
                     std::future::pending().await
                 }
-            } => {
+            }, if !ui.input_mode.is_modal() => {
                 // Plugin asked the user via harness/confirm or harness/select.
                 // #387 follow-up: render the dialog and hand the reply channel to
                 // the unified input dispatcher instead of spinning a nested
@@ -3390,7 +3308,7 @@ pub async fn run_interactive(
                 } else {
                     std::future::pending().await
                 }
-            } => {
+            }, if !ui.input_mode.is_modal() => {
                 ui.was_reasoning = false;
                 ui.agent_line_started = false;
 
