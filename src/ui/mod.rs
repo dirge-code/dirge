@@ -522,6 +522,97 @@ pub async fn run_interactive(
         }};
     }
 
+    // #387 follow-up: the unified input dispatcher. When a modal owns the
+    // input (`ui.input_mode` != Compose), the single `user_rx` arm routes
+    // the event here instead of the compose editor — replacing the former
+    // nested blocking `loop { user_rx.recv().await }` read loops, which
+    // could park the whole UI. Each modal handles one event, mutates its
+    // state, and on resolution sends its reply + returns to `Compose`; the
+    // loop-top `render_frame!` paints the result. Key/Paste events are
+    // always swallowed while a modal is active (a stray key must not leak
+    // into the hidden compose box); other events (resize/scroll) fall
+    // through to the normal handlers. Expanded once, inside the arm, so it
+    // can borrow the same locals (`agent`, channels, `context`, …) the
+    // former arms did.
+    macro_rules! dispatch_modal {
+        ($ev:expr) => {
+            if let UserEvent::Key(key) = &$ev {
+                let key = *key;
+                match ui.input_mode.kind() {
+                    state::ModalKind::Compose => {}
+                    state::ModalKind::PlanSwitch => match key.code {
+                        KeyCode::Char('y') | KeyCode::Enter => {
+                            let state::InputMode::PlanSwitch {
+                                reply,
+                                prompt_name,
+                                label,
+                            } = std::mem::replace(&mut ui.input_mode, state::InputMode::Compose)
+                            else {
+                                unreachable!()
+                            };
+                            // Activate the new prompt layer + push its
+                            // deny-list to the perm checker, then rebuild
+                            // the agent under the new prompt mode.
+                            if let Some(p) = context.prompts.get(prompt_name) {
+                                let body = p.body.clone();
+                                let deny = p.deny_tools.clone();
+                                context.set_prompt_layer(
+                                    Some(prompt_name.to_string()),
+                                    Some(body),
+                                    deny,
+                                );
+                                crate::permission::apply_prompt_deny(
+                                    &permission,
+                                    &context.current_prompt_deny_tools,
+                                );
+                            }
+                            let model = client.completion_model(session.model.to_string());
+                            agent = crate::provider::build_agent(
+                                model,
+                                cli,
+                                cfg,
+                                context,
+                                permission.clone(),
+                                ask_tx.clone(),
+                                question_tx.clone(),
+                                plan_tx.clone(),
+                                bg_store.clone(),
+                                #[cfg(feature = "lsp")]
+                                lsp_manager.clone(),
+                                sandbox.clone(),
+                                #[cfg(feature = "mcp")]
+                                mcp_manager.as_ref(),
+                                #[cfg(feature = "semantic")]
+                                semantic_manager,
+                                Some(session.id.to_string()),
+                            )
+                            .await;
+                            let _ = reply.send(PlanSwitchResponse::Accepted);
+                            renderer
+                                .write_line(&format!("  switched to {}", label), Color::Green)?;
+                            if !cli.print
+                                && let Err(e) =
+                                    render_session(&mut renderer, session, cli, cfg, context)
+                            {
+                                renderer.write_line(&format!("render error: {}", e), c_error())?;
+                            }
+                        }
+                        KeyCode::Char('n') | KeyCode::Esc => {
+                            let state::InputMode::PlanSwitch { reply, .. } =
+                                std::mem::replace(&mut ui.input_mode, state::InputMode::Compose)
+                            else {
+                                unreachable!()
+                            };
+                            let _ = reply.send(PlanSwitchResponse::Rejected);
+                        }
+                        _ => {}
+                    },
+                }
+                continue;
+            }
+        };
+    }
+
     render_session(&mut renderer, session, cli, cfg, context)?;
     renderer.request_repaint();
 
@@ -715,6 +806,11 @@ pub async fn run_interactive(
                         continue;
                     }
                     crate::ui::selection::Outcome::NotHandled => {}
+                }
+                // #387 follow-up: if a modal owns the input, route the event
+                // there (swallowing keys) instead of the compose editor.
+                if ui.input_mode.is_modal() {
+                    dispatch_modal!(ev);
                 }
                 match ev {
                     // Mouse Down/Drag/Up that selection::handle declined
@@ -3396,79 +3492,16 @@ pub async fn run_interactive(
                     c_perm(),
                 )?;
 
-                let accepted = loop {
-                    let Some(ev) = user_rx.recv().await else { continue; };
-                    match crate::ui::selection::handle(&ev, &mut renderer) {
-                        crate::ui::selection::Outcome::Repaint
-                        | crate::ui::selection::Outcome::RepaintAndCopied => {
-                            render_frame!();
-                            continue;
-                        }
-                        crate::ui::selection::Outcome::NotHandled => {}
-                    }
-                    let UserEvent::Key(key) = ev else { continue; };
-                    match key.code {
-                        KeyCode::Char('y') | KeyCode::Enter => break true,
-                        KeyCode::Char('n') | KeyCode::Esc => break false,
-                        _ => {}
-                    }
+                // #387 follow-up: hand the prompt off to the unified input
+                // dispatcher instead of spinning a nested blocking read
+                // loop. The y/n decision + agent rebuild now run in
+                // `dispatch_modal!` when the keystroke arrives, keeping the
+                // event loop live (Ctrl+C, selection, resize still work).
+                ui.input_mode = state::InputMode::PlanSwitch {
+                    reply: plan_req.reply,
+                    prompt_name,
+                    label,
                 };
-
-                if accepted {
-                    // Update context with the new prompt + push its
-                    // deny-list to the perm checker so any prompt-
-                    // level tool restrictions kick in immediately.
-                    if let Some(p) = context.prompts.get(prompt_name) {
-                        let body = p.body.clone();
-                        let deny = p.deny_tools.clone();
-                        context.set_prompt_layer(Some(prompt_name.to_string()), Some(body), deny);
-                        crate::permission::apply_prompt_deny(
-                            &permission,
-                            &context.current_prompt_deny_tools,
-                        );
-                    }
-
-                    // Rebuild agent with new prompt mode
-                    let model = client.completion_model(session.model.to_string());
-                    agent = crate::provider::build_agent(
-                        model,
-                        cli,
-                        cfg,
-                        context,
-                        permission.clone(),
-                        ask_tx.clone(),
-                        question_tx.clone(),
-                        plan_tx.clone(),
-                        bg_store.clone(),
-                        #[cfg(feature = "lsp")]
-                        lsp_manager.clone(),
-                        sandbox.clone(),
-                        #[cfg(feature = "mcp")]
-                        mcp_manager.as_ref(),
-                        #[cfg(feature = "semantic")]
-                        semantic_manager,
-                        Some(session.id.to_string()),
-                    )
-                    .await;
-
-                    let _ = plan_req.reply.send(PlanSwitchResponse::Accepted);
-                    renderer.write_line(
-                        &format!("  switched to {}", label),
-                        Color::Green,
-                    )?;
-
-                    // Re-render the session to show new prompt mode
-                    if !cli.print
-                        && let Err(e) = render_session(&mut renderer, session, cli, cfg, context) {
-                            renderer.write_line(
-                                &format!("render error: {}", e),
-                                c_error(), // honors --no-color via theme now [dirge-zrda]
-                            )?;
-                        }
-                } else {
-                    let _ = plan_req.reply.send(PlanSwitchResponse::Rejected);
-                }
-
                 renderer.request_repaint();
             }
             _ = tokio::time::sleep(tokio::time::Duration::from_millis(200)), if ui.is_running => {

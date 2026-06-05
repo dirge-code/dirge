@@ -120,6 +120,55 @@ pub(crate) struct UiState {
     pub(crate) rewind_picker: ListPicker,
     /// Timestamp of the last Esc (double-tap detection).
     pub(crate) last_esc: Option<Instant>,
+
+    // ── Unified input mode (#387 follow-up) ──────────────────────────
+    /// What the next user input event applies to. `Compose` is the normal
+    /// prompt editor; the modal variants own their reply channel + UI
+    /// state, so the central event loop dispatches input to them instead
+    /// of spinning a nested blocking read loop (which could park the UI).
+    pub(crate) input_mode: InputMode,
+}
+
+/// The active input context — see [`UiState::input_mode`]. Each modal
+/// variant owns the request's reply channel and the modal's UI state, so
+/// the one `user_rx` arm can drive it event-by-event and the render effect
+/// can paint it, with no nested blocking loop.
+pub(crate) enum InputMode {
+    /// Normal prompt editing.
+    Compose,
+    /// `/plan` (or `plan_enter`/`plan_exit`) confirmation: y/n.
+    PlanSwitch {
+        reply: tokio::sync::oneshot::Sender<crate::agent::tools::plan::PlanSwitchResponse>,
+        /// Prompt name to activate on accept (`"plan"` / `"code"`).
+        prompt_name: &'static str,
+        /// Human label for the confirmation/result lines.
+        label: &'static str,
+    },
+}
+
+/// Copy discriminant of [`InputMode`]. The dispatcher routes on this so it
+/// can read the active mode without holding a borrow on `input_mode` (which
+/// would block the `mem::replace` used to take ownership of the reply
+/// channel on resolution).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ModalKind {
+    Compose,
+    PlanSwitch,
+}
+
+impl InputMode {
+    /// True when a modal input mode is active (not normal compose).
+    pub(crate) fn is_modal(&self) -> bool {
+        !matches!(self, InputMode::Compose)
+    }
+
+    /// The Copy discriminant — see [`ModalKind`].
+    pub(crate) fn kind(&self) -> ModalKind {
+        match self {
+            InputMode::Compose => ModalKind::Compose,
+            InputMode::PlanSwitch { .. } => ModalKind::PlanSwitch,
+        }
+    }
 }
 
 impl UiState {
@@ -167,6 +216,8 @@ impl UiState {
 
             rewind_picker: ListPicker::new(),
             last_esc: None,
+
+            input_mode: InputMode::Compose,
         }
     }
 
