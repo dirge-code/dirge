@@ -1,6 +1,6 @@
 pub(crate) mod apply_patch;
 pub(crate) mod background;
-mod bash;
+pub(crate) mod bash;
 pub(crate) mod bg_shell;
 pub(crate) mod cache;
 #[cfg(feature = "dap")]

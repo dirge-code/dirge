@@ -12,7 +12,7 @@ use crate::agent::model_family::resolve_family;
 use crate::agent::tools::ToolCache;
 use crate::cli::Cli;
 use crate::config::Config;
-use crate::sandbox::Sandbox;
+use crate::sandbox::{Sandbox, SandboxMode};
 use clap::Parser;
 
 #[test]
@@ -149,7 +149,7 @@ async fn build_loop_tools_produces_core_registry() {
     let cli = Cli::parse_from::<_, &str>(["dirge"]);
     let cfg = Config::default();
     let cache = ToolCache::new();
-    let sandbox = Sandbox::new(false);
+    let sandbox = Sandbox::new(SandboxMode::Off);
 
     let (tools, _) = build_loop_tools(
         cache,
@@ -200,7 +200,7 @@ async fn tool_descriptions_meet_quality_bar() {
         None,
         #[cfg(feature = "lsp")]
         None,
-        Sandbox::new(false),
+        Sandbox::new(SandboxMode::Off),
         None,
         #[cfg(feature = "mcp")]
         None,
@@ -667,7 +667,7 @@ async fn build_loop_tools_empty_with_no_tools() {
     let cli = Cli::parse_from::<_, &str>(["dirge", "--no-tools"]);
     let cfg = Config::default();
     let cache = ToolCache::new();
-    let sandbox = Sandbox::new(false);
+    let sandbox = Sandbox::new(SandboxMode::Off);
     let (tools, _) = build_loop_tools(
         cache,
         None,
@@ -702,7 +702,7 @@ async fn build_loop_tools_mutating_tools_are_sequential() {
     let cli = Cli::parse_from::<_, &str>(["dirge"]);
     let cfg = Config::default();
     let cache = ToolCache::new();
-    let sandbox = Sandbox::new(false);
+    let sandbox = Sandbox::new(SandboxMode::Off);
     let (tools, _) = build_loop_tools(
         cache,
         None,
@@ -746,7 +746,7 @@ async fn build_loop_tools_read_only_tools_are_parallel_capable() {
     let cli = Cli::parse_from::<_, &str>(["dirge"]);
     let cfg = Config::default();
     let cache = ToolCache::new();
-    let sandbox = Sandbox::new(false);
+    let sandbox = Sandbox::new(SandboxMode::Off);
     let (tools, _) = build_loop_tools(
         cache,
         None,

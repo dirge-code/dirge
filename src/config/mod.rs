@@ -249,6 +249,141 @@ impl LspConfig {
     }
 }
 
+/// Sandbox mode from config.json. Accepts:
+/// - `true` / `false` (bool)
+/// - `"off"` / `"bwrap"` / `"microvm"` (string)
+/// - `{"mode": "microvm", "image": "...", "cpus": 2, "memory_mib": 1024}` (object)
+///
+/// Backward compatibility: the old form `{"mode": "microvm", "microvm": {"image": "..."}}`
+/// is still accepted transparently.
+///
+/// TODO(sandbox-net): network filtering
+///   The microVM gets full outbound network via TSI (Transparent Socket
+///   Impersonation). There is currently NO domain/IP allowlisting —
+///   any process in the guest can reach any host on the internet.
+///   The plan is to add a host-side SNI proxy that intercepts all
+///   guest TCP port 443 traffic, checks the TLS Server Name Indication
+///   against a configurable `domains_allowlist`, and drops non-matching
+///   connections. Port 80 HTTP would be blocked entirely (force HTTPS).
+///   The proxy would run as a lightweight sidecar spawned by the runner
+///   and connected via `krun_add_net_unixstream`. Until that's done,
+///   the VM has unrestricted outbound network access.
+#[derive(Debug, Clone, Default)]
+pub struct SandboxConfig {
+    pub mode: Option<String>,
+    pub image: Option<String>,
+    pub cpus: Option<u8>,
+    pub memory_mib: Option<u32>,
+}
+
+impl SandboxConfig {
+    pub fn to_mode(&self) -> crate::sandbox::SandboxMode {
+        #[cfg(feature = "sandbox-microvm")]
+        {
+            match self.mode.as_deref() {
+                Some("microvm") => crate::sandbox::SandboxMode::Microvm,
+                Some("off") => crate::sandbox::SandboxMode::Off,
+                _ => crate::sandbox::SandboxMode::Bwrap,
+            }
+        }
+        #[cfg(not(feature = "sandbox-microvm"))]
+        {
+            match self.mode.as_deref() {
+                Some("microvm") => {
+                    eprintln!(
+                        "warning: sandbox=microvm in config but dirge was built without the sandbox-microvm feature. Using bwrap instead."
+                    );
+                    crate::sandbox::SandboxMode::Bwrap
+                }
+                Some("off") => crate::sandbox::SandboxMode::Off,
+                _ => crate::sandbox::SandboxMode::Bwrap,
+            }
+        }
+    }
+}
+
+// ── deserialization glue: accept old flat forms too ──────────────
+
+impl<'de> Deserialize<'de> for SandboxConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de;
+
+        struct SandboxConfigVisitor;
+
+        impl<'de> de::Visitor<'de> for SandboxConfigVisitor {
+            type Value = SandboxConfig;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str(
+                    "a sandbox mode string, bool, or {mode, image, cpus, memory_mib} object",
+                )
+            }
+
+            fn visit_bool<E: de::Error>(self, v: bool) -> Result<Self::Value, E> {
+                Ok(SandboxConfig {
+                    mode: Some(if v { "bwrap" } else { "off" }.to_string()),
+                    ..Default::default()
+                })
+            }
+
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(SandboxConfig {
+                    mode: Some(v.to_string()),
+                    ..Default::default()
+                })
+            }
+
+            fn visit_map<M: de::MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
+                let mut mode: Option<String> = None;
+                let mut image: Option<String> = None;
+                let mut cpus: Option<u8> = None;
+                let mut memory_mib: Option<u32> = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "mode" => mode = Some(map.next_value()?),
+                        "image" => image = Some(map.next_value()?),
+                        "cpus" => cpus = Some(map.next_value()?),
+                        "memory_mib" => memory_mib = Some(map.next_value()?),
+                        // Accept old nested microvm: {image, cpus, memory_mib}
+                        "microvm" => {
+                            let sub: serde_json::Value = map.next_value()?;
+                            if let Some(obj) = sub.as_object() {
+                                if image.is_none() {
+                                    image =
+                                        obj.get("image").and_then(|v| v.as_str().map(String::from));
+                                }
+                                if cpus.is_none() {
+                                    cpus =
+                                        obj.get("cpus").and_then(|v| v.as_u64().map(|n| n as u8));
+                                }
+                                if memory_mib.is_none() {
+                                    memory_mib = obj
+                                        .get("memory_mib")
+                                        .and_then(|v| v.as_u64().map(|n| n as u32));
+                                }
+                            }
+                        }
+                        _ => {
+                            let _: de::IgnoredAny = map.next_value()?;
+                        }
+                    }
+                }
+                Ok(SandboxConfig {
+                    mode,
+                    image,
+                    cpus,
+                    memory_mib,
+                })
+            }
+        }
+
+        deserializer.deserialize_any(SandboxConfigVisitor)
+    }
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -282,7 +417,12 @@ pub struct Config {
     pub restrictive: Option<bool>,
     pub accept_all: Option<bool>,
     pub yolo: Option<bool>,
-    pub sandbox: Option<bool>,
+    pub sandbox: Option<SandboxConfig>,
+    /// OCI image for microVM sandbox (e.g. "local://dirge-microvm:alpine",
+    /// "docker.io/library/debian:stable-slim"). **Deprecated:** prefer the
+    /// nested `sandbox.microvm.image` key for new configs. This top-level
+    /// key still works as a fallback.
+    pub microvm_image: Option<String>,
     pub default_permission_mode: Option<String>,
     pub show_tool_details: Option<bool>,
     pub show_edit_diff: Option<bool>,
@@ -593,6 +733,36 @@ impl Config {
     pub fn resolve_show_edit_diff(&self) -> bool {
         self.show_edit_diff.unwrap_or(true)
     }
+
+    /// Resolve the sandbox mode, preferring the nested `sandbox.mode`.
+    pub fn resolve_sandbox_mode(&self) -> crate::sandbox::SandboxMode {
+        self.sandbox
+            .as_ref()
+            .map(|s| s.to_mode())
+            .unwrap_or(crate::sandbox::SandboxMode::Off)
+    }
+
+    /// Resolve the microVM image: `sandbox.image` first, then
+    /// the legacy top-level `microvm_image` as fallback.
+    pub fn resolve_microvm_image(&self) -> Option<String> {
+        self.sandbox
+            .as_ref()
+            .and_then(|s| s.image.clone())
+            .or_else(|| self.microvm_image.clone())
+    }
+
+    /// Resolve microVM vCPU count. Default 1.
+    pub fn resolve_microvm_cpus(&self) -> u8 {
+        self.sandbox.as_ref().and_then(|s| s.cpus).unwrap_or(1)
+    }
+
+    /// Resolve microVM RAM in MiB. Default 512.
+    pub fn resolve_microvm_memory_mib(&self) -> u32 {
+        self.sandbox
+            .as_ref()
+            .and_then(|s| s.memory_mib)
+            .unwrap_or(512)
+    }
 }
 
 /// Static per-model context-window table. Returns `None` for unknown
@@ -814,6 +984,36 @@ pub fn load() -> Config {
     }
 
     cfg
+}
+
+/// Merge sandbox-related keys into the user's config.json without
+/// clobbering unrelated keys. Reads the existing file (if any),
+/// sets/overwrites only the given keys, and writes back pretty-printed
+/// JSON. Creates the config dir + file if they don't exist.
+#[cfg(feature = "sandbox-microvm")]
+pub fn update_config_file(updates: &serde_json::Value) -> anyhow::Result<()> {
+    let path = config_file_path();
+
+    let mut existing: serde_json::Map<String, serde_json::Value> = if path.exists() {
+        let content = std::fs::read_to_string(&path)?;
+        serde_json::from_str(&content).unwrap_or_default()
+    } else {
+        serde_json::Map::new()
+    };
+
+    if let Some(obj) = updates.as_object() {
+        for (k, v) in obj {
+            existing.insert(k.clone(), v.clone());
+        }
+    }
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let json = serde_json::to_string_pretty(&existing)?;
+    std::fs::write(&path, json)?;
+    Ok(())
 }
 
 #[cfg(all(test, feature = "lsp"))]

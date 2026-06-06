@@ -42,10 +42,8 @@ impl std::io::Write for BackendWriter {
 /// Build the ratatui terminal and report whether its backend writer is a real
 /// terminal (so synchronized-update brackets are worth emitting). `true` for a
 /// `/dev/tty` handle; for the stdout fallback, follows `IsTerminal(stdout)`.
-fn build_tui_terminal() -> Option<(
-    ratatui::Terminal<ratatui::backend::CrosstermBackend<BackendWriter>>,
-    bool,
-)> {
+fn build_tui_terminal()
+-> Option<ratatui::Terminal<ratatui::backend::CrosstermBackend<BackendWriter>>> {
     // Never open /dev/tty or stdout for painting during tests.
     // cargo test captures stdout but /dev/tty still points at the
     // real terminal.  Multiple test threads calling tui_redraw
@@ -56,21 +54,15 @@ fn build_tui_terminal() -> Option<(
     // jumps).  Returning None makes tui_redraw a no-op.
     #[cfg(test)]
     {
-        return None;
+        None
     }
     #[cfg(not(test))]
     {
-        let (writer, sync_capable) = match crate::ui::terminal::open_tty_for_write() {
-            Some(f) => (BackendWriter::Tty(f), true),
-            None => {
-                let stdout = std::io::stdout();
-                let sync = std::io::IsTerminal::is_terminal(&stdout);
-                (BackendWriter::Stdout(stdout), sync)
-            }
+        let writer = match crate::ui::terminal::open_tty_for_write() {
+            Some(f) => BackendWriter::Tty(f),
+            None => BackendWriter::Stdout(std::io::stdout()),
         };
-        ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(writer))
-            .ok()
-            .map(|t| (t, sync_capable))
+        ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(writer)).ok()
     }
 }
 
@@ -303,6 +295,10 @@ pub struct Renderer {
     /// instead of painting inline; [`Renderer::flush`] performs the one
     /// real `tui_redraw` per event iff it is set. See [`crate::ui::state`].
     needs_paint: bool,
+    /// Timestamp of the most recent successful `tui_redraw`. Used by the
+    /// 8ms repaint throttle to prevent /dev/tty write contention between
+    /// keystroke-driven repaints — the root cause of typing stutter.
+    last_paint: Option<std::time::Instant>,
     buffer: Vec<LineEntry>,
     partial: CompactString,
     partial_color: Color,
@@ -393,12 +389,8 @@ pub struct Renderer {
     /// no terminal handle either — this preserves the same testable
     /// shape).
     tui_terminal: Option<ratatui::Terminal<ratatui::backend::CrosstermBackend<BackendWriter>>>,
-    /// Whether the `tui_terminal` backend writes to a real terminal — gates
-    /// the synchronized-update brackets (dirge-wk7m). `false` in tests and when
-    /// painting to a non-tty stdout fallback.
-    tui_sync_capable: bool,
-    /// Cached input editor snapshot used when `write_line` / `write`
-    /// trigger a redraw — they don't have the editor reference at
+    /// Cached input editor snapshot — used when `write_line` / `write`
+    /// trigger a redraw and don't have the editor reference at
     /// hand, but the last `draw_bottom` did. Stored as pre-wrapped
     /// rows (one per visual line) so the widget can render multi-
     /// line input without re-wrapping each frame.
@@ -457,15 +449,13 @@ pub struct Renderer {
 
 impl Renderer {
     pub fn new() -> io::Result<Self> {
-        let (tui_terminal, tui_sync_capable) = match build_tui_terminal() {
-            Some((t, sync)) => (Some(t), sync),
-            None => (None, false),
-        };
+        let tui_terminal = build_tui_terminal();
         Ok(Renderer {
             lines: 0,
             col: 0,
             spinner_tick: false,
             needs_paint: false,
+            last_paint: None,
             buffer: Vec::new(),
             partial: CompactString::new(""),
             partial_color: Color::White,
@@ -503,7 +493,6 @@ impl Renderer {
             // the TTY anymore. Falls back to stdout when /dev/tty
             // isn't available (CI tests, headless).
             tui_terminal,
-            tui_sync_capable,
             cached_input_rows: vec![String::new()],
             cached_input_cursor_row: 0,
             cached_input_cursor_col: 0,
@@ -585,7 +574,6 @@ impl Renderer {
             modified_offset,
             cached_modified_rect,
             tui_terminal,
-            tui_sync_capable,
             selection_active,
             selection_start,
             selection_end,
@@ -596,6 +584,17 @@ impl Renderer {
         let Some(terminal) = tui_terminal.as_mut() else {
             return Ok(());
         };
+
+        // ── repaint throttle: skip if last paint was < 8ms ago ──────
+        // Without this, every keystroke triggers a terminal.draw() —
+        // those escape-sequence writes to /dev/tty compete with the
+        // input reader, causing typing stutter. 8ms ≈ 125 fps.
+        if let Some(last) = self.last_paint {
+            let elapsed = last.elapsed();
+            if elapsed < std::time::Duration::from_millis(8) {
+                return Ok(());
+            }
+        }
 
         let face = avatar::art(*avatar_state, *avatar_tick);
         let avatar_color = crate::ui::tui::chat::crossterm_to_ratatui(avatar::color(*avatar_state));
@@ -752,24 +751,17 @@ impl Renderer {
         use crossterm::ExecutableCommand as _;
         use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
         // dirge-wk7m: emit the brackets through the SAME backend writer
-        // ratatui draws to (`/dev/tty`), NOT process stdout. `TerminalGuard`
-        // redirects fd 1 to the log, so brackets sent to stdout would land in
-        // the log while the frame went to the tty — the synchronized-update
-        // never wrapped the draw and the anti-flicker was dead. Gated on a real
-        // terminal so non-tty paints (CI / redirected) don't accrue escape
-        // noise. Mirrors the OSC-title write below.
-        let sync = *tui_sync_capable;
-        if sync {
-            let _ = terminal.backend_mut().execute(BeginSynchronizedUpdate);
-        }
+        // Synchronized-update brackets eliminate flicker on modern terminals.
+        // The sandbox always paints through /dev/tty so sync is always viable.
+        let _ = terminal.backend_mut().execute(BeginSynchronizedUpdate);
         // `.map(|_| ())` drops the returned `CompletedFrame` (which borrows
         // `terminal`) right away, so the End bracket below can re-borrow the
         // backend.
         let draw_result = terminal.draw(|f| render_frame(&scene, f)).map(|_| ());
-        if sync {
-            let _ = terminal.backend_mut().execute(EndSynchronizedUpdate);
-        }
+        let _ = terminal.backend_mut().execute(EndSynchronizedUpdate);
         draw_result?;
+        self.last_paint = Some(std::time::Instant::now());
+        self.needs_paint = false;
 
         #[cfg(feature = "experimental-ui-terminal-tab")]
         {
@@ -1055,12 +1047,14 @@ impl Renderer {
         if self.alert_title.is_empty() {
             self.alert_title = "[ALERT]".to_string();
         }
+        self.last_paint = None;
         self.needs_paint = true;
     }
 
     pub fn clear_alert_overlay(&mut self) {
         self.alert_overlay = None;
         self.alert_title.clear();
+        self.last_paint = None;
         self.needs_paint = true;
     }
 
@@ -1790,16 +1784,34 @@ impl Renderer {
     }
 
     /// #387: the single paint per event. Performs one `tui_redraw` iff the
-    /// frame is dirty, then clears the flag. A no-op when nothing changed,
-    /// which preserves token-stream coalescing (the token handler only
-    /// marks dirty at frame intervals).
+    /// frame is dirty. The flag is cleared inside `tui_redraw` only
+    /// after a successful `terminal.draw()`, so a throttled paint or
+    /// draw failure retries on the next event-loop iteration. A no-op
+    /// when nothing changed (preserves token-stream coalescing — the
+    /// token handler only marks dirty at frame intervals).
     pub fn flush(&mut self) -> io::Result<()> {
         if self.needs_paint {
-            self.needs_paint = false;
             self.tui_redraw()
         } else {
             Ok(())
         }
+    }
+
+    /// Flag the renderer for a full repaint (session + viewport + bottom)
+    /// on the next main-loop iteration.
+    #[cfg(unix)]
+    pub fn set_needs_repaint(&mut self) {
+        self.needs_paint = true;
+    }
+
+    /// Re-create the ratatui Terminal with a fresh backend and empty
+    /// diff buffer — forces a full paint on the next frame, identical
+    /// to what happens at startup. Used after `/sandbox attach` restores
+    /// the TUI so the screen is completely repainted instead of diff'd
+    /// against a stale pre-attach buffer.
+    #[cfg(unix)]
+    pub fn reset_tui(&mut self) {
+        self.tui_terminal = build_tui_terminal();
     }
 }
 

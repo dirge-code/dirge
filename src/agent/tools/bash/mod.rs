@@ -2,8 +2,12 @@ use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 
 mod check;
-mod exec;
-use exec::{run_with_timeout, spawn_streaming_shell};
+pub(crate) mod exec;
+use exec::spawn_streaming_shell;
+
+// Re-exported for test visibility (tests use `use super::*`).
+#[allow(unused_imports)]
+use exec::run_with_timeout;
 
 use crate::agent::agent_loop::tool_input_repair::with_contract_hint;
 use crate::agent::tools::cache::ToolCache;
@@ -117,6 +121,14 @@ impl Tool for BashTool {
         // `kill_shell`. `timeout`, if given, becomes an auto-kill-after-N.
         // Degrades to synchronous if no shell store was injected.
         if background && let Some(store) = &self.shell_store {
+            if self.sandbox.is_microvm() {
+                return Err(ToolError::Msg(
+                    "background shells not supported in microvm mode. \
+                     Use foreground execution (background=false) with a timeout, \
+                     or switch to bwrap sandbox for background shells."
+                        .to_string(),
+                ));
+            }
             use crate::agent::tools::bg_shell::BackgroundShellStore;
             if let Some(t) = args.timeout
                 && t == 0
@@ -159,7 +171,7 @@ impl Tool for BashTool {
             return Err(ToolError::Msg("timeout must be > 0".to_string()));
         }
 
-        let output = run_with_timeout(self.sandbox.wrap_command(&command), secs).await?;
+        let output = self.sandbox.exec(&command, secs).await?;
 
         // F12: `merged` already contains stdout + stderr in arrival
         // order. Previously we concatenated stdout then stderr,

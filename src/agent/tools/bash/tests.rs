@@ -21,8 +21,12 @@ async fn background_bash_registers_shell_and_streams_output() {
     use crate::agent::tools::bg_shell::{BackgroundShellStore, ShellStatus};
 
     let store = BackgroundShellStore::new();
-    let tool = BashTool::new(None, None, crate::sandbox::Sandbox::new(false))
-        .with_shell_store(Some(store.clone()));
+    let tool = BashTool::new(
+        None,
+        None,
+        crate::sandbox::Sandbox::new(crate::sandbox::SandboxMode::Off),
+    )
+    .with_shell_store(Some(store.clone()));
 
     // Unbounded background run (timeout: None) — Claude-Code model.
     let res = tool
@@ -663,7 +667,11 @@ async fn bash_create_propagates_to_modified_tracker() {
     let file = dir.join("created-by-bash.txt");
     let _ = std::fs::remove_file(&file);
 
-    let tool = BashTool::new(None, None, crate::sandbox::Sandbox::new(false));
+    let tool = BashTool::new(
+        None,
+        None,
+        crate::sandbox::Sandbox::new(crate::sandbox::SandboxMode::Off),
+    );
     tool.call(BashArgs {
         command: format!("echo hi > {}", file.display()),
         timeout: None,

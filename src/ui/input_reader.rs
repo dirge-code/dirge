@@ -12,10 +12,19 @@ use crate::event::UserEvent;
 
 /// Spawn the blocking crossterm reader thread. `user_tx` is consumed (pass
 /// a clone — the caller keeps its own sender for other event sources). The
-/// `JoinHandle` is intentionally dropped: the thread exits on its own when
-/// the channel closes or `EVENT_READER_SHUTDOWN` is set.
-pub(super) fn spawn_input_reader(user_tx: tokio::sync::mpsc::Sender<UserEvent>) {
-    std::thread::spawn(move || {
+/// `JoinHandle` is stored in `READER_HANDLE` so the sandbox attach path
+/// can fully join the thread before draining stdin.
+pub(crate) fn spawn_input_reader(user_tx: tokio::sync::mpsc::UnboundedSender<UserEvent>) {
+    let handle = std::thread::spawn(move || {
+        // ── CFS priority boost for the input reader ──────────────
+        // nice -10 gives ~3x scheduling weight over default-priority
+        // threads. Works without CAP_SYS_NICE on kernels with
+        // default RLIMIT_NICE (allows 0 to -20 for unprivileged).
+        #[cfg(unix)]
+        unsafe {
+            libc::setpriority(libc::PRIO_PROCESS, 0, -10);
+        }
+
         // Poll-based loop so `TerminalGuard::drop` can signal a
         // cooperative shutdown via `EVENT_READER_SHUTDOWN`. Previously
         // this thread blocked in `event::read()` indefinitely; on
@@ -30,10 +39,18 @@ pub(super) fn spawn_input_reader(user_tx: tokio::sync::mpsc::Sender<UserEvent>) 
             {
                 break;
             }
-            match event::poll(std::time::Duration::from_millis(50)) {
+            match event::poll(std::time::Duration::from_millis(1)) {
                 Ok(true) => {}
                 Ok(false) => continue,
                 Err(_) => break,
+            }
+            // Re-check the shutdown flag between poll and read.
+            // poll() returning true means there are bytes on fd 0;
+            // if shutdown was signalled during poll, we must not
+            // consume those bytes — they belong to the drain pass.
+            if crate::ui::terminal::EVENT_READER_SHUTDOWN.load(std::sync::atomic::Ordering::Relaxed)
+            {
+                break;
             }
             // `clippy::collapsible_match` suggests moving the `is_err()` check into
             // a match guard, but doing so tries to move bound values (e.g. `text`
@@ -50,7 +67,12 @@ pub(super) fn spawn_input_reader(user_tx: tokio::sync::mpsc::Sender<UserEvent>) 
                     if key.kind != event::KeyEventKind::Press {
                         continue;
                     }
-                    if user_tx.blocking_send(UserEvent::Key(key)).is_err() {
+
+                    // With unbounded channel, sends never block — the only
+                    // failure is a closed channel (UI loop exited).
+                    if let Err(tokio::sync::mpsc::error::SendError(_)) =
+                        user_tx.send(UserEvent::Key(key))
+                    {
                         break;
                     }
                 }
@@ -84,19 +106,23 @@ pub(super) fn spawn_input_reader(user_tx: tokio::sync::mpsc::Sender<UserEvent>) 
                         }),
                         _ => None,
                     };
-                    if let Some(ev) = ev
-                        && user_tx.blocking_send(ev).is_err()
+                    if let Some(ev) = ev {
+                        if let Err(tokio::sync::mpsc::error::SendError(_)) = user_tx.send(ev) {
+                            break;
+                        }
+                    }
+                }
+                Ok(event::Event::Paste(text)) => {
+                    if let Err(tokio::sync::mpsc::error::SendError(_)) =
+                        user_tx.send(UserEvent::Paste(text))
                     {
                         break;
                     }
                 }
-                Ok(event::Event::Paste(text)) => {
-                    if user_tx.blocking_send(UserEvent::Paste(text)).is_err() {
-                        break;
-                    }
-                }
                 Ok(event::Event::Resize(_, _)) => {
-                    if user_tx.blocking_send(UserEvent::Resize).is_err() {
+                    if let Err(tokio::sync::mpsc::error::SendError(_)) =
+                        user_tx.send(UserEvent::Resize)
+                    {
                         break;
                     }
                 }
@@ -113,4 +139,10 @@ pub(super) fn spawn_input_reader(user_tx: tokio::sync::mpsc::Sender<UserEvent>) 
         // visible to subsequent reads.
         crate::ui::terminal::EVENT_READER_EXITED.store(true, std::sync::atomic::Ordering::Release);
     });
+    // Store the handle so `join_reader` can wait for the thread to
+    // actually exit — critical for the sandbox attach path where we
+    // need to guarantee the reader is gone before draining stdin.
+    if let Ok(mut guard) = crate::ui::terminal::READER_HANDLE.lock() {
+        *guard = Some(handle);
+    }
 }

@@ -25,6 +25,8 @@ mod cmd_debug;
 mod cmd_misc;
 mod cmd_model;
 mod cmd_plan;
+#[cfg(unix)]
+mod cmd_sandbox;
 mod cmd_session;
 #[cfg(feature = "git-worktree")]
 mod cmd_worktree;
@@ -62,6 +64,9 @@ pub(super) struct SlashCtx<'a> {
     pub todo_tools_enabled: &'a mut bool,
     pub bg_store: &'a Option<crate::agent::tools::background::BackgroundStore>,
     pub sandbox: &'a Sandbox,
+    /// mpsc sender for restarting the input reader after `/sandbox attach`.
+    #[cfg(unix)]
+    pub user_tx: &'a tokio::sync::mpsc::UnboundedSender<crate::event::UserEvent>,
     #[cfg(feature = "loop")]
     pub loop_state: &'a mut Option<crate::extras::r#loop::LoopState>,
     #[cfg(feature = "mcp")]
@@ -181,6 +186,7 @@ pub async fn handle_compress(
     // the channels through.
     question_tx: &Option<crate::agent::tools::question::QuestionSender>,
     plan_tx: &Option<crate::agent::tools::plan::PlanSwitchSender>,
+    _user_tx: &tokio::sync::mpsc::UnboundedSender<crate::event::UserEvent>,
     bg_store: &Option<crate::agent::tools::background::BackgroundStore>,
     sandbox: &Sandbox,
     #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
@@ -420,6 +426,7 @@ pub async fn handle_slash(
     todo_tools_enabled: &mut bool,
     bg_store: &Option<crate::agent::tools::background::BackgroundStore>,
     sandbox: &Sandbox,
+    #[cfg(unix)] user_tx: &tokio::sync::mpsc::UnboundedSender<crate::event::UserEvent>,
     #[cfg(feature = "loop")] loop_state: &mut Option<crate::extras::r#loop::LoopState>,
     #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
     #[cfg(feature = "semantic")] semantic_manager: Option<&SemanticManager>,
@@ -450,6 +457,8 @@ pub async fn handle_slash(
         todo_tools_enabled,
         bg_store,
         sandbox,
+        #[cfg(unix)]
+        user_tx,
         #[cfg(feature = "loop")]
         loop_state,
         #[cfg(feature = "mcp")]
@@ -508,6 +517,8 @@ pub async fn handle_slash(
         "/why" => cmd_misc::cmd_why(&mut ctx, &parts).await?,
         "/help" => cmd_misc::cmd_help(&mut ctx).await?,
         "/kill" => cmd_misc::cmd_kill(&mut ctx, &parts).await?,
+        #[cfg(unix)]
+        "/sandbox" => cmd_sandbox::cmd_sandbox(&mut ctx, &parts).await?,
         #[cfg(feature = "dap")]
         "/debug" => cmd_debug::cmd_debug(&mut ctx, &parts).await?,
         _ => {
@@ -714,6 +725,8 @@ pub fn slash_command_names() -> Vec<&'static str> {
         "/reasoning",
         "/regen-prompts",
         "/retry",
+        #[cfg(unix)]
+        "/sandbox",
         "/sessions",
         "/tasks",
         "/toggle",

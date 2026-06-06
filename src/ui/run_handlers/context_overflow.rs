@@ -59,6 +59,7 @@ pub(crate) async fn handle_context_overflow(
     let plan_tx = deps.plan_tx;
     let bg_store = deps.bg_store;
     let sandbox = deps.sandbox;
+    let user_tx = deps.user_tx;
     #[cfg(feature = "mcp")]
     let mcp_manager = deps.mcp_manager;
     #[cfg(feature = "semantic")]
@@ -123,6 +124,7 @@ pub(crate) async fn handle_context_overflow(
         ask_tx,
         question_tx,
         plan_tx,
+        user_tx,
         bg_store,
         sandbox,
         #[cfg(feature = "mcp")]
@@ -281,6 +283,7 @@ async fn compress(
     ask_tx: &Option<AskSender>,
     question_tx: &Option<QuestionSender>,
     plan_tx: &Option<PlanSwitchSender>,
+    user_tx: &tokio::sync::mpsc::UnboundedSender<crate::event::UserEvent>,
     bg_store: &Option<BackgroundStore>,
     sandbox: &Sandbox,
     #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
@@ -301,6 +304,7 @@ async fn compress(
         ask_tx,
         question_tx,
         plan_tx,
+        user_tx,
         bg_store,
         sandbox,
         #[cfg(feature = "mcp")]

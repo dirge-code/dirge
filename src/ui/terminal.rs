@@ -1,6 +1,6 @@
 use std::io::Write;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use crossterm::ExecutableCommand;
@@ -53,6 +53,10 @@ pub(crate) static EVENT_READER_SHUTDOWN: AtomicBool = AtomicBool::new(false);
 /// the worst case (reader stuck in `event::poll`) and over-estimates
 /// the common case (reader exits within a few ms).
 pub(crate) static EVENT_READER_EXITED: AtomicBool = AtomicBool::new(false);
+
+/// Stored `JoinHandle` of the crossterm input-reader thread.
+/// Set by `spawn_input_reader`, consumed by `join_reader`.
+pub(crate) static READER_HANDLE: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(None);
 
 pub struct TerminalGuard {
     /// Original stdout (fd 1) saved before we redirected fd 1 to
@@ -241,7 +245,7 @@ impl Drop for TerminalGuard {
         // not before (would race for stdin bytes) and not after
         // (would burn unnecessary shutdown time on a fast path).
         EVENT_READER_SHUTDOWN.store(true, Ordering::Relaxed);
-        wait_for_reader_exit(Duration::from_millis(200));
+        wait_for_reader_exit(Duration::from_millis(50));
         // Cleanup writes go to /dev/tty, NOT stdout — fd 1 is still
         // redirected to the log file at this point. We restore
         // stdout/stderr AFTER the terminal reset escapes have been
@@ -297,7 +301,7 @@ impl Drop for TerminalGuard {
         // for very-slow / non-responsive terminals (raw write to
         // /dev/null or similar).
         #[cfg(unix)]
-        sync_and_drain_via_sentinel(stdout, Duration::from_millis(500));
+        sync_and_drain_via_sentinel(stdout, Duration::from_millis(100));
 
         // === Phase 3: tear down raw mode ===
         // By here the synchronization sentinel has fired and the
@@ -335,7 +339,7 @@ impl Drop for TerminalGuard {
 /// of seeing the shutdown flag — incurs near-zero shutdown latency,
 /// while the worst case (reader stuck somewhere in crossterm
 /// internals, OS scheduling delay) is bounded.
-fn wait_for_reader_exit(budget: Duration) {
+pub(crate) fn wait_for_reader_exit(budget: Duration) {
     let deadline = std::time::Instant::now() + budget;
     while !EVENT_READER_EXITED.load(Ordering::Acquire) {
         if std::time::Instant::now() >= deadline {
@@ -343,6 +347,93 @@ fn wait_for_reader_exit(budget: Duration) {
         }
         std::thread::sleep(Duration::from_millis(2));
     }
+}
+
+/// Join the input-reader thread with a timeout budget.
+///
+/// Unlike `wait_for_reader_exit` which only polls the EXITED flag,
+/// this takes the stored `JoinHandle` and actually blocks on
+/// `thread::join`. If the thread hasn't exited within `budget`, the
+/// handle is returned to storage and we fall back to the flag-only
+/// guarantee. On success the handle is consumed so a new reader can
+/// be spawned later.
+///
+/// Used by the sandbox attach path to guarantee the reader thread
+/// has fully exited before draining stdin — closing the race window
+/// where crossterm's internal `read()` consumes bytes that
+/// `drain_stdin_nonblocking` should have captured.
+#[cfg(unix)]
+pub(crate) fn join_reader(budget: Duration) {
+    let handle = match READER_HANDLE.lock() {
+        Ok(mut guard) => guard.take(),
+        Err(_) => return,
+    };
+    let Some(handle) = handle else {
+        return;
+    };
+    // Spawn a watchdog so we don't block forever if the reader is
+    // stuck somewhere deep in crossterm that ignores the shutdown
+    // flag (unlikely with the poll-based loop, but belts-and-suspenders).
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let done2 = std::sync::Arc::clone(&done);
+    std::thread::spawn(move || {
+        std::thread::sleep(budget);
+        done2.store(true, std::sync::atomic::Ordering::Relaxed);
+    });
+    // Busy-wait join: check `is_finished` every 2ms so we can
+    // observe the watchdog flag.
+    while !done.load(std::sync::atomic::Ordering::Relaxed) {
+        if handle.is_finished() {
+            let _ = handle.join();
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    // Timeout expired. Return the handle to storage — the thread
+    // is still running but EVENT_READER_EXITED is a lower-bound
+    // guarantee once it finishes its current poll iteration.
+    if let Ok(mut guard) = READER_HANDLE.lock() {
+        *guard = Some(handle);
+    }
+}
+
+/// Drain stdin without blocking. Sets O_NONBLOCK on fd 0, reads until
+/// EAGAIN, restores original flags, and returns the drained bytes.
+/// Used before sandbox attach to capture keystrokes typed during the
+/// TUI suspend window so they can be injected into the PTY.
+#[cfg(unix)]
+pub(crate) fn drain_stdin_nonblocking() -> Vec<u8> {
+    let fd_in: libc::c_int = 0;
+    let original_flags = unsafe { libc::fcntl(fd_in, libc::F_GETFL) };
+    if original_flags < 0 {
+        return Vec::new();
+    }
+    let nb_flags = original_flags | libc::O_NONBLOCK;
+    if unsafe { libc::fcntl(fd_in, libc::F_SETFL, nb_flags) } < 0 {
+        return Vec::new();
+    }
+
+    let mut drained = Vec::with_capacity(256);
+    let mut buf = [0u8; 1024];
+    loop {
+        let n = unsafe { libc::read(fd_in, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        if n > 0 {
+            drained.extend_from_slice(&buf[..n as usize]);
+            continue;
+        }
+        if n == 0 {
+            break;
+        }
+        let err = std::io::Error::last_os_error().raw_os_error();
+        match err {
+            Some(e) if e == libc::EAGAIN || e == libc::EWOULDBLOCK => break,
+            Some(libc::EINTR) => continue,
+            _ => break,
+        }
+    }
+
+    let _ = unsafe { libc::fcntl(fd_in, libc::F_SETFL, original_flags) };
+    drained
 }
 
 /// Send a DSR-OS query (`\x1b[5n`) and read stdin until the
@@ -363,16 +454,13 @@ fn wait_for_reader_exit(budget: Duration) {
 /// purpose is to reply to `\x1b[5n` ("are you OK?"). The exact
 /// 4-byte reply `ESC [ 0 n` is uniquely tied to our query.
 ///
-/// `tcflush(STDIN_FILENO, TCIFLUSH)` runs after the read loop as
-/// a belt-and-braces dump of anything still queued at the OS
-/// level (stragglers from a slow terminal). Bytes that arrive
-/// AFTER tcflush would still leak, but the sentinel reply
-/// already proves the bulk of the chatter has been delivered.
-///
 /// Bounded by `budget` as a fallback for terminals that don't
 /// reply (rare; mostly headless / pipe contexts).
+///
+/// Callers should run this function BEFORE spawning the input reader.
+/// Both read from fd 0 — if the reader is already active, they race.
 #[cfg(unix)]
-fn sync_and_drain_via_sentinel(stdout: &mut dyn std::io::Write, budget: Duration) {
+pub(crate) fn sync_and_drain_via_sentinel(stdout: &mut dyn std::io::Write, budget: Duration) {
     let fd_in: libc::c_int = 0; // stdin
 
     // Save the current stdin flags so we can restore blocking
@@ -434,13 +522,6 @@ fn sync_and_drain_via_sentinel(stdout: &mut dyn std::io::Write, budget: Duration
             Some(libc::EINTR) => continue,
             _ => break,
         }
-    }
-
-    // Belt-and-braces: dump anything still queued at the OS level.
-    // `TCIFLUSH` discards all unread input. Catches stragglers
-    // that arrived between the last successful read and now.
-    unsafe {
-        libc::tcflush(fd_in, libc::TCIFLUSH);
     }
 
     // Restore blocking semantics for the shell.

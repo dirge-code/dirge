@@ -83,6 +83,7 @@ pub(crate) async fn handle_done(
     let ask_tx = deps.ask_tx;
     let question_tx = deps.question_tx;
     let plan_tx = deps.plan_tx;
+    let user_tx = deps.user_tx;
     let bg_store = deps.bg_store;
     let sandbox = deps.sandbox;
     #[cfg(feature = "mcp")]
@@ -372,6 +373,7 @@ pub(crate) async fn handle_done(
             ask_tx,
             question_tx,
             plan_tx,
+            user_tx,
             bg_store,
             sandbox,
             #[cfg(feature = "mcp")]

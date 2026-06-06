@@ -153,9 +153,19 @@ pub struct Cli {
 
     #[arg(
         long = "sandbox",
-        help = "Run bash commands inside bubblewrap (bwrap) sandbox"
+        num_args = 0..=1,
+        default_missing_value = "none",
+        require_equals = false,
+        help = "Run bash in an isolated sandbox: 'bwrap' (bubblewrap), 'microvm' (hardware VM via libkrun), or 'none' (default, no sandbox)"
     )]
-    pub sandbox: bool,
+    pub sandbox: Option<String>,
+
+    #[arg(
+        long = "microvm-image",
+        value_name = "IMAGE",
+        help = "OCI image or local reference for the microVM sandbox (e.g. 'docker.io/library/alpine:3.21', 'local://my-image:tag')"
+    )]
+    pub microvm_image: Option<String>,
 
     #[arg(
         long = "no-context-files",
@@ -223,6 +233,30 @@ pub struct Cli {
 
     #[arg(help = "Prompt message(s)")]
     pub message: Vec<String>,
+
+    #[command(subcommand)]
+    pub command: Option<Command>,
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum Command {
+    /// Check and set up sandbox dependencies
+    Sandbox {
+        #[command(subcommand)]
+        action: SandboxAction,
+    },
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum SandboxAction {
+    /// Print a report of sandbox dependencies
+    Check,
+    /// Set up microVM sandbox: check deps, update config.json, pre-pull OCI image
+    Setup {
+        /// OCI image to use (default: docker.io/library/debian:bookworm-slim)
+        #[arg(long = "image")]
+        image: Option<String>,
+    },
 }
 
 impl Cli {
@@ -299,7 +333,17 @@ impl Cli {
         }
     }
 
-    pub fn resolve_sandbox(&self, cfg: &config::Config) -> bool {
-        self.sandbox || cfg.sandbox.unwrap_or(false)
+    pub fn resolve_sandbox(&self, cfg: &config::Config) -> crate::sandbox::SandboxMode {
+        if let Some(val) = self.sandbox.as_deref() {
+            return crate::sandbox::SandboxMode::parse(Some(val));
+        }
+        cfg.resolve_sandbox_mode()
+    }
+
+    /// Override image for microVM sandbox. None = use default.
+    pub fn resolve_microvm_image(&self, cfg: &config::Config) -> Option<String> {
+        self.microvm_image
+            .clone()
+            .or_else(|| cfg.resolve_microvm_image())
     }
 }

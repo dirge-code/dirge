@@ -42,6 +42,7 @@ fn set_busy(ctx: &mut SlashCtx<'_>, busy: bool) -> anyhow::Result<()> {
         None,
         ctx.bg_store.as_ref(),
         None,
+        ctx.sandbox.mode.status_badge(),
     );
     ctx.renderer.draw_bottom(ctx.input, &status, busy)?;
     ctx.renderer.render_viewport()?;

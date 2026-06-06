@@ -65,7 +65,7 @@ impl Drop for PgKillGuard {
 /// Windows we fall back to tokio's `kill_on_drop` which signals
 /// the direct child only (Windows job objects would be cleaner
 /// but require extra deps). F6 + F12 fix.
-pub(super) async fn run_with_timeout(
+pub(crate) async fn run_with_timeout(
     cmd: Command,
     secs: u64,
 ) -> Result<InterleavedOutput, ToolError> {

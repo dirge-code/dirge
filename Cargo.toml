@@ -41,6 +41,11 @@ exclude = [
 name = "dirge"
 path = "src/main.rs"
 
+[[bin]]
+name = "dirge-microvm-runner"
+path = "src/bin/dirge-microvm-runner.rs"
+required-features = ["sandbox-microvm"]
+
 [package.metadata.cargo-machete]
 # rig-core is a direct dep solely to pin feature flags (reqwest,
 # derive, rustls) — the actual `use rig_core::…` imports come
@@ -121,6 +126,11 @@ semantic-elixir = ["semantic", "dep:tree-sitter-elixir"]
 plugin = ["dep:janetrs"]
 lsp = ["dep:lsp-types"]
 dap = ["dep:which", "dep:dap"]
+sandbox-microvm = ["dep:libkrun-sys", "dep:ssh2", "dep:sha2", "dep:hex"]
+# timing-diagnostics: compile-time gate for relay byte accounting
+# counters and invariants. No runtime cost when disabled. Used in
+# stress tests to identify keystroke-loss points.
+timing-diagnostics = []
 experimental-ui-tab-slash = []
 experimental-ui-terminal-tab = []
 
@@ -243,6 +253,17 @@ which = { version = "8", optional = true }
 # types in src/dap/types.rs. The `client` feature enables Deserialize on
 # response/event types so we can deserialize adapter responses.
 dap = { version = "0.4.1-alpha1", features = ["client"], optional = true }
+# libkrun-sys: FFI bindings for libkrun (hardware-isolated microVM sandbox).
+# Requires libkrun.so and libkrunfw.so installed on the system.
+libkrun-sys = { version = "0.9.5", optional = true }
+# ssh2: pure Rust SSH client (libssh2 via ssh2-sys). Used by the microVM
+# sandbox to execute commands inside the guest VM.
+ssh2 = { version = "0.9", optional = true }
+# sha2 + hex: OCI layer digest verification for the microVM sandbox.
+# Every blob downloaded from the registry is SHA-256 hashed and compared
+# against the manifest's declared digest before extraction.
+sha2 = { version = "0.10", optional = true }
+hex = { version = "0.4", optional = true }
 # YAML parser for skill frontmatter (replaces hand-rolled parser in
 # `src/extras/skills/format.rs`). `yaml-rust2` is the maintained fork
 # of the abandoned `yaml-rust` crate, fully YAML 1.2 compliant.

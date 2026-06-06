@@ -86,6 +86,7 @@ impl StatusLine {
         perm_mode: Option<&str>,
         bg_store: Option<&BackgroundStore>,
         shell_store: Option<&BackgroundShellStore>,
+        sandbox_badge: Option<&'static str>,
     ) -> String {
         let state = if is_running { "running" } else { "ready" };
         let wd_path = Path::new(&session.working_dir);
@@ -151,8 +152,13 @@ impl StatusLine {
             String::new()
         };
 
+        let sandbox_badge_str = match sandbox_badge {
+            Some(label) => format!(" | sbx:{}", label),
+            None => String::new(),
+        };
+
         format!(
-            "{}{} | {}{} | {}/{} ({}%) | {}msgs | {}{}{}{}{}{}",
+            "{}{} | {}{} | {}/{} ({}%) | {}msgs | {}{}{}{}{}{}{}",
             project_label,
             cost_str,
             session.model,
@@ -163,6 +169,7 @@ impl StatusLine {
             session.messages.len(),
             state,
             compact_badge,
+            sandbox_badge_str,
             prompt_badge,
             perm_badge,
             agents_badge,
@@ -218,7 +225,17 @@ mod tests {
         let session = Session::new("openrouter", "test-model", 100_000);
         let a = agent_store(agents);
         let s = shell_store(shells);
-        StatusLine::render(&session, false, 0, None, None, None, Some(&a), Some(&s))
+        StatusLine::render(
+            &session,
+            false,
+            0,
+            None,
+            None,
+            None,
+            Some(&a),
+            Some(&s),
+            None,
+        )
     }
 
     #[tokio::test]

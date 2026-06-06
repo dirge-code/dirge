@@ -390,6 +390,155 @@ async fn main() -> anyhow::Result<()> {
         .with_ansi(false)
         .init();
     let cfg = config::load();
+
+    // Handle subcommands that exit before the TUI starts.
+    if let Some(ref command) = cli.command {
+        match command {
+            cli::Command::Sandbox { action } => match action {
+                cli::SandboxAction::Check => {
+                    println!("=== Bwrap sandbox ===");
+                    for r in sandbox::check::check_bwrap() {
+                        let icon = match r.status {
+                            sandbox::check::Status::Ok => "✓",
+                            sandbox::check::Status::Warn => "⚠",
+                            sandbox::check::Status::Error => "✗",
+                        };
+                        println!("  {icon} {} — {}", r.name, r.message);
+                        if let Some(fix) = r.fix {
+                            println!("    → {fix}");
+                        }
+                    }
+                    println!("\n=== MicroVM sandbox ===");
+                    for r in sandbox::check::check_microvm() {
+                        let icon = match r.status {
+                            sandbox::check::Status::Ok => "✓",
+                            sandbox::check::Status::Warn => "⚠",
+                            sandbox::check::Status::Error => "✗",
+                        };
+                        println!("  {icon} {} — {}", r.name, r.message);
+                        if let Some(fix) = r.fix {
+                            println!("    → {fix}");
+                        }
+                    }
+                    #[cfg(feature = "sandbox-microvm")]
+                    {
+                        let raw = cfg
+                            .resolve_microvm_image()
+                            .unwrap_or_else(|| "debian".to_string());
+                        let image_ref =
+                            crate::sandbox::microvm::rootfs::canonicalize_image_ref(&raw);
+                        let cache_dir = crate::sandbox::microvm::MicrovmConfig::default().cache_dir;
+                        println!();
+                        for r in sandbox::check::check_cached_rootfs(&image_ref, &cache_dir) {
+                            let icon = match r.status {
+                                sandbox::check::Status::Ok => "✓",
+                                sandbox::check::Status::Warn => "⚠",
+                                sandbox::check::Status::Error => "✗",
+                            };
+                            println!("  {icon} {} — {}", r.name, r.message);
+                            if let Some(fix) = r.fix {
+                                println!("    → {fix}");
+                            }
+                        }
+                    }
+                    return Ok(());
+                }
+                cli::SandboxAction::Setup { image } => {
+                    #[cfg(not(feature = "sandbox-microvm"))]
+                    {
+                        let _ = &image;
+                        return Ok(());
+                    }
+                    #[cfg(feature = "sandbox-microvm")]
+                    {
+                        use crate::sandbox::microvm::rootfs;
+
+                        let raw_default = "debian";
+                        let raw = image.as_deref().unwrap_or(raw_default);
+                        let image_ref = rootfs::canonicalize_image_ref(raw);
+
+                        println!("=== Checking dependencies ===");
+                        let mut all_ok = true;
+                        for r in sandbox::check::check_microvm() {
+                            let icon = match r.status {
+                                sandbox::check::Status::Ok => "✓",
+                                sandbox::check::Status::Warn => "⚠",
+                                sandbox::check::Status::Error => {
+                                    all_ok = false;
+                                    "✗"
+                                }
+                            };
+                            println!("  {icon} {} — {}", r.name, r.message);
+                            if let Some(fix) = r.fix {
+                                println!("    → {fix}");
+                            }
+                        }
+                        if !all_ok {
+                            anyhow::bail!(
+                                "Some dependencies are missing. Install them and re-run `dirge sandbox setup`."
+                            );
+                        }
+
+                        // Build local images from images/<name>/Dockerfile.
+                        if let Some(variant) = rootfs::local_variant_name(&image_ref) {
+                            println!("\n=== Building guest image: dirge-microvm:{variant} ===");
+                            rootfs::build_guest_image(variant)?;
+                            println!("  Image built successfully.");
+                        }
+
+                        println!("\n=== Updating config.json ===");
+                        let updates = serde_json::json!({
+                            "sandbox": {
+                                "mode": "microvm",
+                                "image": &image_ref,
+                            }
+                        });
+                        config::update_config_file(&updates)?;
+                        println!(
+                            "  Updated config.json: sandbox.mode=microvm, sandbox.image={image_ref}"
+                        );
+
+                        // Pre-pull/prep OCI image.
+                        println!("\n=== Preparing image: {image_ref} ===");
+                        let microvm_cfg = crate::sandbox::microvm::MicrovmConfig::default();
+                        let cache_dir = microvm_cfg.cache_dir;
+                        let image_safe = image_ref.replace(['/', ':'], "_");
+                        let base_dir = cache_dir.join(&image_safe).join("base");
+                        if base_dir.exists() {
+                            let sshd_path = base_dir.join("usr/sbin/sshd");
+                            if sshd_path.exists() {
+                                println!("  Image already cached at {}", base_dir.display());
+                            } else {
+                                println!(
+                                    "  Cached rootfs is stale (missing sshd) — removing and re-preparing..."
+                                );
+                                std::fs::remove_dir_all(&base_dir)?;
+                                rootfs::prepare(&image_ref, &cache_dir).await?;
+                                println!("  Done. Cached at {}", base_dir.display());
+                            }
+                        } else {
+                            rootfs::prepare(&image_ref, &cache_dir).await?;
+                            println!("  Done. Cached at {}", base_dir.display());
+                        }
+
+                        // Validate the prepared rootfs has sshd.
+                        let sshd_path = base_dir.join("usr/sbin/sshd");
+                        if !sshd_path.exists() {
+                            anyhow::bail!(
+                                "rootfs at {} is missing /usr/sbin/sshd after preparation — \
+                                 the image may not have openssh-server installed",
+                                base_dir.display()
+                            );
+                        }
+
+                        println!("\n✓ Ready. Run `dirge`.");
+                        return Ok(());
+                    }
+                }
+            },
+        }
+    }
+
     // Initialize the global UI theme before any rendering happens. The
     // theme is global state; setting it once at boot keeps every
     // render site from having to thread it explicitly.
@@ -865,6 +1014,38 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let sandbox = sandbox::Sandbox::new(cli.resolve_sandbox(&cfg));
+    if let Some(image) = cli.resolve_microvm_image(&cfg) {
+        sandbox.set_microvm_image(image);
+    }
+    sandbox.set_microvm_resources(cfg.resolve_microvm_cpus(), cfg.resolve_microvm_memory_mib());
+    #[cfg(feature = "sandbox-microvm")]
+    if sandbox.is_microvm() {
+        let raw = cli
+            .resolve_microvm_image(&cfg)
+            .unwrap_or_else(|| "debian".to_string());
+        let image_ref = crate::sandbox::microvm::rootfs::canonicalize_image_ref(&raw);
+        let cache_dir = crate::sandbox::microvm::MicrovmConfig::default().cache_dir;
+        let checks = sandbox::check::check_cached_rootfs(&image_ref, &cache_dir);
+        for r in &checks {
+            if matches!(
+                r.status,
+                sandbox::check::Status::Error | sandbox::check::Status::Warn
+            ) {
+                eprintln!(
+                    "  {} {}",
+                    if matches!(r.status, sandbox::check::Status::Error) {
+                        "✗"
+                    } else {
+                        "⚠"
+                    },
+                    r.message
+                );
+                if let Some(fix) = r.fix {
+                    eprintln!("    → {fix}");
+                }
+            }
+        }
+    }
     let Channels {
         permission,
         ask_tx,
