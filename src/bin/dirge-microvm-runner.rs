@@ -85,6 +85,8 @@ fn main() {
         assert!(rc == 0, "krun_add_virtiofs failed: {rc}");
 
         // Port forward: host:ssh_port -> guest:22.
+        // libkrun's krun_set_port_map binds the host side to 127.0.0.1
+        // only — the port is never exposed on external interfaces.
         if ssh_port > 0 {
             let port_map_str = format!("{ssh_port}:22");
             let pm_cstr = to_cstr(&port_map_str);

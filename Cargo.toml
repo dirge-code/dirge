@@ -126,7 +126,7 @@ semantic-elixir = ["semantic", "dep:tree-sitter-elixir"]
 plugin = ["dep:janetrs"]
 lsp = ["dep:lsp-types"]
 dap = ["dep:which", "dep:dap"]
-sandbox-microvm = ["dep:libkrun-sys", "dep:ssh2", "dep:sha2", "dep:hex"]
+sandbox-microvm = ["dep:libkrun-sys", "dep:ssh2", "dep:sha2", "dep:hex", "dep:base64"]
 # timing-diagnostics: compile-time gate for relay byte accounting
 # counters and invariants. No runtime cost when disabled. Used in
 # stress tests to identify keystroke-loss points.
@@ -264,6 +264,8 @@ ssh2 = { version = "0.9", optional = true }
 # against the manifest's declared digest before extraction.
 sha2 = { version = "0.10", optional = true }
 hex = { version = "0.4", optional = true }
+# base64: decode OpenSSH-format public keys for host-key verification.
+base64 = { version = "0.22", optional = true }
 # YAML parser for skill frontmatter (replaces hand-rolled parser in
 # `src/extras/skills/format.rs`). `yaml-rust2` is the maintained fork
 # of the abandoned `yaml-rust` crate, fully YAML 1.2 compliant.

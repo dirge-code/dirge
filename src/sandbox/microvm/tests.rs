@@ -115,7 +115,6 @@ mod tests {
                  && mkdir -p /run/sshd \
                  && mkdir -p /workspace \
                  && mount -t virtiofs workspace /workspace \
-                 && ssh-keygen -A \
                  && chmod 755 /var/empty \
                  && exec /usr/sbin/sshd -D -e -o StrictModes=no"
             ],
@@ -129,8 +128,8 @@ mod tests {
 
         let cmd = config["Cmd"][2].as_str().unwrap();
 
-        // Host keys are injected from the host. ssh-keygen -A fills
-        // in RSA/ECDSA as a complement — ed25519 is already present.
+        // Host keys are injected from the host (ed25519 only).
+        // Only the injected keys are present — no ssh-keygen -A.
         assert!(
             cmd.contains("mount -t tmpfs tmpfs /run"),
             "init command must mount tmpfs on /run"
@@ -144,8 +143,8 @@ mod tests {
             "init command must mount workspace virtiofs"
         );
         assert!(
-            cmd.contains("ssh-keygen -A"),
-            "init command must generate missing host key types"
+            !cmd.contains("ssh-keygen"),
+            "init command must NOT run ssh-keygen; host keys are injected from host"
         );
         assert!(cmd.contains("sshd -D -e"), "init command must start sshd");
 
@@ -1013,6 +1012,76 @@ mod tests {
             assert!(
                 err.contains("invalid snapshot name"),
                 "expected 'invalid snapshot name' for '{bad_name}', got: {err}"
+            );
+        }
+    }
+
+    // ── validate_snapshot_name allowlist ─────────────────────────
+
+    #[test]
+    fn snapshot_name_allowlist_accepts_valid() {
+        for name in &["snap", "my-snap", "snap_1", "v1.0", "a.b-c_d", "foo"] {
+            MicrovmSandbox::validate_snapshot_name(name)
+                .unwrap_or_else(|e| panic!("'{name}' should be valid: {e}"));
+        }
+    }
+
+    #[test]
+    fn snapshot_name_allowlist_rejects_control_chars() {
+        for name in &["a\nb", "tab\tx", "\x00", "\x1b"] {
+            let err = MicrovmSandbox::validate_snapshot_name(name)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("invalid snapshot name"),
+                "expected rejection for control chars in '{name}': {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_name_allowlist_rejects_spaces() {
+        for name in &["a b", " leading", "trailing ", "mid dle"] {
+            let err = MicrovmSandbox::validate_snapshot_name(name)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("invalid snapshot name"),
+                "expected rejection for spaces in '{name}': {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_name_allowlist_rejects_special_chars() {
+        for name in &["a@b", "x!y", "p#q", "a$b", "%x", "a^b", "&x", "a*b", "x(y)"] {
+            let err = MicrovmSandbox::validate_snapshot_name(name)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("invalid snapshot name"),
+                "expected rejection for special chars in '{name}': {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_name_allowlist_rejects_empty() {
+        let err = MicrovmSandbox::validate_snapshot_name("")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid snapshot name"));
+    }
+
+    #[test]
+    fn snapshot_name_allowlist_rejects_dot_and_dotdot() {
+        for name in &[".", ".."] {
+            let err = MicrovmSandbox::validate_snapshot_name(name)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("invalid snapshot name"),
+                "expected rejection for '{name}': {err}"
             );
         }
     }

@@ -6,7 +6,7 @@
 use std::io;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 /// A prepared rootfs, cleaned up on drop.
 #[derive(Debug)]
@@ -37,26 +37,81 @@ impl Drop for PreparedRootfs {
 ///
 /// On first use the rootfs is cached. On subsequent uses the cached
 /// rootfs is cloned per session.
+///
+/// Cache directory structure:
+/// ```text
+/// <cache_dir>/<image_safe>/
+///   .lock       — advisory lock file (blocks concurrent pulls)
+///   .staging/   — temporary extraction target (cleaned up on success or failure)
+///   base/       — cached rootfs (atomically renamed from .staging/)
+///   session-<pid>/ — per-session clone of base/
+/// ```
 pub async fn prepare(image: &str, cache_dir: &Path) -> anyhow::Result<PreparedRootfs> {
     let image_safe = image.replace(['/', ':'], "_");
-    let cached_base = cache_dir.join(&image_safe).join("base");
+    let image_dir = cache_dir.join(&image_safe);
+    let cached_base = image_dir.join("base");
+    let lock_path = image_dir.join(".lock");
+    let staging = image_dir.join(".staging");
 
     if !cached_base.exists() {
-        std::fs::create_dir_all(cache_dir.join(&image_safe))?;
+        std::fs::create_dir_all(&image_dir)?;
 
-        if let Some(local_ref) = image.strip_prefix("local://") {
-            prepare_local(local_ref, &cached_base)?;
-        } else {
-            super::oci::pull(image, &cached_base, cache_dir).await?;
+        // Acquire an advisory lock so only one session pulls at a time.
+        // create_new fails if the lock file already exists — we retry
+        // with a short sleep until the holder finishes or we time out.
+        let lock_file = acquire_lock(&lock_path)?;
+
+        // Double-check after acquiring the lock: another session may
+        // have finished the pull while we were waiting.
+        if !cached_base.exists() {
+            // Remove any stale staging dir from a previous failed attempt.
+            if staging.exists() {
+                let _ = std::fs::remove_dir_all(&staging);
+            }
+
+            if let Some(local_ref) = image.strip_prefix("local://") {
+                prepare_local(local_ref, &staging)?;
+            } else {
+                super::oci::pull(image, &staging, cache_dir).await?;
+            }
+
+            // Atomically promote the staging dir to the cached base.
+            std::fs::rename(&staging, &cached_base)?;
         }
+
+        drop(lock_file);
+        let _ = std::fs::remove_file(&lock_path);
     }
 
-    let session_dir = cache_dir
-        .join(&image_safe)
-        .join(format!("session-{}", std::process::id()));
+    let session_dir = image_dir.join(format!("session-{}", std::process::id()));
     cp_r(&cached_base, &session_dir)?;
 
     Ok(PreparedRootfs { path: session_dir })
+}
+
+/// Acquire an advisory lock file, blocking (with polling) until the
+/// lock is available or we time out.
+fn acquire_lock(lock_path: &Path) -> anyhow::Result<std::fs::File> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        match std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(lock_path)
+        {
+            Ok(file) => return Ok(file),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                if std::time::Instant::now() > deadline {
+                    anyhow::bail!(
+                        "timed out waiting for rootfs cache lock {}",
+                        lock_path.display()
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
 }
 
 /// Extract a rootfs from a locally-built image via buildah.
@@ -69,9 +124,7 @@ fn prepare_local(image_ref: &str, dest: &Path) -> anyhow::Result<()> {
         build_guest_image(variant)?;
     }
 
-    static EXPORT_COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = EXPORT_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let tmp = std::env::temp_dir().join(format!("dirge-oci-export-{}-{}", std::process::id(), n));
+    let tmp = std::env::temp_dir().join(format!("dirge-oci-export-{}", uuid::Uuid::new_v4()));
     let tarball = tmp.with_extension("tar");
 
     let push = std::process::Command::new("buildah")
@@ -607,5 +660,36 @@ mod tests {
         assert!(dir.exists(), "test dir should exist before cleanup");
         cleanup(&dir).expect("cleanup should succeed on existing dir");
         assert!(!dir.exists(), "dir should be removed after cleanup");
+    }
+
+    #[test]
+    fn acquire_lock_exclusive() {
+        let dir = std::env::temp_dir().join(format!(
+            "dirge-test-lock-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock_path = dir.join(".lock");
+
+        let _lock1 = acquire_lock(&lock_path).expect("first lock");
+        // Second lock on the same path should fail (the lock file exists).
+        let result = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&lock_path);
+        assert!(
+            result.is_err(),
+            "second lock should fail while first is held"
+        );
+
+        drop(_lock1);
+        let _ = std::fs::remove_file(&lock_path);
+        // Now a new lock should succeed.
+        let _lock2 = acquire_lock(&lock_path).expect("lock after release");
+        drop(_lock2);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

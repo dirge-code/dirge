@@ -85,6 +85,10 @@ Managed by `src/sandbox/microvm/rootfs.rs`. Two sourcing modes:
 
 `src/sandbox/microvm/ssh.rs` manages:
 
+**Port forwarding** — `krun_set_port_map` maps `host:ssh_port → guest:22`.
+libkrun binds the host side to 127.0.0.1 only; the VM's SSH is never
+network-exposed. The host key is verified on every handshake.
+
 **Ephemeral keys** — `ssh-keygen -t ed25519` generates a key pair on every
 session. The public key is injected into the rootfs's
 `/home/sandbox/.ssh/authorized_keys` before boot. The private key is held

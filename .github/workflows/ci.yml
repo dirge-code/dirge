@@ -64,6 +64,8 @@ jobs:
             features: "--features loop,git-worktree"
           - name: semantic-bash
             features: "--features semantic-bash"
+          - name: sandbox-microvm
+            features: "--features sandbox-microvm"
           - name: all-features
             features: "--all-features"
     steps:

@@ -9,7 +9,7 @@ set -euo pipefail
 #     (ts / python / bash / clojure / go / ruby / rust / java / c / c++)
 # - `plugin` (Janet runtime)
 # - `acp` (Zed/editor agent-protocol server)
-FEATURES="${FEATURES:-semantic,semantic-ts,semantic-python,semantic-bash,semantic-clojure,semantic-go,semantic-ruby,semantic-rust,semantic-java,semantic-c,semantic-cpp,mcp,loop,git-worktree,plugin,acp,lsp}"
+FEATURES="${FEATURES:-semantic,semantic-ts,semantic-python,semantic-bash,semantic-clojure,semantic-go,semantic-ruby,semantic-rust,semantic-java,semantic-c,semantic-cpp,mcp,loop,git-worktree,plugin,acp,lsp,sandbox-microvm}"
 
 echo "==> Building dirge with features: $FEATURES"
 cargo build --features "$FEATURES" --release

@@ -120,6 +120,125 @@ pub(crate) struct UiState {
     pub(crate) rewind_picker: ListPicker,
     /// Timestamp of the last Esc (double-tap detection).
     pub(crate) last_esc: Option<Instant>,
+
+    // ── Unified input mode (#387 follow-up) ──────────────────────────
+    /// What the next user input event applies to. `Compose` is the normal
+    /// prompt editor; the modal variants own their reply channel + UI
+    /// state, so the central event loop dispatches input to them instead
+    /// of spinning a nested blocking read loop (which could park the UI).
+    pub(crate) input_mode: InputMode,
+}
+
+/// The active input context — see [`UiState::input_mode`]. Each modal
+/// variant owns the request's reply channel and the modal's UI state, so
+/// the one `user_rx` arm can drive it event-by-event and the render effect
+/// can paint it, with no nested blocking loop.
+pub(crate) enum InputMode {
+    /// Normal prompt editing.
+    Compose,
+    /// `/plan` (or `plan_enter`/`plan_exit`) confirmation: y/n.
+    PlanSwitch {
+        reply: tokio::sync::oneshot::Sender<crate::agent::tools::plan::PlanSwitchResponse>,
+        /// Prompt name to activate on accept (`"plan"` / `"code"`).
+        prompt_name: &'static str,
+        /// Human label for the confirmation/result lines.
+        label: &'static str,
+    },
+    /// `question` tool: walk the questionnaire one option-picker at a time.
+    Question(QuestionState),
+    /// Plugin `harness/confirm` dialog: y/n (Esc / Ctrl+C = no).
+    DialogConfirm {
+        reply: std::sync::mpsc::Sender<crate::plugin::DialogReply>,
+    },
+    /// Plugin `harness/select` dialog: pick option 1-9 (Esc / Ctrl+C = none).
+    DialogSelect {
+        reply: std::sync::mpsc::Sender<crate::plugin::DialogReply>,
+        /// The selectable option labels, in display order.
+        options: Vec<String>,
+    },
+    /// Tool permission prompt: y (allow once) / a (allow always) / n / Esc.
+    /// The `(O_O)` alert overlay is already painted; the dispatcher reads
+    /// the keystroke, replies, and runs the chamber-reopen / cascade-deny
+    /// / allowlist-save post-work.
+    Permission(PermissionState),
+}
+
+/// In-flight state for the tool-permission modal — replaces the former
+/// nested `loop { select! { user_rx … } }`. Holds the request (tool +
+/// input + reply) and the chamber that must be reopened if the user
+/// allows the tool.
+pub(crate) struct PermissionState {
+    /// The permission request (tool, input, and the decision reply).
+    pub(crate) req: crate::permission::ask::AskRequest,
+    /// If a tool chamber was closed to make room for the alert, the name
+    /// to reopen it under once the user allows (`None` = nothing to reopen).
+    pub(crate) pending_chamber_tool: Option<String>,
+}
+
+/// In-flight state for the `question` tool modal — replaces the former
+/// triple-nested blocking loop (questions → option-select → custom-text).
+/// The dispatcher drives one keystroke at a time against these fields and
+/// re-renders the option block in place.
+pub(crate) struct QuestionState {
+    /// The request (questions + the reply channel).
+    pub(crate) req: crate::agent::tools::question::QuestionRequest,
+    /// Confirmed answers, one inner Vec per already-answered question.
+    pub(crate) answers: Vec<Vec<String>>,
+    /// Index of the question currently being answered.
+    pub(crate) qi: usize,
+    /// Cursor row within the current question's options (`num_options`
+    /// itself addresses the "(custom)" row when the question allows it).
+    pub(crate) cursor: usize,
+    /// Per-option toggle state (multi-select).
+    pub(crate) selected: Vec<bool>,
+    /// Pending custom answer for the current question, if typed.
+    pub(crate) custom_text: Option<String>,
+    /// Buffer line index where the current question's option block starts
+    /// (so re-renders `replace_from` here on every keystroke).
+    pub(crate) anchor: usize,
+    /// `Some` while the user is typing a free-form custom answer.
+    pub(crate) entry: Option<CustomEntry>,
+}
+
+/// Free-form custom-answer text entry, the innermost former loop.
+pub(crate) struct CustomEntry {
+    /// Text typed so far.
+    pub(crate) buf: String,
+    /// Buffer line index where the typed answer renders.
+    pub(crate) input_anchor: usize,
+}
+
+/// Copy discriminant of [`InputMode`]. The dispatcher routes on this so it
+/// can read the active mode without holding a borrow on `input_mode` (which
+/// would block the `mem::replace` used to take ownership of the reply
+/// channel on resolution).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ModalKind {
+    Compose,
+    PlanSwitch,
+    Question,
+    DialogConfirm,
+    DialogSelect,
+    Permission,
+}
+
+impl InputMode {
+    /// True when a modal input mode is active (not normal compose).
+    pub(crate) fn is_modal(&self) -> bool {
+        !matches!(self, InputMode::Compose)
+    }
+
+    /// The Copy discriminant — see [`ModalKind`].
+    pub(crate) fn kind(&self) -> ModalKind {
+        match self {
+            InputMode::Compose => ModalKind::Compose,
+            InputMode::PlanSwitch { .. } => ModalKind::PlanSwitch,
+            InputMode::Question(_) => ModalKind::Question,
+            InputMode::DialogConfirm { .. } => ModalKind::DialogConfirm,
+            InputMode::DialogSelect { .. } => ModalKind::DialogSelect,
+            InputMode::Permission(_) => ModalKind::Permission,
+        }
+    }
 }
 
 impl UiState {
@@ -167,6 +286,8 @@ impl UiState {
 
             rewind_picker: ListPicker::new(),
             last_esc: None,
+
+            input_mode: InputMode::Compose,
         }
     }
 

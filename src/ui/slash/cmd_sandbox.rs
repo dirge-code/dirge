@@ -67,18 +67,27 @@ async fn cmd_sandbox_attach(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
             return Ok(());
         }
     };
-    let (port, key_path) = info;
+    let (port, key_path, host_public_key) = info;
 
     ctx.renderer
         .write_line(&format!("connecting to VM on port {port}..."), c_agent())?;
+
+    // Write a temporary known_hosts file with the expected host key
+    // so we can verify it instead of blindly trusting (StrictHostKeyChecking=no).
+    let known_hosts_dir = std::env::temp_dir().join(format!("dirge-known-hosts-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&known_hosts_dir)
+        .map_err(|e| anyhow::anyhow!("failed to create temp dir for known_hosts: {e}"))?;
+    let known_hosts_path = known_hosts_dir.join("known_hosts");
+    std::fs::write(
+        &known_hosts_path,
+        format!("[127.0.0.1]:{port} {host_public_key}\n"),
+    )?;
 
     // Pre-flight: try a quick SSH connection to verify the key works.
     let preflight = std::process::Command::new("ssh")
         .args([
             "-o",
-            "StrictHostKeyChecking=no",
-            "-o",
-            "UserKnownHostsFile=/dev/null",
+            "StrictHostKeyChecking=yes",
             "-o",
             "LogLevel=ERROR",
             "-o",
@@ -90,6 +99,8 @@ async fn cmd_sandbox_attach(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
             "-i",
         ])
         .arg(key_path.as_os_str())
+        .arg("-o")
+        .arg(format!("UserKnownHostsFile={}", known_hosts_path.display()))
         .arg("-p")
         .arg(port.to_string())
         .arg("sandbox@127.0.0.1")
@@ -198,9 +209,7 @@ async fn cmd_sandbox_attach(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     cmd.args([
         "-t",
         "-o",
-        "StrictHostKeyChecking=no",
-        "-o",
-        "UserKnownHostsFile=/dev/null",
+        "StrictHostKeyChecking=yes",
         "-o",
         "LogLevel=ERROR",
         "-o",
@@ -212,6 +221,8 @@ async fn cmd_sandbox_attach(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
         "-i",
     ])
     .arg(key_path.as_os_str())
+    .arg("-o")
+    .arg(format!("UserKnownHostsFile={}", known_hosts_path.display()))
     .arg("-p")
     .arg(port.to_string())
     .arg("sandbox@127.0.0.1")

@@ -864,6 +864,7 @@ dependencies = [
  "ansi-to-tui",
  "anyhow",
  "async-stream",
+ "base64",
  "chrono",
  "clap",
  "compact_str",

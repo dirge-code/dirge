@@ -9,6 +9,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
+use futures::StreamExt;
+
 /// Pull an OCI image and extract its rootfs to `dest`.
 ///
 /// Layers are cached by digest in `cache_dir/blobs/<algo>/<hex>`.
@@ -353,8 +355,19 @@ async fn extract_or_cache_layer(
     let dest = dest.to_path_buf();
     let digest_owned = digest.to_string();
     tokio::task::spawn_blocking(move || {
+        // Reject tarball entries with '..' path components before
+        // extraction. This prevents a malicious layer from escaping
+        // the extraction directory via path traversal.
+        validate_tar_entries(&blob_bytes)?;
+
         let mut child = std::process::Command::new("tar")
-            .args(["-x", "--no-same-owner", "--no-same-permissions", "-C"])
+            .args([
+                "-x",
+                "--no-same-owner",
+                "--no-same-permissions",
+                "--no-absolute-filenames",
+                "-C",
+            ])
             .arg(&dest)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
@@ -376,6 +389,12 @@ async fn extract_or_cache_layer(
             let stderr = String::from_utf8_lossy(&output.stderr);
             anyhow::bail!("tar extraction failed for {digest_owned}: {stderr}");
         }
+
+        // Process OCI whiteout files (.wh.<name> and .wh..wh..opq)
+        // so that deleted files from lower layers are actually removed.
+        process_whiteouts(&dest)
+            .map_err(|e| anyhow::anyhow!("whiteout processing failed for {digest_owned}: {e}"))?;
+
         Ok(())
     })
     .await
@@ -408,10 +427,151 @@ async fn download_blob(ref_: &ImageRef, digest: &str, token: &str) -> anyhow::Re
         }
     }
 
-    resp.bytes()
-        .await
-        .map(|b| b.to_vec())
-        .map_err(|e| anyhow::anyhow!("reading blob: {e}"))
+    // Stream the response with a running byte counter so chunked
+    // (Content-Length-less) responses are also capped.
+    stream_blob_with_cap(resp.bytes_stream(), digest, MAX_BLOB_BYTES).await
+}
+
+/// Stream chunks into a buffer, enforcing a size cap.
+///
+/// Accepts any stream of byte chunks so it can be tested with mock streams
+/// without a live HTTP server.
+async fn stream_blob_with_cap<S, T, E>(
+    mut stream: S,
+    digest: &str,
+    max_bytes: u64,
+) -> anyhow::Result<Vec<u8>>
+where
+    S: futures::Stream<Item = Result<T, E>> + Unpin,
+    T: AsRef<[u8]>,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    let mut buf = Vec::new();
+    let mut total: u64 = 0;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| anyhow::anyhow!("reading blob chunk: {e}"))?;
+        let bytes = chunk.as_ref();
+        total += bytes.len() as u64;
+        if total > max_bytes {
+            anyhow::bail!("blob {digest} exceeds {max_bytes} byte cap");
+        }
+        buf.extend_from_slice(bytes);
+    }
+    Ok(buf)
+}
+
+/// Scan a tarball's headers and reject any entry whose path contains
+/// `..` components — prevents extraction-time path traversal out of
+/// the destination directory.
+fn validate_tar_entries(bytes: &[u8]) -> anyhow::Result<()> {
+    let mut offset = 0;
+    while offset + 512 <= bytes.len() {
+        let header = &bytes[offset..offset + 512];
+        // End-of-archive marker: all zeros (two consecutive zero blocks).
+        if header.iter().take(100).all(|&b| b == 0) {
+            break;
+        }
+        // Read the filename from the first 100 bytes of the header.
+        let name_len = header[0..100].iter().position(|&b| b == 0).unwrap_or(100);
+        let name = std::str::from_utf8(&header[0..name_len]).unwrap_or("");
+        // Also check the ustar prefix (bytes 345-499) for long paths.
+        let is_ustar = header[257..263] == *b"ustar\x00" || header[257..263] == *b"ustar  ";
+        let prefix = if is_ustar {
+            let prefix_end = header[345..500].iter().position(|&b| b == 0).unwrap_or(155);
+            std::str::from_utf8(&header[345..345 + prefix_end]).unwrap_or("")
+        } else {
+            ""
+        };
+        let full_name = if prefix.is_empty() {
+            name.to_string()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        if contains_dotdot(&full_name) {
+            anyhow::bail!("tar entry {full_name:?} contains '..' path component");
+        }
+        // Skip past header + data blocks (data is rounded up to 512-byte boundary).
+        let size_str = std::str::from_utf8(&header[124..136]).unwrap_or("");
+        let size_str = size_str.trim_end_matches('\0').trim();
+        let size = u64::from_str_radix(size_str, 8).unwrap_or(0);
+        let data_blocks = ((size + 511) / 512) as usize;
+        offset += 512 + data_blocks * 512;
+        if offset > bytes.len() {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn contains_dotdot(path: &str) -> bool {
+    path == ".."
+        || path.starts_with("../")
+        || path.contains("/../")
+        || path.ends_with("/..")
+}
+
+/// Walk `dest` and process OCI whiteout files:
+/// - `.wh..wh..opq` removes all siblings in the directory.
+/// - `.wh.<name>` removes the file/dir `<name>` in the same directory.
+/// After processing, the whiteout marker file itself is deleted.
+fn process_whiteouts(dest: &Path) -> std::io::Result<()> {
+    let mut to_remove: Vec<PathBuf> = Vec::new();
+    let mut dirs_to_clear: Vec<PathBuf> = Vec::new();
+
+    walk_whiteouts(dest, &mut to_remove, &mut dirs_to_clear)?;
+
+    // Remove files first, then clear directories.
+    for path in &to_remove {
+        if path.is_dir() {
+            let _ = std::fs::remove_dir_all(path);
+        } else {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    for dir in &dirs_to_clear {
+        if dir.is_dir() {
+            for child in std::fs::read_dir(dir)? {
+                let child = child?;
+                let _ = std::fs::remove_file(child.path());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn walk_whiteouts(
+    dir: &Path,
+    to_remove: &mut Vec<PathBuf>,
+    dirs_to_clear: &mut Vec<PathBuf>,
+) -> std::io::Result<()> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => return Ok(()),
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let path = entry.path();
+        let file_name = entry.file_name().to_string_lossy().into_owned();
+        if file_name == ".wh..wh..opq" {
+            if let Some(parent) = path.parent() {
+                dirs_to_clear.push(parent.to_path_buf());
+            }
+            to_remove.push(path);
+        } else if let Some(target) = file_name.strip_prefix(".wh.") {
+            if let Some(parent) = path.parent() {
+                to_remove.push(parent.join(target));
+            }
+            to_remove.push(path);
+        } else if path.is_dir() {
+            walk_whiteouts(&path, to_remove, dirs_to_clear)?;
+        }
+    }
+    Ok(())
 }
 
 /// Map a digest like "sha256:abcdef..." to "cache_dir/blobs/sha256/abcdef...".
@@ -699,5 +859,258 @@ mod tests {
         let (api, auth) = registry_endpoints("localhost:5000");
         assert_eq!(api, "localhost:5000");
         assert_eq!(auth, "localhost:5000");
+    }
+
+    // -- contains_dotdot --
+
+    #[test]
+    fn contains_dotdot_bare_dotdot() {
+        assert!(contains_dotdot(".."));
+    }
+
+    #[test]
+    fn contains_dotdot_starts_with_dotdot_slash() {
+        assert!(contains_dotdot("../etc/passwd"));
+    }
+
+    #[test]
+    fn contains_dotdot_middle_dotdot() {
+        assert!(contains_dotdot("foo/../bar"));
+    }
+
+    #[test]
+    fn contains_dotdot_ends_with_slash_dotdot() {
+        assert!(contains_dotdot("foo/bar/.."));
+    }
+
+    #[test]
+    fn contains_dotdot_safe_path() {
+        assert!(!contains_dotdot("foo/bar/baz"));
+        assert!(!contains_dotdot("foo.bar"));
+        assert!(!contains_dotdot("..."));
+    }
+
+    // -- validate_tar_entries --
+
+    /// Build a minimal tar with a single regular file entry.
+    fn tar_header(name: &str, size: u64) -> Vec<u8> {
+        let mut header = [0u8; 512];
+        // name (100 bytes)
+        let name_bytes = name.as_bytes();
+        let copy_len = name_bytes.len().min(99);
+        header[..copy_len].copy_from_slice(&name_bytes[..copy_len]);
+        // mode = 0o644
+        header[100..108].copy_from_slice(b"0000644\0");
+        // uid/gid
+        header[108..116].copy_from_slice(b"0000000\0");
+        header[116..124].copy_from_slice(b"0000000\0");
+        // size (12 bytes octal)
+        let size_str = format!("{size:011o}\0");
+        header[124..136].copy_from_slice(size_str.as_bytes());
+        // mtime
+        header[136..148].copy_from_slice(b"00000000000\0");
+        // type flag = '0' (regular file)
+        header[156] = b'0';
+        // ustar magic
+        header[257..263].copy_from_slice(b"ustar\x00");
+        // checksum (8 bytes, 6 octal digits + null + space)
+        // Compute checksum treating checksum field as spaces.
+        let mut cksum: u32 = 0;
+        for b in header.iter() {
+            cksum += *b as u32;
+        }
+        // Add 8 * b' ' for the checksum field itself
+        for i in 148..156 {
+            cksum -= header[i] as u32;
+            cksum += b' ' as u32;
+        }
+        let cksum_str = format!("{cksum:06o}\0 ");
+        header[148..156].copy_from_slice(cksum_str.as_bytes());
+        let mut tar = header.to_vec();
+        // pad data to 512-byte boundary
+        let data_blocks = ((size + 511) / 512) as usize;
+        tar.resize(512 + data_blocks * 512, 0);
+        tar
+    }
+
+    #[test]
+    fn validate_tar_entries_safe_paths() {
+        let mut tar = Vec::new();
+        tar.extend(tar_header("usr/bin/foo", 0));
+        tar.extend(tar_header("etc/config", 0));
+        // End-of-archive: two zero blocks.
+        tar.extend(vec![0u8; 1024]);
+        validate_tar_entries(&tar).expect("safe paths should pass");
+    }
+
+    #[test]
+    fn validate_tar_entries_rejects_dotdot() {
+        let mut tar = Vec::new();
+        tar.extend(tar_header("usr/bin/foo", 0));
+        tar.extend(tar_header("../etc/passwd", 0));
+        tar.extend(vec![0u8; 1024]);
+        let err = validate_tar_entries(&tar).unwrap_err();
+        assert!(err.to_string().contains(".."));
+    }
+
+    #[test]
+    fn validate_tar_entries_empty_tar() {
+        let tar = vec![0u8; 1024];
+        validate_tar_entries(&tar).expect("empty tar should pass");
+    }
+
+    // -- process_whiteouts --
+
+    #[test]
+    fn process_whiteouts_wh_file_removes_target() {
+        let dir = std::env::temp_dir().join(format!(
+            "dirge-oci-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("removed.txt");
+        let marker = dir.join(".wh.removed.txt");
+
+        std::fs::write(&target, b"lower layer content").unwrap();
+        std::fs::write(&marker, b"").unwrap();
+
+        process_whiteouts(&dir).unwrap();
+
+        assert!(!target.exists(), "whited-out file should be removed");
+        assert!(!marker.exists(), "whiteout marker should be removed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn process_whiteouts_opaque_clears_directory() {
+        let dir = std::env::temp_dir().join(format!(
+            "dirge-oci-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("keep.me"), b"keep").unwrap();
+        std::fs::write(dir.join(".wh..wh..opq"), b"").unwrap();
+
+        process_whiteouts(&dir).unwrap();
+
+        assert!(!dir.join("keep.me").exists(), "opaque dir should clear siblings");
+        assert!(!dir.join(".wh..wh..opq").exists(), "opaque marker should be removed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn process_whiteouts_no_whiteouts_leaves_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "dirge-oci-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("stay.txt"), b"data").unwrap();
+        std::fs::create_dir(dir.join("subdir")).unwrap();
+        std::fs::write(dir.join("subdir/nested.txt"), b"nested").unwrap();
+
+        process_whiteouts(&dir).unwrap();
+
+        assert!(dir.join("stay.txt").exists());
+        assert!(dir.join("subdir/nested.txt").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- stream_blob_with_cap --
+
+    #[tokio::test]
+    async fn stream_blob_with_cap_below_limit() {
+        let chunks: Vec<Result<Vec<u8>, std::io::Error>> = vec![
+            Ok(b"hello ".to_vec()),
+            Ok(b"world".to_vec()),
+        ];
+        let stream = futures::stream::iter(chunks);
+        let result = stream_blob_with_cap(stream, "sha256:test", 100)
+            .await
+            .unwrap();
+        assert_eq!(result, b"hello world");
+    }
+
+    #[tokio::test]
+    async fn stream_blob_with_cap_empty_stream() {
+        let chunks: Vec<Result<Vec<u8>, std::io::Error>> = vec![];
+        let stream = futures::stream::iter(chunks);
+        let result = stream_blob_with_cap(stream, "sha256:test", 100)
+            .await
+            .unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stream_blob_with_cap_exceeds_limit_in_single_chunk() {
+        // Cap is 10, single 20-byte chunk exceeds it
+        let chunks: Vec<Result<Vec<u8>, std::io::Error>> =
+            vec![Ok(b"12345678901234567890".to_vec())];
+        let stream = futures::stream::iter(chunks);
+        let err = stream_blob_with_cap(stream, "sha256:big", 10)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds"),
+            "expected 'exceeds', got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_blob_with_cap_exceeds_limit_across_chunks() {
+        // Cap is 5, three 2-byte chunks exceed after the third
+        let chunks: Vec<Result<Vec<u8>, std::io::Error>> = vec![
+            Ok(b"ab".to_vec()),
+            Ok(b"cd".to_vec()),
+            Ok(b"ef".to_vec()),
+        ];
+        let stream = futures::stream::iter(chunks);
+        let err = stream_blob_with_cap(stream, "sha256:big", 5)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds"),
+            "expected 'exceeds', got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_blob_with_cap_exactly_at_limit() {
+        let chunks: Vec<Result<Vec<u8>, std::io::Error>> =
+            vec![Ok(b"12345".to_vec())];
+        let stream = futures::stream::iter(chunks);
+        let result = stream_blob_with_cap(stream, "sha256:exact", 5)
+            .await
+            .unwrap();
+        assert_eq!(result, b"12345");
+    }
+
+    #[tokio::test]
+    async fn stream_blob_with_cap_propagates_error() {
+        let chunks: Vec<Result<Vec<u8>, std::io::Error>> = vec![
+            Ok(b"first ".to_vec()),
+            Err(std::io::Error::new(std::io::ErrorKind::Other, "connection lost")),
+        ];
+        let stream = futures::stream::iter(chunks);
+        let err = stream_blob_with_cap(stream, "sha256:test", 100)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("reading blob chunk"),
+            "expected 'reading blob chunk', got: {err}"
+        );
+        assert!(
+            err.to_string().contains("connection lost"),
+            "expected 'connection lost', got: {err}"
+        );
     }
 }

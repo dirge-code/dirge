@@ -255,9 +255,9 @@ impl PtyRelay {
     /// returns `WouldBlock` (other side isn't draining fast enough),
     /// unsent bytes are queued and retried on the next poll iteration.
     pub(crate) fn relay(self) -> io::Result<std::process::ExitStatus> {
-        // ── thread priority ──────────────────────────────────────
+        // ── relay priority: below input reader (-20), above KVM (19) ──
         unsafe {
-            libc::setpriority(libc::PRIO_PROCESS, 0, -10);
+            libc::setpriority(libc::PRIO_PROCESS, 0, -19);
         }
         let tty = std::fs::OpenOptions::new()
             .read(true)

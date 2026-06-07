@@ -509,7 +509,7 @@ pub async fn run_interactive(
     // rather than ~85 ad-hoc inline paint sites.
     macro_rules! render_frame {
         () => {{
-            let status = with_queue(
+                let status = with_queue(
                 StatusLine::render(
                     session,
                     ui.is_running,
@@ -528,6 +528,534 @@ pub async fn run_interactive(
         }};
     }
 
+    // #387 follow-up: the unified input dispatcher. When a modal owns the
+    // input (`ui.input_mode` != Compose), the single `user_rx` arm routes
+    // the event here instead of the compose editor — replacing the former
+    // nested blocking `loop { user_rx.recv().await }` read loops, which
+    // could park the whole UI. Each modal handles one event, mutates its
+    // state, and on resolution sends its reply + returns to `Compose`; the
+    // loop-top `render_frame!` paints the result. Key/Paste events are
+    // always swallowed while a modal is active (a stray key must not leak
+    // into the hidden compose box); other events (resize/scroll) fall
+    // through to the normal handlers. Expanded once, inside the arm, so it
+    // can borrow the same locals (`agent`, channels, `context`, …) the
+    // former arms did.
+    macro_rules! dispatch_modal {
+        ($ev:expr) => {
+            if let UserEvent::Key(key) = &$ev {
+                let key = *key;
+                match ui.input_mode.kind() {
+                    state::ModalKind::Compose => {}
+                    state::ModalKind::PlanSwitch => match key.code {
+                        KeyCode::Char('y') | KeyCode::Enter => {
+                            let state::InputMode::PlanSwitch {
+                                reply,
+                                prompt_name,
+                                label,
+                            } = std::mem::replace(&mut ui.input_mode, state::InputMode::Compose)
+                            else {
+                                unreachable!()
+                            };
+                            // Activate the new prompt layer + push its
+                            // deny-list to the perm checker, then rebuild
+                            // the agent under the new prompt mode.
+                            if let Some(p) = context.prompts.get(prompt_name) {
+                                let body = p.body.clone();
+                                let deny = p.deny_tools.clone();
+                                context.set_prompt_layer(
+                                    Some(prompt_name.to_string()),
+                                    Some(body),
+                                    deny,
+                                );
+                                crate::permission::apply_prompt_deny(
+                                    &permission,
+                                    &context.current_prompt_deny_tools,
+                                );
+                            }
+                            let model = client.completion_model(session.model.to_string());
+                            agent = crate::provider::build_agent(
+                                model,
+                                cli,
+                                cfg,
+                                context,
+                                permission.clone(),
+                                ask_tx.clone(),
+                                question_tx.clone(),
+                                plan_tx.clone(),
+                                bg_store.clone(),
+                                #[cfg(feature = "lsp")]
+                                lsp_manager.clone(),
+                                sandbox.clone(),
+                                #[cfg(feature = "mcp")]
+                                mcp_manager.as_ref(),
+                                #[cfg(feature = "semantic")]
+                                semantic_manager,
+                                Some(session.id.to_string()),
+                            )
+                            .await;
+                            let _ = reply.send(PlanSwitchResponse::Accepted);
+                            renderer
+                                .write_line(&format!("  switched to {}", label), Color::Green)?;
+                            if !cli.print
+                                && let Err(e) =
+                                    render_session(&mut renderer, session, cli, cfg, context)
+                            {
+                                renderer.write_line(&format!("render error: {}", e), c_error())?;
+                            }
+                        }
+                        KeyCode::Char('n') | KeyCode::Esc => {
+                            let state::InputMode::PlanSwitch { reply, .. } =
+                                std::mem::replace(&mut ui.input_mode, state::InputMode::Compose)
+                            else {
+                                unreachable!()
+                            };
+                            let _ = reply.send(PlanSwitchResponse::Rejected);
+                        }
+                        _ => {}
+                    },
+                    state::ModalKind::Question => {
+                        // Phase 1: mutate the QuestionState behind `&mut`,
+                        // recording what to do next. The reply channel can
+                        // only be taken via `mem::replace` once this borrow
+                        // ends, hence the two-phase shape.
+                        let step = {
+                            let state::InputMode::Question(q) = &mut ui.input_mode else {
+                                unreachable!()
+                            };
+                            let question = &q.req.questions[q.qi];
+                            let multi = question.multi_select.unwrap_or(false);
+                            let custom = question.custom;
+                            let num_options = question.options.len();
+
+                            if let Some(entry) = &mut q.entry {
+                                // Innermost former loop: free-form text entry.
+                                match key.code {
+                                    KeyCode::Enter => {
+                                        q.custom_text = if entry.buf.is_empty() {
+                                            None
+                                        } else {
+                                            Some(std::mem::take(&mut entry.buf))
+                                        };
+                                        q.entry = None;
+                                        if !multi {
+                                            if let Some(ct) = q.custom_text.take() {
+                                                q.answers.push(vec![ct]);
+                                            }
+                                            QStep::Next
+                                        } else {
+                                            // Multi: keep going; Enter again confirms.
+                                            QStep::Stay
+                                        }
+                                    }
+                                    KeyCode::Esc => {
+                                        // Discard the typed text, back to options.
+                                        q.entry = None;
+                                        QStep::Stay
+                                    }
+                                    KeyCode::Backspace => {
+                                        entry.buf.pop();
+                                        QStep::Stay
+                                    }
+                                    KeyCode::Char(c) => {
+                                        entry.buf.push(c);
+                                        QStep::Stay
+                                    }
+                                    _ => QStep::Stay,
+                                }
+                            } else {
+                                // Option-select.
+                                match key.code {
+                                    KeyCode::Up | KeyCode::Char('k') => {
+                                        q.cursor = q.cursor.saturating_sub(1);
+                                        QStep::Stay
+                                    }
+                                    KeyCode::Down | KeyCode::Char('j') => {
+                                        let max = if custom {
+                                            num_options
+                                        } else {
+                                            num_options.saturating_sub(1)
+                                        };
+                                        if q.cursor < max {
+                                            q.cursor += 1;
+                                        }
+                                        QStep::Stay
+                                    }
+                                    KeyCode::Enter => {
+                                        if custom && q.cursor == num_options {
+                                            // Enter free-form custom-text entry.
+                                            renderer
+                                                .write_line("  enter your answer:", c_perm())?;
+                                            let input_anchor = renderer.buffer_len();
+                                            q.entry = Some(state::CustomEntry {
+                                                buf: String::new(),
+                                                input_anchor,
+                                            });
+                                            QStep::Stay
+                                        } else if multi {
+                                            let mut picked: Vec<String> = question
+                                                .options
+                                                .iter()
+                                                .enumerate()
+                                                .filter(|(i, _)| q.selected[*i])
+                                                .map(|(_, o)| o.label.clone())
+                                                .collect();
+                                            if let Some(ct) = q.custom_text.take() {
+                                                picked.push(ct);
+                                            }
+                                            if picked.is_empty() {
+                                                renderer.write_line(
+                                                    "  select at least one option",
+                                                    c_perm(),
+                                                )?;
+                                                QStep::Stay
+                                            } else {
+                                                q.answers.push(picked);
+                                                QStep::Next
+                                            }
+                                        } else {
+                                            let label = question.options[q.cursor].label.clone();
+                                            q.answers.push(vec![label]);
+                                            QStep::Next
+                                        }
+                                    }
+                                    KeyCode::Char(' ') => {
+                                        if multi && q.cursor < num_options {
+                                            q.selected[q.cursor] = !q.selected[q.cursor];
+                                            QStep::Stay
+                                        } else if !multi && q.cursor < num_options {
+                                            let label = question.options[q.cursor].label.clone();
+                                            q.answers.push(vec![label]);
+                                            QStep::Next
+                                        } else {
+                                            QStep::Stay
+                                        }
+                                    }
+                                    KeyCode::Esc => QStep::Rejected,
+                                    _ => QStep::Stay,
+                                }
+                            }
+                        };
+
+                        // Phase 2: act on the step (borrow on `q` released).
+                        match step {
+                            QStep::Stay => {
+                                let state::InputMode::Question(q) = &ui.input_mode else {
+                                    unreachable!()
+                                };
+                                if let Some(entry) = &q.entry {
+                                    render_custom_entry(
+                                        &mut renderer,
+                                        &entry.buf,
+                                        entry.input_anchor,
+                                    );
+                                } else {
+                                    render_question_options(
+                                        &mut renderer,
+                                        &q.req.questions[q.qi],
+                                        q.cursor,
+                                        &q.selected,
+                                        &q.custom_text,
+                                        q.anchor,
+                                    );
+                                }
+                            }
+                            QStep::Next => {
+                                // Advance; reset per-question state if more
+                                // questions remain, else finish.
+                                let next = {
+                                    let state::InputMode::Question(q) = &mut ui.input_mode else {
+                                        unreachable!()
+                                    };
+                                    q.qi += 1;
+                                    if q.qi >= q.req.questions.len() {
+                                        None
+                                    } else {
+                                        let qi = q.qi;
+                                        let question = q.req.questions[qi].clone();
+                                        q.cursor = 0;
+                                        q.selected = vec![false; question.options.len()];
+                                        q.custom_text = None;
+                                        q.entry = None;
+                                        Some((question, qi))
+                                    }
+                                };
+                                match next {
+                                    None => {
+                                        let state::InputMode::Question(q) = std::mem::replace(
+                                            &mut ui.input_mode,
+                                            state::InputMode::Compose,
+                                        ) else {
+                                            unreachable!()
+                                        };
+                                        let _ =
+                                            q.req.reply.send(QuestionResponse::Answered(q.answers));
+                                        renderer.write_line("", Color::White)?;
+                                    }
+                                    Some((question, qi)) => {
+                                        let anchor =
+                                            render_question_stem(&mut renderer, &question, qi)?;
+                                        if let state::InputMode::Question(q) = &mut ui.input_mode {
+                                            q.anchor = anchor;
+                                        }
+                                        render_question_options(
+                                            &mut renderer,
+                                            &question,
+                                            0,
+                                            &vec![false; question.options.len()],
+                                            &None,
+                                            anchor,
+                                        );
+                                    }
+                                }
+                            }
+                            QStep::Rejected => {
+                                let state::InputMode::Question(q) = std::mem::replace(
+                                    &mut ui.input_mode,
+                                    state::InputMode::Compose,
+                                ) else {
+                                    unreachable!()
+                                };
+                                let _ = q.req.reply.send(QuestionResponse::Rejected);
+                                renderer.write_line("", Color::White)?;
+                            }
+                        }
+                    }
+                    state::ModalKind::DialogConfirm => {
+                        // y / n / Esc / Ctrl+C — anything else is ignored.
+                        let answer = match key.code {
+                            KeyCode::Char('y') | KeyCode::Char('Y') => Some(true),
+                            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Some(false),
+                            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                Some(false)
+                            }
+                            _ => None,
+                        };
+                        if let Some(answer) = answer {
+                            let state::InputMode::DialogConfirm { reply } =
+                                std::mem::replace(&mut ui.input_mode, state::InputMode::Compose)
+                            else {
+                                unreachable!()
+                            };
+                            let _ = reply.send(crate::plugin::DialogReply::Confirm(answer));
+                            renderer.write_line(
+                                &format!("  -> {}", if answer { "yes" } else { "no" }),
+                                theme::dim(),
+                            )?;
+                        }
+                    }
+                    state::ModalKind::DialogSelect => {
+                        // 1-9 selects (if in range); Esc / Ctrl+C cancels.
+                        // Compute the picked label (or cancel) without holding
+                        // the borrow across the resolving `mem::replace`.
+                        enum Pick {
+                            None_,
+                            Cancel,
+                            Label(String),
+                        }
+                        let pick = match key.code {
+                            KeyCode::Char(c) if c.is_ascii_digit() => {
+                                let state::InputMode::DialogSelect { options, .. } = &ui.input_mode
+                                else {
+                                    unreachable!()
+                                };
+                                let idx = (c as u8 - b'0') as usize;
+                                if idx >= 1 && idx <= options.len() {
+                                    Pick::Label(options[idx - 1].clone())
+                                } else {
+                                    Pick::None_
+                                }
+                            }
+                            KeyCode::Esc => Pick::Cancel,
+                            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                Pick::Cancel
+                            }
+                            _ => Pick::None_,
+                        };
+                        let resolved = match pick {
+                            Pick::None_ => None,
+                            Pick::Cancel => Some(None),
+                            Pick::Label(l) => Some(Some(l)),
+                        };
+                        if let Some(answer) = resolved {
+                            let state::InputMode::DialogSelect { reply, .. } =
+                                std::mem::replace(&mut ui.input_mode, state::InputMode::Compose)
+                            else {
+                                unreachable!()
+                            };
+                            let label = answer.as_deref().unwrap_or("(cancelled)").to_string();
+                            let _ = reply.send(crate::plugin::DialogReply::Select(answer));
+                            renderer.write_line(&format!("  -> {}", label), theme::dim())?;
+                        }
+                    }
+                    state::ModalKind::Permission => {
+                        // Phase 1: map the keystroke to a decision. Ctrl+C /
+                        // Ctrl+D = "I want out" → Deny. The `a` branch also
+                        // prints the will-allow line (or downgrades to allow-
+                        // once when the input yields no useful pattern).
+                        let is_ctrl_c = key.code == KeyCode::Char('c')
+                            && key.modifiers.contains(KeyModifiers::CONTROL);
+                        let is_ctrl_d = key.code == KeyCode::Char('d')
+                            && key.modifiers.contains(KeyModifiers::CONTROL);
+                        let decision: Option<UserDecision> = if is_ctrl_c || is_ctrl_d {
+                            Some(UserDecision::Deny)
+                        } else {
+                            match key.code {
+                                KeyCode::Char('y') => Some(UserDecision::AllowOnce),
+                                KeyCode::Char('a') => {
+                                    let state::InputMode::Permission(p) = &ui.input_mode else {
+                                        unreachable!()
+                                    };
+                                    let pattern =
+                                        suggest_pattern(&p.req.tool, &p.req.input);
+                                    if is_placeholder_pattern(&pattern) {
+                                        renderer.write_line(
+                                            "  -> can't derive a useful pattern from empty input; allowing once only",
+                                            theme::dim(),
+                                        )?;
+                                        Some(UserDecision::AllowOnce)
+                                    } else {
+                                        renderer.write_line(
+                                            &format!(
+                                                "  -> will allow: {}",
+                                                sanitize_output(&pattern),
+                                            ),
+                                            Color::Green,
+                                        )?;
+                                        Some(UserDecision::AllowAlways(pattern))
+                                    }
+                                }
+                                KeyCode::Char('n') | KeyCode::Esc => Some(UserDecision::Deny),
+                                _ => None,
+                            }
+                        };
+
+                        // Phase 2: decision made — run the post-decision work
+                        // (overlay clear, reply, avatar, cascade-deny, allow-
+                        // list save, chamber reopen). Borrow on the state is
+                        // released by the `mem::replace`.
+                        if let Some(decision) = decision {
+                            let state::InputMode::Permission(p) = std::mem::replace(
+                                &mut ui.input_mode,
+                                state::InputMode::Compose,
+                            ) else {
+                                unreachable!()
+                            };
+                            let ask_req = p.req;
+                            let pending_chamber_tool = p.pending_chamber_tool;
+
+                            let allow_pattern = match &decision {
+                                UserDecision::AllowAlways(p) => Some(p.clone()),
+                                _ => None,
+                            };
+                            let was_denied = matches!(decision, UserDecision::Deny);
+                            // Alert decided — clear the overlay so the [ALERT]
+                            // frame swaps back to the input editor.
+                            renderer.clear_alert_overlay();
+                            let _ = ask_req.reply.send(decision);
+
+                            // On allow, reset the avatar to the tool's working
+                            // face (it was stuck on the Alert face). Deny path
+                            // leaves it for the turn's Done/Error/Idle handler.
+                            if !was_denied {
+                                renderer.set_avatar_state(avatar::AvatarState::from_tool_name(
+                                    &ask_req.tool,
+                                ));
+                            }
+
+                            // Cascading reject: deny any sibling requests
+                            // already queued in `ask_rx` from the same run,
+                            // then interject so the runner halts at the next
+                            // tool-result boundary.
+                            if was_denied {
+                                if let Some(rx) = ask_rx.as_mut() {
+                                    let mut cascaded = 0usize;
+                                    while let Ok(stale) = rx.try_recv() {
+                                        let _ = stale.reply.send(UserDecision::Deny);
+                                        cascaded += 1;
+                                    }
+                                    if cascaded > 0 {
+                                        renderer.write_line(
+                                            &format!(
+                                                "  ↳ also denied {} queued tool request{}",
+                                                cascaded,
+                                                if cascaded == 1 { "" } else { "s" },
+                                            ),
+                                            theme::dim(),
+                                        )?;
+                                    }
+                                }
+                                if let Some(tx) = ui.agent_interject.as_ref() {
+                                    let _ = tx.try_send(());
+                                }
+                            }
+
+                            // Allow-always: persist the pattern to the session
+                            // allowlist + install it into the live checker now
+                            // (so queued siblings coalesce). The confirmation
+                            // line must precede any chamber reopen below.
+                            if let Some(pattern) = allow_pattern {
+                                session.permission_allowlist.push(PermissionAllowEntry {
+                                    tool: ask_req.tool.clone(),
+                                    pattern: pattern.clone(),
+                                });
+                                if let Some(perm) = &permission
+                                    && let Ok(mut guard) = perm.lock()
+                                {
+                                    guard.add_session_allowlist(ask_req.tool.clone(), &pattern);
+                                }
+                                if !cli.no_session
+                                    && let Err(e) =
+                                        crate::session::storage::save_session(session)
+                                {
+                                    renderer.write_line(
+                                        &format!("warning: failed to save session: {}", e),
+                                        c_error(),
+                                    )?;
+                                }
+                                renderer.write_line("", Color::White)?;
+                                renderer.write_line(
+                                    &format!(
+                                        "  allowed {} {} (saved to session)",
+                                        sanitize_output(&ask_req.tool),
+                                        pattern,
+                                    ),
+                                    Color::Green,
+                                )?;
+                            }
+
+                            // Reopen the in-flight chamber (allow) or write a
+                            // dim "(denied)" trailer (deny).
+                            if let Some(reopen_name) = pending_chamber_tool {
+                                renderer.write_line("", Color::White)?;
+                                if was_denied {
+                                    renderer.write_line(
+                                        &format!(
+                                            "  ↳ denied: {} {}",
+                                            sanitize_output(&ask_req.tool),
+                                            sanitize_output(&ask_req.input),
+                                        ),
+                                        theme::dim(),
+                                    )?;
+                                } else {
+                                    let upper = reopen_name.to_ascii_uppercase();
+                                    let raw_value =
+                                        sanitize_output(&ask_req.input).into_string();
+                                    let (frame_w, _) = chamber_widths(&renderer);
+                                    let header =
+                                        fit_banner_header(&upper, &raw_value, frame_w);
+                                    renderer.write_line(&header, c_tool())?;
+                                    ui.last_tool_name = Some(reopen_name);
+                                    ui.tool_chamber_open = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+        };
+    }
+
     render_session(&mut renderer, session, cli, cfg, context)?;
     renderer.request_repaint();
 
@@ -540,11 +1068,6 @@ pub async fn run_interactive(
 
     let (user_tx, mut user_rx) = mpsc::unbounded_channel::<UserEvent>();
     input_reader::spawn_input_reader(user_tx.clone());
-    // Defer rendering during streaming bursts (reasoning/tokens) —
-    // accumulate mutations in the buffer and paint once when the
-    // burst ends or a user event arrives. Prevents ~100s of
-    // unnecessary cache_bottom() calls per second during thinking.
-    let mut defer_render = false;
 
     loop {
         // Refresh the info panel snapshot once per iteration so it stays
@@ -705,12 +1228,7 @@ pub async fn run_interactive(
         // once, THEN block on the next event. Because every handler returns
         // here (the trailing `continue`s restart the loop), no per-arm
         // inline paint is required — the arms just mutate `ui`.
-        if defer_render {
-            defer_render = false;
-            renderer.request_repaint();
-        } else {
-            render_frame!();
-        }
+        render_frame!();
 
         tokio::select! {
             // #387: poll arms in order so USER INPUT takes priority — when a
@@ -731,6 +1249,11 @@ pub async fn run_interactive(
                         continue;
                     }
                     crate::ui::selection::Outcome::NotHandled => {}
+                }
+                // #387 follow-up: if a modal owns the input, route the event
+                // there (swallowing keys) instead of the compose editor.
+                if ui.input_mode.is_modal() {
+                    dispatch_modal!(ev);
                 }
                 match ev {
                     // Mouse Down/Drag/Up that selection::handle declined
@@ -1792,7 +2315,6 @@ pub async fn run_interactive(
                             }
                             ui.reasoning_buf.push_str(&sanitize_output(&text));
                         }
-                    defer_render = true;
                     }
                     AgentEvent::Token(text) => {
                         // Caught-up check for the render coalescer, computed
@@ -1814,7 +2336,6 @@ pub async fn run_interactive(
                             #[cfg(feature = "plugin")]
                             current_turn_index,
                         )?;
-                    defer_render = true;
                     }
                     AgentEvent::ToolCall { id, name, args } => {
                         let mut ctx = make_run_ctx!();
@@ -2109,7 +2630,7 @@ pub async fn run_interactive(
                 } else {
                     std::future::pending().await
                 }
-            } => {
+            }, if !ui.input_mode.is_modal() => {
                 // Coalesce parallel-tool prompts. When the agent fires
                 // several tool calls at once, each that needs permission
                 // queues its own AskRequest. If the user picked "allow
@@ -2279,269 +2800,18 @@ pub async fn run_interactive(
                     renderer.set_alert_overlay(overlay);
                     renderer.request_repaint();
                 }
-                // Paint the overlay NOW — without this flush(), the
-                // screen is frozen showing the pre-alert state until
-                // the user presses a key inside the nested loop below.
-                // The render_frame!() call sites inside that loop only
-                // fire on mouse/selection events, not keyboard events.
-                render_frame!();
 
-                let decision = loop {
-                    tokio::select! {
-                        Some(ev) = user_rx.recv() => {
-                            // Selection works through the alert: drag
-                            // anywhere over the chat behind, mouse-up
-                            // copies. `y` and `Esc` are reserved for
-                            // the alert's own keys when no selection
-                            // is active — selection::handle only
-                            // claims them while active.
-                            match crate::ui::selection::handle(&ev, &mut renderer) {
-                                crate::ui::selection::Outcome::Repaint
-                                | crate::ui::selection::Outcome::RepaintAndCopied => {
-                                    render_frame!();
-                                    continue;
-                                }
-                                crate::ui::selection::Outcome::NotHandled => {}
-                            }
-                            // `match` form is kept (vs the lint's `if let`
-                            // suggestion) so we can later route MouseDown /
-                            // Paste / Resize without restructuring the body.
-                            #[allow(clippy::single_match)]
-                            match ev {
-                                UserEvent::Key(key) => {
-                                    // Ctrl+C / Ctrl+D in the alert
-                                    // = "I want out" → treat as
-                                    // Deny. Without this the loop
-                                    // fell through to `_ => {}` and
-                                    // the tool hung waiting for an
-                                    // answer that never came; the
-                                    // user had to keyboard-mash to
-                                    // discover that only y/a/n/Esc
-                                    // worked.
-                                    let is_ctrl_c = key.code == KeyCode::Char('c')
-                                        && key.modifiers.contains(KeyModifiers::CONTROL);
-                                    let is_ctrl_d = key.code == KeyCode::Char('d')
-                                        && key.modifiers.contains(KeyModifiers::CONTROL);
-                                    if is_ctrl_c || is_ctrl_d {
-                                        break UserDecision::Deny;
-                                    }
-                                    match key.code {
-                                    KeyCode::Char('y') => break UserDecision::AllowOnce,
-                                    KeyCode::Char('a') => {
-                                        let pattern = suggest_pattern(&ask_req.tool, &ask_req.input);
-                                        // Refuse to store the empty-
-                                        // input placeholder as a real
-                                        // pattern. Without this, an "a"
-                                        // press on a tool call with
-                                        // empty/whitespace args would
-                                        // pin "<edit this pattern>" as
-                                        // a literal allowlist entry —
-                                        // useless and confusing.
-                                        // Fall back to AllowOnce so the
-                                        // tool still runs, but no
-                                        // permanent rule is added.
-                                        if is_placeholder_pattern(&pattern) {
-                                            renderer.write_line(
-                                                "  -> can't derive a useful pattern from empty input; allowing once only",
-                                                theme::dim(),
-                                            )?;
-                                            break UserDecision::AllowOnce;
-                                        }
-                                        renderer.write_line(
-                                            &format!(
-                                                "  -> will allow: {}",
-                                                sanitize_output(&pattern),
-                                            ),
-                                            Color::Green,
-                                        )?;
-                                        break UserDecision::AllowAlways(pattern);
-                                    }
-                                    KeyCode::Char('n') | KeyCode::Esc => break UserDecision::Deny,
-                                    _ => {}
-                                    }
-                                }
-                                // Keep scroll responsive while the
-                                // alert is up — previously these
-                                // events were dropped on the floor
-                                // inside this loop, locking the chat
-                                // viewport.
-                                _ => {}
-                            }
-                        }
-                    }
-                };
-
-                let allow_pattern = match &decision {
-                    UserDecision::AllowAlways(p) => Some(p.clone()),
-                    _ => None,
-                };
-                let was_denied = matches!(decision, UserDecision::Deny);
-                // ui-redesign Phase 6: alert decided — clear the
-                // overlay so the [ALERT] frame swaps back to the
-                // input editor for the next user interaction.
-                renderer.clear_alert_overlay();
-                let _ = ask_req.reply.send(decision);
-
-                // Avatar bugfix: when the user lets the tool proceed
-                // (Allow / AllowAlways), the avatar is still stuck on
-                // the Alert face `(O_O)` that was set at prompt time
-                // (see set_avatar_state(Alert) above). Reset it to the
-                // tool's working face (Reading/Writing/Bash) so the
-                // bottom-row avatar matches the tool that's now
-                // running again. The deny path intentionally leaves
-                // this alone — the tool isn't going to run, and the
-                // turn's own Done/Error/Idle handlers own the next
-                // transition.
-                if !was_denied {
-                    renderer.set_avatar_state(avatar::AvatarState::from_tool_name(&ask_req.tool));
-                }
-
-                // Audit H10: cascading reject. When the user denies
-                // one tool, any other tool requests already queued
-                // in `ask_rx` belong to the same agent run and the
-                // user almost certainly doesn't want to be asked
-                // about them serially. Drain whatever's already
-                // enqueued and auto-deny each. New requests that
-                // arrive after this drain still go through the
-                // normal alert flow on the next iteration.
-                if was_denied {
-                    if let Some(rx) = ask_rx.as_mut() {
-                        let mut cascaded = 0usize;
-                        while let Ok(stale) = rx.try_recv() {
-                            let _ = stale.reply.send(UserDecision::Deny);
-                            cascaded += 1;
-                        }
-                        if cascaded > 0 {
-                            renderer.write_line(
-                                &format!(
-                                    "  ↳ also denied {} queued tool request{}",
-                                    cascaded,
-                                    if cascaded == 1 { "" } else { "s" },
-                                ),
-                                theme::dim(),
-                            )?;
-                        }
-                    }
-                    // Audit H10 (extended): the drain above only
-                    // covers requests already in `ask_rx` at this
-                    // moment. The agent may still emit MORE tool
-                    // calls in the current run — without an
-                    // interject signal, the user would keep seeing
-                    // fresh permission dialogs for the same denied
-                    // intent. Send an interject so the runner halts
-                    // at the next tool-result boundary; the partial
-                    // response is preserved via the Interjected
-                    // event. try_send so a full channel is a no-op.
-                    if let Some(tx) = ui.agent_interject.as_ref() {
-                        let _ = tx.try_send(());
-                    }
-                }
-
-                // Reopen / mark the chamber depending on outcome:
-                //
-                // - **Allow**: write a fresh chamber TOP banner so
-                //   the about-to-arrive ToolResult body has a
-                //   chamber to land inside. This gives the user a
-                //   clear "permission granted, tool running" visual
-                //   pair (closed chamber for the pause, fresh
-                //   chamber for the result).
-                //
-                // - **Deny**: chamber stayed closed; render a
-                //   single dim "(denied)" trailer line so it's
-                //   clear no result is coming.
-                // The "allowed … (saved to session)" confirmation
-                // line MUST be emitted before any chamber-reopen
-                // below, otherwise it lands inside the freshly-
-                // painted chamber TOP and reads as if it's part of
-                // the tool's output. Same shape of bug as the
-                // earlier alert-inside-chamber fix — visible
-                // affordance order: confirmation → blank → chamber
-                // TOP → (incoming tool result body) → chamber bottom.
-                if let Some(pattern) = allow_pattern {
-                    session.permission_allowlist.push(PermissionAllowEntry {
-                        tool: ask_req.tool.clone(),
-                        pattern: pattern.clone(),
-                    });
-                    // Install into the LIVE checker now, synchronously,
-                    // so queued sibling asks from the same parallel batch
-                    // see it on the next loop iteration and get coalesced
-                    // (see the auto-allow fast-path at the top of this
-                    // arm). The tool-side handler also adds it on reply
-                    // receipt, but that runs asynchronously and would
-                    // race the next queued ask; add::dedup makes the
-                    // double-add a no-op.
-                    if let Some(perm) = &permission
-                        && let Ok(mut guard) = perm.lock()
-                    {
-                        guard.add_session_allowlist(ask_req.tool.clone(), &pattern);
-                    }
-                    if !cli.no_session
-                        && let Err(e) = crate::session::storage::save_session(session) {
-                            renderer.write_line(
-                                &format!("warning: failed to save session: {}", e),
-                                c_error(),
-                            )?;
-                        }
-                    // Review #9: blank-line breathing room between
-                    // the alert's `╰─╯` and this green confirmation.
-                    // Without it the alert bottom and the "allowed"
-                    // line read as adjacent rows of one block.
-                    renderer.write_line("", Color::White)?;
-                    renderer.write_line(
-                        &format!(
-                            "  allowed {} {} (saved to session)",
-                            sanitize_output(&ask_req.tool),
-                            pattern,
-                        ),
-                        Color::Green,
-                    )?;
-                }
-
-                if let Some(reopen_name) = pending_chamber_tool {
-                    // Visual breathing room between the alert box's
-                    // bottom border and whatever follows (reopened
-                    // chamber OR denied trailer). Without this, the
-                    // alert's `╰─╯` sits flush against the next
-                    // line which reads as continuous output.
-                    renderer.write_line("", Color::White)?;
-                    if was_denied {
-                        // Same sanitization as the ALERT rows above:
-                        // tool name + args can carry attacker-shaped
-                        // bytes; don't paint them raw even on the
-                        // deny path.
-                        renderer.write_line(
-                            &format!(
-                                "  ↳ denied: {} {}",
-                                sanitize_output(&ask_req.tool),
-                                sanitize_output(&ask_req.input),
-                            ),
-                            theme::dim(),
-                        )?;
-                    } else {
-                        // Reopen with the same banner shape the
-                        // ToolCall handler uses. `ask_req.input` is
-                        // the value that the original banner would
-                        // have rendered (path for read/write/edit,
-                        // command for bash, etc.) so we can pass it
-                        // directly without re-parsing the JSON args.
-                        //
-                        // Note for `apply_patch`: the initial chamber
-                        // showed "N ops" (overview); the reopened
-                        // chamber here shows the specific path the
-                        // user just permitted. Intentional — the
-                        // user is approving per-op, so per-op
-                        // identification is more useful at the
-                        // reopen point.
-                        let upper = reopen_name.to_ascii_uppercase();
-                        let raw_value = sanitize_output(&ask_req.input).into_string();
-                        let (frame_w, _) = chamber_widths(&renderer);
-                        let header = fit_banner_header(&upper, &raw_value, frame_w);
-                        renderer.write_line(&header, c_tool())?;
-                        ui.last_tool_name = Some(reopen_name);
-                        ui.tool_chamber_open = true;
-                    }
-                }
-
+                // #387 follow-up: the alert overlay is painted; hand the request
+                // to the unified input dispatcher instead of spinning a nested
+                // blocking select! loop. The y/a/n/Esc decision and all the
+                // post-decision work (reply, avatar reset, cascade-deny, allowlist
+                // save, chamber reopen) now run in dispatch_modal! when the
+                // keystroke arrives — so Ctrl+C, chat selection, and scroll stay
+                // live while the prompt is up.
+                ui.input_mode = state::InputMode::Permission(state::PermissionState {
+                    req: ask_req,
+                    pending_chamber_tool,
+                });
                 renderer.request_repaint();
             }
             Some(notif) = async {
@@ -2628,7 +2898,7 @@ pub async fn run_interactive(
                 };
                 let (label, color) = match &lifecycle_evt {
                     LifecycleEvent::Started { id } => {
-                        let short = crate::text::short_id(id);
+                        let short = crate::text::short_id(&id);
                         (format!("[task {} started]", short), c_tool())
                     }
                     LifecycleEvent::Finished(notif) => {
@@ -2933,7 +3203,7 @@ pub async fn run_interactive(
                 } else {
                     std::future::pending().await
                 }
-            } => {
+            }, if !ui.input_mode.is_modal() => {
                 ui.was_reasoning = false;
                 // Single chokepoint: close any open tool chamber
                 // (and clear the agent-line state) before painting
@@ -2955,278 +3225,29 @@ pub async fn run_interactive(
                     Color::White,
                 )?;
 
-                let mut answers: Vec<Vec<String>> = Vec::new();
-                let mut rejected = false;
-
-                for (qi, question) in question_req.questions.iter().enumerate() {
-                    if let Some(header) = &question.header {
-                        renderer.write_line(
-                            &format!("\n--- {} ---", header),
-                            c_perm(),
-                        )?;
-                    }
-                    // Soft-wrap the question stem so a long prompt
-                    // doesn't get char-broken mid-word. Continuation
-                    // lines indent under the text past `[question N] `
-                    // so wrapped tail aligns visually with the first
-                    // word of the question.
-                    let prefix = format!("[question {}] ", qi + 1);
-                    let prefix_w = prefix.chars().count();
-                    let cont_indent = " ".repeat(prefix_w);
-                    let stem = format!("{}{}", prefix, question.question);
-                    let width = renderer.content_width().saturating_sub(2).max(20);
-                    renderer.write_line("", c_perm())?;
-                    for row in wrap::soft_wrap(&stem, width, &cont_indent) {
-                        renderer.write_line(&row, c_perm())?;
-                    }
-
-                    let multi = question.multi_select.unwrap_or(false);
-                    let custom = question.custom;
-                    let num_options = question.options.len();
-                    let mut cursor: usize = 0;
-                    let mut selected: Vec<bool> = vec![false; num_options];
-                    let mut custom_text: Option<String> = None;
-
-                    // Anchor point — options rendered below will be replaced on each keystroke
-                    let anchor = renderer.buffer_len();
-
-                    loop {
-                        // Build option lines as Vec<LineEntry>. Each
-                        // option's full text gets soft-wrapped through
-                        // the central `wrap::soft_wrap` helper so a
-                        // long description doesn't fall off the right
-                        // edge or hard-break mid-word.
-                        let width = renderer.content_width().saturating_sub(2).max(20);
-                        let mut lines: Vec<LineEntry> =
-                            Vec::with_capacity(num_options + if custom { 2 } else { 1 });
-                        for (i, opt) in question.options.iter().enumerate() {
-                            // Review #11: keep every marker in a
-                            // question at equal display width so
-                            // continuation indents (computed from
-                            // head_w) line up across rows. Without
-                            // this, single-select cursor (`▶`, w=1)
-                            // and non-cursor (`  `, w=2) differ by
-                            // one column, and the wrapped tails of
-                            // adjacent options misalign by 1.
-                            let marker = if i == cursor {
-                                if multi {
-                                    if selected[i] { "▶ [x]" } else { "▶ [ ]" }
-                                } else {
-                                    "▶ "
-                                }
-                            } else if multi {
-                                if selected[i] { "  [x]" } else { "  [ ]" }
-                            } else {
-                                "  "
-                            };
-                            // Layout: `  <marker> <label> — <description>`.
-                            // Continuation rows align under the label
-                            // start (past the leading spaces + marker
-                            // + space) so the eye keeps the option
-                            // grouping visually.
-                            let head = format!("  {} ", marker);
-                            // Review #10: display-width not chars.
-                            // Future markers using CJK arrows / emoji
-                            // (wide glyphs) would otherwise under-pad
-                            // the continuation indent — wrapped tails
-                            // would drift one column left of the
-                            // label.
-                            let head_w =
-                                unicode_width::UnicodeWidthStr::width(head.as_str());
-                            let body = format!("{} — {}", opt.label, opt.description);
-                            let cont_indent = " ".repeat(head_w);
-                            let full = format!("{}{}", head, body);
-                            for row in wrap::soft_wrap(&full, width, &cont_indent) {
-                                lines.push(LineEntry {
-                                    text: compact_str::CompactString::new(&row),
-                                    color: c_perm(),
-                                });
-                            }
-                        }
-                        if custom {
-                            let custom_marker = if cursor == num_options { "▶" } else { "  " };
-                            let custom_label = if let Some(ref t) = custom_text {
-                                format!("  {} (custom) \"{}\"", custom_marker, t)
-                            } else {
-                                format!("  {} (custom) type your own answer...", custom_marker)
-                            };
-                            // Same wrap treatment as the option rows
-                            // so a long custom-answer string doesn't
-                            // also fall off the edge.
-                            let cont = "        ";
-                            for row in wrap::soft_wrap(&custom_label, width, cont) {
-                                lines.push(LineEntry {
-                                    text: compact_str::CompactString::new(&row),
-                                    color: c_perm(),
-                                });
-                            }
-                        }
-                        lines.push(LineEntry {
-                            text: compact_str::CompactString::new(if multi {
-                                "  ↑↓ navigate  Space toggle  Enter confirm  Esc reject all"
-                            } else {
-                                "  ↑↓ navigate  Enter select  Esc reject all"
-                            }),
-                            color: c_perm(),
-                        });
-
-                        // Replace previous render with updated options
-                        renderer.replace_from(anchor, lines);
-                        render_frame!();
-
-                        // Wait for user input. Selection events
-                        // (drag, mouse-up, `y`/`Esc` while active)
-                        // are handled before the question's own
-                        // key handling so the user can still copy
-                        // chat text behind the question.
-                        let user_ev = user_rx.recv().await;
-                        let Some(ev) = user_ev else { continue; };
-                        match crate::ui::selection::handle(&ev, &mut renderer) {
-                            crate::ui::selection::Outcome::Repaint
-                            | crate::ui::selection::Outcome::RepaintAndCopied => {
-                                continue;
-                            }
-                            crate::ui::selection::Outcome::NotHandled => {}
-                        }
-                        let UserEvent::Key(key) = ev else {
-                            continue;
-                        };
-
-                        match key.code {
-                            KeyCode::Up | KeyCode::Char('k') => {
-                                cursor = cursor.saturating_sub(1);
-                            }
-                            KeyCode::Down | KeyCode::Char('j') => {
-                                let max = if custom { num_options } else { num_options.saturating_sub(1) };
-                                if cursor < max { cursor += 1; }
-                            }
-                            KeyCode::Enter => {
-                                if custom && cursor == num_options {
-                                    // Custom text input (works for both single and multi)
-                                    let mut buf = String::new();
-                                    renderer.write_line("  enter your answer:", c_perm())?;
-                                    let input_anchor = renderer.buffer_len();
-                                    loop {
-                                        // Soft-wrap the typed answer to the
-                                        // available width (reusing the compose
-                                        // box's wrap helper) so a long custom
-                                        // answer flows onto new lines and the
-                                        // tail stays visible instead of running
-                                        // off the right edge (dirge-0dqe). The
-                                        // "  > " / "    " prefixes are 4 cols.
-                                        let wrap_w =
-                                            renderer.content_width().saturating_sub(4).max(1);
-                                        let (rows, _, _) = crate::ui::renderer::wrap_editor(
-                                            &buf,
-                                            buf.len(),
-                                            wrap_w,
-                                        );
-                                        let lines: Vec<LineEntry> = if rows.is_empty() {
-                                            vec![LineEntry {
-                                                text: compact_str::CompactString::new("  > "),
-                                                color: c_perm(),
-                                            }]
-                                        } else {
-                                            rows.iter()
-                                                .enumerate()
-                                                .map(|(i, row)| LineEntry {
-                                                    text: compact_str::CompactString::new(
-                                                        if i == 0 {
-                                                            format!("  > {row}")
-                                                        } else {
-                                                            format!("    {row}")
-                                                        },
-                                                    ),
-                                                    color: c_perm(),
-                                                })
-                                                .collect()
-                                        };
-                                        renderer.replace_from(input_anchor, lines);
-                                        render_frame!();
-                                        let ev = user_rx.recv().await;
-                                        if let Some(UserEvent::Key(k)) = ev {
-                                            match k.code {
-                                                KeyCode::Enter => break,
-                                                KeyCode::Esc => {
-                                                    buf = String::new();
-                                                    break;
-                                                }
-                                                KeyCode::Backspace => { buf.pop(); }
-                                                KeyCode::Char(c) => { buf.push(c); }
-                                                _ => {}
-                                            }
-                                        }
-                                    }
-                                    if buf.is_empty() {
-                                        custom_text = None;
-                                    } else {
-                                        custom_text = Some(buf);
-                                    }
-                                    if !multi {
-                                        // Single select: confirm immediately
-                                        if let Some(ct) = custom_text.take() {
-                                            answers.push(vec![ct]);
-                                        }
-                                        break;
-                                    }
-                                    // Multi select: continue, user presses Enter again to confirm
-                                } else if multi {
-                                    // Confirm multi-select
-                                    let mut picked: Vec<String> = question
-                                        .options
-                                        .iter()
-                                        .enumerate()
-                                        .filter(|(i, _)| selected[*i])
-                                        .map(|(_, o)| o.label.clone())
-                                        .collect();
-                                    if let Some(ct) = custom_text.take() {
-                                        picked.push(ct);
-                                    }
-                                    if picked.is_empty() {
-                                        renderer.write_line(
-                                            "  select at least one option",
-                                            c_perm(),
-                                        )?;
-                                    } else {
-                                        answers.push(picked);
-                                        break;
-                                    }
-                                } else {
-                                    // Single select
-                                    let opt = &question.options[cursor];
-                                    answers.push(vec![opt.label.clone()]);
-                                    break;
-                                }
-                            }
-                            KeyCode::Char(' ') => {
-                                if multi && cursor < num_options {
-                                    selected[cursor] = !selected[cursor];
-                                } else if !multi && cursor < num_options {
-                                    // Space acts like Enter for single-select
-                                    let opt = &question.options[cursor];
-                                    answers.push(vec![opt.label.clone()]);
-                                    break;
-                                }
-                            }
-                            KeyCode::Esc => {
-                                rejected = true;
-                                break;
-                            }
-                            _ => {}
-                        }
-                    };
-                    if rejected {
-                        break;
-                    }
-                }
-
-                if rejected {
-                    let _ = question_req.reply.send(QuestionResponse::Rejected);
+                // #387 follow-up: hand the questionnaire to the unified input
+                // dispatcher instead of the former triple-nested blocking loop
+                // (questions -> option-select -> custom-text), which could park
+                // the UI. Render question 0 now; the dispatcher walks the rest one
+                // keystroke at a time and sends the reply on confirm/reject.
+                if question_req.questions.is_empty() {
+                    let _ = question_req.reply.send(QuestionResponse::Answered(Vec::new()));
                 } else {
-                    let _ = question_req.reply.send(QuestionResponse::Answered(answers));
+                    let q0 = &question_req.questions[0];
+                    let anchor = render_question_stem(&mut renderer, q0, 0)?;
+                    let selected = vec![false; q0.options.len()];
+                    render_question_options(&mut renderer, q0, 0, &selected, &None, anchor);
+                    ui.input_mode = state::InputMode::Question(state::QuestionState {
+                        req: question_req,
+                        answers: Vec::new(),
+                        qi: 0,
+                        cursor: 0,
+                        selected,
+                        custom_text: None,
+                        anchor,
+                        entry: None,
+                    });
                 }
-
-                renderer.write_line("", Color::White)?;
                 renderer.request_repaint();
             }
             Some(dialog_req) = async {
@@ -3235,27 +3256,19 @@ pub async fn run_interactive(
                 } else {
                     std::future::pending().await
                 }
-            } => {
-                // Plugin asked the user a question via harness/confirm or
-                // harness/select. The Janet worker thread is blocked on
-                // the reply channel; render the dialog, drive a synchronous
-                // key-read loop, then send the answer back. Other agent
-                // events keep queuing in their channels — they'll process
-                // after this arm returns.
-                use crate::plugin::{DialogReply, DialogRequest};
-                // Events that arrived during the dialog but didn't match
-                // its accepted keys are stashed here, then pushed back into
-                // user_rx after the dialog ends. Without this, a paste or
-                // unrelated key during a confirm dialog would be lost.
-                let mut deferred: Vec<UserEvent> = Vec::new();
-                // Close any open tool chamber FIRST. A plugin hook
-                // can fire from inside on-tool-start which runs
-                // while a tool chamber is open — without this the
-                // confirm/select dialog renders INSIDE the chamber.
+            }, if !ui.input_mode.is_modal() => {
+                // Plugin asked the user via harness/confirm or harness/select.
+                // #387 follow-up: render the dialog and hand the reply channel to
+                // the unified input dispatcher instead of spinning a nested
+                // blocking select! loop (which parked every other arm). The Janet
+                // worker thread stays blocked on the reply channel until the
+                // dispatcher resolves the keystroke. Close any open tool chamber
+                // FIRST so the dialog never renders inside an in-flight chamber.
+                use crate::plugin::DialogRequest;
                 match dialog_req {
                     DialogRequest::Confirm { title, question, reply } => {
-                        // Strip ANSI escapes from plugin-controlled strings
-                        // to prevent repaint/screen-manipulation attacks.
+                        // Strip ANSI escapes from plugin-controlled strings to
+                        // prevent repaint/screen-manipulation attacks.
                         let safe_title = crate::ui::ansi::strip_escapes(
                             &title,
                             crate::ui::ansi::StripPolicy::KEEP_NEWLINE,
@@ -3268,127 +3281,30 @@ pub async fn run_interactive(
                             &mut renderer,
                             &mut ui.last_tool_name,
                             &mut ui.tool_chamber_open,
-                                    &mut ui.chamber_top_start,
-                                    &mut ui.chamber_top_end,
+                            &mut ui.chamber_top_start,
+                            &mut ui.chamber_top_end,
                             &format!("[plugin {}] {}", safe_title, safe_question),
                             c_perm(),
                         )?;
-                        renderer.write_line(
-                            "  (y) yes  (n) no  (ESC) cancel = no",
-                            c_perm(),
-                        )?;
-                        let answer = loop {
-                            tokio::select! {
-                                Some(ev) = user_rx.recv() => {
-                                    match crate::ui::selection::handle(&ev, &mut renderer) {
-                                        crate::ui::selection::Outcome::Repaint
-                                        | crate::ui::selection::Outcome::RepaintAndCopied => {
-                                            render_frame!();
-                                            continue;
-                                        }
-                                        crate::ui::selection::Outcome::NotHandled => {}
-                                    }
-                                    if let UserEvent::Key(key) = ev {
-                                        match key.code {
-                                            KeyCode::Char('y') | KeyCode::Char('Y') => break true,
-                                            KeyCode::Char('n')
-                                            | KeyCode::Char('N')
-                                            | KeyCode::Esc => break false,
-                                            // Treat Ctrl+C as cancel (same
-                                            // as Esc / no), not as
-                                            // "interrupt the agent" — the
-                                            // agent isn't running this code
-                                            // path, the dialog is.
-                                            KeyCode::Char('c')
-                                                if key.modifiers
-                                                    .contains(KeyModifiers::CONTROL) =>
-                                            {
-                                                break false;
-                                            }
-                                            _ => deferred.push(UserEvent::Key(key)),
-                                        }
-                                    } else {
-                                        // Paste, Resize, etc. Hand them back after
-                                        // the dialog so the main loop arms
-                                        // can handle them as usual.
-                                        deferred.push(ev);
-                                    }
-                                }
-                            }
-                        };
-                        let _ = reply.send(DialogReply::Confirm(answer));
-                        renderer.write_line(
-                            &format!("  -> {}", if answer { "yes" } else { "no" }),
-                            theme::dim(),
-                        )?;
+                        renderer.write_line("  (y) yes  (n) no  (ESC) cancel = no", c_perm())?;
+                        ui.input_mode = state::InputMode::DialogConfirm { reply };
                     }
                     DialogRequest::Select { title, options, reply } => {
                         write_outside_chamber(
                             &mut renderer,
                             &mut ui.last_tool_name,
                             &mut ui.tool_chamber_open,
-                                    &mut ui.chamber_top_start,
-                                    &mut ui.chamber_top_end,
+                            &mut ui.chamber_top_start,
+                            &mut ui.chamber_top_end,
                             &format!("[plugin {}] pick one:", title),
                             c_perm(),
                         )?;
                         for (i, opt) in options.iter().enumerate() {
-                            renderer.write_line(
-                                &format!("  {}: {}", i + 1, opt),
-                                c_perm(),
-                            )?;
+                            renderer.write_line(&format!("  {}: {}", i + 1, opt), c_perm())?;
                         }
-                        renderer.write_line(
-                            "  (1-9) select  (ESC) cancel",
-                            c_perm(),
-                        )?;
-                        let answer: Option<String> = loop {
-                            tokio::select! {
-                                Some(ev) = user_rx.recv() => {
-                                    match crate::ui::selection::handle(&ev, &mut renderer) {
-                                        crate::ui::selection::Outcome::Repaint
-                                        | crate::ui::selection::Outcome::RepaintAndCopied => {
-                                            render_frame!();
-                                            continue;
-                                        }
-                                        crate::ui::selection::Outcome::NotHandled => {}
-                                    }
-                                    if let UserEvent::Key(key) = ev {
-                                        match key.code {
-                                            KeyCode::Char(c) if c.is_ascii_digit() => {
-                                                let idx = (c as u8 - b'0') as usize;
-                                                if idx >= 1 && idx <= options.len() {
-                                                    break Some(options[idx - 1].clone());
-                                                }
-                                            }
-                                            KeyCode::Esc => break None,
-                                            KeyCode::Char('c')
-                                                if key.modifiers
-                                                    .contains(KeyModifiers::CONTROL) =>
-                                            {
-                                                break None;
-                                            }
-                                            _ => deferred.push(UserEvent::Key(key)),
-                                        }
-                                    } else {
-                                        deferred.push(ev);
-                                    }
-                                }
-                            }
-                        };
-                        let label = answer.as_deref().unwrap_or("(cancelled)").to_string();
-                        let _ = reply.send(DialogReply::Select(answer));
-                        renderer.write_line(
-                            &format!("  -> {}", label),
-                            theme::dim(),
-                        )?;
+                        renderer.write_line("  (1-9) select  (ESC) cancel", c_perm())?;
+                        ui.input_mode = state::InputMode::DialogSelect { reply, options };
                     }
-                }
-                // Replay deferred events into user_rx so the outer select!
-                // arms see them next iteration. Best-effort: a full channel
-                // (very unlikely, capacity 64) silently drops the tail.
-                for ev in deferred {
-                    let _ = user_tx.send(ev);
                 }
                 renderer.request_repaint();
             }
@@ -3398,7 +3314,7 @@ pub async fn run_interactive(
                 } else {
                     std::future::pending().await
                 }
-            } => {
+            }, if !ui.input_mode.is_modal() => {
                 ui.was_reasoning = false;
                 ui.agent_line_started = false;
 
@@ -3420,79 +3336,16 @@ pub async fn run_interactive(
                     c_perm(),
                 )?;
 
-                let accepted = loop {
-                    let Some(ev) = user_rx.recv().await else { continue; };
-                    match crate::ui::selection::handle(&ev, &mut renderer) {
-                        crate::ui::selection::Outcome::Repaint
-                        | crate::ui::selection::Outcome::RepaintAndCopied => {
-                            render_frame!();
-                            continue;
-                        }
-                        crate::ui::selection::Outcome::NotHandled => {}
-                    }
-                    let UserEvent::Key(key) = ev else { continue; };
-                    match key.code {
-                        KeyCode::Char('y') | KeyCode::Enter => break true,
-                        KeyCode::Char('n') | KeyCode::Esc => break false,
-                        _ => {}
-                    }
+                // #387 follow-up: hand the prompt off to the unified input
+                // dispatcher instead of spinning a nested blocking read
+                // loop. The y/n decision + agent rebuild now run in
+                // `dispatch_modal!` when the keystroke arrives, keeping the
+                // event loop live (Ctrl+C, selection, resize still work).
+                ui.input_mode = state::InputMode::PlanSwitch {
+                    reply: plan_req.reply,
+                    prompt_name,
+                    label,
                 };
-
-                if accepted {
-                    // Update context with the new prompt + push its
-                    // deny-list to the perm checker so any prompt-
-                    // level tool restrictions kick in immediately.
-                    if let Some(p) = context.prompts.get(prompt_name) {
-                        let body = p.body.clone();
-                        let deny = p.deny_tools.clone();
-                        context.set_prompt_layer(Some(prompt_name.to_string()), Some(body), deny);
-                        crate::permission::apply_prompt_deny(
-                            &permission,
-                            &context.current_prompt_deny_tools,
-                        );
-                    }
-
-                    // Rebuild agent with new prompt mode
-                    let model = client.completion_model(session.model.to_string());
-                    agent = crate::provider::build_agent(
-                        model,
-                        cli,
-                        cfg,
-                        context,
-                        permission.clone(),
-                        ask_tx.clone(),
-                        question_tx.clone(),
-                        plan_tx.clone(),
-                        bg_store.clone(),
-                        #[cfg(feature = "lsp")]
-                        lsp_manager.clone(),
-                        sandbox.clone(),
-                        #[cfg(feature = "mcp")]
-                        mcp_manager.as_ref(),
-                        #[cfg(feature = "semantic")]
-                        semantic_manager,
-                        Some(session.id.to_string()),
-                    )
-                    .await;
-
-                    let _ = plan_req.reply.send(PlanSwitchResponse::Accepted);
-                    renderer.write_line(
-                        &format!("  switched to {}", label),
-                        Color::Green,
-                    )?;
-
-                    // Re-render the session to show new prompt mode
-                    if !cli.print
-                        && let Err(e) = render_session(&mut renderer, session, cli, cfg, context) {
-                            renderer.write_line(
-                                &format!("render error: {}", e),
-                                c_error(), // honors --no-color via theme now [dirge-zrda]
-                            )?;
-                        }
-                } else {
-                    let _ = plan_req.reply.send(PlanSwitchResponse::Rejected);
-                }
-
                 renderer.request_repaint();
             }
             _ = tokio::time::sleep(tokio::time::Duration::from_millis(200)), if ui.is_running => {
@@ -3526,6 +3379,140 @@ pub async fn run_interactive(
     }
 
     Ok(())
+}
+
+/// #387 follow-up: what the question dispatcher should do after handling
+/// one keystroke. Computed while the `QuestionState` is borrowed `&mut`,
+/// then acted on once the borrow is released (resolution needs to
+/// `mem::replace` `input_mode` to take ownership of the reply channel).
+enum QStep {
+    /// Stay on the current question; re-render its option/entry block.
+    Stay,
+    /// Current question answered — advance (or finish the questionnaire).
+    Next,
+    /// User rejected the whole questionnaire (Esc).
+    Rejected,
+}
+
+/// #387 follow-up: write a question's header + soft-wrapped stem and
+/// return the buffer index where its option block begins (the `anchor`
+/// the dispatcher `replace_from`s on every keystroke). Extracted from the
+/// former in-loop rendering so it can run both at modal setup and when
+/// advancing to the next question.
+fn render_question_stem(
+    renderer: &mut Renderer,
+    question: &crate::agent::tools::question::QuestionItem,
+    qi: usize,
+) -> std::io::Result<usize> {
+    if let Some(header) = &question.header {
+        renderer.write_line(&format!("\n--- {} ---", header), c_perm())?;
+    }
+    let prefix = format!("[question {}] ", qi + 1);
+    let prefix_w = prefix.chars().count();
+    let cont_indent = " ".repeat(prefix_w);
+    let stem = format!("{}{}", prefix, question.question);
+    let width = renderer.content_width().saturating_sub(2).max(20);
+    renderer.write_line("", c_perm())?;
+    for row in wrap::soft_wrap(&stem, width, &cont_indent) {
+        renderer.write_line(&row, c_perm())?;
+    }
+    Ok(renderer.buffer_len())
+}
+
+/// #387 follow-up: (re)render the option block for the current question in
+/// place at `anchor`. Mirrors the former inline render: soft-wrapped option
+/// rows with aligned markers, an optional "(custom)" row, and the key-hint
+/// footer. Called on every keystroke that changes cursor/selection/custom.
+fn render_question_options(
+    renderer: &mut Renderer,
+    question: &crate::agent::tools::question::QuestionItem,
+    cursor: usize,
+    selected: &[bool],
+    custom_text: &Option<String>,
+    anchor: usize,
+) {
+    let multi = question.multi_select.unwrap_or(false);
+    let custom = question.custom;
+    let num_options = question.options.len();
+    let width = renderer.content_width().saturating_sub(2).max(20);
+    let mut lines: Vec<LineEntry> = Vec::with_capacity(num_options + if custom { 2 } else { 1 });
+    for (i, opt) in question.options.iter().enumerate() {
+        // Keep every marker at equal display width so continuation
+        // indents line up across rows (Review #10/#11).
+        let marker = if i == cursor {
+            if multi {
+                if selected[i] { "▶ [x]" } else { "▶ [ ]" }
+            } else {
+                "▶ "
+            }
+        } else if multi {
+            if selected[i] { "  [x]" } else { "  [ ]" }
+        } else {
+            "  "
+        };
+        let head = format!("  {} ", marker);
+        let head_w = unicode_width::UnicodeWidthStr::width(head.as_str());
+        let body = format!("{} — {}", opt.label, opt.description);
+        let cont_indent = " ".repeat(head_w);
+        let full = format!("{}{}", head, body);
+        for row in wrap::soft_wrap(&full, width, &cont_indent) {
+            lines.push(LineEntry {
+                text: compact_str::CompactString::new(&row),
+                color: c_perm(),
+            });
+        }
+    }
+    if custom {
+        let custom_marker = if cursor == num_options { "▶" } else { "  " };
+        let custom_label = if let Some(t) = custom_text {
+            format!("  {} (custom) \"{}\"", custom_marker, t)
+        } else {
+            format!("  {} (custom) type your own answer...", custom_marker)
+        };
+        let cont = "        ";
+        for row in wrap::soft_wrap(&custom_label, width, cont) {
+            lines.push(LineEntry {
+                text: compact_str::CompactString::new(&row),
+                color: c_perm(),
+            });
+        }
+    }
+    lines.push(LineEntry {
+        text: compact_str::CompactString::new(if multi {
+            "  ↑↓ navigate  Space toggle  Enter confirm  Esc reject all"
+        } else {
+            "  ↑↓ navigate  Enter select  Esc reject all"
+        }),
+        color: c_perm(),
+    });
+    renderer.replace_from(anchor, lines);
+}
+
+/// #387 follow-up: (re)render the in-progress custom-answer text at
+/// `input_anchor`, soft-wrapped to the content width. Mirrors the former
+/// innermost loop's render.
+fn render_custom_entry(renderer: &mut Renderer, buf: &str, input_anchor: usize) {
+    let wrap_w = renderer.content_width().saturating_sub(4).max(1);
+    let (rows, _, _) = crate::ui::renderer::wrap_editor(buf, buf.len(), wrap_w);
+    let lines: Vec<LineEntry> = if rows.is_empty() {
+        vec![LineEntry {
+            text: compact_str::CompactString::new("  > "),
+            color: c_perm(),
+        }]
+    } else {
+        rows.iter()
+            .enumerate()
+            .map(|(i, row)| LineEntry {
+                text: compact_str::CompactString::new(if i == 0 {
+                    format!("  > {row}")
+                } else {
+                    format!("    {row}")
+                }),
+                color: c_perm(),
+            })
+            .collect()
+    };
+    renderer.replace_from(input_anchor, lines);
 }
 
 /// dirge-b11: hit-test a `(row, col)` terminal cell against an

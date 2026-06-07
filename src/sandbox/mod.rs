@@ -4,6 +4,8 @@ use regex::Regex;
 use tokio::process::Command;
 
 #[cfg(feature = "sandbox-microvm")]
+use std::time::Duration;
+#[cfg(feature = "sandbox-microvm")]
 use crate::sandbox::microvm::{MicrovmConfig, MicrovmSandbox};
 #[cfg(feature = "sandbox-microvm")]
 use std::sync::Arc;
@@ -111,40 +113,54 @@ impl Sandbox {
 
     /// Override the microVM image. No-op when sandbox mode is not Microvm.
     #[cfg(feature = "sandbox-microvm")]
-    pub fn set_microvm_image(&self, image: String) {
+    pub fn set_microvm_image(&self, image: String) -> Result<(), anyhow::Error> {
         use crate::sandbox::microvm::rootfs;
         let canonical = rootfs::canonicalize_image_ref(&image);
-        if let Ok(mut guard) = self.microvm.try_lock() {
-            if let Some(ref mut mv) = *guard {
-                mv.config.image = canonical;
-            }
+        let mut guard = self
+            .microvm
+            .try_lock()
+            .map_err(|_| anyhow::anyhow!("microvm is busy — retry"))?;
+        if let Some(ref mut mv) = *guard {
+            mv.config.image = canonical;
         }
+        Ok(())
     }
 
     #[cfg(not(feature = "sandbox-microvm"))]
     #[allow(dead_code)]
-    pub fn set_microvm_image(&self, _image: String) {}
+    pub fn set_microvm_image(&self, _image: String) -> Result<(), anyhow::Error> {
+        Ok(())
+    }
 
     /// Override microVM vCPUs and RAM.
     #[cfg(feature = "sandbox-microvm")]
-    pub fn set_microvm_resources(&self, cpus: u8, memory_mib: u32) {
-        if let Ok(mut guard) = self.microvm.try_lock() {
-            if let Some(ref mut mv) = *guard {
-                mv.config.cpus = cpus;
-                mv.config.memory_mib = memory_mib;
-            }
+    pub fn set_microvm_resources(&self, cpus: u8, memory_mib: u32) -> Result<(), anyhow::Error> {
+        let mut guard = self
+            .microvm
+            .try_lock()
+            .map_err(|_| anyhow::anyhow!("microvm is busy — retry"))?;
+        if let Some(ref mut mv) = *guard {
+            mv.config.cpus = cpus;
+            mv.config.memory_mib = memory_mib;
         }
+        Ok(())
     }
 
     #[cfg(not(feature = "sandbox-microvm"))]
     #[allow(dead_code)]
-    pub fn set_microvm_resources(&self, _cpus: u8, _memory_mib: u32) {}
+    pub fn set_microvm_resources(&self, _cpus: u8, _memory_mib: u32) -> Result<(), anyhow::Error> {
+        Ok(())
+    }
 
     /// Return SSH connection info when the microVM is running.
     /// Returns `None` when not in microVM mode or the VM hasn't
     /// been started yet (port is still 0).
+    ///
+    /// Returns `(port, private_key_path, host_public_key)`.
+    /// The host public key is in OpenSSH format (`ssh-ed25519 <base64>`),
+    /// suitable for writing into a `known_hosts` file.
     #[cfg(feature = "sandbox-microvm")]
-    pub fn ssh_connect_info(&self) -> Option<(u16, std::path::PathBuf)> {
+    pub fn ssh_connect_info(&self) -> Option<(u16, std::path::PathBuf, String)> {
         if !self.is_microvm() {
             return None;
         }
@@ -153,13 +169,19 @@ impl Sandbox {
         if mv.ssh_port() == 0 {
             return None;
         }
-        let key_path = mv.keys.as_ref()?.private_key_path.clone();
-        Some((mv.ssh_port(), key_path))
+        let keys = mv.keys.as_ref()?;
+        let key_path = keys.private_key_path.clone();
+        let host_public_key = mv
+            .host_keys
+            .as_ref()?
+            .public_key
+            .clone();
+        Some((mv.ssh_port(), key_path, host_public_key))
     }
 
     #[cfg(not(feature = "sandbox-microvm"))]
     #[allow(dead_code)]
-    pub fn ssh_connect_info(&self) -> Option<(u16, std::path::PathBuf)> {
+    pub fn ssh_connect_info(&self) -> Option<(u16, std::path::PathBuf, String)> {
         None
     }
 
@@ -377,24 +399,48 @@ impl Sandbox {
                     .ok_or_else(|| {
                         crate::agent::tools::ToolError::Msg("VM keys missing".to_string())
                     })?;
+                let host_key_bytes = mv
+                    .host_keys
+                    .as_ref()
+                    .and_then(|hk| hk.public_key_bytes().ok());
                 drop(guard);
-                // Prepend cd /workspace so commands run relative to the
-                // host's current working directory (mounted via virtio-fs).
-                // Without this, commands execute in /home/sandbox (empty).
-                let command = format!("cd /workspace && {}", command);
-                let (stdout, stderr, exit_code) = tokio::task::spawn_blocking(move || {
-                    crate::sandbox::microvm::ssh::ssh_exec(
-                        "127.0.0.1",
-                        ssh_port,
-                        &private_key_path,
-                        &command,
-                    )
-                })
-                .await
-                .map_err(|e| {
-                    crate::agent::tools::ToolError::Msg(format!("microvm exec join error: {e}"))
-                })?
-                .map_err(|e| crate::agent::tools::ToolError::Msg(e.to_string()))?;
+                // Prepend cd /workspace and a guest-side timeout so the
+                // guest kernel kills the process if it exceeds the budget.
+                // tokio::time::timeout is a second layer in case SSH itself
+                // hangs (e.g. network stall).
+                let command = format!(
+                    "cd /workspace && timeout {} {}",
+                    timeout_secs, command
+                );
+                let result = tokio::time::timeout(
+                    Duration::from_secs(timeout_secs),
+                    tokio::task::spawn_blocking(move || {
+                        crate::sandbox::microvm::ssh::ssh_exec(
+                            "127.0.0.1",
+                            ssh_port,
+                            &private_key_path,
+                            &command,
+                            host_key_bytes.as_deref(),
+                        )
+                    }),
+                )
+                .await;
+                let (stdout, stderr, exit_code) = match result {
+                    Ok(Ok(Ok((stdout, stderr, exit_code)))) => (stdout, stderr, exit_code),
+                    Ok(Ok(Err(e))) => {
+                        return Err(crate::agent::tools::ToolError::Msg(e.to_string()));
+                    }
+                    Ok(Err(join_err)) => {
+                        return Err(crate::agent::tools::ToolError::Msg(format!(
+                            "microvm exec join error: {join_err}"
+                        )));
+                    }
+                    Err(_elapsed) => {
+                        return Err(crate::agent::tools::ToolError::Msg(format!(
+                            "command timed out after {timeout_secs}s"
+                        )));
+                    }
+                };
                 Ok(crate::agent::tools::bash::exec::InterleavedOutput {
                     merged: if stderr.is_empty() {
                         stdout
@@ -1005,7 +1051,7 @@ mod tests {
     fn set_microvm_image_in_bwrap_mode_is_noop() {
         let sb = Sandbox::new(SandboxMode::Bwrap);
         // Should not panic
-        sb.set_microvm_image("alpine".to_string());
+        sb.set_microvm_image("alpine".to_string()).unwrap();
         // In Bwrap mode, microvm stays None
         assert!(sb.ssh_connect_info().is_none());
     }
@@ -1015,7 +1061,7 @@ mod tests {
     fn set_microvm_resources_in_bwrap_mode_is_noop() {
         let sb = Sandbox::new(SandboxMode::Bwrap);
         // Should not panic
-        sb.set_microvm_resources(4, 2048);
+        sb.set_microvm_resources(4, 2048).unwrap();
         // In Bwrap mode, microvm stays None
         assert!(sb.ssh_connect_info().is_none());
     }

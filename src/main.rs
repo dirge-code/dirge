@@ -1015,9 +1015,13 @@ async fn main() -> anyhow::Result<()> {
 
     let sandbox = sandbox::Sandbox::new(cli.resolve_sandbox(&cfg));
     if let Some(image) = cli.resolve_microvm_image(&cfg) {
-        sandbox.set_microvm_image(image);
+        if let Err(e) = sandbox.set_microvm_image(image) {
+            eprintln!("warning: failed to set microvm image: {e}");
+        }
     }
-    sandbox.set_microvm_resources(cfg.resolve_microvm_cpus(), cfg.resolve_microvm_memory_mib());
+    if let Err(e) = sandbox.set_microvm_resources(cfg.resolve_microvm_cpus(), cfg.resolve_microvm_memory_mib()) {
+        eprintln!("warning: failed to set microvm resources: {e}");
+    }
     #[cfg(feature = "sandbox-microvm")]
     if sandbox.is_microvm() {
         let raw = cli
@@ -1045,6 +1049,10 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
+        eprintln!(
+            "  ℹ microvm mode: only bash commands are isolated. \
+             File tools (read, write, edit, etc.) operate on the host filesystem."
+        );
     }
     let Channels {
         permission,

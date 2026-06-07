@@ -89,6 +89,7 @@ pub struct MicrovmSandbox {
     child: Option<std::process::Child>,
     pub(crate) rootfs_path: Option<PathBuf>,
     pub(crate) keys: Option<EphemeralKeys>,
+    pub(crate) host_keys: Option<HostKeys>,
 }
 
 impl std::fmt::Debug for MicrovmSandbox {
@@ -111,6 +112,7 @@ impl MicrovmSandbox {
             child: None,
             rootfs_path: None,
             keys: None,
+            host_keys: None,
         }
     }
 
@@ -128,9 +130,8 @@ impl MicrovmSandbox {
         let keys = EphemeralKeys::generate()?;
 
         // Generate host keys on the host and inject them into the rootfs.
-        // This follows brood-box's approach: host keys are written from the
-        // host side so they appear as root-owned inside the VM, avoiding
-        // the ownership corruption from non-root OCI layer extraction.
+        // Store them so ssh_exec can verify the guest's host key on every
+        // connection, preventing MITM on the ephemeral localhost port.
         let host_keys = HostKeys::generate()?;
 
         // Inject the public key, ensure sandbox user + group exist,
@@ -175,8 +176,9 @@ impl MicrovmSandbox {
 
             // Inject host keys into the rootfs. Removes stale keys from
             // the image build and writes fresh ed25519 keys generated on
-            // the host. ssh-keygen -A inside the VM fills in RSA/ECDSA.
+            // the host.
             host_keys.inject(rootfs_path)?;
+            self.host_keys = Some(host_keys);
 
             // libkrun reads this JSON to determine the init command.
             // The `mounts` field tells the init to mount tmpfs over
@@ -190,7 +192,6 @@ impl MicrovmSandbox {
                      && mkdir -p /run/sshd \
                      && mkdir -p /workspace \
                      && mount -t virtiofs workspace /workspace \
-                     && ssh-keygen -A \
                      && chmod 755 /var/empty \
                      && exec /usr/sbin/sshd -D -e -o StrictModes=no"
                 ],
@@ -208,6 +209,12 @@ impl MicrovmSandbox {
         }
 
         let port = if self.config.ssh_port == 0 {
+            // Bind port 0 to let the kernel pick an ephemeral port.
+            // We read the port, then drop the listener and pass the number
+            // to the runner.  Another process could race and bind this port
+            // between the drop and krun_set_port_map, but the window is
+            // microseconds against ~28k ephemeral ports — risk is negligible.
+            // If this ever matters, pass the listener fd to the runner instead.
             let listener = TcpListener::bind("127.0.0.1:0")?;
             let port = listener.local_addr()?.port();
             drop(listener);
@@ -227,7 +234,7 @@ impl MicrovmSandbox {
         let child = std::process::Command::new(&binary)
             .arg(serde_json::to_string(&config)?)
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
             .spawn()
             .map_err(|e| anyhow::anyhow!("failed to spawn dirge-microvm-runner: {e}"))?;
 
@@ -236,8 +243,9 @@ impl MicrovmSandbox {
         //
         // renice -n 19 — lowest CFS priority for the runner and all
         // its child threads (including KVM vCPUs). Combined with
-        // setpriority(-10) in the input reader thread, this gives the
-        // input reader ~50x scheduling weight over KVM threads,
+        // setpriority(-20) in the input reader thread and
+        // setpriority(-19) in the PTY relay, this gives the
+        // input reader ~5900x scheduling weight over KVM threads,
         // eliminating typing stutter without root.
         // ──────────────────────────────────────────────────────────
 
@@ -339,8 +347,19 @@ impl MicrovmSandbox {
             .keys
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("VM not started"))?;
+        let host_key_bytes = self
+            .host_keys
+            .as_ref()
+            .map(|hk| hk.public_key_bytes())
+            .transpose()?;
         let command = format!("cd {} && {}", cwd, command);
-        ssh_exec("127.0.0.1", self.ssh_port, &keys.private_key_path, &command)
+        ssh_exec(
+            "127.0.0.1",
+            self.ssh_port,
+            &keys.private_key_path,
+            &command,
+            host_key_bytes.as_deref(),
+        )
     }
 
     /// Shut down the VM gracefully.
@@ -348,13 +367,26 @@ impl MicrovmSandbox {
     /// Tries graceful shutdown via SSH first ("poweroff"), then escalates
     /// through SIGTERM → SIGKILL. Rootfs cleanup runs regardless.
     pub fn stop(&mut self) -> anyhow::Result<()> {
+        // Compute host key bytes for verification before moving fields out.
+        // If decoding fails, skip verification — shutdown is best-effort.
+        let host_key_bytes = self
+            .host_keys
+            .as_ref()
+            .and_then(|hk| hk.public_key_bytes().ok());
         if let Some(mut child) = self.child.take() {
             // 1. Fire-and-forget graceful SSH shutdown.
             if let (Some(keys), ssh_port) = (self.keys.as_ref(), self.ssh_port) {
                 if ssh_port != 0 {
                     let private_key = keys.private_key_path.clone();
+                    let hkb = host_key_bytes;
                     std::thread::spawn(move || {
-                        let _ = ssh_exec("127.0.0.1", ssh_port, &private_key, "poweroff");
+                        let _ = ssh_exec(
+                            "127.0.0.1",
+                            ssh_port,
+                            &private_key,
+                            "poweroff",
+                            hkb.as_deref(),
+                        );
                     });
                     // Give the VM a moment to process the poweroff.
                     std::thread::sleep(std::time::Duration::from_secs(1));
@@ -396,9 +428,18 @@ impl MicrovmSandbox {
 
     // ── snapshot management ──────────────────────────────────────
 
-    /// Reject snapshot names that contain path separators or traversal.
-    fn validate_snapshot_name(name: &str) -> anyhow::Result<()> {
-        if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains("..") {
+    /// Reject snapshot names that contain anything other than
+    /// alphanumerics, dots, underscores, and hyphens.
+    /// Also rejects "." and ".." which would resolve to directory traversal.
+    pub(crate) fn validate_snapshot_name(name: &str) -> anyhow::Result<()> {
+        if name.is_empty()
+            || name == "."
+            || name == ".."
+            || !name
+                .as_bytes()
+                .iter()
+                .all(|b| b.is_ascii_alphanumeric() || *b == b'.' || *b == b'_' || *b == b'-')
+        {
             anyhow::bail!("invalid snapshot name '{name}'");
         }
         Ok(())

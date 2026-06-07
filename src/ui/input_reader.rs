@@ -17,12 +17,12 @@ use crate::event::UserEvent;
 pub(crate) fn spawn_input_reader(user_tx: tokio::sync::mpsc::UnboundedSender<UserEvent>) {
     let handle = std::thread::spawn(move || {
         // ── CFS priority boost for the input reader ──────────────
-        // nice -10 gives ~3x scheduling weight over default-priority
+        // nice -20 gives ~5900x scheduling weight over KVM (nice 19)
         // threads. Works without CAP_SYS_NICE on kernels with
         // default RLIMIT_NICE (allows 0 to -20 for unprivileged).
         #[cfg(unix)]
         unsafe {
-            libc::setpriority(libc::PRIO_PROCESS, 0, -10);
+            libc::setpriority(libc::PRIO_PROCESS, 0, -20);
         }
 
         // Poll-based loop so `TerminalGuard::drop` can signal a

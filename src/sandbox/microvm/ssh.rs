@@ -5,6 +5,8 @@ use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use base64::Engine;
+
 /// An ephemeral SSH key pair for authenticating with the guest VM.
 pub struct EphemeralKeys {
     /// Path to the temporary private key file.
@@ -77,6 +79,41 @@ impl HostKeys {
         })
     }
 
+    /// Return the raw 32-byte ed25519 public key for host-key verification.
+    ///
+    /// Decodes the OpenSSH-format public key (`ssh-ed25519 <base64>`) stored
+    /// in [`Self::public_key`] into the bare ed25519 key bytes suitable for
+    /// comparison against [`ssh2::Session::host_key`].
+    pub fn public_key_bytes(&self) -> anyhow::Result<Vec<u8>> {
+        let encoded = self
+            .public_key
+            .strip_prefix("ssh-ed25519 ")
+            .ok_or_else(|| anyhow::anyhow!("host public key has unexpected format"))?;
+        // Strip optional trailing comment (some ssh-keygen versions append
+        // " root@host" after the base64 data).
+        let encoded = encoded.split_whitespace().next().unwrap_or(encoded);
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(|e| anyhow::anyhow!("failed to base64-decode host public key: {e}"))?;
+        // SSH wire format: [u32 len][algo name]["ssh-ed25519"][u32 len][raw key]
+        // For ed25519, the algo name is 11 bytes, so skip 4+11+4 = 19 bytes.
+        if decoded.len() < 19 + 32 {
+            anyhow::bail!("host public key too short for ed25519");
+        }
+        let algo_len =
+            u32::from_be_bytes([decoded[0], decoded[1], decoded[2], decoded[3]]) as usize;
+        if algo_len + 4 > decoded.len() || &decoded[4..4 + algo_len] != b"ssh-ed25519" {
+            anyhow::bail!("host public key algorithm is not ssh-ed25519");
+        }
+        let key_offset = 4 + algo_len;
+        let key_len =
+            u32::from_be_bytes([decoded[key_offset], decoded[key_offset + 1], decoded[key_offset + 2], decoded[key_offset + 3]]) as usize;
+        if key_offset + 4 + key_len > decoded.len() || key_len != 32 {
+            anyhow::bail!("host public key has unexpected ed25519 key length");
+        }
+        Ok(decoded[key_offset + 4..key_offset + 4 + key_len].to_vec())
+    }
+
     /// Write the host key into a rootfs so sshd can find it at boot.
     /// Writes both the private key and the public key, and removes any
     /// stale host keys left over from the image build to prevent
@@ -118,14 +155,8 @@ impl Drop for HostKeys {
 }
 
 fn temp_dir(prefix: &str) -> anyhow::Result<PathBuf> {
-    let dir = std::env::temp_dir().join(format!(
-        "{prefix}-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).map_err(|e| anyhow::anyhow!("failed to create temp dir: {e}"))?;
+    let dir = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&dir).map_err(|e| anyhow::anyhow!("failed to create temp dir: {e}"))?;
     Ok(dir)
 }
 
@@ -179,11 +210,16 @@ pub fn wait_for_ssh(host: &str, port: u16, timeout: Duration) -> anyhow::Result<
 }
 
 /// Execute a command via SSH and return (stdout, stderr, exit_code).
+///
+/// `host_key_bytes` is the raw 32-byte ed25519 public key expected from
+/// the server. If provided, the server's host key is verified against it
+/// immediately after the handshake.
 pub fn ssh_exec(
     host: &str,
     port: u16,
     private_key_path: &Path,
     command: &str,
+    host_key_bytes: Option<&[u8]>,
 ) -> anyhow::Result<(String, String, i32)> {
     let tcp = TcpStream::connect(format!("{host}:{port}"))
         .map_err(|e| anyhow::anyhow!("failed to connect to SSH: {e}"))?;
@@ -195,6 +231,20 @@ pub fn ssh_exec(
     session
         .handshake()
         .map_err(|e| anyhow::anyhow!("SSH handshake failed: {e}"))?;
+
+    // Verify the server's host key against the expected ed25519 key.
+    if let Some(expected) = host_key_bytes {
+        let (key_data, key_type) = session
+            .host_key()
+            .ok_or_else(|| anyhow::anyhow!("SSH server did not present a host key"))?;
+        if !matches!(key_type, ssh2::HostKeyType::Ed25519) || key_data != expected {
+            anyhow::bail!(
+                "host key mismatch: expected ed25519 key from our injected host keys, \
+                 got {key_type:?} with {} bytes",
+                key_data.len()
+            );
+        }
+    }
 
     session
         .userauth_pubkey_file("sandbox", None, private_key_path, None)
@@ -251,7 +301,7 @@ mod tests {
                 .unwrap_or_default()
                 .as_nanos()
         ));
-        let result = ssh_exec("127.0.0.1", free_port, &tmp_key, "echo hi");
+        let result = ssh_exec("127.0.0.1", free_port, &tmp_key, "echo hi", None);
         assert!(
             result.is_err(),
             "ssh_exec to free port should fail, got: {result:?}"
@@ -289,7 +339,7 @@ mod tests {
                 .unwrap_or_default()
                 .as_nanos()
         ));
-        let result = ssh_exec("127.0.0.1", port, &tmp_key, "echo hi");
+        let result = ssh_exec("127.0.0.1", port, &tmp_key, "echo hi", None);
         assert!(
             result.is_err(),
             "ssh_exec to non-SSH port should fail, got: {result:?}"
@@ -313,7 +363,7 @@ mod tests {
                 .as_nanos()
         ));
         let start = std::time::Instant::now();
-        let result = ssh_exec("nonexistent.invalid", 22, &tmp_key, "echo hi");
+        let result = ssh_exec("nonexistent.invalid", 22, &tmp_key, "echo hi", None);
         let elapsed = start.elapsed();
         assert!(
             result.is_err(),
@@ -341,6 +391,24 @@ mod tests {
         assert!(
             msg.contains("invalid address"),
             "expected 'invalid address', got: {msg}"
+        );
+    }
+
+    #[test]
+    fn host_keys_public_key_bytes_roundtrip() {
+        let hk = HostKeys::generate().expect("generate host keys");
+        let raw = hk.public_key_bytes().expect("decode public key");
+        assert_eq!(raw.len(), 32, "ed25519 raw key must be 32 bytes");
+        let raw2 = hk.public_key_bytes().expect("decode again");
+        assert_eq!(raw, raw2);
+    }
+
+    #[test]
+    fn host_keys_generated_key_is_ed25519() {
+        let hk = HostKeys::generate().unwrap();
+        assert!(
+            hk.public_key.starts_with("ssh-ed25519 "),
+            "generated host key should be ed25519"
         );
     }
 }
