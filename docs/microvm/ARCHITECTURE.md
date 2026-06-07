@@ -37,7 +37,7 @@
 
 ### 1. Runner binary (`dirge-microvm-runner`)
 
-A small (~200 line) binary in `src/bin/dirge-microvm-runner.rs`. It:
+A small binary (109 lines) in `src/bin/dirge-microvm-runner.rs`. It:
 
 1. Receives a JSON config on argv[1] with `rootfs_path`, `workspace_path`,
    `ssh_port`, `cpus`, `memory_mib`
@@ -75,6 +75,9 @@ Managed by `src/sandbox/microvm/rootfs.rs`. Two sourcing modes:
 - Extraction uses the same `gzip | tar` pipeline
 
 **Caching:**
+- First pull extracts into a staging directory, then atomically renames it
+  to `base/` — a partial pull can't leave a broken cache for the next session.
+- An advisory lock file (`.lock`) serializes pulls across concurrent sessions.
 - The extracted rootfs is cached at `<cache_dir>/<image_safe>/base/`
 - On subsequent boots, `cp_r()` clones the cache with `copy_file_range`
   (CoW reflinks on btrfs/xfs, full copy on ext4)
@@ -104,9 +107,17 @@ build are removed during injection.
 to:
 1. Open a TCP connection to `127.0.0.1:<port>`
 2. Perform SSH handshake
-3. Authenticate with the ephemeral private key as user `sandbox`
-4. Open a session channel, execute `cd /workspace && <command>`
-5. Read stdout and stderr separately, return exit code
+3. Verify the server's host key against the ed25519 key injected into the
+   rootfs before boot (prevents local port-hijack MITM)
+4. Authenticate with the ephemeral private key as user `sandbox`
+5. Open a session channel, execute `cd /workspace && timeout <N> <command>`
+6. Read stdout and stderr separately, return exit code
+
+Two layers of timeout protect against hung commands:
+- **Guest-side**: `timeout N` prepended to the command, so the guest kernel
+  kills the process if it exceeds the budget.
+- **Host-side**: `tokio::time::timeout` wraps the whole SSH call, catching
+  cases where SSH itself hangs (e.g. network stall).
 
 **`wait_for_ssh()`** — polls TCP connect with a timeout. Used after spawning
 the runner to ensure sshd is ready before the first exec.
@@ -138,22 +149,18 @@ in the mirrored directory.
 - Symlinks, hardlinks, and special files may behave differently inside
   the VM.
 
-### 5. The bash tool backend
+### 5. Command execution flow
 
-`src/sandbox/backend.rs` defines the `SandboxBackend` trait. The
-`MicrovmBackend` implementation:
+The `Sandbox::exec` method in `src/sandbox/mod.rs` dispatches based on mode.
+For Microvm mode it:
 
-```rust
-async fn exec(&self, command: &str, timeout_secs: u64) -> Result<InterleavedOutput, ToolError> {
-    // Lock the VM, start it if not running, get SSH port + key
-    // Drop the lock before the blocking SSH call
-    // Run ssh_exec on a spawn_blocking thread
-}
-```
-
-The VM starts lazily — the first bash call triggers `start()`. Subsequent
-calls reuse the running VM. The VM is stopped when dirge exits (Drop impl
-kills the runner child process).
+1. Acquires a lock on the VM, starts it if not already running (lazy boot)
+2. Releases the lock before the blocking SSH call so the TUI event loop
+   stays responsive during command execution
+3. Wraps the command with `cd /workspace && timeout <N>` and passes the
+   expected host key for verification
+4. Runs `ssh_exec` on a `spawn_blocking` thread, wrapped in
+   `tokio::time::timeout` for a second layer of timeout protection
 
 ### 6. PTY relay (interactive attach)
 
@@ -189,8 +196,8 @@ dirge start
        └─ MicrovmSandbox::new(config)   # just stores config, no VM yet
 
 first bash call
-  └─ MicrovmBackend::exec("ls")
-       └─ guard.start().await
+  └─ Sandbox::exec("ls", timeout_secs)
+       └─ mv.start().await
             ├─ rootfs::prepare(image, cache_dir)
             │    ├─ if local://: buildah push → OCI archive → extract
             │    └─ else: oci::pull → extract
@@ -201,11 +208,11 @@ first bash call
             ├─ spawn dirge-microvm-runner
             ├─ renice +19 runner
             └─ wait_for_ssh(port, 30s)
-       └─ ssh_exec("127.0.0.1", port, key, "cd /workspace && ls")
+       └─ ssh_exec("127.0.0.1", port, key, "cd /workspace && timeout 60 ls", host_key_bytes)
 
 subsequent bash calls
-  └─ MicrovmBackend::exec("cargo build")
-       └─ ssh_exec(...)  # VM already running, SSH port cached
+  └─ Sandbox::exec("cargo build", timeout_secs)
+       └─ ssh_exec(...)  # VM already running, SSH port cached, host key verified each time
 
 /sandbox attach
   └─ cmd_sandbox_attach()

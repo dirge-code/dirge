@@ -140,10 +140,13 @@ trust the image publisher for everything else:
   (which only proves the image hasn't changed since publication — not
   that it's safe).
 
-- **Layer content:** Whiteout files (`.wh.<name>`, `.wh..wh..opq`) are
-  processed correctly, but we don't validate that layer contents are
-  sensible. A malicious layer could, for example, replace `/etc/passwd`
-  or add an `authorized_keys` file with a known key.
+- **Layer content:** Before extraction, each blob is streamed through a
+  running byte counter that aborts if the total exceeds the 2 GiB cap —
+  this includes chunked-encoded responses where `Content-Length` isn't
+  available. Whiteout files (`.wh.<name>`, `.wh..wh..opq`) are processed
+  correctly, but we don't validate that layer contents are sensible. A
+  malicious layer could, for example, replace `/etc/passwd` or add an
+  `authorized_keys` file with a known key.
 
 - **Registry integrity:** The image is fetched over HTTPS and the
   manifest digest is verified against the configured image reference.

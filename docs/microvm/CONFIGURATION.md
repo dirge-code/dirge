@@ -169,15 +169,19 @@ Layout:
 ```
 ~/.cache/dirge/microvm/
 ├── local_docker.io_library_debian_bookworm-20250224-slim/
-│   ├── base/              ← extracted rootfs (shared, read-only template)
-│   └── session-12345/     ← per-session clone (deleted on exit)
+│   ├── .lock                ← advisory lock (serializes concurrent pulls)
+│   ├── .staging/            ← new rootfs extracted here, then atomically renamed to base/
+│   ├── base/                ← extracted rootfs (shared, read-only template)
+│   └── session-12345/       ← per-session clone (deleted on exit)
 ├── local_dirge-microvm_alpine/
+│   ├── .lock
+│   ├── .staging/
 │   ├── base/
 │   └── session-12346/
-├── blobs/                  ← OCI layer cache (for remote images)
+├── blobs/                   ← OCI layer cache (for remote images)
 │   └── sha256/
 │       └── abcd1234...
-└── snapshots/              ← saved VM states
+└── snapshots/               ← saved VM states
     └── before-risky-change/
 ```
 
