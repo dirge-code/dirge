@@ -106,8 +106,12 @@ impl HostKeys {
             anyhow::bail!("host public key algorithm is not ssh-ed25519");
         }
         let key_offset = 4 + algo_len;
-        let key_len =
-            u32::from_be_bytes([decoded[key_offset], decoded[key_offset + 1], decoded[key_offset + 2], decoded[key_offset + 3]]) as usize;
+        let key_len = u32::from_be_bytes([
+            decoded[key_offset],
+            decoded[key_offset + 1],
+            decoded[key_offset + 2],
+            decoded[key_offset + 3],
+        ]) as usize;
         if key_offset + 4 + key_len > decoded.len() || key_len != 32 {
             anyhow::bail!("host public key has unexpected ed25519 key length");
         }
@@ -218,7 +222,8 @@ fn extract_ed25519_raw_key(key_data: &[u8]) -> anyhow::Result<Vec<u8>> {
     if key_data.len() < 19 {
         anyhow::bail!("host key data too short for ed25519 wire format");
     }
-    let algo_len = u32::from_be_bytes([key_data[0], key_data[1], key_data[2], key_data[3]]) as usize;
+    let algo_len =
+        u32::from_be_bytes([key_data[0], key_data[1], key_data[2], key_data[3]]) as usize;
     if 4 + algo_len > key_data.len() || &key_data[4..4 + algo_len] != b"ssh-ed25519" {
         anyhow::bail!("host key algorithm is not ssh-ed25519");
     }

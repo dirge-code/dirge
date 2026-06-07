@@ -119,9 +119,7 @@ mod tests {
         );
         // Should contain recognizable error text.
         assert!(
-            stderr.contains("rror")
-                || stderr.contains("sage")
-                || stderr.contains("thread"),
+            stderr.contains("rror") || stderr.contains("sage") || stderr.contains("thread"),
             "runner stderr should contain diagnostic text, got: {stderr}"
         );
     }

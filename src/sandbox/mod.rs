@@ -4,11 +4,11 @@ use regex::Regex;
 use tokio::process::Command;
 
 #[cfg(feature = "sandbox-microvm")]
-use std::time::Duration;
-#[cfg(feature = "sandbox-microvm")]
 use crate::sandbox::microvm::{MicrovmConfig, MicrovmSandbox};
 #[cfg(feature = "sandbox-microvm")]
 use std::sync::Arc;
+#[cfg(feature = "sandbox-microvm")]
+use std::time::Duration;
 #[cfg(feature = "sandbox-microvm")]
 use tokio::sync::Mutex;
 
@@ -171,11 +171,7 @@ impl Sandbox {
         }
         let keys = mv.keys.as_ref()?;
         let key_path = keys.private_key_path.clone();
-        let host_public_key = mv
-            .host_keys
-            .as_ref()?
-            .public_key
-            .clone();
+        let host_public_key = mv.host_keys.as_ref()?.public_key.clone();
         Some((mv.ssh_port(), key_path, host_public_key))
     }
 
@@ -408,10 +404,7 @@ impl Sandbox {
                 // guest kernel kills the process if it exceeds the budget.
                 // tokio::time::timeout is a second layer in case SSH itself
                 // hangs (e.g. network stall).
-                let command = format!(
-                    "cd /workspace && timeout {} {}",
-                    timeout_secs, command
-                );
+                let command = format!("cd /workspace && timeout {} {}", timeout_secs, command);
                 let result = tokio::time::timeout(
                     Duration::from_secs(timeout_secs),
                     tokio::task::spawn_blocking(move || {

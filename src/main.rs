@@ -1019,7 +1019,9 @@ async fn main() -> anyhow::Result<()> {
             eprintln!("warning: failed to set microvm image: {e}");
         }
     }
-    if let Err(e) = sandbox.set_microvm_resources(cfg.resolve_microvm_cpus(), cfg.resolve_microvm_memory_mib()) {
+    if let Err(e) =
+        sandbox.set_microvm_resources(cfg.resolve_microvm_cpus(), cfg.resolve_microvm_memory_mib())
+    {
         eprintln!("warning: failed to set microvm resources: {e}");
     }
     #[cfg(feature = "sandbox-microvm")]

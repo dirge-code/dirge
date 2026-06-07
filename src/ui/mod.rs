@@ -509,7 +509,7 @@ pub async fn run_interactive(
     // rather than ~85 ad-hoc inline paint sites.
     macro_rules! render_frame {
         () => {{
-                let status = with_queue(
+            let status = with_queue(
                 StatusLine::render(
                     session,
                     ui.is_running,

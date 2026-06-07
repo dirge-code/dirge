@@ -74,7 +74,8 @@ async fn cmd_sandbox_attach(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
 
     // Write a temporary known_hosts file with the expected host key
     // so we can verify it instead of blindly trusting (StrictHostKeyChecking=no).
-    let known_hosts_dir = std::env::temp_dir().join(format!("dirge-known-hosts-{}", uuid::Uuid::new_v4()));
+    let known_hosts_dir =
+        std::env::temp_dir().join(format!("dirge-known-hosts-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir(&known_hosts_dir)
         .map_err(|e| anyhow::anyhow!("failed to create temp dir for known_hosts: {e}"))?;
     let known_hosts_path = known_hosts_dir.join("known_hosts");

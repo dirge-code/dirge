@@ -1722,7 +1722,8 @@ mod tests {
 
         let sb = Sandbox::new(SandboxMode::Microvm);
         // Override the default image to use the local test image.
-        sb.set_microvm_image("local://dirge-microvm:alpine".to_string()).ok();
+        sb.set_microvm_image("local://dirge-microvm:alpine".to_string())
+            .ok();
         // Set minimal resources for fast boot.
         sb.set_microvm_resources(1, 256).ok();
 

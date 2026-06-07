@@ -504,10 +504,7 @@ fn validate_tar_entries(bytes: &[u8]) -> anyhow::Result<()> {
 }
 
 fn contains_dotdot(path: &str) -> bool {
-    path == ".."
-        || path.starts_with("../")
-        || path.contains("/../")
-        || path.ends_with("/..")
+    path == ".." || path.starts_with("../") || path.contains("/../") || path.ends_with("/..")
 }
 
 /// Walk `dest` and process OCI whiteout files:
@@ -999,8 +996,14 @@ mod tests {
 
         process_whiteouts(&dir).unwrap();
 
-        assert!(!dir.join("keep.me").exists(), "opaque dir should clear siblings");
-        assert!(!dir.join(".wh..wh..opq").exists(), "opaque marker should be removed");
+        assert!(
+            !dir.join("keep.me").exists(),
+            "opaque dir should clear siblings"
+        );
+        assert!(
+            !dir.join(".wh..wh..opq").exists(),
+            "opaque marker should be removed"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1029,10 +1032,8 @@ mod tests {
 
     #[tokio::test]
     async fn stream_blob_with_cap_below_limit() {
-        let chunks: Vec<Result<Vec<u8>, std::io::Error>> = vec![
-            Ok(b"hello ".to_vec()),
-            Ok(b"world".to_vec()),
-        ];
+        let chunks: Vec<Result<Vec<u8>, std::io::Error>> =
+            vec![Ok(b"hello ".to_vec()), Ok(b"world".to_vec())];
         let stream = futures::stream::iter(chunks);
         let result = stream_blob_with_cap(stream, "sha256:test", 100)
             .await
@@ -1068,11 +1069,8 @@ mod tests {
     #[tokio::test]
     async fn stream_blob_with_cap_exceeds_limit_across_chunks() {
         // Cap is 5, three 2-byte chunks exceed after the third
-        let chunks: Vec<Result<Vec<u8>, std::io::Error>> = vec![
-            Ok(b"ab".to_vec()),
-            Ok(b"cd".to_vec()),
-            Ok(b"ef".to_vec()),
-        ];
+        let chunks: Vec<Result<Vec<u8>, std::io::Error>> =
+            vec![Ok(b"ab".to_vec()), Ok(b"cd".to_vec()), Ok(b"ef".to_vec())];
         let stream = futures::stream::iter(chunks);
         let err = stream_blob_with_cap(stream, "sha256:big", 5)
             .await
@@ -1085,8 +1083,7 @@ mod tests {
 
     #[tokio::test]
     async fn stream_blob_with_cap_exactly_at_limit() {
-        let chunks: Vec<Result<Vec<u8>, std::io::Error>> =
-            vec![Ok(b"12345".to_vec())];
+        let chunks: Vec<Result<Vec<u8>, std::io::Error>> = vec![Ok(b"12345".to_vec())];
         let stream = futures::stream::iter(chunks);
         let result = stream_blob_with_cap(stream, "sha256:exact", 5)
             .await
@@ -1098,7 +1095,10 @@ mod tests {
     async fn stream_blob_with_cap_propagates_error() {
         let chunks: Vec<Result<Vec<u8>, std::io::Error>> = vec![
             Ok(b"first ".to_vec()),
-            Err(std::io::Error::new(std::io::ErrorKind::Other, "connection lost")),
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "connection lost",
+            )),
         ];
         let stream = futures::stream::iter(chunks);
         let err = stream_blob_with_cap(stream, "sha256:test", 100)
