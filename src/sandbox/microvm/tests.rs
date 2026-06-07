@@ -8,6 +8,7 @@
 #[cfg(feature = "sandbox-microvm")]
 mod tests {
     use super::super::*;
+    use crate::sandbox::{Sandbox, SandboxMode};
 
     /// Serialize VM-booting tests — only one microVM can run at a time
     /// on the host. Parallel VM boots cause SSH handshake timeouts and
@@ -1696,6 +1697,55 @@ mod tests {
         );
 
         sandbox.stop().ok();
+        let _ = std::fs::remove_dir_all(&cache);
+    }
+
+    /// Verify that a long-running command (`sleep 300`) is killed by
+    /// the dual-layer timeout (guest-side `timeout N` prefix +
+    /// host-side `tokio::time::timeout` around `spawn_blocking`).
+    #[tokio::test]
+    async fn timeout_kills_long_running_command() {
+        if !vm_available() {
+            eprintln!("skipping: /dev/kvm not available");
+            return;
+        }
+        let _guard = serial_vm_test();
+
+        let cache = std::env::temp_dir().join(format!(
+            "dirge-test-timeout-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&cache);
+
+        let sb = Sandbox::new(SandboxMode::Microvm);
+        // Override the default image to use the local test image.
+        sb.set_microvm_image("local://dirge-microvm:alpine".to_string()).ok();
+        // Set minimal resources for fast boot.
+        sb.set_microvm_resources(1, 256).ok();
+
+        let start = std::time::Instant::now();
+        let result = sb.exec("sleep 300", 2).await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            result.is_err(),
+            "sleep 300 with 2s timeout should fail, got: {result:?}"
+        );
+        let msg = format!("{:?}", result);
+        assert!(
+            msg.contains("timed out after 2s"),
+            "expected 'timed out after 2s' in error: {msg}"
+        );
+        // Must return within 10s — if we waited the full 300s this
+        // test would hang the suite.
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "timeout took too long: {elapsed:?}"
+        );
+
         let _ = std::fs::remove_dir_all(&cache);
     }
 }

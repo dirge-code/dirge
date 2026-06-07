@@ -209,6 +209,35 @@ pub fn wait_for_ssh(host: &str, port: u16, timeout: Duration) -> anyhow::Result<
     }
 }
 
+/// Extract the raw 32-byte ed25519 key from the SSH wire-format blob
+/// returned by [`ssh2::Session::host_key`].
+///
+/// Wire format is `[u32 algo_len][algo_name][u32 key_len][raw_key]`,
+/// which for ed25519 is 4 + 11 + 4 + 32 = 51 bytes.
+fn extract_ed25519_raw_key(key_data: &[u8]) -> anyhow::Result<Vec<u8>> {
+    if key_data.len() < 19 {
+        anyhow::bail!("host key data too short for ed25519 wire format");
+    }
+    let algo_len = u32::from_be_bytes([key_data[0], key_data[1], key_data[2], key_data[3]]) as usize;
+    if 4 + algo_len > key_data.len() || &key_data[4..4 + algo_len] != b"ssh-ed25519" {
+        anyhow::bail!("host key algorithm is not ssh-ed25519");
+    }
+    let key_offset = 4 + algo_len;
+    if key_offset + 4 > key_data.len() {
+        anyhow::bail!("host key data too short for key length field");
+    }
+    let key_len = u32::from_be_bytes([
+        key_data[key_offset],
+        key_data[key_offset + 1],
+        key_data[key_offset + 2],
+        key_data[key_offset + 3],
+    ]) as usize;
+    if key_offset + 4 + key_len > key_data.len() || key_len != 32 {
+        anyhow::bail!("host key has unexpected ed25519 key length");
+    }
+    Ok(key_data[key_offset + 4..key_offset + 4 + key_len].to_vec())
+}
+
 /// Execute a command via SSH and return (stdout, stderr, exit_code).
 ///
 /// `host_key_bytes` is the raw 32-byte ed25519 public key expected from
@@ -233,14 +262,22 @@ pub fn ssh_exec(
         .map_err(|e| anyhow::anyhow!("SSH handshake failed: {e}"))?;
 
     // Verify the server's host key against the expected ed25519 key.
-    if let Some(expected) = host_key_bytes {
+    if let Some(expected_raw) = host_key_bytes {
         let (key_data, key_type) = session
             .host_key()
             .ok_or_else(|| anyhow::anyhow!("SSH server did not present a host key"))?;
-        if !matches!(key_type, ssh2::HostKeyType::Ed25519) || key_data != expected {
+        if !matches!(key_type, ssh2::HostKeyType::Ed25519) {
+            anyhow::bail!("host key type mismatch: expected ed25519, got {key_type:?}");
+        }
+        // session.host_key() returns the SSH wire-format blob:
+        //   [u32 algo_len][algo_name][u32 key_len][raw_key]
+        // For ed25519: 4 + 11 + 4 + 32 = 51 bytes.
+        // Extract just the raw key bytes for comparison.
+        let key_data_raw = extract_ed25519_raw_key(key_data)?;
+        if key_data_raw != expected_raw {
             anyhow::bail!(
                 "host key mismatch: expected ed25519 key from our injected host keys, \
-                 got {key_type:?} with {} bytes",
+                 got different key data ({} bytes)",
                 key_data.len()
             );
         }
@@ -410,5 +447,62 @@ mod tests {
             hk.public_key.starts_with("ssh-ed25519 "),
             "generated host key should be ed25519"
         );
+    }
+
+    #[test]
+    fn extract_ed25519_raw_key_from_wire_format() {
+        let hk = HostKeys::generate().unwrap();
+        let raw = hk.public_key_bytes().unwrap();
+        assert_eq!(raw.len(), 32);
+
+        // Construct the SSH wire-format blob as returned by session.host_key():
+        // [u32 algo_len][algo_name][u32 key_len][raw_key]
+        let algo = b"ssh-ed25519";
+        let algo_len = algo.len() as u32;
+        let key_len = raw.len() as u32;
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&algo_len.to_be_bytes());
+        wire.extend_from_slice(algo);
+        wire.extend_from_slice(&key_len.to_be_bytes());
+        wire.extend_from_slice(&raw);
+
+        assert_eq!(wire.len(), 4 + 11 + 4 + 32);
+
+        let extracted = extract_ed25519_raw_key(&wire).unwrap();
+        assert_eq!(extracted, raw);
+    }
+
+    #[test]
+    fn extract_ed25519_raw_key_rejects_wrong_algo() {
+        // Wire format with "ssh-rsa" algo
+        let algo = b"ssh-rsa";
+        let algo_len = algo.len() as u32;
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&algo_len.to_be_bytes());
+        wire.extend_from_slice(algo);
+        wire.extend_from_slice(&32u32.to_be_bytes());
+        wire.extend_from_slice(&[0u8; 32]);
+        let err = extract_ed25519_raw_key(&wire).unwrap_err().to_string();
+        assert!(err.contains("not ssh-ed25519"));
+    }
+
+    #[test]
+    fn extract_ed25519_raw_key_rejects_wrong_key_len() {
+        // Wire format with key_len=64 for ed25519
+        let algo = b"ssh-ed25519";
+        let algo_len = algo.len() as u32;
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&algo_len.to_be_bytes());
+        wire.extend_from_slice(algo);
+        wire.extend_from_slice(&64u32.to_be_bytes());
+        wire.extend_from_slice(&[0u8; 64]);
+        let err = extract_ed25519_raw_key(&wire).unwrap_err().to_string();
+        assert!(err.contains("unexpected ed25519 key length"));
+    }
+
+    #[test]
+    fn extract_ed25519_raw_key_rejects_too_short() {
+        let err = extract_ed25519_raw_key(&[0u8; 5]).unwrap_err().to_string();
+        assert!(err.contains("too short"));
     }
 }

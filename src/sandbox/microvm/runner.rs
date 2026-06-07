@@ -92,4 +92,37 @@ mod tests {
             "expected 'not found' error, got: {err}"
         );
     }
+
+    #[test]
+    fn runner_stderr_captured_on_crash() {
+        let binary = match find_runner_binary() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping: runner binary not found: {e}");
+                return;
+            }
+        };
+        // Pass garbage JSON that will fail at the first expect().
+        use std::process::Stdio;
+        let output = std::process::Command::new(&binary)
+            .arg("not-valid-json")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("spawn runner");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // Verify stderr is non-empty. Before the Phase 3.1 fix,
+        // Stdio::null() would have made this always empty.
+        assert!(
+            !stderr.is_empty(),
+            "runner stderr should contain crash diagnostics"
+        );
+        // Should contain recognizable error text.
+        assert!(
+            stderr.contains("rror")
+                || stderr.contains("sage")
+                || stderr.contains("thread"),
+            "runner stderr should contain diagnostic text, got: {stderr}"
+        );
+    }
 }
