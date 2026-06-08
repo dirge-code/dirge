@@ -873,6 +873,19 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
+        // Register plugin commands for tab completion.
+        #[cfg(feature = "experimental-ui-tab-slash")]
+        {
+            let cmds: Vec<String> = {
+                let mut mgr = pm_arc.lock_ignore_poison();
+                mgr.list_commands()
+                    .into_iter()
+                    .map(|(name, _)| name)
+                    .collect()
+            };
+            crate::ui::slash::register_plugin_commands(cmds);
+        }
+
         // After all plugins have loaded, harvest the providers each
         // registered via `harness/register-provider` and install them
         // into the global provider resolver. Config-declared

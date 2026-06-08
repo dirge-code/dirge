@@ -10,7 +10,6 @@
 
 use tokio::sync::mpsc;
 
-use super::SlashCtx;
 use crate::agent::plan::runtime::{
     ActivePlan, PlanKickoff, PlanPhaseEvent, PlanPhaseHandle, collect_runner_text,
 };
@@ -18,6 +17,7 @@ use crate::agent::plan::workflow::{READONLY_PHASE_TOOLS, explore_prompt, plan_pr
 use crate::provider::AnyAgent;
 use crate::ui::avatar::AvatarState;
 use crate::ui::colors::c_error;
+use crate::ui::slash::SlashCtx;
 
 /// Switch the bottom bar into the busy presentation and repaint.
 ///
@@ -50,7 +50,7 @@ fn set_busy(ctx: &mut SlashCtx<'_>, busy: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub(super) async fn cmd_plan(
+pub(crate) async fn cmd_plan(
     ctx: &mut SlashCtx<'_>,
     parts: &[&str],
     _text: &str,

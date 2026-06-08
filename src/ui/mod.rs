@@ -28,7 +28,7 @@ mod run_handlers;
 mod search_rewind;
 mod selection;
 mod shell_exec;
-mod slash;
+pub(crate) mod slash;
 mod state;
 mod status;
 #[cfg(feature = "plugin")]

@@ -5,10 +5,10 @@
 //! event loop in `ui/mod.rs` parses — preserve those return paths
 //! exactly.
 
-use super::{SlashCtx, c_agent, c_error};
 use crate::ui::events::render_session;
+use crate::ui::slash::{SlashCtx, c_agent, c_error};
 
-pub(super) async fn cmd_worktree(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyhow::Result<()> {
+pub(crate) async fn cmd_worktree(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyhow::Result<()> {
     if parts.len() < 2 {
         ctx.renderer
             .write_line("usage: /worktree <name>", c_error())?;
@@ -91,7 +91,7 @@ pub(super) async fn cmd_worktree(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyh
     Ok(())
 }
 
-pub(super) async fn cmd_wt_merge(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyhow::Result<()> {
+pub(crate) async fn cmd_wt_merge(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyhow::Result<()> {
     let info = match crate::extras::git_worktree::detect() {
         Some(i) => i,
         None => {
@@ -134,7 +134,7 @@ pub(super) async fn cmd_wt_merge(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyh
     ))
 }
 
-pub(super) async fn cmd_wt_exit(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyhow::Result<()> {
+pub(crate) async fn cmd_wt_exit(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyhow::Result<()> {
     let info = match crate::extras::git_worktree::detect() {
         Some(i) => i,
         None => {

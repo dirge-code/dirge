@@ -2,6 +2,7 @@ use compact_str::CompactString;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::ui::picker::FilePicker;
+#[cfg(feature = "experimental-ui-tab-slash")]
 use crate::ui::slash::CompletionResult;
 #[cfg(feature = "experimental-ui-tab-slash")]
 use crate::ui::slash::try_complete;
@@ -232,6 +233,7 @@ pub struct InputEditor {
     /// existing indices remain valid).
     pastes: Vec<Option<CompactString>>,
     /// Current slash-command completion state, for rendering a preview.
+    #[cfg(feature = "experimental-ui-tab-slash")]
     pub completion: Option<CompletionResult>,
     /// Display width the buffer is soft-wrapped to in the box, pushed in
     /// from the renderer before each key dispatch. `0` = unknown (e.g.
@@ -396,6 +398,7 @@ impl InputEditor {
             last_action_was_kill: false,
             yank_state: None,
             pastes: Vec::new(),
+            #[cfg(feature = "experimental-ui-tab-slash")]
             completion: None,
             wrap_w: 0,
             search_mode: false,
@@ -656,7 +659,10 @@ impl InputEditor {
     fn reset_kill_accumulation(&mut self) {
         self.last_action_was_kill = false;
         self.yank_state = None;
-        self.completion = None;
+        #[cfg(feature = "experimental-ui-tab-slash")]
+        {
+            self.completion = None;
+        }
     }
 
     fn push_kill(&mut self, text: CompactString, direction: KillDir) {
@@ -1122,13 +1128,16 @@ impl InputEditor {
                 // At end-of-line with a slash-command ghost completion
                 // showing, Right accepts it (fills in the suffix) instead
                 // of just moving the cursor.
-                if self.cursor == self.buffer.len()
-                    && let Some(suffix) = crate::ui::slash::ghost_suffix(self.buffer.as_str())
+                #[cfg(feature = "experimental-ui-tab-slash")]
                 {
-                    self.buffer.push_str(&suffix);
-                    self.cursor = self.buffer.len();
-                    self.reset_kill_accumulation();
-                    return None;
+                    if self.cursor == self.buffer.len()
+                        && let Some(suffix) = crate::ui::slash::ghost_suffix(self.buffer.as_str())
+                    {
+                        self.buffer.push_str(&suffix);
+                        self.cursor = self.buffer.len();
+                        self.reset_kill_accumulation();
+                        return None;
+                    }
                 }
                 if self.cursor < self.buffer.len() {
                     self.cursor = next_pos(&self.buffer, self.cursor);

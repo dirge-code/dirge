@@ -20,16 +20,15 @@ use crate::ui::input::InputEditor;
 use crate::ui::renderer::Renderer;
 use crate::ui::theme;
 
-#[cfg(feature = "dap")]
-mod cmd_debug;
-mod cmd_misc;
-mod cmd_model;
-mod cmd_plan;
-#[cfg(unix)]
-mod cmd_sandbox;
-mod cmd_session;
-#[cfg(feature = "git-worktree")]
-mod cmd_worktree;
+mod cmd;
+#[cfg(feature = "experimental-ui-tab-slash")]
+mod completion;
+
+#[cfg(feature = "experimental-ui-tab-slash")]
+pub use completion::{
+    CompletionResult, format_completion_preview, ghost_suffix, register_plugin_commands,
+    try_complete,
+};
 
 #[inline]
 pub(super) fn c_agent() -> Color {
@@ -383,24 +382,6 @@ fn split_command_parts(text: &str) -> SmallVec<[&str; 3]> {
     text.split_whitespace().collect()
 }
 
-/// The "ghost" autocomplete suffix for an in-progress slash command, or
-/// `None`. As the user types `/dis`, this returns `play` (for `/display`)
-/// to be shown inline in dark gray and accepted with the Right arrow.
-///
-/// Only fires for a single slash token (a leading `/`, at least one more
-/// char, no whitespace yet) that is a strict prefix of some command. The
-/// first match in the (sorted) registry wins, mirroring shell-style ghost
-/// completion.
-pub fn ghost_suffix(input: &str) -> Option<String> {
-    if !input.starts_with('/') || input.len() < 2 || input.contains(char::is_whitespace) {
-        return None;
-    }
-    slash_command_names()
-        .into_iter()
-        .find(|c| c.len() > input.len() && c.starts_with(input))
-        .map(|c| c[input.len()..].to_string())
-}
-
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_slash(
     text: &str,
@@ -470,13 +451,13 @@ pub async fn handle_slash(
         plan_phase,
     };
     match parts[0] {
-        "/model" => cmd_model::cmd_model(&mut ctx, &parts).await?,
-        "/sessions" => cmd_session::cmd_sessions(&mut ctx, &parts).await?,
-        "/reasoning" => cmd_model::cmd_reasoning(&mut ctx).await?,
-        "/mode" => cmd_model::cmd_mode(&mut ctx, &parts).await?,
+        "/model" => cmd::model::cmd_model(&mut ctx, &parts).await?,
+        "/sessions" => cmd::sessions::cmd_sessions(&mut ctx, &parts).await?,
+        "/reasoning" => cmd::model::cmd_reasoning(&mut ctx).await?,
+        "/mode" => cmd::mode::cmd_mode(&mut ctx, &parts).await?,
         #[cfg(feature = "mcp")]
-        "/mcp" => cmd_misc::cmd_mcp(&mut ctx, &parts).await?,
-        "/toggle" => cmd_model::cmd_toggle(&mut ctx, &parts).await?,
+        "/mcp" => cmd::mcp::cmd_mcp(&mut ctx, &parts).await?,
+        "/toggle" => cmd::toggle::cmd_toggle(&mut ctx, &parts).await?,
         "/compress" | "/compact" => {
             // Deferred via sentinel — the outer event loop in
             // `ui/mod.rs` parses the `DEFER_COMPRESS:` prefix and
@@ -490,37 +471,37 @@ pub async fn handle_slash(
             let instr_str = instructions.clone().unwrap_or_default();
             return Err(anyhow::anyhow!("DEFER_COMPRESS:{}", instr_str));
         }
-        "/loop" => cmd_misc::cmd_loop(&mut ctx, &parts, text).await?,
-        "/prompt" => cmd_model::cmd_prompt(&mut ctx, &parts).await?,
-        "/agent" | "/agents" => cmd_model::cmd_agent(&mut ctx, &parts).await?,
-        "/plan" => cmd_plan::cmd_plan(&mut ctx, &parts, text).await?,
+        "/loop" => cmd::loop_cmd::cmd_loop(&mut ctx, &parts, text).await?,
+        "/prompt" => cmd::prompt::cmd_prompt(&mut ctx, &parts).await?,
+        "/agent" | "/agents" => cmd::agent::cmd_agent(&mut ctx, &parts).await?,
+        "/plan" => cmd::plan::cmd_plan(&mut ctx, &parts, text).await?,
         #[cfg(feature = "git-worktree")]
-        "/worktree" => cmd_worktree::cmd_worktree(&mut ctx, &parts).await?,
+        "/worktree" => cmd::worktree::cmd_worktree(&mut ctx, &parts).await?,
         #[cfg(feature = "git-worktree")]
-        "/wt-merge" => return cmd_worktree::cmd_wt_merge(&mut ctx, &parts).await,
+        "/wt-merge" => return cmd::worktree::cmd_wt_merge(&mut ctx, &parts).await,
         #[cfg(feature = "git-worktree")]
-        "/wt-exit" => return cmd_worktree::cmd_wt_exit(&mut ctx, &parts).await,
-        "/regen-prompts" => cmd_model::cmd_regen_prompts(&mut ctx).await?,
-        "/quit" => return cmd_misc::cmd_quit(&mut ctx).await,
-        "/tasks" => cmd_session::cmd_tasks(&mut ctx).await?,
-        "/clear" => cmd_session::cmd_clear(&mut ctx).await?,
-        "/tree" => cmd_session::cmd_tree(&mut ctx, &parts).await?,
-        "/fork" => cmd_session::cmd_fork(&mut ctx, &parts).await?,
-        "/clone" => cmd_session::cmd_clone(&mut ctx, &parts).await?,
-        "/panel" => cmd_misc::cmd_panel(&mut ctx, &parts).await?,
-        "/display" => cmd_misc::cmd_display(&mut ctx, &parts).await?,
-        "/btw" => cmd_misc::cmd_btw(&mut ctx, &parts).await?,
-        "/cd" => cmd_misc::cmd_cd(&mut ctx, text).await?,
-        "/undo" => cmd_session::cmd_undo(&mut ctx).await?,
-        "/retry" => cmd_session::cmd_retry(&mut ctx).await?,
-        "/allow" => cmd_misc::cmd_allow(&mut ctx, &parts, text).await?,
-        "/why" => cmd_misc::cmd_why(&mut ctx, &parts).await?,
-        "/help" => cmd_misc::cmd_help(&mut ctx).await?,
-        "/kill" => cmd_misc::cmd_kill(&mut ctx, &parts).await?,
+        "/wt-exit" => return cmd::worktree::cmd_wt_exit(&mut ctx, &parts).await,
+        "/regen-prompts" => cmd::regen::cmd_regen_prompts(&mut ctx).await?,
+        "/quit" => return cmd::quit::cmd_quit(&mut ctx).await,
+        "/tasks" => cmd::tasks::cmd_tasks(&mut ctx).await?,
+        "/clear" => cmd::clear::cmd_clear(&mut ctx).await?,
+        "/tree" => cmd::tree::cmd_tree(&mut ctx, &parts).await?,
+        "/fork" => cmd::fork::cmd_fork(&mut ctx, &parts).await?,
+        "/clone" => cmd::clone::cmd_clone(&mut ctx, &parts).await?,
+        "/panel" => cmd::panel::cmd_panel(&mut ctx, &parts).await?,
+        "/display" => cmd::panel::cmd_display(&mut ctx, &parts).await?,
+        "/btw" => cmd::btw::cmd_btw(&mut ctx, &parts).await?,
+        "/cd" => cmd::cd::cmd_cd(&mut ctx, text).await?,
+        "/undo" => cmd::undo::cmd_undo(&mut ctx).await?,
+        "/retry" => cmd::retry::cmd_retry(&mut ctx).await?,
+        "/allow" => cmd::allow::cmd_allow(&mut ctx, &parts, text).await?,
+        "/why" => cmd::allow::why::cmd_why(&mut ctx, &parts).await?,
+        "/help" => cmd::help::cmd_help(&mut ctx).await?,
+        "/kill" => cmd::kill::cmd_kill(&mut ctx, &parts).await?,
         #[cfg(unix)]
-        "/sandbox" => cmd_sandbox::cmd_sandbox(&mut ctx, &parts).await?,
+        "/sandbox" => cmd::sandbox::cmd_sandbox(&mut ctx, &parts).await?,
         #[cfg(feature = "dap")]
-        "/debug" => cmd_debug::cmd_debug(&mut ctx, &parts).await?,
+        "/debug" => cmd::debug::cmd_debug(&mut ctx, &parts).await?,
         _ => {
             // If `slash_command_names()` advertised this command
             // but no match arm above caught it, the lists drifted
@@ -596,99 +577,9 @@ pub async fn handle_slash(
     Ok(())
 }
 
-/// Result of a slash-command tab completion.
-#[allow(dead_code)]
-pub struct CompletionResult {
-    pub new_buffer: String,
-    pub new_cursor: usize,
-    /// The full sorted command list and the index of the currently-selected
-    /// command, so the renderer can show a preview of upcoming items.
-    pub all_commands: Vec<&'static str>,
-    pub current_index: usize,
-}
-
-/// Try to complete the slash command at `cursor` in `buffer`.
-/// Returns `Some(CompletionResult)` if completion was possible.
-/// Tab cycles through matching commands; when narrowed to one match,
-/// subsequent tabs cycle through ALL commands so the user can keep browsing.
-#[cfg(feature = "experimental-ui-tab-slash")]
-pub fn try_complete(buffer: &str, cursor: usize) -> Option<CompletionResult> {
-    if !buffer.starts_with('/') {
-        return None;
-    }
-
-    let cursor = cursor.min(buffer.len());
-    // Find the bounds of the FIRST word in the buffer (the command
-    // name). Previously the replacement range was
-    // `[word_start..cursor]`, which corrupted the buffer when the
-    // cursor sat mid-word: e.g. Tab with cursor at byte 2 of `/mod`
-    // produced `/mcpod` (replacement appended to the tail after the
-    // cursor). Anchor the replacement to the whole word boundary
-    // instead — the cursor can land anywhere inside the command and
-    // the result is still well-formed.
-    let word_start = 0usize;
-    let word_end = buffer.find(char::is_whitespace).unwrap_or(buffer.len());
-    let current_word = &buffer[word_start..word_end];
-
-    // Only complete when the cursor is inside (or just after) the
-    // first word. Cursor past the first whitespace means the user is
-    // typing args, not a command name.
-    if cursor > word_end {
-        return None;
-    }
-
-    let all_commands = builtin_commands();
-    let matching: Vec<&str> = all_commands
-        .iter()
-        .filter(|c| c.starts_with(current_word))
-        .copied()
-        .collect();
-
-    if matching.is_empty() {
-        return None;
-    }
-
-    // Once the current word is an exact command name, cycle through ALL
-    // commands so the user can keep browsing.  Otherwise stay within the
-    // matching prefix subset (e.g. /mod → /mode, /model → repeats).
-    let is_exact = all_commands.contains(&current_word);
-
-    let (replacement, current_index) = if is_exact {
-        let all_idx = all_commands.iter().position(|c| *c == current_word);
-        let next_idx = match all_idx {
-            Some(i) => (i + 1) % all_commands.len(),
-            None => 0,
-        };
-        (all_commands[next_idx], next_idx)
-    } else {
-        let current_idx = matching.iter().position(|c| *c == current_word);
-        let next_idx = match current_idx {
-            Some(i) => (i + 1) % matching.len(),
-            None => 0,
-        };
-        let cmd = matching[next_idx];
-        let all_idx = all_commands.iter().position(|c| *c == cmd).unwrap_or(0);
-        (cmd, all_idx)
-    };
-    // Build the new buffer: prefix (everything before the word —
-    // always empty here since word_start==0) + replacement + tail
-    // (everything from word_end onward). Cursor lands at the end of
-    // the replacement so the user can immediately type args.
-    let mut new_buffer = String::with_capacity(replacement.len() + buffer.len() - word_end);
-    new_buffer.push_str(replacement);
-    new_buffer.push_str(&buffer[word_end..]);
-    let new_cursor = replacement.len();
-    Some(CompletionResult {
-        new_buffer,
-        new_cursor,
-        all_commands,
-        current_index,
-    })
-}
-
 /// Canonical list of built-in slash commands. **Single source of
 /// truth** consulted by:
-///   * `builtin_commands()`     — tab completion (feature-gated)
+///   * `all_commands()`        — tab completion (feature-gated)
 ///   * `is_known_slash_command` — handle_slash's "internal error"
 ///     vs "unknown command" branching in the default arm
 ///
@@ -763,46 +654,10 @@ pub fn is_known_slash_command(name: &str) -> bool {
     slash_command_names().contains(&name)
 }
 
-/// Returns all built-in slash commands (with leading `/`), sorted alphabetically.
-#[cfg(feature = "experimental-ui-tab-slash")]
-pub fn builtin_commands() -> Vec<&'static str> {
-    slash_command_names()
-}
-
-/// Format a completion preview string showing upcoming commands.
-/// Returns an empty string when `cr` is `None`. The result is shaped
-/// to fit within `avail_w` display cells (after the continuation
-/// prompt), showing as many upcoming command names as will fit.
-#[cfg(feature = "experimental-ui-tab-slash")]
-pub fn format_completion_preview(cr: Option<&CompletionResult>, avail_w: usize) -> String {
-    let cr = match cr {
-        Some(c) => c,
-        None => return String::new(),
-    };
-    if cr.all_commands.is_empty() || avail_w < 4 {
-        return String::new();
-    }
-    let all = &cr.all_commands;
-    let start = (cr.current_index + 1) % all.len();
-    let mut result = String::new();
-    for i in 0..all.len() {
-        let cmd = all[(start + i) % all.len()];
-        let candidate = if result.is_empty() {
-            cmd.to_string()
-        } else {
-            format!("{result}  {cmd}")
-        };
-        use unicode_width::UnicodeWidthStr;
-        if UnicodeWidthStr::width(candidate.as_str()) > avail_w {
-            break;
-        }
-        result = candidate;
-    }
-    result
-}
-
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "experimental-ui-tab-slash")]
+    use super::completion::all_commands;
     use super::*;
     use crate::session::{Session, SessionMessage};
 
@@ -975,7 +830,7 @@ mod tests {
             cur = r.new_cursor;
             seen.insert(buf.clone());
         }
-        let all = builtin_commands();
+        let all = all_commands();
         assert_eq!(
             seen.len(),
             all.len(),
@@ -992,7 +847,7 @@ mod tests {
     #[cfg(feature = "experimental-ui-tab-slash")]
     #[test]
     fn commands_are_sorted() {
-        let cmds = builtin_commands();
+        let cmds = all_commands();
         for pair in cmds.windows(2) {
             assert!(
                 pair[0] <= pair[1],
@@ -1035,12 +890,12 @@ mod tests {
         // exactly a candidate command — not the candidate +
         // residual `od` from the source.
         let r = try_complete("/mod", 2).unwrap();
-        let candidates = builtin_commands()
+        let candidates = all_commands()
             .into_iter()
             .filter(|c| c.starts_with("/mod"))
             .collect::<Vec<_>>();
         assert!(
-            candidates.contains(&r.new_buffer.as_str()),
+            candidates.contains(&r.new_buffer),
             "{:?} must be one of the /mod* commands {:?} — no Frankenstein concatenation",
             r.new_buffer,
             candidates,
@@ -1060,12 +915,12 @@ mod tests {
     #[test]
     fn complete_with_cursor_at_start_produces_clean_buffer() {
         let r = try_complete("/mod", 0).unwrap();
-        let candidates = builtin_commands()
+        let candidates = all_commands()
             .into_iter()
             .filter(|c| c.starts_with("/mod"))
             .collect::<Vec<_>>();
         assert!(
-            candidates.contains(&r.new_buffer.as_str()),
+            candidates.contains(&r.new_buffer),
             "{:?} must be a /mod* command (clean replacement, no /mod residual): candidates {:?}",
             r.new_buffer,
             candidates,
@@ -1090,9 +945,10 @@ mod tests {
     #[cfg(feature = "experimental-ui-tab-slash")]
     #[test]
     fn no_completion_when_cursor_in_args() {
-        // Cursor inside the args portion of "/mode standard".
-        let buf = "/mode standard";
-        let cursor = buf.len(); // past the space
+        // Cursor inside args of a command WITHOUT subcommand entries
+        // (e.g. /btw freeform text) — no completion should fire.
+        let buf = "/btw some arbitrary text";
+        let cursor = buf.len();
         assert!(try_complete(buf, cursor).is_none());
     }
 

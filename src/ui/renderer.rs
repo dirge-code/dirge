@@ -1696,11 +1696,18 @@ impl Renderer {
         // Inline ghost completion: only when the cursor is at the very end
         // of an in-progress slash command (so the ghost paints right after
         // the typed text and Right-to-accept is unambiguous).
-        self.cached_input_ghost = if cursor_byte == full.len() {
-            crate::ui::slash::ghost_suffix(full).unwrap_or_default()
-        } else {
-            String::new()
-        };
+        #[cfg(feature = "experimental-ui-tab-slash")]
+        {
+            self.cached_input_ghost = if cursor_byte == full.len() {
+                crate::ui::slash::ghost_suffix(full).unwrap_or_default()
+            } else {
+                String::new()
+            };
+        }
+        #[cfg(not(feature = "experimental-ui-tab-slash"))]
+        {
+            self.cached_input_ghost = String::new();
+        }
         self.cached_status = status.to_string();
         self.cached_is_running = is_running;
         self.input_rows = total_rows.clamp(1, MAX_INPUT_VISIBLE_LINES as u16);
