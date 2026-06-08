@@ -166,9 +166,15 @@ mod tests {
     fn find_git_root_in_this_repo() {
         let cwd = std::env::current_dir().unwrap();
         let root = find_git_root(&cwd);
+        let dot_git = root.join(".git");
+        let is_git = dot_git.is_dir()
+            || (dot_git.is_file()
+                && std::fs::read_to_string(&dot_git)
+                    .map(|c| c.starts_with("gitdir:"))
+                    .unwrap_or(false));
         assert!(
-            root.join(".git").is_dir(),
-            "expected {root:?} to contain .git/"
+            is_git,
+            "expected {root:?} to contain .git/ or a worktree .git file"
         );
     }
 
