@@ -292,17 +292,16 @@ pub fn try_complete(buffer: &str, cursor: usize) -> Option<CompletionResult> {
 
     // Re-resolve candidates for the potentially-composite parent.
     let candidates = sub_candidates(&parent_cmd, current_sub);
-    if candidates.is_empty() {
-        // Exact match? Try cycling all sub-entries for the parent.
+    if candidates.is_empty() || (candidates.len() == 1 && candidates[0] == current_sub) {
+        // Exact match or single match that equals current — cycle all
+        // sub-entries for the parent so the user can reach the next entry.
         let all_for_parent = sub_candidates(&parent_cmd, "");
         if all_for_parent.is_empty() {
             return None;
         }
-        // Build composite command index map for preview.
         return cycle_subcommand(buffer, sub_span, &all_for_parent, current_sub);
     }
 
-    // Build composite command index map for preview.
     cycle_subcommand(buffer, sub_span, &candidates, current_sub)
 }
 
@@ -497,6 +496,25 @@ mod tests {
         let r = try_complete("/mode ", 6).unwrap();
         assert!(r.new_buffer.starts_with("/mode "));
         assert!(r.new_buffer.len() > 6);
+    }
+
+    #[cfg(feature = "experimental-ui-tab-slash")]
+    #[test]
+    fn subcommand_cycles_past_first_match() {
+        // First tab from empty subcommand: picks first candidate.
+        let r1 = try_complete("/mode ", 6).unwrap();
+        assert_eq!(r1.new_buffer, "/mode standard");
+        // Second tab: should cycle to the next, not stay stuck on "standard".
+        let r2 = try_complete(&r1.new_buffer, r1.new_cursor).unwrap();
+        assert_eq!(r2.new_buffer, "/mode restrictive");
+        // Third tab: cycles further.
+        let r3 = try_complete(&r2.new_buffer, r2.new_cursor).unwrap();
+        assert_eq!(r3.new_buffer, "/mode accept");
+        // Wraps around.
+        let r4 = try_complete(&r3.new_buffer, r3.new_cursor).unwrap();
+        assert_eq!(r4.new_buffer, "/mode yolo");
+        let r5 = try_complete(&r4.new_buffer, r4.new_cursor).unwrap();
+        assert_eq!(r5.new_buffer, "/mode standard");
     }
 
     #[cfg(feature = "experimental-ui-tab-slash")]
