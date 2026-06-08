@@ -683,12 +683,14 @@ mod tests {
         assert_eq!(p[1..].join(" "), "keep the auth flow");
     }
 
+    #[cfg(feature = "experimental-ui-tab-slash")]
     #[test]
     fn ghost_suffix_completes_a_unique_prefix() {
         // `/display` is the only command with this prefix.
         assert_eq!(ghost_suffix("/disp").as_deref(), Some("lay"));
     }
 
+    #[cfg(feature = "experimental-ui-tab-slash")]
     #[test]
     fn ghost_suffix_returns_none_when_not_completable() {
         assert_eq!(ghost_suffix("/"), None); // too short / ambiguous
