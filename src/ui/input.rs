@@ -1715,6 +1715,7 @@ mod tests {
         assert!(e.history_draft.is_none());
     }
 
+    #[cfg(feature = "experimental-ui-tab-slash")]
     #[test]
     fn right_arrow_accepts_slash_ghost_completion() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};

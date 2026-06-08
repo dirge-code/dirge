@@ -288,6 +288,17 @@ cargo fmt --check && cargo clippy
 - [x] Feature-gated commands (`mcp`, `loop`, `dap`, `git-worktree`, `unix/sandbox`) still compile under the correct feature flags — verified with `cargo build --features experimental-ui-tab-slash,plugin,mcp,dap,git-worktree`
 - [ ] CI matrix (11 jobs) passes green — requires CI run
 
+### Final verification (8 Jun 2025)
+
+- `cargo build` — passes with zero warnings (all feature combos: plugin, mcp, dap, git-worktree)
+- `cargo test --features "experimental-ui-tab-slash,plugin"` — 59 passed, 0 failed (slash + completion + input tests)
+- `cargo fmt --check` — clean
+- `cargo clippy` — 3 pre-existing warnings in unrelated code, zero new warnings from our changes
+- All 6 old `cmd_*.rs` files deleted; 53 new files in `cmd/` created; `completion.rs` created
+- `mod.rs` match block delegates every command to `cmd::*` via one-line arms
+- `main.rs` calls `register_plugin_commands` after plugin init
+- `right_arrow_accepts_slash_ghost_completion` test now feature-gated (was missing `#[cfg(feature = "experimental-ui-tab-slash")]`)
+
 ### Acceptance test — manual
 
 1. `cargo run --features experimental-ui-tab-slash,plugin`
