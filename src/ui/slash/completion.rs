@@ -12,6 +12,8 @@
 
 use std::sync::Mutex;
 
+use crate::sync_util::LockExt;
+
 /// Plugin-registered command names (without leading `/`).
 /// Populated by `register_plugin_commands` after plugin init.
 static PLUGIN_COMMANDS: Mutex<Vec<String>> = Mutex::new(Vec::new());
@@ -19,9 +21,7 @@ static PLUGIN_COMMANDS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// Register plugin command names for tab completion.
 /// Called from `main.rs` after plugin init.
 pub fn register_plugin_commands(cmds: Vec<String>) {
-    if let Ok(mut guard) = PLUGIN_COMMANDS.lock() {
-        *guard = cmds;
-    }
+    *PLUGIN_COMMANDS.lock_ignore_poison() = cmds;
 }
 
 /// All completable slash commands: built-ins + plugin-registered.
@@ -32,12 +32,11 @@ pub fn all_commands() -> Vec<String> {
         .into_iter()
         .map(|s| s.to_string())
         .collect();
-    if let Ok(guard) = PLUGIN_COMMANDS.lock() {
-        for name in guard.iter() {
-            let with_slash = format!("/{}", name);
-            if !cmds.contains(&with_slash) {
-                cmds.push(with_slash);
-            }
+    let guard = PLUGIN_COMMANDS.lock_ignore_poison();
+    for name in guard.iter() {
+        let with_slash = format!("/{}", name);
+        if !cmds.contains(&with_slash) {
+            cmds.push(with_slash);
         }
     }
     cmds.sort();
@@ -144,6 +143,19 @@ static SUBCOMMAND_ENTRIES: &[(&str, &[&str])] = &[
     ("/btw", &[]),     // freeform
     ("/why", &[]),     // dynamic: tool name
 ];
+
+/// Build the parent command name for subcommand lookup.
+/// For token 1, this is just the command name (e.g. "/mode").
+/// For deeper tokens, it's the slice through the previous token's end
+/// (e.g. "/sandbox snapshot").
+fn parent_command(input: &str, spans: &[(usize, usize)], token_idx: usize) -> String {
+    if token_idx >= 2 {
+        let parent_end = spans[token_idx - 1].1;
+        input[0..parent_end].trim_end().to_string()
+    } else {
+        input[spans[0].0..spans[0].1].to_string()
+    }
+}
 
 /// Return subcommand candidates for a (command, prefix) pair.
 #[cfg(feature = "experimental-ui-tab-slash")]
@@ -271,12 +283,7 @@ pub fn try_complete(buffer: &str, cursor: usize) -> Option<CompletionResult> {
     // Determine which sub-token we're on: if token_idx is 1, the user
     // is typing the first subcommand. If token_idx > 1, we're deeper
     // and build the composite parent command (e.g. "/sandbox snapshot").
-    let parent_cmd = if token_idx >= 2 {
-        let parent_end = spans[token_idx - 1].1;
-        buffer[0..parent_end].trim_end().to_string()
-    } else {
-        command.to_string()
-    };
+    let parent_cmd = parent_command(buffer, &spans, token_idx);
 
     // If the cursor is past all tokens (empty next token, e.g. "/mode █"),
     // synthesize an empty span at the cursor position.
@@ -376,12 +383,7 @@ pub fn ghost_suffix(input: &str) -> Option<String> {
     let current_sub = &input[sub_span.0..sub_span.1];
 
     // Build parent command (may be composite like "/sandbox snapshot").
-    let parent_cmd = if token_idx >= 2 {
-        let parent_end = spans[token_idx - 1].1;
-        input[0..parent_end].trim_end().to_string()
-    } else {
-        command.to_string()
-    };
+    let parent_cmd = parent_command(input, &spans, token_idx);
 
     let candidates = sub_candidates(&parent_cmd, current_sub);
     if candidates.len() == 1 && candidates[0] != current_sub {

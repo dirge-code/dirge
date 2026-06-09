@@ -1,11 +1,14 @@
 //! /loop start <prompt> — start a loop.
 
-use crate::ui::slash::{SlashCtx, c_agent, c_error};
+#[cfg(feature = "loop")]
+use crate::ui::slash::c_error;
+use crate::ui::slash::{SlashCtx, c_agent};
 
 pub(crate) async fn cmd_loop_start(
     ctx: &mut SlashCtx<'_>,
     _parts: &[&str],
-    text: &str,
+    #[cfg(feature = "loop")] text: &str,
+    #[cfg(not(feature = "loop"))] _text: &str,
 ) -> anyhow::Result<()> {
     #[cfg(feature = "loop")]
     {
