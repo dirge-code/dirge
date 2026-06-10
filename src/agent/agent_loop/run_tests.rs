@@ -2422,3 +2422,115 @@ async fn finalization_all_gates_silent_yields_none() {
     assert!(msgs.is_empty());
     assert_eq!(source, FollowUpSource::None);
 }
+
+/// A tool that always fails. Distinct args per call so the storm
+/// breaker (which only suppresses *identical* repeats) lets every call
+/// through — the scenario the failure tracker exists to catch.
+#[derive(Debug)]
+struct FailingTool;
+impl LoopTool for FailingTool {
+    fn name(&self) -> &str {
+        "boom"
+    }
+    fn description(&self) -> &str {
+        "Always fails"
+    }
+    fn label(&self) -> &str {
+        "Boom"
+    }
+    fn parameters(&self) -> &Value {
+        static EMPTY: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+        EMPTY.get_or_init(|| serde_json::json!({"type": "object"}))
+    }
+    fn execute<'a>(
+        &'a self,
+        _id: &'a str,
+        _args: Value,
+        _signal: AbortSignal,
+        _on_update: LoopToolUpdate,
+    ) -> Pin<Box<dyn Future<Output = Result<super::super::LoopToolResult, String>> + Send + 'a>>
+    {
+        Box::pin(async move { Err("boom: nothing matched".to_string()) })
+    }
+}
+
+/// dirge-opdt: three consecutive *distinct* tool failures inject a
+/// recovery checkpoint into the conversation. Distinct args dodge the
+/// storm breaker, proving the failure tracker covers the gap storm
+/// leaves open.
+#[tokio::test]
+async fn consecutive_distinct_failures_inject_recovery_checkpoint() {
+    let mut ctx = empty_context();
+    ctx.tools.push(std::sync::Arc::new(FailingTool));
+
+    let factory = canned_factory(vec![
+        tool_use_response("c1", "boom", serde_json::json!({"n": 1})),
+        tool_use_response("c2", "boom", serde_json::json!({"n": 2})),
+        tool_use_response("c3", "boom", serde_json::json!({"n": 3})),
+        text_response("giving up"),
+    ]);
+
+    let (tx, _rx) = mpsc::channel::<LoopEvent>(256);
+    let messages = run_agent_loop(
+        vec![user("do the thing")],
+        ctx,
+        build_config(),
+        AbortSignal::new(),
+        &tx,
+        &factory,
+        None,
+        None,
+    )
+    .await;
+    drop(tx);
+
+    let checkpoint = messages.iter().find_map(|m| match m {
+        LoopMessage::User(u) if u.content.contains("[Recovery checkpoint]") => {
+            Some(u.content.clone())
+        }
+        _ => None,
+    });
+    let body =
+        checkpoint.expect("a recovery checkpoint must be injected after 3 distinct failures");
+    assert!(body.contains("3 tool calls in a row have failed"));
+    assert!(body.contains("boom: nothing matched"));
+    assert!(body.contains("DIFFERENT next step"));
+}
+
+/// A single failure followed by a success leaves no checkpoint — the
+/// streak resets on the good result.
+#[tokio::test]
+async fn failure_then_success_injects_no_checkpoint() {
+    let mut ctx = empty_context();
+    ctx.tools.push(std::sync::Arc::new(FailingTool));
+    ctx.tools.push(std::sync::Arc::new(EchoTool::new()));
+
+    let factory = canned_factory(vec![
+        tool_use_response("c1", "boom", serde_json::json!({"n": 1})),
+        tool_use_response("c2", "echo", serde_json::json!({"v": 1})),
+        tool_use_response("c3", "boom", serde_json::json!({"n": 2})),
+        text_response("ok"),
+    ]);
+
+    let (tx, _rx) = mpsc::channel::<LoopEvent>(256);
+    let messages = run_agent_loop(
+        vec![user("go")],
+        ctx,
+        build_config(),
+        AbortSignal::new(),
+        &tx,
+        &factory,
+        None,
+        None,
+    )
+    .await;
+    drop(tx);
+
+    assert!(
+        !messages.iter().any(|m| matches!(
+            m,
+            LoopMessage::User(u) if u.content.contains("[Recovery checkpoint]")
+        )),
+        "a success between failures must reset the streak"
+    );
+}

@@ -25,6 +25,7 @@ pub mod bridge;
 pub mod context_depth;
 pub mod context_manager;
 pub mod critic;
+pub mod failure_tracker;
 #[cfg(test)]
 mod h7_smoke;
 pub mod heal;

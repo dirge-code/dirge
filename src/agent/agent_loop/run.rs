@@ -67,7 +67,10 @@ use super::types::{Context, LoopConfig};
 /// steering (the interjection queue) — the file-touch reminder doesn't
 /// count. The bool drives the turn-budget reset (dirge-st8r): active human
 /// steering gets a fresh budget; ambient reminders do not.
-async fn poll_steering_and_reminder(config: &LoopConfig) -> (Vec<LoopMessage>, bool) {
+async fn poll_steering_and_reminder(
+    config: &LoopConfig,
+    failure_tracker: &super::failure_tracker::FailureTracker,
+) -> (Vec<LoopMessage>, bool) {
     let mut out = match &config.get_steering_messages {
         Some(get) => get().await,
         None => Vec::new(),
@@ -76,7 +79,24 @@ async fn poll_steering_and_reminder(config: &LoopConfig) -> (Vec<LoopMessage>, b
     if let Some(tracker) = &config.file_touch_tracker {
         out.extend(tracker.poll_reminder());
     }
+    // Cross-turn recovery checkpoint: fired when consecutive *distinct*
+    // tool errors pile up (storm only catches identical repeats). Follows
+    // any user steering so the human's guidance is read first.
+    out.extend(failure_tracker.poll_reflection());
     (out, had_user_steering)
+}
+
+/// Joined text of a tool result's content blocks — fed to the failure
+/// tracker as the error excerpt quoted back in a recovery checkpoint.
+fn tool_result_excerpt(content: &[super::message::ContentBlock]) -> String {
+    content
+        .iter()
+        .filter_map(|b| match b {
+            super::message::ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Build a `StormBreaker` from `LoopConfig`, merging custom
@@ -111,6 +131,12 @@ fn storm_for_config(config: &LoopConfig) -> StormBreaker {
 /// abandoned todo list can't trap the loop in an endless "finish your todos"
 /// cycle.
 const MAX_TODO_NUDGES: u8 = 3;
+
+/// Consecutive errored tool results before the failure tracker injects a
+/// recovery checkpoint. Tuned low — the tool-repair literature finds the
+/// gains from corrective reflection concentrate over the first few
+/// attempts (dirge-opdt).
+const FAILURE_REFLECTION_THRESHOLD: usize = 3;
 
 /// Which finalization gate produced the interjection this turn. The loop
 /// injects at most ONE follow-up per finalization, chosen in strict priority
@@ -728,6 +754,13 @@ pub async fn run_loop(
     // Port of Reasonix `repair/index.ts:38-46` + `loop.ts:621`.
     let mut storm = storm_for_config(&config);
 
+    // Cross-turn failure tracker: counts consecutive errored tool
+    // results (NOT reset per turn, unlike storm) and injects a
+    // recovery checkpoint when a streak of distinct failures piles up.
+    // Catches the thrash storm misses — a model failing differently
+    // every call. dirge-opdt.
+    let failure_tracker = super::failure_tracker::FailureTracker::new(FAILURE_REFLECTION_THRESHOLD);
+
     // Inflight set: authoritative running-id tracker.
     // UI cards consult `inflight.has(call_id)` to derive spinner state.
     // Port of Reasonix `loop.ts:147` InflightSet.
@@ -753,7 +786,7 @@ pub async fn run_loop(
     // Phase 4 part 2: composes with the file-touch tracker's
     // reminder poll when configured.
     let (mut pending_messages, _initial_user_steering): (Vec<LoopMessage>, bool) =
-        poll_steering_and_reminder(&config).await;
+        poll_steering_and_reminder(&config, &failure_tracker).await;
 
     // dirge-nqr: count assistant turns so a hard cap can stop a
     // runaway run. `max_turns = None` means unlimited (legacy).
@@ -1111,6 +1144,11 @@ pub async fn run_loop(
                     tool_results.extend(batch.messages.clone());
                     has_more_tool_calls = !batch.terminate;
                     for result in &batch.messages {
+                        failure_tracker.record_result(
+                            result.is_error,
+                            &result.tool_name,
+                            &tool_result_excerpt(&result.content),
+                        );
                         current_context.messages.push(tool_result_to_value(result));
                         new_messages.push(LoopMessage::ToolResult(result.clone()));
                     }
@@ -1327,7 +1365,8 @@ pub async fn run_loop(
 
             // Pi line 253: refresh steering for next iteration.
             // Phase 4 part 2: also polls the file-touch tracker.
-            let (next_pending, had_user_steering) = poll_steering_and_reminder(&config).await;
+            let (next_pending, had_user_steering) =
+                poll_steering_and_reminder(&config, &failure_tracker).await;
             pending_messages = next_pending;
 
             // dirge-st8r: a fresh USER steering message means the human is
