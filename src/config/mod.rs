@@ -304,6 +304,21 @@ impl SandboxConfig {
 
 // ── deserialization glue: accept old flat forms too ──────────────
 
+/// Convert a JSON value to a bounded integer, erroring (not wrapping)
+/// when it isn't a non-negative integer in range for `T`. dirge-mt91:
+/// the legacy nested-microvm path used `as u8`/`as u32` casts that
+/// silently wrapped.
+fn checked_u64<T, E>(v: &serde_json::Value, field: &str) -> Result<T, E>
+where
+    T: TryFrom<u64>,
+    E: serde::de::Error,
+{
+    let n = v
+        .as_u64()
+        .ok_or_else(|| E::custom(format!("microvm.{field} must be a non-negative integer")))?;
+    T::try_from(n).map_err(|_| E::custom(format!("microvm.{field} value {n} out of range")))
+}
+
 impl<'de> Deserialize<'de> for SandboxConfig {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -347,7 +362,9 @@ impl<'de> Deserialize<'de> for SandboxConfig {
                         "image" => image = Some(map.next_value()?),
                         "cpus" => cpus = Some(map.next_value()?),
                         "memory_mib" => memory_mib = Some(map.next_value()?),
-                        // Accept old nested microvm: {image, cpus, memory_mib}
+                        // Accept old nested microvm: {image, cpus, memory_mib}.
+                        // dirge-mt91: bound the integer casts — `as u8`/`as u32`
+                        // silently wrapped (256 CPUs → 0). Out-of-range errors.
                         "microvm" => {
                             let sub: serde_json::Value = map.next_value()?;
                             if let Some(obj) = sub.as_object() {
@@ -355,14 +372,16 @@ impl<'de> Deserialize<'de> for SandboxConfig {
                                     image =
                                         obj.get("image").and_then(|v| v.as_str().map(String::from));
                                 }
-                                if cpus.is_none() {
-                                    cpus =
-                                        obj.get("cpus").and_then(|v| v.as_u64().map(|n| n as u8));
+                                if cpus.is_none()
+                                    && let Some(v) = obj.get("cpus")
+                                {
+                                    cpus = Some(checked_u64::<u8, M::Error>(v, "cpus")?);
                                 }
-                                if memory_mib.is_none() {
-                                    memory_mib = obj
-                                        .get("memory_mib")
-                                        .and_then(|v| v.as_u64().map(|n| n as u32));
+                                if memory_mib.is_none()
+                                    && let Some(v) = obj.get("memory_mib")
+                                {
+                                    memory_mib =
+                                        Some(checked_u64::<u32, M::Error>(v, "memory_mib")?);
                                 }
                             }
                         }
@@ -1019,6 +1038,27 @@ pub fn update_config_file(updates: &serde_json::Value) -> anyhow::Result<()> {
 #[cfg(all(test, feature = "lsp"))]
 mod tests {
     use super::*;
+
+    /// dirge-mt91: the legacy nested `microvm: {cpus, memory_mib}`
+    /// form used `as u8`/`as u32` casts that silently wrapped — 256
+    /// CPUs became 0. Out-of-range values must now be a clean
+    /// deserialization error, and valid ones still parse.
+    #[test]
+    fn sandbox_legacy_nested_rejects_out_of_range_cpus() {
+        let ok: SandboxConfig =
+            serde_json::from_str(r#"{ "mode": "microvm", "microvm": { "cpus": 4 } }"#).unwrap();
+        assert_eq!(ok.cpus, Some(4));
+
+        let err = serde_json::from_str::<SandboxConfig>(
+            r#"{ "mode": "microvm", "microvm": { "cpus": 256 } }"#,
+        );
+        assert!(err.is_err(), "256 CPUs must error, not wrap to 0");
+
+        let err = serde_json::from_str::<SandboxConfig>(
+            r#"{ "mode": "microvm", "microvm": { "memory_mib": 5000000000 } }"#,
+        );
+        assert!(err.is_err(), "out-of-range memory_mib must error");
+    }
 
     /// Phased workflow is opt-in and off by default; the review-cycle
     /// budget defaults to vix's 2 and is honored when set.

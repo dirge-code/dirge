@@ -8,7 +8,7 @@ A dirge is a song to keep the dead from losing their way. It turns grief into so
 
 What sets dirge apart from other agentic editors:
 
-- **Tiny and fast.** ~8 MB RAM idle, ~15 MB working, ~36 MB binary (speed-optimized: `opt-level=3` + LTO) — versus ~300 MB for JS-based agents. Native Rust, no runtime.
+- **Tiny and fast.** Roughly 8 MB RAM idle, 15 MB working, 36 MB binary (approximate, measured on a Linux release build: `opt-level=3` + LTO) — versus ~300 MB for JS-based agents. Native Rust, no runtime.
 - **Built to keep weaker/cheaper models on the rails.** A [robust agent loop](docs/features.md#robust-agent-loop) repairs malformed tool calls, validates every write through tree-sitter *before* it touches disk, escalates to a stronger model on repeated failure, and trips circuit breakers on non-progressing loops.
 - **One explainable permission engine.** All authorization flows through a single Policy Decision Point with four modes, op-based rules, session allowlists, and a `/why` command that traces exactly which policy decided and why. See [docs/permissions.md](docs/permissions.md).
 - **Role-based multi-provider routing.** Point the main loop, review, escalation, summarization, and subagent roles at different models — mix DeepSeek, GLM, Anthropic, OpenAI, Ollama, and any OpenAI-compatible endpoint in one session. Define your own opt-in [agent profiles](docs/agents.md) (a named model + prompt + tool-policy bundle) and switch personas mid-session with `/agent`.

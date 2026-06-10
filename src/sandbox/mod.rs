@@ -287,12 +287,27 @@ impl Sandbox {
     }
 
     pub fn wrap_command(&self, command: &str) -> Command {
-        let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
         let mut cmd = if self.mode == SandboxMode::Off {
+            // Off mode runs bash directly; it inherits the process cwd,
+            // so we don't resolve / bind one.
             let mut c = Command::new("bash");
             c.arg("-c").arg(command);
             c
         } else {
+            // dirge-mt91: bwrap binds the working directory read-write.
+            // If `current_dir()` fails (e.g. the cwd was deleted
+            // mid-session) the old code silently fell back to "." —
+            // which bwrap resolves to an undefined path. Warn loudly;
+            // the "." fallback is a last resort, not a silent default.
+            let cwd = std::env::current_dir().unwrap_or_else(|e| {
+                tracing::warn!(
+                    target: "dirge::sandbox",
+                    error = %e,
+                    "current_dir() failed while building the sandbox bind — \
+                     falling back to '.', which may bind an unexpected directory",
+                );
+                ".".into()
+            });
             let mut c = Command::new("bwrap");
             c.args(["--ro-bind", "/", "/", "--bind"]);
             c.arg(cwd.as_os_str());

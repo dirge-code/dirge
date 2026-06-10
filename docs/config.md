@@ -85,7 +85,7 @@ Accepted top-level keys:
 | `restrictive`             | boolean | Select restrictive permission mode. Overridden by `accept_all`/`yolo` if those are also true.                                                                               |
 | `accept_all`              | boolean | Select accept mode, equivalent to `--accept-all`. Overridden by `yolo` if true.                                                                                             |
 | `yolo`                    | boolean | Select yolo mode, auto-approving all operations.                                                                                                                            |
-| `sandbox`                 | boolean | Run bash commands in the bubblewrap sandbox. Default: `false`.                                                                                                              |
+| `sandbox`                 | bool / string / object | Sandbox bash commands. `true`/`false`, a mode string (`"off"`, `"bwrap"`, `"microvm"`), or an object — see [Sandbox configuration](#sandbox-configuration). Default: `false`. |
 | `default_permission_mode` | string  | Permission mode when no mode boolean/CLI flag is set. Use `standard`, `restrictive`, `accept`, or `yolo`.                                                                   |
 | `show_tool_details`       | boolean | Show tool-result output in the TUI. Default: `true`.                                                                                                                         |
 | `show_edit_diff`          | boolean | Show colorized diff output for `edit` tool results (`-` red, `+` green, `@@` cyan). Default: `true`.                                                                        |
@@ -353,6 +353,30 @@ Plugin authors: read your own settings in **load-time** code with
 (or `nil`). The host sets it just before your files load and clears it
 after, so capture it at the top level — not from a shared hook, where it
 would reflect the last plugin loaded.
+
+## Sandbox configuration
+
+The `sandbox` key accepts three forms:
+
+```jsonc
+// 1. boolean — false (off) or true (bubblewrap, Linux)
+"sandbox": true
+
+// 2. mode string
+"sandbox": "off" | "bwrap" | "microvm"
+
+// 3. object — required for microVM, optional for tuning
+"sandbox": {
+  "mode": "microvm",        // "off" | "bwrap" | "microvm"
+  "image": "alpine:latest", // microVM root image (microvm mode)
+  "cpus": 2,                // microVM vCPUs (1–255)
+  "memory_mib": 1024        // microVM memory in MiB
+}
+```
+
+- `bwrap` runs each bash command inside [bubblewrap](https://github.com/containers/bubblewrap) (Linux only; needs the `bwrap` binary). The working directory is bound read-write; the rest of the filesystem is read-only.
+- `microvm` runs commands in a full microVM (requires the `sandbox-microvm` build feature). `image`, `cpus`, and `memory_mib` apply only to this mode.
+- A legacy nested form `{"mode": "microvm", "microvm": {"image", "cpus", "memory_mib"}}` is still accepted; out-of-range `cpus`/`memory_mib` are now a config error rather than silently wrapping.
 
 ## Streaming timeouts
 
