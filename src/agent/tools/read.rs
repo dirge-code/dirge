@@ -231,12 +231,15 @@ impl Tool for ReadTool {
         );
 
         if let Some(ref cache) = self.cache
-            && let Some(cached) = cache.get(&cache_key)
+            && let Some(_cached) = cache.get(&cache_key)
         {
-            // A cache hit means the model has already seen this file's content
-            // this session — keep the read-before-edit gate satisfied.
+            // LOOP-3: cache hit — the model already saw this file unchanged.
+            // Return a terse status so we don't waste tokens re-sending content.
             cache.mark_read(std::path::Path::new(&resolved_path));
-            return Ok(cached);
+            return Ok(format!(
+                "📎 cached — {} unchanged from previous read (use offset/limit to re-read a range)",
+                args.path,
+            ));
         }
 
         // F4: stream the file line-by-line via BufReader instead of

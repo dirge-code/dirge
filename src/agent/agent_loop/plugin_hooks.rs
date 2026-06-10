@@ -213,10 +213,16 @@ pub fn after_hook_from_plugin_manager(pm: Arc<Mutex<PluginManager>>) -> AfterToo
             // 2. Build context, lock manager, dispatch. LOOP-8:
             // same outer tokio timeout as the before-hook so a
             // runaway `on-tool-end` doesn't strand the loop.
+            let command_str = ctx
+                .args
+                .get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let janet_ctx = format!(
-                "@{{:tool \"{}\" :output \"{}\"}}",
+                "@{{:tool \"{}\" :output \"{}\" :command \"{}\"}}",
                 escape_janet_string(&ctx.tool_call_name),
                 escape_janet_string(&output_text),
+                escape_janet_string(command_str),
             );
             const HOOK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
             let pm_for_dispatch = pm.clone();

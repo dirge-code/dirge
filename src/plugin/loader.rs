@@ -140,9 +140,11 @@ pub fn load_plugin(
         }
     }
 
-    Ok(LoadedPlugin {
+    let loaded = LoadedPlugin {
         stem,
         files,
         hooks_registered,
-    })
+    };
+    mgr.push_loaded_plugin(loaded.clone());
+    Ok(loaded)
 }

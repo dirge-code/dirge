@@ -28,6 +28,7 @@ pub(crate) mod mode;
 pub(crate) mod model;
 pub(crate) mod panel;
 pub(crate) mod plan;
+pub(crate) mod plugins;
 pub(crate) mod quit;
 pub(crate) mod regen;
 pub(crate) mod retry;

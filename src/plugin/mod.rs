@@ -181,6 +181,7 @@ pub fn load_plugin(
 
 pub struct PluginManager {
     hooks: HashMap<String, Vec<String>>,
+    loaded_plugins: Vec<LoadedPlugin>,
     /// All Janet evaluation goes through this handle to the worker
     /// thread. The handle is naturally `Send + Sync` (only an mpsc
     /// Sender + JoinHandle inside) so no unsafe impl is needed — the
@@ -209,6 +210,7 @@ impl PluginManager {
         let (worker, dialog_rx, lsp_rx) = Worker::try_spawn()?;
         Ok(PluginManager {
             hooks: HashMap::new(),
+            loaded_plugins: Vec::new(),
             worker,
             dialog_rx: Some(dialog_rx),
             lsp_rx: Some(lsp_rx),
@@ -639,6 +641,17 @@ impl PluginManager {
             Ok(s) => !s.is_empty() && s != "nil",
             Err(_) => false,
         }
+    }
+
+    /// Record a successfully-loaded plugin descriptor. Called by
+    /// [`load_plugin`](loader::load_plugin) after hook registration.
+    pub fn push_loaded_plugin(&mut self, plugin: LoadedPlugin) {
+        self.loaded_plugins.push(plugin);
+    }
+
+    /// Return a snapshot of all loaded plugin descriptors.
+    pub fn list_plugins(&self) -> Vec<LoadedPlugin> {
+        self.loaded_plugins.clone()
     }
 
     /// Snapshot the plugin-registered slash commands as `(cmd-name,
