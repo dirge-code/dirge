@@ -32,16 +32,23 @@ cargo build --features dap
 /debug terminate
 ```
 
-Or use the Janet-powered `/dap-repl`:
+Or drive the same session with `/dap-repl`, which takes the same
+operations under a debugger's terse aliases (`c`, `n`, `s`, `p`, `bp`,
+…) — handy if you live in gdb/lldb:
 
 ```
 /dap-repl launch src/tests/dap/fixtures/test_program.py
-dap> bp src/tests/dap/fixtures/test_program.py 95
-dap> c
-dap> p "counter.value"
-dap> n
-dap> terminate
+/dap-repl bp src/tests/dap/fixtures/test_program.py 95
+/dap-repl c
+/dap-repl p "counter.value"
+/dap-repl n
+/dap-repl terminate
 ```
+
+Aliases: `launch`/`l`, `attach`/`a`, `bp`, `c`/`continue`,
+`n`/`next`/`step`, `s`/`step_in`, `o`/`step_out`, `p`/`print`/`eval`,
+`bt`/`status`, `terminate`/`q`. `/dap-repl` with no argument (or
+`help`) prints the full table.
 
 ## Prerequisites
 

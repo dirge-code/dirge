@@ -136,6 +136,23 @@ static SUBCOMMAND_ENTRIES: &[(&str, &[&str])] = &[
             "panel",
         ],
     ),
+    (
+        "/dap-repl",
+        &[
+            "launch",
+            "attach",
+            "bp",
+            "c",
+            "n",
+            "s",
+            "o",
+            "p",
+            "bt",
+            "status",
+            "terminate",
+            "help",
+        ],
+    ),
     ("/panel", &["on", "off", "auto", "debug"]),
     ("/display", &[]), // dynamic: pane spec
     ("/kill", &[]),    // dynamic: subagent ID

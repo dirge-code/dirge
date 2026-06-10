@@ -11,9 +11,12 @@ mod breakpoint;
 mod evaluate;
 mod launch;
 mod panel;
+mod repl;
 mod sessions;
 mod stepping;
 mod terminate;
+
+pub(crate) use repl::cmd_dap_repl;
 
 use std::time::Duration;
 

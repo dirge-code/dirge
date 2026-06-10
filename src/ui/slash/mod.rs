@@ -502,6 +502,8 @@ pub async fn handle_slash(
         "/sandbox" => cmd::sandbox::cmd_sandbox(&mut ctx, &parts).await?,
         #[cfg(feature = "dap")]
         "/debug" => cmd::debug::cmd_debug(&mut ctx, &parts).await?,
+        #[cfg(feature = "dap")]
+        "/dap-repl" => cmd::debug::cmd_dap_repl(&mut ctx, &parts).await?,
         _ => {
             // If `slash_command_names()` advertised this command
             // but no match arm above caught it, the lists drifted
@@ -641,6 +643,8 @@ pub fn slash_command_names() -> Vec<&'static str> {
     cmds.push("/loop");
     #[cfg(feature = "dap")]
     cmds.push("/debug");
+    #[cfg(feature = "dap")]
+    cmds.push("/dap-repl");
     cmds.sort_unstable();
     cmds
 }
