@@ -1696,7 +1696,7 @@ impl Renderer {
         // Inline ghost completion: only when the cursor is at the very end
         // of an in-progress slash command (so the ghost paints right after
         // the typed text and Right-to-accept is unambiguous).
-        #[cfg(feature = "experimental-ui-tab-slash")]
+        #[cfg(feature = "slash-completion")]
         {
             self.cached_input_ghost = if cursor_byte == full.len() {
                 crate::ui::slash::ghost_suffix(full).unwrap_or_default()
@@ -1704,7 +1704,7 @@ impl Renderer {
                 String::new()
             };
         }
-        #[cfg(not(feature = "experimental-ui-tab-slash"))]
+        #[cfg(not(feature = "slash-completion"))]
         {
             self.cached_input_ghost = String::new();
         }
@@ -1713,12 +1713,12 @@ impl Renderer {
         self.input_rows = total_rows.clamp(1, MAX_INPUT_VISIBLE_LINES as u16);
 
         // Build slash-command completion preview if active.
-        #[cfg(feature = "experimental-ui-tab-slash")]
+        #[cfg(feature = "slash-completion")]
         {
             self.cached_completion_preview =
                 crate::ui::slash::format_completion_preview(editor.completion.as_ref(), wrap_w);
         }
-        #[cfg(not(feature = "experimental-ui-tab-slash"))]
+        #[cfg(not(feature = "slash-completion"))]
         {
             self.cached_completion_preview = String::new();
         }

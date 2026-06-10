@@ -878,7 +878,7 @@ async fn main() -> anyhow::Result<()> {
         }
 
         // Register plugin commands for tab completion.
-        #[cfg(feature = "experimental-ui-tab-slash")]
+        #[cfg(feature = "slash-completion")]
         {
             let cmds: Vec<String> = {
                 let mut mgr = pm_arc.lock_ignore_poison();

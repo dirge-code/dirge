@@ -26,7 +26,7 @@ pub fn register_plugin_commands(cmds: Vec<String>) {
 
 /// All completable slash commands: built-ins + plugin-registered.
 /// Sorted, with leading `/`.
-#[cfg(feature = "experimental-ui-tab-slash")]
+#[cfg(feature = "slash-completion")]
 pub fn all_commands() -> Vec<String> {
     let mut cmds: Vec<String> = super::slash_command_names()
         .into_iter()
@@ -96,7 +96,7 @@ pub fn cursor_on_span(spans: &[(usize, usize)], cursor: usize) -> (usize, usize)
 /// Subcommand entries: `(command_name, &[candidate, ...])`.
 /// Each entry maps a slash command (with leading `/`) to its completable
 /// subcommand / argument values.
-#[cfg(feature = "experimental-ui-tab-slash")]
+#[cfg(feature = "slash-completion")]
 static SUBCOMMAND_ENTRIES: &[(&str, &[&str])] = &[
     ("/mode", &["standard", "restrictive", "accept", "yolo"]),
     ("/toggle", &["todo"]),
@@ -175,7 +175,7 @@ fn parent_command(input: &str, spans: &[(usize, usize)], token_idx: usize) -> St
 }
 
 /// Return subcommand candidates for a (command, prefix) pair.
-#[cfg(feature = "experimental-ui-tab-slash")]
+#[cfg(feature = "slash-completion")]
 fn sub_candidates(command: &str, prefix: &str) -> Vec<String> {
     SUBCOMMAND_ENTRIES
         .iter()
@@ -222,7 +222,7 @@ pub struct CompletionResult {
 /// Two-phase:
 ///   1. Cursor in token 0 → complete command name.
 ///   2. Cursor in token 1+ → complete subcommand/argument if registered.
-#[cfg(feature = "experimental-ui-tab-slash")]
+#[cfg(feature = "slash-completion")]
 pub fn try_complete(buffer: &str, cursor: usize) -> Option<CompletionResult> {
     if !buffer.starts_with('/') {
         return None;
@@ -331,7 +331,7 @@ pub fn try_complete(buffer: &str, cursor: usize) -> Option<CompletionResult> {
 
 /// Cycle the subcommand at `token_idx` through `candidates`.
 /// Builds the new buffer by replacing the token span with the next candidate.
-#[cfg(feature = "experimental-ui-tab-slash")]
+#[cfg(feature = "slash-completion")]
 fn cycle_subcommand(
     buffer: &str,
     span: (usize, usize),
@@ -363,7 +363,7 @@ fn cycle_subcommand(
 /// - 0 words: `/mod` + Right → `/mode`
 /// - 1 word, exact command: `/mode ` + Right → no suffix (use Tab for args)
 /// - 1 word, unique prefix: `/mode sta` + Right → `ndard`
-#[cfg(feature = "experimental-ui-tab-slash")]
+#[cfg(feature = "slash-completion")]
 pub fn ghost_suffix(input: &str) -> Option<String> {
     if !input.starts_with('/') || input.len() < 2 {
         return None;
@@ -413,7 +413,7 @@ pub fn ghost_suffix(input: &str) -> Option<String> {
 /// Returns an empty string when `cr` is `None`. The result is shaped
 /// to fit within `avail_w` display cells (after the continuation
 /// prompt), showing as many upcoming command names as will fit.
-#[cfg(feature = "experimental-ui-tab-slash")]
+#[cfg(feature = "slash-completion")]
 pub fn format_completion_preview(cr: Option<&CompletionResult>, avail_w: usize) -> String {
     let cr = match cr {
         Some(c) => c,
@@ -488,19 +488,19 @@ mod tests {
         assert_eq!(cursor_on_span(&spans, 5), (0, 5));
     }
 
-    #[cfg(feature = "experimental-ui-tab-slash")]
+    #[cfg(feature = "slash-completion")]
     #[test]
     fn ghost_suffix_completes_command() {
         assert_eq!(ghost_suffix("/disp").as_deref(), Some("lay"));
     }
 
-    #[cfg(feature = "experimental-ui-tab-slash")]
+    #[cfg(feature = "slash-completion")]
     #[test]
     fn ghost_suffix_subcommand() {
         assert_eq!(ghost_suffix("/mode sta").as_deref(), Some("ndard"));
     }
 
-    #[cfg(feature = "experimental-ui-tab-slash")]
+    #[cfg(feature = "slash-completion")]
     #[test]
     fn ghost_suffix_returns_none_when_not_completable() {
         assert_eq!(ghost_suffix("/"), None);
@@ -509,7 +509,7 @@ mod tests {
         assert_eq!(ghost_suffix("/mode standard"), None); // exact, not a prefix
     }
 
-    #[cfg(feature = "experimental-ui-tab-slash")]
+    #[cfg(feature = "slash-completion")]
     #[test]
     fn subcommand_completion_cycles() {
         let r = try_complete("/mode ", 6).unwrap();
@@ -517,7 +517,7 @@ mod tests {
         assert!(r.new_buffer.len() > 6);
     }
 
-    #[cfg(feature = "experimental-ui-tab-slash")]
+    #[cfg(feature = "slash-completion")]
     #[test]
     fn subcommand_cycles_past_first_match() {
         // First tab from empty subcommand: picks first candidate.
@@ -536,14 +536,14 @@ mod tests {
         assert_eq!(r5.new_buffer, "/mode standard");
     }
 
-    #[cfg(feature = "experimental-ui-tab-slash")]
+    #[cfg(feature = "slash-completion")]
     #[test]
     fn subcommand_ghost_for_unique_prefix() {
         // "/sandbox sna" → unique match "snapshot"
         assert_eq!(ghost_suffix("/sandbox sna").as_deref(), Some("pshot"));
     }
 
-    #[cfg(feature = "experimental-ui-tab-slash")]
+    #[cfg(feature = "slash-completion")]
     #[test]
     fn complete_partial_command() {
         let r = try_complete("/mod", 4).unwrap();
@@ -551,39 +551,39 @@ mod tests {
         assert_eq!(r.new_cursor, 5);
     }
 
-    #[cfg(feature = "experimental-ui-tab-slash")]
+    #[cfg(feature = "slash-completion")]
     #[test]
     fn empty_buffer_returns_none() {
         assert!(try_complete("", 0).is_none());
     }
 
-    #[cfg(feature = "experimental-ui-tab-slash")]
+    #[cfg(feature = "slash-completion")]
     #[test]
     fn no_completion_without_slash() {
         assert!(try_complete("hello", 5).is_none());
     }
 
-    #[cfg(feature = "experimental-ui-tab-slash")]
+    #[cfg(feature = "slash-completion")]
     #[test]
     fn unknown_command_returns_none() {
         assert!(try_complete("/nonexistent", 12).is_none());
     }
 
-    #[cfg(feature = "experimental-ui-tab-slash")]
+    #[cfg(feature = "slash-completion")]
     #[test]
     fn sub_candidates_for_mode() {
         let c = sub_candidates("/mode", "");
         assert_eq!(c, vec!["standard", "restrictive", "accept", "yolo"]);
     }
 
-    #[cfg(feature = "experimental-ui-tab-slash")]
+    #[cfg(feature = "slash-completion")]
     #[test]
     fn sub_candidates_filtered() {
         let c = sub_candidates("/mode", "s");
         assert_eq!(c, vec!["standard"]);
     }
 
-    #[cfg(feature = "experimental-ui-tab-slash")]
+    #[cfg(feature = "slash-completion")]
     #[test]
     fn plugin_command_in_all_commands() {
         register_plugin_commands(vec!["myplugin".to_string()]);
@@ -591,7 +591,7 @@ mod tests {
         assert!(cmds.contains(&"/myplugin".to_string()));
     }
 
-    #[cfg(feature = "experimental-ui-tab-slash")]
+    #[cfg(feature = "slash-completion")]
     #[test]
     fn plugin_command_completion_cycles() {
         register_plugin_commands(vec!["myplugin".to_string()]);
@@ -600,7 +600,7 @@ mod tests {
         assert_eq!(r.new_buffer, "/myplugin");
     }
 
-    #[cfg(feature = "experimental-ui-tab-slash")]
+    #[cfg(feature = "slash-completion")]
     #[test]
     fn plugin_command_ghost_suffix() {
         register_plugin_commands(vec!["myplugin".to_string()]);

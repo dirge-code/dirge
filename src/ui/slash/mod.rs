@@ -21,10 +21,10 @@ use crate::ui::renderer::Renderer;
 use crate::ui::theme;
 
 mod cmd;
-#[cfg(feature = "experimental-ui-tab-slash")]
+#[cfg(feature = "slash-completion")]
 mod completion;
 
-#[cfg(feature = "experimental-ui-tab-slash")]
+#[cfg(feature = "slash-completion")]
 pub use completion::{
     CompletionResult, format_completion_preview, ghost_suffix, register_plugin_commands,
     try_complete,
@@ -662,7 +662,7 @@ pub fn is_known_slash_command(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "experimental-ui-tab-slash")]
+    #[cfg(feature = "slash-completion")]
     use super::completion::all_commands;
     use super::*;
     use crate::session::{Session, SessionMessage};
@@ -689,14 +689,14 @@ mod tests {
         assert_eq!(p[1..].join(" "), "keep the auth flow");
     }
 
-    #[cfg(feature = "experimental-ui-tab-slash")]
+    #[cfg(feature = "slash-completion")]
     #[test]
     fn ghost_suffix_completes_a_unique_prefix() {
         // `/display` is the only command with this prefix.
         assert_eq!(ghost_suffix("/disp").as_deref(), Some("lay"));
     }
 
-    #[cfg(feature = "experimental-ui-tab-slash")]
+    #[cfg(feature = "slash-completion")]
     #[test]
     fn ghost_suffix_returns_none_when_not_completable() {
         assert_eq!(ghost_suffix("/"), None); // too short / ambiguous
@@ -777,19 +777,19 @@ mod tests {
         assert_eq!(align_cut_to_user_boundary(&messages, 0), 1);
     }
 
-    #[cfg(feature = "experimental-ui-tab-slash")]
+    #[cfg(feature = "slash-completion")]
     #[test]
     fn no_completion_without_slash() {
         assert!(try_complete("hello", 5).is_none());
     }
 
-    #[cfg(feature = "experimental-ui-tab-slash")]
+    #[cfg(feature = "slash-completion")]
     #[test]
     fn empty_buffer_returns_none() {
         assert!(try_complete("", 0).is_none());
     }
 
-    #[cfg(feature = "experimental-ui-tab-slash")]
+    #[cfg(feature = "slash-completion")]
     #[test]
     fn complete_partial_command() {
         let r = try_complete("/mod", 4).unwrap();
@@ -797,14 +797,14 @@ mod tests {
         assert_eq!(r.new_cursor, 5);
     }
 
-    #[cfg(feature = "experimental-ui-tab-slash")]
+    #[cfg(feature = "slash-completion")]
     #[test]
     fn cycles_between_partial_matches() {
         let r = try_complete("/mod", 4).unwrap();
         assert!(r.new_buffer.starts_with("/mod"));
     }
 
-    #[cfg(feature = "experimental-ui-tab-slash")]
+    #[cfg(feature = "slash-completion")]
     #[test]
     fn cycles_beyond_single_match() {
         let r1 = try_complete("/", 1).unwrap();
@@ -814,7 +814,7 @@ mod tests {
         assert!(r2.new_buffer.starts_with('/'));
     }
 
-    #[cfg(feature = "experimental-ui-tab-slash")]
+    #[cfg(feature = "slash-completion")]
     #[test]
     fn cycles_from_full_command() {
         let r = try_complete("/btw", 4).unwrap();
@@ -822,7 +822,7 @@ mod tests {
         assert!(r.new_buffer.starts_with('/'));
     }
 
-    #[cfg(feature = "experimental-ui-tab-slash")]
+    #[cfg(feature = "slash-completion")]
     #[test]
     fn cycles_through_all_commands() {
         let mut seen = std::collections::HashSet::new();
@@ -846,13 +846,13 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "experimental-ui-tab-slash")]
+    #[cfg(feature = "slash-completion")]
     #[test]
     fn unknown_command_returns_none() {
         assert!(try_complete("/nonexistent", 12).is_none());
     }
 
-    #[cfg(feature = "experimental-ui-tab-slash")]
+    #[cfg(feature = "slash-completion")]
     #[test]
     fn commands_are_sorted() {
         let cmds = all_commands();
@@ -866,7 +866,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "experimental-ui-tab-slash")]
+    #[cfg(feature = "slash-completion")]
     #[test]
     fn preview_includes_upcoming_commands() {
         let r = try_complete("/", 1).unwrap();
@@ -891,7 +891,7 @@ mod tests {
     /// instead, so cursor position inside the command name doesn't
     /// corrupt the buffer — the result is exactly one of the
     /// matching commands, no Frankenstein.
-    #[cfg(feature = "experimental-ui-tab-slash")]
+    #[cfg(feature = "slash-completion")]
     #[test]
     fn complete_with_cursor_mid_word_produces_clean_buffer() {
         // /mod, cursor at the `o` (byte 2). The new buffer must be
@@ -919,7 +919,7 @@ mod tests {
     /// `/allow/mod` because the entire buffer was concatenated as
     /// the tail. Verify it now produces a clean replacement —
     /// exactly one of the matching commands, no residual `/mod`.
-    #[cfg(feature = "experimental-ui-tab-slash")]
+    #[cfg(feature = "slash-completion")]
     #[test]
     fn complete_with_cursor_at_start_produces_clean_buffer() {
         let r = try_complete("/mod", 0).unwrap();
@@ -937,7 +937,7 @@ mod tests {
 
     /// Tab on a command with trailing args (e.g. `/mode standard`
     /// with cursor after `/mode`) preserves the args tail.
-    #[cfg(feature = "experimental-ui-tab-slash")]
+    #[cfg(feature = "slash-completion")]
     #[test]
     fn complete_preserves_trailing_args() {
         let r = try_complete("/mod standard", 4).unwrap();
@@ -950,7 +950,7 @@ mod tests {
 
     /// Cursor past the first whitespace means the user is typing
     /// args, not a command name — no completion should fire.
-    #[cfg(feature = "experimental-ui-tab-slash")]
+    #[cfg(feature = "slash-completion")]
     #[test]
     fn no_completion_when_cursor_in_args() {
         // Cursor inside args of a command WITHOUT subcommand entries

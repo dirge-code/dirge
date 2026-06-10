@@ -2,9 +2,9 @@ use compact_str::CompactString;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::ui::picker::FilePicker;
-#[cfg(feature = "experimental-ui-tab-slash")]
+#[cfg(feature = "slash-completion")]
 use crate::ui::slash::CompletionResult;
-#[cfg(feature = "experimental-ui-tab-slash")]
+#[cfg(feature = "slash-completion")]
 use crate::ui::slash::try_complete;
 
 const KILL_RING_MAX: usize = 10;
@@ -233,7 +233,7 @@ pub struct InputEditor {
     /// existing indices remain valid).
     pastes: Vec<Option<CompactString>>,
     /// Current slash-command completion state, for rendering a preview.
-    #[cfg(feature = "experimental-ui-tab-slash")]
+    #[cfg(feature = "slash-completion")]
     pub completion: Option<CompletionResult>,
     /// Display width the buffer is soft-wrapped to in the box, pushed in
     /// from the renderer before each key dispatch. `0` = unknown (e.g.
@@ -398,7 +398,7 @@ impl InputEditor {
             last_action_was_kill: false,
             yank_state: None,
             pastes: Vec::new(),
-            #[cfg(feature = "experimental-ui-tab-slash")]
+            #[cfg(feature = "slash-completion")]
             completion: None,
             wrap_w: 0,
             search_mode: false,
@@ -659,7 +659,7 @@ impl InputEditor {
     fn reset_kill_accumulation(&mut self) {
         self.last_action_was_kill = false;
         self.yank_state = None;
-        #[cfg(feature = "experimental-ui-tab-slash")]
+        #[cfg(feature = "slash-completion")]
         {
             self.completion = None;
         }
@@ -1128,7 +1128,7 @@ impl InputEditor {
                 // At end-of-line with a slash-command ghost completion
                 // showing, Right accepts it (fills in the suffix) instead
                 // of just moving the cursor.
-                #[cfg(feature = "experimental-ui-tab-slash")]
+                #[cfg(feature = "slash-completion")]
                 {
                     if self.cursor == self.buffer.len()
                         && let Some(suffix) = crate::ui::slash::ghost_suffix(self.buffer.as_str())
@@ -1240,7 +1240,7 @@ impl InputEditor {
             }
 
             KeyCode::Tab => {
-                #[cfg(feature = "experimental-ui-tab-slash")]
+                #[cfg(feature = "slash-completion")]
                 {
                     // Don't grab Tab while the `@`-file-picker is
                     // active — that path has its own keystroke
@@ -1715,7 +1715,7 @@ mod tests {
         assert!(e.history_draft.is_none());
     }
 
-    #[cfg(feature = "experimental-ui-tab-slash")]
+    #[cfg(feature = "slash-completion")]
     #[test]
     fn right_arrow_accepts_slash_ghost_completion() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};

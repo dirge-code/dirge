@@ -76,6 +76,7 @@ default = [
     'semantic-c',
     'semantic-cpp',
     'semantic-elixir',
+    'slash-completion',
 ]
 # Default feature set minus `plugin` (dirge-4xgd / Windows release).
 # The Janet bindings don't build on Windows MSVC: `evil_janet` references
@@ -101,6 +102,7 @@ windows-default = [
     'semantic-c',
     'semantic-cpp',
     'semantic-elixir',
+    'slash-completion',
 ]
 loop = []
 git-worktree = []
@@ -131,7 +133,11 @@ sandbox-microvm = ["dep:libkrun-sys", "dep:ssh2", "dep:sha2", "dep:hex", "dep:ba
 # counters and invariants. No runtime cost when disabled. Used in
 # stress tests to identify keystroke-loss points.
 timing-diagnostics = []
-experimental-ui-tab-slash = []
+# Slash-command tab completion + ghost-suffix hinting. On by default
+# (it had been gated off as `experimental-ui-tab-slash`, so default
+# builds silently had no command autocomplete). Opt out with
+# --no-default-features.
+slash-completion = []
 experimental-ui-terminal-tab = []
 
 [target.'cfg(unix)'.dependencies]
