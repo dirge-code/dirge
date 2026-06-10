@@ -1,6 +1,5 @@
 //! Ephemeral SSH key generation and command execution for the microVM sandbox.
 
-use std::io::Read;
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -82,8 +81,9 @@ impl HostKeys {
     /// Return the raw 32-byte ed25519 public key for host-key verification.
     ///
     /// Decodes the OpenSSH-format public key (`ssh-ed25519 <base64>`) stored
-    /// in [`Self::public_key`] into the bare ed25519 key bytes suitable for
-    /// comparison against [`ssh2::Session::host_key`].
+    /// in [`Self::public_key`] into the bare ed25519 key bytes, which
+    /// [`ssh_exec`]'s host-key check compares against the key the guest
+    /// presents during the handshake.
     pub fn public_key_bytes(&self) -> anyhow::Result<Vec<u8>> {
         let encoded = self
             .public_key
@@ -213,41 +213,40 @@ pub fn wait_for_ssh(host: &str, port: u16, timeout: Duration) -> anyhow::Result<
     }
 }
 
-/// Extract the raw 32-byte ed25519 key from the SSH wire-format blob
-/// returned by [`ssh2::Session::host_key`].
-///
-/// Wire format is `[u32 algo_len][algo_name][u32 key_len][raw_key]`,
-/// which for ed25519 is 4 + 11 + 4 + 32 = 51 bytes.
-fn extract_ed25519_raw_key(key_data: &[u8]) -> anyhow::Result<Vec<u8>> {
-    if key_data.len() < 19 {
-        anyhow::bail!("host key data too short for ed25519 wire format");
+/// A russh client handler that pins the guest's ed25519 host key.
+struct HostKeyVerifier {
+    /// Expected raw 32-byte ed25519 public key, or `None` to accept any
+    /// key (best-effort shutdown doesn't need verification).
+    expected: Option<Vec<u8>>,
+}
+
+impl russh::client::Handler for HostKeyVerifier {
+    type Error = anyhow::Error;
+
+    async fn check_server_key(
+        &mut self,
+        server_public_key: &russh::keys::ssh_key::PublicKey,
+    ) -> anyhow::Result<bool> {
+        let Some(expected) = &self.expected else {
+            return Ok(true);
+        };
+        // Accept only if the guest presents the exact ed25519 key we injected.
+        match server_public_key.key_data().ed25519() {
+            Some(key) => Ok(key.0.as_slice() == expected.as_slice()),
+            None => Ok(false),
+        }
     }
-    let algo_len =
-        u32::from_be_bytes([key_data[0], key_data[1], key_data[2], key_data[3]]) as usize;
-    if 4 + algo_len > key_data.len() || &key_data[4..4 + algo_len] != b"ssh-ed25519" {
-        anyhow::bail!("host key algorithm is not ssh-ed25519");
-    }
-    let key_offset = 4 + algo_len;
-    if key_offset + 4 > key_data.len() {
-        anyhow::bail!("host key data too short for key length field");
-    }
-    let key_len = u32::from_be_bytes([
-        key_data[key_offset],
-        key_data[key_offset + 1],
-        key_data[key_offset + 2],
-        key_data[key_offset + 3],
-    ]) as usize;
-    if key_offset + 4 + key_len > key_data.len() || key_len != 32 {
-        anyhow::bail!("host key has unexpected ed25519 key length");
-    }
-    Ok(key_data[key_offset + 4..key_offset + 4 + key_len].to_vec())
 }
 
 /// Execute a command via SSH and return (stdout, stderr, exit_code).
 ///
 /// `host_key_bytes` is the raw 32-byte ed25519 public key expected from
-/// the server. If provided, the server's host key is verified against it
-/// immediately after the handshake.
+/// the server. If provided, the guest's host key is verified against it
+/// during the handshake and the connection is refused on mismatch.
+///
+/// Synchronous wrapper: every caller already runs this on a blocking
+/// thread (`spawn_blocking` / `thread::spawn`), so it spins up its own
+/// current-thread runtime to drive the async russh client.
 pub fn ssh_exec(
     host: &str,
     port: u16,
@@ -255,70 +254,97 @@ pub fn ssh_exec(
     command: &str,
     host_key_bytes: Option<&[u8]>,
 ) -> anyhow::Result<(String, String, i32)> {
-    let tcp = TcpStream::connect(format!("{host}:{port}"))
-        .map_err(|e| anyhow::anyhow!("failed to connect to SSH: {e}"))?;
-    tcp.set_read_timeout(Some(Duration::from_secs(60)))?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| anyhow::anyhow!("failed to build SSH runtime: {e}"))?;
+    rt.block_on(ssh_exec_async(
+        host,
+        port,
+        private_key_path,
+        command,
+        host_key_bytes,
+    ))
+}
 
-    let mut session =
-        ssh2::Session::new().map_err(|e| anyhow::anyhow!("failed to create SSH session: {e}"))?;
-    session.set_tcp_stream(tcp);
-    session
-        .handshake()
-        .map_err(|e| anyhow::anyhow!("SSH handshake failed: {e}"))?;
+async fn ssh_exec_async(
+    host: &str,
+    port: u16,
+    private_key_path: &Path,
+    command: &str,
+    host_key_bytes: Option<&[u8]>,
+) -> anyhow::Result<(String, String, i32)> {
+    use russh::ChannelMsg;
 
-    // Verify the server's host key against the expected ed25519 key.
-    if let Some(expected_raw) = host_key_bytes {
-        let (key_data, key_type) = session
-            .host_key()
-            .ok_or_else(|| anyhow::anyhow!("SSH server did not present a host key"))?;
-        if !matches!(key_type, ssh2::HostKeyType::Ed25519) {
-            anyhow::bail!("host key type mismatch: expected ed25519, got {key_type:?}");
-        }
-        // session.host_key() returns the SSH wire-format blob:
-        //   [u32 algo_len][algo_name][u32 key_len][raw_key]
-        // For ed25519: 4 + 11 + 4 + 32 = 51 bytes.
-        // Extract just the raw key bytes for comparison.
-        let key_data_raw = extract_ed25519_raw_key(key_data)?;
-        if key_data_raw != expected_raw {
-            anyhow::bail!(
-                "host key mismatch: expected ed25519 key from our injected host keys, \
-                 got different key data ({} bytes)",
-                key_data.len()
-            );
-        }
-    }
+    let config = std::sync::Arc::new(russh::client::Config {
+        inactivity_timeout: Some(Duration::from_secs(60)),
+        ..Default::default()
+    });
+    let handler = HostKeyVerifier {
+        expected: host_key_bytes.map(|b| b.to_vec()),
+    };
 
-    session
-        .userauth_pubkey_file("sandbox", None, private_key_path, None)
+    // Bound connect + handshake so a half-open or non-SSH port can't hang.
+    let mut session = tokio::time::timeout(
+        Duration::from_secs(30),
+        russh::client::connect(config, (host, port), handler),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("failed to connect to SSH: handshake timed out"))?
+    .map_err(|e| anyhow::anyhow!("failed to connect to SSH: {e}"))?;
+
+    let key = russh::keys::load_secret_key(private_key_path, None)
+        .map_err(|e| anyhow::anyhow!("failed to load SSH private key: {e}"))?;
+
+    let authed = session
+        .authenticate_publickey(
+            "sandbox",
+            russh::keys::PrivateKeyWithHashAlg::new(std::sync::Arc::new(key), None),
+        )
+        .await
         .map_err(|e| {
             anyhow::anyhow!(
                 "SSH authentication failed: {e}\n\
-             If using a microVM, virtio-fs maps host files as root-owned inside the guest, \
-             which causes sshd's StrictModes check to reject the authorized_keys file. \
-             Ensure the VM image has sshd configured with `-o StrictModes=no`."
+                 If using a microVM, virtio-fs maps host files as root-owned inside the guest, \
+                 which causes sshd's StrictModes check to reject the authorized_keys file. \
+                 Ensure the VM image has sshd configured with `-o StrictModes=no`."
             )
         })?;
+    if !authed.success() {
+        anyhow::bail!("SSH authentication rejected by the server (publickey)");
+    }
 
     let mut channel = session
-        .channel_session()
+        .channel_open_session()
+        .await
         .map_err(|e| anyhow::anyhow!("failed to open SSH channel: {e}"))?;
     channel
-        .exec(command)
+        .exec(true, command)
+        .await
         .map_err(|e| anyhow::anyhow!("failed to exec command: {e}"))?;
 
-    let mut stdout = String::new();
-    channel.read_to_string(&mut stdout)?;
+    let mut stdout: Vec<u8> = Vec::new();
+    let mut stderr: Vec<u8> = Vec::new();
+    let mut exit_code: i32 = -1;
+    // Drain the channel until it closes, accumulating stdout/stderr and
+    // capturing the remote exit status.
+    while let Some(msg) = channel.wait().await {
+        match msg {
+            ChannelMsg::Data { ref data } => stdout.extend_from_slice(data),
+            // ext == 1 is SSH_EXTENDED_DATA_STDERR.
+            ChannelMsg::ExtendedData { ref data, ext } if ext == 1 => {
+                stderr.extend_from_slice(data)
+            }
+            ChannelMsg::ExitStatus { exit_status } => exit_code = exit_status as i32,
+            _ => {}
+        }
+    }
 
-    let mut stderr = String::new();
-    let mut stderr_stream = channel.stderr();
-    stderr_stream.read_to_string(&mut stderr)?;
-
-    channel
-        .wait_close()
-        .map_err(|e| anyhow::anyhow!("failed to wait for channel close: {e}"))?;
-    let exit_code = channel.exit_status().unwrap_or(-1);
-
-    Ok((stdout, stderr, exit_code))
+    Ok((
+        String::from_utf8_lossy(&stdout).into_owned(),
+        String::from_utf8_lossy(&stderr).into_owned(),
+        exit_code,
+    ))
 }
 
 #[cfg(test)]
@@ -452,62 +478,5 @@ mod tests {
             hk.public_key.starts_with("ssh-ed25519 "),
             "generated host key should be ed25519"
         );
-    }
-
-    #[test]
-    fn extract_ed25519_raw_key_from_wire_format() {
-        let hk = HostKeys::generate().unwrap();
-        let raw = hk.public_key_bytes().unwrap();
-        assert_eq!(raw.len(), 32);
-
-        // Construct the SSH wire-format blob as returned by session.host_key():
-        // [u32 algo_len][algo_name][u32 key_len][raw_key]
-        let algo = b"ssh-ed25519";
-        let algo_len = algo.len() as u32;
-        let key_len = raw.len() as u32;
-        let mut wire = Vec::new();
-        wire.extend_from_slice(&algo_len.to_be_bytes());
-        wire.extend_from_slice(algo);
-        wire.extend_from_slice(&key_len.to_be_bytes());
-        wire.extend_from_slice(&raw);
-
-        assert_eq!(wire.len(), 4 + 11 + 4 + 32);
-
-        let extracted = extract_ed25519_raw_key(&wire).unwrap();
-        assert_eq!(extracted, raw);
-    }
-
-    #[test]
-    fn extract_ed25519_raw_key_rejects_wrong_algo() {
-        // Wire format with "ssh-rsa" algo
-        let algo = b"ssh-rsa";
-        let algo_len = algo.len() as u32;
-        let mut wire = Vec::new();
-        wire.extend_from_slice(&algo_len.to_be_bytes());
-        wire.extend_from_slice(algo);
-        wire.extend_from_slice(&32u32.to_be_bytes());
-        wire.extend_from_slice(&[0u8; 32]);
-        let err = extract_ed25519_raw_key(&wire).unwrap_err().to_string();
-        assert!(err.contains("not ssh-ed25519"));
-    }
-
-    #[test]
-    fn extract_ed25519_raw_key_rejects_wrong_key_len() {
-        // Wire format with key_len=64 for ed25519
-        let algo = b"ssh-ed25519";
-        let algo_len = algo.len() as u32;
-        let mut wire = Vec::new();
-        wire.extend_from_slice(&algo_len.to_be_bytes());
-        wire.extend_from_slice(algo);
-        wire.extend_from_slice(&64u32.to_be_bytes());
-        wire.extend_from_slice(&[0u8; 64]);
-        let err = extract_ed25519_raw_key(&wire).unwrap_err().to_string();
-        assert!(err.contains("unexpected ed25519 key length"));
-    }
-
-    #[test]
-    fn extract_ed25519_raw_key_rejects_too_short() {
-        let err = extract_ed25519_raw_key(&[0u8; 5]).unwrap_err().to_string();
-        assert!(err.contains("too short"));
     }
 }

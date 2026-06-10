@@ -128,7 +128,7 @@ semantic-elixir = ["semantic", "dep:tree-sitter-elixir"]
 plugin = ["dep:janetrs"]
 lsp = ["dep:lsp-types"]
 dap = ["dep:which", "dep:dap"]
-sandbox-microvm = ["dep:libkrun-sys", "dep:ssh2", "dep:sha2", "dep:hex", "dep:base64"]
+sandbox-microvm = ["dep:libkrun-sys", "dep:russh", "dep:sha2", "dep:hex", "dep:base64"]
 # timing-diagnostics: compile-time gate for relay byte accounting
 # counters and invariants. No runtime cost when disabled. Used in
 # stress tests to identify keystroke-loss points.
@@ -262,9 +262,10 @@ dap = { version = "0.4.1-alpha1", features = ["client"], optional = true }
 # libkrun-sys: FFI bindings for libkrun (hardware-isolated microVM sandbox).
 # Requires libkrun.so and libkrunfw.so installed on the system.
 libkrun-sys = { version = "0.9.5", optional = true }
-# ssh2: pure Rust SSH client (libssh2 via ssh2-sys). Used by the microVM
-# sandbox to execute commands inside the guest VM.
-ssh2 = { version = "0.9", optional = true }
+# russh: pure-Rust SSH client (no libssh2/OpenSSL — uses the `ring` crypto
+# backend so the build needs no system OpenSSL or cmake). Used by the
+# microVM sandbox to execute commands inside the guest VM.
+russh = { version = "0.61", default-features = false, features = ["ring"], optional = true }
 # sha2 + hex: OCI layer digest verification for the microVM sandbox.
 # Every blob downloaded from the registry is SHA-256 hashed and compared
 # against the manifest's declared digest before extraction.
