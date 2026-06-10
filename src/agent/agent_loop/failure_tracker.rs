@@ -141,7 +141,30 @@ fn format_checkpoint(consecutive: usize, recent: &[(String, String)]) -> String 
             re-read the exact error) before acting again.\n\
          Name the root cause in one sentence, then take a DIFFERENT next step.",
     );
+    // When one tool dominates the streak, point the model straight at its
+    // contract. The tool's full description + parameter schema are already
+    // in context (the tool definitions), so re-reading them is cheaper and
+    // more reliable than the model guessing again (cf. arXiv:2510.17874,
+    // tool-doc re-grounding on repeated failure).
+    if let Some(tool) = dominant_tool(recent) {
+        s.push_str(&format!(
+            "\nEvery one of these was `{tool}`. Re-read its description and parameter \
+             schema in your tool definitions before calling it again — or use a different \
+             tool to make progress.",
+        ));
+    }
     s
+}
+
+/// The single tool name shared by every recent failure, or `None` if
+/// the streak spans more than one tool.
+fn dominant_tool(recent: &[(String, String)]) -> Option<String> {
+    let first = recent.first()?.0.as_str();
+    if recent.iter().all(|(t, _)| t == first) {
+        Some(first.to_string())
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -179,6 +202,22 @@ mod tests {
         assert!(body.contains("read: file not found"));
         // Asks for a different approach, not a retry.
         assert!(body.contains("DIFFERENT next step"));
+        // Mixed tools → no single-tool re-grounding line.
+        assert!(!body.contains("Re-read its description"));
+    }
+
+    #[test]
+    fn one_tool_dominating_points_at_its_contract() {
+        let t = FailureTracker::new(3);
+        for _ in 0..3 {
+            t.record_result(true, "edit", "old_string not found");
+        }
+        let body = content_of(&t.poll_reflection());
+        assert!(
+            body.contains("Every one of these was `edit`"),
+            "single-tool streak should name the tool: {body}"
+        );
+        assert!(body.contains("Re-read its description"));
     }
 
     #[test]

@@ -261,7 +261,19 @@ impl Tool for ReadTool {
         const MAX_LINE_BYTES: usize = 16 * 1024;
         const TRUNC_MARKER: &str = " …[line truncated]";
 
-        let metadata = tokio::fs::metadata(&resolved_path).await?;
+        let metadata = match tokio::fs::metadata(&resolved_path).await {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Weaker models mistype paths. Point at a near-miss in
+                // the same directory rather than a bare "not found".
+                let mut msg = format!("File not found: {}", args.path.as_str());
+                if let Some(near) = suggest_nearby_path(&args.path).await {
+                    msg.push_str(&format!(". Did you mean `{near}`?"));
+                }
+                return Err(ToolError::Msg(msg));
+            }
+            Err(e) => return Err(e.into()),
+        };
         let file_size = metadata.len();
         if file_size > MAX_FILE_BYTES {
             return Err(ToolError::Msg(format!(
@@ -431,6 +443,41 @@ impl Tool for ReadTool {
     }
 }
 
+/// For a path that doesn't exist, look in its parent directory for a
+/// filename close enough to be a likely typo, and return the suggestion
+/// in the SAME directory form the caller used (so the model can paste it
+/// straight back). `None` when the parent can't be read or nothing is
+/// close. Reuses the shared [`suggest::closest`] picker.
+async fn suggest_nearby_path(orig: &str) -> Option<String> {
+    use crate::agent::agent_loop::suggest;
+
+    let orig_path = std::path::Path::new(orig);
+    let target_name = orig_path.file_name()?.to_str()?;
+    // Scan the directory the caller pointed at.
+    let parent = orig_path.parent()?;
+    let dir = if parent.as_os_str().is_empty() {
+        std::path::Path::new(".")
+    } else {
+        parent
+    };
+
+    let mut names: Vec<String> = Vec::new();
+    let mut rd = tokio::fs::read_dir(dir).await.ok()?;
+    while let Ok(Some(entry)) = rd.next_entry().await {
+        if let Some(n) = entry.file_name().to_str() {
+            names.push(n.to_string());
+        }
+    }
+
+    let near = suggest::closest(target_name, &names)?;
+    // Re-attach the original directory portion.
+    if parent.as_os_str().is_empty() {
+        Some(near.to_string())
+    } else {
+        Some(parent.join(near).to_string_lossy().into_owned())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -537,6 +584,39 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// dirge-opdt: reading a mistyped path suggests the near-miss
+    /// neighbour in the same directory.
+    #[tokio::test]
+    async fn missing_file_suggests_near_miss_neighbour() {
+        let dir =
+            std::env::temp_dir().join(format!("dirge-read-suggest-{}-{}", std::process::id(), "a"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("parser.rs"), "fn main() {}\n").unwrap();
+
+        let tool = ReadTool::with_cache(
+            None,
+            None,
+            crate::agent::tools::ToolCache::new(),
+            #[cfg(feature = "lsp")]
+            None,
+        );
+        let typo = dir.join("parserr.rs");
+        let err = tool
+            .call(ReadArgs {
+                path: typo.to_string_lossy().to_string(),
+                offset: None,
+                limit: None,
+            })
+            .await
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("File not found"), "{msg}");
+        assert!(msg.contains("Did you mean"), "{msg}");
+        assert!(msg.contains("parser.rs"), "{msg}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// F4: pathological lines (e.g. 100KB single line from minified JS
