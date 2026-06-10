@@ -51,6 +51,7 @@ pub mod schema_flatten;
 pub mod steering;
 pub mod storm;
 pub mod stream;
+pub mod suggest;
 pub mod tool;
 pub mod tool_input_repair;
 pub mod tools;

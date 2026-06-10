@@ -554,6 +554,43 @@ async fn test_tool_not_found_immediate_error() {
     }
 }
 
+/// dirge-opdt: an unknown tool name that's a near-miss of a real tool
+/// gets a "Did you mean?" suggestion.
+#[tokio::test]
+async fn test_tool_not_found_suggests_closest() {
+    let echo = Arc::new(EchoTool::new("echo"));
+    let context = build_context(echo);
+    let assistant_msg = AssistantMessage::new(
+        vec![ContentBlock::ToolCall {
+            id: "tool-1".to_string(),
+            name: "ehco".to_string(), // typo of "echo"
+            arguments: serde_json::json!({}),
+        }],
+        StopReason::ToolUse,
+    );
+    let tool_calls = extract_tool_calls(&assistant_msg);
+    let (tx, _rx) = mpsc::channel::<LoopEvent>(64);
+    let config = build_config();
+    let batch = execute_tool_calls_sequential(
+        &context,
+        &assistant_msg,
+        &tool_calls,
+        &config,
+        &AbortSignal::new(),
+        &tx,
+        &InflightSet::new(),
+    )
+    .await;
+    assert!(batch.messages[0].is_error);
+    match &batch.messages[0].content[0] {
+        ContentBlock::Text { text } => assert!(
+            text.contains("Did you mean `echo`?"),
+            "should suggest the closest tool: {text}"
+        ),
+        _ => panic!("expected text content block"),
+    }
+}
+
 /// beforeToolCall block=true → immediate error with reason.
 /// Port of pi `prepareToolCall` lines 598-604.
 #[tokio::test]

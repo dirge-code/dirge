@@ -26,7 +26,10 @@ pub fn format_structured_error(schema: &Value, args: &Value, errors: &[String]) 
     };
 
     let schema_hint = extract_schema_hint(schema, errors);
-    let concrete_hint = build_concrete_hint(errors);
+    // A closed-set (enum) violation gets a precise hint — the valid
+    // values plus the nearest match — rather than the generic fallback.
+    let concrete_hint =
+        enum_hint(schema, args, errors).unwrap_or_else(|| build_concrete_hint(errors));
 
     format!(
         "Tool input rejected: {summary}\n\
@@ -34,6 +37,42 @@ pub fn format_structured_error(schema: &Value, args: &Value, errors: &[String]) 
          Got:      {truncated}\n\
          Try:      {concrete_hint}"
     )
+}
+
+/// When a validation error is a closed-set (enum) violation, build a
+/// hint listing the valid values and — if the offending value is a
+/// string — the nearest one. Returns `None` for non-enum errors so the
+/// caller falls back to the generic hint.
+fn enum_hint(schema: &Value, args: &Value, errors: &[String]) -> Option<String> {
+    for err in errors {
+        let path_start = err.strip_prefix("at /")?;
+        let path = path_start.split(':').next().unwrap_or(path_start).trim();
+        let parts = parse_json_pointer(&format!("/{path}"));
+        let prop_schema = navigate_schema(schema, &parts)?;
+        let variants = prop_schema.get("enum").and_then(|v| v.as_array())?;
+
+        let valid: Vec<String> = variants
+            .iter()
+            .map(|v| match v {
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            })
+            .collect();
+        if valid.is_empty() {
+            continue;
+        }
+
+        // The offending value, read back from the args at the same path.
+        let got = args.pointer(&format!("/{path}"));
+        let mut hint = format!("Valid values: {}", valid.join(", "));
+        if let Some(Value::String(bad)) = got
+            && let Some(near) = crate::agent::agent_loop::suggest::closest(bad, &valid)
+        {
+            hint.push_str(&format!(". Did you mean `{near}`?"));
+        }
+        return Some(hint);
+    }
+    None
 }
 
 fn extract_schema_hint(schema: &Value, errors: &[String]) -> String {
@@ -100,4 +139,59 @@ pub(super) fn build_concrete_hint(errors: &[String]) -> String {
 /// Used by Phase 2 (markdown auto-link unwrap).
 pub fn is_path_field_name(key: &str) -> bool {
     matches!(key, "path" | "file_path" | "filename" | "paths" | "dir")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn schema_with_enum() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "mode": { "type": "string", "enum": ["read", "write", "append"] }
+            }
+        })
+    }
+
+    #[test]
+    fn enum_violation_lists_valid_values_and_nearest() {
+        let schema = schema_with_enum();
+        let args = json!({ "mode": "writ" });
+        // Shape of the jsonschema enum error the dispatcher passes in.
+        let errors = vec!["at /mode: \"writ\" is not one of [...]".to_string()];
+        let out = format_structured_error(&schema, &args, &errors);
+        assert!(out.contains("Valid values: read, write, append"), "{out}");
+        assert!(out.contains("Did you mean `write`?"), "{out}");
+    }
+
+    #[test]
+    fn enum_without_close_match_still_lists_values() {
+        let schema = schema_with_enum();
+        let args = json!({ "mode": "zzzzzz" });
+        let errors = vec!["at /mode: \"zzzzzz\" is not one of [...]".to_string()];
+        let out = format_structured_error(&schema, &args, &errors);
+        assert!(out.contains("Valid values: read, write, append"), "{out}");
+        assert!(
+            !out.contains("Did you mean"),
+            "no near match → no guess: {out}"
+        );
+    }
+
+    #[test]
+    fn non_enum_error_uses_generic_hint() {
+        let schema = json!({
+            "type": "object",
+            "properties": { "items": { "type": "array" } }
+        });
+        let args = json!({ "items": "x" });
+        let errors = vec!["at /items: \"x\" is not of type array".to_string()];
+        let out = format_structured_error(&schema, &args, &errors);
+        assert!(!out.contains("Valid values:"), "{out}");
+        assert!(
+            out.contains("array"),
+            "falls back to the generic array hint: {out}"
+        );
+    }
 }

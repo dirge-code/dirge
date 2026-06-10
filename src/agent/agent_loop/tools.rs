@@ -254,8 +254,16 @@ async fn prepare_tool_call(
     let tool = match context.tools.iter().find(|t| t.name() == tool_call.name) {
         Some(t) => t.clone(),
         None => {
+            // "Did you mean?" — weaker models hallucinate tool names
+            // (e.g. `search_files` for `grep`, `view` for `read`). A
+            // nearest-name hint turns a dead end into a one-shot fix.
+            let names: Vec<&str> = context.tools.iter().map(|t| t.name()).collect();
+            let mut msg = format!("Tool {} not found", tool_call.name);
+            if let Some(sugg) = super::suggest::closest(&tool_call.name, &names) {
+                msg.push_str(&format!(". Did you mean `{sugg}`?"));
+            }
             return PrepareOutcome::Immediate {
-                result: create_error_tool_result(&format!("Tool {} not found", tool_call.name)),
+                result: create_error_tool_result(&msg),
                 is_error: true,
             };
         }
