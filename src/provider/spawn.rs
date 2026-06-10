@@ -407,66 +407,18 @@ impl AnyAgent {
             std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
         >,
     ) -> crate::agent::agent_loop::StreamFn {
-        use crate::agent::agent_loop::rig_stream_fn_from_model_with_filter;
         let chunk_timeout = self.chunk_timeout;
         let provider = Some(self.provider_name().to_string());
-        match &self.inner {
-            AnyAgentInner::OpenRouter(a) => rig_stream_fn_from_model_with_filter(
-                (*a.model).clone(),
-                tools.clone(),
-                Some(chunk_timeout),
-                provider,
-                tool_def_filter,
-            ),
-            AnyAgentInner::OpenAI(a) => rig_stream_fn_from_model_with_filter(
-                (*a.model).clone(),
-                tools.clone(),
-                Some(chunk_timeout),
-                provider,
-                tool_def_filter,
-            ),
-            AnyAgentInner::Anthropic(a) => rig_stream_fn_from_model_with_filter(
-                (*a.model).clone(),
-                tools.clone(),
-                Some(chunk_timeout),
-                provider,
-                tool_def_filter,
-            ),
-            AnyAgentInner::Gemini(a) => rig_stream_fn_from_model_with_filter(
-                (*a.model).clone(),
-                tools.clone(),
-                Some(chunk_timeout),
-                provider,
-                tool_def_filter,
-            ),
-            AnyAgentInner::DeepSeek(a) => rig_stream_fn_from_model_with_filter(
-                (*a.model).clone(),
-                tools.clone(),
-                Some(chunk_timeout),
-                provider,
-                tool_def_filter,
-            ),
-            AnyAgentInner::Glm(a) => rig_stream_fn_from_model_with_filter(
-                (*a.model).clone(),
-                tools.clone(),
-                Some(chunk_timeout),
-                provider,
-                tool_def_filter,
-            ),
-            AnyAgentInner::Ollama(a) => rig_stream_fn_from_model_with_filter(
-                (*a.model).clone(),
-                tools.clone(),
-                Some(chunk_timeout),
-                provider,
-                tool_def_filter,
-            ),
-            AnyAgentInner::Custom(a) => rig_stream_fn_from_model_with_filter(
-                (*a.model).clone(),
-                tools.clone(),
-                Some(chunk_timeout),
-                provider,
-                tool_def_filter,
-            ),
+        // dirge-iy20: single provider list in `stream_dispatch`. Each
+        // arm clones `tools`/passes `tool_def_filter` by move — only
+        // one arm runs, so the moves are exclusive.
+        crate::provider::stream_dispatch::dispatch_stream_fn! {
+            match &self.inner;
+            AnyAgentInner(a) => (*a.model).clone(),
+            tools = tools.clone(),
+            timeout = Some(chunk_timeout),
+            provider = provider,
+            filter = tool_def_filter,
         }
     }
 }

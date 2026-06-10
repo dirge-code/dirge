@@ -4,6 +4,7 @@ mod dispatch;
 mod resolve;
 mod run;
 mod spawn;
+mod stream_dispatch;
 pub mod summarize;
 
 pub use build::*;

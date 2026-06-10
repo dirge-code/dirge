@@ -206,64 +206,15 @@ impl AnyModel {
         chunk_timeout: std::time::Duration,
         provider_name: Option<String>,
     ) -> crate::agent::agent_loop::StreamFn {
-        use crate::agent::agent_loop::rig_stream_fn_from_model_with_filter;
-        match self {
-            AnyModel::OpenRouter(m) => rig_stream_fn_from_model_with_filter(
-                m.clone(),
-                tools,
-                Some(chunk_timeout),
-                provider_name,
-                None,
-            ),
-            AnyModel::OpenAI(m) => rig_stream_fn_from_model_with_filter(
-                m.clone(),
-                tools,
-                Some(chunk_timeout),
-                provider_name,
-                None,
-            ),
-            AnyModel::Anthropic(m) => rig_stream_fn_from_model_with_filter(
-                m.clone(),
-                tools,
-                Some(chunk_timeout),
-                provider_name,
-                None,
-            ),
-            AnyModel::Gemini(m) => rig_stream_fn_from_model_with_filter(
-                m.clone(),
-                tools,
-                Some(chunk_timeout),
-                provider_name,
-                None,
-            ),
-            AnyModel::DeepSeek(m) => rig_stream_fn_from_model_with_filter(
-                m.clone(),
-                tools,
-                Some(chunk_timeout),
-                provider_name,
-                None,
-            ),
-            AnyModel::Glm(m) => rig_stream_fn_from_model_with_filter(
-                m.clone(),
-                tools,
-                Some(chunk_timeout),
-                provider_name,
-                None,
-            ),
-            AnyModel::Ollama(m) => rig_stream_fn_from_model_with_filter(
-                m.clone(),
-                tools,
-                Some(chunk_timeout),
-                provider_name,
-                None,
-            ),
-            AnyModel::Custom(m) => rig_stream_fn_from_model_with_filter(
-                m.clone(),
-                tools,
-                Some(chunk_timeout),
-                provider_name,
-                None,
-            ),
+        // dirge-iy20: single provider list in `stream_dispatch`,
+        // shared with `AnyAgent::build_stream_fn_with_filter`.
+        crate::provider::stream_dispatch::dispatch_stream_fn! {
+            match self;
+            AnyModel(m) => m.clone(),
+            tools = tools,
+            timeout = Some(chunk_timeout),
+            provider = provider_name,
+            filter = None,
         }
     }
 
