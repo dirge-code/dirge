@@ -538,6 +538,48 @@ pub fn spawn_dap_bridge() -> (
     (handle, tx)
 }
 
+/// Decide whether a DAP `evaluate` may proceed, given the permission
+/// registry. dirge-l9j6: FAILS CLOSED — a poisoned registry or checker
+/// lock returns `Err` (deny) rather than skipping the gate. Returns
+/// `Ok(())` only when there is genuinely no permission engine
+/// configured (a session without gating) or the engine allows. `Ask`
+/// is a denial here: the bridge task has no UI to raise a dialog.
+fn decide_eval_permission(
+    registry: &std::sync::Mutex<Option<crate::permission::checker::PermCheck>>,
+    expression: &str,
+) -> Result<(), String> {
+    use crate::permission::checker::CheckResult;
+
+    let perm = match registry.lock() {
+        Ok(guard) => guard.clone(),
+        Err(_) => {
+            return Err(
+                "permission state unavailable (poisoned lock) — denying debug evaluation".into(),
+            );
+        }
+    };
+    // No engine configured for this session → nothing to gate.
+    let Some(perm) = perm else {
+        return Ok(());
+    };
+    let mut checker = match perm.lock() {
+        Ok(c) => c,
+        Err(_) => {
+            return Err(
+                "permission checker unavailable (poisoned lock) — denying debug evaluation".into(),
+            );
+        }
+    };
+    match checker.check("debug", &format!("evaluate {expression}")) {
+        CheckResult::Allowed => Ok(()),
+        CheckResult::Ask => Err(
+            "expression evaluation requires permission dialog (not available in plugin bridge)"
+                .to_string(),
+        ),
+        CheckResult::Denied(r) => Err(format!("expression evaluation denied: {r}")),
+    }
+}
+
 /// Process a single DAP command on the tokio runtime.
 async fn handle_dap_command(cmd: DapCommand) {
     use crate::agent::agent_loop::tool::AbortSignal;
@@ -557,27 +599,13 @@ async fn handle_dap_command(cmd: DapCommand) {
 
     // For expression evaluation, check the permission engine before
     // forwarding to the adapter. Expressions execute in the debuggee's
-    // context with full process privileges. Ask results are treated as
-    // denial (no dialog in the bridge task).
+    // context with full process privileges. dirge-l9j6: the decision
+    // FAILS CLOSED — a poisoned permission lock denies rather than
+    // silently skipping the gate.
     if let DapCommand::Evaluate { expression, .. } = &cmd {
-        if let Some(perm) = DAP_PERM_CHECK.lock().ok().and_then(|g| g.clone()) {
-            if let Ok(mut checker) = perm.lock() {
-                use crate::permission::checker::CheckResult;
-                match checker.check("debug", &format!("evaluate {expression}")) {
-                    CheckResult::Allowed => {}
-                    CheckResult::Ask => {
-                        send_dap_reply(
-                            &cmd,
-                            Err("expression evaluation requires permission dialog (not available in plugin bridge)".to_string()),
-                        );
-                        return;
-                    }
-                    CheckResult::Denied(r) => {
-                        send_dap_reply(&cmd, Err(format!("expression evaluation denied: {r}")));
-                        return;
-                    }
-                }
-            }
+        if let Err(reason) = decide_eval_permission(&DAP_PERM_CHECK, expression) {
+            send_dap_reply(&cmd, Err(reason));
+            return;
         }
     }
 
@@ -809,6 +837,67 @@ mod tests {
         assert!(
             guard.is_none(),
             "DAP_PERM_CHECK should be None after cleanup"
+        );
+    }
+
+    // ── dirge-l9j6: fail-closed decision over an isolated registry ──
+
+    /// No checker configured → no gating (allow). A session without a
+    /// permission engine legitimately has nothing to consult.
+    #[test]
+    fn decide_eval_allows_when_no_checker() {
+        let registry: std::sync::Mutex<Option<PermCheck>> = std::sync::Mutex::new(None);
+        assert!(decide_eval_permission(&registry, "x + 1").is_ok());
+    }
+
+    /// Allowed by the checker → proceed.
+    #[test]
+    fn decide_eval_allows_when_checker_allows() {
+        let registry = std::sync::Mutex::new(Some(make_checker(SecurityMode::Accept)));
+        assert!(decide_eval_permission(&registry, "x + 1").is_ok());
+    }
+
+    /// Ask / Denied → deny (no dialog in the bridge).
+    #[test]
+    fn decide_eval_denies_on_ask_or_denied() {
+        let registry = std::sync::Mutex::new(Some(make_checker(SecurityMode::Standard)));
+        let err = decide_eval_permission(&registry, "x + 1").unwrap_err();
+        assert!(err.contains("evaluation"), "got: {err}");
+    }
+
+    /// FAIL CLOSED: a poisoned REGISTRY lock denies rather than
+    /// silently skipping the check.
+    #[test]
+    fn decide_eval_denies_on_poisoned_registry() {
+        let registry: std::sync::Mutex<Option<PermCheck>> =
+            std::sync::Mutex::new(Some(make_checker(SecurityMode::Accept)));
+        // Poison it: panic while holding the lock.
+        let r = &registry;
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = r.lock().unwrap();
+            panic!("poison");
+        }));
+        let err = decide_eval_permission(&registry, "x + 1").unwrap_err();
+        assert!(
+            err.contains("denying") || err.to_lowercase().contains("unavailable"),
+            "poisoned registry must fail closed, got: {err}"
+        );
+    }
+
+    /// FAIL CLOSED: a poisoned CHECKER lock denies too.
+    #[test]
+    fn decide_eval_denies_on_poisoned_checker() {
+        let checker = make_checker(SecurityMode::Accept);
+        let c = checker.clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = c.lock().unwrap();
+            panic!("poison");
+        }));
+        let registry = std::sync::Mutex::new(Some(checker));
+        let err = decide_eval_permission(&registry, "x + 1").unwrap_err();
+        assert!(
+            err.contains("denying") || err.to_lowercase().contains("unavailable"),
+            "poisoned checker must fail closed, got: {err}"
         );
     }
 }
