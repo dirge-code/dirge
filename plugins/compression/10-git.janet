@@ -172,8 +172,12 @@
   (each [i line] (pairs lines)
     (if (string/has-prefix? "diff --git" line)
       (do
+        # `i` (not `dec i`) is the exclusive slice end: file content
+        # runs [file-start, i) — the line at i-1 is this file's last
+        # line. The old `dec i` dropped the last line of every file
+        # except the last in a multi-file diff.
         (when (not (nil? file-start))
-          (array/push file-ranges [file-start (dec i) file-name]))
+          (array/push file-ranges [file-start i file-name]))
         (set file-start i)
         (def parts (string/split " b/" line))
         (set file-name (if (> (length parts) 1) (in parts 1) "?")))))
@@ -183,15 +187,12 @@
   (def result @[])
   (each [start end name] file-ranges
     (def file-lines (tuple/slice lines start end))
-    (if (<= (length file-lines) 250)
-      (each l file-lines (array/push result l))
-      (do
-        (each l (take 200 file-lines) (array/push result l))
-        (array/push result (string "[WARNING: diff truncated ("
-                                 (- (length file-lines) 250)
-                                 " lines hidden)]"))
-        (each l (take 50 (drop (- (length file-lines) 50) file-lines))
-          (array/push result l)))))
+    # Per-file head+tail via the shared helper, so the marker matches
+    # every other compressor and names the file. Keeps the first 200
+    # and last 50 lines of an over-long file diff (the tail often
+    # holds the most recent / most relevant hunks).
+    (array/push result
+                (truncate-lines file-lines 200 50 (string "diff lines in " name))))
   (string/join result "\n"))
 
 # ---------------------------------------------------------------------------

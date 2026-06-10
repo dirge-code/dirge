@@ -75,6 +75,7 @@ The plugin loads as a single shared Janet environment. Files are eval'd in alpha
 - **Structural extraction** — `git status` pulls branch name, ahead/behind count, and changed file lists into `branch↑N staged: ... unstaged: ...` format.
 - **Deduplication** — `kubectl logs` and `docker logs` collapse repeated lines with `(xN)` suffixes.
 - **Stat extraction** — `git merge`/`pull`/`cherry-pick` extract `N files, +M/-K` from the trailing summary line.
+- **Head+tail truncation** — when a list is too long to keep whole (`grep`/`find`/`ls`/`curl`/large `git diff`), `truncate-lines` (in `05-util.janet`) keeps the FIRST and LAST lines with an explicit marker — `… [N of M matches hidden — showing first H + last T] …`. Never head-only: errors, totals, and summaries usually sit at the *end* of output, so dropping the tail is the dangerous kind. The marker also makes clear the shown lines are a head+tail sample, not a relevance ranking.
 - **Passthrough** — commands with ≤10 lines of output or that don't match any pattern pass through unchanged. Already-terse output (like `git diff --stat` or small `curl` responses) is left alone.
 
 ## Files
@@ -82,6 +83,7 @@ The plugin loads as a single shared Janet environment. Files are eval'd in alpha
 ```
 .dirge/plugins/compression/
 ├── 00-regex.janet       Vendored spork/regex (MIT) — regex→PEG compiler
+├── 05-util.janet        Shared truncation helpers (head+tail with markers)
 ├── 10-git.janet         git (19 subcommands: status, log, diff, branch, ...)
 ├── 20-cargo.janet       cargo (10 subcommands: build, test, clippy, ...)
 ├── 30-docker.janet      docker + compose (12 subcommands: ps, images, build, ...)
@@ -91,19 +93,19 @@ The plugin loads as a single shared Janet environment. Files are eval'd in alpha
 ├── init.janet           ANSI strip, generic noise removal, on-tool-end hook,
 │                        main dispatch routing
 └── tests/
-    ├── bench.janet      A/B compression benchmark with realistic samples
-    └── test.janet       Unit tests for each compressor + tool-gate tests
+    └── test.janet       Runnable truncation checks (head+tail invariants)
 ```
 
 ## Running the tests
 
 ```bash
-# Unit tests (23 tests, all compressors + tool gate)
+# Truncation invariants (head+tail, markers, off-by-one regressions)
 janet .dirge/plugins/compression/tests/test.janet
-
-# A/B benchmark (17 realistic samples, threshold checks)
-janet .dirge/plugins/compression/tests/bench.janet
 ```
+
+These run in the Janet worker, not under `cargo test`, so they're a
+runnable local artifact rather than a CI gate — run them after editing
+any compressor.
 
 ## Porting from lean-ctx
 

@@ -32,10 +32,10 @@
 (defn- compress-grep-output [output]
   (def lines (string/split "\n" output))
   (if (<= (length lines) 30) (break output))
-  (def match-count (length (filter (fn [l] (not (empty? (string/trim l)))) lines)))
-  (let [sample (take 20 lines)]
-    (string (string/join sample "\n")
-            "\n... (" match-count " matches, " (- (length lines) 20) " lines omitted)")))
+  # Head+tail: grep emits matches in file order, so the LAST matches
+  # are as load-bearing as the first. Head-only truncation hid the
+  # tail entirely (the regression this refactor fixes).
+  (truncate-lines lines 18 8 "matching lines"))
 
 (defn grep-compress [command output]
   (if (not (or (string/find "grep " command) (string/has-prefix? "grep" command)
@@ -48,13 +48,14 @@
 # ---------------------------------------------------------------------------
 
 (defn- compress-find-output [output]
-  (def lines (filter (fn [l] (not (empty? (string/trim l)))) (string/split "\n" output)))
+  (def lines (nonblank-lines output))
   (if (<= (length lines) 20) (break (string/join lines "\n")))
-  (def dirs (filter (fn [l] (not (string/find "." (last (string/split "/" l))))) lines))
-  (def files (- (length lines) (length dirs)))
-  (def sample (take 15 lines))
-  (string (string/join sample "\n")
-          "\n... (" (length lines) " results: " files " files, " (length dirs) " dirs)"))
+  # Show actual paths head+tail. The previous version guessed
+  # file-vs-dir from "does the basename contain a dot" — which
+  # miscounts (Makefile/README → "dir", .git → "file"). `find`
+  # output is just paths; there's no reliable file/dir signal in the
+  # string, so we report the honest total instead of a wrong split.
+  (truncate-lines lines 12 6 "paths"))
 
 (defn find-compress [command output]
   (if (not (or (string/find "find " command) (string/find "fd " command))) (break nil))
@@ -65,14 +66,13 @@
 # ---------------------------------------------------------------------------
 
 (defn- compress-ls-output [output]
-  (def lines (filter (fn [l] (not (empty? (string/trim l)))) (string/split "\n" output)))
+  (def lines (nonblank-lines output))
   (if (<= (length lines) 30) (break (string/join lines "\n")))
-  (def dirs (filter (fn [l]
-                      (let [t (string/trim l)]
-                        (or (string/has-prefix? "d" t) (string/has-prefix? "total" t))))
-                    lines))
-  (def files (- (length lines) (length dirs)))
-  (string (length lines) " entries (" files " files, " (length dirs) " dirs)"))
+  # Show actual entry names head+tail rather than collapsing to a bare
+  # count — the model usually re-runs `ls` to learn WHICH files exist,
+  # so a names-less "N entries" was nearly useless. (The old file/dir
+  # split only worked for `ls -l`; dropped as unreliable.)
+  (truncate-lines lines 18 6 "entries"))
 
 (defn ls-compress [command output]
   (if (not (or (string/has-prefix? "ls" command) (string/find " ls " command) (string/find "/ls" command))) (break nil))
@@ -85,13 +85,9 @@
 (defn- compress-curl-output [output]
   (def trimmed (string/trim output))
   (when (empty? trimmed) (break "ok"))
-  (def lines (string/split "\n" trimmed))
-  (if (<= (length lines) 20) (break trimmed))
-  (def head (take 10 lines))
-  (def tail (take 10 (drop (- (length lines) 10) lines)))
-  (string (string/join head "\n")
-          "\n... (" (- (length lines) 20) " lines omitted)\n"
-          (string/join tail "\n")))
+  # Already head+tail; route through the shared helper so the marker
+  # matches every other compressor.
+  (truncate-lines (string/split "\n" trimmed) 10 10 "lines"))
 
 (defn curl-compress [command output]
   (if (not (or (string/find "curl " command) (string/has-prefix? "curl" command)))
