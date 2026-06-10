@@ -231,15 +231,19 @@ impl Tool for ReadTool {
         );
 
         if let Some(ref cache) = self.cache
-            && let Some(_cached) = cache.get(&cache_key)
+            && let Some(cached) = cache.get(&cache_key)
         {
-            // LOOP-3: cache hit — the model already saw this file unchanged.
-            // Return a terse status so we don't waste tokens re-sending content.
+            // Cache hit: the host already rendered this exact range of
+            // the unchanged file this generation. Return the cached
+            // CONTENT — the cache avoids a disk re-read, it is not a
+            // reason to withhold content from the model. dirge-4lzg:
+            // returning a terse "cached — unchanged" message here
+            // stranded the model after a compaction (the cache
+            // outlives compaction; the earlier read may be gone from
+            // context, leaving no way to see the file). Also satisfies
+            // the read-before-edit gate.
             cache.mark_read(std::path::Path::new(&resolved_path));
-            return Ok(format!(
-                "📎 cached — {} unchanged from previous read (use offset/limit to re-read a range)",
-                args.path,
-            ));
+            return Ok(cached);
         }
 
         // F4: stream the file line-by-line via BufReader instead of
@@ -484,6 +488,55 @@ mod tests {
 
     fn temp_path(suffix: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("dirge-read-test-{}-{}", std::process::id(), suffix,))
+    }
+
+    /// dirge-4lzg: a content-cache HIT must return the file content,
+    /// not a terse "cached — unchanged" message. The cache survives
+    /// context compaction, so a model that re-reads a file after the
+    /// earlier read was compacted out of context would otherwise get
+    /// no content and be stuck. The cache is a token-cost optimization
+    /// for the host (no disk re-read), never a reason to withhold
+    /// content from the model.
+    #[tokio::test]
+    async fn cache_hit_returns_content_not_a_terse_message() {
+        let path = temp_path("cachehit");
+        std::fs::write(&path, "alpha\nbravo\ncharlie\n").unwrap();
+
+        let cache = crate::agent::tools::ToolCache::new();
+        let tool = ReadTool::with_cache(
+            None,
+            None,
+            cache,
+            #[cfg(feature = "lsp")]
+            None,
+        );
+        let args = || ReadArgs {
+            path: path.to_string_lossy().to_string(),
+            offset: None,
+            limit: None,
+        };
+
+        // First read populates the cache.
+        let first = tool.call(args()).await.unwrap();
+        assert!(first.contains("bravo"), "first read returns content");
+
+        // Second read (same range, unchanged file) is a cache hit and
+        // must STILL return the content.
+        let second = tool.call(args()).await.unwrap();
+        assert!(
+            second.contains("bravo"),
+            "cache hit must return content, got: {second:?}",
+        );
+        assert!(
+            !second.contains("cached"),
+            "cache hit must not return a terse status message, got: {second:?}",
+        );
+        assert_eq!(
+            first, second,
+            "cache hit returns the same output as the live read"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 
     /// F4: pathological lines (e.g. 100KB single line from minified JS
