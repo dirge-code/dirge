@@ -487,7 +487,7 @@ fn dedupe<I: IntoIterator<Item = Diagnostic>>(items: I) -> Vec<Diagnostic> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lsp::jsonrpc::{decode_frame, encode_frame};
+    use crate::jsonrpc_framing::{decode_frame, encode_frame};
     use lsp_types::{DiagnosticSeverity, NumberOrString, Position, Range};
     use serde_json::json;
     use tokio::io::BufReader;

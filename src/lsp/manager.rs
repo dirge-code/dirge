@@ -911,7 +911,7 @@ mod tests {
                 let (client_in, mut server_writer) = tokio::io::duplex(8192);
                 let (mut server_reader, client_out) = tokio::io::duplex(8192);
                 let fake_server = tokio::spawn(async move {
-                    use crate::lsp::jsonrpc::{decode_frame, encode_frame};
+                    use crate::jsonrpc_framing::{decode_frame, encode_frame};
                     let mut reader = tokio::io::BufReader::new(&mut server_reader);
                     loop {
                         let frame = match decode_frame(&mut reader).await {

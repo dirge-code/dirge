@@ -267,7 +267,7 @@ mod tests {
                 let seen_outer = std::sync::Arc::clone(&seen_arc);
                 let response_clone = response.clone();
                 let fake_server = tokio::spawn(async move {
-                    use crate::lsp::jsonrpc::{decode_frame, encode_frame};
+                    use crate::jsonrpc_framing::{decode_frame, encode_frame};
                     let mut reader = tokio::io::BufReader::new(&mut server_reader);
                     loop {
                         let frame = match decode_frame(&mut reader).await {

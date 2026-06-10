@@ -5,7 +5,6 @@ pub mod diagnostic;
 #[cfg(feature = "plugin")]
 pub mod harness;
 pub mod init;
-pub mod jsonrpc;
 pub mod language;
 pub mod manager;
 pub mod query;

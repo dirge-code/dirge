@@ -1,6 +1,6 @@
 //! JSON-RPC 2.0 request/response correlation over a framed transport.
 //!
-//! Built on top of [`crate::lsp::jsonrpc`]. The client spawns a background
+//! Built on top of [`crate::jsonrpc_framing`]. The client spawns a background
 //! task that pumps incoming frames and routes them:
 //! - responses (have `id`, no `method`) → resolve the matching pending request
 //! - notifications (have `method`, no `id`) → dispatch to registered handlers
@@ -24,7 +24,7 @@ use tokio::sync::{Mutex, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
-use crate::lsp::jsonrpc::{decode_frame, encode_frame};
+use crate::jsonrpc_framing::{decode_frame, encode_frame};
 
 /// Failure surfaced to a pending request.
 #[derive(Debug, thiserror::Error)]

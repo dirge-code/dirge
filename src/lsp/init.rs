@@ -115,7 +115,7 @@ fn client_capabilities() -> ClientCapabilities {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lsp::jsonrpc::{decode_frame, encode_frame};
+    use crate::jsonrpc_framing::{decode_frame, encode_frame};
     use serde_json::{Value, json};
     use tokio::io::BufReader;
 

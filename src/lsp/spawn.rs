@@ -285,7 +285,7 @@ mod tests {
 
                 // Fake server task: respond to anything with a sensible reply.
                 let fake_server = tokio::spawn(async move {
-                    use crate::lsp::jsonrpc::{decode_frame, encode_frame};
+                    use crate::jsonrpc_framing::{decode_frame, encode_frame};
                     use serde_json::json;
                     let mut reader = tokio::io::BufReader::new(&mut server_reader);
                     loop {

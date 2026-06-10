@@ -1,27 +1,34 @@
-//! JSON-RPC framing for LSP.
+//! Content-Length message framing, shared by LSP and DAP (dirge-lnd8).
 //!
-//! LSP uses HTTP-style framing on top of stdio:
+//! Both protocols use HTTP-style framing on top of stdio:
 //! ```text
 //! Content-Length: <N>\r\n
 //! \r\n
 //! <body of N bytes>
 //! ```
-//! Content-Type is allowed by the spec but ignored — every modern server
-//! sends UTF-8 JSON. Multiple frames can follow back-to-back on the same
-//! stream, so the reader operates on a buffered source.
+//! Other headers (e.g. `Content-Type`) are allowed by both specs but
+//! ignored — every modern server sends UTF-8 JSON. Multiple frames
+//! can follow back-to-back on the same stream, so the reader operates
+//! on a buffered source.
+//!
+//! This was duplicated byte-for-byte as `lsp::jsonrpc` and
+//! `dap::framing`; a bug fixed in one would have silently missed the
+//! other. Single source of truth now.
 
 use std::io;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 const CONTENT_LENGTH_PREFIX: &str = "Content-Length:";
 
-/// Maximum body length we'll accept. Prevents a malformed Content-Length value
-/// from forcing us to allocate an unbounded buffer. LSP messages in the wild
-/// are KB-scale; 16 MB is more than enough headroom.
+/// Maximum body length we'll accept. Prevents a malformed
+/// Content-Length value from forcing us to allocate an unbounded
+/// buffer. LSP/DAP messages in the wild are KB-scale; 16 MB is more
+/// than enough headroom.
 const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 
-/// Write a single LSP message frame to `writer`. The caller passes the raw
-/// JSON body as bytes; framing prepends `Content-Length` + the blank line.
+/// Write a single framed message to `writer`. The caller passes the
+/// raw JSON body as bytes; framing prepends `Content-Length` + the
+/// blank line and flushes.
 pub async fn encode_frame<W>(writer: &mut W, body: &[u8]) -> io::Result<()>
 where
     W: AsyncWrite + Unpin,
@@ -33,9 +40,9 @@ where
     Ok(())
 }
 
-/// Read one LSP message frame from `reader`. Returns the raw body bytes.
-/// Errors on EOF mid-frame, missing/malformed `Content-Length`, or a body
-/// length above [`MAX_BODY_BYTES`].
+/// Read one framed message from `reader`. Returns the raw body bytes.
+/// Errors on EOF mid-frame, missing/malformed `Content-Length`, or a
+/// body length above [`MAX_BODY_BYTES`].
 pub async fn decode_frame<R>(reader: &mut R) -> io::Result<Vec<u8>>
 where
     R: AsyncBufRead + Unpin,
@@ -73,7 +80,7 @@ where
             }
             content_length = Some(parsed);
         }
-        // Other headers (e.g. Content-Type) are ignored per the LSP spec.
+        // Other headers (e.g. Content-Type) are ignored per both specs.
     }
 
     let len = content_length.ok_or_else(|| {
@@ -108,7 +115,7 @@ mod tests {
     #[tokio::test]
     async fn roundtrip_unicode_body_preserves_byte_count() {
         // Multi-byte chars: byte length ≠ char count. Content-Length is bytes
-        // per the LSP spec — this test pins that down.
+        // per the spec — this test pins that down.
         let body = "{\"text\":\"hello 🦀 rust\"}".as_bytes();
         assert_eq!(roundtrip(body).await, body);
     }

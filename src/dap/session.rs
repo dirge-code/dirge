@@ -1003,7 +1003,7 @@ fn rpc_to_tool_error(e: RpcError) -> ToolError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dap::framing::{decode_frame, encode_frame};
+    use crate::jsonrpc_framing::{decode_frame, encode_frame};
     use serde_json::Value;
     use tokio::io::{AsyncBufRead, AsyncWrite};
 

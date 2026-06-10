@@ -19,8 +19,8 @@ use tokio::sync::{Mutex, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
-use crate::dap::framing::{decode_frame, encode_frame};
 use crate::dap::types::Capabilities;
+use crate::jsonrpc_framing::{decode_frame, encode_frame};
 
 /// Cap on how long a single frame write to the adapter may block. The
 /// per-request `timeout` only covers the *response* (`rx`); without this a
