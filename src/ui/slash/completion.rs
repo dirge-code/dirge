@@ -19,7 +19,12 @@ use crate::sync_util::LockExt;
 static PLUGIN_COMMANDS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// Register plugin command names for tab completion.
-/// Called from `main.rs` after plugin init.
+/// Called from `main.rs` after plugin init. Only the `plugin` feature
+/// has anything to register — without it the setter is dead (the
+/// `PLUGIN_COMMANDS` static stays empty and `all_commands` just reads
+/// through it), so gate it to avoid a dead-code error on plugin-less
+/// builds like `windows-default`.
+#[cfg(feature = "plugin")]
 pub fn register_plugin_commands(cmds: Vec<String>) {
     *PLUGIN_COMMANDS.lock_ignore_poison() = cmds;
 }

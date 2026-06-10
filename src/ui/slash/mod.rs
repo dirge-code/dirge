@@ -25,10 +25,11 @@ mod cmd;
 mod completion;
 
 #[cfg(feature = "slash-completion")]
-pub use completion::{
-    CompletionResult, format_completion_preview, ghost_suffix, register_plugin_commands,
-    try_complete,
-};
+pub use completion::{CompletionResult, format_completion_preview, ghost_suffix, try_complete};
+// Only meaningful with plugins; gated to match its sole caller so a
+// plugin-less build (e.g. windows-default) doesn't re-export a dead fn.
+#[cfg(all(feature = "slash-completion", feature = "plugin"))]
+pub use completion::register_plugin_commands;
 
 #[inline]
 pub(super) fn c_agent() -> Color {
