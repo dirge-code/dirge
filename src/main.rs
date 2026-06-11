@@ -1470,6 +1470,20 @@ async fn main() -> anyhow::Result<()> {
         )
         .await?;
 
+        // Dark-gray hint so the user can jump straight back into the
+        // session they just left. `--session <id>` resumes that exact
+        // session (unlike `-r`/`--resume`, which opens the picker).
+        // Skipped for ephemeral (`--no-session`) and empty sessions —
+        // nothing was saved to resume. ANSI 90 = dark gray; only when
+        // stdout is a terminal so the escape can't leak into a pipe.
+        {
+            use std::io::IsTerminal;
+            if !cli.no_session && !session.messages.is_empty() && std::io::stdout().is_terminal() {
+                println!("\n\x1b[90mResume this session with:\x1b[0m");
+                println!("\x1b[90m  dirge --session {}\x1b[0m", session.id);
+            }
+        }
+
         // Best-effort `textDocument/didClose` for every file each
         // LSP server saw this session. Servers retain parse trees
         // + diagnostic caches keyed on open files; without this
