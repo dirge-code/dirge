@@ -1790,6 +1790,15 @@ impl Renderer {
         self.needs_paint = true;
     }
 
+    /// Whether a frame is marked dirty but not yet painted — e.g. the
+    /// `tui_redraw` paint throttle deferred it. The event loop polls
+    /// this so a throttled frame (the tail of a fast wheel/PageUp scroll
+    /// burst) gets flushed shortly instead of being stranded until the
+    /// next unrelated event.
+    pub fn needs_paint(&self) -> bool {
+        self.needs_paint
+    }
+
     /// #387: the single paint per event. Performs one `tui_redraw` iff the
     /// frame is dirty. The flag is cleared inside `tui_redraw` only
     /// after a successful `terminal.draw()`, so a throttled paint or

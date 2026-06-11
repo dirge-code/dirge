@@ -3355,6 +3355,13 @@ pub async fn run_interactive(
                 // itself). The status line is built once by `render_frame!`.
                 renderer.request_repaint();
             }
+            // A dirty frame the 8ms paint throttle deferred (the tail of a fast
+            // wheel-scroll / PageUp burst) would otherwise sit unpainted: while
+            // the agent is idle there's no other timer to wake the loop, so the
+            // scrolled position stalls until the next unrelated event. Wake just
+            // past the throttle window and let the loop-top `render_frame!` flush
+            // it (no body needed — needs_paint is already set).
+            _ = tokio::time::sleep(tokio::time::Duration::from_millis(16)), if renderer.needs_paint() => {}
             else => {
                 tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
             }
