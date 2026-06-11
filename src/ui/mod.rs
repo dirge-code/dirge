@@ -5,7 +5,7 @@ pub(crate) mod box_render;
 pub(crate) mod buffer;
 mod chat_state;
 pub(crate) mod colors;
-mod events;
+pub(crate) mod events;
 pub(crate) mod gitstatus;
 mod highlight;
 pub(crate) mod input;

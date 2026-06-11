@@ -540,6 +540,10 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
             },
+            #[cfg(feature = "mcp-server")]
+            cli::Command::Mcp { model, sandbox } => {
+                return extras::mcp_server::serve(&cli, &cfg, model.clone(), sandbox.clone()).await;
+            }
         }
     }
 

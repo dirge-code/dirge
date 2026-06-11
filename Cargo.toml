@@ -77,6 +77,7 @@ default = [
     'semantic-cpp',
     'semantic-elixir',
     'slash-completion',
+    'mcp-server',
 ]
 # Default feature set minus `plugin` (dirge-4xgd / Windows release).
 # The Janet bindings don't build on Windows MSVC: `evil_janet` references
@@ -103,8 +104,13 @@ windows-default = [
     'semantic-cpp',
     'semantic-elixir',
     'slash-completion',
+    'mcp-server',
 ]
 loop = []
+# Run dirge itself as an MCP server (`dirge mcp`) so another agent (e.g.
+# Claude Code) can delegate implementation tasks to dirge and review them.
+# Pulls rmcp's server side + stdio transport + the tool macros.
+mcp-server = ["dep:rmcp", "rmcp?/server", "rmcp?/macros", "rmcp?/transport-io", "rmcp?/schemars"]
 git-worktree = []
 mcp = [
     "dep:rmcp",

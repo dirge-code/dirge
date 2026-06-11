@@ -245,6 +245,21 @@ pub enum Command {
         #[command(subcommand)]
         action: SandboxAction,
     },
+    /// Run dirge as an MCP server so another agent can delegate
+    /// implementation tasks to it (and review them). Speaks MCP over
+    /// stdio; keeps a persistent per-project session. Requires the
+    /// `mcp-server` build feature.
+    #[cfg(feature = "mcp-server")]
+    Mcp {
+        /// Model dirge uses for delegated work (overrides config for this
+        /// server). Defaults to the configured/default model.
+        #[arg(long = "model")]
+        model: Option<String>,
+        /// Sandbox bash during delegations: 'bwrap', 'microvm', or 'none'.
+        /// Defaults to no sandbox (tools are still cwd-scoped accept-all).
+        #[arg(long = "sandbox")]
+        sandbox: Option<String>,
+    },
 }
 
 #[derive(clap::Subcommand, Debug)]

@@ -7,6 +7,9 @@ pub mod git_worktree;
 #[cfg(feature = "mcp")]
 pub mod mcp;
 
+#[cfg(feature = "mcp-server")]
+pub mod mcp_server;
+
 #[cfg(feature = "acp")]
 pub mod acp;
 

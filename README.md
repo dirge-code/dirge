@@ -15,6 +15,7 @@ What sets dirge apart from other agentic editors:
 - **Self-improving project memory.** Persistent per-project memory plus a post-session orchestrator that extracts learnings and curates memory + skills.
 - **Code intelligence baked in.** Tree-sitter [semantic tools](docs/semantic.md) and [LSP diagnostics](docs/lsp.md) for 10+ languages, surfaced inline so the agent fixes compile errors on the same turn.
 - **Extensible at runtime.** A [Janet plugin system](docs/plugins.md) hooks the full lifecycle, and [Claude-compatible skills](docs/skills.md) load instructions on demand.
+- **Delegate to dirge from another agent.** Run `dirge mcp` to expose dirge as an [MCP server](docs/mcp-server.md): a planner agent (e.g. Claude Code) hands implementation tasks to dirge on a persistent per-project session, then reviews the summary + changed files it returns.
 
 See the full [feature catalog](docs/features.md) for everything else.
 
