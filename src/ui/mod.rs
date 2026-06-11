@@ -1277,7 +1277,11 @@ pub async fn run_interactive(
                         if rect_contains_xy(renderer.cached_modified_rect, row, col) {
                             renderer.panel_modified_scroll(-3, modified_visible_rows(renderer.cached_modified_rect));
                         } else {
-                            renderer.scroll_line_up();
+                            // 3 lines/tick so the chat wheel matches the
+                            // MODIFIED panel's feel instead of crawling 1/tick.
+                            for _ in 0..3 {
+                                renderer.scroll_line_up();
+                            }
                         }
                         renderer.request_repaint();
                         continue;
@@ -1286,7 +1290,9 @@ pub async fn run_interactive(
                         if rect_contains_xy(renderer.cached_modified_rect, row, col) {
                             renderer.panel_modified_scroll(3, modified_visible_rows(renderer.cached_modified_rect));
                         } else {
-                            renderer.scroll_line_down();
+                            for _ in 0..3 {
+                                renderer.scroll_line_down();
+                            }
                         }
                         renderer.request_repaint();
                         continue;
