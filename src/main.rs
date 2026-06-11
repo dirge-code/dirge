@@ -1162,7 +1162,7 @@ async fn main() -> anyhow::Result<()> {
         // `session` here is the session `--session` resolved (loaded or fresh);
         // its messages are the prior turns, the new prompt is appended after.
         let history = crate::agent::runner::convert_history(&session);
-        let response = agent
+        let (response, turn_tool_calls) = agent
             .run_print(
                 &msg,
                 cli.resolve_max_agent_turns(&cfg),
@@ -1199,7 +1199,10 @@ async fn main() -> anyhow::Result<()> {
         // fail without losing the lifecycle signal.
         if !cli.no_session {
             session.add_message(MessageRole::User, &msg);
-            session.add_message(MessageRole::Assistant, &response);
+            // Persist the full assistant turn — text PLUS the tool calls/
+            // results — so a resumed `--session` (e.g. an MCP delegation
+            // follow-up) sees what dirge actually did, not just a text blurb.
+            session.add_message_with_tool_calls(MessageRole::Assistant, &response, turn_tool_calls);
             crate::agent::review::maybe_fire_session_end(&agent, &session);
             if let Err(e) = session::storage::save_session(&mut session) {
                 eprintln!("warning: failed to save session: {}", e);
@@ -1580,7 +1583,7 @@ async fn run_headless_loop(
             )
             .await
         {
-            Ok(r) => r,
+            Ok((r, _tool_calls)) => r,
             Err(e) => {
                 eprintln!("[loop] error in iteration {}: {}", state.iteration, e);
                 return Ok(HeadlessLoopExit::MaxIterations);

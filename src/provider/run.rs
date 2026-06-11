@@ -65,7 +65,9 @@ impl AnyAgent {
         // session's history (via `convert_history`) so a headless run
         // continues where it left off instead of starting cold each time.
         history: Vec<rig::completion::Message>,
-    ) -> anyhow::Result<String> {
+        // Returns the final response text plus the turn's tool calls (so the
+        // caller can persist a full-fidelity assistant message).
+    ) -> anyhow::Result<(String, Vec<crate::session::ToolCallEntry>)> {
         // dirge-nqr: honor the cap explicitly even if the agent was
         // built with a different one. `run_print` is the headless
         // entry point — callers explicitly pass the cap they want.
@@ -124,9 +126,44 @@ impl AnyAgent {
         // can't claim success for a truncated or runner-died run.
         let mut completed = false;
         let mut truncated = false;
+        // Accumulate the turn's tool calls so the headless save is
+        // full-fidelity (matching the interactive path). Without this the
+        // saved assistant message carried only its final text, so a resumed
+        // `--session` lost every tool call/result — and a tool-heavy final
+        // turn saved an empty/partial message, reading as a cut-off end.
+        // Mirrors the UI's ToolCall/ToolResult accumulation
+        // (run_handlers/tool_call.rs + tool_result.rs).
+        use crate::session::{ToolCallEntry, ToolCallState};
+        let mut tool_calls: Vec<ToolCallEntry> = Vec::new();
 
         while let Some(event) = event_rx.recv().await {
             match event {
+                AgentEvent::ToolCall { id, name, args } => {
+                    // Start Interrupted; the matching ToolResult flips it to
+                    // Completed. An unanswered call stays Interrupted, which
+                    // convert_history re-emits so the model sees no orphan.
+                    tool_calls.push(ToolCallEntry {
+                        id: id.to_string(),
+                        name: name.to_string(),
+                        args,
+                        state: ToolCallState::Interrupted,
+                    });
+                }
+                AgentEvent::ToolResult { id, output, .. } => {
+                    let target = if !id.is_empty() {
+                        tool_calls.iter_mut().rev().find(|e| e.id == id.as_str())
+                    } else {
+                        tool_calls
+                            .iter_mut()
+                            .rev()
+                            .find(|e| matches!(e.state, ToolCallState::Interrupted))
+                    };
+                    if let Some(entry) = target {
+                        entry.state = ToolCallState::Completed {
+                            result: output.to_string(),
+                        };
+                    }
+                }
                 AgentEvent::Token(text) => {
                     full_response.push_str(&text);
                     if !suppress_inline {
@@ -252,7 +289,7 @@ impl AnyAgent {
                 "run ended without completing — the agent runner stopped before producing a result"
             ));
         }
-        Ok(full_response)
+        Ok((full_response, tool_calls))
     }
 }
 
