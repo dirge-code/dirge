@@ -224,24 +224,37 @@ pub fn render_session(
         let cont_indent = " ".repeat(handle.chars().count());
 
         if msg.role == MessageRole::Assistant {
-            // Wrap chat to the same width tool chambers use so chat
-            // and chamber blocks line up visually. The 8-col handle
-            // prefix is subtracted so wrapped continuation text fits
-            // beneath the handle position.
-            let max_width = renderer
-                .content_width()
-                .saturating_sub(handle.chars().count() + 1);
-            let mut styled = markdown::markdown_to_styled(&msg.content, max_width, line_color);
-            for (i, entry) in styled.iter_mut().enumerate() {
-                if i == 0 {
-                    entry.text = CompactString::from(format!("{} {}", handle, entry.text));
-                } else {
-                    entry.text = CompactString::from(format!("{}{}", cont_indent, entry.text));
+            // Prose first — but only when there's text. A turn that was
+            // pure tool calls has empty content; rendering it anyway left
+            // a bare `<dirge>` handle with nothing after it on reload.
+            if !msg.content.is_empty() {
+                // Wrap chat to the same width tool chambers use so chat
+                // and chamber blocks line up visually. The 8-col handle
+                // prefix is subtracted so wrapped continuation text fits
+                // beneath the handle position.
+                let max_width = renderer
+                    .content_width()
+                    .saturating_sub(handle.chars().count() + 1);
+                let mut styled = markdown::markdown_to_styled(&msg.content, max_width, line_color);
+                for (i, entry) in styled.iter_mut().enumerate() {
+                    if i == 0 {
+                        entry.text = CompactString::from(format!("{} {}", handle, entry.text));
+                    } else {
+                        entry.text = CompactString::from(format!("{}{}", cont_indent, entry.text));
+                    }
+                }
+                for entry in styled {
+                    renderer.write_line(&entry.text, entry.color)?;
                 }
             }
-            for entry in styled {
-                renderer.write_line(&entry.text, entry.color)?;
-            }
+            // Then reconstruct the turn's tool chambers from the persisted
+            // calls so reloading a session keeps its edits/bash/reads.
+            render_tool_calls_replay(
+                renderer,
+                &msg.tool_calls,
+                cfg.resolve_tool_result_max_chars(),
+                cfg.resolve_tool_result_max_lines(),
+            )?;
         } else {
             for (i, line) in body.lines().enumerate() {
                 let prefix = if i == 0 {
@@ -260,6 +273,46 @@ pub fn render_session(
         } else {
             renderer.write_line("", Color::Reset)?;
         }
+    }
+    Ok(())
+}
+
+/// Reconstruct an assistant turn's persisted tool calls as chambers, so a
+/// reloaded session shows the edits/bash/reads/results — not just prose.
+/// Mirrors the live view by reusing the same `tool_display` rendering
+/// (header + collapsed body + chamber bottom). `max_chars`/`max_lines` are
+/// the caller's resolved tool-result display caps.
+pub(crate) fn render_tool_calls_replay(
+    renderer: &mut Renderer,
+    tool_calls: &[crate::session::ToolCallEntry],
+    max_chars: usize,
+    max_lines: usize,
+) -> anyhow::Result<()> {
+    use crate::session::ToolCallState;
+    use crate::ui::tool_display::{
+        chamber_widths, fit_banner_header, format_tool_banner_value, render_tool_output,
+    };
+    for tc in tool_calls {
+        let banner_value = format_tool_banner_value(&tc.name, &tc.args);
+        let (frame_w, _) = chamber_widths(renderer);
+        let header = fit_banner_header(&tc.name.to_ascii_uppercase(), &banner_value, frame_w);
+        renderer.write_line("", Color::Reset)?;
+        renderer.write_line(&header, theme::tool())?;
+        // Body mirrors `convert_history`'s state→text mapping so the replayed
+        // chamber matches what the model re-sees on resume.
+        let body = match &tc.state {
+            ToolCallState::Completed { result } => result.clone(),
+            ToolCallState::Interrupted => "[Tool execution was interrupted]".to_string(),
+            ToolCallState::Failed { error } => format!("[Tool error: {error}]"),
+        };
+        render_tool_output(
+            renderer,
+            &tc.name,
+            &banner_value,
+            &body,
+            max_chars,
+            max_lines,
+        )?;
     }
     Ok(())
 }
@@ -578,6 +631,55 @@ mod tests {
         assert!(
             p.contains("the user's actual intent"),
             "should fall through past empty sections to user message: {p:?}"
+        );
+    }
+
+    /// dirge: a reloaded session must reconstruct tool chambers from the
+    /// persisted `tool_calls`, not drop them. Before the fix `render_session`
+    /// rendered only `msg.content`, so every edit/bash/read vanished on resume.
+    #[test]
+    fn replays_tool_calls_as_chambers() {
+        use crate::session::{ToolCallEntry, ToolCallState};
+        let mut renderer = Renderer::new().unwrap();
+        renderer.set_chat_rect_for_test(ratatui::layout::Rect::new(0, 1, 100, 24));
+        let calls = vec![ToolCallEntry {
+            id: "call_1".into(),
+            name: "bash".into(),
+            args: serde_json::json!({ "command": "ls -la" }),
+            state: ToolCallState::Completed {
+                result: "total 4\ndrwxr-xr-x  src".into(),
+            },
+        }];
+        render_tool_calls_replay(&mut renderer, &calls, 10_000, 100).unwrap();
+        let text = renderer.buffer_lines().join("\n");
+        // Header carries the upper-cased tool name + its banner value.
+        assert!(text.contains("BASH"), "missing tool header: {text}");
+        assert!(text.contains("ls -la"), "missing banner value: {text}");
+        // Body carries the result the user saw live.
+        assert!(text.contains("total 4"), "missing tool output: {text}");
+    }
+
+    /// A failed/interrupted call still renders a chamber (not nothing), so the
+    /// reloaded transcript shows the call happened.
+    #[test]
+    fn replays_failed_tool_call_with_error_body() {
+        use crate::session::{ToolCallEntry, ToolCallState};
+        let mut renderer = Renderer::new().unwrap();
+        renderer.set_chat_rect_for_test(ratatui::layout::Rect::new(0, 1, 100, 24));
+        let calls = vec![ToolCallEntry {
+            id: "call_1".into(),
+            name: "read".into(),
+            args: serde_json::json!({ "path": "/nope.txt" }),
+            state: ToolCallState::Failed {
+                error: "file not found".into(),
+            },
+        }];
+        render_tool_calls_replay(&mut renderer, &calls, 10_000, 100).unwrap();
+        let text = renderer.buffer_lines().join("\n");
+        assert!(text.contains("READ"), "missing tool header: {text}");
+        assert!(
+            text.contains("file not found"),
+            "missing error body: {text}"
         );
     }
 }
