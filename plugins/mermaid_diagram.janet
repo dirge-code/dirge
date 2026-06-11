@@ -12,7 +12,7 @@
 (var phase :idle)
 (var diagram nil)
 (var attempt 0)
-(var max-retries 3)
+(def max-retries 3)
 (var original-task nil)
 
 # --- Prompts (arXiv 2604.00171: diagrams as intermediate representations) ---
@@ -84,18 +84,26 @@
   (unless (or has-flowchart has-seq has-class has-state has-er)
     (array/push errors "Missing diagram type header — add e.g. 'flowchart TD' or 'sequenceDiagram'"))
 
-  (def has-edge (or (string/find "-->" text)
+  # Cover the common mermaid connectors across diagram types: flowchart
+  # (--> --- -.-> ==>), sequence (->> -->>), and er/class/state, which use
+  # `--`-based links. The old check only matched --> / ->> / --- and so
+  # falsely rejected valid er/classDiagrams (and flowchart -.-> / ==>).
+  (def has-edge (or (string/find "--" text)
                     (string/find "->>" text)
-                    (string/find "---" text)))
+                    (string/find "==>" text)
+                    (string/find "-.-" text)))
   (unless has-edge
     (array/push errors "No connections between nodes — add edges like 'A --> B' or 'A->>B'"))
 
   (def bracket-diff (- (count-char text "[") (count-char text "]")))
   (def paren-diff (- (count-char text "(") (count-char text ")")))
+  (def brace-diff (- (count-char text "{") (count-char text "}")))
   (when (not= bracket-diff 0)
-    (array/push errors (string "Unbalanced square brackets [" bracket-diff " — check node labels")))
+    (array/push errors (string "Unbalanced square brackets " bracket-diff " — check node labels")))
   (when (not= paren-diff 0)
     (array/push errors (string "Unbalanced parentheses " paren-diff " — check node labels")))
+  (when (not= brace-diff 0)
+    (array/push errors (string "Unbalanced braces " brace-diff " — check {decision}/{{hexagon}} nodes")))
 
   {:valid (empty? errors) :errors errors})
 
