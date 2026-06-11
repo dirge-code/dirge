@@ -322,29 +322,68 @@ async fn run_delegation(
 
 /// `git status --porcelain` as a set of `"XY path"` lines. Empty (not an
 /// error) when the project isn't a git repo or git is unavailable.
-fn git_status_set(dir: &Path) -> std::collections::HashSet<String> {
+/// Signature for the path under each `git status --porcelain` entry:
+/// `path -> (size, mtime-nanos)`. Empty when the dir isn't a git repo.
+///
+/// We key on a content signature, not just the porcelain line, so a file
+/// that was ALREADY dirty before a delegation (e.g. created untracked by
+/// an earlier delegation in the same session) and is edited again is still
+/// attributed — a plain porcelain-line diff misses that, since `?? path`
+/// is identical before and after.
+fn git_status_set(dir: &Path) -> std::collections::HashMap<String, (u64, i128)> {
     let out = std::process::Command::new("git")
         .current_dir(dir)
         .args(["status", "--porcelain"])
         .output();
-    match out {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
-            .lines()
-            .map(|l| l.to_string())
-            .collect(),
-        _ => std::collections::HashSet::new(),
+    let mut map = std::collections::HashMap::new();
+    if let Ok(o) = out
+        && o.status.success()
+    {
+        for line in String::from_utf8_lossy(&o.stdout).lines() {
+            let path = porcelain_path(line);
+            if path.is_empty() {
+                continue;
+            }
+            let sig = std::fs::metadata(dir.join(&path))
+                .ok()
+                .map(|m| (m.len(), mtime_nanos(&m)))
+                .unwrap_or((0, 0));
+            map.insert(path, sig);
+        }
+    }
+    map
+}
+
+/// The path from a porcelain line: strip the 3-char `XY ` status prefix,
+/// and for a rename/copy (`old -> new`) attribute the change to `new`.
+fn porcelain_path(line: &str) -> String {
+    let p = line.get(3..).unwrap_or("").trim();
+    match p.find(" -> ") {
+        Some(i) => p[i + 4..].to_string(),
+        None => p.to_string(),
     }
 }
 
-/// Paths that changed during the run: porcelain lines present after but
-/// not before. Strips the 3-char `XY ` status prefix to bare paths.
+fn mtime_nanos(m: &std::fs::Metadata) -> i128 {
+    m.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as i128)
+        .unwrap_or(0)
+}
+
+/// Paths dirge touched during the run: dirty afterward AND either newly
+/// dirty or with a changed `(size, mtime)` signature vs before — so edits
+/// to an already-dirty file are caught, while the caller's pre-existing
+/// untouched changes are not falsely attributed.
 fn changed_paths(
-    before: &std::collections::HashSet<String>,
-    after: &std::collections::HashSet<String>,
+    before: &std::collections::HashMap<String, (u64, i128)>,
+    after: &std::collections::HashMap<String, (u64, i128)>,
 ) -> Vec<String> {
     let mut v: Vec<String> = after
-        .difference(before)
-        .map(|l| l.get(3..).unwrap_or(l).trim().to_string())
+        .iter()
+        .filter(|(path, sig)| before.get(*path) != Some(*sig))
+        .map(|(path, _)| path.clone())
         .collect();
     v.sort();
     v.dedup();
@@ -432,18 +471,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn changed_paths_reports_new_entries_and_strips_status() {
-        let before: std::collections::HashSet<String> = [" M src/a.rs".to_string()].into();
-        let after: std::collections::HashSet<String> = [
-            " M src/a.rs".to_string(),
-            "?? src/b.rs".to_string(),
-            "A  c.rs".to_string(),
+    fn changed_paths_detects_new_and_modified_not_untouched() {
+        use std::collections::HashMap;
+        // src/a.rs dirty before with sig (10,1). After: a.rs unchanged,
+        // b.rs newly dirty, c.rs already dirty but its signature changed
+        // (further edited — the case the old line-diff missed).
+        let before: HashMap<String, (u64, i128)> =
+            [("src/a.rs".into(), (10, 1)), ("c.rs".into(), (5, 1))].into();
+        let after: HashMap<String, (u64, i128)> = [
+            ("src/a.rs".into(), (10, 1)), // untouched → not reported
+            ("src/b.rs".into(), (3, 2)),  // new → reported
+            ("c.rs".into(), (8, 9)),      // sig changed → reported
         ]
         .into();
         let changed = changed_paths(&before, &after);
-        // a.rs unchanged between snapshots → not reported; new ones are,
-        // with the 3-char `XY ` porcelain prefix stripped.
         assert_eq!(changed, vec!["c.rs".to_string(), "src/b.rs".to_string()]);
+    }
+
+    #[test]
+    fn porcelain_path_strips_status_and_handles_rename() {
+        assert_eq!(porcelain_path("?? src/b.rs"), "src/b.rs");
+        assert_eq!(porcelain_path(" M src/a.rs"), "src/a.rs");
+        assert_eq!(porcelain_path("R  old.rs -> new.rs"), "new.rs");
     }
 
     #[test]

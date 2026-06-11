@@ -60,6 +60,11 @@ impl AnyAgent {
         prompt: &str,
         max_turns: usize,
         output_format: crate::cli::OutputFormat,
+        // Prior conversation to resume into the model's context. Empty for a
+        // fresh run; for `--session <id>` the caller passes the loaded
+        // session's history (via `convert_history`) so a headless run
+        // continues where it left off instead of starting cold each time.
+        history: Vec<rig::completion::Message>,
     ) -> anyhow::Result<String> {
         // dirge-nqr: honor the cap explicitly even if the agent was
         // built with a different one. `run_print` is the headless
@@ -109,7 +114,7 @@ impl AnyAgent {
         // — Arc internals + refcounts), spawn a runner, and drain the
         // event channel collecting text. Use the max_turns-stamped
         // `agent` from above so the cap is honored.
-        let runner = agent.spawn_runner(effective_prompt.clone(), Vec::new(), None);
+        let runner = agent.spawn_runner(effective_prompt.clone(), history, None);
         let task = runner.task;
         let mut event_rx = runner.event_rx;
 

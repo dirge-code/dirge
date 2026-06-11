@@ -1157,8 +1157,18 @@ async fn main() -> anyhow::Result<()> {
         )
         .await;
         let msg = cli.message.join(" ");
+        // Resume the loaded session's prior conversation so `--session <id>`
+        // continues with context instead of running the model cold each time.
+        // `session` here is the session `--session` resolved (loaded or fresh);
+        // its messages are the prior turns, the new prompt is appended after.
+        let history = crate::agent::runner::convert_history(&session);
         let response = agent
-            .run_print(&msg, cli.resolve_max_agent_turns(&cfg), cli.output_format)
+            .run_print(
+                &msg,
+                cli.resolve_max_agent_turns(&cfg),
+                cli.output_format,
+                history,
+            )
             .await?;
         // A plugin may have called `harness/set-next-model` during
         // `prepare-next-run`. `--print` is single-shot so we can't
@@ -1564,6 +1574,9 @@ async fn run_headless_loop(
                 &iteration_prompt,
                 cli.resolve_max_agent_turns(cfg),
                 cli.output_format,
+                // The loop drives its own prompt sequence (from LOOP_PLAN),
+                // not a resumed chat history.
+                Vec::new(),
             )
             .await
         {
