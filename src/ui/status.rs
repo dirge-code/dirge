@@ -157,8 +157,10 @@ impl StatusLine {
             None => String::new(),
         };
 
+        let session_badge = format!(" session:{}", crate::text::short_id(session.id.as_str()));
+
         format!(
-            "{}{} | {}{} | {}/{} ({}%) | {}msgs | {}{}{}{}{}{}{}",
+            "{}{} | {}{} | {}/{} ({}%) | {}msgs | {}{}{}{}{}{}{}{}",
             project_label,
             cost_str,
             session.model,
@@ -174,6 +176,7 @@ impl StatusLine {
             perm_badge,
             agents_badge,
             shells_badge,
+            session_badge,
         )
     }
 }
@@ -256,5 +259,15 @@ mod tests {
         let line = render(2, 3);
         assert!(line.contains("agents:2"), "expected agents:2 in: {line}");
         assert!(line.contains("shells:3"), "expected shells:3 in: {line}");
+    }
+
+    /// The session id is shown at the end of the status line so the
+    /// user can copy it for `--session <id>` resume from the banner.
+    #[tokio::test]
+    async fn session_id_appears_in_status_line() {
+        let session = Session::new("openrouter", "test-model", 100_000);
+        let line = StatusLine::render(&session, false, 0, None, None, None, None, None, None);
+        let expected = format!(" session:{}", crate::text::short_id(session.id.as_str()));
+        assert!(line.contains(&expected), "session id not in status: {line}");
     }
 }
