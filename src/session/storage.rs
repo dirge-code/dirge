@@ -308,6 +308,22 @@ mod tests {
         // Resuming the tip id stays on the tip.
         let resolved2 = load_session_tip(tip.id.as_str()).unwrap();
         assert_eq!(resolved2.id, tip.id);
+
+        // An UNRELATED session that is newer than the tip but has a different
+        // origin must NOT be selected — the cheap partial-parse scan still
+        // filters by origin. Guards the load_session_tip refactor.
+        let mut unrelated = Session::new("p", "m", 128_000);
+        unrelated.id =
+            compact_str::CompactString::new(format!("other-{}", uuid::Uuid::new_v4().simple()));
+        unrelated.add_message(MessageRole::User, "different conversation");
+        unrelated.updated_at = compact_str::CompactString::new("2030-01-01T00:00:00+00:00");
+        save_session(&mut unrelated).unwrap();
+
+        let resolved3 = load_session_tip(&origin).unwrap();
+        assert_eq!(
+            resolved3.id, tip.id,
+            "a newer session from a different origin must not be chosen as the tip"
+        );
     }
 
     /// A folded conversation collapses to its tip in a listing: the
@@ -976,7 +992,25 @@ pub fn load_session_tip(id: &str) -> anyhow::Result<Session> {
     if !dir.exists() {
         return Ok(requested);
     }
-    let mut tip = requested;
+
+    // Find the chain tip with a CHEAP partial parse. A fold leaves the older
+    // (often large) session file behind, so these accumulate; fully
+    // deserializing every one — every message, tool result, and the
+    // `message_store` map — on each resume was the dominant cost of
+    // `--session` startup. `TipMeta` pulls only the three fields the scan
+    // compares; serde skips everything else via `IgnoredAny`, never
+    // allocating the message structures. We then fully load just the winner.
+    #[derive(serde::Deserialize)]
+    struct TipMeta {
+        id: String,
+        #[serde(default)]
+        origin_id: Option<String>,
+        #[serde(default)]
+        updated_at: String,
+    }
+
+    let mut tip_id = requested.id.to_string();
+    let mut tip_updated = requested.updated_at.to_string();
     for entry in std::fs::read_dir(&dir)? {
         // Skip a bad directory entry rather than aborting resume: a
         // concurrent fold/cleanup can delete a sibling file mid-scan, and
@@ -986,14 +1020,25 @@ pub fn load_session_tip(id: &str) -> anyhow::Result<Session> {
         let path = entry.path();
         if path.extension().is_some_and(|e| e == "json")
             && let Ok(json) = std::fs::read_to_string(&path)
-            && let Ok(s) = serde_json::from_str::<Session>(&json)
-            && s.effective_origin() == origin
-            && s.updated_at > tip.updated_at
+            && let Ok(meta) = serde_json::from_str::<TipMeta>(&json)
         {
-            tip = s;
+            let meta_origin = meta.origin_id.as_deref().unwrap_or(&meta.id);
+            if meta_origin == origin && meta.updated_at > tip_updated {
+                tip_updated = meta.updated_at;
+                tip_id = meta.id;
+            }
         }
     }
-    Ok(tip)
+
+    if tip_id.as_str() == requested.id.as_str() {
+        // Seed is already the tip — no second load.
+        Ok(requested)
+    } else {
+        // Fully deserialize only the winner. If it vanished between the scan
+        // and this load (concurrent fold/cleanup), fall back to the seed we
+        // already have rather than failing the resume.
+        Ok(load_session(&tip_id).unwrap_or(requested))
+    }
 }
 
 pub fn find_sessions_by_prefix(prefix: &str) -> anyhow::Result<Vec<Session>> {
