@@ -110,6 +110,14 @@ pub enum AgentEvent {
         prompt: CompactString,
         error: CompactString,
     },
+    /// A destructive compaction fold is ABOUT to summarize the
+    /// conversation — emitted before the (multi-second) summarizer call so
+    /// the UI can show a "compacting…" indicator during the wait, rather
+    /// than appearing frozen. `ContextCompacted` follows when it finishes.
+    /// `tokens_before` is the pre-fold estimate.
+    CompactionStarted {
+        tokens_before: u64,
+    },
     /// Context was compacted mid-run — old tool results pruned,
     /// session rotated. The UI persists the split via session DB,
     /// mutates `Session::id` in-place, and calls

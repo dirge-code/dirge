@@ -1224,6 +1224,7 @@ mod tests {
             AgentEvent::Interjected { .. } => "Interjected",
             AgentEvent::CustomMessage { .. } => "CustomMessage",
             AgentEvent::UserMessage { .. } => "UserMessage",
+            AgentEvent::CompactionStarted { .. } => "CompactionStarted",
             AgentEvent::ContextCompacted { .. } => "ContextCompacted",
             AgentEvent::CheckpointRefresh { .. } => "CheckpointRefresh",
             AgentEvent::RetryNotice { .. } => "RetryNotice",

@@ -761,6 +761,41 @@ pub fn apply_summary(
     out
 }
 
+/// Fold using a precomputed running summary that already covers
+/// `messages[0..boundary]` (the background incremental checkpoint). The
+/// covered prefix is replaced with one summary marker; everything from the
+/// snapped tail-cut onward is kept verbatim. This is the FAST fold path:
+/// no inline summarizer call, because the expensive summarization already
+/// ran off the loop.
+///
+/// Returns `Some((new_messages, first_kept_index))` on success, or `None`
+/// when reuse wouldn't be safe or useful:
+/// - `boundary` is 0 or past the end (nothing to fold, or stale),
+/// - the user-boundary snap collapses the cut to 0 (no whole turn to fold).
+///
+/// The cut snaps BACKWARD to a user-message boundary so the kept tail never
+/// begins with an orphaned tool_result (which would 400 the next request).
+/// Snapping backward only ever keeps MORE verbatim than the summary covers
+/// — it never drops an un-summarized message — so it can't lose data; the
+/// few messages in `[cut..boundary]` are simply carried both in the summary
+/// and verbatim.
+pub fn apply_checkpoint_summary(
+    messages: &[Value],
+    summary: &str,
+    boundary: usize,
+) -> Option<(Vec<Value>, usize)> {
+    let n = messages.len();
+    if boundary == 0 || boundary > n {
+        return None;
+    }
+    let cut = snap_backward_to_user(messages, boundary);
+    if cut == 0 {
+        return None;
+    }
+    let out = apply_summary(messages, summary, 0, cut);
+    Some((out, cut))
+}
+
 /// Compute the boundary `(compress_start, compress_end)` for the
 /// middle section to summarize. Port of Hermes's
 /// `_protect_head_size` + `_find_tail_cut_by_tokens`.
@@ -1500,6 +1535,83 @@ mod tests {
         // Tail.
         assert_eq!(out[3]["content"].as_str().unwrap(), "recent user");
         assert_eq!(out[4]["content"].as_str().unwrap(), "recent assistant");
+    }
+
+    #[test]
+    fn checkpoint_reuse_folds_covered_prefix_and_keeps_tail() {
+        let msgs = vec![
+            serde_json::json!({"role": "user", "content": "u0"}),
+            serde_json::json!({"role": "assistant", "content": "a0"}),
+            serde_json::json!({"role": "user", "content": "u1"}),
+            serde_json::json!({"role": "assistant", "content": "a1"}),
+            // boundary = 4: checkpoint covers u0..a1; tail starts here.
+            serde_json::json!({"role": "user", "content": "u2"}),
+            serde_json::json!({"role": "assistant", "content": "a2"}),
+        ];
+        let summary = "## Active Task\nport the loop\n## Remaining Work\nwire it";
+        let (out, first_kept) = apply_checkpoint_summary(&msgs, summary, 4).unwrap();
+        // index 4 ("u2") is already a user boundary, so cut == boundary.
+        assert_eq!(first_kept, 4);
+        // [summary] + tail(u2, a2) = 3 messages.
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0]["role"].as_str().unwrap(), "system");
+        assert!(
+            out[0]["content"]
+                .as_str()
+                .unwrap()
+                .starts_with(SUMMARY_PREFIX)
+        );
+        assert!(
+            out[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("port the loop")
+        );
+        assert_eq!(out[1]["content"].as_str().unwrap(), "u2");
+        assert_eq!(out[2]["content"].as_str().unwrap(), "a2");
+    }
+
+    #[test]
+    fn checkpoint_reuse_snaps_cut_back_to_user_boundary() {
+        // boundary lands mid-turn (on an assistant/tool message); the cut
+        // must snap BACK to the preceding user turn so the kept tail never
+        // starts with an orphaned tool_result.
+        let msgs = vec![
+            serde_json::json!({"role": "user", "content": "u0"}),
+            serde_json::json!({"role": "assistant", "content": "a0"}),
+            serde_json::json!({"role": "user", "content": "u1"}),
+            serde_json::json!({"role": "assistant", "content": "a1"}),
+            serde_json::json!({"role": "tool", "content": "t1"}),
+        ];
+        let summary = "## Goal\nx";
+        // boundary = 5 (end); snap_backward finds u1 at index 2.
+        let (out, first_kept) = apply_checkpoint_summary(&msgs, summary, 5).unwrap();
+        assert_eq!(first_kept, 2, "cut snaps back to the user turn at index 2");
+        // [summary] + u1 + a1 + t1.
+        assert_eq!(out.len(), 4);
+        assert_eq!(out[1]["content"].as_str().unwrap(), "u1");
+    }
+
+    #[test]
+    fn checkpoint_reuse_rejects_out_of_range_or_zero_boundary() {
+        let msgs = vec![
+            serde_json::json!({"role": "user", "content": "u0"}),
+            serde_json::json!({"role": "assistant", "content": "a0"}),
+        ];
+        assert!(apply_checkpoint_summary(&msgs, "## Goal\nx", 0).is_none());
+        assert!(apply_checkpoint_summary(&msgs, "## Goal\nx", 99).is_none());
+    }
+
+    #[test]
+    fn checkpoint_reuse_rejects_when_snap_collapses_to_zero() {
+        // No user turn at/before the boundary → snap_backward returns 0 →
+        // None (nothing whole to fold).
+        let msgs = vec![
+            serde_json::json!({"role": "assistant", "content": "a0"}),
+            serde_json::json!({"role": "assistant", "content": "a1"}),
+            serde_json::json!({"role": "assistant", "content": "a2"}),
+        ];
+        assert!(apply_checkpoint_summary(&msgs, "## Goal\nx", 2).is_none());
     }
 
     #[test]

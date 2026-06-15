@@ -455,6 +455,12 @@ pub enum LoopEvent {
         tool_results: Vec<ToolResultMessage>,
     },
 
+    /// A destructive compaction fold is about to run its summarizer —
+    /// emitted before the (slow) LLM call so the UI can show a
+    /// "compacting…" indicator during the wait. `ContextCompacted`
+    /// follows on completion.
+    CompactionStarted { tokens_before: u64 },
+
     /// Context compression fired — middle turns were summarized
     /// and the session id rotated. The UI should show a status
     /// line. Carries the new session id for lineage tracking.
@@ -580,6 +586,7 @@ impl LoopEvent {
             LoopEvent::AgentEnd { .. } => "agent_end",
             LoopEvent::TurnStart => "turn_start",
             LoopEvent::TurnEnd { .. } => "turn_end",
+            LoopEvent::CompactionStarted { .. } => "compaction_started",
             LoopEvent::ContextCompacted { .. } => "context_compacted",
             LoopEvent::CheckpointRefresh { .. } => "checkpoint_refresh",
             LoopEvent::RetryNotice { .. } => "retry_notice",

@@ -12,6 +12,13 @@ use std::pin::Pin;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// An empty reusable-checkpoint slot for the compaction-pass tests. With no
+/// cached summary the fold always takes the inline summarizer path, so these
+/// tests exercise the same behavior they did before Round 1's fast path.
+fn empty_checkpoint_slot() -> super::CheckpointSlot {
+    std::sync::Arc::new(std::sync::Mutex::new(None))
+}
+
 /// Build a stream factory that returns canned assistant
 /// messages in sequence. Mirrors pi's typical test mock —
 /// `callIndex` increments per invocation; each call returns
@@ -24,6 +31,37 @@ fn canned_factory(responses: Vec<AssistantMessage>) -> StreamFn {
     let counter = std::sync::Arc::new(AtomicUsize::new(0));
     let responses = std::sync::Arc::new(responses);
     std::sync::Arc::new(move |_ctx, _opts| {
+        let n = counter.fetch_add(1, Ordering::SeqCst);
+        let msg = responses.get(n).cloned().unwrap_or_else(|| {
+            AssistantMessage::new(
+                vec![ContentBlock::Text {
+                    text: "end".to_string(),
+                }],
+                StopReason::Stop,
+            )
+        });
+        let reason = msg.stop_reason;
+        Box::pin(futures::stream::iter(vec![StreamEvent::Done {
+            reason,
+            message: msg,
+            usage: None,
+        }]))
+    })
+}
+
+/// Like [`canned_factory`] but records a JSON snapshot of each call's
+/// context messages into `seen`, so a test can inspect what the model was
+/// actually sent (e.g. a mid-loop memory re-injection).
+fn capturing_factory(
+    responses: Vec<AssistantMessage>,
+    seen: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+) -> StreamFn {
+    let counter = std::sync::Arc::new(AtomicUsize::new(0));
+    let responses = std::sync::Arc::new(responses);
+    std::sync::Arc::new(move |ctx, _opts| {
+        seen.lock()
+            .unwrap()
+            .push(serde_json::to_string(&ctx.messages).unwrap_or_default());
         let n = counter.fetch_add(1, Ordering::SeqCst);
         let msg = responses.get(n).cloned().unwrap_or_else(|| {
             AssistantMessage::new(
@@ -155,7 +193,19 @@ async fn run_compaction_pass_inserts_summary_and_rotates_session() {
         }));
 
     let (tx, mut rx) = mpsc::channel::<LoopEvent>(8);
-    super::run_compaction_pass(&mut ctx, &summarize_fn, 5, 0, &None, None, &tx).await;
+    super::run_compaction_pass(
+        &mut ctx,
+        &summarize_fn,
+        5,
+        0,
+        &None,
+        None,
+        &tx,
+        &empty_checkpoint_slot(),
+        &mut 0,
+        u64::MAX,
+    )
+    .await;
     drop(tx);
 
     // (a) older messages dropped.
@@ -203,6 +253,270 @@ async fn run_compaction_pass_inserts_summary_and_rotates_session() {
     let received = prompt_seen.lock().unwrap().clone();
     assert!(received.contains("TURNS TO SUMMARIZE"));
     assert!(received.contains("## Active Task"));
+}
+
+/// Build a padded context with `n` alternating turns after a system +
+/// initial-user pair, for the compaction-pass tests.
+fn padded_ctx(n: usize) -> super::Context {
+    let mut ctx = empty_context();
+    ctx.messages
+        .push(serde_json::json!({"role": "system", "content": "you are an agent"}));
+    ctx.messages
+        .push(serde_json::json!({"role": "user", "content": "initial task"}));
+    for i in 0..n {
+        let role = if i % 2 == 0 { "assistant" } else { "user" };
+        ctx.messages.push(serde_json::json!({
+            "role": role,
+            "content": format!("turn {i} with some content to fill bytes"),
+        }));
+    }
+    ctx.messages
+        .push(serde_json::json!({"role": "user", "content": "latest user request"}));
+    ctx
+}
+
+/// A summarizer that records whether it was called and returns a distinct
+/// inline summary, so a test can tell the inline path from the fast path.
+fn recording_summarizer(
+    called: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Option<crate::agent::compression::SummarizeFn> {
+    Some(std::sync::Arc::new(move |_prompt: String| {
+        let called = called.clone();
+        Box::pin(async move {
+            called.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok("## Active Task\nINLINE SUMMARY\n## Remaining Work\nx".to_string())
+        })
+    }))
+}
+
+/// A populated checkpoint slot for the fast-path tests.
+fn slot_with(summary: &str, boundary: usize, generation: u64) -> super::CheckpointSlot {
+    std::sync::Arc::new(std::sync::Mutex::new(Some(super::CachedCheckpoint {
+        summary: summary.to_string(),
+        boundary,
+        generation,
+    })))
+}
+
+/// Round 1 fast path: when the slot holds a fresh checkpoint (matching the
+/// current epoch) and reusing it clears the fold target, the fold splices it
+/// in WITHOUT calling the inline summarizer, then bumps the epoch and clears
+/// the slot.
+#[tokio::test]
+async fn run_compaction_pass_reuses_fresh_checkpoint_without_calling_summarizer() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let mut ctx = padded_ctx(20);
+    let called = std::sync::Arc::new(AtomicBool::new(false));
+    let summarize_fn = recording_summarizer(called.clone());
+    let slot = slot_with(
+        "## Active Task\nFROM CHECKPOINT\n## Remaining Work\nfinish",
+        10,
+        0,
+    );
+    let mut generation = 0u64;
+
+    let (tx, _rx) = mpsc::channel::<LoopEvent>(16);
+    let outcome = super::run_compaction_pass(
+        &mut ctx,
+        &summarize_fn,
+        5,
+        0,
+        &None,
+        None,
+        &tx,
+        &slot,
+        &mut generation,
+        u64::MAX,
+    )
+    .await;
+    drop(tx);
+
+    assert!(
+        matches!(outcome, super::SummaryOutcome::Succeeded(_)),
+        "reuse should succeed"
+    );
+    assert!(
+        !called.load(Ordering::SeqCst),
+        "inline summarizer must NOT be called on the fast path"
+    );
+    let summary_msg = ctx
+        .messages
+        .iter()
+        .find_map(|m| {
+            let c = m.get("content").and_then(|v| v.as_str())?;
+            c.contains("CONTEXT COMPACTION").then_some(c)
+        })
+        .expect("a summary message should be present");
+    assert!(
+        summary_msg.contains("FROM CHECKPOINT"),
+        "the spliced summary should be the checkpoint's, not the inline one"
+    );
+    assert_eq!(generation, 1, "a successful fold bumps the epoch");
+    assert!(
+        slot.lock().unwrap().is_none(),
+        "the consumed checkpoint slot is cleared after the fold"
+    );
+}
+
+/// A checkpoint from a stale epoch (generation mismatch) is ignored — the
+/// fold falls back to the inline summarizer.
+#[tokio::test]
+async fn run_compaction_pass_ignores_stale_generation_checkpoint() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let mut ctx = padded_ctx(20);
+    let called = std::sync::Arc::new(AtomicBool::new(false));
+    let summarize_fn = recording_summarizer(called.clone());
+    // Slot built under epoch 0, but the loop is now at epoch 7.
+    let slot = slot_with(
+        "## Active Task\nFROM CHECKPOINT\n## Remaining Work\nx",
+        10,
+        0,
+    );
+    let mut generation = 7u64;
+
+    let (tx, _rx) = mpsc::channel::<LoopEvent>(16);
+    let outcome = super::run_compaction_pass(
+        &mut ctx,
+        &summarize_fn,
+        5,
+        0,
+        &None,
+        None,
+        &tx,
+        &slot,
+        &mut generation,
+        u64::MAX,
+    )
+    .await;
+    drop(tx);
+
+    assert!(matches!(outcome, super::SummaryOutcome::Succeeded(_)));
+    assert!(
+        called.load(Ordering::SeqCst),
+        "stale checkpoint → inline summarizer must run"
+    );
+    let summary_msg = ctx
+        .messages
+        .iter()
+        .find_map(|m| {
+            let c = m.get("content").and_then(|v| v.as_str())?;
+            c.contains("CONTEXT COMPACTION").then_some(c)
+        })
+        .expect("a summary message should be present");
+    assert!(
+        summary_msg.contains("INLINE SUMMARY"),
+        "the inline summary should be used when the checkpoint is stale"
+    );
+}
+
+/// Serializes the two tests that touch the process-global memory-dirty flag
+/// so they don't steal each other's marks under parallel test execution.
+static DIRTY_FLAG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Round 2 flag: `mark_memories_dirty` then `take_memories_dirty` returns
+/// true exactly once, then false.
+#[test]
+fn memories_dirty_flag_is_consumed_once() {
+    use crate::agent::agent_loop::context_manager::{mark_memories_dirty, take_memories_dirty};
+    let _guard = DIRTY_FLAG_TEST_LOCK.lock().unwrap();
+    // Clear any prior state from other tests touching the global.
+    let _ = take_memories_dirty();
+    mark_memories_dirty();
+    assert!(take_memories_dirty(), "first take after mark is true");
+    assert!(!take_memories_dirty(), "second take resets to false");
+}
+
+/// Round 2 behavior: when consolidation has marked memories dirty, the loop
+/// re-injects the refreshed memory block into the model-facing context at the
+/// next turn boundary, so the agent sees it without a restart.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // current-thread test runtime; lock only serializes the global flag
+async fn memory_refresh_injects_block_at_turn_boundary_when_dirty() {
+    use crate::extras::memory_provider::MemoryProvider;
+    let _guard = DIRTY_FLAG_TEST_LOCK.lock().unwrap();
+
+    struct StubProvider;
+    impl MemoryProvider for StubProvider {
+        fn name(&self) -> &str {
+            "stub"
+        }
+        fn format_for_system_prompt(&self) -> String {
+            "STUBMEM: prefer the fast path".to_string()
+        }
+        fn view(&self, _t: &str) -> Value {
+            serde_json::json!({})
+        }
+        fn add(&self, _: &str, _: &str, _: Option<&str>) -> Result<Value, String> {
+            Ok(serde_json::json!({}))
+        }
+        fn replace(&self, _: &str, _: &str, _: &str, _: Option<&str>) -> Result<Value, String> {
+            Ok(serde_json::json!({}))
+        }
+        fn remove(&self, _: &str, _: &str) -> Result<Value, String> {
+            Ok(serde_json::json!({}))
+        }
+    }
+
+    let echo = std::sync::Arc::new(EchoTool::new());
+    let mut ctx = empty_context();
+    ctx.tools.push(echo.clone());
+
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    // Turn 1: a tool call (forces another loop iteration → a turn boundary).
+    // Turn 2: final text.
+    let factory = capturing_factory(
+        vec![
+            tool_use_response("call-1", "echo", serde_json::json!({"v": 1})),
+            text_response("done"),
+        ],
+        seen.clone(),
+    );
+
+    let provider: std::sync::Arc<dyn MemoryProvider> = std::sync::Arc::new(StubProvider);
+
+    // The injected refresh is a `system` message; use a converter that keeps
+    // system messages (production's does — fold summaries are system-role).
+    let mut config = build_config();
+    config.convert_to_llm = std::sync::Arc::new(|messages: &[Value]| {
+        messages
+            .iter()
+            .filter(|m| {
+                let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("");
+                matches!(
+                    role,
+                    "user" | "assistant" | "tool" | "toolResult" | "system"
+                )
+            })
+            .cloned()
+            .collect()
+    });
+
+    // Simulate background consolidation completing: mark dirty just before
+    // the run so the next turn boundary consumes it.
+    crate::agent::agent_loop::context_manager::mark_memories_dirty();
+
+    let (tx, _rx) = mpsc::channel::<LoopEvent>(128);
+    let _ = run_agent_loop(
+        vec![user("echo please")],
+        ctx,
+        config,
+        AbortSignal::new(),
+        &tx,
+        &factory,
+        None,
+        Some(provider),
+    )
+    .await;
+    drop(tx);
+
+    let snapshots = seen.lock().unwrap().clone();
+    assert!(
+        snapshots.iter().any(|s| s.contains("STUBMEM")),
+        "the refreshed memory block should appear in the model-facing context \
+         after the turn boundary; snapshots={snapshots:?}"
+    );
 }
 
 /// dirge-jia8: a plugin `on-compact` hook supplying a valid summary
@@ -253,7 +567,19 @@ async fn compaction_on_compact_hook_overrides_llm_summary() {
     };
 
     let (tx, _rx) = mpsc::channel::<LoopEvent>(8);
-    super::run_compaction_pass(&mut ctx, &summarize_fn, 5, 0, &None, Some(&hooks), &tx).await;
+    super::run_compaction_pass(
+        &mut ctx,
+        &summarize_fn,
+        5,
+        0,
+        &None,
+        Some(&hooks),
+        &tx,
+        &empty_checkpoint_slot(),
+        &mut 0,
+        u64::MAX,
+    )
+    .await;
     drop(tx);
 
     // on-before-compact observed the fold.
@@ -332,7 +658,19 @@ async fn compaction_invalid_plugin_summary_falls_through_to_llm() {
     };
 
     let (tx, _rx) = mpsc::channel::<LoopEvent>(8);
-    super::run_compaction_pass(&mut ctx, &summarize_fn, 5, 0, &None, Some(&hooks), &tx).await;
+    super::run_compaction_pass(
+        &mut ctx,
+        &summarize_fn,
+        5,
+        0,
+        &None,
+        Some(&hooks),
+        &tx,
+        &empty_checkpoint_slot(),
+        &mut 0,
+        u64::MAX,
+    )
+    .await;
     drop(tx);
 
     assert_eq!(
@@ -374,7 +712,19 @@ async fn run_compaction_pass_without_summarizer_prunes_only() {
     // Use protect_tail = 2 so the large tool result is eligible
     // for pruning (it's at index 1, end = 4 - 2 = 2, so index
     // 1 is in-range).
-    super::run_compaction_pass(&mut ctx, &None, 2, 0, &None, None, &tx).await;
+    super::run_compaction_pass(
+        &mut ctx,
+        &None,
+        2,
+        0,
+        &None,
+        None,
+        &tx,
+        &empty_checkpoint_slot(),
+        &mut 0,
+        u64::MAX,
+    )
+    .await;
     drop(tx);
 
     // No SUMMARY_PREFIX message inserted.
@@ -2235,9 +2585,19 @@ async fn compaction_circuit_breaker_skips_summarizer_after_max_failures() {
     // Sub-threshold: the summarizer IS called and reports Failed.
     for failures in 0..super::MAX_CONSECUTIVE_COMPACTION_FAILURES {
         let mut ctx = make_ctx();
-        let outcome =
-            super::run_compaction_pass(&mut ctx, &summarize_fn, 5, failures, &None, None, &tx)
-                .await;
+        let outcome = super::run_compaction_pass(
+            &mut ctx,
+            &summarize_fn,
+            5,
+            failures,
+            &None,
+            None,
+            &tx,
+            &empty_checkpoint_slot(),
+            &mut 0,
+            u64::MAX,
+        )
+        .await;
         assert_eq!(
             outcome,
             super::SummaryOutcome::Failed,
@@ -2263,6 +2623,9 @@ async fn compaction_circuit_breaker_skips_summarizer_after_max_failures() {
         &None,
         None,
         &tx,
+        &empty_checkpoint_slot(),
+        &mut 0,
+        u64::MAX,
     )
     .await;
     assert_eq!(
@@ -2305,7 +2668,19 @@ async fn context_compacted_reports_compaction_kind() {
         ctx.messages
             .push(serde_json::json!({"role":"user","content":"latest"}));
         let (tx, mut rx) = mpsc::channel::<LoopEvent>(8);
-        super::run_compaction_pass(&mut ctx, &summarize_fn, 5, failures, &None, None, &tx).await;
+        super::run_compaction_pass(
+            &mut ctx,
+            &summarize_fn,
+            5,
+            failures,
+            &None,
+            None,
+            &tx,
+            &empty_checkpoint_slot(),
+            &mut 0,
+            u64::MAX,
+        )
+        .await;
         drop(tx);
         while let Some(ev) = rx.recv().await {
             if let LoopEvent::ContextCompacted {

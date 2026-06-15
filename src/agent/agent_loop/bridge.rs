@@ -103,6 +103,9 @@ impl EventBridge {
             // conversion needed — the UI shows a status line when it
             // sees the event. In the future this could emit a
             // dedicated AgentEvent variant for richer UI feedback.
+            LoopEvent::CompactionStarted { tokens_before } => {
+                vec![AgentEvent::CompactionStarted { tokens_before }]
+            }
             LoopEvent::ContextCompacted {
                 ref new_session_id,
                 tokens_before,

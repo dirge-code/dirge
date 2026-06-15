@@ -373,32 +373,80 @@ fn record_compaction_outcome(failures: &mut u32, outcome: SummaryOutcome) {
     }
 }
 
+/// A background-generated running summary that the destructive fold can
+/// reuse instead of summarizing inline. The summary covers
+/// `messages[0..boundary]` of the live context; `generation` is the fold
+/// epoch it was built under. A destructive fold rebuilds the context (the
+/// message indices change), so it bumps the epoch — a checkpoint whose
+/// `generation` no longer matches the loop's is stale and won't be reused.
+#[derive(Clone)]
+struct CachedCheckpoint {
+    summary: String,
+    boundary: usize,
+    generation: u64,
+}
+
+/// Loop-owned slot holding the freshest reusable checkpoint, shared with
+/// the detached checkpoint tasks (which write it) and the fold (which reads
+/// it). `None` means no reusable summary is available — the fold falls back
+/// to an inline summarizer call.
+type CheckpointSlot = std::sync::Arc<std::sync::Mutex<Option<CachedCheckpoint>>>;
+
+/// Wall-clock ceiling on the inline compaction summarizer. A fold blocks
+/// the loop until it returns; without a bound, a provider that stalls
+/// without erroring (no chunks, stream never closes) freezes the session
+/// indefinitely. On timeout the fold keeps the pruned context (a Failed
+/// outcome) rather than hanging — the next turn retries or the breaker
+/// eventually latches.
+const COMPACTION_SUMMARY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Wall-clock ceiling on a background checkpoint summarizer call. The
+/// checkpoint is detached so it never blocks the loop, but a hung provider
+/// would otherwise leak the task forever; bound it so it gives up.
+const CHECKPOINT_SUMMARY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// Spawn a background incremental checkpoint: summarize a snapshot of the
-/// current context off the loop and emit [`LoopEvent::CheckpointRefresh`]
-/// so the consumer persists it to the durable checkpoint WITHOUT folding.
-/// Best-effort — a summarizer error or invalid summary is silently dropped
-/// (the next threshold, or the eventual destructive fold, will write one).
+/// current context off the loop, store it in `slot` for the next fold to
+/// reuse, and emit [`LoopEvent::CheckpointRefresh`] so the consumer
+/// persists it to the durable checkpoint WITHOUT folding. Best-effort — a
+/// summarizer error, timeout, or invalid summary is silently dropped (the
+/// next threshold, or the eventual destructive fold, will write one).
 /// Mirrors MiMo's background checkpoint writer.
 fn spawn_incremental_checkpoint(
     sfn: crate::agent::compression::SummarizeFn,
     messages: Vec<serde_json::Value>,
     emit: mpsc::Sender<LoopEvent>,
+    slot: CheckpointSlot,
+    generation: u64,
 ) {
     tokio::spawn(async move {
         use crate::agent::compression;
         if messages.is_empty() {
             return;
         }
+        // Boundary = the snapshot length: this summary covers messages
+        // [0..boundary]. Captured before the await so it reflects exactly
+        // what was summarized, regardless of what the loop appends meanwhile.
+        let boundary = messages.len();
         let budget = compression::summary_budget(compression::estimate_messages_tokens(&messages));
         let prompt = compression::build_summary_prompt(&messages, budget, None, None);
-        if let Ok(summary) = sfn(prompt).await
+        let result = tokio::time::timeout(CHECKPOINT_SUMMARY_TIMEOUT, sfn(prompt)).await;
+        if let Ok(Ok(summary)) = result
             && compression::validate_summary(&summary)
         {
+            if let Ok(mut guard) = slot.lock() {
+                *guard = Some(CachedCheckpoint {
+                    summary: summary.clone(),
+                    boundary,
+                    generation,
+                });
+            }
             let _ = emit.send(LoopEvent::CheckpointRefresh { summary }).await;
         }
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_compaction_pass(
     current_context: &mut Context,
     summarize_fn: &Option<crate::agent::compression::SummarizeFn>,
@@ -407,6 +455,9 @@ async fn run_compaction_pass(
     memory_provider: &Option<std::sync::Arc<dyn crate::extras::memory_provider::MemoryProvider>>,
     compaction_hooks: Option<&crate::agent::agent_loop::types::CompactionHooks>,
     emit: &mpsc::Sender<LoopEvent>,
+    checkpoint_slot: &CheckpointSlot,
+    generation: &mut u64,
+    fold_target: u64,
 ) -> SummaryOutcome {
     run_compaction_pass_with_focus(
         current_context,
@@ -417,6 +468,9 @@ async fn run_compaction_pass(
         memory_provider,
         compaction_hooks,
         emit,
+        checkpoint_slot,
+        generation,
+        fold_target,
     )
     .await
 }
@@ -442,6 +496,13 @@ async fn run_compaction_pass_with_focus(
     memory_provider: &Option<std::sync::Arc<dyn crate::extras::memory_provider::MemoryProvider>>,
     compaction_hooks: Option<&crate::agent::agent_loop::types::CompactionHooks>,
     emit: &mpsc::Sender<LoopEvent>,
+    // Round 1 (fast compaction): reusable background-checkpoint slot, the
+    // current fold epoch (bumped on a successful destructive fold so
+    // pre-fold checkpoints go stale), and the token level reuse must clear
+    // to count as "fast enough" (else fall back to inline summarization).
+    checkpoint_slot: &CheckpointSlot,
+    generation: &mut u64,
+    fold_target: u64,
 ) -> SummaryOutcome {
     use crate::agent::compression;
 
@@ -488,12 +549,55 @@ async fn run_compaction_pass_with_focus(
             "compaction summarizer failed {compaction_failures} consecutive times — circuit breaker open, skipping LLM summarization",
         );
     } else if let Some(sfn) = summarize_fn {
+        // Fast path (Round 1): reuse a fresh background-checkpoint summary
+        // instead of summarizing inline. The expensive summarization already
+        // ran off the loop; here the fold is just prune + splice. Only when
+        // the checkpoint is from the current fold epoch AND reusing it
+        // actually clears `fold_target` — otherwise fall through to inline.
+        let reusable = checkpoint_slot
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+            .filter(|cp| cp.generation == *generation);
+        let mut reused = false;
+        if let Some(cp) = reusable
+            && let Some((new_msgs, first_kept)) = compression::apply_checkpoint_summary(
+                &current_context.messages,
+                &cp.summary,
+                cp.boundary,
+            )
+        {
+            let projected = compression::estimate_messages_tokens(&new_msgs);
+            if projected <= fold_target {
+                current_context.messages = new_msgs;
+                after_summary = projected;
+                applied_summary = cp.summary;
+                applied_first_kept = first_kept;
+                outcome = SummaryOutcome::Succeeded(first_kept);
+                reused = true;
+                tracing::info!(
+                    target: "dirge::agent_loop",
+                    boundary = cp.boundary,
+                    tokens_after = projected,
+                    "fast compaction: reused background checkpoint summary (no inline LLM call)",
+                );
+            }
+        }
+
         let (start, end) = compression::compute_compress_window(
             &current_context.messages,
             compression::PROTECT_HEAD_DEFAULT,
             protect_tail.max(compression::PROTECT_TAIL_DEFAULT),
         );
-        if start < end {
+        if !reused && start < end {
+            // Signal the UI BEFORE the multi-second summarizer call so it
+            // can show a "compacting…" indicator during the wait instead of
+            // appearing frozen. `ContextCompacted` follows on completion.
+            let _ = emit
+                .send(LoopEvent::CompactionStarted {
+                    tokens_before: before,
+                })
+                .await;
             let middle: Vec<serde_json::Value> = current_context.messages[start..end].to_vec();
             // Carry forward any previous summary body for iterative
             // re-compression (Hermes _find_latest_context_summary).
@@ -528,7 +632,16 @@ async fn run_compaction_pass_with_focus(
                         prev.as_deref(),
                         augmented_focus.as_deref(),
                     );
-                    sfn(prompt).await
+                    // Bound the inline call: a provider that stalls without
+                    // erroring would otherwise freeze the loop indefinitely.
+                    // On timeout, keep the pruned context (Failed outcome).
+                    match tokio::time::timeout(COMPACTION_SUMMARY_TIMEOUT, sfn(prompt)).await {
+                        Ok(r) => r,
+                        Err(_) => Err(anyhow::anyhow!(
+                            "compaction summarizer timed out after {}s",
+                            COMPACTION_SUMMARY_TIMEOUT.as_secs()
+                        )),
+                    }
                 }
             };
             match summary_result {
@@ -564,6 +677,18 @@ async fn run_compaction_pass_with_focus(
                     outcome = SummaryOutcome::Failed;
                 }
             }
+        }
+    }
+
+    // A successful destructive fold rebuilt the context — message indices
+    // changed. Bump the fold epoch so any in-flight or already-stored
+    // checkpoint built against the OLD indices is stale (generation mismatch
+    // → never reused), and drop the slot: its summary was just consumed, or
+    // belongs to a context that no longer exists.
+    if matches!(outcome, SummaryOutcome::Succeeded(_)) {
+        *generation = generation.wrapping_add(1);
+        if let Ok(mut guard) = checkpoint_slot.lock() {
+            *guard = None;
         }
     }
 
@@ -858,6 +983,14 @@ pub async fn run_loop(
     // after a destructive fold rebuilds the context.
     let mut checkpoint_schedule: Option<context_manager::CheckpointSchedule> = None;
 
+    // Round 1 (fast compaction): the reusable background-checkpoint slot and
+    // the fold epoch. Detached checkpoint tasks write the slot; the
+    // destructive fold reads it to skip the inline summarizer when a fresh
+    // summary is available, and bumps the epoch on success so pre-fold
+    // checkpoints go stale.
+    let checkpoint_slot: CheckpointSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let mut checkpoint_generation: u64 = 0;
+
     // vix-port: don't let the model end a turn while it still has unfinished
     // todos (bounded by MAX_TODO_NUDGES; vix caps at 3, session.go:1551).
     let mut todo_nudges: u8 = 0;
@@ -951,6 +1084,9 @@ pub async fn run_loop(
                         &memory_provider,
                         config.compaction_hooks.as_ref(),
                         emit,
+                        &checkpoint_slot,
+                        &mut checkpoint_generation,
+                        (ctx_max as f64 * context_manager::HISTORY_FOLD_THRESHOLD) as u64,
                     )
                     .await;
                     if let SummaryOutcome::Succeeded(idx) = outcome {
@@ -961,6 +1097,29 @@ pub async fn run_loop(
                         compaction_recorded_this_iter = true;
                     }
                     folded_this_turn = true;
+                }
+            }
+
+            // Round 2 (memory-awareness feedback): if background
+            // consolidation wrote new memories since the last turn, re-inject
+            // the refreshed memory block here so the running agent becomes
+            // aware of them without a restart — the system-prompt memory block
+            // is baked at agent-build time and wouldn't otherwise update.
+            // Model-facing only: pushed into the live context, not into
+            // `new_messages` or persisted session history. The dirty flag is
+            // consumed (swap-to-false), so this fires at most once per
+            // consolidation.
+            if context_manager::take_memories_dirty()
+                && let Some(provider) = &memory_provider
+            {
+                let block = provider.format_for_system_prompt();
+                if !block.trim().is_empty() {
+                    current_context.messages.push(serde_json::json!({
+                        "role": "system",
+                        "content": format!(
+                            "## Updated memory (consolidated mid-session)\n{block}"
+                        ),
+                    }));
                 }
             }
 
@@ -1306,6 +1465,10 @@ pub async fn run_loop(
                                     &memory_provider,
                                     config.compaction_hooks.as_ref(),
                                     emit,
+                                    &checkpoint_slot,
+                                    &mut checkpoint_generation,
+                                    (ctx_max as f64 * context_manager::HISTORY_FOLD_THRESHOLD)
+                                        as u64,
                                 )
                                 .await;
                                 if let SummaryOutcome::Succeeded(idx) = outcome {
@@ -1345,6 +1508,9 @@ pub async fn run_loop(
                             &memory_provider,
                             config.compaction_hooks.as_ref(),
                             emit,
+                            &checkpoint_slot,
+                            &mut checkpoint_generation,
+                            (ctx_max as f64 * context_manager::HISTORY_FOLD_THRESHOLD) as u64,
                         )
                         .await;
                         if let SummaryOutcome::Succeeded(idx) = outcome {
@@ -1379,6 +1545,8 @@ pub async fn run_loop(
                                     sfn.clone(),
                                     current_context.messages.clone(),
                                     emit.clone(),
+                                    checkpoint_slot.clone(),
+                                    checkpoint_generation,
                                 );
                             }
                         }

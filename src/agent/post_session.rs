@@ -146,6 +146,12 @@ pub fn spawn_post_session(agent: AnyAgent, paths: ProjectPaths, transcript: Stri
             ),
         ];
         run_stages_sequentially(stages, STAGE_TIMEOUT).await;
+        // Round 2: the review + curator passes may have written or
+        // consolidated memories. Flag it so the running loop re-injects the
+        // refreshed memory block at its next turn boundary — the agent's
+        // baked-in system-prompt block wouldn't otherwise reflect these
+        // writes until a restart.
+        crate::agent::agent_loop::context_manager::mark_memories_dirty();
     });
 }
 

@@ -2565,6 +2565,19 @@ pub async fn run_interactive(
                         #[cfg(not(feature = "plugin"))]
                         let _ = index;
                     }
+                    AgentEvent::CompactionStarted { tokens_before } => {
+                        // Show progress in the main pane during the
+                        // multi-second summarizer call so it's clear the
+                        // session is compacting, not hung. The result line
+                        // ("context compacted: X → Y") follows on
+                        // ContextCompacted.
+                        let approx_k = tokens_before.div_ceil(1000);
+                        renderer.write_line(
+                            &format!("  ⟳ compacting context (~{approx_k}k tokens)…"),
+                            Color::DarkGrey,
+                        )?;
+                        renderer.request_repaint();
+                    }
                     AgentEvent::ContextCompacted {
                         ref new_session_id,
                         tokens_before,

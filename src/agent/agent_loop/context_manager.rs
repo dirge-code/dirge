@@ -335,6 +335,26 @@ pub fn incremental_checkpoint_enabled() -> bool {
     *INCREMENTAL_CHECKPOINT.get().unwrap_or(&true)
 }
 
+/// Round 2 (memory-awareness feedback): set when background learning
+/// (post-session consolidation) has written new memories. The system-prompt
+/// memory block is baked at agent-build time, so mid-session writes wouldn't
+/// otherwise reach the running agent until restart. The loop consumes this
+/// at the next turn boundary and re-injects the refreshed memory block.
+static MEMORIES_DIRTY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Mark consolidated memories as changed; the running loop re-injects the
+/// refreshed block at its next turn boundary. Called by the post-session
+/// orchestrator after its learning passes complete.
+pub fn mark_memories_dirty() {
+    MEMORIES_DIRTY.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// Consume the memory-dirty flag — returns `true` exactly once per `mark`,
+/// resetting it. Cheap to poll every turn (a single atomic swap).
+pub fn take_memories_dirty() -> bool {
+    MEMORIES_DIRTY.swap(false, std::sync::atomic::Ordering::AcqRel)
+}
+
 /// Clamp a configured early-fold threshold into a safe range. An override
 /// may only make the NORMAL fold fire *earlier* — never later than the
 /// default and never below a floor that would fold almost immediately —

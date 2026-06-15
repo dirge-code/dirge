@@ -154,6 +154,9 @@ fn dump_events(events: &[AgentEvent]) {
             AgentEvent::UserMessage { content } => {
                 eprintln!("\n[user_message] {content}");
             }
+            AgentEvent::CompactionStarted { .. } => {
+                eprintln!("\n[compaction_started]");
+            }
             AgentEvent::ContextCompacted { .. } => {
                 eprintln!("\n[context_compacted]");
             }

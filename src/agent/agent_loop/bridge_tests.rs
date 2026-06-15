@@ -679,6 +679,7 @@ fn full_run_event_sequence_translates_correctly() {
             AgentEvent::Done { .. } => "Done",
             AgentEvent::Error(_) => "Error",
             AgentEvent::ContextOverflow { .. } => "ContextOverflow",
+            AgentEvent::CompactionStarted { .. } => "CompactionStarted",
             AgentEvent::ContextCompacted { .. } => "ContextCompacted",
             AgentEvent::CheckpointRefresh { .. } => "CheckpointRefresh",
             AgentEvent::Interjected { .. } => "Interjected",
