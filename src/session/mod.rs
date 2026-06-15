@@ -294,6 +294,19 @@ pub struct Session {
     /// `None` for backward compat with pre-feature session files.
     #[serde(default)]
     pub current_prompt_name: Option<String>,
+    /// Snapshot of the in-session todo list (`write_todo_list` state) taken
+    /// at save time. Persisted so a resumed session restores the TODOS panel
+    /// even past a destructive compaction, which drains the originating tool
+    /// calls out of `messages` — replaying history alone can't recover them.
+    /// Defaulted on deserialize for pre-feature files; `rehydrate` falls back
+    /// to replaying message history when this is empty.
+    #[serde(default)]
+    pub todo_list: Vec<crate::agent::tools::todo::TodoItem>,
+    /// Snapshot of the MODIFIED panel — canonical paths in recency order
+    /// (most-recent last) — taken at save time. Same rationale as
+    /// `todo_list`. Defaulted on deserialize for back-compat.
+    #[serde(default)]
+    pub modified_files: Vec<String>,
     /// Batch2-3 (audit fix): file mtime at load time. Used by
     /// `save_session` to detect concurrent writes — if the on-disk
     /// file has a newer mtime than this when we go to save, a
@@ -399,6 +412,8 @@ impl Session {
             message_store: HashMap::new(),
             branch_summaries: Vec::new(),
             current_prompt_name: None,
+            todo_list: Vec::new(),
+            modified_files: Vec::new(),
             loaded_mtime: None,
             loaded_from_newer_version: None,
         }
@@ -840,6 +855,12 @@ impl Session {
         // over implicitly.
         self.loaded_mtime = None;
         self.current_prompt_name = None;
+        // Panel snapshots are per-session — a fresh session starts with empty
+        // TODOS / MODIFIED. The process-global panel statics are cleared by
+        // the command handler (see /clear); this keeps the persisted side in
+        // step so the next save doesn't carry the prior session's snapshot.
+        self.todo_list.clear();
+        self.modified_files.clear();
         // SESS-15: reset_to_new generates a fresh id, so we own
         // the on-disk file under that id; the newer-schema flag
         // belonged to the prior id's file.

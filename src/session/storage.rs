@@ -103,6 +103,18 @@ pub fn save_session(session: &mut Session) -> anyhow::Result<()> {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
     }
+    // Snapshot the live panel globals into the session so a resume restores
+    // the TODOS / MODIFIED panels even after a destructive compaction has
+    // drained the originating tool calls out of `messages`. `save_session`
+    // is the single persistence chokepoint and only ever runs for the main
+    // interactive session (subagents don't call it), so the process-global
+    // statics map to this session. See `session::rehydrate`.
+    session.todo_list = crate::agent::tools::todo::snapshot();
+    session.modified_files = crate::agent::tools::modified::recent(256)
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+
     let path = dir.join(format!("{}.json", session.id));
     let json = serde_json::to_string_pretty(session)?;
 

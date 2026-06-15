@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::agent::tools::{AskSender, PermCheck, ToolError, check_perm};
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct TodoItem {
     pub content: String,
     pub status: String,
@@ -32,6 +32,14 @@ pub static TODO_LIST: std::sync::Mutex<Vec<TodoItem>> = std::sync::Mutex::new(Ve
 /// with the conversation, mirroring `modified::clear_modified`.
 pub fn clear() {
     TODO_LIST.lock_ignore_poison().clear();
+}
+
+/// Snapshot the current todo list. `save_session` persists this with the
+/// session so a resumed session restores the TODOS panel even when a
+/// compaction has dropped the originating `write_todo_list` call from the
+/// message history.
+pub fn snapshot() -> Vec<TodoItem> {
+    TODO_LIST.lock_ignore_poison().clone()
 }
 
 /// Number of todos still `pending` or `in_progress`. Used by the agent loop

@@ -8,12 +8,21 @@
 //! panels come back blank even though the work that filled them is recorded
 //! in the message history.
 //!
-//! The fix: replay the persisted tool calls and re-derive the same state.
-//! `write_todo_list` carries its full list in the args (each call replaces the
-//! whole list, so last-write-wins); `write` / `edit` / `edit_minified` /
-//! `apply_patch` each name the file they touched. We only count tool calls
-//! that actually ran to `Completed` — an interrupted or failed edit never
-//! marked the file modified live, so it shouldn't on resume either.
+//! Two sources, in priority order:
+//!
+//! 1. **The persisted snapshot** (`Session::todo_list` / `modified_files`).
+//!    `save_session` records the live globals on every save, so this survives
+//!    a destructive compaction — the common case for a long resumed session,
+//!    whose fold drains the originating tool calls out of `messages`.
+//! 2. **Replaying the message history** — the fallback for sessions written
+//!    before the snapshot fields existed. `write_todo_list` carries its full
+//!    list in the args (each call replaces the whole list, so last-write-wins);
+//!    `write` / `edit` / `edit_minified` / `apply_patch` each name the file
+//!    they touched. Only `Completed` calls count — an interrupted or failed
+//!    edit never marked the file modified live, so it shouldn't on resume.
+//!
+//! Replay can't recover state a compaction already discarded, which is why the
+//! snapshot is preferred whenever it carries anything.
 
 use std::path::PathBuf;
 
@@ -87,13 +96,20 @@ pub fn derive_panel_state(session: &Session) -> PanelState {
     PanelState { todos, modified }
 }
 
-/// Push the derived state into the process-global panel statics so a resumed
-/// session's TODOS and MODIFIED panels reflect where the previous run left
-/// off. Clears both first so the panels show exactly this session's state.
+/// Push a resumed session's panel state into the process-global statics so the
+/// TODOS and MODIFIED panels reflect where the previous run left off. Clears
+/// both first so the panels show exactly this session's state.
+///
+/// Prefers the persisted snapshot (which survives compaction); falls back to
+/// replaying the message history for sessions saved before the snapshot fields
+/// existed. "Has a snapshot" means either field is non-empty — an empty
+/// snapshot is indistinguishable from a pre-feature default, and in that case
+/// replay yields the same result (an uncompacted history agrees with the
+/// snapshot; a compacted one has nothing left to replay).
 pub fn restore_panels(session: &Session) {
     use crate::sync_util::LockExt;
 
-    let state = derive_panel_state(session);
+    let state = selected_panel_state(session);
 
     *crate::agent::tools::todo::TODO_LIST.lock_ignore_poison() = state.todos;
 
@@ -102,6 +118,20 @@ pub fn restore_panels(session: &Session) {
     crate::agent::tools::modified::clear_modified();
     for p in &state.modified {
         crate::agent::tools::modified::mark_modified(p);
+    }
+}
+
+/// Choose the panel state to restore: the persisted snapshot when it carries
+/// anything, otherwise a replay of the message history. Pure — split out so the
+/// source-selection logic is testable without touching the process globals.
+pub fn selected_panel_state(session: &Session) -> PanelState {
+    if !session.todo_list.is_empty() || !session.modified_files.is_empty() {
+        PanelState {
+            todos: session.todo_list.clone(),
+            modified: session.modified_files.iter().map(PathBuf::from).collect(),
+        }
+    } else {
+        derive_panel_state(session)
     }
 }
 
@@ -229,6 +259,68 @@ mod tests {
         let state = derive_panel_state(&session_with(vec![]));
         assert!(state.todos.is_empty());
         assert!(state.modified.is_empty());
+    }
+
+    #[test]
+    fn snapshot_is_preferred_over_history_replay() {
+        // History would derive one modified file + a one-item todo list...
+        let mut s = session_with(vec![assistant_with_calls(vec![
+            completed(
+                "write",
+                serde_json::json!({"path": "/proj/from_history.rs"}),
+            ),
+            completed(
+                "write_todo_list",
+                serde_json::json!({"todos": [
+                    {"content": "history task", "status": "pending", "priority": "low"}
+                ]}),
+            ),
+        ])]);
+        // ...but a persisted snapshot exists, so it wins.
+        s.todo_list = vec![TodoItem {
+            content: "snapshot task".into(),
+            status: "in_progress".into(),
+            priority: "high".into(),
+        }];
+        s.modified_files = vec!["/proj/from_snapshot.rs".into()];
+
+        let state = selected_panel_state(&s);
+        assert_eq!(state.todos.len(), 1);
+        assert_eq!(state.todos[0].content, "snapshot task");
+        assert_eq!(state.modified.len(), 1);
+        assert!(state.modified[0].ends_with("from_snapshot.rs"));
+    }
+
+    #[test]
+    fn snapshot_survives_compaction_that_emptied_history() {
+        // A compacted session: messages (and their tool_calls) are gone, but
+        // the snapshot persisted the panel state.
+        let mut s = session_with(vec![]);
+        s.modified_files = vec!["/proj/a.rs".into(), "/proj/b.rs".into()];
+        s.todo_list = vec![TodoItem {
+            content: "still here".into(),
+            status: "in_progress".into(),
+            priority: "high".into(),
+        }];
+
+        let state = selected_panel_state(&s);
+        assert_eq!(state.todos.len(), 1);
+        assert_eq!(state.modified.len(), 2);
+        assert!(state.modified[1].ends_with("b.rs"));
+    }
+
+    #[test]
+    fn falls_back_to_replay_when_snapshot_empty() {
+        // Pre-feature session: no snapshot, but history still has the calls.
+        let s = session_with(vec![assistant_with_calls(vec![completed(
+            "edit",
+            serde_json::json!({"path": "/proj/legacy.rs"}),
+        )])]);
+        assert!(s.todo_list.is_empty() && s.modified_files.is_empty());
+
+        let state = selected_panel_state(&s);
+        assert_eq!(state.modified.len(), 1);
+        assert!(state.modified[0].ends_with("legacy.rs"));
     }
 
     #[test]
