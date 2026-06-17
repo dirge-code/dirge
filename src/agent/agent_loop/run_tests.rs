@@ -2080,6 +2080,62 @@ async fn dirge_7bwx_end_to_end_storm_dedupes_after_truncation_repair() {
     );
 }
 
+/// Storm-breaker graceful failure: when the run gives up because
+/// it's stuck looping the same call, it must surface a first-person
+/// assistant explanation (not an empty/abrupt stop). Drives the loop
+/// with the same single tool call repeated across turns: storm
+/// suppresses it, the first all-suppressed turn injects the
+/// self-correct nudge, and the next reaches the terminal branch —
+/// which appends the failure narrative as an assistant message.
+#[tokio::test]
+async fn storm_terminal_emits_failure_narrative() {
+    let echo = std::sync::Arc::new(EchoTool::new());
+    let mut ctx = empty_context();
+    ctx.tools.push(echo.clone());
+
+    // Five identical echo calls (distinct ids so each turn's results
+    // pair cleanly). Default storm threshold is 3.
+    let make = |i: usize| {
+        AssistantMessage::new(
+            vec![ContentBlock::ToolCall {
+                id: format!("call-{i}"),
+                name: "echo".to_string(),
+                arguments: serde_json::json!({"v": 1}),
+            }],
+            StopReason::ToolUse,
+        )
+    };
+    let factory = canned_factory((0..5).map(make).collect());
+
+    let (tx, _rx) = mpsc::channel::<LoopEvent>(128);
+    let config = build_config();
+    let messages = run_agent_loop(
+        vec![user("echo")],
+        ctx,
+        config,
+        AbortSignal::new(),
+        &tx,
+        &factory,
+        None,
+        None,
+    )
+    .await;
+    drop(tx);
+
+    let has_narrative = messages.iter().any(|m| match m {
+        LoopMessage::Assistant(a) => a.content.iter().any(|b| match b {
+            ContentBlock::Text { text } => text.contains("stopped here to avoid spinning"),
+            _ => false,
+        }),
+        _ => false,
+    });
+    assert!(
+        has_narrative,
+        "expected a storm failure-narrative assistant message; got {} messages",
+        messages.len()
+    );
+}
+
 /// dirge-ngic review-fix #3: end-to-end wiring proof for the
 /// scavenge-source fix. Drives `run_agent_loop` with a canned
 /// assistant message containing a DSML invoke ONLY in

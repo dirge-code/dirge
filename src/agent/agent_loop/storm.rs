@@ -201,6 +201,42 @@ impl StormBreaker {
     }
 }
 
+/// Compose a first-person assistant message explaining that the run
+/// stopped because it was stuck repeating tool calls — the
+/// "storm-breaker" graceful-failure narrative. Surfacing this as the
+/// assistant's own reply (rather than an abrupt/empty stop or a raw
+/// error) gives the user a coherent explanation and leaves the model
+/// a failure account to build on when the user responds.
+///
+/// `looped_tools` is the set of tool names the run looped on (deduped,
+/// order preserved). Pure so it can be unit-tested.
+pub fn failure_narrative(looped_tools: &[String]) -> String {
+    // Dedup while preserving first-seen order.
+    let mut seen = std::collections::HashSet::new();
+    let tools: Vec<&str> = looped_tools
+        .iter()
+        .filter(|t| seen.insert(t.as_str()))
+        .map(|t| t.as_str())
+        .collect();
+
+    let tool_phrase = match tools.as_slice() {
+        [] => "the same tool call".to_string(),
+        [one] => format!("the same `{one}` call"),
+        many => {
+            let quoted: Vec<String> = many.iter().map(|t| format!("`{t}`")).collect();
+            format!("the same {} calls", quoted.join(" and "))
+        }
+    };
+
+    format!(
+        "I've stopped here to avoid spinning in a loop. I kept making {tool_phrase} \
+         and getting the same result, and repeating it wasn't going to get me any further, \
+         so I'd rather pause than burn the session retrying a dead end.\n\n\
+         I wasn't able to finish what you asked. If you can confirm the goal, point me at \
+         the right file, or suggest a different angle, I'll pick it back up from there."
+    )
+}
+
 /// Built-in mutating tools: calls that change filesystem state or run
 /// external code. Derived from the canonical tool→[`Operation`] mapping
 /// (`Edit` = file mutation, `Execute` = shell) rather than a hand-kept
@@ -453,5 +489,31 @@ mod tests {
         assert_eq!(surviving2.len(), 0);
         assert_eq!(report2.storms_broken, 3);
         assert!(report2.all_suppressed(3));
+    }
+
+    #[test]
+    fn narrative_is_first_person_and_names_the_tool() {
+        let n = failure_narrative(&["bash".to_string()]);
+        assert!(n.starts_with("I've stopped"), "first-person: {n}");
+        assert!(n.contains("`bash`"), "names the tool: {n}");
+        // Reads as a coherent reply, not a raw error.
+        assert!(!n.contains("Error"), "should not look like an error: {n}");
+    }
+
+    #[test]
+    fn narrative_dedups_and_lists_multiple_tools() {
+        let n = failure_narrative(&[
+            "edit".to_string(),
+            "bash".to_string(),
+            "edit".to_string(), // dup — must not repeat
+        ]);
+        assert!(n.contains("`edit` and `bash`"), "got: {n}");
+        assert_eq!(n.matches("`edit`").count(), 1, "edit listed once: {n}");
+    }
+
+    #[test]
+    fn narrative_handles_empty_tool_list() {
+        let n = failure_narrative(&[]);
+        assert!(n.contains("the same tool call"), "got: {n}");
     }
 }

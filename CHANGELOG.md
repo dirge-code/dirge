@@ -7,6 +7,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **Storm-breaker graceful failure.** When a run gives up because it's stuck
+  repeating the same tool call (the repeat-loop guard's terminal case), it now
+  appends a short first-person assistant message explaining that it stopped to
+  avoid spinning, instead of ending on an empty/abrupt turn. The message names
+  the tool(s) it looped on and is recorded in history, so the user gets a
+  coherent reply and the model carries its own failure account into the next
+  turn. The internal reflect-then-pivot nudge on the first trip is unchanged.
 - **`/rewind` now rolls back files, not just the conversation.** Every
   write/edit/edit_lines/apply_patch (including delete and rename) snapshots the
   touched file's pre-mutation content, keyed by the user prompt that triggered

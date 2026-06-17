@@ -1287,6 +1287,12 @@ pub async fn run_loop(
 
             let mut tool_results: Vec<ToolResultMessage> = Vec::new();
             has_more_tool_calls = false;
+            // Storm-breaker: when the run gives up because it's stuck
+            // looping, the tool names it looped on — used to synthesize
+            // a graceful assistant explanation after the turn's results
+            // are backfilled (below). None unless the terminal-stuck
+            // branch fires.
+            let mut storm_give_up_tools: Option<Vec<String>> = None;
             if !tool_calls.is_empty() {
                 let original_count = tool_calls.len();
                 let (surviving_calls, storm_report) = storm.filter_calls(&tool_calls);
@@ -1354,6 +1360,11 @@ pub async fn run_loop(
                     // tool calls to dispatch, exit the inner
                     // loop.
                     has_more_tool_calls = false;
+                    // Storm-breaker: rather than end on an abrupt/empty
+                    // stop, synthesize a coherent assistant explanation
+                    // (built after backfill, below).
+                    storm_give_up_tools =
+                        Some(tool_calls.iter().map(|c| c.name.clone()).collect());
                 }
 
                 // Dispatch surviving calls through the unified dispatch.
@@ -1393,6 +1404,42 @@ pub async fn run_loop(
                     current_context.messages.push(tool_result_to_value(&tr));
                     new_messages.push(LoopMessage::ToolResult(tr.clone()));
                     tool_results.push(tr);
+                }
+
+                // Storm-breaker graceful failure: the run is giving up
+                // because it looped. Now that every suppressed call has
+                // a backfilled result (history is well-formed), append a
+                // first-person assistant message explaining the stop, so
+                // the user sees a coherent reply instead of an empty turn
+                // and the model carries its own failure account forward.
+                if let Some(tools) = storm_give_up_tools.take() {
+                    let text = super::storm::failure_narrative(&tools);
+                    let msg = AssistantMessage::new(
+                        vec![ContentBlock::Text { text }],
+                        StopReason::Stop,
+                    );
+                    // Render it to the user (text flows via MessageUpdate).
+                    let _ = emit
+                        .send(LoopEvent::MessageStart {
+                            message: LoopMessage::Assistant(msg.clone()),
+                        })
+                        .await;
+                    let _ = emit
+                        .send(LoopEvent::MessageUpdate {
+                            message: msg.clone(),
+                            phase: super::message::DeltaPhase::TextStart,
+                        })
+                        .await;
+                    let _ = emit
+                        .send(LoopEvent::MessageEnd {
+                            message: LoopMessage::Assistant(msg.clone()),
+                        })
+                        .await;
+                    // Record in history so it persists for the next turn.
+                    current_context
+                        .messages
+                        .push(loop_message_to_value(&LoopMessage::Assistant(msg.clone())));
+                    new_messages.push(LoopMessage::Assistant(msg));
                 }
             }
 
