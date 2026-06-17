@@ -164,6 +164,18 @@ const DEFAULT_PITFALL_CHAR_LIMIT: usize = 1375;
 const BREADCRUMB_MEMORY_CHAR_LIMIT: usize = 22_000;
 const BREADCRUMB_PITFALL_CHAR_LIMIT: usize = 13_750;
 
+/// dirge-vzlb: slice of the `memory` HOT budget that working-kind
+/// entries hold against long-term growth. Salience alone evicts
+/// `working` (0.3) before any durable kind, so a knowledge-rich project
+/// — HOT full of high-salience invariants — would starve working memory
+/// of all in-context space. This reserve guarantees a toehold: long-term
+/// may use the slack when working is empty (the reserve is NOT a
+/// proactive cap), but it can never evict working below the reserve. The
+/// protection is for working *in aggregate up to the reserve* — a single
+/// working note larger than it is not individually immune. `pitfalls`
+/// don't carry working entries, so their reserve is 0.
+const DEFAULT_WORKING_HOT_RESERVE: usize = 400;
+
 /// Max results returned by the `search` action.
 const SEARCH_RESULT_LIMIT: usize = 8;
 
@@ -202,6 +214,20 @@ fn breadcrumb_limit_for(target: &str) -> usize {
         "pitfalls" => BREADCRUMB_PITFALL_CHAR_LIMIT,
         _ => BREADCRUMB_MEMORY_CHAR_LIMIT,
     }
+}
+
+/// HOT chars reserved for working-kind entries (dirge-vzlb). Only the
+/// `memory` target carries working entries.
+fn working_reserve_for(target: &str) -> usize {
+    match target {
+        "pitfalls" => 0,
+        _ => DEFAULT_WORKING_HOT_RESERVE,
+    }
+}
+
+/// Whether a row is a working-kind entry (the reserve's protected class).
+fn is_working_row(row: &ActiveRow) -> bool {
+    row.kind == "working"
 }
 
 // ── Threat scanning (port of Hermes `_MEMORY_THREAT_PATTERNS`) ──────
@@ -599,6 +625,19 @@ impl SqliteMemoryStore {
     /// actively-consulted memories outlive equally-salient ones
     /// nobody has touched.
     fn least_salient_index(rows: &[ActiveRow]) -> usize {
+        // Callers here always pass a non-empty slice; the filtered form
+        // with an always-true predicate then always yields Some.
+        Self::least_salient_index_where(rows, |_| true).expect("non-empty rows")
+    }
+
+    /// Like [`least_salient_index`] but only considers rows for which
+    /// `keep` is true. Returns `None` when no row matches — lets the
+    /// working-reserve eviction prefer a class and fall back cleanly
+    /// when that class is empty (dirge-vzlb).
+    fn least_salient_index_where(
+        rows: &[ActiveRow],
+        keep: impl Fn(&ActiveRow) -> bool,
+    ) -> Option<usize> {
         let cutoff =
             (chrono::Utc::now() - chrono::Duration::days(RECENT_USE_WINDOW_DAYS)).to_rfc3339();
         let effective = |r: &ActiveRow| -> f64 {
@@ -611,17 +650,19 @@ impl SqliteMemoryStore {
                 .unwrap_or(false);
             r.salience + if recent { RECENT_USE_BONUS } else { 0.0 }
         };
-        let mut victim = 0usize;
-        let mut victim_score = effective(&rows[0]);
-        for (i, row) in rows.iter().enumerate().skip(1) {
+        let mut best: Option<(usize, f64)> = None;
+        for (i, row) in rows.iter().enumerate() {
+            if !keep(row) {
+                continue;
+            }
             let score = effective(row);
             // Strict `<` keeps the tie-break stable on the oldest row.
-            if score < victim_score {
-                victim = i;
-                victim_score = score;
+            match best {
+                Some((_, bs)) if score >= bs => {}
+                _ => best = Some((i, score)),
             }
         }
-        victim
+        best.map(|(i, _)| i)
     }
 
     /// dirge-8h22: nothing is hard-deleted. `remove` and breadcrumb
@@ -751,14 +792,41 @@ impl SqliteMemoryStore {
         // before durable `identity` / `semantic` facts — breaking
         // ties by age. Each entry costs `len + 3` for its delimiter,
         // matching the markdown store's accounting.
+        //
+        // dirge-vzlb: the working reserve overrides the pure-salience
+        // pick. While long-term content exceeds its share
+        // (`char_limit - reserve`) we demote a long-term entry even
+        // though a working note is less salient — that's what keeps
+        // working from being starved as invariants accumulate. Only
+        // once long-term is back within its share does the working
+        // overflow (the part past the reserve) become the victim.
+        // `.or_else` falls back to the other class so a single oversized
+        // entry can't deadlock the loop.
+        let reserve = working_reserve_for(target);
+        let new_is_working = matches!(kind.unwrap_or_default(), MemoryKind::Working);
         let mut hot = Self::hot_rows(&tx, target)?;
         let mut demoted = 0usize;
         while !hot.is_empty() {
-            let current: usize = hot.iter().map(|r| r.content.len() + 3).sum();
-            if current + entry_cost <= char_limit {
+            let hot_total: usize = hot.iter().map(|r| r.content.len() + 3).sum();
+            if hot_total + entry_cost <= char_limit {
                 break;
             }
-            let victim = Self::least_salient_index(&hot);
+            let working_total: usize = hot
+                .iter()
+                .filter(|r| is_working_row(r))
+                .map(|r| r.content.len() + 3)
+                .sum::<usize>()
+                + if new_is_working { entry_cost } else { 0 };
+            let longterm_total = (hot_total + entry_cost) - working_total;
+            let demote_longterm_first = longterm_total > char_limit.saturating_sub(reserve);
+            let victim = if demote_longterm_first {
+                Self::least_salient_index_where(&hot, |r| !is_working_row(r))
+                    .or_else(|| Self::least_salient_index_where(&hot, |_| true))
+            } else {
+                Self::least_salient_index_where(&hot, is_working_row)
+                    .or_else(|| Self::least_salient_index_where(&hot, |_| true))
+            };
+            let Some(victim) = victim else { break };
             let removed = hot.remove(victim);
             Self::demote_row(&tx, removed.id)?;
             demoted += 1;
@@ -1752,6 +1820,124 @@ mod tests {
         assert!(
             !entries.iter().any(|e| e.starts_with("working")),
             "low-salience working entry must be demoted first: {entries:?}"
+        );
+    }
+
+    // ── Working-memory HOT reserve (dirge-vzlb) ──────────────────
+
+    #[test]
+    fn working_reserve_survives_longterm_flood() {
+        // Anti-starvation: a knowledge-rich project fills HOT with
+        // high-salience long-term facts. A small working note must
+        // still keep a toehold — long-term is demoted to make room
+        // rather than the working note (which pure salience would
+        // evict first).
+        let (paths, _dir) = temp_project();
+        let store = SqliteMemoryStore::load(&paths).unwrap();
+        // The working note is resident first; then long-term facts
+        // flood in. Each over-budget add runs eviction over the existing
+        // HOT set, and pure salience would pick the working note (0.3)
+        // every time. The reserve must demote a fact instead while the
+        // note stays within its slice.
+        let wk = format!("working {}", "b".repeat(343));
+        store
+            .add_entry("memory", &wk, Some(MemoryKind::Working))
+            .unwrap();
+        for i in 0..10 {
+            let e = format!("fact{i:02} {}", "a".repeat(243));
+            store
+                .add_entry("memory", &e, Some(MemoryKind::Semantic))
+                .unwrap();
+        }
+
+        let view = store.view("memory");
+        let entries: Vec<String> = view["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e.as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            entries.iter().any(|e| e.starts_with("working")),
+            "working note must survive in HOT via the reserve: {entries:?}"
+        );
+        assert!(
+            entries.iter().any(|e| e.starts_with("fact")),
+            "long-term facts still present, just trimmed to their share: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn working_add_spares_longterm() {
+        // Anti-dilution: adding a working note must never demote a
+        // long-term fact that is within its share — the working
+        // entries absorb the overflow among themselves.
+        let (paths, _dir) = temp_project();
+        let store = SqliteMemoryStore::load(&paths).unwrap();
+        let semantic = format!("semantic {}", "a".repeat(1690));
+        store
+            .add_entry("memory", &semantic, Some(MemoryKind::Semantic))
+            .unwrap();
+        let work1 = format!("work1 {}", "b".repeat(380));
+        store
+            .add_entry("memory", &work1, Some(MemoryKind::Working))
+            .unwrap();
+        // This second working note overflows the budget. The victim
+        // must be a WORKING entry, never the long-term semantic fact.
+        let work2 = format!("work2 {}", "c".repeat(280));
+        store
+            .add_entry("memory", &work2, Some(MemoryKind::Working))
+            .unwrap();
+
+        let view = store.view("memory");
+        let entries: Vec<String> = view["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e.as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            entries.iter().any(|e| e.starts_with("semantic")),
+            "long-term fact must not be demoted by a working add: {entries:?}"
+        );
+        assert!(
+            !entries.iter().any(|e| e.starts_with("work1")),
+            "the older working note absorbs the overflow: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn working_beyond_reserve_is_not_protected() {
+        // The guarantee is a *reserve*, not blanket immunity: a working
+        // note far larger than the reserve is still demoted by a
+        // higher-salience long-term add (its excess past the reserve is
+        // fair game). This is the existing salience behavior holding for
+        // the unprotected portion.
+        let (paths, _dir) = temp_project();
+        let store = SqliteMemoryStore::load(&paths).unwrap();
+        let big_working = format!("working {}", "a".repeat(1400));
+        store
+            .add_entry("memory", &big_working, Some(MemoryKind::Working))
+            .unwrap();
+        let semantic = format!("semantic {}", "b".repeat(1400));
+        store
+            .add_entry("memory", &semantic, Some(MemoryKind::Semantic))
+            .unwrap();
+
+        let view = store.view("memory");
+        let entries: Vec<String> = view["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e.as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            entries.iter().any(|e| e.starts_with("semantic")),
+            "incoming long-term fact present: {entries:?}"
+        );
+        assert!(
+            !entries.iter().any(|e| e.starts_with("working")),
+            "an over-reserve working note is not immune to demotion: {entries:?}"
         );
     }
 
