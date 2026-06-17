@@ -380,6 +380,10 @@ pub struct CurationEntry {
     pub target: String,
     pub content: String,
     pub uid: String,
+    /// UMP kind string (semantic/episodic/procedural/working/identity).
+    /// The curator uses it to spot `working` entries that have proven
+    /// durable and are due for promotion (dirge-26h1).
+    pub kind: String,
     /// RFC3339 — when the entry first entered the store (survives
     /// `replace`, unlike the markdown store's content-hash keying).
     pub created_at: String,
@@ -1207,7 +1211,7 @@ impl SqliteMemoryStore {
         let conn = self.conn.lock_ignore_poison();
         let mut stmt = conn
             .prepare(
-                "SELECT target, content, uid, created_at, use_count, last_used_at
+                "SELECT target, content, uid, kind, created_at, use_count, last_used_at
                  FROM memories WHERE status = 'active' ORDER BY id",
             )
             .map_err(|e| format!("Failed to prepare curation query: {e}"))?;
@@ -1217,9 +1221,10 @@ impl SqliteMemoryStore {
                     target: row.get(0)?,
                     content: row.get(1)?,
                     uid: row.get(2)?,
-                    created_at: row.get(3)?,
-                    use_count: row.get(4)?,
-                    last_used_at: row.get(5)?,
+                    kind: row.get(3)?,
+                    created_at: row.get(4)?,
+                    use_count: row.get(5)?,
+                    last_used_at: row.get(6)?,
                 })
             })
             .map_err(|e| format!("Failed to query curation entries: {e}"))?
@@ -1675,6 +1680,42 @@ mod tests {
         assert!(
             (salience - 0.3).abs() < 1e-9,
             "working salience: {salience}"
+        );
+    }
+
+    #[test]
+    fn promote_working_keeps_usage_lineage() {
+        // dirge-26h1: promoting a durable working note is a `replace`
+        // with a new kind. It must bump salience to the new kind's
+        // default AND preserve the usage lineage that proved the entry
+        // durable — the curator surfaces candidates by use count.
+        let (paths, _dir) = temp_project();
+        let store = SqliteMemoryStore::load(&paths).unwrap();
+        let text = "build: cargo test --bin dirge";
+        store
+            .add_entry("memory", text, Some(MemoryKind::Working))
+            .unwrap();
+        // The agent consulted it twice — that's what makes it durable.
+        store.expand("cargo test").unwrap();
+        store.expand("cargo test").unwrap();
+
+        store
+            .replace_entry("memory", text, text, Some(MemoryKind::Procedural))
+            .unwrap();
+
+        let entries = store.entries_for_curation().unwrap();
+        let e = entries
+            .iter()
+            .find(|e| e.content.contains("cargo test"))
+            .expect("entry still present after promotion");
+        assert_eq!(e.kind, "procedural", "kind promoted");
+        assert_eq!(e.use_count, 2, "usage lineage survives promotion");
+        let salience = store.view("memory")["meta"][text]["lifecycle"]["salience"]
+            .as_f64()
+            .unwrap();
+        assert!(
+            (salience - 0.5).abs() < 1e-9,
+            "promoted to procedural salience: {salience}"
         );
     }
 

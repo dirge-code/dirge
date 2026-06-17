@@ -66,6 +66,15 @@ removing. Removal ARCHIVES the entry (it can be restored with `memory(action='re
 so a justified removal is recoverable. The `old_text` argument also accepts the entry's exact \
 `urn:ump:...` id from the stale-candidate table below when a substring would be ambiguous.\n\
 \n\
+PROMOTE durable working memory. `working`-kind entries are transient session scratch and are the \
+first to be evicted from context. The promotion-candidates table below lists `working` entries that \
+have outlived their session. For any whose content is a durable project fact or convention — a build/test \
+command, a design decision, a recurring quirk — and whose Uses count shows it has actually been consulted, \
+re-classify it with `memory(action='replace', old_text='<id-or-substring>', content='<same or lightly cleaned text>', \
+kind='procedural')` (use `semantic` for a pure fact about the project, `procedural` for a how-to/rule). \
+This keeps the knowledge in long-term memory instead of letting it decay. Leave genuinely transient notes \
+(\"currently refactoring X\") as `working`; a low or zero Uses count is a reason NOT to promote.\n\
+\n\
 Do NOT:\n\
   • Add new facts. The curator is for consolidation, not capture. Background review handles capture.\n\
   • Reword for style. Only change wording when consolidating duplicates or fixing a fact that's \
@@ -81,6 +90,13 @@ Operate on these only.";
 
 /// Days since `first_seen_at` before an entry counts as stale.
 const STALE_AFTER_DAYS: u64 = 30;
+
+/// dirge-26h1: minimum age before a `working`-kind entry is surfaced as
+/// a promotion candidate. This only filters out same-session scratch
+/// notes; it does NOT decide durability — the LLM pass weighs each
+/// candidate's use count and content and decides whether to re-kind it
+/// to `procedural`/`semantic`.
+const PROMOTE_MIN_AGE_DAYS: u64 = 7;
 
 /// dirge-jyks: hot-tier utilization (%) at or above which the LLM
 /// pass is told consolidation of YOUNGER overlapping entries is also
@@ -164,6 +180,7 @@ impl MemoryCurator {
         let recent_use_cutoff =
             (started_at - chrono::Duration::days(STALE_AFTER_DAYS as i64)).to_rfc3339();
         let mut stale_candidates: Vec<StaleCandidate> = Vec::new();
+        let mut promotion_candidates: Vec<PromotionCandidate> = Vec::new();
         for entry in &entries {
             let Ok(first_seen) = chrono::DateTime::parse_from_rfc3339(&entry.created_at) else {
                 continue;
@@ -175,6 +192,19 @@ impl MemoryCurator {
                 .as_deref()
                 .map(|t| t > recent_use_cutoff.as_str())
                 .unwrap_or(false);
+            // dirge-26h1: a `working` entry that outlived its session is
+            // a promotion candidate (the LLM decides on its use count).
+            // Such an entry is also, by usage, NOT stale, so the two
+            // lists never overlap.
+            if entry.kind == "working" && age_days >= PROMOTE_MIN_AGE_DAYS {
+                promotion_candidates.push(PromotionCandidate {
+                    target: entry.target.clone(),
+                    entry_id: entry.uid.clone(),
+                    preview: crate::text::first_line_preview(&entry.content),
+                    age_days,
+                    use_count: entry.use_count,
+                });
+            }
             if age_days >= STALE_AFTER_DAYS && !recently_used {
                 stale_candidates.push(StaleCandidate {
                     target: entry.target.clone(),
@@ -186,6 +216,7 @@ impl MemoryCurator {
             }
         }
         stale_candidates.sort_by_key(|c| std::cmp::Reverse(c.age_days));
+        promotion_candidates.sort_by_key(|c| std::cmp::Reverse(c.use_count));
 
         // 4. Budget pressure: targets at/over the threshold are
         //    flagged so the LLM pass may consolidate YOUNGER
@@ -205,6 +236,7 @@ impl MemoryCurator {
             decayed,
             pressure_targets,
             stale_candidates,
+            promotion_candidates,
         };
 
         // 4. Write audit report.
@@ -238,6 +270,23 @@ pub struct MechanicalReport {
     /// pass may consolidate younger overlapping entries there.
     pub pressure_targets: Vec<String>,
     pub stale_candidates: Vec<StaleCandidate>,
+    /// dirge-26h1: `working`-kind entries old enough to have outlived
+    /// their session. The LLM pass decides which have proven durable
+    /// and re-kinds those to `procedural`/`semantic`.
+    pub promotion_candidates: Vec<PromotionCandidate>,
+}
+
+/// A `working`-kind entry the curator surfaces for possible promotion.
+/// Same shape as [`StaleCandidate`] but a distinct type so the two
+/// lists can't be confused — stale entries are removal candidates,
+/// these are re-kind candidates (dirge-26h1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromotionCandidate {
+    pub target: String,
+    pub entry_id: String,
+    pub preview: String,
+    pub age_days: u64,
+    pub use_count: i64,
 }
 
 /// One entry the curator would propose for archive consideration.
@@ -272,6 +321,11 @@ impl MechanicalReport {
             );
         }
         let _ = writeln!(out, "- Stale candidates: {}", self.stale_candidates.len());
+        let _ = writeln!(
+            out,
+            "- Working promotion candidates: {}",
+            self.promotion_candidates.len(),
+        );
 
         if !self.stale_candidates.is_empty() {
             let _ = writeln!(
@@ -430,6 +484,34 @@ pub fn render_curator_input(
         let _ = writeln!(out, "| Target | Age (days) | Uses | Entry ID | Preview |");
         let _ = writeln!(out, "|---|---|---|---|---|");
         for c in &report.stale_candidates {
+            let _ = writeln!(
+                out,
+                "| `{}` | {} | {} | `{}` | {} |",
+                c.target,
+                c.age_days,
+                c.use_count,
+                c.entry_id,
+                c.preview.replace('|', "\\|"),
+            );
+        }
+    }
+    // dirge-26h1: working entries that have outlived their session —
+    // promote the durable ones (see the PROMOTE rule above).
+    if !report.promotion_candidates.is_empty() {
+        let _ = writeln!(
+            out,
+            "\n## Working-memory promotion candidates ({})\n",
+            report.promotion_candidates.len(),
+        );
+        let _ = writeln!(
+            out,
+            "These `working` entries are older than {PROMOTE_MIN_AGE_DAYS} days. Promote the ones \
+             whose content is a durable fact/convention AND whose Uses count shows it's been \
+             consulted; leave transient notes as working.\n"
+        );
+        let _ = writeln!(out, "| Target | Age (days) | Uses | Entry ID | Preview |");
+        let _ = writeln!(out, "|---|---|---|---|---|");
+        for c in &report.promotion_candidates {
             let _ = writeln!(
                 out,
                 "| `{}` | {} | {} | `{}` | {} |",
@@ -777,6 +859,7 @@ mod tests {
             decayed: 0,
             pressure_targets: vec![],
             stale_candidates: vec![],
+            promotion_candidates: vec![],
         };
         let md = report.to_markdown();
         assert!(
@@ -794,6 +877,7 @@ mod tests {
             decayed: 0,
             pressure_targets: vec![],
             stale_candidates: stale,
+            promotion_candidates: vec![],
         }
     }
 
@@ -843,6 +927,91 @@ mod tests {
         assert!(out.contains("_(empty)_"));
         assert!(out.contains("## Current PITFALLS.md"));
         assert!(out.contains("None. The mechanical pass found no entries"));
+    }
+
+    // ── Working-memory promotion (dirge-26h1) ────────────────────
+
+    #[test]
+    fn curator_prompt_instructs_working_promotion() {
+        let p = MEMORY_CURATOR_PROMPT.to_lowercase();
+        assert!(p.contains("promote"), "prompt must mention promotion");
+        assert!(p.contains("working"), "prompt must name the working kind");
+        assert!(
+            p.contains("procedural") || p.contains("semantic"),
+            "prompt must name the promotion target kind"
+        );
+    }
+
+    #[test]
+    fn mechanical_pass_collects_durable_working_candidates() {
+        let (paths, _tmp) = temp_project();
+        let store = crate::extras::memory_db::SqliteMemoryStore::load(&paths).unwrap();
+        store
+            .add_entry(
+                "memory",
+                "build: cargo test --bin dirge",
+                Some(crate::extras::memory_db::MemoryKind::Working),
+            )
+            .unwrap();
+        store
+            .add_entry(
+                "memory",
+                "fresh scratch note",
+                Some(crate::extras::memory_db::MemoryKind::Working),
+            )
+            .unwrap();
+        store
+            .add_entry(
+                "memory",
+                "a durable project fact",
+                Some(crate::extras::memory_db::MemoryKind::Semantic),
+            )
+            .unwrap();
+        // Age only the first working entry past the promotion gate.
+        backdate_entry(&paths, "build: cargo test --bin dirge", 10);
+        drop(store);
+
+        let mut curator = MemoryCurator::new(&paths).unwrap();
+        let report = curator.run_mechanical_pass().unwrap();
+
+        let previews: Vec<&str> = report
+            .promotion_candidates
+            .iter()
+            .map(|c| c.preview.as_str())
+            .collect();
+        assert!(
+            previews.iter().any(|p| p.contains("cargo test")),
+            "aged working entry is a promotion candidate: {previews:?}"
+        );
+        assert!(
+            !previews.iter().any(|p| p.contains("fresh scratch")),
+            "a same-session working note is not yet a candidate: {previews:?}"
+        );
+        assert!(
+            !previews.iter().any(|p| p.contains("durable project fact")),
+            "non-working entries are never promotion candidates: {previews:?}"
+        );
+    }
+
+    #[test]
+    fn render_curator_input_lists_promotion_candidates() {
+        let mut report = make_report(vec![]);
+        report.promotion_candidates = vec![PromotionCandidate {
+            target: "memory".to_string(),
+            entry_id: "urn:ump:abc".to_string(),
+            preview: "build: cargo test --bin dirge".to_string(),
+            age_days: 12,
+            use_count: 3,
+        }];
+        let out = render_curator_input(&report, "[working] build: cargo test --bin dirge", "");
+        assert!(
+            out.contains("promotion candidates"),
+            "render must include the promotion section: {out}"
+        );
+        assert!(
+            out.contains("build: cargo test --bin dirge"),
+            "candidate preview must appear: {out}"
+        );
     }
 
     /// LLM report markdown captures elapsed, tool actions
