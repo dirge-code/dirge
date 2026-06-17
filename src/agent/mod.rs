@@ -1,5 +1,7 @@
 pub mod agent_loop;
 pub mod builder;
+#[cfg(test)]
+mod compaction_recall;
 pub mod compression;
 pub mod exemplars;
 pub mod model_family;
