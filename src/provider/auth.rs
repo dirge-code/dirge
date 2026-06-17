@@ -2,10 +2,28 @@ use std::path::PathBuf;
 
 use crate::config::ProviderAuth;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ProviderAuthHeaders {
     pub bearer_token: String,
     pub chatgpt_account_id: Option<String>,
+}
+
+// Hand-written so the live ChatGPT bearer token can never land in a log or
+// panic message via `{:?}` — the derived Debug would print it verbatim.
+impl std::fmt::Debug for ProviderAuthHeaders {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderAuthHeaders")
+            .field(
+                "bearer_token",
+                &if self.bearer_token.is_empty() {
+                    "<unset>"
+                } else {
+                    "<redacted>"
+                },
+            )
+            .field("chatgpt_account_id", &self.chatgpt_account_id)
+            .finish()
+    }
 }
 
 pub fn resolve_auth_headers(auth: ProviderAuth) -> anyhow::Result<Option<ProviderAuthHeaders>> {
@@ -135,6 +153,20 @@ mod tests {
             extract_string_by_keys(&value, &["chatgpt_account_id"]).as_deref(),
             Some("acct-456")
         );
+    }
+
+    #[test]
+    fn debug_redacts_bearer_token() {
+        let headers = ProviderAuthHeaders {
+            bearer_token: "super-secret-token".to_string(),
+            chatgpt_account_id: Some("acct-1".to_string()),
+        };
+        let rendered = format!("{headers:?}");
+        assert!(
+            !rendered.contains("super-secret-token"),
+            "bearer token must not appear in Debug output: {rendered}"
+        );
+        assert!(rendered.contains("<redacted>"), "{rendered}");
     }
 
     #[test]

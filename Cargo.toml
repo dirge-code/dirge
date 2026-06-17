@@ -213,6 +213,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt", "macros", "sync", "time", "process", "fs", "io-util"] }
 anyhow = "1"
+# Already transitive via rig's `http_client` API (rig re-exports `bytes::Bytes`
+# in the request/response types). Declared directly so `provider::codex_http`
+# can name `Bytes` when normalizing the Codex `/responses` body — no new crate
+# enters the tree.
 bytes = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

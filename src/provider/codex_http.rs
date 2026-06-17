@@ -148,12 +148,18 @@ fn strip_system_input_items(obj: &mut serde_json::Map<String, serde_json::Value>
 
 fn extract_system_instructions(value: &serde_json::Value) -> Option<String> {
     let input = value.get("input")?.as_array()?;
-    input
+    // Collect EVERY system message, not just the first: `strip_system_input_
+    // items` deletes all of them, so lifting only the first would silently
+    // drop any later system content. Join them in order.
+    let combined = input
         .iter()
-        .find(|item| item.get("role").and_then(serde_json::Value::as_str) == Some("system"))
-        .and_then(extract_message_text)
+        .filter(|item| item.get("role").and_then(serde_json::Value::as_str) == Some("system"))
+        .filter_map(extract_message_text)
         .map(|text| text.trim().to_string())
         .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(combined).filter(|text| !text.is_empty())
 }
 
 fn extract_message_text(item: &serde_json::Value) -> Option<String> {
@@ -178,6 +184,31 @@ fn extract_message_text(item: &serde_json::Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merges_multiple_system_messages_into_instructions() {
+        // `strip_system_input_items` deletes ALL system items, so every
+        // system message must be lifted into `instructions` — not just the
+        // first — or the rest would be silently lost.
+        let body = Bytes::from(
+            serde_json::json!({
+                "input": [
+                    { "role": "system", "content": "First." },
+                    { "role": "system", "content": "Second." },
+                    { "role": "user", "content": "Hi" }
+                ]
+            })
+            .to_string(),
+        );
+
+        let value: serde_json::Value =
+            serde_json::from_slice(&normalize_codex_responses_body(body)).unwrap();
+
+        assert_eq!(value["instructions"], "First.\nSecond.");
+        // Both system items stripped; only the user item remains.
+        assert_eq!(value["input"].as_array().unwrap().len(), 1);
+        assert_eq!(value["input"][0]["role"], "user");
+    }
 
     #[test]
     fn injects_responses_instructions_from_system_input() {

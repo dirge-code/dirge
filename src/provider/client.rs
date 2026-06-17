@@ -51,6 +51,18 @@ fn create_client_with_resolved_auth(
     })?;
 
     let auth = info.auth.or(default_auth).unwrap_or(ProviderAuth::ApiKey);
+    // ChatGPT (Codex) auth is only wired for the OpenAI kind — the Codex base
+    // URL, the chatgpt-account-id header, and the request-body shim all live in
+    // the OpenAI arm below. For any other provider the resolved bearer token
+    // would be passed as THAT provider's api_key and sent to its endpoint,
+    // leaking the Codex login token to a third party. A top-level
+    // `auth: chatgpt` (default_auth) applies to every provider, so guard here.
+    if auth == ProviderAuth::ChatGpt && info.kind != ProviderKind::OpenAI {
+        anyhow::bail!(
+            "ChatGPT (Codex) auth is only supported for the `openai` provider, not `{provider_name}`. \
+             Set `auth: chatgpt` only on your openai provider (or use an API key for `{provider_name}`)."
+        );
+    }
     let auth_headers = match (auth, resolved_auth_headers) {
         (ProviderAuth::ChatGpt, Some(headers)) => Some(headers),
         _ => resolve_auth_headers(auth)?,
@@ -100,6 +112,19 @@ fn create_client_with_resolved_auth(
             .or_else(|| Some(CHATGPT_CODEX_BASE_URL.to_string())),
         _ => info.base_url,
     };
+
+    // A Codex login token is higher-value than a per-provider API key, so it
+    // must never leave over plaintext — `allow_insecure` (which the custom-
+    // provider validator otherwise honors) is NOT respected under ChatGPT auth.
+    if is_chatgpt_auth
+        && let Some(url) = base_url.as_deref()
+        && !url.starts_with("https://")
+    {
+        anyhow::bail!(
+            "ChatGPT (Codex) auth requires an https base URL, but got `{url}`. The Codex login \
+             token is too sensitive to send over http:// — `allow_insecure` is ignored here."
+        );
+    }
 
     match info.kind {
         ProviderKind::OpenAI => {
@@ -271,6 +296,53 @@ mod tests {
         let crate::provider::AnyClient::OpenAI(_) = client else {
             panic!("expected API-key OpenAI to use Chat Completions client");
         };
+    }
+
+    #[test]
+    fn chatgpt_auth_rejected_for_non_openai_provider() {
+        // A top-level `auth: chatgpt` applies to every provider. Selecting a
+        // non-openai one must be refused, not silently send the Codex bearer
+        // token to that provider's endpoint.
+        let providers = HashMap::new();
+        let msg = match create_client_with_chatgpt_auth_headers(
+            "anthropic",
+            &providers,
+            test_chatgpt_headers(),
+        ) {
+            Ok(_) => panic!("chatgpt auth on a non-openai provider must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("only supported for the `openai` provider"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains("anthropic"),
+            "error should name the provider: {msg}"
+        );
+    }
+
+    #[test]
+    fn chatgpt_auth_refuses_insecure_base_url_even_with_allow_insecure() {
+        // A Codex token must never go out over http://, even if the user set
+        // allow_insecure (which the custom-provider validator otherwise honors).
+        let providers = HashMap::from([(
+            "openai".to_string(),
+            ProviderEntry {
+                base_url: Some("http://proxy.local/openai".to_string()),
+                allow_insecure: true,
+                ..Default::default()
+            },
+        )]);
+        let msg = match create_client_with_chatgpt_auth_headers(
+            "openai",
+            &providers,
+            test_chatgpt_headers(),
+        ) {
+            Ok(_) => panic!("http base url must be refused under chatgpt auth"),
+            Err(e) => e.to_string(),
+        };
+        assert!(msg.contains("https base URL"), "unexpected error: {msg}");
     }
 
     #[test]
