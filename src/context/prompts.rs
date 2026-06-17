@@ -291,6 +291,50 @@ mod tests {
         assert_eq!(p.body, "You are dirge.\n");
     }
 
+    /// #429: plan mode must be a comprehensive read-only lock — every tool
+    /// that can change the filesystem, run a command, reach the network, or
+    /// delegate work must be denied. A denylist is fragile (a new mutating
+    /// tool is unsafe-by-default until added here), so pin the required set.
+    #[test]
+    fn plan_prompt_locks_down_all_mutation_and_exec_tools() {
+        let raw = EMBEDDED
+            .get_file("plan.md")
+            .and_then(|f| f.contents_utf8())
+            .expect("embedded plan.md present");
+        let p = parse_frontmatter(raw);
+        for required in [
+            "edit",
+            "write",
+            "apply_patch",
+            "edit_lines",
+            "edit_minified",
+            "bash",
+            "webfetch",
+            "task",
+            "mcp_tool",
+            "plugin_tool",
+            "debug",
+            "spec",
+        ] {
+            assert!(
+                p.deny_tools
+                    .iter()
+                    .any(|d| d.eq_ignore_ascii_case(required)),
+                "plan mode must deny {required:?}; deny_tools = {:?}",
+                p.deny_tools,
+            );
+        }
+        // Every entry must be a known built-in, or it warns at load.
+        for d in &p.deny_tools {
+            assert!(
+                crate::agent::tools::BUILTIN_TOOL_NAMES
+                    .iter()
+                    .any(|k| k.eq_ignore_ascii_case(d)),
+                "plan deny_tools entry {d:?} isn't a known built-in (would warn at load)",
+            );
+        }
+    }
+
     #[test]
     fn frontmatter_tolerates_quoted_tool_names_and_whitespace() {
         let raw = "---\ndeny_tools: [ \"edit\" , 'write' ,  bash ]\n---\nbody\n";

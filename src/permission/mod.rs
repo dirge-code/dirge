@@ -215,14 +215,18 @@ pub fn default_bash_rules() -> Vec<(&'static str, Action)> {
         ("git branch **", Action::Allow),
         ("git add **", Action::Allow),
         ("git commit **", Action::Allow),
-        ("git checkout **", Action::Allow),
-        ("git switch **", Action::Allow),
+        // git checkout / switch / restore / reset / clean are deliberately
+        // NOT auto-allowed (#429): they discard uncommitted working-tree
+        // changes (`git checkout -- file`, `git restore file`, `reset
+        // --hard`, `clean -fd`), so they must prompt rather than run
+        // silently — an agent reverting "its own" edit can otherwise wipe a
+        // user's pending changes. They fall through to the default Ask.
+        // `git pull`/`fetch` stay allowed (routine; conflicts surface).
         ("git pull **", Action::Allow),
         ("git fetch **", Action::Allow),
         ("git remote **", Action::Allow),
         ("git tag **", Action::Allow),
         ("git blame **", Action::Allow),
-        ("git restore **", Action::Allow),
         ("git rev-parse **", Action::Allow),
         ("git rev-list **", Action::Allow),
         ("git ls-files **", Action::Allow),

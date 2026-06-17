@@ -878,11 +878,10 @@ fn default_bash_rules_cover_common_flagged_invocations() {
         "cargo run --release",
         "git add -A",
         "git commit -m \"msg\"",
-        "git checkout main",
-        "git switch -c feat/foo",
+        // git checkout / switch / restore are NOT here — they can discard
+        // uncommitted work, so they prompt (see the gated test below, #429).
         "git pull --rebase",
         "git fetch origin",
-        "git restore --staged file.rs",
         "make test",
         "pytest -x tests/",
         "npm test -- --coverage",
@@ -914,6 +913,15 @@ fn default_bash_rules_keep_high_risk_gated() {
         "git reset --hard",
         "git rebase -i main",
         "git stash drop",
+        // #429: these discard uncommitted work — they must prompt, not run
+        // silently. `git checkout -- file` / `git restore file` were the
+        // commands that destroyed a user's pending changes in plan mode.
+        "git checkout main",
+        "git checkout -- src/main.rs",
+        "git switch -c feat/foo",
+        "git restore --staged file.rs",
+        "git restore src/main.rs",
+        "git clean -fd",
         "npm install lodash",
         "pip install requests",
         "curl http://example.com",
