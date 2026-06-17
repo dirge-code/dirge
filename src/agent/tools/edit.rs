@@ -321,8 +321,7 @@ impl Tool for EditTool {
             None => String::new(),
         };
 
-        #[allow(unused_mut)]
-        let mut output = if has_crlf {
+        let candidate = if has_crlf {
             new_content.replace('\n', "\r\n")
         } else {
             new_content
@@ -334,20 +333,9 @@ impl Tool for EditTool {
         // imbalance is mechanically closed (parity with the JSON
         // truncation repair) and reported, rather than bounced back.
         // See docs/AGENTIC_LOOP_PLAN.md §2.
-        #[cfg(feature = "semantic")]
-        let syntax_note: Option<String> = {
-            use crate::semantic::syntax_validator::{SyntaxOutcome, validate_or_repair};
-            match validate_or_repair(std::path::Path::new(&resolved_path), &output) {
-                SyntaxOutcome::Clean => None,
-                SyntaxOutcome::Repaired { content, note } => {
-                    output = content;
-                    Some(note)
-                }
-                SyntaxOutcome::Rejected { message } => return Err(ToolError::Msg(message)),
-            }
-        };
-        #[cfg(not(feature = "semantic"))]
-        let syntax_note: Option<String> = None;
+        let (output, syntax_note) =
+            crate::agent::tools::syntax_gate(std::path::Path::new(&resolved_path), &candidate)
+                .map_err(ToolError::Msg)?;
         #[cfg(feature = "lsp")]
         let write_at = std::time::Instant::now();
         // Snapshot pre-edit content for /rewind before mutating. Reuse
@@ -379,9 +367,7 @@ impl Tool for EditTool {
         } else {
             format!("Applied edit{}", fallback_note)
         };
-        if let Some(note) = syntax_note {
-            result.push_str(&format!("\n[auto-repair] {note}"));
-        }
+        crate::agent::tools::append_repair_note(&mut result, syntax_note);
         // Mention the line delta when adding/removing lines so the
         // LLM can confirm the size of change without re-reading
         // the diff block. For replace_all the per-replacement

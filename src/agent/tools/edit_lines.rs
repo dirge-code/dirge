@@ -231,8 +231,7 @@ impl Tool for EditLinesTool {
 
         // Re-apply CRLF if the file used it, so we don't silently
         // rewrite line endings.
-        #[allow(unused_mut)]
-        let mut output = if has_crlf {
+        let candidate = if has_crlf {
             new_content.replace('\n', "\r\n")
         } else {
             new_content
@@ -243,20 +242,9 @@ impl Tool for EditLinesTool {
         // dirge-p5fu: a purely unclosed-delimiter imbalance is
         // mechanically closed (parity with the JSON truncation repair)
         // and reported, rather than bounced back to the model.
-        #[cfg(feature = "semantic")]
-        let syntax_note: Option<String> = {
-            use crate::semantic::syntax_validator::{SyntaxOutcome, validate_or_repair};
-            match validate_or_repair(std::path::Path::new(&resolved_path), &output) {
-                SyntaxOutcome::Clean => None,
-                SyntaxOutcome::Repaired { content, note } => {
-                    output = content;
-                    Some(note)
-                }
-                SyntaxOutcome::Rejected { message } => return Err(ToolError::Msg(message)),
-            }
-        };
-        #[cfg(not(feature = "semantic"))]
-        let syntax_note: Option<String> = None;
+        let (output, syntax_note) =
+            crate::agent::tools::syntax_gate(std::path::Path::new(&resolved_path), &candidate)
+                .map_err(ToolError::Msg)?;
 
         // Snapshot pre-edit content for /rewind before mutating, reusing
         // the bytes already read above instead of re-reading from disk.
@@ -285,9 +273,7 @@ impl Tool for EditLinesTool {
             args.end_line - args.start_line + 1,
             new_span,
         );
-        if let Some(note) = syntax_note {
-            msg.push_str(&format!("\n[auto-repair] {note}"));
-        }
+        crate::agent::tools::append_repair_note(&mut msg, syntax_note);
         Ok(msg)
     }
 }

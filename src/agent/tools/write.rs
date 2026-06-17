@@ -112,25 +112,8 @@ impl Tool for WriteTool {
         // the fix is reported on the result so it's never silent. No-op
         // for unknown file types or when no `semantic-<lang>` feature is
         // built. See docs/AGENTIC_LOOP_PLAN.md §2.
-        let (content, syntax_note): (std::borrow::Cow<'_, str>, Option<String>) = {
-            #[cfg(feature = "semantic")]
-            {
-                use crate::semantic::syntax_validator::{SyntaxOutcome, validate_or_repair};
-                match validate_or_repair(path, &args.content) {
-                    SyntaxOutcome::Clean => {
-                        (std::borrow::Cow::Borrowed(args.content.as_str()), None)
-                    }
-                    SyntaxOutcome::Repaired { content, note } => {
-                        (std::borrow::Cow::Owned(content), Some(note))
-                    }
-                    SyntaxOutcome::Rejected { message } => return Err(ToolError::Msg(message)),
-                }
-            }
-            #[cfg(not(feature = "semantic"))]
-            {
-                (std::borrow::Cow::Borrowed(args.content.as_str()), None)
-            }
-        };
+        let (content, syntax_note) =
+            crate::agent::tools::syntax_gate(path, &args.content).map_err(ToolError::Msg)?;
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
@@ -171,9 +154,7 @@ impl Tool for WriteTool {
         let verb = if was_creation { "Created" } else { "Wrote" };
         #[allow(unused_mut)]
         let mut output = format!("{} {} bytes ({} lines)", verb, bytes, line_count);
-        if let Some(note) = syntax_note {
-            output.push_str(&format!("\n[auto-repair] {note}"));
-        }
+        crate::agent::tools::append_repair_note(&mut output, syntax_note);
         #[cfg(feature = "lsp")]
         output.push_str(&append_lsp_block(self.lsp_manager.as_ref(), path, write_at).await);
         Ok(output)

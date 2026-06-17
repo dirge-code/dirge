@@ -130,24 +130,15 @@ impl Tool for EditMinifiedTool {
             .and_then(|e| e.to_str())
             .unwrap_or("");
 
-        let new_source = apply_minified_edit(ext, &source, &args.old_text, &args.new_text)
+        let candidate = apply_minified_edit(ext, &source, &args.old_text, &args.new_text)
             .map_err(|e| ToolError::Msg(minified_edit_error_message(e, &args.path)))?;
 
-        // Syntax-check the result BEFORE writing (same gate as `edit`): refuse
-        // to write a syntactically-broken edit.
-        #[cfg(feature = "semantic")]
-        if let Err(errors) = crate::semantic::syntax_validator::check_syntax(
-            std::path::Path::new(&resolved),
-            &new_source,
-        ) {
-            return Err(ToolError::Msg(
-                crate::semantic::syntax_validator::format_errors(
-                    std::path::Path::new(&resolved),
-                    &new_source,
-                    &errors,
-                ),
-            ));
-        }
+        // Same pre-write gate as `edit` (via the shared choke point): refuse a
+        // syntactically-broken edit, or mechanically close a purely-unclosed
+        // delimiter imbalance and report it (dirge-p5fu).
+        let (new_source, syntax_note) =
+            crate::agent::tools::syntax_gate(std::path::Path::new(&resolved), &candidate)
+                .map_err(ToolError::Msg)?;
 
         crate::fs_atomic::atomic_write(std::path::Path::new(&resolved), new_source.as_bytes())
             .await?;
@@ -157,11 +148,13 @@ impl Tool for EditMinifiedTool {
             cache.mark_read(std::path::Path::new(&resolved));
         }
 
-        Ok(format!(
+        let mut msg = format!(
             "Applied minified edit to {} ({} bytes)",
             args.path,
             new_source.len()
-        ))
+        );
+        crate::agent::tools::append_repair_note(&mut msg, syntax_note);
+        Ok(msg)
     }
 }
 

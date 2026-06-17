@@ -243,6 +243,48 @@ pub fn require_absolute_path(path: &str, subject: &str) -> Result<(), String> {
     }
 }
 
+/// Pre-write syntax gate shared by EVERY content-writing edit tool
+/// (write/edit/edit_lines/edit_minified/apply_patch). Validates `content`
+/// and, on a purely-unclosed delimiter imbalance, mechanically closes it
+/// (dirge-p5fu) — returning the repaired text plus a note to surface on the
+/// success result. On an unrepairable imbalance returns `Err(message)` (the
+/// formatted reject; file must NOT be written). Returns the content
+/// unchanged when the `semantic` feature is off.
+///
+/// This is the single choke point so a tool can't silently drift out of the
+/// repair contract (a per-call-site copy of this was how `edit_minified`
+/// got missed). Err is the `String` message; `ToolError` callers wrap with
+/// `.map_err(ToolError::Msg)`.
+pub(crate) fn syntax_gate<'a>(
+    path: &std::path::Path,
+    content: &'a str,
+) -> Result<(std::borrow::Cow<'a, str>, Option<String>), String> {
+    #[cfg(feature = "semantic")]
+    {
+        use crate::semantic::syntax_validator::{SyntaxOutcome, validate_or_repair};
+        match validate_or_repair(path, content) {
+            SyntaxOutcome::Clean => Ok((std::borrow::Cow::Borrowed(content), None)),
+            SyntaxOutcome::Repaired { content, note } => {
+                Ok((std::borrow::Cow::Owned(content), Some(note)))
+            }
+            SyntaxOutcome::Rejected { message } => Err(message),
+        }
+    }
+    #[cfg(not(feature = "semantic"))]
+    {
+        let _ = path;
+        Ok((std::borrow::Cow::Borrowed(content), None))
+    }
+}
+
+/// Append the auto-repair note (if any) to a tool's success message, in one
+/// uniform format across every edit tool.
+pub(crate) fn append_repair_note(msg: &mut String, note: Option<String>) {
+    if let Some(note) = note {
+        msg.push_str(&format!("\n[auto-repair] {note}"));
+    }
+}
+
 #[derive(Deserialize)]
 pub struct ReadArgs {
     pub path: String,

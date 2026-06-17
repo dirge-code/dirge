@@ -94,29 +94,14 @@ async fn apply_create(path: &str, content: &str) -> Result<String, String> {
     // syntactically-broken files. dirge-p5fu: a purely unclosed-delimiter
     // imbalance is mechanically closed (parity with the JSON truncation
     // repair) and reported, rather than rejected. See AGENTIC_LOOP_PLAN §2.
-    #[cfg(feature = "semantic")]
-    let (content, syntax_note): (std::borrow::Cow<'_, str>, Option<String>) = {
-        use crate::semantic::syntax_validator::{SyntaxOutcome, validate_or_repair};
-        match validate_or_repair(p, content) {
-            SyntaxOutcome::Clean => (std::borrow::Cow::Borrowed(content), None),
-            SyntaxOutcome::Repaired { content: c, note } => {
-                (std::borrow::Cow::Owned(c), Some(note))
-            }
-            SyntaxOutcome::Rejected { message } => return Err(message),
-        }
-    };
-    #[cfg(not(feature = "semantic"))]
-    let (content, syntax_note): (std::borrow::Cow<'_, str>, Option<String>) =
-        (std::borrow::Cow::Borrowed(content), None);
+    let (content, syntax_note) = crate::agent::tools::syntax_gate(p, content)?;
     // Snapshot pre-state (absent) for /rewind so restore deletes it.
     crate::agent::tools::snapshots::capture(p);
     crate::fs_atomic::atomic_write(p, content.as_bytes())
         .await
         .map_err(|e| format!("write failed: {}", e))?;
     let mut msg = format!("created {}", path);
-    if let Some(note) = syntax_note {
-        msg.push_str(&format!(" [auto-repair] {note}"));
-    }
+    crate::agent::tools::append_repair_note(&mut msg, syntax_note);
     Ok(msg)
 }
 
@@ -171,8 +156,7 @@ async fn apply_update(path: &str, old_text: &str, new_text: &str) -> Result<Stri
     let updated_normalized = normalized.replacen(&needle, &replacement, 1);
     // Restore CRLF line endings on write-back so we don't silently
     // re-format the user's file.
-    #[allow(unused_mut)]
-    let mut to_write = if crlf {
+    let candidate = if crlf {
         updated_normalized.replace('\n', "\r\n")
     } else {
         updated_normalized
@@ -181,20 +165,8 @@ async fn apply_update(path: &str, old_text: &str, new_text: &str) -> Result<Stri
     // dirge-p5fu: a purely unclosed-delimiter imbalance is mechanically
     // closed (parity with the JSON truncation repair) and reported, rather
     // than rejected. See docs/AGENTIC_LOOP_PLAN.md §2.
-    #[cfg(feature = "semantic")]
-    let syntax_note: Option<String> = {
-        use crate::semantic::syntax_validator::{SyntaxOutcome, validate_or_repair};
-        match validate_or_repair(std::path::Path::new(path), &to_write) {
-            SyntaxOutcome::Clean => None,
-            SyntaxOutcome::Repaired { content, note } => {
-                to_write = content;
-                Some(note)
-            }
-            SyntaxOutcome::Rejected { message } => return Err(message),
-        }
-    };
-    #[cfg(not(feature = "semantic"))]
-    let syntax_note: Option<String> = None;
+    let (to_write, syntax_note) =
+        crate::agent::tools::syntax_gate(std::path::Path::new(path), &candidate)?;
     // Snapshot pre-update content for /rewind, reusing the bytes we
     // already read into `original` rather than re-reading from disk.
     crate::agent::tools::snapshots::capture_bytes(std::path::Path::new(path), original.as_bytes());
@@ -202,9 +174,7 @@ async fn apply_update(path: &str, old_text: &str, new_text: &str) -> Result<Stri
         .await
         .map_err(|e| format!("write failed: {}", e))?;
     let mut msg = format!("updated {}", path);
-    if let Some(note) = syntax_note {
-        msg.push_str(&format!(" [auto-repair] {note}"));
-    }
+    crate::agent::tools::append_repair_note(&mut msg, syntax_note);
     Ok(msg)
 }
 
