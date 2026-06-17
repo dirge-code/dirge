@@ -17,6 +17,7 @@ pub fn discover_skills(cwd: &Path) -> Vec<Skill> {
         [
             home.join(".claude").join("skills"),
             home.join(".opencode").join("skills"),
+            home.join(".agents").join("skills"),
             home.join(".dirge").join("skills"),
         ]
     });
@@ -36,6 +37,7 @@ pub fn discover_skills(cwd: &Path) -> Vec<Skill> {
         [
             ancestor.join(".claude").join("skills"),
             ancestor.join(".opencode").join("skills"),
+            ancestor.join(".agents").join("skills"),
             ancestor.join(".dirge").join("skills"),
         ]
     });
@@ -240,6 +242,29 @@ mod tests {
         let (name, desc) = parse_frontmatter("description: Does stuff", "dir-name");
         assert_eq!(name, "dir-name");
         assert_eq!(desc, "Does stuff");
+    }
+
+    #[test]
+    fn discover_finds_skills_under_dot_agents() {
+        // A project-scoped `.agents/skills/<name>/SKILL.md` must be picked
+        // up (cwd is always a project ancestor, no .git needed).
+        let dir = std::env::temp_dir().join(format!("dirge-agents-skill-{}", std::process::id()));
+        let skill_dir = dir.join(".agents").join("skills").join("agents-dir-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: agents-dir-skill\ndescription: from .agents\n---\nDo the agents thing.\n",
+        )
+        .unwrap();
+
+        let skills = discover_skills(&dir);
+        assert!(
+            find_skill("agents-dir-skill", &skills).is_some(),
+            "a skill under .agents/skills must be discovered: {:?}",
+            skills.iter().map(|s| &s.name).collect::<Vec<_>>(),
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

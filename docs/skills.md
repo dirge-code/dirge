@@ -3,8 +3,9 @@
 Skills are on-demand instruction bundles the agent can load mid-session via the
 `skill` tool. dirge reads the same format as Claude and opencode.
 
-Place skill directories in `.claude/skills/`, `.opencode/skills/`, or
-`.dirge/skills/` in your project or home directory. Each skill is a directory
+Place skill directories in `.claude/skills/`, `.opencode/skills/`,
+`.agents/skills/`, or `.dirge/skills/` in your project or home directory.
+Each skill is a directory
 containing `SKILL.md` with optional YAML frontmatter:
 
 ```markdown
