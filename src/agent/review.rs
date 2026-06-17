@@ -368,7 +368,10 @@ pub(crate) async fn run_memory_curator_review(
     // dirge-18ks: entries live in the session DB now; `rendered`
     // keeps the §-delimited shape the prompt always had.
     let (memory_md, pitfalls_md) = match crate::extras::memory_db::SqliteMemoryStore::load(&paths) {
-        Ok(store) => (store.rendered("memory"), store.rendered("pitfalls")),
+        Ok(store) => (
+            store.rendered_for_curator("memory"),
+            store.rendered_for_curator("pitfalls"),
+        ),
         Err(e) => {
             tracing::warn!(
                 target: "dirge::memory_curator",

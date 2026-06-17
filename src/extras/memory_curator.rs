@@ -443,6 +443,16 @@ pub fn render_curator_input(
 ) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
+    // dirge-27py: each entry below is prefixed with its metadata so the
+    // pass can weigh usage and target entries precisely, not just guess
+    // from content.
+    let _ = writeln!(
+        out,
+        "\nEach entry is prefixed `[kind | N uses | id]`: its memory kind, how many times the \
+         agent has looked it up, and its `urn:ump:…` id (pass that id as `old_text` to act on \
+         exactly that entry). Uses is a signal of how load-bearing an entry is — but a low count \
+         is NOT on its own a reason to remove; keep facts that are still true."
+    );
     let _ = writeln!(out, "\n## Current MEMORY.md\n");
     if memory_md.trim().is_empty() {
         let _ = writeln!(out, "_(empty)_");
@@ -1011,6 +1021,25 @@ mod tests {
         assert!(
             out.contains("build: cargo test --bin dirge"),
             "candidate preview must appear: {out}"
+        );
+    }
+
+    #[test]
+    fn render_curator_input_explains_entry_metadata() {
+        // dirge-27py: the bulk dump entries now carry `[kind | N uses |
+        // id]` prefixes, so the input must explain how to read them.
+        let out = render_curator_input(
+            &make_report(vec![]),
+            "[procedural | 2 uses | urn:ump:x]\nsome durable fact",
+            "",
+        );
+        assert!(
+            out.contains("[kind | N uses | id]"),
+            "input must explain the per-entry metadata prefix: {out}"
+        );
+        assert!(
+            out.contains("urn:ump:x") && out.contains("some durable fact"),
+            "annotated entry passes through: {out}"
         );
     }
 

@@ -1275,16 +1275,33 @@ impl SqliteMemoryStore {
     /// Live entries of one target rendered as delimiter-joined text —
     /// the shape curator/extractor LLM prompts expect ("current
     /// MEMORY.md" sections).
-    pub fn rendered(&self, target: &str) -> String {
+    /// The §-delimited render of a target's active entries for the
+    /// background curator, each entry prefixed with the metadata the
+    /// pass needs to reason over the WHOLE store, not just the flagged
+    /// candidate tables: kind, use count, and the urn id (so it can
+    /// target an entry precisely with `replace`/`remove`). This is the
+    /// curator-input path; system-prompt injection goes through the
+    /// frozen snapshot, which is unaffected (dirge-27py).
+    pub fn rendered_for_curator(&self, target: &str) -> String {
         let conn = self.conn.lock_ignore_poison();
-        let rows = match Self::active_rows(&conn, target) {
-            Ok(r) => r,
+        let mut stmt = match conn.prepare(
+            "SELECT kind, use_count, uid, content FROM memories
+             WHERE target = ?1 AND status = 'active' ORDER BY id",
+        ) {
+            Ok(s) => s,
             Err(_) => return String::new(),
         };
-        rows.iter()
-            .map(|r| r.content.as_str())
-            .collect::<Vec<_>>()
-            .join(ENTRY_DELIMITER)
+        let rows = stmt
+            .query_map(params![target], |row| {
+                let kind: String = row.get(0)?;
+                let uses: i64 = row.get(1)?;
+                let uid: String = row.get(2)?;
+                let content: String = row.get(3)?;
+                Ok(format!("[{kind} | {uses} uses | {uid}]\n{content}"))
+            })
+            .map(|rows| rows.filter_map(|r| r.ok()).collect::<Vec<_>>())
+            .unwrap_or_default();
+        rows.join(ENTRY_DELIMITER)
     }
 }
 
@@ -1716,6 +1733,35 @@ mod tests {
         assert!(
             (salience - 0.5).abs() < 1e-9,
             "promoted to procedural salience: {salience}"
+        );
+    }
+
+    #[test]
+    fn rendered_for_curator_annotates_metadata() {
+        // dirge-27py: the curator bulk view must carry kind + uses + id
+        // so the LLM can weigh and target every entry, not just flagged
+        // candidates. The prompt-injection `rendered` stays metadata-free.
+        let (paths, _dir) = temp_project();
+        let store = SqliteMemoryStore::load(&paths).unwrap();
+        let text = "build: cargo test --bin dirge";
+        store
+            .add_entry("memory", text, Some(MemoryKind::Procedural))
+            .unwrap();
+        store.expand("cargo test").unwrap();
+
+        let curated = store.rendered_for_curator("memory");
+        assert!(curated.contains("procedural"), "kind annotated: {curated}");
+        assert!(curated.contains("1 uses"), "use count annotated: {curated}");
+        assert!(
+            curated.contains("urn:ump:"),
+            "urn id annotated for precise targeting: {curated}"
+        );
+        assert!(curated.contains(text), "content still present: {curated}");
+        // Metadata is a prefix, not woven into the fact: the content
+        // line stands on its own after the annotation.
+        assert!(
+            curated.contains(&format!("]\n{text}")),
+            "content follows the metadata prefix on its own line: {curated}"
         );
     }
 
@@ -2160,13 +2206,20 @@ mod tests {
     }
 
     #[test]
-    fn rendered_joins_with_delimiter() {
+    fn rendered_for_curator_joins_with_delimiter() {
         let (paths, _dir) = temp_project();
         let store = SqliteMemoryStore::load(&paths).unwrap();
         store.add_entry("memory", "fact A", None).unwrap();
         store.add_entry("memory", "fact B", None).unwrap();
-        assert_eq!(store.rendered("memory"), "fact A\n§\nfact B");
-        assert_eq!(store.rendered("pitfalls"), "");
+        let out = store.rendered_for_curator("memory");
+        // Two entries separated by the §-delimiter; content preserved.
+        assert_eq!(
+            out.matches(ENTRY_DELIMITER).count(),
+            1,
+            "one delimiter: {out}"
+        );
+        assert!(out.contains("fact A") && out.contains("fact B"));
+        assert_eq!(store.rendered_for_curator("pitfalls"), "");
     }
 
     // ── Response shape parity ────────────────────────────────────
