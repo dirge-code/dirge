@@ -310,6 +310,21 @@ pub async fn build_loop_tools(
         )
         .await,
     );
+    // Hash-anchored line editing (companion to read(line_hashes=true)).
+    // Mutating → Sequential.
+    tools.push(
+        wrap(
+            tools::EditLinesTool::with_cache(
+                permission.clone(),
+                ask_tx.clone(),
+                cache.clone(),
+                #[cfg(feature = "lsp")]
+                lsp_manager.clone(),
+            ),
+            Some(ToolExecutionMode::Sequential),
+        )
+        .await,
+    );
     // Edit against the minified form (companion to read_minified). Mutating →
     // Sequential.
     #[cfg(feature = "semantic")]

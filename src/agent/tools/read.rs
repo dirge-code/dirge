@@ -155,6 +155,7 @@ impl Tool for ReadTool {
                     },
                     "offset": { "type": "integer", "description": "Line number to start from (1-indexed)" },
                     "limit": { "type": "integer", "description": "Maximum number of lines to read" },
+                    "line_hashes": { "type": "boolean", "description": "Prefix each line with its 3-char content hash (e.g. `42 a3f: ...`) for hash-anchored editing with edit_lines. Pass the start/end line numbers and these hashes to edit_lines to replace a range without retyping the old text." },
                     "reason": { "type": "string", "description": "Why you're reading this file: what you expect to learn and how it serves the current task. Be specific and targeted — don't read files for general orientation." }
                 },
                 "required": ["path", "reason"],
@@ -320,7 +321,9 @@ impl Tool for ReadTool {
         let reader = tokio::io::BufReader::new(file);
         let mut lines = reader.lines();
         let mut total_lines = 0usize;
-        let mut excerpt_lines: Vec<(usize, String)> = Vec::with_capacity(limit);
+        let mut excerpt_lines: Vec<(usize, String, Option<String>)> =
+            Vec::with_capacity(limit);
+        let want_hashes = args.line_hashes.unwrap_or(false);
         let want_end = offset.saturating_add(limit);
         let mut first_line = true;
         // Audit L11: bail out once we've satisfied the requested
@@ -348,6 +351,17 @@ impl Tool for ReadTool {
                 }
                 first_line = false;
             }
+            let line_idx = total_lines;
+            total_lines += 1;
+            let in_range = line_idx >= offset && line_idx < want_end;
+            // Hash the FULL line before any display truncation so the
+            // hash the model sees matches what `edit_lines` recomputes
+            // from disk. Only for in-range lines we'll actually show.
+            let hash = if want_hashes && in_range {
+                Some(crate::agent::tools::line_hash::line_hash(&line))
+            } else {
+                None
+            };
             if line.len() > MAX_LINE_BYTES {
                 // Truncate by byte index — careful to land on a UTF-8
                 // boundary. Drop bytes until we find one.
@@ -358,10 +372,8 @@ impl Tool for ReadTool {
                 line.truncate(truncate_at);
                 line.push_str(TRUNC_MARKER);
             }
-            let line_idx = total_lines;
-            total_lines += 1;
-            if line_idx >= offset && line_idx < want_end {
-                excerpt_lines.push((line_idx, line));
+            if in_range {
+                excerpt_lines.push((line_idx, line, hash));
             }
             // Past the requested range — keep counting to compute
             // `total_lines` for the header, but skip allocation.
@@ -375,7 +387,10 @@ impl Tool for ReadTool {
         let width = (total_lines.to_string().len()).max(1);
         let excerpt: String = excerpt_lines
             .into_iter()
-            .map(|(idx, line)| format!("{:>width$}: {}", idx + 1, line))
+            .map(|(idx, line, hash)| match hash {
+                Some(h) => format!("{:>width$} {}: {}", idx + 1, h, line),
+                None => format!("{:>width$}: {}", idx + 1, line),
+            })
             .collect::<Vec<_>>()
             .join("\n");
         // Path lives in the chamber banner (`╭─ READ ─ "<path>" ─╮`),
@@ -561,6 +576,7 @@ mod tests {
             path: path.to_string_lossy().to_string(),
             offset: None,
             limit: None,
+            line_hashes: None,
         };
 
         // First read populates the cache.
@@ -608,6 +624,7 @@ mod tests {
                 path: typo.to_string_lossy().to_string(),
                 offset: None,
                 limit: None,
+                line_hashes: None,
             })
             .await
             .unwrap_err();
@@ -635,6 +652,7 @@ mod tests {
                 path: path.to_string_lossy().into_owned(),
                 offset: None,
                 limit: None,
+                line_hashes: None,
             })
             .await
             .unwrap();
@@ -674,6 +692,7 @@ mod tests {
                 path: path.to_string_lossy().into_owned(),
                 offset: Some(1),
                 limit: Some(5),
+                line_hashes: None,
             })
             .await;
         let _ = std::fs::remove_file(&path);
@@ -699,6 +718,60 @@ mod tests {
         assert_eq!(body_lines.len(), 5);
     }
 
+    /// `line_hashes=true` prefixes each excerpt line with the same
+    /// 3-char hash `edit_lines` will recompute from disk, so the
+    /// model can echo them back. Hash must match the canonical
+    /// `line_hash` of the (LF-normalized) line content.
+    #[tokio::test]
+    async fn read_line_hashes_prefixes_match_canonical_hash() {
+        use crate::agent::tools::line_hash::line_hash;
+        let path = temp_path("hashed");
+        std::fs::write(&path, "alpha\nbeta\ngamma\n").unwrap();
+
+        let tool = ReadTool::new(None, None);
+        let out = tool
+            .call(ReadArgs {
+                path: path.to_string_lossy().into_owned(),
+                offset: None,
+                limit: None,
+                line_hashes: Some(true),
+            })
+            .await
+            .expect("hashed read succeeds");
+        let _ = std::fs::remove_file(&path);
+
+        // Each content line should render as `N hhh: content` where
+        // hhh == line_hash(content).
+        for (content, n) in [("alpha", 1), ("beta", 2), ("gamma", 3)] {
+            let expected = format!("{} {}: {}", n, line_hash(content), content);
+            assert!(
+                out.lines().any(|l| l.trim_start() == expected),
+                "expected line {expected:?} in output:\n{out}"
+            );
+        }
+    }
+
+    /// Without the flag, output keeps the plain `N: content` form —
+    /// no hash column leaks into normal reads.
+    #[tokio::test]
+    async fn read_without_line_hashes_is_unchanged() {
+        let path = temp_path("nohash");
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        let tool = ReadTool::new(None, None);
+        let out = tool
+            .call(ReadArgs {
+                path: path.to_string_lossy().into_owned(),
+                offset: None,
+                limit: None,
+                line_hashes: None,
+            })
+            .await
+            .expect("read succeeds");
+        let _ = std::fs::remove_file(&path);
+        assert!(out.lines().any(|l| l.trim_start() == "1: one"), "got:\n{out}");
+        assert!(out.lines().any(|l| l.trim_start() == "2: two"), "got:\n{out}");
+    }
+
     /// F19: UTF-8 BOM (U+FEFF, bytes 0xEF 0xBB 0xBF) at the start
     /// of a file is stripped before the line reaches the LLM. The
     /// raw 3-byte prefix would otherwise render as an
@@ -715,6 +788,7 @@ mod tests {
                 path: path.to_string_lossy().into_owned(),
                 offset: None,
                 limit: None,
+                line_hashes: None,
             })
             .await
             .unwrap();
@@ -746,6 +820,7 @@ mod tests {
                 path: path.to_string_lossy().into_owned(),
                 offset: None,
                 limit: None,
+                line_hashes: None,
             })
             .await
             .unwrap();
@@ -769,6 +844,7 @@ mod tests {
                 path: path.to_string_lossy().into_owned(),
                 offset: None,
                 limit: None,
+                line_hashes: None,
             })
             .await
             .unwrap();
@@ -798,6 +874,7 @@ mod tests {
                 path: path.to_string_lossy().into_owned(),
                 offset: Some(100),
                 limit: Some(10),
+                line_hashes: None,
             })
             .await
             .unwrap();
@@ -829,6 +906,7 @@ mod tests {
                 path: path.to_string_lossy().into_owned(),
                 offset: None,
                 limit: None,
+                line_hashes: None,
             })
             .await
             .unwrap();
@@ -850,6 +928,7 @@ mod tests {
                 path: path.to_string_lossy().into_owned(),
                 offset: Some(2),
                 limit: None,
+                line_hashes: None,
             })
             .await
             .unwrap();
@@ -881,6 +960,7 @@ mod tests {
                 path: path.to_string_lossy().into_owned(),
                 offset: None,
                 limit: Some(2),
+                line_hashes: None,
             })
             .await
             .unwrap();
@@ -912,6 +992,7 @@ mod tests {
                 path: path.to_string_lossy().into_owned(),
                 offset: Some(2),
                 limit: Some(2),
+                line_hashes: None,
             })
             .await
             .unwrap();

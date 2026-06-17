@@ -7,6 +7,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **Hash-anchored editing (`edit_lines` + `read(line_hashes=true)`).** A new
+  edit path aimed at cheaper models: `read` can prefix each line with a 3-char
+  content hash (`42 a3f: ...`), and `edit_lines` replaces a line *range* by
+  number — `start_line`, `end_line`, the `expected_hashes` for that range, and
+  `new_text` — without retyping the old block. The tool recomputes the hashes
+  from disk and rejects the edit (per-line diff) if any line drifted since the
+  read, so it never clobbers content that changed underneath it. Reuses the
+  existing read-before-edit gate, tree-sitter pre-write validation, and atomic
+  write. The win, per the [howard chen
+  writeup](https://howardchen.substack.com/p/deepseek-v4-pro-at-5-the-cost-of):
+  fewer retries and markedly lower output tokens on models like DeepSeek, since
+  the model emits line numbers + tiny hashes instead of reproducing the text it
+  wants to replace. The existing exact-string `edit` is unchanged.
 - **Prefix-cache hit accounting + `/cache` command.** Providers like DeepSeek
   and Anthropic serve repeated request prefixes from a cache at a steep
   discount (DeepSeek ~1/10 the input price), and dirge already holds the system

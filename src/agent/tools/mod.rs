@@ -6,11 +6,13 @@ pub(crate) mod cache;
 #[cfg(feature = "dap")]
 pub(crate) mod debug;
 pub(crate) mod edit;
+pub(crate) mod edit_lines;
 #[cfg(feature = "semantic")]
 mod edit_minified;
 mod find_files;
 mod glob;
 mod grep;
+pub(crate) mod line_hash;
 mod list_dir;
 #[cfg(feature = "lsp")]
 mod lsp;
@@ -43,6 +45,7 @@ pub use cache::ToolCache;
 #[cfg(feature = "dap")]
 pub use debug::DebugTool;
 pub use edit::EditTool;
+pub use edit_lines::EditLinesTool;
 #[cfg(feature = "semantic")]
 pub use edit_minified::EditMinifiedTool;
 pub use find_files::FindFilesTool;
@@ -244,6 +247,10 @@ pub struct ReadArgs {
     pub path: String,
     pub offset: Option<usize>,
     pub limit: Option<usize>,
+    /// When true, prefix each line with its 3-char content hash
+    /// (`  42 a3f: ...`) for hash-anchored editing via `edit_lines`.
+    /// Defaults to the plain `  42: ...` numbering.
+    pub line_hashes: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -258,6 +265,15 @@ pub struct EditArgs {
     pub old_text: String,
     pub new_text: String,
     pub replace_all: Option<bool>,
+}
+
+#[derive(Deserialize)]
+pub struct EditLinesArgs {
+    pub path: String,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub expected_hashes: Vec<String>,
+    pub new_text: String,
 }
 
 #[derive(Deserialize)]
