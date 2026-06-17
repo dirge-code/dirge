@@ -18,6 +18,30 @@
 //! In-memory and process-scoped: rewind works within a live session,
 //! not across a restart. Persisting objects to the session dir is a
 //! follow-up.
+//!
+//! Why a process-global `static` is the right scope here (dirge-ho0g).
+//! dirge runs exactly one interactive/headless session per process, so
+//! the global store *is* the session store — there is no second
+//! top-level session to collide with. Subagents (the `task` tool) run
+//! in-process and deliberately share it: they never call [`begin_turn`]
+//! (only the UI does, once per user message — see
+//! `ui::begin_snapshot_turn`), so a subagent's edits fold into the
+//! parent's open turn bucket and a parent `/rewind` rolls them back
+//! along with the parent's own edits. That is the behavior we want — a
+//! turn's file changes undo as a unit regardless of which agent made
+//! them. Giving each subagent its own store would *break* that
+//! (subagent edits would become un-rewindable); a per-session handle
+//! threaded through every tool would behave identically to this global
+//! in the single-session model, for a much larger surface. So the
+//! global stays until a real multi-session-per-process need appears.
+//!
+//! Captures are atomic under the store mutex with earliest-pre-state-
+//! per-path-per-turn, so concurrent subagents can't corrupt a bucket —
+//! interleaved captures just resolve to the first pre-state seen for
+//! each path, which is exactly the restore target. One acknowledged
+//! wrinkle: a *background* subagent that finishes after the parent has
+//! moved to a later turn attributes its capture to that later bucket;
+//! this is inherent to any shared-session store and is accepted.
 
 #[allow(unused_imports)]
 use crate::hash::fnv64;
@@ -223,6 +247,13 @@ pub fn clear() {
 /// don't observe each other's turns/objects when run in parallel.
 /// Lives at module scope so cross-module tests (e.g. the UI rewind
 /// integration test) can serialize against the unit tests here.
+///
+/// This exists *because* the store is a deliberate process-global (see
+/// the module doc / dirge-ho0g): one shared store means parallel tests
+/// must serialize. It is the accepted cost of keeping the global, not a
+/// smell to refactor away — a per-session store would remove the need
+/// for it but at the price of a much larger production surface and a
+/// loss of parent-rewindable subagent edits.
 #[cfg(test)]
 pub(crate) static TEST_GATE: Mutex<()> = Mutex::new(());
 
@@ -354,6 +385,40 @@ mod tests {
 
             restore_from("u1");
             assert_eq!(std::fs::read_to_string(&p).unwrap(), "inhand");
+        });
+    }
+
+    #[test]
+    fn subagent_edits_fold_into_parent_turn_and_are_parent_rewindable() {
+        // Contract lock (dirge-ho0g): subagents run in-process and
+        // share this global store. They never open their own turn —
+        // only the UI calls begin_turn, once per user message — so an
+        // edit made "by a subagent" (i.e. any capture with no nested
+        // begin_turn of its own) must attribute to the parent's open
+        // turn and be undone by a parent rewind to that turn. This is
+        // the intended behavior the global store provides; a
+        // per-subagent store would break it.
+        isolated(|dir| {
+            let parent_file = dir.join("parent.txt");
+            let sub_file = dir.join("sub.txt");
+            std::fs::write(&parent_file, "p0").unwrap();
+            std::fs::write(&sub_file, "s0").unwrap();
+
+            // Parent opens the turn and makes one edit.
+            begin_turn("u1");
+            capture(&parent_file);
+            std::fs::write(&parent_file, "p1").unwrap();
+
+            // A subagent edits a different file during the same turn,
+            // WITHOUT opening a turn of its own.
+            capture(&sub_file);
+            std::fs::write(&sub_file, "s1").unwrap();
+
+            // Parent rewind to u1 rolls back both files.
+            let restored = restore_from("u1");
+            assert_eq!(restored.len(), 2, "both parent and subagent edits restore");
+            assert_eq!(std::fs::read_to_string(&parent_file).unwrap(), "p0");
+            assert_eq!(std::fs::read_to_string(&sub_file).unwrap(), "s0");
         });
     }
 
