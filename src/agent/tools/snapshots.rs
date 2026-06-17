@@ -20,6 +20,7 @@
 //! follow-up.
 
 #[allow(unused_imports)]
+use crate::hash::fnv64;
 use crate::sync_util::LockExt;
 use indexmap::IndexMap;
 use std::path::{Path, PathBuf};
@@ -65,15 +66,6 @@ static STORE: LazyLock<Mutex<Store>> = LazyLock::new(|| {
         pool: std::collections::HashMap::new(),
     })
 });
-
-fn fnv64(bytes: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for &b in bytes {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    h
-}
 
 /// Open a new turn bucket for `turn_id` (the user message that
 /// triggered the agent run). Captures made until the next

@@ -492,11 +492,5 @@ fn compute_head_hash(path: &std::path::Path) -> Option<u64> {
     let mut f = std::fs::File::open(path).ok()?;
     let mut buf = [0u8; 4096];
     let n = f.read(&mut buf).ok()?;
-    // FNV-1a 64-bit.
-    let mut h: u64 = 0xcbf29ce484222325;
-    for &b in &buf[..n] {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    Some(h)
+    Some(crate::hash::fnv64(&buf[..n]))
 }

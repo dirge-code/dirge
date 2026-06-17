@@ -20,9 +20,7 @@
 //! forever — it must not depend on a process-random seed, or a hash
 //! shown by one `read` call wouldn't match the next.
 
-/// FNV-1a 32-bit offset basis / prime.
-const FNV_OFFSET: u32 = 0x811c_9dc5;
-const FNV_PRIME: u32 = 0x0100_0193;
+use crate::hash::fnv32;
 
 /// Content hash for a single line, as exactly 3 lowercase hex chars.
 ///
@@ -30,11 +28,7 @@ const FNV_PRIME: u32 = 0x0100_0193;
 /// normalize CRLF to LF first so the same logical line hashes
 /// identically regardless of on-disk line endings.
 pub fn line_hash(line: &str) -> String {
-    let mut h = FNV_OFFSET;
-    for &b in line.as_bytes() {
-        h ^= b as u32;
-        h = h.wrapping_mul(FNV_PRIME);
-    }
+    let h = fnv32(line.as_bytes());
     // Fold to 12 bits: xor the top bits down so all input bits
     // influence the 3-char output.
     let folded = (h ^ (h >> 12) ^ (h >> 24)) & 0xfff;
@@ -55,6 +49,23 @@ mod tests {
                     .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()),
                 "hash {h:?} not lowercase hex"
             );
+        }
+    }
+
+    #[test]
+    fn hash_output_is_locked() {
+        // These exact strings are part of the edit_lines contract: a
+        // model echoes them back, so they must never change. Locking
+        // them guards against any drift in the FNV/fold pipeline.
+        for (input, expected) in [
+            ("", "c8d"),
+            ("x", "0bf"),
+            ("fn main() {}", "8a1"),
+            ("    let y = 1;", "b4d"),
+            ("🦀 unicode", "64b"),
+            ("let total = a + b;", "e3b"),
+        ] {
+            assert_eq!(line_hash(input), expected, "drift for {input:?}");
         }
     }
 

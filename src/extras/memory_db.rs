@@ -1274,14 +1274,7 @@ fn find_unique_match(rows: &[ActiveRow], old_text: &str) -> Result<usize, String
 /// legacy `.meta.json` / `.usage.json` sidecars used. Kept only for
 /// the one-time import.
 fn legacy_entry_id(content: &str) -> String {
-    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-    let mut h = FNV_OFFSET;
-    for byte in content.as_bytes() {
-        h ^= *byte as u64;
-        h = h.wrapping_mul(FNV_PRIME);
-    }
-    format!("{h:016x}")
+    format!("{:016x}", crate::hash::fnv64(content.as_bytes()))
 }
 
 #[derive(serde::Deserialize)]
