@@ -253,8 +253,12 @@ impl Tool for EditLinesTool {
             ));
         }
 
-        // Snapshot pre-edit content for /rewind before mutating.
-        crate::agent::tools::snapshots::capture(std::path::Path::new(&resolved_path));
+        // Snapshot pre-edit content for /rewind before mutating, reusing
+        // the bytes already read above instead of re-reading from disk.
+        crate::agent::tools::snapshots::capture_bytes(
+            std::path::Path::new(&resolved_path),
+            &bytes,
+        );
         crate::fs_atomic::atomic_write(std::path::Path::new(&resolved_path), output.as_bytes())
             .await?;
         crate::agent::tools::modified::mark_modified(std::path::Path::new(&resolved_path));

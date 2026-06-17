@@ -152,6 +152,31 @@ pub fn capture(path: &Path) {
     }
 }
 
+/// Record `content` as the pre-mutation snapshot for `path` this
+/// turn, when the caller already has the file's current bytes in hand
+/// (e.g. an edit tool that just read the file to apply its change).
+/// Avoids a second read from disk and captures the exact bytes the
+/// edit was based on. Use [`capture`] instead when the file may be
+/// absent (create) or when the pre-content isn't already available.
+pub fn capture_bytes(path: &Path, content: &[u8]) {
+    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if content.len() as u64 > MAX_SNAPSHOT_BYTES {
+        return;
+    }
+    let mut s = STORE.lock_ignore_poison();
+    if s.turns.is_empty() {
+        s.turns.push(TurnBucket {
+            turn_id: String::new(),
+            captures: IndexMap::new(),
+        });
+    }
+    let interned = intern(&mut s, content.to_vec());
+    let last = s.turns.last_mut().expect("just ensured non-empty");
+    if !last.captures.contains_key(&canonical) {
+        last.captures.insert(canonical, Capture::Content(interned));
+    }
+}
+
 /// Roll files back to their pre-state as of `turn_id` and every later
 /// turn, then drop those turn buckets. Returns the restored paths.
 ///
@@ -320,6 +345,23 @@ mod tests {
             let restored = restore_from("u1");
             assert!(restored.is_empty());
             assert_eq!(std::fs::read_to_string(&p).unwrap(), "v2");
+        });
+    }
+
+    #[test]
+    fn capture_bytes_records_pre_state_without_reading_disk() {
+        isolated(|dir| {
+            let p = dir.join("a.txt");
+            // File on disk says "disk", but the caller hands us "inhand"
+            // — capture_bytes must record the in-hand bytes (the content
+            // the edit was based on), not re-read the file.
+            std::fs::write(&p, "disk").unwrap();
+            begin_turn("u1");
+            capture_bytes(&p, b"inhand");
+            std::fs::write(&p, "mutated").unwrap();
+
+            restore_from("u1");
+            assert_eq!(std::fs::read_to_string(&p).unwrap(), "inhand");
         });
     }
 

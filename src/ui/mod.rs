@@ -1905,6 +1905,7 @@ pub async fn run_interactive(
                                                 ui.last_user_prompt.clone_from(&msg);
                                                 let history = crate::agent::runner::convert_history(session);
                                                 session.add_message(MessageRole::User, &msg);
+                                                begin_snapshot_turn(session);
                                 renderer.set_avatar_state(avatar::AvatarState::Idle);
                                                 let runner = agent.clone().spawn_runner(
                                                     crate::agent::tools::background::prepend_pending_notifications(&msg, bg_store.as_ref()),
@@ -2338,12 +2339,7 @@ pub async fn run_interactive(
                                 runner.install_into(&mut ui.agent_rx, &mut ui.agent_abort, &mut ui.agent_interject, &mut ui.agent_cancel, &mut ui.is_running);
 
                                 session.add_message(MessageRole::User, &text);
-                                // Open a file-snapshot turn keyed by this user
-                                // message so /rewind can roll the working tree
-                                // back to its pre-prompt state.
-                                if let Some(uid) = session.messages.last().map(|m| m.id.clone()) {
-                                    crate::agent::tools::snapshots::begin_turn(&uid);
-                                }
+                                begin_snapshot_turn(session);
                                 renderer.set_avatar_state(avatar::AvatarState::Idle);
                             }
                         }
@@ -2707,6 +2703,7 @@ pub async fn run_interactive(
                         ui.plan_phase = None;
                         let kickoff = *kickoff;
                         session.add_message(MessageRole::User, &kickoff.impl_prompt);
+                        begin_snapshot_turn(session);
                         ui.last_user_prompt.clone_from(&kickoff.impl_prompt);
                         let history = crate::agent::runner::convert_history(session);
                         renderer.set_avatar_state(avatar::AvatarState::Idle);
@@ -3289,6 +3286,7 @@ pub async fn run_interactive(
                     let synth_prompt =
                         "Continue based on the background task results above.".to_string();
                     session.add_message(MessageRole::User, &synth_prompt);
+                    begin_snapshot_turn(session);
                     let history = crate::agent::runner::convert_history(session);
                     renderer.set_avatar_state(avatar::AvatarState::Idle);
                     let composed =
@@ -3663,6 +3661,19 @@ fn rect_contains_xy(rect: Option<ratatui::layout::Rect>, row: u16, col: u16) -> 
 fn modified_visible_rows(rect: Option<ratatui::layout::Rect>) -> usize {
     rect.map(|r| (r.height as usize).saturating_sub(2).saturating_sub(1))
         .unwrap_or(0)
+}
+
+/// Open a file-snapshot turn keyed by the most recent user message,
+/// so `/rewind` can roll the working tree back to its pre-prompt
+/// state. Call this at every site that adds a `User` message and then
+/// spawns an agent run — the rewind picker lists user messages, so a
+/// run triggered by one must have a matching snapshot turn or
+/// rewinding to it would restore nothing and its edits would fold
+/// into the previous turn's bucket.
+fn begin_snapshot_turn(session: &crate::session::Session) {
+    if let Some(uid) = session.messages.last().map(|m| m.id.clone()) {
+        crate::agent::tools::snapshots::begin_turn(&uid);
+    }
 }
 
 /// Whether a slash command is safe to run while the agent is active.

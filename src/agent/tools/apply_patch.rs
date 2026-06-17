@@ -174,8 +174,9 @@ async fn apply_update(path: &str, old_text: &str, new_text: &str) -> Result<Stri
             &errors,
         ));
     }
-    // Snapshot pre-update content for /rewind.
-    crate::agent::tools::snapshots::capture(std::path::Path::new(path));
+    // Snapshot pre-update content for /rewind, reusing the bytes we
+    // already read into `original` rather than re-reading from disk.
+    crate::agent::tools::snapshots::capture_bytes(std::path::Path::new(path), original.as_bytes());
     crate::fs_atomic::atomic_write(std::path::Path::new(path), to_write.as_bytes())
         .await
         .map_err(|e| format!("write failed: {}", e))?;
