@@ -1787,6 +1787,60 @@ fn build_critic_transcript_pins_the_exact_critic_facing_format() {
     );
 }
 
+/// Regression (dirge-p9qm): in a long run the head is planning/scaffolding
+/// and the implementation + verification land at the END. The builder used
+/// to keep only the FIRST 8000 chars, so the critic was fed the planning and
+/// never saw the work — wrongly reporting "nothing done". The transcript must
+/// keep the original request (head) AND the most recent activity (tail).
+#[test]
+fn build_critic_transcript_keeps_request_and_recent_work_when_over_budget() {
+    use crate::agent::agent_loop::message::ToolResultMessage;
+    let mut msgs = vec![user("REQUEST: build an animated water canvas")];
+    // Planning chatter that blows well past the budget.
+    for i in 0..120 {
+        msgs.push(LoopMessage::Assistant(AssistantMessage::new(
+            vec![ContentBlock::Text {
+                text: format!("planning step {i}: {}", "x".repeat(200)),
+            }],
+            StopReason::Stop,
+        )));
+    }
+    // The actual work + verification, at the end of the run.
+    msgs.push(LoopMessage::Assistant(AssistantMessage::new(
+        vec![ContentBlock::Text {
+            text: "DONE: created water.js + flowfield.js; tests 12/12 pass".to_string(),
+        }],
+        StopReason::Stop,
+    )));
+    msgs.push(LoopMessage::ToolResult(ToolResultMessage {
+        tool_call_id: "v".to_string(),
+        tool_name: "bash".to_string(),
+        content: vec![ContentBlock::Text {
+            text: "VERIFIED: WATER RENDERED (cyan/blue flow field)".to_string(),
+        }],
+        details: serde_json::json!({}),
+        is_error: false,
+    }));
+
+    let t = super::build_critic_transcript(&msgs);
+    assert!(
+        t.contains("REQUEST: build an animated water canvas"),
+        "original request (head) must survive truncation"
+    );
+    assert!(
+        t.contains("WATER RENDERED"),
+        "recent verification (tail) must survive — this is what the critic judges"
+    );
+    assert!(
+        t.contains("tests 12/12 pass"),
+        "recent work (tail) must survive"
+    );
+    assert!(
+        t.contains("elided"),
+        "an elision marker should mark the dropped middle"
+    );
+}
+
 // =====================================================================
 // dirge-ngic — scavenge must inspect both Thinking AND Text blocks.
 // Reasonix combines both at `loop.ts:910-913` →

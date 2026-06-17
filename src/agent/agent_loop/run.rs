@@ -1796,31 +1796,41 @@ fn run_made_tool_calls(new_messages: &[LoopMessage]) -> bool {
 /// request, the assistant's text, the tool calls it made, and a short
 /// slice of each tool result. Capped so a giant run can't blow up the
 /// critic prompt.
+///
+/// dirge-p9qm: when over budget, keep the HEAD (the original request and
+/// early framing) AND the TAIL (the most recent activity), eliding the
+/// middle — NOT the first N chars. The critic judges "is the task complete
+/// and correct", which is decided by the latest work and verification; a
+/// blind head cut fed it the planning phase and dropped the implementation,
+/// so it wrongly reported nothing was done.
 fn build_critic_transcript(new_messages: &[LoopMessage]) -> String {
-    const MAX_CHARS: usize = 8000;
+    const MAX_CHARS: usize = 12_000;
+    // Reserve for the run's opening (the user request + first framing) so the
+    // critic still knows what was asked; the rest of the budget goes to the
+    // tail, where completion is decided.
+    const HEAD_CHARS: usize = 2_000;
     const PER_RESULT_CHARS: usize = 400;
-    let mut s = String::new();
+    const ELISION: &str =
+        "\n…(earlier run steps elided; showing the start and the most recent activity)…\n";
+
+    let mut blocks: Vec<String> = Vec::new();
     for m in new_messages {
         match m {
             LoopMessage::User(u) => {
-                s.push_str("USER: ");
-                s.push_str(u.content.trim());
-                s.push('\n');
+                blocks.push(format!("USER: {}\n", u.content.trim()));
             }
             LoopMessage::Assistant(a) => {
                 for block in &a.content {
                     match block {
                         ContentBlock::Text { text } if !text.trim().is_empty() => {
-                            s.push_str("ASSISTANT: ");
-                            s.push_str(text.trim());
-                            s.push('\n');
+                            blocks.push(format!("ASSISTANT: {}\n", text.trim()));
                         }
                         ContentBlock::ToolCall {
                             name, arguments, ..
                         } => {
                             let args = serde_json::to_string(arguments).unwrap_or_default();
                             let args: String = args.chars().take(200).collect();
-                            s.push_str(&format!("ASSISTANT called {name}({args})\n"));
+                            blocks.push(format!("ASSISTANT called {name}({args})\n"));
                         }
                         _ => {}
                     }
@@ -1838,17 +1848,61 @@ fn build_critic_transcript(new_messages: &[LoopMessage]) -> String {
                     .join(" ");
                 let text: String = text.chars().take(PER_RESULT_CHARS).collect();
                 let tag = if t.is_error { "ERROR" } else { "result" };
-                s.push_str(&format!(
-                    "TOOL {} [{}]: {}\n",
-                    t.tool_name,
-                    tag,
-                    text.trim()
-                ));
+                blocks.push(format!("TOOL {} [{}]: {}\n", t.tool_name, tag, text.trim()));
             }
             _ => {}
         }
     }
-    s.chars().take(MAX_CHARS).collect()
+
+    let total: usize = blocks.iter().map(|b| b.chars().count()).sum();
+    if total <= MAX_CHARS {
+        return blocks.concat();
+    }
+
+    // Over budget. Take leading blocks up to HEAD_CHARS (always at least the
+    // first block, the request)…
+    let mut head_end = 0;
+    let mut head_len = 0;
+    while head_end < blocks.len() {
+        let n = blocks[head_end].chars().count();
+        if head_len + n > HEAD_CHARS && head_end > 0 {
+            break;
+        }
+        head_len += n;
+        head_end += 1;
+        if head_len >= HEAD_CHARS {
+            break;
+        }
+    }
+
+    // …then fill the remaining budget from the END backward, without
+    // re-crossing into the head region.
+    let tail_budget = MAX_CHARS.saturating_sub(head_len + ELISION.chars().count());
+    let mut tail_start = blocks.len();
+    let mut tail_len = 0;
+    while tail_start > head_end {
+        let n = blocks[tail_start - 1].chars().count();
+        if tail_len + n > tail_budget && tail_start < blocks.len() {
+            break;
+        }
+        tail_len += n;
+        tail_start -= 1;
+        if tail_len >= tail_budget {
+            break;
+        }
+    }
+
+    let mut out = String::new();
+    out.push_str(&blocks[..head_end].concat());
+    out.push_str(ELISION);
+    out.push_str(&blocks[tail_start..].concat());
+    // Final safety clamp — keep the TAIL (recent activity), never the head,
+    // if a pathological single block still overran.
+    let len = out.chars().count();
+    if len > MAX_CHARS {
+        return out.chars().skip(len - MAX_CHARS).collect();
+    }
+    out
 }
 
 /// dirge-ngic: build the merged source the scavenger inspects from
