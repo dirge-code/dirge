@@ -377,6 +377,55 @@ fn rewind_truncates_tree_and_store_in_sync_with_messages() {
     }
 }
 
+// Rewinding restores the working tree, not just the conversation:
+// files mutated during the rewound prompt(s) are rolled back to
+// their pre-prompt content, keyed by the user message id the
+// snapshot turn was opened with.
+#[test]
+fn rewind_restores_files_to_pre_prompt_state() {
+    use crate::agent::tools::snapshots;
+    let _gate = {
+        use crate::sync_util::LockExt;
+        snapshots::TEST_GATE.lock_ignore_poison()
+    };
+    snapshots::clear();
+
+    let dir = std::env::temp_dir().join(format!("dirge-rewind-it-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("work.txt");
+    std::fs::write(&file, "original").unwrap();
+
+    let mut session = crate::session::Session::new("p", "m", 100_000);
+
+    // Turn u1: open snapshot turn, capture pre-state, mutate.
+    session.add_message(crate::session::MessageRole::User, "u1");
+    let uid1 = session.messages.last().unwrap().id.clone();
+    snapshots::begin_turn(&uid1);
+    snapshots::capture(&file);
+    std::fs::write(&file, "edited by u1").unwrap();
+    session.add_message(crate::session::MessageRole::Assistant, "a1");
+
+    // Turn u2: another mutation.
+    session.add_message(crate::session::MessageRole::User, "u2");
+    let uid2 = session.messages.last().unwrap().id.clone();
+    snapshots::begin_turn(&uid2);
+    snapshots::capture(&file);
+    std::fs::write(&file, "edited by u2").unwrap();
+    session.add_message(crate::session::MessageRole::Assistant, "a2");
+
+    // Rewind back through BOTH user prompts (idx=1 → cut at u1).
+    let mut renderer = crate::ui::renderer::Renderer::new().unwrap();
+    let _ = rewind_session(&mut session, 1, &mut renderer);
+
+    let after = std::fs::read_to_string(&file).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    snapshots::clear();
+    assert_eq!(
+        after, "original",
+        "rewinding to u1 must restore the file to its pre-u1 content"
+    );
+}
+
 // The token accumulator on the abort path keeps `total_tokens`
 // in sync with `total_estimated_tokens`. Both fields are
 // TODO(cost-tracking) placeholders today but the inconsistency

@@ -98,6 +98,8 @@ async fn apply_create(path: &str, content: &str) -> Result<String, String> {
             p, content, &errors,
         ));
     }
+    // Snapshot pre-state (absent) for /rewind so restore deletes it.
+    crate::agent::tools::snapshots::capture(p);
     crate::fs_atomic::atomic_write(p, content.as_bytes())
         .await
         .map_err(|e| format!("write failed: {}", e))?;
@@ -172,6 +174,8 @@ async fn apply_update(path: &str, old_text: &str, new_text: &str) -> Result<Stri
             &errors,
         ));
     }
+    // Snapshot pre-update content for /rewind.
+    crate::agent::tools::snapshots::capture(std::path::Path::new(path));
     crate::fs_atomic::atomic_write(std::path::Path::new(path), to_write.as_bytes())
         .await
         .map_err(|e| format!("write failed: {}", e))?;
@@ -179,6 +183,8 @@ async fn apply_update(path: &str, old_text: &str, new_text: &str) -> Result<Stri
 }
 
 async fn apply_delete(path: &str) -> Result<String, String> {
+    // Snapshot the content before deleting so /rewind recreates it.
+    crate::agent::tools::snapshots::capture(std::path::Path::new(path));
     tokio::fs::remove_file(path)
         .await
         .map_err(|e| format!("delete failed: {}", e))?;
@@ -186,6 +192,10 @@ async fn apply_delete(path: &str) -> Result<String, String> {
 }
 
 async fn apply_rename(path: &str, new_path: &str) -> Result<String, String> {
+    // Snapshot both ends: src content (restore recreates it) and the
+    // dst's prior state (restore removes the renamed-in file).
+    crate::agent::tools::snapshots::capture(std::path::Path::new(path));
+    crate::agent::tools::snapshots::capture(std::path::Path::new(new_path));
     tokio::fs::rename(path, new_path)
         .await
         .map_err(|e| format!("rename failed: {}", e))?;

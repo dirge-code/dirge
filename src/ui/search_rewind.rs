@@ -118,6 +118,14 @@ pub(crate) fn rewind_session(
     let target = user_indices.len().saturating_sub(idx + 1);
     if let Some(&msg_idx) = user_indices.get(target) {
         let removed = session.messages.len() - msg_idx;
+        // Roll the working tree back to its state before this prompt
+        // ran, in lockstep with the conversation truncation. Keyed by
+        // the user message id the snapshot turn was opened with.
+        let restored = session
+            .messages
+            .get(msg_idx)
+            .map(|m| crate::agent::tools::snapshots::restore_from(&m.id))
+            .unwrap_or_default();
         // Collect ids of the messages we're dropping BEFORE truncate
         // so we can also prune them from `tree.entries` and
         // `message_store`. Without this, the tree references
@@ -238,6 +246,16 @@ pub(crate) fn rewind_session(
         session.tree.leaf_id = session.messages.last().map(|m| m.id.clone());
         session.total_estimated_tokens = session.messages.iter().map(|m| m.estimated_tokens).sum();
         renderer.write_line(&format!("rewound {} message(s)", removed), theme::accent())?;
+        if !restored.is_empty() {
+            renderer.write_line(
+                &format!(
+                    "restored {} file{} to their pre-prompt state",
+                    restored.len(),
+                    if restored.len() == 1 { "" } else { "s" },
+                ),
+                theme::accent(),
+            )?;
+        }
         if pruned_siblings > 0 {
             renderer.write_line(
                 &format!(

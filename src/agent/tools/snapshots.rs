@@ -1,0 +1,341 @@
+//! File-state snapshots for `/rewind`.
+//!
+//! Conversation rewind (`ui/search_rewind.rs`) truncates the message
+//! history but leaves the *files* the agent edited in their mutated
+//! state. This module captures the pre-mutation content of every file
+//! a write/edit/edit_lines/apply_patch touches, keyed by the user
+//! turn that triggered it, so a rewind can also roll the working tree
+//! back — making a long autonomous run safe to unwind (the article's
+//! "rewind" lever).
+//!
+//! Shape, mirroring the global `modified` registry: a process-global
+//! store the mutating tools poke at via [`capture`], the UI brackets
+//! turns with [`begin_turn`], and the rewind path calls
+//! [`restore_from`]. Content is addressed through a small dedup pool
+//! (FNV-64 keyed, byte-verified on collision) so a file edited many
+//! times across turns doesn't store many copies.
+//!
+//! In-memory and process-scoped: rewind works within a live session,
+//! not across a restart. Persisting objects to the session dir is a
+//! follow-up.
+
+#[allow(unused_imports)]
+use crate::sync_util::LockExt;
+use indexmap::IndexMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex};
+
+/// Largest file we snapshot. Above this we skip capture entirely
+/// rather than hold huge blobs in memory; such a file simply won't be
+/// rolled back (a documented gap, not a correctness bug).
+const MAX_SNAPSHOT_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Most turn buckets retained. A long run editing across hundreds of
+/// turns drops its oldest pre-states rather than growing without
+/// bound; rewinding past the retained window restores nothing for the
+/// evicted turns.
+const MAX_TURNS: usize = 200;
+
+/// What a file looked like before a turn first touched it.
+#[derive(Clone)]
+enum Capture {
+    /// File did not exist — restoring deletes it.
+    Absent,
+    /// File existed with this content (shared via the dedup pool).
+    Content(Arc<Vec<u8>>),
+}
+
+struct TurnBucket {
+    /// The user-message id that opened this turn.
+    turn_id: String,
+    /// First-seen pre-state per file this turn (earliest wins).
+    captures: IndexMap<PathBuf, Capture>,
+}
+
+struct Store {
+    turns: Vec<TurnBucket>,
+    /// Content-addressed pool: FNV-64(content) → interned bytes.
+    /// On a hash hit we verify bytes are equal before reusing.
+    pool: std::collections::HashMap<u64, Arc<Vec<u8>>>,
+}
+
+static STORE: LazyLock<Mutex<Store>> = LazyLock::new(|| {
+    Mutex::new(Store {
+        turns: Vec::new(),
+        pool: std::collections::HashMap::new(),
+    })
+});
+
+fn fnv64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// Open a new turn bucket for `turn_id` (the user message that
+/// triggered the agent run). Captures made until the next
+/// `begin_turn` are attributed to this turn.
+pub fn begin_turn(turn_id: &str) {
+    let mut s = STORE.lock_ignore_poison();
+    s.turns.push(TurnBucket {
+        turn_id: turn_id.to_string(),
+        captures: IndexMap::new(),
+    });
+    // Evict oldest turns past the cap; pool entries they alone
+    // referenced drop when their Arcs go.
+    while s.turns.len() > MAX_TURNS {
+        s.turns.remove(0);
+    }
+}
+
+/// Intern `bytes` through the dedup pool, returning a shared handle.
+/// On an FNV-64 collision with *different* bytes, returns a fresh
+/// un-pooled Arc so we never alias distinct content.
+fn intern(store: &mut Store, bytes: Vec<u8>) -> Arc<Vec<u8>> {
+    let key = fnv64(&bytes);
+    if let Some(existing) = store.pool.get(&key) {
+        if **existing == bytes {
+            return existing.clone();
+        }
+        // Collision with different content — don't pool, don't clobber.
+        return Arc::new(bytes);
+    }
+    let arc = Arc::new(bytes);
+    store.pool.insert(key, arc.clone());
+    arc
+}
+
+/// Record the current on-disk state of `path` as the pre-mutation
+/// snapshot for the active turn, if not already captured this turn.
+/// Best-effort: a missing file is recorded as "absent" (restore will
+/// delete it); an over-cap file is skipped.
+///
+/// Call this from a mutating tool *before* writing.
+pub fn capture(path: &Path) {
+    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+
+    // Read pre-state before locking the store (I/O outside the lock).
+    let capture = match std::fs::metadata(&canonical) {
+        Ok(meta) if meta.is_file() => {
+            if meta.len() > MAX_SNAPSHOT_BYTES {
+                return; // too big to snapshot; leave it un-rewindable
+            }
+            match std::fs::read(&canonical) {
+                Ok(bytes) => Some(bytes),
+                Err(_) => return, // unreadable — skip rather than guess
+            }
+        }
+        // Doesn't exist (or isn't a regular file) → absent.
+        _ => None,
+    };
+
+    let mut s = STORE.lock_ignore_poison();
+    // No turn open (e.g. a tool ran before any prompt) → open an
+    // anonymous one so the capture isn't lost.
+    if s.turns.is_empty() {
+        s.turns.push(TurnBucket {
+            turn_id: String::new(),
+            captures: IndexMap::new(),
+        });
+    }
+    let entry = match capture {
+        Some(bytes) => Capture::Content(intern(&mut s, bytes)),
+        None => Capture::Absent,
+    };
+    let last = s.turns.last_mut().expect("just ensured non-empty");
+    // Earliest pre-state within a turn wins — don't overwrite.
+    if !last.captures.contains_key(&canonical) {
+        last.captures.insert(canonical, entry);
+    }
+}
+
+/// Roll files back to their pre-state as of `turn_id` and every later
+/// turn, then drop those turn buckets. Returns the restored paths.
+///
+/// For each file, the *earliest* captured pre-state at or after
+/// `turn_id` is the restore target (that's the content from before
+/// the rewound region began touching it). A file captured as absent
+/// is deleted. If `turn_id` isn't in the store, nothing is restored.
+pub fn restore_from(turn_id: &str) -> Vec<PathBuf> {
+    let mut s = STORE.lock_ignore_poison();
+    let idx = match s.turns.iter().position(|t| t.turn_id == turn_id) {
+        Some(i) => i,
+        None => return Vec::new(),
+    };
+
+    // Collect earliest capture per path across buckets [idx..].
+    let mut targets: IndexMap<PathBuf, Capture> = IndexMap::new();
+    for bucket in &s.turns[idx..] {
+        for (path, cap) in &bucket.captures {
+            targets.entry(path.clone()).or_insert_with(|| cap.clone());
+        }
+    }
+
+    let mut restored = Vec::new();
+    for (path, cap) in &targets {
+        let ok = match cap {
+            Capture::Content(bytes) => std::fs::write(path, bytes.as_slice()).is_ok(),
+            Capture::Absent => match std::fs::remove_file(path) {
+                Ok(_) => true,
+                // Already gone is a successful "restore to absent".
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+                Err(_) => false,
+            },
+        };
+        if ok {
+            restored.push(path.clone());
+        }
+    }
+
+    // Drop the rewound turns.
+    s.turns.truncate(idx);
+    restored
+}
+
+/// Drop all snapshots (hooked into /clear).
+pub fn clear() {
+    let mut s = STORE.lock_ignore_poison();
+    s.turns.clear();
+    s.pool.clear();
+}
+
+/// Process-wide gate for tests that touch the global store, so they
+/// don't observe each other's turns/objects when run in parallel.
+/// Lives at module scope so cross-module tests (e.g. the UI rewind
+/// integration test) can serialize against the unit tests here.
+#[cfg(test)]
+pub(crate) static TEST_GATE: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn isolated<R>(f: impl FnOnce(&Path) -> R) -> R {
+        let _g = TEST_GATE.lock_ignore_poison();
+        clear();
+        let dir = std::env::temp_dir().join(format!("dirge-snap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let r = f(&dir);
+        clear();
+        let _ = std::fs::remove_dir_all(&dir);
+        r
+    }
+
+    #[test]
+    fn restore_reverts_edit_to_pre_state() {
+        isolated(|dir| {
+            let p = dir.join("a.txt");
+            std::fs::write(&p, "original").unwrap();
+
+            begin_turn("u1");
+            capture(&p); // pre-state = "original"
+            std::fs::write(&p, "mutated").unwrap();
+
+            let restored = restore_from("u1");
+            assert_eq!(restored.len(), 1);
+            assert_eq!(std::fs::read_to_string(&p).unwrap(), "original");
+        });
+    }
+
+    #[test]
+    fn earliest_pre_state_within_turn_wins() {
+        isolated(|dir| {
+            let p = dir.join("a.txt");
+            std::fs::write(&p, "v0").unwrap();
+            begin_turn("u1");
+            capture(&p); // v0 — this is the one that must restore
+            std::fs::write(&p, "v1").unwrap();
+            capture(&p); // v1 — ignored (already captured this turn)
+            std::fs::write(&p, "v2").unwrap();
+
+            restore_from("u1");
+            assert_eq!(std::fs::read_to_string(&p).unwrap(), "v0");
+        });
+    }
+
+    #[test]
+    fn restore_spans_multiple_turns_taking_earliest() {
+        isolated(|dir| {
+            let p = dir.join("a.txt");
+            std::fs::write(&p, "t1pre").unwrap();
+            begin_turn("u1");
+            capture(&p);
+            std::fs::write(&p, "after-t1").unwrap();
+
+            begin_turn("u2");
+            capture(&p); // pre = "after-t1"
+            std::fs::write(&p, "after-t2").unwrap();
+
+            // Rewinding to u1 undoes BOTH turns → earliest pre-state.
+            restore_from("u1");
+            assert_eq!(std::fs::read_to_string(&p).unwrap(), "t1pre");
+        });
+    }
+
+    #[test]
+    fn newly_created_file_is_deleted_on_restore() {
+        isolated(|dir| {
+            let p = dir.join("new.txt");
+            begin_turn("u1");
+            capture(&p); // file absent
+            std::fs::write(&p, "created this turn").unwrap();
+
+            let restored = restore_from("u1");
+            assert_eq!(restored.len(), 1);
+            assert!(!p.exists(), "file created in the turn must be removed");
+        });
+    }
+
+    #[test]
+    fn rewinding_to_unknown_turn_restores_nothing() {
+        isolated(|dir| {
+            let p = dir.join("a.txt");
+            std::fs::write(&p, "x").unwrap();
+            begin_turn("u1");
+            capture(&p);
+            std::fs::write(&p, "y").unwrap();
+
+            let restored = restore_from("nope");
+            assert!(restored.is_empty());
+            // Untouched.
+            assert_eq!(std::fs::read_to_string(&p).unwrap(), "y");
+        });
+    }
+
+    #[test]
+    fn restore_truncates_rewound_turns() {
+        isolated(|dir| {
+            let p = dir.join("a.txt");
+            std::fs::write(&p, "v0").unwrap();
+            begin_turn("u1");
+            capture(&p);
+            std::fs::write(&p, "v1").unwrap();
+            restore_from("u1"); // drops u1
+
+            // A second rewind to u1 now finds nothing.
+            std::fs::write(&p, "v2").unwrap();
+            let restored = restore_from("u1");
+            assert!(restored.is_empty());
+            assert_eq!(std::fs::read_to_string(&p).unwrap(), "v2");
+        });
+    }
+
+    #[test]
+    fn dedup_pool_reuses_identical_content() {
+        isolated(|dir| {
+            let a = dir.join("a.txt");
+            let b = dir.join("b.txt");
+            std::fs::write(&a, "same").unwrap();
+            std::fs::write(&b, "same").unwrap();
+            begin_turn("u1");
+            capture(&a);
+            capture(&b);
+            // Both captures should share one pooled object.
+            let s = STORE.lock_ignore_poison();
+            assert_eq!(s.pool.len(), 1, "identical content must dedup to one object");
+        });
+    }
+}

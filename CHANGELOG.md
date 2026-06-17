@@ -7,6 +7,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **`/rewind` now rolls back files, not just the conversation.** Every
+  write/edit/edit_lines/apply_patch (including delete and rename) snapshots the
+  touched file's pre-mutation content, keyed by the user prompt that triggered
+  it. Rewinding to a prompt restores the working tree to its state before that
+  prompt ran, in lockstep with the conversation truncation — so a long
+  autonomous run is safe to unwind. Content is deduplicated through a small
+  content-addressed pool so a file edited many times across turns doesn't store
+  many copies. In-memory and process-scoped (rewind works within a live
+  session, not across a restart); a created file is deleted on restore, a
+  deleted file is recreated. From the [howard chen
+  writeup](https://howardchen.substack.com/p/deepseek-v4-pro-at-5-the-cost-of)'s
+  rewind lever.
 - **Hash-anchored editing (`edit_lines` + `read(line_hashes=true)`).** A new
   edit path aimed at cheaper models: `read` can prefix each line with a 3-char
   content hash (`42 a3f: ...`), and `edit_lines` replaces a line *range* by

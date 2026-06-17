@@ -128,6 +128,8 @@ impl Tool for WriteTool {
         let was_creation = !path.exists();
         #[cfg(feature = "lsp")]
         let write_at = Instant::now();
+        // Snapshot pre-write content (or absence) for /rewind.
+        crate::agent::tools::snapshots::capture(path);
         // Atomic write: tmp + fsync + rename so a crash mid-write
         // leaves the previous file content intact, not a truncated
         // half-write. `tokio::fs::write` opens with O_TRUNC and

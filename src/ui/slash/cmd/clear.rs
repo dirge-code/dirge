@@ -12,6 +12,7 @@ pub(crate) async fn cmd_clear(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     ctx.session.tree.entries.clear();
     ctx.session.tree.leaf_id = None;
     crate::agent::tools::modified::clear_modified();
+    crate::agent::tools::snapshots::clear();
     crate::agent::tools::todo::clear();
     render_session(ctx.renderer, ctx.session, ctx.cli, ctx.cfg, ctx.context)?;
     Ok(())

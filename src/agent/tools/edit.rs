@@ -345,6 +345,8 @@ impl Tool for EditTool {
         }
         #[cfg(feature = "lsp")]
         let write_at = std::time::Instant::now();
+        // Snapshot pre-edit content for /rewind before mutating.
+        crate::agent::tools::snapshots::capture(std::path::Path::new(&resolved_path));
         // Atomic write so a mid-write crash leaves the previous
         // content intact rather than a truncated half-write.
         crate::fs_atomic::atomic_write(std::path::Path::new(&resolved_path), output.as_bytes())

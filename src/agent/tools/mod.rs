@@ -29,6 +29,7 @@ mod repo_overview;
 pub mod semantic;
 mod session_search;
 mod skill;
+pub(crate) mod snapshots;
 mod spec;
 pub mod task;
 mod task_status;

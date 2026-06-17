@@ -2338,6 +2338,12 @@ pub async fn run_interactive(
                                 runner.install_into(&mut ui.agent_rx, &mut ui.agent_abort, &mut ui.agent_interject, &mut ui.agent_cancel, &mut ui.is_running);
 
                                 session.add_message(MessageRole::User, &text);
+                                // Open a file-snapshot turn keyed by this user
+                                // message so /rewind can roll the working tree
+                                // back to its pre-prompt state.
+                                if let Some(uid) = session.messages.last().map(|m| m.id.clone()) {
+                                    crate::agent::tools::snapshots::begin_turn(&uid);
+                                }
                                 renderer.set_avatar_state(avatar::AvatarState::Idle);
                             }
                         }
