@@ -174,6 +174,18 @@ pub struct TokenUsage {
     pub input_tokens: u64,
     /// Completion (output) tokens produced by this request.
     pub output_tokens: u64,
+    /// Input tokens served from a provider-managed prefix cache
+    /// (DeepSeek `prompt_tokens_details.cached_tokens`, Anthropic
+    /// `cache_read_input_tokens`). These are billed at a steep
+    /// discount (DeepSeek ~1/10, Anthropic ~1/10) so the cache-hit
+    /// ratio is the headline cost lever for cheaper models. A
+    /// subset of `input_tokens`.
+    pub cached_input_tokens: u64,
+    /// Input tokens written to a provider-managed cache this
+    /// request (Anthropic `cache_creation_input_tokens`; DeepSeek
+    /// reports 0). Billed at a premium but amortized over later
+    /// cache hits.
+    pub cache_creation_input_tokens: u64,
 }
 
 /// Sub-discriminator for `StreamEvent::Delta`. Mirrors pi's nine
@@ -455,6 +467,16 @@ pub enum LoopEvent {
         tool_results: Vec<ToolResultMessage>,
     },
 
+    /// Provider-reported token usage for the turn that just
+    /// finished. Emitted from `stream_assistant_response` whenever
+    /// the provider reported usage on the terminal stream event, so
+    /// the host can fold real input/cached counts into the session's
+    /// cumulative cache stats (see `Session::record_token_usage`).
+    /// Separate from `TurnEnd` because not every provider reports
+    /// usage and the host accumulates it independently of turn
+    /// bracketing.
+    Usage { usage: TokenUsage },
+
     /// A destructive compaction fold is about to run its summarizer —
     /// emitted before the (slow) LLM call so the UI can show a
     /// "compacting…" indicator during the wait. `ContextCompacted`
@@ -586,6 +608,7 @@ impl LoopEvent {
             LoopEvent::AgentEnd { .. } => "agent_end",
             LoopEvent::TurnStart => "turn_start",
             LoopEvent::TurnEnd { .. } => "turn_end",
+            LoopEvent::Usage { .. } => "usage",
             LoopEvent::CompactionStarted { .. } => "compaction_started",
             LoopEvent::ContextCompacted { .. } => "context_compacted",
             LoopEvent::CheckpointRefresh { .. } => "checkpoint_refresh",

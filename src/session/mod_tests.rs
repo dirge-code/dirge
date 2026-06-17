@@ -998,3 +998,52 @@ fn reset_to_new_records_parent_lineage() {
     s.reset_to_new(Some("00000000-prev"));
     assert_eq!(s.name, "parent:00000000-prev");
 }
+
+/// A fresh session has recorded no real usage, so the cache-hit
+/// ratio is `None` (distinct from a misleading 0%).
+#[test]
+fn cache_hit_ratio_none_before_any_usage() {
+    let s = Session::new("p", "m", 0);
+    assert_eq!(s.cache_hit_ratio(), None);
+}
+
+/// `record_token_usage` accumulates across turns and the ratio is
+/// cumulative cached / cumulative input.
+#[test]
+fn cache_hit_ratio_accumulates_across_turns() {
+    let mut s = Session::new("p", "m", 0);
+    // Turn 1: cold-ish — 1000 input, 800 cached.
+    s.record_token_usage(1000, 800, 0);
+    // Turn 2: 500 input, 100 cached.
+    s.record_token_usage(500, 100, 0);
+    assert_eq!(s.cumulative_input_tokens, 1500);
+    assert_eq!(s.cumulative_cached_input_tokens, 900);
+    // 900 / 1500 = 0.6
+    let ratio = s.cache_hit_ratio().expect("usage recorded");
+    assert!((ratio - 0.6).abs() < 1e-9, "ratio was {ratio}");
+}
+
+/// Cache-creation tokens accumulate independently and don't skew
+/// the hit ratio (which is over cached *reads*).
+#[test]
+fn cache_creation_tracked_separately_from_ratio() {
+    let mut s = Session::new("p", "m", 0);
+    s.record_token_usage(200, 0, 200);
+    assert_eq!(s.cumulative_cache_creation_tokens, 200);
+    assert_eq!(s.cache_hit_ratio(), Some(0.0));
+}
+
+/// Cumulative cache fields default to 0 when absent from an older
+/// session file (serde backward-compat).
+#[test]
+fn cache_fields_default_on_legacy_deserialize() {
+    let s = Session::new("p", "m", 0);
+    let mut v = serde_json::to_value(&s).expect("serialize");
+    let obj = v.as_object_mut().expect("object");
+    obj.remove("cumulative_input_tokens");
+    obj.remove("cumulative_cached_input_tokens");
+    obj.remove("cumulative_cache_creation_tokens");
+    let restored: Session = serde_json::from_value(v).expect("deserialize legacy");
+    assert_eq!(restored.cumulative_input_tokens, 0);
+    assert_eq!(restored.cache_hit_ratio(), None);
+}

@@ -409,6 +409,8 @@ where
                     token_usage = r.token_usage().map(|u| super::message::TokenUsage {
                         input_tokens: u.input_tokens,
                         output_tokens: u.output_tokens,
+                        cached_input_tokens: u.cached_input_tokens,
+                        cache_creation_input_tokens: u.cache_creation_input_tokens,
                     });
                 }
                 Err(err) => {
@@ -1646,5 +1648,53 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, StreamEvent::Error { .. }))
         );
+    }
+
+    /// A `Final` response that reports prefix-cache usage must carry
+    /// the cached/creation counts through onto `Done.usage`, not
+    /// just input/output. This is the source of the session
+    /// cache-hit ratio.
+    #[tokio::test]
+    async fn final_response_propagates_cached_token_usage() {
+        #[derive(Clone, Debug)]
+        struct UsageResponse;
+        impl GetTokenUsage for UsageResponse {
+            fn token_usage(&self) -> Option<rig::completion::Usage> {
+                let mut u = rig::completion::Usage::new();
+                u.input_tokens = 1000;
+                u.output_tokens = 50;
+                u.cached_input_tokens = 800;
+                u.cache_creation_input_tokens = 0;
+                Some(u)
+            }
+        }
+
+        let raw: Pin<
+            Box<
+                dyn Stream<
+                        Item = Result<
+                            StreamedAssistantContent<UsageResponse>,
+                            CompletionError,
+                        >,
+                    > + Send,
+            >,
+        > = Box::pin(futures::stream::iter(vec![
+            Ok(StreamedAssistantContent::Text(Text {
+                text: "hi".to_string(),
+            })),
+            Ok(StreamedAssistantContent::Final(UsageResponse)),
+        ]));
+
+        let events = drain(wrap_streamed_assistant(raw, None, None)).await;
+        let usage = events
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::Done { usage, .. } => Some(usage.expect("usage reported")),
+                _ => None,
+            })
+            .expect("a Done event");
+        assert_eq!(usage.input_tokens, 1000);
+        assert_eq!(usage.cached_input_tokens, 800);
+        assert_eq!(usage.cache_creation_input_tokens, 0);
     }
 }

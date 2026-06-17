@@ -16,6 +16,7 @@ pub(crate) mod sessions;
 
 pub(crate) mod agents;
 pub(crate) mod btw;
+pub(crate) mod cache;
 pub(crate) mod cd;
 pub(crate) mod clear;
 pub(crate) mod clone;

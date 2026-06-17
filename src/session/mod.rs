@@ -248,6 +248,22 @@ pub struct Session {
     pub total_tokens: u64,
     pub total_cost: f64,
     pub total_estimated_tokens: u64,
+    /// Cumulative real input (prompt) tokens reported by the
+    /// provider across this session's lifetime. Unlike
+    /// `total_estimated_tokens` (a per-message heuristic), this is
+    /// the actual billed input count, summed per turn. Defaulted on
+    /// deserialize so pre-cache-stats session files load unchanged.
+    #[serde(default)]
+    pub cumulative_input_tokens: u64,
+    /// Cumulative input tokens served from the provider's prefix
+    /// cache. The headline cost lever for cheaper models — see
+    /// [`Session::cache_hit_ratio`].
+    #[serde(default)]
+    pub cumulative_cached_input_tokens: u64,
+    /// Cumulative input tokens written to the provider cache
+    /// (Anthropic only; DeepSeek reports 0).
+    #[serde(default)]
+    pub cumulative_cache_creation_tokens: u64,
     pub context_window: u64,
     pub model: CompactString,
     pub provider: CompactString,
@@ -399,6 +415,9 @@ impl Session {
             total_tokens: 0,
             total_cost: 0.0,
             total_estimated_tokens: 0,
+            cumulative_input_tokens: 0,
+            cumulative_cached_input_tokens: 0,
+            cumulative_cache_creation_tokens: 0,
             context_window,
             model: CompactString::new(model),
             provider: CompactString::new(provider),
@@ -417,6 +436,37 @@ impl Session {
             loaded_mtime: None,
             loaded_from_newer_version: None,
         }
+    }
+
+    /// Fold one turn's provider-reported token usage into the
+    /// session's cumulative cache counters. Called once per
+    /// finalized LLM turn (the `AgentEvent::Usage` handler). Cheap
+    /// integer adds; safe to call with all-zero usage.
+    pub fn record_token_usage(
+        &mut self,
+        input_tokens: u64,
+        cached_input_tokens: u64,
+        cache_creation_input_tokens: u64,
+    ) {
+        self.cumulative_input_tokens =
+            self.cumulative_input_tokens.saturating_add(input_tokens);
+        self.cumulative_cached_input_tokens = self
+            .cumulative_cached_input_tokens
+            .saturating_add(cached_input_tokens);
+        self.cumulative_cache_creation_tokens = self
+            .cumulative_cache_creation_tokens
+            .saturating_add(cache_creation_input_tokens);
+    }
+
+    /// Cumulative prefix-cache hit ratio for this session:
+    /// cached input tokens / total input tokens, in `0.0..=1.0`.
+    /// Returns `None` when no real input usage has been recorded yet
+    /// (so callers can show "no data" rather than a misleading 0%).
+    pub fn cache_hit_ratio(&self) -> Option<f64> {
+        if self.cumulative_input_tokens == 0 {
+            return None;
+        }
+        Some(self.cumulative_cached_input_tokens as f64 / self.cumulative_input_tokens as f64)
     }
 
     /// Populate `message_store` from `messages` for legacy session

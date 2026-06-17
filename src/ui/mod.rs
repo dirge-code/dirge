@@ -2457,6 +2457,21 @@ pub async fn run_interactive(
                             loop_bits,
                         ).await?;
                     }
+                    AgentEvent::Usage {
+                        input_tokens,
+                        cached_input_tokens,
+                        cache_creation_input_tokens,
+                        ..
+                    } => {
+                        // Fold real provider usage into the session's
+                        // cumulative cache stats so `/cache` reports a
+                        // live prefix-cache hit ratio.
+                        session.record_token_usage(
+                            input_tokens,
+                            cached_input_tokens,
+                            cache_creation_input_tokens,
+                        );
+                    }
                     #[cfg(feature = "plugin")]
                     AgentEvent::CustomMessage { payload } => {
                         // Plugin-emitted custom message (P9d).
@@ -3649,7 +3664,8 @@ fn modified_visible_rows(rect: Option<ratatui::layout::Rect>) -> usize {
 fn is_safe_during_agent(text: &str) -> bool {
     let head = text.split_whitespace().next().unwrap_or("");
     let args = text.split_whitespace().nth(1).map(|s| s.to_string());
-    let always_safe = matches!(head, "/quit" | "/help" | "/reasoning" | "/tasks" | "/mode");
+    let always_safe =
+        matches!(head, "/quit" | "/help" | "/reasoning" | "/tasks" | "/mode" | "/cache");
     let safe_when_no_arg =
         matches!(head, "/sessions" | "/tree" | "/model" | "/prompt") && args.is_none();
     let safe_when_list = matches!(

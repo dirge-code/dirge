@@ -258,6 +258,13 @@ pub async fn stream_assistant_response(
                 let mut finalised = message;
                 finalised.stop_reason = reason;
                 finalize(context, &finalised, added_partial, emit).await;
+                // Surface real provider usage so the host can fold it
+                // into cumulative cache stats. Only emit when the
+                // provider actually reported usage; a zero-usage event
+                // would dilute the cache-hit ratio with empty turns.
+                if let Some(u) = usage {
+                    let _ = emit.send(LoopEvent::Usage { usage: u }).await;
+                }
                 final_message = Some((finalised, usage));
                 break;
             }

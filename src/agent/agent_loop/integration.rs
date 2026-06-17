@@ -1221,6 +1221,7 @@ mod tests {
             AgentEvent::Done { .. } => "Done",
             AgentEvent::TurnStart { .. } => "TurnStart",
             AgentEvent::TurnEnd { .. } => "TurnEnd",
+            AgentEvent::Usage { .. } => "Usage",
             AgentEvent::Interjected { .. } => "Interjected",
             AgentEvent::CustomMessage { .. } => "CustomMessage",
             AgentEvent::UserMessage { .. } => "UserMessage",

@@ -6,6 +6,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **Prefix-cache hit accounting + `/cache` command.** Providers like DeepSeek
+  and Anthropic serve repeated request prefixes from a cache at a steep
+  discount (DeepSeek ~1/10 the input price), and dirge already holds the system
+  prompt + sorted tool defs at a stable prefix to keep that cache warm — but
+  there was no way to tell whether hits were actually landing. Real
+  provider-reported usage (`cached_input_tokens`, `cache_creation_input_tokens`)
+  now flows from the stream through to a cumulative per-session counter, and
+  `/cache` prints the session's cumulative prefix-cache hit ratio. This is the
+  instrument for the DeepSeek cost story in the [howard chen
+  writeup](https://howardchen.substack.com/p/deepseek-v4-pro-at-5-the-cost-of):
+  cache discipline is the headline lever for running cheaper models, and now
+  you can measure it.
+
 ## [0.7.2] - 2026-06-15
 
 ### Changed

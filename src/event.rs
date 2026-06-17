@@ -152,6 +152,16 @@ pub enum AgentEvent {
         tokens: u64,
         cost: f64,
     },
+    /// Provider-reported token usage for one finished turn. Bridged
+    /// from `LoopEvent::Usage`; the UI folds it into the session's
+    /// cumulative cache counters (`Session::record_token_usage`) so
+    /// `/cache` can report a real prefix-cache hit ratio. Emitted
+    /// only when the provider reported usage.
+    Usage {
+        input_tokens: u64,
+        cached_input_tokens: u64,
+        cache_creation_input_tokens: u64,
+    },
     /// Marks the start of one turn within an agent run. A "turn" is one
     /// LLM call + any tool calls it dispatched + the tool results
     /// returning. A pure-text response has exactly one turn (TurnStart 0

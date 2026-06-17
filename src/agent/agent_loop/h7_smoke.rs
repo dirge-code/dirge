@@ -135,6 +135,7 @@ fn dump_events(events: &[AgentEvent]) {
                 eprintln!("\n[tool_call] {name}({args})");
             }
             AgentEvent::ToolStarted { .. } => {}
+            AgentEvent::Usage { .. } => {}
             AgentEvent::ToolResult { output, .. } => {
                 eprintln!("\n[tool_result] {} bytes", output.len());
             }

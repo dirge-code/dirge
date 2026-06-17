@@ -676,6 +676,7 @@ fn full_run_event_sequence_translates_correctly() {
             AgentEvent::ToolResult { .. } => "ToolResult",
             AgentEvent::TurnStart { .. } => "TurnStart",
             AgentEvent::TurnEnd { .. } => "TurnEnd",
+            AgentEvent::Usage { .. } => "Usage",
             AgentEvent::Done { .. } => "Done",
             AgentEvent::Error(_) => "Error",
             AgentEvent::ContextOverflow { .. } => "ContextOverflow",
@@ -704,4 +705,34 @@ fn full_run_event_sequence_translates_correctly() {
             "Done",
         ]
     );
+}
+
+/// `LoopEvent::Usage` translates to `AgentEvent::Usage`, carrying
+/// the provider's real input/cached/creation counts through to the
+/// host so it can fold them into the session cache stats.
+#[test]
+fn usage_event_translates_with_cache_counts() {
+    use crate::agent::agent_loop::message::TokenUsage;
+    let mut bridge = EventBridge::new();
+    let out = bridge.translate(LoopEvent::Usage {
+        usage: TokenUsage {
+            input_tokens: 1000,
+            output_tokens: 50,
+            cached_input_tokens: 800,
+            cache_creation_input_tokens: 0,
+        },
+    });
+    assert_eq!(out.len(), 1);
+    match &out[0] {
+        AgentEvent::Usage {
+            input_tokens,
+            cached_input_tokens,
+            cache_creation_input_tokens,
+        } => {
+            assert_eq!(*input_tokens, 1000);
+            assert_eq!(*cached_input_tokens, 800);
+            assert_eq!(*cache_creation_input_tokens, 0);
+        }
+        other => panic!("expected AgentEvent::Usage, got {other:?}"),
+    }
 }
