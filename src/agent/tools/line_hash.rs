@@ -51,7 +51,8 @@ mod tests {
             let h = line_hash(s);
             assert_eq!(h.len(), 3, "hash {h:?} for {s:?} not 3 chars");
             assert!(
-                h.chars().all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()),
+                h.chars()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()),
                 "hash {h:?} not lowercase hex"
             );
         }
@@ -61,7 +62,10 @@ mod tests {
     fn hash_is_deterministic() {
         // Stability is the whole contract: the same line must hash
         // the same on every call / process.
-        assert_eq!(line_hash("let total = a + b;"), line_hash("let total = a + b;"));
+        assert_eq!(
+            line_hash("let total = a + b;"),
+            line_hash("let total = a + b;")
+        );
     }
 
     #[test]

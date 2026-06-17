@@ -448,8 +448,7 @@ impl Session {
         cached_input_tokens: u64,
         cache_creation_input_tokens: u64,
     ) {
-        self.cumulative_input_tokens =
-            self.cumulative_input_tokens.saturating_add(input_tokens);
+        self.cumulative_input_tokens = self.cumulative_input_tokens.saturating_add(input_tokens);
         self.cumulative_cached_input_tokens = self
             .cumulative_cached_input_tokens
             .saturating_add(cached_input_tokens);

@@ -3681,8 +3681,10 @@ fn begin_snapshot_turn(session: &crate::session::Session) {
 fn is_safe_during_agent(text: &str) -> bool {
     let head = text.split_whitespace().next().unwrap_or("");
     let args = text.split_whitespace().nth(1).map(|s| s.to_string());
-    let always_safe =
-        matches!(head, "/quit" | "/help" | "/reasoning" | "/tasks" | "/mode" | "/cache");
+    let always_safe = matches!(
+        head,
+        "/quit" | "/help" | "/reasoning" | "/tasks" | "/mode" | "/cache"
+    );
     let safe_when_no_arg =
         matches!(head, "/sessions" | "/tree" | "/model" | "/prompt") && args.is_none();
     let safe_when_list = matches!(

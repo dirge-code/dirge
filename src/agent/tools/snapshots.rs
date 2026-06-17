@@ -377,7 +377,11 @@ mod tests {
             capture(&b);
             // Both captures should share one pooled object.
             let s = STORE.lock_ignore_poison();
-            assert_eq!(s.pool.len(), 1, "identical content must dedup to one object");
+            assert_eq!(
+                s.pool.len(),
+                1,
+                "identical content must dedup to one object"
+            );
         });
     }
 }

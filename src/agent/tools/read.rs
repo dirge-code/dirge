@@ -321,8 +321,7 @@ impl Tool for ReadTool {
         let reader = tokio::io::BufReader::new(file);
         let mut lines = reader.lines();
         let mut total_lines = 0usize;
-        let mut excerpt_lines: Vec<(usize, String, Option<String>)> =
-            Vec::with_capacity(limit);
+        let mut excerpt_lines: Vec<(usize, String, Option<String>)> = Vec::with_capacity(limit);
         let want_hashes = args.line_hashes.unwrap_or(false);
         let want_end = offset.saturating_add(limit);
         let mut first_line = true;
@@ -768,8 +767,14 @@ mod tests {
             .await
             .expect("read succeeds");
         let _ = std::fs::remove_file(&path);
-        assert!(out.lines().any(|l| l.trim_start() == "1: one"), "got:\n{out}");
-        assert!(out.lines().any(|l| l.trim_start() == "2: two"), "got:\n{out}");
+        assert!(
+            out.lines().any(|l| l.trim_start() == "1: one"),
+            "got:\n{out}"
+        );
+        assert!(
+            out.lines().any(|l| l.trim_start() == "2: two"),
+            "got:\n{out}"
+        );
     }
 
     /// F19: UTF-8 BOM (U+FEFF, bytes 0xEF 0xBB 0xBF) at the start

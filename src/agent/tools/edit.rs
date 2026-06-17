@@ -347,10 +347,7 @@ impl Tool for EditTool {
         let write_at = std::time::Instant::now();
         // Snapshot pre-edit content for /rewind before mutating. Reuse
         // the bytes already read above rather than re-reading from disk.
-        crate::agent::tools::snapshots::capture_bytes(
-            std::path::Path::new(&resolved_path),
-            &bytes,
-        );
+        crate::agent::tools::snapshots::capture_bytes(std::path::Path::new(&resolved_path), &bytes);
         // Atomic write so a mid-write crash leaves the previous
         // content intact rather than a truncated half-write.
         crate::fs_atomic::atomic_write(std::path::Path::new(&resolved_path), output.as_bytes())

@@ -1363,8 +1363,7 @@ pub async fn run_loop(
                     // Storm-breaker: rather than end on an abrupt/empty
                     // stop, synthesize a coherent assistant explanation
                     // (built after backfill, below).
-                    storm_give_up_tools =
-                        Some(tool_calls.iter().map(|c| c.name.clone()).collect());
+                    storm_give_up_tools = Some(tool_calls.iter().map(|c| c.name.clone()).collect());
                 }
 
                 // Dispatch surviving calls through the unified dispatch.
@@ -1414,10 +1413,8 @@ pub async fn run_loop(
                 // and the model carries its own failure account forward.
                 if let Some(tools) = storm_give_up_tools.take() {
                     let text = super::storm::failure_narrative(&tools);
-                    let msg = AssistantMessage::new(
-                        vec![ContentBlock::Text { text }],
-                        StopReason::Stop,
-                    );
+                    let msg =
+                        AssistantMessage::new(vec![ContentBlock::Text { text }], StopReason::Stop);
                     // Render it to the user (text flows via MessageUpdate).
                     let _ = emit
                         .send(LoopEvent::MessageStart {

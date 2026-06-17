@@ -1671,12 +1671,8 @@ mod tests {
 
         let raw: Pin<
             Box<
-                dyn Stream<
-                        Item = Result<
-                            StreamedAssistantContent<UsageResponse>,
-                            CompletionError,
-                        >,
-                    > + Send,
+                dyn Stream<Item = Result<StreamedAssistantContent<UsageResponse>, CompletionError>>
+                    + Send,
             >,
         > = Box::pin(futures::stream::iter(vec![
             Ok(StreamedAssistantContent::Text(Text {
