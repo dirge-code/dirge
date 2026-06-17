@@ -437,12 +437,25 @@ fn adv(b: &[u8], i: &mut usize, line: &mut usize, col: &mut usize, count: usize)
     }
 }
 
-/// Scan source for a delimiter imbalance under `rules`, returning a
-/// concrete, actionable summary — so the model never has to count
-/// delimiters by hand. Comment/string/char-literal aware. Returns `None`
-/// when delimiters balance (then the real error is elsewhere). All
+/// Structured result of the comment/string/char-aware delimiter scan.
+/// Both the human summary ([`delimiter_summary`]) and the mechanical
+/// repair ([`repair_delimiters`]) read from this, so they share one
+/// understanding of what is and isn't a delimiter (dirge-p5fu).
+enum DelimiterBalance {
+    /// Every opener has its matching closer.
+    Balanced,
+    /// Openers left on the stack at EOF (bottom→top): `(open, line, col)`.
+    /// Safely closable by appending the matching closers in reverse.
+    Unclosed(Vec<(u8, usize, usize)>),
+    /// A closer with no/mismatched opener at `(closer, line, col)`. NOT
+    /// safely closable — appending can't fix a misplaced closer.
+    Stray(char, usize, usize),
+}
+
+/// Scan source for a delimiter imbalance under `rules`. Comment/string/
+/// char-literal aware so the real `()[]{}` are counted correctly. All
 /// comment/string/delimiter syntax is ASCII, so a byte scan is safe.
-fn delimiter_summary(content: &str, rules: &LexRules) -> Option<String> {
+fn delimiter_balance(content: &str, rules: &LexRules) -> DelimiterBalance {
     let b = content.as_bytes();
     let n = b.len();
     let mut i = 0usize;
@@ -571,12 +584,7 @@ fn delimiter_summary(content: &str, rules: &LexRules) -> Option<String> {
                         stack.pop();
                     }
                     _ => {
-                        let c = b[i] as char;
-                        return Some(format!(
-                            "Delimiter imbalance: unexpected `{c}` at line {line}, col {col} \
-                             with no matching open — remove an extra closer, or add the missing \
-                             opener before it."
-                        ));
+                        return DelimiterBalance::Stray(b[i] as char, line, col);
                     }
                 }
             }
@@ -585,19 +593,120 @@ fn delimiter_summary(content: &str, rules: &LexRules) -> Option<String> {
         adv(b, &mut i, &mut line, &mut col, 1);
     }
 
-    stack.first().map(|&(open, l, c)| {
-        let openc = open as char;
-        let close = match open {
-            b'(' => ')',
-            b'[' => ']',
-            _ => '}',
-        };
-        format!(
-            "Delimiter imbalance: {n} unclosed — the `{openc}` opened at line {l}, col {c} is \
-             never closed; add {n} matching `{close}` (do not count by hand — fix this delimiter).",
-            n = stack.len()
-        )
-    })
+    if stack.is_empty() {
+        DelimiterBalance::Balanced
+    } else {
+        DelimiterBalance::Unclosed(stack)
+    }
+}
+
+/// Closing delimiter for an opener byte.
+fn closer_for(open: u8) -> char {
+    match open {
+        b'(' => ')',
+        b'[' => ']',
+        _ => '}',
+    }
+}
+
+/// Concrete, actionable summary of a delimiter imbalance — so the model
+/// never has to count by hand. `None` when delimiters balance (the real
+/// error is elsewhere). Wording is load-bearing (tests pin it).
+fn delimiter_summary(content: &str, rules: &LexRules) -> Option<String> {
+    match delimiter_balance(content, rules) {
+        DelimiterBalance::Balanced => None,
+        DelimiterBalance::Stray(c, line, col) => Some(format!(
+            "Delimiter imbalance: unexpected `{c}` at line {line}, col {col} \
+             with no matching open — remove an extra closer, or add the missing \
+             opener before it."
+        )),
+        DelimiterBalance::Unclosed(stack) => {
+            let (open, l, c) = stack[0];
+            let openc = open as char;
+            let close = closer_for(open);
+            Some(format!(
+                "Delimiter imbalance: {n} unclosed — the `{openc}` opened at line {l}, col {c} is \
+                 never closed; add {n} matching `{close}` (do not count by hand — fix this delimiter).",
+                n = stack.len()
+            ))
+        }
+    }
+}
+
+/// Mechanically close a purely-unclosed delimiter imbalance, mirroring the
+/// JSON truncation closer (`tool_input_repair::repair_truncated_json`):
+/// rather than bounce a trivial mechanical fix back to the model, append
+/// the matching closers and let the write proceed. Returns `(repaired,
+/// note)` or `None` when no safe mechanical fix exists.
+///
+/// Safety (dirge-p5fu):
+/// - Only languages with comment/string/char-aware lex rules qualify, so a
+///   `)` inside a string or comment is never miscounted.
+/// - Only the pure-unclosed case is repaired. A stray/mismatched closer is
+///   NOT touched — appending can't fix a misplaced closer, and the model
+///   gets the precise summary instead.
+/// - The repaired text is RE-VALIDATED with [`check_syntax`] (tree-sitter
+///   for grammared languages — the oracle that rejects a close producing
+///   nonsense like `fn main( {})` — the scanner for lisps). The repair is
+///   returned only if it now parses clean; otherwise we fall back to the
+///   reject-with-summary path. The note is surfaced on the success result,
+///   so the fix is never silent and the model can correct a wrong guess.
+pub fn repair_delimiters(path: &Path, content: &str) -> Option<(String, String)> {
+    let rules = lex_rules_for_path(path)?;
+    let DelimiterBalance::Unclosed(stack) = delimiter_balance(content, rules) else {
+        return None;
+    };
+    // Append closers top-of-stack first (innermost closes first).
+    let closers: String = stack
+        .iter()
+        .rev()
+        .map(|&(open, _, _)| closer_for(open))
+        .collect();
+    let mut repaired = content.to_string();
+    repaired.push_str(&closers);
+    // tree-sitter / scanner must agree the result is now valid — otherwise
+    // the imbalance wasn't a simple truncation and a blind close would be
+    // wrong (e.g. a delimiter missing mid-expression).
+    if check_syntax(path, &repaired).is_err() {
+        return None;
+    }
+    let (open, l, c) = stack[0];
+    let note = format!(
+        "auto-closed {n} unclosed delimiter(s): appended `{closers}` to balance the `{openc}` \
+         opened at line {l}, col {c}. If that placement is wrong, resend the corrected text.",
+        n = stack.len(),
+        openc = open as char,
+    );
+    Some((repaired, note))
+}
+
+/// Validate `content`; on a delimiter imbalance, try a mechanical close
+/// before giving up. The single entry point the edit tools call.
+pub enum SyntaxOutcome {
+    /// Clean as written.
+    Clean,
+    /// Was unbalanced but mechanically closed. `content` is the text to
+    /// write; `note` describes the fix (surface it on the success result).
+    Repaired { content: String, note: String },
+    /// Unrepairable. `message` is the formatted reject (file NOT written).
+    Rejected { message: String },
+}
+
+/// Validate, and auto-repair a closable delimiter imbalance if possible.
+/// Parity with the JSON truncation repair (dirge-p5fu).
+pub fn validate_or_repair(path: &Path, content: &str) -> SyntaxOutcome {
+    match check_syntax(path, content) {
+        Ok(()) => SyntaxOutcome::Clean,
+        Err(errors) => match repair_delimiters(path, content) {
+            Some((repaired, note)) => SyntaxOutcome::Repaired {
+                content: repaired,
+                note,
+            },
+            None => SyntaxOutcome::Rejected {
+                message: format_errors(path, content, &errors),
+            },
+        },
+    }
 }
 
 /// Convenience wrapper: format a `Vec<SyntaxError>` as a single
@@ -734,6 +843,112 @@ int main(void) {
         // Python: unclosed `[`.
         let s = delimiter_summary("xs = [1, 2,\n", &RULES_PYTHON).expect("py imbalance");
         assert!(s.contains("unclosed"), "{s}");
+    }
+
+    // ── Mechanical delimiter repair (dirge-p5fu) ─────────────────
+
+    #[test]
+    fn repair_closes_truncated_form() {
+        // .janet has no tree-sitter grammar, so check_syntax uses the
+        // comment/string-aware scanner — deterministic, no feature needed.
+        let path = PathBuf::from("/tmp/x.janet");
+        let (repaired, note) = repair_delimiters(&path, "(defn f [x]\n  (+ x 1")
+            .expect("truncated form is repairable");
+        assert_eq!(repaired, "(defn f [x]\n  (+ x 1))");
+        assert!(
+            check_syntax(&path, &repaired).is_ok(),
+            "repaired must validate"
+        );
+        assert!(
+            note.contains("auto-closed 2"),
+            "note reports the fix: {note}"
+        );
+    }
+
+    #[test]
+    fn repair_ignores_delimiters_in_strings_and_comments() {
+        // The `)` in the string and the `)` in the `#` comment must NOT be
+        // counted — only the real unclosed `(` on the last line is, so
+        // exactly one `)` is appended (and lands in code, not a comment).
+        let path = PathBuf::from("/tmp/x.janet");
+        let src = "(def s \"a ) b\")\n# comment )\n(+ 1 2";
+        let (repaired, note) = repair_delimiters(&path, src).expect("string/comment-aware repair");
+        assert_eq!(repaired, "(def s \"a ) b\")\n# comment )\n(+ 1 2)");
+        assert!(check_syntax(&path, &repaired).is_ok());
+        assert!(note.contains("auto-closed 1"), "{note}");
+    }
+
+    #[test]
+    fn repair_declines_when_closer_would_land_in_a_comment() {
+        // If the content ends inside a line comment, appending the closer at
+        // EOF would bury it in the comment and not actually balance — the
+        // re-validation gate must catch that and decline rather than emit
+        // still-broken text.
+        let path = PathBuf::from("/tmp/x.janet");
+        assert!(repair_delimiters(&path, "(+ 1 2 # oops").is_none());
+    }
+
+    #[test]
+    fn repair_refuses_stray_closer() {
+        // A stray/mismatched closer is NOT a truncation — appending can't
+        // fix a misplaced closer, so repair declines and the model gets the
+        // precise summary instead.
+        let path = PathBuf::from("/tmp/x.janet");
+        assert!(repair_delimiters(&path, "(+ 1 2))").is_none());
+    }
+
+    #[test]
+    fn repair_unavailable_without_lex_rules() {
+        // No comment/string-aware rules → we can't trust the delimiter count,
+        // so no repair (keeps the current reject behavior).
+        let path = PathBuf::from("/tmp/x.thisisntreal");
+        assert!(repair_delimiters(&path, "(((").is_none());
+    }
+
+    #[cfg(feature = "semantic-rust")]
+    #[test]
+    fn repair_closes_truncated_rust_and_validates() {
+        let path = PathBuf::from("/tmp/x.rs");
+        let (repaired, note) = repair_delimiters(&path, "fn main() {\n    let x = 1;\n")
+            .expect("truncated rust block is repairable");
+        assert_eq!(repaired, "fn main() {\n    let x = 1;\n}");
+        assert!(check_syntax(&path, &repaired).is_ok());
+        assert!(note.contains("auto-closed 1"), "{note}");
+    }
+
+    #[cfg(feature = "semantic-rust")]
+    #[test]
+    fn repair_declines_when_close_does_not_validate() {
+        // Balancing the delimiters of `fn main( {` yields `fn main( {})`,
+        // which tree-sitter still rejects (a block can't sit in a param
+        // list). The re-validation gate must catch that and decline, so a
+        // nonsense close never lands — the model gets the summary instead.
+        let path = PathBuf::from("/tmp/x.rs");
+        assert!(
+            repair_delimiters(&path, "fn main( {").is_none(),
+            "a close that doesn't actually parse must be refused"
+        );
+    }
+
+    #[cfg(feature = "semantic-rust")]
+    #[test]
+    fn validate_or_repair_paths() {
+        let path = PathBuf::from("/tmp/x.rs");
+        assert!(matches!(
+            validate_or_repair(&path, "fn main() {}\n"),
+            SyntaxOutcome::Clean
+        ));
+        assert!(matches!(
+            validate_or_repair(&path, "fn main() {\n  let x = 1;\n"),
+            SyntaxOutcome::Repaired { .. }
+        ));
+        // Stray closer → unrepairable → rejected with the summary.
+        match validate_or_repair(&path, "fn main() {}}\n") {
+            SyntaxOutcome::Rejected { message } => {
+                assert!(message.contains("Syntax check failed"), "{message}")
+            }
+            _ => panic!("stray closer must be rejected, not repaired"),
+        }
     }
 
     #[cfg(feature = "semantic-rust")]

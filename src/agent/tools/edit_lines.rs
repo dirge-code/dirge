@@ -231,7 +231,8 @@ impl Tool for EditLinesTool {
 
         // Re-apply CRLF if the file used it, so we don't silently
         // rewrite line endings.
-        let output = if has_crlf {
+        #[allow(unused_mut)]
+        let mut output = if has_crlf {
             new_content.replace('\n', "\r\n")
         } else {
             new_content
@@ -239,19 +240,23 @@ impl Tool for EditLinesTool {
 
         // Tree-sitter pre-write validation: refuse syntactically
         // broken results so the model sees the error this turn.
+        // dirge-p5fu: a purely unclosed-delimiter imbalance is
+        // mechanically closed (parity with the JSON truncation repair)
+        // and reported, rather than bounced back to the model.
         #[cfg(feature = "semantic")]
-        if let Err(errors) = crate::semantic::syntax_validator::check_syntax(
-            std::path::Path::new(&resolved_path),
-            &output,
-        ) {
-            return Err(ToolError::Msg(
-                crate::semantic::syntax_validator::format_errors(
-                    std::path::Path::new(&resolved_path),
-                    &output,
-                    &errors,
-                ),
-            ));
-        }
+        let syntax_note: Option<String> = {
+            use crate::semantic::syntax_validator::{SyntaxOutcome, validate_or_repair};
+            match validate_or_repair(std::path::Path::new(&resolved_path), &output) {
+                SyntaxOutcome::Clean => None,
+                SyntaxOutcome::Repaired { content, note } => {
+                    output = content;
+                    Some(note)
+                }
+                SyntaxOutcome::Rejected { message } => return Err(ToolError::Msg(message)),
+            }
+        };
+        #[cfg(not(feature = "semantic"))]
+        let syntax_note: Option<String> = None;
 
         // Snapshot pre-edit content for /rewind before mutating, reusing
         // the bytes already read above instead of re-reading from disk.
@@ -273,13 +278,17 @@ impl Tool for EditLinesTool {
                 .split('\n')
                 .count()
         };
-        Ok(format!(
+        let mut msg = format!(
             "Replaced lines {}-{} ({} line(s) → {} line(s)).",
             args.start_line,
             args.end_line,
             args.end_line - args.start_line + 1,
             new_span,
-        ))
+        );
+        if let Some(note) = syntax_note {
+            msg.push_str(&format!("\n[auto-repair] {note}"));
+        }
+        Ok(msg)
     }
 }
 

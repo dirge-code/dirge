@@ -91,19 +91,33 @@ async fn apply_create(path: &str, content: &str) -> Result<String, String> {
         ));
     }
     // Phase-2 tree-sitter validation: refuse to create
-    // syntactically-broken files. See docs/AGENTIC_LOOP_PLAN.md §2.
+    // syntactically-broken files. dirge-p5fu: a purely unclosed-delimiter
+    // imbalance is mechanically closed (parity with the JSON truncation
+    // repair) and reported, rather than rejected. See AGENTIC_LOOP_PLAN §2.
     #[cfg(feature = "semantic")]
-    if let Err(errors) = crate::semantic::syntax_validator::check_syntax(p, content) {
-        return Err(crate::semantic::syntax_validator::format_errors(
-            p, content, &errors,
-        ));
-    }
+    let (content, syntax_note): (std::borrow::Cow<'_, str>, Option<String>) = {
+        use crate::semantic::syntax_validator::{SyntaxOutcome, validate_or_repair};
+        match validate_or_repair(p, content) {
+            SyntaxOutcome::Clean => (std::borrow::Cow::Borrowed(content), None),
+            SyntaxOutcome::Repaired { content: c, note } => {
+                (std::borrow::Cow::Owned(c), Some(note))
+            }
+            SyntaxOutcome::Rejected { message } => return Err(message),
+        }
+    };
+    #[cfg(not(feature = "semantic"))]
+    let (content, syntax_note): (std::borrow::Cow<'_, str>, Option<String>) =
+        (std::borrow::Cow::Borrowed(content), None);
     // Snapshot pre-state (absent) for /rewind so restore deletes it.
     crate::agent::tools::snapshots::capture(p);
     crate::fs_atomic::atomic_write(p, content.as_bytes())
         .await
         .map_err(|e| format!("write failed: {}", e))?;
-    Ok(format!("created {}", path))
+    let mut msg = format!("created {}", path);
+    if let Some(note) = syntax_note {
+        msg.push_str(&format!(" [auto-repair] {note}"));
+    }
+    Ok(msg)
 }
 
 async fn apply_update(path: &str, old_text: &str, new_text: &str) -> Result<String, String> {
@@ -157,30 +171,41 @@ async fn apply_update(path: &str, old_text: &str, new_text: &str) -> Result<Stri
     let updated_normalized = normalized.replacen(&needle, &replacement, 1);
     // Restore CRLF line endings on write-back so we don't silently
     // re-format the user's file.
-    let to_write = if crlf {
+    #[allow(unused_mut)]
+    let mut to_write = if crlf {
         updated_normalized.replace('\n', "\r\n")
     } else {
         updated_normalized
     };
-    // Phase-2 tree-sitter validation on the updated content
-    // before write. See docs/AGENTIC_LOOP_PLAN.md §2.
+    // Phase-2 tree-sitter validation on the updated content before write.
+    // dirge-p5fu: a purely unclosed-delimiter imbalance is mechanically
+    // closed (parity with the JSON truncation repair) and reported, rather
+    // than rejected. See docs/AGENTIC_LOOP_PLAN.md §2.
     #[cfg(feature = "semantic")]
-    if let Err(errors) =
-        crate::semantic::syntax_validator::check_syntax(std::path::Path::new(path), &to_write)
-    {
-        return Err(crate::semantic::syntax_validator::format_errors(
-            std::path::Path::new(path),
-            &to_write,
-            &errors,
-        ));
-    }
+    let syntax_note: Option<String> = {
+        use crate::semantic::syntax_validator::{SyntaxOutcome, validate_or_repair};
+        match validate_or_repair(std::path::Path::new(path), &to_write) {
+            SyntaxOutcome::Clean => None,
+            SyntaxOutcome::Repaired { content, note } => {
+                to_write = content;
+                Some(note)
+            }
+            SyntaxOutcome::Rejected { message } => return Err(message),
+        }
+    };
+    #[cfg(not(feature = "semantic"))]
+    let syntax_note: Option<String> = None;
     // Snapshot pre-update content for /rewind, reusing the bytes we
     // already read into `original` rather than re-reading from disk.
     crate::agent::tools::snapshots::capture_bytes(std::path::Path::new(path), original.as_bytes());
     crate::fs_atomic::atomic_write(std::path::Path::new(path), to_write.as_bytes())
         .await
         .map_err(|e| format!("write failed: {}", e))?;
-    Ok(format!("updated {}", path))
+    let mut msg = format!("updated {}", path);
+    if let Some(note) = syntax_note {
+        msg.push_str(&format!(" [auto-repair] {note}"));
+    }
+    Ok(msg)
 }
 
 async fn apply_delete(path: &str) -> Result<String, String> {

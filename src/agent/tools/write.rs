@@ -106,25 +106,41 @@ impl Tool for WriteTool {
         let path = Path::new(&resolved_path);
         // Phase-2 tree-sitter validation: refuse to write
         // syntactically-broken code so the model sees the error
-        // in the SAME turn and self-corrects. No-op for unknown
-        // file types or when no `semantic-<lang>` feature is
+        // in the SAME turn and self-corrects. dirge-p5fu: a purely
+        // unclosed-delimiter imbalance is mechanically closed (parity
+        // with the JSON truncation repair) instead of bounced back —
+        // the fix is reported on the result so it's never silent. No-op
+        // for unknown file types or when no `semantic-<lang>` feature is
         // built. See docs/AGENTIC_LOOP_PLAN.md §2.
-        #[cfg(feature = "semantic")]
-        if let Err(errors) = crate::semantic::syntax_validator::check_syntax(path, &args.content) {
-            return Err(ToolError::Msg(
-                crate::semantic::syntax_validator::format_errors(path, &args.content, &errors),
-            ));
-        }
+        let (content, syntax_note): (std::borrow::Cow<'_, str>, Option<String>) = {
+            #[cfg(feature = "semantic")]
+            {
+                use crate::semantic::syntax_validator::{SyntaxOutcome, validate_or_repair};
+                match validate_or_repair(path, &args.content) {
+                    SyntaxOutcome::Clean => {
+                        (std::borrow::Cow::Borrowed(args.content.as_str()), None)
+                    }
+                    SyntaxOutcome::Repaired { content, note } => {
+                        (std::borrow::Cow::Owned(content), Some(note))
+                    }
+                    SyntaxOutcome::Rejected { message } => return Err(ToolError::Msg(message)),
+                }
+            }
+            #[cfg(not(feature = "semantic"))]
+            {
+                (std::borrow::Cow::Borrowed(args.content.as_str()), None)
+            }
+        };
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        let bytes = args.content.len();
+        let bytes = content.len();
         // Line count is useful for the LLM to confirm what it wrote
         // landed; cheap to compute on the in-memory string before
         // the write. `lines()` doesn't count a trailing empty line
         // (so "a\nb\n" is 2 lines, not 3) which matches read's
         // counting convention.
-        let line_count = args.content.lines().count();
+        let line_count = content.lines().count();
         let was_creation = !path.exists();
         #[cfg(feature = "lsp")]
         let write_at = Instant::now();
@@ -135,7 +151,7 @@ impl Tool for WriteTool {
         // half-write. `tokio::fs::write` opens with O_TRUNC and
         // writes in-place — a corruption vector on power loss /
         // OOM-kill / SIGKILL.
-        crate::fs_atomic::atomic_write(path, args.content.as_bytes()).await?;
+        crate::fs_atomic::atomic_write(path, content.as_bytes()).await?;
         crate::agent::tools::modified::mark_modified(path);
         // File mutated → invalidate cached reads/greps/listings for this turn.
         // A wholesale write means the model now knows the on-disk content, so
@@ -155,6 +171,9 @@ impl Tool for WriteTool {
         let verb = if was_creation { "Created" } else { "Wrote" };
         #[allow(unused_mut)]
         let mut output = format!("{} {} bytes ({} lines)", verb, bytes, line_count);
+        if let Some(note) = syntax_note {
+            output.push_str(&format!("\n[auto-repair] {note}"));
+        }
         #[cfg(feature = "lsp")]
         output.push_str(&append_lsp_block(self.lsp_manager.as_ref(), path, write_at).await);
         Ok(output)
@@ -266,6 +285,37 @@ mod tests {
             "expected `Created`/`Wrote 2 bytes` prefix; got: {out}",
         );
         assert!(!out.contains("LSP errors"), "got: {out}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// dirge-p5fu: a write whose content has a purely unclosed-delimiter
+    /// imbalance (e.g. a truncated form) is mechanically closed and the
+    /// BALANCED content lands on disk, with the fix reported — instead of
+    /// the write being rejected and bounced back to the model.
+    #[cfg(feature = "semantic")]
+    #[tokio::test]
+    async fn auto_repairs_truncated_delimiters_on_write() {
+        let dir = std::env::temp_dir().join(format!("dirge-write-repair-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = tempfile_in(&dir, "trunc.janet");
+
+        let tool = WriteTool::with_cache(None, None, ToolCache::new(), None);
+        let out = tool
+            .call(WriteArgs {
+                path: path.to_string_lossy().into_owned(),
+                content: "(defn f [x]\n  (+ x 1".into(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            out.contains("[auto-repair]"),
+            "the result must report the repair: {out}"
+        );
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            on_disk, "(defn f [x]\n  (+ x 1))",
+            "the balanced (repaired) content must be what got written"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

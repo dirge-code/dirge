@@ -321,7 +321,8 @@ impl Tool for EditTool {
             None => String::new(),
         };
 
-        let output = if has_crlf {
+        #[allow(unused_mut)]
+        let mut output = if has_crlf {
             new_content.replace('\n', "\r\n")
         } else {
             new_content
@@ -329,20 +330,24 @@ impl Tool for EditTool {
 
         // Phase-2 tree-sitter validation: refuse to write
         // syntactically-broken edits so the model sees the error
-        // in the same turn. See docs/AGENTIC_LOOP_PLAN.md §2.
+        // in the same turn. dirge-p5fu: a purely unclosed-delimiter
+        // imbalance is mechanically closed (parity with the JSON
+        // truncation repair) and reported, rather than bounced back.
+        // See docs/AGENTIC_LOOP_PLAN.md §2.
         #[cfg(feature = "semantic")]
-        if let Err(errors) = crate::semantic::syntax_validator::check_syntax(
-            std::path::Path::new(&resolved_path),
-            &output,
-        ) {
-            return Err(ToolError::Msg(
-                crate::semantic::syntax_validator::format_errors(
-                    std::path::Path::new(&resolved_path),
-                    &output,
-                    &errors,
-                ),
-            ));
-        }
+        let syntax_note: Option<String> = {
+            use crate::semantic::syntax_validator::{SyntaxOutcome, validate_or_repair};
+            match validate_or_repair(std::path::Path::new(&resolved_path), &output) {
+                SyntaxOutcome::Clean => None,
+                SyntaxOutcome::Repaired { content, note } => {
+                    output = content;
+                    Some(note)
+                }
+                SyntaxOutcome::Rejected { message } => return Err(ToolError::Msg(message)),
+            }
+        };
+        #[cfg(not(feature = "semantic"))]
+        let syntax_note: Option<String> = None;
         #[cfg(feature = "lsp")]
         let write_at = std::time::Instant::now();
         // Snapshot pre-edit content for /rewind before mutating. Reuse
@@ -374,6 +379,9 @@ impl Tool for EditTool {
         } else {
             format!("Applied edit{}", fallback_note)
         };
+        if let Some(note) = syntax_note {
+            result.push_str(&format!("\n[auto-repair] {note}"));
+        }
         // Mention the line delta when adding/removing lines so the
         // LLM can confirm the size of change without re-reading
         // the diff block. For replace_all the per-replacement
