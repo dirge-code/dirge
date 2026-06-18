@@ -132,6 +132,39 @@ fn flush_acc(acc: &str, color: Color, max_width: usize, out: &mut Vec<LineEntry>
     }
 }
 
+/// Render a blockquote paragraph's accumulated text with a `│ ` chamber bar on
+/// EVERY wrapped line (continuation rows keep the bar). Content is wrapped
+/// first, then prefixed, so a long quoted line splits at word boundaries with
+/// the bar carried onto each chunk. Empty lines render as a bare blank.
+///
+/// This runs at paragraph-end (the blockquote's text lives in a paragraph, so
+/// `TagEnd::Paragraph` is where `acc` is non-empty) — previously the bar code
+/// sat in `TagEnd::BlockQuote`, which fires AFTER the paragraph already flushed
+/// `acc`, so it was dead and blockquotes rendered as bar-less dim prose.
+fn flush_blockquote(acc: &str, max_width: usize, out: &mut Vec<LineEntry>) {
+    if acc.is_empty() {
+        return;
+    }
+    let dim = crate::ui::theme::dim();
+    let inner_w = max_width.saturating_sub(2);
+    for line in acc.split('\n') {
+        let trimmed = line.trim_end_matches('\r');
+        if trimmed.is_empty() {
+            out.push(LineEntry {
+                text: CompactString::new(""),
+                color: dim,
+            });
+        } else {
+            for chunk in word_wrap(trimmed, inner_w) {
+                out.push(LineEntry {
+                    text: CompactString::from(format!("│ {}", chunk)),
+                    color: dim,
+                });
+            }
+        }
+    }
+}
+
 fn bullet_prefix(in_blockquote: bool) -> &'static str {
     if in_blockquote { "  ┊ " } else { "  • " }
 }
@@ -342,7 +375,20 @@ pub fn markdown_to_styled(text: &str, max_width: usize, base_color: Color) -> Ve
     for event in parser {
         match event {
             Event::Start(tag) => match tag {
-                Tag::Paragraph => {}
+                Tag::Paragraph => {
+                    // A blank `>` line between two quoted paragraphs: render a
+                    // bare blank between them so they read as separate blocks.
+                    if in_blockquote
+                        && result
+                            .last()
+                            .is_some_and(|e: &LineEntry| e.text.starts_with('│'))
+                    {
+                        result.push(LineEntry {
+                            text: CompactString::new(""),
+                            color: crate::ui::theme::dim(),
+                        });
+                    }
+                }
                 Tag::Heading { level, .. } => {
                     flush_acc(&acc, base_color, max_width, &mut result);
                     acc.clear();
@@ -426,12 +472,11 @@ pub fn markdown_to_styled(text: &str, max_width: usize, base_color: Color) -> Ve
             },
             Event::End(tag_end) => match tag_end {
                 TagEnd::Paragraph => {
-                    let color = if in_blockquote {
-                        crate::ui::theme::dim()
+                    if in_blockquote {
+                        flush_blockquote(&acc, max_width, &mut result);
                     } else {
-                        base_color
-                    };
-                    flush_acc(&acc, color, max_width, &mut result);
+                        flush_acc(&acc, base_color, max_width, &mut result);
+                    }
                     acc.clear();
                 }
                 TagEnd::Heading(_) => {
@@ -498,31 +543,11 @@ pub fn markdown_to_styled(text: &str, max_width: usize, base_color: Color) -> Ve
                     });
                 }
                 TagEnd::BlockQuote(_) => {
-                    let mut quoted = Vec::new();
-                    // Wrap the content first (without the prefix) so
-                    // long blockquote lines split at word boundaries,
-                    // then prepend `│ ` to *every* resulting chunk so
-                    // continuation rows keep the chamber bar. The old
-                    // code prefixed once then wrapped, dropping the
-                    // bar from wrapped continuations.
-                    let inner_w = max_width.saturating_sub(2);
-                    for line in acc.split('\n') {
-                        let trimmed = line.trim_end_matches('\r');
-                        if trimmed.is_empty() {
-                            quoted.push(LineEntry {
-                                text: CompactString::new(""),
-                                color: crate::ui::theme::dim(),
-                            });
-                        } else {
-                            for chunk in word_wrap(trimmed, inner_w) {
-                                quoted.push(LineEntry {
-                                    text: CompactString::from(format!("│ {}", chunk)),
-                                    color: crate::ui::theme::dim(),
-                                });
-                            }
-                        }
-                    }
-                    result.extend(quoted);
+                    // Paragraphs inside the quote already rendered with the bar
+                    // at `TagEnd::Paragraph`; this flushes any straggler content
+                    // not wrapped in a paragraph (defensive — normally `acc` is
+                    // empty here) and closes the block with a blank line.
+                    flush_blockquote(&acc, max_width, &mut result);
                     acc.clear();
                     in_blockquote = false;
                     result.push(LineEntry {
@@ -711,16 +736,19 @@ pub fn markdown_to_styled(text: &str, max_width: usize, base_color: Color) -> Ve
     }
 
     if !acc.is_empty() {
-        let color = if in_blockquote {
-            crate::ui::theme::dim()
-        } else if in_code_block {
-            crate::ui::theme::tool()
-        } else if in_heading {
-            crate::ui::theme::header()
+        if in_blockquote {
+            // Unterminated quote (pulldown normally closes it, but be safe).
+            flush_blockquote(&acc, max_width, &mut result);
         } else {
-            base_color
-        };
-        flush_acc(&acc, color, max_width, &mut result);
+            let color = if in_code_block {
+                crate::ui::theme::tool()
+            } else if in_heading {
+                crate::ui::theme::header()
+            } else {
+                base_color
+            };
+            flush_acc(&acc, color, max_width, &mut result);
+        }
     }
 
     result
@@ -730,6 +758,74 @@ pub fn markdown_to_styled(text: &str, max_width: usize, base_color: Color) -> Ve
 mod tests {
     use super::*;
     use unicode_width::UnicodeWidthStr;
+
+    fn texts(rows: &[LineEntry]) -> Vec<String> {
+        rows.iter().map(|r| r.text.as_str().to_string()).collect()
+    }
+
+    /// A multi-line blockquote renders EVERY line (not just the first), each
+    /// carrying the `│ ` chamber bar. Guards both the never-reproduced
+    /// "blockquote cuts off after the first line" report and the actual bug
+    /// found: the bar was dead code (rendered after the paragraph flushed).
+    #[test]
+    fn multiline_blockquote_keeps_all_lines_with_bar() {
+        let input = "> First sentence here.\n> Second sentence here.\n> Third sentence here.";
+        let rendered = markdown_to_styled(input, 80, crate::ui::theme::agent());
+        let bar_lines: Vec<String> = texts(&rendered)
+            .into_iter()
+            .filter(|t| t.starts_with('│'))
+            .collect();
+        assert_eq!(
+            bar_lines.len(),
+            3,
+            "all three quote lines present: {bar_lines:?}"
+        );
+        assert!(bar_lines[0].contains("First sentence here."));
+        assert!(bar_lines[1].contains("Second sentence here."));
+        assert!(bar_lines[2].contains("Third sentence here."));
+    }
+
+    /// A long single-line blockquote wraps at word boundaries and the bar rides
+    /// onto every continuation row (no bar-less wrapped tail).
+    #[test]
+    fn long_blockquote_wraps_with_bar_on_every_row() {
+        let long = "> ".to_string()
+            + "Detail-oriented full-stack developer with experience building and \
+               deploying web applications from concept to launch.";
+        let rendered = markdown_to_styled(&long, 40, crate::ui::theme::agent());
+        let bar_lines: Vec<String> = texts(&rendered)
+            .into_iter()
+            .filter(|t| t.starts_with('│'))
+            .collect();
+        assert!(
+            bar_lines.len() >= 2,
+            "long quote wrapped to multiple rows: {bar_lines:?}"
+        );
+        for l in &bar_lines {
+            assert!(
+                l.starts_with("│ "),
+                "every wrapped row keeps the bar: {l:?}"
+            );
+        }
+    }
+
+    /// Two quoted paragraphs (blank `>` line between) render with a bare blank
+    /// separator, both carrying the bar.
+    #[test]
+    fn multi_paragraph_blockquote_separates_paragraphs() {
+        let input = "> Para one.\n>\n> Para two.";
+        let rendered = markdown_to_styled(input, 80, crate::ui::theme::agent());
+        let t = texts(&rendered);
+        let bars: Vec<&String> = t.iter().filter(|x| x.starts_with('│')).collect();
+        assert_eq!(bars.len(), 2, "both paragraphs render with a bar: {t:?}");
+        // A bare blank line sits between the two quoted paragraphs.
+        let p1 = t.iter().position(|x| x.contains("Para one.")).unwrap();
+        let p2 = t.iter().position(|x| x.contains("Para two.")).unwrap();
+        assert!(
+            t[p1 + 1..p2].iter().any(|x| x.is_empty()),
+            "blank separator between quoted paragraphs: {t:?}",
+        );
+    }
 
     /// Each rendered row must occupy the same number of terminal
     /// cells so the right border `│` lines up vertically.
