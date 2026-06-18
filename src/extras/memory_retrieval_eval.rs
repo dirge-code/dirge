@@ -270,3 +270,109 @@ fn target_for<'a>(corpus: &'a [MemoryProbe], query: &str) -> &'a str {
         // turn a corpus typo into a never-matching phantom "hit".
         .unwrap_or_else(|| panic!("query {query:?} is not registered in the corpus"))
 }
+
+// ── Hybrid retriever, measured by the SAME scorer (dirge-4hld) ────────
+
+/// A deterministic stand-in for a real embedding model, scoped to THIS corpus:
+/// each entry's distinguishing terms and each paraphrase query's synonyms map
+/// to a shared concept dimension, so a query lands near its target without any
+/// lexical overlap. Generic/shared tokens (`cargo`, `rust`, `agent`, `search`,
+/// `file`) are deliberately unmapped so entries don't bleed into each other.
+/// It plays the role `compaction_recall`'s faithful mock summarizer does — the
+/// real semantic quality is for an off-CI run with a real embedder; this proves
+/// the FUSION recovers paraphrases when the embedder has signal.
+struct ConceptEmbedder;
+
+impl ConceptEmbedder {
+    fn concept(word: &str) -> Option<usize> {
+        Some(match word.to_lowercase().as_str() {
+            "build" | "compile" | "executable" => 0,
+            "test" | "tests" | "suite" | "unit" | "checks" => 1,
+            "msrv" | "toolchain" | "minimum" | "supported" | "language" | "baseline" => 2,
+            "format" | "fmt" | "tidy" | "whitespace" | "indentation" => 3,
+            "memory" | "persists" | "sqlite" | "recollections" | "saved" => 4,
+            "loop" | "control" | "cycle" | "primary" => 5,
+            "secrets" | "redacted" | "credentials" | "scrubbed" => 6,
+            "beads" | "issue" | "tracking" | "ticket" => 7,
+            _ => return None,
+        })
+    }
+}
+
+impl crate::extras::memory_hybrid::Embedder for ConceptEmbedder {
+    fn embed(&self, texts: &[String]) -> Vec<Option<Vec<f32>>> {
+        texts
+            .iter()
+            .map(|t| {
+                let mut v = vec![0.0f32; 8];
+                let mut any = false;
+                for word in t.split(|c: char| !c.is_alphanumeric()) {
+                    if let Some(d) = Self::concept(word) {
+                        v[d] += 1.0;
+                        any = true;
+                    }
+                }
+                any.then_some(v)
+            })
+            .collect()
+    }
+}
+
+fn provider_ranked_contents(
+    provider: &dyn crate::extras::memory_provider::MemoryProvider,
+    query: &str,
+) -> Vec<String> {
+    let resp = provider.search(query).unwrap();
+    resp["results"]
+        .as_array()
+        .map(|rs| {
+            rs.iter()
+                .filter_map(|r| r["content"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The headline result of dirge-4hld measured on the SAME corpus + scorer as
+/// the BM25 baseline: hybrid (dense fused with BM25) recovers the paraphrase
+/// queries that pure BM25 structurally misses, so its semantic Recall@5 beats
+/// BM25's. This is the "number hybrid has to beat" actually being beaten —
+/// driven by a deterministic embedder so it runs in CI.
+#[test]
+fn hybrid_beats_bm25_on_the_paraphrase_corpus() {
+    use std::sync::Arc;
+    let corpus = seed_corpus();
+    let (paths, dir) = temp_project();
+    let store = Arc::new(SqliteMemoryStore::load(&paths).unwrap());
+    for p in &corpus {
+        store.add_entry("memory", p.content, Some(p.kind)).unwrap();
+    }
+
+    let semantic = pairs(&corpus, true);
+    // BM25 baseline over the paraphrase queries — structurally ~0 (no shared
+    // tokens, implicit AND).
+    let bm25 = recall_at_k(|q| ranked_contents(&store, q), &semantic, 5);
+
+    // Same corpus, same scorer, hybrid retriever with the concept embedder.
+    let hybrid = crate::extras::memory_hybrid::HybridMemoryProvider::new(
+        store.clone(),
+        Arc::new(ConceptEmbedder),
+    );
+    let hybrid_report = recall_at_k(|q| provider_ranked_contents(&hybrid, q), &semantic, 5);
+
+    assert!(
+        hybrid_report.recall() > bm25.recall(),
+        "hybrid paraphrase Recall@5 ({:.2}) must beat BM25 ({:.2}); hybrid misses: {:?}",
+        hybrid_report.recall(),
+        bm25.recall(),
+        hybrid_report.misses,
+    );
+    // With a clean concept signal the fusion should recover essentially all of
+    // them — guard against a fusion regression that only partially helps.
+    assert!(
+        hybrid_report.recall() >= 0.85,
+        "hybrid should recover the paraphrases given embedder signal: {:.2}",
+        hybrid_report.recall(),
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

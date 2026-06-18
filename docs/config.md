@@ -134,6 +134,12 @@ errors. Embeddings are computed at search time (the first search of a session
 embeds all active entries; later searches only embed the query) and cached for
 the session.
 
+Cost note: enabling `hybrid_retrieval` **and** `verbatim_pre_recall` together
+means roughly one embeddings API call per agent turn (pre-recall searches the
+verbatim message every turn, and with hybrid each search embeds the query). On
+a paid endpoint that adds up over a long session; on a local endpoint it's just
+latency.
+
 ## Providers and roles
 
 Providers are declared once in the `providers` map and referenced by alias from

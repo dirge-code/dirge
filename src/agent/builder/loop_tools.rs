@@ -205,7 +205,15 @@ fn resolve_embedder(
     if cfg.hybrid_retrieval != Some(true) {
         return None;
     }
-    let url = cfg.embed_url.clone()?;
+    let Some(url) = cfg.embed_url.clone() else {
+        // The most common misconfiguration: hybrid on, but no endpoint. Warn
+        // instead of silently staying BM25 with no feedback (dirge-4hld).
+        tracing::warn!(
+            target: "dirge::memory_hybrid",
+            "memory.hybrid_retrieval is on but memory.embed_url is unset — staying BM25-only",
+        );
+        return None;
+    };
     let model = cfg
         .embed_model
         .clone()

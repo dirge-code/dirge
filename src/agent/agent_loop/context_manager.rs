@@ -381,12 +381,16 @@ const PRE_RECALL_LIMIT: usize = 5;
 /// Format a memory `search` response into the supplemental pre-recall context
 /// block, or `None` when nothing new matched (so the loop injects nothing on a
 /// miss). `snapshot` is the frozen `<project_memory>` block already in the
-/// system prompt: entries whose content already appears there are dropped, so
-/// pre-recall surfaces only what the agent CAN'T already see (the breadcrumb /
-/// non-hot tier) — no double-injection, and the "you did not search for these"
-/// framing stays true. Blanks are filtered before the cap so dead rows can't
-/// crowd out real hits. The block is labeled auto-surfaced and advisory so the
-/// model treats it as a hint, not a user instruction.
+/// system prompt; a hit is dropped when its full content is a substring of the
+/// snapshot. That reliably de-dups HOT-tier entries (the snapshot inlines their
+/// full text). A BREADCRUMB-tier entry the snapshot lists only as a truncated
+/// preview won't match, so it can still surface here — which is the point:
+/// pre-recall exists to put the full breadcrumb in front of the agent. So the
+/// "you did not search for these" framing holds for the common case (the model
+/// can't already read these in full); it's not a guarantee that no preview of a
+/// hit appears anywhere in the snapshot. Blanks are filtered before the cap so
+/// dead rows can't crowd out real hits. The block is labeled auto-surfaced and
+/// advisory so the model treats it as a hint, not a user instruction.
 pub fn pre_recall_block(search_resp: &serde_json::Value, snapshot: &str) -> Option<String> {
     let results = search_resp["results"].as_array()?;
     let lines: Vec<String> = results
