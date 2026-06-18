@@ -1616,16 +1616,20 @@ impl SqliteMemoryStore {
     /// the curator's mechanical pass so decay accrues per curation
     /// cycle, not per session. Returns how many entries decayed.
     ///
-    /// dirge-zygq: a `procedural` entry with a recorded track record
-    /// (any success/failure) is EXEMPT. Such a playbook ranks on its
-    /// proven effectiveness ([`effectiveness_bonus`]), not on recency
-    /// of use — decaying it by disuse would reward "recently tried"
-    /// over "recently effective", the failure mode the Elastic
-    /// agent-memory work calls out for procedural memory. The exemption
-    /// is deliberately scoped to PROVEN playbooks: `procedural` is the
-    /// default kind, so an unvalidated procedural entry (no outcomes
-    /// yet) still decays like any other stale, unconsulted fact — it
-    /// only escapes decay once it has effectiveness data to rank on.
+    /// dirge-zygq/dirge-j92d: a `procedural` entry that has been
+    /// RECENTLY EFFECTIVE is EXEMPT — it has a `last_success_at` within
+    /// the same cutoff window. Such a playbook ranks on proven
+    /// effectiveness ([`effectiveness_bonus`]), not recency of use, and
+    /// decaying it by disuse would reward "recently tried" over
+    /// "recently effective" (the failure mode the Elastic agent-memory
+    /// work calls out). The exemption keys on `last_success_at`, not the
+    /// mere presence of outcomes, so it stays scoped to playbooks that
+    /// are STILL working: a procedural whose only successes are older
+    /// than the window, one that has only ever failed, and an
+    /// unvalidated procedural (no outcomes — `procedural` is the default
+    /// kind) all decay like any other stale, unconsulted entry. This is
+    /// what makes `last_success_at` a live signal rather than a
+    /// write-only column.
     pub fn apply_disuse_decay(&self, cutoff_days: i64) -> Result<usize, String> {
         let cutoff = (chrono::Utc::now() - chrono::Duration::days(cutoff_days)).to_rfc3339();
         let conn = self.conn.lock_ignore_poison();
@@ -1634,7 +1638,9 @@ impl SqliteMemoryStore {
                 "UPDATE memories
                  SET salience = MAX(?1, salience - ?2)
                  WHERE status = 'active'
-                   AND NOT (kind = 'procedural' AND (success_count + failure_count) > 0)
+                   AND NOT (kind = 'procedural'
+                            AND last_success_at IS NOT NULL
+                            AND last_success_at >= ?3)
                    AND created_at < ?3
                    AND (last_used_at IS NULL OR last_used_at < ?3)
                    AND salience > ?1",
@@ -3521,6 +3527,65 @@ mod tests {
             sal("old fact") < 0.6,
             "semantic still decays: {}",
             sal("old fact")
+        );
+    }
+
+    /// dirge-j92d: the exemption is "recently effective", not "ever had an
+    /// outcome". A procedural whose last success is older than the window
+    /// decays, and one that has only ever failed decays — only a recently
+    /// successful playbook is spared, which is what makes `last_success_at` a
+    /// live signal.
+    #[test]
+    fn disuse_decay_exempts_only_recently_effective_procedural() {
+        let (paths, _dir) = temp_project();
+        let store = SqliteMemoryStore::load(&paths).unwrap();
+        for c in ["recent win", "stale win", "only fails"] {
+            store
+                .add_entry("memory", c, Some(MemoryKind::Procedural))
+                .unwrap();
+        }
+        store.record_outcome("memory", "recent win", true).unwrap();
+        store.record_outcome("memory", "stale win", true).unwrap();
+        store.record_outcome("memory", "only fails", false).unwrap();
+
+        // Age every entry past the decay window; backdate "stale win"'s success
+        // beyond the window so it's no longer recently effective.
+        let conn = raw_conn(&paths);
+        let old = (chrono::Utc::now() - chrono::Duration::days(90)).to_rfc3339();
+        conn.execute(
+            "UPDATE memories SET created_at = ?1 WHERE content IN ('recent win', 'stale win', 'only fails')",
+            rusqlite::params![old],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE memories SET last_success_at = ?1 WHERE content = 'stale win'",
+            rusqlite::params![old],
+        )
+        .unwrap();
+        drop(conn);
+
+        let decayed = store.apply_disuse_decay(30).unwrap();
+        assert_eq!(decayed, 2, "stale-win and only-fails decay; recent-win exempt");
+
+        let conn = raw_conn(&paths);
+        let sal = |content: &str| -> f64 {
+            conn.query_row(
+                "SELECT salience FROM memories WHERE content = ?1",
+                rusqlite::params![content],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert!(
+            (sal("recent win") - 0.5).abs() < 1e-9,
+            "recently-effective playbook exempt: {}",
+            sal("recent win"),
+        );
+        assert!(sal("stale win") < 0.5, "stale success decays: {}", sal("stale win"));
+        assert!(
+            sal("only fails") < 0.5,
+            "failure-only playbook decays: {}",
+            sal("only fails"),
         );
     }
 
