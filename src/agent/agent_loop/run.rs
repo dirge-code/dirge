@@ -883,7 +883,7 @@ pub async fn run_agent_loop(
     // the prefix; a user message stays a plain transcript item on every path.
     if super::context_manager::verbatim_pre_recall_enabled()
         && let Some(provider) = &memory_provider
-        && !task_query.trim().is_empty()
+        && super::context_manager::query_worth_pre_recalling(&task_query)
     {
         let snapshot = provider.format_for_system_prompt();
         let q = task_query.clone();

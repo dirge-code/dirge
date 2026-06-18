@@ -378,6 +378,20 @@ pub fn verbatim_pre_recall_enabled() -> bool {
 /// Max entries surfaced in a pre-recall block — a handful of hints, not a dump.
 const PRE_RECALL_LIMIT: usize = 5;
 
+/// dirge-7xi2: a cheap triviality floor for pre-recall. Skip the whole search
+/// (and, with hybrid, an embedding round-trip) when the verbatim message has no
+/// substantial word — `false` for bare acks like "ok", "yes", "go on", "do it",
+/// `true` once any token is ≥ 4 chars ("fix the build", a real question). It's
+/// a QUERY-side floor on purpose: BM25 and hybrid score on different scales so a
+/// fixed relevance threshold doesn't generalize, and a token-OVERLAP floor would
+/// kill the paraphrase recall (zero shared tokens) that hybrid pre-recall exists
+/// to provide. This only suppresses no-real-query turns, not weak matches.
+pub fn query_worth_pre_recalling(query: &str) -> bool {
+    query
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|t| t.chars().count() >= 4)
+}
+
 /// Format a memory `search` response into the supplemental pre-recall context
 /// block, or `None` when nothing new matched (so the loop injects nothing on a
 /// miss). `snapshot` is the frozen `<project_memory>` block already in the
@@ -468,6 +482,24 @@ mod pre_recall_tests {
             block.contains("a breadcrumb fact not in the snapshot"),
             "non-snapshot entry surfaces: {block}",
         );
+    }
+
+    #[test]
+    fn query_worth_pre_recalling_floors_trivial_acks() {
+        // Bare acknowledgments / contentless turns → skip.
+        for trivial in ["", "  ", "ok", "yes", "go on", "do it", "k", "yep!"] {
+            assert!(
+                !query_worth_pre_recalling(trivial),
+                "should skip trivial query {trivial:?}",
+            );
+        }
+        // Anything with a substantial word → search.
+        for real in ["fix the build", "how do I cache the widget", "rollback"] {
+            assert!(
+                query_worth_pre_recalling(real),
+                "should pre-recall real query {real:?}",
+            );
+        }
     }
 
     #[test]
