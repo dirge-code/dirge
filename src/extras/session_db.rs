@@ -22,7 +22,7 @@ use regex::Regex;
 // Used in migrate() to set user_version pragma. pub(crate) so tests
 // assert against the constant instead of a hardcoded number that
 // breaks on every migration.
-pub(crate) const SCHEMA_VERSION: u32 = 12;
+pub(crate) const SCHEMA_VERSION: u32 = 13;
 
 /// Thread-safe snapshot of the most recent `SessionDb::open()` failure.
 /// Port of Hermes's `_last_init_error` (hermes_state.py:66-67).
@@ -311,6 +311,10 @@ impl SessionDb {
 
         if current < 12 {
             self.run_migration_v12()?;
+        }
+
+        if current < 13 {
+            self.run_migration_v13()?;
         }
 
         self.conn
@@ -868,6 +872,32 @@ impl SessionDb {
                 && !e.to_string().contains("duplicate column name")
             {
                 return Err(format!("Migration v12 failed on {col}: {e}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// v13 (dirge-fa10): confidence axis + contradiction supersession.
+    /// `confidence` returns the truth-likelihood scalar that v9 dropped
+    /// (dirge-lerb) as write-only — this time it is READ by eviction,
+    /// search ordering, and curation, and WRITTEN with meaning by the
+    /// supersession path (a harsh contradiction lands the successor at
+    /// reduced confidence). `superseded_at` timestamps when an entry was
+    /// retired by a newer fact; the `superseded_by` column already exists
+    /// (added inert in v7) and now holds the successor's uid. A
+    /// superseded entry is moved to `status='superseded'`, which the
+    /// active-only queries already exclude, so it leaves the snapshot,
+    /// views, search, and eviction while staying in the table as an
+    /// audit record. `ADD COLUMN` is duplicate-guarded so a
+    /// partially-migrated DB doesn't error.
+    fn run_migration_v13(&self) -> Result<(), String> {
+        for col in &["confidence REAL NOT NULL DEFAULT 0.6", "superseded_at TEXT"] {
+            if let Err(e) = self
+                .conn
+                .execute(&format!("ALTER TABLE memories ADD COLUMN {col}"), [])
+                && !e.to_string().contains("duplicate column name")
+            {
+                return Err(format!("Migration v13 failed on {col}: {e}"));
             }
         }
         Ok(())

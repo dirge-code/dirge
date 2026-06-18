@@ -90,12 +90,16 @@ fn schema_v8_drops_the_stale_fts_delete_trigger() {
     assert_eq!(trigram, 1, "the correct trigram delete trigger stays");
 }
 
-/// dirge-lerb: v9 drops the dead `memories.confidence` column. A
-/// fresh DB ends up without it, and a DB that already has it (created
-/// at v7/v8 with rows) migrates cleanly, keeping its rows.
+/// dirge-lerb + dirge-fa10: v9 dropped the dead `memories.confidence`
+/// column (and its constant data); v13 later RE-introduced confidence
+/// as a live, read column. So across the full chain a pre-v9 DB ends up
+/// with a confidence column again — but holding the v13 DEFAULT, proving
+/// v9 really discarded the old column and its values rather than
+/// preserving them. Rows survive the drop-then-re-add.
 #[test]
 fn schema_v9_drops_confidence_column() {
-    // Fresh DB: confidence absent.
+    // Fresh DB runs every migration including v13, so confidence is
+    // present again (it was absent only between v9 and v13).
     let (db, _dir) = temp_db();
     let present: i64 = db
         .conn
@@ -105,10 +109,11 @@ fn schema_v9_drops_confidence_column() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(present, 0, "fresh DB must not have a confidence column");
+    assert_eq!(present, 1, "v13 re-adds confidence after v9 dropped it");
 
-    // Simulate a pre-v9 DB: a memories table WITH confidence + a row,
-    // user_version pinned to 8, then reopen so migrate() runs v9.
+    // Simulate a pre-v9 DB: a memories table WITH a HIGH confidence
+    // value + a row, user_version pinned to 8, then reopen so migrate()
+    // runs v9 (drop) … v13 (re-add).
     let n = DB_COUNTER.fetch_add(1, Ordering::SeqCst);
     let dir = std::env::temp_dir().join(format!("dirge-v9-migrate-{}-{}", std::process::id(), n));
     let _ = std::fs::remove_dir_all(&dir);
@@ -126,22 +131,28 @@ fn schema_v9_drops_confidence_column() {
                  updated_at TEXT NOT NULL, last_used_at TEXT,
                  use_count INTEGER NOT NULL DEFAULT 0, superseded_by TEXT
              );
-             INSERT INTO memories (uid, target, content, created_at, updated_at)
-                 VALUES ('urn:ump:keep', 'memory', 'survives the drop', 'x', 'x');
+             INSERT INTO memories (uid, target, content, confidence, created_at, updated_at)
+                 VALUES ('urn:ump:keep', 'memory', 'survives the drop', 0.99, 'x', 'x');
              PRAGMA user_version = 8;",
         )
         .unwrap();
     }
     let db = SessionDb::open(&path).unwrap();
-    let present: i64 = db
+    let (present, confidence): (i64, f64) = db
         .conn
         .query_row(
-            "SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name = 'confidence'",
+            "SELECT
+                 (SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name = 'confidence'),
+                 (SELECT confidence FROM memories WHERE uid = 'urn:ump:keep')",
             [],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .unwrap();
-    assert_eq!(present, 0, "v9 must drop confidence on a pre-v9 DB");
+    assert_eq!(present, 1, "confidence column present again after v13");
+    assert!(
+        (confidence - 0.6).abs() < 1e-9,
+        "the old 0.99 value was discarded by v9; v13 re-adds at the 0.6 default: {confidence}",
+    );
     let kept: i64 = db
         .conn
         .query_row(
@@ -150,7 +161,7 @@ fn schema_v9_drops_confidence_column() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(kept, 1, "existing rows survive the column drop");
+    assert_eq!(kept, 1, "existing rows survive the drop-then-re-add");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1106,5 +1117,66 @@ fn schema_v12_adds_procedural_outcome_columns() {
         (0, 0, None),
         "outcome columns default to 0/0/NULL"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// dirge-fa10: a fresh DB carries the confidence + superseded_at
+/// columns, and a pre-v13 DB gains them on reopen — confidence
+/// defaulting to 0.6 on existing rows — without disturbing them.
+#[test]
+fn schema_v13_adds_confidence_and_supersession_columns() {
+    let (db, _dir) = temp_db();
+    for col in ["confidence", "superseded_at"] {
+        let present: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name = ?1",
+                [col],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(present, 1, "fresh DB must have the {col} column");
+    }
+
+    // Pre-v13 DB (v12 shape: has outcome columns, no confidence), a row,
+    // version pinned to 12, then reopen so migrate() runs v13.
+    let n = DB_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!("dirge-v13-migrate-{}-{}", std::process::id(), n));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("state.db");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE memories (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT, uid TEXT NOT NULL UNIQUE,
+                 target TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'procedural',
+                 content TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active',
+                 tier TEXT NOT NULL DEFAULT 'hot', salience REAL NOT NULL DEFAULT 0.5,
+                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL, last_used_at TEXT,
+                 use_count INTEGER NOT NULL DEFAULT 0, superseded_by TEXT,
+                 success_count INTEGER NOT NULL DEFAULT 0,
+                 failure_count INTEGER NOT NULL DEFAULT 0, last_success_at TEXT
+             );
+             INSERT INTO memories (uid, target, content, created_at, updated_at)
+                 VALUES ('urn:ump:keep', 'memory', 'survives the migration', 'x', 'x');
+             PRAGMA user_version = 12;",
+        )
+        .unwrap();
+    }
+    let db = SessionDb::open(&path).unwrap();
+    let (confidence, superseded_at): (f64, Option<String>) = db
+        .conn
+        .query_row(
+            "SELECT confidence, superseded_at FROM memories WHERE uid = 'urn:ump:keep'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert!(
+        (confidence - 0.6).abs() < 1e-9,
+        "existing rows backfill confidence to 0.6: {confidence}"
+    );
+    assert_eq!(superseded_at, None, "superseded_at defaults NULL");
     let _ = std::fs::remove_dir_all(&dir);
 }

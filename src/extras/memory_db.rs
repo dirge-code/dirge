@@ -235,6 +235,43 @@ fn effectiveness_bonus(kind: &str, success_count: i64, failure_count: i64) -> f6
     if net > 0 { bounded } else { -bounded }
 }
 
+// ── Confidence axis + supersession (dirge-fa10) ──────────────────────
+
+/// Truth-likelihood of an entry, in [0,1]. Distinct from `salience`
+/// (importance) — a fact can be important but contested, or trivial but
+/// certain. Default for a freshly captured entry. v9 (dirge-lerb) once
+/// dropped this column for being write-only; it earns its place now by
+/// being read in eviction, search ordering, and curation, and written
+/// with meaning on the supersession path.
+const DEFAULT_CONFIDENCE: f64 = 0.6;
+
+/// Confidence of the successor written when a fact is superseded by a
+/// `natural` contradiction — the user simply updated a preference or a
+/// changed fact, so the new value is current and trusted.
+const SUPERSEDE_CONFIDENCE: f64 = 0.7;
+
+/// How much a `harsh` contradiction (the user denied the old fact
+/// outright) discounts the successor's confidence. A flat denial means
+/// the area is contested, so the replacement is held below a clean
+/// update — `SUPERSEDE_CONFIDENCE - SUPERSEDE_CONFIDENCE_PENALTY` = 0.5.
+const SUPERSEDE_CONFIDENCE_PENALTY: f64 = 0.2;
+
+/// Eviction weight on confidence. Its decisive role is as a TIEBREAK:
+/// among entries of equal salience (same kind), the lower-confidence one
+/// evicts first — and there even the small spread between the values the
+/// store actually writes (harsh 0.5, default 0.6, natural 0.7) is enough
+/// to order them deterministically. Across DIFFERENT kinds it's only a
+/// gentle nudge: 0.25 keeps the full [0,1] swing within ±0.1, below the
+/// 0.1–0.15 gaps between kind tiers, so a contested fact never jumps the
+/// kind hierarchy (a 0.2-confidence `identity` at 0.75-0.1=0.65 still
+/// outranks a certain `semantic` at 0.6). Centered on
+/// [`DEFAULT_CONFIDENCE`] so the common case stays neutral.
+const CONFIDENCE_EVICTION_WEIGHT: f64 = 0.25;
+
+fn confidence_eviction_bonus(confidence: f64) -> f64 {
+    (confidence - DEFAULT_CONFIDENCE) * CONFIDENCE_EVICTION_WEIGHT
+}
+
 fn char_limit_for(target: &str) -> usize {
     match target {
         "pitfalls" => DEFAULT_PITFALL_CHAR_LIMIT,
@@ -375,6 +412,8 @@ struct ActiveRow {
     /// non-procedural kinds (`record_outcome` only writes procedural).
     success_count: i64,
     failure_count: i64,
+    /// dirge-fa10: truth-likelihood in [0,1]. See [`DEFAULT_CONFIDENCE`].
+    confidence: f64,
 }
 
 /// What a budget compaction did: `demoted` hot entries moved to the
@@ -620,7 +659,7 @@ impl SqliteMemoryStore {
     ) -> Result<Vec<ActiveRow>, String> {
         let sql = format!(
             "SELECT id, uid, kind, content, salience, status, tier, last_used_at,
-                    success_count, failure_count
+                    success_count, failure_count, confidence
              FROM memories WHERE target = ?1 AND {extra_where} ORDER BY id"
         );
         let mut stmt = conn
@@ -639,6 +678,7 @@ impl SqliteMemoryStore {
                     last_used_at: row.get(7)?,
                     success_count: row.get(8)?,
                     failure_count: row.get(9)?,
+                    confidence: row.get(10)?,
                 })
             })
             .map_err(|e| format!("Failed to query entries: {e}"))?
@@ -695,10 +735,12 @@ impl SqliteMemoryStore {
             // dirge-zygq: a procedural playbook's proven track record
             // shifts its eviction priority — a repeatedly-effective one
             // outlives a failed one of equal salience; zero for other
-            // kinds.
+            // kinds. dirge-fa10: a contested (low-confidence) entry is a
+            // little more evictable than a certain one of equal salience.
             r.salience
                 + if recent { RECENT_USE_BONUS } else { 0.0 }
                 + effectiveness_bonus(&r.kind, r.success_count, r.failure_count)
+                + confidence_eviction_bonus(r.confidence)
         };
         let mut best: Option<(usize, f64)> = None;
         for (i, row) in rows.iter().enumerate() {
@@ -768,13 +810,14 @@ impl SqliteMemoryStore {
         target: &str,
         content: &str,
         kind: MemoryKind,
+        confidence: f64,
     ) -> Result<i64, String> {
         let now = chrono::Utc::now().to_rfc3339();
         conn.execute(
             "INSERT INTO memories
                 (uid, target, kind, content, status, tier, salience,
-                 created_at, updated_at, use_count)
-             VALUES (?1, ?2, ?3, ?4, 'active', 'hot', ?5, ?6, ?6, 0)",
+                 created_at, updated_at, use_count, confidence)
+             VALUES (?1, ?2, ?3, ?4, 'active', 'hot', ?5, ?6, ?6, 0, ?7)",
             params![
                 random_entry_id(),
                 target,
@@ -782,6 +825,7 @@ impl SqliteMemoryStore {
                 content,
                 default_salience_for_kind(kind),
                 now,
+                confidence,
             ],
         )
         .map_err(|e| format!("Failed to insert entry: {e}"))?;
@@ -837,11 +881,37 @@ impl SqliteMemoryStore {
             ));
         }
 
+        // Hot-tier insert with budget compaction (working-reserve rules
+        // live in `insert_into_hot`). A new fact starts at the default
+        // confidence.
+        let (_id, outcome) = Self::insert_into_hot(
+            &tx,
+            target,
+            &entry,
+            kind.unwrap_or_default(),
+            DEFAULT_CONFIDENCE,
+        )?;
+        tx.commit().map_err(|e| format!("Failed to commit: {e}"))?;
+        Ok(outcome)
+    }
+
+    /// Insert `entry` into the hot tier within an open transaction,
+    /// demoting/archiving to make room under the working-reserve rules,
+    /// and return the new row id plus what compaction did. The caller is
+    /// responsible for duplicate/size validation and for committing.
+    /// Shared by `add_entry` and `supersede_entry` so the (subtle)
+    /// eviction policy lives in exactly one place.
+    fn insert_into_hot(
+        tx: &Connection,
+        target: &str,
+        entry: &str,
+        kind: MemoryKind,
+        confidence: f64,
+    ) -> Result<(i64, CompactionOutcome), String> {
         // Compact: demote the LEAST-salient hot entry first —
         // kind-derived importance, so transient `working` notes go
-        // before durable `identity` / `semantic` facts — breaking
-        // ties by age. Each entry costs `len + 3` for its delimiter,
-        // matching the markdown store's accounting.
+        // before durable `identity` / `semantic` facts — breaking ties
+        // by age. Each entry costs `len + 3` for its delimiter.
         //
         // dirge-vzlb: the working reserve overrides the pure-salience
         // pick. While long-term content exceeds its share
@@ -852,9 +922,11 @@ impl SqliteMemoryStore {
         // overflow (the part past the reserve) become the victim.
         // `.or_else` falls back to the other class so a single oversized
         // entry can't deadlock the loop.
+        let char_limit = char_limit_for(target);
+        let entry_cost = entry.len();
         let reserve = working_reserve_for(target);
-        let new_is_working = matches!(kind.unwrap_or_default(), MemoryKind::Working);
-        let mut hot = Self::hot_rows(&tx, target)?;
+        let new_is_working = matches!(kind, MemoryKind::Working);
+        let mut hot = Self::hot_rows(tx, target)?;
         let mut demoted = 0usize;
         while !hot.is_empty() {
             let hot_total: usize = hot.iter().map(|r| r.content.len() + 3).sum();
@@ -878,18 +950,17 @@ impl SqliteMemoryStore {
             };
             let Some(victim) = victim else { break };
             let removed = hot.remove(victim);
-            Self::demote_row(&tx, removed.id)?;
+            Self::demote_row(tx, removed.id)?;
             demoted += 1;
         }
 
-        Self::insert_row(&tx, target, &entry, kind.unwrap_or_default())?;
+        let id = Self::insert_row(tx, target, entry, kind, confidence)?;
         let archived = if demoted > 0 {
-            Self::compact_breadcrumbs(&tx, target)?
+            Self::compact_breadcrumbs(tx, target)?
         } else {
             0
         };
-        tx.commit().map_err(|e| format!("Failed to commit: {e}"))?;
-        Ok(CompactionOutcome { demoted, archived })
+        Ok((id, CompactionOutcome { demoted, archived }))
     }
 
     /// Replace an entry found by substring match. If multiple entries
@@ -956,6 +1027,111 @@ impl SqliteMemoryStore {
         .map_err(|e| format!("Failed to reindex entry: {e}"))?;
         tx.commit().map_err(|e| format!("Failed to commit: {e}"))?;
         Ok(())
+    }
+
+    /// Supersede an active entry with a newer fact (dirge-fa10). Where
+    /// `replace` is an in-place UPDATE for a reworded SAME fact (keeps
+    /// uid, lineage, outcome record), supersession is for a
+    /// CONTRADICTION — the old fact is now wrong or outdated. The old
+    /// row moves to `status='superseded'`, so it leaves the snapshot,
+    /// views, search, and eviction exactly like a tombstone, but is
+    /// recorded as retired-by-successor (`superseded_by` = the new
+    /// entry's uid, `superseded_at` = now) for an audit chain rather
+    /// than presented as user-removable. A NEW active entry carries the
+    /// corrected fact.
+    ///
+    /// `harsh` is the contradiction type: a `natural` update (a changed
+    /// preference or fact) lands the successor at [`SUPERSEDE_CONFIDENCE`];
+    /// a `harsh` denial (the user flatly rejected the old fact) discounts
+    /// it by [`SUPERSEDE_CONFIDENCE_PENALTY`], since a flat denial signals
+    /// a contested area where the replacement is less certain. The
+    /// successor enters the hot tier like an add, so the returned
+    /// [`CompactionOutcome`] reports any demotion/archival it caused.
+    ///
+    /// Supersession is deliberately TERMINAL — unlike `remove`/`restore`
+    /// (a reversible archive), a superseded fact has no tool-level
+    /// revival, because reviving it alongside its successor would create
+    /// two competing facts. If a contradiction is later judged wrong, the
+    /// recovery is to `add` the correct fact afresh; the old row remains
+    /// only as an audit record.
+    pub fn supersede_entry(
+        &self,
+        target: &str,
+        old_text: &str,
+        new_entry: &str,
+        kind: Option<MemoryKind>,
+        harsh: bool,
+    ) -> Result<CompactionOutcome, String> {
+        scan_for_threats(new_entry)?;
+        let new_entry = new_entry.trim().to_string();
+        if new_entry.is_empty() {
+            return Err("Cannot supersede with an empty entry".to_string());
+        }
+        let char_limit = char_limit_for(target);
+        if new_entry.len() > char_limit {
+            return Err(format!(
+                "Entry is {} chars but the entire memory budget is {char_limit}; \
+                 split it into smaller entries.",
+                new_entry.len()
+            ));
+        }
+
+        let mut conn = self.conn.lock_ignore_poison();
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("Failed to begin transaction: {e}"))?;
+
+        let rows = Self::active_rows(&tx, target)?;
+        let idx = find_unique_match(&rows, old_text)?;
+        let old_id = rows[idx].id;
+        // Inherit the old entry's kind unless the caller re-classifies.
+        let kind = kind.unwrap_or_else(|| parse_kind(&rows[idx].kind).unwrap_or_default());
+
+        // Reject if the successor duplicates a DIFFERENT active entry —
+        // superseding the matched one with an identical copy of another
+        // is a no-op fact that would just collide.
+        if rows
+            .iter()
+            .enumerate()
+            .any(|(i, r)| i != idx && r.content.trim().eq_ignore_ascii_case(new_entry.trim()))
+        {
+            return Err(
+                "Duplicate entry — the superseding fact already exists in memory".to_string(),
+            );
+        }
+
+        let now = chrono::Utc::now().to_rfc3339();
+        // Retire the old fact FIRST so it no longer counts against the
+        // hot budget while the successor is inserted (superseded_by is
+        // backfilled once the successor's uid exists).
+        tx.execute(
+            "UPDATE memories SET status = 'superseded', superseded_at = ?1, updated_at = ?1
+             WHERE id = ?2",
+            params![now, old_id],
+        )
+        .map_err(|e| format!("Failed to retire superseded entry: {e}"))?;
+
+        let confidence = if harsh {
+            SUPERSEDE_CONFIDENCE - SUPERSEDE_CONFIDENCE_PENALTY
+        } else {
+            SUPERSEDE_CONFIDENCE
+        };
+        let (new_id, outcome) = Self::insert_into_hot(&tx, target, &new_entry, kind, confidence)?;
+        let new_uid: String = tx
+            .query_row(
+                "SELECT uid FROM memories WHERE id = ?1",
+                params![new_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| format!("Failed to read successor uid: {e}"))?;
+        tx.execute(
+            "UPDATE memories SET superseded_by = ?1 WHERE id = ?2",
+            params![new_uid, old_id],
+        )
+        .map_err(|e| format!("Failed to link supersession: {e}"))?;
+
+        tx.commit().map_err(|e| format!("Failed to commit: {e}"))?;
+        Ok(outcome)
     }
 
     /// Remove an entry found by substring match (or exact uid). Same
@@ -1165,7 +1341,8 @@ impl SqliteMemoryStore {
                  ORDER BY rank,
                           CASE WHEN m.kind = 'procedural'
                                THEN (m.success_count - m.failure_count) ELSE 0 END DESC,
-                          m.salience DESC, m.last_used_at DESC LIMIT ?2",
+                          m.salience DESC, m.confidence DESC,
+                          m.last_used_at DESC LIMIT ?2",
             )
             .map_err(|e| format!("Failed to prepare search: {e}"))?;
         let results: Vec<serde_json::Value> = stmt
@@ -1225,6 +1402,7 @@ impl SqliteMemoryStore {
                         "kind": r.kind,
                         "lifecycle": {
                             "salience": r.salience,
+                            "confidence": r.confidence,
                             "status": r.status,
                         }
                     }),
@@ -1237,6 +1415,17 @@ impl SqliteMemoryStore {
         let tombstoned: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM memories WHERE target = ?1 AND status = 'tombstoned'",
+                params![target],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+
+        // dirge-fa10: superseded entries are retired by a newer fact —
+        // surfaced separately from tombstones so the count reflects the
+        // audit chain, not the restore pile.
+        let superseded: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE target = ?1 AND status = 'superseded'",
                 params![target],
                 |row| row.get(0),
             )
@@ -1265,6 +1454,7 @@ impl SqliteMemoryStore {
             "usage": format!("{}% — {}/{} chars", pct, current, limit),
             "entry_count": entries.len(),
             "tombstoned_count": tombstoned,
+            "superseded_count": superseded,
             "breadcrumb_count": breadcrumbs.len(),
             "breadcrumbs": breadcrumbs,
         });
@@ -1298,6 +1488,20 @@ impl SqliteMemoryStore {
         self.replace_entry(target, old_text, new_content, kind)?;
         let conn = self.conn.lock_ignore_poison();
         Self::success_response(&conn, target, "Entry replaced.")
+    }
+
+    pub fn supersede(
+        &self,
+        target: &str,
+        old_text: &str,
+        new_content: &str,
+        kind: Option<MemoryKind>,
+        harsh: bool,
+    ) -> Result<serde_json::Value, String> {
+        let outcome = self.supersede_entry(target, old_text, new_content, kind, harsh)?;
+        let message = compaction_message("Fact superseded", &outcome);
+        let conn = self.conn.lock_ignore_poison();
+        Self::success_response(&conn, target, &message)
     }
 
     pub fn remove(&self, target: &str, old_text: &str) -> Result<serde_json::Value, String> {
@@ -1427,7 +1631,7 @@ impl SqliteMemoryStore {
     pub fn rendered_for_curator(&self, target: &str) -> String {
         let conn = self.conn.lock_ignore_poison();
         let mut stmt = match conn.prepare(
-            "SELECT kind, use_count, uid, content FROM memories
+            "SELECT kind, use_count, uid, content, confidence FROM memories
              WHERE target = ?1 AND status = 'active' ORDER BY id",
         ) {
             Ok(s) => s,
@@ -1439,7 +1643,13 @@ impl SqliteMemoryStore {
                 let uses: i64 = row.get(1)?;
                 let uid: String = row.get(2)?;
                 let content: String = row.get(3)?;
-                Ok(format!("[{kind} | {uses} uses | {uid}]\n{content}"))
+                // dirge-fa10: surface confidence so the curator can act on
+                // contested facts (a low-confidence entry is a candidate
+                // to verify, re-confidence, or supersede).
+                let confidence: f64 = row.get(4)?;
+                Ok(format!(
+                    "[{kind} | {uses} uses | conf {confidence:.2} | {uid}]\n{content}"
+                ))
             })
             .map(|rows| rows.filter_map(|r| r.ok()).collect::<Vec<_>>())
             .unwrap_or_default();
@@ -1511,9 +1721,11 @@ fn legacy_entry_id(content: &str) -> String {
 
 #[derive(serde::Deserialize)]
 struct LegacyLifecycle {
-    // `confidence` is intentionally NOT read — it was dead (dirge-lerb)
-    // and the column is gone. serde ignores unknown fields by default,
-    // so a legacy sidecar carrying it still deserializes.
+    // A legacy sidecar's `confidence` is intentionally NOT read on
+    // import: the column was dropped as dead in v9 (dirge-lerb) and
+    // reintroduced with fresh semantics in v13 (dirge-fa10), so an
+    // imported entry takes the current schema default rather than a
+    // stale pre-v9 value. serde ignores the unknown field by default.
     #[serde(default = "legacy_default_salience")]
     salience: f64,
     #[serde(default = "legacy_default_status")]
@@ -1894,6 +2106,10 @@ mod tests {
         let curated = store.rendered_for_curator("memory");
         assert!(curated.contains("procedural"), "kind annotated: {curated}");
         assert!(curated.contains("1 uses"), "use count annotated: {curated}");
+        assert!(
+            curated.contains("conf 0.60"),
+            "confidence annotated (dirge-fa10): {curated}"
+        );
         assert!(
             curated.contains("urn:ump:"),
             "urn id annotated for precise targeting: {curated}"
@@ -2384,9 +2600,11 @@ mod tests {
         assert_eq!(meta["kind"], "procedural");
         assert_eq!(meta["lifecycle"]["status"], "active");
         assert!(meta["lifecycle"]["salience"].as_f64().is_some());
+        // dirge-fa10: confidence is back (this time read by eviction,
+        // search, and surfaced here) — a new entry carries the default.
         assert!(
-            meta["lifecycle"]["confidence"].is_null(),
-            "confidence was removed as dead (dirge-lerb)",
+            (meta["lifecycle"]["confidence"].as_f64().unwrap() - DEFAULT_CONFIDENCE).abs() < 1e-9,
+            "view meta surfaces the default confidence",
         );
     }
 
@@ -2735,14 +2953,18 @@ mod tests {
         let pit = store.view("pitfalls");
         assert_eq!(pit["entry_count"], 1);
 
-        // Sidecar metadata carried over. (A legacy sidecar still
-        // carrying the removed `confidence` field imports fine — serde
-        // ignores it; it just isn't surfaced anymore.)
+        // Sidecar metadata carried over. (A legacy sidecar's old
+        // `confidence` field is still ignored on import; the column is
+        // back as dirge-fa10 but imported entries take the schema
+        // default, not the sidecar value.)
         let meta = &mem["meta"]["build with: cargo build"];
         assert_eq!(meta["id"], "urn:ump:legacyid");
         assert_eq!(meta["kind"], "semantic");
         assert_eq!(meta["lifecycle"]["salience"], 0.6);
-        assert!(meta["lifecycle"]["confidence"].is_null());
+        assert!(
+            (meta["lifecycle"]["confidence"].as_f64().unwrap() - DEFAULT_CONFIDENCE).abs() < 1e-9,
+            "imported entry takes the default confidence",
+        );
 
         // Usage first_seen became created_at.
         let entries = store.entries_for_curation().unwrap();
@@ -3347,6 +3569,266 @@ mod tests {
         assert!(
             results[0]["content"].as_str().unwrap().contains("bbbb"),
             "the more-effective playbook ranks first: {results:?}"
+        );
+    }
+
+    // ── Confidence axis + supersession (dirge-fa10) ──────────────
+
+    fn confidence_of(paths: &ProjectPaths, content: &str) -> f64 {
+        raw_conn(paths)
+            .query_row(
+                "SELECT confidence FROM memories WHERE content = ?1",
+                rusqlite::params![content],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    /// A natural supersession retires the old fact (status='superseded',
+    /// linked to the successor) and writes the new one at the natural
+    /// confidence; the old leaves the active view, the new is present.
+    #[test]
+    fn supersede_retires_old_and_writes_successor() {
+        let (paths, _dir) = temp_project();
+        let store = SqliteMemoryStore::load(&paths).unwrap();
+        store
+            .add_entry(
+                "memory",
+                "deploys go through Heroku",
+                Some(MemoryKind::Semantic),
+            )
+            .unwrap();
+
+        store
+            .supersede_entry("memory", "Heroku", "deploys go through Fly.io", None, false)
+            .unwrap();
+
+        // Active view shows only the successor.
+        let view = store.view("memory");
+        let entries: Vec<String> = view["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e.as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            entries.iter().any(|e| e.contains("Fly.io")),
+            "successor is active: {entries:?}"
+        );
+        assert!(
+            !entries.iter().any(|e| e.contains("Heroku")),
+            "old fact left the active view: {entries:?}"
+        );
+        assert_eq!(view["superseded_count"], 1, "one superseded entry surfaced");
+
+        // Audit chain: the old row is status='superseded' and points at
+        // the successor's uid.
+        let conn = raw_conn(&paths);
+        let (status, by, at): (String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT status, superseded_by, superseded_at FROM memories
+                 WHERE content = 'deploys go through Heroku'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "superseded");
+        assert!(at.is_some(), "superseded_at stamped");
+        let successor_uid: String = conn
+            .query_row(
+                "SELECT uid FROM memories WHERE content = 'deploys go through Fly.io'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            by.as_deref(),
+            Some(successor_uid.as_str()),
+            "linked to successor"
+        );
+
+        // Natural supersession → natural confidence on the successor.
+        assert!(
+            (confidence_of(&paths, "deploys go through Fly.io") - SUPERSEDE_CONFIDENCE).abs()
+                < 1e-9
+        );
+    }
+
+    /// A harsh denial discounts the successor's confidence.
+    #[test]
+    fn harsh_supersession_discounts_confidence() {
+        let (paths, _dir) = temp_project();
+        let store = SqliteMemoryStore::load(&paths).unwrap();
+        store
+            .add_entry("memory", "the API is versioned in the URL path", None)
+            .unwrap();
+        store
+            .supersede_entry(
+                "memory",
+                "versioned in the URL path",
+                "the API is versioned via a header",
+                None,
+                true,
+            )
+            .unwrap();
+        let conf = confidence_of(&paths, "the API is versioned via a header");
+        assert!(
+            (conf - (SUPERSEDE_CONFIDENCE - SUPERSEDE_CONFIDENCE_PENALTY)).abs() < 1e-9,
+            "harsh successor held at reduced confidence: {conf}"
+        );
+    }
+
+    /// A superseded fact stays out of the frozen system-prompt snapshot
+    /// on the next load (it's status!='active'), but remains in the
+    /// table as an audit record.
+    #[test]
+    fn superseded_entries_stay_out_of_snapshot_but_persist() {
+        let (paths, _dir) = temp_project();
+        let store = SqliteMemoryStore::load(&paths).unwrap();
+        store
+            .add_entry("memory", "build with make", Some(MemoryKind::Procedural))
+            .unwrap();
+        store
+            .supersede_entry("memory", "build with make", "build with cargo", None, false)
+            .unwrap();
+        drop(store);
+
+        // Fresh load → snapshot reflects only active entries.
+        let reloaded = SqliteMemoryStore::load(&paths).unwrap();
+        let snapshot = reloaded.format_for_system_prompt();
+        assert!(
+            snapshot.contains("build with cargo"),
+            "successor in snapshot"
+        );
+        assert!(
+            !snapshot.contains("build with make"),
+            "superseded fact excluded from snapshot: {snapshot}"
+        );
+        // Still in the table for audit.
+        let kept: i64 = raw_conn(&paths)
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE content = 'build with make' AND status = 'superseded'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, 1, "superseded row persists as audit record");
+    }
+
+    /// Confidence is READ by eviction: of two entries of equal salience,
+    /// the lower-confidence one is demoted first under budget pressure.
+    #[test]
+    fn lower_confidence_evicted_first() {
+        let (paths, _dir) = temp_project();
+        let store = SqliteMemoryStore::load(&paths).unwrap();
+        // Two ~900-char semantic facts (equal salience 0.6).
+        let certain = format!("certain fact {}", "c".repeat(900));
+        let shaky = format!("shaky fact {}", "s".repeat(900));
+        store
+            .add_entry("memory", &certain, Some(MemoryKind::Semantic))
+            .unwrap();
+        store
+            .add_entry("memory", &shaky, Some(MemoryKind::Semantic))
+            .unwrap();
+        // Drop one's confidence well below default; raise the other's.
+        let conn = raw_conn(&paths);
+        conn.execute(
+            "UPDATE memories SET confidence = 0.2 WHERE content = ?1",
+            rusqlite::params![shaky],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE memories SET confidence = 0.95 WHERE content = ?1",
+            rusqlite::params![certain],
+        )
+        .unwrap();
+        drop(conn);
+
+        // Overflow with a high-salience identity entry → one demotion.
+        let filler = format!("operator identity {}", "i".repeat(900));
+        store
+            .add_entry("memory", &filler, Some(MemoryKind::Identity))
+            .unwrap();
+
+        let conn = raw_conn(&paths);
+        let tier_of = |content: &str| -> String {
+            conn.query_row(
+                "SELECT tier FROM memories WHERE content = ?1",
+                rusqlite::params![content],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(tier_of(&shaky), "breadcrumb", "low-confidence fact demoted");
+        assert_eq!(tier_of(&certain), "hot", "high-confidence fact kept hot");
+    }
+
+    /// Eviction-by-confidence holds for the values the store ACTUALLY
+    /// writes (not just hand-forced extremes): a harsh-superseded fact
+    /// (confidence 0.5) is demoted before a default-confidence sibling
+    /// (0.6) of equal salience. Drives the dirge-fa10 claim that
+    /// confidence is genuinely read in eviction through the real path.
+    #[test]
+    fn harsh_successor_evicted_before_default_sibling() {
+        let (paths, _dir) = temp_project();
+        let store = SqliteMemoryStore::load(&paths).unwrap();
+        // Sibling semantic fact at the default confidence (0.6).
+        let sibling = format!("stable fact {}", "k".repeat(900));
+        store
+            .add_entry("memory", &sibling, Some(MemoryKind::Semantic))
+            .unwrap();
+        // A fact we then harshly supersede — the successor lands at 0.5,
+        // same semantic kind/salience as the sibling.
+        store
+            .add_entry("memory", "old contested claim", Some(MemoryKind::Semantic))
+            .unwrap();
+        let contested = format!("contested fact {}", "x".repeat(900));
+        store
+            .supersede_entry("memory", "old contested claim", &contested, None, true)
+            .unwrap();
+
+        // Overflow with a high-salience identity entry → one demotion.
+        let filler = format!("operator identity {}", "i".repeat(900));
+        store
+            .add_entry("memory", &filler, Some(MemoryKind::Identity))
+            .unwrap();
+
+        let conn = raw_conn(&paths);
+        let tier_of = |content: &str| -> String {
+            conn.query_row(
+                "SELECT tier FROM memories WHERE content = ?1",
+                rusqlite::params![content],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            tier_of(&contested),
+            "breadcrumb",
+            "harsh-superseded fact (conf 0.5) demoted before the default sibling"
+        );
+        assert_eq!(
+            tier_of(&sibling),
+            "hot",
+            "default-confidence sibling kept hot"
+        );
+    }
+
+    /// New entries default to the documented confidence, and view meta
+    /// surfaces it.
+    #[test]
+    fn add_defaults_confidence_and_view_surfaces_it() {
+        let (paths, _dir) = temp_project();
+        let store = SqliteMemoryStore::load(&paths).unwrap();
+        store.add_entry("memory", "a plain fact", None).unwrap();
+        assert!((confidence_of(&paths, "a plain fact") - DEFAULT_CONFIDENCE).abs() < 1e-9);
+        let view = store.view("memory");
+        let conf = view["meta"]["a plain fact"]["lifecycle"]["confidence"]
+            .as_f64()
+            .unwrap();
+        assert!(
+            (conf - DEFAULT_CONFIDENCE).abs() < 1e-9,
+            "view surfaces confidence"
         );
     }
 }

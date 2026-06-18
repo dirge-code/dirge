@@ -448,10 +448,12 @@ pub fn render_curator_input(
     // from content.
     let _ = writeln!(
         out,
-        "\nEach entry is prefixed `[kind | N uses | id]`: its memory kind, how many times the \
-         agent has looked it up, and its `urn:ump:…` id (pass that id as `old_text` to act on \
-         exactly that entry). Uses is a signal of how load-bearing an entry is — but a low count \
-         is NOT on its own a reason to remove; keep facts that are still true."
+        "\nEach entry is prefixed `[kind | N uses | conf C | id]`: its memory kind, how many times \
+         the agent has looked it up, its confidence (0–1 truth-likelihood; entries the user \
+         contradicted are held lower), and its `urn:ump:…` id (pass that id as `old_text` to act \
+         on exactly that entry). Uses is a signal of how load-bearing an entry is — but a low \
+         count is NOT on its own a reason to remove; keep facts that are still true. A low \
+         confidence is a reason to VERIFY a fact, not to delete it blindly."
     );
     let _ = writeln!(out, "\n## Current MEMORY.md\n");
     if memory_md.trim().is_empty() {
@@ -1026,15 +1028,16 @@ mod tests {
 
     #[test]
     fn render_curator_input_explains_entry_metadata() {
-        // dirge-27py: the bulk dump entries now carry `[kind | N uses |
-        // id]` prefixes, so the input must explain how to read them.
+        // dirge-27py / dirge-fa10: the bulk dump entries carry
+        // `[kind | N uses | conf C | id]` prefixes, so the input must
+        // explain how to read them (confidence included).
         let out = render_curator_input(
             &make_report(vec![]),
-            "[procedural | 2 uses | urn:ump:x]\nsome durable fact",
+            "[procedural | 2 uses | conf 0.60 | urn:ump:x]\nsome durable fact",
             "",
         );
         assert!(
-            out.contains("[kind | N uses | id]"),
+            out.contains("[kind | N uses | conf C | id]"),
             "input must explain the per-entry metadata prefix: {out}"
         );
         assert!(

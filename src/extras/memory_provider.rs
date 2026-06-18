@@ -64,6 +64,24 @@ pub trait MemoryProvider: Send + Sync {
         kind: Option<&str>,
     ) -> Result<Value, String>;
 
+    /// Supersede an entry with a newer, contradicting fact (dirge-fa10).
+    /// Unlike `replace` (in-place edit of the SAME fact), this retires
+    /// the old entry as an audit record and writes a NEW one. `harsh`
+    /// marks a flat user denial (vs a natural update), which the builtin
+    /// backend uses to discount the successor's confidence. Default
+    /// errors so backends without a confidence/supersession model don't
+    /// silently fall back to a lossy replace.
+    fn supersede(
+        &self,
+        _target: &str,
+        _old_text: &str,
+        _content: &str,
+        _kind: Option<&str>,
+        _harsh: bool,
+    ) -> Result<Value, String> {
+        Err("This memory backend does not support superseding entries".to_string())
+    }
+
     /// Drop an entry matched by substring. Same uniqueness rule as
     /// `replace`. The builtin backend tombstones rather than deletes
     /// (dirge-8h22); other backends may hard-delete.
@@ -228,6 +246,20 @@ impl MemoryProvider for super::memory_db::SqliteMemoryStore {
 
     fn record_outcome(&self, target: &str, old_text: &str, success: bool) -> Result<Value, String> {
         super::memory_db::SqliteMemoryStore::record_outcome(self, target, old_text, success)
+    }
+
+    fn supersede(
+        &self,
+        target: &str,
+        old_text: &str,
+        content: &str,
+        kind: Option<&str>,
+        harsh: bool,
+    ) -> Result<Value, String> {
+        let mkind = kind.and_then(super::memory_db::parse_kind);
+        super::memory_db::SqliteMemoryStore::supersede(
+            self, target, old_text, content, mkind, harsh,
+        )
     }
 }
 

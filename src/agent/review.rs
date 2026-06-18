@@ -90,6 +90,11 @@ When unsure, use `semantic` for facts and `procedural` for rules.
   • `failure` — following the rule led to a broken or rejected result ("that didn't help", the step had to be undone).
 This ranks proven playbooks above ones that fail in practice and keeps effective rules from decaying. Only mark when the transcript makes the outcome unambiguous; skip it otherwise. Marking applies to `procedural` entries only.
 
+**1c. Supersede CONTRADICTED facts.** When the conversation shows an existing memory entry is now WRONG or outdated — the user changed a preference, a fact was corrected, an approach was abandoned — do NOT silently `replace` it (that erases the old fact). Use `memory(action='supersede', old_text='<id-or-substring>', content='<corrected fact>', harsh=<bool>)`:
+  • `harsh=false` (default) — a natural update: the user changed their mind or a fact simply changed. The new fact is written at normal confidence.
+  • `harsh=true` — the user flatly DENIED the old fact ("no, that's wrong", "we never did that"). The new fact is held at reduced confidence because the area is contested.
+Supersession keeps the old entry as an audit record and removes it from active memory. Use `replace` only for rewording the SAME fact; use `supersede` when the fact itself changed.
+
 **2. Update SKILLS (procedural improvements):**
 Be ACTIVE — most sessions produce at least one skill update. A pass that does nothing is a missed learning opportunity.
 

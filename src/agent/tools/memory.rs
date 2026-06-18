@@ -70,6 +70,11 @@ pub struct Args {
     /// "failure". Records a procedural playbook's real-world result.
     #[serde(default)]
     outcome: Option<String>,
+    /// Contradiction type for the `supersede` action (dirge-fa10):
+    /// `true` when the user flatly denied the old fact (discounts the
+    /// successor's confidence), `false`/absent for a natural update.
+    #[serde(default)]
+    harsh: Option<bool>,
     /// Memory scope: "project" (default) for facts about THIS repo, or
     /// "global" for durable cross-project user preferences that should
     /// follow the user everywhere.
@@ -120,8 +125,8 @@ old_text matches a unique substring or the exact "urn:ump:…" id from view/inde
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["view", "add", "replace", "remove", "restore", "expand", "search", "mark"],
-                        "description": "The action to perform."
+                        "enum": ["view", "add", "replace", "remove", "restore", "expand", "search", "mark", "supersede"],
+                        "description": "The action to perform. 'supersede' retires a contradicted fact (old_text) and writes a corrected one (content), keeping the old as an audit record — use it instead of 'replace' when a fact CHANGED rather than was reworded."
                     },
                     "target": {
                         "type": "string",
@@ -144,6 +149,10 @@ old_text matches a unique substring or the exact "urn:ump:…" id from view/inde
                         "type": "string",
                         "enum": ["success", "failure"],
                         "description": "For the 'mark' action: whether a procedural playbook worked ('success') or failed ('failure') in practice."
+                    },
+                    "harsh": {
+                        "type": "boolean",
+                        "description": "For the 'supersede' action: true when the user flatly DENIED the old fact (discounts the new fact's confidence); false/omitted for a natural update like a changed preference."
                     },
                     "kind": {
                         "type": "string",
@@ -213,6 +222,37 @@ old_text matches a unique substring or the exact "urn:ump:…" id from view/inde
                     .replace(target, old_text, content, args.kind.as_deref())
                     .map_err(ToolError::Msg)?;
                 crate::agent::review::fire_memory_write(store.as_ref(), "replace", target, content);
+                Ok(serde_json::to_string_pretty(&resp)
+                    .unwrap_or_else(|_| r#"{"error":"serialization failed"}"#.to_string()))
+            }
+            // supersede writes a NEW corrected entry, so the hook payload
+            // is the new content (like add/replace), not the old_text.
+            "supersede" => {
+                let old_text = crate::agent::tools::required_nonblank(
+                    args.old_text.as_deref(),
+                    "old_text",
+                    "supersede",
+                )?;
+                let content = crate::agent::tools::required_nonblank(
+                    args.content.as_deref(),
+                    "content",
+                    "supersede",
+                )?;
+                let resp = store
+                    .supersede(
+                        target,
+                        old_text,
+                        content,
+                        args.kind.as_deref(),
+                        args.harsh.unwrap_or(false),
+                    )
+                    .map_err(ToolError::Msg)?;
+                crate::agent::review::fire_memory_write(
+                    store.as_ref(),
+                    "supersede",
+                    target,
+                    content,
+                );
                 Ok(serde_json::to_string_pretty(&resp)
                     .unwrap_or_else(|_| r#"{"error":"serialization failed"}"#.to_string()))
             }
@@ -295,7 +335,7 @@ old_text matches a unique substring or the exact "urn:ump:…" id from view/inde
                     .unwrap_or_else(|_| r#"{"error":"serialization failed"}"#.to_string()))
             }
             _ => Err(ToolError::Msg(format!(
-                "Unknown action '{}'. Use: view, add, replace, remove, restore, expand, search, mark.",
+                "Unknown action '{}'. Use: view, add, replace, remove, restore, expand, search, mark, supersede.",
                 args.action
             ))),
         }
@@ -358,6 +398,7 @@ mod tests {
             query: None,
             scope: Some("global".into()),
             outcome: None,
+            harsh: None,
         }))
         .expect("global add should succeed");
 
@@ -393,6 +434,7 @@ mod tests {
             query: None,
             scope: None,
             outcome: None,
+            harsh: None,
         }));
         assert!(result.is_ok(), "add failed: {:?}", result);
         let resp: serde_json::Value = serde_json::from_str(&result.unwrap()).expect("valid JSON");
@@ -409,6 +451,7 @@ mod tests {
             query: None,
             scope: None,
             outcome: None,
+            harsh: None,
         }));
         let resp: serde_json::Value = serde_json::from_str(&result.unwrap()).expect("valid JSON");
         let entries = resp["entries"].as_array().unwrap();
@@ -431,6 +474,7 @@ mod tests {
             query: None,
             scope: None,
             outcome: None,
+            harsh: None,
         }));
         assert!(result.is_ok());
         let resp: serde_json::Value = serde_json::from_str(&result.unwrap()).expect("valid JSON");
@@ -452,6 +496,7 @@ mod tests {
             query: None,
             scope: None,
             outcome: None,
+            harsh: None,
         }))
         .unwrap();
 
@@ -464,6 +509,7 @@ mod tests {
             query: None,
             scope: None,
             outcome: None,
+            harsh: None,
         }));
         assert!(result.is_err());
     }
@@ -483,6 +529,7 @@ mod tests {
             query: None,
             scope: None,
             outcome: None,
+            harsh: None,
         }))
         .unwrap();
 
@@ -495,6 +542,7 @@ mod tests {
             query: None,
             scope: None,
             outcome: None,
+            harsh: None,
         }));
         let resp: serde_json::Value = serde_json::from_str(&result.unwrap()).expect("valid JSON");
         assert_eq!(resp["success"], true);
@@ -509,6 +557,7 @@ mod tests {
             query: None,
             scope: None,
             outcome: None,
+            harsh: None,
         }));
         let resp: serde_json::Value = serde_json::from_str(&result.unwrap()).expect("valid JSON");
         let entries = resp["entries"].as_array().unwrap();
@@ -530,6 +579,7 @@ mod tests {
             query: None,
             scope: None,
             outcome: None,
+            harsh: None,
         }))
         .unwrap();
 
@@ -542,6 +592,7 @@ mod tests {
             query: None,
             scope: None,
             outcome: None,
+            harsh: None,
         }));
         let resp: serde_json::Value = serde_json::from_str(&result.unwrap()).expect("valid JSON");
         assert_eq!(resp["success"], true);
@@ -556,6 +607,7 @@ mod tests {
             query: None,
             scope: None,
             outcome: None,
+            harsh: None,
         }));
         let resp: serde_json::Value = serde_json::from_str(&result.unwrap()).expect("valid JSON");
         assert_eq!(resp["entry_count"], 0);
@@ -576,6 +628,7 @@ mod tests {
             query: None,
             scope: None,
             outcome: None,
+            harsh: None,
         }));
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Invalid target"));
@@ -596,6 +649,7 @@ mod tests {
             query: None,
             scope: None,
             outcome: None,
+            harsh: None,
         }));
         assert!(result.is_err());
     }
@@ -679,6 +733,7 @@ mod tests {
             query: None,
             scope: None,
             outcome: None,
+            harsh: None,
         }))
         .unwrap();
         rt.block_on(tool.call(Args {
@@ -690,6 +745,7 @@ mod tests {
             query: None,
             scope: None,
             outcome: None,
+            harsh: None,
         }))
         .unwrap();
         rt.block_on(tool.call(Args {
@@ -701,6 +757,7 @@ mod tests {
             query: None,
             scope: None,
             outcome: None,
+            harsh: None,
         }))
         .unwrap();
         rt.block_on(tool.call(Args {
@@ -712,6 +769,7 @@ mod tests {
             query: None,
             scope: None,
             outcome: None,
+            harsh: None,
         }))
         .unwrap();
 
@@ -793,6 +851,7 @@ mod tests {
             query: None,
             scope: None,
             outcome: None,
+            harsh: None,
         }))
         .unwrap();
         assert!(
@@ -810,6 +869,7 @@ mod tests {
             query: None,
             scope: None,
             outcome: None,
+            harsh: None,
         }))
         .unwrap();
         // replace → one fire with the new content.
@@ -822,6 +882,7 @@ mod tests {
             query: None,
             scope: None,
             outcome: None,
+            harsh: None,
         }))
         .unwrap();
         // remove → one fire with the old_text (no new content).
@@ -834,6 +895,7 @@ mod tests {
             query: None,
             scope: None,
             outcome: None,
+            harsh: None,
         }))
         .unwrap();
 
@@ -895,6 +957,7 @@ mod tests {
             query: None,
             scope: None,
             outcome: None,
+            harsh: None,
         }))
         .expect("seed add should succeed");
 
@@ -909,6 +972,7 @@ mod tests {
                     query: None,
                     scope: None,
                     outcome: None,
+                    harsh: None,
                 },
                 "add" => Args {
                     action: "add".into(),
@@ -919,6 +983,7 @@ mod tests {
                     query: None,
                     scope: None,
                     outcome: None,
+                    harsh: None,
                 },
                 "replace" => Args {
                     action: "replace".into(),
@@ -929,6 +994,7 @@ mod tests {
                     query: None,
                     scope: None,
                     outcome: None,
+                    harsh: None,
                 },
                 "remove" => Args {
                     action: "remove".into(),
@@ -939,6 +1005,7 @@ mod tests {
                     query: None,
                     scope: None,
                     outcome: None,
+                    harsh: None,
                 },
                 // Runs after "remove" archived entry-for-add, so the
                 // restore has a tombstoned entry to revive.
@@ -951,6 +1018,7 @@ mod tests {
                     query: None,
                     scope: None,
                     outcome: None,
+                    harsh: None,
                 },
                 // Runs after "restore", so entry-for-add is active.
                 "expand" => Args {
@@ -962,6 +1030,7 @@ mod tests {
                     query: None,
                     scope: None,
                     outcome: None,
+                    harsh: None,
                 },
                 "search" => Args {
                     action: "search".into(),
@@ -972,6 +1041,7 @@ mod tests {
                     query: Some("seed".into()),
                     scope: None,
                     outcome: None,
+                    harsh: None,
                 },
                 _ => unreachable!(),
             };
