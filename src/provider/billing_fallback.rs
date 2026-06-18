@@ -44,13 +44,21 @@ pub(crate) fn prompt_from_ask_sender(ask_tx: Option<AskSender>) -> BillingFallba
                 "OpenAI subscription quota/model access appears exhausted. Switch this request to OpenAI API-key billing? This may incur OpenAI API charges. Original error: {}",
                 request.error,
             );
-            let send = ask_tx
-                .send(AskRequest {
+            let send = tokio::time::timeout(
+                BILLING_FALLBACK_CONFIRMATION_TIMEOUT,
+                ask_tx.send(AskRequest {
                     tool: "openai_api_billing".to_string(),
                     input,
                     reply,
-                })
-                .await;
+                }),
+            )
+            .await;
+            let Ok(send) = send else {
+                return BillingFallbackDecision::Unavailable(
+                    "OpenAI API-key billing fallback requires interactive confirmation, but the confirmation request was not delivered in time."
+                        .to_string(),
+                );
+            };
             if send.is_err() {
                 return BillingFallbackDecision::Unavailable(
                     "OpenAI API-key billing fallback requires interactive confirmation, but the confirmation channel is unavailable."
@@ -141,8 +149,10 @@ pub(crate) fn is_openai_subscription_exhausted_error(error: &str) -> bool {
     if lower.contains("rate limit") {
         return false;
     }
+    if model_access_is_plan_limited(&lower) {
+        return true;
+    }
     if lower.contains("usage limit")
-        || lower.contains("limit reached")
         || lower.contains("insufficient_quota")
         || lower.contains("billing_not_active")
         || lower.contains("billing_hard_limit_reached")
@@ -155,8 +165,31 @@ pub(crate) fn is_openai_subscription_exhausted_error(error: &str) -> bool {
     {
         return true;
     }
+    if lower.contains("limit reached") {
+        return lower.contains("subscription")
+            || lower.contains("quota")
+            || lower.contains("billing")
+            || lower.contains("plan")
+            || lower.contains("monthly")
+            || lower.contains("usage");
+    }
     lower.contains("subscription")
         && (lower.contains("limit") || lower.contains("quota") || lower.contains("exhausted"))
+}
+
+fn model_access_is_plan_limited(lower: &str) -> bool {
+    if !lower.contains("model") {
+        return false;
+    }
+    let access_denied = lower.contains("do not have access")
+        || lower.contains("don't have access")
+        || lower.contains("not available")
+        || lower.contains("does not include");
+    let plan_scoped = lower.contains("plan")
+        || lower.contains("subscription")
+        || lower.contains("account")
+        || lower.contains("workspace");
+    access_denied && plan_scoped
 }
 
 fn is_content_delta(phase: DeltaPhase) -> bool {
@@ -177,7 +210,7 @@ mod tests {
     use crate::agent::agent_loop::stream::{LlmContext, StreamFn, StreamOptions};
     use crate::agent::agent_loop::tool::AbortSignal;
     use crate::agent::recovery::RecoveryPolicy;
-    use crate::permission::ask::UserDecision;
+    use crate::permission::ask::{AskRequest, UserDecision};
     use futures::StreamExt;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -312,6 +345,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn request_limit_reached_does_not_prompt_or_fallback() {
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let primary = canned(
+            vec![StreamEvent::Error {
+                error: "429 Too Many Requests: request limit reached, retry later".to_string(),
+            }],
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let fallback = canned(Vec::new(), fallback_calls.clone());
+        let prompt: BillingFallbackPrompt = Arc::new(|_| {
+            panic!("generic request limits must not prompt for API-key billing fallback")
+        });
+
+        let events = drain(with_openai_api_billing_fallback(primary, fallback, prompt)).await;
+
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 0);
+        assert!(matches!(events[0], StreamEvent::Error { .. }));
+    }
+
+    #[tokio::test]
     async fn subscription_exhaustion_prompts_before_retry_budget() {
         let primary_calls = Arc::new(AtomicUsize::new(0));
         let fallback_calls = Arc::new(AtomicUsize::new(0));
@@ -361,6 +414,16 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn detector_matches_plan_model_access_errors() {
+        assert!(is_openai_subscription_exhausted_error(
+            "You do not have access to this model on your current plan."
+        ));
+        assert!(is_openai_subscription_exhausted_error(
+            "This model is not available on your plan."
+        ));
+    }
+
     #[tokio::test]
     async fn prompt_from_missing_ask_channel_reports_non_interactive_error() {
         let prompt = prompt_from_ask_sender(None);
@@ -398,6 +461,37 @@ mod tests {
             panic!("unanswered ask channel must not hang or approve API-key billing fallback");
         };
         assert!(message.contains("confirmation was not answered"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn prompt_from_full_undrained_ask_channel_times_out() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let (reply, _decision) = tokio::sync::oneshot::channel();
+        tx.try_send(AskRequest {
+            tool: "already_queued".to_string(),
+            input: "pending".to_string(),
+            reply,
+        })
+        .unwrap();
+        let prompt = prompt_from_ask_sender(Some(tx));
+        let task = tokio::spawn(async move {
+            prompt(BillingFallbackRequest {
+                error: "429: usage limit reached".to_string(),
+            })
+            .await
+        });
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(31)).await;
+
+        let decision = tokio::time::timeout(Duration::from_millis(1), task)
+            .await
+            .expect("full ask channel must time out instead of hanging")
+            .unwrap();
+        let BillingFallbackDecision::Unavailable(message) = decision else {
+            panic!("full ask channel must not hang or approve API-key billing fallback");
+        };
+        assert!(message.contains("confirmation request was not delivered"));
     }
 
     #[tokio::test]
