@@ -530,6 +530,16 @@ pub fn markdown_to_styled(text: &str, max_width: usize, base_color: Color) -> Ve
                     // Inside a quote, every code row carries the `│ ` bar (in
                     // place of the 2-space gutter) so the block stays contained.
                     let gutter = if in_blockquote { "│ " } else { "  " };
+                    // Wrap long code lines to the content width instead of
+                    // emitting one over-wide row per source line. The chat
+                    // painter draws one screen row per LineEntry and CLIPS to
+                    // width (chat.rs), so an unwrapped long line is cut off —
+                    // the "I can only see one sentence" report. `word_wrap` is
+                    // ANSI-aware (visible-char width, escapes ride with their
+                    // text) and breaks at spaces between tokens, so the
+                    // per-span coloring survives the wrap.
+                    let gutter_w = iter_visible_chars(gutter).len();
+                    let inner_w = max_width.saturating_sub(gutter_w).max(1);
                     for spans in highlighted {
                         if spans.is_empty() {
                             result.push(LineEntry {
@@ -542,22 +552,27 @@ pub fn markdown_to_styled(text: &str, max_width: usize, base_color: Color) -> Ve
                             });
                             continue;
                         }
-                        // Assemble the row by concatenating ANSI-wrapped
-                        // spans. Pre-pad with the gutter (or quote bar) so code
-                        // blocks visually offset from prose.
-                        let mut row = String::from(gutter);
+                        // Build the colored content (no gutter), then wrap it,
+                        // carrying the gutter onto every wrapped row. The color
+                        // field is a fallback for terminals that strip ANSI; the
+                        // embedded escapes drive the actual paint.
+                        let mut content = String::new();
                         for s in &spans {
-                            row.push_str(&ansi_fg(s.color));
-                            row.push_str(&s.text);
-                            row.push_str("\x1b[0m");
+                            content.push_str(&ansi_fg(s.color));
+                            content.push_str(&s.text);
+                            content.push_str("\x1b[0m");
                         }
-                        // Single LineEntry per row; the color field is
-                        // a fallback for terminals that strip ANSI but
-                        // the embedded escapes drive the actual paint.
-                        result.push(LineEntry {
-                            text: CompactString::from(row),
-                            color: crate::ui::theme::tool(),
-                        });
+                        for chunk in word_wrap(&content, inner_w) {
+                            let mut row = String::from(gutter);
+                            row.push_str(&chunk);
+                            // Defensive reset so a hard break mid-span can't
+                            // bleed color into the row's padding.
+                            row.push_str("\x1b[0m");
+                            result.push(LineEntry {
+                                text: CompactString::from(row),
+                                color: crate::ui::theme::tool(),
+                            });
+                        }
                     }
                     acc.clear();
                     code_block_lang.clear();
@@ -1085,6 +1100,59 @@ mod tests {
         // immediately before "fn" indicates it was painted.
         assert!(blob.contains("fn"));
         assert!(blob.contains("\x1b["));
+    }
+
+    /// A long single line inside a fenced code block must WRAP to multiple rows
+    /// (each within the width) rather than be emitted as one over-wide
+    /// `LineEntry` — the chat painter draws one screen row per entry and CLIPS
+    /// to width, so an unwrapped long code line gets cut off (the "I can only
+    /// see one sentence in the code block" report). Prose already wraps via
+    /// `word_wrap`; code rows previously did not.
+    #[test]
+    fn long_code_line_wraps_instead_of_clipping() {
+        let line = "this is a very long single line of profile text inside a code \
+                    block that must wrap across several rows instead of being clipped \
+                    at the window edge";
+        let input = format!("```\n{line}\n```");
+        let width = 40;
+        let rendered = markdown_to_styled(&input, width, crate::ui::theme::agent());
+
+        // Code rows carry the 2-space gutter; strip ANSI to measure + inspect.
+        let code_rows: Vec<String> = rendered
+            .iter()
+            .map(|e| crate::ui::ansi::strip_ansi(&e.text))
+            .filter(|t| t.starts_with("  ") && !t.trim().is_empty())
+            .collect();
+
+        assert!(
+            code_rows.len() >= 2,
+            "long code line must wrap to >=2 rows, got {code_rows:?}"
+        );
+        for r in &code_rows {
+            assert!(
+                UnicodeWidthStr::width(r.as_str()) <= width,
+                "wrapped code row exceeds width {width}: {r:?} (w={})",
+                UnicodeWidthStr::width(r.as_str())
+            );
+        }
+        // Every word survived across the wrapped rows (nothing clipped).
+        let joined: String = code_rows
+            .iter()
+            .map(|r| r.trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            joined.contains("this is a very long"),
+            "head preserved: {joined:?}"
+        );
+        assert!(
+            joined.contains("wrap across several rows"),
+            "middle preserved: {joined:?}"
+        );
+        assert!(
+            joined.contains("at the window edge"),
+            "tail preserved: {joined:?}"
+        );
     }
 
     /// Control characters injected by the LLM into response text
