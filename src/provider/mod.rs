@@ -132,6 +132,11 @@ pub struct AnyAgent {
     /// built (test agents, --no-tools, build failure). The provider
     /// is shared with `MemoryTool` via `Arc` — same instance.
     memory_provider: Option<std::sync::Arc<dyn crate::extras::memory_provider::MemoryProvider>>,
+    /// dirge-ygm3: a memory tool with the background-review actions
+    /// (`mark`/`supersede`) enabled, kept OUT of `loop_tools` so the
+    /// interactive agent never sees them. The review runner swaps this in
+    /// place of the main memory tool. `None` when no store loaded.
+    review_memory_tool: Option<std::sync::Arc<dyn crate::agent::agent_loop::LoopTool>>,
 }
 
 #[derive(Clone)]
@@ -180,7 +185,17 @@ impl AnyAgent {
             review_model_name: None,
             bg_store: None,
             memory_provider: None,
+            review_memory_tool: None,
         }
+    }
+
+    /// dirge-ygm3: attach the review-enabled memory tool (see the field doc).
+    pub fn with_review_memory_tool(
+        mut self,
+        tool: std::sync::Arc<dyn crate::agent::agent_loop::LoopTool>,
+    ) -> Self {
+        self.review_memory_tool = Some(tool);
+        self
     }
 
     /// dirge-x949: append tools to the live loop registry. Background

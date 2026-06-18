@@ -379,6 +379,40 @@ fn filter_loop_tools_is_a_hard_allowlist() {
     assert!(crate::provider::spawn::filter_loop_tools(&tools, &[]).is_empty());
 }
 
+/// dirge-ygm3: the review fork swaps its `memory` tool for the review-enabled
+/// instance; other tools are untouched, and a set without `memory` is a no-op.
+#[cfg(feature = "mcp")]
+#[test]
+fn swap_in_review_memory_replaces_only_the_memory_tool() {
+    use crate::agent::agent_loop::LoopTool;
+    use std::sync::Arc;
+
+    let original_memory: Arc<dyn LoopTool> = Arc::new(NamedTool("memory"));
+    let skill: Arc<dyn LoopTool> = Arc::new(NamedTool("skill"));
+    // Distinct instance, same name — the review-enabled tool.
+    let review_memory: Arc<dyn LoopTool> = Arc::new(NamedTool("memory"));
+
+    let mut tools = vec![original_memory.clone(), skill.clone()];
+    crate::provider::spawn::swap_in_review_memory(&mut tools, &review_memory);
+    assert!(
+        Arc::ptr_eq(&tools[0], &review_memory),
+        "memory slot now points at the review tool",
+    );
+    assert!(
+        !Arc::ptr_eq(&tools[0], &original_memory),
+        "the original memory tool was replaced",
+    );
+    assert!(Arc::ptr_eq(&tools[1], &skill), "skill tool untouched");
+
+    // No `memory` tool present → no-op (skill-only curator/phase fork).
+    let mut skill_only = vec![skill.clone()];
+    crate::provider::spawn::swap_in_review_memory(&mut skill_only, &review_memory);
+    assert!(
+        Arc::ptr_eq(&skill_only[0], &skill),
+        "no memory tool → unchanged"
+    );
+}
+
 /// dirge-z73i: `with_review_route` stashes the alternate stream_fn,
 /// provider alias, and model name on AnyAgent so
 /// `spawn_review_runner_with_cache` can pick them up. This is a pure

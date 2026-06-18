@@ -31,6 +31,21 @@ pub(crate) fn filter_loop_tools(
         .collect()
 }
 
+/// dirge-ygm3: replace the `memory`-named tool in a filtered set with the
+/// review-enabled instance (`mark`/`supersede`). Used only for the background
+/// review fork, so those actions are reachable there and nowhere else. No-op
+/// when the set has no `memory` tool.
+pub(crate) fn swap_in_review_memory(
+    tools: &mut [std::sync::Arc<dyn crate::agent::agent_loop::LoopTool>],
+    review_tool: &std::sync::Arc<dyn crate::agent::agent_loop::LoopTool>,
+) {
+    for slot in tools.iter_mut() {
+        if slot.name() == "memory" {
+            *slot = review_tool.clone();
+        }
+    }
+}
+
 impl AnyAgent {
     /// Map a tool slice to rig `ToolDefinition`s for the per-turn request
     /// builder. Shared by the main (`spawn_runner`) and fork
@@ -233,8 +248,13 @@ impl AnyAgent {
         prompt: String,
         transcript: String,
     ) -> crate::agent::runner::AgentRunner {
-        let (runner, _isolated_cache) =
-            self.spawn_filtered_runner_with_cache(prompt, transcript, ToolCache::new(), &["skill"]);
+        let (runner, _isolated_cache) = self.spawn_filtered_runner_with_cache(
+            prompt,
+            transcript,
+            ToolCache::new(),
+            &["skill"],
+            false,
+        );
         runner
     }
 
@@ -252,8 +272,13 @@ impl AnyAgent {
         transcript: String,
         allowed: &[&str],
     ) -> crate::agent::runner::AgentRunner {
-        let (runner, _isolated_cache) =
-            self.spawn_filtered_runner_with_cache(prompt, transcript, ToolCache::new(), allowed);
+        let (runner, _isolated_cache) = self.spawn_filtered_runner_with_cache(
+            prompt,
+            transcript,
+            ToolCache::new(),
+            allowed,
+            false,
+        );
         runner
     }
 
@@ -274,6 +299,10 @@ impl AnyAgent {
             transcript,
             ToolCache::new(),
             &["memory"],
+            // The consolidation curator only add/replace/remove/promotes — it
+            // has no transcript to infer outcomes/contradictions from, so it
+            // does NOT get mark/supersede.
+            false,
         );
         runner
     }
@@ -299,6 +328,9 @@ impl AnyAgent {
             transcript,
             review_cache,
             &["memory", "skill"],
+            // The review pass is the one that records outcomes (`mark`) and
+            // supersedes contradicted facts — give it the review-enabled tool.
+            true,
         )
     }
 
@@ -315,6 +347,11 @@ impl AnyAgent {
         transcript: String,
         review_cache: ToolCache,
         allowed_tools: &[&str],
+        // dirge-ygm3: when true, swap in the review-enabled memory tool
+        // (`mark`/`supersede`). Only the background REVIEW pass passes true —
+        // it's the one that infers outcomes and contradictions from the
+        // transcript. The consolidation curator and phase runners pass false.
+        review_memory: bool,
     ) -> (crate::agent::runner::AgentRunner, ToolCache) {
         use crate::agent::agent_loop::{LoopSpawnConfig, retrying_stream_fn, spawn_loop_runner};
         use crate::agent::recovery::RecoveryPolicy;
@@ -329,7 +366,15 @@ impl AnyAgent {
         );
 
         // Filter to the caller-supplied allow-list (shared, tested helper).
-        let review_tools = filter_loop_tools(&self.loop_tools, allowed_tools);
+        let mut review_tools = filter_loop_tools(&self.loop_tools, allowed_tools);
+
+        // dirge-ygm3: for the review pass, replace the main (non-review) memory
+        // tool with the review-enabled one so `mark`/`supersede` are reachable
+        // here but nowhere else. No-op if the store didn't load or "memory"
+        // wasn't in the allow-list.
+        if review_memory && let Some(review_tool) = &self.review_memory_tool {
+            swap_in_review_memory(&mut review_tools, review_tool);
+        }
 
         let tool_defs = Self::tool_defs_for(&review_tools);
 

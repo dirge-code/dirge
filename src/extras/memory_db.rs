@@ -1261,11 +1261,10 @@ impl SqliteMemoryStore {
     ///
     /// The intended caller is the background review pass, which reads
     /// the transcript and infers outcomes ("that worked" / "that didn't
-    /// help") — not the interactive agent's hot path. The action is
-    /// kept out of `SYSTEM_PROMPT` so the live agent isn't told to
-    /// self-grade; it remains in the shared tool schema because the
-    /// review runner filters tools by name, not action (a per-context
-    /// action gate is tracked as follow-up).
+    /// help") — not the interactive agent's hot path. dirge-ygm3 enforces
+    /// that: the `mark` action is gated behind `MemoryTool::review_actions`,
+    /// so it's absent from the interactive agent's tool schema (and rejected
+    /// at the call layer) and present only on the review runner's instance.
     pub fn record_outcome(
         &self,
         target: &str,
