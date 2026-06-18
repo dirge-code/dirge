@@ -51,6 +51,7 @@ impl ProviderCredential {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn create_client(
     provider_name: &str,
     api_key: Option<&str>,
@@ -82,6 +83,7 @@ pub(crate) fn create_client_with_auth(
     )
 }
 
+#[cfg(test)]
 fn create_client_with<F, G>(
     provider_name: &str,
     api_key: Option<&str>,
@@ -147,7 +149,10 @@ where
         // (literal or `${VAR}`-expanded) > `entry.api_key_env` > default
         // env var for the kind > kind-specific fallback env vars > native
         // Dirge OpenAI OAuth fallback.
+        let allow_openai_oauth =
+            provider_name.eq_ignore_ascii_case("openai") && info.base_url.as_deref().is_none();
         resolve_provider_credential(
+            allow_openai_oauth,
             info.kind,
             info.api_key_literal.as_deref(),
             info.api_key_env.as_deref(),
@@ -321,6 +326,7 @@ fn chatgpt_http_headers(auth_headers: Option<&ProviderAuthHeaders>) -> Option<He
 }
 
 fn resolve_provider_credential<F, G>(
+    allow_openai_oauth: bool,
     kind: ProviderKind,
     api_key_literal: Option<&str>,
     api_key_env: Option<&str>,
@@ -341,7 +347,8 @@ where
 
     match resolve_api_key_from(kind, api_key_env, None, env) {
         Ok(key) => Ok(ProviderCredential::ApiKey(key)),
-        Err(err) if kind == ProviderKind::OpenAI => match load_openai_oauth()? {
+        Err(err) if kind == ProviderKind::OpenAI && allow_openai_oauth => match load_openai_oauth()?
+        {
             Some(credential) => Ok(ProviderCredential::OpenAiOAuth(
                 credential.access_token().to_string(),
             )),
@@ -418,6 +425,7 @@ mod tests {
         let loaded = Cell::new(false);
 
         let credential = resolve_provider_credential(
+            true,
             ProviderKind::OpenAI,
             None,
             None,
@@ -445,6 +453,7 @@ mod tests {
         let loaded = Cell::new(false);
 
         let credential = resolve_provider_credential(
+            true,
             ProviderKind::OpenAI,
             None,
             None,
@@ -466,16 +475,7 @@ mod tests {
 
     #[test]
     fn openai_oauth_fallback_builds_chatgpt_codex_client() {
-        let providers = HashMap::from([(
-            "openai".to_string(),
-            ProviderEntry {
-                provider_type: Some("openai".to_string()),
-                base_url: Some("https://proxy.invalid/v1".to_string()),
-                ..Default::default()
-            },
-        )]);
-
-        let client = create_client_with("openai", None, &providers, no_env, || {
+        let client = create_client_with("openai", None, &HashMap::new(), no_env, || {
             Ok(Some(oauth("oauth-token")))
         })
         .unwrap();
@@ -486,6 +486,34 @@ mod tests {
             }
             _ => panic!("OAuth fallback must use the ChatGPT Codex client"),
         }
+    }
+
+    #[test]
+    fn configured_openai_base_url_does_not_fallback_to_oauth() {
+        let loaded = Cell::new(false);
+        let providers = HashMap::from([(
+            "openai".to_string(),
+            ProviderEntry {
+                provider_type: Some("openai".to_string()),
+                base_url: Some("https://proxy.invalid/v1".to_string()),
+                ..Default::default()
+            },
+        )]);
+
+        let result = create_client_with("openai", None, &providers, no_env, || {
+            loaded.set(true);
+            Ok(Some(oauth("oauth-token")))
+        });
+        let err = match result {
+            Ok(_) => panic!("configured OpenAI base_url must not use OAuth fallback"),
+            Err(err) => err.to_string(),
+        };
+
+        assert!(err.contains("OPENAI_API_KEY"), "unexpected error: {err}");
+        assert!(
+            !loaded.get(),
+            "configured OpenAI base_url must not read the Dirge OAuth store"
+        );
     }
 
     #[test]
@@ -509,13 +537,20 @@ mod tests {
     fn oauth_fallback_is_openai_only() {
         let loaded = Cell::new(false);
 
-        let err =
-            resolve_provider_credential(ProviderKind::Anthropic, None, None, None, no_env, || {
+        let err = resolve_provider_credential(
+            false,
+            ProviderKind::Anthropic,
+            None,
+            None,
+            None,
+            no_env,
+            || {
                 loaded.set(true);
                 Ok(Some(oauth("oauth-token")))
-            })
-            .unwrap_err()
-            .to_string();
+            },
+        )
+        .unwrap_err()
+        .to_string();
 
         assert!(err.contains("ANTHROPIC_API_KEY"));
         assert!(
@@ -525,13 +560,47 @@ mod tests {
     }
 
     #[test]
+    fn openai_compatible_alias_does_not_fallback_to_oauth() {
+        let loaded = Cell::new(false);
+        let providers = HashMap::from([(
+            "local-vllm".to_string(),
+            ProviderEntry {
+                provider_type: Some("openai".to_string()),
+                base_url: Some("http://localhost:11434/v1".to_string()),
+                allow_insecure: true,
+                ..Default::default()
+            },
+        )]);
+
+        let result = create_client_with("local-vllm", None, &providers, no_env, || {
+            loaded.set(true);
+            Ok(Some(oauth("oauth-token")))
+        });
+        let err = match result {
+            Ok(_) => panic!("OpenAI-compatible custom alias must not use OAuth fallback"),
+            Err(err) => err.to_string(),
+        };
+
+        assert!(err.contains("OPENAI_API_KEY"), "unexpected error: {err}");
+        assert!(
+            !loaded.get(),
+            "OpenAI-compatible custom aliases must not read the Dirge OAuth store"
+        );
+    }
+
+    #[test]
     fn missing_openai_oauth_fallback_points_to_login_command() {
-        let err =
-            resolve_provider_credential(ProviderKind::OpenAI, None, None, None, no_env, || {
-                Ok(None)
-            })
-            .unwrap_err()
-            .to_string();
+        let err = resolve_provider_credential(
+            true,
+            ProviderKind::OpenAI,
+            None,
+            None,
+            None,
+            no_env,
+            || Ok(None),
+        )
+        .unwrap_err()
+        .to_string();
 
         assert!(err.contains("OPENAI_API_KEY"));
         assert!(err.contains("dirge auth openai"));

@@ -6,9 +6,9 @@ usage() {
 Usage: scripts/validate-openai-oauth.sh [--login] [--model MODEL] [PROMPT...]
 
 Runs the feature-worktree Dirge binary against the OpenAI OAuth/Codex provider
-path. The script forces a single isolated DIRGE_DATA_DIR, unsets API-key and
-provider/model env vars that could mask OAuth fallback, and passes --provider
-openai before the prompt.
+path. The script forces isolated DIRGE_DATA_DIR and DIRGE_CONFIG_DIR values,
+unsets API-key and provider/model env vars that could mask OAuth fallback, and
+passes --provider openai before the prompt.
 
 Options:
   --login        Run `dirge auth openai` first using the same DIRGE_DATA_DIR.
@@ -17,6 +17,7 @@ Options:
 
 Environment:
   DIRGE_OAUTH_VALIDATION_DATA_DIR  Auth/data dir. Default: /var/tmp/opencode/dirge-oauth-validation
+  DIRGE_OAUTH_VALIDATION_CONFIG_DIR  Config parent dir. Default: /var/tmp/opencode/dirge-oauth-validation-config
   DIRGE_OPENAI_MODEL               Default model when --model is omitted.
   CARGO                            Cargo executable. Default: /home/user/.cargo/bin/cargo
 
@@ -60,9 +61,12 @@ prompt="${*:-Reply with exactly: dirge-oauth-ok}"
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 worktree_dir="$(cd -- "$script_dir/.." && pwd)"
 data_dir="${DIRGE_OAUTH_VALIDATION_DATA_DIR:-/var/tmp/opencode/dirge-oauth-validation}"
+config_root="${DIRGE_OAUTH_VALIDATION_CONFIG_DIR:-/var/tmp/opencode/dirge-oauth-validation-config}"
+config_dir="$config_root/empty-config"
 cargo_bin="${CARGO:-/home/user/.cargo/bin/cargo}"
 
-mkdir -p -- "$data_dir"
+rm -rf -- "$config_dir"
+mkdir -p -- "$data_dir" "$config_dir"
 cd -- "$worktree_dir"
 
 # Force OAuth fallback and avoid accidental provider/model defaults.
@@ -78,9 +82,11 @@ unset ZHIPU_API_KEY
 unset DIRGE_PROVIDER
 unset DIRGE_MODEL
 export DIRGE_DATA_DIR="$data_dir"
+export DIRGE_CONFIG_DIR="$config_dir"
 
 printf 'Using worktree: %s\n' "$worktree_dir" >&2
 printf 'Using DIRGE_DATA_DIR: %s\n' "$DIRGE_DATA_DIR" >&2
+printf 'Using DIRGE_CONFIG_DIR: %s\n' "$DIRGE_CONFIG_DIR" >&2
 printf 'Using provider: openai\n' >&2
 printf 'Using model: %s\n' "$model" >&2
 

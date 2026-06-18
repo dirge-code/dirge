@@ -160,7 +160,7 @@ async fn run_prompt(
         state.cli.resolve_model(&state.cfg)
     };
 
-    let client = crate::provider::create_client(&provider_str, None, &state.cfg.providers_map())
+    let client = create_acp_client(&provider_str, &state.cfg)
         .map_err(|e| agent_client_protocol::Error::new(-32603, e.to_string()))?;
 
     let model = client.completion_model(model_str.to_string());
@@ -359,6 +359,13 @@ async fn run_prompt(
     Ok(())
 }
 
+fn create_acp_client(
+    provider_str: &str,
+    cfg: &Config,
+) -> anyhow::Result<crate::provider::AnyClient> {
+    crate::provider::create_client_with_auth(provider_str, None, &cfg.providers_map(), cfg.auth)
+}
+
 fn build_acp_permission(state: &AcpState) -> (Option<PermCheck>, Option<AskSender>) {
     use std::sync::Mutex;
 
@@ -452,6 +459,93 @@ fn spawn_acp_ask_drain(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ProviderAuth;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    static ACP_AUTH_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new(tag: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "dirge_acp_{tag}_{}_{}",
+                std::process::id(),
+                uuid::Uuid::new_v4().simple()
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct EnvGuard {
+        key: &'static str,
+        old: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set_path(key: &'static str, value: &Path) -> Self {
+            let old = std::env::var(key).ok();
+            // SAFETY: ACP_AUTH_ENV_LOCK serializes all mutations in this module.
+            unsafe { std::env::set_var(key, value) };
+            Self { key, old }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let old = std::env::var(key).ok();
+            // SAFETY: ACP_AUTH_ENV_LOCK serializes all mutations in this module.
+            unsafe { std::env::remove_var(key) };
+            Self { key, old }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: ACP_AUTH_ENV_LOCK serializes all mutations in this module.
+            unsafe {
+                match &self.old {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn acp_client_uses_top_level_chatgpt_auth() {
+        let _lock = ACP_AUTH_ENV_LOCK.lock().unwrap();
+        let dir = TestDir::new("codex_home");
+        let _home = EnvGuard::set_path("CODEX_HOME", dir.path());
+        let _access = EnvGuard::remove("CODEX_ACCESS_TOKEN");
+        let _account = EnvGuard::remove("CHATGPT_ACCOUNT_ID");
+        let cfg = Config {
+            auth: Some(ProviderAuth::ChatGpt),
+            ..Default::default()
+        };
+
+        let result = create_acp_client("openai", &cfg);
+        let err = match result {
+            Ok(_) => panic!("ACP client should attempt ChatGPT auth"),
+            Err(err) => err.to_string(),
+        };
+
+        assert!(
+            err.contains("ChatGPT auth requested"),
+            "unexpected error: {err}"
+        );
+        assert!(!err.contains("OPENAI_API_KEY"), "unexpected error: {err}");
+    }
 
     /// Regression for F1: any `AskRequest` sent through the ACP
     /// ask channel must be promptly responded to with `Deny`,

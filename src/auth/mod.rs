@@ -432,4 +432,32 @@ mod command_tests {
         let saved = std::fs::read_to_string(store.path()).unwrap();
         assert!(saved.contains("1700000300000"));
     }
+
+    #[test]
+    fn oauth_validation_scripts_isolate_config_dir() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        for script in [
+            "scripts/validate-openai-oauth.sh",
+            "scripts/openai-oauth-interactive.sh",
+        ] {
+            let body = std::fs::read_to_string(root.join(script)).unwrap();
+
+            assert!(
+                body.contains("DIRGE_OAUTH_VALIDATION_CONFIG_DIR"),
+                "{script} must document its isolated config dir override"
+            );
+            assert!(
+                body.contains("export DIRGE_CONFIG_DIR=\"$config_dir\""),
+                "{script} must export an isolated DIRGE_CONFIG_DIR"
+            );
+            assert!(
+                body.contains("rm -rf -- \"$config_dir\""),
+                "{script} must clear stale validation config before each run"
+            );
+            assert!(
+                body.contains("Using DIRGE_CONFIG_DIR"),
+                "{script} must print the non-secret config dir in validation evidence"
+            );
+        }
+    }
 }
