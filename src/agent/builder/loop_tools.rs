@@ -172,6 +172,36 @@ pub(crate) async fn register_spec_tool(
     }
 }
 
+/// dirge-4hld: build the embeddings-backed retriever when hybrid memory is
+/// configured. Returns `None` (→ BM25-only) unless `hybrid_retrieval` is on
+/// AND an embeddings endpoint is set, so the default and misconfigured cases
+/// degrade silently to the builtin store.
+fn resolve_embedder(
+    cfg: &crate::config::MemoryConfig,
+) -> Option<std::sync::Arc<dyn crate::extras::memory_hybrid::Embedder>> {
+    if cfg.hybrid_retrieval != Some(true) {
+        return None;
+    }
+    let url = cfg.embed_url.clone()?;
+    let model = cfg
+        .embed_model
+        .clone()
+        .unwrap_or_else(|| crate::extras::memory_hybrid::DEFAULT_EMBED_MODEL.to_string());
+    let api_key = cfg
+        .embed_api_key_env
+        .as_ref()
+        .and_then(|var| std::env::var(var).ok());
+    // Surface the active backend once so a misconfigured url/model (e.g. a
+    // non-OpenAI endpoint left on the default model id) is visible in logs
+    // rather than only as a silent BM25 fallback.
+    tracing::info!(
+        target: "dirge::memory_hybrid",
+        url = %url, model = %model, keyed = api_key.is_some(),
+        "hybrid memory retrieval enabled",
+    );
+    crate::extras::memory_hybrid::api_embedder(url, model, api_key)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn build_loop_tools(
     cache: ToolCache,
@@ -216,6 +246,8 @@ pub async fn build_loop_tools(
     // filesystem can't stall the async runtime worker. dirge-fmau:
     // returns `Arc<dyn MemoryProvider>` so plugin backends can plug
     // in without churning the call sites.
+    // dirge-4hld: wrap the BM25 store in the hybrid retriever when configured.
+    let mem_cfg = cfg.memory.clone().unwrap_or_default();
     let memory_store: Option<Arc<dyn crate::extras::memory_provider::MemoryProvider>> =
         if let Ok(c) = std::env::current_dir() {
             let paths = crate::extras::dirge_paths::ProjectPaths::new(&c);
@@ -223,9 +255,24 @@ pub async fn build_loop_tools(
                 crate::extras::memory_db::SqliteMemoryStore::load(&paths)
                     .ok()
                     .map(|s| {
-                        let arc: Arc<dyn crate::extras::memory_provider::MemoryProvider> =
-                            Arc::new(s);
-                        arc
+                        let inner = Arc::new(s);
+                        match resolve_embedder(&mem_cfg) {
+                            Some(embedder) => {
+                                let hybrid: Arc<
+                                    dyn crate::extras::memory_provider::MemoryProvider,
+                                > = Arc::new(
+                                    crate::extras::memory_hybrid::HybridMemoryProvider::new(
+                                        inner, embedder,
+                                    ),
+                                );
+                                hybrid
+                            }
+                            None => {
+                                let arc: Arc<dyn crate::extras::memory_provider::MemoryProvider> =
+                                    inner;
+                                arc
+                            }
+                        }
                     })
             })
             .await

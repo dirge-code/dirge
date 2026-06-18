@@ -301,7 +301,16 @@ old_text matches a unique substring or the exact "urn:ump:…" id from view/inde
                     "query",
                     "search",
                 )?;
-                let resp = store.search(query).map_err(ToolError::Msg)?;
+                // dirge-4hld: search can do blocking work — SQLite I/O for the
+                // builtin store, and a network embedding round-trip for the
+                // hybrid provider. Off-load to the blocking pool so it never
+                // parks an async runtime worker.
+                let store = store.clone();
+                let query = query.to_string();
+                let resp = tokio::task::spawn_blocking(move || store.search(&query))
+                    .await
+                    .map_err(|e| ToolError::Msg(format!("memory search task failed: {e}")))?
+                    .map_err(ToolError::Msg)?;
                 Ok(serde_json::to_string_pretty(&resp)
                     .unwrap_or_else(|_| r#"{"error":"serialization failed"}"#.to_string()))
             }

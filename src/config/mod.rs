@@ -133,6 +133,25 @@ pub struct KeybindingConfig {
     pub command: String,
 }
 
+/// Long-term memory retrieval tuning (dirge-4hld). Absent/default = the
+/// builtin BM25 store, unchanged. `hybrid_retrieval` opts into dense+BM25
+/// fusion, which additionally needs an embeddings backend (`embed_url`, plus
+/// `embed_api_key_env` for hosted ones); if the backend isn't configured the
+/// store silently stays BM25-only.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct MemoryConfig {
+    /// Turn on hybrid (dense + BM25) memory search. Default off.
+    pub hybrid_retrieval: Option<bool>,
+    /// OpenAI-compatible `/v1/embeddings` endpoint URL.
+    pub embed_url: Option<String>,
+    /// Embedding model id; defaults to `memory_hybrid::DEFAULT_EMBED_MODEL`.
+    pub embed_model: Option<String>,
+    /// Env var holding the embeddings API key. Omit for a keyless local
+    /// endpoint. (The key itself is never stored in config.)
+    pub embed_api_key_env: Option<String>,
+}
+
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(default)]
 pub struct ToolsConfig {
@@ -550,6 +569,8 @@ pub struct Config {
     /// applied over the built-in defaults by `ui::keymap`.
     pub keybindings: Option<Vec<KeybindingConfig>>,
     pub tools: Option<ToolsConfig>,
+    /// dirge-4hld: long-term memory retrieval tuning (hybrid dense+BM25).
+    pub memory: Option<MemoryConfig>,
 
     /// Phase-3 (`docs/AGENTIC_LOOP_PLAN.md`): when true, ship only
     /// `tool_search` + a small always-on set in the per-turn tool
@@ -1119,6 +1140,30 @@ mod tests {
         .unwrap();
         assert!(cfg.resolve_phased_workflow_enabled());
         assert_eq!(cfg.resolve_phased_workflow_max_review_cycles(), 4);
+    }
+
+    /// dirge-4hld: the `memory` block is absent by default and parses its
+    /// fields when present.
+    #[test]
+    fn memory_config_defaults_absent_and_parses() {
+        let cfg: Config = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(cfg.memory.is_none(), "no memory block by default");
+
+        let cfg: Config = serde_json::from_str(
+            r#"{ "memory": { "hybrid_retrieval": true, "embed_url": "http://localhost:11434/v1/embeddings", "embed_api_key_env": "OPENAI_API_KEY" } }"#,
+        )
+        .unwrap();
+        let m = cfg.memory.expect("memory block present");
+        assert_eq!(m.hybrid_retrieval, Some(true));
+        assert_eq!(
+            m.embed_url.as_deref(),
+            Some("http://localhost:11434/v1/embeddings")
+        );
+        assert_eq!(
+            m.embed_model, None,
+            "model is optional (falls back to default)"
+        );
+        assert_eq!(m.embed_api_key_env.as_deref(), Some("OPENAI_API_KEY"));
     }
 
     /// dirge-4xgd: `[timeouts]` overrides merge onto Timeouts::DEFAULT;

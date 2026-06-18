@@ -1314,8 +1314,22 @@ impl SqliteMemoryStore {
 
     /// Full-text search over all ACTIVE entries, both targets and
     /// tiers (dirge-q8wt). Tokens are individually quoted so user
-    /// phrasing can't be an FTS5 syntax error; ranked by bm25.
+    /// phrasing can't be an FTS5 syntax error; ranked by bm25. Returns
+    /// up to [`SEARCH_RESULT_LIMIT`] results.
     pub fn search_entries(&self, query: &str) -> Result<serde_json::Value, String> {
+        self.search_entries_limited(query, SEARCH_RESULT_LIMIT)
+    }
+
+    /// As [`search_entries`] but with an explicit result cap. dirge-4hld:
+    /// the hybrid retriever over-fetches the BM25 leg so a lexically
+    /// relevant entry ranked just past the default cap can still
+    /// contribute its rank to the fusion, instead of being clipped to 8
+    /// while dense recall sees the whole corpus.
+    pub fn search_entries_limited(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<serde_json::Value, String> {
         let fts_query = crate::extras::fts::quote_terms(query);
         if fts_query.is_empty() {
             return Ok(serde_json::json!({
@@ -1346,7 +1360,7 @@ impl SqliteMemoryStore {
             )
             .map_err(|e| format!("Failed to prepare search: {e}"))?;
         let results: Vec<serde_json::Value> = stmt
-            .query_map(params![fts_query, SEARCH_RESULT_LIMIT as i64], |row| {
+            .query_map(params![fts_query, limit as i64], |row| {
                 Ok(serde_json::json!({
                     "id": row.get::<_, String>(0)?,
                     "target": row.get::<_, String>(1)?,
@@ -1364,6 +1378,36 @@ impl SqliteMemoryStore {
             "count": results.len(),
             "results": results,
         }))
+    }
+
+    /// All ACTIVE entries (both targets and tiers) in the same JSON
+    /// shape `search_entries` returns — `{id, target, kind, tier,
+    /// content}`. dirge-4hld: a hybrid retriever needs every candidate's
+    /// content to score dense similarity (BM25's matched subset isn't
+    /// enough), and the shared shape lets it emit fused results that
+    /// match the existing tool contract without re-fetching metadata.
+    pub fn active_search_rows(&self) -> Result<Vec<serde_json::Value>, String> {
+        let conn = self.conn.lock_ignore_poison();
+        let mut stmt = conn
+            .prepare(
+                "SELECT uid, target, kind, tier, content FROM memories
+                 WHERE status = 'active' ORDER BY id",
+            )
+            .map_err(|e| format!("Failed to prepare active rows: {e}"))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(serde_json::json!({
+                    "id": row.get::<_, String>(0)?,
+                    "target": row.get::<_, String>(1)?,
+                    "kind": row.get::<_, String>(2)?,
+                    "tier": row.get::<_, String>(3)?,
+                    "content": row.get::<_, String>(4)?,
+                }))
+            })
+            .map_err(|e| format!("Failed to read active rows: {e}"))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
     }
 
     fn tombstoned_rows(conn: &Connection, target: &str) -> Result<Vec<ActiveRow>, String> {
@@ -3132,6 +3176,34 @@ mod tests {
         store.remove_entry("memory", "tokio for async").unwrap();
         let resp = store.search_entries("tokio runtime").unwrap();
         assert_eq!(resp["count"], 1, "tombstoned entry must not surface");
+    }
+
+    /// dirge-4hld: `search_entries` caps at the default limit, but
+    /// `search_entries_limited` can over-fetch — the BM25 fusion leg needs
+    /// more than the default 8 candidates.
+    #[test]
+    fn search_entries_limited_overfetches_past_default_cap() {
+        let (paths, _dir) = temp_project();
+        let store = SqliteMemoryStore::load(&paths).unwrap();
+        // 12 entries all matching the same token.
+        for i in 0..12 {
+            store
+                .add_entry("memory", &format!("widget config knob number {i}"), None)
+                .unwrap();
+        }
+        let capped = store.search_entries("widget config knob").unwrap();
+        assert_eq!(
+            capped["count"], 8,
+            "default search caps at SEARCH_RESULT_LIMIT"
+        );
+
+        let pool = store
+            .search_entries_limited("widget config knob", 50)
+            .unwrap();
+        assert_eq!(
+            pool["count"], 12,
+            "over-fetch returns the whole matching set for fusion",
+        );
     }
 
     #[test]

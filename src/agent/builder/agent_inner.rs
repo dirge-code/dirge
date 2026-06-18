@@ -148,6 +148,14 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
     // `MemoryProvider` trait so a non-default backend's prompt block
     // appears too. The unsizing coercion from `Arc<MemoryToolStore>`
     // to `Arc<dyn MemoryProvider>` is the only call-site change.
+    //
+    // dirge-4hld: this provider feeds the preamble snapshot and lifecycle
+    // hooks ONLY — it is the plain BM25 store, NOT the hybrid-wrapped one. The
+    // search-serving instance is built in `build_loop_tools` (the single
+    // source of truth for the tool set); `format_for_system_prompt` and the
+    // hooks delegate to the inner store either way, so the two are equivalent
+    // here. If anything ever calls `search()` on THIS handle it would bypass
+    // hybrid — route such callers through the tool instead.
     let memory_store: Option<Arc<dyn crate::extras::memory_provider::MemoryProvider>> =
         match memory_load_result {
             Ok(store) => {

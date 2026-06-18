@@ -18,6 +18,7 @@ pub mod dirge_paths;
 pub mod fts;
 pub mod memory_curator;
 pub mod memory_db;
+pub mod memory_hybrid;
 pub mod memory_provider;
 #[cfg(test)]
 mod memory_retrieval_eval;

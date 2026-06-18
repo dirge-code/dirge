@@ -98,8 +98,40 @@ Accepted top-level keys:
 | `default_prompt`          | string  | Prompt name to activate on startup. Default: `code`.                                                                                                                        |
 | `theme`                   | string  | UI color theme. `phosphor` (default — 80s CRT green-on-black), `plain` (pre-theme white/cyan), or any `<name>.theme.json` file in the config dir. See [themes.md](themes.md). |
 | `tools`                   | object  | Optional per-tool enable map. Currently honors `tools.websearch` and `tools.webfetch` (both `bool`, default `true`); set either to `false` to drop the tool from the registered set even when its env vars are present. |
+| `memory`                  | object  | Long-term memory retrieval tuning. See [Hybrid memory retrieval](#hybrid-memory-retrieval) below. Absent = the builtin BM25 store. |
 | `mcp_servers`             | object  | MCP server map when compiled with the `mcp` feature. When omitted, defaults to a single Exa Web Search server; see below.                                                   |
 | `acp_servers`             | object  | ACP server config map when compiled with the `acp` feature. See the ACP section below.                                                                                       |
+
+### Hybrid memory retrieval
+
+By default the `memory` tool's `search` is BM25 (keyword) only — exact on
+paths, error codes, and identifiers, but blind to paraphrase. Opt into hybrid
+dense+BM25 retrieval to also recover semantically-related entries, fused with
+Reciprocal Rank Fusion. It needs an OpenAI-compatible embeddings endpoint.
+
+```json
+{
+  "memory": {
+    "hybrid_retrieval": true,
+    "embed_url": "https://api.openai.com/v1/embeddings",
+    "embed_model": "text-embedding-3-small",
+    "embed_api_key_env": "OPENAI_API_KEY"
+  }
+}
+```
+
+| Key                 | Type    | Description |
+| ------------------- | ------- | ----------- |
+| `hybrid_retrieval`  | boolean | Turn on dense+BM25 fusion. Default `false`. |
+| `embed_url`         | string  | OpenAI-compatible `/v1/embeddings` endpoint. **Required** for hybrid; if unset, retrieval stays BM25. |
+| `embed_model`       | string  | Embedding model id. Default `text-embedding-3-small` — set it when pointing at a non-OpenAI endpoint. |
+| `embed_api_key_env` | string  | Name of the env var holding the API key (the key itself is never stored in config). Omit for a keyless local endpoint. |
+
+Safe by default and on failure: with `hybrid_retrieval` off, or the endpoint
+unset/unreachable/timed out, search silently falls back to BM25 — it never
+errors. Embeddings are computed at search time (the first search of a session
+embeds all active entries; later searches only embed the query) and cached for
+the session.
 
 ## Providers and roles
 
