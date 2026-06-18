@@ -246,6 +246,11 @@ pub struct Cli {
 
 #[derive(clap::Subcommand, Debug)]
 pub enum Command {
+    /// Authenticate provider credentials for future sessions
+    Auth {
+        #[command(subcommand)]
+        action: AuthAction,
+    },
     /// Check and set up sandbox dependencies
     Sandbox {
         #[command(subcommand)]
@@ -266,6 +271,16 @@ pub enum Command {
         #[arg(long = "sandbox")]
         sandbox: Option<String>,
     },
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum AuthAction {
+    /// Log in to OpenAI using device-code auth
+    #[command(
+        name = "openai",
+        long_about = "Log in to OpenAI using device-code auth.\n\nBefore running this command, enable device-code auth in ChatGPT Codex security settings."
+    )]
+    Openai,
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -366,5 +381,36 @@ impl Cli {
         self.microvm_image
             .clone()
             .or_else(|| cfg.resolve_microvm_image())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::{CommandFactory, Parser};
+
+    #[test]
+    fn parses_auth_openai_subcommand() {
+        let cli = Cli::try_parse_from(["dirge", "auth", "openai"]).unwrap();
+
+        match cli.command {
+            Some(Command::Auth {
+                action: AuthAction::Openai,
+            }) => {}
+            other => panic!("expected auth openai command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn help_mentions_auth_and_openai_device_code_prerequisite() {
+        let top_level_help = Cli::command().render_help().to_string();
+        assert!(top_level_help.contains("auth"));
+
+        let err = Cli::try_parse_from(["dirge", "auth", "openai", "--help"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
+        let openai_help = err.to_string();
+
+        assert!(openai_help.contains("device-code auth"));
+        assert!(openai_help.contains("ChatGPT Codex security settings"));
     }
 }

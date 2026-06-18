@@ -181,6 +181,37 @@ Each `providers` entry accepts:
 The aliases on the left of the map become the values you write in
 role-assignment keys.
 
+### OpenAI device-code auth
+
+Run `dirge auth openai` to authorize OpenAI through the device-code flow and
+persist a local OAuth refresh token. Before running the command, enable
+device-code auth in ChatGPT Codex security settings. Dirge prints the OpenAI
+verification URL and user code; the user code is part of the interactive login
+UX, but you should not share it with anyone.
+
+The credential store lives in the Dirge data directory, not the repository or
+program directory:
+
+- Linux default: `~/.local/share/dirge/auth.json`
+- Override: `$DIRGE_DATA_DIR/auth.json`
+
+Successful login persists across Dirge sessions. Delete `auth.json` or revoke
+the OpenAI authorization if you want to force a new login.
+
+API-key precedence is unchanged: explicit CLI keys, key files/stdin, config
+`api_key`, config `api_key_env`, and provider environment variables win before
+OAuth. If no higher-precedence OpenAI key is available, Dirge uses the fresh
+stored OAuth access token against the ChatGPT Codex backend. Expired OAuth
+credentials require rerunning `dirge auth openai` or setting an API key.
+
+Troubleshooting:
+
+- `OpenAI device-code auth is not enabled` or a 404 from the user-code endpoint:
+  enable device-code auth in ChatGPT Codex security settings and rerun
+  `dirge auth openai`.
+- Timeout: complete approval in the browser and rerun the command.
+- Corrupt auth store: fix or remove `auth.json`, then rerun `dirge auth openai`.
+
 ### Role assignments
 
 | Key | Used for | Falls back to |

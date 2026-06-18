@@ -139,6 +139,33 @@ dirge --provider openai --api-key-file /run/secrets/openai_key
 pass openai-key | dirge --provider openai --api-key-stdin
 ```
 
+### OpenAI device-code login
+
+Dirge can store a local OpenAI OAuth refresh token for OpenAI provider fallback:
+
+```bash
+dirge auth openai
+```
+
+Before running it, enable device-code auth in ChatGPT Codex security settings.
+The command prints an OpenAI verification URL and user code; do not share that
+code with anyone. On success, credentials are saved under the Dirge data
+directory: `~/.local/share/dirge/auth.json` on Linux, or
+`$DIRGE_DATA_DIR/auth.json` when `DIRGE_DATA_DIR` is set. The login persists
+across Dirge sessions until you delete that file or OpenAI revokes/expires it.
+
+Provider credential precedence is unchanged: configured API keys,
+`--api-key-file`, `--api-key-stdin`, config `api_key`, config `api_key_env`, and
+provider environment variables win first. If no higher-precedence OpenAI key is
+available, Dirge uses the fresh stored OAuth access token against the ChatGPT
+Codex backend. Expired OAuth credentials require rerunning `dirge auth openai` or
+setting an API key.
+
+Troubleshooting: a 404 or "device-code auth is not enabled" error means the
+ChatGPT Codex security setting is still disabled. A timeout means the browser
+approval did not complete in time; rerun `dirge auth openai`. To reset local
+authorization, delete the `auth.json` file and log in again.
+
 ## Slash commands
 
 | Command | Description |

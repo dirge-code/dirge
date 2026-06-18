@@ -1,4 +1,5 @@
 mod agent;
+mod auth;
 mod cli;
 mod config;
 mod context;
@@ -195,6 +196,10 @@ fn build_channels(cli: &cli::Cli, cfg: &config::Config) -> Channels {
         bg_store: Some(bg_store),
         lifecycle_rx: Some(lifecycle_rx),
     }
+}
+
+fn command_is_config_free(command: &cli::Command) -> bool {
+    matches!(command, cli::Command::Auth { .. })
 }
 
 /// Construct the `LspManager` (if LSP is enabled). Built standalone —
@@ -394,11 +399,29 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(std::sync::Mutex::new(log_writer))
         .with_ansi(false)
         .init();
+
+    // Auth commands must work even when the user's runtime config is legacy or
+    // invalid; they only need the auth module and local credential store.
+    if let Some(ref command) = cli.command
+        && command_is_config_free(command)
+    {
+        match command {
+            cli::Command::Auth { action } => {
+                auth::command::run_auth_action(action).await?;
+                return Ok(());
+            }
+            cli::Command::Sandbox { .. } => {}
+            #[cfg(feature = "mcp-server")]
+            cli::Command::Mcp { .. } => {}
+        }
+    }
+
     let cfg = config::load();
 
     // Handle subcommands that exit before the TUI starts.
     if let Some(ref command) = cli.command {
         match command {
+            cli::Command::Auth { .. } => unreachable!("auth command handled before config load"),
             cli::Command::Sandbox { action } => match action {
                 cli::SandboxAction::Check => {
                     println!("=== Bwrap sandbox ===");
@@ -1751,5 +1774,21 @@ mod session_id_tests {
         let session = fresh_session();
         let got = session_id_for_agent(&cli, &session);
         assert_eq!(got.as_deref(), Some(session.id.as_str()));
+    }
+
+    #[test]
+    fn auth_command_is_config_free() {
+        let cli = cli::Cli::parse_from(["dirge", "auth", "openai"]);
+        let command = cli.command.as_ref().unwrap();
+
+        assert!(command_is_config_free(command));
+    }
+
+    #[test]
+    fn sandbox_command_still_requires_config() {
+        let cli = cli::Cli::parse_from(["dirge", "sandbox", "check"]);
+        let command = cli.command.as_ref().unwrap();
+
+        assert!(!command_is_config_free(command));
     }
 }

@@ -16,7 +16,7 @@ pub use resolve::*;
 #[allow(unused_imports)]
 use crate::sync_util::LockExt;
 use rig::agent::Agent;
-use rig::providers::{anthropic, gemini, ollama, openai, openrouter};
+use rig::providers::{anthropic, chatgpt, gemini, ollama, openai, openrouter};
 
 use crate::agent::tools::ToolCache;
 
@@ -141,6 +141,7 @@ pub(crate) enum AnyAgentInner {
     ChatGptOpenAI(
         Agent<openai::responses_api::ResponsesCompletionModel<codex_http::CodexHttpClient>>,
     ),
+    OpenAICodex(Agent<chatgpt::ResponsesCompletionModel>),
     Anthropic(Agent<anthropic::completion::CompletionModel>),
     Gemini(Agent<gemini::completion::CompletionModel>),
     DeepSeek(Agent<openai::completion::CompletionModel>),
@@ -367,6 +368,7 @@ impl AnyAgent {
             AnyAgentInner::OpenRouter(_) => "openrouter",
             AnyAgentInner::OpenAI(_) => "openai",
             AnyAgentInner::ChatGptOpenAI(_) => "openai",
+            AnyAgentInner::OpenAICodex(_) => "openai",
             AnyAgentInner::Anthropic(_) => "anthropic",
             AnyAgentInner::Gemini(_) => "gemini",
             AnyAgentInner::DeepSeek(_) => "deepseek",

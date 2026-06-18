@@ -1,0 +1,541 @@
+use serde::Deserialize;
+use serde_json::{Map, Value, json};
+use std::fmt;
+use std::path::{Path, PathBuf};
+
+type Result<T> = std::result::Result<T, AuthStoreError>;
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum AuthStoreError {
+    #[error("OpenAI auth store I/O failed for {path:?}: {source}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error(
+        "OpenAI auth store JSON is corrupt at {path:?}; fix or remove the file and run `dirge auth openai` again: {source}"
+    )]
+    CorruptJson {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("OpenAI auth entry is invalid at {path:?}; run `dirge auth openai` again: {reason}")]
+    InvalidOpenAiCredential { path: PathBuf, reason: String },
+    #[error("OpenAI auth store serialization failed for {path:?}: {source}")]
+    Serialize {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct OpenAiOAuthCredential {
+    access_token: String,
+    refresh_token: String,
+    id_token: Option<String>,
+    expires_at_epoch_ms: i64,
+}
+
+impl OpenAiOAuthCredential {
+    pub(crate) fn new(
+        access_token: impl Into<String>,
+        refresh_token: impl Into<String>,
+        id_token: Option<String>,
+        expires_at_epoch_ms: i64,
+    ) -> Self {
+        Self {
+            access_token: access_token.into(),
+            refresh_token: refresh_token.into(),
+            id_token,
+            expires_at_epoch_ms,
+        }
+    }
+
+    pub(crate) fn access_token(&self) -> &str {
+        &self.access_token
+    }
+
+    pub(crate) fn refresh_token(&self) -> &str {
+        &self.refresh_token
+    }
+
+    pub(crate) fn id_token(&self) -> Option<&str> {
+        self.id_token.as_deref()
+    }
+
+    pub(crate) fn expires_at_epoch_ms(&self) -> i64 {
+        self.expires_at_epoch_ms
+    }
+
+    pub(crate) fn is_expired_at(&self, epoch_ms: i64) -> bool {
+        epoch_ms >= self.expires_at_epoch_ms
+    }
+
+    pub(crate) fn is_fresh_at(&self, epoch_ms: i64) -> bool {
+        !self.is_expired_at(epoch_ms)
+    }
+}
+
+impl fmt::Debug for OpenAiOAuthCredential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let id_token = self.id_token.as_ref().map(|_| "[REDACTED]");
+        f.debug_struct("OpenAiOAuthCredential")
+            .field("access_token", &"[REDACTED]")
+            .field("refresh_token", &"[REDACTED]")
+            .field("id_token", &id_token)
+            .field("expires_at_epoch_ms", &self.expires_at_epoch_ms)
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct OpenAiAuthStore {
+    path: PathBuf,
+}
+
+impl Default for OpenAiAuthStore {
+    fn default() -> Self {
+        Self::at(crate::session::storage::dirs_path().join("auth.json"))
+    }
+}
+
+impl OpenAiAuthStore {
+    pub(crate) fn at(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn load_openai(&self) -> Result<Option<OpenAiOAuthCredential>> {
+        let Some(mut document) = self.load_document()? else {
+            return Ok(None);
+        };
+        let Some(openai) = document.remove("openai") else {
+            return Ok(None);
+        };
+        if openai.get("type").and_then(Value::as_str) != Some("oauth") {
+            return Ok(None);
+        }
+        let entry: StoredOpenAiCredential = serde_json::from_value(openai).map_err(|_source| {
+            AuthStoreError::InvalidOpenAiCredential {
+                path: self.path.clone(),
+                reason: "stored OpenAI OAuth credential fields are malformed".to_string(),
+            }
+        })?;
+        Ok(Some(entry.into_credential()))
+    }
+
+    pub(crate) fn save_openai(&self, credential: &OpenAiOAuthCredential) -> Result<()> {
+        let mut document = self.load_document()?.unwrap_or_default();
+        let mut openai = match document.remove("openai") {
+            Some(Value::Object(map)) => map,
+            _ => Map::new(),
+        };
+        openai.insert("type".to_string(), json!("oauth"));
+        openai.insert("access".to_string(), json!(credential.access_token));
+        openai.insert("refresh".to_string(), json!(credential.refresh_token));
+        openai.insert("expires".to_string(), json!(credential.expires_at_epoch_ms));
+        match credential.id_token.as_deref() {
+            Some(id_token) => {
+                openai.insert("id_token".to_string(), json!(id_token));
+            }
+            None => {
+                openai.remove("id_token");
+            }
+        }
+        document.insert("openai".to_string(), Value::Object(openai));
+
+        self.ensure_parent_dir()?;
+        let bytes = serde_json::to_vec_pretty(&Value::Object(document)).map_err(|source| {
+            AuthStoreError::Serialize {
+                path: self.path.clone(),
+                source,
+            }
+        })?;
+        self.prepare_existing_file_for_private_replace()?;
+        crate::fs_atomic::atomic_write_sync(&self.path, &bytes).map_err(|source| {
+            AuthStoreError::Io {
+                path: self.path.clone(),
+                source,
+            }
+        })?;
+        self.restrict_file_permissions()?;
+        Ok(())
+    }
+
+    fn load_document(&self) -> Result<Option<Map<String, Value>>> {
+        let contents = match std::fs::read_to_string(&self.path) {
+            Ok(contents) => contents,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => {
+                return Err(AuthStoreError::Io {
+                    path: self.path.clone(),
+                    source,
+                });
+            }
+        };
+        let value: Value =
+            serde_json::from_str(&contents).map_err(|source| AuthStoreError::CorruptJson {
+                path: self.path.clone(),
+                source,
+            })?;
+        match value {
+            Value::Object(document) => Ok(Some(document)),
+            _ => Err(AuthStoreError::InvalidOpenAiCredential {
+                path: self.path.clone(),
+                reason: "top-level auth document must be a JSON object".to_string(),
+            }),
+        }
+    }
+
+    fn ensure_parent_dir(&self) -> Result<()> {
+        let Some(parent) = self
+            .path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+        else {
+            return Ok(());
+        };
+        std::fs::create_dir_all(parent).map_err(|source| AuthStoreError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).map_err(
+                |source| AuthStoreError::Io {
+                    path: parent.to_path_buf(),
+                    source,
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn prepare_existing_file_for_private_replace(&self) -> Result<()> {
+        match std::fs::metadata(&self.path) {
+            Ok(_) => self.restrict_file_permissions(),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(source) => Err(AuthStoreError::Io {
+                path: self.path.clone(),
+                source,
+            }),
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn prepare_existing_file_for_private_replace(&self) -> Result<()> {
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn restrict_file_permissions(&self) -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600)).map_err(
+            |source| AuthStoreError::Io {
+                path: self.path.clone(),
+                source,
+            },
+        )
+    }
+
+    #[cfg(not(unix))]
+    fn restrict_file_permissions(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Deserialize)]
+struct StoredOpenAiCredential {
+    access: String,
+    refresh: String,
+    id_token: Option<String>,
+    expires: i64,
+}
+
+impl StoredOpenAiCredential {
+    fn into_credential(self) -> OpenAiOAuthCredential {
+        OpenAiOAuthCredential::new(self.access, self.refresh, self.id_token, self.expires)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::path::{Path, PathBuf};
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new(tag: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "dirge_auth_store_{tag}_{}_{}",
+                std::process::id(),
+                uuid::Uuid::new_v4().simple()
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+
+        fn auth_path(&self) -> PathBuf {
+            self.path().join("auth.json")
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn credential() -> OpenAiOAuthCredential {
+        OpenAiOAuthCredential::new(
+            "ACCESS-TOKEN",
+            "REFRESH-TOKEN",
+            Some("ID-TOKEN".to_string()),
+            1_900_000_000_000,
+        )
+    }
+
+    #[test]
+    fn missing_auth_file_loads_as_none() {
+        let dir = TestDir::new("missing");
+        let store = OpenAiAuthStore::at(dir.auth_path());
+
+        assert!(store.load_openai().unwrap().is_none());
+    }
+
+    #[test]
+    fn valid_openai_oauth_entry_loads() {
+        let dir = TestDir::new("valid");
+        std::fs::write(
+            dir.auth_path(),
+            json!({
+                "openai": {
+                    "type": "oauth",
+                    "access": "ACCESS-TOKEN",
+                    "refresh": "REFRESH-TOKEN",
+                    "id_token": "ID-TOKEN",
+                    "expires": 1900000000000_i64
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let store = OpenAiAuthStore::at(dir.auth_path());
+
+        let loaded = store.load_openai().unwrap().unwrap();
+
+        assert_eq!(loaded.access_token(), "ACCESS-TOKEN");
+        assert_eq!(loaded.refresh_token(), "REFRESH-TOKEN");
+        assert_eq!(loaded.id_token(), Some("ID-TOKEN"));
+        assert_eq!(loaded.expires_at_epoch_ms(), 1_900_000_000_000);
+    }
+
+    #[test]
+    fn corrupt_auth_file_errors_without_deleting_or_echoing_secrets() {
+        let dir = TestDir::new("corrupt");
+        let secret_body = "{ ACCESS-TOKEN REFRESH-TOKEN ID-TOKEN USER-CODE";
+        std::fs::write(dir.auth_path(), secret_body).unwrap();
+        let store = OpenAiAuthStore::at(dir.auth_path());
+
+        let err = store.load_openai().unwrap_err();
+        let message = err.to_string();
+
+        assert!(matches!(err, AuthStoreError::CorruptJson { .. }));
+        assert_eq!(
+            std::fs::read_to_string(dir.auth_path()).unwrap(),
+            secret_body
+        );
+        assert!(!message.contains("ACCESS-TOKEN"));
+        assert!(!message.contains("REFRESH-TOKEN"));
+        assert!(!message.contains("ID-TOKEN"));
+        assert!(!message.contains("USER-CODE"));
+    }
+
+    #[test]
+    fn save_openai_preserves_other_providers_and_unknown_openai_fields() {
+        let dir = TestDir::new("preserve");
+        std::fs::write(
+            dir.auth_path(),
+            json!({
+                "anthropic": {
+                    "type": "api_key",
+                    "key": "ANTHROPIC-SECRET",
+                    "extra": { "keep": true }
+                },
+                "openai": {
+                    "type": "oauth",
+                    "access": "OLD-ACCESS",
+                    "refresh": "OLD-REFRESH",
+                    "id_token": "OLD-ID",
+                    "expires": 1_i64,
+                    "account_id": "acct_keep",
+                    "fedramp": true
+                },
+                "custom": "keep-me"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let store = OpenAiAuthStore::at(dir.auth_path());
+
+        store.save_openai(&credential()).unwrap();
+
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.auth_path()).unwrap()).unwrap();
+        assert_eq!(saved["anthropic"]["key"], "ANTHROPIC-SECRET");
+        assert_eq!(saved["custom"], "keep-me");
+        assert_eq!(saved["openai"]["type"], "oauth");
+        assert_eq!(saved["openai"]["access"], "ACCESS-TOKEN");
+        assert_eq!(saved["openai"]["refresh"], "REFRESH-TOKEN");
+        assert_eq!(saved["openai"]["id_token"], "ID-TOKEN");
+        assert_eq!(saved["openai"]["expires"], 1_900_000_000_000_i64);
+        assert_eq!(saved["openai"]["account_id"], "acct_keep");
+        assert_eq!(saved["openai"]["fedramp"], true);
+    }
+
+    #[test]
+    fn save_openai_creates_private_auth_file_on_unix() {
+        let dir = TestDir::new("permissions");
+        let store = OpenAiAuthStore::at(dir.auth_path());
+
+        store.save_openai(&credential()).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.auth_path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_openai_tightens_existing_auth_file_permissions_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TestDir::new("tighten_permissions");
+        std::fs::write(dir.auth_path(), "{}").unwrap();
+        std::fs::set_permissions(dir.auth_path(), std::fs::Permissions::from_mode(0o644)).unwrap();
+        let store = OpenAiAuthStore::at(dir.auth_path());
+
+        store.save_openai(&credential()).unwrap();
+
+        let mode = std::fs::metadata(dir.auth_path())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepares_existing_auth_file_private_before_atomic_replacement_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TestDir::new("prepare_permissions");
+        std::fs::write(dir.auth_path(), "{}").unwrap();
+        std::fs::set_permissions(dir.auth_path(), std::fs::Permissions::from_mode(0o644)).unwrap();
+        let store = OpenAiAuthStore::at(dir.auth_path());
+
+        store.prepare_existing_file_for_private_replace().unwrap();
+
+        let mode = std::fs::metadata(dir.auth_path())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn expiry_helpers_distinguish_fresh_and_expired_tokens() {
+        let token = OpenAiOAuthCredential::new("ACCESS-TOKEN", "REFRESH-TOKEN", None, 1_000);
+
+        assert!(token.is_fresh_at(999));
+        assert!(!token.is_expired_at(999));
+        assert!(token.is_expired_at(1_000));
+        assert!(!token.is_fresh_at(1_000));
+    }
+
+    #[test]
+    fn default_store_uses_dirge_data_dir_override() {
+        let _guard = crate::auth::DIRGE_DATA_DIR_ENV_LOCK.lock().unwrap();
+        let dir = TestDir::new("env");
+        let previous = std::env::var_os("DIRGE_DATA_DIR");
+        // SAFETY: auth tests serialize DIRGE_DATA_DIR changes with DIRGE_DATA_DIR_ENV_LOCK.
+        unsafe {
+            std::env::set_var("DIRGE_DATA_DIR", dir.path());
+        }
+
+        let store = OpenAiAuthStore::default();
+
+        assert_eq!(store.path(), dir.auth_path());
+        // SAFETY: DIRGE_DATA_DIR_ENV_LOCK remains held until after restoration.
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("DIRGE_DATA_DIR", value),
+                None => std::env::remove_var("DIRGE_DATA_DIR"),
+            }
+        }
+    }
+
+    #[test]
+    fn debug_and_errors_redact_secret_values() {
+        let dir = TestDir::new("redact");
+        let token = credential();
+        let debug = format!("{token:?}");
+
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("ACCESS-TOKEN"));
+        assert!(!debug.contains("REFRESH-TOKEN"));
+        assert!(!debug.contains("ID-TOKEN"));
+
+        std::fs::write(
+            dir.auth_path(),
+            json!({
+                "openai": {
+                    "type": "oauth",
+                    "access": "ACCESS-TOKEN",
+                    "refresh": "REFRESH-TOKEN",
+                    "id_token": "ID-TOKEN",
+                    "expires": "ACCESS-TOKEN"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let err = OpenAiAuthStore::at(dir.auth_path())
+            .load_openai()
+            .unwrap_err();
+        let message = err.to_string();
+        let error_debug = format!("{err:?}");
+
+        assert!(!message.contains("ACCESS-TOKEN"));
+        assert!(!message.contains("REFRESH-TOKEN"));
+        assert!(!message.contains("ID-TOKEN"));
+        assert!(!message.contains("USER-CODE"));
+        assert!(!error_debug.contains("ACCESS-TOKEN"));
+        assert!(!error_debug.contains("REFRESH-TOKEN"));
+        assert!(!error_debug.contains("ID-TOKEN"));
+        assert!(!error_debug.contains("USER-CODE"));
+    }
+}

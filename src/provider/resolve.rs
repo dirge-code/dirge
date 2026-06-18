@@ -454,11 +454,15 @@ pub(crate) fn provider_env_var_fallbacks(kind: ProviderKind) -> &'static [&'stat
     }
 }
 
-pub(crate) fn resolve_api_key(
+pub(crate) fn resolve_api_key_from<F>(
     kind: ProviderKind,
     api_key_env_override: Option<&str>,
     cli_key: Option<&str>,
-) -> anyhow::Result<String> {
+    env: F,
+) -> anyhow::Result<String>
+where
+    F: Fn(&str) -> Option<String>,
+{
     if let Some(key) = cli_key.filter(|k| !k.is_empty()) {
         // Audit C2: the `/proc/*/cmdline` warning now fires at the
         // call site in main.rs where we know which CLI source the
@@ -472,7 +476,7 @@ pub(crate) fn resolve_api_key(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| provider_env_var(kind));
 
-    if let Ok(key) = std::env::var(env_var)
+    if let Some(key) = env(env_var)
         && !key.is_empty()
     {
         return Ok(key);
@@ -483,7 +487,7 @@ pub(crate) fn resolve_api_key(
     // the user named the env var they want; don't second-guess.
     if api_key_env_override.is_none_or(|s| s.is_empty()) {
         for fallback in provider_env_var_fallbacks(kind) {
-            if let Ok(key) = std::env::var(fallback)
+            if let Some(key) = env(fallback)
                 && !key.is_empty()
             {
                 return Ok(key);
