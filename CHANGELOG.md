@@ -6,6 +6,45 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.7.8] - 2026-06-18
+
+### Added
+- **Memory improvements.** Procedural playbooks now rank on measured
+  effectiveness rather than recency, so a play that keeps working surfaces
+  ahead of one that was merely used recently (#436). A confidence axis with
+  contradiction-driven supersession lets a newer fact retire a stale one
+  instead of both lingering (#437). An opt-in hybrid retrieval provider fuses
+  dense embeddings with BM25 via reciprocal-rank fusion (#439). Verbatim
+  pre-recall surfaces exact prior snippets as supplemental context without
+  disturbing the frozen system-prompt snapshot (#440). Mark/supersede is gated
+  to the background review runner so it can't stall the main loop (#441).
+  (#442, #445)
+- **Retrieval eval harnesses.** A Recall@K harness for the memory retriever
+  (#438) and a compaction-recall harness that probes whether load-bearing
+  facts survive a fold (#434).
+- **Live thinking streams into the Ctrl+O panel.** Expanding an in-progress
+  reasoning burst now updates in place as new tokens arrive, instead of
+  freezing the snapshot you first opened (#444).
+
+### Fixed
+- **Compaction no longer resurrects finished tasks (#443).** After a fold the
+  model could re-derive the original request as if still pending when it was
+  already done and the live work had moved to a follow-up. The summary's
+  `## Active Task` now describes the immediate in-flight work and marks the
+  original complete, and the summary preamble warns not to redo finished work.
+- **Blockquotes render the `│` bar on every line (#446).** The bar code ran
+  after the paragraph had already flushed, so it was dead and multi-line
+  quotes rendered as bar-less dim prose.
+- **Live-thinking expansion hardening (#449, #450).** The in-place re-render
+  no longer truncates content that scrolled below the block, the expansion
+  state resets across chat switches, and the per-delta re-render is coalesced
+  so a long reasoning burst is no longer O(n²). Quoted headings and code
+  blocks now carry the quote bar too.
+
+### Docs
+- Documented how the context/compaction fold point is computed
+  (`compaction_fold_threshold` × `min(model_window, context_target)`) (#447).
+
 ## [0.7.7] - 2026-06-17
 
 ### Added

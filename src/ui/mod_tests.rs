@@ -707,3 +707,161 @@ fn scroll_snap_typing_and_down_snap_but_command_combos_dont() {
     assert_eq!(scroll_snap_for(&KeyEvent::new(KeyCode::Up, none)), None);
     assert_eq!(scroll_snap_for(&KeyEvent::new(KeyCode::Enter, none)), None);
 }
+
+// ============================================================
+// dirge #444 — live thinking streams into the Ctrl+O panel
+// ============================================================
+
+/// After Ctrl+O expands a live thinking burst, new reasoning deltas re-render
+/// the expanded block IN PLACE (anchored at the same start) rather than leaving
+/// the frozen snapshot the user first saw.
+#[test]
+fn live_thinking_expansion_streams_in_place() {
+    let mut r = Renderer::new().expect("renderer");
+    r.write_line("<you> hi", Color::White).unwrap();
+    r.write_line(
+        "  ◇ thinking… (Ctrl+O to view)",
+        crate::ui::theme::thinking(),
+    )
+    .unwrap();
+
+    // Ctrl+O expands the current snapshot of the thinking-so-far.
+    let start = r.buffer_len();
+    render_thinking_block(&mut r, "first thought").unwrap();
+    let anchor = (start, r.buffer_len(), r.eviction_generation());
+    let snap: Vec<String> = r.buffer_lines().iter().map(|s| s.to_string()).collect();
+    assert!(snap.iter().any(|l| l.contains("first thought")));
+    assert!(
+        !snap.iter().any(|l| l.contains("second thought")),
+        "snapshot must not contain text that hasn't streamed yet",
+    );
+
+    // More reasoning arrives — re-render in place with the fuller buffer.
+    let updated = restream_expanded_thinking(&mut r, anchor, "first thought\nsecond thought")
+        .unwrap()
+        .expect("re-rendered in place");
+
+    let now: Vec<String> = r.buffer_lines().iter().map(|s| s.to_string()).collect();
+    assert!(now.iter().any(|l| l.contains("first thought")));
+    assert!(
+        now.iter().any(|l| l.contains("second thought")),
+        "new thinking streamed into the expanded block: {now:?}",
+    );
+    // Exactly one of each — the old block was replaced, not duplicated.
+    assert_eq!(
+        now.iter().filter(|l| l.contains("first thought")).count(),
+        1
+    );
+    assert_eq!(updated.0, start, "block stays anchored at the same start");
+    // The placeholder above the block is untouched.
+    assert!(now.iter().any(|l| l.contains("thinking… (Ctrl+O to view)")));
+}
+
+/// When front-eviction has shifted indices since the block was anchored
+/// (gen mismatch), the in-place re-render bails (returns None) so the caller
+/// stops tracking instead of truncating live content at a stale index.
+#[test]
+fn restream_bails_on_eviction_generation_mismatch() {
+    let mut r = Renderer::new().expect("renderer");
+    render_thinking_block(&mut r, "thought").unwrap();
+    // Anchor with a deliberately wrong eviction generation.
+    let stale = (
+        0usize,
+        r.buffer_len(),
+        r.eviction_generation().wrapping_add(1),
+    );
+    let out = restream_expanded_thinking(&mut r, stale, "thought more").unwrap();
+    assert!(
+        out.is_none(),
+        "stale-generation anchor must not re-render in place"
+    );
+}
+
+/// dirge #448 finding 1: when content has been appended below the anchored
+/// block (the block is no longer at the buffer tail), restreaming must bail
+/// (return None) instead of truncating from `start` to the END of the buffer
+/// and silently destroying that appended content.
+#[test]
+fn restream_bails_when_block_buried_below_tail() {
+    let mut r = Renderer::new().expect("renderer");
+    r.write_line("<you> hi", Color::White).unwrap();
+
+    let start = r.buffer_len();
+    render_thinking_block(&mut r, "first thought").unwrap();
+    let anchor = (start, r.buffer_len(), r.eviction_generation());
+
+    // Something appends below the block — it's no longer at the tail.
+    r.write_line("response token", Color::White).unwrap();
+
+    let out = restream_expanded_thinking(&mut r, anchor, "first thought\nsecond thought").unwrap();
+    assert!(
+        out.is_none(),
+        "buried anchor (content below the block) must not re-render in place"
+    );
+
+    let now: Vec<String> = r.buffer_lines().iter().map(|s| s.to_string()).collect();
+    assert!(
+        now.iter().any(|l| l.contains("response token")),
+        "appended content below the block must survive a bailed restream: {now:?}"
+    );
+    assert!(
+        !now.iter().any(|l| l.contains("second thought")),
+        "bailed restream must not stream new thinking: {now:?}"
+    );
+}
+
+/// dirge-8p79: the per-delta restream is coalesced, so the last deltas of a
+/// burst can be unpainted when the burst ends. `freeze_live_thinking` flushes
+/// the full buffer one final time at the boundary so the frozen block is
+/// complete, and stops live tracking.
+#[test]
+fn freeze_live_thinking_flushes_coalesced_tail() {
+    let mut r = Renderer::new().expect("renderer");
+    let start = r.buffer_len();
+    // The block was last painted with only the first delta (coalescing skipped
+    // the rest as more events were still queued).
+    render_thinking_block(&mut r, "first thought").unwrap();
+    let mut anchor = Some((start, r.buffer_len(), r.eviction_generation()));
+    let mut expanded = true;
+
+    freeze_live_thinking(
+        &mut r,
+        &mut anchor,
+        &mut expanded,
+        "first thought\nsecond thought",
+    )
+    .unwrap();
+
+    let now: Vec<String> = r.buffer_lines().iter().map(|s| s.to_string()).collect();
+    assert!(
+        now.iter().any(|l| l.contains("second thought")),
+        "coalesced tail flushed into the frozen block: {now:?}"
+    );
+    assert_eq!(
+        now.iter().filter(|l| l.contains("first thought")).count(),
+        1,
+        "block replaced, not duplicated: {now:?}"
+    );
+    assert!(!expanded, "live tracking stops after the block freezes");
+}
+
+/// `freeze_live_thinking` is a no-op when nothing is being live-tracked — it
+/// must not touch the buffer or re-render anything.
+#[test]
+fn freeze_live_thinking_noop_when_not_tracking() {
+    let mut r = Renderer::new().expect("renderer");
+    render_thinking_block(&mut r, "done thinking").unwrap();
+    let len_before = r.buffer_len();
+    let mut anchor = None;
+    let mut expanded = false;
+
+    freeze_live_thinking(&mut r, &mut anchor, &mut expanded, "done thinking\nmore").unwrap();
+
+    assert_eq!(
+        r.buffer_len(),
+        len_before,
+        "buffer untouched when not tracking"
+    );
+    assert!(anchor.is_none());
+    assert!(!expanded);
+}

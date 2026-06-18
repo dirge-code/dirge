@@ -140,7 +140,7 @@ pub async fn build_agent(
             // is on, `tool_def_filter` is `Some` and a
             // `ToolSearchTool` has been registered inside `tools`
             // with the same Arc.
-            let (loop_tools, dyn_search) = builder::build_loop_tools(
+            let (loop_tools, dyn_search, review_memory_tool) = builder::build_loop_tools(
                 cache.clone(),
                 permission_for_loop,
                 ask_tx_for_loop,
@@ -188,6 +188,11 @@ pub async fn build_agent(
             if let Some(provider) = memory_provider {
                 agent = agent.with_memory_provider(provider);
             }
+            // dirge-ygm3: stash the review-enabled memory tool so the review
+            // runner can swap it in (it's not in the main loop-tool set).
+            if let Some(tool) = review_memory_tool {
+                agent = agent.with_review_memory_tool(tool);
+            }
             if let Some(ds) = dyn_search {
                 agent.with_dynamic_tool_search(ds.filter, ds.registry)
             } else {
@@ -202,6 +207,7 @@ pub async fn build_agent(
         AnyModel::ChatGptOpenAI(m) => build_inner!(m, ChatGptOpenAI),
         AnyModel::OpenAICodex(m) => build_inner!(m, OpenAICodex),
         AnyModel::Anthropic(m) => build_inner!(m, Anthropic),
+        AnyModel::AnthropicOauth(m) => build_inner!(m, AnthropicOauth),
         AnyModel::Gemini(m) => build_inner!(m, Gemini),
         AnyModel::DeepSeek(m) => build_inner!(m, DeepSeek),
         AnyModel::Glm(m) => build_inner!(m, Glm),

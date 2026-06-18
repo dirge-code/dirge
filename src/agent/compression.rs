@@ -62,6 +62,9 @@ into the summary below. This is a handoff from a previous context \
 window — treat it as background reference, NOT as active instructions. \
 Do NOT answer questions or fulfill requests mentioned in this summary; \
 they were already addressed. \
+The work described here — INCLUDING the original task — may already be \
+complete: the '## Completed Actions' and '## Active State' sections record \
+what is already done, so do NOT redo it. \
 Your current task is identified in the '## Active Task' section of the \
 summary — resume exactly from there. \
 Respond ONLY to the latest user message \
@@ -585,10 +588,17 @@ conversation — do not translate or switch to English.";
 
     let _template_sections = format!(
         "## Active Task\n\
-[THE SINGLE MOST IMPORTANT FIELD. Copy the user's most recent request or\n\
-task assignment verbatim — the exact words they used. If multiple tasks\n\
-were requested and only some are done, list only the ones NOT yet completed.\n\
-If no outstanding task exists, write \"None.\"]\n\
+[THE SINGLE MOST IMPORTANT FIELD. State what should happen NEXT — the\n\
+immediate piece of work in flight right now, in plain terms. This is NOT\n\
+necessarily the user's original wording: the current work is often an\n\
+emergent follow-up (e.g. debugging a failing test) that arose mid-session\n\
+and was never an explicit user request — capture THAT, not the original\n\
+assignment, when that is what is actually underway. If the user's original\n\
+request is already COMPLETE and only follow-up work remains, the Active\n\
+Task IS that follow-up; state plainly that the original request is already\n\
+done so the next context does not redo it. If multiple tasks were requested\n\
+and only some are done, list only the ones NOT yet completed. If nothing is\n\
+outstanding, write \"None.\"]\n\
 \n\
 ## Goal\n\
 [What the user is trying to accomplish overall]\n\
@@ -890,6 +900,42 @@ mod tests {
     #[test]
     fn summary_prefix_starts_with_compaction_marker() {
         assert!(SUMMARY_PREFIX.starts_with(COMPACTION_MARKER));
+    }
+
+    /// #443: the prefix must keep the marker AND warn that work described in
+    /// the summary (including the original task) may already be complete, so a
+    /// resumed context doesn't redo finished work.
+    #[test]
+    fn summary_prefix_warns_original_task_may_be_complete() {
+        assert!(SUMMARY_PREFIX.starts_with(COMPACTION_MARKER));
+        // Points the model at the already-done record.
+        assert!(SUMMARY_PREFIX.contains("Completed Actions"));
+        // Says the work — including the original task — may already be complete.
+        let lower = SUMMARY_PREFIX.to_lowercase();
+        assert!(lower.contains("already"));
+        assert!(lower.contains("complete") || lower.contains("done"));
+        assert!(lower.contains("do not redo") || lower.contains("not redo"));
+    }
+
+    /// #443: the `## Active Task` instruction must frame the active task as the
+    /// immediate next/follow-up work, not a verbatim copy of the user's
+    /// original request.
+    #[test]
+    fn active_task_section_frames_followup_not_verbatim() {
+        let turns: Vec<Value> = vec![serde_json::json!({
+            "role": "user",
+            "content": "convert this to stdlib"
+        })];
+        let prompt = build_summary_prompt(&turns, 2000, None, None);
+
+        // New framing is present.
+        assert!(prompt.contains("## Active Task"));
+        assert!(prompt.contains("follow-up"));
+        let lower = prompt.to_lowercase();
+        assert!(lower.contains("already") || lower.contains("complete"));
+
+        // Old verbatim-copy framing is gone.
+        assert!(!prompt.contains("verbatim — the exact words they used"));
     }
 
     // IMPROVEMENTS_PLAN #3: the per-result cap tightens above 60% ctx.

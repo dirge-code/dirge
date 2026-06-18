@@ -103,6 +103,15 @@ fn content_key(content: &str) -> u64 {
     crate::hash::fnv64(content.as_bytes())
 }
 
+/// Hard cap on cached embeddings (dirge-mqyv). The cache is keyed by content
+/// hash and inserts a fresh vector whenever content changes (replace /
+/// supersede), so a long, heavily-edited session would otherwise grow it
+/// without bound. Memory stores hold tens-to-hundreds of active entries, so
+/// 4096 is generous headroom; crossing it clears the cache (a rare, cheap
+/// re-embed) rather than leaking. At 1536 f32 (text-embedding-3-small) this
+/// bounds the cache near ~25 MB.
+const MAX_CACHE_ENTRIES: usize = 4096;
+
 /// A memory provider that fuses the inner store's BM25 search with dense
 /// embedding recall. All non-search operations delegate to `inner`.
 pub struct HybridMemoryProvider {
@@ -143,6 +152,12 @@ impl HybridMemoryProvider {
         let miss_texts: Vec<String> = miss_idx.iter().map(|&i| contents[i].clone()).collect();
         let fresh = self.embedder.embed(&miss_texts);
         let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+        // dirge-mqyv: bound the cache against churn — clear before the batch
+        // would push it past the cap. Drops orphaned vectors; the live entries
+        // simply re-embed on the next search.
+        if cache.len() >= MAX_CACHE_ENTRIES {
+            cache.clear();
+        }
         for (slot, vec) in miss_idx.into_iter().zip(fresh) {
             if let Some(v) = vec {
                 cache.insert(content_key(&contents[slot]), v.clone());
@@ -150,6 +165,11 @@ impl HybridMemoryProvider {
             }
         }
         out
+    }
+
+    #[cfg(test)]
+    fn cache_len(&self) -> usize {
+        self.cache.lock().unwrap_or_else(|p| p.into_inner()).len()
     }
 
     /// Dense ranking of all active entries against `query`, best-first, by
@@ -289,6 +309,12 @@ impl MemoryProvider for HybridMemoryProvider {
     }
 
     fn on_session_switch(&self, new_session_id: &str, parent_session_id: &str, reset: bool) {
+        // dirge-mqyv: a true reset is a fresh conversation — drop the cached
+        // vectors. A compaction-rotation continuation (reset=false) keeps them,
+        // since the same project's entries are still in play.
+        if reset {
+            self.cache.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        }
         self.inner
             .on_session_switch(new_session_id, parent_session_id, reset);
     }
@@ -658,6 +684,59 @@ mod tests {
                 .any(|e| e.as_str().unwrap().contains("delegated fact")),
             "add routed to inner and is visible via view",
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Always-embeds stub so every distinct content lands in the cache.
+    struct OnesEmbedder;
+    impl Embedder for OnesEmbedder {
+        fn embed(&self, texts: &[String]) -> Vec<Option<Vec<f32>>> {
+            texts.iter().map(|_| Some(vec![1.0f32])).collect()
+        }
+    }
+
+    /// dirge-mqyv: the embedding cache is bounded — crossing the cap clears it
+    /// instead of growing without limit under content churn.
+    #[test]
+    fn embedding_cache_is_bounded() {
+        let (store, dir) = temp_store();
+        let hybrid = HybridMemoryProvider::new(store, Arc::new(OnesEmbedder));
+
+        // Fill exactly to the cap.
+        let full: Vec<String> = (0..MAX_CACHE_ENTRIES).map(|i| format!("c{i}")).collect();
+        hybrid.embed_cached(&full);
+        assert_eq!(
+            hybrid.cache_len(),
+            MAX_CACHE_ENTRIES,
+            "cache filled to the cap"
+        );
+
+        // The next batch trips the cap → clear, then insert the new batch.
+        let more: Vec<String> = (0..10).map(|i| format!("d{i}")).collect();
+        hybrid.embed_cached(&more);
+        assert_eq!(
+            hybrid.cache_len(),
+            10,
+            "cap cleared the cache before the new batch"
+        );
+        assert!(hybrid.cache_len() <= MAX_CACHE_ENTRIES);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// dirge-mqyv: a reset session switch drops the cache; a continuation
+    /// (reset=false) keeps it.
+    #[test]
+    fn reset_clears_cache_continuation_keeps_it() {
+        let (store, dir) = temp_store();
+        let hybrid = HybridMemoryProvider::new(store, Arc::new(OnesEmbedder));
+        hybrid.embed_cached(&["a".to_string(), "b".to_string()]);
+        assert_eq!(hybrid.cache_len(), 2);
+
+        hybrid.on_session_switch("s2", "s1", false);
+        assert_eq!(hybrid.cache_len(), 2, "continuation keeps the cache");
+
+        hybrid.on_session_switch("s3", "", true);
+        assert_eq!(hybrid.cache_len(), 0, "reset clears the cache");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

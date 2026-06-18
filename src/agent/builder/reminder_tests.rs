@@ -151,7 +151,7 @@ async fn build_loop_tools_produces_core_registry() {
     let cache = ToolCache::new();
     let sandbox = Sandbox::new(SandboxMode::Off);
 
-    let (tools, _) = build_loop_tools(
+    let (tools, _, _) = build_loop_tools(
         cache,
         None, // permission
         None, // ask_tx
@@ -225,7 +225,7 @@ async fn memory_tool_registration_degrades_when_store_unavailable() {
 async fn tool_descriptions_meet_quality_bar() {
     let cli = Cli::parse_from::<_, &str>(["dirge"]);
     let cfg = Config::default();
-    let (tools, _) = build_loop_tools(
+    let (tools, _, _) = build_loop_tools(
         ToolCache::new(),
         None,
         None,
@@ -704,7 +704,7 @@ async fn build_loop_tools_empty_with_no_tools() {
     let cfg = Config::default();
     let cache = ToolCache::new();
     let sandbox = Sandbox::new(SandboxMode::Off);
-    let (tools, _) = build_loop_tools(
+    let (tools, _, _) = build_loop_tools(
         cache,
         None,
         None,
@@ -739,7 +739,7 @@ async fn build_loop_tools_mutating_tools_are_sequential() {
     let cfg = Config::default();
     let cache = ToolCache::new();
     let sandbox = Sandbox::new(SandboxMode::Off);
-    let (tools, _) = build_loop_tools(
+    let (tools, _, _) = build_loop_tools(
         cache,
         None,
         None,
@@ -783,7 +783,7 @@ async fn build_loop_tools_read_only_tools_are_parallel_capable() {
     let cfg = Config::default();
     let cache = ToolCache::new();
     let sandbox = Sandbox::new(SandboxMode::Off);
-    let (tools, _) = build_loop_tools(
+    let (tools, _, _) = build_loop_tools(
         cache,
         None,
         None,

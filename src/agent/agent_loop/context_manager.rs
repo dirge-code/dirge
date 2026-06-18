@@ -378,15 +378,33 @@ pub fn verbatim_pre_recall_enabled() -> bool {
 /// Max entries surfaced in a pre-recall block — a handful of hints, not a dump.
 const PRE_RECALL_LIMIT: usize = 5;
 
+/// dirge-7xi2: a cheap triviality floor for pre-recall. Skip the whole search
+/// (and, with hybrid, an embedding round-trip) when the verbatim message has no
+/// substantial word — `false` for bare acks like "ok", "yes", "go on", "do it",
+/// `true` once any token is ≥ 4 chars ("fix the build", a real question). It's
+/// a QUERY-side floor on purpose: BM25 and hybrid score on different scales so a
+/// fixed relevance threshold doesn't generalize, and a token-OVERLAP floor would
+/// kill the paraphrase recall (zero shared tokens) that hybrid pre-recall exists
+/// to provide. This only suppresses no-real-query turns, not weak matches.
+pub fn query_worth_pre_recalling(query: &str) -> bool {
+    query
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|t| t.chars().count() >= 4)
+}
+
 /// Format a memory `search` response into the supplemental pre-recall context
 /// block, or `None` when nothing new matched (so the loop injects nothing on a
 /// miss). `snapshot` is the frozen `<project_memory>` block already in the
-/// system prompt: entries whose content already appears there are dropped, so
-/// pre-recall surfaces only what the agent CAN'T already see (the breadcrumb /
-/// non-hot tier) — no double-injection, and the "you did not search for these"
-/// framing stays true. Blanks are filtered before the cap so dead rows can't
-/// crowd out real hits. The block is labeled auto-surfaced and advisory so the
-/// model treats it as a hint, not a user instruction.
+/// system prompt; a hit is dropped when its full content is a substring of the
+/// snapshot. That reliably de-dups HOT-tier entries (the snapshot inlines their
+/// full text). A BREADCRUMB-tier entry the snapshot lists only as a truncated
+/// preview won't match, so it can still surface here — which is the point:
+/// pre-recall exists to put the full breadcrumb in front of the agent. So the
+/// "you did not search for these" framing holds for the common case (the model
+/// can't already read these in full); it's not a guarantee that no preview of a
+/// hit appears anywhere in the snapshot. Blanks are filtered before the cap so
+/// dead rows can't crowd out real hits. The block is labeled auto-surfaced and
+/// advisory so the model treats it as a hint, not a user instruction.
 pub fn pre_recall_block(search_resp: &serde_json::Value, snapshot: &str) -> Option<String> {
     let results = search_resp["results"].as_array()?;
     let lines: Vec<String> = results
@@ -464,6 +482,24 @@ mod pre_recall_tests {
             block.contains("a breadcrumb fact not in the snapshot"),
             "non-snapshot entry surfaces: {block}",
         );
+    }
+
+    #[test]
+    fn query_worth_pre_recalling_floors_trivial_acks() {
+        // Bare acknowledgments / contentless turns → skip.
+        for trivial in ["", "  ", "ok", "yes", "go on", "do it", "k", "yep!"] {
+            assert!(
+                !query_worth_pre_recalling(trivial),
+                "should skip trivial query {trivial:?}",
+            );
+        }
+        // Anything with a substantial word → search.
+        for real in ["fix the build", "how do I cache the widget", "rollback"] {
+            assert!(
+                query_worth_pre_recalling(real),
+                "should pre-recall real query {real:?}",
+            );
+        }
     }
 
     #[test]

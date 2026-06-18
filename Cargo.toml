@@ -134,7 +134,7 @@ semantic-elixir = ["semantic", "dep:tree-sitter-elixir"]
 plugin = ["dep:janetrs"]
 lsp = ["dep:lsp-types"]
 dap = ["dep:which", "dep:dap"]
-sandbox-microvm = ["dep:libkrun-sys", "dep:russh", "dep:sha2", "dep:hex", "dep:base64"]
+sandbox-microvm = ["dep:libkrun-sys", "dep:russh", "dep:hex"]
 # timing-diagnostics: compile-time gate for relay byte accounting
 # counters and invariants. No runtime cost when disabled. Used in
 # stress tests to identify keystroke-loss points.
@@ -280,10 +280,10 @@ russh = { version = "0.61", default-features = false, features = ["ring"], optio
 # sha2 + hex: OCI layer digest verification for the microVM sandbox.
 # Every blob downloaded from the registry is SHA-256 hashed and compared
 # against the manifest's declared digest before extraction.
-sha2 = { version = "0.10", optional = true }
+sha2 = "0.10"
 hex = { version = "0.4", optional = true }
 # base64: decode OpenSSH-format public keys for host-key verification.
-base64 = { version = "0.22", optional = true }
+base64 = "0.22"
 # YAML parser for skill frontmatter (replaces hand-rolled parser in
 # `src/extras/skills/format.rs`). `yaml-rust2` is the maintained fork
 # of the abandoned `yaml-rust` crate, fully YAML 1.2 compliant.
@@ -294,6 +294,7 @@ yaml-rust2 = "0.11"
 # retriever (`agent::exemplars`), which scores curated tool-use
 # examples against the user's task to inject the most relevant ones.
 nucleo-matcher = "0.3"
+url = "2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }

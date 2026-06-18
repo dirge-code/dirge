@@ -16,6 +16,11 @@
 //!     dirge *controls* — every planted fact must reach the prompt handed to
 //!     the summarizer. Guards against a pre-LLM regression (truncation, window
 //!     selection, serialization) silently starving the summarizer of facts.
+//!   * `task_supersession_signal_reaches_the_summarizer` (deterministic, CI):
+//!     guards #443 — a #443-shaped session (original task done, follow-up live)
+//!     must carry BOTH the completion and follow-up signals into the summarizer
+//!     prompt, so the prompt fix can mark the original complete and surface the
+//!     follow-up as the active task.
 //!   * [`run_recall_eval`]: the full article-style probe — compact through a
 //!     [`SummarizeFn`] and score the *summary*. Driven by a mock here so it
 //!     runs in CI; point it at a real model's `SummarizeFn` off-CI to measure
@@ -190,6 +195,96 @@ mod tests {
             report.all_survived(),
             "facts dropped before reaching the summarizer: {:?}",
             report.dropped
+        );
+    }
+
+    /// Build a #443-shaped history: an early turn assigns the ORIGINAL task,
+    /// a middle turn marks it DONE, and a later turn establishes a follow-up as
+    /// the live work. Sized/interleaved like [`session_with_facts`] so
+    /// `compute_compress_window` snaps a non-empty middle around all three (head
+    /// snaps forward to the first user turn ≥ `PROTECT_HEAD_DEFAULT`, tail snaps
+    /// backward to the last user turn ≤ `n - PROTECT_TAIL_DEFAULT`). Content is
+    /// scalar-string and well under the 2000-char per-turn truncation in
+    /// `serialize_turns_for_summary`, so the supersession signals survive.
+    fn session_443_task_supersession() -> Vec<Value> {
+        let mut msgs: Vec<Value> = vec![
+            json!({"role": "system", "content": "you are dirge, a coding agent"}),
+            json!({"role": "user", "content": "let's work on the chat server"}),
+        ];
+
+        // Lead-in filler so the first signal is well past the protected head.
+        for i in 0..4 {
+            msgs.push(json!({"role": "assistant", "content": format!("on it (step {i})")}));
+            msgs.push(json!({"role": "user", "content": format!("ok, continue {i}")}));
+        }
+
+        // Original task assignment — lands in the compacted middle.
+        msgs.push(json!({
+            "role": "user",
+            "content": "Convert the TCP chat server from tokio to stdlib and add an integration test",
+        }));
+        msgs.push(json!({"role": "assistant", "content": "starting the conversion"}));
+        msgs.push(json!({"role": "user", "content": "go ahead"}));
+
+        // Original task COMPLETED — the supersession completion signal.
+        msgs.push(json!({
+            "role": "assistant",
+            "content": "stdlib conversion complete — no tokio remains; cargo build passes",
+        }));
+        msgs.push(json!({"role": "user", "content": "great, what now"}));
+
+        // Follow-up becomes the live work — the supersession follow-up signal.
+        msgs.push(json!({
+            "role": "user",
+            "content": "the integration test hangs — debugging the race in the accept loop",
+        }));
+        msgs.push(json!({"role": "assistant", "content": "looking at the accept loop"}));
+        msgs.push(json!({"role": "user", "content": "keep going"}));
+
+        // Trailing filler, then the protected tail ending on the latest request.
+        for i in 0..4 {
+            msgs.push(json!({"role": "assistant", "content": format!("still on it (step {i})")}));
+            msgs.push(json!({"role": "user", "content": format!("keep going {i}")}));
+        }
+        msgs.push(json!({"role": "user", "content": "so where does the race actually come from?"}));
+        msgs
+    }
+
+    /// #443: after compaction the model re-derived the ORIGINAL task ("convert
+    /// to stdlib") as if still pending, when it was already DONE and the live
+    /// work was a follow-up (debugging a hanging integration test). The summary
+    /// PROMPT fix (sibling: `build_summary_prompt`/`SUMMARY_PREFIX`) can only
+    /// mark the original complete and surface the follow-up if BOTH signals
+    /// actually reach the summarizer. This guards the dirge-controlled part:
+    /// window selection + serialization must carry the completion signal AND
+    /// the follow-up signal into the prompt. A pre-LLM regression (a window that
+    /// drops the "complete" turn, or truncation that eats the follow-up) would
+    /// starve the summarizer of the supersession signal and reintroduce #443
+    /// before the model is ever consulted.
+    #[test]
+    fn task_supersession_signal_reaches_the_summarizer() {
+        let msgs = session_443_task_supersession();
+        let (start, end) =
+            compute_compress_window(&msgs, PROTECT_HEAD_DEFAULT, PROTECT_TAIL_DEFAULT);
+        assert!(
+            start < end,
+            "session must produce a non-empty compaction window"
+        );
+
+        let middle = &msgs[start..end];
+        let prompt = build_summary_prompt(
+            middle,
+            summary_budget(estimate_messages_tokens(middle)),
+            None,
+            None,
+        );
+        assert!(
+            prompt.contains("stdlib conversion complete") && prompt.contains("no tokio remains"),
+            "completion signal (original task DONE) must reach the summarizer prompt"
+        );
+        assert!(
+            prompt.contains("integration test hangs") && prompt.contains("debugging the race"),
+            "follow-up signal (live work) must reach the summarizer prompt"
         );
     }
 

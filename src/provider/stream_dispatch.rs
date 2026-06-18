@@ -35,6 +35,9 @@ macro_rules! dispatch_stream_fn {
             }
             $enum::OpenAICodex($bind) => __stream_fn($model, $tools, $timeout, $provider, $filter),
             $enum::Anthropic($bind) => __stream_fn($model, $tools, $timeout, $provider, $filter),
+            $enum::AnthropicOauth($bind) => {
+                __stream_fn($model, $tools, $timeout, $provider, $filter)
+            }
             $enum::Gemini($bind) => __stream_fn($model, $tools, $timeout, $provider, $filter),
             $enum::DeepSeek($bind) => __stream_fn($model, $tools, $timeout, $provider, $filter),
             $enum::Glm($bind) => __stream_fn($model, $tools, $timeout, $provider, $filter),

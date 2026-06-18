@@ -252,7 +252,7 @@ pub struct Cli {
 
 #[derive(clap::Subcommand, Debug)]
 pub enum Command {
-    /// Authenticate provider credentials for future sessions
+    /// Manage provider authentication
     Auth {
         #[command(subcommand)]
         action: AuthAction,
@@ -287,6 +287,8 @@ pub enum AuthAction {
         long_about = "Log in to OpenAI using device-code auth.\n\nBefore running this command, enable device-code auth in ChatGPT Codex security settings."
     )]
     Openai,
+    /// Start Anthropic Claude Code OAuth login and persist credentials
+    Anthropic,
 }
 
 #[derive(clap::Subcommand, Debug)]

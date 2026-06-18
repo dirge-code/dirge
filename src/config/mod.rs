@@ -33,6 +33,8 @@ pub enum ProviderAuth {
         alias = "codex"
     )]
     ChatGpt,
+    #[serde(alias = "claude-code", alias = "claude_code", alias = "claude")]
+    Anthropic,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -1265,6 +1267,23 @@ mod tests {
             cfg.providers.unwrap()["openai"].auth,
             Some(ProviderAuth::ApiKey)
         );
+    }
+
+    #[test]
+    fn provider_auth_mode_parses_anthropic_aliases() {
+        let cfg: Config = serde_json::from_str(
+            r#"{
+                "providers": {
+                    "anthropic": { "auth": "anthropic" },
+                    "claude": { "auth": "claude-code" }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let providers = cfg.providers.unwrap();
+        assert_eq!(providers["anthropic"].auth, Some(ProviderAuth::Anthropic));
+        assert_eq!(providers["claude"].auth, Some(ProviderAuth::Anthropic));
     }
 
     #[test]

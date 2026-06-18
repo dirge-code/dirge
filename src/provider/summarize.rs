@@ -102,6 +102,7 @@ pub(crate) async fn oneshot_with_model(
         super::AnyModel::ChatGptOpenAI(m) => run_oneshot(m, label, preamble, prompt).await,
         super::AnyModel::OpenAICodex(m) => run_oneshot(m, label, preamble, prompt).await,
         super::AnyModel::Anthropic(m) => run_oneshot(m, label, preamble, prompt).await,
+        super::AnyModel::AnthropicOauth(m) => run_oneshot(m, label, preamble, prompt).await,
         super::AnyModel::Gemini(m) => run_oneshot(m, label, preamble, prompt).await,
         super::AnyModel::DeepSeek(m) => run_oneshot(m, label, preamble, prompt).await,
         super::AnyModel::Glm(m) => run_oneshot(m, label, preamble, prompt).await,

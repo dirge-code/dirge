@@ -137,6 +137,29 @@ pub(crate) async fn register_memory_tool(
     }
 }
 
+/// dirge-ygm3: build a SECOND memory tool with the background-review actions
+/// (`mark`/`supersede`) enabled. It is deliberately NOT pushed into the main
+/// agent's tool set — `build_loop_tools` returns it separately so the review
+/// runner can swap it in, keeping those actions off the interactive agent's
+/// schema. `None` when the store didn't load (same degradation as the main
+/// tool).
+pub(crate) async fn build_review_memory_tool(
+    memory_store: Option<std::sync::Arc<dyn crate::extras::memory_provider::MemoryProvider>>,
+    global_store: Option<std::sync::Arc<dyn crate::extras::memory_provider::MemoryProvider>>,
+    permission: Option<PermCheck>,
+    ask_tx: Option<AskSender>,
+) -> Option<std::sync::Arc<dyn crate::agent::agent_loop::LoopTool>> {
+    use crate::agent::agent_loop::{RigToolAdapter, types::ToolExecutionMode};
+    let store = memory_store?;
+    let tool = tools::MemoryTool::new(store, permission, ask_tx)
+        .with_global(global_store)
+        .with_review_actions(true);
+    let adapter = RigToolAdapter::new(Box::new(tool))
+        .await
+        .with_execution_mode(ToolExecutionMode::Sequential);
+    Some(std::sync::Arc::new(adapter))
+}
+
 /// Register the `spec` tool when its store opens. Mirrors
 /// [`register_memory_tool`]: an open failure (fresh-state I/O, unreadable
 /// DB) degrades to a session without the spec tool, with a warning, rather
@@ -182,7 +205,15 @@ fn resolve_embedder(
     if cfg.hybrid_retrieval != Some(true) {
         return None;
     }
-    let url = cfg.embed_url.clone()?;
+    let Some(url) = cfg.embed_url.clone() else {
+        // The most common misconfiguration: hybrid on, but no endpoint. Warn
+        // instead of silently staying BM25 with no feedback (dirge-4hld).
+        tracing::warn!(
+            target: "dirge::memory_hybrid",
+            "memory.hybrid_retrieval is on but memory.embed_url is unset — staying BM25-only",
+        );
+        return None;
+    };
     let model = cfg
         .embed_model
         .clone()
@@ -223,12 +254,15 @@ pub async fn build_loop_tools(
 ) -> (
     Vec<std::sync::Arc<dyn crate::agent::agent_loop::LoopTool>>,
     Option<DynamicToolSearch>,
+    // dirge-ygm3: the review-enabled memory tool (mark/supersede), kept OUT of
+    // the main tool set above and handed to the review runner separately.
+    Option<std::sync::Arc<dyn crate::agent::agent_loop::LoopTool>>,
 ) {
     use crate::agent::agent_loop::types::ToolExecutionMode;
     use crate::agent::agent_loop::{LoopTool, RigToolAdapter};
 
     if cli.resolve_no_tools(cfg) {
-        return (Vec::new(), None);
+        return (Vec::new(), None, None);
     }
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
@@ -497,6 +531,16 @@ pub async fn build_loop_tools(
         crate::extras::memory_db::SqliteMemoryStore::load_global()
             .ok()
             .map(|s| std::sync::Arc::new(s) as _);
+    // dirge-ygm3: build the review-enabled memory tool BEFORE `global_store` is
+    // moved into the main registration. It is returned separately, never added
+    // to `tools`.
+    let review_memory_tool = build_review_memory_tool(
+        memory_store.clone(),
+        global_store.clone(),
+        permission.clone(),
+        ask_tx.clone(),
+    )
+    .await;
     register_memory_tool(
         &mut tools,
         memory_store.clone(),
@@ -717,7 +761,7 @@ pub async fn build_loop_tools(
         None
     };
 
-    (tools, tool_def_filter)
+    (tools, tool_def_filter, review_memory_tool)
 }
 
 #[cfg(all(test, any(feature = "mcp", feature = "plugin")))]

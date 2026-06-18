@@ -140,12 +140,15 @@ pub const MEMORY_GUIDANCE: &str = "\n\n## Memory usage\n\n\
      You have persistent memory across sessions on this project. Save \
      durable facts using the `memory` tool: user preferences, environment \
      details, tool quirks, and stable conventions.\n\
-     Your saved memory is injected as a SNAPSHOT taken at the start of \
-     this session (so the prompt stays cache-stable). A fact you save NOW \
-     becomes active from the NEXT session — it will not appear in the \
-     <project_memory> block above mid-session, so don't re-save a fact \
-     just because you don't see it reappear. Keep memory compact and \
-     focused on facts that will still matter later.\n\
+     Your saved memory is injected as a frozen SNAPSHOT (so the prompt \
+     stays cache-stable). A fact you save NOW will appear in the prompt \
+     after the user runs `/memory reload` — it won't show up mid-turn, \
+     so don't re-save a fact just because you don't see it reappear.\n\
+     If you notice a memory entry is stale, wrong, or contradicts what \
+     the user just said, update it. After batch-editing stale entries, \
+     tell the user to run `/memory reload` so the corrections surface \
+     in your next prompt.\n\
+     Keep memory compact and focused on facts that will still matter later.\n\
      Prioritize what reduces future user steering — the most valuable \
      memory is one that prevents the user from having to correct or remind \
      you again. User preferences and recurring corrections matter more \
@@ -352,7 +355,7 @@ mod tests {
 
     /// dirge-kvfm: the guidance must explain the frozen snapshot so the
     /// model knows a fact it saves this session won't appear in its
-    /// prompt until next session (otherwise it re-saves). It must NOT
+    /// prompt until `/memory reload` (otherwise it re-saves). It must NOT
     /// claim memory is re-injected "every turn" — that's the misleading
     /// wording this fixed.
     #[test]
@@ -360,8 +363,8 @@ mod tests {
         let g = MEMORY_GUIDANCE.to_lowercase();
         assert!(g.contains("snapshot"), "must name the snapshot");
         assert!(
-            g.contains("next session"),
-            "must say writes land next session",
+            g.contains("/memory reload"),
+            "must say writes land after /memory reload",
         );
         assert!(
             !MEMORY_GUIDANCE.contains("injected into\n     every turn")

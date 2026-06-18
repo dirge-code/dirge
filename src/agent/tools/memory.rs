@@ -19,6 +19,14 @@ pub struct MemoryTool {
     /// with `scope: "global"` routes here instead of the per-project
     /// `store`; absent, a global request falls back to the project store.
     global_store: Option<Arc<dyn MemoryProvider>>,
+    /// dirge-ygm3: gate the background-review actions (`mark`, `supersede`).
+    /// These record procedural outcomes and contradiction supersessions that
+    /// the background review pass infers from the transcript — the interactive
+    /// agent must not self-grade or self-supersede. When `false` (the default,
+    /// the main agent's instance) those actions are absent from the tool
+    /// schema AND rejected at the call layer; the review runner gets a separate
+    /// instance built with `true`.
+    review_actions: bool,
 }
 
 impl MemoryTool {
@@ -32,12 +40,20 @@ impl MemoryTool {
             ask_tx,
             store,
             global_store: None,
+            review_actions: false,
         }
     }
 
     /// Attach the global (cross-project) memory tier. `None` is a no-op.
     pub fn with_global(mut self, global_store: Option<Arc<dyn MemoryProvider>>) -> Self {
         self.global_store = global_store;
+        self
+    }
+
+    /// Enable the background-review-only actions (`mark`/`supersede`). Set on
+    /// the instance handed to the review runner, never the main agent's.
+    pub fn with_review_actions(mut self, enabled: bool) -> Self {
+        self.review_actions = enabled;
         self
     }
 
@@ -98,6 +114,26 @@ impl Tool for MemoryTool {
     type Output = String;
 
     async fn definition(&self, _prompt: String) -> ToolDefinition {
+        // dirge-ygm3: `mark`/`supersede` are background-review-only. They live
+        // in the action enum (parameters), not the prose description, so gating
+        // them changes only the schema's allowed values — never the
+        // length-checked description. The review runner's instance sets
+        // `review_actions = true`; the main agent's leaves them out entirely.
+        let mut actions = vec![
+            "view", "add", "replace", "remove", "restore", "expand", "search",
+        ];
+        let mut action_desc = "The action to perform.".to_string();
+        if self.review_actions {
+            actions.push("mark");
+            actions.push("supersede");
+            action_desc.push_str(
+                " 'mark' records a procedural playbook's outcome (old_text + \
+                 outcome=success|failure). 'supersede' retires a contradicted fact \
+                 (old_text) and writes a corrected one (content), keeping the old as \
+                 an audit record — use it instead of 'replace' when a fact CHANGED \
+                 rather than was reworded.",
+            );
+        }
         ToolDefinition {
             name: "memory".to_string(),
             description: r#"Persistent long-term memory for project facts and pitfalls.
@@ -116,57 +152,71 @@ ACTIONS:
 - restore: un-archive a removed entry (old_text)
 - expand: full text of one entry by id/substring (old_text)
 - search: full-text search across all memory (query)
-- mark: record a playbook outcome (old_text + outcome=success|failure)
 
 old_text matches a unique substring or the exact "urn:ump:…" id from view/index."#
                 .to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["view", "add", "replace", "remove", "restore", "expand", "search", "mark", "supersede"],
-                        "description": "The action to perform. 'supersede' retires a contradicted fact (old_text) and writes a corrected one (content), keeping the old as an audit record — use it instead of 'replace' when a fact CHANGED rather than was reworded."
+            parameters: {
+                let mut params = serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": actions,
+                            "description": action_desc
+                        },
+                        "target": {
+                            "type": "string",
+                            "enum": ["memory", "pitfalls"],
+                            "description": "Which memory store: 'memory' for project facts, 'pitfalls' for anti-patterns."
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "The entry content. Required for 'add' and 'replace'."
+                        },
+                        "old_text": {
+                            "type": "string",
+                            "description": "Short unique substring identifying the entry to replace, remove, restore, or expand — or the entry's exact 'urn:ump:…' id from view's meta / the breadcrumb index."
+                        },
+                        "query": {
+                            "type": "string",
+                            "description": "Full-text query for the 'search' action."
+                        },
+                        "kind": {
+                            "type": "string",
+                            "enum": ["semantic", "episodic", "procedural", "working", "identity"],
+                            "description": "The UMP memory kind. Defaults to 'procedural'. See KINDS above."
+                        },
+                        "scope": {
+                            "type": "string",
+                            "enum": ["project", "global"],
+                            "description": "Where the entry lives: 'project' (default) for facts about THIS repo; 'global' for durable user preferences that should follow the user across every project."
+                        }
                     },
-                    "target": {
-                        "type": "string",
-                        "enum": ["memory", "pitfalls"],
-                        "description": "Which memory store: 'memory' for project facts, 'pitfalls' for anti-patterns."
-                    },
-                    "content": {
-                        "type": "string",
-                        "description": "The entry content. Required for 'add' and 'replace'."
-                    },
-                    "old_text": {
-                        "type": "string",
-                        "description": "Short unique substring identifying the entry to replace, remove, restore, or expand — or the entry's exact 'urn:ump:…' id from view's meta / the breadcrumb index."
-                    },
-                    "query": {
-                        "type": "string",
-                        "description": "Full-text query for the 'search' action."
-                    },
-                    "outcome": {
-                        "type": "string",
-                        "enum": ["success", "failure"],
-                        "description": "For the 'mark' action: whether a procedural playbook worked ('success') or failed ('failure') in practice."
-                    },
-                    "harsh": {
-                        "type": "boolean",
-                        "description": "For the 'supersede' action: true when the user flatly DENIED the old fact (discounts the new fact's confidence); false/omitted for a natural update like a changed preference."
-                    },
-                    "kind": {
-                        "type": "string",
-                        "enum": ["semantic", "episodic", "procedural", "working", "identity"],
-                        "description": "The UMP memory kind. Defaults to 'procedural'. See KINDS above."
-                    },
-                    "scope": {
-                        "type": "string",
-                        "enum": ["project", "global"],
-                        "description": "Where the entry lives: 'project' (default) for facts about THIS repo; 'global' for durable user preferences that should follow the user across every project."
-                    }
-                },
-                "required": ["action"]
-            }),
+                    "required": ["action"]
+                });
+                // dirge-ygm3: the mark/supersede-only params travel with their
+                // actions — present only on the review instance.
+                if self.review_actions
+                    && let Some(props) = params["properties"].as_object_mut()
+                {
+                    props.insert(
+                        "outcome".to_string(),
+                        serde_json::json!({
+                            "type": "string",
+                            "enum": ["success", "failure"],
+                            "description": "For the 'mark' action: whether a procedural playbook worked ('success') or failed ('failure') in practice."
+                        }),
+                    );
+                    props.insert(
+                        "harsh".to_string(),
+                        serde_json::json!({
+                            "type": "boolean",
+                            "description": "For the 'supersede' action: true when the user flatly DENIED the old fact (discounts the new fact's confidence); false/omitted for a natural update like a changed preference."
+                        }),
+                    );
+                }
+                params
+            },
         }
     }
 
@@ -176,6 +226,17 @@ old_text matches a unique substring or the exact "urn:ump:…" id from view/inde
         let target = validate_target(&args.target)?;
         // Route to the project or global tier per `scope` (default project).
         let store = self.scoped_store(args.scope.as_deref());
+
+        // dirge-ygm3: defense in depth — `mark`/`supersede` are absent from
+        // this instance's schema unless review_actions is on, but reject them
+        // at the call layer too so a hand-crafted call can't reach them on the
+        // interactive agent's tool.
+        if !self.review_actions && matches!(args.action.as_str(), "mark" | "supersede") {
+            return Err(ToolError::Msg(format!(
+                "Action '{}' is only available to the background review pass.",
+                args.action
+            )));
+        }
 
         match args.action.as_str() {
             "view" => {
@@ -386,6 +447,105 @@ mod tests {
             .enable_time()
             .build()
             .unwrap()
+    }
+
+    /// Minimal `Args` with everything but `action` defaulted.
+    fn action_args(action: &str) -> Args {
+        Args {
+            action: action.into(),
+            target: "memory".into(),
+            content: None,
+            old_text: None,
+            kind: None,
+            query: None,
+            outcome: None,
+            harsh: None,
+            scope: None,
+        }
+    }
+
+    fn action_enum(tool: &MemoryTool, rt: &tokio::runtime::Runtime) -> Vec<String> {
+        let def = rt.block_on(tool.definition(String::new()));
+        def.parameters["properties"]["action"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// dirge-ygm3: the main agent's instance (default) must not advertise the
+    /// background-review actions in its schema.
+    #[test]
+    fn default_tool_hides_review_actions_from_schema() {
+        let (store, _d) = temp_store();
+        let tool = MemoryTool::new(store, None, None);
+        let rt = make_runtime();
+        let actions = action_enum(&tool, &rt);
+        assert!(
+            !actions.iter().any(|a| a == "mark" || a == "supersede"),
+            "main agent schema must omit mark/supersede: {actions:?}",
+        );
+        // The base actions are still all present.
+        for a in [
+            "view", "add", "replace", "remove", "restore", "expand", "search",
+        ] {
+            assert!(actions.iter().any(|x| x == a), "missing base action {a}");
+        }
+    }
+
+    /// The review runner's instance exposes mark/supersede.
+    #[test]
+    fn review_tool_exposes_review_actions() {
+        let (store, _d) = temp_store();
+        let tool = MemoryTool::new(store, None, None).with_review_actions(true);
+        let rt = make_runtime();
+        let actions = action_enum(&tool, &rt);
+        assert!(
+            actions.iter().any(|a| a == "mark"),
+            "mark present: {actions:?}"
+        );
+        assert!(
+            actions.iter().any(|a| a == "supersede"),
+            "supersede present: {actions:?}",
+        );
+    }
+
+    /// Defense in depth: even a hand-crafted call is rejected on the main
+    /// agent's (non-review) instance.
+    #[test]
+    fn default_tool_rejects_review_actions_at_call_layer() {
+        let (store, _d) = temp_store();
+        let tool = MemoryTool::new(store, None, None);
+        let rt = make_runtime();
+        for action in ["mark", "supersede"] {
+            let err = rt
+                .block_on(tool.call(action_args(action)))
+                .expect_err("must be rejected");
+            let msg = format!("{err:?}");
+            assert!(
+                msg.contains("background review"),
+                "reject reason names the gate: {msg}",
+            );
+        }
+    }
+
+    /// The review instance can actually record an outcome.
+    #[test]
+    fn review_tool_accepts_mark() {
+        let (store, _d) = temp_store();
+        store
+            .add("memory", "run cargo fmt before commit", Some("procedural"))
+            .unwrap();
+        let tool = MemoryTool::new(store, None, None).with_review_actions(true);
+        let rt = make_runtime();
+        let mut args = action_args("mark");
+        args.old_text = Some("cargo fmt".into());
+        args.outcome = Some("success".into());
+        let out = rt
+            .block_on(tool.call(args))
+            .expect("mark succeeds on review tool");
+        assert!(out.contains("success"), "outcome recorded: {out}");
     }
 
     /// `scope: "global"` routes the write to the global tier, leaving the

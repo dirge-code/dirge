@@ -1,3 +1,5 @@
+pub(crate) mod anthropic_http;
+pub(crate) mod anthropic_oauth;
 pub(crate) mod auth;
 mod billing_fallback;
 mod build;
@@ -138,6 +140,11 @@ pub struct AnyAgent {
     /// switching this request to API-key billing.
     openai_api_key_fallback_model: Option<AnyModel>,
     api_billing_ask_tx: Option<crate::permission::ask::AskSender>,
+    /// dirge-ygm3: a memory tool with the background-review actions
+    /// (`mark`/`supersede`) enabled, kept OUT of `loop_tools` so the
+    /// interactive agent never sees them. The review runner swaps this in
+    /// place of the main memory tool. `None` when no store loaded.
+    review_memory_tool: Option<std::sync::Arc<dyn crate::agent::agent_loop::LoopTool>>,
 }
 
 #[derive(Clone)]
@@ -149,6 +156,9 @@ pub(crate) enum AnyAgentInner {
     ),
     OpenAICodex(Agent<chatgpt::ResponsesCompletionModel>),
     Anthropic(Agent<anthropic::completion::CompletionModel>),
+    AnthropicOauth(
+        Agent<anthropic::completion::CompletionModel<anthropic_http::AnthropicHttpClient>>,
+    ),
     Gemini(Agent<gemini::completion::CompletionModel>),
     DeepSeek(Agent<openai::completion::CompletionModel>),
     Glm(Agent<openai::completion::CompletionModel>),
@@ -189,7 +199,17 @@ impl AnyAgent {
             memory_provider: None,
             openai_api_key_fallback_model: None,
             api_billing_ask_tx: None,
+            review_memory_tool: None,
         }
+    }
+
+    /// dirge-ygm3: attach the review-enabled memory tool (see the field doc).
+    pub fn with_review_memory_tool(
+        mut self,
+        tool: std::sync::Arc<dyn crate::agent::agent_loop::LoopTool>,
+    ) -> Self {
+        self.review_memory_tool = Some(tool);
+        self
     }
 
     /// dirge-x949: append tools to the live loop registry. Background
@@ -388,6 +408,7 @@ impl AnyAgent {
             AnyAgentInner::ChatGptOpenAI(_) => "openai",
             AnyAgentInner::OpenAICodex(_) => "openai",
             AnyAgentInner::Anthropic(_) => "anthropic",
+            AnyAgentInner::AnthropicOauth(_) => "anthropic",
             AnyAgentInner::Gemini(_) => "gemini",
             AnyAgentInner::DeepSeek(_) => "deepseek",
             AnyAgentInner::Glm(_) => "glm",

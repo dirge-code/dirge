@@ -1205,6 +1205,7 @@ dependencies = [
  "tree-sitter-rust",
  "tree-sitter-typescript",
  "unicode-width",
+ "url",
  "uuid",
  "which",
  "yaml-rust2",

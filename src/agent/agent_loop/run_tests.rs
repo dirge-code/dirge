@@ -411,8 +411,11 @@ async fn run_compaction_pass_ignores_stale_generation_checkpoint() {
     );
 }
 
-/// Serializes the two tests that touch the process-global memory-dirty flag
-/// so they don't steal each other's marks under parallel test execution.
+/// Serializes the tests that touch a process-global memory flag (the
+/// memory-dirty flag and the verbatim-pre-recall toggle) so they don't perturb
+/// each other under parallel test execution — e.g. a pre-recall test leaving
+/// the toggle on while a memory-refresh test runs `run_agent_loop` with a
+/// provider. Every test that flips one of those globals holds this lock.
 static DIRTY_FLAG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Round 2 flag: `mark_memories_dirty` then `take_memories_dirty` returns
@@ -516,6 +519,97 @@ async fn memory_refresh_injects_block_at_turn_boundary_when_dirty() {
         snapshots.iter().any(|s| s.contains("STUBMEM")),
         "the refreshed memory block should appear in the model-facing context \
          after the turn boundary; snapshots={snapshots:?}"
+    );
+}
+
+/// dirge-0gxb: with verbatim pre-recall on, the hits from searching the
+/// verbatim user message reach the MODEL-FACING context, but the injected
+/// block is NEVER persisted into the returned (`new_messages`) history — the
+/// core supplemental-not-persisted invariant, exercised end-to-end through
+/// `run_agent_loop` (the unit tests only cover `pre_recall_block` formatting).
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // current-thread test runtime; lock only serializes the global flag
+async fn pre_recall_reaches_model_context_but_not_persisted_history() {
+    use crate::agent::agent_loop::context_manager::set_verbatim_pre_recall;
+    use crate::extras::memory_provider::MemoryProvider;
+    let _guard = DIRTY_FLAG_TEST_LOCK.lock().unwrap();
+
+    // Provider whose search returns a distinctive hit; empty snapshot so the
+    // hit isn't de-duped against `<project_memory>`.
+    struct RecallProvider;
+    impl MemoryProvider for RecallProvider {
+        fn name(&self) -> &str {
+            "recall-stub"
+        }
+        fn format_for_system_prompt(&self) -> String {
+            String::new()
+        }
+        fn view(&self, _t: &str) -> Value {
+            serde_json::json!({})
+        }
+        fn add(&self, _: &str, _: &str, _: Option<&str>) -> Result<Value, String> {
+            Ok(serde_json::json!({}))
+        }
+        fn replace(&self, _: &str, _: &str, _: &str, _: Option<&str>) -> Result<Value, String> {
+            Ok(serde_json::json!({}))
+        }
+        fn remove(&self, _: &str, _: &str) -> Result<Value, String> {
+            Ok(serde_json::json!({}))
+        }
+        fn search(&self, _q: &str) -> Result<Value, String> {
+            Ok(serde_json::json!({
+                "results": [{"id": "urn:ump:x", "content": "PRERECALLHIT: the widget cache lives in src/cache.rs"}]
+            }))
+        }
+    }
+
+    let ctx = empty_context();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let factory = capturing_factory(vec![text_response("done")], seen.clone());
+    let provider: std::sync::Arc<dyn MemoryProvider> = std::sync::Arc::new(RecallProvider);
+
+    // Pre-recall injects a `user`-role message; keep user/assistant/tool/system.
+    let mut config = build_config();
+    config.convert_to_llm = std::sync::Arc::new(|messages: &[Value]| {
+        messages
+            .iter()
+            .filter(|m| {
+                let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("");
+                matches!(
+                    role,
+                    "user" | "assistant" | "tool" | "toolResult" | "system"
+                )
+            })
+            .cloned()
+            .collect()
+    });
+
+    set_verbatim_pre_recall(true);
+    let (tx, _rx) = mpsc::channel::<LoopEvent>(128);
+    let returned = run_agent_loop(
+        vec![user("how do I cache the widget")],
+        ctx,
+        config,
+        AbortSignal::new(),
+        &tx,
+        &factory,
+        None,
+        Some(provider),
+    )
+    .await;
+    drop(tx);
+    // Reset BEFORE asserting so a failure can't leak the toggle to other tests.
+    set_verbatim_pre_recall(false);
+
+    let snapshots = seen.lock().unwrap().clone();
+    assert!(
+        snapshots.iter().any(|s| s.contains("PRERECALLHIT")),
+        "pre-recall hit must reach the model-facing context; snapshots={snapshots:?}",
+    );
+    let persisted = format!("{returned:?}");
+    assert!(
+        !persisted.contains("PRERECALLHIT"),
+        "pre-recall block must NOT be persisted into new_messages: {persisted}",
     );
 }
 

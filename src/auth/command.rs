@@ -68,6 +68,9 @@ where
 {
     match action {
         crate::cli::AuthAction::Openai => openai_login().await,
+        crate::cli::AuthAction::Anthropic => {
+            anyhow::bail!("Anthropic OAuth login is handled after config loading")
+        }
     }
 }
 

@@ -193,7 +193,12 @@ where
              Set `auth: chatgpt` only on your openai provider (or use an API key for `{provider_name}`)."
         );
     }
-
+    if auth == ProviderAuth::Anthropic && info.kind != ProviderKind::Anthropic {
+        anyhow::bail!(
+            "Anthropic OAuth is only supported for the `anthropic` provider, not `{provider_name}`. \
+             Set `auth: anthropic` only on your anthropic provider (or use an API key for `{provider_name}`)."
+        );
+    }
     let auth_headers = match (auth, resolved_auth_headers) {
         (ProviderAuth::ChatGpt, Some(headers)) => Some(headers),
         _ => resolve_auth_headers(auth)?,
@@ -298,11 +303,25 @@ where
             Ok(AnyClient::OpenAI(b.build()?))
         }
         ProviderKind::Anthropic => {
-            let mut b = anthropic::Client::builder().api_key(&key);
-            if let Some(base_url) = &base_url {
-                b = b.base_url(base_url);
+            if auth == ProviderAuth::Anthropic {
+                let bearer = auth_headers
+                    .as_ref()
+                    .map(|h| h.bearer_token.clone())
+                    .unwrap_or_else(|| key.clone());
+                let mut b = anthropic::Client::builder()
+                    .api_key(&key)
+                    .http_client(super::anthropic_http::AnthropicHttpClient::new(bearer));
+                if let Some(base_url) = &base_url {
+                    b = b.base_url(base_url);
+                }
+                Ok(AnyClient::AnthropicOauth(b.build()?))
+            } else {
+                let mut b = anthropic::Client::builder().api_key(&key);
+                if let Some(base_url) = &base_url {
+                    b = b.base_url(base_url);
+                }
+                Ok(AnyClient::Anthropic(b.build()?))
             }
-            Ok(AnyClient::Anthropic(b.build()?))
         }
         ProviderKind::Gemini => {
             let mut b = gemini::Client::builder().api_key(&key);
