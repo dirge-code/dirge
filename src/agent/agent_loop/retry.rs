@@ -89,10 +89,19 @@ fn is_timeout_error(msg: &str) -> bool {
 /// the inner stream's responsibility (the rig adapter's
 /// `AbortSignal` poll inside its own loop).
 pub fn retrying_stream_fn(inner: StreamFn, policy: RecoveryPolicy) -> StreamFn {
+    retrying_stream_fn_with_non_retryable(inner, policy, Arc::new(|_| false))
+}
+
+pub fn retrying_stream_fn_with_non_retryable(
+    inner: StreamFn,
+    policy: RecoveryPolicy,
+    non_retryable: Arc<dyn Fn(&str) -> bool + Send + Sync>,
+) -> StreamFn {
     let policy = Arc::new(policy);
     Arc::new(move |ctx, opts: super::stream::StreamOptions| {
         let inner = inner.clone();
         let policy = policy.clone();
+        let non_retryable = non_retryable.clone();
         let signal_outer = opts.signal.clone();
         // Mutable so the stall-recovery nudge can be appended to the context
         // before a timeout retry.
@@ -120,6 +129,10 @@ pub fn retrying_stream_fn(inner: StreamFn, policy: RecoveryPolicy) -> StreamFn {
                             // Decide on retry vs surface BEFORE
                             // yielding the Error event downstream.
                             if !committed {
+                                if non_retryable(error) {
+                                    yield evt;
+                                    return;
+                                }
                                 let kind = classify_error(error);
                                 if policy.should_retry(attempts, kind) {
                                     retry_msg = Some(error.clone());

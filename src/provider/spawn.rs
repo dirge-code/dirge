@@ -66,8 +66,8 @@ impl AnyAgent {
         >,
     ) -> AgentRunner {
         use crate::agent::agent_loop::{
-            LoopSpawnConfig, retrying_stream_fn, rig_history_system_prompt,
-            rig_history_to_loop_messages, spawn_loop_runner,
+            LoopSpawnConfig, retrying_stream_fn, retrying_stream_fn_with_non_retryable,
+            rig_history_system_prompt, rig_history_to_loop_messages, spawn_loop_runner,
         };
         use crate::agent::recovery::RecoveryPolicy;
 
@@ -90,10 +90,36 @@ impl AnyAgent {
         let tool_def_filter = self.tool_def_filter.clone();
 
         // Build the StreamFn (4.5h-2 + 4.5h-3 chunk timeout).
-        let inner_stream_fn = self.build_stream_fn_with_filter(tool_defs, tool_def_filter.clone());
+        let inner_stream_fn =
+            self.build_stream_fn_with_filter(tool_defs.clone(), tool_def_filter.clone());
         // Wrap with retry (4.5g) so transient Network / RateLimit
         // errors auto-retry with exponential backoff + Retry-After.
-        let stream_fn = retrying_stream_fn(inner_stream_fn, RecoveryPolicy::default());
+        let policy = RecoveryPolicy::default();
+        let stream_fn = if let Some(fallback_model) = self.openai_api_key_fallback_model.clone() {
+            let primary_stream_fn = retrying_stream_fn_with_non_retryable(
+                inner_stream_fn,
+                policy.clone(),
+                std::sync::Arc::new(
+                    crate::provider::billing_fallback::is_openai_subscription_exhausted_error,
+                ),
+            );
+            let fallback_inner = fallback_model.build_stream_fn_with_filter(
+                tool_defs,
+                self.chunk_timeout,
+                Some("openai".to_string()),
+                tool_def_filter.clone(),
+            );
+            let fallback_stream_fn = retrying_stream_fn(fallback_inner, policy);
+            crate::provider::billing_fallback::with_openai_api_billing_fallback(
+                primary_stream_fn,
+                fallback_stream_fn,
+                crate::provider::billing_fallback::prompt_from_ask_sender(
+                    self.api_billing_ask_tx.clone(),
+                ),
+            )
+        } else {
+            retrying_stream_fn(inner_stream_fn, policy)
+        };
 
         // Merge any system-message content from the history
         // (e.g. compaction summary) into the loop's

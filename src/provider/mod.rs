@@ -1,4 +1,5 @@
 pub(crate) mod auth;
+mod billing_fallback;
 mod build;
 pub mod client;
 pub(crate) mod codex_http;
@@ -132,6 +133,11 @@ pub struct AnyAgent {
     /// built (test agents, --no-tools, build failure). The provider
     /// is shared with `MemoryTool` via `Arc` — same instance.
     memory_provider: Option<std::sync::Arc<dyn crate::extras::memory_provider::MemoryProvider>>,
+    /// Optional OpenAI API-key model used only after native OpenAI/Codex OAuth
+    /// reports subscription quota/model-access exhaustion and the user confirms
+    /// switching this request to API-key billing.
+    openai_api_key_fallback_model: Option<AnyModel>,
+    api_billing_ask_tx: Option<crate::permission::ask::AskSender>,
 }
 
 #[derive(Clone)]
@@ -181,6 +187,8 @@ impl AnyAgent {
             review_model_name: None,
             bg_store: None,
             memory_provider: None,
+            openai_api_key_fallback_model: None,
+            api_billing_ask_tx: None,
         }
     }
 
@@ -253,6 +261,16 @@ impl AnyAgent {
         store: crate::agent::tools::background::BackgroundStore,
     ) -> Self {
         self.bg_store = Some(store);
+        self
+    }
+
+    pub(crate) fn with_openai_api_key_billing_fallback(
+        mut self,
+        model: AnyModel,
+        ask_tx: Option<crate::permission::ask::AskSender>,
+    ) -> Self {
+        self.openai_api_key_fallback_model = Some(model);
+        self.api_billing_ask_tx = ask_tx;
         self
     }
 

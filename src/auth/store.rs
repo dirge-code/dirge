@@ -5,6 +5,14 @@ use std::path::{Path, PathBuf};
 
 type Result<T> = std::result::Result<T, AuthStoreError>;
 
+const ACCOUNT_ID_KEYS: &[&str] = &[
+    "account_id",
+    "chatgpt_account_id",
+    "chatgptAccountId",
+    "chatgpt_account",
+    "accountId",
+];
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum AuthStoreError {
     #[error("OpenAI auth store I/O failed for {path:?}: {source}")]
@@ -36,6 +44,7 @@ pub(crate) struct OpenAiOAuthCredential {
     access_token: String,
     refresh_token: String,
     id_token: Option<String>,
+    account_id: Option<String>,
     expires_at_epoch_ms: i64,
 }
 
@@ -44,12 +53,14 @@ impl OpenAiOAuthCredential {
         access_token: impl Into<String>,
         refresh_token: impl Into<String>,
         id_token: Option<String>,
+        account_id: Option<String>,
         expires_at_epoch_ms: i64,
     ) -> Self {
         Self {
             access_token: access_token.into(),
             refresh_token: refresh_token.into(),
             id_token,
+            account_id: normalize_optional_string(account_id),
             expires_at_epoch_ms,
         }
     }
@@ -64,6 +75,10 @@ impl OpenAiOAuthCredential {
 
     pub(crate) fn id_token(&self) -> Option<&str> {
         self.id_token.as_deref()
+    }
+
+    pub(crate) fn account_id(&self) -> Option<&str> {
+        self.account_id.as_deref()
     }
 
     pub(crate) fn expires_at_epoch_ms(&self) -> i64 {
@@ -86,6 +101,7 @@ impl fmt::Debug for OpenAiOAuthCredential {
             .field("access_token", &"[REDACTED]")
             .field("refresh_token", &"[REDACTED]")
             .field("id_token", &id_token)
+            .field("account_id", &self.account_id)
             .field("expires_at_epoch_ms", &self.expires_at_epoch_ms)
             .finish()
     }
@@ -118,15 +134,21 @@ impl OpenAiAuthStore {
         let Some(openai) = document.remove("openai") else {
             return Ok(None);
         };
+        let mut openai = match openai {
+            Value::Object(openai) => openai,
+            _ => return Ok(None),
+        };
         if openai.get("type").and_then(Value::as_str) != Some("oauth") {
             return Ok(None);
         }
-        let entry: StoredOpenAiCredential = serde_json::from_value(openai).map_err(|_source| {
-            AuthStoreError::InvalidOpenAiCredential {
-                path: self.path.clone(),
-                reason: "stored OpenAI OAuth credential fields are malformed".to_string(),
-            }
-        })?;
+        canonicalize_account_id_aliases(&mut openai);
+        let entry: StoredOpenAiCredential =
+            serde_json::from_value(Value::Object(openai)).map_err(|_source| {
+                AuthStoreError::InvalidOpenAiCredential {
+                    path: self.path.clone(),
+                    reason: "stored OpenAI OAuth credential fields are malformed".to_string(),
+                }
+            })?;
         Ok(Some(entry.into_credential()))
     }
 
@@ -147,6 +169,12 @@ impl OpenAiAuthStore {
             None => {
                 openai.remove("id_token");
             }
+        }
+        for key in ACCOUNT_ID_KEYS {
+            openai.remove(*key);
+        }
+        if let Some(account_id) = credential.account_id.as_deref() {
+            openai.insert("account_id".to_string(), json!(account_id));
         }
         document.insert("openai".to_string(), Value::Object(openai));
 
@@ -257,12 +285,48 @@ struct StoredOpenAiCredential {
     access: String,
     refresh: String,
     id_token: Option<String>,
+    #[serde(
+        default,
+        alias = "chatgpt_account_id",
+        alias = "chatgptAccountId",
+        alias = "chatgpt_account",
+        alias = "accountId"
+    )]
+    account_id: Option<String>,
     expires: i64,
 }
 
 impl StoredOpenAiCredential {
     fn into_credential(self) -> OpenAiOAuthCredential {
-        OpenAiOAuthCredential::new(self.access, self.refresh, self.id_token, self.expires)
+        OpenAiOAuthCredential::new(
+            self.access,
+            self.refresh,
+            self.id_token,
+            self.account_id,
+            self.expires,
+        )
+    }
+}
+
+fn normalize_optional_string(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn canonicalize_account_id_aliases(openai: &mut Map<String, Value>) {
+    let account_id = openai.get("account_id").cloned().or_else(|| {
+        ACCOUNT_ID_KEYS
+            .iter()
+            .copied()
+            .filter(|key| *key != "account_id")
+            .find_map(|key| openai.get(key).cloned())
+    });
+    for key in ACCOUNT_ID_KEYS {
+        openai.remove(*key);
+    }
+    if let Some(account_id) = account_id {
+        openai.insert("account_id".to_string(), account_id);
     }
 }
 
@@ -271,6 +335,14 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::path::{Path, PathBuf};
+
+    const ACCOUNT_ID_KEYS: &[&str] = &[
+        "account_id",
+        "chatgpt_account_id",
+        "chatgptAccountId",
+        "chatgpt_account",
+        "accountId",
+    ];
 
     struct TestDir(PathBuf);
 
@@ -305,6 +377,7 @@ mod tests {
             "ACCESS-TOKEN",
             "REFRESH-TOKEN",
             Some("ID-TOKEN".to_string()),
+            Some("acct-new".to_string()),
             1_900_000_000_000,
         )
     }
@@ -328,6 +401,7 @@ mod tests {
                     "access": "ACCESS-TOKEN",
                     "refresh": "REFRESH-TOKEN",
                     "id_token": "ID-TOKEN",
+                    "account_id": "acct-load",
                     "expires": 1900000000000_i64
                 }
             })
@@ -341,7 +415,59 @@ mod tests {
         assert_eq!(loaded.access_token(), "ACCESS-TOKEN");
         assert_eq!(loaded.refresh_token(), "REFRESH-TOKEN");
         assert_eq!(loaded.id_token(), Some("ID-TOKEN"));
+        assert_eq!(loaded.account_id(), Some("acct-load"));
         assert_eq!(loaded.expires_at_epoch_ms(), 1_900_000_000_000);
+    }
+
+    #[test]
+    fn openai_oauth_entry_with_canonical_and_alias_account_ids_loads_canonical() {
+        let dir = TestDir::new("load_duplicate_account_aliases");
+        std::fs::write(
+            dir.auth_path(),
+            json!({
+                "openai": {
+                    "type": "oauth",
+                    "access": "ACCESS-TOKEN",
+                    "refresh": "REFRESH-TOKEN",
+                    "id_token": "ID-TOKEN",
+                    "account_id": "acct-canonical",
+                    "chatgpt_account_id": "acct-stale-alias",
+                    "expires": 1900000000000_i64
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let store = OpenAiAuthStore::at(dir.auth_path());
+
+        let loaded = store.load_openai().unwrap().unwrap();
+
+        assert_eq!(loaded.account_id(), Some("acct-canonical"));
+    }
+
+    #[test]
+    fn legacy_openai_oauth_entry_without_account_id_loads() {
+        let dir = TestDir::new("legacy_without_account");
+        std::fs::write(
+            dir.auth_path(),
+            json!({
+                "openai": {
+                    "type": "oauth",
+                    "access": "ACCESS-TOKEN",
+                    "refresh": "REFRESH-TOKEN",
+                    "id_token": "ID-TOKEN",
+                    "expires": 1900000000000_i64
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let store = OpenAiAuthStore::at(dir.auth_path());
+
+        let loaded = store.load_openai().unwrap().unwrap();
+
+        assert_eq!(loaded.account_id(), None);
+        assert_eq!(loaded.access_token(), "ACCESS-TOKEN");
     }
 
     #[test]
@@ -403,8 +529,122 @@ mod tests {
         assert_eq!(saved["openai"]["refresh"], "REFRESH-TOKEN");
         assert_eq!(saved["openai"]["id_token"], "ID-TOKEN");
         assert_eq!(saved["openai"]["expires"], 1_900_000_000_000_i64);
-        assert_eq!(saved["openai"]["account_id"], "acct_keep");
+        assert_eq!(saved["openai"]["account_id"], "acct-new");
         assert_eq!(saved["openai"]["fedramp"], true);
+    }
+
+    #[test]
+    fn save_openai_removes_stale_account_id_when_new_credential_has_none() {
+        let dir = TestDir::new("remove_account_id");
+        std::fs::write(
+            dir.auth_path(),
+            json!({
+                "openai": {
+                    "type": "oauth",
+                    "access": "OLD-ACCESS",
+                    "refresh": "OLD-REFRESH",
+                    "expires": 1_i64,
+                    "account_id": "acct-stale"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let store = OpenAiAuthStore::at(dir.auth_path());
+        let credential = OpenAiOAuthCredential::new(
+            "ACCESS-TOKEN",
+            "REFRESH-TOKEN",
+            Some("ID-TOKEN".to_string()),
+            None,
+            1_900_000_000_000,
+        );
+
+        store.save_openai(&credential).unwrap();
+
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.auth_path()).unwrap()).unwrap();
+        assert!(saved["openai"].get("account_id").is_none());
+    }
+
+    #[test]
+    fn save_openai_removes_stale_account_id_aliases_when_new_credential_has_none() {
+        let dir = TestDir::new("remove_account_id_aliases");
+        std::fs::write(
+            dir.auth_path(),
+            json!({
+                "openai": {
+                    "type": "oauth",
+                    "access": "OLD-ACCESS",
+                    "refresh": "OLD-REFRESH",
+                    "expires": 1_i64,
+                    "account_id": "acct-stale-canonical",
+                    "chatgpt_account_id": "acct-stale-snake",
+                    "chatgptAccountId": "acct-stale-camel",
+                    "chatgpt_account": "acct-stale-short",
+                    "accountId": "acct-stale-account-id"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let store = OpenAiAuthStore::at(dir.auth_path());
+        let credential = OpenAiOAuthCredential::new(
+            "ACCESS-TOKEN",
+            "REFRESH-TOKEN",
+            Some("ID-TOKEN".to_string()),
+            None,
+            1_900_000_000_000,
+        );
+
+        store.save_openai(&credential).unwrap();
+
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.auth_path()).unwrap()).unwrap();
+        for key in ACCOUNT_ID_KEYS {
+            assert!(
+                saved["openai"].get(key).is_none(),
+                "stale alias {key} remained"
+            );
+        }
+    }
+
+    #[test]
+    fn save_openai_canonicalizes_account_id_aliases_when_new_credential_has_account_id() {
+        let dir = TestDir::new("canonicalize_account_id_aliases");
+        std::fs::write(
+            dir.auth_path(),
+            json!({
+                "openai": {
+                    "type": "oauth",
+                    "access": "OLD-ACCESS",
+                    "refresh": "OLD-REFRESH",
+                    "expires": 1_i64,
+                    "chatgpt_account_id": "acct-stale-snake",
+                    "chatgptAccountId": "acct-stale-camel",
+                    "chatgpt_account": "acct-stale-short",
+                    "accountId": "acct-stale-account-id"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let store = OpenAiAuthStore::at(dir.auth_path());
+
+        store.save_openai(&credential()).unwrap();
+
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.auth_path()).unwrap()).unwrap();
+        assert_eq!(saved["openai"]["account_id"], "acct-new");
+        for key in ACCOUNT_ID_KEYS
+            .iter()
+            .copied()
+            .filter(|key| *key != "account_id")
+        {
+            assert!(
+                saved["openai"].get(key).is_none(),
+                "stale alias {key} remained"
+            );
+        }
     }
 
     #[test]
@@ -468,7 +708,7 @@ mod tests {
 
     #[test]
     fn expiry_helpers_distinguish_fresh_and_expired_tokens() {
-        let token = OpenAiOAuthCredential::new("ACCESS-TOKEN", "REFRESH-TOKEN", None, 1_000);
+        let token = OpenAiOAuthCredential::new("ACCESS-TOKEN", "REFRESH-TOKEN", None, None, 1_000);
 
         assert!(token.is_fresh_at(999));
         assert!(!token.is_expired_at(999));

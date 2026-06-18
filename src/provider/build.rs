@@ -28,6 +28,13 @@ use super::{
     AnyAgent, AnyAgentInner, AnyClient, AnyModel, client, default_model_for_entry, summarize,
 };
 
+fn openai_api_billing_fallback_key(cli: &Cli) -> Option<&str> {
+    cli.resolved_api_key
+        .as_deref()
+        .filter(|key| !key.is_empty())
+        .or_else(|| cli.api_key.as_deref().filter(|key| !key.is_empty()))
+}
+
 #[cfg(test)]
 pub fn create_client(
     provider_name: &str,
@@ -201,6 +208,34 @@ pub async fn build_agent(
         AnyModel::Ollama(m) => build_inner!(m, Ollama),
         AnyModel::Custom(m) => build_inner!(m, Custom),
     };
+
+    if matches!(parent_model, AnyModel::OpenAICodex(_)) {
+        match client::create_openai_api_key_fallback_client(
+            &provider_name,
+            openai_api_billing_fallback_key(cli),
+            &cfg.providers_map(),
+        ) {
+            Ok(Some(fallback_client)) => {
+                let fallback_model = fallback_client.completion_model(model_name.clone());
+                agent = agent.with_openai_api_key_billing_fallback(fallback_model, ask_tx.clone());
+                tracing::info!(
+                    target: "dirge::provider",
+                    provider = %provider_name,
+                    model = %model_name,
+                    "OpenAI API-key billing fallback armed; requires user confirmation before use",
+                );
+            }
+            Ok(None) => {}
+            Err(err) => {
+                tracing::warn!(
+                    target: "dirge::provider",
+                    provider = %provider_name,
+                    error = %err,
+                    "failed to arm OpenAI API-key billing fallback",
+                );
+            }
+        }
+    }
 
     // dirge-008x + dirge-nw25: wire the in-loop LLM compaction summarizer.
     // The proactive folds in `run_agent_loop` need a `SummarizeFn` to call
@@ -686,6 +721,7 @@ fn build_review_stream_fn(
 mod nw25_tests {
     use super::*;
     use crate::config::{Config, ProviderAuth};
+    use clap::Parser;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
 
@@ -760,6 +796,14 @@ mod nw25_tests {
             resolve_subagent_model(&cfg).is_none(),
             "unset subagent_provider must yield no override model"
         );
+    }
+
+    #[test]
+    fn api_billing_fallback_prefers_resolved_api_key_file_or_stdin_key() {
+        let mut cli = Cli::parse_from(["dirge", "--api-key", "argv-key"]);
+        cli.resolved_api_key = Some("resolved-key".to_string());
+
+        assert_eq!(openai_api_billing_fallback_key(&cli), Some("resolved-key"));
     }
 
     #[test]

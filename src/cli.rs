@@ -39,7 +39,7 @@ pub enum AutoConfirmMode {
     No,
 }
 
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[command(name = "dirge", version, about = "Minimal coding agent")]
 pub struct Cli {
     #[arg(short = 'p', long = "print", help = "Print response and exit")]
@@ -108,6 +108,12 @@ pub struct Cli {
         help = "Read API key from stdin at startup (single line; mutually exclusive with --api-key-file)"
     )]
     pub api_key_stdin: bool,
+
+    /// Populated after startup resolves `--api-key-file` / `--api-key-stdin`.
+    /// Skipped by Clap so rebuild paths can reuse the secret without exposing a
+    /// second CLI option.
+    #[arg(skip)]
+    pub resolved_api_key: Option<String>,
 
     #[arg(long = "max-tokens", help = "Maximum tokens in response")]
     pub max_tokens: Option<u64>,
@@ -406,7 +412,10 @@ mod tests {
         let top_level_help = Cli::command().render_help().to_string();
         assert!(top_level_help.contains("auth"));
 
-        let err = Cli::try_parse_from(["dirge", "auth", "openai", "--help"]).unwrap_err();
+        let err = match Cli::try_parse_from(["dirge", "auth", "openai", "--help"]) {
+            Ok(_) => panic!("--help must return a display-help error"),
+            Err(err) => err,
+        };
         assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
         let openai_help = err.to_string();
 

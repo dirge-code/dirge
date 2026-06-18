@@ -321,7 +321,7 @@ fn warn_on_stale_resume(session: &session::Session) {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
-    let cli = cli::Cli::parse();
+    let mut cli = cli::Cli::parse();
 
     // Install the off-stream notification channel EARLY so MCP
     // stderr forwarders spawning during `connect_all` (later in
@@ -1037,6 +1037,7 @@ async fn main() -> anyhow::Result<()> {
     } else {
         cli.api_key.clone()
     };
+    cli.resolved_api_key = resolved_key.clone();
 
     let client = provider::create_client_with_auth(
         &provider,

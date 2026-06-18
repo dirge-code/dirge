@@ -77,6 +77,7 @@ pub(crate) struct OAuthTokens {
     pub(crate) access_token: String,
     pub(crate) refresh_token: String,
     pub(crate) id_token: String,
+    pub(crate) account_id: Option<String>,
     pub(crate) expires_in: Option<u64>,
 }
 
@@ -86,6 +87,7 @@ impl fmt::Debug for OAuthTokens {
             .field("access_token", &"[REDACTED]")
             .field("refresh_token", &"[REDACTED]")
             .field("id_token", &"[REDACTED]")
+            .field("account_id", &self.account_id)
             .field("expires_in", &self.expires_in)
             .finish()
     }
@@ -338,6 +340,7 @@ where
                     access_token: body.access_token,
                     refresh_token: body.refresh_token,
                     id_token: body.id_token,
+                    account_id: normalize_optional_string(body.account_id),
                     expires_in: body.expires_in,
                 })
             }
@@ -372,7 +375,21 @@ struct TokenResponse {
     access_token: String,
     refresh_token: String,
     id_token: String,
+    #[serde(
+        default,
+        alias = "chatgpt_account_id",
+        alias = "chatgptAccountId",
+        alias = "chatgpt_account",
+        alias = "accountId"
+    )]
+    account_id: Option<String>,
     expires_in: Option<u64>,
+}
+
+fn normalize_optional_string(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn default_poll_interval_seconds() -> u64 {
@@ -588,6 +605,7 @@ mod tests {
             access_token: "ACCESS-TOKEN".to_string(),
             refresh_token: "REFRESH-TOKEN".to_string(),
             id_token: "ID-TOKEN".to_string(),
+            account_id: None,
             expires_in: Some(3600),
         };
         let response = HttpResponse {
@@ -716,6 +734,7 @@ mod tests {
                     "access_token": "ACCESS-TOKEN",
                     "refresh_token": "REFRESH-TOKEN",
                     "id_token": "ID-TOKEN",
+                    "chatgpt_account_id": "acct-device",
                     "expires_in": 3600
                 }),
             ),
@@ -736,6 +755,7 @@ mod tests {
         assert_eq!(tokens.access_token, "ACCESS-TOKEN");
         assert_eq!(tokens.refresh_token, "REFRESH-TOKEN");
         assert_eq!(tokens.id_token, "ID-TOKEN");
+        assert_eq!(tokens.account_id.as_deref(), Some("acct-device"));
         assert_eq!(tokens.expires_in, Some(3600));
         assert_eq!(runtime.sleeps(), vec![Duration::from_secs(4)]);
         assert_eq!(

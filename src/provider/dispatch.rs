@@ -229,6 +229,18 @@ impl AnyModel {
         chunk_timeout: std::time::Duration,
         provider_name: Option<String>,
     ) -> crate::agent::agent_loop::StreamFn {
+        self.build_stream_fn_with_filter(tools, chunk_timeout, provider_name, None)
+    }
+
+    pub fn build_stream_fn_with_filter(
+        &self,
+        tools: Vec<rig::completion::ToolDefinition>,
+        chunk_timeout: std::time::Duration,
+        provider_name: Option<String>,
+        tool_def_filter: Option<
+            std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+        >,
+    ) -> crate::agent::agent_loop::StreamFn {
         // dirge-iy20: single provider list in `stream_dispatch`,
         // shared with `AnyAgent::build_stream_fn_with_filter`.
         crate::provider::stream_dispatch::dispatch_stream_fn! {
@@ -237,7 +249,7 @@ impl AnyModel {
             tools = tools,
             timeout = Some(chunk_timeout),
             provider = provider_name,
-            filter = None,
+            filter = tool_def_filter,
         }
     }
 

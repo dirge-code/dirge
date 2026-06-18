@@ -76,7 +76,7 @@ pub use message::{
 #[cfg(feature = "plugin")]
 pub use plugin_hooks::{after_hook_from_plugin_manager, before_hook_from_plugin_manager};
 pub use result::{AfterToolCallResult, BeforeToolCallResult, LoopToolResult};
-pub use retry::retrying_stream_fn;
+pub use retry::{retrying_stream_fn, retrying_stream_fn_with_non_retryable};
 pub use rig_stream::{wrap_rig_stream, wrap_streamed_assistant};
 #[cfg(test)]
 pub use rig_stream_factory::rig_stream_fn_from_model;

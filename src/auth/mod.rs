@@ -238,7 +238,15 @@ mod command_tests {
             access_token: "ACCESS-TOKEN".to_string(),
             refresh_token: "REFRESH-TOKEN".to_string(),
             id_token: "ID-TOKEN".to_string(),
+            account_id: None,
             expires_in,
+        }
+    }
+
+    fn tokens_with_account(account_id: &str) -> OAuthTokens {
+        OAuthTokens {
+            account_id: Some(account_id.to_string()),
+            ..tokens(Some(3600))
         }
     }
 
@@ -289,6 +297,25 @@ mod command_tests {
         assert!(!stdout.contains("REFRESH-TOKEN"));
         assert!(!stdout.contains("ID-TOKEN"));
         assert!(!stdout.contains("DEVICE-AUTH-ID"));
+    }
+
+    #[tokio::test]
+    async fn openai_login_saves_optional_account_id_from_token_response() {
+        let flow = FakeLoginFlow::new(device_code(), tokens_with_account("acct-login"));
+        let store = FakeStore::new(PathBuf::from("/tmp/fake-auth.json"));
+        let mut stdout = Vec::new();
+
+        login_openai_with(flow, store.clone(), 1_700_000_000_000, &mut stdout)
+            .await
+            .unwrap();
+
+        let saved = store.saved();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].account_id(), Some("acct-login"));
+        let stdout = String::from_utf8(stdout).unwrap();
+        assert!(!stdout.contains("ACCESS-TOKEN"));
+        assert!(!stdout.contains("REFRESH-TOKEN"));
+        assert!(!stdout.contains("ID-TOKEN"));
     }
 
     #[tokio::test]

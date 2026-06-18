@@ -139,6 +139,7 @@ fn oauth_tokens_to_credential(tokens: OAuthTokens, now_epoch_ms: i64) -> OpenAiO
         tokens.access_token,
         tokens.refresh_token,
         Some(tokens.id_token),
+        tokens.account_id,
         expires_at_epoch_ms,
     )
 }

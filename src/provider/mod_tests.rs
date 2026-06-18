@@ -212,6 +212,108 @@ fn build_stream_fn_covers_all_variants_compile_time() {
     let _ = agent.build_stream_fn(vec![]);
 }
 
+#[tokio::test]
+async fn any_model_filtered_stream_fn_hides_unloaded_dynamic_tools() {
+    use crate::agent::agent_loop::stream::{LlmContext, StreamOptions};
+    use crate::agent::agent_loop::tool::AbortSignal;
+    use futures::StreamExt;
+    use rig::completion::ToolDefinition;
+    use rig::providers::openai;
+    use std::collections::HashSet;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn tool_def(name: &str) -> ToolDefinition {
+        ToolDefinition {
+            name: name.to_string(),
+            description: format!("{name} description"),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+        }
+    }
+
+    fn header_end(buf: &[u8]) -> Option<usize> {
+        buf.windows(4).position(|window| window == b"\r\n\r\n")
+    }
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let (body_tx, body_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut buf = Vec::new();
+        let body_start = loop {
+            let mut chunk = [0u8; 1024];
+            let read = socket.read(&mut chunk).await.unwrap();
+            assert!(read > 0, "client closed before sending request headers");
+            buf.extend_from_slice(&chunk[..read]);
+            if let Some(end) = header_end(&buf) {
+                break end + 4;
+            }
+        };
+        let headers = String::from_utf8_lossy(&buf[..body_start]);
+        let content_length = headers
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find_map(|(name, value)| {
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap();
+        while buf.len() < body_start + content_length {
+            let mut chunk = [0u8; 1024];
+            let read = socket.read(&mut chunk).await.unwrap();
+            assert!(read > 0, "client closed before sending full request body");
+            buf.extend_from_slice(&chunk[..read]);
+        }
+        let body = serde_json::from_slice::<serde_json::Value>(
+            &buf[body_start..body_start + content_length],
+        )
+        .unwrap();
+        body_tx.send(body).ok();
+        socket
+            .write_all(
+                b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+    });
+
+    let client = openai::CompletionsClient::builder()
+        .api_key("test-key")
+        .base_url(&base_url)
+        .build()
+        .unwrap();
+    let model = AnyModel::OpenAI(client.completion_model("gpt-4o"));
+    let loaded = Arc::new(Mutex::new(HashSet::from(["mcp_loaded".to_string()])));
+    let stream_fn = model.build_stream_fn_with_filter(
+        vec![tool_def("mcp_loaded"), tool_def("mcp_hidden")],
+        std::time::Duration::from_secs(5),
+        Some("openai".to_string()),
+        Some(loaded),
+    );
+    let mut stream = stream_fn(
+        LlmContext {
+            system_prompt: String::new(),
+            messages: vec![serde_json::json!({"role": "user", "content": "hi"})],
+        },
+        StreamOptions::from_signal(AbortSignal::new()),
+    );
+    while stream.next().await.is_some() {}
+
+    let body = body_rx.await.unwrap();
+    server.await.unwrap();
+    let tool_names: Vec<_> = body["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["function"]["name"].as_str().unwrap())
+        .collect();
+
+    assert!(tool_names.contains(&"mcp_loaded"));
+    assert!(!tool_names.contains(&"mcp_hidden"));
+}
+
 // --- dirge-7ls: review-runner cache isolation regression --------
 
 /// Phase 4 background review runner must NOT share the
