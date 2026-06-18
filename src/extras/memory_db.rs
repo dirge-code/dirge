@@ -1650,6 +1650,48 @@ impl SqliteMemoryStore {
         Ok(changed)
     }
 
+    /// dirge-bb4y: hard-delete RETIRED rows (tombstoned or superseded) whose
+    /// last mutation is older than `older_than_days`, with their FTS index
+    /// rows. Returns how many were purged. Run by the curator's mechanical
+    /// pass to bound long-term DB growth.
+    ///
+    /// This is a deliberately bounded relaxation of dirge-8h22 ("nothing is
+    /// hard-deleted"): the never-delete guarantee exists so a removal is
+    /// restorable and an audit chain survives, but neither needs to last
+    /// forever. With a long retention window a tombstone old enough to purge
+    /// is one nobody restored in months, and a superseded fact that old has a
+    /// live successor — so dropping them frees space without any practical loss
+    /// of the restore affordance or recent audit history. ACTIVE rows are never
+    /// touched. `memories_fts` is standalone (not external-content), so a plain
+    /// `DELETE ... WHERE rowid` is exact (the v7 schema note).
+    pub fn purge_retired_rows(&self, older_than_days: i64) -> Result<usize, String> {
+        let cutoff = (chrono::Utc::now() - chrono::Duration::days(older_than_days)).to_rfc3339();
+        let mut conn = self.conn.lock_ignore_poison();
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("Failed to begin purge transaction: {e}"))?;
+        let ids: Vec<i64> = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT id FROM memories
+                     WHERE status IN ('tombstoned', 'superseded') AND updated_at < ?1",
+                )
+                .map_err(|e| format!("Failed to prepare purge query: {e}"))?;
+            stmt.query_map(params![cutoff], |r| r.get(0))
+                .map_err(|e| format!("Failed to scan retired rows: {e}"))?
+                .filter_map(|r| r.ok())
+                .collect()
+        };
+        for id in &ids {
+            tx.execute("DELETE FROM memories_fts WHERE rowid = ?1", params![id])
+                .map_err(|e| format!("Failed to purge fts row: {e}"))?;
+            tx.execute("DELETE FROM memories WHERE id = ?1", params![id])
+                .map_err(|e| format!("Failed to purge memory row: {e}"))?;
+        }
+        tx.commit().map_err(|e| format!("Failed to commit purge: {e}"))?;
+        Ok(ids.len())
+    }
+
     /// Hot-tier budget utilization (%) for a target — the curator's
     /// budget-pressure signal (dirge-jyks).
     pub fn hot_usage_pct(&self, target: &str) -> u32 {
@@ -3587,6 +3629,64 @@ mod tests {
             "failure-only playbook decays: {}",
             sal("only fails"),
         );
+    }
+
+    /// dirge-bb4y: the curator GC hard-deletes ancient retired rows
+    /// (tombstoned/superseded) and their FTS entries, while leaving active rows
+    /// and recently-retired rows alone.
+    #[test]
+    fn purge_retired_rows_drops_only_ancient_retired() {
+        let (paths, _dir) = temp_project();
+        let store = SqliteMemoryStore::load(&paths).unwrap();
+        store.add_entry("memory", "active fact", None).unwrap();
+        store.add_entry("memory", "old removed entry", None).unwrap();
+        store.remove_entry("memory", "old removed entry").unwrap();
+        store.add_entry("memory", "recent removed entry", None).unwrap();
+        store.remove_entry("memory", "recent removed entry").unwrap();
+        store
+            .add_entry("memory", "old claim", Some(MemoryKind::Semantic))
+            .unwrap();
+        store
+            .supersede_entry("memory", "old claim", "new claim", None, false)
+            .unwrap();
+
+        // Backdate the two "old" retired rows past the retention window.
+        let conn = raw_conn(&paths);
+        let old = (chrono::Utc::now() - chrono::Duration::days(200)).to_rfc3339();
+        conn.execute(
+            "UPDATE memories SET updated_at = ?1 WHERE content IN ('old removed entry', 'old claim')",
+            rusqlite::params![old],
+        )
+        .unwrap();
+        drop(conn);
+
+        let purged = store.purge_retired_rows(180).unwrap();
+        assert_eq!(purged, 2, "old tombstone + old superseded purged");
+
+        let conn = raw_conn(&paths);
+        let count = |content: &str| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM memories WHERE content = ?1",
+                rusqlite::params![content],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(count("old removed entry"), 0, "old tombstone gone");
+        assert_eq!(count("old claim"), 0, "old superseded gone");
+        assert_eq!(count("recent removed entry"), 1, "recent tombstone kept");
+        assert_eq!(count("active fact"), 1, "active row untouched");
+        assert_eq!(count("new claim"), 1, "active successor untouched");
+        // The purged entry's FTS row is gone — only the recent tombstone's
+        // 'removed' token remains.
+        let fts: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories_fts WHERE memories_fts MATCH ?1",
+                rusqlite::params!["removed"],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        assert_eq!(fts, 1, "purged entry's FTS row deleted; recent one remains");
     }
 
     /// Eviction: of two procedural entries of equal base salience, the

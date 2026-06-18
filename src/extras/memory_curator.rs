@@ -108,6 +108,11 @@ const BUDGET_PRESSURE_PCT: u32 = 90;
 #[allow(dead_code)]
 const ARCHIVE_AFTER_STALE_DAYS: u64 = 90;
 
+/// dirge-bb4y: retention for RETIRED rows (tombstoned/superseded). After this
+/// long the curator hard-deletes them to bound DB growth. Generous so the
+/// restore affordance and recent audit chain are unaffected in practice.
+const PURGE_RETIRED_AFTER_DAYS: u64 = 180;
+
 /// Minimum hours between curator runs.
 const INTERVAL_HOURS: u64 = 168; // 7 days
 
@@ -165,6 +170,20 @@ impl MemoryCurator {
                     target: "dirge::memory_curator",
                     error = %e,
                     "disuse decay failed — continuing pass",
+                );
+                0
+            });
+
+        // 1b. dirge-bb4y: GC ancient retired (tombstoned/superseded) rows to
+        //     bound DB growth. Conservative retention — long enough that a
+        //     purged tombstone is one nobody restored in months.
+        let purged = store
+            .purge_retired_rows(PURGE_RETIRED_AFTER_DAYS as i64)
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    target: "dirge::memory_curator",
+                    error = %e,
+                    "retired-row purge failed — continuing pass",
                 );
                 0
             });
@@ -234,6 +253,7 @@ impl MemoryCurator {
             started_at_iso: started_at_iso.clone(),
             total_entries,
             decayed,
+            purged,
             pressure_targets,
             stale_candidates,
             promotion_candidates,
@@ -266,6 +286,9 @@ pub struct MechanicalReport {
     pub total_entries: usize,
     /// Entries whose salience decayed for disuse this run (dirge-jyks).
     pub decayed: usize,
+    /// dirge-bb4y: ancient retired (tombstoned/superseded) rows hard-deleted
+    /// this run to bound DB growth.
+    pub purged: usize,
     /// Targets at/over the hot-budget pressure threshold — the LLM
     /// pass may consolidate younger overlapping entries there.
     pub pressure_targets: Vec<String>,
@@ -313,6 +336,7 @@ impl MechanicalReport {
         let _ = writeln!(out, "- Started: {}", self.started_at_iso);
         let _ = writeln!(out, "- Total entries: {}", self.total_entries);
         let _ = writeln!(out, "- Salience decayed (disuse): {}", self.decayed);
+        let _ = writeln!(out, "- Retired rows purged: {}", self.purged);
         if !self.pressure_targets.is_empty() {
             let _ = writeln!(
                 out,
@@ -869,6 +893,7 @@ mod tests {
             started_at_iso: "2026-05-28T12:00:00Z".to_string(),
             total_entries: 5,
             decayed: 0,
+            purged: 0,
             pressure_targets: vec![],
             stale_candidates: vec![],
             promotion_candidates: vec![],
@@ -887,6 +912,7 @@ mod tests {
             started_at_iso: "2026-05-28T12:00:00Z".to_string(),
             total_entries: stale.len(),
             decayed: 0,
+            purged: 0,
             pressure_targets: vec![],
             stale_candidates: stale,
             promotion_candidates: vec![],
