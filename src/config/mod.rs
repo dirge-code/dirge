@@ -150,6 +150,11 @@ pub struct MemoryConfig {
     /// Env var holding the embeddings API key. Omit for a keyless local
     /// endpoint. (The key itself is never stored in config.)
     pub embed_api_key_env: Option<String>,
+    /// dirge-0gxb: each turn, auto-search memory on the verbatim user message
+    /// and inject the hits as a supplemental context block (never the frozen
+    /// snapshot). Surfaces relevant memory the agent wouldn't think to look
+    /// up. Default off.
+    pub verbatim_pre_recall: Option<bool>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -1150,7 +1155,7 @@ mod tests {
         assert!(cfg.memory.is_none(), "no memory block by default");
 
         let cfg: Config = serde_json::from_str(
-            r#"{ "memory": { "hybrid_retrieval": true, "embed_url": "http://localhost:11434/v1/embeddings", "embed_api_key_env": "OPENAI_API_KEY" } }"#,
+            r#"{ "memory": { "hybrid_retrieval": true, "embed_url": "http://localhost:11434/v1/embeddings", "embed_api_key_env": "OPENAI_API_KEY", "verbatim_pre_recall": true } }"#,
         )
         .unwrap();
         let m = cfg.memory.expect("memory block present");
@@ -1164,6 +1169,7 @@ mod tests {
             "model is optional (falls back to default)"
         );
         assert_eq!(m.embed_api_key_env.as_deref(), Some("OPENAI_API_KEY"));
+        assert_eq!(m.verbatim_pre_recall, Some(true));
     }
 
     /// dirge-4xgd: `[timeouts]` overrides merge onto Timeouts::DEFAULT;

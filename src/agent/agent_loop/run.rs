@@ -832,25 +832,26 @@ pub async fn run_agent_loop(
     // Pi line 103: `newMessages = [...prompts]`.
     let new_messages = prompts.clone();
 
+    // The verbatim user message for this turn — drives both few-shot exemplar
+    // retrieval and verbatim pre-recall.
+    let task_query: String = prompts
+        .iter()
+        .filter_map(|m| match m {
+            LoopMessage::User(u) => Some(u.content.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+
     // Few-shot tool-use exemplars: retrieve up to K demonstrations
     // relevant to this task and inject them just before the prompt, so
     // the model has on-topic examples at the action boundary (in-context
     // tool demonstrations are a large reliability lever for open models).
     // Injected into the model-facing context ONLY — not `new_messages` —
     // so it steers this run without being persisted into session history.
-    {
-        let task_query: String = prompts
-            .iter()
-            .filter_map(|m| match m {
-                LoopMessage::User(u) => Some(u.content.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join(" ");
-        if let Some(block) = crate::agent::exemplars::block_for_task(&task_query, EXEMPLAR_TOP_K) {
-            let ex_msg = LoopMessage::User(super::message::UserMessage { content: block });
-            context.messages.push(loop_message_to_value(&ex_msg));
-        }
+    if let Some(block) = crate::agent::exemplars::block_for_task(&task_query, EXEMPLAR_TOP_K) {
+        let ex_msg = LoopMessage::User(super::message::UserMessage { content: block });
+        context.messages.push(loop_message_to_value(&ex_msg));
     }
 
     // Pi line 105: `currentContext.messages = [...context.messages, ...prompts]`.
@@ -861,6 +862,45 @@ pub async fn run_agent_loop(
         // resets to a new topic.
         if let (Some(tracker), LoopMessage::User(u)) = (&config.file_touch_tracker, prompt) {
             tracker.record_user_message(&u.content);
+        }
+    }
+
+    // dirge-0gxb: verbatim pre-recall. Auto-search long-term memory on this
+    // turn's verbatim user message and inject the hits as a SUPPLEMENTAL
+    // context note — pushed to the model-facing context ONLY, never to
+    // `new_messages` (persisted history) or the frozen `<project_memory>`
+    // snapshot (`system_prompt`). Appending at the tail can't churn the cached
+    // prefix. Surfaces relevant stored memory the agent wouldn't think to look
+    // up. Off-loaded to the blocking pool because the hybrid provider's search
+    // may do a network embedding round-trip.
+    //
+    // The `memory_provider` gate is also the real safety net for the global
+    // flag: the forked review/curator runners build with `memory_provider:
+    // None`, so they never pre-recall regardless of the process-global toggle.
+    // Injected as a USER message (like the exemplar block) rather than a
+    // `system` one — the Codex/Responses path strips `system` transcript items
+    // into the cached `instructions`, which would both drop the block and churn
+    // the prefix; a user message stays a plain transcript item on every path.
+    if super::context_manager::verbatim_pre_recall_enabled()
+        && let Some(provider) = &memory_provider
+        && !task_query.trim().is_empty()
+    {
+        let snapshot = provider.format_for_system_prompt();
+        let q = task_query.clone();
+        let p = provider.clone();
+        match tokio::task::spawn_blocking(move || p.search(&q)).await {
+            Ok(Ok(resp)) => {
+                if let Some(block) = super::context_manager::pre_recall_block(&resp, &snapshot) {
+                    let msg = LoopMessage::User(super::message::UserMessage { content: block });
+                    context.messages.push(loop_message_to_value(&msg));
+                }
+            }
+            Ok(Err(e)) => {
+                tracing::debug!(target: "dirge::memory", error = %e, "pre-recall search failed")
+            }
+            Err(e) => {
+                tracing::debug!(target: "dirge::memory", error = %e, "pre-recall task join failed")
+            }
         }
     }
 

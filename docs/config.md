@@ -126,6 +126,7 @@ Reciprocal Rank Fusion. It needs an OpenAI-compatible embeddings endpoint.
 | `embed_url`         | string  | OpenAI-compatible `/v1/embeddings` endpoint. **Required** for hybrid; if unset, retrieval stays BM25. |
 | `embed_model`       | string  | Embedding model id. Default `text-embedding-3-small` — set it when pointing at a non-OpenAI endpoint. |
 | `embed_api_key_env` | string  | Name of the env var holding the API key (the key itself is never stored in config). Omit for a keyless local endpoint. |
+| `verbatim_pre_recall` | boolean | Each turn, auto-search memory on the verbatim user message and inject the hits as a supplemental context note (separate from the frozen system-prompt snapshot — it never changes the cached prefix). Surfaces relevant memory the agent wouldn't think to look up. Works with BM25 or hybrid. Default `false`. |
 
 Safe by default and on failure: with `hybrid_retrieval` off, or the endpoint
 unset/unreachable/timed out, search silently falls back to BM25 — it never

@@ -248,6 +248,10 @@ pub async fn build_loop_tools(
     // in without churning the call sites.
     // dirge-4hld: wrap the BM25 store in the hybrid retriever when configured.
     let mem_cfg = cfg.memory.clone().unwrap_or_default();
+    // dirge-0gxb: latch the verbatim pre-recall toggle for the loop to read.
+    crate::agent::agent_loop::context_manager::set_verbatim_pre_recall(
+        mem_cfg.verbatim_pre_recall == Some(true),
+    );
     let memory_store: Option<Arc<dyn crate::extras::memory_provider::MemoryProvider>> =
         if let Ok(c) = std::env::current_dir() {
             let paths = crate::extras::dirge_paths::ProjectPaths::new(&c);
