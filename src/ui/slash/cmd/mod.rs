@@ -25,6 +25,7 @@ pub(crate) mod help;
 pub(crate) mod kill;
 #[cfg(feature = "mcp")]
 pub(crate) mod mcp;
+pub(crate) mod memory;
 pub(crate) mod mode;
 pub(crate) mod model;
 pub(crate) mod panel;

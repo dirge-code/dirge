@@ -123,6 +123,15 @@ pub trait MemoryProvider: Send + Sync {
         Err("This memory backend does not support recording outcomes".to_string())
     }
 
+    /// Re-fetch the system-prompt snapshot from the live backing
+    /// store WITHOUT tearing down the session. The next
+    /// `format_for_system_prompt()` call will reflect all writes
+    /// since the last snapshot. Default no-op for backends that
+    /// don't cache a frozen snapshot (they already read live).
+    fn refresh_snapshot(&self) -> Result<(), String> {
+        Ok(())
+    }
+
     // ── Optional lifecycle hooks — default no-ops ──────────────
 
     /// Notify the provider that a memory write just happened via
@@ -260,6 +269,10 @@ impl MemoryProvider for super::memory_db::SqliteMemoryStore {
         super::memory_db::SqliteMemoryStore::supersede(
             self, target, old_text, content, mkind, harsh,
         )
+    }
+
+    fn refresh_snapshot(&self) -> Result<(), String> {
+        super::memory_db::SqliteMemoryStore::refresh_snapshot(self)
     }
 }
 

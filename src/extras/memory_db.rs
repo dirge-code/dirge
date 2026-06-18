@@ -428,10 +428,9 @@ pub struct CompactionOutcome {
 /// Tool-response message for an add/restore that may have compacted.
 fn compaction_message(verb: &str, outcome: &CompactionOutcome) -> String {
     // The system-prompt snapshot is frozen at session start, so a new
-    // entry is active from the NEXT session, not the current prompt.
-    // Say so at the point of the write so the model doesn't re-add a
-    // fact it won't see reappear (dirge-kvfm).
-    let mut message = format!("{verb} (active in your memory from the next session).");
+    // entry won't appear mid-turn. Tell the model `/memory reload` will
+    // surface it (dirge-kvfm).
+    let mut message = format!("{verb} (active; run /memory reload to see it in your prompt).");
     if outcome.demoted > 0 {
         message = format!(
             "{verb}; demoted {} least-salient entr{} to the breadcrumb index to stay within the inline budget (full text via action='expand').",
@@ -485,9 +484,11 @@ struct SnapshotEntry {
 
 pub struct SqliteMemoryStore {
     conn: Mutex<Connection>,
-    /// Active entries at load time that passed the render-time threat
-    /// scan. Never changes mid-session.
-    snapshot: Vec<SnapshotEntry>,
+    /// Active entries that passed the render-time threat scan.
+    /// Frozen at load time; `refresh_snapshot()` re-queries the DB
+    /// so `/memory reload` can surface mid-session changes without
+    /// ending the session.
+    snapshot: Mutex<Vec<SnapshotEntry>>,
 }
 
 impl SqliteMemoryStore {
@@ -588,11 +589,11 @@ impl SqliteMemoryStore {
 
         Ok(SqliteMemoryStore {
             conn: Mutex::new(conn),
-            snapshot,
+            snapshot: Mutex::new(snapshot),
         })
     }
 
-    /// The frozen snapshot formatted for system prompt injection.
+    /// The snapshot formatted for system prompt injection.
     /// HOT-tier entries render verbatim — one `<project_memory>`
     /// block per non-empty target, entries prefixed with their UMP
     /// kind tag, same shape the markdown store produced.
@@ -600,12 +601,12 @@ impl SqliteMemoryStore {
     /// + preview) the agent dereferences with `expand` (dirge-q8wt) —
     /// the matryoshka stub-and-expand pattern, kept inline in the
     /// prompt so weak models don't need a multi-step read loop for
-    /// the hot facts. Never changes mid-session.
+    /// the hot facts. Refreshable via `/memory reload`.
     pub fn format_for_system_prompt(&self) -> String {
         let mut out = String::new();
+        let snapshot = self.snapshot.lock_ignore_poison();
         for target in ["memory", "pitfalls"] {
-            let entries: Vec<&SnapshotEntry> = self
-                .snapshot
+            let entries: Vec<&SnapshotEntry> = snapshot
                 .iter()
                 .filter(|e| e.target == target && e.tier == "hot")
                 .collect();
@@ -624,11 +625,8 @@ impl SqliteMemoryStore {
             out.push_str("\n</project_memory>\n");
         }
 
-        let crumbs: Vec<&SnapshotEntry> = self
-            .snapshot
-            .iter()
-            .filter(|e| e.tier == "breadcrumb")
-            .collect();
+        let crumbs: Vec<&SnapshotEntry> =
+            snapshot.iter().filter(|e| e.tier == "breadcrumb").collect();
         if !crumbs.is_empty() {
             out.push_str("\n<project_memory_index>\n");
             out.push_str(
@@ -648,6 +646,65 @@ impl SqliteMemoryStore {
             out.push_str("</project_memory_index>\n");
         }
         out
+    }
+
+    /// Re-run the snapshot query against the live DB, updating the
+    /// in-memory snapshot. Used by `/memory reload` so writes from
+    /// the current session appear in the next prompt without
+    /// restarting.
+    pub fn refresh_snapshot(&self) -> Result<(), String> {
+        let conn = self.conn.lock_ignore_poison();
+        let mut new_snapshot = Vec::new();
+        let mut withheld = 0usize;
+        {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT target, kind, content, uid, tier FROM memories
+                     WHERE status = 'active' ORDER BY id",
+                )
+                .map_err(|e| format!("Failed to prepare snapshot query: {e}"))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok(SnapshotEntry {
+                        target: row.get(0)?,
+                        kind: row.get(1)?,
+                        content: row.get(2)?,
+                        uid: row.get(3)?,
+                        tier: row.get(4)?,
+                    })
+                })
+                .map_err(|e| format!("Failed to query snapshot: {e}"))?;
+            for row in rows.flatten() {
+                match scan_for_threats(&row.content) {
+                    Ok(()) => new_snapshot.push(row),
+                    Err(reason) => {
+                        withheld += 1;
+                        tracing::warn!(
+                            target: "dirge::memory",
+                            %reason,
+                            "refresh_snapshot: withholding a memory entry from system-prompt injection (failed security scan)",
+                        );
+                    }
+                }
+            }
+        }
+        if withheld > 0 {
+            tracing::warn!(
+                target: "dirge::memory",
+                withheld,
+                "{withheld} memory entr{} withheld during refresh (failed scan)",
+                if withheld == 1 { "y" } else { "ies" },
+            );
+        }
+        let mut snap = self.snapshot.lock_ignore_poison();
+        let count = new_snapshot.len();
+        *snap = new_snapshot;
+        tracing::info!(
+            target: "dirge::memory",
+            count,
+            "snapshot refreshed — {count} active entries",
+        );
+        Ok(())
     }
 
     /// Shared row query. `extra_where` must be a CONSTANT clause from
@@ -2001,7 +2058,7 @@ mod tests {
     fn load_empty_store() {
         let (paths, _dir) = temp_project();
         let store = SqliteMemoryStore::load(&paths).unwrap();
-        assert!(store.snapshot.is_empty());
+        assert!(store.snapshot.lock_ignore_poison().is_empty());
         assert_eq!(store.format_for_system_prompt(), "");
     }
 
@@ -2556,6 +2613,15 @@ mod tests {
         let frozen2 = store.format_for_system_prompt();
         assert_eq!(frozen, frozen2, "snapshot must not see new writes");
         assert!(!frozen2.contains("entry two"));
+
+        // After refresh_snapshot(), the new entry surfaces.
+        store.refresh_snapshot().unwrap();
+        let fresh = store.format_for_system_prompt();
+        assert!(
+            fresh.contains("entry two"),
+            "refresh must surface new writes"
+        );
+        assert_ne!(fresh, frozen2, "refresh must change the cached snapshot");
     }
 
     #[test]
@@ -2683,7 +2749,7 @@ mod tests {
         assert_eq!(resp["entry_count"], 1);
         assert_eq!(
             resp["message"],
-            "Entry added (active in your memory from the next session)."
+            "Entry added (active; run /memory reload to see it in your prompt)."
         );
         assert!(resp["usage"].as_str().unwrap().contains("/2200 chars"));
         let meta = &resp["meta"]["shape check"];
