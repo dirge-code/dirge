@@ -707,3 +707,72 @@ fn scroll_snap_typing_and_down_snap_but_command_combos_dont() {
     assert_eq!(scroll_snap_for(&KeyEvent::new(KeyCode::Up, none)), None);
     assert_eq!(scroll_snap_for(&KeyEvent::new(KeyCode::Enter, none)), None);
 }
+
+// ============================================================
+// dirge #444 — live thinking streams into the Ctrl+O panel
+// ============================================================
+
+/// After Ctrl+O expands a live thinking burst, new reasoning deltas re-render
+/// the expanded block IN PLACE (anchored at the same start) rather than leaving
+/// the frozen snapshot the user first saw.
+#[test]
+fn live_thinking_expansion_streams_in_place() {
+    let mut r = Renderer::new().expect("renderer");
+    r.write_line("<you> hi", Color::White).unwrap();
+    r.write_line(
+        "  ◇ thinking… (Ctrl+O to view)",
+        crate::ui::theme::thinking(),
+    )
+    .unwrap();
+
+    // Ctrl+O expands the current snapshot of the thinking-so-far.
+    let start = r.buffer_len();
+    render_thinking_block(&mut r, "first thought").unwrap();
+    let anchor = (start, r.buffer_len(), r.eviction_generation());
+    let snap: Vec<String> = r.buffer_lines().iter().map(|s| s.to_string()).collect();
+    assert!(snap.iter().any(|l| l.contains("first thought")));
+    assert!(
+        !snap.iter().any(|l| l.contains("second thought")),
+        "snapshot must not contain text that hasn't streamed yet",
+    );
+
+    // More reasoning arrives — re-render in place with the fuller buffer.
+    let updated = restream_expanded_thinking(&mut r, anchor, "first thought\nsecond thought")
+        .unwrap()
+        .expect("re-rendered in place");
+
+    let now: Vec<String> = r.buffer_lines().iter().map(|s| s.to_string()).collect();
+    assert!(now.iter().any(|l| l.contains("first thought")));
+    assert!(
+        now.iter().any(|l| l.contains("second thought")),
+        "new thinking streamed into the expanded block: {now:?}",
+    );
+    // Exactly one of each — the old block was replaced, not duplicated.
+    assert_eq!(
+        now.iter().filter(|l| l.contains("first thought")).count(),
+        1
+    );
+    assert_eq!(updated.0, start, "block stays anchored at the same start");
+    // The placeholder above the block is untouched.
+    assert!(now.iter().any(|l| l.contains("thinking… (Ctrl+O to view)")));
+}
+
+/// When front-eviction has shifted indices since the block was anchored
+/// (gen mismatch), the in-place re-render bails (returns None) so the caller
+/// stops tracking instead of truncating live content at a stale index.
+#[test]
+fn restream_bails_on_eviction_generation_mismatch() {
+    let mut r = Renderer::new().expect("renderer");
+    render_thinking_block(&mut r, "thought").unwrap();
+    // Anchor with a deliberately wrong eviction generation.
+    let stale = (
+        0usize,
+        r.buffer_len(),
+        r.eviction_generation().wrapping_add(1),
+    );
+    let out = restream_expanded_thinking(&mut r, stale, "thought more").unwrap();
+    assert!(
+        out.is_none(),
+        "stale-generation anchor must not re-render in place"
+    );
+}

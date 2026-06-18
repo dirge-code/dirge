@@ -178,6 +178,11 @@ pub(crate) struct UiState {
     /// eviction counter is unchanged — so streamed output or buffer-cap
     /// eviction after expanding can't make collapse delete real content.
     pub(crate) expansion_anchor: Option<(usize, usize, u64)>,
+    /// dirge #444: `true` when the current `expansion_anchor` block is showing
+    /// LIVE (still-streaming) thinking, so new reasoning deltas re-render it in
+    /// place instead of leaving a frozen snapshot. Cleared on collapse, on a
+    /// new turn, or when the expansion targets a completed burst / tool output.
+    pub(crate) live_thinking_expanded: bool,
 
     // ── User toggles ─────────────────────────────────────────────────
     pub(crate) show_reasoning: bool,
@@ -363,6 +368,7 @@ impl UiState {
             last_thinking: None,
             expand_target: ExpandTarget::None,
             expansion_anchor: None,
+            live_thinking_expanded: false,
 
             show_reasoning: false,
             todo_tools_enabled: false,

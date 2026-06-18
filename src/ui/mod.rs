@@ -1558,6 +1558,7 @@ pub async fn run_interactive(
                                         renderer.replace_from(start, Vec::new());
                                     }
                                     ui.expansion_anchor = None;
+                                    ui.live_thinking_expanded = false;
                                 }
                                 ExpandToggle::Expand => {
                                     let start = renderer.buffer_len();
@@ -1571,8 +1572,13 @@ pub async fn run_interactive(
                                         ExpandSource::LiveThinking => {
                                             let text = ui.reasoning_buf.clone();
                                             render_thinking_block(&mut renderer, &text)?;
+                                            // dirge #444: track that this block is
+                                            // LIVE so new reasoning deltas stream
+                                            // into it instead of freezing here.
+                                            ui.live_thinking_expanded = true;
                                         }
                                         ExpandSource::Thinking => {
+                                            ui.live_thinking_expanded = false;
                                             if let Some(text) = ui.last_thinking.clone() {
                                                 render_thinking_block(&mut renderer, &text)?;
                                             }
@@ -1847,6 +1853,7 @@ pub async fn run_interactive(
                             ui.last_thinking = None;
                             ui.expand_target = crate::ui::state::ExpandTarget::None;
                             ui.expansion_anchor = None;
+                            ui.live_thinking_expanded = false;
                             #[cfg(feature = "loop")]
                             if loop_state.as_ref().is_some_and(|ls| ls.active) && !text.starts_with('/') {
                                 // Queue the message instead of dropping it.
@@ -2380,9 +2387,37 @@ pub async fn run_interactive(
                                 ui.was_reasoning = true;
                             }
                             ui.reasoning_buf.push_str(&sanitize_output(&text));
+
+                            // dirge #444: if the user expanded this live thinking
+                            // with Ctrl+O, stream new deltas into the expanded
+                            // block IN PLACE instead of leaving a frozen snapshot.
+                            if ui.live_thinking_expanded
+                                && let Some(anchor) = ui.expansion_anchor
+                            {
+                                match restream_expanded_thinking(
+                                    &mut renderer,
+                                    anchor,
+                                    &ui.reasoning_buf,
+                                )? {
+                                    Some(updated) => ui.expansion_anchor = Some(updated),
+                                    None => {
+                                        ui.expansion_anchor = None;
+                                        ui.live_thinking_expanded = false;
+                                    }
+                                }
+                                renderer.request_repaint();
+                            }
                         }
                     }
                     AgentEvent::Token(text) => {
+                        // dirge #444: the thinking burst is over once response
+                        // tokens start. Stop live-updating any expanded thinking
+                        // panel so an interleaved later reasoning delta can't
+                        // re-render at the (now-buried) anchor and clobber the
+                        // response. The block stays as collapsible history.
+                        if ui.was_reasoning {
+                            ui.live_thinking_expanded = false;
+                        }
                         // Caught-up check for the render coalescer, computed
                         // before ctx borrows the render state (dirge-ufe0).
                         let pending = ui.agent_rx.as_ref().map_or(0, |rx| rx.len());
@@ -3615,6 +3650,34 @@ fn render_thinking_block(renderer: &mut Renderer, text: &str) -> std::io::Result
     renderer.write_line("  ╰─", crate::ui::theme::thinking())?;
     renderer.write_line("", Color::White)?;
     Ok(())
+}
+
+/// dirge #444: re-render the expanded LIVE-thinking block in place with the
+/// latest `reasoning_buf`, so new reasoning deltas stream into the panel
+/// instead of leaving a frozen snapshot. `anchor` is `(start, _end,
+/// eviction_gen)` from `expansion_anchor`. Returns the UPDATED anchor, or
+/// `None` when the block can't be re-rendered in place — front-eviction shifted
+/// indices (gen mismatch), or the start is past the buffer end — in which case
+/// the caller stops tracking and leaves the block as history (Ctrl+O re-expands
+/// a fresh snapshot). Assumes the block sits at the buffer tail, which holds
+/// during a pure thinking burst where nothing else appends.
+fn restream_expanded_thinking(
+    renderer: &mut Renderer,
+    anchor: (usize, usize, u64),
+    reasoning_buf: &str,
+) -> std::io::Result<Option<(usize, usize, u64)>> {
+    let (start, _end, anchor_gen) = anchor;
+    if renderer.eviction_generation() != anchor_gen || start > renderer.buffer_len() {
+        return Ok(None);
+    }
+    let gen_before = renderer.eviction_generation();
+    renderer.replace_from(start, Vec::new());
+    render_thinking_block(renderer, reasoning_buf)?;
+    Ok(if renderer.eviction_generation() == gen_before {
+        Some((start, renderer.buffer_len(), gen_before))
+    } else {
+        None
+    })
 }
 
 fn render_custom_entry(renderer: &mut Renderer, buf: &str, input_anchor: usize) {
