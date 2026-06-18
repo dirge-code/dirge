@@ -1670,26 +1670,26 @@ impl SqliteMemoryStore {
         let tx = conn
             .transaction()
             .map_err(|e| format!("Failed to begin purge transaction: {e}"))?;
-        let ids: Vec<i64> = {
-            let mut stmt = tx
-                .prepare(
-                    "SELECT id FROM memories
-                     WHERE status IN ('tombstoned', 'superseded') AND updated_at < ?1",
-                )
-                .map_err(|e| format!("Failed to prepare purge query: {e}"))?;
-            stmt.query_map(params![cutoff], |r| r.get(0))
-                .map_err(|e| format!("Failed to scan retired rows: {e}"))?
-                .filter_map(|r| r.ok())
-                .collect()
-        };
-        for id in &ids {
-            tx.execute("DELETE FROM memories_fts WHERE rowid = ?1", params![id])
-                .map_err(|e| format!("Failed to purge fts row: {e}"))?;
-            tx.execute("DELETE FROM memories WHERE id = ?1", params![id])
-                .map_err(|e| format!("Failed to purge memory row: {e}"))?;
-        }
-        tx.commit().map_err(|e| format!("Failed to commit purge: {e}"))?;
-        Ok(ids.len())
+        // Two set-based deletes (not a per-row loop): drop the FTS rows FIRST,
+        // while the subquery still resolves against the about-to-be-deleted
+        // memory rows, then the memory rows themselves.
+        const RETIRED: &str = "status IN ('tombstoned', 'superseded') AND updated_at < ?1";
+        tx.execute(
+            &format!(
+                "DELETE FROM memories_fts WHERE rowid IN (SELECT id FROM memories WHERE {RETIRED})"
+            ),
+            params![cutoff],
+        )
+        .map_err(|e| format!("Failed to purge fts rows: {e}"))?;
+        let purged = tx
+            .execute(
+                &format!("DELETE FROM memories WHERE {RETIRED}"),
+                params![cutoff],
+            )
+            .map_err(|e| format!("Failed to purge memory rows: {e}"))?;
+        tx.commit()
+            .map_err(|e| format!("Failed to commit purge: {e}"))?;
+        Ok(purged)
     }
 
     /// Hot-tier budget utilization (%) for a target — the curator's
@@ -3504,10 +3504,11 @@ mod tests {
         );
     }
 
-    /// dirge-zygq: a PROVEN procedural entry (has outcomes) is exempt
-    /// from disuse decay — it ranks on its record, not on recency. But
-    /// an unvalidated procedural (no outcomes) still decays, since
-    /// procedural is the default kind and must not get a blanket pass.
+    /// dirge-zygq/dirge-j92d: a procedural entry with a RECENT success is
+    /// exempt from disuse decay (here the success is fresh), while an
+    /// unvalidated procedural still decays — procedural is the default kind and
+    /// gets no blanket pass. The recency gate itself (stale success / failures
+    /// decay) is covered by `disuse_decay_exempts_only_recently_effective_procedural`.
     #[test]
     fn disuse_decay_exempts_only_proven_procedural() {
         let (paths, _dir) = temp_project();
@@ -3607,7 +3608,10 @@ mod tests {
         drop(conn);
 
         let decayed = store.apply_disuse_decay(30).unwrap();
-        assert_eq!(decayed, 2, "stale-win and only-fails decay; recent-win exempt");
+        assert_eq!(
+            decayed, 2,
+            "stale-win and only-fails decay; recent-win exempt"
+        );
 
         let conn = raw_conn(&paths);
         let sal = |content: &str| -> f64 {
@@ -3623,7 +3627,11 @@ mod tests {
             "recently-effective playbook exempt: {}",
             sal("recent win"),
         );
-        assert!(sal("stale win") < 0.5, "stale success decays: {}", sal("stale win"));
+        assert!(
+            sal("stale win") < 0.5,
+            "stale success decays: {}",
+            sal("stale win")
+        );
         assert!(
             sal("only fails") < 0.5,
             "failure-only playbook decays: {}",
@@ -3639,10 +3647,16 @@ mod tests {
         let (paths, _dir) = temp_project();
         let store = SqliteMemoryStore::load(&paths).unwrap();
         store.add_entry("memory", "active fact", None).unwrap();
-        store.add_entry("memory", "old removed entry", None).unwrap();
+        store
+            .add_entry("memory", "old removed entry", None)
+            .unwrap();
         store.remove_entry("memory", "old removed entry").unwrap();
-        store.add_entry("memory", "recent removed entry", None).unwrap();
-        store.remove_entry("memory", "recent removed entry").unwrap();
+        store
+            .add_entry("memory", "recent removed entry", None)
+            .unwrap();
+        store
+            .remove_entry("memory", "recent removed entry")
+            .unwrap();
         store
             .add_entry("memory", "old claim", Some(MemoryKind::Semantic))
             .unwrap();

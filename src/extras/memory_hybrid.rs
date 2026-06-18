@@ -705,12 +705,20 @@ mod tests {
         // Fill exactly to the cap.
         let full: Vec<String> = (0..MAX_CACHE_ENTRIES).map(|i| format!("c{i}")).collect();
         hybrid.embed_cached(&full);
-        assert_eq!(hybrid.cache_len(), MAX_CACHE_ENTRIES, "cache filled to the cap");
+        assert_eq!(
+            hybrid.cache_len(),
+            MAX_CACHE_ENTRIES,
+            "cache filled to the cap"
+        );
 
         // The next batch trips the cap → clear, then insert the new batch.
         let more: Vec<String> = (0..10).map(|i| format!("d{i}")).collect();
         hybrid.embed_cached(&more);
-        assert_eq!(hybrid.cache_len(), 10, "cap cleared the cache before the new batch");
+        assert_eq!(
+            hybrid.cache_len(),
+            10,
+            "cap cleared the cache before the new batch"
+        );
         assert!(hybrid.cache_len() <= MAX_CACHE_ENTRIES);
         let _ = std::fs::remove_dir_all(&dir);
     }
