@@ -219,6 +219,7 @@ Each `providers` entry accepts:
 | `model` | Model name for this provider. |
 | `api_key` | Literal key or `${ENV_VAR}` interpolation. Takes precedence over `api_key_env`. |
 | `api_key_env` | Name of the env var holding the API key. |
+| `auth` | Authentication mode: `api-key` (default), `chatgpt` for Codex/OpenAI login tokens, or `anthropic` / `claude-code` for Anthropic Claude Code OAuth. |
 | `allow_insecure` | Allow `http://` URLs (plaintext). Default `false`; only enable for local-only proxies. |
 | `stream_chunk_timeout_secs` | Per-provider streaming chunk timeout override. |
 | `options` | Free-form per-provider model options; currently honors `temperature`. |
@@ -243,11 +244,14 @@ program directory:
 Successful login persists across Dirge sessions. Delete `auth.json` or revoke
 the OpenAI authorization if you want to force a new login.
 
-API-key precedence is unchanged: explicit CLI keys, key files/stdin, config
-`api_key`, config `api_key_env`, and provider environment variables win before
-OAuth. If no higher-precedence OpenAI key is available, Dirge uses the fresh
-stored OAuth access token against the ChatGPT Codex backend. Expired OAuth
-credentials require rerunning `dirge auth openai` or setting an API key.
+For the canonical `openai` provider with no configured `base_url`, a fresh
+stored OAuth credential is treated as subscription auth and is preferred before
+API-key billing. OpenAI-compatible aliases and providers with a custom
+`base_url` keep normal API-key behavior. If no fresh OAuth credential exists,
+Dirge uses the usual API-key sources: explicit CLI keys, key files/stdin, config
+`api_key`, config `api_key_env`, and provider environment variables. If the
+OAuth/Codex request reports subscription quota or model-access exhaustion, Dirge
+asks before switching that request to API-key billing.
 
 Troubleshooting:
 
@@ -256,6 +260,37 @@ Troubleshooting:
   `dirge auth openai`.
 - Timeout: complete approval in the browser and rerun the command.
 - Corrupt auth store: fix or remove `auth.json`, then rerun `dirge auth openai`.
+
+### Anthropic Claude Code OAuth
+
+To use a Claude Pro/Max subscription token instead of an Anthropic API key,
+run:
+
+```bash
+dirge auth anthropic
+```
+
+Complete the browser login. dirge listens on `http://localhost:53692/callback`,
+exchanges the PKCE code, and writes credentials to
+`~/.claude/.credentials.json` in the same shape as Claude Code. Then configure
+the Anthropic provider to use OAuth:
+
+```json
+{
+  "provider": "anthropic",
+  "providers": {
+    "anthropic": {
+      "auth": "anthropic",
+      "model": "claude-sonnet-4-5"
+    }
+  }
+}
+```
+
+Aliases `claude-code`, `claude_code`, and `claude` are accepted for the same
+auth mode. `ANTHROPIC_OAUTH_TOKEN` can also provide a raw access token for
+smoke tests, but persisted credentials are preferred because dirge can refresh
+expired tokens before rebuilding the Anthropic client.
 
 ### Role assignments
 
