@@ -19,6 +19,8 @@ pub mod fts;
 pub mod memory_curator;
 pub mod memory_db;
 pub mod memory_provider;
+#[cfg(test)]
+mod memory_retrieval_eval;
 pub mod session_db;
 pub mod session_search;
 pub mod skills;
