@@ -102,6 +102,45 @@ Accepted top-level keys:
 | `mcp_servers`             | object  | MCP server map when compiled with the `mcp` feature. When omitted, defaults to a single Exa Web Search server; see below.                                                   |
 | `acp_servers`             | object  | ACP server config map when compiled with the `acp` feature. See the ACP section below.                                                                                       |
 
+### Context window & compaction
+
+Two keys control how large the live context grows before history is folded
+into a summary (compaction):
+
+- **`context_target`** — the working-context budget in tokens (default
+  `100000`). The decision treats the effective window as `min(model_window,
+  context_target)`, so dirge folds to stay within *your* budget rather than the
+  model's full advertised window (whose quality degrades well before it fills).
+  Floored at 16k; a value above the model's real window is a no-op.
+- **`compaction_fold_threshold`** — the fraction of that budget at which the
+  fold (and durable checkpoint) fires, clamped to `0.3`–`0.75` (default
+  `0.75`). Lower folds earlier, from more coherent context.
+
+The **fold point** — the size the context reaches before compaction kicks in —
+is the product of the two:
+
+```
+fold_point = compaction_fold_threshold × min(model_window, context_target)
+```
+
+| Goal | `context_target` | `compaction_fold_threshold` | Folds at |
+| ---- | ---------------- | --------------------------- | -------- |
+| Default (200k model) | unset (100k) | unset (0.75) | ~75k |
+| Smaller, tighter context | `60000` | unset (0.75) | ~45k |
+| Same budget, fold earlier | unset (100k) | `0.5` | ~50k |
+| Both | `80000` | `0.6` | ~48k |
+
+```json
+{
+  "context_target": 80000,
+  "compaction_fold_threshold": 0.6
+}
+```
+
+Set `compact_enabled` to `false` to disable automatic compaction entirely.
+(The separate `context_window` / `reserve_tokens` keys feed the status line and
+the older token-reserve path; the budget above is what the fold decision uses.)
+
 ### Hybrid memory retrieval
 
 By default the `memory` tool's `search` is BM25 (keyword) only — exact on
