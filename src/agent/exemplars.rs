@@ -107,7 +107,7 @@ pub fn retrieve(query: &str, k: usize) -> Vec<&'static Exemplar> {
         .collect();
 
     // Highest score first; stable so corpus order breaks ties.
-    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    scored.sort_by_key(|(s, _)| std::cmp::Reverse(*s));
     scored.into_iter().take(k).map(|(_, ex)| ex).collect()
 }
 

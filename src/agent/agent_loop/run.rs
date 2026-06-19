@@ -796,10 +796,9 @@ async fn restore_working_files(
     }
     let snapshots = crate::agent::compression::build_post_compact_snapshots(&contents);
     // Insert right after the summary message, before the protected tail.
-    let mut at = (summary_idx + 1).min(ctx.messages.len());
-    for snap in snapshots {
-        ctx.messages.insert(at, snap);
-        at += 1;
+    let at = (summary_idx + 1).min(ctx.messages.len());
+    for (offset, snap) in snapshots.into_iter().enumerate() {
+        ctx.messages.insert(at + offset, snap);
     }
 }
 

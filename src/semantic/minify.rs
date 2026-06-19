@@ -319,9 +319,13 @@ fn render_with_spans(tokens: &[Token]) -> (String, Vec<Span>) {
             }
             if let Some(&last) = out.as_bytes().last() {
                 let first = tok.text.as_bytes()[0];
-                if last != b'\n' && is_word_char(last) && is_word_char(first) {
-                    out.push(' ');
-                } else if is_operator_char(last) && first == b'.' {
+                // Insert a separating space when joining would fuse two
+                // tokens: word-char against word-char (would merge two
+                // identifiers), or an operator against a leading `.`
+                // (would change `a +.b` into `a+.b`).
+                let word_join = last != b'\n' && is_word_char(last) && is_word_char(first);
+                let dot_join = is_operator_char(last) && first == b'.';
+                if word_join || dot_join {
                     out.push(' ');
                 }
             }

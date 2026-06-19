@@ -617,9 +617,7 @@ fn build_summarize_fn(
 /// route on a specific `task(agent=…)` call still overrides this — it is
 /// the fallback default, matching `task.rs`'s `route_model.unwrap_or`.
 fn resolve_subagent_model(cfg: &Config) -> Option<AnyModel> {
-    if cfg.subagent_provider.is_none() {
-        return None;
-    }
+    cfg.subagent_provider.as_ref()?;
     let (default_alias, _) = cfg.resolve_role(crate::config::ConfigRole::Default)?;
     let (alias, entry) = cfg.resolve_role(crate::config::ConfigRole::Subagent)?;
     if default_alias.eq_ignore_ascii_case(&alias) {

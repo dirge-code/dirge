@@ -3073,7 +3073,7 @@ pub async fn run_interactive(
                 };
                 let (label, color) = match &lifecycle_evt {
                     LifecycleEvent::Started { id } => {
-                        let short = crate::text::short_id(&id);
+                        let short = crate::text::short_id(id);
                         (format!("[task {} started]", short), c_tool())
                     }
                     LifecycleEvent::Finished(notif) => {

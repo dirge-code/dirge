@@ -118,8 +118,8 @@ fn word_wrap(text: &str, max_width: usize) -> Vec<CompactString> {
 /// width with `prefix` prepended to EVERY wrapped chunk (continuation rows keep
 /// the prefix). The wrap width subtracts the prefix's display width (clamped to
 /// >=1 so a `prefix` as wide as `max_width` can't drive word_wrap into a
-/// non-advancing loop). `flush_acc` delegates with an empty prefix; the
-/// blockquote bar delegates with `"│ "`.
+/// > non-advancing loop). `flush_acc` delegates with an empty prefix; the
+/// > blockquote bar delegates with `"│ "`.
 fn flush_prefixed(
     acc: &str,
     color: Color,

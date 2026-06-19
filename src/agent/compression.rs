@@ -268,10 +268,9 @@ pub fn cap_oversized_tool_results(messages: &[Value], max_tokens: u64) -> Vec<Va
                     // text block.)
                     let text_block_count =
                         blocks.iter().filter(|b| text_of_block(b).is_some()).count();
-                    let per_block_budget = if text_block_count == 0 {
-                        return msg.clone();
-                    } else {
-                        std::cmp::max(max_chars / text_block_count, MIN_PER_BLOCK_BUDGET)
+                    let per_block_budget = match max_chars.checked_div(text_block_count) {
+                        Some(d) => std::cmp::max(d, MIN_PER_BLOCK_BUDGET),
+                        None => return msg.clone(),
                     };
                     let new_blocks: Vec<Value> = blocks
                         .iter()

@@ -211,9 +211,9 @@ impl Engine {
                     continue;
                 }
                 let refined = m.refine(req, op, resource, eff, &self.ctx);
-                if refined.by.is_some() {
+                if let Some(by) = refined.by {
                     let entry = TraceEntry {
-                        policy: refined.by.unwrap(),
+                        policy: by,
                         resource: ri,
                         effect: Some(refined.effect()),
                         why: refined.why.clone(),

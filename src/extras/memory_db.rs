@@ -597,8 +597,8 @@ impl SqliteMemoryStore {
     /// HOT-tier entries render verbatim — one `<project_memory>`
     /// block per non-empty target, entries prefixed with their UMP
     /// kind tag, same shape the markdown store produced.
-    /// BREADCRUMB-tier entries render as a one-line index (id + kind
-    /// + preview) the agent dereferences with `expand` (dirge-q8wt) —
+    /// BREADCRUMB-tier entries render as a one-line index (id + kind +
+    /// preview) the agent dereferences with `expand` (dirge-q8wt) —
     /// the matryoshka stub-and-expand pattern, kept inline in the
     /// prompt so weak models don't need a multi-step read loop for
     /// the hot facts. Refreshable via `/memory reload`.

@@ -337,8 +337,8 @@ pub struct Renderer {
     /// 8ms repaint throttle to prevent /dev/tty write contention between
     /// keystroke-driven repaints — the root cause of typing stutter.
     last_paint: Option<std::time::Instant>,
-    /// Timestamp of the last terminal-mode re-assertion (SGR mouse capture
-    /// + bracketed paste). Those modes are enabled once at startup, but a
+    /// Timestamp of the last terminal-mode re-assertion (SGR mouse capture +
+    /// bracketed paste). Those modes are enabled once at startup, but a
     /// child program run via the bash tool (a pager / TUI) can reset them
     /// mid-session by emitting `?1000l`/`?2004l` on exit — and there's no
     /// other path that turns them back on, so the loss is permanent (wheel
