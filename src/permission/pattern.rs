@@ -3,8 +3,31 @@ use regex::Regex;
 #[derive(Debug, Clone)]
 pub struct Pattern {
     regex: Regex,
+    /// Path-style patterns normalize their match input the same way the
+    /// pattern was normalized (Windows: strip `\\?\`, `\`→`/`). Command
+    /// patterns must NOT — a bash command can contain literal backslashes.
+    path_style: bool,
     #[allow(dead_code)]
     pub original: String,
+}
+
+/// Normalize a Windows filesystem path/pattern for glob comparison:
+/// strip the `\\?\` / `\\?\UNC\` verbatim prefix `canonicalize` adds and
+/// unify `\` → `/` so the slash-based glob engine matches. Case is
+/// handled separately (case-insensitive regex on Windows). No-op on Unix,
+/// so Unix glob behavior is byte-for-byte unchanged.
+#[cfg(windows)]
+fn normalize_path_for_glob(s: &str) -> String {
+    let stripped = s
+        .strip_prefix(r"\\?\UNC\")
+        .map(|rest| format!(r"\\{rest}"))
+        .unwrap_or_else(|| s.strip_prefix(r"\\?\").unwrap_or(s).to_string());
+    stripped.replace('\\', "/")
+}
+
+#[cfg(not(windows))]
+fn normalize_path_for_glob(s: &str) -> String {
+    s.to_string()
 }
 
 impl Pattern {
@@ -28,6 +51,14 @@ impl Pattern {
 
     fn compile(pattern: &str, path_style: bool) -> Self {
         let expanded = expand_home(pattern);
+        // Path patterns are separator-normalized on Windows so a `\\?\C:\…`
+        // canonical pattern (mixed `\` and the glob's `/`) compiles with a
+        // single `/` separator. Command patterns keep literal backslashes.
+        let expanded = if path_style {
+            normalize_path_for_glob(&expanded)
+        } else {
+            expanded
+        };
         let regex_str = glob_to_regex(&expanded, path_style);
         // dirge-9zbd: command-style patterns match against whole bash
         // command segments, whose arguments routinely contain embedded
@@ -41,7 +72,19 @@ impl Pattern {
         // paths don't legitimately contain newlines, and letting `**` span
         // them would weaken path scoping in deny rules.
         let regex = if path_style {
-            Regex::new(&regex_str)
+            // Path patterns stay line-sensitive. On Windows match
+            // case-insensitively (NTFS is case-insensitive, and a server
+            // or the agent may echo a differently-cased drive/dir).
+            #[cfg(windows)]
+            {
+                regex::RegexBuilder::new(&regex_str)
+                    .case_insensitive(true)
+                    .build()
+            }
+            #[cfg(not(windows))]
+            {
+                Regex::new(&regex_str)
+            }
         } else {
             regex::RegexBuilder::new(&regex_str)
                 .dot_matches_new_line(true)
@@ -50,12 +93,19 @@ impl Pattern {
         .unwrap_or_else(|_| Regex::new("^$").unwrap());
         Pattern {
             regex,
+            path_style,
             original: pattern.to_string(),
         }
     }
 
     pub fn matches(&self, input: &str) -> bool {
-        self.regex.is_match(input)
+        if self.path_style {
+            // Normalize the probe the same way the pattern was, so a
+            // `\\?\C:\…\sub\file` canonical path matches a `…/sub/**` glob.
+            self.regex.is_match(&normalize_path_for_glob(input))
+        } else {
+            self.regex.is_match(input)
+        }
     }
 }
 
@@ -272,6 +322,32 @@ mod tests {
         assert!(pat.matches("/etc/passwd"));
         // A newline-bearing "path" must not be swallowed by `**`.
         assert!(!pat.matches("/etc/x\n/home/victim"));
+    }
+
+    /// The "Allow always" Windows regression: the canonical twin pattern
+    /// is `\\?\C:\…\sub/**` (verbatim prefix + backslash head + `/` glob),
+    /// but probes arrive as backslash paths. Without separator/prefix
+    /// normalization the `(?:/.*)?` tail never matched a `\`-separated
+    /// child, so coalescing failed and every sibling write re-prompted.
+    #[cfg(windows)]
+    #[test]
+    fn windows_path_pattern_matches_backslash_and_verbatim() {
+        let pat = Pattern::new(r"\\?\C:\proj\sub/**");
+        assert!(pat.matches(r"\\?\C:\proj\sub\other.rs"));
+        assert!(pat.matches(r"C:\proj\sub\other.rs"));
+        // Case-insensitive drive / dir (NTFS).
+        assert!(pat.matches(r"c:\proj\sub\deep\f.rs"));
+        // Boundary: a sibling sharing the name prefix must NOT match.
+        assert!(!pat.matches(r"C:\proj\subother\x.rs"));
+    }
+
+    /// Relative path patterns still match a backslash-separated probe.
+    #[cfg(windows)]
+    #[test]
+    fn windows_relative_path_pattern_matches_backslash_probe() {
+        let pat = Pattern::new("sub/**");
+        assert!(pat.matches(r"sub\other.rs"));
+        assert!(pat.matches("sub/other.rs"));
     }
 
     /// PERM-4: `/etc/**` should match the bare directory and all
