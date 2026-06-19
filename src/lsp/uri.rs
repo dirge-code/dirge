@@ -19,14 +19,60 @@ use lsp_types::Uri;
 /// the parse error.
 pub fn path_to_file_uri_string(path: &Path) -> String {
     let s = path.to_string_lossy();
-    let encoded = percent_encode_path(&s);
-    if s.starts_with('/') {
+    #[cfg(windows)]
+    {
+        win_path_to_uri(&s)
+    }
+    #[cfg(not(windows))]
+    {
+        let encoded = percent_encode_path(&s);
+        if s.starts_with('/') {
+            format!("file://{encoded}")
+        } else {
+            // Relative path or Windows-style. Emit with an extra `/` so the
+            // result is parseable as a URI.
+            format!("file:///{encoded}")
+        }
+    }
+}
+
+/// Windows path → `file://` URI. Handles the forms `canonicalize` and the
+/// agent produce, which the generic (Unix) encoder mangled:
+/// - `\\?\C:\dir\f`  (extended-length) → `file:///C:/dir/f`
+/// - `C:\dir\f`                         → `file:///C:/dir/f`
+/// - `\\?\UNC\srv\sh\f` / `\\srv\sh\f`  → `file://srv/sh/f`
+///
+/// Without this, the backslashes and the `\\?\` prefix were percent-encoded
+/// (`file:///%5C%5C%3F%5CC:...`), so LSP servers never matched the opened
+/// document and no diagnostics/symbols flowed back.
+#[cfg(windows)]
+fn win_path_to_uri(s: &str) -> String {
+    // UNC share: the server name is the URI authority (no leading `/`).
+    if let Some(rest) = s
+        .strip_prefix(r"\\?\UNC\")
+        .or_else(|| s.strip_prefix(r"\\").filter(|_| !s.starts_with(r"\\?\")))
+    {
+        let body = rest.replace('\\', "/");
+        return format!("file://{}", percent_encode_path(&body));
+    }
+    // Local volume: drop the `\\?\` verbatim prefix when present.
+    let stripped = s.strip_prefix(r"\\?\").unwrap_or(s);
+    let body = stripped.replace('\\', "/");
+    let encoded = percent_encode_path(&body);
+    if body.starts_with('/') {
+        // Already an absolute slash path (e.g. a Unix-style path in a test).
         format!("file://{encoded}")
     } else {
-        // Relative path or Windows-style. Emit with an extra `/` so the
-        // result is parseable as a URI.
+        // Drive path (`C:/...`) or relative — needs the empty authority `/`.
         format!("file:///{encoded}")
     }
+}
+
+/// Whether `s` begins with a Windows drive prefix like `C:`.
+#[cfg(windows)]
+fn is_drive_prefixed(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':'
 }
 
 /// Convert a path to a parsed [`Uri`]. Returns an I/O error wrapped around
@@ -48,7 +94,37 @@ pub fn uri_to_path(uri: &str) -> Option<PathBuf> {
     let trimmed = uri
         .strip_prefix("file://")
         .or_else(|| uri.strip_prefix("file:"))?;
-    Some(PathBuf::from(percent_decode(trimmed)))
+    #[cfg(windows)]
+    {
+        Some(win_uri_to_path(trimmed))
+    }
+    #[cfg(not(windows))]
+    {
+        Some(PathBuf::from(percent_decode(trimmed)))
+    }
+}
+
+/// `file://`-body → Windows path. Inverse of [`win_path_to_uri`]:
+/// - `/C:/dir/f` → `C:\dir\f`   (drive letter upper-cased so a server that
+///    echoes a lowercase drive still matches the `canonicalize`d path)
+/// - `srv/sh/f`  → `\\srv\sh\f` (UNC authority form)
+/// - anything else (Unix-style absolute, relative) passes through unchanged.
+#[cfg(windows)]
+fn win_uri_to_path(trimmed: &str) -> PathBuf {
+    let decoded = percent_decode(trimmed);
+    // Drive form: leading `/` before a `X:` drive (from `file:///C:/...`).
+    if let Some(rest) = decoded.strip_prefix('/')
+        && is_drive_prefixed(rest)
+    {
+        let drive = rest.as_bytes()[0].to_ascii_uppercase() as char;
+        let body = format!("{drive}{}", &rest[1..]);
+        return PathBuf::from(body.replace('/', "\\"));
+    }
+    // UNC authority form: `srv/sh/...` (no leading slash, not a drive).
+    if !decoded.starts_with('/') && decoded.contains('/') && !is_drive_prefixed(&decoded) {
+        return PathBuf::from(format!(r"\\{}", decoded.replace('/', "\\")));
+    }
+    PathBuf::from(decoded)
 }
 
 /// Percent-encode `path` per RFC 3986. Slashes are preserved (path
@@ -151,6 +227,50 @@ mod tests {
     fn parses_to_lsp_types_uri() {
         let uri = path_to_file_uri(Path::new("/tmp/main.rs")).unwrap();
         assert_eq!(uri.as_str(), "file:///tmp/main.rs");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_verbatim_and_plain_drive_paths_to_uri() {
+        assert_eq!(
+            path_to_file_uri_string(Path::new(r"\\?\C:\Users\me\Bad.dfy")),
+            "file:///C:/Users/me/Bad.dfy"
+        );
+        assert_eq!(
+            path_to_file_uri_string(Path::new(r"C:\proj\a b\main.dfy")),
+            "file:///C:/proj/a%20b/main.dfy"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_drive_uri_round_trips() {
+        let p = PathBuf::from(r"C:\Users\me\Spec.dfy");
+        let uri = path_to_file_uri_string(&p);
+        assert_eq!(uri, "file:///C:/Users/me/Spec.dfy");
+        assert_eq!(uri_to_path(&uri).unwrap(), p);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_lowercase_drive_uri_normalizes_to_uppercase() {
+        // A server echoing a lowercase drive must still resolve to the
+        // canonical (upper-cased) path dirge opened.
+        assert_eq!(
+            uri_to_path("file:///c:/Users/me/Spec.dfy").unwrap(),
+            PathBuf::from(r"C:\Users\me\Spec.dfy")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_unc_path_round_trips() {
+        let uri = path_to_file_uri_string(Path::new(r"\\server\share\f.dfy"));
+        assert_eq!(uri, "file://server/share/f.dfy");
+        assert_eq!(
+            uri_to_path(&uri).unwrap(),
+            PathBuf::from(r"\\server\share\f.dfy")
+        );
     }
 
     #[test]

@@ -1274,20 +1274,13 @@ mod tests {
             "dafny server must not land in the broken set"
         );
 
-        // File-level features (diagnostics, document symbols) require a
-        // valid `file://` URI round-trip. On Windows that's currently
-        // broken: `canonicalize` yields a `\\?\C:\...` verbatim path and
-        // `lsp::uri::path_to_file_uri_string` percent-encodes the
-        // backslashes, so the server never matches the opened document.
-        // Tracked separately from Dafny support. On Unix the round-trip
-        // works, so assert diagnostics there.
-        #[cfg(not(windows))]
-        {
-            let diags = manager
-                .diagnostics_for(&file)
-                .expect("expected diagnostics for the type-mismatched .dfy");
-            assert!(!diags.is_empty(), "expected at least one diagnostic");
-        }
+        // File-level features (diagnostics) round-trip the `file://` URI for
+        // the opened document. This exercises the Windows path↔URI fix in
+        // `lsp::uri` (verbatim `\\?\` stripping + backslash/drive handling).
+        let diags = manager
+            .diagnostics_for(&file)
+            .expect("expected diagnostics for the type-mismatched .dfy");
+        assert!(!diags.is_empty(), "expected at least one diagnostic");
 
         std::fs::remove_dir_all(&tree).ok();
     }
