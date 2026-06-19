@@ -154,12 +154,22 @@ impl ProcessSpawner {
                 init_options: Value::Null,
             },
         );
-        // Dafny CLI's built-in language server: `dafny server` (stdio).
+        // Dafny CLI's built-in language server, over stdio. `dafny` (the
+        // apphost on PATH) is equivalent to `dotnet Dafny.dll`; we default
+        // to it for portability. Setups with only the DLL override via
+        // config: `lsp.servers.dafny.command = ["dotnet", "C:/.../Dafny.dll",
+        // "server", "--verify-on", "change"]`. `--verify-on change`
+        // re-verifies (SMT) on every edit so diagnostics reflect proof
+        // failures, not just parse/resolve errors.
         m.insert(
             "dafny".to_string(),
             ProcessCommand {
                 program: PathBuf::from("dafny"),
-                args: vec!["server".to_string()],
+                args: vec![
+                    "server".to_string(),
+                    "--verify-on".to_string(),
+                    "change".to_string(),
+                ],
                 env: vec![],
                 init_options: Value::Null,
             },

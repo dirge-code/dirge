@@ -1230,6 +1230,68 @@ mod tests {
         std::fs::remove_dir_all(&tree).ok();
     }
 
+    /// End-to-end: drive a real `dafny server` through the production
+    /// `ProcessSpawner` + `LspManager` and confirm a deliberately-broken
+    /// `.dfy` produces published diagnostics. Ignored by default — needs
+    /// `dafny` (or the `dotnet Dafny.dll` apphost) on PATH and spawns Z3.
+    /// Run with: `cargo test --features <lsp set> -- --ignored dafny_real`.
+    #[tokio::test]
+    #[ignore = "requires the dafny LSP server on PATH; run with --ignored"]
+    async fn dafny_real_server_publishes_diagnostics() {
+        use crate::lsp::spawn::ProcessSpawner;
+
+        let tree = std::env::temp_dir().join(format!("dirge-dafny-lsp-{}", std::process::id()));
+        std::fs::create_dir_all(&tree).unwrap();
+        let file = tree.join("Bad.dfy");
+        // Type error: `r: int` assigned a bool. Surfaces as a fast
+        // resolution diagnostic (no proof / Z3 round-trip needed).
+        std::fs::write(&file, "method M() returns (r: int) {\n  r := true;\n}\n").unwrap();
+
+        let spawner = StdArc::new(ProcessSpawner::new(ProcessSpawner::default_commands()));
+        let manager = LspManager::new(spawner, tree.clone());
+
+        manager
+            .touch_file(
+                &file,
+                TouchMode::AwaitPush {
+                    after: Instant::now(),
+                    timeout: Duration::from_secs(90),
+                },
+            )
+            .await;
+
+        // The server launches and completes the initialize handshake
+        // through dirge's real spawn path (proves the `dafny server
+        // --verify-on change` command + registry wiring work in-app).
+        let active = manager.active_servers();
+        assert!(
+            active.iter().any(|(id, _)| id == "dafny"),
+            "dafny server should be active; active={active:?} broken={:?}",
+            manager.broken_servers()
+        );
+        assert!(
+            manager.broken_servers().is_empty(),
+            "dafny server must not land in the broken set"
+        );
+
+        // File-level features (diagnostics, document symbols) require a
+        // valid `file://` URI round-trip. On Windows that's currently
+        // broken: `canonicalize` yields a `\\?\C:\...` verbatim path and
+        // `lsp::uri::path_to_file_uri_string` percent-encodes the
+        // backslashes, so the server never matches the opened document.
+        // Tracked separately from Dafny support. On Unix the round-trip
+        // works, so assert diagnostics there.
+        #[cfg(not(windows))]
+        {
+            let diags = manager
+                .diagnostics_for(&file)
+                .expect("expected diagnostics for the type-mismatched .dfy");
+            assert!(!diags.is_empty(), "expected at least one diagnostic");
+        }
+
+        std::fs::remove_dir_all(&tree).ok();
+    }
+
     // Manager drop cascades through client guards. We can't directly assert
     // the spawned tokio task aborts, but we can assert dropping the manager
     // releases its state lock (no deadlock on shutdown).
