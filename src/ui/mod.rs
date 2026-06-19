@@ -3684,8 +3684,16 @@ fn render_question_options(
 /// by the per-delta re-render in `restream_expanded_thinking`.
 fn render_thinking_block(renderer: &mut Renderer, text: &str) -> std::io::Result<()> {
     renderer.write_line("  ╭─ thinking ─", crate::ui::theme::thinking())?;
+    // Wrap each line ourselves and carry the `  │ ` bar onto EVERY wrapped row.
+    // Passing `  │ {line}` straight to write_line lets its prefix-less wrap drop
+    // the bar on continuation rows, so a long thought escaped the box at the
+    // left edge. Pre-wrap to the content width minus the 4-col `  │ ` prefix so
+    // the prefixed row still fits and write_line doesn't wrap it again.
+    let inner_w = renderer.content_width().saturating_sub(4).max(1);
     for line in text.lines() {
-        renderer.write_line(&format!("  │ {}", line), crate::ui::theme::thinking())?;
+        for chunk in crate::ui::wrap::soft_wrap(line, inner_w, "") {
+            renderer.write_line(&format!("  │ {}", chunk), crate::ui::theme::thinking())?;
+        }
     }
     renderer.write_line("  ╰─", crate::ui::theme::thinking())?;
     renderer.write_line("", Color::White)?;

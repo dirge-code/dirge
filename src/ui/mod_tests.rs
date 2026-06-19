@@ -865,3 +865,37 @@ fn freeze_live_thinking_noop_when_not_tracking() {
     assert!(anchor.is_none());
     assert!(!expanded);
 }
+
+/// A long line in the expanded thinking block must wrap with the `│` bar on
+/// EVERY row — previously write_line wrapped `  │ {line}` with no continuation
+/// prefix, so wrapped rows dropped the bar and started at column 0, escaping
+/// the box. Width-agnostic: content_width caps at 120, so a 600-char line
+/// always wraps to multiple rows.
+#[test]
+fn expanded_thinking_wrapped_rows_keep_the_bar() {
+    let mut r = Renderer::new().expect("renderer");
+    let long = "word ".repeat(120);
+    render_thinking_block(&mut r, long.trim()).unwrap();
+
+    let lines: Vec<String> = r.buffer_lines().iter().map(|s| s.to_string()).collect();
+    let header = lines
+        .iter()
+        .position(|l| l.contains("╭─ thinking"))
+        .expect("thinking header present");
+    let footer = lines
+        .iter()
+        .position(|l| l.contains("╰─"))
+        .expect("thinking footer present");
+    let content = &lines[header + 1..footer];
+
+    assert!(
+        content.len() >= 2,
+        "a 600-char line must wrap to multiple rows: {content:?}"
+    );
+    for row in content {
+        assert!(
+            row.starts_with("  │"),
+            "every wrapped thinking row must keep the bar (stay in the box): {row:?}"
+        );
+    }
+}
