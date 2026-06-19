@@ -169,7 +169,7 @@ fn anthropic_token_is_expired(value: &serde_json::Value) -> bool {
     else {
         return false;
     };
-    expires_at <= chrono::Utc::now().timestamp_millis()
+    crate::auth::file_store::epoch_ms_is_expired(expires_at, chrono::Utc::now().timestamp_millis())
 }
 
 fn refresh_anthropic_token_sync(

@@ -1,7 +1,5 @@
 use std::io::{Read, Write};
 use std::net::TcpListener;
-#[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 
 use anyhow::Context;
@@ -142,19 +140,8 @@ fn persist_credentials_to_path(
     credentials: &AnthropicOAuthCredentials,
     path: PathBuf,
 ) -> anyhow::Result<PathBuf> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     let json = serde_json::json!({ "claudeAiOauth": credentials });
-    let bytes = serde_json::to_vec_pretty(&json)?;
-    let mut options = std::fs::OpenOptions::new();
-    options.create(true).write(true).truncate(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let mut file = options.open(&path)?;
-    file.write_all(&bytes)?;
-    #[cfg(unix)]
-    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    crate::auth::file_store::save_json_0600(&path, &json)?;
     Ok(path)
 }
 
@@ -254,6 +241,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn credentials_persist_with_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
         let creds = AnthropicOAuthCredentials {
             access_token: "sk-ant-oat-test".to_string(),
             refresh_token: "refresh".to_string(),
@@ -268,6 +257,42 @@ mod tests {
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn credentials_persist_round_trips_through_private_atomic_write() {
+        let creds = AnthropicOAuthCredentials {
+            access_token: "sk-ant-oat-roundtrip".to_string(),
+            refresh_token: "refresh-roundtrip".to_string(),
+            expires_at: 456,
+        };
+        let dir = std::env::temp_dir().join(format!(
+            "dirge-anthropic-oauth-roundtrip-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let path = dir.join(".claude").join(".credentials.json");
+
+        let returned = persist_credentials_to_path(&creds, path.clone()).unwrap();
+        assert_eq!(returned, path);
+
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            value["claudeAiOauth"]["accessToken"],
+            "sk-ant-oat-roundtrip"
+        );
+        assert_eq!(value["claudeAiOauth"]["refreshToken"], "refresh-roundtrip");
+        assert_eq!(value["claudeAiOauth"]["expiresAt"], 456);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -199,12 +199,10 @@ fn build_channels(cli: &cli::Cli, cfg: &config::Config) -> Channels {
 }
 
 fn command_is_config_free(command: &cli::Command) -> bool {
-    matches!(
-        command,
-        cli::Command::Auth {
-            action: cli::AuthAction::Openai,
-        }
-    )
+    // Both auth flows (OpenAI device-code and Anthropic loopback OAuth) only
+    // need the auth module and a local credential store, never the runtime
+    // config — so they dispatch before config loading.
+    matches!(command, cli::Command::Auth { .. })
 }
 
 /// Construct the `LspManager` (if LSP is enabled). Built standalone —
@@ -426,16 +424,11 @@ async fn main() -> anyhow::Result<()> {
     // Handle subcommands that exit before the TUI starts.
     if let Some(ref command) = cli.command {
         match command {
-            cli::Command::Auth { action } => match action {
-                cli::AuthAction::Openai => {
-                    unreachable!("OpenAI auth command handled before config load")
-                }
-                cli::AuthAction::Anthropic => {
-                    let path = provider::anthropic_oauth::login_and_persist().await?;
-                    println!("Anthropic OAuth credentials saved to {}", path.display());
-                    return Ok(());
-                }
-            },
+            // `dirge auth` (both variants) is dispatched before config load via
+            // `command_is_config_free`; it never reaches this post-config match.
+            cli::Command::Auth { .. } => {
+                unreachable!("auth commands handled before config load")
+            }
             cli::Command::Sandbox { action } => match action {
                 cli::SandboxAction::Check => {
                     println!("=== Bwrap sandbox ===");
@@ -1800,11 +1793,13 @@ mod session_id_tests {
     }
 
     #[test]
-    fn anthropic_auth_command_still_loads_config() {
+    fn anthropic_auth_command_is_config_free() {
+        // Both auth flows are now dispatched before config load via the single
+        // `run_auth_action` path; neither login needs runtime config.
         let cli = cli::Cli::parse_from(["dirge", "auth", "anthropic"]);
         let command = cli.command.as_ref().unwrap();
 
-        assert!(!command_is_config_free(command));
+        assert!(command_is_config_free(command));
     }
 
     #[test]

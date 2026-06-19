@@ -284,6 +284,7 @@ pub enum AuthAction {
     /// Log in to OpenAI using device-code auth
     #[command(
         name = "openai",
+        visible_alias = "chatgpt",
         long_about = "Log in to OpenAI using device-code auth.\n\nBefore running this command, enable device-code auth in ChatGPT Codex security settings."
     )]
     Openai,
@@ -406,6 +407,18 @@ mod tests {
                 action: AuthAction::Openai,
             }) => {}
             other => panic!("expected auth openai command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_auth_chatgpt_alias_as_openai() {
+        let cli = Cli::try_parse_from(["dirge", "auth", "chatgpt"]).unwrap();
+
+        match cli.command {
+            Some(Command::Auth {
+                action: AuthAction::Openai,
+            }) => {}
+            other => panic!("expected auth openai command from chatgpt alias, got {other:?}"),
         }
     }
 

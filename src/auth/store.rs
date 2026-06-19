@@ -1,17 +1,10 @@
+use super::file_store::OPENAI_ACCOUNT_ID_ALIASES as ACCOUNT_ID_KEYS;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
 type Result<T> = std::result::Result<T, AuthStoreError>;
-
-const ACCOUNT_ID_KEYS: &[&str] = &[
-    "account_id",
-    "chatgpt_account_id",
-    "chatgptAccountId",
-    "chatgpt_account",
-    "accountId",
-];
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum AuthStoreError {
@@ -86,7 +79,7 @@ impl OpenAiOAuthCredential {
     }
 
     pub(crate) fn is_expired_at(&self, epoch_ms: i64) -> bool {
-        epoch_ms >= self.expires_at_epoch_ms
+        super::file_store::epoch_ms_is_expired(self.expires_at_epoch_ms, epoch_ms)
     }
 
     pub(crate) fn is_fresh_at(&self, epoch_ms: i64) -> bool {
@@ -178,22 +171,12 @@ impl OpenAiAuthStore {
         }
         document.insert("openai".to_string(), Value::Object(openai));
 
-        self.ensure_parent_dir()?;
-        let bytes = serde_json::to_vec_pretty(&Value::Object(document)).map_err(|source| {
-            AuthStoreError::Serialize {
-                path: self.path.clone(),
-                source,
-            }
-        })?;
-        self.prepare_existing_file_for_private_replace()?;
-        crate::fs_atomic::atomic_write_sync(&self.path, &bytes).map_err(|source| {
+        super::file_store::save_json_0600(&self.path, &Value::Object(document)).map_err(|source| {
             AuthStoreError::Io {
                 path: self.path.clone(),
-                source,
+                source: std::io::Error::other(source.to_string()),
             }
-        })?;
-        self.restrict_file_permissions()?;
-        Ok(())
+        })
     }
 
     fn load_document(&self) -> Result<Option<Map<String, Value>>> {
@@ -219,31 +202,6 @@ impl OpenAiAuthStore {
                 reason: "top-level auth document must be a JSON object".to_string(),
             }),
         }
-    }
-
-    fn ensure_parent_dir(&self) -> Result<()> {
-        let Some(parent) = self
-            .path
-            .parent()
-            .filter(|path| !path.as_os_str().is_empty())
-        else {
-            return Ok(());
-        };
-        std::fs::create_dir_all(parent).map_err(|source| AuthStoreError::Io {
-            path: parent.to_path_buf(),
-            source,
-        })?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).map_err(
-                |source| AuthStoreError::Io {
-                    path: parent.to_path_buf(),
-                    source,
-                },
-            )?;
-        }
-        Ok(())
     }
 
     #[cfg(unix)]
@@ -315,18 +273,12 @@ fn normalize_optional_string(value: Option<String>) -> Option<String> {
 }
 
 fn canonicalize_account_id_aliases(openai: &mut Map<String, Value>) {
-    let account_id = openai.get("account_id").cloned().or_else(|| {
-        ACCOUNT_ID_KEYS
-            .iter()
-            .copied()
-            .filter(|key| *key != "account_id")
-            .find_map(|key| openai.get(key).cloned())
-    });
+    let account_id = super::file_store::extract_account_id(&Value::Object(openai.clone()));
     for key in ACCOUNT_ID_KEYS {
         openai.remove(*key);
     }
     if let Some(account_id) = account_id {
-        openai.insert("account_id".to_string(), account_id);
+        openai.insert("account_id".to_string(), json!(account_id));
     }
 }
 
