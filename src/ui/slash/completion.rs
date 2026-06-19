@@ -588,7 +588,7 @@ mod tests {
         assert_eq!(c, vec!["standard"]);
     }
 
-    #[cfg(feature = "slash-completion")]
+    #[cfg(all(feature = "slash-completion", feature = "plugin"))]
     #[test]
     fn plugin_command_in_all_commands() {
         register_plugin_commands(vec!["myplugin".to_string()]);
@@ -596,7 +596,7 @@ mod tests {
         assert!(cmds.contains(&"/myplugin".to_string()));
     }
 
-    #[cfg(feature = "slash-completion")]
+    #[cfg(all(feature = "slash-completion", feature = "plugin"))]
     #[test]
     fn plugin_command_completion_cycles() {
         register_plugin_commands(vec!["myplugin".to_string()]);
@@ -605,7 +605,7 @@ mod tests {
         assert_eq!(r.new_buffer, "/myplugin");
     }
 
-    #[cfg(feature = "slash-completion")]
+    #[cfg(all(feature = "slash-completion", feature = "plugin"))]
     #[test]
     fn plugin_command_ghost_suffix() {
         register_plugin_commands(vec!["myplugin".to_string()]);

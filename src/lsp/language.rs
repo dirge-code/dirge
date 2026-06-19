@@ -74,6 +74,7 @@ const LANGUAGES: &[(&str, &str)] = &[
     ("xml", "xml"),
     ("nix", "nix"),
     ("zig", "zig"),
+    ("dfy", "dafny"),
 ];
 
 const FILENAMES: &[(&str, &str)] = &[("makefile", "makefile"), ("dockerfile", "dockerfile")];
@@ -125,6 +126,12 @@ mod tests {
         // in filenames must not break the mapping.
         assert_eq!(lang("README.MD"), "markdown");
         assert_eq!(lang("Main.RS"), "rust");
+    }
+
+    #[test]
+    fn dfy_is_dafny() {
+        assert_eq!(lang("src/Spec.dfy"), "dafny");
+        assert_eq!(lang("Spec.DFY"), "dafny");
     }
 
     #[test]

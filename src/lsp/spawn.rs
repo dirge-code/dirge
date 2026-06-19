@@ -154,6 +154,16 @@ impl ProcessSpawner {
                 init_options: Value::Null,
             },
         );
+        // Dafny CLI's built-in language server: `dafny server` (stdio).
+        m.insert(
+            "dafny".to_string(),
+            ProcessCommand {
+                program: PathBuf::from("dafny"),
+                args: vec!["server".to_string()],
+                env: vec![],
+                init_options: Value::Null,
+            },
+        );
         m
     }
 }

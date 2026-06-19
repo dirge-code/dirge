@@ -88,6 +88,7 @@ fn normalize_lang(lang: &str) -> &str {
         "toml" => "toml",
         "sql" => "sql",
         "md" | "markdown" => "markdown",
+        "dfy" | "dafny" => "dafny",
         other => other,
     }
 }
@@ -126,6 +127,7 @@ fn rules_for(lang: &str) -> Option<&'static Rules> {
         "yaml" => Some(&YAML_RULES),
         "toml" => Some(&TOML_RULES),
         "sql" => Some(&SQL_RULES),
+        "dafny" => Some(&DAFNY_RULES),
         _ => None,
     }
 }
@@ -692,6 +694,92 @@ static RUST_RULES: Rules = Rules {
     hash_directive: false,
 };
 
+static DAFNY_RULES: Rules = Rules {
+    keywords: &[
+        "abstract",
+        "allocated",
+        "as",
+        "assert",
+        "assume",
+        "by",
+        "calc",
+        "case",
+        "class",
+        "codatatype",
+        "const",
+        "constructor",
+        "datatype",
+        "decreases",
+        "downto",
+        "else",
+        "ensures",
+        "exists",
+        "export",
+        "extends",
+        "false",
+        "for",
+        "forall",
+        "fresh",
+        "function",
+        "ghost",
+        "if",
+        "iff",
+        "import",
+        "in",
+        "include",
+        "invariant",
+        "is",
+        "iterator",
+        "label",
+        "lemma",
+        "match",
+        "method",
+        "modifies",
+        "modify",
+        "module",
+        "nameonly",
+        "new",
+        "newtype",
+        "null",
+        "old",
+        "older",
+        "opened",
+        "predicate",
+        "print",
+        "provides",
+        "reads",
+        "refines",
+        "replaces",
+        "requires",
+        "return",
+        "returns",
+        "reveal",
+        "reveals",
+        "static",
+        "then",
+        "this",
+        "to",
+        "trait",
+        "true",
+        "twostate",
+        "type",
+        "unchanged",
+        "var",
+        "while",
+        "witness",
+        "yield",
+        "yields",
+    ],
+    types: &[
+        "bool", "char", "int", "nat", "real", "string", "seq", "set", "iset", "multiset", "map",
+        "imap", "array", "array2", "array3", "object", "ORDINAL", "bv8", "bv16", "bv32", "bv64",
+    ],
+    line_comment: Some("//"),
+    block_comment: Some(("/*", "*/")),
+    string_delims: &['"', '\''],
+    hash_directive: false,
+};
+
 static JAVA_RULES: Rules = Rules {
     keywords: &[
         "abstract",
@@ -1136,6 +1224,18 @@ mod tests {
         let row = &lines[0];
         let fn_span = row.iter().find(|s| s.text == "fn").expect("fn span");
         assert_eq!(fn_span.color, theme::user());
+    }
+
+    #[test]
+    fn dafny_keywords_colored_via_alias() {
+        assert!(supports("dfy") && supports("dafny"));
+        let lines = render("method Foo() { assert true; }", "dfy");
+        let row = &lines[0];
+        let kw = row
+            .iter()
+            .find(|s| s.text == "method")
+            .expect("method span");
+        assert_eq!(kw.color, theme::user());
     }
 
     #[test]

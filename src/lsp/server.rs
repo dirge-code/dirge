@@ -212,6 +212,12 @@ fn bash_root(file: &Path, stop_at: &Path) -> Option<PathBuf> {
         .or_else(|| Some(stop_at.to_path_buf()))
 }
 
+fn dafny_root(file: &Path, stop_at: &Path) -> Option<PathBuf> {
+    // `dfyconfig.toml` is Dafny's project marker; fall back to the
+    // worktree boundary for loose single-file specs.
+    nearest_root(file, stop_at, &["dfyconfig.toml"], &[])
+}
+
 /// All built-in LSP server descriptors. Order is significant only for tie-
 /// breaking when an extension is claimed by more than one server — earlier
 /// entries are tried first.
@@ -269,6 +275,14 @@ pub fn builtin_servers() -> Vec<ServerInfo> {
             id: "bash-language-server",
             extensions: owned(&["sh", "bash"]),
             root: bash_root,
+        },
+        // Dafny: `dafny server` speaks LSP over stdio. Best-effort like
+        // the others — if `dafny` isn't on PATH the spawn errors and the
+        // broken-server backoff takes over.
+        ServerInfo {
+            id: "dafny",
+            extensions: owned(&["dfy"]),
+            root: dafny_root,
         },
     ]
 }

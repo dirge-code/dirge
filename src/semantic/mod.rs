@@ -65,6 +65,9 @@ impl SemanticManager {
         #[cfg(feature = "semantic-elixir")]
         adapters.push(Box::new(adapters::ElixirAdapter));
 
+        #[cfg(feature = "semantic-dafny")]
+        adapters.push(Box::new(adapters::DafnyAdapter));
+
         let registry = Arc::new(adapters::AdapterRegistry::new(adapters));
         let index = Arc::new(RwLock::new(SymbolIndex::new(registry)));
 

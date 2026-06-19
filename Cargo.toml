@@ -76,6 +76,7 @@ default = [
     'semantic-c',
     'semantic-cpp',
     'semantic-elixir',
+    'semantic-dafny',
     'slash-completion',
     'mcp-server',
 ]
@@ -103,6 +104,7 @@ windows-default = [
     'semantic-c',
     'semantic-cpp',
     'semantic-elixir',
+    'semantic-dafny',
     'slash-completion',
     'mcp-server',
 ]
@@ -131,6 +133,7 @@ semantic-java = ["semantic", "dep:tree-sitter-java"]
 semantic-c = ["semantic", "dep:tree-sitter-c"]
 semantic-cpp = ["semantic", "dep:tree-sitter-cpp"]
 semantic-elixir = ["semantic", "dep:tree-sitter-elixir"]
+semantic-dafny = ["semantic", "dep:tree-sitter-dafny"]
 plugin = ["dep:janetrs"]
 lsp = ["dep:lsp-types"]
 dap = ["dep:which", "dep:dap"]
@@ -257,6 +260,10 @@ html2text = "0.17"
 indexmap = "2"
 lsp-types = { version = "0.97", optional = true }
 tree-sitter-elixir = { version = "0.3.5", optional = true }
+# Local, unpublished grammar (path dep). Switch to a git dep
+# (`git = "https://github.com/hath995/tree-sitter-dafny"`) for CI / other
+# machines. Builds via `cc` (parser.c + scanner.c) — no bindgen, MSVC-safe.
+tree-sitter-dafny = { path = "../dafny-treesitter/tree-sitter-dafny", optional = true }
 rusqlite = { version = "0.31", features = ["bundled"] }
 # DAP (Debug Adapter Protocol) — optional feature for driving
 # debuggers (lldb-dap, dlv, debugpy, node) to fix crashes instead

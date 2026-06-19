@@ -5,6 +5,8 @@ mod c;
 mod clojure;
 #[cfg(feature = "semantic-cpp")]
 mod cpp;
+#[cfg(feature = "semantic-dafny")]
+mod dafny;
 #[cfg(feature = "semantic-elixir")]
 mod elixir;
 #[cfg(feature = "semantic-go")]
@@ -26,6 +28,8 @@ pub use c::CAdapter;
 pub use clojure::ClojureAdapter;
 #[cfg(feature = "semantic-cpp")]
 pub use cpp::CppAdapter;
+#[cfg(feature = "semantic-dafny")]
+pub use dafny::DafnyAdapter;
 #[cfg(feature = "semantic-elixir")]
 pub use elixir::ElixirAdapter;
 #[cfg(feature = "semantic-go")]
