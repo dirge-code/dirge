@@ -360,6 +360,18 @@ impl Sandbox {
         // legitimate `KEY_BINDINGS` env var stripped) are acceptable
         // cost — the alternative is leaking credentials.
         scrub_env(&mut cmd);
+
+        // dirge-tc2q: force non-interactive defaults so tools that would
+        // otherwise prompt fail fast with a clear message instead of
+        // blocking. `detach_session` (exec.rs) already removes the
+        // controlling terminal so /dev/tty prompts can't hang; these turn
+        // the same situations into clean errors and cover the GUI-askpass
+        // / credential-manager paths that don't go through the tty. Set
+        // unconditionally — an agent has no human at the keyboard to
+        // answer a prompt regardless of the inherited environment.
+        cmd.env("GIT_TERMINAL_PROMPT", "0");
+        cmd.env("GCM_INTERACTIVE", "Never");
+        cmd.env("DEBIAN_FRONTEND", "noninteractive");
         cmd
     }
 
@@ -1182,6 +1194,28 @@ mod tests {
         assert!(
             out.contains("echo hello"),
             "expected 'echo hello' in command args, got: {out}"
+        );
+    }
+
+    // dirge-tc2q: every wrapped command gets non-interactive env
+    // defaults so prompting tools fail fast instead of blocking on a
+    // tty the agent can't answer.
+    #[test]
+    fn wrap_command_sets_noninteractive_env() {
+        let sb = Sandbox::new(SandboxMode::Off);
+        let cmd = sb.wrap_command("true");
+        let found: std::collections::HashMap<String, String> = cmd
+            .as_std()
+            .get_envs()
+            .filter_map(|(k, v)| {
+                v.map(|v| (k.to_string_lossy().into_owned(), v.to_string_lossy().into_owned()))
+            })
+            .collect();
+        assert_eq!(found.get("GIT_TERMINAL_PROMPT").map(String::as_str), Some("0"));
+        assert_eq!(found.get("GCM_INTERACTIVE").map(String::as_str), Some("Never"));
+        assert_eq!(
+            found.get("DEBIAN_FRONTEND").map(String::as_str),
+            Some("noninteractive")
         );
     }
 

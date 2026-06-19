@@ -207,6 +207,68 @@ async fn run_with_timeout_interleaves_stdout_stderr() {
     );
 }
 
+/// dirge-tc2q: the bash child must run in its OWN session so it has no
+/// controlling terminal. That's what makes interactive credential
+/// prompts fail fast: git/ssh open `/dev/tty` (NOT stdin, which we
+/// already null), and with no controlling terminal that open fails with
+/// ENXIO instead of blocking until the timeout. `setsid()` makes the
+/// child a session leader, so `getsid(child) == child_pid`. The old
+/// `process_group(0)` only made a new process group — the child kept
+/// the parent's session, so this would NOT hold.
+#[cfg(unix)]
+#[tokio::test]
+async fn child_runs_in_its_own_session() {
+    use std::process::Stdio;
+    let mut cmd = Command::new("sleep");
+    cmd.arg("2")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    super::exec::detach_session(&mut cmd);
+    let child = cmd.spawn().expect("spawn sleep");
+    let pid = child.id().expect("child pid") as libc::pid_t;
+
+    // getsid(pid) == pid  ⟺  the child is its own session leader.
+    let sid = unsafe { libc::getsid(pid) };
+    assert_eq!(sid, pid, "child must be its own session leader (setsid)");
+    // And it must NOT share the test process's session.
+    let my_sid = unsafe { libc::getsid(0) };
+    assert_ne!(sid, my_sid, "child session must differ from parent's");
+
+    // Reap.
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+    }
+}
+
+/// dirge-tc2q: end-to-end — a command that reads from `/dev/tty` must
+/// NOT hang to the timeout. With the child detached from the
+/// controlling terminal the `/dev/tty` open fails and bash exits fast
+/// (non-zero), well under the requested timeout. (When the test host
+/// has no controlling terminal this also passes; the assertion is that
+/// we never block for the full timeout.)
+#[tokio::test]
+async fn reading_dev_tty_fails_fast_not_timeout() {
+    let start = std::time::Instant::now();
+    let cmd = {
+        let mut c = Command::new("bash");
+        c.arg("-c").arg("cat /dev/tty");
+        c
+    };
+    // Generous timeout so a real hang would be obvious.
+    let result = run_with_timeout(cmd, 10).await;
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "reading /dev/tty should fail fast, not block to timeout (took {elapsed:?})",
+    );
+    // It should be a normal (non-zero) exit, not our timeout error.
+    match result {
+        Ok(out) => assert_ne!(out.exit_code, 0, "cat /dev/tty should fail"),
+        Err(e) => panic!("expected fast non-zero exit, got error: {e:?}"),
+    }
+}
+
 /// F10: a `;` inside double quotes is part of the string, not a
 /// segment boundary. Before this, the naive splitter produced
 /// two segments, the second being `rm -rf /"`, which could

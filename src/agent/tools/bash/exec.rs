@@ -59,6 +59,41 @@ impl Drop for PgKillGuard {
     }
 }
 
+/// Put the spawned child in its own session: a new session with no
+/// controlling terminal, and (as a side effect of `setsid`) a new
+/// process group whose pgid == pid.
+///
+/// This is the Unix mechanism that makes interactive prompts fail fast.
+/// `stdin(Stdio::null())` is not enough: git/ssh and friends read
+/// credentials from `/dev/tty` — the *controlling terminal* — not stdin.
+/// In Off sandbox mode the bash child would otherwise inherit dirge's
+/// controlling terminal (a bare `process_group(0)` makes a new group but
+/// keeps the session + terminal), so a `git clone` username prompt blocks
+/// on the TUI's tty until the timeout. With no controlling terminal the
+/// `/dev/tty` open fails with ENXIO and the prompt errors out instantly.
+/// Bwrap mode already gets this via bwrap's `--new-session`; this brings
+/// Off mode in line. Mirrors the DAP adapter spawn (`dap/client.rs`).
+///
+/// pgid == pid is preserved, so the `killpg(-pid, SIGKILL)` paths below
+/// (timeout + `PgKillGuard`) still reach the whole subprocess tree.
+#[cfg(unix)]
+pub(crate) fn detach_session(cmd: &mut Command) {
+    // SAFETY: pre_exec runs in the forked child before exec. setsid()
+    // is async-signal-safe; immediately after fork the child is not a
+    // process-group leader, so setsid() succeeds and creates a new
+    // session (no controlling terminal). Returning the error aborts the
+    // spawn rather than running the command attached to dirge's tty.
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        cmd.as_std_mut().pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
 /// Spawn `cmd` into its own process group and wait for it,
 /// capped at `secs`. On timeout, send SIGKILL to the process
 /// group so the whole subprocess tree dies — not just bash. On
@@ -81,11 +116,11 @@ pub(crate) async fn run_with_timeout(
 
     #[cfg(unix)]
     {
-        // process_group(0) makes the spawned child the leader of a
-        // new process group with pgid = pid. Then `killpg(-pid)`
-        // reaches every descendant. (tokio's `Command` exposes this
-        // natively without needing the std `CommandExt` trait.)
-        cmd.process_group(0);
+        // New session (not just a new process group): detaches the
+        // controlling terminal so interactive prompts fail fast, and
+        // still gives pgid == pid so `killpg(-pid)` reaches every
+        // descendant. See `detach_session`.
+        detach_session(&mut cmd);
     }
 
     let mut child = cmd
@@ -296,7 +331,7 @@ pub(super) fn spawn_streaming_shell(
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         #[cfg(unix)]
-        cmd.process_group(0);
+        detach_session(&mut cmd);
 
         let mut child = match cmd.spawn() {
             Ok(c) => c,
