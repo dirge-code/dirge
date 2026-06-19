@@ -56,3 +56,5 @@ spikes/
 #misc
 publishing.md
 /tmux
+LOOP_PLAN.md
+__pycache__/
