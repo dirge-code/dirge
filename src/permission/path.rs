@@ -30,6 +30,54 @@ pub fn canonical_or_self(path: &Path) -> std::path::PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+/// Normalize a path string for prefix comparison. On Windows
+/// `canonicalize` yields a `\\?\C:\...` verbatim path with backslashes,
+/// and callers may pass `/`-vs-`\` mixed separators or differing
+/// drive-letter case; left unnormalized, the slash-anchored prefix test
+/// in [`path_is_within`] never matches and every in-cwd file is
+/// misclassified as external. Strip the `\\?\` / `\\?\UNC\` prefix,
+/// unify separators to `/`, and lowercase (NTFS is case-insensitive).
+/// No-op on Unix, so the existing forward-slash logic is unchanged.
+#[cfg(windows)]
+fn normalize_for_prefix(s: &str) -> String {
+    let stripped = s
+        .strip_prefix(r"\\?\UNC\")
+        .map(|rest| format!(r"\\{rest}"))
+        .unwrap_or_else(|| s.strip_prefix(r"\\?\").unwrap_or(s).to_string());
+    stripped.replace('\\', "/").to_lowercase()
+}
+
+#[cfg(not(windows))]
+fn normalize_for_prefix(s: &str) -> String {
+    s.to_string()
+}
+
+/// Whether `child` is `base` itself or a path nested under it. The
+/// comparison is boundary-safe — `/foo` does NOT contain `/foobar` —
+/// because the prefix test requires a trailing separator. On Windows it
+/// tolerates the `\\?\` verbatim prefix, `/`-vs-`\` separators, and
+/// drive-letter case (see [`normalize_for_prefix`]). An empty or root
+/// `base` matches nothing (callers treat "no usable cwd" as external).
+pub(crate) fn path_is_within(child: &str, base: &str) -> bool {
+    let child = normalize_for_prefix(child);
+    let base = normalize_for_prefix(base);
+    let base = base.trim_end_matches('/');
+    // Refuse filesystem roots as a containing dir: empty, `/`, and the
+    // Windows drive-root form (`c:` after the trailing-slash trim). Without
+    // the drive-root guard, `c:/` would match every path on the drive and
+    // a `/` working_dir would silently allow everything.
+    if base.is_empty() || base == "/" || is_drive_root(base) {
+        return false;
+    }
+    child == base || child.starts_with(&format!("{base}/"))
+}
+
+/// `c:` / `Z:` — a normalized drive root with no path component.
+fn is_drive_root(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 2 && b[0].is_ascii_alphabetic() && b[1] == b':'
+}
+
 pub(crate) fn resolve_absolute(path: &str, working_dir: &str) -> String {
     let p = Path::new(path);
     let joined = if p.is_absolute() {
@@ -167,6 +215,34 @@ pub fn validate_path(path: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn path_is_within_basic_and_boundary() {
+        assert!(path_is_within("/proj/src/a.rs", "/proj"));
+        assert!(path_is_within("/proj", "/proj"));
+        assert!(path_is_within("/proj/", "/proj"));
+        // Boundary-safe: a sibling sharing a name prefix is NOT within.
+        assert!(!path_is_within("/proj-other/a.rs", "/proj"));
+        assert!(!path_is_within("/elsewhere/a.rs", "/proj"));
+        // Empty / root base matches nothing.
+        assert!(!path_is_within("/a", ""));
+        assert!(!path_is_within("/a", "/"));
+    }
+
+    /// The Windows regression: a `\\?\C:\...` verbatim canonical path,
+    /// mixed `/`-vs-`\` separators, and drive-letter case must all still
+    /// resolve as in-cwd. Before the fix the slash-anchored prefix test
+    /// failed on every Windows in-project file → "outside project".
+    #[cfg(windows)]
+    #[test]
+    fn path_is_within_windows_verbatim_separators_and_case() {
+        assert!(path_is_within(r"\\?\C:\proj\src\a.dfy", r"C:\proj"));
+        assert!(path_is_within(r"\\?\C:\proj/src/a.dfy", r"C:\proj"));
+        assert!(path_is_within(r"\\?\c:\proj\src\a.dfy", r"C:\proj"));
+        assert!(path_is_within(r"C:\proj\a.dfy", r"\\?\C:\proj"));
+        // Boundary still enforced under normalization.
+        assert!(!path_is_within(r"\\?\C:\proj-other\a.dfy", r"C:\proj"));
+    }
 
     /// F7: `resolve_absolute` must follow symlinks so a symlink
     /// pointing at a deny-listed path can't bypass the rule.

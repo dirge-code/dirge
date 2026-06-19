@@ -84,12 +84,9 @@ pub fn classify_path(raw: &str, working_dir: &str) -> Resource {
     // in-tree paths as external: the path resolved through the
     // deepest-existing-ancestor canonicalization, the cached
     // canonical, and the literal working_dir.
-    let under = |base: &str| {
-        let b = base.trim_end_matches('/');
-        !b.is_empty()
-            && b != "/"
-            && (resolved_str == b || resolved_str.starts_with(&format!("{b}/")))
-    };
+    // Boundary-safe, Windows-tolerant containment (handles `\\?\`
+    // verbatim prefixes, `/`-vs-`\` separators, drive-letter case).
+    let under = |base: &str| crate::permission::path::path_is_within(&resolved_str, base);
     // A working_dir containing glob metacharacters can't anchor a
     // trustworthy in-cwd classification (the old code refused to
     // install a CWD-allow for such dirs); treat nothing as in-cwd so
@@ -296,6 +293,41 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// Regression for the Windows "outside project" misclassification:
+    /// against a REAL on-disk cwd, `canonicalize` returns a `\\?\C:\...`
+    /// verbatim path with backslashes, so the old slash-anchored prefix
+    /// test marked every in-project file external. Uses real dirs so the
+    /// canonicalize path (not the lexical fallback) is exercised.
+    #[test]
+    fn classify_path_real_cwd_in_project_is_in_cwd() {
+        let cwd = std::env::temp_dir().join(format!("dirge-classify-real-{}", std::process::id()));
+        std::fs::create_dir_all(cwd.join("sub")).unwrap();
+        let file = cwd.join("sub").join("a.dfy");
+        std::fs::write(&file, "// x\n").unwrap();
+        let cwd_s = cwd.to_string_lossy();
+
+        let inside = classify_path(&file.to_string_lossy(), &cwd_s);
+        assert!(
+            matches!(inside, Resource::Path { in_cwd: true, .. }),
+            "in-project file must classify in_cwd; got {inside:?}"
+        );
+
+        // A path outside the cwd subtree stays external.
+        let outside_dir =
+            std::env::temp_dir().join(format!("dirge-classify-out-{}", std::process::id()));
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        let outside = outside_dir.join("b.dfy");
+        std::fs::write(&outside, "// y\n").unwrap();
+        let ext = classify_path(&outside.to_string_lossy(), &cwd_s);
+        assert!(
+            matches!(ext, Resource::Path { in_cwd: false, .. }),
+            "out-of-project file must classify external; got {ext:?}"
+        );
+
+        std::fs::remove_dir_all(&cwd).ok();
+        std::fs::remove_dir_all(&outside_dir).ok();
     }
 
     #[test]

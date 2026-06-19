@@ -475,7 +475,6 @@ impl PermissionChecker {
             // fall through to the default action.
             return false;
         }
-        let cwd = Path::new(&self.working_dir);
         // PERM-3: re-canonicalize at check time so a symlink
         // rewrite (or `working_dir_canonical` going stale for
         // any other reason) doesn't misclassify in-tree paths
@@ -487,14 +486,14 @@ impl PermissionChecker {
         // canonical, AND the literal form handles symlinked
         // roots like macOS's `/tmp → /private/tmp`: `resolved`
         // is canonical (`/private/tmp/...`) but `cwd` may still
-        // be the literal `/tmp` form. Without all three checks
-        // every in-tree access in such a setup would classify
-        // as external.
-        let canonical_cwd_cached = Path::new(&self.working_dir_canonical);
-        let canonical_cwd_fresh = Path::new(&fresh_canonical);
-        !p.starts_with(canonical_cwd_fresh)
-            && !p.starts_with(canonical_cwd_cached)
-            && !p.starts_with(cwd)
+        // be the literal `/tmp` form. `path_is_within` is also
+        // Windows-tolerant (verbatim `\\?\` prefix, `/`-vs-`\`,
+        // drive-letter case) — a plain `Path::starts_with` against
+        // a `\\?\C:\...` canonical path misclassified every
+        // in-tree file as external.
+        !(path::path_is_within(&resolved, &fresh_canonical)
+            || path::path_is_within(&resolved, &self.working_dir_canonical)
+            || path::path_is_within(&resolved, &self.working_dir))
     }
 }
 
