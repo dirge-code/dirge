@@ -69,7 +69,7 @@ use super::types::{Context, LoopConfig};
 /// steering gets a fresh budget; ambient reminders do not.
 async fn poll_steering_and_reminder(
     config: &LoopConfig,
-    failure_tracker: &super::failure_tracker::FailureTracker,
+    guards: &super::activity::LoopGuards,
 ) -> (Vec<LoopMessage>, bool) {
     let mut out = match &config.get_steering_messages {
         Some(get) => get().await,
@@ -82,7 +82,7 @@ async fn poll_steering_and_reminder(
     // Cross-turn recovery checkpoint: fired when consecutive *distinct*
     // tool errors pile up (storm only catches identical repeats). Follows
     // any user steering so the human's guidance is read first.
-    out.extend(failure_tracker.poll_reflection());
+    out.extend(guards.poll_reflection());
     (out, had_user_steering)
 }
 
@@ -962,17 +962,20 @@ pub async fn run_loop(
 ) -> Vec<LoopMessage> {
     let mut first_turn = true;
 
-    // Storm breaker: tracks (tool_name, args) repeats to detect
-    // stuck-in-a-loop behavior. Reset each new user turn.
-    // Port of Reasonix `repair/index.ts:38-46` + `loop.ts:621`.
-    let mut storm = storm_for_config(&config);
-
-    // Cross-turn failure tracker: counts consecutive errored tool
-    // results (NOT reset per turn, unlike storm) and injects a
-    // recovery checkpoint when a streak of distinct failures piles up.
-    // Catches the thrash storm misses — a model failing differently
-    // every call. dirge-opdt.
-    let failure_tracker = super::failure_tracker::FailureTracker::new(FAILURE_REFLECTION_THRESHOLD);
+    // Loop-protection guards behind one facade (dirge-hn60). Two engines:
+    //   - storm breaker: pre-dispatch, SUPPRESSES a call repeated with
+    //     identical args (reset each user turn). Port of Reasonix
+    //     `repair/index.ts:38-46` + `loop.ts:621`.
+    //   - failure tracker: post-result, NUDGES when errors pile up across
+    //     turns (reset by success), catching the thrash storm misses —
+    //     a model failing differently every call (dirge-opdt).
+    // The facade classifies each result once (Ok/Error/Timeout) and feeds
+    // both, so a timeout escalates in each: the tracker counts it double,
+    // the storm breaker drops its threshold for that exact call.
+    let mut guards = super::activity::LoopGuards::new(
+        storm_for_config(&config),
+        super::failure_tracker::FailureTracker::new(FAILURE_REFLECTION_THRESHOLD),
+    );
 
     // Inflight set: authoritative running-id tracker.
     // UI cards consult `inflight.has(call_id)` to derive spinner state.
@@ -999,7 +1002,7 @@ pub async fn run_loop(
     // Phase 4 part 2: composes with the file-touch tracker's
     // reminder poll when configured.
     let (mut pending_messages, _initial_user_steering): (Vec<LoopMessage>, bool) =
-        poll_steering_and_reminder(&config, &failure_tracker).await;
+        poll_steering_and_reminder(&config, &guards).await;
 
     // dirge-nqr: count assistant turns so a hard cap can stop a
     // runaway run. `max_turns = None` means unlimited (legacy).
@@ -1038,7 +1041,7 @@ pub async fn run_loop(
     'outer: loop {
         // Storm: fresh intent on each new user turn.
         // Port of Reasonix loop.ts:621 `this.repair.resetStorm()`.
-        storm.reset();
+        guards.reset_turn();
         let mut turn_self_corrected = false;
 
         // Multi-tier: fresh turn intent — clear fold flag.
@@ -1335,7 +1338,7 @@ pub async fn run_loop(
             let mut storm_give_up_tools: Option<Vec<String>> = None;
             if !tool_calls.is_empty() {
                 let original_count = tool_calls.len();
-                let (surviving_calls, storm_report) = storm.filter_calls(&tool_calls);
+                let (surviving_calls, storm_report) = guards.inspect_calls(&tool_calls);
                 let all_suppressed = storm_report.all_suppressed(original_count);
 
                 // Port of Reasonix loop.ts:935-956 — first-time
@@ -1422,11 +1425,24 @@ pub async fn run_loop(
                     tool_results.extend(batch.messages.clone());
                     has_more_tool_calls = !batch.terminate;
                     for result in &batch.messages {
-                        failure_tracker.record_result(
-                            result.is_error,
-                            &result.tool_name,
-                            &tool_result_excerpt(&result.content),
-                        );
+                        // Classify + feed both guards. Match the result back
+                        // to its originating call so a timeout can be tied to
+                        // the exact signature the storm breaker will see on a
+                        // retry. `surviving_calls` are the dispatched ones, so
+                        // the id lookup hits; fall back to a name-only call if
+                        // it somehow doesn't (defensive — still feeds the
+                        // failure tracker, just no storm signature).
+                        let excerpt = tool_result_excerpt(&result.content);
+                        let originating = surviving_calls
+                            .iter()
+                            .find(|c| c.id == result.tool_call_id)
+                            .cloned()
+                            .unwrap_or_else(|| super::tools::ToolCall {
+                                id: result.tool_call_id.clone(),
+                                name: result.tool_name.clone(),
+                                arguments: serde_json::Value::Null,
+                            });
+                        guards.record_result(&originating, result.is_error, &excerpt);
                         current_context.messages.push(tool_result_to_value(result));
                         new_messages.push(LoopMessage::ToolResult(result.clone()));
                     }
@@ -1714,7 +1730,7 @@ pub async fn run_loop(
             // Pi line 253: refresh steering for next iteration.
             // Phase 4 part 2: also polls the file-touch tracker.
             let (next_pending, had_user_steering) =
-                poll_steering_and_reminder(&config, &failure_tracker).await;
+                poll_steering_and_reminder(&config, &guards).await;
             pending_messages = next_pending;
 
             // dirge-st8r: a fresh USER steering message means the human is

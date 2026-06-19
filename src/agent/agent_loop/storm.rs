@@ -14,7 +14,9 @@
 //! Storm-exempt tools (cheap inspectors like `list_dir`) never trip
 //! the guard regardless of repetition count.
 
+use super::activity::Outcome;
 use super::tools::ToolCall;
+use std::collections::HashSet;
 
 /// Outcome of `StormBreaker::inspect`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,6 +79,13 @@ pub struct StormBreaker {
     is_mutating: Option<Box<dyn Fn(&ToolCall) -> bool + Send + Sync>>,
     is_storm_exempt: Option<Box<dyn Fn(&ToolCall) -> bool + Send + Sync>>,
     recent: Vec<RecentEntry>,
+    /// Canonical `name\0args` signatures that timed out this turn. A
+    /// timed-out call is expensive — it burned the whole budget — so we
+    /// don't let the model run three identical copies before breaking the
+    /// loop. While a signature is in here its effective threshold drops by
+    /// one (suppressed on the 2nd identical retry, not the 3rd). Cleared
+    /// each turn alongside `recent`. See [`StormBreaker::note_outcome`].
+    expensive: HashSet<String>,
 }
 
 impl StormBreaker {
@@ -101,7 +110,27 @@ impl StormBreaker {
             is_mutating,
             is_storm_exempt,
             recent: Vec::with_capacity(window_size),
+            expensive: HashSet::new(),
         }
+    }
+
+    /// Canonical `name\0args` signature, matching the keys in `recent`
+    /// and `expensive`. Shares `canonical_json` with `inspect` so the two
+    /// can't disagree on what "the same call" is.
+    fn signature(name: &str, args: &str) -> String {
+        format!("{name}\u{0}{args}")
+    }
+
+    /// Record the [`Outcome`] of a dispatched call. A `Timeout` marks the
+    /// call's signature expensive so the next identical retry trips the
+    /// breaker one occurrence sooner. Ok/Error are no-ops — ordinary
+    /// failures are the failure tracker's job, not the repeat guard's.
+    pub fn note_outcome(&mut self, call: &ToolCall, outcome: Outcome) {
+        if outcome != Outcome::Timeout {
+            return;
+        }
+        let args = super::message::canonical_json(&call.arguments);
+        self.expensive.insert(Self::signature(&call.name, &args));
     }
 
     pub fn inspect(&mut self, call: &ToolCall) -> StormVerdict {
@@ -146,7 +175,18 @@ impl StormBreaker {
             .filter(|e| e.name == *name && e.args == args)
             .count();
 
-        if count >= self.threshold.saturating_sub(1) {
+        // A signature that already timed out this turn is expensive:
+        // drop its threshold by one (but never below 2, so a call that
+        // has only run once can't be suppressed). For the default
+        // threshold of 3 this suppresses the 2nd identical retry of a
+        // hung command instead of the 3rd.
+        let effective = if self.expensive.contains(&Self::signature(name, &args)) {
+            self.threshold.saturating_sub(1).max(2)
+        } else {
+            self.threshold
+        };
+
+        if count >= effective.saturating_sub(1) {
             return StormVerdict::suppress(name, count + 1);
         }
 
@@ -164,6 +204,7 @@ impl StormBreaker {
 
     pub fn reset(&mut self) {
         self.recent.clear();
+        self.expensive.clear();
     }
 
     /// Filter a batch of tool calls through the storm breaker.
@@ -308,6 +349,47 @@ mod tests {
         let verdict = sb.inspect(&call_json("x", "{}"));
         assert!(verdict.suppress);
         assert!(verdict.reason.unwrap().contains("repeat-loop guard"));
+    }
+
+    #[test]
+    fn timed_out_call_is_suppressed_one_retry_sooner() {
+        // Default threshold 3 normally suppresses the 3rd identical call.
+        // After a timeout on that signature, the 2nd identical retry is
+        // suppressed instead — a hung command can't burn the budget thrice.
+        let mut sb = StormBreaker::new(6, 3, None, None);
+        let c = call_json("bash", r#"{"command":"git clone x"}"#);
+        // First call runs (passes the breaker), then times out.
+        assert!(!sb.inspect(&c).suppress, "1st call runs");
+        sb.note_outcome(&c, Outcome::Timeout);
+        // 2nd identical call is now suppressed (would have passed pre-fix).
+        assert!(
+            sb.inspect(&c).suppress,
+            "2nd retry of a timed-out call should be suppressed"
+        );
+    }
+
+    #[test]
+    fn non_timeout_outcomes_do_not_lower_the_threshold() {
+        let mut sb = StormBreaker::new(6, 3, None, None);
+        let c = call_json("bash", r#"{"command":"false"}"#);
+        assert!(!sb.inspect(&c).suppress);
+        sb.note_outcome(&c, Outcome::Error); // ordinary failure: no effect
+        assert!(!sb.inspect(&c).suppress, "2nd call still allowed");
+        // 3rd identical trips at the normal threshold.
+        assert!(sb.inspect(&c).suppress, "3rd identical trips normally");
+    }
+
+    #[test]
+    fn reset_clears_expensive_signatures() {
+        let mut sb = StormBreaker::new(6, 3, None, None);
+        let c = call_json("bash", r#"{"command":"slow"}"#);
+        sb.inspect(&c);
+        sb.note_outcome(&c, Outcome::Timeout);
+        sb.reset();
+        // Fresh turn: the timeout penalty is gone, normal threshold applies.
+        assert!(!sb.inspect(&c).suppress);
+        assert!(!sb.inspect(&c).suppress);
+        assert!(sb.inspect(&c).suppress, "back to threshold 3 after reset");
     }
 
     #[test]

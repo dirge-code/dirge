@@ -46,14 +46,27 @@ pub struct FailureTracker {
 
 #[derive(Debug)]
 struct Inner {
-    /// Consecutive errored tool results, reset by any success.
+    /// Consecutive errored tool *calls*, reset by any success. Drives
+    /// the "{n} tool calls in a row have failed" wording — a truthful
+    /// call count, distinct from the weighted escalation below.
     consecutive: usize,
+    /// Weighted streak score: a plain error adds 1, a timeout adds 2.
+    /// The nudge fires off this, not the raw count, so expensive
+    /// failures (a command that burned its whole time budget) escalate
+    /// sooner — two timeouts trip a threshold-3 tracker, where two plain
+    /// errors would not. For error-only streaks escalation == consecutive,
+    /// so the legacy behaviour is unchanged.
+    escalation: usize,
+    /// Timeouts within the current streak, used to add a targeted line to
+    /// the checkpoint ("retrying a hung command won't help").
+    timeouts: usize,
     /// `(tool_name, excerpt)` for the most recent failures in the
     /// current streak, bounded to `MAX_QUOTED`.
     recent: Vec<(String, String)>,
-    /// Streak length at the last emitted checkpoint; 0 = none emitted
-    /// for this streak. Re-arm only after another `threshold` failures
-    /// so a stubborn streak gets periodic — not per-call — nudges.
+    /// Escalation score at the last emitted checkpoint; 0 = none emitted
+    /// for this streak. Re-arm only after another `threshold` of
+    /// escalation so a stubborn streak gets periodic — not per-call —
+    /// nudges.
     last_emitted_at: usize,
 }
 
@@ -69,23 +82,40 @@ impl FailureTracker {
             threshold,
             inner: Mutex::new(Inner {
                 consecutive: 0,
+                escalation: 0,
+                timeouts: 0,
                 recent: Vec::new(),
                 last_emitted_at: 0,
             }),
         })
     }
 
-    /// Record one tool result. A success clears the streak; an error
-    /// extends it and remembers a short excerpt for the checkpoint.
-    pub fn record_result(&self, is_error: bool, tool_name: &str, excerpt: &str) {
+    /// Record one tool result by [`Outcome`]. A success clears the
+    /// streak; an error or timeout extends it (a timeout counting double
+    /// toward the escalation score) and remembers a short excerpt for the
+    /// checkpoint.
+    pub fn record(&self, outcome: super::activity::Outcome, tool_name: &str, excerpt: &str) {
+        use super::activity::Outcome;
         let mut inner = self.inner.lock_ignore_poison();
-        if !is_error {
-            inner.consecutive = 0;
-            inner.recent.clear();
-            inner.last_emitted_at = 0;
-            return;
+        match outcome {
+            Outcome::Ok => {
+                inner.consecutive = 0;
+                inner.escalation = 0;
+                inner.timeouts = 0;
+                inner.recent.clear();
+                inner.last_emitted_at = 0;
+                return;
+            }
+            Outcome::Error => {
+                inner.consecutive += 1;
+                inner.escalation += 1;
+            }
+            Outcome::Timeout => {
+                inner.consecutive += 1;
+                inner.escalation += 2;
+                inner.timeouts += 1;
+            }
         }
-        inner.consecutive += 1;
         inner
             .recent
             .push((tool_name.to_string(), condense(excerpt)));
@@ -95,23 +125,39 @@ impl FailureTracker {
         }
     }
 
+    /// Back-compat shim: record a result by its error flag (no timeout
+    /// distinction). Kept for call sites / tests that only know
+    /// success-vs-error; prefer [`FailureTracker::record`] where the
+    /// outcome is classified.
+    #[cfg(test)]
+    pub fn record_result(&self, is_error: bool, tool_name: &str, excerpt: &str) {
+        use super::activity::Outcome;
+        let outcome = if is_error {
+            Outcome::Error
+        } else {
+            Outcome::Ok
+        };
+        self.record(outcome, tool_name, excerpt);
+    }
+
     /// Poll hook: returns one recovery-checkpoint message when the
     /// streak has reached `threshold` and we haven't nudged since the
     /// last `threshold`-failure interval; otherwise empty.
     pub fn poll_reflection(&self) -> Vec<LoopMessage> {
         let mut inner = self.inner.lock_ignore_poison();
-        if inner.consecutive < self.threshold {
+        if inner.escalation < self.threshold {
             return Vec::new();
         }
-        // First crossing, or another full `threshold` of failures since
-        // the last nudge.
+        // First crossing, or another full `threshold` of escalation since
+        // the last nudge. Keyed on the weighted score so timeouts pull
+        // the nudge forward.
         let due = inner.last_emitted_at == 0
-            || inner.consecutive.saturating_sub(inner.last_emitted_at) >= self.threshold;
+            || inner.escalation.saturating_sub(inner.last_emitted_at) >= self.threshold;
         if !due {
             return Vec::new();
         }
-        inner.last_emitted_at = inner.consecutive;
-        let body = format_checkpoint(inner.consecutive, &inner.recent);
+        inner.last_emitted_at = inner.escalation;
+        let body = format_checkpoint(inner.consecutive, inner.timeouts, &inner.recent);
         vec![LoopMessage::User(UserMessage { content: body })]
     }
 }
@@ -128,10 +174,20 @@ fn condense(s: &str) -> String {
 }
 
 /// Build the recovery-checkpoint body. Free fn so tests pin the wording.
-fn format_checkpoint(consecutive: usize, recent: &[(String, String)]) -> String {
+fn format_checkpoint(consecutive: usize, timeouts: usize, recent: &[(String, String)]) -> String {
     let mut s = format!("[Recovery checkpoint] {consecutive} tool calls in a row have failed:\n");
     for (tool, excerpt) in recent {
         s.push_str(&format!("  - {tool}: {excerpt}\n"));
+    }
+    // Timeouts are a distinct failure mode from "wrong arguments": the
+    // command ran to its time limit. Re-issuing it verbatim just burns
+    // the budget again, so call it out specifically.
+    if timeouts > 0 {
+        s.push_str(&format!(
+            "{timeouts} of these timed out — the command ran out its time budget, it didn't \
+             fail on bad input. Re-running it unchanged will hang again: narrow the work, fix \
+             why it hangs, or raise the timeout deliberately — don't just retry.\n",
+        ));
     }
     s.push_str(
         "Stop and diagnose before retrying — this is a system checkpoint, not a new task:\n\
@@ -218,6 +274,49 @@ mod tests {
             "single-tool streak should name the tool: {body}"
         );
         assert!(body.contains("Re-read its description"));
+    }
+
+    #[test]
+    fn two_timeouts_trip_a_threshold_three_tracker() {
+        use super::super::activity::Outcome;
+        let t = FailureTracker::new(3);
+        t.record(Outcome::Timeout, "bash", "Command timed out after 120s");
+        // One timeout (escalation 2) is below threshold 3 — still silent.
+        assert!(
+            t.poll_reflection().is_empty(),
+            "single timeout (weight 2) < threshold 3"
+        );
+        t.record(Outcome::Timeout, "bash", "Command timed out after 120s");
+        // Two timeouts (escalation 4) cross threshold 3 after only 2 calls,
+        // where two plain errors (weight 2) would not have.
+        let msgs = t.poll_reflection();
+        assert_eq!(msgs.len(), 1, "two timeouts escalate past threshold");
+        let body = content_of(&msgs);
+        // Truthful call count, not the weighted score.
+        assert!(body.contains("2 tool calls in a row have failed"), "{body}");
+    }
+
+    #[test]
+    fn timeout_checkpoint_calls_out_the_timeout() {
+        use super::super::activity::Outcome;
+        let t = FailureTracker::new(2);
+        t.record(Outcome::Timeout, "bash", "Command timed out after 120s");
+        let body = content_of(&t.poll_reflection());
+        assert!(
+            body.contains("timed out") && body.contains("time budget"),
+            "checkpoint should name the timeout failure mode: {body}"
+        );
+    }
+
+    #[test]
+    fn error_then_timeout_reaches_threshold_three() {
+        use super::super::activity::Outcome;
+        let t = FailureTracker::new(3);
+        t.record(Outcome::Error, "edit", "no match");
+        assert!(t.poll_reflection().is_empty(), "escalation 1 < 3");
+        t.record(Outcome::Timeout, "bash", "Command timed out after 5s");
+        // 1 (error) + 2 (timeout) = 3 → trips.
+        assert_eq!(t.poll_reflection().len(), 1, "error+timeout escalate to 3");
     }
 
     #[test]

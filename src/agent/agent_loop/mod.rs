@@ -21,6 +21,7 @@
 // per-item unused-import warnings on this block.
 #![allow(unused_imports)]
 
+pub mod activity;
 pub mod bridge;
 pub mod context_depth;
 pub mod context_manager;
