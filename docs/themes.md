@@ -82,7 +82,7 @@ Each color field accepts three forms:
 | Field | What it colors |
 |---|---|
 | `agent` | Assistant chat text |
-| `user` | User message prefix (`<you>`) |
+| `user` | User message prefix (`<you>`) and the bottom input-bar text you type |
 | `system` | System messages — context loaded, compactions |
 | `tool` | Tool chamber headers (`╭─ BASH ─ …`) |
 | `perm` | Permission prompts (loud — yellow/red recommended) |

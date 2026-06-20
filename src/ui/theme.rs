@@ -45,7 +45,8 @@ use serde::Deserialize;
 pub struct Theme {
     /// Assistant chat text.
     pub agent: Color,
-    /// User-message prefix (and prompt indicator).
+    /// User-message prefix (and prompt indicator), plus the text the
+    /// user types in the bottom input bar.
     pub user: Color,
     /// System/info messages — context loaded, compactions, etc.
     pub system: Color,
