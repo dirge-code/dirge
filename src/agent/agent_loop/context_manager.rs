@@ -298,6 +298,21 @@ pub fn effective_ctx_max(model_window: u64) -> u64 {
     model_window.min(context_target())
 }
 
+/// The token budget the agent actually has to work within before
+/// auto-compaction kicks in: the effective window
+/// ([`effective_ctx_max`], i.e. `min(model_window, context_target)`) times
+/// the active early-fold threshold ([`effective_fold_threshold`], default
+/// [`HISTORY_FOLD_THRESHOLD`], lowered by `compaction_fold_threshold`). The
+/// post-response fold — the earliest tier that fires in normal operation —
+/// triggers once usage crosses this, so it is the honest denominator for
+/// the status line: at 100% a fold is imminent, rather than the misleading
+/// fraction-of-a-1M-window the raw model window would show. Uses the
+/// process-installed knobs (`None` override), so it tracks whatever the
+/// user configured at startup.
+pub fn compaction_budget(model_window: u64) -> u64 {
+    (effective_ctx_max(model_window) as f64 * effective_fold_threshold(None)) as u64
+}
+
 /// Process-wide explicit context-window override from
 /// `Config::context_window`, installed at startup. When set it replaces the
 /// built-in model-table lookup for the loop's window (before the
@@ -729,6 +744,23 @@ mod tests {
             decide_after_usage(Some(76_000), budget, false).kind,
             PostUsageDecisionKind::Fold
         );
+    }
+
+    #[test]
+    fn compaction_budget_caps_window_and_applies_fold_threshold() {
+        // The status-line budget is the fold-trigger point: the effective
+        // window (capped by the context target) times the active fold
+        // threshold — never the raw advertised window. Computed from the
+        // same primitives so it holds regardless of any process-global
+        // knobs another test may have installed.
+        let huge = 1_000_000;
+        let eff = effective_ctx_max(huge);
+        let expected = (eff as f64 * effective_fold_threshold(None)) as u64;
+        assert_eq!(compaction_budget(huge), expected);
+        // Strictly below the effective window (a fold fires before it fills)…
+        assert!(compaction_budget(huge) < eff);
+        // …and far below the raw advertised window.
+        assert!(compaction_budget(huge) < huge);
     }
 
     // ============================================================

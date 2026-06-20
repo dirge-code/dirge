@@ -59,13 +59,17 @@ If UNMET, follow with a short bullet list of exactly what remains for the stop c
 const MAX_RULES_CHARS: usize = 16_000;
 
 /// Build the judge prompt: the agent's constraints, the stop condition, the
-/// transcript, and the response format. `rules` is truncated to
-/// [`MAX_RULES_CHARS`] with a note when elided.
+/// transcript, and the response format. The compaction summary is stripped
+/// from `rules` first (same stale-state guard as the critic — a resumed
+/// session's `## Active Task` describes already-done work, not the goal),
+/// then it is truncated to [`MAX_RULES_CHARS`] with a note when elided.
 pub fn build_goal_prompt(goal: &str, rules: &str, transcript: &str) -> String {
-    let (rules, elided) = if rules.len() > MAX_RULES_CHARS {
-        (&rules[..MAX_RULES_CHARS], "\n[…constraints truncated…]")
+    let rules = super::critic::strip_compaction_summary(rules);
+    let (rules, elided) = if rules.chars().count() > MAX_RULES_CHARS {
+        let head: String = rules.chars().take(MAX_RULES_CHARS).collect();
+        (head, "\n[…constraints truncated…]")
     } else {
-        (rules, "")
+        (rules.to_string(), "")
     };
     format!(
         "{GOAL_PREAMBLE}\n\n\
@@ -179,6 +183,33 @@ mod tests {
         assert!(p.contains("never push to remote"));
         assert!(p.contains("assistant ran the tests"));
         assert!(p.contains("GOAL: MET"));
+    }
+
+    /// Same stale-state guard as the critic (dirge-wp0e): after a resume the
+    /// merged system prompt carries the `[CONTEXT COMPACTION — REFERENCE
+    /// ONLY]` summary, whose `## Active Task` describes already-completed
+    /// work. It must not reach the goal judge, or the gate would re-demand
+    /// superseded work as if it were the stop condition.
+    #[test]
+    fn build_goal_prompt_drops_the_compaction_summary_from_rules() {
+        let rules = format!(
+            "RULE: never push to remote.\n\n{} \
+             ## Active Task\nFinish Phase 3: wire the Janet loader and add tests.",
+            crate::agent::compression::COMPACTION_MARKER,
+        );
+        let p = build_goal_prompt("all tests pass", &rules, "assistant ran the tests");
+        assert!(
+            p.contains("never push to remote"),
+            "real rules must survive"
+        );
+        assert!(
+            !p.contains("Active Task") && !p.contains("Phase 3") && !p.contains("Janet"),
+            "the compaction summary must be stripped from the judge's rules",
+        );
+        assert!(
+            !p.contains(crate::agent::compression::COMPACTION_MARKER),
+            "the compaction marker itself must be stripped",
+        );
     }
 
     #[tokio::test]

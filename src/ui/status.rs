@@ -102,7 +102,13 @@ impl StatusLine {
             None => dir.to_string(),
         };
 
-        let ctx = session.context_window;
+        // Denominator is the compaction-trigger budget, not the raw model
+        // window: the loop folds at `fold_threshold * min(window,
+        // context_target)`, so showing the advertised window (200k/1M)
+        // understated how full the working context really was. At 100% here
+        // a fold is imminent (dirge-l4rp).
+        let ctx =
+            crate::agent::agent_loop::context_manager::compaction_budget(session.context_window);
         let used = session.total_estimated_tokens;
         let pct = (used * 100).checked_div(ctx).unwrap_or(0);
 

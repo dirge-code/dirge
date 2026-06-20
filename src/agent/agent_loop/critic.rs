@@ -83,7 +83,10 @@ const MAX_RULES_CHARS: usize = 16_000;
 /// `## Active Task` describes already-completed work the critic would
 /// otherwise demand again (the stale-state bug). Returns the input unchanged
 /// when no summary is present.
-fn strip_compaction_summary(rules: &str) -> &str {
+///
+/// Shared with the sibling goal gate ([`super::goal`]), which feeds the same
+/// merged system prompt to the same judge and needs the same protection.
+pub(crate) fn strip_compaction_summary(rules: &str) -> &str {
     match rules.find(crate::agent::compression::COMPACTION_MARKER) {
         Some(idx) => rules[..idx].trim_end(),
         None => rules,
