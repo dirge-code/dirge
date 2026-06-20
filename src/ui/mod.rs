@@ -3849,7 +3849,7 @@ fn is_safe_during_agent(text: &str) -> bool {
         matches!(head, "/sessions" | "/tree" | "/model" | "/prompt") && args.is_none();
     let safe_when_list = matches!(
         (head, args.as_deref()),
-        ("/memory", Some("list")) | ("/skill", Some("list"))
+        ("/memory", Some("list")) | ("/skill", Some("list")) | ("/sessions", Some("list"))
     );
     always_safe || safe_when_no_arg || safe_when_list
 }

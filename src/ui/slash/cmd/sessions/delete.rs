@@ -1,6 +1,7 @@
 //! /sessions delete <prefix> — delete session by ID prefix.
 
-use crate::ui::events::{format_time, session_preview};
+use crate::session::Session;
+use crate::ui::events::{format_time, render_session, session_preview};
 use crate::ui::slash::{SlashCtx, c_agent, c_error, c_result};
 
 pub(crate) async fn cmd_sessions_delete(
@@ -14,6 +15,7 @@ pub(crate) async fn cmd_sessions_delete(
     } else if sessions.len() == 1 {
         if let Some(s) = sessions.into_iter().next() {
             let id = s.id.clone();
+            let is_current = id == ctx.session.id;
             let preview = s
                 .messages
                 .last()
@@ -27,6 +29,27 @@ pub(crate) async fn cmd_sessions_delete(
                     &format!("deleted session {} {}", crate::text::head(&id, 8), preview),
                     c_agent(),
                 )?;
+                // Deleting the session we're in would otherwise leave the
+                // live session pointing at a removed file (a zombie). Boot
+                // into a fresh empty session — same model/provider/cwd — so
+                // there's always a real session backing the UI (dirge).
+                if is_current {
+                    let mut fresh = Session::new(
+                        &ctx.session.provider,
+                        &ctx.session.model,
+                        ctx.session.context_window,
+                    );
+                    fresh.working_dir = ctx.session.working_dir.clone();
+                    super::swap_to_session(ctx, fresh).await?;
+                    render_session(ctx.renderer, ctx.session, ctx.cli, ctx.cfg, ctx.context)?;
+                    ctx.renderer.write_line(
+                        &format!(
+                            "started a fresh session ({})",
+                            crate::text::head(&ctx.session.id, 8)
+                        ),
+                        c_agent(),
+                    )?;
+                }
             }
         }
     } else {
