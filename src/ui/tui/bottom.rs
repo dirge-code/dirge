@@ -303,7 +303,7 @@ fn paint_editor_box(
     let prompt_w = input_prompt_width(is_running) as usize;
     let accent = Style::default().fg(RColor::Yellow);
     let user =
-        Style::default().fg(super::chat::crossterm_to_ratatui(crate::ui::theme::user()));
+        Style::default().fg(super::chat::crossterm_to_ratatui(crate::ui::theme::user_input()));
     let dim = Style::default().fg(RColor::DarkGray);
     let text_avail = inner_w.saturating_sub(prompt_w);
     let visible_rows = (area.height as usize).saturating_sub(2);
