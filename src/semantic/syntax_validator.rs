@@ -688,6 +688,7 @@ pub fn repair_delimiters(path: &Path, content: &str) -> Option<(String, String)>
 
 /// Validate `content`; on a delimiter imbalance, try a mechanical close
 /// before giving up. The single entry point the edit tools call.
+#[derive(Clone, Debug)]
 pub enum SyntaxOutcome {
     /// Clean as written.
     Clean,
@@ -970,6 +971,25 @@ int main(void) {
             }
             _ => panic!("stray closer must be rejected, not repaired"),
         }
+    }
+
+    #[cfg(feature = "semantic-rust")]
+    #[test]
+    fn disable_auto_repair_rejects_instead_of_repairing() {
+        let path = PathBuf::from("/tmp/x.rs");
+        // Unclosed `{` — default auto-repair would close it; with the flag
+        // off it must be Rejected outright.  The expected error (from
+        // format_errors) names the missing `}` token and the location.
+        let content = "fn main() {\n  let x = 1;\n";
+        set_auto_repair(false);
+        match validate_or_repair(&path, content) {
+            SyntaxOutcome::Rejected { message } => {
+                assert!(message.contains("syntax error"), "{message}");
+            }
+            other => panic!("expected Rejected with auto-repair off, got {other:?}"),
+        }
+        // Restore default so subsequent tests aren't affected.
+        set_auto_repair(true);
     }
 
     #[cfg(feature = "semantic-rust")]
