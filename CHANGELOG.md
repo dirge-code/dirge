@@ -6,6 +6,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.10.4] - 2026-06-21
+
+### Added
+- **Debug a Python module, not just a file.** The DAP launch path now takes an
+  optional `module`, so a debuggee can start as `python -m <module>` (e.g.
+  `pytest`) instead of by program path — exposed via the `dap/launch-module`
+  Janet binding and the debug slash command. The `debug` tool's launch args also
+  gained an `env` map for per-launch environment variables. CI runs the new
+  smoke/e2e tests under a `dap` feature-matrix entry. (#497)
+
 ## [0.10.3] - 2026-06-21
 
 ### Added
