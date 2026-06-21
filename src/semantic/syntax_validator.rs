@@ -17,6 +17,12 @@
 //! broken file doesn't dump 1000 errors into the tool result.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Process-wide flag: when `false`, `validate_or_repair` skips auto-repair
+/// and rejects unbalanced-delimiter edits outright. Default `true`
+/// (auto-repair on). Set once from config at agent startup.
+static AUTO_REPAIR_ENABLED: AtomicBool = AtomicBool::new(true);
 
 /// One syntax error discovered by tree-sitter. Carries enough
 /// detail for the model to localize the fix without re-reading
@@ -695,18 +701,33 @@ pub enum SyntaxOutcome {
 /// Validate, and auto-repair a closable delimiter imbalance if possible.
 /// Parity with the JSON truncation repair (dirge-p5fu).
 pub fn validate_or_repair(path: &Path, content: &str) -> SyntaxOutcome {
-    match check_syntax(path, content) {
-        Ok(()) => SyntaxOutcome::Clean,
-        Err(errors) => match repair_delimiters(path, content) {
-            Some((repaired, note)) => SyntaxOutcome::Repaired {
-                content: repaired,
-                note,
-            },
-            None => SyntaxOutcome::Rejected {
+    if !AUTO_REPAIR_ENABLED.load(Ordering::Relaxed) {
+        match check_syntax(path, content) {
+            Ok(()) => SyntaxOutcome::Clean,
+            Err(errors) => SyntaxOutcome::Rejected {
                 message: format_errors(path, content, &errors),
             },
-        },
+        }
+    } else {
+        match check_syntax(path, content) {
+            Ok(()) => SyntaxOutcome::Clean,
+            Err(errors) => match repair_delimiters(path, content) {
+                Some((repaired, note)) => SyntaxOutcome::Repaired {
+                    content: repaired,
+                    note,
+                },
+                None => SyntaxOutcome::Rejected {
+                    message: format_errors(path, content, &errors),
+                },
+            },
+        }
     }
+}
+
+/// Enable or disable auto-repair across the process. Called once from
+/// agent startup when `tools.auto_repair` config is `Some(false)`.
+pub fn set_auto_repair(enabled: bool) {
+    AUTO_REPAIR_ENABLED.store(enabled, Ordering::Relaxed);
 }
 
 /// Convenience wrapper: format a `Vec<SyntaxError>` as a single

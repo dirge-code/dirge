@@ -286,6 +286,16 @@ pub async fn build_loop_tools(
     crate::agent::agent_loop::context_manager::set_verbatim_pre_recall(
         mem_cfg.verbatim_pre_recall == Some(true),
     );
+    // Process-wide auto-repair toggle: when `tools.auto_repair` is
+    // explicitly `false`, skip delimiter-balance auto-close and reject
+    // broken edits outright. Default (unset) preserves auto-repair.
+    if cfg
+        .tools
+        .clone()
+        .is_some_and(|t| t.auto_repair == Some(false))
+    {
+        crate::semantic::syntax_validator::set_auto_repair(false);
+    }
     let memory_store: Option<Arc<dyn crate::extras::memory_provider::MemoryProvider>> =
         if let Ok(c) = std::env::current_dir() {
             let paths = crate::extras::dirge_paths::ProjectPaths::new(&c);

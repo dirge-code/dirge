@@ -186,6 +186,15 @@ pub struct ToolsConfig {
     /// 3000-char hard truncation that silently dropped the tail of
     /// large subagent answers.
     pub task_output_inline_max_bytes: Option<usize>,
+    /// Auto-repair delimiter imbalances in edit/write results. When
+    /// `true` (default), a file with unclosed delimiters (e.g. `{`)
+    /// gets closers appended at EOF to make it parseable, and the
+    /// edit succeeds with a note. When `false`, such edits are
+    /// rejected outright — the model sees a syntax error and must
+    /// resubmit a correct edit. Turn off if auto-repair causes more
+    /// confusion than it saves (e.g. a bad edit whose structural
+    /// mistake gets silently papered over).
+    pub auto_repair: Option<bool>,
 }
 
 /// Override block for the named per-operation timeouts, under the
