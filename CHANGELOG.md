@@ -6,6 +6,38 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.10.3] - 2026-06-21
+
+### Added
+- **`/model` lists the models your config pins.** With no argument it now prints
+  every model set across your `providers`, marks the active one, and tells you to
+  switch with `/model <id>` — previously it only echoed the current model with
+  nothing to pick from. (#495, issue #492)
+
+### Changed
+- **`Ctrl+D` is forward-delete in the input editor**, not a hard exit. It deletes
+  the character under the cursor (rebindable as `delete_char_forward`); `Ctrl+C`
+  and `Esc` remain the interrupt/exit gestures. (#493)
+- **The context gauge reads 0–100%.** Its denominator is now the full effective
+  window instead of the fold-trigger budget (~75% of it), so real usage past 75%
+  no longer showed a confusing `>100%` (e.g. `90k/75k (120%)`). A compact
+  `fold`/`fold!` marker flags when a fold is near/imminent. (dirge-l4rp, dirge-cx7t)
+
+### Fixed
+- **Auto-repair no longer silently mangles files.** Delimiter auto-close now only
+  fixes a genuine *trailing* truncation; a mid-file imbalance that would swallow
+  the following code is rejected and bounced back to the model instead of being
+  "repaired" into valid-but-wrong code. (dirge-a0nl)
+- **Auto-repairs are verified by the language server and rolled back when wrong.**
+  After an auto-close, `write`/`edit` ask the LSP whether the result actually
+  holds up; on error-severity diagnostics the change is reverted to its pre-write
+  state and the model gets the diagnostics to fix its original text. A rollback
+  that can't snapshot the prior content (e.g. an unreadable existing file) now
+  leaves the file in place rather than deleting it. (dirge-p1ws, #501)
+- **Nix release job no longer fails on every tag.** The `bin.nix` version bump is
+  committed straight to `main` instead of trying to open a PR (which GitHub
+  Actions can't do with the default token). (#491)
+
 ## [0.10.2] - 2026-06-20
 
 ### Added
