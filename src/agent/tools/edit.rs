@@ -419,6 +419,9 @@ impl Tool for EditTool {
                     self.lsp_manager.as_ref(),
                     path,
                     Some(bytes.clone()),
+                    // Edit always targets an existing file; `before` is always
+                    // Some, so this flag is moot, but keep it honest.
+                    false,
                     write_at,
                 )
                 .await
