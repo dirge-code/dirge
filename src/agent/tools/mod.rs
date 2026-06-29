@@ -942,7 +942,7 @@ mod tests {
         )
         .await;
         assert!(
-            matches!(result, Err(_)),
+            result.is_err(),
             "edit deny should propagate to write; got {result:?}",
         );
 
@@ -954,7 +954,7 @@ mod tests {
         )
         .await;
         assert!(
-            matches!(result, Err(_)),
+            result.is_err(),
             "edit deny should propagate to apply_patch; got {result:?}",
         );
     }
@@ -985,7 +985,7 @@ mod tests {
             Scope::PathResolve("/etc/passwd"),
         )
         .await;
-        assert!(matches!(result, Err(_)));
+        assert!(result.is_err());
 
         // `/tmp/x.rs`: write/edit/apply_patch now share Operation::Edit,
         // so both rules live in ONE ruleset, last-match-wins. The
@@ -1020,7 +1020,7 @@ mod tests {
         )
         .await;
         assert!(
-            matches!(result, Ok(_)),
+            result.is_ok(),
             "read isn't aliased to edit; should pass via builtin-allow; got {result:?}",
         );
     }

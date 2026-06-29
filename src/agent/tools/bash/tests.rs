@@ -423,18 +423,18 @@ async fn redirect_target_routes_through_write_rules() {
     );
 }
 
-/// Sibling check: a redirect target inside the working directory
-/// (non-external) passes the write-rules check. Without this, a
-/// regression that over-broadly denied all redirects could pass
-/// the negative case above and ship.
-///
-/// Uses an in-cwd path because the catch-all at
-/// `permission/checker.rs:434` upgrades unmatched-Allow to Ask
-/// for EXTERNAL paths — so `/tmp/x` (external to the test's cwd
-/// of the dirge repo) would test the external-path catch-all,
-/// not the write-rules-allow path we want to exercise here.
-/// M3 is intentionally tightening external bash-redirects to
-/// prompt; this test pins the in-cwd happy path.
+// Sibling check: a redirect target inside the working directory
+// (non-external) passes the write-rules check. Without this, a
+// regression that over-broadly denied all redirects could pass
+// the negative case above and ship.
+//
+// Uses an in-cwd path because the catch-all at
+// `permission/checker.rs:434` upgrades unmatched-Allow to Ask
+// for EXTERNAL paths — so `/tmp/x` (external to the test's cwd
+// of the dirge repo) would test the external-path catch-all,
+// not the write-rules-allow path we want to exercise here.
+// M3 is intentionally tightening external bash-redirects to
+// prompt; this test pins the in-cwd happy path.
 // F1 (dirge-dvy) — bash arg-side path checks. Pin that
 // file-mutating commands route their positional path args
 // through the write rules, independent of the bash command-

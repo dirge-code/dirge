@@ -45,6 +45,7 @@ pub(crate) enum CompactionThen {
     ///   - otherwise (pure first-token overflow, nothing streamed): re-send the
     ///     `prompt` against the compacted history (the trailing user message is
     ///     dropped + not re-recorded).
+    ///
     /// If compaction made no progress, the user is told to recover manually.
     RetryAfterOverflow { prompt: String, made_progress: bool },
 }
@@ -73,30 +74,6 @@ pub(crate) fn overflow_recovery(compacted: bool, made_progress: bool) -> Overflo
         (true, true) => OverflowRecovery::Continue,
         (true, false) => OverflowRecovery::Resend,
         (false, _) => OverflowRecovery::GiveUp,
-    }
-}
-
-#[cfg(test)]
-mod recovery_tests {
-    use super::{OverflowRecovery, overflow_recovery};
-
-    #[test]
-    fn made_progress_resumes_as_continuation() {
-        // dirge-b899: the failed turn ran tools / streamed text — resume the
-        // task, do NOT strand it (the old code refused when tools had run).
-        assert_eq!(overflow_recovery(true, true), OverflowRecovery::Continue);
-    }
-
-    #[test]
-    fn no_progress_resends_prompt() {
-        // Pure first-token overflow: nothing streamed, safe to re-send.
-        assert_eq!(overflow_recovery(true, false), OverflowRecovery::Resend);
-    }
-
-    #[test]
-    fn uncompacted_gives_up_regardless_of_progress() {
-        assert_eq!(overflow_recovery(false, true), OverflowRecovery::GiveUp);
-        assert_eq!(overflow_recovery(false, false), OverflowRecovery::GiveUp);
     }
 }
 
@@ -168,5 +145,29 @@ pub(crate) fn spawn(req: CompactionRequest, then: CompactionThen) -> CompactionP
         cut_idx,
         tokens_before,
         then,
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::{OverflowRecovery, overflow_recovery};
+
+    #[test]
+    fn made_progress_resumes_as_continuation() {
+        // dirge-b899: the failed turn ran tools / streamed text — resume the
+        // task, do NOT strand it (the old code refused when tools had run).
+        assert_eq!(overflow_recovery(true, true), OverflowRecovery::Continue);
+    }
+
+    #[test]
+    fn no_progress_resends_prompt() {
+        // Pure first-token overflow: nothing streamed, safe to re-send.
+        assert_eq!(overflow_recovery(true, false), OverflowRecovery::Resend);
+    }
+
+    #[test]
+    fn uncompacted_gives_up_regardless_of_progress() {
+        assert_eq!(overflow_recovery(false, true), OverflowRecovery::GiveUp);
+        assert_eq!(overflow_recovery(false, false), OverflowRecovery::GiveUp);
     }
 }

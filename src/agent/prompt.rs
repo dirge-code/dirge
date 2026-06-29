@@ -403,7 +403,7 @@ mod tests {
 
         for forbidden in forbidden_actions {
             assert!(
-                !words.iter().any(|w| *w == forbidden),
+                !words.contains(&forbidden),
                 "memory tool prompt mentions unsupported action '{}': {}",
                 forbidden,
                 memory_line
@@ -411,7 +411,7 @@ mod tests {
         }
         for action in real_actions {
             assert!(
-                words.iter().any(|w| *w == action),
+                words.contains(&action),
                 "memory tool prompt missing real action '{}': {}",
                 action,
                 memory_line

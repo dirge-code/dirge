@@ -1664,9 +1664,9 @@ unsafe fn read_string_array_arg(
         // it sat at argv[idx]. Doable because read_string_arg only uses
         // the raw Janet, not its position.
         let elt_ptr = unsafe { data.add(idx) } as *mut janetrs::lowlevel::Janet;
-        match unsafe { read_string_arg(elt_ptr, 0) } {
-            Some(s) => out.push(s),
-            None => return None,
+        {
+            let s = unsafe { read_string_arg(elt_ptr, 0) }?;
+            out.push(s)
         }
     }
     Some(out)

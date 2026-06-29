@@ -319,7 +319,7 @@ async fn exa_mcp_search(
         return Err(ToolError::Msg(format!(
             "websearch returned {}: {}",
             status.as_u16(),
-            &body.chars().take(300).collect::<String>()
+            body.chars().take(300).collect::<String>()
         )));
     }
 
@@ -379,7 +379,7 @@ async fn parallel_mcp_search(
         return Err(ToolError::Msg(format!(
             "websearch (parallel) returned {}: {}",
             status.as_u16(),
-            &body.chars().take(300).collect::<String>()
+            body.chars().take(300).collect::<String>()
         )));
     }
 

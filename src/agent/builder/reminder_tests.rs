@@ -590,6 +590,9 @@ async fn build_agent_inner_emits_assembled_preamble() {
 /// shows up in the assembled preamble. `dirs::home_dir()` reads
 /// `$HOME` live on Unix; serialize the override so parallel tests
 /// don't observe the temporary HOME.
+// Serialization: `dirs::home_dir()` reads `$HOME` live, so the guard
+// below is intentionally held across this test's `.await`s.
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn preamble_lists_global_tier_skills() {
     use crate::context::ContextFiles;

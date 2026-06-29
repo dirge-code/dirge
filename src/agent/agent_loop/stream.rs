@@ -377,11 +377,22 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    // Aliases for the `LoopConfig` callback types — clippy's
+    // `type_complexity` lint flags the bare `Arc<dyn Fn…>` spellings.
+    type ConvertToLlmFn = Arc<dyn Fn(&[serde_json::Value]) -> Vec<serde_json::Value> + Send + Sync>;
+    type TransformContextFn = Arc<
+        dyn Fn(
+                Vec<serde_json::Value>,
+            )
+                -> Pin<Box<dyn std::future::Future<Output = Vec<serde_json::Value>> + Send>>
+            + Send
+            + Sync,
+    >;
+
     /// Identity convertToLlm — passes through user/assistant/
     /// toolResult messages, drops anything else. Mirrors pi's
     /// `identityConverter` at test file line 79.
-    fn identity_converter()
-    -> Arc<dyn Fn(&[serde_json::Value]) -> Vec<serde_json::Value> + Send + Sync> {
+    fn identity_converter() -> ConvertToLlmFn {
         Arc::new(|messages: &[serde_json::Value]| {
             messages
                 .iter()
@@ -412,9 +423,7 @@ mod tests {
         })
     }
 
-    fn build_config(
-        convert: Arc<dyn Fn(&[serde_json::Value]) -> Vec<serde_json::Value> + Send + Sync>,
-    ) -> LoopConfig {
+    fn build_config(convert: ConvertToLlmFn) -> LoopConfig {
         LoopConfig {
             convert_to_llm: convert,
             transform_context: None,
@@ -636,17 +645,16 @@ mod tests {
         // Inspector closure — records what convertToLlm received.
         let received = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
         let received_clone = received.clone();
-        let convert: Arc<dyn Fn(&[serde_json::Value]) -> Vec<serde_json::Value> + Send + Sync> =
-            Arc::new(move |messages| {
-                let mut slot = received_clone.lock().unwrap();
-                *slot = messages.to_vec();
-                // Filter notifications out for the LLM.
-                messages
-                    .iter()
-                    .filter(|m| m.get("role").and_then(|r| r.as_str()) != Some("notification"))
-                    .cloned()
-                    .collect()
-            });
+        let convert: ConvertToLlmFn = Arc::new(move |messages| {
+            let mut slot = received_clone.lock().unwrap();
+            *slot = messages.to_vec();
+            // Filter notifications out for the LLM.
+            messages
+                .iter()
+                .filter(|m| m.get("role").and_then(|r| r.as_str()) != Some("notification"))
+                .cloned()
+                .collect()
+        });
 
         let config = build_config(convert);
         let signal = AbortSignal::new();
@@ -696,14 +704,7 @@ mod tests {
         let counter = Arc::new(AtomicUsize::new(0));
 
         let transform_order = counter.clone();
-        let transform: Arc<
-            dyn Fn(
-                    Vec<serde_json::Value>,
-                )
-                    -> Pin<Box<dyn std::future::Future<Output = Vec<serde_json::Value>> + Send>>
-                + Send
-                + Sync,
-        > = Arc::new(move |messages| {
+        let transform: TransformContextFn = Arc::new(move |messages| {
             let order = transform_order.clone();
             Box::pin(async move {
                 let n = order.fetch_add(1, Ordering::SeqCst);
@@ -723,13 +724,12 @@ mod tests {
         let convert_order = counter.clone();
         let received_convert = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
         let received_clone = received_convert.clone();
-        let convert: Arc<dyn Fn(&[serde_json::Value]) -> Vec<serde_json::Value> + Send + Sync> =
-            Arc::new(move |messages| {
-                let n = convert_order.fetch_add(1, Ordering::SeqCst);
-                assert_eq!(n, 1, "convert_to_llm must run after transform_context");
-                *received_clone.lock().unwrap() = messages.to_vec();
-                messages.to_vec()
-            });
+        let convert: ConvertToLlmFn = Arc::new(move |messages| {
+            let n = convert_order.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(n, 1, "convert_to_llm must run after transform_context");
+            *received_clone.lock().unwrap() = messages.to_vec();
+            messages.to_vec()
+        });
 
         let config = LoopConfig {
             convert_to_llm: convert,

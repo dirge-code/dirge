@@ -1,4 +1,7 @@
 #[cfg(test)]
+// The file is already module `tests::semantic_tests`; the same-named
+// inner module is dirge's per-file test convention, not a mistake.
+#[allow(clippy::module_inception)]
 mod semantic_tests {
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -14,8 +17,10 @@ mod semantic_tests {
             .join("fixtures")
     }
 
+    // The adapter pushes below are all `#[cfg(feature = …)]`-gated, so this
+    // can't be written as a single `vec![…]` literal.
+    #[allow(unused_mut, clippy::vec_init_then_push)]
     fn mk_registry() -> Arc<AdapterRegistry> {
-        #[allow(unused_mut)]
         let mut adapters: Vec<Box<dyn LanguageAdapter>> = Vec::new();
 
         #[cfg(feature = "semantic-ts")]

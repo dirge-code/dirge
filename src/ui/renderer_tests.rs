@@ -296,7 +296,7 @@ fn fresh_with_lines_scrollable(n: usize, min_scroll_margin: usize) -> Renderer {
     let need = (visible + min_scroll_margin).max(n);
     for i in 0..need {
         r.buffer.push(LineEntry {
-            text: CompactString::new(&format!("line {i}")),
+            text: CompactString::new(format!("line {i}")),
             color: Color::White,
         });
     }
@@ -340,7 +340,7 @@ fn regression_scrolled_up_view_stays_anchored_through_appends() {
     // Stream in 8 new lines while the user is scrolled up.
     for i in 0..8 {
         r.push_buffer_line(LineEntry {
-            text: CompactString::new(&format!("new {i}")),
+            text: CompactString::new(format!("new {i}")),
             color: Color::White,
         });
     }
@@ -371,7 +371,7 @@ fn regression_replace_from_keeps_view_anchored_when_scrolled_up() {
     let repl_start = total.saturating_sub(10);
     let new_lines: Vec<LineEntry> = (0..20)
         .map(|i| LineEntry {
-            text: CompactString::new(&format!("repl {i}")),
+            text: CompactString::new(format!("repl {i}")),
             color: Color::White,
         })
         .collect();
@@ -390,7 +390,7 @@ fn regression_replace_from_keeps_view_anchored_when_scrolled_up() {
     let repl_start = total.saturating_sub(8);
     let shorter: Vec<LineEntry> = (0..3)
         .map(|i| LineEntry {
-            text: CompactString::new(&format!("sh {i}")),
+            text: CompactString::new(format!("sh {i}")),
             color: Color::White,
         })
         .collect();
@@ -412,7 +412,7 @@ fn at_bottom_view_follows_new_content() {
 
     for i in 0..5 {
         r.push_buffer_line(LineEntry {
-            text: CompactString::new(&format!("new {i}")),
+            text: CompactString::new(format!("new {i}")),
             color: Color::White,
         });
     }
@@ -440,7 +440,7 @@ fn selection_indices_stay_absolute_under_streaming_appends() {
 
     for i in 0..7 {
         r.push_buffer_line(LineEntry {
-            text: CompactString::new(&format!("new {i}")),
+            text: CompactString::new(format!("new {i}")),
             color: Color::White,
         });
     }

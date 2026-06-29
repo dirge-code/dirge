@@ -1435,6 +1435,12 @@ async fn main() -> anyhow::Result<()> {
                 .await
             };
 
+            // In `--loop` mode the body only re-iterates on a plugin-driven
+            // model swap; without the `plugin` feature the sole match arm
+            // returns, so clippy's (correct) `never_loop` fires for a config
+            // that intentionally runs the body exactly once. Scope the allow
+            // to that config so the lint stays live under `plugin`.
+            #[cfg_attr(not(feature = "plugin"), allow(clippy::never_loop))]
             loop {
                 let exit = run_headless_loop(
                     &current_agent,

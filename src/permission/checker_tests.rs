@@ -642,8 +642,10 @@ fn regression_session_allowlist_cd_star_matches_path_arg() {
 // the session-allowlist contribution in isolation from the default.
 #[test]
 fn path_tool_session_allowlist_keeps_one_segment_semantics() {
-    let mut cfg = PermissionConfig::default();
-    cfg.default = Some(Action::Ask);
+    let cfg = PermissionConfig {
+        default: Some(Action::Ask),
+        ..Default::default()
+    };
     // The CWD-scoped builtin-allow rule for write/edit/apply_patch
     // would otherwise intercept any path under `working_dir` and
     // mask the session-allowlist semantics under test. Pin
@@ -680,8 +682,10 @@ fn path_tool_session_allowlist_keeps_one_segment_semantics() {
 /// combined result is Ask — infinite re-prompt loop.
 #[test]
 fn add_session_allowlist_mirrors_write_to_edit() {
-    let mut cfg = PermissionConfig::default();
-    cfg.default = Some(Action::Ask);
+    let cfg = PermissionConfig {
+        default: Some(Action::Ask),
+        ..Default::default()
+    };
     let mut checker = PermissionChecker::new(
         &cfg,
         SecurityMode::Standard,
@@ -775,8 +779,10 @@ fn add_session_allowlist_mirrors_write_to_edit() {
 // entry intact, so a "revoked" grant kept auto-allowing.
 #[test]
 fn remove_session_allowlist_revokes_engine_grant() {
-    let mut cfg = PermissionConfig::default();
-    cfg.default = Some(Action::Ask);
+    let cfg = PermissionConfig {
+        default: Some(Action::Ask),
+        ..Default::default()
+    };
     let mut checker = PermissionChecker::new(
         &cfg,
         SecurityMode::Standard,
@@ -1206,8 +1212,10 @@ fn accept_mode_auto_approves_edit_inside_cwd_through_symlink() {
 /// SAME folder must hit the session allowlist — no re-prompt.
 #[test]
 fn allow_always_folder_persists_in_session_allowlist() {
-    let mut cfg = PermissionConfig::default();
-    cfg.default = Some(Action::Ask);
+    let cfg = PermissionConfig {
+        default: Some(Action::Ask),
+        ..Default::default()
+    };
     // Use a working_dir OUTSIDE the test paths so the CWD-allow
     // installer doesn't intercept and mask the session allowlist
     // under test.
@@ -1240,8 +1248,10 @@ fn allow_always_folder_persists_in_session_allowlist() {
 /// The session allowlist entry is `<cwd>/src/**`.
 #[test]
 fn allow_always_folder_covers_subsequent_writes_to_same_folder() {
-    let mut cfg = PermissionConfig::default();
-    cfg.default = Some(Action::Ask);
+    let cfg = PermissionConfig {
+        default: Some(Action::Ask),
+        ..Default::default()
+    };
     let mut checker = PermissionChecker::new(
         &cfg,
         SecurityMode::Standard,
@@ -1303,8 +1313,10 @@ fn allow_always_folder_resolves_through_symlinks() {
     #[cfg(windows)]
     std::os::windows::fs::symlink_dir(&real, &link).unwrap();
 
-    let mut cfg = PermissionConfig::default();
-    cfg.default = Some(Action::Ask);
+    let cfg = PermissionConfig {
+        default: Some(Action::Ask),
+        ..Default::default()
+    };
     // Put the cwd somewhere OFF the test paths so the CWD-allow
     // rule doesn't mask the allowlist behavior under test.
     let mut checker = PermissionChecker::new(

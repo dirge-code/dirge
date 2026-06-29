@@ -1020,7 +1020,7 @@ mod tests {
     #[test]
     fn chamber_row_styled_aligns_despite_ansi() {
         let inner = 30;
-        let content = format!("\x1b[32mfn\x1b[0m main() {{}}");
+        let content = "\x1b[32mfn\x1b[0m main() {}".to_string();
         let row = chamber_row_styled(&content, inner, Color::Green);
         assert_eq!(crate::ui::wrap::visible_width(&row), inner + 4);
         assert!(row.starts_with("│ ") && row.ends_with(" │"));

@@ -161,7 +161,7 @@ mod tests {
         dir.join("state.db")
     }
 
-    fn seed_session(db_path: &PathBuf, id: &str) {
+    fn seed_session(db_path: &std::path::Path, id: &str) {
         let db = SessionDb::open(db_path).unwrap();
         db.insert_session(id, "cli", "gpt-5", "openai", "2025-01-15T10:00:00Z")
             .unwrap();

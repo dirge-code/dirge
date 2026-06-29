@@ -284,7 +284,7 @@ async fn drive(n: usize, result_order: Vec<usize>) -> Vec<Chamber> {
             .expect("handle_tool_result");
     }
 
-    drop(ctx);
+    let _ = ctx;
     collect_chambers(&renderer)
 }
 
@@ -402,7 +402,7 @@ async fn dirge_5h5_repro_interleaved_baseline() {
             .await
             .expect("handle_tool_result");
     }
-    drop(ctx);
+    let _ = ctx;
     let chambers = collect_chambers(&renderer);
     assert_all_chambers_have_body(&chambers, 7);
 }
@@ -464,7 +464,7 @@ async fn dirge_5h5_repro_add_chat_during_burst() {
     }
     let _post = ctx.renderer.add_chat("subagent-post");
 
-    drop(ctx);
+    let _ = ctx;
     let chambers = collect_chambers(&renderer);
     assert_all_chambers_have_body(&chambers, 7);
 }
@@ -498,7 +498,7 @@ async fn dirge_5h5_repro_buffer_integrity_after_burst() {
             .expect("handle_tool_result");
     }
 
-    drop(ctx);
+    let _ = ctx;
 
     // Every chamber must have >= 1 body row distinct from TOP and BOTTOM.
     let chambers = collect_chambers(&renderer);
@@ -591,7 +591,7 @@ async fn dirge_5h5_repro_subagent_writes_between_tool_results() {
         );
     }
 
-    drop(ctx);
+    let _ = ctx;
     let chambers = collect_chambers(&renderer);
     assert_all_chambers_have_body(&chambers, 7);
 }
@@ -769,7 +769,7 @@ async fn dirge_5h5_repro_full_issue_shape() {
         );
     }
 
-    drop(ctx);
+    let _ = ctx;
     let chambers = collect_chambers(&renderer);
 
     // Every one of the 7 parent reads must have a body row.

@@ -80,6 +80,88 @@ fn expand_home(pattern: &str) -> String {
     pattern.to_string()
 }
 
+fn glob_to_regex(pattern: &str, path_style: bool) -> String {
+    // F3 (dirge-efw): trailing ` *` becomes ` (?:.*)?$` — opencode's
+    // `util/wildcard.ts:13-15` semantic. Lets a session-allowlist
+    // pattern like `ls *` match BOTH `ls` (no args) and `ls -la`
+    // (with args). Without this rewrite, `ls *` compiles to
+    // `^ls .*$` which requires the trailing space, so the user
+    // gets re-prompted for bare `ls`.
+    //
+    // Applies only to command-style patterns (path_style=false).
+    // Path patterns like `src/*` legitimately require at least
+    // one character after the slash; relaxing those would let
+    // `src/` (the directory itself, no file) match a per-file
+    // rule. Command tools use shell-style globbing where the
+    // optional-trailing-arg semantic is the user expectation.
+    // dirge-9zbd: also covers a trailing ` **`. For COMMAND patterns `*`
+    // and `**` both compile to `.*`, so `cargo test *` and `cargo test **`
+    // are equivalent — the only purpose of this rewrite is making the
+    // trailing args OPTIONAL. Without it, `cargo test **` compiled to
+    // `^cargo test .*$`, which requires a trailing space, so the BARE
+    // command `cargo test` (no args) silently re-prompted — and most
+    // `default_bash_rules` entries use the ` **` form.
+    if !path_style && !pattern.ends_with("\\ *") {
+        if let Some(head) = pattern
+            .strip_suffix(" **")
+            .or_else(|| pattern.strip_suffix(" *"))
+        {
+            let head_regex = glob_to_regex_inner(head, path_style);
+            return format!("^{head_regex}(?: .*)?$");
+        }
+    }
+    // PERM-4: a user-written `/etc/**` should match BOTH the
+    // directory itself and everything beneath it. Default inner
+    // semantics emit `^/etc/.*$` for that pattern, which requires
+    // a slash + content and silently misses the bare-directory
+    // case. Trailing `/**` rewrites the tail to `(?:/.*)?` so both
+    // forms hit. Path-style only; command patterns don't have
+    // this idiom.
+    if path_style && pattern.ends_with("/**") && pattern.len() >= 3 {
+        let head = &pattern[..pattern.len() - 3];
+        let head_regex = glob_to_regex_inner(head, path_style);
+        return format!("^{head_regex}(?:/.*)?$");
+    }
+    format!("^{}$", glob_to_regex_inner(pattern, path_style))
+}
+
+/// Inner glob → regex without the leading `^` and trailing `$`
+/// anchors. Separated so the F3 trailing-space-star rewrite can
+/// wrap the head independently.
+fn glob_to_regex_inner(pattern: &str, path_style: bool) -> String {
+    let mut re = String::with_capacity(pattern.len() * 2);
+    let mut chars = pattern.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '*' => {
+                if chars.peek() == Some(&'*') {
+                    chars.next();
+                    if chars.peek() == Some(&'/') {
+                        chars.next();
+                        re.push_str("(?:.*/)?");
+                    } else {
+                        re.push_str(".*");
+                    }
+                } else if path_style {
+                    re.push_str("[^/]*");
+                } else {
+                    re.push_str(".*");
+                }
+            }
+            '?' if path_style => re.push_str("[^/]"),
+            '?' => re.push('.'),
+            '.' => re.push_str("\\."),
+            '\\' => re.push_str("\\\\"),
+            '(' | ')' | '[' | ']' | '{' | '}' | '+' | '^' | '$' | '|' => {
+                re.push('\\');
+                re.push(c);
+            }
+            _ => re.push(c),
+        }
+    }
+    re
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,86 +371,4 @@ mod tests {
         // Sibling that shares a prefix must NOT match.
         assert!(!pat.matches("/etcetera/foo"));
     }
-}
-
-fn glob_to_regex(pattern: &str, path_style: bool) -> String {
-    // F3 (dirge-efw): trailing ` *` becomes ` (?:.*)?$` — opencode's
-    // `util/wildcard.ts:13-15` semantic. Lets a session-allowlist
-    // pattern like `ls *` match BOTH `ls` (no args) and `ls -la`
-    // (with args). Without this rewrite, `ls *` compiles to
-    // `^ls .*$` which requires the trailing space, so the user
-    // gets re-prompted for bare `ls`.
-    //
-    // Applies only to command-style patterns (path_style=false).
-    // Path patterns like `src/*` legitimately require at least
-    // one character after the slash; relaxing those would let
-    // `src/` (the directory itself, no file) match a per-file
-    // rule. Command tools use shell-style globbing where the
-    // optional-trailing-arg semantic is the user expectation.
-    // dirge-9zbd: also covers a trailing ` **`. For COMMAND patterns `*`
-    // and `**` both compile to `.*`, so `cargo test *` and `cargo test **`
-    // are equivalent — the only purpose of this rewrite is making the
-    // trailing args OPTIONAL. Without it, `cargo test **` compiled to
-    // `^cargo test .*$`, which requires a trailing space, so the BARE
-    // command `cargo test` (no args) silently re-prompted — and most
-    // `default_bash_rules` entries use the ` **` form.
-    if !path_style && !pattern.ends_with("\\ *") {
-        if let Some(head) = pattern
-            .strip_suffix(" **")
-            .or_else(|| pattern.strip_suffix(" *"))
-        {
-            let head_regex = glob_to_regex_inner(head, path_style);
-            return format!("^{head_regex}(?: .*)?$");
-        }
-    }
-    // PERM-4: a user-written `/etc/**` should match BOTH the
-    // directory itself and everything beneath it. Default inner
-    // semantics emit `^/etc/.*$` for that pattern, which requires
-    // a slash + content and silently misses the bare-directory
-    // case. Trailing `/**` rewrites the tail to `(?:/.*)?` so both
-    // forms hit. Path-style only; command patterns don't have
-    // this idiom.
-    if path_style && pattern.ends_with("/**") && pattern.len() >= 3 {
-        let head = &pattern[..pattern.len() - 3];
-        let head_regex = glob_to_regex_inner(head, path_style);
-        return format!("^{head_regex}(?:/.*)?$");
-    }
-    format!("^{}$", glob_to_regex_inner(pattern, path_style))
-}
-
-/// Inner glob → regex without the leading `^` and trailing `$`
-/// anchors. Separated so the F3 trailing-space-star rewrite can
-/// wrap the head independently.
-fn glob_to_regex_inner(pattern: &str, path_style: bool) -> String {
-    let mut re = String::with_capacity(pattern.len() * 2);
-    let mut chars = pattern.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '*' => {
-                if chars.peek() == Some(&'*') {
-                    chars.next();
-                    if chars.peek() == Some(&'/') {
-                        chars.next();
-                        re.push_str("(?:.*/)?");
-                    } else {
-                        re.push_str(".*");
-                    }
-                } else if path_style {
-                    re.push_str("[^/]*");
-                } else {
-                    re.push_str(".*");
-                }
-            }
-            '?' if path_style => re.push_str("[^/]"),
-            '?' => re.push('.'),
-            '.' => re.push_str("\\."),
-            '\\' => re.push_str("\\\\"),
-            '(' | ')' | '[' | ']' | '{' | '}' | '+' | '^' | '$' | '|' => {
-                re.push('\\');
-                re.push(c);
-            }
-            _ => re.push(c),
-        }
-    }
-    re
 }

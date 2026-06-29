@@ -26,7 +26,7 @@ pub(crate) fn dirs_path() -> PathBuf {
     // (DIRGE_DATA_DIR still wins, so tests can pick their own location).
     #[cfg(test)]
     {
-        return std::env::temp_dir().join(format!("dirge-test-data-{}", std::process::id()));
+        std::env::temp_dir().join(format!("dirge-test-data-{}", std::process::id()))
     }
     #[cfg(not(test))]
     {
@@ -275,6 +275,267 @@ pub fn delete_session(id: &str) -> anyhow::Result<()> {
         std::fs::remove_file(path)?;
     }
     Ok(())
+}
+
+/// Collapse fold chains to one entry per conversation: keep only the
+/// first session seen for each [`Session::effective_origin`]. Callers
+/// pass a newest-first list, so the survivor is the chain tip and the
+/// stale older rotations drop out — the session list shows a folded
+/// conversation once, not once per rotation. Pure for testability.
+fn dedup_by_origin(sessions: Vec<Session>) -> Vec<Session> {
+    let mut seen = std::collections::HashSet::new();
+    sessions
+        .into_iter()
+        .filter(|s| seen.insert(s.effective_origin().to_string()))
+        .collect()
+}
+
+/// Resume helper: resolve `id` to the TIP of its fold chain. A compaction
+/// fold rotates the session id and leaves the older file behind unchanged
+/// (pre-fold state), so resuming *any* member of a chain must hop to the
+/// newest session that shares the same [`Session::effective_origin`] —
+/// otherwise resume silently loads a stale snapshot. Falls back to the
+/// directly-loaded session when nothing newer shares its origin (the
+/// common case: the user already named the tip, or the session never
+/// folded). Filtering by origin makes the directory scan robust to
+/// unrelated sessions.
+pub fn load_session_tip(id: &str) -> anyhow::Result<Session> {
+    let requested = load_session(id)?;
+    let origin = requested.effective_origin().to_string();
+    let dir = session_dir();
+    if !dir.exists() {
+        return Ok(requested);
+    }
+
+    // Find the chain tip with a CHEAP partial parse. A fold leaves the older
+    // (often large) session file behind, so these accumulate; fully
+    // deserializing every one — every message, tool result, and the
+    // `message_store` map — on each resume was the dominant cost of
+    // `--session` startup. `TipMeta` pulls only the three fields the scan
+    // compares; serde skips everything else via `IgnoredAny`, never
+    // allocating the message structures. We then fully load just the winner.
+    #[derive(serde::Deserialize)]
+    struct TipMeta {
+        id: String,
+        #[serde(default)]
+        origin_id: Option<String>,
+        #[serde(default)]
+        updated_at: String,
+    }
+
+    let mut tip_id = requested.id.to_string();
+    let mut tip_updated = requested.updated_at.to_string();
+    for entry in std::fs::read_dir(&dir)? {
+        // Skip a bad directory entry rather than aborting resume: a
+        // concurrent fold/cleanup can delete a sibling file mid-scan, and
+        // the seed session already loaded fine — a plain load would have
+        // succeeded, so the tip scan must degrade to it, not error out.
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e == "json")
+            && let Ok(json) = std::fs::read_to_string(&path)
+            && let Ok(meta) = serde_json::from_str::<TipMeta>(&json)
+        {
+            let meta_origin = meta.origin_id.as_deref().unwrap_or(&meta.id);
+            if meta_origin == origin && meta.updated_at > tip_updated {
+                tip_updated = meta.updated_at;
+                tip_id = meta.id;
+            }
+        }
+    }
+
+    if tip_id.as_str() == requested.id.as_str() {
+        // Seed is already the tip — no second load.
+        Ok(requested)
+    } else {
+        // Fully deserialize only the winner. If it vanished between the scan
+        // and this load (concurrent fold/cleanup), fall back to the seed we
+        // already have rather than failing the resume.
+        Ok(load_session(&tip_id).unwrap_or(requested))
+    }
+}
+
+pub fn find_sessions_by_prefix(prefix: &str) -> anyhow::Result<Vec<Session>> {
+    // SESS-5: `stem.starts_with("")` matches every session file, so
+    // `/sessions ` or `/sessions delete ` (trailing space) would
+    // enumerate or operate on ALL sessions instead of a prefix
+    // match. Reject empty prefix so callers must supply at least
+    // one character.
+    if prefix.is_empty() {
+        anyhow::bail!("session prefix must not be empty");
+    }
+    let dir = session_dir();
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut sessions: Vec<Session> = Vec::new();
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e == "json")
+            && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+            && stem.starts_with(prefix)
+            && let Ok(json) = std::fs::read_to_string(&path)
+            && let Ok(session) = serde_json::from_str::<Session>(&json)
+        {
+            sessions.push(session);
+        }
+    }
+    sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    // Collapse fold chains so a prefix that spans a rotated conversation
+    // returns the single tip, not every rotation.
+    Ok(dedup_by_origin(sessions))
+}
+
+pub fn find_recent_sessions(limit: usize) -> anyhow::Result<Vec<Session>> {
+    let dir = session_dir();
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    // Audit L10: previously read + parsed every `*.json` then sorted
+    // by `updated_at` then truncated. For a user with 5 000 stored
+    // sessions this is 5 000 file reads + parses on every `/sessions`
+    // invocation. Sort by filesystem mtime first (cheap; uses the
+    // metadata already read by `read_dir`), then parse only the top
+    // `limit`. mtime corresponds closely to `updated_at` since both
+    // are bumped on every `save_session` write.
+    let mut entries: Vec<(std::path::PathBuf, std::time::SystemTime)> = Vec::new();
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().is_none_or(|e| e != "json") {
+            continue;
+        }
+        let mtime = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        entries.push((path, mtime));
+    }
+    // Newest first.
+    entries.sort_by_key(|e| std::cmp::Reverse(e.1));
+    entries.truncate(limit);
+
+    let mut sessions: Vec<Session> = Vec::with_capacity(entries.len());
+    for (path, _) in entries {
+        if let Ok(json) = std::fs::read_to_string(&path)
+            && let Ok(session) = serde_json::from_str::<Session>(&json)
+        {
+            sessions.push(session);
+        }
+    }
+    // Refine ordering by the in-file updated_at — mtime is a good
+    // proxy but `updated_at` is canonical. Cheap on the already-
+    // truncated list.
+    sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    // Show one row per conversation: a just-folded chain can have both
+    // its tip and a recent older rotation inside the window; keep the
+    // tip. Stale rotations from older folds already sink below the
+    // window by mtime. (A chain occupying the window can yield slightly
+    // fewer than `limit` rows — acceptable for a recents list.)
+    Ok(dedup_by_origin(sessions))
+}
+
+/// Cross-session Up-arrow history: the `max_sessions` most-recent OTHER
+/// sessions in the same project (same `working_dir`, different
+/// conversation origin than `current`). Returned OLDEST-first so the
+/// caller can append their prompts ahead of the current session's own,
+/// keeping the newest command at the tail of history (where Up-arrow
+/// recall starts).
+///
+/// Candidate files are ordered by filesystem mtime (free from `read_dir`
+/// metadata) and visited newest-first, so only enough files to find the
+/// `max_sessions` most-recent same-project conversations are read — a
+/// large session store isn't loaded wholesale on startup. mtime tracks
+/// `updated_at` (both bumped on every `save_session` write), the same
+/// recency proxy `find_recent_sessions` relies on. A cheap partial parse
+/// (`ProjMeta`) filters by `working_dir` before the few winners are fully
+/// deserialized. Fold chains are collapsed by origin — the first file
+/// seen for an origin is its newest-mtime tip — so `max_sessions` counts
+/// distinct prior conversations, not rotation files, and a folded prior
+/// can't seed overlapping prompts.
+pub fn recent_project_sessions(current: &Session, max_sessions: usize) -> Vec<Session> {
+    if max_sessions == 0 {
+        return Vec::new();
+    }
+    let dir = session_dir();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let current_origin = current.effective_origin();
+    let current_wd = current.working_dir.as_str();
+
+    #[derive(serde::Deserialize)]
+    struct ProjMeta {
+        id: String,
+        #[serde(default)]
+        origin_id: Option<String>,
+        #[serde(default)]
+        working_dir: Option<String>,
+    }
+
+    // Order by mtime newest-first using only the directory metadata — no
+    // file content read yet.
+    let mut files: Vec<(std::path::PathBuf, std::time::SystemTime)> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|e| e != "json") {
+            continue;
+        }
+        let mtime = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        files.push((path, mtime));
+    }
+    files.sort_by_key(|f| std::cmp::Reverse(f.1));
+
+    // Walk newest-first, partial-parsing only until the `max_sessions`
+    // most-recent same-project conversations are found. Pre-seeding `seen`
+    // with the current origin skips the current session's own fold chain;
+    // the first file seen for any other origin is its tip, so the set also
+    // collapses rotations. A vanished or unparseable sibling is skipped
+    // rather than aborting (concurrent fold/cleanup can rewrite a file
+    // mid-scan).
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    seen.insert(current_origin.to_string());
+    let mut picked: Vec<std::path::PathBuf> = Vec::new();
+    for (path, _) in files {
+        if picked.len() == max_sessions {
+            break;
+        }
+        let Ok(json) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(meta) = serde_json::from_str::<ProjMeta>(&json) else {
+            continue;
+        };
+        if meta.working_dir.as_deref() != Some(current_wd) {
+            continue;
+        }
+        let origin = meta.origin_id.unwrap_or(meta.id);
+        if !seen.insert(origin) {
+            continue;
+        }
+        picked.push(path);
+    }
+    // Oldest-first: appending then yields oldest-session prompts first,
+    // so the newest prior session sits just behind the current session.
+    picked.reverse();
+
+    let mut out = Vec::with_capacity(picked.len());
+    for path in picked {
+        if let Ok(json) = std::fs::read_to_string(&path)
+            && let Ok(session) = serde_json::from_str::<Session>(&json)
+        {
+            out.push(session);
+        }
+    }
+    out
+}
+
+pub fn agents_path() -> PathBuf {
+    config_path().join("agent").join("AGENTS.md")
 }
 
 #[cfg(test)]
@@ -1214,265 +1475,4 @@ mod tests {
             "alternative approach..."
         );
     }
-}
-
-/// Collapse fold chains to one entry per conversation: keep only the
-/// first session seen for each [`Session::effective_origin`]. Callers
-/// pass a newest-first list, so the survivor is the chain tip and the
-/// stale older rotations drop out — the session list shows a folded
-/// conversation once, not once per rotation. Pure for testability.
-fn dedup_by_origin(sessions: Vec<Session>) -> Vec<Session> {
-    let mut seen = std::collections::HashSet::new();
-    sessions
-        .into_iter()
-        .filter(|s| seen.insert(s.effective_origin().to_string()))
-        .collect()
-}
-
-/// Resume helper: resolve `id` to the TIP of its fold chain. A compaction
-/// fold rotates the session id and leaves the older file behind unchanged
-/// (pre-fold state), so resuming *any* member of a chain must hop to the
-/// newest session that shares the same [`Session::effective_origin`] —
-/// otherwise resume silently loads a stale snapshot. Falls back to the
-/// directly-loaded session when nothing newer shares its origin (the
-/// common case: the user already named the tip, or the session never
-/// folded). Filtering by origin makes the directory scan robust to
-/// unrelated sessions.
-pub fn load_session_tip(id: &str) -> anyhow::Result<Session> {
-    let requested = load_session(id)?;
-    let origin = requested.effective_origin().to_string();
-    let dir = session_dir();
-    if !dir.exists() {
-        return Ok(requested);
-    }
-
-    // Find the chain tip with a CHEAP partial parse. A fold leaves the older
-    // (often large) session file behind, so these accumulate; fully
-    // deserializing every one — every message, tool result, and the
-    // `message_store` map — on each resume was the dominant cost of
-    // `--session` startup. `TipMeta` pulls only the three fields the scan
-    // compares; serde skips everything else via `IgnoredAny`, never
-    // allocating the message structures. We then fully load just the winner.
-    #[derive(serde::Deserialize)]
-    struct TipMeta {
-        id: String,
-        #[serde(default)]
-        origin_id: Option<String>,
-        #[serde(default)]
-        updated_at: String,
-    }
-
-    let mut tip_id = requested.id.to_string();
-    let mut tip_updated = requested.updated_at.to_string();
-    for entry in std::fs::read_dir(&dir)? {
-        // Skip a bad directory entry rather than aborting resume: a
-        // concurrent fold/cleanup can delete a sibling file mid-scan, and
-        // the seed session already loaded fine — a plain load would have
-        // succeeded, so the tip scan must degrade to it, not error out.
-        let Ok(entry) = entry else { continue };
-        let path = entry.path();
-        if path.extension().is_some_and(|e| e == "json")
-            && let Ok(json) = std::fs::read_to_string(&path)
-            && let Ok(meta) = serde_json::from_str::<TipMeta>(&json)
-        {
-            let meta_origin = meta.origin_id.as_deref().unwrap_or(&meta.id);
-            if meta_origin == origin && meta.updated_at > tip_updated {
-                tip_updated = meta.updated_at;
-                tip_id = meta.id;
-            }
-        }
-    }
-
-    if tip_id.as_str() == requested.id.as_str() {
-        // Seed is already the tip — no second load.
-        Ok(requested)
-    } else {
-        // Fully deserialize only the winner. If it vanished between the scan
-        // and this load (concurrent fold/cleanup), fall back to the seed we
-        // already have rather than failing the resume.
-        Ok(load_session(&tip_id).unwrap_or(requested))
-    }
-}
-
-pub fn find_sessions_by_prefix(prefix: &str) -> anyhow::Result<Vec<Session>> {
-    // SESS-5: `stem.starts_with("")` matches every session file, so
-    // `/sessions ` or `/sessions delete ` (trailing space) would
-    // enumerate or operate on ALL sessions instead of a prefix
-    // match. Reject empty prefix so callers must supply at least
-    // one character.
-    if prefix.is_empty() {
-        anyhow::bail!("session prefix must not be empty");
-    }
-    let dir = session_dir();
-    if !dir.exists() {
-        return Ok(Vec::new());
-    }
-    let mut sessions: Vec<Session> = Vec::new();
-    for entry in std::fs::read_dir(&dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().is_some_and(|e| e == "json")
-            && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
-            && stem.starts_with(prefix)
-            && let Ok(json) = std::fs::read_to_string(&path)
-            && let Ok(session) = serde_json::from_str::<Session>(&json)
-        {
-            sessions.push(session);
-        }
-    }
-    sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-    // Collapse fold chains so a prefix that spans a rotated conversation
-    // returns the single tip, not every rotation.
-    Ok(dedup_by_origin(sessions))
-}
-
-pub fn find_recent_sessions(limit: usize) -> anyhow::Result<Vec<Session>> {
-    let dir = session_dir();
-    if !dir.exists() {
-        return Ok(Vec::new());
-    }
-    // Audit L10: previously read + parsed every `*.json` then sorted
-    // by `updated_at` then truncated. For a user with 5 000 stored
-    // sessions this is 5 000 file reads + parses on every `/sessions`
-    // invocation. Sort by filesystem mtime first (cheap; uses the
-    // metadata already read by `read_dir`), then parse only the top
-    // `limit`. mtime corresponds closely to `updated_at` since both
-    // are bumped on every `save_session` write.
-    let mut entries: Vec<(std::path::PathBuf, std::time::SystemTime)> = Vec::new();
-    for entry in std::fs::read_dir(&dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().is_none_or(|e| e != "json") {
-            continue;
-        }
-        let mtime = entry
-            .metadata()
-            .and_then(|m| m.modified())
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        entries.push((path, mtime));
-    }
-    // Newest first.
-    entries.sort_by_key(|e| std::cmp::Reverse(e.1));
-    entries.truncate(limit);
-
-    let mut sessions: Vec<Session> = Vec::with_capacity(entries.len());
-    for (path, _) in entries {
-        if let Ok(json) = std::fs::read_to_string(&path)
-            && let Ok(session) = serde_json::from_str::<Session>(&json)
-        {
-            sessions.push(session);
-        }
-    }
-    // Refine ordering by the in-file updated_at — mtime is a good
-    // proxy but `updated_at` is canonical. Cheap on the already-
-    // truncated list.
-    sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-    // Show one row per conversation: a just-folded chain can have both
-    // its tip and a recent older rotation inside the window; keep the
-    // tip. Stale rotations from older folds already sink below the
-    // window by mtime. (A chain occupying the window can yield slightly
-    // fewer than `limit` rows — acceptable for a recents list.)
-    Ok(dedup_by_origin(sessions))
-}
-
-/// Cross-session Up-arrow history: the `max_sessions` most-recent OTHER
-/// sessions in the same project (same `working_dir`, different
-/// conversation origin than `current`). Returned OLDEST-first so the
-/// caller can append their prompts ahead of the current session's own,
-/// keeping the newest command at the tail of history (where Up-arrow
-/// recall starts).
-///
-/// Candidate files are ordered by filesystem mtime (free from `read_dir`
-/// metadata) and visited newest-first, so only enough files to find the
-/// `max_sessions` most-recent same-project conversations are read — a
-/// large session store isn't loaded wholesale on startup. mtime tracks
-/// `updated_at` (both bumped on every `save_session` write), the same
-/// recency proxy `find_recent_sessions` relies on. A cheap partial parse
-/// (`ProjMeta`) filters by `working_dir` before the few winners are fully
-/// deserialized. Fold chains are collapsed by origin — the first file
-/// seen for an origin is its newest-mtime tip — so `max_sessions` counts
-/// distinct prior conversations, not rotation files, and a folded prior
-/// can't seed overlapping prompts.
-pub fn recent_project_sessions(current: &Session, max_sessions: usize) -> Vec<Session> {
-    if max_sessions == 0 {
-        return Vec::new();
-    }
-    let dir = session_dir();
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return Vec::new();
-    };
-    let current_origin = current.effective_origin();
-    let current_wd = current.working_dir.as_str();
-
-    #[derive(serde::Deserialize)]
-    struct ProjMeta {
-        id: String,
-        #[serde(default)]
-        origin_id: Option<String>,
-        #[serde(default)]
-        working_dir: Option<String>,
-    }
-
-    // Order by mtime newest-first using only the directory metadata — no
-    // file content read yet.
-    let mut files: Vec<(std::path::PathBuf, std::time::SystemTime)> = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().is_none_or(|e| e != "json") {
-            continue;
-        }
-        let mtime = entry
-            .metadata()
-            .and_then(|m| m.modified())
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        files.push((path, mtime));
-    }
-    files.sort_by_key(|f| std::cmp::Reverse(f.1));
-
-    // Walk newest-first, partial-parsing only until the `max_sessions`
-    // most-recent same-project conversations are found. Pre-seeding `seen`
-    // with the current origin skips the current session's own fold chain;
-    // the first file seen for any other origin is its tip, so the set also
-    // collapses rotations. A vanished or unparseable sibling is skipped
-    // rather than aborting (concurrent fold/cleanup can rewrite a file
-    // mid-scan).
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    seen.insert(current_origin.to_string());
-    let mut picked: Vec<std::path::PathBuf> = Vec::new();
-    for (path, _) in files {
-        if picked.len() == max_sessions {
-            break;
-        }
-        let Ok(json) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let Ok(meta) = serde_json::from_str::<ProjMeta>(&json) else {
-            continue;
-        };
-        if meta.working_dir.as_deref() != Some(current_wd) {
-            continue;
-        }
-        let origin = meta.origin_id.unwrap_or(meta.id);
-        if !seen.insert(origin) {
-            continue;
-        }
-        picked.push(path);
-    }
-    // Oldest-first: appending then yields oldest-session prompts first,
-    // so the newest prior session sits just behind the current session.
-    picked.reverse();
-
-    let mut out = Vec::with_capacity(picked.len());
-    for path in picked {
-        if let Ok(json) = std::fs::read_to_string(&path)
-            && let Ok(session) = serde_json::from_str::<Session>(&json)
-        {
-            out.push(session);
-        }
-    }
-    out
-}
-
-pub fn agents_path() -> PathBuf {
-    config_path().join("agent").join("AGENTS.md")
 }

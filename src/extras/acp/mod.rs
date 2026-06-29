@@ -456,6 +456,25 @@ fn spawn_acp_ask_drain(
     });
 }
 
+fn resolve_acp_mode(cli: &Cli, cfg: &Config) -> SecurityMode {
+    if cli.yolo || cfg.yolo.unwrap_or(false) {
+        SecurityMode::Yolo
+    } else if cli.accept_all || cfg.accept_all.unwrap_or(false) {
+        SecurityMode::Accept
+    } else if cli.restrictive || cfg.restrictive.unwrap_or(false) {
+        SecurityMode::Restrictive
+    } else if let Some(m) = &cfg.default_permission_mode {
+        match m.as_str() {
+            "yolo" => SecurityMode::Yolo,
+            "accept" => SecurityMode::Accept,
+            "restrictive" => SecurityMode::Restrictive,
+            _ => SecurityMode::Standard,
+        }
+    } else {
+        SecurityMode::Standard
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -665,24 +684,5 @@ mod tests {
                 .expect("reply channel dropped");
             assert!(matches!(resp, crate::permission::ask::UserDecision::Deny));
         }
-    }
-}
-
-fn resolve_acp_mode(cli: &Cli, cfg: &Config) -> SecurityMode {
-    if cli.yolo || cfg.yolo.unwrap_or(false) {
-        SecurityMode::Yolo
-    } else if cli.accept_all || cfg.accept_all.unwrap_or(false) {
-        SecurityMode::Accept
-    } else if cli.restrictive || cfg.restrictive.unwrap_or(false) {
-        SecurityMode::Restrictive
-    } else if let Some(m) = &cfg.default_permission_mode {
-        match m.as_str() {
-            "yolo" => SecurityMode::Yolo,
-            "accept" => SecurityMode::Accept,
-            "restrictive" => SecurityMode::Restrictive,
-            _ => SecurityMode::Standard,
-        }
-    } else {
-        SecurityMode::Standard
     }
 }

@@ -69,6 +69,24 @@ pub fn contract_hint_for(tool_name: &str) -> Option<&'static str> {
     }
 }
 
+/// Compose a tool description with its contract hint appended.
+/// Convenience wrapper around `contract_hint_for` so a tool's
+/// `definition()` impl reads as a single function call:
+///
+///     description: with_contract_hint(
+///         "read",
+///         "Read the contents of a file. …",
+///     ),
+///
+/// Tools without a registered hint just get their base description
+/// back unchanged.
+pub fn with_contract_hint(tool_name: &str, base_description: &str) -> String {
+    match contract_hint_for(tool_name) {
+        Some(hint) => format!("{base_description}\n\n{hint}"),
+        None => base_description.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod phase2_tests {
     use super::super::*;
@@ -205,23 +223,5 @@ mod phase2_tests {
         let args = json!({"thing": "[a.rs](http://a.rs)"});
         let result = validate_and_repair(&schema, &args).unwrap().unwrap();
         assert_eq!(result.repaired["thing"], "a.rs");
-    }
-}
-
-/// Compose a tool description with its contract hint appended.
-/// Convenience wrapper around `contract_hint_for` so a tool's
-/// `definition()` impl reads as a single function call:
-///
-///     description: with_contract_hint(
-///         "read",
-///         "Read the contents of a file. …",
-///     ),
-///
-/// Tools without a registered hint just get their base description
-/// back unchanged.
-pub fn with_contract_hint(tool_name: &str, base_description: &str) -> String {
-    match contract_hint_for(tool_name) {
-        Some(hint) => format!("{base_description}\n\n{hint}"),
-        None => base_description.to_string(),
     }
 }

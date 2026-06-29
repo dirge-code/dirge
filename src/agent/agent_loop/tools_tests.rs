@@ -287,7 +287,7 @@ async fn test_handle_tool_calls_and_results() {
     drop(tx);
 
     // Tool executed; args reached `execute`.
-    let recorded = echo.executed_args.lock().unwrap();
+    let recorded = echo.executed_args.lock().unwrap().clone();
     assert_eq!(recorded.len(), 1);
     assert_eq!(recorded[0]["value"], "hello");
     drop(recorded);
@@ -362,7 +362,7 @@ async fn test_before_tool_call_mutates_args() {
     while rx.recv().await.is_some() {}
 
     // The tool must have observed the MUTATED args.
-    let recorded = echo.executed_args.lock().unwrap();
+    let recorded = echo.executed_args.lock().unwrap().clone();
     assert_eq!(recorded.len(), 1);
     assert_eq!(recorded[0]["value"], serde_json::json!(123));
 }
@@ -652,6 +652,7 @@ async fn test_before_tool_call_block_with_reason() {
 ///   - empty batch → false
 ///   - some terminate=false → false
 ///   - all terminate=true → true
+///
 /// Faithful port of pi line 544.
 #[test]
 fn should_terminate_invariants() {
@@ -758,10 +759,10 @@ async fn test_tool_execution_end_completion_order_results_source_order() {
             LoopEvent::ToolExecutionEnd { tool_call_id, .. } => {
                 tool_execution_end_ids.push(tool_call_id.clone());
             }
-            LoopEvent::MessageEnd { message } => {
-                if let LoopMessage::ToolResult(t) = message {
-                    tool_result_message_end_ids.push(t.tool_call_id.clone());
-                }
+            LoopEvent::MessageEnd {
+                message: LoopMessage::ToolResult(t),
+            } => {
+                tool_result_message_end_ids.push(t.tool_call_id.clone());
             }
             _ => {}
         }
@@ -1363,7 +1364,7 @@ async fn truncation_repair_end_to_end_through_dispatch() {
 
     // 1. Tool was called — args reached `execute` AS A PARSED
     //    OBJECT, not the raw truncated string.
-    let recorded = echo.executed_args.lock().unwrap();
+    let recorded = echo.executed_args.lock().unwrap().clone();
     assert_eq!(
         recorded.len(),
         1,

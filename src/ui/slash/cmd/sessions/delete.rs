@@ -19,7 +19,7 @@ pub(crate) async fn cmd_sessions_delete(
             let preview = s
                 .messages
                 .last()
-                .map(|m| format!("...{}", &m.content.chars().take(40).collect::<String>()))
+                .map(|m| format!("...{}", m.content.chars().take(40).collect::<String>()))
                 .unwrap_or_default();
             if let Err(e) = crate::session::storage::delete_session(&id) {
                 ctx.renderer

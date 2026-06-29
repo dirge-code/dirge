@@ -1202,8 +1202,10 @@ mod tests {
     /// RightPanel stacks sub-panels and shows their titles.
     #[test]
     fn right_panel_stacks_sub_panels() {
-        let mut data = PanelData::default();
-        data.mcp = vec![("server1".into(), true)];
+        let data = PanelData {
+            mcp: vec![("server1".into(), true)],
+            ..Default::default()
+        };
         let layout = Layout::new(160, 30, 1);
         let mut backend = TestBackend::new(160, 30);
         let mut terminal = Terminal::new(backend.clone()).unwrap();
@@ -1268,8 +1270,10 @@ mod tests {
     /// rows plus one row per modified file — while it still fits.
     #[test]
     fn modified_rect_grows_with_file_count() {
-        let mut data = PanelData::default();
-        data.modified = vec!["a.rs".into(), "b.rs".into(), "c.rs".into()];
+        let data = PanelData {
+            modified: vec!["a.rs".into(), "b.rs".into(), "c.rs".into()],
+            ..Default::default()
+        };
         let area = Rect::new(0, 0, 40, 30);
         let rect = compute_modified_rect(&data, area).expect("rect");
         assert_eq!(rect.height, 5, "3 files → 2 borders + 3 rows");
@@ -1280,8 +1284,10 @@ mod tests {
     /// over) rather than overflowing the panel or its natural height.
     #[test]
     fn modified_rect_caps_at_remaining_space() {
-        let mut data = PanelData::default();
-        data.modified = (0..100).map(|i| format!("f{i}.rs")).collect();
+        let data = PanelData {
+            modified: (0..100).map(|i| format!("f{i}.rs")).collect(),
+            ..Default::default()
+        };
         let area = Rect::new(0, 0, 40, 30);
         let rect = compute_modified_rect(&data, area).expect("rect");
         assert!(
@@ -1340,13 +1346,15 @@ mod tests {
     /// 6-row box on a tall panel.
     #[test]
     fn modified_box_grows_to_content_height_with_files() {
-        let mut data = PanelData::default();
-        data.modified = vec![
-            "src/verify.ts".into(),
-            "test/todatests.test.ts".into(),
-            "src/graph.ts".into(),
-            "src/interpreter.ts".into(),
-        ];
+        let data = PanelData {
+            modified: vec![
+                "src/verify.ts".into(),
+                "test/todatests.test.ts".into(),
+                "src/graph.ts".into(),
+                "src/interpreter.ts".into(),
+            ],
+            ..Default::default()
+        };
         let layout = Layout::new(160, 40, 1);
         let backend = TestBackend::new(160, 40);
         let mut terminal = Terminal::new(backend).unwrap();

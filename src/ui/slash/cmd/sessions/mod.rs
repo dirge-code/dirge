@@ -55,7 +55,7 @@ pub(crate) fn distinct_id_len(ids: &[&str]) -> usize {
     // UUID ids have their first `-` at index 8, so they stay at 8.
     let floor = ids
         .iter()
-        .map(|s| s.find('-').unwrap_or_else(|| s.len()).min(s.len()))
+        .map(|s| s.find('-').unwrap_or(s.len()).min(s.len()))
         .max()
         .unwrap_or(8)
         .max(8);

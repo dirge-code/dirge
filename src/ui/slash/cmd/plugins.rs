@@ -91,7 +91,7 @@ async fn cmd_load(ctx: &mut SlashCtx<'_>, args: &[&str]) -> anyhow::Result<()> {
             "plugins are disabled in this build (enable the 'plugin' feature)",
             c_error(),
         )?;
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(feature = "plugin")]
@@ -231,10 +231,11 @@ async fn load_all(
                 continue;
             }
 
-            match {
+            let res = {
                 let mut mgr = pm_arc.lock_ignore_poison();
                 crate::plugin::load_plugin(&mut mgr, &path)
-            } {
+            };
+            match res {
                 Ok(desc) => {
                     loaded += 1;
                     ctx.renderer.write_line(

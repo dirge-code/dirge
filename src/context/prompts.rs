@@ -545,14 +545,14 @@ body
 
     #[test]
     fn next_prompt_starts_at_head_from_base() {
-        let names = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let names = ["a".to_string(), "b".to_string(), "c".to_string()];
         let names: Vec<&String> = names.iter().collect();
         assert_eq!(next_prompt(None, &names), Some(Some("a")));
     }
 
     #[test]
     fn next_prompt_advances_then_returns_to_base() {
-        let names = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let names = ["a".to_string(), "b".to_string(), "c".to_string()];
         let names: Vec<&String> = names.iter().collect();
         assert_eq!(next_prompt(Some("a"), &names), Some(Some("b")));
         assert_eq!(next_prompt(Some("b"), &names), Some(Some("c")));
@@ -563,7 +563,7 @@ body
 
     #[test]
     fn next_prompt_single_prompt_alternates_with_base() {
-        let names = vec!["only".to_string()];
+        let names = ["only".to_string()];
         let names: Vec<&String> = names.iter().collect();
         assert_eq!(next_prompt(None, &names), Some(Some("only")));
         assert_eq!(next_prompt(Some("only"), &names), Some(None));
@@ -571,7 +571,7 @@ body
 
     #[test]
     fn next_prompt_unknown_current_starts_at_head() {
-        let names = vec!["a".to_string(), "b".to_string()];
+        let names = ["a".to_string(), "b".to_string()];
         let names: Vec<&String> = names.iter().collect();
         assert_eq!(next_prompt(Some("zzz"), &names), Some(Some("a")));
     }

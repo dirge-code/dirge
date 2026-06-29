@@ -879,7 +879,7 @@ fn convert_history_pairs_interrupted_tool_calls_with_error_marker() {
     let history = crate::agent::runner::convert_history(&s);
     // 2 messages: Assistant(text + tool_use) + User(tool_result-interrupted).
     assert_eq!(history.len(), 2);
-    let last_str = format!("{:?}", &history[1]);
+    let last_str = format!("{:?}", history[1]);
     assert!(
         last_str.contains("tc_99"),
         "interrupted result must reference call id: {last_str}",

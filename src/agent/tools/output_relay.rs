@@ -488,10 +488,13 @@ mod tests {
         let two_days_ago =
             std::time::SystemTime::now() - std::time::Duration::from_secs(48 * 60 * 60);
         // Use libc/utimensat indirectly via std::fs::set_file_times (1.75+).
-        if let Err(_) = std::fs::File::open(&stale).and_then(|f| {
-            f.set_modified(two_days_ago)?;
-            Ok(())
-        }) {
+        if std::fs::File::open(&stale)
+            .and_then(|f| {
+                f.set_modified(two_days_ago)?;
+                Ok(())
+            })
+            .is_err()
+        {
             // Best-effort: skip if mtime setting unsupported.
             let _ = std::fs::remove_dir_all(&pid_dir);
             return;
