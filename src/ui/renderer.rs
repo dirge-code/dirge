@@ -443,6 +443,9 @@ pub struct Renderer {
     /// must NOT extend/clear that selection (it would collapse the word
     /// to the click point). Consumed on the next mouse-up.
     pub suppress_next_mouseup: bool,
+    /// Timestamp of the most recent clipboard copy, for "Copied!" tooltip.
+    /// `None` when no copy has happened this session.
+    copied_at: Option<std::time::Instant>,
     /// Visibility mode for the left / right side panels, controlled
     /// independently (`/display`, `/panel`, and the `display` config).
     /// The main conversation pane is always shown.
@@ -592,6 +595,7 @@ impl Renderer {
             selection_end: None,
             last_click: None,
             suppress_next_mouseup: false,
+            copied_at: None,
             left_panel_mode: PanelMode::Auto,
             right_panel_mode: PanelMode::Auto,
             panel_data: PanelData::default(),
@@ -631,6 +635,22 @@ impl Renderer {
             #[cfg(feature = "experimental-ui-terminal-tab")]
             last_tool_name: None,
         })
+    }
+
+    /// Record that text was just copied to clipboard, so a "Copied!"
+    /// tooltip appears on the next redraw.
+    pub fn notify_copied(&mut self) {
+        self.copied_at = Some(std::time::Instant::now());
+    }
+
+    /// If text was copied within the last 2 seconds, returns the
+    /// tooltip text to display (e.g. `"Copied!"`). Otherwise returns
+    /// `None` so the tooltip disappears.
+    fn current_tooltip(&self) -> Option<&'static str> {
+        match self.copied_at {
+            Some(t) if t.elapsed() < std::time::Duration::from_secs(2) => Some("Copied!"),
+            _ => None,
+        }
     }
 
     /// Phase 6 paint entry point. Builds a `Scene` from current
@@ -687,6 +707,9 @@ impl Renderer {
         let show_left_panel = self.left_panel_visible();
         let show_right_panel = self.right_panel_visible();
         let frame_color = crate::ui::theme::header();
+
+        // Compute tooltip before the split borrow destructuring.
+        let tooltip = self.current_tooltip().unwrap_or("");
 
         // Split borrows on Self so we can hold &mut tui_terminal
         // and immutable references to the data fields at the same
@@ -877,6 +900,7 @@ impl Renderer {
             background: crate::ui::theme::background(),
             picker: picker_overlay.as_ref(),
             right_panel_mode: *right_panel_mode,
+            tooltip,
             #[cfg(feature = "dap")]
             debug_panel_data: self.debug_panel_data.as_ref(),
         };

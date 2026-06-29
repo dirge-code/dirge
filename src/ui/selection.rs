@@ -65,6 +65,7 @@ fn handle_inner(ev: &UserEvent, renderer: &mut Renderer) -> Outcome {
                     return match renderer.selected_text() {
                         Some(t) => {
                             copy_to_clipboard(&t);
+                            renderer.notify_copied();
                             Outcome::RepaintAndCopied
                         }
                         None => Outcome::Repaint,
@@ -107,6 +108,7 @@ fn handle_inner(ev: &UserEvent, renderer: &mut Renderer) -> Outcome {
             match text {
                 Some(t) => {
                     copy_to_clipboard(&t);
+                    renderer.notify_copied();
                     Outcome::RepaintAndCopied
                 }
                 None => Outcome::Repaint,
