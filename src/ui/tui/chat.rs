@@ -125,9 +125,7 @@ impl<'a> Widget for ChatPane<'a> {
             if tooltip_w + 2 < l.chat.width {
                 let tooltip_x = l.chat.x + l.chat.width - tooltip_w - 1;
                 let tooltip_y = l.chat.y + l.chat.height.saturating_sub(1);
-                let style = Style::default()
-                    .fg(RColor::White)
-                    .bg(RColor::DarkGray);
+                let style = Style::default().fg(RColor::White).bg(RColor::DarkGray);
                 for cx in tooltip_x..tooltip_x + tooltip_w {
                     let cell = &mut buf[(cx, tooltip_y)];
                     cell.set_symbol(" ");

@@ -109,10 +109,9 @@ pub fn render_frame(scene: &Scene, f: &mut Frame<'_>) {
     }
 
     // Chat region (content + │ verticals).
-    let mut chat =
-        ChatPane::new(&layout, scene.chat_buffer, scene.scroll_offset)
-            .border_style(frame_style)
-            .tooltip(scene.tooltip);
+    let mut chat = ChatPane::new(&layout, scene.chat_buffer, scene.scroll_offset)
+        .border_style(frame_style)
+        .tooltip(scene.tooltip);
     if let Some(sel) = scene.chat_selection {
         chat = chat.selection(sel);
     }
