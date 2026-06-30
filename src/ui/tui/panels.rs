@@ -290,7 +290,13 @@ fn paint_idle_card(
     } else {
         subagents
             .iter()
-            .map(|r| (r.agent.clone().unwrap_or_else(|| r.id_short.clone()), green))
+            .map(|r| {
+                let label = match &r.agent {
+                    Some(a) => format!("{a} {}", r.id_short),
+                    None => r.id_short.clone(),
+                };
+                (label, green)
+            })
             .collect()
     };
     let agents_reserve = 2 + agent_lines.len() as u16 + 1;
@@ -1116,6 +1122,60 @@ mod tests {
         assert!(
             !box_body.contains("build the parser"),
             "prompt prose must NOT appear in the AGENTS box:\n{box_body}"
+        );
+    }
+
+    /// Two concurrent subagents on the SAME agent profile must stay
+    /// distinguishable in the [AGENTS] box — each row shows the profile
+    /// name plus its `id_short`, so they don't render as an identical
+    /// pair (the profile name alone is ambiguous).
+    #[test]
+    fn left_panel_same_profile_agents_are_distinguishable() {
+        use crate::ui::panel_data::ContextGauge;
+        let info = LeftPanelInfo {
+            context: ContextGauge {
+                used: 5000,
+                window: 128_000,
+                pct: 4,
+                compactions: 0,
+                fold_soon: false,
+            },
+            activity: vec!["read x.rs".into()],
+            git: None,
+        };
+        let subs = vec![
+            SubagentStatusRow {
+                id_short: "aaa111".into(),
+                agent: Some("architect".into()),
+            },
+            SubagentStatusRow {
+                id_short: "bbb222".into(),
+                agent: Some("architect".into()),
+            },
+        ];
+        let backend = TestBackend::new(30, 50);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| f.render_widget(LeftPanel::new(&info, &subs), Rect::new(0, 0, 30, 50)))
+            .unwrap();
+        let backend = terminal.backend().clone();
+        let rows: Vec<String> = (0..50)
+            .map(|y| {
+                (0..30)
+                    .map(|x| backend.buffer().cell((x, y)).unwrap().symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect();
+        let dump = rows.join("\n");
+        // Isolate the [AGENTS] box body.
+        let header = rows.iter().position(|r| r.contains("AGENTS")).unwrap();
+        let bottom = (header + 1..rows.len())
+            .find(|&y| rows[y].contains('╰'))
+            .unwrap();
+        let box_body: String = rows[header + 1..bottom].join("\n");
+        assert!(
+            box_body.contains("aaa111") && box_body.contains("bbb222"),
+            "same-profile subagents must each show their id_short to stay distinguishable:\n{box_body}\nfull:\n{dump}"
         );
     }
 
