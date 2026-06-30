@@ -23,8 +23,11 @@
 //!   exit code: `Visible` (`!`) feeds it to the agent **and** writes it to the
 //!   chat log; `Invisible` (`!!`) writes it to the chat log only.
 
-use std::io::{self, Read, Write};
+use std::io;
+#[cfg(unix)]
+use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
+#[cfg(unix)]
 use std::time::Duration;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -33,6 +36,7 @@ use tokio::task::JoinHandle;
 
 use crate::sandbox::Sandbox;
 use crate::ui::ansi::{StripPolicy, strip_escapes};
+#[cfg(unix)]
 use crate::ui::pty_relay::stdio_from_fd;
 use crate::ui::shell_phase::ShellKind;
 
@@ -70,6 +74,7 @@ pub(crate) struct ShellSession {
 /// Spawn `command` on a fresh PTY. The child becomes a session leader with the
 /// PTY as its controlling terminal, so `isatty(0..2)` is true and `Ctrl+C`
 /// (`0x03`) reaches it as SIGINT.
+#[cfg(unix)]
 pub(crate) fn spawn(
     command: &str,
     sandbox: &Sandbox,
@@ -248,6 +253,113 @@ pub(crate) fn key_to_bytes(key: KeyEvent) -> Option<Vec<u8>> {
     }
 }
 
+#[cfg(not(unix))]
+async fn pump<R>(
+    mut reader: R,
+    events_tx: mpsc::UnboundedSender<ShellEvent>,
+    captured: Arc<Mutex<Vec<u8>>>,
+) where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    let mut buf = [0u8; 4096];
+    loop {
+        match reader.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                let chunk = &buf[..n];
+                if let Ok(mut c) = captured.lock() {
+                    c.extend_from_slice(chunk);
+                }
+                let _ = events_tx.send(ShellEvent::Output(chunk.to_vec()));
+            }
+        }
+    }
+}
+
+/// Non-Unix fallback (Windows): there is no PTY, so the child runs with piped
+/// stdio. Its combined stdout/stderr is forwarded as [`ShellEvent::Output`]
+/// chunks then a single [`ShellEvent::Exited`]; keystrokes are not forwarded
+/// (no controlling terminal to receive them). The live shell box, if it mounts,
+/// just streams the captured output.
+#[cfg(not(unix))]
+pub(crate) fn spawn(
+    command: &str,
+    sandbox: &Sandbox,
+    kind: ShellKind,
+    _cols: u16,
+    _rows: u16,
+) -> io::Result<ShellSession> {
+    use std::process::Stdio;
+
+    let mut cmd = sandbox.command_for_interactive(command);
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    cmd.kill_on_drop(true);
+
+    let mut child = cmd.spawn()?;
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    let (events_tx, events_rx) = mpsc::unbounded_channel::<ShellEvent>();
+    let (input_tx, mut input_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (interrupt_tx, interrupt_rx) = oneshot::channel::<()>();
+
+    let join = tokio::spawn(async move {
+        // No TTY to write keystrokes to; drain the channel so it doesn't linger
+        // for the session's lifetime.
+        let _drain = tokio::spawn(async move {
+            while input_rx.recv().await.is_some() {}
+        });
+
+        let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let cap = captured.clone();
+        let out_task = stdout.map(|s| tokio::spawn(pump(s, events_tx.clone(), cap)));
+        let cap = captured.clone();
+        let err_task = stderr.map(|s| tokio::spawn(pump(s, events_tx.clone(), cap)));
+
+        let (status, interrupted) = tokio::select! {
+            biased;
+            Ok(()) = interrupt_rx => {
+                let _ = child.kill().await;
+                (child.wait().await, true)
+            }
+            s = child.wait() => (s, false),
+        };
+
+        // Flush remaining output once the pipes close on child exit.
+        if let Some(t) = out_task {
+            let _ = t.await;
+        }
+        if let Some(t) = err_task {
+            let _ = t.await;
+        }
+
+        let raw = captured
+            .lock()
+            .map(|c| String::from_utf8_lossy(&c).into_owned())
+            .unwrap_or_default();
+        let exit_code = status.ok().and_then(|s| s.code());
+        let stripped = strip_escapes(&raw, StripPolicy::KEEP_NEWLINE);
+        let outcome = ShellOutcome {
+            exit_code,
+            captured: stripped,
+            interrupted,
+        };
+        let _ = events_tx.send(ShellEvent::Exited { outcome });
+    });
+
+    Ok(ShellSession {
+        input_tx,
+        events_rx,
+        interrupt: Some(interrupt_tx),
+        join: Some(join),
+        kind,
+        command: command.to_string(),
+    })
+}
+
 #[cfg(unix)]
 fn kill_group(pid: Option<u32>) {
     if let Some(pid) = pid {
@@ -265,9 +377,11 @@ fn kill_group(_pid: Option<u32>) {}
 
 // ── PTY helpers ────────────────────────────────────────────────────────────
 
+#[cfg(unix)]
 use std::os::unix::io::{AsRawFd, FromRawFd};
 
 /// Open a new PTY pair, returning `(master, slave)`.
+#[cfg(unix)]
 fn open_pty_pair() -> io::Result<(std::fs::File, std::fs::File)> {
     let master_fd = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) };
     if master_fd < 0 {
@@ -299,6 +413,7 @@ fn open_pty_pair() -> io::Result<(std::fs::File, std::fs::File)> {
 }
 
 /// Set sane cooked-mode termios on a PTY fd (echo, canonical, ISIG, CRLF).
+#[cfg(unix)]
 fn set_cooked(fd: libc::c_int) {
     let mut t: libc::termios = unsafe { std::mem::zeroed() };
     if unsafe { libc::tcgetattr(fd, &mut t) } < 0 {
@@ -319,6 +434,7 @@ fn set_cooked(fd: libc::c_int) {
     }
 }
 
+#[cfg(unix)]
 fn set_winsize(fd: libc::c_int, cols: u16, rows: u16) {
     let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
     ws.ws_col = cols;
@@ -330,7 +446,7 @@ fn set_winsize(fd: libc::c_int, cols: u16, rows: u16) {
 
 // ── tests ──────────────────────────────────────────────────────────────────
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::sandbox::{Sandbox, SandboxMode};
