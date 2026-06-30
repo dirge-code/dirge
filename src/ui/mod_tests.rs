@@ -1003,3 +1003,29 @@ fn real_user_prompt_rejects_synthetic_turns() {
         None,
     );
 }
+
+// ============================================================
+// shell_overlay_rows — vt100 screen collapses cursor redraws
+// ============================================================
+
+/// The fix for the `gh auth login` rendering bug: an interactive prompt that
+/// redraws a line in place (cursor-up + erase-line + reprint) must update the
+/// same screen row, not append a second copy. A naive append of ansi-stripped
+/// text would stack every redraw (the screen filled with repeated menus); the
+/// vt100 screen parser shows only the final state.
+#[test]
+fn shell_overlay_rows_collapses_cursor_redraws() {
+    let mut p = vt100::Parser::new(4, 24, 0);
+    p.process(b"? pick one\r\n");
+    p.process(b"> GitHub.com\r\n");
+    // Emulate a survey redraw after pressing Down: move the cursor back up to
+    // the selection line, erase it, and reprint with the marker moved.
+    p.process(b"\x1b[1A"); // up 1
+    p.process(b"\x1b[2K"); // erase entire line
+    p.process(b"> Other");
+    let rows = shell_overlay_rows(&p);
+    let lines: Vec<&str> = rows.iter().map(|(s, _)| s.as_str()).collect();
+    assert_eq!(lines, vec!["? pick one", "> Other"]);
+    // The stale selection must not linger anywhere on the screen.
+    assert!(!lines.iter().any(|l| l.contains("GitHub.com")));
+}

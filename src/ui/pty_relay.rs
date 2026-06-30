@@ -271,25 +271,6 @@ impl PtyRelay {
         self.relay_to_fd(tty)
     }
 
-    /// Like [`relay`](Self::relay), but also captures the child's PTY output
-    /// into a buffer and returns it alongside the exit status. Used by the
-    /// interactive bang-command path (`!`/`!!`) so the output can be fed to
-    /// the agent while still being streamed live to the user's terminal.
-    pub(crate) fn relay_capturing(mut self) -> io::Result<(std::process::ExitStatus, Vec<u8>)> {
-        // ── relay priority: below input reader (-20), above KVM (19) ──
-        unsafe {
-            libc::setpriority(libc::PRIO_PROCESS, 0, -19);
-        }
-        let mut tty = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open("/dev/tty")?;
-        self.capture = Some(Vec::new());
-        let status = self.run_loop(&mut tty)?;
-        let captured = self.capture.take().unwrap_or_default();
-        Ok((status, captured))
-    }
-
     /// Same as [`relay`] but takes an explicit tty file descriptor instead
     /// of opening `/dev/tty`. Used by stress tests that inject keystrokes
     /// through a PTY pair instead of a real terminal.
@@ -302,9 +283,7 @@ impl PtyRelay {
 
     /// Run the relay loop against an explicit tty. When `self.capture` is
     /// `Some`, record every byte the child writes to the PTY so callers can
-    /// feed it back (e.g. interactive bang commands sending output to the
-    /// agent). Shared core of [`PtyRelay::relay`] / [`relay_to_fd`] /
-    /// [`PtyRelay::relay_capturing`].
+    /// feed it back. Shared core of [`PtyRelay::relay`] / [`relay_to_fd`].
     fn run_loop(&mut self, tty: &mut std::fs::File) -> io::Result<std::process::ExitStatus> {
         #[cfg(feature = "timing-diagnostics")]
         let t_relay_enter = std::time::Instant::now();
@@ -657,7 +636,7 @@ fn disable_echo(fd: libc::c_int) {
 
 /// Convert an owned `File` into a `Stdio` for `Command` plumbing.
 /// SAFETY: the caller must ensure the fd is valid and not used elsewhere.
-unsafe fn stdio_from_fd(file: std::fs::File) -> std::process::Stdio {
+pub(crate) unsafe fn stdio_from_fd(file: std::fs::File) -> std::process::Stdio {
     let fd = file.as_raw_fd();
     // Leak the OwnedFd we'd get from into_raw_fd, transferring ownership
     // to the Stdio (which will close it when the child drops).

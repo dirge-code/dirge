@@ -305,6 +305,7 @@ yaml-rust2 = "0.11"
 # examples against the user's task to inject the most relevant ones.
 nucleo-matcher = "0.3"
 url = "2"
+vt100 = "0.16.2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }

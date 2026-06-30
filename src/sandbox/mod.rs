@@ -374,6 +374,16 @@ impl Sandbox {
         cmd
     }
 
+    /// Build the command for a headless interactive run (`!cmd` / `!!cmd`):
+    /// the same secret-scrubbing as [`wrap_command`] but WITHOUT the
+    /// non-interactive env defaults, so a command may legitimately read from
+    /// its stdin — which dirge forwards from the input box. Returns a
+    /// [`tokio::process::Command`] ready for `Stdio::piped()` (no PTY, no
+    /// screen takeover; the caller sets stdio + `detach_session`).
+    pub(crate) fn command_for_interactive(&self, command: &str) -> Command {
+        self.build_command(command)
+    }
+
     /// Wrap `command` for the sandbox backend used by the AGENT's bash tool.
     /// Builds via [`build_command`] then forces non-interactive defaults so
     /// tools that would otherwise prompt fail fast instead of blocking — an
@@ -384,17 +394,6 @@ impl Sandbox {
         cmd.env("GCM_INTERACTIVE", "Never");
         cmd.env("DEBIAN_FRONTEND", "noninteractive");
         cmd
-    }
-
-    /// Build the command for an INTERACTIVE run on the user's real terminal
-    /// (a PTY attached to `/dev/tty`). Same secret-scrubbing as
-    /// [`wrap_command`], but WITHOUT the non-interactive env defaults so the
-    /// command may legitimately prompt the user (e.g. `gh auth login`).
-    /// Returns a [`std::process::Command`] for `PtyRelay::spawn`. Unix-only:
-    /// the interactive PTY path only exists on Unix.
-    #[cfg(unix)]
-    pub fn command_for_pty(&self, command: &str) -> std::process::Command {
-        self.build_command(command).into_std()
     }
 
     /// Execute a command through the configured sandbox backend.
@@ -1272,33 +1271,5 @@ mod tests {
             );
             assert!(out.contains("echo hello"), "expected command, got: {out}");
         }
-    }
-
-    /// The interactive bang-command path (`!`/`!!`) runs on the user's real
-    /// terminal, so `command_for_pty` must NOT force the non-interactive env
-    /// defaults that `wrap_command` sets for the agent — otherwise prompts
-    /// (e.g. `gh auth login`) would fail fast instead of interacting.
-    #[cfg(unix)]
-    #[test]
-    fn command_for_pty_omits_noninteractive_env() {
-        let sandbox = Sandbox::new(SandboxMode::Off);
-        let cmd = sandbox.command_for_pty("echo hi");
-        let envs: Vec<String> = cmd
-            .get_envs()
-            .filter_map(|(k, v)| Some((k.to_str()?, v?.to_str()?.to_string())))
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect();
-        assert!(
-            !envs.iter().any(|e| e.starts_with("GIT_TERMINAL_PROMPT=")),
-            "interactive command must not force GIT_TERMINAL_PROMPT, got: {envs:?}"
-        );
-        assert!(
-            !envs.iter().any(|e| e.starts_with("GCM_INTERACTIVE=")),
-            "interactive command must not force GCM_INTERACTIVE, got: {envs:?}"
-        );
-        assert!(
-            !envs.iter().any(|e| e.starts_with("DEBIAN_FRONTEND=")),
-            "interactive command must not force DEBIAN_FRONTEND, got: {envs:?}"
-        );
     }
 }

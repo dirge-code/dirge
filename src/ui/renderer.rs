@@ -146,6 +146,10 @@ pub const CHAT_FRAME_ROWS: u16 = 2;
 /// gate always bound first — and the README's "≥100 cols" was wrong.
 const PANEL_AUTO_MIN_COLS: u16 = 152;
 
+/// Max rows the live shell box (`!cmd`/`!!cmd`) may occupy, so a chatty
+/// command never crowds out the whole chat. The painter clips the tail.
+const SHELL_BOX_MAX_ROWS: u16 = 12;
+
 /// Global terminal modes dirge owns and must keep asserted for its whole
 /// session: SGR mouse capture (`?1000`/`?1002`/`?1003`/`?1006`) so wheel +
 /// click reach the app, and bracketed paste (`?2004`). These are set once
@@ -476,6 +480,9 @@ pub struct Renderer {
     /// (text, color); painter centers text horizontally within the
     /// frame's inner band.
     alert_overlay: Option<Vec<(String, Color)>>,
+    /// Live PTY output for an active `!cmd`/`!!cmd` shell session, shown in the
+    /// input-box frame as an overlay titled `[shell]` while the session runs.
+    shell_overlay: Option<Vec<(String, Color)>>,
     /// Picker candidate-list overlay fed to the scene each frame (file
     /// completion or rewind list). Recomputed by `draw_bottom` from the input
     /// editor's file picker, falling back to `rewind_overlay`; cached so
@@ -571,6 +578,7 @@ impl Renderer {
             lines: 0,
             col: 0,
             spinner_tick: false,
+            shell_overlay: None,
             needs_paint: false,
             last_paint: None,
             last_mode_reassert: None,
@@ -772,6 +780,11 @@ impl Renderer {
                 title: alert_title.as_str(),
                 lines: lines.as_slice(),
             }
+        } else if let Some(lines) = self.shell_overlay.as_ref() {
+            BottomBody::Overlay {
+                title: "[shell]",
+                lines: lines.as_slice(),
+            }
         } else {
             // dirge-5w9v: scroll the editor so the cursor's wrapped row
             // stays visible once the content exceeds the capped box
@@ -826,6 +839,20 @@ impl Renderer {
             // of frames/status), so input_rows ≤ rows - 9.
             let ceiling = (rows_q as i32 - 9).max(1) as u16;
             (wrapped as u16).clamp(1, ceiling)
+        } else if let Some(lines) = self.shell_overlay.as_ref() {
+            let probe = crate::ui::tui::layout::Layout::with_panels(
+                cols_q,
+                rows_q,
+                1,
+                show_left_panel,
+                show_right_panel,
+            );
+            let wrapped =
+                crate::ui::tui::bottom::overlay_wrapped_row_count(lines, probe.input_box.width);
+            let ceiling = (rows_q as i32 - 9).max(1) as u16;
+            // Cap the shell box height so long sessions don't crowd out the
+            // chat; the painter clips, and the box shows the tail of output.
+            (wrapped as u16).clamp(1, ceiling.min(SHELL_BOX_MAX_ROWS))
         } else {
             *input_rows
         };
@@ -1228,6 +1255,20 @@ impl Renderer {
     pub fn clear_alert_overlay(&mut self) {
         self.alert_overlay = None;
         self.alert_title.clear();
+        self.last_paint = None;
+        self.needs_paint = true;
+    }
+
+    /// Set the live shell-session overlay (bottom box showing PTY output while
+    /// a `!cmd`/`!!cmd` run is mounted). Cleared when the shell exits.
+    pub fn set_shell_overlay(&mut self, rows: Vec<(String, Color)>) {
+        self.shell_overlay = Some(rows);
+        self.last_paint = None;
+        self.needs_paint = true;
+    }
+
+    pub fn clear_shell_overlay(&mut self) {
+        self.shell_overlay = None;
         self.last_paint = None;
         self.needs_paint = true;
     }
