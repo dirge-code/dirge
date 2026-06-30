@@ -78,6 +78,13 @@ cargo install dirge-agent --no-default-features \
   --features "loop,git-worktree,mcp,lsp,semantic-rust,semantic-python"
 ```
 
+If a source build fails while using a newer system LLVM than the project
+expects, point bindgen at LLVM 18's libclang explicitly:
+
+```bash
+LIBCLANG_PATH=/usr/lib64/llvm18/lib cargo install dirge-agent
+```
+
 Prebuilt binaries for Linux (glibc + static musl), macOS (Intel + Apple
 Silicon), and Windows are attached to each [GitHub Release](https://github.com/dirge-code/dirge/releases).
 
