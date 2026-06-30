@@ -723,7 +723,6 @@ static DAFNY_RULES: Rules = Rules {
         "function",
         "ghost",
         "if",
-        "iff",
         "import",
         "in",
         "include",
