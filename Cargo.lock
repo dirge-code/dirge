@@ -5117,6 +5117,8 @@ dependencies = [
 [[package]]
 name = "tree-sitter-dafny"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8c0d15ae3182196f73a30b4ddf3e68ee0f72757ba7ec0d133ffcb9d0fa737fc9"
 dependencies = [
  "cc",
  "tree-sitter-language",

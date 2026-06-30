@@ -260,10 +260,7 @@ html2text = "0.17"
 indexmap = "2"
 lsp-types = { version = "0.97", optional = true }
 tree-sitter-elixir = { version = "0.3.5", optional = true }
-# Local, unpublished grammar (path dep). Switch to a git dep
-# (`git = "https://github.com/hath995/tree-sitter-dafny"`) for CI / other
-# machines. Builds via `cc` (parser.c + scanner.c) — no bindgen, MSVC-safe.
-tree-sitter-dafny = { path = "../dafny-treesitter/tree-sitter-dafny", optional = true }
+tree-sitter-dafny = { version = "0.1", optional = true }
 rusqlite = { version = "0.31", features = ["bundled"] }
 # DAP (Debug Adapter Protocol) — optional feature for driving
 # debuggers (lldb-dap, dlv, debugpy, node) to fix crashes instead
