@@ -62,11 +62,16 @@ use super::tool::AbortSignal;
 /// gives it a chance to break out instead of repeating the stall.
 const STALL_RECOVERY_NUDGE: &str = "Your previous response did not complete in time — you may have been stuck in a long reasoning loop. Stop deliberating: state your conclusion concisely and take the next concrete action (a tool call, or your final answer) now.";
 
-/// Whether `msg` looks like a timeout (vs a generic transient network blip),
-/// used to gate the stall-recovery nudge so it doesn't fire on, say, a 503.
-fn is_timeout_error(msg: &str) -> bool {
+/// Whether `msg` looks like a stall timeout the nudge can help break
+/// out of (request-level timeout, or a mid-assembly stream-chunk
+/// timeout where the model was actively producing), vs a generic
+/// transient blip (503) — or the plain transport stream-chunk timeout
+/// ("provider stalled or connection silently dropped"), which is a
+/// connection drop, not a reasoning-loop stall: blaming "a long
+/// reasoning loop" there is mis-attributed, so the retry re-runs clean.
+fn is_stall_timeout(msg: &str) -> bool {
     let l = msg.to_ascii_lowercase();
-    l.contains("timeout") || l.contains("timed out")
+    (l.contains("timeout") || l.contains("timed out")) && !l.contains("connection silently dropped")
 }
 
 /// Wrap an inner `StreamFn` with retry-on-transient-error
@@ -216,7 +221,7 @@ pub fn retrying_stream_fn_with_non_retryable(
                         // If the previous attempt timed out, reinject a
                         // one-time "conclude and act" nudge so the retry can
                         // break out of a stall instead of repeating it.
-                        let was_timeout = is_timeout_error(&err_msg);
+                        let was_stall_timeout = is_stall_timeout(&err_msg);
                         // PROV-2: surface the retry so the UI can
                         // show a banner instead of freezing.
                         yield StreamEvent::Retry {
@@ -224,7 +229,7 @@ pub fn retrying_stream_fn_with_non_retryable(
                             delay_ms: backoff.as_millis() as u64,
                             error: err_msg,
                         };
-                        if was_timeout && !stall_nudged {
+                        if was_stall_timeout && !stall_nudged {
                             stall_nudged = true;
                             ctx.messages.push(serde_json::json!({
                                 "role": "user",
@@ -837,6 +842,34 @@ mod tests {
         assert!(
             !has_stall_nudge(&recorded[1]),
             "no nudge for a non-timeout error"
+        );
+    }
+
+    /// A plain stream-chunk timeout — the transport case ("provider
+    /// stalled or connection silently dropped", no tool call open) —
+    /// retries, but is NOT a reasoning-loop stall, so the
+    /// stall-recovery nudge must not be injected. The nudge blames
+    /// "a long reasoning loop", which is mis-attributed for a
+    /// connection drop: the retry should just re-run cleanly.
+    #[tokio::test]
+    async fn plain_stream_chunk_timeout_does_not_nudge() {
+        // Verbatim shape produced by rig_stream.rs for a plain
+        // (no tool call open) stream-chunk timeout.
+        let (factory, seen) = recording_factory(
+            "stream chunk timed out after 300s (provider stalled or connection silently dropped) \
+             — bump `stream_chunk_timeout_secs` in config.json if your model has long reasoning gaps",
+        );
+        let wrapped = retrying_stream_fn(factory, RecoveryPolicy::default());
+        let _ = drain(wrapped(
+            ctx(),
+            crate::agent::agent_loop::StreamOptions::from_signal(AbortSignal::new()),
+        ))
+        .await;
+        let recorded = seen.lock().unwrap();
+        assert_eq!(recorded.len(), 2, "pre-commit timeout still retries");
+        assert!(
+            !has_stall_nudge(&recorded[1]),
+            "transport stream-chunk timeout is not a reasoning-loop stall — no nudge"
         );
     }
 }
