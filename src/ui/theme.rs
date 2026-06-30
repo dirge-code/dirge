@@ -47,6 +47,8 @@ pub struct Theme {
     pub agent: Color,
     /// User-message prefix (and prompt indicator).
     pub user: Color,
+    /// The text the user types in the bottom input bar.
+    pub user_input: Color,
     /// System/info messages — context loaded, compactions, etc.
     pub system: Color,
     /// Tool execution headers (`bash:`, `read:`, …).
@@ -121,6 +123,9 @@ impl Theme {
                 g: 205,
                 b: 210,
             },
+            // White — the text you type in the bottom input bar. Matches
+            // the pre-theme behavior where the composer was pinned white.
+            user_input: Color::White,
             // Muted green-grey — system / info notes ("context loaded",
             // compactions). Supporting; recedes below the conversation.
             system: Color::Rgb {
@@ -230,6 +235,7 @@ impl Theme {
         Theme {
             agent: Color::White,
             user: Color::Green,
+            user_input: Color::White,
             system: Color::DarkGrey,
             tool: Color::Yellow,
             perm: Color::Magenta,
@@ -266,6 +272,7 @@ impl Theme {
 struct ThemeJson {
     agent: Option<ColorValue>,
     user: Option<ColorValue>,
+    user_input: Option<ColorValue>,
     system: Option<ColorValue>,
     tool: Option<ColorValue>,
     perm: Option<ColorValue>,
@@ -374,6 +381,7 @@ impl ThemeJson {
         Ok(Theme {
             agent: pick(self.agent, base.agent),
             user: pick(self.user, base.user),
+            user_input: pick(self.user_input, base.user_input),
             system: pick(self.system, base.system),
             tool: pick(self.tool, base.tool),
             perm: pick(self.perm, base.perm),
@@ -500,6 +508,9 @@ pub fn agent() -> Color {
 }
 pub fn user() -> Color {
     themed(current().user)
+}
+pub fn user_input() -> Color {
+    themed(current().user_input)
 }
 pub fn system() -> Color {
     themed(current().system)

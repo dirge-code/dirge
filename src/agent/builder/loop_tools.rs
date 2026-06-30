@@ -25,6 +25,8 @@ use crate::semantic::SemanticManager;
 
 use crate::skill::{self, Skill};
 
+#[cfg(feature = "experimental-graph-search")]
+use super::build_graph_tool;
 use super::build_session_search_tool;
 
 /// Built-in tool names take precedence over externally-sourced tools: an MCP
@@ -479,22 +481,57 @@ pub async fn build_loop_tools(
         .await,
     );
 
-    // Mutates internal todo state — Sequential.
+    // Session search — read-only DB queries.
+    let session_db_path = std::env::current_dir()
+        .map(|c| crate::extras::dirge_paths::ProjectPaths::new(&c).session_db_path())
+        .unwrap_or_else(|_| std::path::PathBuf::from(".dirge/sessions/state.db"));
+
+    // Bulk planning surface over the persistent issue board — writes to the
+    // project DB, so Sequential. Shares the `issues` table with `IssueTool`.
     tools.push(
         wrap(
-            tools::WriteTodoList::new(permission.clone(), ask_tx.clone()),
+            tools::WriteTodoList::new(
+                session_db_path.clone(),
+                session_id.clone(),
+                permission.clone(),
+                ask_tx.clone(),
+            ),
+            Some(ToolExecutionMode::Sequential),
+        )
+        .await,
+    );
+    tools.push(
+        wrap(
+            build_session_search_tool(
+                session_db_path.clone(),
+                session_id.clone(),
+                permission.clone(),
+                ask_tx.clone(),
+            ),
+            None,
+        )
+        .await,
+    );
+
+    // Persistent issue/kanban board — mutates the project DB, so Sequential.
+    tools.push(
+        wrap(
+            tools::IssueTool::new(
+                session_db_path.clone(),
+                session_id.clone(),
+                permission.clone(),
+                ask_tx.clone(),
+            ),
             Some(ToolExecutionMode::Sequential),
         )
         .await,
     );
 
-    // Session search — read-only DB queries.
-    let session_db_path = std::env::current_dir()
-        .map(|c| crate::extras::dirge_paths::ProjectPaths::new(&c).session_db_path())
-        .unwrap_or_else(|_| std::path::PathBuf::from(".dirge/sessions/state.db"));
+    // Entity/relation graph search — read-only; feature-gated.
+    #[cfg(feature = "experimental-graph-search")]
     tools.push(
         wrap(
-            build_session_search_tool(
+            build_graph_tool(
                 session_db_path,
                 session_id.clone(),
                 permission.clone(),

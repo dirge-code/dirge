@@ -82,47 +82,39 @@ pub fn before_hook_from_plugin_manager(pm: Arc<Mutex<PluginManager>>) -> BeforeT
 
             // 2. Build context, lock manager, dispatch.
             //
-            // LOOP-8: wrap the synchronous Janet dispatch in a
-            // tokio timeout so a runaway hook can't block the
-            // agent loop forever. `spawn_blocking` moves the
-            // sync work off the runtime thread; the timeout
-            // detaches the call (it keeps running on the
-            // blocking pool but we proceed). The plugin worker
-            // has its own internal HOOK_TIMEOUT but layering
-            // both is cheap and defensive.
+            // `spawn_blocking` moves the synchronous Janet dispatch off the
+            // runtime thread. We AWAIT it to completion (dirge-u5ig) rather
+            // than racing it against a tokio timeout: `dispatch_tool_hook`
+            // is already bounded internally (each worker eval caps at its
+            // own HOOK_TIMEOUT on the caller side, and an unsubscribed hook
+            // returns immediately), so it always finishes promptly. The old
+            // outer `tokio::time::timeout` "detached" the call on expiry —
+            // but a `spawn_blocking` task can't be cancelled, so the
+            // abandoned closure kept holding the global PM mutex AND the
+            // single Janet worker, and the NEXT hook's `lock()` stalled
+            // behind it. Awaiting guarantees the lock is released before we
+            // proceed, so a slow hook can't strand the headless loop.
             let janet_ctx = format!(
                 "@{{:tool \"{}\" :args \"{}\"}}",
                 escape_janet_string(&ctx.tool_call_name),
                 escape_janet_string(&args_json),
             );
-            const HOOK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
             let pm_for_dispatch = pm.clone();
             let janet_ctx_clone = janet_ctx.clone();
             let tool_name = ctx.tool_call_name.clone();
-            let dispatch_future = tokio::task::spawn_blocking(move || {
+            let dispatch_result = match tokio::task::spawn_blocking(move || {
                 let mut mgr = pm_for_dispatch.lock_ignore_poison();
                 mgr.dispatch_tool_hook("on-tool-start", &janet_ctx_clone)
-            });
-            let dispatch_result = match tokio::time::timeout(HOOK_TIMEOUT, dispatch_future).await {
-                Ok(Ok(r)) => r,
-                Ok(Err(join_err)) => {
+            })
+            .await
+            {
+                Ok(r) => r,
+                Err(join_err) => {
                     tracing::warn!(
                         target: "dirge::agent_loop::plugin_hooks",
                         tool = %tool_name,
                         error = %join_err,
                         "on-tool-start hook panicked; proceeding without hook",
-                    );
-                    return BeforeToolCallReturn {
-                        result: None,
-                        args: ctx.args,
-                    };
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        target: "dirge::agent_loop::plugin_hooks",
-                        tool = %tool_name,
-                        timeout_ms = HOOK_TIMEOUT.as_millis() as u64,
-                        "on-tool-start hook exceeded timeout; proceeding without hook",
                     );
                     return BeforeToolCallReturn {
                         result: None,
@@ -210,9 +202,12 @@ pub fn after_hook_from_plugin_manager(pm: Arc<Mutex<PluginManager>>) -> AfterToo
             //    flatten_content shape used by the bridge).
             let output_text = flatten_text(&ctx.result.content);
 
-            // 2. Build context, lock manager, dispatch. LOOP-8:
-            // same outer tokio timeout as the before-hook so a
-            // runaway `on-tool-end` doesn't strand the loop.
+            // 2. Build context, lock manager, dispatch. Await the blocking
+            // dispatch to completion (dirge-u5ig) — see the before-hook for
+            // why the old detaching `tokio::time::timeout` is gone:
+            // `dispatch_tool_hook` is internally bounded, and a detached
+            // spawn_blocking would keep holding the PM mutex + worker and
+            // stall the next hook.
             let command_str = ctx
                 .args
                 .get("command")
@@ -224,31 +219,22 @@ pub fn after_hook_from_plugin_manager(pm: Arc<Mutex<PluginManager>>) -> AfterToo
                 escape_janet_string(&output_text),
                 escape_janet_string(command_str),
             );
-            const HOOK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
             let pm_for_dispatch = pm.clone();
             let janet_ctx_clone = janet_ctx.clone();
             let tool_name = ctx.tool_call_name.clone();
-            let dispatch_future = tokio::task::spawn_blocking(move || {
+            let dispatch_result = match tokio::task::spawn_blocking(move || {
                 let mut mgr = pm_for_dispatch.lock_ignore_poison();
                 mgr.dispatch_tool_hook("on-tool-end", &janet_ctx_clone)
-            });
-            let dispatch_result = match tokio::time::timeout(HOOK_TIMEOUT, dispatch_future).await {
-                Ok(Ok(r)) => r,
-                Ok(Err(join_err)) => {
+            })
+            .await
+            {
+                Ok(r) => r,
+                Err(join_err) => {
                     tracing::warn!(
                         target: "dirge::agent_loop::plugin_hooks",
                         tool = %tool_name,
                         error = %join_err,
                         "on-tool-end hook panicked; proceeding without hook",
-                    );
-                    return None;
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        target: "dirge::agent_loop::plugin_hooks",
-                        tool = %tool_name,
-                        timeout_ms = HOOK_TIMEOUT.as_millis() as u64,
-                        "on-tool-end hook exceeded timeout; proceeding without hook",
                     );
                     return None;
                 }

@@ -33,6 +33,54 @@ pub(crate) fn handle_user_message(renderer: &mut Renderer, content: &str) -> std
     renderer.write_line("", Color::White)
 }
 
+/// Render a user-role message that arrives WHILE an assistant response is
+/// still the live stream target, finalizing that response first.
+///
+/// The finalization nudges (critic / verifier / todo) re-enter the loop as
+/// user-role messages without a `Done`/`ToolCall` event in between, so the
+/// previous turn's stream anchor (`response_start_line`) is still pointing
+/// at the just-streamed response. If we render the nudge and leave the
+/// anchor live, the NEXT turn's `replace_from(anchor, …)` truncates the
+/// buffer from there and overwrites the nudge — it disappears on screen a
+/// moment later even though the model still has it in context. So commit
+/// the in-flight response and drop the anchor first; the next response then
+/// streams BELOW the nudge. A no-op for an ordinary user turn (the prior
+/// `Done` already cleared these). Mirrors the reset the `ToolCall`/`Done`
+/// handlers do for the multi-turn-with-tools path.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn handle_user_message_after_response(
+    renderer: &mut Renderer,
+    content: &str,
+    response_buf: &mut String,
+    response_start_line: &mut Option<usize>,
+    reasoning_buf: &mut String,
+    reasoning_start_line: &mut Option<usize>,
+    agent_line_started: &mut bool,
+) -> anyhow::Result<()> {
+    if !response_buf.is_empty() {
+        // Flush any trailing token the render coalescer skipped, then close
+        // the line so the nudge lands on a fresh row below it.
+        crate::ui::agent_io::render_agent_stream(
+            response_buf,
+            response_start_line,
+            crate::ui::colors::c_agent(),
+            renderer,
+        )?;
+        if *agent_line_started {
+            renderer.write_line("", Color::White)?;
+        }
+    }
+    *agent_line_started = false;
+    response_buf.clear();
+    *response_start_line = None;
+    // The next turn's reasoning must anchor fresh too.
+    reasoning_buf.clear();
+    *reasoning_start_line = None;
+
+    handle_user_message(renderer, content)?;
+    Ok(())
+}
+
 /// `AgentEvent::SystemNotice` — a dirge-originated `<system>` log line
 /// (e.g. the max-agent-turns cap), rendered in the warning color so it
 /// reads as runtime output rather than something the user typed.
@@ -98,4 +146,91 @@ pub(crate) fn handle_repair_stats(
         line.push_str(&format!("; {} invalid", snapshot.invalid));
     }
     renderer.write_line(&line, theme::dim())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::agent_loop::critic::CRITIC_TAG;
+    use crate::ui::agent_io::render_agent_stream;
+    use crate::ui::colors::c_agent;
+    use crate::ui::renderer::Renderer;
+
+    fn has_line_containing(r: &Renderer, needle: &str) -> bool {
+        r.buffer_lines()
+            .iter()
+            .any(|l| crate::ui::ansi::strip_ansi(l).contains(needle))
+    }
+
+    /// dirge-m10x: a critic nudge re-enters as a user-role message while the
+    /// previous turn's stream anchor is still live. It must survive the NEXT
+    /// turn's stream — without the anchor reset, `replace_from` overwrote it
+    /// and it vanished from the log.
+    #[test]
+    fn critic_nudge_survives_the_next_turn_stream() {
+        let mut r = Renderer::new().unwrap();
+
+        // Turn 1: stream an assistant response, anchoring response_start_line.
+        let mut response_buf = String::from("here is the answer");
+        let mut response_start_line: Option<usize> = None;
+        let mut reasoning_buf = String::new();
+        let mut reasoning_start_line: Option<usize> = None;
+        let mut agent_line_started = true;
+        render_agent_stream(&response_buf, &mut response_start_line, c_agent(), &mut r).unwrap();
+        assert!(response_start_line.is_some(), "turn 1 anchored the stream");
+
+        // Critic nudge re-enters as a user-role message.
+        handle_user_message_after_response(
+            &mut r,
+            &format!("{CRITIC_TAG} verify the build before finishing"),
+            &mut response_buf,
+            &mut response_start_line,
+            &mut reasoning_buf,
+            &mut reasoning_start_line,
+            &mut agent_line_started,
+        )
+        .unwrap();
+
+        // Anchor + buffers reset so the next turn streams BELOW the nudge.
+        assert_eq!(response_start_line, None);
+        assert!(response_buf.is_empty());
+        assert!(
+            has_line_containing(&r, "verify the build"),
+            "critic nudge rendered"
+        );
+
+        // Turn 2: the model responds to the critic — fresh stream.
+        response_buf.push_str("ok, ran the tests");
+        render_agent_stream(&response_buf, &mut response_start_line, c_agent(), &mut r).unwrap();
+
+        // The nudge must still be on screen, and the new turn below it.
+        assert!(
+            has_line_containing(&r, "verify the build"),
+            "critic nudge must survive the next turn's stream",
+        );
+        assert!(has_line_containing(&r, "ran the tests"));
+    }
+
+    /// An ordinary user turn (no in-flight response) renders unchanged — the
+    /// finalize path is a no-op when the anchor was already cleared by Done.
+    #[test]
+    fn ordinary_user_message_renders_normally() {
+        let mut r = Renderer::new().unwrap();
+        let mut response_buf = String::new();
+        let mut response_start_line: Option<usize> = None;
+        let mut reasoning_buf = String::new();
+        let mut reasoning_start_line: Option<usize> = None;
+        let mut agent_line_started = false;
+        handle_user_message_after_response(
+            &mut r,
+            "what time is it?",
+            &mut response_buf,
+            &mut response_start_line,
+            &mut reasoning_buf,
+            &mut reasoning_start_line,
+            &mut agent_line_started,
+        )
+        .unwrap();
+        assert!(has_line_containing(&r, "what time is it?"));
+    }
 }

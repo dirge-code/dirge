@@ -125,6 +125,15 @@ impl Tool for WriteTool {
         // counting convention.
         let line_count = content.lines().count();
         let was_creation = !path.exists();
+        // Repair-path rollback (dirge-p1ws): when syntax_gate had to auto-close
+        // a truncation, snapshot the pre-write bytes so an LSP-rejected repair
+        // can be reverted. Clean writes skip this entirely.
+        #[cfg(feature = "lsp")]
+        let repair_before: Option<Vec<u8>> = if syntax_note.is_some() && !was_creation {
+            tokio::fs::read(path).await.ok()
+        } else {
+            None
+        };
         #[cfg(feature = "lsp")]
         let write_at = Instant::now();
         // Snapshot pre-write content (or absence) for /rewind.
@@ -154,9 +163,41 @@ impl Tool for WriteTool {
         let verb = if was_creation { "Created" } else { "Wrote" };
         #[allow(unused_mut)]
         let mut output = format!("{} {} bytes ({} lines)", verb, bytes, line_count);
-        crate::agent::tools::append_repair_note(&mut output, syntax_note);
+
         #[cfg(feature = "lsp")]
-        output.push_str(&append_lsp_block(self.lsp_manager.as_ref(), path, write_at).await);
+        {
+            // A repaired write is verified by the language server; if the
+            // close produced errors, the file is rolled back and the model
+            // gets the diagnostics. A clean write keeps today's behavior:
+            // surface diagnostics, never block (dirge-p1ws).
+            let lsp_block = if syntax_note.is_some() {
+                match verify_repaired_write_or_rollback(
+                    self.lsp_manager.as_ref(),
+                    path,
+                    repair_before,
+                    was_creation,
+                    write_at,
+                )
+                .await
+                {
+                    Ok(block) => block,
+                    Err(feedback) => {
+                        // File reverted — drop the stale cache read-mark.
+                        if let Some(ref cache) = self.cache {
+                            cache.clear();
+                        }
+                        return Err(ToolError::Msg(feedback));
+                    }
+                }
+            } else {
+                append_lsp_block(self.lsp_manager.as_ref(), path, write_at).await
+            };
+            crate::agent::tools::append_repair_note(&mut output, syntax_note);
+            output.push_str(&lsp_block);
+        }
+        #[cfg(not(feature = "lsp"))]
+        crate::agent::tools::append_repair_note(&mut output, syntax_note);
+
         Ok(output)
     }
 }
@@ -186,6 +227,120 @@ pub(crate) async fn append_lsp_block(
         .await;
     let diagnostics = manager.all_diagnostics();
     diagnostic::build_report_block(path, &diagnostics)
+}
+
+/// Max error diagnostics echoed back when a repaired write is rolled back.
+#[cfg(feature = "lsp")]
+const MAX_ROLLBACK_DIAGS: usize = 8;
+
+/// Error-severity diagnostics that justify reverting a repaired write. An
+/// unspecified severity counts as an error — conservative, so a server that
+/// omits severity can't let a broken repair slip through.
+#[cfg(feature = "lsp")]
+fn error_diagnostics(diags: &[lsp_types::Diagnostic]) -> Vec<&lsp_types::Diagnostic> {
+    use lsp_types::DiagnosticSeverity;
+    diags
+        .iter()
+        .filter(|d| matches!(d.severity, Some(DiagnosticSeverity::ERROR) | None))
+        .collect()
+}
+
+/// Undo a write. Returns `true` if the on-disk file was actually rolled back:
+/// the original bytes were restored (`before == Some`), or a file we created
+/// this call was removed (`before == None && was_creation`). Returns `false`
+/// when the file existed before but we have no snapshot to restore it from
+/// (`before == None && !was_creation` — e.g. the pre-write read failed): we must
+/// NOT delete it, or a transient read error would destroy the user's file. In
+/// that case the repaired (likely wrong) content stays on disk and the caller
+/// tells the model it wasn't reverted. Best-effort — a failure here can't make
+/// things worse than the broken write already on disk.
+#[cfg(feature = "lsp")]
+async fn revert_write(path: &Path, before: Option<&[u8]>, was_creation: bool) -> bool {
+    match before {
+        Some(orig) => {
+            let _ = crate::fs_atomic::atomic_write(path, orig).await;
+            true
+        }
+        None if was_creation => {
+            let _ = tokio::fs::remove_file(path).await;
+            true
+        }
+        // Existed before, but its prior content is unknown — never delete.
+        None => false,
+    }
+}
+
+/// Repair-path safety net (dirge-p1ws). Called ONLY after a write whose
+/// content was auto-repaired (a trailing truncation closed by
+/// `repair_delimiters`). Asks the language server whether the result is
+/// actually sound: a close can yield structurally-valid-but-wrong code
+/// tree-sitter can't flag (e.g. a `#[test]` fn nested into another fn). If
+/// the server reports error-severity diagnostics, the on-disk change is
+/// ROLLED BACK to `before` (or the just-created file is removed) and the
+/// errors are returned so the model fixes its own un-repaired text.
+///
+/// Returns `Ok(report_block)` to keep the write (the block — possibly with
+/// warnings/infos — is appended to the tool output, reusing the single
+/// touch+wait); `Err(feedback)` means the file was reverted and `feedback`
+/// is the tool error. A clean write never calls this, so WIP/multi-file
+/// states that don't yet typecheck are unaffected.
+#[cfg(feature = "lsp")]
+pub(crate) async fn verify_repaired_write_or_rollback(
+    manager: Option<&Arc<LspManager>>,
+    path: &Path,
+    before: Option<Vec<u8>>,
+    was_creation: bool,
+    after: Instant,
+) -> Result<String, String> {
+    let Some(manager) = manager else {
+        return Ok(String::new());
+    };
+    manager
+        .touch_file(
+            path,
+            TouchMode::AwaitPush {
+                after,
+                timeout: DIAGNOSTIC_WAIT,
+            },
+        )
+        .await;
+    let diags = manager.diagnostics_for(path).unwrap_or_default();
+    let errors = error_diagnostics(&diags);
+    if errors.is_empty() {
+        // Repair holds up — keep it, and surface the usual report.
+        return Ok(diagnostic::build_report_block(
+            path,
+            &manager.all_diagnostics(),
+        ));
+    }
+
+    let reverted = revert_write(path, before.as_deref(), was_creation).await;
+    // Re-sync the server to the on-disk content so its diagnostics don't
+    // linger (best-effort; the disk rollback already happened).
+    manager.touch_file(path, TouchMode::Notify).await;
+
+    let mut msg = String::from(if reverted {
+        "Auto-repair reverted: the file was restored to its previous state and NOT modified. \
+         Closing the unbalanced delimiters in your text produced these language-server errors — \
+         fix your original text and resend:\n"
+    } else {
+        "Auto-repair failed verification, but the file's prior content was unreadable so it could \
+         NOT be rolled back — the repaired (and likely wrong) content is still on disk. Closing the \
+         unbalanced delimiters in your text produced these language-server errors — fix and rewrite \
+         the file:\n"
+    });
+    for d in errors.iter().take(MAX_ROLLBACK_DIAGS) {
+        msg.push_str("  ");
+        msg.push_str(&diagnostic::pretty(d));
+        msg.push('\n');
+    }
+    if errors.len() > MAX_ROLLBACK_DIAGS {
+        msg.push_str(&format!(
+            "  …and {} more\n",
+            errors.len() - MAX_ROLLBACK_DIAGS
+        ));
+    }
+    Err(msg)
 }
 
 #[cfg(all(test, feature = "lsp"))]
@@ -304,6 +459,64 @@ mod tests {
     /// immediately with a clear error. Without this guard the tool
     /// silently resolves "1" → "{cwd}/1" and creates the file, which
     /// confuses the model into retrying the same nonsense write.
+    // dirge-p1ws: repair-path LSP verify + rollback.
+
+    #[test]
+    fn error_diagnostics_keeps_errors_and_unspecified() {
+        use lsp_types::{Diagnostic, DiagnosticSeverity};
+        let d = |sev: Option<DiagnosticSeverity>| Diagnostic {
+            severity: sev,
+            message: "m".into(),
+            ..Default::default()
+        };
+        let diags = vec![
+            d(Some(DiagnosticSeverity::ERROR)),
+            d(Some(DiagnosticSeverity::WARNING)),
+            d(Some(DiagnosticSeverity::INFORMATION)),
+            d(Some(DiagnosticSeverity::HINT)),
+            d(None), // unspecified severity → treated as an error
+        ];
+        let errs = error_diagnostics(&diags);
+        assert_eq!(
+            errs.len(),
+            2,
+            "ERROR and unspecified are kept; warning/info/hint are dropped",
+        );
+    }
+
+    #[tokio::test]
+    async fn revert_restores_overwrite_and_removes_new_file() {
+        let dir = std::env::temp_dir().join(format!("dirge-revert-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+
+        // Overwrite case: a rejected repair restores the original bytes.
+        let p = dir.join("existing.rs");
+        std::fs::write(&p, b"original").unwrap();
+        std::fs::write(&p, b"broken repair").unwrap();
+        assert!(revert_write(&p, Some(b"original"), false).await);
+        assert_eq!(std::fs::read(&p).unwrap(), b"original");
+
+        // Creation case: a file that didn't exist before is removed.
+        let np = dir.join("new.rs");
+        std::fs::write(&np, b"broken new file").unwrap();
+        assert!(revert_write(&np, None, true).await);
+        assert!(!np.exists(), "a newly-created file is removed on revert");
+
+        // Unsnapshotted-overwrite case: the file existed but we have no prior
+        // bytes (read failed). It must NOT be deleted — losing the user's file
+        // is worse than leaving the broken repair for them to fix.
+        let up = dir.join("unreadable.rs");
+        std::fs::write(&up, b"repaired but wrong").unwrap();
+        assert!(
+            !revert_write(&up, None, false).await,
+            "returns false: not reverted",
+        );
+        assert!(up.exists(), "an existing file is never deleted on revert");
+        assert_eq!(std::fs::read(&up).unwrap(), b"repaired but wrong");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn rejects_non_absolute_path() {
         let tool = WriteTool::with_cache(None, None, ToolCache::new(), None);

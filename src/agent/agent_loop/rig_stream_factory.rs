@@ -186,10 +186,11 @@ where
 {
     Box::pin(async_stream::stream! {
         // 1. Convert our messages to rig messages.
+        let provider: Option<&str> = provider_name.as_ref().as_deref();
         let rig_messages: Vec<Message> = ctx
             .messages
             .iter()
-            .filter_map(value_to_rig_message)
+            .filter_map(|message| value_to_rig_message_for_provider(message, provider))
             .collect();
 
         // 2. Split: last is prompt; rest is chat_history.
@@ -225,13 +226,38 @@ where
         // analysis can detect unexpected drift in the cacheable
         // (system + tools) prefix across turns. See
         // docs/PROMPT_CACHE_AUDIT.md.
-        let provider: Option<&str> = provider_name.as_ref().as_deref();
         emit_cache_prefix_event(
             provider,
             &system_prompt,
             &outgoing_tools,
             history_len,
         );
+
+        // Build additional_params using a per-provider mapper
+        // (phase 4.6 follow-up). Each provider has its own
+        // shape for reasoning configuration — Anthropic wants
+        // `thinking: { type: "enabled", budget_tokens | effort }`,
+        // OpenAI Responses wants `reasoning: { effort }`, etc.
+        // The mapper produces the right shape; rig's
+        // additional_params is opaque so it forwards whatever
+        // we give it. Computed before the builder moves `system_prompt` /
+        // `outgoing_tools` so the wire dump below can read them.
+        let additional = build_provider_additional_params(provider, &opts);
+        // dirge-wire: opt-in dump of the outgoing agent request (turn /
+        // escalation / subagent / forked review), so secondary calls are
+        // visible alongside the one-shot side-LLM dumps. No-op unless
+        // DIRGE_DUMP_REQUESTS is set. `additional` carrying reasoning params is
+        // the per-provider signal that thinking is enabled for this request.
+        if crate::provider::wire::enabled() {
+            let tool_names: Vec<String> = outgoing_tools.iter().map(|t| t.name.clone()).collect();
+            crate::provider::wire::dump_turn(
+                provider,
+                &system_prompt,
+                history_len,
+                &tool_names,
+                additional.is_some(),
+            );
+        }
 
         if !system_prompt.is_empty() {
             builder = builder.preamble(system_prompt);
@@ -240,15 +266,6 @@ where
         if !outgoing_tools.is_empty() {
             builder = builder.tools(outgoing_tools);
         }
-        // Build additional_params using a per-provider mapper
-        // (phase 4.6 follow-up). Each provider has its own
-        // shape for reasoning configuration — Anthropic wants
-        // `thinking: { type: "enabled", budget_tokens | effort }`,
-        // OpenAI Responses wants `reasoning: { effort }`, etc.
-        // The mapper produces the right shape; rig's
-        // additional_params is opaque so it forwards whatever
-        // we give it.
-        let additional = build_provider_additional_params(provider, &opts);
         if let Some(v) = additional {
             builder = builder.additional_params(v);
         }
@@ -350,19 +367,10 @@ pub fn filter_tool_defs(
     }
 }
 
-/// Convert one of our `Value`-shaped messages to a rig
-/// `Message`. Returns `None` for unrecognized roles (custom
-/// messages get filtered at this boundary — pi calls this
-/// out as the `convertToLlm` contract).
-///
-/// The shapes we recognize match what `run.rs` writes via
-/// `loop_message_to_value` and what `stream.rs` writes via
-/// `serialize_assistant`:
-///
-/// - User: `{"role": "user", "content": "<string>"}`
-/// - Assistant: `{"role": "assistant", "content": [<blocks>], ...}`
-/// - ToolResult: `{"role": "toolResult", "toolCallId": ..., "content": [<blocks>], ...}`
-pub fn value_to_rig_message(value: &Value) -> Option<Message> {
+fn value_to_rig_message_for_provider(
+    value: &Value,
+    provider_name: Option<&str>,
+) -> Option<Message> {
     let role = value.get("role").and_then(|r| r.as_str())?;
     match role {
         "user" => {
@@ -371,9 +379,13 @@ pub fn value_to_rig_message(value: &Value) -> Option<Message> {
         }
         "assistant" => {
             let blocks = value.get("content").and_then(|c| c.as_array())?;
+            let include_reasoning = !provider_requires_openai_reasoning_ids(provider_name);
+            let synthesize_call_id = provider_requires_openai_call_ids(provider_name);
             let assistant_contents: Vec<AssistantContent> = blocks
                 .iter()
-                .filter_map(value_to_assistant_content)
+                .filter_map(|block| {
+                    value_to_assistant_content(block, include_reasoning, synthesize_call_id)
+                })
                 .collect();
             // `OneOrMany::many` errors on empty input; rig
             // returns the error variant rather than constructing
@@ -416,15 +428,52 @@ pub fn value_to_rig_message(value: &Value) -> Option<Message> {
                     }
                 })
                 .unwrap_or_default();
-            Some(Message::tool_result(tool_call_id, text))
+            if provider_requires_openai_call_ids(provider_name) {
+                Some(Message::tool_result_with_call_id(
+                    tool_call_id,
+                    Some(tool_call_id.to_string()),
+                    text,
+                ))
+            } else {
+                Some(Message::tool_result(tool_call_id, text))
+            }
         }
         _ => None,
     }
 }
 
+/// Convert one of our `Value`-shaped messages to a rig
+/// `Message`. Returns `None` for unrecognized roles (custom
+/// messages get filtered at this boundary — pi calls this
+/// out as the `convertToLlm` contract).
+///
+/// The shapes we recognize match what `run.rs` writes via
+/// `loop_message_to_value` and what `stream.rs` writes via
+/// `serialize_assistant`:
+///
+/// - User: `{"role": "user", "content": "<string>"}`
+/// - Assistant: `{"role": "assistant", "content": [<blocks>], ...}`
+/// - ToolResult: `{"role": "toolResult", "toolCallId": ..., "content": [<blocks>], ...}`
+#[cfg(test)]
+fn value_to_rig_message(value: &Value) -> Option<Message> {
+    value_to_rig_message_for_provider(value, None)
+}
+
+fn provider_requires_openai_reasoning_ids(provider_name: Option<&str>) -> bool {
+    matches!(provider_name, Some(provider) if provider.eq_ignore_ascii_case("openai"))
+}
+
+fn provider_requires_openai_call_ids(provider_name: Option<&str>) -> bool {
+    matches!(provider_name, Some(provider) if provider.eq_ignore_ascii_case("openai"))
+}
+
 /// Convert one assistant content block to a rig `AssistantContent`.
 /// Recognizes `{type: "text"|"thinking"|"toolCall", ...}`.
-fn value_to_assistant_content(block: &Value) -> Option<AssistantContent> {
+fn value_to_assistant_content(
+    block: &Value,
+    include_reasoning: bool,
+    synthesize_call_id: bool,
+) -> Option<AssistantContent> {
     let obj = block.as_object()?;
     let kind = obj.get("type").and_then(|t| t.as_str())?;
     match kind {
@@ -433,6 +482,9 @@ fn value_to_assistant_content(block: &Value) -> Option<AssistantContent> {
             Some(AssistantContent::text(text))
         }
         "thinking" => {
+            if !include_reasoning {
+                return None;
+            }
             let text = obj.get("text").and_then(|t| t.as_str())?;
             Some(AssistantContent::Reasoning(Reasoning::new(text)))
         }
@@ -441,8 +493,8 @@ fn value_to_assistant_content(block: &Value) -> Option<AssistantContent> {
             let name = obj.get("name").and_then(|t| t.as_str())?.to_string();
             let arguments = obj.get("arguments").cloned().unwrap_or(Value::Null);
             Some(AssistantContent::ToolCall(ToolCall {
+                call_id: synthesize_call_id.then(|| id.clone()),
                 id,
-                call_id: None,
                 function: ToolFunction { name, arguments },
                 signature: None,
                 additional_params: None,
@@ -736,6 +788,82 @@ mod tests {
                 _ => panic!("expected Reasoning"),
             },
             _ => panic!("expected Assistant"),
+        }
+    }
+
+    #[test]
+    fn openai_assistant_thinking_only_is_skipped() {
+        let v = serde_json::json!({
+            "role": "assistant",
+            "content": [{"type": "thinking", "text": "let me think"}],
+        });
+
+        assert!(
+            value_to_rig_message_for_provider(&v, Some("openai")).is_none(),
+            "OpenAI Responses rejects historical reasoning without provider-generated IDs"
+        );
+    }
+
+    #[test]
+    fn openai_assistant_history_drops_thinking_but_keeps_tool_calls() {
+        let v = serde_json::json!({
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "text": "private reasoning"},
+                {"type": "text", "text": "visible answer"},
+                {
+                    "type": "toolCall",
+                    "id": "call_1",
+                    "name": "echo",
+                    "arguments": {"value": "x"}
+                }
+            ],
+        });
+
+        let msg = value_to_rig_message_for_provider(&v, Some("openai")).expect("must convert");
+        match msg {
+            Message::Assistant { content, .. } => {
+                let parts: Vec<_> = content.into_iter().collect();
+                assert_eq!(parts.len(), 2);
+                match &parts[0] {
+                    AssistantContent::Text(t) => assert_eq!(t.text, "visible answer"),
+                    other => panic!("expected text, got {other:?}"),
+                }
+                match &parts[1] {
+                    AssistantContent::ToolCall(tc) => {
+                        assert_eq!(tc.id, "call_1");
+                        assert_eq!(tc.call_id.as_deref(), Some("call_1"));
+                        assert_eq!(tc.function.name, "echo");
+                        assert_eq!(tc.function.arguments["value"], "x");
+                    }
+                    other => panic!("expected tool call, got {other:?}"),
+                }
+            }
+            _ => panic!("expected Assistant"),
+        }
+    }
+
+    #[test]
+    fn openai_tool_result_history_uses_tool_call_id_as_responses_call_id() {
+        let v = serde_json::json!({
+            "role": "toolResult",
+            "toolCallId": "call_1",
+            "toolName": "echo",
+            "content": [{"type": "text", "text": "line 1"}],
+            "details": {},
+            "isError": true,
+        });
+
+        let msg = value_to_rig_message_for_provider(&v, Some("openai")).expect("must convert");
+        match msg {
+            Message::User { content } => match content.first() {
+                UserContent::ToolResult(tr) => {
+                    assert_eq!(tr.id, "call_1");
+                    assert_eq!(tr.call_id.as_deref(), Some("call_1"));
+                }
+                other => panic!("expected ToolResult, got {other:?}"),
+            },
+            other => panic!("expected User, got {other:?}"),
         }
     }
 

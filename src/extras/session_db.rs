@@ -22,6 +22,14 @@ use regex::Regex;
 // Used in migrate() to set user_version pragma. pub(crate) so tests
 // assert against the constant instead of a hardcoded number that
 // breaks on every migration.
+//
+// SCHEMA_VERSION is feature-gated: v14 adds entities/relations tables
+// behind `experimental-graph-search`. Without the feature, the schema
+// caps at v13 so the user_version pragma never outruns the tables that
+// actually exist.
+#[cfg(feature = "experimental-graph-search")]
+pub(crate) const SCHEMA_VERSION: u32 = 15;
+#[cfg(not(feature = "experimental-graph-search"))]
 pub(crate) const SCHEMA_VERSION: u32 = 13;
 
 /// Thread-safe snapshot of the most recent `SessionDb::open()` failure.
@@ -315,6 +323,16 @@ impl SessionDb {
 
         if current < 13 {
             self.run_migration_v13()?;
+        }
+
+        #[cfg(feature = "experimental-graph-search")]
+        if current < 14 {
+            self.run_migration_v14()?;
+        }
+
+        #[cfg(feature = "experimental-graph-search")]
+        if current < 15 {
+            self.run_migration_v15()?;
         }
 
         self.conn
@@ -900,6 +918,70 @@ impl SessionDb {
                 return Err(format!("Migration v13 failed on {col}: {e}"));
             }
         }
+        Ok(())
+    }
+
+    /// v14: entity/relation graph tables for PRISM-style recursive CTE
+    /// queries over structured tool-output facts (#393). Gated behind
+    /// `experimental-graph-search` — if the feature is never enabled
+    /// this migration never runs. FTS5 is standalone (no triggers,
+    /// app-managed sync via DELETE+INSERT on entity create/update),
+    /// matching the v7 memories_fts pattern.
+    #[cfg(feature = "experimental-graph-search")]
+    fn run_migration_v14(&self) -> Result<(), String> {
+        self.conn
+            .execute_batch(
+                "
+                CREATE TABLE entities (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL REFERENCES sessions(id),
+                    message_id INTEGER REFERENCES messages(id),
+                    kind TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    extra TEXT,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+
+                CREATE INDEX idx_entities_session ON entities(session_id);
+                CREATE INDEX idx_entities_kind ON entities(kind);
+                CREATE INDEX idx_entities_name ON entities(name);
+
+                CREATE TABLE relations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_id INTEGER NOT NULL REFERENCES entities(id),
+                    target_id INTEGER NOT NULL REFERENCES entities(id),
+                    rel_type TEXT NOT NULL,
+                    session_id TEXT NOT NULL REFERENCES sessions(id),
+                    confidence REAL DEFAULT 1.0,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+
+                CREATE INDEX idx_relations_source ON relations(source_id, rel_type);
+                CREATE INDEX idx_relations_target ON relations(target_id, rel_type);
+                CREATE INDEX idx_relations_session ON relations(session_id);
+
+                CREATE VIRTUAL TABLE entities_fts USING fts5(
+                    name, kind,
+                    tokenize='unicode61'
+                );
+                ",
+            )
+            .map_err(|e| format!("Migration v14 failed: {e}"))?;
+
+        Ok(())
+    }
+
+    /// v15: add schema_version column to entities for PRISM memory schema
+    /// (#393). Defaults to 'generic' — PRISM-typed relations (HAS_FACET,
+    /// DERIVED_FROM, etc.) only apply when schema_version is 'prism'.
+    #[cfg(feature = "experimental-graph-search")]
+    fn run_migration_v15(&self) -> Result<(), String> {
+        self.conn
+            .execute_batch(
+                "ALTER TABLE entities ADD COLUMN schema_version TEXT NOT NULL DEFAULT 'generic';",
+            )
+            .map_err(|e| format!("Migration v15 failed: {e}"))?;
+
         Ok(())
     }
 

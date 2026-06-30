@@ -246,7 +246,8 @@ impl DapSessionManager {
         adapter_cmd: &str,
         adapter_args: &[String],
         cwd: &str,
-        program: &str,
+        program: Option<&str>,
+        module: Option<&str>,
         program_args: &[String],
         stop_on_entry: Option<bool>,
         launch_extra: Option<serde_json::Value>,
@@ -269,6 +270,7 @@ impl DapSessionManager {
             adapter_name,
             cwd,
             program,
+            module,
             program_args,
             stop_on_entry,
             launch_extra,
@@ -290,7 +292,8 @@ impl DapSessionManager {
         &self,
         adapter_name: &str,
         cwd: &str,
-        program: &str,
+        program: Option<&str>,
+        module: Option<&str>,
         program_args: &[String],
         stop_on_entry: Option<bool>,
         launch_extra: Option<serde_json::Value>,
@@ -317,7 +320,8 @@ impl DapSessionManager {
 
         // Build launch arguments.
         let mut launch_args = LaunchArgs {
-            program: Some(program.to_string()),
+            program: program.map(|s| s.to_string()),
+            module: module.map(|s| s.to_string()),
             cwd: Some(cwd.to_string()),
             args: Some(program_args.to_vec()),
             stop_on_entry,
@@ -1183,7 +1187,8 @@ mod tests {
             .launch_with_client(
                 "fake-adapter",
                 "/tmp",
-                "test-program",
+                Some("test-program"),
+                None,
                 &[],
                 Some(true),
                 None,
@@ -1244,7 +1249,8 @@ mod tests {
             .launch_with_client(
                 "fake-adapter",
                 "/tmp",
-                "hello",
+                Some("hello"),
+                None,
                 &[],
                 Some(true),
                 None,
@@ -1274,7 +1280,8 @@ mod tests {
             .launch_with_client(
                 "fake-adapter",
                 "/tmp",
-                "first",
+                Some("first"),
+                None,
                 &[],
                 Some(true),
                 None,
@@ -1334,9 +1341,77 @@ mod tests {
             .launch_with_client(
                 "debugpy",
                 ".",
-                fixture.to_str().unwrap(),
+                Some(fixture.to_str().unwrap()),
+                None,
                 &[],
                 Some(true),
+                None,
+                &signal,
+                client,
+                std::time::Duration::from_secs(15),
+                vec!["python".into()],
+            )
+            .await
+            .expect("launch_with_client should succeed");
+
+        assert_eq!(summary.status, SessionStatus::Stopped);
+        assert!(summary.stop_reason.is_some(), "should have stop reason");
+
+        // Terminate and disconnect.
+        mgr.terminate(std::time::Duration::from_secs(10))
+            .await
+            .expect("terminate should succeed");
+
+        mgr.disconnect(false, std::time::Duration::from_secs(10))
+            .await
+            .expect("disconnect should succeed");
+    }
+
+    /// Launch a Python module (python -m test_mod) via debugpy using
+    /// launch_with_client and exercise the full session-manager lifecycle.
+    #[cfg(feature = "dap")]
+    #[tokio::test]
+    async fn e2e_debugpy_launch_module() {
+        if std::process::Command::new("python3")
+            .args(["-c", "import debugpy"])
+            .output()
+            .map_or(true, |o| !o.status.success())
+        {
+            eprintln!("SKIP: debugpy not installed");
+            return;
+        }
+
+        let fixtures_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("tests")
+            .join("dap")
+            .join("fixtures");
+        assert!(
+            fixtures_dir.join("test_mod").exists(),
+            "test_mod package must exist"
+        );
+
+        let client = DapClient::spawn_stdio(
+            "debugpy",
+            std::path::Path::new("python3"),
+            &["-m".to_string(), "debugpy.adapter".to_string()],
+            std::path::Path::new("."),
+        )
+        .await
+        .expect("debugpy adapter should spawn");
+
+        let mgr = DapSessionManager::new();
+        let signal = AbortSignal::new();
+
+        // launch with module instead of program — debugpy runs python -m test_mod
+        let summary = mgr
+            .launch_with_client(
+                "debugpy",
+                fixtures_dir.to_str().unwrap(),
+                None,             // program: None
+                Some("test_mod"), // module: Some("test_mod")
+                &[],
+                Some(true), // stop_on_entry
                 None,
                 &signal,
                 client,

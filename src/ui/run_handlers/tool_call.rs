@@ -123,7 +123,8 @@ pub(crate) fn handle_tool_call(
     let raw_value = sanitize_output(&raw_value).into_string();
     let (frame_w, _) = chamber_widths(&*ctx.renderer);
     let header = fit_banner_header(&upper, &raw_value, frame_w);
-    ctx.renderer.write_line(&header, c_tool())?;
+    // dirge-qy3y: chamber border — raw (no resize re-wrap; see write_line_raw).
+    ctx.renderer.write_line_raw(&header, c_tool())?;
     *ctx.chamber_top_end = Some(ctx.renderer.buffer_len());
     *ctx.tool_chamber_open = true;
     tracing::trace!(

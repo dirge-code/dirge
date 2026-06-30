@@ -29,7 +29,7 @@
   # Extract a quoted string value for a given key from JSON-like text.
   # e.g. (json-extract "\"name\": \"main\"" "name") → "main"
   (def pat (string "\"" key "\": \""))
-  (def start (string/find pat s))
+  (var start (string/find pat s))
   (if (not start) nil
     (do
       (set start (+ start (length pat)))
@@ -39,7 +39,7 @@
 (defn- json-extract-int [s key]
   # Extract an integer value for a given key.
   (def pat (string "\"" key "\": "))
-  (def start (string/find pat s))
+  (var start (string/find pat s))
   (if (not start) nil
     (do
       (set start (+ start (length pat)))
@@ -48,7 +48,7 @@
                   (>= (get s end) 48) (<= (get s end) 57))
         (set end (+ end 1)))
       (def num-str (string/slice s start end))
-      (if (empty? num-str) nil (math/parse-int num-str)))))
+      (if (empty? num-str) nil (scan-number num-str)))))
 
 (defn- json-extract-array [s key]
   # Extract array of strings like "name": "main", "name": "factorial"
@@ -56,7 +56,7 @@
   (def results @[])
   (var pos 0)
   (while true
-    (def start (string/find pat s pos))
+    (var start (string/find pat s pos))
     (if (not start) (break))
     (set start (+ start (length pat)))
     (def end (string/find "\"" s start))

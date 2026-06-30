@@ -15,6 +15,7 @@ use crate::ui::agent_io::{RENDER_FRAME, render_agent_stream, should_render_token
 use crate::ui::avatar;
 use crate::ui::colors::c_agent;
 use crate::ui::events::sanitize_output;
+use crate::ui::renderer::Renderer;
 use crate::ui::run_handlers::RunCtx;
 
 #[cfg(feature = "plugin")]
@@ -120,4 +121,130 @@ pub(crate) fn handle_token(
     }
     *ctx.agent_line_started = true;
     Ok(())
+}
+
+/// Render the on-screen feedback when a steering message is queued while the
+/// agent is mid-stream, WITHOUT duplicating the partial response.
+///
+/// The renderer's `stream()` always re-renders the FULL `src` it's handed as
+/// one open block at the buffer tail. Writing the echo below it (via
+/// `write_line`) seals that open block, so the next streamed token re-opens a
+/// NEW block with the whole accumulated `response_buf` — painting the sealed
+/// partial a second time (the duplicated `<dirge>` block users saw).
+///
+/// So: flush + seal the partial as its own committed block, echo the queued
+/// message + the "(queued…)" notice, then RESET the render buffer. Tokens that
+/// stream before the runner reaches the interjection boundary now render as a
+/// fresh continuation block instead of re-painting the partial. The session
+/// still gets the full text via the runner's own `partial_response` payload
+/// (`handle_interjected` / the `Done` arm persist that, not `response_buf`), so
+/// clearing here is render-only and loses nothing from history.
+pub(crate) fn render_queued_steering(
+    renderer: &mut Renderer,
+    response_buf: &mut String,
+    response_start_line: &mut Option<usize>,
+    text: &str,
+    notice: &str,
+    notice_color: Color,
+) -> anyhow::Result<()> {
+    if !response_buf.is_empty() {
+        // Flush any coalescer-skipped tail so the sealed block matches
+        // everything streamed so far.
+        renderer.stream(response_buf, c_agent(), true);
+        renderer.render_viewport()?;
+    }
+    renderer.commit_stream();
+    for line in text.lines() {
+        let safe_line = sanitize_output(line);
+        renderer.write_line(&format!("» {}", safe_line), crate::ui::theme::dim())?;
+    }
+    renderer.write_line(notice, notice_color)?;
+    response_buf.clear();
+    *response_start_line = None;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::renderer::Renderer;
+
+    fn screen(r: &Renderer) -> String {
+        r.buffer_lines().join("\n")
+    }
+
+    /// Regression: queueing a steering message mid-stream must NOT duplicate
+    /// the partial `<dirge>` response. Before the fix, the echo's write_line
+    /// sealed the open block and the next streamed token re-opened a new block
+    /// with the WHOLE accumulated response_buf — painting the partial twice.
+    #[test]
+    fn queued_steering_midstream_does_not_duplicate_partial() {
+        let mut r = Renderer::new().expect("renderer");
+        r.set_test_cols(80);
+        let mut response_buf = String::new();
+        let mut start: Option<usize> = None;
+
+        // Agent streams a partial response (one open block at the tail).
+        response_buf.push_str("ALPHAWORD BETAWORD GAMMAWORD");
+        r.stream(&response_buf, c_agent(), true);
+
+        // User queues a steering message while the stream is open.
+        render_queued_steering(
+            &mut r,
+            &mut response_buf,
+            &mut start,
+            "please refactor",
+            "(queued)",
+            Color::White,
+        )
+        .unwrap();
+
+        // The render buffer was reset for a fresh continuation block.
+        assert!(response_buf.is_empty());
+        assert!(start.is_none());
+
+        // A couple more tokens stream before the runner hits the boundary.
+        response_buf.push_str("DELTAWORD");
+        r.stream(&response_buf, c_agent(), true);
+        r.commit_stream();
+
+        let s = screen(&r);
+        // Partial body appears exactly once — not re-painted after the seal.
+        assert_eq!(
+            s.matches("GAMMAWORD").count(),
+            1,
+            "partial duplicated:\n{s}"
+        );
+        assert_eq!(
+            s.matches("ALPHAWORD").count(),
+            1,
+            "partial duplicated:\n{s}"
+        );
+        // Echo + notice + continuation are all present.
+        assert!(s.contains("please refactor"), "missing echo:\n{s}");
+        assert!(s.contains("(queued)"), "missing notice:\n{s}");
+        assert!(s.contains("DELTAWORD"), "missing continuation:\n{s}");
+    }
+
+    /// When nothing has streamed yet, the helper just echoes — no empty block,
+    /// no panic.
+    #[test]
+    fn queued_steering_with_empty_buffer_just_echoes() {
+        let mut r = Renderer::new().expect("renderer");
+        r.set_test_cols(80);
+        let mut response_buf = String::new();
+        let mut start: Option<usize> = None;
+        render_queued_steering(
+            &mut r,
+            &mut response_buf,
+            &mut start,
+            "hello",
+            "(queued)",
+            Color::White,
+        )
+        .unwrap();
+        let s = screen(&r);
+        assert!(s.contains("hello"), "missing echo:\n{s}");
+        assert!(s.contains("(queued)"), "missing notice:\n{s}");
+    }
 }

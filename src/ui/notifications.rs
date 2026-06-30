@@ -110,6 +110,42 @@ pub fn sender() -> Option<Sender<Notification>> {
     slot.clone()
 }
 
+pub fn notify_mcp_log(server: &str, line: &str) {
+    notify_send(Notification::McpLog {
+        server: server.to_string(),
+        line: line.to_string(),
+    });
+}
+
+/// Generic send helper — used by future Info/Warn/Error producers
+/// so they share the orphan-detection + bounded-drop semantics.
+#[allow(dead_code)]
+pub fn notify_send(notif: Notification) {
+    let Some(tx) = sender() else {
+        return;
+    };
+    if tx.try_send(notif).is_err() {
+        // Either the channel is full (drop the line, can't keep up
+        // with a runaway producer — better than OOM) or the
+        // receiver was dropped (UI exited / restarted). Clear the
+        // slot in the latter case so subsequent producers don't
+        // keep retrying against a dead channel. Capacity-full
+        // would just transiently shed; we accept the redundant
+        // slot-clear there.
+        if tx.is_closed() {
+            let mut slot = TX.write().unwrap_or_else(|e| e.into_inner());
+            // Only clear if the slot still points at THIS dead
+            // sender. A concurrent `install()` may have already
+            // swapped in a fresh one — don't trample it.
+            if let Some(current) = slot.as_ref()
+                && current.same_channel(&tx)
+            {
+                *slot = None;
+            }
+        }
+    }
+}
+
 /// Send an MCP log line through the notification channel.
 /// Convenience wrapper for the stderr forwarder. Uses `try_send`
 /// — drops the line if the queue is full (review #4), and detects
@@ -172,41 +208,5 @@ mod tests {
         }
         assert_eq!(accepted, NOTIF_CAP);
         assert_eq!(dropped, 10);
-    }
-}
-
-pub fn notify_mcp_log(server: &str, line: &str) {
-    notify_send(Notification::McpLog {
-        server: server.to_string(),
-        line: line.to_string(),
-    });
-}
-
-/// Generic send helper — used by future Info/Warn/Error producers
-/// so they share the orphan-detection + bounded-drop semantics.
-#[allow(dead_code)]
-pub fn notify_send(notif: Notification) {
-    let Some(tx) = sender() else {
-        return;
-    };
-    if tx.try_send(notif).is_err() {
-        // Either the channel is full (drop the line, can't keep up
-        // with a runaway producer — better than OOM) or the
-        // receiver was dropped (UI exited / restarted). Clear the
-        // slot in the latter case so subsequent producers don't
-        // keep retrying against a dead channel. Capacity-full
-        // would just transiently shed; we accept the redundant
-        // slot-clear there.
-        if tx.is_closed() {
-            let mut slot = TX.write().unwrap_or_else(|e| e.into_inner());
-            // Only clear if the slot still points at THIS dead
-            // sender. A concurrent `install()` may have already
-            // swapped in a fresh one — don't trample it.
-            if let Some(current) = slot.as_ref()
-                && current.same_channel(&tx)
-            {
-                *slot = None;
-            }
-        }
     }
 }

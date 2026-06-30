@@ -13,9 +13,19 @@ pub mod mcp_server;
 #[cfg(feature = "acp")]
 pub mod acp;
 
+#[cfg(feature = "experimental-graph-search")]
+pub mod entity_compress;
+#[cfg(feature = "experimental-graph-search")]
+pub mod entity_db;
+#[cfg(feature = "experimental-graph-search")]
+pub mod entity_router;
+#[cfg(feature = "experimental-graph-search")]
+pub mod entity_search;
+
 pub mod curator_clock;
 pub mod dirge_paths;
 pub mod fts;
+pub mod issue_db;
 pub mod memory_curator;
 pub mod memory_db;
 pub mod memory_hybrid;

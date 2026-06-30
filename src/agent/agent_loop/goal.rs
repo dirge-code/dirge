@@ -16,6 +16,7 @@
 
 use super::critic::CriticFn;
 use super::message::{LoopMessage, UserMessage};
+use super::verifier::VerificationStatus;
 
 /// Max times the goal gate re-enters the loop before giving up and letting
 /// the run finalize anyway. A natural-language goal can be mis-stated or
@@ -33,7 +34,7 @@ pub const GOAL_TAG: &str = "[goal]";
 /// Like the critic, it must respect the agent's own constraints so it never
 /// demands a forbidden action, and it must judge ONLY the stated stop
 /// condition — not invent extra requirements.
-const GOAL_PREAMBLE: &str = "\
+pub(crate) const GOAL_PREAMBLE: &str = "\
 You are a completion judge for an autonomous coding agent. You are given the agent's own \
 instructions and constraints, a single natural-language STOP CONDITION the user set for this run, \
 and a transcript of what the agent has done so far. Decide ONLY whether the stop condition is now \
@@ -58,21 +59,60 @@ If UNMET, follow with a short bullet list of exactly what remains for the stop c
 /// doesn't balloon the call. Mirrors the critic's bound.
 const MAX_RULES_CHARS: usize = 16_000;
 
+/// A SOFT verification advisory for the goal judge (dirge-6q3w). Unlike the
+/// critic — which treats an unverified edit as a concrete gap — the goal
+/// gate judges the user's stop condition, so verification is only relevant
+/// when that condition implies working code. The note is explicitly
+/// advisory and must NEVER, on its own, flip a goal to UNMET when
+/// verification simply couldn't run — that would trap a bounded loop on a
+/// non-testable task. Green / no-code-edited / no-gate add nothing.
+fn goal_verification_note(verification: Option<VerificationStatus>) -> &'static str {
+    match verification {
+        Some(VerificationStatus::Unverified) => {
+            "\n\n=== VERIFICATION (advisory) ===\n\
+             The agent edited code but ran no build/test/lint this run. Consider this ONLY if the \
+             stop condition implies the code is working/verified. Never answer UNMET solely \
+             because verification didn't run — if there's nothing to run, the change isn't \
+             testable, or it's out of scope, judge the stop condition on its own terms."
+        }
+        Some(VerificationStatus::VerifiedRed) => {
+            "\n\n=== VERIFICATION (advisory) ===\n\
+             The agent edited code and the latest build/test FAILED. If the stop condition implies \
+             working code, it is probably not met yet — unless the failure is pre-existing, \
+             expected, or unrelated to the change."
+        }
+        Some(VerificationStatus::VerifiedGreen) | Some(VerificationStatus::NoCodeEdited) | None => {
+            ""
+        }
+    }
+}
+
 /// Build the judge prompt: the agent's constraints, the stop condition, the
-/// transcript, and the response format. `rules` is truncated to
+/// transcript, an advisory verification note, and the response format. The
+/// compaction summary is stripped from `rules` first (same stale-state
+/// guard as the critic — a resumed session's `## Active Task` describes
+/// already-done work, not the goal), then it is truncated to
 /// [`MAX_RULES_CHARS`] with a note when elided.
-pub fn build_goal_prompt(goal: &str, rules: &str, transcript: &str) -> String {
-    let (rules, elided) = if rules.len() > MAX_RULES_CHARS {
-        (&rules[..MAX_RULES_CHARS], "\n[…constraints truncated…]")
+pub fn build_goal_prompt(
+    goal: &str,
+    rules: &str,
+    transcript: &str,
+    verification: Option<VerificationStatus>,
+) -> String {
+    let rules = super::critic::strip_compaction_summary(rules);
+    let (rules, elided) = if rules.chars().count() > MAX_RULES_CHARS {
+        let head: String = rules.chars().take(MAX_RULES_CHARS).collect();
+        (head, "\n[…constraints truncated…]")
     } else {
-        (rules, "")
+        (rules.to_string(), "")
     };
     format!(
         "{GOAL_PREAMBLE}\n\n\
          === AGENT INSTRUCTIONS / CONSTRAINTS ===\n{rules}{elided}\n\n\
          === STOP CONDITION ===\n{goal}\n\n\
-         === TRANSCRIPT ===\n{transcript}\n\n\
-         {GOAL_FORMAT}"
+         === TRANSCRIPT ===\n{transcript}{}\n\n\
+         {GOAL_FORMAT}",
+        goal_verification_note(verification)
     )
 }
 
@@ -114,8 +154,9 @@ pub async fn run_goal_gate(
     goal: &str,
     rules: &str,
     transcript: &str,
+    verification: Option<VerificationStatus>,
 ) -> Vec<LoopMessage> {
-    let prompt = build_goal_prompt(goal, rules, transcript);
+    let prompt = build_goal_prompt(goal, rules, transcript, verification);
     let response = match judge(prompt).await {
         Ok(r) => r,
         Err(e) => {
@@ -174,6 +215,7 @@ mod tests {
             "all tests pass and changes committed",
             "RULE: never push to remote.",
             "user asked X; assistant ran the tests",
+            None,
         );
         assert!(p.contains("all tests pass and changes committed"));
         assert!(p.contains("never push to remote"));
@@ -181,12 +223,95 @@ mod tests {
         assert!(p.contains("GOAL: MET"));
     }
 
+    /// Same stale-state guard as the critic (dirge-wp0e): after a resume the
+    /// merged system prompt carries the `[CONTEXT COMPACTION — REFERENCE
+    /// ONLY]` summary, whose `## Active Task` describes already-completed
+    /// work. It must not reach the goal judge, or the gate would re-demand
+    /// superseded work as if it were the stop condition.
+    #[test]
+    fn build_goal_prompt_drops_the_compaction_summary_from_rules() {
+        let rules = format!(
+            "RULE: never push to remote.\n\n{} \
+             ## Active Task\nFinish Phase 3: wire the Janet loader and add tests.",
+            crate::agent::compression::COMPACTION_MARKER,
+        );
+        let p = build_goal_prompt("all tests pass", &rules, "assistant ran the tests", None);
+        assert!(
+            p.contains("never push to remote"),
+            "real rules must survive"
+        );
+        assert!(
+            !p.contains("Active Task") && !p.contains("Phase 3") && !p.contains("Janet"),
+            "the compaction summary must be stripped from the judge's rules",
+        );
+        assert!(
+            !p.contains(crate::agent::compression::COMPACTION_MARKER),
+            "the compaction marker itself must be stripped",
+        );
+    }
+
+    // dirge-6q3w: soft verification advisory.
+
+    #[test]
+    fn no_verification_note_without_a_signal() {
+        let p = build_goal_prompt("done", "rules", "did stuff", None);
+        assert!(!p.contains("VERIFICATION"));
+        // Green / no-code add nothing either — the note is only for gaps.
+        let p2 = build_goal_prompt(
+            "done",
+            "rules",
+            "did stuff",
+            Some(VerificationStatus::VerifiedGreen),
+        );
+        assert!(!p2.contains("VERIFICATION"));
+        let p3 = build_goal_prompt(
+            "done",
+            "rules",
+            "did stuff",
+            Some(VerificationStatus::NoCodeEdited),
+        );
+        assert!(!p3.contains("VERIFICATION"));
+    }
+
+    /// The advisory must be soft: it explicitly forbids answering UNMET
+    /// merely because verification couldn't run, so a non-testable task
+    /// can't trap the bounded goal loop.
+    #[test]
+    fn unverified_note_is_advisory_and_soft() {
+        let p = build_goal_prompt(
+            "ship it",
+            "rules",
+            "edited foo.rs",
+            Some(VerificationStatus::Unverified),
+        );
+        assert!(p.contains("VERIFICATION"));
+        assert!(p.contains("advisory"));
+        let lower = p.to_lowercase();
+        assert!(
+            lower.contains("never answer unmet solely"),
+            "must forbid blocking the goal just because tests didn't run",
+        );
+    }
+
+    #[test]
+    fn red_note_links_failure_to_the_condition() {
+        let p = build_goal_prompt(
+            "ship it",
+            "rules",
+            "edited foo.rs",
+            Some(VerificationStatus::VerifiedRed),
+        );
+        let lower = p.to_lowercase();
+        assert!(lower.contains("failed"));
+        assert!(lower.contains("stop condition"));
+    }
+
     #[tokio::test]
     async fn unmet_judge_yields_a_tagged_reentry() {
         let judge: CriticFn = Arc::new(|_p| {
             Box::pin(async { Ok("GOAL: UNMET\n- still need to commit".to_string()) })
         });
-        let msgs = run_goal_gate(&judge, "commit the work", "", "edited foo.rs").await;
+        let msgs = run_goal_gate(&judge, "commit the work", "", "edited foo.rs", None).await;
         assert_eq!(msgs.len(), 1);
         let LoopMessage::User(UserMessage { content }) = &msgs[0] else {
             panic!("goal gate must re-enter as a user-role message");
@@ -199,14 +324,14 @@ mod tests {
     #[tokio::test]
     async fn met_judge_yields_no_reentry() {
         let judge: CriticFn = Arc::new(|_p| Box::pin(async { Ok("GOAL: MET".to_string()) }));
-        let msgs = run_goal_gate(&judge, "commit the work", "", "committed").await;
+        let msgs = run_goal_gate(&judge, "commit the work", "", "committed", None).await;
         assert!(msgs.is_empty(), "a met goal must let the run finalize");
     }
 
     #[tokio::test]
     async fn judge_error_fails_open() {
         let judge: CriticFn = Arc::new(|_p| Box::pin(async { anyhow::bail!("provider down") }));
-        let msgs = run_goal_gate(&judge, "commit the work", "", "x").await;
+        let msgs = run_goal_gate(&judge, "commit the work", "", "x", None).await;
         assert!(msgs.is_empty(), "a judge error must not trap the loop");
     }
 }

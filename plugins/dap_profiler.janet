@@ -26,19 +26,27 @@
 (var profile-samples 0)
 (var profile-counts @{})     # frame-name -> count
 
-# ── Hook — sample on each tool-end if profiling ──────────────────────
+# ── Report generator (must precede take-sample — no forward refs) ────
 
-# Monotonic-ish millisecond clock. `os/clock` returns seconds as a double;
-# `os/time` is whole seconds, which made the `profile-interval` (ms) math
-# off by ~1000x (a "200ms" profile sampled every 200s).
-(defn- now-ms [] (* (os/clock) 1000))
+(defn- profiler-report []
+  (def entries @[])
+  (loop [[k v] :pairs profile-counts]
+    (array/push entries [v k]))
+  (sort entries (fn [a b] (> (get a 0) (get b 0))))
+  (var out "PROFILER REPORT\n")
+  (set out (string out "Samples: " profile-samples
+                   "  Interval: " profile-interval "ms\n\n"))
+  (var rank 0)
+  (loop [entry :in entries]
+    (when (< rank 20)
+      (def count (get entry 0))
+      (def key (get entry 1))
+      (def pct (math/round (* 100 (/ count profile-samples))))
+      (set out (string out (string "  " rank ". " pct "%  " key "\n")))
+      (set rank (+ rank 1))))
+  out)
 
-(defn on-tool-end [ctx]
-  (when (and profiling (>= (now-ms) profile-next-sample))
-    (set profile-next-sample (+ (now-ms) profile-interval))
-    (take-sample)))
-
-# ── Sample logic ─────────────────────────────────────────────────────
+# ── Sample logic (must precede on-tool-end — no forward refs) ────────
 
 (defn- take-sample []
   (def frames-str (dap/stack-trace))
@@ -50,7 +58,7 @@
     (while (and (< found 10)
                 (>= idx 0)
                 (< idx (length frames-str)))
-      (def name-start (string/find "\"name\": \"" frames-str idx))
+      (var name-start (string/find "\"name\": \"" frames-str idx))
       (if (not name-start)
         (break))
       (set name-start (+ name-start 9))
@@ -72,32 +80,26 @@
     (harness/notify (profiler-report) :info)
     (set profiling false)))
 
-# ── Report generator ────────────────────────────────────────────────
+# ── Clock (must precede on-tool-end — no forward refs) ────────────────
 
-(defn- profiler-report []
-  (def entries @[])
-  (loop [[k v] :pairs profile-counts]
-    (array/push entries [v k]))
-  (sort entries (fn [a b] (> (get a 0) (get b 0))))
-  (var out "PROFILER REPORT\n")
-  (set out (string out "Samples: " profile-samples
-                   "  Interval: " profile-interval "ms\n\n"))
-  (var rank 0)
-  (loop [entry :in entries]
-    (when (< rank 20)
-      (def count (get entry 0))
-      (def key (get entry 1))
-      (def pct (math/round (* 100 (/ count profile-samples))))
-      (set out (string out (string "  " rank ". " pct "%  " key "\n")))
-      (set rank (+ rank 1))))
-  out)
+# Monotonic-ish millisecond clock. `os/clock` returns seconds as a double;
+# `os/time` is whole seconds, which made the `profile-interval` (ms) math
+# off by ~1000x (a "200ms" profile sampled every 200s).
+(defn- now-ms [] (* (os/clock) 1000))
+
+# ── Hook — sample on each tool-end if profiling ──────────────────────
+
+(defn on-tool-end [ctx]
+  (when (and profiling (>= (now-ms) profile-next-sample))
+    (set profile-next-sample (+ (now-ms) profile-interval))
+    (take-sample)))
 
 # ── Slash commands ──────────────────────────────────────────────────
 
 (defn profile-start [args]
   (when (not (dap/session-active?))
     (break "No active DAP session — launch a program first"))
-  (def interval (if (empty? args) 200 (math/parse-int args)))
+  (def interval (if (empty? args) 200 (scan-number args)))
   (set profiling true)
   (set profile-interval (max 50 interval))
   (set profile-max-samples 100)

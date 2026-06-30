@@ -21,6 +21,7 @@ use super::codex_http::CodexHttpClient;
 use super::{AnyClient, ProviderKind, resolve_api_key_from, resolve_provider_info};
 
 const CHATGPT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
+const CHATGPT_ORIGINATOR: &str = "dirge";
 
 #[derive(Clone, PartialEq, Eq)]
 enum ProviderCredential {
@@ -280,6 +281,7 @@ where
                     access_token: key,
                     account_id: openai_oauth_account_id,
                 })
+                .originator(CHATGPT_ORIGINATOR)
                 .base_url(CHATGPT_CODEX_BASE_URL);
             Ok(AnyClient::OpenAICodex(b.build()?))
         }
@@ -452,27 +454,77 @@ where
         })
 }
 
-fn load_fresh_openai_oauth() -> anyhow::Result<Option<OpenAiOAuthCredential>> {
-    fresh_openai_oauth_at(
-        OpenAiAuthStore::default().load_openai()?,
-        current_epoch_ms(),
-    )
+pub(crate) fn load_fresh_openai_oauth() -> anyhow::Result<Option<OpenAiOAuthCredential>> {
+    let store = OpenAiAuthStore::default();
+    fresh_openai_oauth_at(store.load_openai()?, current_epoch_ms(), |credential| {
+        let refreshed = refresh_openai_credential(credential)?;
+        store.save_openai(&refreshed)?;
+        Ok(refreshed)
+    })
 }
 
 fn fresh_openai_oauth_at(
     credential: Option<OpenAiOAuthCredential>,
     epoch_ms: i64,
+    refresh: impl FnOnce(&OpenAiOAuthCredential) -> anyhow::Result<OpenAiOAuthCredential>,
 ) -> anyhow::Result<Option<OpenAiOAuthCredential>> {
     let Some(credential) = credential else {
         return Ok(None);
     };
     if credential.is_fresh_at(epoch_ms) {
-        Ok(Some(credential))
-    } else {
-        anyhow::bail!(
-            "Stored OpenAI OAuth credential is expired; run `dirge auth openai` again or set OPENAI_API_KEY."
-        )
+        return Ok(Some(credential));
     }
+    if credential.refresh_token().trim().is_empty() {
+        anyhow::bail!(
+            "Stored OpenAI OAuth credential is expired and has no refresh token; run `dirge auth openai` again or set OPENAI_API_KEY."
+        );
+    }
+    let refreshed = refresh(&credential).map_err(|_err| {
+        anyhow::anyhow!(
+            "Stored OpenAI OAuth credential is expired and could not be refreshed; run `dirge auth openai` again or set OPENAI_API_KEY."
+        )
+    })?;
+    Ok(Some(refreshed))
+}
+
+/// Exchange the credential's refresh token for a fresh access token.
+///
+/// Runs the async refresh on a dedicated thread+runtime so it works whether or
+/// not the caller is already inside a Tokio runtime (mirrors the Anthropic
+/// refresh bridge in `provider/auth.rs`).
+fn refresh_openai_credential(
+    credential: &OpenAiOAuthCredential,
+) -> anyhow::Result<OpenAiOAuthCredential> {
+    let refresh_token = credential.refresh_token().to_string();
+    let prior_id_token = credential.id_token().map(str::to_string);
+    let prior_account_id = credential.account_id().map(str::to_string);
+    let tokens = std::thread::spawn(
+        move || -> anyhow::Result<crate::auth::openai_oauth::OAuthTokens> {
+            let runtime = tokio::runtime::Runtime::new()?;
+            let flow = crate::auth::openai_oauth::OpenAiOAuthFlow::new(
+                crate::auth::openai_device::DEFAULT_ISSUER,
+                crate::auth::openai_device::DEFAULT_CLIENT_ID,
+                crate::auth::openai_device::ReqwestDeviceAuthHttp::default(),
+            );
+            Ok(runtime.block_on(flow.refresh_access_token(&refresh_token))?)
+        },
+    )
+    .join()
+    .map_err(|panic| anyhow::anyhow!("OpenAI OAuth refresh thread panicked: {panic:?}"))??;
+
+    let mut tokens = tokens;
+    if tokens.id_token.trim().is_empty()
+        && let Some(prior) = prior_id_token
+    {
+        tokens.id_token = prior;
+    }
+    if tokens.account_id.is_none() {
+        tokens.account_id = prior_account_id;
+    }
+    Ok(crate::auth::command::oauth_tokens_to_credential(
+        tokens,
+        current_epoch_ms(),
+    ))
 }
 
 fn current_epoch_ms() -> i64 {
@@ -673,7 +725,11 @@ mod tests {
             None,
             None,
             |name| (name == "OPENAI_API_KEY").then(|| "env-key".to_string()),
-            || fresh_openai_oauth_at(Some(oauth("ACCESS-TOKEN")), i64::MAX),
+            || {
+                fresh_openai_oauth_at(Some(oauth("ACCESS-TOKEN")), i64::MAX, |_| {
+                    anyhow::bail!("refresh unavailable in test")
+                })
+            },
         )
         .unwrap();
 
@@ -847,14 +903,46 @@ mod tests {
 
     #[test]
     fn expired_openai_oauth_error_is_actionable_and_redacted() {
-        let err = fresh_openai_oauth_at(Some(oauth("ACCESS-TOKEN")), i64::MAX)
-            .unwrap_err()
-            .to_string();
+        let err = fresh_openai_oauth_at(Some(oauth("ACCESS-TOKEN")), i64::MAX, |_| {
+            anyhow::bail!("refresh unavailable in test")
+        })
+        .unwrap_err()
+        .to_string();
 
         assert!(err.contains("dirge auth openai"));
         for secret in ["ACCESS-TOKEN", "REFRESH-TOKEN", "ID-TOKEN"] {
             assert!(!err.contains(secret), "expired-token error leaked {secret}");
         }
+    }
+
+    #[test]
+    fn expired_openai_oauth_is_refreshed_when_refresh_succeeds() {
+        let refreshed = OpenAiOAuthCredential::new(
+            "NEW-ACCESS",
+            "NEW-REFRESH",
+            Some("NEW-ID".to_string()),
+            Some("acct".to_string()),
+            i64::MAX,
+        );
+        let result = fresh_openai_oauth_at(Some(oauth("OLD-ACCESS")), i64::MAX, |cred| {
+            assert_eq!(cred.refresh_token(), "REFRESH-TOKEN");
+            Ok(refreshed.clone())
+        })
+        .unwrap()
+        .expect("refreshed credential returned");
+
+        assert_eq!(result.access_token(), "NEW-ACCESS");
+    }
+
+    #[test]
+    fn fresh_openai_oauth_does_not_refresh() {
+        let result = fresh_openai_oauth_at(Some(oauth("ACCESS-TOKEN")), 0, |_| {
+            panic!("must not refresh a fresh credential")
+        })
+        .unwrap()
+        .expect("fresh credential returned");
+
+        assert_eq!(result.access_token(), "ACCESS-TOKEN");
     }
 
     #[test]

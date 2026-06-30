@@ -172,11 +172,11 @@ pub(crate) fn close_tool_chamber_abort(
 ) -> anyhow::Result<()> {
     if last_tool_name.is_some() || *tool_chamber_open {
         let (frame_w, inner) = chamber_widths(renderer);
-        renderer.write_line(
+        renderer.write_line_raw(
             &chamber_row_centered("⚠ tool denied · aborted · no result", inner),
             theme::perm(),
         )?;
-        renderer.write_line(&chamber_bottom(frame_w), theme::dim())?;
+        renderer.write_line_raw(&chamber_bottom(frame_w), theme::dim())?;
         *last_tool_name = None;
         *tool_chamber_open = false;
     }
@@ -202,7 +202,7 @@ pub(crate) fn close_tool_chamber_passive(
             }
         } else {
             let (frame_w, _inner) = chamber_widths(renderer);
-            renderer.write_line(&chamber_bottom(frame_w), theme::dim())?;
+            renderer.write_line_raw(&chamber_bottom(frame_w), theme::dim())?;
         }
         *last_tool_name = None;
         *tool_chamber_open = false;
@@ -279,7 +279,7 @@ pub(crate) fn render_tool_output(
             "bash" => "(no output)",
             _ => "(no output)",
         };
-        renderer.write_line(&chamber_row(placeholder, inner), theme::dim())?;
+        renderer.write_line_raw(&chamber_row(placeholder, inner), theme::dim())?;
     }
     // dirge-hukk: syntax-highlight `read` boxes (file content) by the file's
     // extension. Unknown/extensionless files fall through to the plain path.
@@ -287,14 +287,14 @@ pub(crate) fn render_tool_output(
         let highlighted = crate::ui::highlight::highlight_code(&char_sliced, &lang);
         for spans in highlighted.iter().take(shown_lines) {
             let ansi = spans_to_ansi(spans);
-            renderer.write_line(
+            renderer.write_line_raw(
                 &chamber_row_styled(&ansi, inner, theme::result()),
                 theme::result(),
             )?;
         }
     } else {
         for line in &lines[..shown_lines] {
-            renderer.write_line(&chamber_row(line, inner), theme::result())?;
+            renderer.write_line_raw(&chamber_row(line, inner), theme::result())?;
         }
     }
     if hidden_lines > 0 {
@@ -303,13 +303,13 @@ pub(crate) fn render_tool_output(
             hidden_lines,
             if hidden_lines == 1 { "" } else { "s" }
         );
-        renderer.write_line(&chamber_row(&note, inner), theme::dim())?;
+        renderer.write_line_raw(&chamber_row(&note, inner), theme::dim())?;
     }
     if chars_truncated > 0 {
         let note = format!("░ +{} chars truncated (output too large)", chars_truncated);
-        renderer.write_line(&chamber_row(&note, inner), theme::dim())?;
+        renderer.write_line_raw(&chamber_row(&note, inner), theme::dim())?;
     }
-    renderer.write_line(&chamber_bottom(frame_w), theme::dim())?;
+    renderer.write_line_raw(&chamber_bottom(frame_w), theme::dim())?;
 
     if hidden_lines > 0 || chars_truncated > 0 {
         Ok(Some(CollapsedToolResult {
@@ -332,7 +332,7 @@ pub(crate) fn render_collapsed_in_full(
     let (frame_w, _) = chamber_widths(renderer);
     let header = fit_banner_header(&upper, &collapsed.banner_value, frame_w);
     renderer.write_line("", Color::White)?;
-    renderer.write_line(&header, theme::tool())?;
+    renderer.write_line_raw(&header, theme::tool())?;
     let _ = render_tool_output(
         renderer,
         &collapsed.tool_name,
@@ -345,7 +345,13 @@ pub(crate) fn render_collapsed_in_full(
 }
 
 pub(crate) fn chamber_widths(renderer: &Renderer) -> (usize, usize) {
-    let frame_w = renderer.content_width().saturating_sub(1).max(20);
+    // Span the full painted chat band: `ChatPane` draws each row at
+    // `chat.x` for up to `chat.width - 1` columns, so a chamber row of
+    // `chat.width - 1` lands its right │ exactly on the last painted
+    // cell. Using the gutter-blind, 120-capped `content_width` here left
+    // the box short of the band on wide terminals (panels hidden),
+    // leaving a dead strip where stale border glyphs showed.
+    let frame_w = renderer.chat_band_width().saturating_sub(1).max(20);
     let inner = frame_w.saturating_sub(4); // `│ ` + ` │`
     (frame_w, inner)
 }
@@ -1014,7 +1020,7 @@ mod tests {
     #[test]
     fn chamber_row_styled_aligns_despite_ansi() {
         let inner = 30;
-        let content = format!("\x1b[32mfn\x1b[0m main() {{}}");
+        let content = "\x1b[32mfn\x1b[0m main() {}".to_string();
         let row = chamber_row_styled(&content, inner, Color::Green);
         assert_eq!(crate::ui::wrap::visible_width(&row), inner + 4);
         assert!(row.starts_with("│ ") && row.ends_with(" │"));

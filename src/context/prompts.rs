@@ -21,6 +21,30 @@ static EMBEDDED: Dir = include_dir!("$CARGO_MANIFEST_DIR/prompts");
 ///
 /// Files without frontmatter still load as a prompt — `body` becomes
 /// the whole file, `deny_tools` is empty, `description` is None.
+/// Which tier a `Prompt` was loaded from. Surfaced by `/prompt` as a
+/// provenance badge so a global/project override of a built-in prompt
+/// is visible. Mirrors `AgentSource` from the `/agents` listing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PromptSource {
+    /// Compiled into the binary via `include_dir!` (the built-ins).
+    #[default]
+    Embedded,
+    /// Read from `~/.config/dirge/prompts/`.
+    Global,
+    /// Read from `<cwd>/.dirge/prompts/`.
+    Project,
+}
+
+impl PromptSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            PromptSource::Embedded => "embedded",
+            PromptSource::Global => "global",
+            PromptSource::Project => "project",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Prompt {
     pub body: String,
@@ -28,6 +52,19 @@ pub struct Prompt {
     /// Surfaced by `/prompt` listing in the slash command UI when set.
     /// Single-line summary of the mode (e.g. "Read-only planning mode").
     pub description: Option<String>,
+    /// Disables the in-loop critic while this prompt is active. Only
+    /// `Some(false)` is meaningful — it suppresses the critic for this
+    /// prompt only (the goal gate is unaffected). `None` / `Some(true)`
+    /// inherit the global (`critic_provider`) behavior. Applied in
+    /// `build_agent`.
+    pub critic: Option<bool>,
+    /// Overrides the critic's system preamble for this prompt. Wins over
+    /// `config.critic_preamble` and the built-in `CRITIC_PREAMBLE`. An
+    /// empty value is treated as unset. `None` = inherit.
+    pub critic_preamble: Option<String>,
+    /// Tier this prompt was loaded from. `parse_frontmatter` defaults to
+    /// `Embedded`; the global/project loaders override it.
+    pub source: PromptSource,
 }
 
 /// Parse `---\n…---\n<body>` frontmatter out of a markdown file.
@@ -67,6 +104,8 @@ fn parse_frontmatter(raw: &str) -> Prompt {
 
     let mut deny_tools: Vec<String> = Vec::new();
     let mut description: Option<String> = None;
+    let mut critic: Option<bool> = None;
+    let mut critic_preamble: Option<String> = None;
     let lines: Vec<&str> = front.lines().collect();
     let mut i = 0;
     while i < lines.len() {
@@ -131,6 +170,42 @@ fn parse_frontmatter(raw: &str) -> Prompt {
                     description = Some(v.to_string());
                 }
             }
+            "critic" => match value {
+                "false" => critic = Some(false),
+                "true" => critic = Some(true),
+                _ => {}
+            },
+            "critic_preamble" => {
+                if (value == "|" || value == "|-") && i < lines.len() {
+                    // YAML block scalar: collect the following indented lines
+                    // (literal style — folding isn't supported).
+                    let mut block: Vec<String> = Vec::new();
+                    while i < lines.len() {
+                        let raw = lines[i];
+                        if raw.is_empty() {
+                            block.push(String::new());
+                            i += 1;
+                        } else if raw.starts_with(char::is_whitespace) {
+                            block.push(raw.trim_start().to_string());
+                            i += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    while block.last().is_some_and(String::is_empty) {
+                        block.pop();
+                    }
+                    let joined = block.join("\n");
+                    if !joined.trim().is_empty() {
+                        critic_preamble = Some(joined);
+                    }
+                } else {
+                    let v = value.trim_matches(|c| c == '"' || c == '\'');
+                    if !v.is_empty() {
+                        critic_preamble = Some(v.to_string());
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -138,6 +213,9 @@ fn parse_frontmatter(raw: &str) -> Prompt {
         body: body.to_string(),
         deny_tools,
         description,
+        critic,
+        critic_preamble,
+        ..Default::default()
     }
 }
 
@@ -145,20 +223,32 @@ pub fn global_prompts_dir() -> PathBuf {
     crate::session::storage::config_path().join("prompts")
 }
 
-/// Load all prompts available to the session, with merge order:
-///
-///   embedded  (lowest precedence — only fills gaps)
-///     ↓
-///   global    (`~/.config/dirge/prompts/`)
-///     ↓
-///   local     (`./prompts/`, highest precedence)
-///
-/// Implementation contract (audit H14): embedded uses `or_insert_with`
-/// (soft) so a global / local prompt of the same name overrides it;
-/// global and local use `insert` (hard, last-write-wins). The three
-/// blocks below MUST stay in this order — swapping them would
-/// silently invert precedence. New tiers (e.g. workspace-scoped)
-/// should slot in by precedence with the same soft-then-hard pattern.
+/// Per-project prompts directory: `<cwd>/.dirge/prompts/`. Mirrors
+/// `.dirge/agents` / `.dirge/plugins`. A project prompt of the same
+/// name as a global or built-in prompt overrides it.
+pub fn local_prompts_dir() -> PathBuf {
+    PathBuf::from(".dirge").join("prompts")
+}
+
+/// Read every `*.md` directly under `dir` and insert it (hard,
+/// last-write-wins) into `prompts`. Absent dir is a no-op. Used for
+/// the global and project-local override tiers.
+fn load_dir_hard(dir: &Path, source: PromptSource, prompts: &mut HashMap<String, Prompt>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e == "md")
+            && let Some(name) = path.file_stem().and_then(|s| s.to_str())
+            && let Ok(content) = std::fs::read_to_string(&path)
+        {
+            let mut prompt = parse_frontmatter(&content);
+            prompt.source = source;
+            prompts.insert(name.to_string(), prompt);
+        }
+    }
+}
 fn warn_unknown_deny_tools(prompt_name: &str, deny: &[String]) {
     // Review-batch #7: single source of truth for built-in tool
     // names lives in `crate::agent::tools::BUILTIN_TOOL_NAMES`.
@@ -186,6 +276,20 @@ fn warn_unknown_deny_tools(prompt_name: &str, deny: &[String]) {
     }
 }
 
+/// Load all prompts available to the session, with merge order:
+///
+///   embedded  (lowest precedence — only fills gaps)
+///     ↓
+///   global    (`~/.config/dirge/prompts/`)
+///     ↓
+///   project   (`<cwd>/.dirge/prompts/`, highest precedence)
+///
+/// Implementation contract (audit H14): embedded uses `or_insert_with`
+/// (soft) so a global / project prompt of the same name overrides it;
+/// global and project use `insert` (hard, last-write-wins). The tiers
+/// MUST load in this order — swapping them would silently invert
+/// precedence. New tiers should slot in by precedence with the same
+/// soft-then-hard pattern.
 pub fn load() -> HashMap<String, Prompt> {
     let mut prompts: HashMap<String, Prompt> = HashMap::new();
 
@@ -200,39 +304,11 @@ pub fn load() -> HashMap<String, Prompt> {
         }
     }
 
-    let global = global_prompts_dir();
-    if global.exists()
-        && let Ok(entries) = std::fs::read_dir(&global)
-    {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().is_some_and(|e| e == "md")
-                && let Some(name) = path.file_stem().and_then(|s| s.to_str())
-                && let Ok(content) = std::fs::read_to_string(&path)
-            {
-                prompts.insert(name.to_string(), parse_frontmatter(&content));
-            }
-        }
-    }
-
-    let local = PathBuf::from("prompts");
-    if local.exists()
-        && let Ok(entries) = std::fs::read_dir(&local)
-    {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().is_some_and(|e| e == "md")
-                && let Some(name) = path.file_stem().and_then(|s| s.to_str())
-                && let Ok(content) = std::fs::read_to_string(&path)
-            {
-                prompts.insert(name.to_string(), parse_frontmatter(&content));
-            }
-        }
-    }
+    load_file_tiers(&global_prompts_dir(), &local_prompts_dir(), &mut prompts);
 
     // Warn once per prompt about unknown tool names in deny_tools.
-    // Done after the full merge so a global-prompt override of an
-    // embedded prompt is checked too.
+    // Done after the full merge so a global/project-prompt override of
+    // an embedded prompt is checked too.
     for (name, p) in &prompts {
         if !p.deny_tools.is_empty() {
             warn_unknown_deny_tools(name, &p.deny_tools);
@@ -240,6 +316,14 @@ pub fn load() -> HashMap<String, Prompt> {
     }
 
     prompts
+}
+
+/// Layer the global then project-local file tiers (both hard /
+/// last-write-wins) onto `prompts`. Split out so the precedence is
+/// unit-testable without touching the real config/prompts dirs.
+fn load_file_tiers(global: &Path, local: &Path, prompts: &mut HashMap<String, Prompt>) {
+    load_dir_hard(global, PromptSource::Global, prompts);
+    load_dir_hard(local, PromptSource::Project, prompts);
 }
 
 pub fn ensure_global() -> anyhow::Result<()> {
@@ -269,6 +353,32 @@ fn copy_embedded(dest: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Pick the next step in the prompt cycle. The cycle is
+/// `[base, sorted[0], sorted[1], …]`, so advancing past the last named
+/// prompt returns to the base (no-prompt) layer — the same key always gets
+/// you back to "no prompt". `sorted` is the caller-sorted list of available
+/// prompt names; `current` is the active prompt name, or `None` for base.
+///
+/// Returns:
+/// - `None` — no named prompts exist, nothing to cycle (no-op).
+/// - `Some(None)` — switch to the base (no-prompt) layer.
+/// - `Some(Some(name))` — switch to that named prompt.
+///
+/// An unknown/stale `current` restarts the cycle at the head.
+pub fn next_prompt<'a>(current: Option<&str>, sorted: &'a [&'a String]) -> Option<Option<&'a str>> {
+    if sorted.is_empty() {
+        return None;
+    }
+    match current.and_then(|c| sorted.iter().position(|n| n.as_str() == c)) {
+        // On a named prompt: advance to the next, or fall back to the base
+        // layer once we step off the last one.
+        Some(i) if i + 1 < sorted.len() => Some(Some(sorted[i + 1].as_str())),
+        Some(_) => Some(None),
+        // Base layer, or an unknown/stale current → start at the head.
+        None => Some(Some(sorted[0].as_str())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,6 +399,41 @@ mod tests {
         assert_eq!(p.deny_tools, vec!["edit", "write", "apply_patch", "bash"]);
         assert_eq!(p.description.as_deref(), Some("Read-only plan mode"));
         assert_eq!(p.body, "You are dirge.\n");
+    }
+
+    #[test]
+    fn frontmatter_parses_critic_disable_and_inline_preamble() {
+        let raw = "---\ncritic: false\ncritic_preamble: Be strict about tests.\n---\nbody\n";
+        let p = parse_frontmatter(raw);
+        assert_eq!(p.critic, Some(false));
+        assert_eq!(p.critic_preamble.as_deref(), Some("Be strict about tests."));
+    }
+
+    #[test]
+    fn frontmatter_parses_critic_preamble_block_scalar() {
+        let raw = "---\ncritic_preamble: |\n  You are a security-focused reviewer.\n  Block on concrete, in-scope gaps.\n---\nbody\n";
+        let p = parse_frontmatter(raw);
+        assert_eq!(
+            p.critic_preamble.as_deref(),
+            Some("You are a security-focused reviewer.\nBlock on concrete, in-scope gaps."),
+        );
+    }
+
+    #[test]
+    fn frontmatter_empty_critic_preamble_is_unset() {
+        // An accidentally-empty preamble is treated as unset (inherits the
+        // config / built-in), not a system-prompt-less critic call.
+        let raw = "---\ncritic_preamble:\n---\nbody\n";
+        let p = parse_frontmatter(raw);
+        assert!(p.critic_preamble.is_none());
+        assert!(p.critic.is_none(), "critic omitted → inherit");
+    }
+
+    #[test]
+    fn frontmatter_critic_true_parses() {
+        let raw = "---\ncritic: true\n---\nbody\n";
+        let p = parse_frontmatter(raw);
+        assert_eq!(p.critic, Some(true));
     }
 
     /// #429: plan mode must be a comprehensive read-only lock — every tool
@@ -396,5 +541,77 @@ body
 ";
         let p = parse_frontmatter(raw);
         assert_eq!(p.deny_tools, vec!["edit", "write", "bash"]);
+    }
+
+    #[test]
+    fn next_prompt_starts_at_head_from_base() {
+        let names = ["a".to_string(), "b".to_string(), "c".to_string()];
+        let names: Vec<&String> = names.iter().collect();
+        assert_eq!(next_prompt(None, &names), Some(Some("a")));
+    }
+
+    #[test]
+    fn next_prompt_advances_then_returns_to_base() {
+        let names = ["a".to_string(), "b".to_string(), "c".to_string()];
+        let names: Vec<&String> = names.iter().collect();
+        assert_eq!(next_prompt(Some("a"), &names), Some(Some("b")));
+        assert_eq!(next_prompt(Some("b"), &names), Some(Some("c")));
+        // Past the last named prompt → back to the base (no-prompt) layer,
+        // not straight to the head — so the cycle can reach "no prompt".
+        assert_eq!(next_prompt(Some("c"), &names), Some(None));
+    }
+
+    #[test]
+    fn next_prompt_single_prompt_alternates_with_base() {
+        let names = ["only".to_string()];
+        let names: Vec<&String> = names.iter().collect();
+        assert_eq!(next_prompt(None, &names), Some(Some("only")));
+        assert_eq!(next_prompt(Some("only"), &names), Some(None));
+    }
+
+    #[test]
+    fn next_prompt_unknown_current_starts_at_head() {
+        let names = ["a".to_string(), "b".to_string()];
+        let names: Vec<&String> = names.iter().collect();
+        assert_eq!(next_prompt(Some("zzz"), &names), Some(Some("a")));
+    }
+
+    #[test]
+    fn next_prompt_empty_is_none() {
+        assert_eq!(next_prompt(None, &[]), None);
+    }
+
+    #[test]
+    fn project_local_overrides_global_by_name() {
+        use std::fs;
+        let root = std::env::temp_dir().join(format!("dirge-prompt-tier-{}", std::process::id()));
+        let global = root.join("global").join("prompts");
+        let local = root.join("project").join(".dirge").join("prompts");
+        fs::create_dir_all(&global).unwrap();
+        fs::create_dir_all(&local).unwrap();
+        fs::write(global.join("shared.md"), "GLOBAL BODY\n").unwrap();
+        fs::write(local.join("shared.md"), "PROJECT BODY\n").unwrap();
+        fs::write(global.join("only-global.md"), "G\n").unwrap();
+        fs::write(local.join("only-local.md"), "L\n").unwrap();
+
+        let mut prompts = HashMap::new();
+        load_file_tiers(&global, &local, &mut prompts);
+        assert_eq!(prompts.get("shared").unwrap().body, "PROJECT BODY\n");
+        assert_eq!(prompts.get("only-global").unwrap().body, "G\n");
+        assert_eq!(prompts.get("only-local").unwrap().body, "L\n");
+
+        // Project wins over global by name → provenance reflects the
+        // winning tier, not the losing one.
+        assert_eq!(prompts.get("shared").unwrap().source, PromptSource::Project);
+        assert_eq!(
+            prompts.get("only-global").unwrap().source,
+            PromptSource::Global
+        );
+        assert_eq!(
+            prompts.get("only-local").unwrap().source,
+            PromptSource::Project
+        );
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

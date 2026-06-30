@@ -56,86 +56,79 @@ impl AnyClient {
             AnyClient::Custom(c) => AnyModel::Custom(c.completion_model(name)),
         }
     }
+}
 
-    pub async fn compress_messages(
-        &self,
-        model_name: &str,
-        messages: &[SessionMessage],
-        previous_summary: Option<&str>,
-        instructions: Option<&str>,
-    ) -> anyhow::Result<String> {
-        // C6 (audit fix): no more 6000-char truncation. A 300K-token
-        // session was previously summarized from ~1500 tokens of
-        // content — fidelity collapsed exactly when compaction was
-        // most needed. Feed the full prefix; the summarizer model
-        // (typically the same model as the agent, or a faster/
-        // cheaper sibling with similar context) has plenty of room
-        // unless the prefix itself is bigger than the summarizer's
-        // window, in which case the summarizer's own context-overflow
-        // path surfaces a real error rather than silently lying. Pi
-        // and opencode both feed the full prefix.
-        let conversation = summarize::serialize_conversation(messages);
+/// dirge-tv3p: build the compaction summarizer prompt from the to-be-discarded
+/// messages. Pure + synchronous (serialize the conversation, assemble the
+/// prompt, run the prompt-injection delimiter check) so the UI thread can do it
+/// before handing the slow LLM call to a background task. Returns `Err` when the
+/// untrusted inputs smuggle the reserved delimiter (caller skips compaction).
+pub(crate) fn build_compaction_prompt(
+    messages: &[SessionMessage],
+    previous_summary: Option<&str>,
+    instructions: Option<&str>,
+) -> anyhow::Result<String> {
+    // C6 (audit fix): no more 6000-char truncation. A 300K-token session was
+    // previously summarized from ~1500 tokens of content — fidelity collapsed
+    // exactly when compaction was most needed. Feed the full prefix; the
+    // summarizer model has plenty of room unless the prefix itself is bigger
+    // than its window, in which case its own context-overflow path surfaces a
+    // real error rather than silently lying. Pi and opencode feed the full prefix.
+    let conversation = summarize::serialize_conversation(messages);
 
-        // `/compress <focus>` argument: when the user passes free-form
-        // text after the slash command, treat it as a Hermes-style
-        // FOCUS TOPIC. The summarizer is asked to allocate ~60-70%
-        // of its budget to information related to the topic. Maps
-        // hermes-agent/context_compressor.py:1050-1054.
-        let instructions_block = match instructions {
-            Some(text) if !text.trim().is_empty() => format!(
-                "FOCUS TOPIC: \"{}\"\n\
-                 The user has requested that this compaction PRIORITISE preserving \
-                 all information related to the focus topic above. For content \
-                 related to \"{}\", include full detail — exact values, file paths, \
-                 command outputs, error messages, and decisions. For content NOT \
-                 related to the focus topic, summarise more aggressively. The \
-                 focus topic sections should receive roughly 60-70% of the \
-                 summary token budget. Even for the focus topic, NEVER preserve \
-                 API keys, tokens, passwords, or credentials — use [REDACTED].",
-                text.trim(),
-                text.trim(),
-            ),
-            _ => "(none)".to_string(),
-        };
+    // `/compress <focus>` argument: free-form text after the slash command is a
+    // Hermes-style FOCUS TOPIC — the summarizer allocates ~60-70% of its budget
+    // to topic-related information. Maps context_compressor.py:1050-1054.
+    let instructions_block = match instructions {
+        Some(text) if !text.trim().is_empty() => format!(
+            "FOCUS TOPIC: \"{}\"\n\
+             The user has requested that this compaction PRIORITISE preserving \
+             all information related to the focus topic above. For content \
+             related to \"{}\", include full detail — exact values, file paths, \
+             command outputs, error messages, and decisions. For content NOT \
+             related to the focus topic, summarise more aggressively. The \
+             focus topic sections should receive roughly 60-70% of the \
+             summary token budget. Even for the focus topic, NEVER preserve \
+             API keys, tokens, passwords, or credentials — use [REDACTED].",
+            text.trim(),
+            text.trim(),
+        ),
+        _ => "(none)".to_string(),
+    };
 
-        // dirge-u13u: prompt-injection defense. Before we fence the
-        // untrusted inputs with our distinctive delimiter pair, scan
-        // them for the delimiter itself. If an attacker (via a prior
-        // tool output, fetched URL, user paste, etc.) has managed to
-        // smuggle the delimiter string in, re-wrapping would let them
-        // close our fence and inject instructions outside it. Bail
-        // rather than risk it. The warning stays on the operator side
-        // (tracing) — we do NOT surface the collision detail to the
-        // LLM. The caller treats this `Err` as "skip compaction for
-        // this turn".
-        let prev_summary_value = previous_summary.unwrap_or("(none)");
-        if prompt::input_contains_compaction_delimiter(&[
-            &conversation,
-            prev_summary_value,
-            &instructions_block,
-        ]) {
-            tracing::warn!(
-                "compaction input contains the untrusted-material delimiter — \
-                 skipping compaction this turn to avoid prompt-injection risk"
-            );
-            anyhow::bail!("compaction aborted: input contains reserved delimiter string");
-        }
-
-        let prompt = prompt::COMPACTION_PROMPT
-            .replace("{conversation}", &conversation)
-            .replace("{previous_summary}", prev_summary_value)
-            .replace("{instructions}", &instructions_block);
-
-        let model = self.completion_model(model_name.to_string());
-        let response = summarize::summarize_with_model(model, prompt).await?;
-        // If the summarizer echoed the delimiters into its output,
-        // strip them before the summary gets injected into the next
-        // turn's system prompt via `rig_history_system_prompt`. A
-        // stray delimiter in the system prompt would (a) confuse the
-        // next-turn LLM about where the untrusted block ends and
-        // (b) trip our collision check on the next compaction.
-        Ok(prompt::strip_compaction_delimiters(&response))
+    // dirge-u13u: prompt-injection defense. Before fencing the untrusted inputs
+    // with our distinctive delimiter pair, scan them for the delimiter itself —
+    // a smuggled delimiter (via a prior tool output, fetched URL, paste) could
+    // close our fence and inject instructions outside it. Bail rather than risk
+    // it; the warning stays operator-side (tracing). The caller treats this
+    // `Err` as "skip compaction for this turn".
+    let prev_summary_value = previous_summary.unwrap_or("(none)");
+    if prompt::input_contains_compaction_delimiter(&[
+        &conversation,
+        prev_summary_value,
+        &instructions_block,
+    ]) {
+        tracing::warn!(
+            "compaction input contains the untrusted-material delimiter — \
+             skipping compaction this turn to avoid prompt-injection risk"
+        );
+        anyhow::bail!("compaction aborted: input contains reserved delimiter string");
     }
+
+    Ok(prompt::COMPACTION_PROMPT
+        .replace("{conversation}", &conversation)
+        .replace("{previous_summary}", prev_summary_value)
+        .replace("{instructions}", &instructions_block))
+}
+
+/// dirge-tv3p: run the compaction summarizer LLM over a prebuilt prompt and
+/// strip any reserved delimiters the model echoed. This is the SLOW half — the
+/// event loop runs it on a spawned task so the UI stays responsive. A stray
+/// delimiter in the output would corrupt the next turn's system prompt (where
+/// the summary is injected), so strip before returning.
+pub(crate) async fn run_compaction(model: AnyModel, prompt_text: String) -> anyhow::Result<String> {
+    let response = summarize::summarize_with_model(model, prompt_text).await?;
+    Ok(prompt::strip_compaction_delimiters(&response))
 }
 
 fn codex_model_name(name: String) -> String {

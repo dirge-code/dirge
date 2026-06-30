@@ -281,13 +281,17 @@ pub enum Command {
 
 #[derive(clap::Subcommand, Debug)]
 pub enum AuthAction {
-    /// Log in to OpenAI using device-code auth
+    /// Log in to OpenAI using browser OAuth (or device-code auth with --device-code)
     #[command(
         name = "openai",
         visible_alias = "chatgpt",
-        long_about = "Log in to OpenAI using device-code auth.\n\nBefore running this command, enable device-code auth in ChatGPT Codex security settings."
+        long_about = "Log in to OpenAI using browser OAuth by default.\n\nUse --device-code for headless device-code auth; before using that mode, enable device-code auth in ChatGPT Codex security settings."
     )]
-    Openai,
+    Openai {
+        /// Use the headless device-code login flow instead of browser OAuth
+        #[arg(long = "device-code")]
+        device_code: bool,
+    },
     /// Start Anthropic Claude Code OAuth login and persist credentials
     Anthropic,
 }
@@ -307,6 +311,19 @@ pub enum SandboxAction {
 impl Cli {
     pub fn resolve_model(&self, cfg: &config::Config) -> CompactString {
         if let Some(m) = self.model.as_deref() {
+            return CompactString::new(m);
+        }
+        // When `--provider` overrides the config default, take the model from
+        // THAT provider's entry — otherwise `--provider ollama` switches the
+        // endpoint but still loads the config default provider's model (the
+        // `Default` role below tracks `cfg.provider`, not the CLI override).
+        if let Some(provider) = self.provider.as_deref().filter(|p| !p.is_empty())
+            && let Some(providers) = cfg.providers.as_ref()
+            && let Some(entry) = providers
+                .get(provider)
+                .or_else(|| providers.get(&provider.to_ascii_lowercase()))
+            && let Some(m) = entry.model.as_deref()
+        {
             return CompactString::new(m);
         }
         if let Some((_, entry)) = cfg.resolve_role(config::ConfigRole::Default)
@@ -404,7 +421,7 @@ mod tests {
 
         match cli.command {
             Some(Command::Auth {
-                action: AuthAction::Openai,
+                action: AuthAction::Openai { device_code: false },
             }) => {}
             other => panic!("expected auth openai command, got {other:?}"),
         }
@@ -416,7 +433,7 @@ mod tests {
 
         match cli.command {
             Some(Command::Auth {
-                action: AuthAction::Openai,
+                action: AuthAction::Openai { device_code: false },
             }) => {}
             other => panic!("expected auth openai command from chatgpt alias, got {other:?}"),
         }
@@ -434,7 +451,78 @@ mod tests {
         assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
         let openai_help = err.to_string();
 
+        assert!(openai_help.contains("browser OAuth"));
         assert!(openai_help.contains("device-code auth"));
         assert!(openai_help.contains("ChatGPT Codex security settings"));
+    }
+
+    fn cfg_with_glm_default_and_ollama() -> config::Config {
+        use std::collections::HashMap;
+        let providers = HashMap::from([
+            (
+                "glm".to_string(),
+                config::ProviderEntry {
+                    provider_type: Some("glm".to_string()),
+                    model: Some("glm-5.2".to_string()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "ollama".to_string(),
+                config::ProviderEntry {
+                    provider_type: Some("openai".to_string()),
+                    base_url: Some("http://127.0.0.1:11434/v1".to_string()),
+                    model: Some("vibe-thinker:latest".to_string()),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        config::Config {
+            provider: Some("glm".to_string()),
+            providers: Some(providers),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn resolve_model_honors_provider_override() {
+        // `--provider ollama` (no --model) must take ollama's pinned model, not
+        // the config default provider's (glm) — otherwise the endpoint switches
+        // but the model stays glm-5.2.
+        let cli = Cli::parse_from(["dirge", "--provider", "ollama"]);
+        assert_eq!(
+            cli.resolve_model(&cfg_with_glm_default_and_ollama()),
+            "vibe-thinker:latest"
+        );
+    }
+
+    #[test]
+    fn resolve_model_without_override_uses_config_default() {
+        let cli = Cli::parse_from(["dirge"]);
+        assert_eq!(
+            cli.resolve_model(&cfg_with_glm_default_and_ollama()),
+            "glm-5.2"
+        );
+    }
+
+    #[test]
+    fn resolve_model_explicit_model_flag_wins_over_provider() {
+        let cli = Cli::parse_from(["dirge", "--provider", "ollama", "--model", "llama3.1"]);
+        assert_eq!(
+            cli.resolve_model(&cfg_with_glm_default_and_ollama()),
+            "llama3.1"
+        );
+    }
+
+    #[test]
+    fn parses_auth_openai_device_code_option() {
+        let cli = Cli::try_parse_from(["dirge", "auth", "openai", "--device-code"]).unwrap();
+
+        match cli.command {
+            Some(Command::Auth {
+                action: AuthAction::Openai { device_code: true },
+            }) => {}
+            other => panic!("expected auth openai --device-code command, got {other:?}"),
+        }
     }
 }

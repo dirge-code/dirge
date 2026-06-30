@@ -43,7 +43,11 @@
       (let [words (filter (fn [w] (not (empty? w))) (string/split " " line))]
         (when (>= (length words) 2)
           (array/push containers (string (in words 0) " (" (in words 1) ")"))))))
-  (if (empty? containers) "no containers" (string/join containers "\n")))
+  (def result (if (empty? containers) "no containers" (string/join containers "\n")))
+  # Record container entities for graph search (#393)
+  (each c containers
+    (harness/record-entity "container" c {}))
+  result)
 
 # ---------------------------------------------------------------------------
 # docker images
@@ -61,8 +65,12 @@
       (def size (in parts (- (length parts) 1)))
       (when (not= repo "<none>")
         (array/push images (string repo ":" tag " (" size ")")))))
-  (if (empty? images) "no images"
+  (def result (if (empty? images) "no images"
     (string (length images) " images:\n" (string/join images "\n"))))
+  # Record image entities for graph search (#393)
+  (each img images
+    (harness/record-entity "image" img {}))
+  result)
 
 # ---------------------------------------------------------------------------
 # docker logs — dedup repeated lines, collapse timestamps

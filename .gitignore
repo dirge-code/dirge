@@ -58,3 +58,5 @@ publishing.md
 /tmux
 LOOP_PLAN.md
 __pycache__/
+.direnv
+2404.07439v1.md

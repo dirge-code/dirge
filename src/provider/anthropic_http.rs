@@ -167,6 +167,14 @@ fn shape_oauth_messages_payload(body: Bytes) -> Bytes {
         split_assistant_tool_use_trailing_content(messages);
     }
 
+    // Anthropic's Messages API only permits user/assistant in `messages[]`.
+    // Dirge injects `role:"system"` entries there for compaction summaries
+    // (compression.rs) and mid-session memory re-injection (run.rs). Under the
+    // OAuth/Claude-Code classifier a stray system turn is read as non-Claude-Code
+    // traffic and rejected as a third-party app ("extra usage" 400), so fold any
+    // such entries into the top-level `system` array before the prepends run.
+    hoist_system_messages(&mut value);
+
     shape_system_blocks(&mut value);
     // Order matters: the billing header must be the FIRST system block. With
     // the Claude Code identity block ahead of it, Anthropic's OAuth classifier
@@ -176,6 +184,68 @@ fn shape_oauth_messages_payload(body: Bytes) -> Bytes {
     prepend_billing_header(&mut value);
 
     serde_json::to_vec(&value).map(Bytes::from).unwrap_or(body)
+}
+
+fn hoist_system_messages(value: &mut serde_json::Value) {
+    let Some(messages) = value
+        .get_mut("messages")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+
+    let mut hoisted: Vec<String> = Vec::new();
+    messages.retain(|m| {
+        if m.get("role").and_then(serde_json::Value::as_str) != Some("system") {
+            return true;
+        }
+        if let Some(text) = system_message_text(m) {
+            if !text.is_empty() {
+                hoisted.push(text);
+            }
+        }
+        false
+    });
+
+    if hoisted.is_empty() {
+        return;
+    }
+
+    match value.get_mut("system") {
+        Some(serde_json::Value::Array(_)) => {}
+        Some(existing @ serde_json::Value::String(_)) => {
+            let prior = existing.take();
+            *existing = serde_json::Value::Array(vec![prior]);
+        }
+        _ => {
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert("system".to_string(), serde_json::Value::Array(Vec::new()));
+            }
+        }
+    }
+    let blocks = value
+        .get_mut("system")
+        .and_then(serde_json::Value::as_array_mut)
+        .expect("system normalized to an array above");
+    for text in hoisted {
+        blocks.push(serde_json::json!({ "type": "text", "text": text }));
+    }
+}
+
+fn system_message_text(message: &serde_json::Value) -> Option<String> {
+    match message.get("content") {
+        Some(serde_json::Value::String(s)) => Some(s.clone()),
+        Some(serde_json::Value::Array(blocks)) => {
+            let joined = blocks
+                .iter()
+                .filter(|b| b.get("type").and_then(serde_json::Value::as_str) == Some("text"))
+                .filter_map(|b| b.get("text").and_then(serde_json::Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n");
+            Some(joined)
+        }
+        _ => None,
+    }
 }
 
 fn is_anthropic_messages_payload(value: &serde_json::Value) -> bool {
@@ -550,6 +620,48 @@ mod tests {
                 .unwrap_or("")
                 .contains("Environment context you are running in:")
         }));
+    }
+
+    #[test]
+    fn oauth_shaper_hoists_system_messages_out_of_messages_array() {
+        // A compaction summary (or mid-session memory re-injection) lands in
+        // `messages[]` as a `role:"system"` entry. Anthropic's Messages API
+        // only allows user/assistant there; under the OAuth classifier a stray
+        // system turn trips the "third-party app / extra usage 400". The shaper
+        // must hoist it into the top-level `system` array.
+        let body = Bytes::from(
+            serde_json::json!({
+                "model": "claude-sonnet-4-5",
+                "stream": true,
+                "system": [{"type": "text", "text": "Real prompt."}],
+                "messages": [
+                    {"role": "user", "content": "first"},
+                    {"role": "system", "content": "[Previous conversation summary]\n## Active Task\nfix"},
+                    {"role": "assistant", "content": "ok"}
+                ]
+            })
+            .to_string(),
+        );
+
+        let value: serde_json::Value =
+            serde_json::from_slice(&shape_oauth_messages_payload(body)).unwrap();
+
+        let messages = value["messages"].as_array().unwrap();
+        assert!(
+            messages
+                .iter()
+                .all(|m| m.get("role").and_then(serde_json::Value::as_str) != Some("system")),
+            "no system-role message may survive in messages[]"
+        );
+        assert_eq!(messages.len(), 2);
+
+        let system = value["system"].as_array().unwrap();
+        assert!(
+            system
+                .iter()
+                .any(|b| b["text"].as_str().unwrap_or("").contains("## Active Task")),
+            "hoisted summary text must land in the system array"
+        );
     }
 
     #[test]

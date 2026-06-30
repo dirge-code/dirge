@@ -20,6 +20,7 @@ use crate::ui::input::InputEditor;
 use crate::ui::renderer::Renderer;
 use crate::ui::theme;
 
+pub(crate) mod aliases;
 mod cmd;
 #[cfg(feature = "slash-completion")]
 mod completion;
@@ -30,6 +31,9 @@ pub use completion::{CompletionResult, format_completion_preview, ghost_suffix, 
 // plugin-less build (e.g. windows-default) doesn't re-export a dead fn.
 #[cfg(all(feature = "slash-completion", feature = "plugin"))]
 pub use completion::register_plugin_commands;
+
+#[cfg(feature = "slash-completion")]
+pub use completion::register_alias_commands;
 
 #[inline]
 pub(super) fn c_agent() -> Color {
@@ -48,7 +52,9 @@ pub(super) fn c_error() -> Color {
 /// Keeps individual handler signatures tractable.
 pub(super) struct SlashCtx<'a> {
     pub agent: &'a mut AnyAgent,
-    pub client: &'a AnyClient,
+    // `&mut` so `/model` can swap the live client when switching to a model
+    // that belongs to a different configured provider.
+    pub client: &'a mut AnyClient,
     pub renderer: &'a mut Renderer,
     pub session: &'a mut Session,
     pub cli: &'a Cli,
@@ -159,57 +165,63 @@ pub fn undo_last(session: &mut Session) -> UndoOutcome {
 /// ContextLength error and loops.
 pub enum CompressOutcome {
     Compacted,
-    NoOp { reason: &'static str },
+    NoOp,
 }
 
-#[allow(clippy::too_many_arguments)]
-pub async fn handle_compress(
-    instructions: Option<&str>,
-    // `true` for an explicit user `/compact` — force the pass regardless of the
-    // current context fraction. Auto-compaction passes `false` so it stays
-    // gated by the "context within limits" check [dirge-fgtj].
-    forced: bool,
-    agent: &mut AnyAgent,
-    client: &AnyClient,
-    renderer: &mut Renderer,
-    session: &mut Session,
-    cli: &Cli,
-    cfg: &Config,
-    context: &mut ContextFiles,
-    permission: &Option<PermCheck>,
-    ask_tx: &Option<AskSender>,
-    // Audit followup (companion to C8 LSP fix): question_tx +
-    // plan_tx were previously passed as None when this function
-    // rebuilt the agent post-compact. Tools that depend on either
-    // (the `question` tool, plan-mode switch hooks) silently
-    // broke after every auto-compact + manual /compress. Thread
-    // the channels through.
-    question_tx: &Option<crate::agent::tools::question::QuestionSender>,
-    plan_tx: &Option<crate::agent::tools::plan::PlanSwitchSender>,
-    _user_tx: &tokio::sync::mpsc::UnboundedSender<crate::event::UserEvent>,
-    bg_store: &Option<crate::agent::tools::background::BackgroundStore>,
-    sandbox: &Sandbox,
-    #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
-    #[cfg(feature = "semantic")] semantic_manager: Option<&SemanticManager>,
-    #[cfg(feature = "lsp")] lsp_manager: Option<&std::sync::Arc<crate::lsp::manager::LspManager>>,
-) -> anyhow::Result<CompressOutcome> {
-    renderer.write_line("compressing...", c_agent())?;
-    renderer.write_line("", Color::White)?;
+/// dirge-tv3p: the inputs a spawned compaction task + its install need —
+/// produced by [`prepare_compaction`] on the UI thread.
+pub(crate) struct CompactionRequest {
+    /// The summarizer model, resolved on-thread. Cloneable, sent to the task.
+    pub model: crate::provider::AnyModel,
+    /// The fully-built compaction prompt (serialize + assemble done on-thread).
+    pub prompt: String,
+    /// Message prefix length to drop on install (`session.messages[..cut_idx]`).
+    pub cut_idx: usize,
+    /// Token cost of the dropped prefix — for the net-savings check on install.
+    pub tokens_before: u64,
+}
 
-    let reserve = cfg.resolve_reserve_tokens();
+pub(crate) struct PruneOnlyCompactionRequest {
+    /// Deterministic local summary; no side LLM call is made.
+    pub summary: String,
+    /// Message prefix length to drop on install (`session.messages[..cut_idx]`).
+    pub cut_idx: usize,
+    /// Token cost of the dropped prefix — for the net-savings check on install.
+    pub tokens_before: u64,
+}
+
+/// Outcome of the cheap on-thread compaction decision.
+pub(crate) enum CompactionDecision {
+    /// Nothing to do — the reason was already rendered.
+    NoOp,
+    /// Run the summarizer (off-thread) then [`install_compaction`]. Boxed —
+    /// `CompactionRequest` (model + prompt) is much larger than `NoOp`.
+    Ready(Box<CompactionRequest>),
+}
+
+/// Fraction (percent) of the usable token budget at which proactive,
+/// pre-send compaction kicks in. Below the hard 100% limit so we compact
+/// BEFORE a send would overflow rather than paying the reactive round-trip.
+pub(crate) const PROACTIVE_COMPACTION_PERCENT: u64 = 85;
+
+/// Whether a proactive (pre-send) compaction is warranted: the current context
+/// plus the `incoming` prompt would cross [`PROACTIVE_COMPACTION_PERCENT`] of
+/// the usable budget (`max_tokens` = context window minus reserve). `total > 0`
+/// skips a fresh session with nothing to compact; the caller still gates on
+/// `compact_enabled`.
+///
+/// This trigger OWNS the proactive decision and uniquely factors `incoming`
+/// (which [`prepare_compaction`] cannot see), so the caller must invoke
+/// `prepare_compaction` with `forced = true`. Otherwise prepare's stricter
+/// within-limits (100%) gate re-rejects everything in the 85–100% band — it
+/// announced "compressing…" then no-op'd, so proactive compaction never ran
+/// (dirge-rz4i).
+pub(crate) fn preemptive_compaction_due(total: u64, incoming: u64, max_tokens: u64) -> bool {
+    total > 0 && total.saturating_add(incoming) > max_tokens * PROACTIVE_COMPACTION_PERCENT / 100
+}
+
+fn compaction_cut_idx(session: &Session, cfg: &Config) -> usize {
     let keep_recent = cfg.resolve_keep_recent_tokens();
-    let max_tokens = session.context_window.saturating_sub(reserve);
-
-    // Auto-compaction skips when context is within limits; an explicit
-    // `/compact` (forced) compacts anyway. The downstream gates (nothing to
-    // compress, summary-larger-than-savings) still apply to both [dirge-fgtj].
-    if !forced && session.total_estimated_tokens <= max_tokens {
-        renderer.write_line("context within limits, no compression needed", c_agent())?;
-        return Ok(CompressOutcome::NoOp {
-            reason: "context within limits",
-        });
-    }
-
     let mut accumulated = 0u64;
     let mut cut_idx = session.messages.len();
     for (i, msg) in session.messages.iter().enumerate().rev() {
@@ -219,21 +231,93 @@ pub async fn handle_compress(
         }
         accumulated = accumulated.saturating_add(msg.estimated_tokens);
     }
+    align_cut_to_user_boundary(&session.messages, cut_idx)
+}
 
-    // F3: nudge `cut_idx` forward until the first kept message is a
-    // User message (or we hit the end). Without this, the kept tail
-    // could start with an Assistant message — Anthropic + OpenAI
-    // expect alternating user/assistant role order; an assistant
-    // following a system summary breaks the role sequence and gets
-    // rejected with a 400. opencode handles this via `splitTurn`
-    // (`compaction.ts:161-184`).
-    cut_idx = align_cut_to_user_boundary(&session.messages, cut_idx);
+fn tokens_before_cut(session: &Session, cut_idx: usize) -> u64 {
+    session.messages[..cut_idx]
+        .iter()
+        .map(|m| m.estimated_tokens)
+        .sum()
+}
+
+fn build_prune_only_summary(session: &Session, cut_idx: usize, reason: &str) -> String {
+    let first_retained = session.messages.get(cut_idx).map(|m| {
+        let preview: String = m.content.chars().take(160).collect();
+        format!("{:?}: {}", m.role, preview.replace('\n', " "))
+    });
+    let previous_summary_note = session
+        .compactions
+        .last()
+        .map(|_| "- A previous compaction summary existed, but was not re-summarized by an LLM during this emergency fallback.\n")
+        .unwrap_or("");
+    format!(
+        "## Emergency prune-only compaction\n\
+         - Reason: {reason}\n\
+         - Dropped {cut_idx} older messages without LLM summarization to recover usable context.\n\
+         - The dropped turns were not summarized; treat the remaining recent conversation as the source of truth.\n\
+         {previous_summary_note}\
+         - If important context is missing, ask the user for clarification instead of guessing.\n\
+         - First retained message: {}",
+        first_retained.unwrap_or_else(|| "(none)".to_string())
+    )
+}
+
+pub(crate) fn prepare_prune_only_compaction(
+    renderer: &mut Renderer,
+    session: &Session,
+    cfg: &Config,
+    reason: &str,
+) -> anyhow::Result<Option<PruneOnlyCompactionRequest>> {
+    renderer.write_line("applying prune-only emergency compaction...", c_agent())?;
+    let cut_idx = compaction_cut_idx(session, cfg);
+    if cut_idx == 0 {
+        renderer.write_line("nothing to prune (entire context is recent)", c_agent())?;
+        return Ok(None);
+    }
+    let tokens_before = tokens_before_cut(session, cut_idx);
+    Ok(Some(PruneOnlyCompactionRequest {
+        summary: build_prune_only_summary(session, cut_idx, reason),
+        cut_idx,
+        tokens_before,
+    }))
+}
+
+/// dirge-tv3p: the SYNCHRONOUS, on-UI-thread half of compaction — decide
+/// whether/what to compact and build the summarizer prompt. Cheap (token math +
+/// conversation serialization), so it stays on the loop; the slow LLM call it
+/// sets up runs off-thread. Renders any "nothing to do" message itself.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_compaction(
+    instructions: Option<&str>,
+    forced: bool,
+    agent: &AnyAgent,
+    client: &AnyClient,
+    renderer: &mut Renderer,
+    session: &Session,
+    cfg: &Config,
+) -> anyhow::Result<CompactionDecision> {
+    renderer.write_line("compressing...", c_agent())?;
+    renderer.write_line("", Color::White)?;
+
+    let reserve = cfg.resolve_reserve_tokens();
+    let max_tokens = session.context_window.saturating_sub(reserve);
+
+    // Non-forced reactive callers skip when context is within the hard limit;
+    // an explicit `/compact` AND the proactive pre-send trigger pass
+    // `forced = true` so they compact at their own (85%) threshold without
+    // being re-rejected here (dirge-rz4i). The downstream gates (nothing to
+    // compress, summary-larger-than-savings) still apply to both [dirge-fgtj].
+    if !forced && session.total_estimated_tokens <= max_tokens {
+        renderer.write_line("context within limits, no compression needed", c_agent())?;
+        return Ok(CompactionDecision::NoOp);
+    }
+
+    let cut_idx = compaction_cut_idx(session, cfg);
 
     if cut_idx == 0 {
         renderer.write_line("nothing to compress (entire context is recent)", c_agent())?;
-        return Ok(CompressOutcome::NoOp {
-            reason: "entire context is within keep_recent_tokens — lower it to compress further",
-        });
+        return Ok(CompactionDecision::NoOp);
     }
 
     let messages_to_summarize = &session.messages[..cut_idx];
@@ -259,20 +343,48 @@ pub async fn handle_compress(
         _ => None,
     };
 
-    let summary = client
-        .compress_messages(
-            &session.model,
-            messages_to_summarize,
-            previous_summary,
-            augmented_instructions.as_deref(),
-        )
-        .await?;
+    let prompt = crate::provider::build_compaction_prompt(
+        messages_to_summarize,
+        previous_summary,
+        augmented_instructions.as_deref(),
+    )?;
+    let tokens_before = tokens_before_cut(session, cut_idx);
+    let model = crate::provider::build_compaction_model(cfg, client, &session.model)?;
 
-    let tokens_before: u64 = messages_to_summarize
-        .iter()
-        .map(|m| m.estimated_tokens)
-        .sum();
+    Ok(CompactionDecision::Ready(Box::new(CompactionRequest {
+        model,
+        prompt,
+        cut_idx,
+        tokens_before,
+    })))
+}
 
+/// dirge-tv3p: the on-UI-thread INSTALL half — given the summary from the
+/// (off-thread) summarizer, rotate the session and rebuild the agent. Cheap
+/// relative to the LLM call. Refuses to install a summary larger than the
+/// messages it replaces (audit M9).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn install_compaction(
+    summary: String,
+    cut_idx: usize,
+    tokens_before: u64,
+    agent: &mut AnyAgent,
+    client: &AnyClient,
+    renderer: &mut Renderer,
+    session: &mut Session,
+    cli: &Cli,
+    cfg: &Config,
+    context: &mut ContextFiles,
+    permission: &Option<PermCheck>,
+    ask_tx: &Option<AskSender>,
+    question_tx: &Option<crate::agent::tools::question::QuestionSender>,
+    plan_tx: &Option<crate::agent::tools::plan::PlanSwitchSender>,
+    bg_store: &Option<crate::agent::tools::background::BackgroundStore>,
+    sandbox: &Sandbox,
+    #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
+    #[cfg(feature = "semantic")] semantic_manager: Option<&SemanticManager>,
+    #[cfg(feature = "lsp")] lsp_manager: Option<&std::sync::Arc<crate::lsp::manager::LspManager>>,
+) -> anyhow::Result<CompressOutcome> {
     // F13: estimate the summary's own token cost so we can
     // report TRUE net savings instead of just "tokens replaced".
     // A pathological summary longer than the messages it
@@ -306,9 +418,7 @@ pub async fn handle_compress(
             ),
             c_error(),
         )?;
-        return Ok(CompressOutcome::NoOp {
-            reason: "summary would be larger than the messages it replaces",
-        });
+        return Ok(CompressOutcome::NoOp);
     }
 
     // `compress_reporting` returns the count of non-active-path
@@ -387,7 +497,7 @@ fn split_command_parts(text: &str) -> SmallVec<[&str; 3]> {
 pub async fn handle_slash(
     text: &str,
     agent: &mut AnyAgent,
-    client: &AnyClient,
+    client: &mut AnyClient,
     renderer: &mut Renderer,
     session: &mut Session,
     cli: &Cli,
@@ -476,7 +586,7 @@ pub async fn handle_slash(
         "/prompt" => cmd::prompt::cmd_prompt(&mut ctx, &parts).await?,
         "/agent" | "/agents" => cmd::agent::cmd_agent(&mut ctx, &parts).await?,
         "/plan" => cmd::plan::cmd_plan(&mut ctx, &parts, text).await?,
-        "/plugins" => cmd::plugins::cmd_plugins(&mut ctx).await?,
+        "/plugins" => cmd::plugins::cmd_plugins(&mut ctx, &parts).await?,
         #[cfg(feature = "git-worktree")]
         "/worktree" => cmd::worktree::cmd_worktree(&mut ctx, &parts).await?,
         #[cfg(feature = "git-worktree")]
@@ -501,6 +611,8 @@ pub async fn handle_slash(
         "/allow" => cmd::allow::cmd_allow(&mut ctx, &parts, text).await?,
         "/why" => cmd::allow::why::cmd_why(&mut ctx, &parts).await?,
         "/help" => cmd::help::cmd_help(&mut ctx).await?,
+        "/graph" => cmd::graph::cmd_graph(&mut ctx, &parts).await?,
+        "/issues" => cmd::issues::cmd_issues(&mut ctx, &parts).await?,
         "/memory" => cmd::memory::cmd_memory(&mut ctx, &parts).await?,
         "/kill" => cmd::kill::cmd_kill(&mut ctx, &parts).await?,
         #[cfg(unix)]
@@ -613,7 +725,9 @@ pub fn slash_command_names() -> Vec<&'static str> {
         "/compress",
         "/display",
         "/fork",
+        "/graph",
         "/help",
+        "/issues",
         "/kill",
         "/memory",
         "/mode",
@@ -673,6 +787,37 @@ mod tests {
     use super::completion::all_commands;
     use super::*;
     use crate::session::{Session, SessionMessage};
+
+    #[test]
+    fn preemptive_due_fires_in_the_85_to_100_band() {
+        // dirge-rz4i: the user's case — 106.7k used of a 114.7k usable budget
+        // (~93%). 85% of 114_700 = 97_495; total already exceeds it, so a
+        // proactive compaction is due even with a tiny incoming prompt. The
+        // OLD within-limits gate (total <= max) would have no-op'd here.
+        let max_tokens = 114_700;
+        assert!(preemptive_compaction_due(106_700, 50, max_tokens));
+        // And it must be < the hard limit, proving this is the band that
+        // regressed (preemptive fired but prepare refused).
+        assert!(106_700 <= max_tokens);
+    }
+
+    #[test]
+    fn preemptive_due_incoming_prompt_pushes_over() {
+        // Under 85% on its own (90k of 114.7k usable ≈ 78%), but a large
+        // incoming prompt crosses the threshold — the case only the trigger
+        // can see, which is why it must drive the (forced) compaction.
+        let max_tokens = 114_700;
+        assert!(!preemptive_compaction_due(90_000, 0, max_tokens));
+        assert!(preemptive_compaction_due(90_000, 10_000, max_tokens));
+    }
+
+    #[test]
+    fn preemptive_due_below_threshold_and_empty_session() {
+        let max_tokens = 100_000; // 85% = 85_000
+        assert!(!preemptive_compaction_due(80_000, 1_000, max_tokens));
+        // Fresh session (total == 0) never triggers, even with a huge prompt.
+        assert!(!preemptive_compaction_due(0, 1_000_000, max_tokens));
+    }
 
     #[test]
     fn split_command_parts_collapses_extra_whitespace() {
@@ -1033,6 +1178,7 @@ mod tests {
             "/compress",
             "/display",
             "/fork",
+            "/graph",
             "/help",
             "/kill",
             "/memory",

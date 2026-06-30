@@ -635,10 +635,16 @@ fn end_session_is_idempotent() {
 }
 
 #[test]
-fn last_init_error_tracks_open_failures() {
-    // Attempt to open a path that doesn't exist as a directory
-    // (the parent dir creation is done by open(), but a file where
-    // a directory should be will fail).
+fn open_failure_returns_descriptive_error() {
+    // dirge-w4i7: assert on the returned Err, NOT the process-global
+    // last_init_error(). open() clears that global on every successful
+    // open, so a parallel test opening a DB races this assertion down to
+    // None and the test flakes. The returned error carries the same
+    // message and is per-call, so it's race-free.
+    //
+    // Attempt to open a path that doesn't exist as a directory (the parent
+    // dir creation is done by open(), but a file where a directory should
+    // be will fail).
     let bad = std::env::temp_dir().join(format!(
         "dirge-bad-db-{}-{}",
         std::process::id(),
@@ -651,13 +657,13 @@ fn last_init_error_tracks_open_failures() {
     std::fs::write(&bad, "not a db").unwrap();
     let db_path = bad.join("state.db");
 
-    let result = SessionDb::open(&db_path);
-    assert!(result.is_err(), "should fail to open on bad path");
-    let err = last_init_error();
-    assert!(err.is_some(), "last_init_error should be set");
+    let err = match SessionDb::open(&db_path) {
+        Ok(_) => panic!("should fail to open on bad path"),
+        Err(e) => e,
+    };
     assert!(
-        err.unwrap().contains("Failed to open"),
-        "error should describe the failure"
+        err.contains("Failed to open"),
+        "error should describe the failure: {err}"
     );
 
     // Clean up.

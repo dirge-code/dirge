@@ -128,21 +128,32 @@ pub fn retrying_stream_fn_with_non_retryable(
                         StreamEvent::Error { error } => {
                             // Decide on retry vs surface BEFORE
                             // yielding the Error event downstream.
-                            if !committed {
-                                if non_retryable(error) {
-                                    yield evt;
-                                    return;
-                                }
-                                let kind = classify_error(error);
-                                if policy.should_retry(attempts, kind) {
-                                    retry_msg = Some(error.clone());
-                                    // Don't yield this Error — we're
-                                    // about to retry.
-                                    break;
-                                }
+                            if non_retryable(error) {
+                                yield evt;
+                                return;
                             }
-                            // Either retry exhausted, non-retryable
-                            // kind, or committed → surface.
+                            let kind = classify_error(error);
+                            // #545: a stream-chunk TIMEOUT is
+                            // retryable even after content has
+                            // committed. A timeout means the
+                            // provider stalled mid-emission, so the
+                            // partial is incomplete; the consumer
+                            // discards it on StreamEvent::Retry
+                            // (stream.rs PROV-5 reset) and the next
+                            // attempt starts clean. Other committed
+                            // errors (hard resets, auth, …) still
+                            // surface — retrying those would
+                            // duplicate tokens already shown.
+                            let retryable = policy.should_retry(attempts, kind)
+                                && (!committed || is_timeout_error(error));
+                            if retryable {
+                                retry_msg = Some(error.clone());
+                                // Don't yield this Error — we're
+                                // about to retry.
+                                break;
+                            }
+                            // Retry exhausted, non-retryable kind,
+                            // or a committed non-timeout → surface.
                             yield evt;
                             return;
                         }
@@ -476,6 +487,64 @@ mod tests {
             }
         ));
         assert!(matches!(events[2], StreamEvent::Error { .. }));
+    }
+
+    /// #545: a stream-chunk TIMEOUT after content has committed is
+    /// still retried. Unlike a hard "connection reset", a timeout
+    /// means the provider stalled mid-emission — the partial is
+    /// incomplete and the consumer discards it on
+    /// `StreamEvent::Retry` (stream.rs PROV-5 reset), so retrying is
+    /// safe. This is what keeps a reasoning model that thinks, then
+    /// stalls mid-tool-call, from halting the whole run.
+    #[tokio::test]
+    async fn retries_timeout_after_content_committed() {
+        let (factory, counter) = counted_canned(vec![
+            vec![
+                StreamEvent::Start {
+                    partial: empty_assistant(),
+                },
+                // Real content streamed → committed.
+                StreamEvent::Delta {
+                    partial: assistant_with("partial "),
+                    phase: DeltaPhase::TextStart,
+                },
+                // Mid-assembly stream-chunk timeout (verbatim shape
+                // produced by rig_stream.rs).
+                StreamEvent::Error {
+                    error: "stream chunk timed out after 29s while a tool call was mid-assembly"
+                        .to_string(),
+                },
+            ],
+            vec![StreamEvent::Done {
+                reason: StopReason::Stop,
+                message: assistant_with("ok"),
+                usage: None,
+            }],
+        ]);
+        let wrapped = retrying_stream_fn(factory, RecoveryPolicy::default());
+
+        tokio::time::pause();
+        let task = tokio::spawn(async move {
+            drain(wrapped(
+                ctx(),
+                crate::agent::agent_loop::StreamOptions::from_signal(AbortSignal::new()),
+            ))
+            .await
+        });
+        tokio::time::advance(std::time::Duration::from_secs(5)).await;
+        let events = task.await.unwrap();
+
+        // Retried once → second attempt succeeded.
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+        // A Retry notice was emitted between attempts (the consumer
+        // uses it to reset partial state + show a banner instead of
+        // freezing).
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::Retry { .. }))
+        );
+        assert!(matches!(events.last(), Some(StreamEvent::Done { .. })));
     }
 
     /// Rate-limit error retries, retry-after-ms gets honoured

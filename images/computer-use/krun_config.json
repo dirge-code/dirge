@@ -1,0 +1,21 @@
+{
+    "Cmd": [
+        "/bin/sh", "-c",
+        "mount -t tmpfs tmpfs /run \
+         && mkdir -p /run/sshd \
+         && mkdir -p /workspace \
+         && mount -t virtiofs workspace /workspace \
+         && chmod 755 /var/empty \
+         && Xvfb :99 -screen 0 1920x1080x24 -ac & \
+         sleep 1 \
+         && openbox --replace & \
+         sleep 1 \
+         && exec /usr/sbin/sshd -D -e -o StrictModes=no"
+    ],
+    "mounts": [
+        {"destination": "/var/empty", "type": "tmpfs", "source": "tmpfs"},
+        {"destination": "/workspace", "type": "virtiofs", "source": "workspace"}
+    ],
+    "Env": ["DISPLAY=:99"],
+    "WorkingDir": "/"
+}

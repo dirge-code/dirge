@@ -116,10 +116,10 @@ where
         // interleaves text + tool-call deltas keeps making
         // forward progress and never trips the gap timeout; only
         // a true mid-assembly stall (no chunks of ANY kind for
-        // 30s while a tool call is open) fires.
+        // the gap window while a tool call is open) fires.
         //
         // This addresses the review finding that the prior
-        // "any chunk subject to the 30s timeout while a tool
+        // "any chunk subject to the gap timeout while a tool
         // call is open" semantic spuriously killed providers
         // that interleave reasoning between tool-call deltas.
         let mut open_tool_calls: std::collections::HashSet<String> =
@@ -187,8 +187,9 @@ where
                         // retry. Matches runner.rs:301-304.
                         let detail = if !open_tool_calls.is_empty() {
                             format!(
-                                "stream chunk timed out after {}s while a tool call was mid-assembly (provider stalled emitting tool-call deltas — common DeepSeek symptom; the harness narrows to {}s while assembling tool calls)",
+                                "stream chunk timed out after {}s while a tool call was mid-assembly (provider stalled emitting tool-call deltas — common DeepSeek symptom; the harness narrows to {}s while assembling tool calls). This is retried automatically; if your model legitimately pauses longer than {}s between deltas, raise `timeouts.tool_call_gap_secs` in config.json.",
                                 t.as_secs(),
+                                tool_call_gap_timeout.as_secs(),
                                 tool_call_gap_timeout.as_secs(),
                             )
                         } else {
@@ -1440,9 +1441,9 @@ mod tests {
                         ))
                     }
                     2 => {
-                        // Sleep another 20s — still under 30s
-                        // since the previous text delta reset
-                        // the budget.
+                        // Sleep another 20s — still under the
+                        // 60s gap budget since the previous text
+                        // delta reset it.
                         tokio::time::sleep(Duration::from_secs(20)).await;
                         Some((
                             Ok(StreamedAssistantContent::Text(Text {
@@ -1467,7 +1468,7 @@ mod tests {
         let events = drain_task.await.unwrap();
 
         // The stream should complete naturally (Done) rather
-        // than timeout. The 30s gap budget never expires
+        // than timeout. The 60s gap budget never expires
         // because each ~20s wait is followed by a chunk.
         let has_timeout_error = events.iter().any(|e| {
             matches!(
@@ -1478,18 +1479,18 @@ mod tests {
         assert!(
             !has_timeout_error,
             "gap timeout should NOT fire when forward progress \
-             (text deltas) keeps arriving within the 30s window: \
+             (text deltas) keeps arriving within the 60s window: \
              events = {events:?}",
         );
     }
 
     /// Phase-1 #4: when a tool call is mid-assembly, the chunk
-    /// timeout narrows to the gap-timeout (30s) even if the
-    /// configured `chunk_timeout` is much larger. Without this,
-    /// a provider stalled emitting tool-call deltas would wait
-    /// the full 300s default before erroring.
+    /// timeout narrows to the gap-timeout (default 60s) even if
+    /// the configured `chunk_timeout` is much larger. Without
+    /// this, a provider stalled emitting tool-call deltas would
+    /// wait the full 300s default before erroring.
     #[tokio::test]
-    async fn tool_call_gap_timeout_fires_within_30s_even_with_large_chunk_timeout() {
+    async fn tool_call_gap_timeout_fires_even_with_large_chunk_timeout() {
         tokio::time::pause();
         let raw = tool_call_delta_then_stall();
         let drain_task = tokio::spawn(async move {
@@ -1502,7 +1503,7 @@ mod tests {
         });
         // Advance just past the gap timeout. The broad 300s
         // timeout would not have fired yet.
-        tokio::time::advance(Duration::from_secs(31)).await;
+        tokio::time::advance(Duration::from_secs(61)).await;
         let events = drain_task.await.unwrap();
 
         let last = events.last().expect("must have events");
@@ -1515,6 +1516,11 @@ mod tests {
                 assert!(
                     error.contains("tool call was mid-assembly") || error.contains("tool-call"),
                     "error should explain the tighter tool-call timeout: {error}"
+                );
+                // Actionable: point the user at the config knob.
+                assert!(
+                    error.contains("tool_call_gap_secs"),
+                    "error should name the configurable knob: {error}"
                 );
             }
             other => panic!("expected Error, got {other:?}"),

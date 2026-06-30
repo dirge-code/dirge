@@ -54,6 +54,66 @@ pub(crate) fn headless_result_json(
     })
 }
 
+/// Build a stream-json `assistant` event for one turn (dirge-kuqp).
+/// The text block carries the turn's streamed text (omitted when
+/// empty so a tool-only turn doesn't emit a stray empty block),
+/// followed by one `tool_use` block per call. Shape mirrors Claude
+/// Code so consumers parsing `claude -p --output-format stream-json`
+/// work against dirge unchanged.
+pub(crate) fn stream_json_assistant_event(
+    text: &str,
+    tool_uses: &[(String, String, serde_json::Value)],
+    session_id: &str,
+) -> serde_json::Value {
+    let mut content: Vec<serde_json::Value> = Vec::new();
+    if !text.is_empty() {
+        content.push(serde_json::json!({"type": "text", "text": text}));
+    }
+    for (id, name, args) in tool_uses {
+        content.push(serde_json::json!({
+            "type": "tool_use",
+            "id": id,
+            "name": name,
+            "input": args,
+        }));
+    }
+    serde_json::json!({
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "content": content,
+        },
+        "session_id": session_id,
+    })
+}
+
+/// Build a stream-json `user` event carrying a turn's tool results
+/// (dirge-kuqp) as `tool_result` content blocks keyed by the
+/// originating call id — the Claude Code shape for tool output.
+pub(crate) fn stream_json_tool_result_event(
+    results: &[(String, String)],
+    session_id: &str,
+) -> serde_json::Value {
+    let content: Vec<serde_json::Value> = results
+        .iter()
+        .map(|(id, output)| {
+            serde_json::json!({
+                "type": "tool_result",
+                "tool_use_id": id,
+                "content": output,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": content,
+        },
+        "session_id": session_id,
+    })
+}
+
 impl AnyAgent {
     pub async fn run_print(
         &self,
@@ -136,9 +196,22 @@ impl AnyAgent {
         use crate::session::{ToolCallEntry, ToolCallState};
         let mut tool_calls: Vec<ToolCallEntry> = Vec::new();
 
+        // dirge-kuqp: per-turn buffers for incremental stream-json. The
+        // bridge collapses `TurnEnd` to a bare index, so we rebuild each
+        // turn's assistant/user envelopes from the streamed events and
+        // emit them at the turn boundary — making `stream-json` a true
+        // incremental stream instead of one final assistant blob.
+        let stream_json = matches!(output_format, crate::cli::OutputFormat::StreamJson);
+        let mut turn_text = String::new();
+        let mut turn_tool_uses: Vec<(String, String, serde_json::Value)> = Vec::new();
+        let mut turn_tool_results: Vec<(String, String)> = Vec::new();
+
         while let Some(event) = event_rx.recv().await {
             match event {
                 AgentEvent::ToolCall { id, name, args } => {
+                    if stream_json {
+                        turn_tool_uses.push((id.to_string(), name.to_string(), args.clone()));
+                    }
                     // Start Interrupted; the matching ToolResult flips it to
                     // Completed. An unanswered call stays Interrupted, which
                     // convert_history re-emits so the model sees no orphan.
@@ -150,6 +223,16 @@ impl AnyAgent {
                     });
                 }
                 AgentEvent::ToolResult { id, output, .. } => {
+                    if stream_json {
+                        // Key the result by its call id. Providers that
+                        // don't emit ids leave it empty for every call in
+                        // the turn, so there's nothing to pair against —
+                        // consumers fall back to positional matching, same
+                        // as the persistence path below. Results can arrive
+                        // in completion order under parallel dispatch, so we
+                        // deliberately don't try to reconstruct an index.
+                        turn_tool_results.push((id.to_string(), output.to_string()));
+                    }
                     let target = if !id.is_empty() {
                         tool_calls.iter_mut().rev().find(|e| e.id == id.as_str())
                     } else {
@@ -166,6 +249,9 @@ impl AnyAgent {
                 }
                 AgentEvent::Token(text) => {
                     full_response.push_str(&text);
+                    if stream_json {
+                        turn_text.push_str(&text);
+                    }
                     if !suppress_inline {
                         let safe = crate::ui::ansi::strip_controls(
                             &text,
@@ -192,6 +278,28 @@ impl AnyAgent {
                 }
                 AgentEvent::TurnEnd { .. } => {
                     num_turns += 1;
+                    // dirge-kuqp: flush this turn's assistant text +
+                    // tool_use blocks, then any tool results, as soon as
+                    // the turn closes. This is what makes the stream
+                    // incremental for multi-turn agentic runs.
+                    if stream_json {
+                        if !turn_text.is_empty() || !turn_tool_uses.is_empty() {
+                            runner::emit_stream_json_event(stream_json_assistant_event(
+                                &turn_text,
+                                &turn_tool_uses,
+                                &session_id,
+                            ));
+                        }
+                        if !turn_tool_results.is_empty() {
+                            runner::emit_stream_json_event(stream_json_tool_result_event(
+                                &turn_tool_results,
+                                &session_id,
+                            ));
+                        }
+                        turn_text.clear();
+                        turn_tool_uses.clear();
+                        turn_tool_results.clear();
+                    }
                 }
                 AgentEvent::SystemNotice { content } => {
                     // dirge-originated runtime notice (e.g. the
@@ -218,6 +326,14 @@ impl AnyAgent {
         // Await the spawned task to catch any panics.
         let _ = task.await;
 
+        // dirge-kuqp: a plugin `on-response` replacement rewrites the
+        // final answer after the last turn already streamed its
+        // assistant event. Track it so the StreamJson arm can emit a
+        // corrected assistant event rather than leaving the stream
+        // showing only the pre-replacement text.
+        #[allow(unused_mut)]
+        let mut response_replaced = false;
+
         // Plugin `on-response` + `on-complete` + `prepare-next-run`
         // dispatch. Headless modes previously skipped these.
         #[cfg(feature = "plugin")]
@@ -225,6 +341,7 @@ impl AnyAgent {
             let mut mgr = pm_arc.lock_ignore_poison();
             let result = runner::apply_response_hooks(&full_response, &mut mgr);
             if let Some(replacement) = result.replacement {
+                response_replaced = true;
                 if suppress_inline {
                     full_response = replacement;
                 } else {
@@ -268,14 +385,40 @@ impl AnyAgent {
                 }
             }
             crate::cli::OutputFormat::StreamJson => {
-                runner::emit_stream_json_event(serde_json::json!({
-                    "type": "assistant",
-                    "message": {
-                        "role": "assistant",
-                        "content": [{"type": "text", "text": full_response.clone()}],
-                    },
-                    "session_id": session_id,
-                }));
+                // dirge-kuqp: each completed turn already streamed its
+                // assistant event at TurnEnd. Two cases still need an
+                // assistant event here:
+                //   1. A partial final turn whose TurnEnd never arrived
+                //      (runner died / interjected mid-turn) — flush the
+                //      buffered text + tool calls.
+                //   2. A plugin `on-response` replacement rewrote the final
+                //      answer after the last turn streamed — emit the
+                //      corrected text so the stream matches the result
+                //      envelope (which carries the replacement).
+                // The two can co-occur (a runner died mid-turn AND a plugin
+                // replaced the result): the replacement is authoritative, so
+                // it wins the text, but still carry any buffered tool_use
+                // blocks from the dead turn so the stream stays well-formed.
+                let leftover = !turn_text.is_empty() || !turn_tool_uses.is_empty();
+                if response_replaced {
+                    runner::emit_stream_json_event(stream_json_assistant_event(
+                        &full_response,
+                        &turn_tool_uses,
+                        &session_id,
+                    ));
+                } else if leftover {
+                    runner::emit_stream_json_event(stream_json_assistant_event(
+                        &turn_text,
+                        &turn_tool_uses,
+                        &session_id,
+                    ));
+                }
+                if (response_replaced || leftover) && !turn_tool_results.is_empty() {
+                    runner::emit_stream_json_event(stream_json_tool_result_event(
+                        &turn_tool_results,
+                        &session_id,
+                    ));
+                }
                 runner::emit_stream_json_event(result_envelope);
             }
         }
@@ -314,6 +457,77 @@ mod tests {
         let died = headless_result_json(RunEnd::Incomplete, 10, 1, "fragment", "sid");
         assert_eq!(died["subtype"], "error");
         assert_eq!(died["is_error"], true);
+    }
+
+    /// dirge-kuqp: a turn's assistant event carries its streamed text
+    /// as a `text` block followed by one `tool_use` block per call,
+    /// matching the Claude Code stream-json shape consumers parse.
+    #[test]
+    fn assistant_event_has_text_then_tool_use_blocks() {
+        let uses = vec![(
+            "toolu_1".to_string(),
+            "read".to_string(),
+            serde_json::json!({"path": "a.rs"}),
+        )];
+        let ev = stream_json_assistant_event("reading the file", &uses, "sid");
+        assert_eq!(ev["type"], "assistant");
+        assert_eq!(ev["session_id"], "sid");
+        assert_eq!(ev["message"]["role"], "assistant");
+        let content = ev["message"]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "reading the file");
+        assert_eq!(content[1]["type"], "tool_use");
+        assert_eq!(content[1]["id"], "toolu_1");
+        assert_eq!(content[1]["name"], "read");
+        assert_eq!(content[1]["input"]["path"], "a.rs");
+    }
+
+    /// An empty text block is omitted — a tool-only turn (no narration)
+    /// emits just the `tool_use` block, not a stray empty text block.
+    #[test]
+    fn assistant_event_omits_empty_text() {
+        let uses = vec![(
+            "toolu_1".to_string(),
+            "list_dir".to_string(),
+            serde_json::json!({}),
+        )];
+        let ev = stream_json_assistant_event("", &uses, "sid");
+        let content = ev["message"]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "tool_use");
+    }
+
+    /// A pure-text turn with no tool calls emits a single text block —
+    /// the unchanged single-turn shape (system, assistant, result).
+    #[test]
+    fn assistant_event_text_only() {
+        let ev = stream_json_assistant_event("the answer", &[], "sid");
+        let content = ev["message"]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "the answer");
+    }
+
+    /// Tool results come back as a `user` event with `tool_result`
+    /// content blocks keyed by the originating call id — the Claude
+    /// Code shape for a turn's tool output.
+    #[test]
+    fn tool_result_event_shape() {
+        let results = vec![
+            ("toolu_1".to_string(), "file contents".to_string()),
+            ("toolu_2".to_string(), "dir listing".to_string()),
+        ];
+        let ev = stream_json_tool_result_event(&results, "sid");
+        assert_eq!(ev["type"], "user");
+        assert_eq!(ev["session_id"], "sid");
+        assert_eq!(ev["message"]["role"], "user");
+        let content = ev["message"]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "tool_result");
+        assert_eq!(content[0]["tool_use_id"], "toolu_1");
+        assert_eq!(content[0]["content"], "file contents");
+        assert_eq!(content[1]["tool_use_id"], "toolu_2");
     }
 
     /// The truncation detector matches the notice the agent loop

@@ -13,6 +13,7 @@ What sets dirge apart from other agentic editors:
 - **One explainable permission engine.** All authorization flows through a single Policy Decision Point with four modes, op-based rules, session allowlists, and a `/why` command that traces exactly which policy decided and why. See [docs/permissions.md](docs/permissions.md).
 - **Role-based multi-provider routing.** Point the main loop, review, escalation, summarization, and subagent roles at different models — mix DeepSeek, GLM, Anthropic, OpenAI, Ollama, and any OpenAI-compatible endpoint in one session. Define your own opt-in [agent profiles](docs/agents.md) (a named model + prompt + tool-policy bundle) and switch personas mid-session with `/agent`.
 - **Self-improving project memory.** Persistent per-project memory (plus a global cross-project tier for durable user preferences) and a post-session orchestrator that extracts learnings and curates memory + skills.
+- **A built-in issue board.** A persistent, agent-facing kanban in the session DB — the harness surfaces the top open issues at the start of every turn, so the agent works its backlog without polling a tracker. The `issue` tool manages it; `/issues` views it. See [docs/issues.md](docs/issues.md).
 - **Long-horizon sessions that resume where they left off.** Every conversation keeps a durable, incrementally-refreshed checkpoint, anchored to a stable identity so resuming a long, compacted session recovers its live state instead of a stale snapshot. Autonomous runs can be held to a natural-language stop condition with `--goal`. Adapted from [MiMo-Code](https://github.com/XiaomiMiMo/MiMo-Code).
 - **Code intelligence baked in.** Tree-sitter [semantic tools](docs/semantic.md) and [LSP diagnostics](docs/lsp.md) for 10+ languages, surfaced inline so the agent fixes compile errors on the same turn.
 - **Extensible at runtime.** A [Janet plugin system](docs/plugins.md) hooks the full lifecycle, and [Claude-compatible skills](docs/skills.md) load instructions on demand.
@@ -77,8 +78,84 @@ cargo install dirge-agent --no-default-features \
   --features "loop,git-worktree,mcp,lsp,semantic-rust,semantic-python"
 ```
 
+If a source build fails while using a newer system LLVM than the project
+expects, point bindgen at LLVM 18's libclang explicitly:
+
+```bash
+LIBCLANG_PATH=/usr/lib64/llvm18/lib cargo install dirge-agent
+```
+
 Prebuilt binaries for Linux (glibc + static musl), macOS (Intel + Apple
 Silicon), and Windows are attached to each [GitHub Release](https://github.com/dirge-code/dirge/releases).
+
+### Build with Nix
+
+The flake ships the crate default features (the release feature set):
+
+```bash
+nix build                 # builds packages.default / packages.dirge from this pinned ref
+nix run . -- --version    # runs the source-built binary
+nix develop               # opens a Rust dev shell with clang, cmake, and bindgen support
+nix build .#dirge-bin     # installs the recorded upstream release binary
+```
+
+`packages.default` / `packages.dirge` build from the flake input's pinned
+source (`self`). `packages.dirge-bin` downloads the latest release recorded in
+`nix/bin.nix`, so it can differ when you pin `main` or a feature branch.
+
+
+#### Automatic devshell activation with direnv
+This repository includes a `.envrc`. If you have `direnv` installed, this will activate the nix devshell automatically.
+N.B. .envrc is untrusted by default -- opt in by entering the command `direnv allow` at the repository root.
+
+
+#### Install via your own flake (home-manager)
+
+A minimal `flake.nix` that installs dirge through home-manager:
+
+```nix
+{
+  inputs = {
+    nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
+    home-manager.url = "github:nix-community/home-manager";
+    dirge.url = "github:dirge-code/dirge";
+  };
+
+  outputs = { nixpkgs, home-manager, dirge, ... }:
+    let
+      system = "x86_64-linux";
+      pkgs = import nixpkgs {
+        inherit system;
+        overlays = [ dirge.overlays.default ];
+      };
+    in {
+      homeConfigurations.me = home-manager.lib.homeManagerConfiguration {
+        inherit pkgs;
+        modules = [{
+          home.username = "me";
+          home.homeDirectory = "/home/me";
+          home.stateVersion = "24.11";
+          home.packages = [ pkgs.dirge ]; # or pkgs.dirge-bin for the prebuilt binary
+        }];
+      };
+    };
+}
+```
+
+Then `home-manager switch --flake .#me`.
+
+#### Maintaining the flake
+
+- `nix/bin.nix` (the prebuilt `dirge-bin`) is bumped automatically: on a release
+  tag the release workflow refreshes its version and hashes from the new assets
+  and opens a PR.
+- `nix flake check` runs in CI whenever the flake, `nix/`, or the Cargo
+  manifests change.
+- Run `nix flake update` to refresh the pinned `nixpkgs` in the committed
+  `flake.lock`.
+
+Consumers can also import `inputs.dirge.overlays.default` into an existing
+`nixpkgs` overlay list to expose `pkgs.dirge` and `pkgs.dirge-bin`.
 
 ### Optional: sandbox mode
 
@@ -158,8 +235,10 @@ Provider credential precedence is unchanged: configured API keys,
 `--api-key-file`, `--api-key-stdin`, config `api_key`, config `api_key_env`, and
 provider environment variables win first. If no higher-precedence OpenAI key is
 available, Dirge uses the fresh stored OAuth access token against the ChatGPT
-Codex backend. Expired OAuth credentials require rerunning `dirge auth openai` or
-setting an API key.
+Codex backend. Explicit `auth: "chatgpt"` uses this Dirge-managed token before
+falling back to legacy `~/.codex/auth.json`, so rerunning `dirge auth openai`
+refreshes Dirge even when Codex's own login file is stale. Expired OAuth
+credentials require rerunning `dirge auth openai` or setting an API key.
 
 Troubleshooting: a 404 or "device-code auth is not enabled" error means the
 ChatGPT Codex security setting is still disabled. A timeout means the browser
@@ -181,6 +260,7 @@ authorization, delete the `auth.json` file and log in again.
 | `/reasoning` | Toggle reasoning visibility |
 | `/btw <question>` | Ask a quick question (no tools, doesn't affect session) |
 | `/sessions` | List/save/load sessions |
+| `/issues` | View the native issue board (`/issues list`, `/issues <id>`, `/issues search <q>`); the agent manages it with the `issue` tool. See [docs/issues.md](docs/issues.md) |
 | `/tree [id-prefix]` | Show session tree; with prefix, switch the active branch to that leaf |
 | `/fork [id-prefix]` | Branch off the chosen message (default: last user message) and restore its text to the editor |
 | `/clone <id-prefix>` | Switch the active branch to the entry without restoring text |
@@ -233,6 +313,109 @@ referenced by alias from role-assignment keys (`provider`, `review_provider`,
 `escalation_provider`, `summarization_provider`, `subagent_provider`) — so each
 role can run on a different model. See [docs/config.md](docs/config.md) for the schema,
 provider aliases, role-assignment table, permission rules, and MCP setup.
+
+## Example config
+
+dirge reads `$XDG_CONFIG_HOME/dirge/config.json` (i.e. `~/.config/dirge/config.json`);
+a `.dirge/config.json` in the repo root overrides it per-project. Everything is
+optional — with no config at all, dirge auto-detects a provider from your
+environment. Here's a fuller real-world config that runs each role on a
+different model, pre-allows a few MCP tool namespaces, and wires up MCP servers,
+LSP servers, and a plugin:
+
+```json
+{
+  "max_agent_turns": 1000,
+  "phased_workflow_enabled": true,
+
+  "provider": "glm",
+  "critic_provider": "deepseek",
+  "summarization_provider": "deepseek-flash",
+  "approval_provider": "deepseek-flash",
+
+  "providers": {
+    "deepseek": { "model": "deepseek-v4-pro" },
+    "deepseek-flash": {
+      "provider_type": "deepseek",
+      "model": "deepseek-v4-flash",
+      "api_key": "${DEEPSEEK_API_KEY}"
+    },
+    "glm": {
+      "provider_type": "glm",
+      "base_url": "https://open.bigmodel.cn/api/coding/paas/v4/chat/completions",
+      "api_key": "${ZHIPU_API_KEY}",
+      "model": "glm-5.2",
+      "options": { "temperature": 0.2 }
+    },
+    "ollama": {
+      "provider_type": "openai",
+      "base_url": "http://127.0.0.1:11434/v1"
+    }
+  },
+
+  "permission": {
+    "rules": [
+      { "op": "mcp", "match": "mcp_tool:chiasmus:*", "effect": "allow" },
+      { "op": "mcp", "match": "mcp_tool:lattice:*",  "effect": "allow" }
+    ]
+  },
+
+  "mcp_servers": {
+    "lattice":  { "command": "lattice-mcp", "args": [] },
+    "chiasmus": { "command": "npx", "args": ["-y", "chiasmus"] }
+  },
+
+  "lsp": {
+    "clojure-lsp": {
+      "command": ["clojure-lsp"],
+      "extend_extensions": ["janet"]
+    },
+    "typescript": { "command": ["typescript-language-server", "--stdio"] }
+  },
+
+  "plugins": {
+    "backpressured": { "auto_start": false }
+  }
+}
+```
+
+> JSON has no comments — copy the block above and delete what you don't need.
+
+**Role routing.** The top-level `provider` is the main agent; `critic_provider`,
+`summarization_provider`, `approval_provider` (and `review_provider`,
+`escalation_provider`, `subagent_provider`) point each side-job at its own model.
+Above, the main loop runs on GLM, the compaction summarizer and the auto-approval
+evaluator on a cheap/fast DeepSeek, and the completion critic on the larger
+DeepSeek. `review_provider`/`summarization_provider`/`subagent_provider` fall
+back to `provider` when unset; `critic_provider`/`approval_provider` are off
+entirely unless you name one. Each value is an **alias** into `providers`.
+
+**Provider aliases.** Each `providers` entry is keyed by an alias you choose.
+`provider_type` is the actual backend (`openai`, `anthropic`, `gemini`,
+`deepseek`, `glm`, `ollama`, `openrouter`, or omit it to default to a custom
+OpenAI-compatible endpoint) — and it **defaults to the alias** when omitted, which
+is why `"deepseek": { "model": "…" }` needs no `provider_type` but the second
+DeepSeek route must spell it out as a distinct alias (`deepseek-flash`). Point an
+alias at any OpenAI-compatible server with `base_url` (here a local Ollama and
+GLM's coding endpoint). `options` carries provider tuning — `temperature` is
+applied to the request.
+
+**Secrets.** `api_key` supports `${VAR}` interpolation expanded from the
+environment at use time, so the key itself never lives in the file. Omit it to
+fall back to the provider's standard env var (e.g. `DEEPSEEK_API_KEY`,
+`OPENAI_API_KEY`). (Note: it's `base_url` and `${VAR}` — not `url` or
+`${'VAR'}`.)
+
+**Permission rules.** Pre-decide tool authorizations so the agent doesn't prompt.
+Each rule is `{ op, match, effect }`; the `mcp` op matches `mcp_tool:<server>:<tool>`
+globs and `effect: "allow"` greenlights them. See
+[docs/permissions.md](docs/permissions.md) for the full rule grammar and modes.
+
+**MCP servers / LSP / plugins.** `mcp_servers` launches each tool server by
+`command` + `args` (stdio). `lsp` registers language servers (`command` is argv;
+`extend_extensions` maps extra file extensions onto an existing server — here
+`.janet` files go to `clojure-lsp`). `plugins` carries per-plugin settings such
+as `auto_start`.
 
 ## Documentation
 

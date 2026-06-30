@@ -918,14 +918,6 @@ impl Session {
         // so the host can keep the same agent runtime.
     }
 
-    pub fn needs_compaction(&self, reserve_tokens: u64) -> bool {
-        compact::needs_compaction(
-            self.total_estimated_tokens,
-            self.context_window,
-            reserve_tokens,
-        )
-    }
-
     pub fn compacted_context(&self) -> (Option<&str>, usize) {
         compact::compacted_context(&self.compactions, self.messages.len())
     }

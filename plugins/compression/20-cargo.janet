@@ -37,14 +37,21 @@
 
 (defn- cargo-compress-build [output]
   (var crate-count 0)
+  (var crates @[])
   (var errors @[])
   (var warnings 0)
   (var time "")
   (each line (string/split "\n" output)
     (def t (string/trim line))
-    (when (compiling-match t) (++ crate-count))
+    (if-let [c (compiling-match t)]
+      (do
+        (++ crate-count)
+        (array/push crates (string (in c 0) " v" (in c 1)))))
     (if-let [c (error-match t)]
-      (array/push errors (string "E" (in c 0) ": " (in c 1))))
+      (do
+        (def err (string "E" (in c 0) ": " (in c 1)))
+        (array/push errors err)
+        (harness/record-entity "error" (string "E" (in c 0)) {:message (in c 1)})))
     (when (and (warning-match t)
                (not (string/find "generated" t)))
       (++ warnings))
@@ -53,6 +60,8 @@
   (def parts @[])
   (when (> crate-count 0)
     (array/push parts (string "compiled " crate-count " crates")))
+  (each c crates
+    (harness/record-entity "crate" c {}))
   (when (not (empty? errors))
     (array/push parts (string (length errors) " errors:"))
     (each e errors (array/push parts (string "  " e))))
@@ -77,7 +86,9 @@
       (array/push results (string (in c 0) ": " (in c 1) " pass, " (in c 2) " fail, " (in c 3) " skip")))
     (when (and (string/find "FAILED" t) (string/find "---" t))
       (if-let [name (last (string/split " " t))]
-        (array/push failed-tests name)))
+        (do
+          (array/push failed-tests name)
+          (harness/record-entity "test" name {:status "failing"}))))
     (if (and (string/has-prefix? "test " t)
              (>= (length line) 6)
              (= (string/slice line (- (length line) 6)) " ... ok"))

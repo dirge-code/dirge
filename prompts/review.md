@@ -1,6 +1,7 @@
 ---
 deny_tools: [edit, write, apply_patch, bash, webfetch]
 description: Read-only code review — analyze and critique, do not change files
+critic: false
 ---
 ## Code Review Mode
 

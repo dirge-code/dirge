@@ -107,11 +107,16 @@ pub fn derive_panel_state(session: &Session) -> PanelState {
 /// replay yields the same result (an uncompacted history agrees with the
 /// snapshot; a compacted one has nothing left to replay).
 pub fn restore_panels(session: &Session) {
-    use crate::sync_util::LockExt;
-
     let state = selected_panel_state(session);
 
-    *crate::agent::tools::todo::TODO_LIST.lock_ignore_poison() = state.todos;
+    // Todos are now durable issues. Refresh the panel/nudge mirror straight
+    // from this session's live board in the issue DB — the authoritative
+    // source — rather than the persisted snapshot or a history replay.
+    let db_path = crate::extras::dirge_paths::ProjectPaths::new(std::path::Path::new(
+        session.working_dir.as_str(),
+    ))
+    .session_db_path();
+    crate::agent::tools::todo::refresh_board(&db_path, Some(session.id.as_str()));
 
     // Replay through `mark_modified` so canonicalization, dedup, the 256-entry
     // cap and the panel's version counter all match the live write path.

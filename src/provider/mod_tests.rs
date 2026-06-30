@@ -575,6 +575,126 @@ async fn with_summarizer_stashes_summarize_fn_dirge_008x() {
     assert_eq!(out, "summary of: hello");
 }
 
+#[test]
+fn ui_compaction_model_honors_summarization_provider() {
+    use std::collections::HashMap;
+
+    let providers = HashMap::from([
+        (
+            "main".to_string(),
+            crate::config::ProviderEntry {
+                provider_type: Some("openai".to_string()),
+                model: Some("gpt-main".to_string()),
+                api_key: Some("sk-main".to_string()),
+                ..Default::default()
+            },
+        ),
+        (
+            "summ".to_string(),
+            crate::config::ProviderEntry {
+                provider_type: Some("deepseek".to_string()),
+                model: Some("deepseek-chat".to_string()),
+                api_key: Some("sk-summ".to_string()),
+                ..Default::default()
+            },
+        ),
+    ]);
+    let cfg = crate::config::Config {
+        provider: Some("main".to_string()),
+        summarization_provider: Some("summ".to_string()),
+        providers: Some(providers),
+        ..Default::default()
+    };
+    let main_client =
+        crate::provider::create_client_with_auth("main", None, &cfg.providers_map(), cfg.auth)
+            .expect("main client builds from literal API key");
+
+    let model = crate::provider::build_compaction_model(&cfg, &main_client, "gpt-main")
+        .expect("summarization_provider route resolves");
+
+    assert!(
+        matches!(model, crate::provider::AnyModel::DeepSeek(_)),
+        "UI compaction must use summarization_provider, not the active session model"
+    );
+}
+
+#[tokio::test]
+async fn in_loop_compaction_refuses_anthropic_oauth_without_summarization_provider() {
+    let cfg = crate::config::Config::default();
+    let client = rig::providers::anthropic::Client::builder()
+        .api_key("sk-ant-oat-test")
+        .http_client(crate::provider::anthropic_http::AnthropicHttpClient::new(
+            "sk-ant-oat-test".to_string(),
+        ))
+        .build()
+        .expect("Anthropic OAuth client builds");
+    let model = crate::provider::AnyModel::AnthropicOauth(client.completion_model("claude-sonnet"));
+
+    let summarize = crate::provider::build_summarize_fn(&cfg, model);
+    let err = summarize("prompt".to_string())
+        .await
+        .expect_err("Anthropic OAuth must not be used for in-loop side compaction");
+
+    assert!(
+        err.to_string().contains("summarization_provider"),
+        "error should tell the user to configure summarization_provider: {err}"
+    );
+}
+
+#[test]
+fn ui_compaction_refuses_anthropic_oauth_without_summarization_provider() {
+    let cfg = crate::config::Config::default();
+    let main_client = crate::provider::AnyClient::AnthropicOauth(
+        rig::providers::anthropic::Client::builder()
+            .api_key("sk-ant-oat-test")
+            .http_client(crate::provider::anthropic_http::AnthropicHttpClient::new(
+                "sk-ant-oat-test".to_string(),
+            ))
+            .build()
+            .expect("Anthropic OAuth client builds"),
+    );
+
+    let err = match crate::provider::build_compaction_model(&cfg, &main_client, "claude-sonnet") {
+        Ok(_) => panic!("Anthropic OAuth must not be used for side compaction"),
+        Err(err) => err,
+    };
+
+    assert!(
+        err.to_string().contains("summarization_provider"),
+        "error should tell the user to configure summarization_provider: {err}"
+    );
+}
+
+#[test]
+fn oauth_compaction_disabled_error_is_detected_through_context_wrapping() {
+    use anyhow::Context;
+
+    // The disabled-compaction error is the routing key the reactive-overflow
+    // handler uses to switch to prune-only fallback. It must stay detectable
+    // even if a caller wraps it with extra context — `anyhow`'s `to_string()`
+    // only shows the outermost message, so a naive top-level match would miss
+    // a wrapped error and silently drop the prune-only fallback.
+    let bare = anyhow::anyhow!(crate::provider::ANTHROPIC_OAUTH_COMPACTION_DISABLED);
+    assert!(
+        crate::provider::is_anthropic_oauth_compaction_disabled_error(&bare),
+        "bare disabled-compaction error must be detected"
+    );
+
+    let wrapped = Err::<(), _>(bare)
+        .context("preparing compaction")
+        .unwrap_err();
+    assert!(
+        crate::provider::is_anthropic_oauth_compaction_disabled_error(&wrapped),
+        "disabled-compaction error must be detected through a context wrapper"
+    );
+
+    let unrelated = anyhow::anyhow!("some other failure").context("preparing compaction");
+    assert!(
+        !crate::provider::is_anthropic_oauth_compaction_disabled_error(&unrelated),
+        "unrelated errors must not be misrouted to the prune-only fallback"
+    );
+}
+
 // --- C6/C7: compaction prefix is full + includes tool calls -----
 
 use super::summarize;
@@ -866,20 +986,11 @@ fn config_alias_still_enforces_url_scheme() {
 /// check failed open, the test would hit the URL and fail with a
 /// connection error instead of the expected "reserved delimiter"
 /// error).
-#[tokio::test]
-async fn compaction_rejects_input_containing_delimiter() {
-    use rig::providers::openai;
-
-    // Build a Custom client pointed at an unroutable URL. If the
-    // delimiter check is bypassed, the test fails with a network
-    // error instead of the expected validation error.
-    let inner = openai::CompletionsClient::builder()
-        .api_key("test-key")
-        .base_url("http://127.0.0.1:1/v1")
-        .build()
-        .expect("build custom client");
-    let client = AnyClient::Custom(inner);
-
+#[test]
+fn compaction_rejects_input_containing_delimiter() {
+    // dirge-tv3p: the delimiter/injection check moved into the pure,
+    // synchronous `build_compaction_prompt` (the on-thread half), so we test
+    // it directly — no client/network needed.
     let poisoned = format!(
         "innocent text {} attacker payload {} more",
         crate::agent::prompt::COMPACTION_DELIMITER_OPEN,
@@ -887,9 +998,7 @@ async fn compaction_rejects_input_containing_delimiter() {
     );
     let msgs = vec![sm(MessageRole::User, &poisoned, vec![])];
 
-    let result = client
-        .compress_messages("test-model", &msgs, None, None)
-        .await;
+    let result = crate::provider::build_compaction_prompt(&msgs, None, None);
 
     assert!(
         result.is_err(),
@@ -902,38 +1011,23 @@ async fn compaction_rejects_input_containing_delimiter() {
     );
 }
 
-/// Sanity: clean input passes the delimiter check (it then hits the
-/// bogus URL and fails with a network/auth error — not the validation
-/// error). This confirms the check is precisely scoped and isn't
-/// over-rejecting innocuous content.
-#[tokio::test]
-async fn compaction_passes_check_on_clean_input() {
-    use rig::providers::openai;
-
-    let inner = openai::CompletionsClient::builder()
-        .api_key("test-key")
-        .base_url("http://127.0.0.1:1/v1")
-        .build()
-        .expect("build custom client");
-    let client = AnyClient::Custom(inner);
-
+/// Sanity: clean input passes the delimiter check and yields a prompt. This
+/// confirms the check is precisely scoped and isn't over-rejecting innocuous
+/// content.
+#[test]
+fn compaction_passes_check_on_clean_input() {
     let msgs = vec![sm(
         MessageRole::User,
         "ordinary message, no markers",
         vec![],
     )];
 
-    let result = client
-        .compress_messages("test-model", &msgs, None, None)
-        .await;
+    let result = crate::provider::build_compaction_prompt(&msgs, None, None);
 
-    // We expect SOME failure (no real LLM endpoint), but NOT the
-    // delimiter-validation failure.
-    assert!(result.is_err(), "expected network/auth failure");
-    let err = result.unwrap_err().to_string();
     assert!(
-        !err.contains("reserved delimiter"),
-        "clean input must NOT trip the delimiter check, got: {err}"
+        result.is_ok(),
+        "clean input must NOT trip the delimiter check, got: {:?}",
+        result.err()
     );
 }
 

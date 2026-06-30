@@ -68,6 +68,18 @@ struct Inner {
     /// escalation so a stubborn streak gets periodic — not per-call —
     /// nudges.
     last_emitted_at: usize,
+    /// dirge-iwwq: consecutive permission/approval denials, a SEPARATE
+    /// streak from the mechanical one above. A denial is a policy wall the
+    /// model cannot retry around, so it must not feed `escalation` (which
+    /// drives the "try a DIFFERENT approach" nudge). Reset by any success,
+    /// like the mechanical streak; untouched by mechanical errors.
+    denials: usize,
+    /// `(tool_name, excerpt)` for recent denials, bounded to `MAX_QUOTED`,
+    /// quoted in the permission checkpoint.
+    recent_denials: Vec<(String, String)>,
+    /// Denial-streak score at the last emitted permission checkpoint;
+    /// re-arm mirrors `last_emitted_at`.
+    last_denial_emitted_at: usize,
 }
 
 impl FailureTracker {
@@ -86,6 +98,9 @@ impl FailureTracker {
                 timeouts: 0,
                 recent: Vec::new(),
                 last_emitted_at: 0,
+                denials: 0,
+                recent_denials: Vec::new(),
+                last_denial_emitted_at: 0,
             }),
         })
     }
@@ -104,6 +119,24 @@ impl FailureTracker {
                 inner.timeouts = 0;
                 inner.recent.clear();
                 inner.last_emitted_at = 0;
+                inner.denials = 0;
+                inner.recent_denials.clear();
+                inner.last_denial_emitted_at = 0;
+                return;
+            }
+            // dirge-iwwq: a denial is a policy wall, tracked on its own
+            // streak. It neither extends nor resets the mechanical streak —
+            // routing the model toward "a DIFFERENT approach" here is the
+            // bug. It gets its own permission checkpoint instead.
+            Outcome::Denied => {
+                inner.denials += 1;
+                inner
+                    .recent_denials
+                    .push((tool_name.to_string(), condense(excerpt)));
+                if inner.recent_denials.len() > MAX_QUOTED {
+                    let drop = inner.recent_denials.len() - MAX_QUOTED;
+                    inner.recent_denials.drain(0..drop);
+                }
                 return;
             }
             Outcome::Error => {
@@ -145,20 +178,35 @@ impl FailureTracker {
     /// last `threshold`-failure interval; otherwise empty.
     pub fn poll_reflection(&self) -> Vec<LoopMessage> {
         let mut inner = self.inner.lock_ignore_poison();
-        if inner.escalation < self.threshold {
-            return Vec::new();
+        let mut out = Vec::new();
+
+        // dirge-iwwq: permission denials first — their own streak, re-armed
+        // like the mechanical one. Distinct message: this is a wall the
+        // model can't retry around, so don't send it back to "diagnose and
+        // try a different approach".
+        if inner.denials >= self.threshold {
+            let due = inner.last_denial_emitted_at == 0
+                || inner.denials.saturating_sub(inner.last_denial_emitted_at) >= self.threshold;
+            if due {
+                inner.last_denial_emitted_at = inner.denials;
+                let body = format_permission_checkpoint(inner.denials, &inner.recent_denials);
+                out.push(LoopMessage::User(UserMessage { content: body }));
+            }
         }
-        // First crossing, or another full `threshold` of escalation since
-        // the last nudge. Keyed on the weighted score so timeouts pull
-        // the nudge forward.
-        let due = inner.last_emitted_at == 0
-            || inner.escalation.saturating_sub(inner.last_emitted_at) >= self.threshold;
-        if !due {
-            return Vec::new();
+
+        if inner.escalation >= self.threshold {
+            // First crossing, or another full `threshold` of escalation since
+            // the last nudge. Keyed on the weighted score so timeouts pull
+            // the nudge forward.
+            let due = inner.last_emitted_at == 0
+                || inner.escalation.saturating_sub(inner.last_emitted_at) >= self.threshold;
+            if due {
+                inner.last_emitted_at = inner.escalation;
+                let body = format_checkpoint(inner.consecutive, inner.timeouts, &inner.recent);
+                out.push(LoopMessage::User(UserMessage { content: body }));
+            }
         }
-        inner.last_emitted_at = inner.escalation;
-        let body = format_checkpoint(inner.consecutive, inner.timeouts, &inner.recent);
-        vec![LoopMessage::User(UserMessage { content: body })]
+        out
     }
 }
 
@@ -209,6 +257,32 @@ fn format_checkpoint(consecutive: usize, timeouts: usize, recent: &[(String, Str
              tool to make progress.",
         ));
     }
+    s
+}
+
+/// Build the permission-checkpoint body (dirge-iwwq). Deliberately
+/// shares NO wording with [`format_checkpoint`]: a denial is not a
+/// mechanical failure to diagnose and retry differently, it is a policy
+/// wall only the user can lift. The message says so and forbids the
+/// workaround a "try a different approach" nudge otherwise invites
+/// (writing a script to do the blocked action, moving the work elsewhere).
+fn format_permission_checkpoint(denials: usize, recent: &[(String, String)]) -> String {
+    let mut s = format!(
+        "[Permission checkpoint] {denials} tool calls in a row were blocked by the \
+         permission system:\n"
+    );
+    for (tool, excerpt) in recent {
+        s.push_str(&format!("  - {tool}: {excerpt}\n"));
+    }
+    s.push_str(
+        "This is a policy block, not a tool error. Retrying, rephrasing, or switching to \
+         another tool will not clear it, and you must NOT try to work around it — do not write \
+         a script to perform the blocked action, move the work to an allowed path, or otherwise \
+         route around the guardrail. Only the user can permit this. Either ask the user to \
+         approve it (they can run `/allow add <tool> <pattern>`, e.g. `/allow add write \
+         ~/dir/**`), or stop and report plainly what is blocked and what you would do once it \
+         is allowed.",
+    );
     s
 }
 
@@ -402,5 +476,90 @@ mod tests {
         assert!(!body.contains("err1"));
         assert!(body.contains("err2"));
         assert!(body.contains("err6"));
+    }
+
+    // dirge-iwwq: permission denials are a policy wall, not a mechanical
+    // failure. They get their own checkpoint and must never feed the
+    // "try a DIFFERENT approach" mechanical nudge — that nudge is exactly
+    // what drives a model to route around the guardrail.
+
+    #[test]
+    fn denial_streak_emits_permission_checkpoint_not_mechanical() {
+        use super::super::activity::Outcome;
+        let t = FailureTracker::new(3);
+        for _ in 0..3 {
+            t.record(
+                Outcome::Denied,
+                "edit",
+                "Permission denied: writes outside project",
+            );
+        }
+        let msgs = t.poll_reflection();
+        assert_eq!(msgs.len(), 1, "denial streak nudges once");
+        let body = content_of(&msgs);
+        // NOT the mechanical checkpoint — none of its tells.
+        assert!(!body.contains("DIFFERENT next step"), "{body}");
+        assert!(!body.contains("Re-read its description"), "{body}");
+        assert!(!body.contains("wrong arguments, wrong tool"), "{body}");
+        assert!(!body.contains("tool calls in a row have failed"), "{body}");
+        // Permission-specific: names the block, points at /allow, and
+        // forbids routing around it.
+        assert!(body.contains("Permission checkpoint"), "{body}");
+        assert!(body.contains("/allow"), "{body}");
+        let lc = body.to_lowercase();
+        assert!(
+            lc.contains("work around") || lc.contains("route around"),
+            "must forbid the workaround: {body}"
+        );
+        // Quotes the blocked tool + reason.
+        assert!(body.contains("edit: Permission denied"), "{body}");
+    }
+
+    #[test]
+    fn denials_do_not_inflate_the_mechanical_streak() {
+        use super::super::activity::Outcome;
+        let t = FailureTracker::new(3);
+        t.record(Outcome::Error, "edit", "old_string not found");
+        t.record(Outcome::Error, "read", "file not found");
+        // If this denial wrongly fed the mechanical streak, escalation
+        // would reach 3 and the mechanical checkpoint would fire.
+        t.record(
+            Outcome::Denied,
+            "write",
+            "Permission denied: outside project",
+        );
+        assert!(
+            t.poll_reflection().is_empty(),
+            "2 mechanical errors + 1 denial: neither streak at threshold"
+        );
+    }
+
+    #[test]
+    fn denial_does_not_reset_the_mechanical_streak() {
+        use super::super::activity::Outcome;
+        let t = FailureTracker::new(3);
+        t.record(Outcome::Error, "edit", "no match");
+        t.record(Outcome::Error, "edit", "no match");
+        // A denial between errors is neither a success (no reset) nor a
+        // mechanical failure (no increment) — the error streak survives it.
+        t.record(Outcome::Denied, "write", "Permission denied: x");
+        t.record(Outcome::Error, "edit", "no match");
+        let msgs = t.poll_reflection();
+        assert_eq!(msgs.len(), 1, "3 mechanical errors across a denial trip");
+        assert!(content_of(&msgs).contains("3 tool calls in a row have failed"));
+    }
+
+    #[test]
+    fn success_clears_the_denial_streak() {
+        use super::super::activity::Outcome;
+        let t = FailureTracker::new(3);
+        t.record(Outcome::Denied, "write", "Permission denied: x");
+        t.record(Outcome::Denied, "write", "Permission denied: x");
+        t.record(Outcome::Ok, "read", "ok");
+        t.record(Outcome::Denied, "write", "Permission denied: x");
+        assert!(
+            t.poll_reflection().is_empty(),
+            "success reset the denial streak; 1 denial < threshold"
+        );
     }
 }

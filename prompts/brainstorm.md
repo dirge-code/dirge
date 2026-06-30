@@ -1,3 +1,6 @@
+---
+critic: false
+---
 ## Design-Only Mode
 
 You are in **design-only mode**. Do NOT write any code, tests, or implementation files. Your sole task is to explore the idea, refine requirements, present a design, and get user approval.

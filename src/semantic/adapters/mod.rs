@@ -19,6 +19,8 @@ mod python;
 mod ruby;
 #[cfg(feature = "semantic-rust")]
 mod rust;
+#[cfg(feature = "semantic-sql")]
+mod sql;
 #[cfg(feature = "semantic-ts")]
 mod typescript;
 
@@ -42,6 +44,8 @@ pub use python::PythonAdapter;
 pub use ruby::RubyAdapter;
 #[cfg(feature = "semantic-rust")]
 pub use rust::RustAdapter;
+#[cfg(feature = "semantic-sql")]
+pub use sql::SqlAdapter;
 #[cfg(feature = "semantic-ts")]
 pub use typescript::TypescriptAdapter;
 

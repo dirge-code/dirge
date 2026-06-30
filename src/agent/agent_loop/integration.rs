@@ -397,8 +397,12 @@ pub struct LoopSpawnConfig {
     /// `LoopConfig.critic_fn`. `None` = off (default).
     pub critic_fn: Option<crate::agent::agent_loop::critic::CriticFn>,
 
+    /// Goal gate's judge callback, threaded into `LoopConfig.goal_fn`.
+    /// `None` = off (default).
+    pub goal_fn: Option<crate::agent::agent_loop::critic::CriticFn>,
+
     /// Goal gate: optional natural-language stop condition, threaded into
-    /// `LoopConfig.goal`. Active only when also given a `critic_fn` (the
+    /// `LoopConfig.goal`. Active only when also given a `goal_fn` (the
     /// gate's judge). `None` = off (default).
     pub goal: Option<String>,
 
@@ -454,6 +458,7 @@ impl LoopSpawnConfig {
             file_touch_tracker: None,
             verifier: None,
             critic_fn: None,
+            goal_fn: None,
             goal: None,
             max_turns: None,
             bg_store: None,
@@ -528,6 +533,7 @@ pub fn spawn_loop_runner(cfg: LoopSpawnConfig) -> LoopRunner {
         file_touch_tracker: cfg.file_touch_tracker.clone(),
         verifier: cfg.verifier.clone(),
         critic_fn: cfg.critic_fn.clone(),
+        goal_fn: cfg.goal_fn.clone(),
         goal: cfg.goal.clone(),
         max_turns: cfg.max_turns,
     };

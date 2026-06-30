@@ -72,6 +72,45 @@ pub struct LineEntry {
     pub color: Color,
 }
 
+/// dirge-qy3y: width-independent source for one committed chat region.
+/// The scrollback `buffer` is a *derived cache* of wrapped rows; on a
+/// terminal resize it is regenerated from these blocks at the new width
+/// (`Renderer::rebuild`) so markdown — tables especially — reflows instead
+/// of keeping the column widths it was first rendered at.
+#[derive(Clone)]
+enum SourceBlock {
+    /// Plain text (may contain `\n`). Re-rendered by splitting on `\n` and
+    /// soft-wrapping each segment at the current content width — an empty
+    /// segment renders as a blank row, matching `write_line`.
+    Plain { text: String, color: Color },
+    /// A markdown region re-rendered with `markdown_to_styled`. `handle`
+    /// prepends the `<dirge> ` agent handle to the first row (the streamed
+    /// reasoning/response register).
+    Markdown {
+        src: String,
+        base_color: Color,
+        handle: bool,
+    },
+    /// Pre-rendered rows that do NOT reflow — transient/modal content placed
+    /// via `replace_from` (input editor, pickers, collapsed chambers). Stored
+    /// verbatim so `source` stays a faithful mirror of `buffer` and `rebuild`
+    /// reproduces it exactly; it just doesn't re-wrap (it's re-rendered by its
+    /// own owner each interaction anyway).
+    Raw { rows: Vec<LineEntry> },
+}
+
+/// A source block plus its cached rendered-row count at the width the `buffer`
+/// currently reflects. The count lets `replace_from` / `enforce_cap` map a
+/// buffer offset to a block boundary WITHOUT re-rendering (markdown re-parse)
+/// every block — `replace_from` runs per keystroke in modal sub-loops, so an
+/// O(scrollback) re-render there would lag typing. Kept in sync on every
+/// append, on `stream`, and recomputed wholesale in `rebuild`.
+#[derive(Clone)]
+struct Block {
+    src: SourceBlock,
+    rows: usize,
+}
+
 /// Cap on how many logical input lines we'll show stacked at the bottom of
 /// the screen before the input box starts internally scrolling. Beyond this
 /// the chat-history viewport would be unreasonably squashed.
@@ -106,6 +145,10 @@ pub const CHAT_FRAME_ROWS: u16 = 2;
 /// `cols >= 152`. The old value of 100 was dead — the `content_indent`
 /// gate always bound first — and the README's "≥100 cols" was wrong.
 const PANEL_AUTO_MIN_COLS: u16 = 152;
+
+/// Max rows the live shell box (`!cmd`/`!!cmd`) may occupy, so a chatty
+/// command never crowds out the whole chat. The painter clips the tail.
+const SHELL_BOX_MAX_ROWS: u16 = 12;
 
 /// Global terminal modes dirge owns and must keep asserted for its whole
 /// session: SGR mouse capture (`?1000`/`?1002`/`?1003`/`?1006`) so wheel +
@@ -314,6 +357,11 @@ pub fn normalize_selection_range(a: (usize, usize), b: (usize, usize)) -> Select
 pub struct ChatSnapshot {
     pub name: String,
     buffer: Vec<LineEntry>,
+    /// dirge-qy3y: per-chat source-of-truth, swapped with the active fields
+    /// on chat switch so each chat reflows independently.
+    source: Vec<Block>,
+    streaming: bool,
+    open_rows: usize,
     partial: CompactString,
     partial_color: Color,
     scroll_offset: usize,
@@ -353,7 +401,23 @@ pub struct Renderer {
     /// coincidence alone can't tell whether an eviction invalidated the
     /// index.
     eviction_generation: u64,
+    /// Test-only forced terminal width (see `set_test_cols`); `None` in
+    /// production, where the real tty size is queried.
+    #[cfg(test)]
+    test_cols: Option<u16>,
     buffer: Vec<LineEntry>,
+    /// dirge-qy3y: width-independent source-of-truth for `buffer`. Every
+    /// committed region appends a [`SourceBlock`]; `buffer` is the wrapped
+    /// render cache derived from these. `rebuild` regenerates `buffer` from
+    /// `source` at the current width so scrollback reflows on resize.
+    source: Vec<Block>,
+    /// True while the tail of `source`/`buffer` is an open (in-flight)
+    /// streamed block being re-rendered per token (`stream`). Sealed by
+    /// `commit_stream`.
+    streaming: bool,
+    /// Rows the open streamed block currently occupies at the buffer tail
+    /// (only meaningful while `streaming`).
+    open_rows: usize,
     partial: CompactString,
     partial_color: Color,
     scroll_offset: usize,
@@ -383,6 +447,9 @@ pub struct Renderer {
     /// must NOT extend/clear that selection (it would collapse the word
     /// to the click point). Consumed on the next mouse-up.
     pub suppress_next_mouseup: bool,
+    /// Timestamp of the most recent clipboard copy, for "Copied!" tooltip.
+    /// `None` when no copy has happened this session.
+    copied_at: Option<std::time::Instant>,
     /// Visibility mode for the left / right side panels, controlled
     /// independently (`/display`, `/panel`, and the `display` config).
     /// The main conversation pane is always shown.
@@ -413,6 +480,9 @@ pub struct Renderer {
     /// (text, color); painter centers text horizontally within the
     /// frame's inner band.
     alert_overlay: Option<Vec<(String, Color)>>,
+    /// Live PTY output for an active `!cmd`/`!!cmd` shell session, shown in the
+    /// input-box frame as an overlay titled `[shell]` while the session runs.
+    shell_overlay: Option<Vec<(String, Color)>>,
     /// Picker candidate-list overlay fed to the scene each frame (file
     /// completion or rewind list). Recomputed by `draw_bottom` from the input
     /// editor's file picker, falling back to `rewind_overlay`; cached so
@@ -508,11 +578,17 @@ impl Renderer {
             lines: 0,
             col: 0,
             spinner_tick: false,
+            shell_overlay: None,
             needs_paint: false,
             last_paint: None,
             last_mode_reassert: None,
             eviction_generation: 0,
+            #[cfg(test)]
+            test_cols: None,
             buffer: Vec::new(),
+            source: Vec::new(),
+            streaming: false,
+            open_rows: 0,
             partial: CompactString::new(""),
             partial_color: Color::White,
             scroll_offset: 0,
@@ -527,6 +603,7 @@ impl Renderer {
             selection_end: None,
             last_click: None,
             suppress_next_mouseup: false,
+            copied_at: None,
             left_panel_mode: PanelMode::Auto,
             right_panel_mode: PanelMode::Auto,
             panel_data: PanelData::default(),
@@ -566,6 +643,22 @@ impl Renderer {
             #[cfg(feature = "experimental-ui-terminal-tab")]
             last_tool_name: None,
         })
+    }
+
+    /// Record that text was just copied to clipboard, so a "Copied!"
+    /// tooltip appears on the next redraw.
+    pub fn notify_copied(&mut self) {
+        self.copied_at = Some(std::time::Instant::now());
+    }
+
+    /// If text was copied within the last 2 seconds, returns the
+    /// tooltip text to display (e.g. `"Copied!"`). Otherwise returns
+    /// `None` so the tooltip disappears.
+    fn current_tooltip(&self) -> Option<&'static str> {
+        match self.copied_at {
+            Some(t) if t.elapsed() < std::time::Duration::from_secs(2) => Some("Copied!"),
+            _ => None,
+        }
     }
 
     /// Phase 6 paint entry point. Builds a `Scene` from current
@@ -622,6 +715,9 @@ impl Renderer {
         let show_left_panel = self.left_panel_visible();
         let show_right_panel = self.right_panel_visible();
         let frame_color = crate::ui::theme::header();
+
+        // Compute tooltip before the split borrow destructuring.
+        let tooltip = self.current_tooltip().unwrap_or("");
 
         // Split borrows on Self so we can hold &mut tui_terminal
         // and immutable references to the data fields at the same
@@ -684,6 +780,11 @@ impl Renderer {
                 title: alert_title.as_str(),
                 lines: lines.as_slice(),
             }
+        } else if let Some(lines) = self.shell_overlay.as_ref() {
+            BottomBody::Overlay {
+                title: "[shell]",
+                lines: lines.as_slice(),
+            }
         } else {
             // dirge-5w9v: scroll the editor so the cursor's wrapped row
             // stays visible once the content exceeds the capped box
@@ -738,6 +839,20 @@ impl Renderer {
             // of frames/status), so input_rows ≤ rows - 9.
             let ceiling = (rows_q as i32 - 9).max(1) as u16;
             (wrapped as u16).clamp(1, ceiling)
+        } else if let Some(lines) = self.shell_overlay.as_ref() {
+            let probe = crate::ui::tui::layout::Layout::with_panels(
+                cols_q,
+                rows_q,
+                1,
+                show_left_panel,
+                show_right_panel,
+            );
+            let wrapped =
+                crate::ui::tui::bottom::overlay_wrapped_row_count(lines, probe.input_box.width);
+            let ceiling = (rows_q as i32 - 9).max(1) as u16;
+            // Cap the shell box height so long sessions don't crowd out the
+            // chat; the painter clips, and the box shows the tail of output.
+            (wrapped as u16).clamp(1, ceiling.min(SHELL_BOX_MAX_ROWS))
         } else {
             *input_rows
         };
@@ -812,6 +927,7 @@ impl Renderer {
             background: crate::ui::theme::background(),
             picker: picker_overlay.as_ref(),
             right_panel_mode: *right_panel_mode,
+            tooltip,
             #[cfg(feature = "dap")]
             debug_panel_data: self.debug_panel_data.as_ref(),
         };
@@ -951,6 +1067,9 @@ impl Renderer {
     fn save_active(&mut self) {
         let slot = &mut self.chats[self.active_chat];
         slot.buffer = std::mem::take(&mut self.buffer);
+        slot.source = std::mem::take(&mut self.source);
+        slot.streaming = self.streaming;
+        slot.open_rows = self.open_rows;
         slot.partial = std::mem::take(&mut self.partial);
         slot.partial_color = self.partial_color;
         slot.scroll_offset = self.scroll_offset;
@@ -967,6 +1086,9 @@ impl Renderer {
     fn load_active(&mut self) {
         let slot = &mut self.chats[self.active_chat];
         self.buffer = std::mem::take(&mut slot.buffer);
+        self.source = std::mem::take(&mut slot.source);
+        self.streaming = slot.streaming;
+        self.open_rows = slot.open_rows;
         self.partial = std::mem::take(&mut slot.partial);
         self.partial_color = slot.partial_color;
         self.scroll_offset = slot.scroll_offset;
@@ -983,6 +1105,9 @@ impl ChatSnapshot {
         Self {
             name: name.into(),
             buffer: Vec::new(),
+            source: Vec::new(),
+            streaming: false,
+            open_rows: 0,
             partial: CompactString::new(""),
             partial_color: Color::White,
             scroll_offset: 0,
@@ -1134,6 +1259,20 @@ impl Renderer {
         self.needs_paint = true;
     }
 
+    /// Set the live shell-session overlay (bottom box showing PTY output while
+    /// a `!cmd`/`!!cmd` run is mounted). Cleared when the shell exits.
+    pub fn set_shell_overlay(&mut self, rows: Vec<(String, Color)>) {
+        self.shell_overlay = Some(rows);
+        self.last_paint = None;
+        self.needs_paint = true;
+    }
+
+    pub fn clear_shell_overlay(&mut self) {
+        self.shell_overlay = None;
+        self.last_paint = None;
+        self.needs_paint = true;
+    }
+
     /// Set (or clear, with `None`) the rewind-mode list-picker overlay. The
     /// file-completion picker syncs itself from the input editor in
     /// `draw_bottom`; the rewind picker lives outside the editor, so its flow
@@ -1213,17 +1352,29 @@ impl Renderer {
     }
 
     fn terminal_size(&self) -> (u16, u16) {
+        #[cfg(test)]
+        if let Some(cols) = self.test_cols {
+            return (cols, 24);
+        }
         crate::ui::terminal::tty_size()
     }
 
-    /// Width chat text wraps to before pushing into the buffer. Uses
-    /// the *capped* `content_width()` (120 cols max) so wide terminals
-    /// don't grow scrollback past the centered band into the
-    /// divider/panel margin. Previously aliased `line_width()` which
-    /// returns the raw band width and ignored the 120-col cap —
-    /// chat overflowed the documented content area on wide terminals.
-    fn max_line_width(&self) -> usize {
-        self.content_width()
+    /// Test-only: force the reported terminal width so width-dependent paths
+    /// (wrap, `content_width`, reflow) can be exercised at a chosen size.
+    #[cfg(test)]
+    pub(crate) fn set_test_cols(&mut self, cols: u16) {
+        self.test_cols = Some(cols);
+    }
+
+    /// Width chat text wraps to before pushing into the buffer. Matches
+    /// the painted chat band (`chat_band_width`) minus the 1-col right
+    /// margin `ChatPane` reserves, so chat text fills the band to the
+    /// right │ exactly like the chamber boxes — no capped-then-padded
+    /// dead zone on wide terminals. When side panels are visible the band
+    /// is itself capped (panels take the gutter), so this still honors
+    /// the readability cap in that mode.
+    pub(crate) fn max_line_width(&self) -> usize {
+        self.chat_band_width().saturating_sub(1).max(1)
     }
 
     /// The display width the compose buffer is soft-wrapped to in the
@@ -1246,9 +1397,33 @@ impl Renderer {
 
     /// Target width for chat content. Caps at 120 cols so wide
     /// terminals don't stretch chambers + chat lines into sprawling
-    /// rivers of text. Matches the cap used by tool chambers.
+    /// rivers of text. Still drives `content_indent` (centering) and,
+    /// through it, side-panel visibility — so this MUST stay capped even
+    /// though chamber/chat rendering now spans the full band (see
+    /// `chat_band_width`).
     pub fn content_width(&self) -> usize {
         self.line_width().min(120)
+    }
+
+    /// Width of the chat band actually painted by `ChatPane`, i.e.
+    /// `Layout::chat.width` for the current terminal + panel visibility.
+    /// Unlike `content_width` this is NOT capped at 120 and reclaims the
+    /// gutter of any hidden side panel — so it matches the real paint
+    /// rect. Chamber boxes and chat text wrap to this so they span to the
+    /// right │ instead of stopping at a capped width and leaving a dead
+    /// band on the right (where stale glyphs showed). The horizontal
+    /// layout depends only on `cols` + panel flags, so the rows/input
+    /// args are placeholders (dirge: chamber-width fix).
+    pub fn chat_band_width(&self) -> usize {
+        let (cols, _) = self.terminal_size();
+        let layout = crate::ui::tui::layout::Layout::with_panels(
+            cols,
+            1,
+            1,
+            self.left_panel_visible(),
+            self.right_panel_visible(),
+        );
+        layout.chat.width as usize
     }
 
     /// Left padding in columns to horizontally center the chat
@@ -1278,6 +1453,48 @@ impl Renderer {
     pub fn replace_from(&mut self, start: usize, lines: Vec<LineEntry>) {
         self.commit_partial();
         let old_len = self.buffer.len();
+        let start = start.min(old_len);
+        // dirge-qy3y: keep `source` a faithful mirror of `buffer` so `rebuild`
+        // (resize reflow) reproduces this. Drop whole source blocks past the
+        // boundary at/under `start`; capture any kept partial-block tail and
+        // the incoming `lines` as non-reflowing `Raw` blocks (this primitive's
+        // callers — modal editors, pickers, collapsed chambers — re-render
+        // their own content, so it needn't reflow). The streamed register uses
+        // `stream`, not this, so it still reflows as markdown.
+        // Cached row counts only — NO re-render here. `replace_from` runs per
+        // keystroke in modal sub-loops, so an O(scrollback) markdown re-parse
+        // would lag typing.
+        let mut acc = 0usize;
+        let mut keep_blocks = 0usize;
+        for b in &self.source {
+            if acc + b.rows <= start {
+                acc += b.rows;
+                keep_blocks += 1;
+            } else {
+                break;
+            }
+        }
+        let carry: Vec<LineEntry> = self.buffer[acc..start].to_vec();
+        self.source.truncate(keep_blocks);
+        if !carry.is_empty() {
+            let rows = carry.len();
+            self.source.push(Block {
+                src: SourceBlock::Raw { rows: carry },
+                rows,
+            });
+        }
+        if !lines.is_empty() {
+            self.source.push(Block {
+                src: SourceBlock::Raw {
+                    rows: lines.clone(),
+                },
+                rows: lines.len(),
+            });
+        }
+        // A tail replace ends any open streamed block (its rows are now part of
+        // the captured prefix).
+        self.streaming = false;
+        self.open_rows = 0;
         self.buffer.truncate(start);
         self.buffer.extend(lines);
         let new_len = self.buffer.len();
@@ -1447,18 +1664,46 @@ impl Renderer {
                 }
             }
         } else {
-            if let Some(chars) = row_clean(start.0) {
-                let lo = start.1.min(chars.len());
-                result.extend(&chars[lo..]);
-            }
-            for i in (start.0 + 1)..end.0 {
-                result.push('\n');
-                if let Some(chars) = row_clean(i) {
-                    let s: String = chars.into_iter().collect();
-                    result.push_str(&s);
+            // Join rows the renderer soft-wrapped back into one line so
+            // prose copies as a single line (dirge-el8o). `word_wrap`
+            // keeps the breaking space on the PRIOR row, so a row whose
+            // predecessor ends in whitespace is a wrap continuation —
+            // append it with no separator. A predecessor that ends
+            // without whitespace is a real line break (paragraph break,
+            // blank line, or hard newline) and keeps its newline.
+            let start_chars = row_clean(start.0);
+            let start_content: String = match &start_chars {
+                Some(chars) => {
+                    let lo = start.1.min(chars.len());
+                    chars[lo..].iter().collect()
                 }
+                None => String::new(),
+            };
+            // Base the wrap-continuation test on the FULL row's last
+            // visible char, not just the selected suffix, so a selection
+            // that begins at the very end of a wrapped row still joins
+            // (the suffix would be empty and lose the trailing space).
+            let mut prev_ended_ws = start_chars
+                .as_ref()
+                .and_then(|chars| chars.last())
+                .is_some_and(|c| c.is_whitespace());
+            result.push_str(&start_content);
+
+            for i in (start.0 + 1)..end.0 {
+                let content: String = match row_clean(i) {
+                    Some(chars) => chars.into_iter().collect(),
+                    None => String::new(),
+                };
+                if !prev_ended_ws {
+                    result.push('\n');
+                }
+                prev_ended_ws = content.chars().next_back().is_some_and(char::is_whitespace);
+                result.push_str(&content);
             }
-            result.push('\n');
+
+            if !prev_ended_ws {
+                result.push('\n');
+            }
             if let Some(chars) = row_clean(end.0) {
                 let hi = end.1.min(chars.len());
                 result.extend(&chars[..hi]);
@@ -1488,6 +1733,9 @@ impl Renderer {
         if !self.partial.is_empty() {
             let max_width = self.max_line_width();
             let c = self.partial_color;
+            // dirge-qy3y: record the flushed partial as a source block so it
+            // reflows on resize like any other committed line.
+            let text = self.partial.to_string();
             for chunk in self.wrap_line(&self.partial, max_width) {
                 self.push_buffer_line(LineEntry {
                     text: chunk,
@@ -1495,7 +1743,207 @@ impl Renderer {
                 });
             }
             self.partial.clear();
+            let block = SourceBlock::Plain { text, color: c };
+            let rows = self.render_block(&block).len();
+            self.source.push(Block { src: block, rows });
+            self.enforce_cap();
         }
+    }
+
+    /// dirge-qy3y: render one source block to wrapped rows at the CURRENT
+    /// width. The inverse direction of an append — used to (re)derive
+    /// `buffer` from `source` in `rebuild` and `enforce_cap`.
+    fn render_block(&self, block: &SourceBlock) -> Vec<LineEntry> {
+        match block {
+            SourceBlock::Plain { text, color } => {
+                // `wrap_line` -> `soft_wrap` already splits on `\n` and yields a
+                // single empty row for an empty line, matching `write_line`.
+                self.wrap_line(text, self.max_line_width())
+                    .into_iter()
+                    .map(|t| LineEntry {
+                        text: t,
+                        color: *color,
+                    })
+                    .collect()
+            }
+            SourceBlock::Markdown {
+                src,
+                base_color,
+                handle,
+            } => {
+                // The streamed register reserves the 8-col "<dirge> " handle
+                // + 1 space on the first row, matching `render_agent_stream`.
+                let w = if *handle {
+                    self.content_width().saturating_sub(9)
+                } else {
+                    self.content_width()
+                };
+                let mut styled = crate::ui::markdown::markdown_to_styled(src, w, *base_color);
+                if *handle && !styled.is_empty() {
+                    styled[0].text = CompactString::from(format!("<dirge> {}", styled[0].text));
+                }
+                styled
+            }
+            SourceBlock::Raw { rows } => rows.clone(),
+        }
+    }
+
+    /// dirge-qy3y: append a committed source block and its rendered rows.
+    /// Seals any open streamed block first so block order matches buffer
+    /// order.
+    fn append_source_block(&mut self, block: SourceBlock) {
+        self.commit_stream();
+        let rendered = self.render_block(&block);
+        let rows = rendered.len();
+        for row in rendered {
+            self.push_buffer_line(row);
+        }
+        self.source.push(Block { src: block, rows });
+        self.enforce_cap();
+    }
+
+    /// dirge-qy3y: update the open in-flight streamed block (or open a new
+    /// one) with the full accumulated `src`, re-rendering its rows at the
+    /// buffer tail. This is the source-tracked equivalent of the old
+    /// `render_agent_stream` -> `replace_from(start_line, …)` path: the open
+    /// block is always the last region of the buffer, so a resize can rebuild
+    /// it like any other block.
+    pub fn stream(&mut self, src: &str, base_color: Color, handle: bool) {
+        self.commit_partial();
+        let block = SourceBlock::Markdown {
+            src: src.to_string(),
+            base_color,
+            handle,
+        };
+        let rows = self.render_block(&block);
+        // Replace the open block's current rows (if any) at the tail.
+        let start =
+            self.buffer
+                .len()
+                .saturating_sub(if self.streaming { self.open_rows } else { 0 });
+        let old_len = self.buffer.len();
+        self.buffer.truncate(start);
+        self.buffer.extend(rows.iter().cloned());
+        let entry = Block {
+            src: block,
+            rows: rows.len(),
+        };
+        if self.streaming {
+            // Update the open block in place.
+            if let Some(last) = self.source.last_mut() {
+                *last = entry;
+            } else {
+                self.source.push(entry);
+            }
+        } else {
+            self.source.push(entry);
+            self.streaming = true;
+        }
+        self.open_rows = rows.len();
+        self.lines = self.buffer.len() as u16;
+        self.col = 0;
+        self.partial.clear();
+        let new_len = self.buffer.len();
+        self.anchor_after_resize_delta(old_len, new_len);
+        self.needs_paint = true;
+    }
+
+    /// dirge-qy3y: seal the open streamed block (no-op when not streaming).
+    /// The block stays in `source`; subsequent appends start after it.
+    pub fn commit_stream(&mut self) {
+        if self.streaming {
+            self.streaming = false;
+            self.open_rows = 0;
+            self.enforce_cap();
+        }
+    }
+
+    /// dirge-qy3y: keep the scroll view anchored to the same content when a
+    /// tail re-render changes the buffer length (mirrors the old
+    /// `replace_from` logic).
+    fn anchor_after_resize_delta(&mut self, old_len: usize, new_len: usize) {
+        let visible = self.visible_lines();
+        let max_offset = new_len.saturating_sub(visible);
+        if self.scroll_offset > 0 {
+            let delta = new_len as isize - old_len as isize;
+            let new_offset = (self.scroll_offset as isize + delta).max(0) as usize;
+            self.scroll_offset = new_offset.min(max_offset);
+        } else if self.scroll_offset > max_offset {
+            self.scroll_offset = max_offset;
+        }
+    }
+
+    /// dirge-qy3y: block-granular scrollback cap. Drops whole front source
+    /// blocks (never the open streamed tail) and the matching rows so
+    /// `source` and `buffer` stay in lockstep.
+    fn enforce_cap(&mut self) {
+        const MAX_SCROLLBACK: usize = 20_000;
+        if self.buffer.len() <= MAX_SCROLLBACK {
+            return;
+        }
+        let mut dropped_rows = 0usize;
+        loop {
+            if self.buffer.len() - dropped_rows.min(self.buffer.len()) <= MAX_SCROLLBACK {
+                break;
+            }
+            let sealed = if self.streaming {
+                self.source.len().saturating_sub(1)
+            } else {
+                self.source.len()
+            };
+            if sealed == 0 {
+                break;
+            }
+            dropped_rows += self.source[0].rows;
+            self.source.remove(0);
+        }
+        if dropped_rows == 0 {
+            return;
+        }
+        let dropped_rows = dropped_rows.min(self.buffer.len());
+        self.buffer.drain(..dropped_rows);
+        // Front eviction shifts every absolute index down — invalidate any
+        // held line anchor (see `eviction_generation`).
+        self.eviction_generation = self.eviction_generation.wrapping_add(1);
+        if let Some(s) = self.selection_start.as_mut() {
+            s.0 = s.0.saturating_sub(dropped_rows);
+        }
+        if let Some(e) = self.selection_end.as_mut() {
+            e.0 = e.0.saturating_sub(dropped_rows);
+        }
+        let visible = self.visible_lines();
+        let max_offset = self.buffer.len().saturating_sub(visible);
+        if self.scroll_offset > max_offset {
+            self.scroll_offset = max_offset;
+        }
+    }
+
+    /// dirge-qy3y: regenerate `buffer` from `source` at the current width.
+    /// Called on terminal resize so scrollback — markdown tables especially —
+    /// reflows to the new width instead of keeping its original wrap. The
+    /// scroll anchor (lines-from-bottom) is preserved across the rebuild.
+    pub fn rebuild(&mut self) {
+        let old_len = self.buffer.len();
+        let mut blocks = std::mem::take(&mut self.source);
+        let mut buffer = Vec::new();
+        let mut open_rows = 0usize;
+        let last = blocks.len().saturating_sub(1);
+        for (i, block) in blocks.iter_mut().enumerate() {
+            let rows = self.render_block(&block.src);
+            block.rows = rows.len();
+            if self.streaming && i == last {
+                open_rows = rows.len();
+            }
+            buffer.extend(rows);
+        }
+        self.source = blocks;
+        self.buffer = buffer;
+        self.open_rows = if self.streaming { open_rows } else { 0 };
+        self.lines = self.buffer.len() as u16;
+        let new_len = self.buffer.len();
+        self.anchor_after_resize_delta(old_len, new_len);
+        self.enforce_cap();
+        self.needs_paint = true;
     }
 
     /// Append a line to the scrollback buffer. If the user is currently
@@ -1505,47 +1953,10 @@ impl Renderer {
     /// indices) is unaffected.
     fn push_buffer_line(&mut self, entry: LineEntry) {
         self.buffer.push(entry);
-        // Audit M10: scrollback was unbounded. A long session with
-        // verbose tool output (large `grep`, repeated test runs,
-        // streaming logs) could grow `buffer` until it OOM'd the
-        // process. Cap at MAX_SCROLLBACK lines; when exceeded, drop
-        // the oldest in a single drain (cheap relative to the
-        // per-line push cost, and only fires once per overflow
-        // batch). Drain in chunks of MAX/8 so we don't shift on
-        // every push once at-cap. Selection indices use absolute
-        // line positions; adjust selection_start / selection_end /
-        // scroll_offset by the eviction count so the user's
-        // visible state remains anchored to the same content.
-        const MAX_SCROLLBACK: usize = 20_000;
-        const DRAIN_CHUNK: usize = MAX_SCROLLBACK / 8;
-        if self.buffer.len() > MAX_SCROLLBACK {
-            let drop_n = DRAIN_CHUNK;
-            self.buffer.drain(..drop_n);
-            // Front eviction shifts every absolute index down — invalidate
-            // any held line anchor (see `eviction_generation`).
-            self.eviction_generation = self.eviction_generation.wrapping_add(1);
-            // Adjust absolute line indices used by selection +
-            // scrolling. `lines` field tracks the same counter
-            // used by selection_indices_stay_absolute_under_streaming_appends
-            // — leave it as a count rather than rebasing, but DO
-            // rebase selection so it points at the same surviving
-            // content.
-            let shift = drop_n;
-            if let Some(s) = self.selection_start.as_mut() {
-                s.0 = s.0.saturating_sub(shift);
-            }
-            if let Some(e) = self.selection_end.as_mut() {
-                e.0 = e.0.saturating_sub(shift);
-            }
-            // scroll_offset is measured from the BOTTOM, so eviction
-            // from the front doesn't change it. But if the user was
-            // scrolled into the now-evicted region, clamp.
-            let visible = self.visible_lines();
-            let max_offset = self.buffer.len().saturating_sub(visible);
-            if self.scroll_offset > max_offset {
-                self.scroll_offset = max_offset;
-            }
-        }
+        // dirge-qy3y: scrollback cap moved to `enforce_cap` (block-granular,
+        // keeps `source` and `buffer` in lockstep). Callers that append a
+        // committed region (`write_line`, `commit_partial`, `commit_stream`)
+        // run `enforce_cap` after.
         if self.scroll_offset > 0 {
             let visible = self.visible_lines();
             let max_offset = self.buffer.len().saturating_sub(visible);
@@ -1633,22 +2044,42 @@ impl Renderer {
 
     pub fn write_line(&mut self, text: &str, color: Color) -> io::Result<()> {
         self.commit_partial();
-        let max_width = self.max_line_width();
-        for segment in text.split('\n') {
-            let wrapped = self.wrap_line(segment, max_width);
-            for chunk in &wrapped {
-                self.push_buffer_line(LineEntry {
-                    text: chunk.clone(),
-                    color,
-                });
-            }
+        // dirge-qy3y: record as a width-independent source block (which renders
+        // + appends the wrapped rows and seals any open stream) so it reflows
+        // on resize. push_buffer_line still gates needs_paint on being at the
+        // bottom, matching prior behavior.
+        self.append_source_block(SourceBlock::Plain {
+            text: text.to_string(),
+            color,
+        });
+        Ok(())
+    }
+
+    /// dirge-qy3y: append PRE-FORMATTED rows that must NOT be re-wrapped on
+    /// resize — tool-chamber borders/rows already laid out to a fixed inner
+    /// width. Stored as a `Raw` block so `rebuild` reproduces them verbatim
+    /// (they don't re-box yet — future work — but they don't wrap-break on a
+    /// narrowing resize either). One buffer row per `\n`-split line, so the
+    /// chamber's `buffer_len()` index bookkeeping is unchanged vs `write_line`.
+    pub fn write_line_raw(&mut self, text: &str, color: Color) -> io::Result<()> {
+        self.commit_partial();
+        self.commit_stream();
+        let rows: Vec<LineEntry> = text
+            .split('\n')
+            .map(|l| LineEntry {
+                text: CompactString::from(l),
+                color,
+            })
+            .collect();
+        let n = rows.len();
+        for row in &rows {
+            self.push_buffer_line(row.clone());
         }
-        // #387: defer paint. Mark dirty only when at the bottom (scrolled-up
-        // views don't auto-jump on new content, matching prior behavior);
-        // the loop's render effect flushes once per event.
-        if self.scroll_offset == 0 {
-            self.needs_paint = true;
-        }
+        self.source.push(Block {
+            src: SourceBlock::Raw { rows },
+            rows: n,
+        });
+        self.enforce_cap();
         Ok(())
     }
 
@@ -1719,6 +2150,9 @@ impl Renderer {
 
     pub fn clear_content(&mut self) -> io::Result<()> {
         self.buffer.clear();
+        self.source.clear();
+        self.streaming = false;
+        self.open_rows = 0;
         self.partial.clear();
         self.scroll_offset = 0;
         self.clear_selection();

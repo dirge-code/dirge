@@ -76,7 +76,7 @@ pub struct Args {
     content: Option<String>,
     old_text: Option<String>,
     /// UMP memory kind (types.ts:8-13). One of: semantic, episodic,
-    /// procedural, working, identity. Defaults to "procedural".
+    /// procedural, working, identity, overview. Defaults to "procedural".
     #[serde(default = "default_kind")]
     kind: Option<String>,
     /// Full-text query for the `search` action (dirge-q8wt).
@@ -142,7 +142,7 @@ SAVE WHEN: the user corrects you or says "remember this"; you discover build/tes
 
 TARGETS: "memory" (facts, conventions, build, architecture), "pitfalls" (anti-patterns, things tried and failed).
 
-KINDS (optional, default "procedural"): semantic (fact), episodic (event), procedural (rule), working (short-lived), identity (user/agent).
+KINDS (optional, default "procedural"): semantic (fact), episodic (event), procedural (rule), working (short-lived), identity (user/agent), overview (singular project orientation; adding one replaces it).
 
 ACTIONS:
 - view: inline entries + breadcrumb index for a target
@@ -183,7 +183,7 @@ old_text matches a unique substring or the exact "urn:ump:…" id from view/inde
                         },
                         "kind": {
                             "type": "string",
-                            "enum": ["semantic", "episodic", "procedural", "working", "identity"],
+                            "enum": ["semantic", "episodic", "procedural", "working", "identity", "overview"],
                             "description": "The UMP memory kind. Defaults to 'procedural'. See KINDS above."
                         },
                         "scope": {

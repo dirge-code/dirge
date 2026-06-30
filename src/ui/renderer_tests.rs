@@ -296,7 +296,7 @@ fn fresh_with_lines_scrollable(n: usize, min_scroll_margin: usize) -> Renderer {
     let need = (visible + min_scroll_margin).max(n);
     for i in 0..need {
         r.buffer.push(LineEntry {
-            text: CompactString::new(&format!("line {i}")),
+            text: CompactString::new(format!("line {i}")),
             color: Color::White,
         });
     }
@@ -340,7 +340,7 @@ fn regression_scrolled_up_view_stays_anchored_through_appends() {
     // Stream in 8 new lines while the user is scrolled up.
     for i in 0..8 {
         r.push_buffer_line(LineEntry {
-            text: CompactString::new(&format!("new {i}")),
+            text: CompactString::new(format!("new {i}")),
             color: Color::White,
         });
     }
@@ -371,7 +371,7 @@ fn regression_replace_from_keeps_view_anchored_when_scrolled_up() {
     let repl_start = total.saturating_sub(10);
     let new_lines: Vec<LineEntry> = (0..20)
         .map(|i| LineEntry {
-            text: CompactString::new(&format!("repl {i}")),
+            text: CompactString::new(format!("repl {i}")),
             color: Color::White,
         })
         .collect();
@@ -390,7 +390,7 @@ fn regression_replace_from_keeps_view_anchored_when_scrolled_up() {
     let repl_start = total.saturating_sub(8);
     let shorter: Vec<LineEntry> = (0..3)
         .map(|i| LineEntry {
-            text: CompactString::new(&format!("sh {i}")),
+            text: CompactString::new(format!("sh {i}")),
             color: Color::White,
         })
         .collect();
@@ -412,7 +412,7 @@ fn at_bottom_view_follows_new_content() {
 
     for i in 0..5 {
         r.push_buffer_line(LineEntry {
-            text: CompactString::new(&format!("new {i}")),
+            text: CompactString::new(format!("new {i}")),
             color: Color::White,
         });
     }
@@ -440,7 +440,7 @@ fn selection_indices_stay_absolute_under_streaming_appends() {
 
     for i in 0..7 {
         r.push_buffer_line(LineEntry {
-            text: CompactString::new(&format!("new {i}")),
+            text: CompactString::new(format!("new {i}")),
             color: Color::White,
         });
     }
@@ -586,6 +586,81 @@ fn selected_text_strips_ansi_escapes() {
     r.selection_end = Some((0, 15));
     r.selection_start = Some((0, 6));
     assert_eq!(r.selected_text(), Some("red world".to_string()));
+}
+
+/// dirge-el8o: prose the renderer soft-wrapped across several display
+/// rows must copy back as ONE line. `word_wrap` keeps the breaking
+/// space on the prior row (chunks look like `["the quick ", "brown
+/// fox ", "jumps"]`), so a continuation row — one whose predecessor
+/// ends in whitespace — joins with no separator instead of a newline.
+#[test]
+fn selected_text_joins_soft_wrapped_rows() {
+    let mut r = fresh_with_text(&["the quick ", "brown fox ", "jumps"]);
+    r.selection_active = true;
+    r.selection_start = Some((0, 0));
+    r.selection_end = Some((2, 5));
+    assert_eq!(
+        r.selected_text(),
+        Some("the quick brown fox jumps".to_string())
+    );
+}
+
+/// A real line break — a row that does NOT end in whitespace — keeps
+/// its newline. Paragraph structure (and the blank line between
+/// paragraphs) survives the copy.
+#[test]
+fn selected_text_keeps_hard_newlines_and_blanks() {
+    let mut r = fresh_with_text(&["para one ", "wraps here", "", "next para"]);
+    r.selection_active = true;
+    r.selection_start = Some((0, 0));
+    r.selection_end = Some((3, 9));
+    assert_eq!(
+        r.selected_text(),
+        Some("para one wraps here\n\nnext para".to_string())
+    );
+}
+
+/// End-to-end: a paragraph wrapped by the REAL markdown path
+/// (`markdown_to_styled` → `word_wrap`) copies back as the original
+/// prose. Guards the join against changes to how wrapping splits.
+#[test]
+fn selected_text_joins_real_wrapped_markdown() {
+    let prose = "the quick brown fox jumps over the lazy dog again and again";
+    let mut styled = crate::ui::markdown::markdown_to_styled(prose, 20, Color::White);
+    // Drop any trailing blank row the renderer may append after the
+    // paragraph so the selection ends on real content.
+    while styled
+        .last()
+        .is_some_and(|e| crate::ui::ansi::strip_ansi(&e.text).trim().is_empty())
+    {
+        styled.pop();
+    }
+    assert!(styled.len() > 1, "prose should wrap to multiple rows");
+    let last = styled.len() - 1;
+    let last_len = crate::ui::ansi::strip_ansi(&styled[last].text)
+        .chars()
+        .count();
+    let mut r = Renderer::new().unwrap();
+    r.buffer.clear();
+    for e in styled {
+        r.buffer.push(e);
+    }
+    r.selection_active = true;
+    r.selection_start = Some((0, 0));
+    r.selection_end = Some((last, last_len));
+    assert_eq!(r.selected_text(), Some(prose.to_string()));
+}
+
+/// The join decision is made per-boundary: a partial first row still
+/// counts as ending in whitespace, and the head of the final row is
+/// appended without a leading newline when its predecessor wrapped.
+#[test]
+fn selected_text_join_respects_partial_rows() {
+    let mut r = fresh_with_text(&["xxthe quick ", "brown foxyy"]);
+    r.selection_active = true;
+    r.selection_start = Some((0, 2)); // skip "xx"
+    r.selection_end = Some((1, 9)); // up to "brown fox"
+    assert_eq!(r.selected_text(), Some("the quick brown fox".to_string()));
 }
 
 /// `buffer_pos_at` clamps char_col to the line's length so dragging
@@ -1050,4 +1125,119 @@ fn eviction_generation_bumps_when_scrollback_overflows() {
         r.eviction_generation() >= 1,
         "front eviction must bump the generation"
     );
+}
+
+// ── dirge-qy3y: scrollback reflow on resize ─────────────────────────
+
+/// Plain text re-wraps to a new width when the buffer is rebuilt from its
+/// source blocks, and rebuilding back at the original width reproduces the
+/// original wrap exactly.
+#[test]
+fn rebuild_reflows_plain_text_to_new_width() {
+    let mut r = Renderer::new().expect("renderer");
+    r.set_test_cols(40);
+    let long = "the quick brown fox jumps over the lazy dog and then keeps on running very far";
+    r.write_line(long, Color::White).unwrap();
+    let wide_rows = r.buffer_len();
+
+    r.set_test_cols(20);
+    r.rebuild();
+    let narrow_rows = r.buffer_len();
+    assert!(
+        narrow_rows > wide_rows,
+        "narrower width must wrap into more rows: {wide_rows} -> {narrow_rows}",
+    );
+
+    r.set_test_cols(40);
+    r.rebuild();
+    assert_eq!(
+        r.buffer_len(),
+        wide_rows,
+        "rebuild at the original width reproduces the original wrap",
+    );
+}
+
+/// A committed markdown table reflows its column layout to a narrower width
+/// on rebuild (the bug report: tables kept their first-render widths).
+#[test]
+fn rebuild_reflows_markdown_table() {
+    use unicode_width::UnicodeWidthStr;
+    let mut r = Renderer::new().expect("renderer");
+    r.set_test_cols(70);
+    let table = "| name | description |\n|---|---|\n| alpha | the first item here |\n| beta | a second item over there |";
+    r.stream(table, Color::White, false);
+    r.commit_stream();
+    let wide_max = r
+        .buffer_lines()
+        .iter()
+        .map(|l| UnicodeWidthStr::width(*l))
+        .max()
+        .unwrap_or(0);
+
+    r.set_test_cols(34);
+    r.rebuild();
+    let narrow_max = r
+        .buffer_lines()
+        .iter()
+        .map(|l| UnicodeWidthStr::width(*l))
+        .max()
+        .unwrap_or(0);
+
+    assert!(
+        narrow_max < wide_max,
+        "table must reflow to a smaller max row width: {wide_max} -> {narrow_max}",
+    );
+    // content_width at 34 cols = min(34-2, 120) = 32.
+    assert!(
+        narrow_max <= 32,
+        "reflowed table rows must fit the new content width (<=32), got {narrow_max}",
+    );
+}
+
+/// The strong invariant the whole design rests on: at a fixed width, the
+/// derived `buffer` equals a rebuild from `source` — so `source` is a
+/// faithful mirror of `buffer` across plain, markdown, and interleaved
+/// content.
+#[test]
+fn rebuild_is_idempotent_at_same_width() {
+    let mut r = Renderer::new().expect("renderer");
+    r.set_test_cols(50);
+    r.write_line("hello world", Color::White).unwrap();
+    r.stream(
+        "# Heading\n\nsome **bold** prose that runs on",
+        Color::White,
+        true,
+    );
+    r.commit_stream();
+    r.write_line("trailing status line", Color::White).unwrap();
+
+    let before: Vec<String> = r.buffer_lines().iter().map(|s| s.to_string()).collect();
+    r.rebuild();
+    let after: Vec<String> = r.buffer_lines().iter().map(|s| s.to_string()).collect();
+    assert_eq!(
+        before, after,
+        "rebuild at the same width must reproduce the buffer exactly",
+    );
+}
+
+/// Pre-formatted chamber rows (recorded via `write_line_raw` as `Raw` blocks)
+/// must NOT re-wrap on a narrowing rebuild — they're preserved verbatim so the
+/// box borders don't fracture (a `Plain` block of the same text would wrap).
+#[test]
+fn raw_rows_do_not_rewrap_on_narrowing() {
+    let mut r = Renderer::new().expect("renderer");
+    r.set_test_cols(80);
+    let row = format!("│ {} │", "x".repeat(60));
+    r.write_line_raw(&row, Color::White).unwrap();
+    let before = r.buffer_len();
+    assert_eq!(before, 1, "one raw row");
+
+    r.set_test_cols(30);
+    r.rebuild();
+    assert_eq!(
+        r.buffer_len(),
+        1,
+        "raw row must stay a single row after narrowing (no border-fracturing re-wrap)",
+    );
+    assert_eq!(r.buffer_lines()[0], row, "raw row preserved verbatim");
 }

@@ -381,6 +381,53 @@ mod tests {
         assert!(result.contains("A2"));
     }
 
+    // Partial answers (user Esc on Q2 after answering Q1) must preserve
+    // what was answered and mark the rest [no answer], not error.
+    #[tokio::test]
+    async fn partial_answers_preserve_answered_questions() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let tool = QuestionTool::new(tx);
+
+        let args = QuestionArgs {
+            questions: vec![
+                QuestionItem {
+                    question: "Q1".to_string(),
+                    header: None,
+                    options: vec![QuestionOption {
+                        label: "A1".to_string(),
+                        description: "".to_string(),
+                    }],
+                    multi_select: None,
+                    custom: false,
+                },
+                QuestionItem {
+                    question: "Q2".to_string(),
+                    header: None,
+                    options: vec![QuestionOption {
+                        label: "A2".to_string(),
+                        description: "".to_string(),
+                    }],
+                    multi_select: None,
+                    custom: false,
+                },
+            ],
+        };
+
+        let handle = tokio::spawn(async move { tool.call(args).await });
+
+        let req = rx.recv().await.unwrap();
+        // Only Q1 answered — Q2 escaped
+        let _ = req
+            .reply
+            .send(QuestionResponse::Answered(vec![vec!["A1".to_string()]]));
+
+        let result = handle.await.unwrap().unwrap();
+        assert!(result.contains("**Q1:** Q1"));
+        assert!(result.contains("**A:** A1"));
+        assert!(result.contains("**Q2:** Q2"));
+        assert!(result.contains("**A:** [no answer]"));
+    }
+
     // Header text must be emitted as a markdown `## …` heading so the agent
     // sees structured output rather than a flat blob.
     #[tokio::test]

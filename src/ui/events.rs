@@ -229,11 +229,14 @@ pub fn render_session(
             // a bare `<dirge>` handle with nothing after it on reload.
             if !msg.content.is_empty() {
                 // Wrap chat to the same width tool chambers use so chat
-                // and chamber blocks line up visually. The 8-col handle
-                // prefix is subtracted so wrapped continuation text fits
-                // beneath the handle position.
+                // and chamber blocks line up visually. Mirrors the live
+                // chat wrap (`chat_band_width - 1`) so a reloaded session
+                // matches what was on screen. The 8-col handle prefix is
+                // subtracted so wrapped continuation text fits beneath the
+                // handle position.
                 let max_width = renderer
-                    .content_width()
+                    .chat_band_width()
+                    .saturating_sub(1)
                     .saturating_sub(handle.chars().count() + 1);
                 let mut styled = markdown::markdown_to_styled(&msg.content, max_width, line_color);
                 for (i, entry) in styled.iter_mut().enumerate() {
@@ -297,7 +300,7 @@ pub(crate) fn render_tool_calls_replay(
         let (frame_w, _) = chamber_widths(renderer);
         let header = fit_banner_header(&tc.name.to_ascii_uppercase(), &banner_value, frame_w);
         renderer.write_line("", Color::Reset)?;
-        renderer.write_line(&header, theme::tool())?;
+        renderer.write_line_raw(&header, theme::tool())?;
         // Body mirrors `convert_history`'s state→text mapping so the replayed
         // chamber matches what the model re-sees on resume.
         let body = match &tc.state {

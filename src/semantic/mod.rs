@@ -65,6 +65,9 @@ impl SemanticManager {
         #[cfg(feature = "semantic-elixir")]
         adapters.push(Box::new(adapters::ElixirAdapter));
 
+        #[cfg(feature = "semantic-sql")]
+        adapters.push(Box::new(adapters::SqlAdapter));
+
         #[cfg(feature = "semantic-dafny")]
         adapters.push(Box::new(adapters::DafnyAdapter));
 

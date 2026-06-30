@@ -15,6 +15,26 @@
 #   → C function (src/dap/janet_bindings.rs) → DAP_TX channel
 #   → tokio bridge task → DapSessionManager (src/dap/session.rs)
 #   → DapClient (src/dap/client.rs) → real adapter process
+#
+# ── DAP workflow with debugpy ─────────────────────────────────────────
+#
+# Launch a script:
+#   (dap/launch "test_program.py" "debugpy")
+#
+# Launch a package (python -m <module>):
+#   (dap/launch-module "test_mod" "debugpy")
+#
+# Launch pytest with xdist and a single test:
+#   (dap/launch-module "pytest" "debugpy")
+#   Then send args via dap/run-in-terminal, or pre-configure
+#   in the launch request's `args` field:
+#     (dap/launch-module "pytest" "debugpy" ["-n4" "tests/test_foo.py::test_bar"])
+#
+# Then set breakpoints, continue, inspect:
+#   (dap/bp "source_file.py" 142)
+#   (dap/continue)
+#   (dap/stack-trace)
+#   (dap/eval "response.status_code")
 
 (def hooks ["on-prompt"])
 
@@ -44,13 +64,24 @@
                      (dap/launch file)))
           (or res "launch failed — check adapter"))))
 
+    "launch-module" (do
+      (def module (get parts 1))
+      (def adapter (get parts 2))
+      (if (not module)
+        "usage: launch-module <module> [adapter]"
+        (do
+          (def res (if adapter
+                     (dap/launch-module module adapter)
+                     (dap/launch-module module)))
+          (or res "launch-module failed — check adapter"))))
+
     "attach" (do
       (def pid-str (get parts 1))
       (def adapter (get parts 2))
       (if (not pid-str)
         "usage: attach <pid> [adapter]"
         (do
-          (def pid (math/parse-int pid-str))
+          (def pid (scan-number pid-str))
           (if (not pid)
             (string "invalid pid: " pid-str)
             (do
@@ -111,8 +142,9 @@
     # Meta
     "help" "
 DAP REPL commands:
-  launch <file> [adapter]  Start debugging a program
-  attach <pid> [adapter]   Attach to a running process
+  launch <file> [adapter]    Start debugging a program
+  launch-module <mod> [adapter]  Launch via python -m <mod> (e.g. pytest)
+  attach <pid> [adapter]     Attach to a running process
   terminate                 End debug session
   c / continue              Resume execution
   n / next / step           Step over current line
@@ -168,8 +200,9 @@ DAP REPL commands:
       (harness/request-prompt "dap> ")
       "
 DAP REPL started. Commands:
-  launch <file> [adapter]   — start debugging
-  attach <pid> [adapter]    — attach to process
+  launch <file> [adapter]     — start debugging
+  launch-module <mod> [adapter] — launch via python -m (e.g. pytest)
+  attach <pid> [adapter]      — attach to process
   c/continue, n/next/step, s/step-in, fin/step-out
   p/eval <expr>, bt/backtrace, bp/break <file> <line>
   sessions, vars <ref>, terminate, q/quit

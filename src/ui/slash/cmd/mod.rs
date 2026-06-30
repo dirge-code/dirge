@@ -21,7 +21,9 @@ pub(crate) mod cd;
 pub(crate) mod clear;
 pub(crate) mod clone;
 pub(crate) mod fork;
+pub(crate) mod graph;
 pub(crate) mod help;
+pub(crate) mod issues;
 pub(crate) mod kill;
 #[cfg(feature = "mcp")]
 pub(crate) mod mcp;

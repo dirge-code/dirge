@@ -94,8 +94,12 @@
       (array/push packages (string (in parts 0) ": " (in parts 1)
                                    " → " (in parts 3)
                                    " (wanted: " (in parts 2) ")"))))
-  (if (empty? packages) "all up-to-date"
+  (def result (if (empty? packages) "all up-to-date"
     (string (length packages) " outdated:\n" (string/join packages "\n"))))
+  # Record outdated package entities for graph search (#393)
+  (each pkg packages
+    (harness/record-entity "package" pkg {}))
+  result)
 
 (defn- npm-compress-list [output]
   (def lines (string/split "\n" output))

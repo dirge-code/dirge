@@ -198,20 +198,48 @@ LLM-assigned tool-call id (`nil` outside handlers).
 
 ### Keyboard shortcuts
 
+A plugin can **add** a shortcut that runs its own code, and **override** a
+built-in binding (remap or unbind it).
+
 | Function | Signature | Effect |
 |----------|-----------|--------|
-| `harness/register-shortcut` | `(keys handler &opt description)` | Binds a key combination. The handler receives the matched key spec as its sole string arg. Returning a non-nil string surfaces as a chat line |
+| `harness/register-shortcut` | `(keys handler &opt description)` | Bind a key to plugin CODE. The handler receives the matched key spec as its sole string arg; returning a non-nil string surfaces as a chat line |
+| `harness/bind-key` | `(keys command)` | Bind a key (or chord sequence) to a BUILT-IN command name, or `"none"` to unbind a default |
 
-Key spec grammar (case-insensitive): `(modifier "-")* key-name`.
-Modifiers: `ctrl`, `control`, `alt`, `meta`, `shift`. Key names: a single
-character, `f1`..`f12`, or one of `enter`, `esc`, `tab`, `backspace`,
-`space`, `up`, `down`, `left`, `right`, `home`, `end`, `pageup`,
-`pagedown`, `delete`, `insert`.
+Use `register-shortcut` to run a Janet function on a key; use `bind-key`
+to remap one of dirge's built-in commands. `bind-key`'s `command` is any
+name from the global or input-editor tables in
+[config.md](config.md#key-bindings) (e.g. `scroll_to_top`,
+`cursor_line_start`), and `keys` may be an emacs-style sequence like
+`"ctrl-x ctrl-s"`.
 
-Reserved keys plugins cannot override: Ctrl+C, Ctrl+D, Esc, search and
-rewind picker keys, Ctrl+O, Ctrl+X, PageUp/PageDown/Home/End. Modifier
-matching is exact — `ctrl-x` and `ctrl-shift-x` are distinct bindings.
-Bad specs are dropped with a `tracing::warn`.
+Key spec grammar (case-insensitive): `(modifier "-")* key-name`, with one
+or more chords separated by whitespace for a sequence. Modifiers: `ctrl`,
+`control`, `alt`, `meta`, `shift`. Key names: a single character,
+`f1`..`f12`, or one of `enter`, `esc`, `tab`, `backspace`, `space`, `up`,
+`down`, `left`, `right`, `home`, `end`, `pageup`, `pagedown`, `delete`,
+`insert`.
+
+**Precedence:** built-in defaults < plugin `bind-key` < the user's
+`keybindings` config — the user always wins, so a `bind-key` is a default a
+user can still override. `register-shortcut` handlers dispatch after the
+built-in global commands but before the text input.
+
+Reserved keys neither form can override: Ctrl+C, Esc (the panic
+gesture), and the search / rewind picker keys. Modifier matching is exact —
+`ctrl-x` and `ctrl-shift-x` are distinct bindings. Bad specs are dropped
+with a `tracing::warn`.
+
+```janet
+# Remap a built-in: scroll to top with an emacs sequence, and disable the
+# default Ctrl+R reasoning toggle.
+(harness/bind-key "ctrl-x ctrl-t" "scroll_to_top")
+(harness/bind-key "ctrl-r" "none")
+
+# Bind a key to your own code.
+(defn my-handler [key] (string "you pressed " key))
+(harness/register-shortcut "f8" "my-handler" "Say hi")
+```
 
 ### Dialogs
 
@@ -395,6 +423,7 @@ In [`plugins/`](../plugins/):
 - `bookmark.janet` — `harness/append-entry` with a custom renderer.
 - `example_tool.janet` — `harness/register-tool` end-to-end.
 - `example_shortcut.janet` — `harness/register-shortcut`.
+- `example_bind_key.janet` — `harness/bind-key` (remap built-in commands).
 - `example_message_renderer.janet` — `harness/register-message-renderer`.
 - `turn_timing.janet` — `on-turn-start` / `on-turn-end` for telemetry.
 - `local_openai.janet` — `harness/register-provider` for a local LLM.

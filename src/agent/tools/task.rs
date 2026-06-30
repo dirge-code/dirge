@@ -997,6 +997,10 @@ mod tests {
     /// The test exercises the racer directly because `btw_query`
     /// requires a real provider. The racer is the same code path
     /// the production `call()` runs.
+    // Serialization guard: intentionally held across the test's `.await`s
+    // so the global abort registry isn't shared with a concurrently-
+    // running test.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn subagent_complete_after_kill_returns_aborted_result() {
         let _guard = registry_test_lock();

@@ -28,6 +28,23 @@ use super::{
     AnyAgent, AnyAgentInner, AnyClient, AnyModel, client, default_model_for_entry, summarize,
 };
 
+pub(crate) const ANTHROPIC_OAUTH_COMPACTION_DISABLED: &str = concat!(
+    "Anthropic OAuth is not used for compaction side-LLM calls; ",
+    "configure `summarization_provider` to a non-Anthropic-OAuth provider",
+);
+
+pub(crate) fn is_anthropic_oauth_compaction_disabled_error(err: &anyhow::Error) -> bool {
+    // Walk the full source chain, not just the outermost message: `anyhow`'s
+    // `to_string()` shows only the top context, so a `bail!` wrapped with
+    // `.context(...)` would otherwise escape detection and skip the prune-only
+    // fallback this error is meant to route to.
+    err.chain().any(|cause| {
+        cause
+            .to_string()
+            .contains(ANTHROPIC_OAUTH_COMPACTION_DISABLED)
+    })
+}
+
 fn openai_api_billing_fallback_key(cli: &Cli) -> Option<&str> {
     cli.resolved_api_key
         .as_deref()
@@ -344,16 +361,68 @@ pub async fn build_agent(
         }
     }
 
-    // F6 tier 3 — bounded critic wiring. Opt-in: only when the user has
-    // set `critic_provider`. `resolve_role(Critic)` has no default
-    // fallback, so an unset provider means no critic (no cost).
+    // F6 tier 3 — bounded critic + goal-gate wiring. Opt-in: only when the
+    // user has set `critic_provider`. `resolve_role(Critic)` has no default
+    // fallback, so an unset provider means no critic / goal gate (no cost).
+    //
+    // The critic and goal gate are DECOUPLED: they share one judge client
+    // but bake DIFFERENT system preambles — the critic under the (possibly
+    // overridden) critic preamble, the goal gate under its own fixed
+    // GOAL_PREAMBLE. A prompt may suppress the critic (`critic: false`)
+    // without affecting the goal gate.
     if cfg.critic_provider.is_some() {
         match cfg.resolve_role(crate::config::ConfigRole::Critic) {
             Some((alias, entry)) => {
-                match build_critic_fn(&alias, &entry, &cfg.providers_map(), cfg.auth) {
-                    Ok(critic_fn) => {
-                        agent = agent.with_critic(critic_fn);
-                        tracing::info!(target: "dirge::provider", alias = %alias, "in-loop critic wired");
+                // Resolve the active prompt's critic settings:
+                //   critic: false   → suppress the critic (goal gate unaffected)
+                //   critic_preamble → override config + built-in for this prompt
+                let active_prompt = context
+                    .current_prompt_name
+                    .as_deref()
+                    .and_then(|name| context.prompts.get(name));
+                let critic_disabled = active_prompt.and_then(|p| p.critic) == Some(false);
+                let critic_preamble: std::sync::Arc<str> =
+                    match active_prompt.and_then(|p| p.critic_preamble.as_deref()) {
+                        Some(p) => std::sync::Arc::from(p),
+                        None => std::sync::Arc::from(cfg.resolve_critic_preamble()),
+                    };
+                let providers = cfg.providers_map();
+                match create_role_client(&alias, &providers, cfg.auth) {
+                    Ok(raw_client) => {
+                        let client = std::sync::Arc::new(raw_client);
+                        let model_name = entry
+                            .model
+                            .clone()
+                            .unwrap_or_else(|| default_model_for_entry(&alias, &entry).to_string());
+                        // Goal gate: always wired (fires only with --goal),
+                        // judged under its OWN fixed preamble — decoupled
+                        // from any critic override.
+                        agent = agent.with_goal_fn(build_judge_fn(
+                            client.clone(),
+                            model_name.clone(),
+                            "critic",
+                            std::sync::Arc::from(crate::agent::agent_loop::goal::GOAL_PREAMBLE),
+                        ));
+                        // Critic: wired unless the active prompt disables it.
+                        if !critic_disabled {
+                            agent = agent.with_critic(build_judge_fn(
+                                client.clone(),
+                                model_name.clone(),
+                                "critic",
+                                critic_preamble.clone(),
+                            ));
+                            tracing::info!(
+                                target: "dirge::provider",
+                                alias = %alias,
+                                "in-loop critic wired",
+                            );
+                        } else {
+                            tracing::info!(
+                                target: "dirge::provider",
+                                alias = %alias,
+                                "critic disabled by active prompt; goal gate unaffected",
+                            );
+                        }
                     }
                     Err(e) => {
                         tracing::error!(target: "dirge::provider", alias = %alias, error = %e, "failed to build critic client; running without critic");
@@ -520,52 +589,99 @@ fn build_escalation_stream_fn(
     Ok(model.build_stream_fn(tool_defs, chunk_timeout, Some(alias.to_string())))
 }
 
-/// F6 tier 3: build the bounded-critic callback. Constructs a fresh
-/// client for the critic alias and returns a [`CriticFn`] that runs one
-/// completion (via `summarize::oneshot_with_model`, with the critic's own
-/// role preamble + telemetry label) per call. No tools — the critic only
-/// reads a transcript and returns a verdict.
-fn build_critic_fn(
-    alias: &str,
-    entry: &ProviderEntry,
-    providers: &HashMap<String, ProviderEntry>,
-    default_auth: Option<ProviderAuth>,
-) -> anyhow::Result<crate::agent::agent_loop::critic::CriticFn> {
-    let client = std::sync::Arc::new(create_role_client(alias, providers, default_auth)?);
-    let model_name = entry
-        .model
-        .clone()
-        .unwrap_or_else(|| default_model_for_entry(alias, entry).to_string());
-    Ok(std::sync::Arc::new(move |prompt: String| {
+/// F6 tier 3: build a one-shot judge callback (`CriticFn`) over a shared
+/// client + model. Bakes `preamble` into the system role and `label` into
+/// retry/telemetry. Used for BOTH the in-loop critic (resolved preamble)
+/// and the goal gate (its own `GOAL_PREAMBLE`) — the two share one
+/// connection while judging under independent preambles. No tools — the
+/// judge only reads a transcript and returns a verdict.
+fn build_judge_fn(
+    client: std::sync::Arc<AnyClient>,
+    model_name: String,
+    label: &'static str,
+    preamble: std::sync::Arc<str>,
+) -> crate::agent::agent_loop::critic::CriticFn {
+    std::sync::Arc::new(move |prompt: String| {
         let client = client.clone();
         let model_name = model_name.clone();
+        let preamble = preamble.clone();
         Box::pin(async move {
             let model = client.completion_model(model_name);
-            // Distinct retry/telemetry label + a role-appropriate system
-            // preamble (the critic's response FORMAT still rides in the
-            // prompt body, next to the transcript).
-            summarize::oneshot_with_model(
-                model,
-                "critic",
-                crate::agent::agent_loop::critic::CRITIC_PREAMBLE,
-                prompt,
-            )
-            .await
+            summarize::oneshot_with_model(model, label, &preamble, prompt).await
         })
             as std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send>>
-    }))
+    })
+}
+
+/// Resolve the model for non-blocking UI compaction side-LLM calls.
+///
+/// When `summarization_provider` is configured AND resolves to a DIFFERENT
+/// alias than the default role, build a dedicated client/model for it (so a
+/// cheaper/faster summarizer can be pointed at compaction); otherwise reuse the
+/// active session model via `main_client`. Resolution failure for an explicitly
+/// configured provider falls back to the main model only when that fallback is
+/// safe; Anthropic OAuth fallback is refused so compaction side calls do not
+/// trip the Claude-Code classifier.
+pub(crate) fn build_compaction_model(
+    cfg: &Config,
+    main_client: &AnyClient,
+    main_model_name: &str,
+) -> anyhow::Result<AnyModel> {
+    // Keep the non-blocking UI compaction path (`/compress`, preemptive
+    // compaction, reactive overflow recovery) on the same provider route as
+    // the in-loop compaction summarizer. In particular, Anthropic OAuth should
+    // not be used for this side one-shot when `summarization_provider` points
+    // elsewhere: the OAuth/Claude-Code classifier is intended for the main CLI
+    // turn shape, not arbitrary summarizer requests.
+    if cfg.summarization_provider.is_some() {
+        let default_role = cfg.resolve_role(crate::config::ConfigRole::Default);
+        let summ_role = cfg.resolve_role(crate::config::ConfigRole::Summarization);
+        if let (Some((default_alias, _)), Some((alias, entry))) = (default_role, summ_role)
+            && !default_alias.eq_ignore_ascii_case(&alias)
+        {
+            match create_role_client(&alias, &cfg.providers_map(), cfg.auth) {
+                Ok(client) => {
+                    if matches!(&client, AnyClient::AnthropicOauth(_)) {
+                        anyhow::bail!(ANTHROPIC_OAUTH_COMPACTION_DISABLED);
+                    }
+                    let model_name = entry
+                        .model
+                        .clone()
+                        .unwrap_or_else(|| default_model_for_entry(&alias, &entry).to_string());
+                    tracing::info!(
+                        target: "dirge::provider",
+                        alias = %alias,
+                        "summarization_provider active for UI compaction",
+                    );
+                    return Ok(client.completion_model(model_name));
+                }
+                Err(e) => {
+                    eprintln!(
+                        "warning: summarization_provider '{alias}' failed to build ({e}); \
+                         falling back to the main model for compaction if safe"
+                    );
+                }
+            }
+        }
+    }
+    if matches!(main_client, AnyClient::AnthropicOauth(_)) {
+        anyhow::bail!(ANTHROPIC_OAUTH_COMPACTION_DISABLED);
+    }
+    Ok(main_client.completion_model(main_model_name.to_string()))
+}
+
+fn anthropic_oauth_compaction_disabled_fn() -> crate::agent::compression::SummarizeFn {
+    std::sync::Arc::new(|_prompt: String| {
+        Box::pin(async { anyhow::bail!(ANTHROPIC_OAUTH_COMPACTION_DISABLED) })
+    })
 }
 
 /// dirge-008x + dirge-nw25: build the in-loop compaction summarizer.
 ///
-/// When `summarization_provider` is configured AND resolves to a
-/// DIFFERENT alias than the default role, build a dedicated client/model
-/// for it (so a cheaper/faster summarizer can be pointed at compaction);
-/// otherwise reuse the main agent `model`. The returned `SummarizeFn`
-/// runs one tool-less completion per fold via `summarize_with_model`.
-/// Resolution failure for an explicitly-configured provider falls back to
-/// the main model with a stderr warning rather than disabling compaction.
-fn build_summarize_fn(
+/// Uses the same summarization-provider routing and Anthropic OAuth guard as
+/// [`build_compaction_model`], but adapts the resolved model into the
+/// `SummarizeFn` callback consumed by the agent loop.
+pub(crate) fn build_summarize_fn(
     cfg: &Config,
     main_model: AnyModel,
 ) -> crate::agent::compression::SummarizeFn {
@@ -586,6 +702,9 @@ fn build_summarize_fn(
         {
             match create_role_client(&alias, &cfg.providers_map(), cfg.auth) {
                 Ok(client) => {
+                    if matches!(&client, AnyClient::AnthropicOauth(_)) {
+                        return anthropic_oauth_compaction_disabled_fn();
+                    }
                     let model_name = entry
                         .model
                         .clone()
@@ -601,11 +720,14 @@ fn build_summarize_fn(
                 Err(e) => {
                     eprintln!(
                         "warning: summarization_provider '{alias}' failed to build ({e}); \
-                         falling back to the main model for compaction"
+                         falling back to the main model for compaction if safe"
                     );
                 }
             }
         }
+    }
+    if matches!(&main_model, AnyModel::AnthropicOauth(_)) {
+        return anthropic_oauth_compaction_disabled_fn();
     }
     from_model(main_model)
 }
@@ -647,7 +769,7 @@ fn resolve_subagent_model(cfg: &Config) -> Option<AnyModel> {
 }
 
 /// dirge-0g6i: build the LLM auto-approval evaluator from a resolved
-/// `approval_provider`. Mirrors [`build_critic_fn`] — same client + model
+/// `approval_provider`. Mirrors [`build_judge_fn`] — same client + model
 /// resolution and the SAME shared one-shot helper
 /// (`summarize::oneshot_with_model`) — but with the approval system
 /// preamble and a verdict parser. Returns an `ApprovalFn` the permission
@@ -791,7 +913,7 @@ mod nw25_tests {
     /// dirge-nw25: with no `subagent_provider` configured, the resolver
     /// returns `None` (so no extra client is built and the task tool keeps
     /// the main model). Guards the "don't touch unset config" path; the
-    /// configured-and-different path mirrors the tested `build_critic_fn`.
+    /// configured-and-different path mirrors the tested `build_judge_fn`.
     #[test]
     fn resolve_subagent_model_none_when_unset() {
         let cfg = Config::default();

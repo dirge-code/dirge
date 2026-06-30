@@ -1,36 +1,23 @@
 //! `AgentEvent::ContextOverflow` handler extracted from `run_interactive`.
 //!
-//! Auto-recovery for a context-length error mid-run: persist what
-//! streamed so far, run `/compress`, then (only when the compaction
-//! actually shrank the session AND no side-effecting tools fired)
-//! respawn the same prompt against the compacted history. Tool-side-
-//! effect-safety and no-op compactions surface as error rows and
-//! leave `is_running` false.
+//! Auto-recovery for a context-length error mid-run: persist what streamed so
+//! far, then kick off a NON-BLOCKING compaction (dirge-tv3p) — the summarizer
+//! LLM runs on a spawned task so the UI stays responsive. The retry (respawn the
+//! same prompt against the compacted history) is the `RetryAfterOverflow`
+//! continuation the `compaction_phase` select! arm runs after install; it only
+//! fires when compaction actually shrank the context AND no side-effecting tools
+//! ran on the failed turn.
 
 use compact_str::CompactString;
 use tokio::sync::mpsc;
 
-use crate::agent::tools::background::BackgroundStore;
-use crate::agent::tools::plan::PlanSwitchSender;
-use crate::agent::tools::question::QuestionSender;
-use crate::cli::Cli;
-use crate::config::Config;
 use crate::context::ContextFiles;
 use crate::event::AgentEvent;
-#[cfg(feature = "mcp")]
-use crate::extras::mcp::McpClientManager;
-use crate::permission::ask::AskSender;
-use crate::permission::checker::PermCheck;
-use crate::provider::{AnyAgent, AnyClient};
-use crate::sandbox::Sandbox;
-#[cfg(feature = "semantic")]
-use crate::semantic::SemanticManager;
+use crate::provider::AnyAgent;
 use crate::ui::agent_io::{persist_turn_to_db, render_agent_stream};
 use crate::ui::colors::{c_agent, c_error};
 use crate::ui::events::sanitize_output;
-use crate::ui::renderer::Renderer;
 use crate::ui::run_handlers::{AgentBuildDeps, RunCtx};
-use crate::ui::slash::{CompressOutcome, handle_compress};
 use crate::ui::theme;
 use crate::ui::tool_display::close_tool_chamber_if_open;
 
@@ -42,7 +29,9 @@ pub(crate) async fn handle_context_overflow(
     was_reasoning: &mut bool,
     is_running: &mut bool,
     agent: &mut AnyAgent,
-    context: &mut ContextFiles,
+    // Kept for signature stability with the call site; install (which needs the
+    // context files) now runs in the `compaction_phase` arm with the loop's own.
+    _context: &mut ContextFiles,
     // dirge-4y4l: the ~10 build_agent inputs bundled (see AgentBuildDeps).
     deps: &AgentBuildDeps<'_>,
     agent_rx: &mut Option<mpsc::Receiver<AgentEvent>>,
@@ -50,34 +39,21 @@ pub(crate) async fn handle_context_overflow(
     agent_interject: &mut Option<mpsc::Sender<()>>,
     agent_cancel: &mut Option<mpsc::Sender<()>>,
     interjection_queue: &std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+    // dirge-tv3p: the loop installs the spawned compaction here; its
+    // `compaction_phase` arm runs the retry after the summary lands.
+    compaction_phase: &mut Option<crate::ui::compaction::CompactionPhaseHandle>,
 ) -> anyhow::Result<()> {
-    // Rebind the bundled deps to locals so the body below reads unchanged.
     let client = deps.client;
-    let permission = deps.permission;
-    let ask_tx = deps.ask_tx;
-    let question_tx = deps.question_tx;
-    let plan_tx = deps.plan_tx;
-    let bg_store = deps.bg_store;
-    let sandbox = deps.sandbox;
-    let user_tx = deps.user_tx;
-    #[cfg(feature = "mcp")]
-    let mcp_manager = deps.mcp_manager;
-    #[cfg(feature = "semantic")]
-    let semantic_manager = deps.semantic_manager;
-    #[cfg(feature = "lsp")]
-    let lsp_manager = deps.lsp_manager;
-    // Audit H17: the streaming run hit a context-
-    // length error. Auto-compact then re-spawn with
-    // the same prompt against the now-compacted
-    // history — opencode-style automatic recovery
-    // (compaction.ts:477-558) instead of leaving the
-    // user stranded at the error.
+    // Audit H17: the streaming run hit a context-length error. Auto-compact
+    // then re-spawn with the same prompt against the now-compacted history —
+    // opencode-style automatic recovery (compaction.ts:477-558) instead of
+    // leaving the user stranded at the error. dirge-tv3p: the summarizer now
+    // runs off-thread (was a 10-60s freeze); the retry is the arm's continuation.
     *was_reasoning = false;
     close_tool_chamber_if_open(ctx.renderer, ctx.last_tool_name, ctx.tool_chamber_open)?;
-    // dirge-ufe0: flush any trailing token the render coalescer skipped
-    // (the ContextOverflow event queued behind the final tokens leaves
-    // them caught-up-but-unpainted) before the overflow line is written,
-    // so the streamed text stays on-screen above it (also DB-persisted).
+    // dirge-ufe0: flush any trailing token the render coalescer skipped (the
+    // ContextOverflow event queued behind the final tokens leaves them
+    // caught-up-but-unpainted) before the overflow line is written.
     if !ctx.response_buf.is_empty() {
         render_agent_stream(
             ctx.response_buf,
@@ -89,15 +65,36 @@ pub(crate) async fn handle_context_overflow(
     let safe = sanitize_output(&error);
     ctx.renderer
         .write_line(&format!("context overflow: {}", safe), c_error())?;
-    // Persist what we have so far (partial response
-    // + tool calls) before tearing down the runner.
+    // Persist what we have so far (partial response + tool calls) before
+    // tearing down the runner.
     persist_turn_to_db(
         ctx.session,
         ctx.last_user_prompt,
         ctx.response_buf,
         ctx.tool_calls_buf,
     );
-    // Tear down the current runner before respawn.
+
+    // dirge-b899: record the partial assistant turn (streamed text + the
+    // tool calls that DID complete on the failed turn) into session.messages
+    // BEFORE compacting, so the compacted history carries the tool RESULTS.
+    // That lets recovery resume as a continuation instead of re-sending the
+    // prompt — re-sending would re-run the side-effecting tools from scratch.
+    // A pure first-token overflow (nothing streamed) records nothing and
+    // falls back to a plain prompt re-send.
+    let made_progress = !ctx.response_buf.is_empty() || !ctx.tool_calls_buf.is_empty();
+    if made_progress {
+        // `take` (not clone) — response_buf is cleared in the teardown below
+        // regardless, so move the streamed text out instead of heap-copying a
+        // potentially-large response on this now-common overflow path.
+        let partial = std::mem::take(ctx.response_buf);
+        ctx.session.add_message_with_tool_calls(
+            crate::session::MessageRole::Assistant,
+            &partial,
+            std::mem::take(ctx.tool_calls_buf),
+        );
+    }
+
+    // Tear down the current runner before compaction.
     if let Some(h) = agent_abort.take() {
         h.abort();
     }
@@ -110,209 +107,107 @@ pub(crate) async fn handle_context_overflow(
     ctx.reasoning_buf.clear();
     *ctx.reasoning_start_line = None;
 
+    // The failed run is over — reset the per-run tool-call counter.
+    *ctx.tool_calls_this_run = 0;
+
     ctx.renderer
         .write_line("▒░ auto-compacting then retrying ░▒", theme::accent())?;
-    let compress_result = compress(
+
+    // dirge-tv3p: decide on-thread, then spawn the summarizer off-thread. The
+    // `compaction_phase` arm installs the summary and, on `Compacted`, resumes
+    // the task — as a continuation when the failed turn made progress (the
+    // partial turn was recorded above), else by re-sending the prompt.
+    match crate::ui::slash::prepare_compaction(
+        None,
+        false, // forced: auto-compaction stays threshold-gated [dirge-fgtj]
         agent,
         client,
         ctx.renderer,
         ctx.session,
-        ctx.cli,
         ctx.cfg,
-        context,
-        permission,
-        ask_tx,
-        question_tx,
-        plan_tx,
-        user_tx,
-        bg_store,
-        sandbox,
-        #[cfg(feature = "mcp")]
-        mcp_manager,
-        #[cfg(feature = "semantic")]
-        semantic_manager,
-        #[cfg(feature = "lsp")]
-        lsp_manager,
-    )
-    .await;
-
-    // Review #1: compress can return Ok WITHOUT
-    // shrinking the session (three no-op paths
-    // inside `handle_compress`). Respawning
-    // against the unchanged history just re-emits
-    // ContextOverflow and infinite-loops the
-    // auto-recovery. Only respawn on `Compacted`.
-    //
-    // Review #2: re-issuing the same prompt
-    // re-runs any side-effecting tool calls the
-    // failed turn already made. The interactive
-    // retry loop already refuses to retry when
-    // `had_tool_calls`; the auto path used to
-    // bypass that safety. We have no direct
-    // `had_tool_calls` signal here (the runner
-    // emitted ContextOverflow without telling us
-    // whether tools fired). Approximate it by
-    // comparing `tool_calls_this_run > 0`, which
-    // tracks every ToolCall event observed during
-    // the failed turn. If any tool ran, surface
-    // the error and let the user decide.
-    let tools_already_ran = *ctx.tool_calls_this_run > 0;
-    // Reset the abort-trailer counter regardless
-    // — the failed run is over.
-    *ctx.tool_calls_this_run = 0;
-    match compress_result {
-        Ok(CompressOutcome::Compacted) if !tools_already_ran => {
-            // Build history from the compacted session.
-            // Drop the trailing User message because
-            // it's the prompt we're about to resubmit
-            // — otherwise rig would receive it twice.
-            let mut history = crate::agent::runner::convert_history(ctx.session);
-            if let Some(last) = history.last()
-                && matches!(last, rig::completion::Message::User { .. })
-            {
-                history.pop();
-            }
-            let prompt_owned = prompt.to_string();
-            ctx.last_user_prompt.clone_from(&prompt_owned);
-            let prepared_prompt = crate::agent::tools::background::prepend_pending_notifications(
-                &prompt_owned,
-                bg_store.as_ref(),
-            );
-            let runner = agent.clone().spawn_runner(
-                prepared_prompt,
-                history,
-                Some(interjection_queue.clone()),
-            );
-            runner.install_into(
-                agent_rx,
-                agent_abort,
-                agent_interject,
-                agent_cancel,
-                is_running,
-            );
-            // Review #4: collapsed result from the
-            // failed run is stale — the user will
-            // care about results from the new
-            // attempt, not what got truncated
-            // before the overflow.
-            *ctx.last_collapsed = None;
-            ctx.renderer
-                .write_line("  ↳ resumed run with compacted history", theme::dim())?;
+    ) {
+        Ok(crate::ui::slash::CompactionDecision::Ready(req)) => {
+            *compaction_phase = Some(crate::ui::compaction::spawn(
+                *req,
+                crate::ui::compaction::CompactionThen::RetryAfterOverflow {
+                    prompt: prompt.to_string(),
+                    made_progress,
+                },
+            ));
+            // Stay busy while compaction runs; the arm releases / retries.
         }
-        Ok(CompressOutcome::Compacted) => {
-            // Compacted, but tool side-effects
-            // already applied — refusing auto-
-            // retry. User can re-issue manually.
+        Ok(crate::ui::slash::CompactionDecision::NoOp) => {
+            // Compaction decided there's nothing to shrink — retrying would just
+            // overflow again. Surface it and drop queued messages (safety).
             ctx.renderer.write_line(
-                "  ↳ context compacted, but the failed run already invoked tools — not auto-retrying. Re-issue your prompt manually if you want to continue.",
+                "auto-compact made no progress; leaving session as-is. Lower keep_recent_tokens, configure summarization_provider, or /clear.",
                 c_error(),
             )?;
             *is_running = false;
-            let dropped = interjection_queue.lock().unwrap().len();
-            interjection_queue.lock().unwrap().clear();
-            if dropped > 0 {
-                ctx.renderer.write_line(
-                    &format!(
-                        "{} queued message{} dropped due to tool-side-effect safety",
-                        dropped,
-                        if dropped == 1 { "" } else { "s" }
-                    ),
-                    c_error(),
-                )?;
+            drop_queued(ctx, interjection_queue, "compact no-op")?;
+        }
+        Err(e) if crate::provider::is_anthropic_oauth_compaction_disabled_error(&e) => {
+            match crate::ui::slash::prepare_prune_only_compaction(
+                ctx.renderer,
+                ctx.session,
+                ctx.cfg,
+                crate::provider::ANTHROPIC_OAUTH_COMPACTION_DISABLED,
+            )? {
+                Some(req) => {
+                    ctx.renderer.write_line(
+                        "LLM compaction requires a non-Anthropic-OAuth summarization_provider; using prune-only emergency compaction for this retry.",
+                        c_error(),
+                    )?;
+                    *compaction_phase = Some(crate::ui::compaction::spawn_local(
+                        req.summary,
+                        req.cut_idx,
+                        req.tokens_before,
+                        crate::ui::compaction::CompactionThen::RetryAfterOverflow {
+                            prompt: prompt.to_string(),
+                            made_progress,
+                        },
+                    ));
+                }
+                None => {
+                    ctx.renderer.write_line(
+                        "auto-compact could not prune enough context. Configure summarization_provider or use /clear.",
+                        c_error(),
+                    )?;
+                    *is_running = false;
+                    drop_queued(ctx, interjection_queue, "compact failure")?;
+                }
             }
         }
-        Ok(CompressOutcome::NoOp { reason }) => {
+        Err(e) => {
             ctx.renderer.write_line(
-                &format!(
-                    "auto-compact made no progress ({reason}); leaving session as-is. Try /compress with stricter instructions, lower keep_recent_tokens, or /clear."
-                ),
+                &format!("auto-compact failed ({e}); leaving session as-is. Configure summarization_provider or use /clear."),
                 c_error(),
             )?;
             *is_running = false;
-            let dropped = interjection_queue.lock().unwrap().len();
-            interjection_queue.lock().unwrap().clear();
-            if dropped > 0 {
-                ctx.renderer.write_line(
-                    &format!(
-                        "{} queued message{} dropped due to compact no-op",
-                        dropped,
-                        if dropped == 1 { "" } else { "s" }
-                    ),
-                    c_error(),
-                )?;
-            }
-        }
-        Err(ce) => {
-            ctx.renderer.write_line(
-                &format!(
-                    "auto-compact failed ({}); leaving session as-is. Try /compress manually or /clear.",
-                    ce
-                ),
-                c_error(),
-            )?;
-            *is_running = false;
-            let dropped = interjection_queue.lock().unwrap().len();
-            interjection_queue.lock().unwrap().clear();
-            if dropped > 0 {
-                ctx.renderer.write_line(
-                    &format!(
-                        "{} queued message{} dropped due to compact failure",
-                        dropped,
-                        if dropped == 1 { "" } else { "s" }
-                    ),
-                    c_error(),
-                )?;
-            }
+            drop_queued(ctx, interjection_queue, "compact failure")?;
         }
     }
     Ok(())
 }
 
-/// Thin wrapper around `handle_compress` so the call site above stays
-/// readable; preserves the exact feature-gated parameter list.
-#[allow(clippy::too_many_arguments)]
-async fn compress(
-    agent: &mut AnyAgent,
-    client: &AnyClient,
-    renderer: &mut Renderer,
-    session: &mut crate::session::Session,
-    cli: &Cli,
-    cfg: &Config,
-    context: &mut ContextFiles,
-    permission: &Option<PermCheck>,
-    ask_tx: &Option<AskSender>,
-    question_tx: &Option<QuestionSender>,
-    plan_tx: &Option<PlanSwitchSender>,
-    user_tx: &tokio::sync::mpsc::UnboundedSender<crate::event::UserEvent>,
-    bg_store: &Option<BackgroundStore>,
-    sandbox: &Sandbox,
-    #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
-    #[cfg(feature = "semantic")] semantic_manager: Option<&SemanticManager>,
-    #[cfg(feature = "lsp")] lsp_manager: Option<&std::sync::Arc<crate::lsp::manager::LspManager>>,
-) -> anyhow::Result<CompressOutcome> {
-    handle_compress(
-        None,
-        false, // forced: auto-compaction stays threshold-gated [dirge-fgtj]
-        agent,
-        client,
-        renderer,
-        session,
-        cli,
-        cfg,
-        context,
-        permission,
-        ask_tx,
-        question_tx,
-        plan_tx,
-        user_tx,
-        bg_store,
-        sandbox,
-        #[cfg(feature = "mcp")]
-        mcp_manager,
-        #[cfg(feature = "semantic")]
-        semantic_manager,
-        #[cfg(feature = "lsp")]
-        lsp_manager,
-    )
-    .await
+/// Clear queued interjections (they can't run against an over-full context) and
+/// tell the user how many were dropped.
+fn drop_queued(
+    ctx: &mut RunCtx<'_>,
+    interjection_queue: &std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+    reason: &str,
+) -> anyhow::Result<()> {
+    let dropped = interjection_queue.lock().unwrap().len();
+    interjection_queue.lock().unwrap().clear();
+    if dropped > 0 {
+        ctx.renderer.write_line(
+            &format!(
+                "{} queued message{} dropped due to {reason}",
+                dropped,
+                if dropped == 1 { "" } else { "s" }
+            ),
+            c_error(),
+        )?;
+    }
+    Ok(())
 }

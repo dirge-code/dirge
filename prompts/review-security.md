@@ -1,6 +1,7 @@
 ---
 deny_tools: [edit, write, apply_patch, bash, webfetch]
 description: Read-only security review — surface HIGH-confidence vulnerabilities
+critic: false
 ---
 ## Security Review Mode
 

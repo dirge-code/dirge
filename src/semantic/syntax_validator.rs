@@ -116,6 +116,15 @@ fn language_for_path(path: &Path) -> Option<tree_sitter::Language> {
         #[cfg(feature = "semantic-bash")]
         "sh" | "bash" => Some(tree_sitter_bash::LANGUAGE.into()),
 
+        // NOTE: `.sql` is deliberately NOT registered here. This gate is a
+        // write-time HARD block (`syntax_gate` → tool error on parse error),
+        // and the generic tree-sitter-sequel grammar reports mainstream,
+        // perfectly valid SQL as ERROR nodes — `CREATE PROCEDURE` (Postgres
+        // 11+/MySQL) and the entire T-SQL dialect (`DECLARE @x`, `GO`) among
+        // them. Blocking those writes leaves the agent unable to save valid
+        // SQL with no recourse. SQL still gets semantic indexing via
+        // `SqlAdapter`, which tolerates parse errors (emits a warning, indexes
+        // what it can) rather than blocking. (dirge follow-up to #516)
         _ => None,
     }
 }
@@ -633,47 +642,79 @@ fn delimiter_summary(content: &str, rules: &LexRules) -> Option<String> {
     }
 }
 
-/// Mechanically close a purely-unclosed delimiter imbalance, mirroring the
-/// JSON truncation closer (`tool_input_repair::repair_truncated_json`):
-/// rather than bounce a trivial mechanical fix back to the model, append
-/// the matching closers and let the write proceed. Returns `(repaired,
-/// note)` or `None` when no safe mechanical fix exists.
+/// Most non-blank lines allowed AFTER the outermost unclosed opener for the
+/// imbalance to count as a trailing truncation. A genuine "forgot the closing
+/// brace(s) at the end" leaves little content past the last open block; a
+/// mid-file stray opener (the nested-fn corruption) leaves the whole rest of
+/// the file after it. Conservative on purpose — when there's no language
+/// server to verify the repair (see the LSP path), erring toward reject just
+/// bounces the model's own text back for it to fix (dirge-a0nl).
+const MAX_TRAILING_NONBLANK_LINES: usize = 10;
+
+/// True when a delimiter imbalance looks like an END-OF-CONTENT truncation
+/// (the model finished the logical content but dropped the trailing closers)
+/// rather than a MID-FILE structural error. Closing a trailing truncation
+/// appends to existing code; closing a mid-file stray opener would WRAP the
+/// complete code after it into the wrongly-opened block — that's the
+/// nested-`fn` corruption (Richie's report), structurally valid yet wrong, so
+/// we reject it and let the model fix its own edit.
+fn is_trailing_truncation(content: &str, stack: &[(u8, usize, usize)]) -> bool {
+    let Some(&(_, open_line, _)) = stack.first() else {
+        return false;
+    };
+    // `open_line` is 1-based; skipping that many lines drops everything up to
+    // and including the opener's line, leaving only what follows it.
+    let trailing_nonblank = content
+        .lines()
+        .skip(open_line)
+        .filter(|l| !l.trim().is_empty())
+        .count();
+    trailing_nonblank <= MAX_TRAILING_NONBLANK_LINES
+}
+
+/// Mechanically close a delimiter imbalance that looks like a TRAILING
+/// TRUNCATION — the model finished the logical content but dropped the closing
+/// delimiters at the very end.
 ///
-/// Safety (dirge-p5fu):
-/// - Only languages with comment/string/char-aware lex rules qualify, so a
-///   `)` inside a string or comment is never miscounted.
-/// - Only the pure-unclosed case is repaired. A stray/mismatched closer is
-///   NOT touched — appending can't fix a misplaced closer, and the model
-///   gets the precise summary instead.
-/// - The repaired text is RE-VALIDATED with [`check_syntax`] (tree-sitter
-///   for grammared languages — the oracle that rejects a close producing
-///   nonsense like `fn main( {})` — the scanner for lisps). The repair is
-///   returned only if it now parses clean; otherwise we fall back to the
-///   reject-with-summary path. The note is surfaced on the success result,
-///   so the fix is never silent and the model can correct a wrong guess.
+/// Safety (dirge-p5fu, hardened dirge-a0nl):
+/// - Only the pure-unclosed case is touched; a stray/mismatched closer is left
+///   for the model (the precise summary explains it).
+/// - Only a trailing truncation qualifies ([`is_trailing_truncation`]). A
+///   MID-FILE stray opener — with complete code after it — is rejected: closing
+///   it would WRAP that code into the wrongly-opened block (the nested-`fn`
+///   corruption), a structurally-valid-but-wrong result tree-sitter can't flag.
+///   That's the structural guard that re-validation alone cannot give.
+/// - For a trailing truncation the missing closers belong at EOF by
+///   definition, so they're appended there (innermost first). Tree-sitter does
+///   NOT reliably emit MISSING-`}` nodes for an unclosed block at EOF — it
+///   marks the region ERROR — so MISSING-node-driven placement only matters for
+///   mid-file closers, which this path rejects; revisit it when the LSP-backed
+///   verifier lets us repair mid-file safely.
+/// - The result is RE-VALIDATED with [`check_syntax`]; returned only if clean.
 pub fn repair_delimiters(path: &Path, content: &str) -> Option<(String, String)> {
     let rules = lex_rules_for_path(path)?;
     let DelimiterBalance::Unclosed(stack) = delimiter_balance(content, rules) else {
         return None;
     };
-    // Append closers top-of-stack first (innermost closes first).
+    if !is_trailing_truncation(content, &stack) {
+        return None;
+    }
+    // Append closers top-of-stack first (innermost closes first) — correct
+    // placement for a trailing truncation.
     let closers: String = stack
         .iter()
         .rev()
         .map(|&(open, _, _)| closer_for(open))
         .collect();
-    let mut repaired = content.to_string();
-    repaired.push_str(&closers);
-    // tree-sitter / scanner must agree the result is now valid — otherwise
-    // the imbalance wasn't a simple truncation and a blind close would be
-    // wrong (e.g. a delimiter missing mid-expression).
+    let repaired = format!("{content}{closers}");
     if check_syntax(path, &repaired).is_err() {
         return None;
     }
     let (open, l, c) = stack[0];
     let note = format!(
-        "auto-closed {n} unclosed delimiter(s): appended `{closers}` to balance the `{openc}` \
-         opened at line {l}, col {c}. If that placement is wrong, resend the corrected text.",
+        "auto-closed {n} unclosed delimiter(s) at a trailing truncation: appended `{closers}` to \
+         balance the `{openc}` opened at line {l}, col {c}. If that placement is wrong, resend the \
+         corrected text.",
         n = stack.len(),
         openc = open as char,
     );
@@ -932,6 +973,32 @@ int main(void) {
 
     #[cfg(feature = "semantic-rust")]
     #[test]
+    fn repair_rejects_mid_file_stray_opener_that_would_swallow_siblings() {
+        // dirge-a0nl (Richie's report): an edit injected an extra `{` high in
+        // the file with complete functions after it. Appending `}` at EOF
+        // *parses* — Rust allows nested fns — but wraps every following item
+        // inside the stray block: silent, structurally-valid corruption that
+        // tree-sitter can't flag. The trailing-truncation guard must reject it
+        // so the model fixes its own edit rather than getting a mangled file.
+        let path = PathBuf::from("/tmp/x.rs");
+        let mut src = String::from("fn stray() {\n");
+        for i in 0..12 {
+            src.push_str(&format!("fn f{i}() {{ let x = 1; }}\n"));
+        }
+        // The danger is real: the naive close DOES parse.
+        assert!(
+            check_syntax(&path, &format!("{src}}}")).is_ok(),
+            "precondition: appending `}}` yields valid (nested-fn) Rust",
+        );
+        // But repair must refuse it.
+        assert!(
+            repair_delimiters(&path, &src).is_none(),
+            "a mid-file stray opener with complete code after it must not be auto-closed",
+        );
+    }
+
+    #[cfg(feature = "semantic-rust")]
+    #[test]
     fn validate_or_repair_paths() {
         let path = PathBuf::from("/tmp/x.rs");
         assert!(matches!(
@@ -985,6 +1052,26 @@ int main(void) {
     fn unknown_extension_skips_silently() {
         let path = PathBuf::from("/tmp/foo.thisisntreal");
         assert!(check_syntax(&path, "(((((").is_ok());
+    }
+
+    #[test]
+    fn sql_writes_are_not_hard_blocked() {
+        // dirge follow-up to #516: `.sql` is intentionally not registered in
+        // the write gate. The generic SQL grammar flags valid mainstream SQL
+        // (CREATE PROCEDURE, T-SQL) as errors; blocking those writes would
+        // strand the agent. These must pass the gate (semantic indexing still
+        // surfaces issues as non-blocking warnings).
+        let path = PathBuf::from("/tmp/proc.sql");
+        assert!(
+            check_syntax(
+                &path,
+                "CREATE PROCEDURE p() LANGUAGE SQL AS $$ SELECT 1; $$;\n"
+            )
+            .is_ok()
+        );
+        assert!(check_syntax(&path, "DECLARE @x INT = 1;\nGO\nSELECT @x;\n").is_ok());
+        // Even a genuinely truncated statement isn't a hard block for SQL.
+        assert!(check_syntax(&path, "CREATE TABLE users (id INT\n").is_ok());
     }
 
     #[test]

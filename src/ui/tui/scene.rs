@@ -79,6 +79,9 @@ pub struct Scene<'a> {
     /// bottom rows of the chat region just above the input box. `None` when no
     /// picker is open [dirge-92em].
     pub picker: Option<&'a crate::ui::picker::PickerOverlay>,
+    /// Brief tooltip text shown in the chat area (e.g. "Copied!").
+    /// Empty string means no tooltip.
+    pub tooltip: &'a str,
 }
 
 /// Paint the entire UI into `f`. Computes layout from the frame's
@@ -106,8 +109,9 @@ pub fn render_frame(scene: &Scene, f: &mut Frame<'_>) {
     }
 
     // Chat region (content + │ verticals).
-    let mut chat =
-        ChatPane::new(&layout, scene.chat_buffer, scene.scroll_offset).border_style(frame_style);
+    let mut chat = ChatPane::new(&layout, scene.chat_buffer, scene.scroll_offset)
+        .border_style(frame_style)
+        .tooltip(scene.tooltip);
     if let Some(sel) = scene.chat_selection {
         chat = chat.selection(sel);
     }
@@ -327,6 +331,7 @@ pub fn empty_scene<'a>(
         frame_color: crossterm::style::Color::Green,
         background: crossterm::style::Color::Reset,
         picker: None,
+        tooltip: "",
     }
 }
 
@@ -467,6 +472,7 @@ mod tests {
             frame_color: crossterm::style::Color::Green,
             background: crossterm::style::Color::Reset,
             picker: None,
+            tooltip: "",
         };
 
         let mut backend = TestBackend::new(160, 30);
@@ -724,6 +730,7 @@ mod tests {
             frame_color: crossterm::style::Color::Green,
             background: crossterm::style::Color::Reset,
             picker: None,
+            tooltip: "",
         };
         terminal.draw(|f| render_frame(&s1, f)).unwrap();
 
@@ -756,6 +763,7 @@ mod tests {
             frame_color: crossterm::style::Color::Green,
             background: crossterm::style::Color::Reset,
             picker: None,
+            tooltip: "",
         };
         terminal.draw(|f| render_frame(&s2, f)).unwrap();
         backend = terminal.backend().clone();

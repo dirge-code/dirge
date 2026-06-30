@@ -6,6 +6,645 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.14.1] - 2026-06-29
+
+### Fixed
+- **Fix the `x86_64-unknown-linux-musl` build** (broken in 0.14.0). The new PTY
+  bang-command code cast `TIOCSCTTY` to `c_ulong` for the `ioctl` request arg,
+  which only matches glibc/macOS — musl declares that arg as `c_int`, so the
+  musl release binary (and `cargo install` on musl) failed to compile. Use
+  `as _` so each target infers the right width. (No behavior change on other
+  platforms.)
+
+## [0.14.0] - 2026-06-29
+
+### Added
+- **`!`/`!!` bang commands run on a real PTY.** They reuse the `/sandbox` attach
+  path — suspend the TUI, attach the command to `/dev/tty`, relay I/O, resume —
+  so commands that need terminal input (`gh auth login`, editors, interactive
+  prompts) work instead of hanging to the 120s timeout. Interactive output
+  renders through a vt100 screen parser, so cursor-moving TUIs (arrow-key menus)
+  update in place rather than stacking redraws; the avatar stays idle while you
+  drive the shell. (#544, #546)
+- **`/prompt <name> <text>` switches *and* runs the text.** Previously everything
+  after the prompt name was silently dropped; it now switches to the named
+  prompt and launches a streamed turn on the trailing text (via a
+  `DEFER_PROMPT_RUN` sentinel, gated on the name resolving). (#538)
+- **Clipboard "Copied!" tooltip** in the chat area, bridging the lack of native
+  terminal copy feedback. (#542)
+- **CI clippy gate** — clippy runs with `-D warnings` and the lint backlog was
+  cleared across all feature builds. (#540)
+
+### Changed
+- **`write_todo_list` is backed by the issue board.** The TODOS panel and the
+  end-of-turn nudge were driven by a separate in-memory checklist; they now share
+  the durable issue tracker — a todo *is* an issue. Bulk planning gains the full
+  lifecycle (open/in_progress/blocked/done/cancelled), items match by title
+  across calls (scoped to the session), and omitted items are no longer silently
+  dropped (close one by restating it completed/cancelled). (#539)
+
+### Fixed
+- **Failed MCP servers are visible in the info panel.** A server that failed its
+  initial connect was invisible (rendered as `(none)`); it now shows as broken
+  (`○`), matching how LSP surfaces broken servers. The live connection is still
+  dropped, so `/mcp reconnect` keeps working. (#541)
+- **Stream retries on a mid-tool-call chunk timeout.** A chunk timeout that fired
+  while a tool call was mid-assembly halted the run — prior thinking/text had
+  marked the attempt "committed" and the retry layer refused to replay it. Timeout
+  errors now retry even after content commits, so a single provider stall no
+  longer kills a run on reasoning models that emit thinking before a tool call.
+  (#547)
+- **Agent construction can't wedge on a stuck DB.** The memory, global-memory,
+  and spec-store loads in `build_agent_inner` are now bounded by a 5s timeout
+  (graceful degradation on timeout), so a locked/slow SQLite no longer hangs
+  agent builds — a contributor to the `/prompt`-rebuild hang.
+
+## [0.13.9] - 2026-06-28
+
+### Changed
+- **The `issue` tool is auto-allowed by default.** It's now classified as a
+  builtin-allowed meta operation (like `write_todo_list`), so the agent records
+  its own work (create/start/block/close/update) without a permission prompt
+  each time — the tracker is a local, user-viewable (`/issues`), reversible DB,
+  so the prompts were friction without security value. Still overridable via an
+  explicit deny rule. (#537)
+
+## [0.13.8] - 2026-06-28
+
+### Added
+- **Steerable critic preamble.** The in-loop critic's system preamble was
+  hardcoded; it's now exposable at two tiers — a global `critic_preamble` in
+  config (`resolve_critic_preamble()`) and a per-prompt frontmatter
+  `critic_preamble:` (inline or a YAML block scalar; empty inherits). A
+  `critic: false` frontmatter suppresses the critic for that prompt only. See
+  [docs/prompts.md](docs/prompts.md). (e0f684a)
+
+### Changed
+- **Goal gate decoupled from the critic.** They previously shared one judge
+  closure (and preamble), so a critic override or `critic: false` leaked into
+  goal judgements. `build_critic_fn` is generalized to a `build_judge_fn` that
+  bakes an independent preamble; the critic and the `--goal` gate now share a
+  client but judge under separate preambles, and the gate always uses its own
+  fixed `GOAL_PREAMBLE`. `CRITIC_FORMAT` and `GOAL_PREAMBLE` remain
+  non-overridable by design. (e0f684a)
+
+## [0.13.7] - 2026-06-27
+
+### Fixed
+- **`/model <id>` switches providers, not just the model name.** The `/model`
+  list shows one row per configured provider's pinned model; selecting a model
+  that belongs to a *different* provider now rebuilds the live client for that
+  provider instead of sending its model name to the active provider's endpoint
+  (which 400'd — e.g. an ollama model sent to GLM). Free-form ids and
+  same-provider models keep the current client. (#535)
+- **`--provider` now selects that provider's model.** With no `--model`,
+  `dirge --provider <p>` took the config default provider's model rather than
+  `<p>`'s, so `--provider ollama` switched the endpoint but still loaded the
+  default model. It now reads the overridden provider's pinned model. (#535)
+- **`XDG_CONFIG_HOME` is honored for the config directory.** Resolution is now
+  `DIRGE_CONFIG_DIR` → `$XDG_CONFIG_HOME/dirge` → `~/.config/dirge` (relative
+  `XDG_CONFIG_HOME` ignored per the XDG spec). (#535)
+
+### Changed
+- **Clearer "no API key" error for keyless OpenAI-compatible endpoints.** When
+  a `provider_type: "openai"` provider has no key, the error now points local
+  ollama/vLLM users at `provider_type: "custom"` (or `"ollama"`), which are
+  keyless. (#535)
+
+## [0.13.6] - 2026-06-27
+
+### Added
+- **Native issue tracker** — a persistent, agent-facing kanban in the existing
+  per-project session DB (`.dirge/sessions/state.db`, `issues` table), framed as
+  a stateful extension of the memory model. The new `issue` tool creates /
+  starts / blocks / closes / updates / lists / searches durable tasks (status
+  `open`/`in_progress`/`blocked`/`done`, priority `high`/`normal`/`low`); unlike
+  the ephemeral `write_todo_list`, issues persist across sessions. The harness
+  injects the top open issues as a board at the **start of each turn** (bounded,
+  with a "+N more" hint) so the model works its backlog without polling — gated
+  so forked review/curator runners don't receive it. View it from the TUI with
+  `/issues` (`/issues list`, `/issues <id>`, `/issues search <q>`). The store
+  owns its schema and opens lock-free, so it adds no migration contention to the
+  shared session DB. See [docs/issues.md](docs/issues.md). (#534)
+
+## [0.13.5] - 2026-06-27
+
+### Fixed
+- **`auth: "chatgpt"` falls back to legacy `codex login` storage when a Dirge
+  OpenAI OAuth credential is present but unusable** (expired with a failed or
+  absent refresh, or an unreadable store). It previously hard-errored the
+  session in that case even when a valid `~/.codex/auth.json` could have served
+  it; now it warns and uses the legacy file. (#533)
+
+## [0.13.4] - 2026-06-26
+
+### Changed
+- **`dirge auth openai` now uses a browser-based OAuth (PKCE) flow** instead of a
+  device password, matching standard Codex authentication — so you no longer have
+  to enable device passwords in the OpenAI console. The browser flow opens a
+  loopback redirect, validates a CSRF `state`, and exchanges the code with PKCE
+  S256. The previous device-code flow is retained behind
+  `dirge auth openai --device-code`. (#532)
+
+### Fixed
+- **`auth: "chatgpt"` now honors fresh Dirge OpenAI OAuth credentials before
+  falling back to legacy Codex storage.** This prevents a stale
+  `~/.codex/auth.json` access token from causing repeated `token_expired` 401s
+  after `dirge auth openai` has already produced a fresh, refreshable Dirge
+  credential. Stored credentials are refreshed on expiry (and re-persisted)
+  rather than served stale. (#532)
+
+## [0.13.3] - 2026-06-26
+
+### Fixed
+- **Compaction no longer makes side-LLM summary calls with Anthropic OAuth
+  credentials.** A bare summarization request doesn't look like a normal Claude
+  Code turn and could trip Anthropic's third-party-use detection, so explicit
+  `/compress`, preemptive compaction, reactive overflow recovery, and in-loop
+  folding now route their summary call through `summarization_provider` and
+  refuse to fall back to Anthropic OAuth. Configure a non-Anthropic-OAuth
+  `summarization_provider` to keep high-fidelity LLM summaries. (#529)
+- **OAuth sessions without a summarizer degrade gracefully instead of breaking.**
+  When no safe summarizer is configured, reactive overflow and explicit
+  `/compress` now fall back to a local prune-only emergency compaction (drop the
+  oldest turns with a deterministic note) so the session keeps going, rather than
+  hard-erroring. The disabled-compaction error is also matched through its full
+  source chain so that fallback can't be silently skipped by a wrapped error.
+  (#530)
+
+### Added
+- **Startup notice when compaction can only prune.** On an Anthropic OAuth
+  session with no non-OAuth `summarization_provider`, the interactive UI now warns
+  once at launch that context folds will be lossy prune-only, so it isn't a
+  surprise at the first fold. The notice self-clears once a summarizer is
+  configured. (#531)
+
+## [0.13.2] - 2026-06-26
+
+### Added
+- **Cross-session command history.** Up/Down and Ctrl+F recall now seed from the
+  most-recent prior sessions in the same project, not just the current one — so a
+  fresh session in a project starts with your earlier prompts already in history
+  instead of an empty pool. The new top-level `max_sessions` config (default `3`)
+  caps how many prior sessions are mined; set `0` to keep recall scoped to the
+  current session. Prior prompts are seeded oldest-first ahead of the current
+  session's own, so Up still starts from your newest command and walks back.
+  Compaction-fold rotations are collapsed so one conversation counts once, and
+  synthetic turns (system-reminder wrappers, mid-turn steers, auto-continues)
+  never enter history. (#527, #528; thanks @nikolap)
+
+## [0.13.1] - 2026-06-26
+
+### Fixed
+- **Headless `--print`/`--loop` no longer hangs forever on a tool that needs
+  permission confirmation.** These modes have no UI loop to service the
+  permission channel, so a tool routing to a confirmation prompt (e.g. a `bash`
+  command `--accept-all` doesn't auto-allow) sent an `AskRequest` and blocked on
+  the reply forever — suspending the agent loop with no output and no `result`.
+  Headless runs now drain that channel with a deny-all responder (mirroring the
+  ACP path), so a not-auto-allowed tool call fails fast instead of hanging; the
+  model sees the denial and re-plans. For fully unattended runs that must never
+  block, use `--yolo` (which allows every tool and never prompts) or configure
+  explicit allow rules. This is the real fix for the deadlock first reported in
+  #523 (the earlier 0.12.5 plugin-worker fix addressed a different path).
+  (#523, dirge-3oy0)
+
+## [0.13.0] - 2026-06-26
+
+### Added
+- **Project-local config overlay.** A project can ship a partial
+  `<project>/.dirge/config.json` that deep-merges on top of the global
+  `~/.config/dirge/config.json` instead of duplicating the whole file. Scalar
+  fields override; map-valued fields (`providers`, `mcp_servers`, `agents`,
+  `slash_aliases`, `keybindings`) union key-by-key, so a project can add or
+  override a single entry without redeclaring the map. An empty object is a
+  no-op, never a wipe. CLI flags and env vars still take precedence over both
+  files. (#526; thanks @nikolap)
+- **Project-local prompts tier with `/prompt` provenance.** Custom prompts can
+  live in `<project>/.dirge/prompts/` and override global or built-in prompts of
+  the same name. `/prompt` now shows a `[global]`/`[project]` badge next to
+  overridden built-ins, mirroring `/agents`. (#526)
+
+### Changed
+- **BREAKING: project-local prompts moved from `./prompts/` to
+  `.dirge/prompts/`.** The old cwd-relative `prompts/` directory is no longer
+  read. If you relied on a project-level `prompts/` directory, move it to
+  `.dirge/prompts/` (matching `.dirge/agents`, `.dirge/plugins`, `.dirge/skills`).
+  Global (`~/.config/dirge/prompts/`) and built-in prompts are unaffected.
+
+## [0.12.6] - 2026-06-26
+
+### Fixed
+- **Tool chambers and chat now span the full chat band.** On wide terminals
+  with the side panels hidden, the chat band reclaims the panel gutters but the
+  chamber boxes (and chat text) were still pinned to the gutter-blind, 120-capped
+  `content_width`, leaving a dead strip on the right where stale border glyphs
+  rendered. Chamber width and chat wrapping now derive from the actual painted
+  band (`Layout::chat.width`), so the right border lands on the last painted cell
+  and the box matches the left edge. When panels are visible the band is capped
+  as before, so that mode is unchanged.
+- **`--no-default-features --features mcp` builds again.** The MCP setup
+  referenced `cli.loop_mode` and an `ansi` import that only exist with the `loop`
+  feature, so that combination failed under `-D warnings`. Both are now gated on
+  `loop`. (dirge-oae9)
+
+### Changed
+- Bumped `crypto-bigint` 0.7.3 → 0.7.5 (0.7.3 was yanked upstream).
+
+## [0.12.5] - 2026-06-26
+
+### Fixed
+- **Headless runs no longer deadlock mid-task on multi-turn agentic work.** In
+  `-p` mode a run could freeze permanently after several tool-call turns (alive,
+  0% CPU, no `result`). Three compounding issues in the plugin worker path are
+  fixed: (1) the before/after tool hooks awaited their `spawn_blocking` dispatch
+  via a `tokio::time::timeout` that, on expiry, *detached* a still-running,
+  uncancellable blocking task — which kept holding the global plugin-manager
+  mutex and the single Janet worker, stalling the next hook; the dispatch is now
+  awaited to completion (it's already bounded internally). (2) `harness/confirm`
+  / `harness/select` (`send_dialog`) was the one host call with no wall-clock
+  bound, so a dialog whose responder never answered pinned the worker forever;
+  it now gives up after a generous timeout. (3) the tool hooks round-tripped to
+  the worker on *every* tool call even with zero plugins registered;
+  `dispatch_tool_hook` now skips the worker entirely when no plugin subscribes.
+  (#523, dirge-u5ig)
+
+## [0.12.4] - 2026-06-25
+
+### Added
+- **Config-driven aliases for built-in slash commands.** A top-level
+  `slash_aliases` map renames a built-in or adds a short alias — `{"exit":
+  "quit", "q": "/quit"}` makes `/exit` and `/q` both run `/quit`. A leading `/`
+  on either side is optional, arguments after the alias pass through verbatim,
+  and an alias inherits its target's safety class (so an alias for `/quit` works
+  mid-run). Resolved once at startup; bad targets and keys that shadow a built-in
+  warn on the same path as keymap warnings. Aliases register in tab-completion,
+  the ghost suffix, and `/help`. (#522; thanks @nikolap)
+
+### Fixed
+- **`--print --output-format stream-json` now streams incrementally.** The
+  headless run loop received the agent's per-turn and per-tool events but, in
+  `stream-json` mode, emitted nothing for them — only a `system` init line, then
+  silence for the whole run, then one final `assistant` + `result` at the end.
+  Multi-turn agentic runs looked frozen to any consumer parsing the stream. The
+  loop now emits a Claude-compatible `assistant` event at each turn boundary
+  (text + `tool_use` blocks) and a `user` event carrying that turn's
+  `tool_result` blocks, so live-progress UIs get real incremental output. The
+  single-turn shape (`system` → `assistant` → `result`) is unchanged. (#520,
+  dirge-kuqp)
+
+## [0.12.3] - 2026-06-25
+
+### Added
+- **SQL semantic support** behind the `semantic-sql` feature (in `default` /
+  `windows-default`), backed by the `tree-sitter-sequel` grammar: `list_symbols`
+  / `get_symbol_body` / `find_definition` over DDL objects (tables, views,
+  materialized views, functions, indexes, types). (#516; thanks @nikolap)
+
+### Fixed
+- **SQL writes are no longer blocked by the generic SQL grammar.** `.sql` was
+  wired into the pre-write syntax gate, which hard-rejects parse errors — but
+  `tree-sitter-sequel` flags valid mainstream SQL (`CREATE PROCEDURE`, the whole
+  T-SQL dialect) as errors, so the agent couldn't save it. `.sql` is dropped
+  from the write gate; semantic indexing (which tolerates parse errors) is
+  unaffected.
+- **SQL adapter: anonymous `CREATE INDEX ON t(col)`** no longer emits the table
+  as a bogus index symbol — an unnamed index has no symbol to record.
+- **SQL adapter: DDL nested in a function body** (e.g. a `CREATE TABLE` inside a
+  PL/pgSQL `$$ … $$` body) no longer leaks in as a spurious top-level symbol.
+
+## [0.12.2] - 2026-06-24
+
+### Fixed
+- **Proactive compaction now actually runs near the limit.** The pre-send
+  trigger fires at 85% of the usable budget, but `prepare_compaction` re-gated
+  every non-forced call behind a stricter 100% within-limits check — so in the
+  85–100% band the UI announced "preemptive compaction… compressing…" and then
+  printed "context within limits, no compression needed" without compacting,
+  leaving proactive compaction effectively dead until a hard overflow. The
+  trigger now owns the decision (it alone accounts for the incoming prompt) and
+  compacts without being re-gated. (dirge-rz4i)
+
+## [0.12.1] - 2026-06-24
+
+### Fixed
+- **Mid-task context overflow now resumes the task after compaction instead of
+  stranding it.** When a turn overflowed the context mid-work, reactive
+  compaction ran but then sat idle because recovery refused to retry once any
+  tool had run. With eager post-turn compaction gone (0.12.0), that mid-turn
+  path became common, so the agent routinely stopped after compacting. The
+  partial assistant turn (streamed text + completed tool calls) is now recorded
+  into history before compacting, and recovery resumes as a continuation — the
+  already-run tools are not re-executed. (dirge-b899)
+- **Queuing a steering message mid-stream no longer duplicates the response.**
+  Echoing the queued message sealed the open stream block, and the next token
+  re-opened a new block with the whole accumulated response, painting the
+  partial `<dirge>` reply twice. The partial is now sealed and the render buffer
+  reset so post-queue tokens render as a clean continuation.
+
+## [0.12.0] - 2026-06-24
+
+### Added
+- **Experimental entity/relation graph storage** behind the
+  `experimental-graph-search` feature gate: entity/relation recording, FTS5 +
+  recursive-CTE graph search, a `/graph` command, and Janet harness hooks
+  (schema v14). Opt-in; no effect on the default build. (#513, closes #393;
+  thanks @allen-munsch)
+
+### Fixed
+- **Computer-use hardening** (experimental `experimental-ui-computer-use`):
+  closed a single-character shell-injection path in key validation, replaced
+  guessable `os/time` temp files with `mktemp`, deduplicated the bash CONTRACT
+  hint, and routed desktop actions through the permission PDP (`deny_tools`).
+  (#514, follow-up to #415; thanks @allen-munsch)
+
+### Changed
+- **The UI no longer freezes during background work.** Long operations used to
+  be `.await`ed inline in the single-threaded event loop, freezing rendering,
+  input, and Ctrl+C for their whole duration. They now run on spawned tasks
+  drained by dedicated `select!` arms, so the loop stays responsive and
+  Ctrl+C/Esc abort the work. Converted: compaction (the summarizer — explicit
+  `/compress`, preemptive pre-prompt, and reactive overflow recovery), the
+  `/plan` reviewer loop (a write-disabled reviewer that runs the code), `/btw`
+  side queries, `!cmd` shell commands (up to the 120s cap), and `/wt-merge`
+  (the git merge). The post-turn auto-compaction that used to block at every
+  turn end was dropped — the now-async preemptive pass covers the next user
+  prompt and reactive recovery covers automated follow-ups.
+- **`build_agent` no longer re-handshakes MCP servers on every rebuild.** It
+  ran a `tools/list` round-trip per connected server, uncached and with no
+  timeout, on each of ~9 inline sites (down to a prompt-cycle keystroke) — so a
+  rebuild froze the UI for the round-trip, unbounded if a server was wedged.
+  Tool definitions are now cached per server (invalidated on `/mcp reconnect`)
+  and each fetch is bounded by a 5s timeout.
+- **The post-session `git diff --stat` runs off the event loop.** The turn-end
+  review digest shelled out on the loop at every turn; the subprocess now runs
+  inside the already-spawned post-session task.
+
+## [0.11.3] - 2026-06-22
+
+### Added
+- **Read the current session id.** `/sessions current` prints the full session
+  id with a `dirge --session <id>` resume hint, and `/sessions list` marks the
+  live session. The status footer's session badge now shows a *distinct*
+  compact id (keeps a `compacted-`/`forked-` prefix plus the unique uuid head)
+  instead of collapsing every compacted session to "compacte".
+
+### Changed
+- **One-shot side-LLM calls no longer burn reasoning tokens.** The summarizer,
+  critic, and approval-evaluator one-shots now request the model's
+  extended-reasoning trace OFF (provider-appropriate param: chat_template_kwargs
+  for the openai-compat/DeepSeek family, `think:false` for Ollama, zero thinking
+  budget for Gemini). On reasoning-by-default models this roughly halves a
+  context-checkpoint summary's latency. Anthropic (off by default) and OpenAI
+  (no safe "off") are untouched.
+
+## [0.11.2] - 2026-06-22
+
+### Fixed
+- **OpenAI Responses streaming.** Historical reasoning blocks (which the
+  Responses API rejects without provider-generated IDs) are dropped and tool
+  `call_id`s are synthesized for OpenAI requests, fixing broken streaming /
+  tool-use against OpenAI. Applies to all three OpenAI client variants — API
+  key, ChatGPT-OAuth, and Codex — regardless of the configured provider alias.
+  (#510 + follow-up, issue #480; thanks @ericschmar)
+- **Preserve partial answers when escaping a multi-question prompt.** Pressing
+  Esc after answering at least one question in a batch now returns the answers
+  given (remaining questions marked `[no answer]`) instead of discarding
+  everything. Esc on the first question still cancels. (#508; thanks @rgkirch)
+
+## [0.11.1] - 2026-06-22
+
+### Added
+- **Hot-load plugins mid-session with `/plugins load`.** `/plugins load <path>`
+  loads a single `.janet` file or plugin directory; `/plugins load all` loads
+  every `.janet` from `.dirge/plugins/` and `~/.config/dirge/plugins/` (cwd wins
+  on same-name). Previously `/plugins` only listed already-loaded plugins. Works
+  in release builds. (#505, thanks @allen-munsch)
+- **See which prompt goes to which provider, and why.** New opt-in request dump
+  behind `DIRGE_DUMP_REQUESTS`: `=1` logs one summary line per outgoing provider
+  request (purpose label, provider, tool count/names, reasoning flag, byte
+  sizes); `=full` also dumps the system / one-shot prompt body. Emitted at INFO
+  on the `dirge::wire` target, so it lands in `dirge.log` (`-v` / `RUST_LOG` /
+  `DIRGE_LOG`) or via `RUST_LOG=dirge::wire=info`. Instrumented at both
+  request-build choke points — the side-LLM one-shot path (summarizer / critic /
+  approval evaluator) and the agent stream factory (turns / escalation /
+  subagents / forked review) — so a mystery secondary completion is now
+  attributable. Off by default. (#507, dirge-iis0)
+
+## [0.11.0] - 2026-06-22
+
+### Added
+- **Scrollback reflows on terminal resize.** The chat buffer became a derived
+  cache over a width-independent source log, so prose and markdown — tables
+  especially — re-wrap to the new width on resize instead of keeping the
+  column widths they were first rendered at. Streamed reasoning/response is
+  source-tracked too; tool-chamber borders are preserved verbatim (re-boxing is
+  a follow-up). (#504, dirge-qy3y)
+- **Memory: a pinned project overview.** A new `overview` memory kind holds a
+  single high-level orientation (stack, layout, how to build/test) that is
+  exempt from eviction and rendered first in the system prompt, refreshed by the
+  background review. (#504, dirge-pkqi)
+- **Memory: deterministic session ground-truth.** A model-free digest (goal,
+  files touched, commands run, todos, `git diff --stat`) is prepended to the
+  background-review transcript so it ranks known facts instead of rediscovering
+  them. (#504, dirge-a62g)
+- **Memory: open-thread carry-over.** The background review records genuinely
+  unfinished work as short `working` entries so a fresh session resumes where
+  the last one stopped, and clears them once the work lands. (#504, dirge-hcv8)
+
+### Changed
+- **Rebind a key across contexts without unbinding it first.** A user (or
+  plugin) keybinding now clears the chord from both the global and input keymaps
+  before inserting the resolved command, so e.g. `ctrl-r → reverse_search` takes
+  effect without a preceding `unbind`. (#504, dirge-z2p6)
+
+### Fixed
+- **Secrets in memory entries are redacted before storage**, not just in the
+  full-text index — closing a leak path into the system prompt and global-scope
+  memory. (#504, dirge-n3qf)
+
+## [0.10.4] - 2026-06-21
+
+### Added
+- **Debug a Python module, not just a file.** The DAP launch path now takes an
+  optional `module`, so a debuggee can start as `python -m <module>` (e.g.
+  `pytest`) instead of by program path — exposed via the `dap/launch-module`
+  Janet binding and the debug slash command. The `debug` tool's launch args also
+  gained an `env` map for per-launch environment variables. CI runs the new
+  smoke/e2e tests under a `dap` feature-matrix entry. (#497)
+
+## [0.10.3] - 2026-06-21
+
+### Added
+- **`/model` lists the models your config pins.** With no argument it now prints
+  every model set across your `providers`, marks the active one, and tells you to
+  switch with `/model <id>` — previously it only echoed the current model with
+  nothing to pick from. (#495, issue #492)
+
+### Changed
+- **`Ctrl+D` is forward-delete in the input editor**, not a hard exit. It deletes
+  the character under the cursor (rebindable as `delete_char_forward`); `Ctrl+C`
+  and `Esc` remain the interrupt/exit gestures. (#493)
+- **The context gauge reads 0–100%.** Its denominator is now the full effective
+  window instead of the fold-trigger budget (~75% of it), so real usage past 75%
+  no longer showed a confusing `>100%` (e.g. `90k/75k (120%)`). A compact
+  `fold`/`fold!` marker flags when a fold is near/imminent. (dirge-l4rp, dirge-cx7t)
+
+### Fixed
+- **Auto-repair no longer silently mangles files.** Delimiter auto-close now only
+  fixes a genuine *trailing* truncation; a mid-file imbalance that would swallow
+  the following code is rejected and bounced back to the model instead of being
+  "repaired" into valid-but-wrong code. (dirge-a0nl)
+- **Auto-repairs are verified by the language server and rolled back when wrong.**
+  After an auto-close, `write`/`edit` ask the LSP whether the result actually
+  holds up; on error-severity diagnostics the change is reverted to its pre-write
+  state and the model gets the diagnostics to fix its original text. A rollback
+  that can't snapshot the prior content (e.g. an unreadable existing file) now
+  leaves the file in place rather than deleting it. (dirge-p1ws, #501)
+- **Nix release job no longer fails on every tag.** The `bin.nix` version bump is
+  committed straight to `main` instead of trying to open a PR (which GitHub
+  Actions can't do with the default token). (#491)
+
+## [0.10.2] - 2026-06-20
+
+### Added
+- **Cycle prompts with Shift+Tab.** A hotkey (rebindable as `cycle_prompt`)
+  steps through the configured prompt layers like a mode switcher, and now
+  cycles back to the no-prompt base layer past the last one. (#485, #489)
+
+### Fixed
+- **Critic / verifier / todo nudge no longer vanishes from the log.** These
+  finalization nudges re-enter as user-role messages without a Done/ToolCall to
+  reset the stream anchor, so the next turn's render overwrote them — they
+  disappeared on screen a moment later even though the model still had them in
+  context. The in-flight response is now finalized before the nudge renders, so
+  the next turn streams below it. (#488)
+
+## [0.10.1] - 2026-06-20
+
+### Added
+- **Undo in the input editor.** `Ctrl+Z` reverts the last edit — a paste, a
+  kill, or a run of typing (grouped by word). State resets on submit and
+  `/fork`. Rebindable as the `undo` command.
+- **Verification-aware finalization.** The in-loop critic now sees whether the
+  run actually built/tested its code changes and nudges on an unverified or red
+  change — with an explicit "nothing to run / not testable → fine" escape so it
+  never forces a test that can't run. The goal gate gets the same signal as a
+  soft advisory that can't trap the bounded loop. Active only when a critic
+  provider is configured. (#484)
+- **Experimental computer-use plugin.** Off by default behind the
+  `experimental-ui-computer-use` build feature; intercepts `bash` commands
+  prefixed `computer:` to drive a desktop (screenshot, type, click, navigate)
+  via ydotool/xdotool plus a local vision backend. Gated by a confirm dialog,
+  an explicit host-control opt-in, and a sandboxed-desktop image. (#415)
+
+### Fixed
+- **Copy wrapped prose as one line.** Selecting chat text the renderer
+  soft-wrapped across rows no longer pastes a newline at every wrap point;
+  real line breaks, paragraph breaks, and blank lines are preserved.
+- **macOS (Apple Silicon) build.** The computer-use plugin used x86_64-only
+  Janet FFI (`janet_wrap_integer`, raw union `.pointer` access), which broke the
+  default plugin build on aarch64 — invisible to the Linux-only CI. Now uses
+  portable janetrs access. (#483)
+- **Shell injection in computer-use `focus`.** The model-controlled app name is
+  validated against a safe character set before reaching `pgrep` / the vision
+  call. (#482)
+
+## [0.10.0] - 2026-06-20
+
+### Added
+- **Configurable key bindings everywhere.** One `keybindings` array now rebinds
+  both the global command keys (scroll, chat nav, …) and the input-editor keys
+  (cursor/word motion, kill-ring, history, …) — the text-box keys used to be
+  hardcoded. Built-in defaults are declarative tables your config merges over;
+  see [docs/config.md](docs/config.md#key-bindings) for the full command list.
+  (#477)
+- **Emacs-style chord sequences.** A binding key may be a sequence like
+  `ctrl-x ctrl-s`; the footer shows the pending prefix and **Esc**/**Ctrl+G**
+  cancels it. Optional `chord_timeout_ms` auto-cancels a pending prefix after a
+  set idle time (default: wait indefinitely). (#477, #478, issue #234)
+- **Plugins can remap built-in bindings.** `(harness/bind-key keys command)`
+  binds a chord (or sequence) to a built-in command, or `"none"` to unbind one,
+  merged under your config (defaults < plugin < user). `register-shortcut`
+  (bind a key to plugin code) is unchanged. (#477, issue #476)
+- **Visual-line cursor motion.** `Ctrl+A`/`Ctrl+E`, `Home`/`End`, and the
+  `Ctrl+U` kill now act on the current soft-wrapped line rather than the whole
+  buffer. (#474)
+
+### Changed
+- **`approval_provider` denials are advisory.** When an LLM approval evaluator
+  denies a tool call, it now escalates to the normal permission prompt (showing
+  *why* it was flagged) instead of hard-failing — so you can still allow it.
+  It's terminal only in non-interactive mode. (#475)
+- **Permission denials aren't treated as fixable failures.** The recovery
+  checkpoint no longer tells the model to "try a different approach" after a
+  permission block (which pushed it to route around the guardrail), and the
+  critic treats a permission-denied capability as out of scope rather than
+  unfinished work. (#475)
+
+### Fixed
+- **`/sessions delete` works when ids collide.** Compacted sessions are named
+  `compacted-<uuid>`, so every one rendered as the identical 8-char stub
+  "compacte" and "be more specific" was impossible. The list/switch/delete
+  views now show ids at the shortest length that keeps them distinct, and never
+  cut the leading marker mid-word. (#478)
+
+## [0.9.1] - 2026-06-20
+
+### Changed
+- **`/sessions` uses explicit verbs.** `/sessions list | switch <id> | delete <id>`,
+  with bare `/sessions <id>` still switching as a shortcut. The first argument no
+  longer does double duty as both a `delete` sentinel and a session id, so a
+  session can no longer shadow a subcommand. (dirge-aqi3)
+- **The footer token budget reflects the compaction point.** The status line now
+  measures usage against the budget where auto-compaction kicks in
+  (`fold_threshold × min(model_window, context_target)`) instead of the raw
+  advertised model window, so the percentage tracks how close the next fold is —
+  at 100% a fold is imminent. (dirge-l4rp)
+
+### Fixed
+- **Deleting the current session no longer leaves a zombie.** Deleting the session
+  you're in removed its file but left the in-memory session pointing at it; you're
+  now booted into a fresh session (new id, same model/provider/cwd) with the agent
+  rebuilt. (dirge-0cvk)
+- **The goal gate no longer acts on a stale compaction summary.** After a resume,
+  the merged system prompt carries a `[CONTEXT COMPACTION — REFERENCE ONLY]`
+  summary whose `## Active Task` describes already-completed work; the goal judge
+  now strips it (matching the critic), so it won't re-demand superseded work. It
+  also no longer risks a panic truncating a multi-byte constraints block. (dirge-wp0e)
+- **Pasting while answering a question no longer leaks into the main prompt.**
+  When typing a free-form custom answer in the `question` modal, a paste went
+  to the compose editor instead of the answer field — the modal dispatcher only
+  routed key events, so pastes fell through. Pastes now land in the active
+  answer (newlines flattened to spaces) and are swallowed for single-key
+  modals. (dirge-7543)
+
+## [0.9.0] - 2026-06-19
+
+### Added
+- **`show_reasoning` config flag.** Set it to `true` to make the model's
+  thinking visible by default instead of pressing `Ctrl+O` each turn. Defaults
+  to `false` (unchanged behavior); `Ctrl+O` still toggles per session. (#461)
+- **Nix flake.** `nix build` / `nix run` build dirge from source, `nix develop`
+  opens a Rust dev shell, and `nix build .#dirge-bin` installs the prebuilt
+  release binary. Ships an overlay and `.envrc` for direnv, and supports
+  x86_64/aarch64 on both Linux and macOS. A release-tag workflow refreshes
+  `nix/bin.nix` hashes and opens a PR. (#462, #466)
+
+### Fixed
+- **Compaction no longer 400s under Anthropic OAuth.** dirge injects
+  `role:"system"` entries into `messages[]` for compaction summaries and
+  mid-session memory re-injection. The OAuth shaper only normalized the
+  top-level `system` field, so a stray system turn reached the wire and the
+  Claude-Code classifier rejected it as third-party traffic ("extra usage" 400)
+  right after every compaction. System-role `messages[]` entries are now folded
+  into the top-level `system` block first. (#463)
+- **Global-tier skills are advertised in the system prompt.** The skill catalog
+  listed only the project-local `.dirge/skills/`, while the `skill` tool could
+  load from the global tiers too — so a globally installed skill was loadable
+  but never advertised. The catalog now lists from the same source as the tool
+  (`discover_skills`). (#464)
+
 ## [0.8.1] - 2026-06-18
 
 ### Fixed

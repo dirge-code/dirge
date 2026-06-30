@@ -226,9 +226,7 @@ impl CheckpointSchedule {
 
     /// Clear crossed state after a destructive fold rebuilt the context.
     pub fn reset(&mut self) {
-        for c in &mut self.crossed {
-            *c = false;
-        }
+        self.crossed.fill(false);
     }
 }
 
@@ -911,15 +909,11 @@ mod tests {
     // Threshold constant sanity
     // ============================================================
 
-    #[test]
-    fn thresholds_are_strictly_ordered() {
-        assert!(FORCE_SUMMARY_THRESHOLD > HISTORY_FOLD_AGGRESSIVE_THRESHOLD);
-        assert!(HISTORY_FOLD_AGGRESSIVE_THRESHOLD > HISTORY_FOLD_THRESHOLD);
-        assert!(HISTORY_FOLD_THRESHOLD > HISTORY_FOLD_MIN_SAVINGS_FRACTION);
-    }
-
-    #[test]
-    fn aggressive_tail_is_smaller_than_normal_tail() {
-        assert!(HISTORY_FOLD_AGGRESSIVE_TAIL_FRACTION < HISTORY_FOLD_TAIL_FRACTION);
-    }
+    // Compile-time invariants: a violation is now a build error rather
+    // than a test failure. (clippy::assertions_on_constants flagged the
+    // former runtime `assert!`s because both operands are consts.)
+    const _: () = assert!(FORCE_SUMMARY_THRESHOLD > HISTORY_FOLD_AGGRESSIVE_THRESHOLD);
+    const _: () = assert!(HISTORY_FOLD_AGGRESSIVE_THRESHOLD > HISTORY_FOLD_THRESHOLD);
+    const _: () = assert!(HISTORY_FOLD_THRESHOLD > HISTORY_FOLD_MIN_SAVINGS_FRACTION);
+    const _: () = assert!(HISTORY_FOLD_AGGRESSIVE_TAIL_FRACTION < HISTORY_FOLD_TAIL_FRACTION);
 }

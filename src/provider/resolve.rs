@@ -503,14 +503,23 @@ where
         return Ok(String::new());
     }
 
+    // OpenAI-compatible endpoints that need no key (a local ollama / vLLM /
+    // LM Studio server) should use `provider_type: "custom"` (or "ollama"),
+    // which are keyless — point the user there rather than just demanding a key.
+    let keyless_hint = if kind == ProviderKind::OpenAI {
+        " For a keyless OpenAI-compatible endpoint (e.g. a local ollama/vLLM server), set `provider_type` to \"custom\" (or \"ollama\") instead of \"openai\"."
+    } else {
+        ""
+    };
+
     let fallbacks = provider_env_var_fallbacks(kind);
     if fallbacks.is_empty() {
         anyhow::bail!(
-            "No API key found for {kind:?}. Set the {env_var} environment variable or pass --api-key."
+            "No API key found for {kind:?}. Set the {env_var} environment variable or pass --api-key.{keyless_hint}"
         )
     } else {
         anyhow::bail!(
-            "No API key found for {kind:?}. Set {env_var} (or one of: {}) or pass --api-key.",
+            "No API key found for {kind:?}. Set {env_var} (or one of: {}) or pass --api-key.{keyless_hint}",
             fallbacks.join(", ")
         )
     }

@@ -125,6 +125,14 @@
     (array/push parts (string "untracked: " (string/join untracked " "))))
   (when (and (string/find "nothing to commit" output) (= (length parts) 1))
     (array/push parts "clean"))
+  # Record extracted entities for graph search (#393).
+  # Strip status prefix chars (+, ~, -, →) from file names.
+  (each f staged
+    (harness/record-entity "file" (string/slice f 1) {:status "staged"}))
+  (each f unstaged
+    (harness/record-entity "file" (string/slice f 1) {:status "unstaged"}))
+  (each f untracked
+    (harness/record-entity "file" f {:status "untracked"}))
   (string/join parts "\n"))
 
 # ---------------------------------------------------------------------------
@@ -180,7 +188,8 @@
           (array/push file-ranges [file-start i file-name]))
         (set file-start i)
         (def parts (string/split " b/" line))
-        (set file-name (if (> (length parts) 1) (in parts 1) "?")))))
+        (set file-name (if (> (length parts) 1) (in parts 1) "?"))
+        (harness/record-entity "file" file-name {:source "git-diff"}))))
   (when (not (nil? file-start))
     (array/push file-ranges [file-start (length lines) file-name]))
   (if (empty? file-ranges) (break (git-compress-diff-keep-hunks output)))
@@ -371,7 +380,8 @@
       (string/has-prefix? "commit " line)
       (do
         (when (not (empty? cur-hash))
-          (array/push commits (string cur-hash " " cur-date " " cur-msg)))
+          (array/push commits (string cur-hash " " cur-date " " cur-msg))
+          (harness/record-entity "commit" cur-hash {:date cur-date :msg cur-msg}))
         (set cur-hash (string/slice (string/trim line) 7 15))
         (set cur-date "")
         (set cur-msg ""))

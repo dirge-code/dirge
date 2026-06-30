@@ -83,6 +83,89 @@ jobs:
           tag: ${{ github.ref }}
           overwrite: true
 
+  nix-binary-package:
+    name: Bump Nix binary package
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          # Full history so the post-build commit can rebase+push to main.
+          fetch-depth: 0
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v16
+
+      - name: Prefetch release assets and update nix/bin.nix
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          version="${tag#v}"
+          assets="$(gh release view "$tag" -R "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')"
+
+          python3 - <<'PY' > /tmp/dirge-nix-assets.tsv
+          import re
+          from pathlib import Path
+
+          text = Path("nix/bin.nix").read_text()
+          for match in re.finditer(r'"(?P<system>[^"]+)" = \{\s*triple = "(?P<triple>[^"]+)";', text):
+              print(f"{match.group('system')}\t{match.group('triple')}")
+          PY
+
+          hashes_json="{}"
+          while IFS=$'\t' read -r system triple; do
+            asset="dirge-${triple}.tar.gz"
+            if ! grep -Fxq "$asset" <<< "$assets"; then
+              echo "Missing release asset: $asset" >&2
+              exit 1
+            fi
+            url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}/${asset}"
+            hash="$(nix store prefetch-file --hash-type sha256 --json "$url" | jq -r .hash)"
+            hashes_json="$(jq --arg system "$system" --arg hash "$hash" '. + {($system): $hash}' <<< "$hashes_json")"
+          done < /tmp/dirge-nix-assets.tsv
+
+          HASHES_JSON="$hashes_json" VERSION="$version" python3 - <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          path = Path("nix/bin.nix")
+          text = path.read_text()
+          text = re.sub(r'version = "[^"]+";', f'version = "{os.environ["VERSION"]}";', text, count=1)
+          hashes = json.loads(os.environ["HASHES_JSON"])
+          for system, hash_ in hashes.items():
+              pattern = rf'("{re.escape(system)}" = \{{\n\s+triple = "[^"]+";\n\s+hash = ")[^"]+(";)'
+              text = re.sub(pattern, rf'\g<1>{hash_}\2', text, count=1)
+          path.write_text(text)
+          PY
+
+      # Commit the bump straight to `main` instead of opening a PR. The
+      # PR route (peter-evans/create-pull-request) failed on every release
+      # with "GitHub Actions is not permitted to create or approve pull
+      # requests" — a repo Actions toggle that's off. `main` is unprotected
+      # and this job has `contents: write` (permissions: write-all), so a
+      # direct push works and needs no extra setting or PAT. A GITHUB_TOKEN
+      # push doesn't re-trigger workflows, so this can't loop.
+      - name: Commit nix/bin.nix bump
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- nix/bin.nix; then
+            echo "nix/bin.nix already current for ${GITHUB_REF_NAME} — nothing to commit"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add nix/bin.nix
+          git commit -m "Bump Nix dirge-bin to ${GITHUB_REF_NAME}"
+          # The release job can run minutes after the tag; rebase on any
+          # main movement so the push fast-forwards.
+          git pull --rebase origin main
+          git push origin HEAD:main
+
   # Bump the Homebrew tap (dirge-code/homebrew-dirge) to the just-released
   # version + checksums. Runs after every target has uploaded its assets, so
   # the .sha256 files exist to read back. Needs a HOMEBREW_TAP_TOKEN secret —

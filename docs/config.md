@@ -8,6 +8,15 @@ folder:
   (for example `$XDG_CONFIG_HOME/dirge/config.json` on Linux)
 - Fallback: `$HOME/.config/dirge/config.json`
 
+A project may also ship a partial `<project>/.dirge/config.json`. It is
+deep-merged on top of the global file: scalar fields override, while maps
+(`providers`, `mcp_servers`, `agents`, `slash_aliases`, `keybindings`) union
+key-by-key, so a project can add or override a single entry without
+redeclaring the whole map. Absent keys fall through to the global file. An
+empty object (e.g. `"providers": {}`) is a no-op, not a wipe — there is no
+syntax to clear a global map from a project config. CLI flags and env vars
+still take precedence over both files.
+
 All config keys are optional. CLI flags and their environment-backed values
 (such as `DIRGE_PROVIDER` and `DIRGE_MODEL`) take precedence where both exist.
 
@@ -26,6 +35,7 @@ Example:
   "default_permission_mode": "standard",
   "show_tool_details": true,
   "show_edit_diff": true,
+  "show_reasoning": false,
   "display": "left|main|right",
   "tool_result_max_chars": 500,
   "tool_result_max_lines": 4,
@@ -64,9 +74,10 @@ Accepted top-level keys:
 | `providers`               | object  | Map of provider alias → entry. The active model lives in `providers.<active-provider>.model`. Each role key below points at one of these aliases. See [Providers and roles](#providers-and-roles). |
 | `review_provider`         | string  | Provider alias for the background session-review pass. Falls back to `provider`. |
 | `escalation_provider`     | string  | Provider alias for the one-shot retry after repair-exhaustion / pre-write syntax failure. Falls back to `provider` (no-op when equal). |
-| `summarization_provider`  | string  | Provider alias for context compaction. Falls back to `provider`. |
+| `summarization_provider`  | string  | Provider alias for context compaction. Falls back to `provider`; with Anthropic OAuth, configure a non-Anthropic-OAuth summarization provider for LLM compaction side calls. Reactive overflow can still use a local prune-only emergency fallback, but high-fidelity LLM summaries require this route. |
 | `subagent_provider`       | string  | Provider alias for `task` tool subagents. Falls back to `provider`. |
 | `critic_provider`         | string  | Provider alias for the F6 in-loop critic (tier 3). When set, the verifier escalates to a bounded LLM critique at finalization on substantive runs (one call per run), and it also serves as the judge for the **goal gate** (`--goal`). **No fallback** — unset means no critic, no goal gate, and no cost. |
+| `critic_preamble`         | string  | Optional system-preamble override for the F6 in-loop critic. Replaces the built-in critic stance for every prompt. A prompt's `critic_preamble` frontmatter overrides this per-prompt; a `critic: false` frontmatter suppresses the critic entirely for that prompt. The **goal gate** is unaffected by either — it always judges under its own fixed preamble. Unset = built-in. |
 | `context_target` | integer | Working-context budget in tokens (default `100000`). The compaction decision treats the effective window as `min(model_window, context_target)`, so the live context is folded — and project memory formed — to stay within the budget instead of trusting a model's full advertised window, whose effective quality degrades well before it fills (the "smart zone" runs out around 100k regardless of size — see [Chroma context-rot research](https://garrit.xyz/posts/2026-05-06-dont-trust-large-context-windows)). Floored at 16k; a value above the model's real window is a no-op. With the default fold fraction the live context stays around 75% of the budget. |
 | `compaction_fold_threshold` | float | Fraction of the (budgeted) context window (0.3–0.75) at which history folds into a summary — and the durable checkpoint is written. Lower folds/checkpoints earlier, from more coherent context. Unset keeps the 0.75 default. Composes with `context_target`: the fold point is `fraction × min(model_window, context_target)`. |
 | `incremental_checkpoint`  | bool    | Refresh the durable session checkpoint in the background at 20%-of-window usage thresholds, without folding, so a resumed session recovers fresh state (adapted from [MiMo-Code](https://github.com/XiaomiMiMo/MiMo-Code)). Default `true`; set `false` to disable the background summary calls. Forced off in headless `-p`/`--loop` (nothing there persists it). |
@@ -92,6 +103,8 @@ Accepted top-level keys:
 | `default_permission_mode` | string  | Permission mode when no mode boolean/CLI flag is set. Use `standard`, `restrictive`, `accept`, or `yolo`.                                                                   |
 | `show_tool_details`       | boolean | Show tool-result output in the TUI. Default: `true`.                                                                                                                         |
 | `show_edit_diff`          | boolean | Show colorized diff output for `edit` tool results (`-` red, `+` green, `@@` cyan). Default: `true`.                                                                        |
+| `show_reasoning`          | boolean | Show the model's thinking/reasoning by default, instead of having to press `Ctrl+O` each turn. Default: `false`.                                                            |
+| `max_sessions`            | integer | How many of the most-recent prior sessions in the same project (same working dir) to mine for Up-arrow / Ctrl+F command history, seeded ahead of the current session's prompts. Default: `3`. Set `0` to keep recall to the current session only. See [Command history](#command-history-cross-session-recall). |
 | `display`                 | string  | Preferred startup pane layout: a `\|`/`,`/space-separated subset of `left`, `main`, `right` (e.g. `"main\|right"`, `"main"`). The main pane is always shown; this picks which side panels appear. Override at runtime with `/display`. Default: automatic (side panels shown at ≥152 cols). |
 | `tool_result_max_chars`   | integer | Hard ceiling on characters per tool result. Default: `500`. Combined with `tool_result_max_lines` (lines applied first; chars trim what's left).                                |
 | `tool_result_max_lines`   | integer | Body lines shown inside a tool chamber before collapsing to `↓ N more lines (Ctrl+O to expand)`. Default: `4`. Press `Ctrl+O` to re-print the most recent collapsed result in full. `edit`, `apply_patch`, `question`, `task`, and `task_status` are exempt (their body IS the value). |
@@ -227,13 +240,18 @@ Each `providers` entry accepts:
 The aliases on the left of the map become the values you write in
 role-assignment keys.
 
-### OpenAI device-code auth
+### OpenAI browser / device-code auth
 
-Run `dirge auth openai` to authorize OpenAI through the device-code flow and
-persist a local OAuth refresh token. Before running the command, enable
-device-code auth in ChatGPT Codex security settings. Dirge prints the OpenAI
-verification URL and user code; the user code is part of the interactive login
-UX, but you should not share it with anyone.
+Run `dirge auth openai` to authorize OpenAI through the browser OAuth flow and
+persist a local OAuth refresh token. Dirge prints an OpenAI authorization URL
+and waits for the browser redirect on `http://localhost:1455/auth/callback`.
+This is the preferred ChatGPT/Codex subscription login path.
+
+For headless environments, run `dirge auth openai --device-code` to use the
+older device-code flow. Before using that mode, enable device-code auth in
+ChatGPT Codex security settings. Dirge prints the OpenAI verification URL and
+user code; the user code is part of the interactive login UX, but you should
+not share it with anyone.
 
 The credential store lives in the Dirge data directory, not the repository or
 program directory:
@@ -246,7 +264,10 @@ the OpenAI authorization if you want to force a new login.
 
 For the canonical `openai` provider with no configured `base_url`, a fresh
 stored OAuth credential is treated as subscription auth and is preferred before
-API-key billing. OpenAI-compatible aliases and providers with a custom
+API-key billing. Explicit `auth: "chatgpt"` also uses this fresh Dirge-managed
+OpenAI OAuth credential before falling back to legacy `~/.codex/auth.json`
+storage, so rerunning `dirge auth openai` is enough to recover from a stale
+Codex login file. OpenAI-compatible aliases and providers with a custom
 `base_url` keep normal API-key behavior. If no fresh OAuth credential exists,
 Dirge uses the usual API-key sources: explicit CLI keys, key files/stdin, config
 `api_key`, config `api_key_env`, and provider environment variables. If the
@@ -255,9 +276,12 @@ asks before switching that request to API-key billing.
 
 Troubleshooting:
 
+- Browser callback port is busy: stop the process using port 1455 and rerun
+  `dirge auth openai`, or use `dirge auth openai --device-code` in a headless
+  environment.
 - `OpenAI device-code auth is not enabled` or a 404 from the user-code endpoint:
   enable device-code auth in ChatGPT Codex security settings and rerun
-  `dirge auth openai`.
+  `dirge auth openai --device-code`.
 - Timeout: complete approval in the browser and rerun the command.
 - Corrupt auth store: fix or remove `auth.json`, then rerun `dirge auth openai`.
 
@@ -299,7 +323,7 @@ expired tokens before rebuilding the Anthropic client.
 | `provider` | Default / main loop | (none — required) |
 | `review_provider` | Background session-review pass | `provider` |
 | `escalation_provider` | One-shot retry after repair-exhaustion / pre-write syntax failure | `provider` (no-op when equal) |
-| `summarization_provider` | Context compaction | `provider` |
+| `summarization_provider` | Context compaction side calls (required for LLM compaction when `provider` uses Anthropic OAuth) | `provider` when safe |
 | `subagent_provider` | `task` tool subagents | `provider` |
 | `critic_provider` | F6 in-loop critic (tier 3) + goal-gate judge (`--goal`) | none (off) |
 
@@ -570,7 +594,7 @@ above is the one exception with richer per-provider precedence;
 | Field | Default | What it bounds |
 |---|---|---|
 | `stream_chunk_secs` | 300 | Per-chunk read deadline for a streaming LLM response (fallback for the per-provider key above) |
-| `tool_call_gap_secs` | 30 | Stall window while a tool call is mid-assembly in the stream |
+| `tool_call_gap_secs` | 60 | Stall window while a tool call is mid-assembly in the stream. A timeout here is retried automatically (the partial, incomplete tool call is discarded and the request restarted); raise it only if your provider legitimately pauses longer than 60s between tool-call deltas. |
 | `mcp_call_secs` | 120 | Total budget for one MCP tool call, including reconnect + retry |
 | `mcp_init_secs` | 10 | MCP server `initialize` handshake |
 | `lsp_request_secs` | 30 | Any non-`initialize` LSP request |
@@ -589,54 +613,162 @@ above is the one exception with richer per-provider precedence;
 
 ## Key bindings
 
-VSCode-style overrides for the global "command" keys. `keybindings` is an
-array of `{ "key": "<chord>", "command": "<command>" }`; each entry is
-layered over the built-in defaults, so you only list what you want to
-change.
+VSCode-style overrides. `keybindings` is an array of
+`{ "key": "<chord>", "command": "<command>" }`; each entry layers over the
+built-in defaults, so you only list what you want to change. One array
+covers BOTH the global "command" keys (scroll, chat nav, …) and the
+input-editor keys (cursor motion, kill-ring, history, …) — each entry
+routes to the right one by its command name.
 
 ```json
 {
   "keybindings": [
-    { "key": "ctrl-t",       "command": "toggle_reasoning" },
-    { "key": "ctrl-shift-k", "command": "kill_subagent" },
-    { "key": "ctrl-r",       "command": "none" }
+    { "key": "ctrl-t",        "command": "toggle_reasoning" },
+    { "key": "ctrl-shift-k",  "command": "kill_subagent" },
+    { "key": "ctrl-r",        "command": "none" },
+    { "key": "alt-a",         "command": "cursor_line_start" },
+    { "key": "ctrl-x ctrl-s", "command": "scroll_to_top" }
   ]
 }
 ```
 
-- **`key`** — a chord: case-insensitive, `-` or `+` separated, modifiers
-  before the key. Modifiers: `ctrl`, `alt` (a.k.a. `meta`/`option`),
-  `shift`. Keys: a single character, `f1`–`f12`, or a named key
-  (`enter`, `esc`, `tab`, `backspace`, `delete`, `insert`, `space`,
-  `up`/`down`/`left`/`right`, `home`, `end`, `pageup`/`pgup`,
-  `pagedown`/`pgdn`). Examples: `ctrl-t`, `pageup`, `ctrl-shift-x`, `f5`.
-- **`command`** — one of the rebindable commands below, or **`none`**
-  (also `unbind`) to disable the default binding on that chord.
+- **`key`** — a chord, or a whitespace-separated *sequence* of chords for
+  an emacs-style binding (e.g. `ctrl-x ctrl-s`). A chord is
+  case-insensitive, `-` or `+` separated, modifiers before the key.
+  Modifiers: `ctrl`, `alt` (a.k.a. `meta`/`option`), `shift`. Keys: a
+  single character, `f1`–`f12`, or a named key (`enter`, `esc`, `tab`,
+  `backspace`, `delete`, `insert`, `space`, `up`/`down`/`left`/`right`,
+  `home`, `end`, `pageup`/`pgup`, `pagedown`/`pgdn`). Examples: `ctrl-t`,
+  `pageup`, `ctrl-shift-x`, `f5`, `ctrl-x ctrl-s`.
+- **`command`** — one of the global or input commands below, or **`none`**
+  (also `unbind`) to disable the default binding on that chord (clears it
+  from both contexts).
 - Binding a command to a new chord **adds** it (the default chord still
   works unless you separately unbind it). Binding a chord that already
   has a default **replaces** it.
 
+### Global commands
+
 | Command | Default | Action |
 |---|---|---|
 | `toggle_reasoning` | `ctrl-r` | Show/hide reasoning tokens |
+| `expand` | `ctrl-o` | Expand buffered thinking / reprint last collapsed tool result |
 | `scroll_page_up` | `pageup` | Scroll chat up one page |
 | `scroll_page_down` | `pagedown` | Scroll chat down one page |
-| `scroll_to_top` | `home` | Jump to top of chat |
-| `scroll_to_bottom` | `end` | Jump to bottom of chat |
+| `scroll_to_top` | `ctrl-home` | Jump to top of chat |
+| `scroll_to_bottom` | `ctrl-end` | Jump to bottom of chat |
 | `next_chat` | `ctrl-n` | Next subagent chat window |
 | `prev_chat` | `ctrl-p` | Previous subagent chat window |
 | `close_chat` | `ctrl-x` | Close the active chat window |
 | `kill_subagent` | `ctrl-k` | Kill the focused subagent |
+| `drop_queue` | `alt-x` | Drop queued interjections (without cancelling the run) |
+| `cycle_prompt` | `shift-tab` | Cycle the active prompt layer to the next available prompt |
+
+### Input-editor commands
+
+| Command | Default | Action |
+|---|---|---|
+| `cursor_line_start` | `ctrl-a`, `home` | Cursor to start of line |
+| `cursor_line_end` | `ctrl-e`, `end` | Cursor to end of line |
+| `cursor_left` | `ctrl-b`, `left` | Cursor one character left |
+| `cursor_right` | `right` | Cursor one character right |
+| `word_left` | `alt-b`, `alt-left` | Cursor one word left |
+| `word_right` | `alt-f`, `alt-right` | Cursor one word right |
+| `delete_char_back` | `ctrl-h` | Delete character before cursor |
+| `delete_char_forward` | `ctrl-d` | Delete character at cursor (forward) |
+| `kill_to_line_end` | `ctrl-k` | Kill to end of line |
+| `kill_to_line_start` | `ctrl-u` | Kill to start of line |
+| `kill_word_back` | `ctrl-w` | Kill word before cursor |
+| `delete_word_back` | `alt-backspace` | Delete word before cursor |
+| `delete_word_forward` | `alt-d` | Delete word after cursor |
+| `yank` | `ctrl-y` | Paste from the kill-ring |
+| `yank_pop` | `alt-y` | Cycle the kill-ring at the last yank |
+| `history_prev` | `ctrl-p` | Previous history entry |
+| `history_next` | `ctrl-n` | Next history entry |
+| `reverse_search` | `ctrl-f` | Reverse-i-search over history |
+| `line_up` | `up` | Up one line (then history) |
+| `line_down` | `down` | Down one line (then history) |
+| `undo` | `ctrl-z` | Undo the last edit |
+
+Some chords serve both contexts (e.g. `ctrl-k` is `kill_subagent` *and*
+`kill_to_line_end`, `ctrl-n` is `next_chat` *and* `history_next`). The
+global command only fires in its situation — `kill_subagent` only when the
+input box is empty, chat nav only with more than one chat window — so the
+editor handler gets the key the rest of the time.
+
+### Chord sequences (emacs-style)
+
+A `key` may be a sequence like `ctrl-x ctrl-s`. After the first chord the
+footer shows the pending prefix (`ctrl-x-`) and waits; the next chord
+completes (or aborts) the sequence. **Esc** or **Ctrl+G** cancels a
+pending prefix. By default a pending prefix waits indefinitely (emacs
+style); set `"chord_timeout_ms": <n>` at the top level of the config to
+auto-cancel it after `n` milliseconds of inactivity. Sequences fire for
+**global commands only**; a sequence bound to an input command is rejected
+with a startup warning. Binding a sequence whose first chord is also a
+single-key command disables that single-key binding (the sequence wins) —
+you'll see a warning.
 
 Notes:
-- **Not rebindable** (kept fixed): the text-editing keys in the input box
-  (Ctrl+A/E/W, kill-ring, word motion, history) and the universal
-  cancel/interrupt gesture (**Ctrl+C / Ctrl+D / Esc**) — the latter must
-  always be available as the panic button.
-- Rebinding a command to a key the input editor uses (e.g. `ctrl-a`)
-  shadows that editing key while the binding is active.
+- **Always fixed** (never rebindable): the cancel/interrupt gesture
+  **Ctrl+C / Esc** (the panic button) and intrinsic editing —
+  typing a character, **Backspace**, **Delete**, **Enter** to submit,
+  **Ctrl+J** (insert newline), and **Tab** completion. Binding a global
+  command to one of these chords shadows the intrinsic behavior while
+  active.
+- Plugins can also add and override bindings; user config always wins over
+  a plugin. See [plugins.md](plugins.md#keyboard-shortcuts).
 - Unrecognized chords or unknown commands are skipped with a warning on
   startup; the rest of the config still loads.
+
+## Command history (cross-session recall)
+
+Pressing **Up** in the input box recalls previous prompts, and **Ctrl+F**
+opens a reverse-i-search over them. By default the recall pool is the
+*current* session's prompts. Set top-level `max_sessions` to an integer
+`N` (default `3`) to additionally mine the `N` most-recent *prior*
+sessions in the same project (matching `working_dir`) for their user
+prompts. Those older prompts are seeded ahead of the current session's
+own, so Up starts from your newest command and walks back through earlier
+conversations in the project.
+
+The scan is scoped to the same project and excludes the current
+conversation's own compaction-fold rotations, so a fold doesn't double its
+prompts into history. Set `"max_sessions": 0` to keep recall limited to
+the current session. Synthetic turns (system-reminder wrappers, mid-turn
+steering, auto-continue markers) never enter history.
+
+## Slash-command aliases
+
+Rename a built-in slash command, or give it a short alias, with the
+top-level `slash_aliases` map. The key is what you type (with or without a
+leading `/`); the value is the built-in command it runs (again with or
+without a leading `/`). Arguments you type after the alias are passed
+through to the target.
+
+```json
+{
+  "slash_aliases": {
+    "exit": "quit",
+    "q": "/quit",
+    "cls": "/clear"
+  }
+}
+```
+
+With the above, `/exit`, `/q`, and `/cls` all run `/quit` or `/clear`. The
+alias is resolved once before dispatch, so it inherits its target's
+behavior (e.g. an alias for `/quit` works while the agent is running).
+
+- Aliases don't replace the built-in — both names work unless they
+  collide (an alias key that matches a built-in shadows it).
+- A leading `/` on either side is optional and normalized.
+- A target that isn't a known built-in produces a startup warning (likely
+  a typo) but is still passed through — it may resolve to a plugin
+  command. Plugin-command targets can't be validated ahead of time.
+- An empty alias key is ignored (with a warning); it would otherwise make
+  a bare `/` run the target.
+- Configured aliases are listed under `slash aliases` in `/help`.
 
 ## Environment variables
 

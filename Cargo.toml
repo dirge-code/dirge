@@ -3,7 +3,7 @@
 # taken on crates.io. The installed BINARY is still `dirge` (see [[bin]]),
 # so users run: `cargo install dirge-agent` then the `dirge` command.
 name = "dirge-agent"
-version = "0.8.1"
+version = "0.14.1"
 edition = "2024"
 # edition 2024 was stabilized in Rust 1.85; pin the MSRV so older
 # toolchains get a clear error instead of a cryptic edition failure.
@@ -76,6 +76,7 @@ default = [
     'semantic-c',
     'semantic-cpp',
     'semantic-elixir',
+    'semantic-sql',
     'semantic-dafny',
     'slash-completion',
     'mcp-server',
@@ -104,6 +105,7 @@ windows-default = [
     'semantic-c',
     'semantic-cpp',
     'semantic-elixir',
+    'semantic-sql',
     'semantic-dafny',
     'slash-completion',
     'mcp-server',
@@ -133,6 +135,7 @@ semantic-java = ["semantic", "dep:tree-sitter-java"]
 semantic-c = ["semantic", "dep:tree-sitter-c"]
 semantic-cpp = ["semantic", "dep:tree-sitter-cpp"]
 semantic-elixir = ["semantic", "dep:tree-sitter-elixir"]
+semantic-sql = ["semantic", "dep:tree-sitter-sequel"]
 semantic-dafny = ["semantic", "dep:tree-sitter-dafny"]
 plugin = ["dep:janetrs"]
 lsp = ["dep:lsp-types"]
@@ -148,6 +151,12 @@ timing-diagnostics = []
 # --no-default-features.
 slash-completion = []
 experimental-ui-terminal-tab = []
+experimental-ui-computer-use = []
+# Entity/relation graph storage + recursive CTE queries over
+# structured tool-output facts extracted by Janet compressors.
+# Opt-in: creates two new SQLite tables (entities, relations)
+# and an entity_search module. PRISM #393.
+experimental-graph-search = []
 
 [target.'cfg(unix)'.dependencies]
 # Used by the bash tool for process-group cleanup on timeout
@@ -214,7 +223,7 @@ ratatui = { version = "0.30", default-features = false, features = ["crossterm"]
 ansi-to-tui = "8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt", "macros", "sync", "time", "process", "fs", "io-util"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "process", "fs", "io-util"] }
 anyhow = "1"
 # Already transitive via rig's `http_client` API (rig re-exports `bytes::Bytes`
 # in the request/response types). Declared directly so `provider::codex_http`
@@ -260,6 +269,7 @@ html2text = "0.17"
 indexmap = "2"
 lsp-types = { version = "0.97", optional = true }
 tree-sitter-elixir = { version = "0.3.5", optional = true }
+tree-sitter-sequel = { version = "0.3", optional = true }
 tree-sitter-dafny = { version = "0.1", optional = true }
 rusqlite = { version = "0.31", features = ["bundled"] }
 # DAP (Debug Adapter Protocol) — optional feature for driving
@@ -299,6 +309,7 @@ yaml-rust2 = "0.11"
 # examples against the user's task to inject the most relevant ones.
 nucleo-matcher = "0.3"
 url = "2"
+vt100 = "0.16.2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }

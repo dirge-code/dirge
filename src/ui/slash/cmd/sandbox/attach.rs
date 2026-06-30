@@ -86,59 +86,17 @@ pub(crate) async fn cmd_sandbox_attach(ctx: &mut SlashCtx<'_>) -> anyhow::Result
         }
     }
 
-    use std::io::Write;
-    use std::sync::atomic::Ordering;
-
     #[cfg(feature = "timing-diagnostics")]
     let t0 = std::time::Instant::now();
 
-    crate::ui::terminal::EVENT_READER_SHUTDOWN.store(true, Ordering::Relaxed);
-    crate::ui::terminal::join_reader(std::time::Duration::from_millis(50));
-
-    #[cfg(feature = "timing-diagnostics")]
-    {
-        let elapsed = t0.elapsed();
-        let reader_exited = crate::ui::terminal::EVENT_READER_EXITED.load(Ordering::Acquire);
-        eprintln!(
-            "[timing-diag] reader_shutdown_signal→wait_done: {:?} reader_exited={}",
-            elapsed, reader_exited
-        );
-    }
-
-    let drained_stdin;
-    {
-        let mut tty = match crate::ui::terminal::open_tty_for_write() {
-            Some(f) => f,
-            None => {
-                crate::ui::terminal::EVENT_READER_SHUTDOWN.store(false, Ordering::Relaxed);
-                crate::ui::terminal::EVENT_READER_EXITED.store(false, Ordering::Relaxed);
-                crate::ui::input_reader::spawn_input_reader(ctx.user_tx.clone());
-                ctx.renderer
-                    .write_line("no /dev/tty available — cannot attach", c_error())?;
-                return Ok(());
-            }
-        };
-        let _ = tty.write_all(
-            b"\x1b[0m\
-              \x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1006l\x1b[?1015l\
-              \x1b[?2004l\
-              \x1b]0;\x1b\\\
-              \x1b[?1049l",
-        );
-        let _ = tty.flush();
-
-        #[cfg(feature = "timing-diagnostics")]
-        let t_drain_start = std::time::Instant::now();
-        drained_stdin = crate::ui::terminal::drain_stdin_nonblocking();
-        #[cfg(feature = "timing-diagnostics")]
-        eprintln!(
-            "[timing-diag] drain_stdin_nonblocking: {:?} bytes={}",
-            t_drain_start.elapsed(),
-            drained_stdin.len()
-        );
-        let _ = tty.write_all(b"\x1b[?25h");
-        let _ = tty.flush();
-    }
+    let drained_stdin = match crate::ui::terminal::suspend_tui_for_subprocess(ctx.user_tx) {
+        Some(d) => d,
+        None => {
+            ctx.renderer
+                .write_line("no /dev/tty available — cannot attach", c_error())?;
+            return Ok(());
+        }
+    };
 
     let mut cmd = std::process::Command::new("ssh");
     cmd.args([
@@ -201,27 +159,10 @@ pub(crate) async fn cmd_sandbox_attach(ctx: &mut SlashCtx<'_>) -> anyhow::Result
         }
     };
 
-    {
-        let _tty = crate::ui::terminal::open_tty_for_write();
-        if let Some(mut tty) = _tty {
-            let _ = tty.write_all(b"\x1b[?1049h\x1b[2J\x1b[?25l");
-            let _ = tty.write_all(b"\x1b[?2004h\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h");
-            let _ = tty.flush();
-        }
-    }
+    crate::ui::terminal::resume_tui_after_subprocess(ctx.renderer, ctx.user_tx);
 
-    ctx.renderer.reset_tui();
-    ctx.renderer.set_needs_repaint();
-    if let Some(mut tty) = crate::ui::terminal::open_tty_for_write() {
-        crate::ui::terminal::sync_and_drain_via_sentinel(
-            &mut tty,
-            std::time::Duration::from_millis(100),
-        );
-    }
-
-    crate::ui::terminal::EVENT_READER_SHUTDOWN.store(false, Ordering::Relaxed);
-    crate::ui::terminal::EVENT_READER_EXITED.store(false, Ordering::Relaxed);
-    crate::ui::input_reader::spawn_input_reader(ctx.user_tx.clone());
+    #[cfg(feature = "timing-diagnostics")]
+    eprintln!("[timing-diag] total subprocess elapsed: {:?}", t0.elapsed());
 
     match status {
         Ok(s) if s.success() => {

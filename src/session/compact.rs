@@ -7,19 +7,6 @@
 use crate::session::{Compaction, MessageRole, Session, SessionMessage, TreeNode};
 use compact_str::CompactString;
 
-/// Check whether the session's estimated token usage exceeds the
-/// context window minus a per-turn reserve.
-pub(crate) fn needs_compaction(
-    total_estimated_tokens: u64,
-    context_window: u64,
-    reserve_tokens: u64,
-) -> bool {
-    if context_window == 0 {
-        return false;
-    }
-    total_estimated_tokens > context_window.saturating_sub(reserve_tokens)
-}
-
 /// Return the latest compaction summary (if any) and the first
 /// message index still live in `messages`.
 pub(crate) fn compacted_context(

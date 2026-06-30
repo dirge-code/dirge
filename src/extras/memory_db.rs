@@ -61,6 +61,13 @@ pub enum MemoryKind {
     /// Who the user/agent is ("operator prefers concise handoffs")
     #[serde(rename = "identity")]
     Identity,
+    /// dirge-pkqi: the single high-level project orientation — what the
+    /// project is, its stack/layout, how to build/test it. At most ONE per
+    /// target: adding another replaces it. Highest salience and exempt from
+    /// eviction so the "what is this project" gestalt is always present at
+    /// session start, rendered first, ahead of the granular fact bag.
+    #[serde(rename = "overview")]
+    Overview,
 }
 
 impl Default for MemoryKind {
@@ -79,6 +86,7 @@ impl MemoryKind {
             MemoryKind::Procedural => "procedural",
             MemoryKind::Working => "working",
             MemoryKind::Identity => "identity",
+            MemoryKind::Overview => "overview",
         }
     }
 }
@@ -92,6 +100,7 @@ pub fn parse_kind(s: &str) -> Option<MemoryKind> {
         "procedural" => Some(MemoryKind::Procedural),
         "working" => Some(MemoryKind::Working),
         "identity" => Some(MemoryKind::Identity),
+        "overview" => Some(MemoryKind::Overview),
         _ => None,
     }
 }
@@ -107,6 +116,10 @@ fn default_salience_for_kind(kind: MemoryKind) -> f64 {
         MemoryKind::Procedural => 0.5,
         MemoryKind::Semantic => 0.6,
         MemoryKind::Identity => 0.75,
+        // Above everything: the overview is eviction-exempt anyway (see
+        // least_salient_index_where), but a top salience keeps ordering and
+        // any future tie-breaks consistent with its always-first status.
+        MemoryKind::Overview => 0.95,
     }
 }
 
@@ -298,6 +311,12 @@ fn working_reserve_for(target: &str) -> usize {
 /// Whether a row is a working-kind entry (the reserve's protected class).
 fn is_working_row(row: &ActiveRow) -> bool {
     row.kind == "working"
+}
+
+/// dirge-pkqi: the singular project-overview entry. Never an eviction victim
+/// and rendered first in the system prompt.
+fn is_overview_row(row: &ActiveRow) -> bool {
+    row.kind == "overview"
 }
 
 // ── Threat scanning (port of Hermes `_MEMORY_THREAT_PATTERNS`) ──────
@@ -605,10 +624,25 @@ impl SqliteMemoryStore {
     pub fn format_for_system_prompt(&self) -> String {
         let mut out = String::new();
         let snapshot = self.snapshot.lock_ignore_poison();
+
+        // dirge-pkqi: the singular project overview renders FIRST — the
+        // high-level "what is this project" gestalt the model should read
+        // before the granular fact bag. Eviction-exempt, so it is always hot.
+        let overview: Vec<&SnapshotEntry> =
+            snapshot.iter().filter(|e| e.kind == "overview").collect();
+        if !overview.is_empty() {
+            out.push_str("\n<project_overview>\n");
+            for entry in overview {
+                out.push_str(&entry.content);
+                out.push('\n');
+            }
+            out.push_str("</project_overview>\n");
+        }
+
         for target in ["memory", "pitfalls"] {
             let entries: Vec<&SnapshotEntry> = snapshot
                 .iter()
-                .filter(|e| e.target == target && e.tier == "hot")
+                .filter(|e| e.target == target && e.tier == "hot" && e.kind != "overview")
                 .collect();
             if entries.is_empty() {
                 continue;
@@ -907,15 +941,57 @@ impl SqliteMemoryStore {
         kind: Option<MemoryKind>,
     ) -> Result<CompactionOutcome, String> {
         scan_for_threats(content)?;
-        let entry = content.trim().to_string();
-        if entry.is_empty() {
+        let trimmed = content.trim();
+        if trimmed.is_empty() {
             return Err("Cannot add empty entry".to_string());
         }
+        // dirge-n3qf: redact secret shapes BEFORE storing, not just in the
+        // FTS projection. `content` is injected verbatim into the system
+        // prompt and shared across projects under global scope, so a key the
+        // agent wrote into a memory would otherwise leak there. The redacted
+        // form is canonical from here on (dedup/budget/insert all see it).
+        let entry = redact_for_fts(trimmed);
 
         let mut conn = self.conn.lock_ignore_poison();
         let tx = conn
             .transaction()
             .map_err(|e| format!("Failed to begin transaction: {e}"))?;
+
+        // dirge-pkqi: the overview is SINGULAR — adding one replaces the
+        // existing overview in place (preserving its uid/created_at lineage)
+        // rather than accumulating a second. This is what lets the review
+        // "refresh" it each session without it ever being a duplicate or
+        // sliding into the breadcrumb tier.
+        if matches!(kind.unwrap_or_default(), MemoryKind::Overview) {
+            let rows = Self::active_rows(&tx, target)?;
+            if let Some(existing) = rows.iter().find(|r| is_overview_row(r)) {
+                let id = existing.id;
+                let now = chrono::Utc::now().to_rfc3339();
+                tx.execute(
+                    "UPDATE memories SET content = ?1, salience = ?2, tier = 'hot',
+                         updated_at = ?3 WHERE id = ?4",
+                    params![
+                        entry,
+                        default_salience_for_kind(MemoryKind::Overview),
+                        now,
+                        id
+                    ],
+                )
+                .map_err(|e| format!("Failed to update overview: {e}"))?;
+                tx.execute("DELETE FROM memories_fts WHERE rowid = ?1", params![id])
+                    .map_err(|e| format!("Failed to reindex overview: {e}"))?;
+                tx.execute(
+                    "INSERT INTO memories_fts(rowid, content) VALUES (?1, ?2)",
+                    params![id, redact_for_fts(&entry)],
+                )
+                .map_err(|e| format!("Failed to reindex overview: {e}"))?;
+                tx.commit().map_err(|e| format!("Failed to commit: {e}"))?;
+                return Ok(CompactionOutcome {
+                    demoted: 0,
+                    archived: 0,
+                });
+            }
+        }
 
         // Reject duplicates (case-insensitive trimmed match) across
         // BOTH tiers — a demoted entry is still the same fact.
@@ -998,12 +1074,17 @@ impl SqliteMemoryStore {
                 + if new_is_working { entry_cost } else { 0 };
             let longterm_total = (hot_total + entry_cost) - working_total;
             let demote_longterm_first = longterm_total > char_limit.saturating_sub(reserve);
+            // dirge-pkqi: the overview is never an eviction victim — it
+            // stays hot so the project gestalt is always in the prompt. The
+            // `|_| true` fallbacks become "anything but the overview"; if the
+            // only remaining hot rows are the overview, we stop demoting and
+            // accept a slight overflow (the overview is tiny and singular).
             let victim = if demote_longterm_first {
-                Self::least_salient_index_where(&hot, |r| !is_working_row(r))
-                    .or_else(|| Self::least_salient_index_where(&hot, |_| true))
+                Self::least_salient_index_where(&hot, |r| !is_working_row(r) && !is_overview_row(r))
+                    .or_else(|| Self::least_salient_index_where(&hot, |r| !is_overview_row(r)))
             } else {
                 Self::least_salient_index_where(&hot, is_working_row)
-                    .or_else(|| Self::least_salient_index_where(&hot, |_| true))
+                    .or_else(|| Self::least_salient_index_where(&hot, |r| !is_overview_row(r)))
             };
             let Some(victim) = victim else { break };
             let removed = hot.remove(victim);
@@ -1034,10 +1115,12 @@ impl SqliteMemoryStore {
         kind: Option<MemoryKind>,
     ) -> Result<(), String> {
         scan_for_threats(new_entry)?;
-        let new_entry = new_entry.trim().to_string();
-        if new_entry.is_empty() {
+        let trimmed = new_entry.trim();
+        if trimmed.is_empty() {
             return Err("Cannot replace with empty entry".to_string());
         }
+        // dirge-n3qf: redact secrets before storing (see add_entry).
+        let new_entry = redact_for_fts(trimmed);
 
         let mut conn = self.conn.lock_ignore_poison();
         let tx = conn
@@ -1120,10 +1203,12 @@ impl SqliteMemoryStore {
         harsh: bool,
     ) -> Result<CompactionOutcome, String> {
         scan_for_threats(new_entry)?;
-        let new_entry = new_entry.trim().to_string();
-        if new_entry.is_empty() {
+        let trimmed = new_entry.trim();
+        if trimmed.is_empty() {
             return Err("Cannot supersede with an empty entry".to_string());
         }
+        // dirge-n3qf: redact secrets before storing (see add_entry).
+        let new_entry = redact_for_fts(trimmed);
         let char_limit = char_limit_for(target);
         if new_entry.len() > char_limit {
             return Err(format!(
@@ -2106,6 +2191,125 @@ mod tests {
         assert!(view["entries"][0].as_str().unwrap().contains("cargo build"));
         // Snapshot frozen — captured before the write.
         assert!(store.format_for_system_prompt().is_empty());
+    }
+
+    #[test]
+    fn add_redacts_secrets_in_stored_content() {
+        // dirge-n3qf: a key the agent writes into a memory must not survive
+        // verbatim in the stored row (it's injected into the system prompt and
+        // shared under global scope). Redaction happens on write, not just in
+        // the FTS projection.
+        let (paths, _dir) = temp_project();
+        let store = SqliteMemoryStore::load(&paths).unwrap();
+        let secret = "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        store
+            .add_entry("memory", &format!("deploy token is {secret}"), None)
+            .unwrap();
+        let view = store.view("memory").to_string();
+        assert!(!view.contains(secret), "raw secret must not be stored");
+        assert!(view.contains("<REDACTED>"), "secret should be redacted");
+
+        // The redacted form is what reaches the system prompt too.
+        store.refresh_snapshot().unwrap();
+        let prompt = store.format_for_system_prompt();
+        assert!(!prompt.contains(secret));
+        assert!(prompt.contains("<REDACTED>"));
+    }
+
+    #[test]
+    fn replace_redacts_secrets_in_stored_content() {
+        let (paths, _dir) = temp_project();
+        let store = SqliteMemoryStore::load(&paths).unwrap();
+        store.add_entry("memory", "placeholder fact", None).unwrap();
+        let secret = "sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ012345";
+        store
+            .replace_entry(
+                "memory",
+                "placeholder fact",
+                &format!("api key {secret}"),
+                None,
+            )
+            .unwrap();
+        let view = store.view("memory").to_string();
+        assert!(!view.contains(secret), "raw secret must not be stored");
+        assert!(view.contains("<REDACTED>"));
+    }
+
+    #[test]
+    fn overview_is_singular_and_replaced_in_place() {
+        // dirge-pkqi: at most one overview per target; adding another
+        // overwrites it rather than accumulating.
+        let (paths, _dir) = temp_project();
+        let store = SqliteMemoryStore::load(&paths).unwrap();
+        store
+            .add_entry("memory", "Project: a Rust CLI", Some(MemoryKind::Overview))
+            .unwrap();
+        store
+            .add_entry(
+                "memory",
+                "Project: a Rust coding agent",
+                Some(MemoryKind::Overview),
+            )
+            .unwrap();
+        let view = store.view("memory");
+        assert_eq!(view["entry_count"], 1, "overview must stay singular");
+        let s = view.to_string();
+        assert!(s.contains("coding agent"));
+        assert!(!s.contains("a Rust CLI"), "old overview replaced");
+    }
+
+    #[test]
+    fn overview_survives_budget_flood() {
+        // dirge-pkqi: ordinary facts demote to breadcrumb under budget
+        // pressure, but the overview is eviction-exempt and stays hot
+        // (rendered verbatim in the system prompt).
+        let (paths, _dir) = temp_project();
+        let store = SqliteMemoryStore::load(&paths).unwrap();
+        store
+            .add_entry(
+                "memory",
+                "OVERVIEW: rust coding agent",
+                Some(MemoryKind::Overview),
+            )
+            .unwrap();
+        for i in 0..60 {
+            let e = format!("fact {i}: {}", "x".repeat(80));
+            store
+                .add_entry("memory", &e, Some(MemoryKind::Semantic))
+                .unwrap();
+        }
+        store.refresh_snapshot().unwrap();
+        let prompt = store.format_for_system_prompt();
+        assert!(
+            prompt.contains("OVERVIEW: rust coding agent"),
+            "overview must remain hot/verbatim after a flood",
+        );
+        assert!(prompt.contains("<project_overview>"));
+    }
+
+    #[test]
+    fn overview_renders_first_and_outside_project_memory() {
+        let (paths, _dir) = temp_project();
+        let store = SqliteMemoryStore::load(&paths).unwrap();
+        store
+            .add_entry("memory", "build: cargo build", Some(MemoryKind::Semantic))
+            .unwrap();
+        store
+            .add_entry(
+                "memory",
+                "A Rust coding agent; src/ layout; cargo build --bin dirge",
+                Some(MemoryKind::Overview),
+            )
+            .unwrap();
+        store.refresh_snapshot().unwrap();
+        let p = store.format_for_system_prompt();
+        let ov = p
+            .find("<project_overview>")
+            .expect("overview block present");
+        let pm = p.find("<project_memory>").expect("memory block present");
+        assert!(ov < pm, "overview renders before the fact bag");
+        // The overview text is not duplicated inside <project_memory>.
+        assert!(!p[pm..].contains("coding agent"));
     }
 
     #[test]
@@ -3488,7 +3692,14 @@ mod tests {
 
     #[test]
     fn parse_kind_round_trips() {
-        for k in ["semantic", "episodic", "procedural", "working", "identity"] {
+        for k in [
+            "semantic",
+            "episodic",
+            "procedural",
+            "working",
+            "identity",
+            "overview",
+        ] {
             assert_eq!(parse_kind(k).unwrap().as_str(), k);
         }
         assert!(parse_kind("bogus").is_none());

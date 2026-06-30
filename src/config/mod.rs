@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
@@ -124,11 +124,12 @@ pub enum ConfigRole {
     Approval,
 }
 
-/// One VSCode-style key binding: bind a key chord to a named command.
-/// `key` is a chord like `"ctrl-t"` / `"pageup"` / `"ctrl-shift-x"`;
-/// `command` is one of the rebindable global commands (see
-/// `ui::keymap::KeyAction`), or `"none"` to unbind the default on that
-/// chord. Parsed by `ui::keymap::Keymap::from_config`.
+/// One VSCode-style key binding: bind a key chord (or chord sequence like
+/// `"ctrl-x ctrl-s"`) to a named command. `key` is a chord like `"ctrl-t"`
+/// / `"pageup"` / `"ctrl-shift-x"`; `command` is one of the rebindable
+/// global commands (`ui::keymap::KeyAction`) or input-editor commands
+/// (`ui::keymap::InputAction`), or `"none"` to unbind the default on that
+/// chord. Parsed by `ui::keymap::Keymaps::from_config`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct KeybindingConfig {
     pub key: String,
@@ -492,6 +493,10 @@ pub struct Config {
     pub default_permission_mode: Option<String>,
     pub show_tool_details: Option<bool>,
     pub show_edit_diff: Option<bool>,
+    /// Make the model's thinking/reasoning burst visible by default,
+    /// without having to press Ctrl+O each turn (GH #461). Absent or
+    /// `false` keeps today's behavior (reasoning hidden until toggled).
+    pub show_reasoning: Option<bool>,
     /// Preferred default pane layout for the TUI: a `|`/`,`/space-
     /// separated subset of `left`, `main`, `right` (e.g.
     /// `"left|main|right"`, `"main"`, `"main|right"`). The main pane is
@@ -553,6 +558,11 @@ pub struct Config {
     /// the verifier escalates to a bounded LLM critique at finalization
     /// on substantive runs. Unset (default) = no critic, no cost.
     pub critic_provider: Option<String>,
+    /// Optional system-preamble override for the in-loop critic. When set,
+    /// replaces the built-in `CRITIC_PREAMBLE` for every prompt unless a
+    /// prompt's own `critic_preamble` frontmatter overrides it. Unset
+    /// (default) = built-in critic stance. See `resolve_critic_preamble`.
+    pub critic_preamble: Option<String>,
     /// dirge-0g6i: optional provider for LLM auto-approval. When set, a
     /// permission prompt is routed to this model (with a safety prompt)
     /// which replies ALLOW/DENY instead of asking the human. Unset
@@ -575,6 +585,25 @@ pub struct Config {
     /// Each entry binds a chord to a command (see `KeybindingConfig`);
     /// applied over the built-in defaults by `ui::keymap`.
     pub keybindings: Option<Vec<KeybindingConfig>>,
+    /// dirge-5kkx.1: auto-cancel an in-progress emacs-style chord sequence
+    /// (e.g. after `ctrl-x` of `ctrl-x ctrl-s`) when no continuing key
+    /// arrives within this many milliseconds. Absent = wait indefinitely
+    /// (emacs default); Esc/Ctrl+G always cancels regardless.
+    pub chord_timeout_ms: Option<u64>,
+    /// Cross-session Up-arrow history: how many of the most-recent prior
+    /// sessions in the same project (same working directory) to mine for
+    /// command history. Their user prompts are seeded into history ahead
+    /// of the current session's own, so pressing Up in a fresh session
+    /// recalls commands typed in earlier conversations. `None` (default)
+    /// → 3. Set 0 to keep history scoped to the current session only.
+    pub max_sessions: Option<usize>,
+    /// User-defined aliases for built-in slash commands: `{alias: command}`.
+    /// `{"exit": "quit"}` makes `/exit` run `/quit`. A leading `/` on either
+    /// side is optional. Targets that aren't known built-ins warn at startup
+    /// (likely typos); plugin-command targets pass through unvalidated.
+    /// Aliases are expanded before dispatch (`ui::slash::aliases`) and are
+    /// NOT built-ins — they don't appear in `slash_command_names()`.
+    pub slash_aliases: Option<HashMap<String, String>>,
     pub tools: Option<ToolsConfig>,
     /// dirge-4hld: long-term memory retrieval tuning (hybrid dense+BM25).
     pub memory: Option<MemoryConfig>,
@@ -709,6 +738,15 @@ impl Config {
         None
     }
 
+    /// Resolve the critic's system preamble: the config override when set,
+    /// else the built-in `CRITIC_PREAMBLE`. A prompt may further override
+    /// this via frontmatter (applied in `build_agent`).
+    pub fn resolve_critic_preamble(&self) -> &str {
+        self.critic_preamble
+            .as_deref()
+            .unwrap_or(crate::agent::agent_loop::critic::CRITIC_PREAMBLE)
+    }
+
     /// Resolve the provider_type for an entry — the entry's
     /// explicit value when set, otherwise the alias (lowercased)
     /// which must match a built-in.
@@ -824,6 +862,18 @@ impl Config {
 
     pub fn resolve_show_edit_diff(&self) -> bool {
         self.show_edit_diff.unwrap_or(true)
+    }
+
+    /// Whether the thinking/reasoning burst is visible by default (GH #461).
+    /// Defaults to false — reasoning stays hidden until toggled with Ctrl+O.
+    pub fn resolve_show_reasoning(&self) -> bool {
+        self.show_reasoning.unwrap_or(false)
+    }
+
+    /// Resolve the cross-session history depth (how many prior
+    /// same-project sessions are mined for Up-arrow recall). Default 3.
+    pub fn resolve_max_sessions(&self) -> usize {
+        self.max_sessions.unwrap_or(3)
     }
 
     /// Resolve the sandbox mode, preferring the nested `sandbox.mode`.
@@ -964,65 +1014,123 @@ pub fn config_file_path() -> PathBuf {
     storage::config_path().join("config.json")
 }
 
-pub fn load() -> Config {
-    let path = config_file_path();
-    #[allow(unused_mut)]
-    let mut cfg: Config = if !path.exists() {
-        Config::default()
-    } else {
-        let content = std::fs::read_to_string(&path).unwrap_or_else(|e| {
-            eprintln!(
-                "error: failed to read config file ({}): {}\n\
-                 Fix the file or remove it to use defaults.",
-                path.display(),
-                e,
-            );
-            std::process::exit(1);
-        });
+/// Project-local config, layered on top of the global
+/// `~/.config/dirge/config.json`. CWD-relative (matches `.dirge/agents`,
+/// `.dirge/plugins`, `.dirge/skills`). Fields present here override
+/// their global counterparts; absent keys fall through. Map-valued
+/// fields (`providers`, `mcp_servers`, `agents`, …) merge key-by-key
+/// rather than replacing the whole map.
+pub fn project_config_file_path() -> PathBuf {
+    PathBuf::from(".dirge").join("config.json")
+}
 
-        // Reject legacy config shape BEFORE deserialising. The old
-        // shape used top-level `model`, `review_model`, and
-        // `custom_providers`; all three have moved into
-        // `providers.<alias>.{model,...}` (with role assignments via
-        // `review_provider`, etc.). Surface a clear migration hint
-        // rather than silently dropping fields.
-        if let Ok(raw) = serde_json::from_str::<serde_json::Value>(&content)
-            && let Some(obj) = raw.as_object()
-        {
-            const LEGACY: &[&str] = &["custom_providers", "model", "review_model"];
-            let found: Vec<&str> = LEGACY
-                .iter()
-                .copied()
-                .filter(|k| obj.contains_key(*k))
-                .collect();
-            if !found.is_empty() {
-                eprintln!(
-                    "error: legacy config keys found in {}: {:?}",
-                    path.display(),
-                    found,
-                );
-                eprintln!("Migrate to the unified `providers` map:");
-                eprintln!("  - top-level `model`         -> `providers.<active-provider>.model`");
-                eprintln!("  - `custom_providers.X`      -> `providers.X`");
-                eprintln!("  - top-level `review_model`  -> `providers.<review-provider>.model`");
-                eprintln!(
-                    "Then optionally set `review_provider`, `escalation_provider`, \
-                     `summarization_provider`, `subagent_provider`."
-                );
-                std::process::exit(2);
+/// Read a config JSON file into a `serde_json::Value`. Returns `None`
+/// when the file is absent (caller falls back to defaults). A
+/// present-but-unreadable or unparseable file is a hard error: print
+/// the offending path and exit, matching the contract for the global
+/// config so a typo never silently downgrades to defaults.
+fn read_config_value(path: &Path) -> Option<serde_json::Value> {
+    if !path.exists() {
+        return None;
+    }
+    let content = std::fs::read_to_string(path).unwrap_or_else(|e| {
+        eprintln!(
+            "error: failed to read config file ({}): {}\n\
+             Fix the file or remove it to use defaults.",
+            path.display(),
+            e,
+        );
+        std::process::exit(1);
+    });
+    Some(serde_json::from_str(&content).unwrap_or_else(|e| {
+        eprintln!(
+            "error: {} is not a valid config: {}\n\
+             Fix the file or remove it to use defaults.",
+            path.display(),
+            e,
+        );
+        std::process::exit(1);
+    }))
+}
+
+/// Recursively merge `overlay` into `base`. Object keys are unioned
+/// (overlay wins on collision, recursing when both sides are objects);
+/// any non-object overlay value replaces `base` outright. This gives
+/// the "project layers on top of global without wiping absent global
+/// keys" semantics: scalars (`provider`, `max_tokens`, …) override,
+/// while maps union so a project can add/override a single entry
+/// without redeclaring the whole map. An empty overlay object is a
+/// no-op (global entries retained) — there is intentionally no syntax
+/// to *clear* a global map from a project config.
+fn merge_json(base: &mut serde_json::Value, overlay: serde_json::Value) {
+    match (base, overlay) {
+        (serde_json::Value::Object(base_map), serde_json::Value::Object(overlay_map)) => {
+            for (k, v) in overlay_map {
+                match base_map.get_mut(&k) {
+                    Some(existing) => merge_json(existing, v),
+                    None => {
+                        base_map.insert(k, v);
+                    }
+                }
             }
         }
+        (slot, overlay) => *slot = overlay,
+    }
+}
 
-        serde_json::from_str(&content).unwrap_or_else(|e| {
+pub fn load() -> Config {
+    let global_path = config_file_path();
+    let project_path = project_config_file_path();
+
+    // Base = global config.json (empty object → defaults if absent).
+    let mut value: serde_json::Value = read_config_value(&global_path)
+        .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+
+    // Layer the project-local `.dirge/config.json` on top.
+    if let Some(project) = read_config_value(&project_path) {
+        merge_json(&mut value, project);
+    }
+
+    // Reject legacy config shape BEFORE deserialising. Checked on the
+    // merged value so a legacy key in EITHER file surfaces with both
+    // paths named so the user knows which file to edit.
+    if let Some(obj) = value.as_object() {
+        const LEGACY: &[&str] = &["custom_providers", "model", "review_model"];
+        let found: Vec<&str> = LEGACY
+            .iter()
+            .copied()
+            .filter(|k| obj.contains_key(*k))
+            .collect();
+        if !found.is_empty() {
             eprintln!(
-                "error: {} is not a valid config: {}\n\
-                 Fix the file or remove it to use defaults.",
-                path.display(),
-                e,
+                "error: legacy config keys found ({:?}) after merging {} and {}",
+                found,
+                global_path.display(),
+                project_path.display(),
             );
-            std::process::exit(1);
-        })
-    };
+            eprintln!("Migrate to the unified `providers` map:");
+            eprintln!("  - top-level `model`         -> `providers.<active-provider>.model`");
+            eprintln!("  - `custom_providers.X`      -> `providers.X`");
+            eprintln!("  - top-level `review_model`  -> `providers.<review-provider>.model`");
+            eprintln!(
+                "Then optionally set `review_provider`, `escalation_provider`, \
+                 `summarization_provider`, `subagent_provider`."
+            );
+            std::process::exit(2);
+        }
+    }
+
+    #[allow(unused_mut)]
+    let mut cfg: Config = serde_json::from_value(value).unwrap_or_else(|e| {
+        eprintln!(
+            "error: merged config ({} + {}) is not valid: {}\n\
+             Fix the offending file or remove it to use defaults.",
+            global_path.display(),
+            project_path.display(),
+            e,
+        );
+        std::process::exit(1);
+    });
 
     // Validate `providers` at load time so a typo in
     // `provider_type` (or an alias that doesn't match a built-in
@@ -1152,6 +1260,49 @@ mod tests {
     /// dirge-4hld: the `memory` block is absent by default and parses its
     /// fields when present.
     #[test]
+    fn chord_timeout_ms_absent_and_parses() {
+        // dirge-5kkx.1: off by default; parses from the documented key.
+        let cfg: Config = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(cfg.chord_timeout_ms.is_none());
+        let cfg: Config = serde_json::from_str(r#"{ "chord_timeout_ms": 1500 }"#).unwrap();
+        assert_eq!(cfg.chord_timeout_ms, Some(1500));
+    }
+
+    #[test]
+    fn critic_preamble_absent_and_parses() {
+        let cfg: Config = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(cfg.critic_preamble.is_none());
+
+        let cfg: Config =
+            serde_json::from_str(r#"{ "critic_preamble": "Be extra strict." }"#).unwrap();
+        assert_eq!(cfg.critic_preamble.as_deref(), Some("Be extra strict."));
+
+        // Absent → resolve returns the built-in critic preamble.
+        let cfg: Config = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(
+            cfg.resolve_critic_preamble(),
+            crate::agent::agent_loop::critic::CRITIC_PREAMBLE,
+        );
+    }
+
+    /// Cross-session Up-arrow history depth: absent by default (→3),
+    /// parses from the documented key, and resolve applies the default.
+    #[test]
+    fn max_sessions_absent_and_parses() {
+        let cfg: Config = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(cfg.max_sessions.is_none());
+        assert_eq!(cfg.resolve_max_sessions(), 3, "default depth is 3");
+
+        let cfg: Config = serde_json::from_str(r#"{ "max_sessions": 5 }"#).unwrap();
+        assert_eq!(cfg.max_sessions, Some(5));
+        assert_eq!(cfg.resolve_max_sessions(), 5);
+
+        // 0 is a valid opt-out: mine zero prior sessions.
+        let cfg: Config = serde_json::from_str(r#"{ "max_sessions": 0 }"#).unwrap();
+        assert_eq!(cfg.resolve_max_sessions(), 0);
+    }
+
+    #[test]
     fn memory_config_defaults_absent_and_parses() {
         let cfg: Config = serde_json::from_str(r#"{}"#).unwrap();
         assert!(cfg.memory.is_none(), "no memory block by default");
@@ -1172,6 +1323,21 @@ mod tests {
         );
         assert_eq!(m.embed_api_key_env.as_deref(), Some("OPENAI_API_KEY"));
         assert_eq!(m.verbatim_pre_recall, Some(true));
+    }
+
+    /// dirge-j0s2 (GH #461): `show_reasoning` controls whether the thinking
+    /// burst is visible by default. Absent → false (current behavior).
+    #[test]
+    fn show_reasoning_defaults_off_and_parses() {
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg.show_reasoning, None);
+        assert!(!cfg.resolve_show_reasoning(), "off by default");
+
+        let cfg: Config = serde_json::from_str(r#"{"show_reasoning": true}"#).unwrap();
+        assert!(cfg.resolve_show_reasoning());
+
+        let cfg: Config = serde_json::from_str(r#"{"show_reasoning": false}"#).unwrap();
+        assert!(!cfg.resolve_show_reasoning());
     }
 
     /// dirge-4xgd: `[timeouts]` overrides merge onto Timeouts::DEFAULT;
@@ -1657,5 +1823,50 @@ mod provider_role_tests {
             .filter(|k| obj.contains_key(*k))
             .collect();
         assert_eq!(found, vec!["custom_providers"]);
+    }
+}
+
+#[cfg(test)]
+mod config_merge_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn merge_overrides_scalar_but_keeps_absent_keys() {
+        let mut base = json!({ "provider": "deepseek", "max_tokens": 4096 });
+        merge_json(&mut base, json!({ "max_tokens": 8192 }));
+        assert_eq!(base["provider"], "deepseek");
+        assert_eq!(base["max_tokens"], 8192);
+    }
+
+    #[test]
+    fn merge_unions_map_values_key_by_key() {
+        let mut base = json!({
+            "providers": { "deepseek": { "model": "v3" }, "glm": { "model": "glm-4.6" } }
+        });
+        merge_json(
+            &mut base,
+            json!({ "providers": { "deepseek": { "model": "v4-pro" } } }),
+        );
+        assert_eq!(base["providers"]["deepseek"]["model"], "v4-pro");
+        assert_eq!(base["providers"]["glm"]["model"], "glm-4.6");
+    }
+
+    #[test]
+    fn merge_recurses_into_nested_objects() {
+        let mut base = json!({ "providers": { "ollama": { "base_url": "x", "model": "qwen" } } });
+        merge_json(
+            &mut base,
+            json!({ "providers": { "ollama": { "model": "llama" } } }),
+        );
+        assert_eq!(base["providers"]["ollama"]["base_url"], "x");
+        assert_eq!(base["providers"]["ollama"]["model"], "llama");
+    }
+
+    #[test]
+    fn merge_empty_map_overlay_is_a_noop_union() {
+        let mut base = json!({ "mcp_servers": { "exa": {} } });
+        merge_json(&mut base, json!({ "mcp_servers": {} }));
+        assert!(base["mcp_servers"]["exa"].as_object().is_some());
     }
 }

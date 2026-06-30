@@ -47,6 +47,11 @@ pub(crate) enum DapCommand {
         adapter: Option<String>,
         reply: mpsc::Sender<Result<String, String>>,
     },
+    LaunchModule {
+        module: String,
+        adapter: Option<String>,
+        reply: mpsc::Sender<Result<String, String>>,
+    },
     Attach {
         pid: u32,
         adapter: Option<String>,
@@ -168,6 +173,49 @@ unsafe fn dap_launch_body(
     let (tx, rx) = mpsc::channel();
     let cmd = DapCommand::Launch {
         file,
+        adapter,
+        reply: tx,
+    };
+    unsafe { dap_send_and_wait(cmd, rx) }
+}
+
+/// C function backing `dap/__launch_module`. Args: module, adapter-name-or-nil.
+/// Launches the debuggee with `module` (e.g. "pytest") via `python -m pytest`.
+unsafe extern "C-unwind" fn dap_launch_module_cfn(
+    argc: i32,
+    argv: *mut janetrs::lowlevel::Janet,
+) -> janetrs::lowlevel::Janet {
+    use janetrs::lowlevel::*;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        dap_launch_module_body(argc, argv)
+    }));
+    match result {
+        Ok(j) => j,
+        Err(_) => unsafe { janet_wrap_nil() },
+    }
+}
+
+unsafe fn dap_launch_module_body(
+    argc: i32,
+    argv: *mut janetrs::lowlevel::Janet,
+) -> janetrs::lowlevel::Janet {
+    use janetrs::lowlevel::*;
+    if argc < 1 {
+        return unsafe { janet_wrap_nil() };
+    }
+    let module = match unsafe { read_dap_str(argv, 0) } {
+        Some(s) => s,
+        None => return unsafe { janet_wrap_nil() },
+    };
+    let adapter = if argc >= 2 {
+        unsafe { read_dap_str(argv, 1) }
+    } else {
+        None
+    };
+
+    let (tx, rx) = mpsc::channel();
+    let cmd = DapCommand::LaunchModule {
+        module,
         adapter,
         reply: tx,
     };
@@ -460,6 +508,7 @@ use janetrs::env::CFunOptions;
 pub fn register_dap_cfns(client: &mut janetrs::client::JanetClient) {
     if let Some(env) = client.env_mut() {
         env.add_c_fn(CFunOptions::new(c"__launch", dap_launch_cfn).namespace(c"dap"));
+        env.add_c_fn(CFunOptions::new(c"__launch_module", dap_launch_module_cfn).namespace(c"dap"));
         env.add_c_fn(CFunOptions::new(c"__attach", dap_attach_cfn).namespace(c"dap"));
         env.add_c_fn(CFunOptions::new(c"__step", dap_step_cfn).namespace(c"dap"));
         env.add_c_fn(CFunOptions::new(c"__step_in", dap_step_in_cfn).namespace(c"dap"));
@@ -489,6 +538,9 @@ pub const HARNESS_DAP_INIT: &str = r#"
 
 (defn dap/launch [file &opt adapter]
   (dap/__launch file (if adapter adapter nil)))
+
+(defn dap/launch-module [module &opt adapter]
+  (dap/__launch_module module (if adapter adapter nil)))
 
 (defn dap/attach [pid &opt adapter]
   (dap/__attach (string pid) (if adapter adapter nil)))
@@ -628,7 +680,8 @@ async fn handle_dap_command(cmd: DapCommand) {
                         &a.resolved_command.to_string_lossy(),
                         &a.args,
                         &cwd.to_string_lossy(),
-                        file,
+                        Some(file),
+                        None,
                         &[],
                         Some(true),
                         Some(a.launch_defaults.clone()),
@@ -640,6 +693,44 @@ async fn handle_dap_command(cmd: DapCommand) {
                     .map(|s| serde_json::to_string_pretty(&s).unwrap_or_else(|_| format!("{s:?}")))
                 }
                 None => Err(ToolError::Msg(format!("no debug adapter found for {file}"))),
+            }
+        }
+        DapCommand::LaunchModule {
+            module, adapter, ..
+        } => {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+
+            let resolved = if let Some(name) = adapter {
+                crate::dap::config::resolve_adapter(name)
+            } else {
+                // No file to match — fall back to the first adapter that has
+                // module support, or let the user specify an adapter explicitly.
+                crate::dap::config::select_launch_adapter(std::path::Path::new(""), &cwd, None)
+            };
+
+            match resolved {
+                Some(a) => {
+                    let languages = a.languages.clone();
+                    mgr.launch(
+                        &a.name,
+                        &a.resolved_command.to_string_lossy(),
+                        &a.args,
+                        &cwd.to_string_lossy(),
+                        None,
+                        Some(module),
+                        &[],
+                        Some(true),
+                        Some(a.launch_defaults.clone()),
+                        &signal,
+                        timeout,
+                        languages,
+                    )
+                    .await
+                    .map(|s| serde_json::to_string_pretty(&s).unwrap_or_else(|_| format!("{s:?}")))
+                }
+                None => Err(ToolError::Msg(format!(
+                    "no debug adapter found for module {module}"
+                ))),
             }
         }
         DapCommand::Attach { pid, adapter, .. } => {
@@ -740,6 +831,7 @@ fn send_dap_reply(cmd: &DapCommand, result: Result<String, String>) {
     }
     match cmd {
         DapCommand::Launch { reply, .. } => reply!(reply),
+        DapCommand::LaunchModule { reply, .. } => reply!(reply),
         DapCommand::Attach { reply, .. } => reply!(reply),
         DapCommand::StepOver { reply } => reply!(reply),
         DapCommand::StepIn { reply } => reply!(reply),

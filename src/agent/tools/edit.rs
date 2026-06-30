@@ -336,6 +336,10 @@ impl Tool for EditTool {
         let (output, syntax_note) =
             crate::agent::tools::syntax_gate(std::path::Path::new(&resolved_path), &candidate)
                 .map_err(ToolError::Msg)?;
+        // Captured before `append_repair_note` consumes `syntax_note` below;
+        // gates the repair-path LSP rollback (dirge-p1ws).
+        #[cfg(feature = "lsp")]
+        let was_repaired = syntax_note.is_some();
         #[cfg(feature = "lsp")]
         let write_at = std::time::Instant::now();
         // Snapshot pre-edit content for /rewind before mutating. Reuse
@@ -406,14 +410,40 @@ impl Tool for EditTool {
         #[cfg(feature = "lsp")]
         {
             let path = std::path::Path::new(&resolved_path);
-            result.push_str(
-                &crate::agent::tools::write::append_lsp_block(
+            // A repaired edit is verified by the language server; if the close
+            // produced errors, the file is rolled back to its pre-edit bytes
+            // and the model gets the diagnostics (dirge-p1ws). A clean edit
+            // keeps today's surface-don't-block behavior.
+            if was_repaired {
+                match crate::agent::tools::write::verify_repaired_write_or_rollback(
                     self.lsp_manager.as_ref(),
                     path,
+                    Some(bytes.clone()),
+                    // Edit always targets an existing file; `before` is always
+                    // Some, so this flag is moot, but keep it honest.
+                    false,
                     write_at,
                 )
-                .await,
-            );
+                .await
+                {
+                    Ok(block) => result.push_str(&block),
+                    Err(feedback) => {
+                        if let Some(ref cache) = self.cache {
+                            cache.clear();
+                        }
+                        return Err(ToolError::Msg(feedback));
+                    }
+                }
+            } else {
+                result.push_str(
+                    &crate::agent::tools::write::append_lsp_block(
+                        self.lsp_manager.as_ref(),
+                        path,
+                        write_at,
+                    )
+                    .await,
+                );
+            }
         }
         Ok(result)
     }

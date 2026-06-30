@@ -84,7 +84,6 @@ pub use rig_stream_factory::rig_stream_fn_from_model;
 pub use rig_stream_factory::{
     build_provider_additional_params, loop_tool_to_rig_definition,
     rig_stream_fn_from_model_with_filter, rig_stream_fn_from_model_with_provider,
-    value_to_rig_message,
 };
 pub use rig_tool::RigToolAdapter;
 pub use run::{run_agent_loop, run_loop};

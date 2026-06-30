@@ -89,6 +89,27 @@ pub(crate) fn short_id(id: &str) -> String {
     id.chars().take(8).collect()
 }
 
+/// A compact but *distinct* session id for glance UI (the status footer).
+///
+/// `short_id`'s fixed 8-char head collapses every `compacted-<uuid>` /
+/// `forked-<uuid>` session to its shared word prefix ("compacte"), so two such
+/// sessions look identical in the footer. When the id has an alphabetic
+/// `word-` prefix, keep the prefix AND show the first 6 chars of the following
+/// segment (the unique uuid head); a bare uuid keeps the first-8 behavior. For
+/// the FULL id (e.g. to resume with `dirge --session <id>`), use `/sessions
+/// current`.
+pub(crate) fn session_glance_id(id: &str) -> String {
+    if let Some((prefix, rest)) = id.split_once('-')
+        && !prefix.is_empty()
+        && prefix.chars().all(|c| c.is_ascii_alphabetic())
+        && !rest.is_empty()
+    {
+        let head: String = rest.chars().take(6).collect();
+        return format!("{prefix}-{head}");
+    }
+    short_id(id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,6 +119,22 @@ mod tests {
         assert_eq!(head("hello", 10), "hello");
         assert_eq!(head("hello", 3), "hel");
         assert_eq!(head("hello", 0), "");
+    }
+
+    #[test]
+    fn session_glance_id_distinguishes_prefixed_sessions() {
+        // Compacted/forked sessions share a word prefix — keep it plus the
+        // unique uuid head instead of collapsing to "compacte".
+        assert_eq!(
+            session_glance_id("compacted-3f9a2b1c4d5e"),
+            "compacted-3f9a2b"
+        );
+        assert_eq!(session_glance_id("forked-abc1234567"), "forked-abc123");
+        // Bare uuid (simple form, no internal '-') keeps the first-8 head.
+        assert_eq!(session_glance_id("3f9a2b1c4d5e6f70"), "3f9a2b1c");
+        // Hyphenated uuid: first group is hex (not all-alpha) → first-8 head,
+        // not mistaken for a word prefix.
+        assert_eq!(session_glance_id("3f9a2b1c-4d5e-6f70"), "3f9a2b1c");
     }
 
     #[test]

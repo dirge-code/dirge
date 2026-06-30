@@ -72,7 +72,9 @@ fn simulate_tool_call(ctx: &mut RunCtx<'_>, id: &str, name: &str, args: serde_js
     let raw_value = sanitize_output(&raw_value).into_string();
     let (frame_w, _) = chamber_widths(ctx.renderer);
     let header = fit_banner_header(&upper, &raw_value, frame_w);
-    ctx.renderer.write_line(&header, c_tool()).expect("header");
+    ctx.renderer
+        .write_line_raw(&header, c_tool())
+        .expect("header");
     *ctx.chamber_top_end = Some(ctx.renderer.buffer_len());
     *ctx.tool_chamber_open = true;
 }
@@ -282,7 +284,7 @@ async fn drive(n: usize, result_order: Vec<usize>) -> Vec<Chamber> {
             .expect("handle_tool_result");
     }
 
-    drop(ctx);
+    let _ = ctx;
     collect_chambers(&renderer)
 }
 
@@ -400,7 +402,7 @@ async fn dirge_5h5_repro_interleaved_baseline() {
             .await
             .expect("handle_tool_result");
     }
-    drop(ctx);
+    let _ = ctx;
     let chambers = collect_chambers(&renderer);
     assert_all_chambers_have_body(&chambers, 7);
 }
@@ -462,7 +464,7 @@ async fn dirge_5h5_repro_add_chat_during_burst() {
     }
     let _post = ctx.renderer.add_chat("subagent-post");
 
-    drop(ctx);
+    let _ = ctx;
     let chambers = collect_chambers(&renderer);
     assert_all_chambers_have_body(&chambers, 7);
 }
@@ -496,7 +498,7 @@ async fn dirge_5h5_repro_buffer_integrity_after_burst() {
             .expect("handle_tool_result");
     }
 
-    drop(ctx);
+    let _ = ctx;
 
     // Every chamber must have >= 1 body row distinct from TOP and BOTTOM.
     let chambers = collect_chambers(&renderer);
@@ -589,7 +591,7 @@ async fn dirge_5h5_repro_subagent_writes_between_tool_results() {
         );
     }
 
-    drop(ctx);
+    let _ = ctx;
     let chambers = collect_chambers(&renderer);
     assert_all_chambers_have_body(&chambers, 7);
 }
@@ -767,7 +769,7 @@ async fn dirge_5h5_repro_full_issue_shape() {
         );
     }
 
-    drop(ctx);
+    let _ = ctx;
     let chambers = collect_chambers(&renderer);
 
     // Every one of the 7 parent reads must have a body row.

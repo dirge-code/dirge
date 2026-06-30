@@ -103,7 +103,7 @@ pub struct Timeouts {
 
 impl Timeouts {
     pub const DEFAULT_STREAM_CHUNK_SECS: u64 = 300;
-    pub const DEFAULT_TOOL_CALL_GAP_SECS: u64 = 30;
+    pub const DEFAULT_TOOL_CALL_GAP_SECS: u64 = 60;
     pub const DEFAULT_MCP_CALL_SECS: u64 = 120;
     pub const DEFAULT_MCP_INIT_SECS: u64 = 10;
     pub const DEFAULT_LSP_REQUEST_SECS: u64 = 30;
@@ -196,7 +196,7 @@ mod tests {
     fn defaults_match_documented_values() {
         let t = Timeouts::DEFAULT;
         assert_eq!(t.stream_chunk, Duration::from_secs(300));
-        assert_eq!(t.tool_call_gap, Duration::from_secs(30));
+        assert_eq!(t.tool_call_gap, Duration::from_secs(60));
         assert_eq!(t.mcp_call, Duration::from_secs(120));
         assert_eq!(t.mcp_init, Duration::from_secs(10));
         assert_eq!(t.lsp_request, Duration::from_secs(30));

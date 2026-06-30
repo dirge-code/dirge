@@ -42,17 +42,12 @@ pub(crate) async fn handle_interjected(
     // the conversation history reflects what the user saw,
     // not a phantom turn that "never happened".
     if !ctx.response_buf.is_empty() {
-        let max_width = ctx.renderer.content_width().saturating_sub(9); // 8-col handle + space
-        let mut styled =
-            crate::ui::markdown::markdown_to_styled(ctx.response_buf, max_width, c_agent());
-        if !styled.is_empty() {
-            styled[0].text = CompactString::from(format!("<dirge> {}", styled[0].text));
-        }
-        if let Some(start) = *ctx.response_start_line {
-            ctx.renderer.replace_from(start, styled);
-            ctx.renderer.render_viewport()?;
-        }
+        // dirge-qy3y: finalize via the source-tracked stream API so the partial
+        // response reflows on resize like a normal committed response.
+        ctx.renderer.stream(ctx.response_buf, c_agent(), true);
+        ctx.renderer.render_viewport()?;
     }
+    ctx.renderer.commit_stream();
     ctx.renderer.write_line("", Color::White)?;
     ctx.renderer.write_line(
         "(interjected — stopped at last tool-result boundary)",

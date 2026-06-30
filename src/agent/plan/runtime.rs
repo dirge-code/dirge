@@ -5,20 +5,18 @@
 //!
 //! This module supplies the missing half: [`collect_runner_text`] drains a
 //! real [`AgentRunner`]'s event stream into the final `String`, and
-//! [`review_once`] forks a write-disabled reviewer and turns its verdict into a
-//! [`ReviewStep`]. It also defines the live `/plan` workflow state
-//! ([`ActivePlan`] / [`PlanKickoff`]). The interactive entry is the `/plan`
-//! slash command (`ui/slash/cmd_plan.rs`): it runs the explore→plan forks via
-//! `collect_runner_text` + `agent.spawn_phase_runner(..)`, then the UI loop
-//! launches the streamed implement run and `run_handlers/done.rs` drives the
-//! reviewer loop with `review_once`.
+//! [`spawn_review`] forks a write-disabled reviewer OFF the UI thread, turning
+//! its verdict into a [`ReviewStep`] delivered over a channel. It also defines
+//! the live `/plan` workflow state ([`ActivePlan`] / [`PlanKickoff`]). The
+//! interactive entry is the `/plan` slash command (`ui/slash/cmd_plan.rs`): it
+//! runs the explore→plan forks via `collect_runner_text` +
+//! `agent.spawn_phase_runner(..)`, then the UI loop launches the streamed
+//! implement run and `run_handlers/done.rs` spawns the reviewer via
+//! [`spawn_review`], whose verdict the `review_phase` arm applies.
 
-use crate::agent::plan::workflow::{
-    PhaseOutput, REVIEWER_TOOLS, ReviewStep, next_review_step, reviewer_prompt,
-};
+use crate::agent::plan::workflow::{PhaseOutput, ReviewStep, next_review_step};
 use crate::agent::runner::{AbortRunnerOnDrop, AgentRunner};
 use crate::event::AgentEvent;
-use crate::provider::AnyAgent;
 
 /// Runtime state for an in-flight `/plan` workflow, carried across `Done`
 /// events so the reviewer loop can drive successive implement retries without
@@ -93,20 +91,58 @@ pub(crate) async fn collect_runner_text(runner: AgentRunner) -> PhaseOutput {
     Ok(text)
 }
 
-/// Fork a write-disabled reviewer that runs the just-written code and decide
-/// the next step. `transcript` must reflect the implementation that just
-/// completed (build it from the post-implement session). On a reviewer fork
-/// error the error surfaces as `Err` — the caller ends the loop rather than
-/// silently shipping.
-pub(crate) async fn review_once(
-    agent: &AnyAgent,
-    plan: &str,
-    transcript: String,
+/// Terminal event from the spawned reviewer task (dirge-4koy). One event per
+/// review: the parsed [`ReviewStep`], or the reviewer's error.
+pub(crate) enum ReviewPhaseEvent {
+    Done { result: Result<ReviewStep, String> },
+}
+
+/// Handle to an off-thread reviewer pass. Mirrors the `/plan` and compaction
+/// phase handles: the loop drains `rx`, can `abort()` the `task` on Ctrl+C, and
+/// uses the carried `plan` / `cycles_left` to re-arm [`ActivePlan`] and build
+/// the retry prompt when the verdict is `Retry`. `response` / `tool_calls` are
+/// the just-finished implement turn's payload, carried so the terminal-verdict
+/// branch can run the idle finalization (persist + post-session review) that
+/// `handle_done` deferred when it kept the loop busy for the reviewer.
+pub(crate) struct ReviewPhaseHandle {
+    pub rx: tokio::sync::mpsc::Receiver<ReviewPhaseEvent>,
+    pub task: tokio::task::JoinHandle<()>,
+    pub plan: String,
+    pub cycles_left: usize,
+    pub response: String,
+    pub tool_calls: Vec<crate::session::ToolCallEntry>,
+}
+
+/// Drain a (write-disabled) reviewer runner OFF the UI thread and deliver the
+/// parsed [`ReviewStep`] over a channel (dirge-4koy). The reviewer runs the
+/// just-written code — tens of seconds to minutes — so awaiting it inline froze
+/// the event loop. The caller builds the runner on-thread (it needs `&agent`),
+/// then hands it here; the UI loop drives the returned handle from its
+/// `select!` and applies the verdict (render / relaunch implement run) when it
+/// lands.
+pub(crate) fn spawn_review(
+    runner: AgentRunner,
+    plan: String,
     cycles_left: usize,
-) -> Result<ReviewStep, String> {
-    let runner = agent.spawn_phase_runner(reviewer_prompt(plan), transcript, REVIEWER_TOOLS);
-    let review = collect_runner_text(runner).await?;
-    Ok(next_review_step(&review, cycles_left))
+    response: String,
+    tool_calls: Vec<crate::session::ToolCallEntry>,
+) -> ReviewPhaseHandle {
+    // Capacity 1: the task sends exactly one terminal event.
+    let (tx, rx) = tokio::sync::mpsc::channel::<ReviewPhaseEvent>(1);
+    let task = tokio::spawn(async move {
+        let result = collect_runner_text(runner)
+            .await
+            .map(|review| next_review_step(&review, cycles_left));
+        let _ = tx.send(ReviewPhaseEvent::Done { result }).await;
+    });
+    ReviewPhaseHandle {
+        rx,
+        task,
+        plan,
+        cycles_left,
+        response,
+        tool_calls,
+    }
 }
 
 #[cfg(test)]
@@ -183,5 +219,37 @@ mod tests {
         // accumulated text rather than hanging or erroring.
         let runner = runner_replaying(vec![AgentEvent::Token("orphaned".into())]);
         assert_eq!(collect_runner_text(runner).await.unwrap(), "orphaned");
+    }
+
+    /// dirge-4koy: `spawn_review` must drain the reviewer runner OFF the UI
+    /// thread and deliver the parsed `ReviewStep` over its channel, so the loop
+    /// stays responsive while the reviewer (which runs code) works.
+    #[tokio::test]
+    async fn spawn_review_emits_approved_step_off_thread() {
+        let runner = runner_replaying(vec![AgentEvent::Done {
+            response: "review done\n```json\n{\"verdict\":\"DONE\",\"missing\":\"\"}\n```".into(),
+            tokens: 0,
+            cost: 0.0,
+        }]);
+        let mut handle = spawn_review(runner, "the plan".to_string(), 3, String::new(), Vec::new());
+        // Continuation inputs are carried for the UI arm.
+        assert_eq!(handle.plan, "the plan");
+        assert_eq!(handle.cycles_left, 3);
+        match handle.rx.recv().await.expect("a terminal event") {
+            ReviewPhaseEvent::Done { result } => {
+                assert!(matches!(result, Ok(ReviewStep::Approved)));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_review_surfaces_reviewer_error() {
+        let runner = runner_replaying(vec![AgentEvent::Error("reviewer exploded".into())]);
+        let mut handle = spawn_review(runner, "p".to_string(), 1, String::new(), Vec::new());
+        match handle.rx.recv().await.expect("a terminal event") {
+            ReviewPhaseEvent::Done { result } => {
+                assert_eq!(result, Err("reviewer exploded".to_string()));
+            }
+        }
     }
 }

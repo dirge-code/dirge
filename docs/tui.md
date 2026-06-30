@@ -22,10 +22,12 @@ kill-subagent) are **rebindable** via the `keybindings` config — see
 | Ctrl+K | Kill to end of line |
 | Ctrl+U | Kill to start of line |
 | Ctrl+W | Kill word before cursor |
+| Ctrl+D | Delete the character at the cursor (forward; no-op at end of line) |
 | Meta+Backspace | Delete word before cursor |
 | Meta+D | Delete word after cursor |
 | Ctrl+Y | Yank (paste) last kill |
 | Meta+Y | Yank-pop (cycle kill ring after yank) |
+| Ctrl+Z | Undo the last edit (typing is grouped by word; paste/kill undo as one step) |
 | Ctrl+N / Down | History next (multi-line: next logical line, history at boundary) |
 | Ctrl+P / Up | History previous (multi-line: previous logical line, history at boundary) |
 | Ctrl+F | Reverse-i-search through history (bash-style): type to narrow, Ctrl+F to cycle, Enter to accept, Esc to cancel |
@@ -38,7 +40,7 @@ kill-subagent) are **rebindable** via the `keybindings` config — see
 
 | Key | Action |
 |-----|--------|
-| Ctrl+C / Ctrl+D / Esc | Interrupt running agent (also clears queued interjections) |
+| Ctrl+C / Esc | Interrupt running agent (also clears queued interjections) |
 | Type while running | Queues your message; runs after the current turn finishes. The runner also stops at the next tool-result boundary so the message is picked up quickly instead of waiting for the whole multi-turn run. Status line shows `q:N` for pending count. |
 | Alt+X | Drop all queued interjections (without cancelling the running agent) |
 | Ctrl+K | Kill subagent on focused chat tab |
@@ -47,6 +49,7 @@ kill-subagent) are **rebindable** via the `keybindings` config — see
 | Esc-Esc (idle) | Open rewind picker (truncate history) |
 | Ctrl+O | Expand collapsed tool result |
 | Ctrl+R | Toggle reasoning visibility |
+| Shift+Tab | Cycle the active prompt layer to the next prompt (silent; status badge updates) |
 | PgUp/PgDn | Scroll chat history |
 | Ctrl+Home/End | Jump chat to top/bottom |
 | `! cmd` | Run shell command (visible, injected into chat) |

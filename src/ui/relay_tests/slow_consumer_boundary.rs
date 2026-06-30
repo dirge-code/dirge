@@ -73,10 +73,20 @@ mod tests {
         }
         tty_secondary.flush().ok();
 
-        // Now drain everything. Switch to non-blocking for drain.
+        // Now drain everything. Switch to non-blocking and poll-drain
+        // until every injected byte has echoed back, or a generous
+        // timeout elapses. The relay is still flushing the backed-up PTY
+        // buffer at this point, so a single fixed sleep + one-shot drain
+        // raced it under CI load and lost trailing echoes (flaky).
         set_nonblocking(&tty_secondary).expect("set nonblocking for drain");
-        std::thread::sleep(Duration::from_millis(500));
-        let echoed = drain_fd_nonblock(&mut tty_secondary);
+        let mut echoed: Vec<u8> = Vec::with_capacity(TOTAL);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while echoed.len() < TOTAL && std::time::Instant::now() < deadline {
+            echoed.extend(drain_fd_nonblock(&mut tty_secondary));
+            if echoed.len() < TOTAL {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
         drop(tty_secondary);
 
         match relay_handle.join() {

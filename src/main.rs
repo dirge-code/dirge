@@ -49,6 +49,9 @@ use crate::lsp::spawn::{ProcessCommand, ProcessSpawner};
 use crate::permission::ask::{AskReceiver, AskSender};
 use crate::permission::checker::{PermCheck, PermissionChecker};
 use crate::permission::{PermissionConfig, SecurityMode};
+// Only used inside `run_headless_loop` (loop-gated); without the feature
+// the import is dead and `-D warnings` rejects it (dirge-oae9).
+#[cfg(feature = "loop")]
 use crate::ui::ansi::{self, StripPolicy};
 
 /// Per-session channels and shared state, threaded through the agent build
@@ -606,7 +609,16 @@ async fn main() -> anyhow::Result<()> {
     // CheckpointRefresh event, so firing it there would just burn
     // background summary calls. Force it off for --print / --loop.
     crate::agent::agent_loop::context_manager::init_incremental_checkpoint(
-        if cli.print || cli.loop_mode {
+        if cli.print || {
+            #[cfg(feature = "loop")]
+            {
+                cli.loop_mode
+            }
+            #[cfg(not(feature = "loop"))]
+            {
+                false
+            }
+        } {
             Some(false)
         } else {
             cfg.incremental_checkpoint
@@ -918,6 +930,11 @@ async fn main() -> anyhow::Result<()> {
                     }
                     continue;
                 }
+                // Feature-gated plugins: skip unless the opt-in Cargo feature is on.
+                #[cfg(not(feature = "experimental-ui-computer-use"))]
+                if plugin_name == "computer_use" {
+                    continue;
+                }
                 if cli.verbose {
                     eprintln!("loading plugin: {}", path.display());
                 }
@@ -1089,7 +1106,14 @@ async fn main() -> anyhow::Result<()> {
     // (dirge-x949). ACP / no-tools don't use MCP on this path.
     #[cfg(feature = "mcp")]
     let mcp_manager = if let Some(servers) = &cfg.mcp_servers {
-        if !cli.resolve_no_tools(&cfg) && (cli.print || cli.loop_mode) {
+        // `loop_mode` only exists with the `loop` feature; treat it as
+        // false otherwise so `--features mcp` (no loop) still compiles
+        // (dirge-oae9).
+        #[cfg(feature = "loop")]
+        let loop_mode = cli.loop_mode;
+        #[cfg(not(feature = "loop"))]
+        let loop_mode = false;
+        if !cli.resolve_no_tools(&cfg) && (cli.print || loop_mode) {
             Some(extras::mcp::McpClientManager::connect_all(servers).await)
         } else {
             None
@@ -1153,10 +1177,37 @@ async fn main() -> anyhow::Result<()> {
              File tools (read, write, edit, etc.) operate on the host filesystem."
         );
     }
+    // ── Spawn the Computer-Use sandbox exec drainer ──────────────────
+    // Computer-use plugins call (harness/computer-use-exec ...) which
+    // reaches the worker C function. The C function sends a
+    // SandboxExecRequest through this channel to the tokio runtime.
+    // The drainer builds the safe command, SSHs into the microVM,
+    // and returns the result.
+    #[cfg(feature = "plugin")]
+    {
+        let (sandbox_exec_tx, mut sandbox_exec_rx) =
+            tokio::sync::mpsc::unbounded_channel::<plugin::worker::SandboxExecRequest>();
+        plugin::worker::install_sandbox_exec_tx(sandbox_exec_tx);
+        let sandbox_for_exec = sandbox.clone();
+        tokio::spawn(async move {
+            use plugin::worker::{SandboxExecOutput, build_safe_command};
+            while let Some(req) = sandbox_exec_rx.recv().await {
+                let command = build_safe_command(&req.action);
+                let result = match sandbox_for_exec.exec(&command, 30).await {
+                    Ok(output) => Ok(SandboxExecOutput {
+                        exit_code: output.exit_code,
+                        merged: output.merged,
+                    }),
+                    Err(e) => Err(format!("{e}")),
+                };
+                let _ = req.reply.send(result);
+            }
+        });
+    }
     let Channels {
         permission,
         ask_tx,
-        ask_rx,
+        mut ask_rx,
         question_tx,
         question_rx,
         plan_tx,
@@ -1164,6 +1215,31 @@ async fn main() -> anyhow::Result<()> {
         bg_store,
         lifecycle_rx,
     } = build_channels(&cli, &cfg);
+
+    // Headless modes (`--print`, `--loop`) have no UI loop to service
+    // `ask_rx`. A tool that routes to a permission prompt would send an
+    // `AskRequest` and block on `reply_rx.await` forever, suspending the
+    // agent loop and hanging the whole run (issue #523). Drain it with a
+    // deny-all responder; the interactive path keeps `ask_rx` for the UI.
+    let headless = cli.print || {
+        #[cfg(feature = "loop")]
+        {
+            cli.loop_mode
+        }
+        #[cfg(not(feature = "loop"))]
+        {
+            false
+        }
+    };
+    let _ask_responder = match (headless, ask_rx.take()) {
+        (true, Some(rx)) => Some(crate::permission::ask::spawn_headless_ask_responder(rx)),
+        (_, taken) => {
+            // Not headless (or no-tools): hand the receiver back to the
+            // interactive path, which drains it via the UI event loop.
+            ask_rx = taken;
+            None
+        }
+    };
 
     if let Some(perm) = &permission {
         let allowlist: Vec<(String, String)> = session
@@ -1359,6 +1435,12 @@ async fn main() -> anyhow::Result<()> {
                 .await
             };
 
+            // In `--loop` mode the body only re-iterates on a plugin-driven
+            // model swap; without the `plugin` feature the sole match arm
+            // returns, so clippy's (correct) `never_loop` fires for a config
+            // that intentionally runs the body exactly once. Scope the allow
+            // to that config so the lint stays live under `plugin`.
+            #[cfg_attr(not(feature = "plugin"), allow(clippy::never_loop))]
             loop {
                 let exit = run_headless_loop(
                     &current_agent,
@@ -1439,13 +1521,22 @@ async fn main() -> anyhow::Result<()> {
                 .display()
                 .to_string();
             let mut pm = pm_arc.lock_ignore_poison();
+            let sandbox_mode = sandbox.mode_str();
+            let auto_confirm = match cli.auto_confirm {
+                Some(crate::cli::AutoConfirmMode::Yes) => "yes",
+                Some(crate::cli::AutoConfirmMode::No) => "no",
+                None => "ask",
+            };
             if let Err(e) = pm.dispatch(
                 "on-init",
                 &format!(
-                    "@{{:model \"{}\" :cwd \"{}\" :provider \"{}\"}}",
+                    "@{{:model \"{}\" :cwd \"{}\" :provider \"{}\" :workspace \"{}\" :sandbox \"{}\" :auto-confirm \"{}\"}}",
                     escape_janet_string(&model),
                     escape_janet_string(&cwd),
                     escape_janet_string(&provider),
+                    escape_janet_string(&cwd),
+                    escape_janet_string(sandbox_mode),
+                    escape_janet_string(auto_confirm),
                 ),
             ) {
                 eprintln!("warning: plugin on-init dispatch failed: {e}");

@@ -6,10 +6,9 @@
 //! MODIFIED_FILES) under their own mutexes is fine from the UI loop
 //! tick — they're all short-lived locks.
 
+#[cfg(feature = "mcp")]
 use crate::extras::mcp::McpClientManager;
 use crate::session::Session;
-#[cfg(feature = "mcp")]
-#[allow(unused_imports)]
 use crate::sync_util::LockExt;
 use crate::ui::panel_data::{ContextGauge, GitSnapshot, LeftPanelInfo};
 use crate::ui::renderer::PanelData;
@@ -102,10 +101,18 @@ pub(crate) fn build_panel_data(
     #[cfg(feature = "mcp")]
     let mcp: Vec<(String, bool)> = mcp_manager
         .map(|m| {
-            m.connections_snapshot()
+            // Live connections render as healthy (`●`). GH #541: a server
+            // whose initial connect failed is appended afterwards as
+            // broken (`○`) so it's visible instead of silently omitted.
+            let mut rows: Vec<(String, bool)> = m
+                .connections_snapshot()
                 .into_iter()
                 .map(|(name, _conn)| (name, true))
-                .collect()
+                .collect();
+            for name in m.failed_servers() {
+                rows.push((name, false));
+            }
+            rows
         })
         .unwrap_or_default();
     #[cfg(not(feature = "mcp"))]
@@ -138,6 +145,9 @@ pub(crate) fn build_panel_data(
     #[cfg(not(feature = "lsp"))]
     let lsp: Vec<(String, String, bool)> = Vec::new();
 
+    // The TODOS panel mirrors this session's live issue board (open /
+    // in_progress / blocked). Terminal items (done / cancelled) have already
+    // dropped off the board, so no completed glyph is needed here.
     let todos: Vec<(String, String)> = {
         let list = crate::agent::tools::todo::TODO_LIST.lock_ignore_poison();
         list.iter()
@@ -145,7 +155,7 @@ pub(crate) fn build_panel_data(
             .map(|t| {
                 let status = match t.status.as_str() {
                     "in_progress" => "[~]",
-                    "completed" => "[x]",
+                    "blocked" => "[!]",
                     _ => "[ ]",
                 };
                 (status.to_string(), t.content.to_string())
@@ -173,5 +183,51 @@ pub(crate) fn build_panel_data(
         todos,
         modified,
         sysload: sysload.map(|s| s.snapshot()),
+    }
+}
+
+#[cfg(all(test, feature = "mcp"))]
+mod tests {
+    use super::*;
+    use crate::extras::mcp::McpClientManager;
+    use crate::extras::mcp::config::McpServerConfig;
+    use std::collections::HashMap;
+
+    fn bogus_server() -> McpServerConfig {
+        // A binary that can't exist → spawn fails immediately, so `connect`
+        // returns Err well inside the init timeout (no 10s wait).
+        McpServerConfig::Command {
+            command: "dirge-nonexistent-mcp-binary".to_string(),
+            args: vec![],
+            env: HashMap::new(),
+            allow_external_paths: false,
+        }
+    }
+
+    /// GH #541: a server that fails its initial connect must still show
+    /// up in the info panel as broken (`○`), not vanish entirely. Before
+    /// the fix `build_panel_data` enumerated only live connections, so a
+    /// misconfigured server rendered as `· (none)`.
+    #[tokio::test]
+    async fn build_panel_data_surfaces_failed_mcp_servers_as_broken() {
+        let mut configs: HashMap<String, McpServerConfig> = HashMap::new();
+        configs.insert("ghost".to_string(), bogus_server());
+        let mgr = McpClientManager::connect_all(&configs).await;
+
+        let session = crate::session::Session::new("p", "m", 100_000);
+        let data = build_panel_data(
+            &session,
+            None,
+            Some(&mgr),
+            #[cfg(feature = "lsp")]
+            None,
+        );
+
+        assert_eq!(data.mcp.len(), 1, "failed server must still be listed");
+        assert_eq!(data.mcp[0].0, "ghost");
+        assert!(
+            !data.mcp[0].1,
+            "failed server must render as broken (ok=false)"
+        );
     }
 }

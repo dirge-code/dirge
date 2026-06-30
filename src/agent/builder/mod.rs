@@ -29,5 +29,15 @@ pub(crate) fn build_session_search_tool(
     tools::SessionSearchTool::new(db_path, session_id, permission, ask_tx)
 }
 
+#[cfg(feature = "experimental-graph-search")]
+pub(crate) fn build_graph_tool(
+    db_path: std::path::PathBuf,
+    session_id: Option<String>,
+    permission: Option<PermCheck>,
+    ask_tx: Option<AskSender>,
+) -> tools::GraphTool {
+    tools::GraphTool::new(db_path, session_id, permission, ask_tx)
+}
+
 #[cfg(test)]
 mod reminder_tests;

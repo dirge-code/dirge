@@ -398,12 +398,18 @@ pub struct LoopConfig {
     /// finalization on substantive runs. `None` = no critic (default).
     pub critic_fn: Option<super::critic::CriticFn>,
 
+    /// Goal gate's judge callback. Decoupled from `critic_fn`: built at
+    /// `build_agent` time from the same critic provider but baking its OWN
+    /// `GOAL_PREAMBLE`, so a critic preamble override or a `critic: false`
+    /// prompt does not steer goal judgements. `None` = no judge (default).
+    pub goal_fn: Option<super::critic::CriticFn>,
+
     /// Goal gate: an opt-in natural-language stop condition for
-    /// autonomous runs. When `Some` AND `critic_fn` is configured (the
-    /// gate reuses the critic provider as its judge), each finalization
-    /// is held until an independent judge rules the condition met, bounded
-    /// by [`super::goal::MAX_GOAL_REACT`]. `None` = no gate (default), so
-    /// interactive and unparameterized runs are unaffected.
+    /// autonomous runs. When `Some` AND `goal_fn` is configured (the
+    /// judge), each finalization is held until the judge rules the
+    /// condition met, bounded by [`super::goal::MAX_GOAL_REACT`]. `None`
+    /// = no gate (default), so interactive and unparameterized runs are
+    /// unaffected.
     pub goal: Option<String>,
 
     /// dirge-nqr: hard cap on assistant turns within a single run.
@@ -551,6 +557,7 @@ impl std::fmt::Debug for LoopConfig {
             )
             .field("verifier", &self.verifier.as_ref().map(|_| "<gate>"))
             .field("critic_fn", &self.critic_fn.as_ref().map(|_| "<critic>"))
+            .field("goal_fn", &self.goal_fn.as_ref().map(|_| "<judge>"))
             .field("goal", &self.goal)
             .field("max_turns", &self.max_turns)
             .finish()
@@ -594,6 +601,7 @@ impl Clone for LoopConfig {
             file_touch_tracker: self.file_touch_tracker.clone(),
             verifier: self.verifier.clone(),
             critic_fn: self.critic_fn.clone(),
+            goal_fn: self.goal_fn.clone(),
             goal: self.goal.clone(),
             max_turns: self.max_turns,
         }

@@ -1,10 +1,8 @@
-use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
 
+use crate::auth::oauth_pkce;
 use anyhow::Context;
-use base64::Engine;
-use sha2::{Digest, Sha256};
 
 const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const AUTHORIZE_URL: &str = "https://claude.ai/oauth/authorize";
@@ -51,8 +49,8 @@ impl std::fmt::Debug for TokenResponse {
 }
 
 pub(crate) async fn login_and_persist() -> anyhow::Result<PathBuf> {
-    let verifier = pkce_verifier();
-    let challenge = pkce_challenge(&verifier);
+    let verifier = oauth_pkce::verifier();
+    let challenge = oauth_pkce::challenge(&verifier);
     let listener = TcpListener::bind(("127.0.0.1", CALLBACK_PORT))
         .with_context(|| format!("failed to bind OAuth callback port {CALLBACK_PORT}"))?;
 
@@ -73,10 +71,7 @@ pub(crate) async fn login_and_persist() -> anyhow::Result<PathBuf> {
     eprintln!("Open this URL to authenticate with Anthropic:\n\n{authorize_url}\n");
     eprintln!("Waiting for browser redirect on {REDIRECT_URI} ...");
 
-    let (code, state) = wait_for_callback(listener)?;
-    if state != verifier {
-        anyhow::bail!("OAuth state mismatch");
-    }
+    let (code, state) = wait_for_callback(listener, &verifier)?;
     let credentials = exchange_authorization_code(&code, &state, &verifier).await?;
     let path = persist_credentials(&credentials)?;
     Ok(path)
@@ -152,52 +147,19 @@ pub(crate) fn credentials_file_path() -> PathBuf {
         .join(".credentials.json")
 }
 
-fn pkce_verifier() -> String {
-    format!(
-        "{}{}{}",
-        uuid::Uuid::new_v4().simple(),
-        uuid::Uuid::new_v4().simple(),
-        uuid::Uuid::new_v4().simple()
+fn wait_for_callback(
+    listener: TcpListener,
+    expected_state: &str,
+) -> anyhow::Result<(String, String)> {
+    oauth_pkce::wait_for_callback(
+        listener,
+        &oauth_pkce::CallbackOptions {
+            success_body: "Anthropic authentication completed. You can close this window.",
+            failure_body: "Anthropic authentication failed. You can close this window.",
+            error_context: "OAuth",
+            expected_state: Some(expected_state),
+        },
     )
-}
-
-fn pkce_challenge(verifier: &str) -> String {
-    let digest = Sha256::digest(verifier.as_bytes());
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
-}
-
-fn wait_for_callback(listener: TcpListener) -> anyhow::Result<(String, String)> {
-    let (mut stream, _) = listener.accept()?;
-    let mut buf = [0_u8; 8192];
-    let len = stream.read(&mut buf)?;
-    let request = String::from_utf8_lossy(&buf[..len]);
-    let line = request
-        .lines()
-        .next()
-        .context("empty OAuth callback request")?;
-    let target = line
-        .split_whitespace()
-        .nth(1)
-        .context("malformed OAuth callback request")?;
-    let url = url::Url::parse(&format!("http://localhost{target}"))?;
-    let code = url
-        .query_pairs()
-        .find(|(key, _)| key == "code")
-        .map(|(_, value)| value.into_owned())
-        .context("OAuth callback missing code")?;
-    let state = url
-        .query_pairs()
-        .find(|(key, _)| key == "state")
-        .map(|(_, value)| value.into_owned())
-        .context("OAuth callback missing state")?;
-    let body = "Anthropic authentication completed. You can close this window.";
-    write!(
-        stream,
-        "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        body.len(),
-        body
-    )?;
-    Ok((code, state))
 }
 
 #[cfg(test)]
@@ -207,7 +169,7 @@ mod tests {
     #[test]
     fn pkce_challenge_uses_s256_url_safe_no_pad() {
         assert_eq!(
-            pkce_challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
+            oauth_pkce::challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
             "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
         );
     }

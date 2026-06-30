@@ -19,6 +19,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use super::message::{LoopMessage, UserMessage};
+use super::verifier::VerificationStatus;
 
 /// One-shot critic call: takes a fully-built prompt, returns the model's
 /// raw verdict text. Mirrors `compression::SummarizeFn` so the provider
@@ -35,7 +36,7 @@ pub const CRITIC_TAG: &str = "[critic]";
 
 /// System preamble for the critic: establishes its role and a calibrated —
 /// not trigger-happy — stance. Passed as the LLM system prompt by
-/// `build_critic_fn` so the model knows what it is BEFORE it sees the
+/// `build_judge_fn` so the model knows what it is BEFORE it sees the
 /// transcript. The response FORMAT lives in [`build_prompt`] instead —
 /// right next to the material being judged.
 ///
@@ -55,6 +56,10 @@ forbid or defer (e.g. if it was told not to push/commit/deploy, do NOT ask it to
 the instructions place out of scope as correctly omitted.\n\
 - Block only on CONCRETE, in-scope incompleteness with evidence (e.g. the user asked for X and X \
 is missing; a change was made but never built/tested when verification was expected).\n\
+- A tool result tagged `[DENIED]` (or whose text begins `Permission denied` / `Auto-approval \
+denied`) is a PERMISSION block, not a failure to fix. Treat that capability as out of scope: \
+never demand the assistant retry it, route around it, or accomplish the blocked action some \
+other way. Judge the rest of the work as if that action were correctly deferred to the user.\n\
 - A block marked `[CONTEXT COMPACTION — REFERENCE ONLY]` (or a `## Active Task` lifted from one) \
 describes ALREADY-COMPLETED prior work — never treat it as an outstanding requirement. Judge only \
 the latest request and the transcript.\n\
@@ -83,19 +88,64 @@ const MAX_RULES_CHARS: usize = 16_000;
 /// `## Active Task` describes already-completed work the critic would
 /// otherwise demand again (the stale-state bug). Returns the input unchanged
 /// when no summary is present.
-fn strip_compaction_summary(rules: &str) -> &str {
+///
+/// Shared with the sibling goal gate ([`super::goal`]), which feeds the same
+/// merged system prompt to the same judge and needs the same protection.
+pub(crate) fn strip_compaction_summary(rules: &str) -> &str {
     match rules.find(crate::agent::compression::COMPACTION_MARKER) {
         Some(idx) => rules[..idx].trim_end(),
         None => rules,
     }
 }
 
+/// Render the verification-status block for the critic prompt (dirge-6q3w).
+/// Empty unless code was edited this run — that's the precondition that
+/// keeps the critic from nagging about tests on a no-code-change turn.
+/// When code WAS edited, it gives the critic the concrete signal the
+/// cheap verifier gate already computed, plus a calibrated instruction so
+/// it treats an unverified/red change as a real, in-scope gap rather than
+/// inventing busywork.
+fn verification_block(verification: Option<VerificationStatus>) -> &'static str {
+    match verification {
+        Some(VerificationStatus::Unverified) => {
+            "\n\n--- verification status ---\n\
+             Code was edited this run but no build/test/lint was detected. If one is runnable \
+             here and not forbidden, flag the unverified change as a concrete gap and name the \
+             command to run. This is a NUDGE, not a hard rule: if there is nothing to run, the \
+             change isn't testable (docs, config, scaffolding), or the assistant already verified \
+             another way and said so, treat it as COMPLETE — never force a test that can't be \
+             run.\n--- end verification status ---"
+        }
+        Some(VerificationStatus::VerifiedRed) => {
+            "\n\n--- verification status ---\n\
+             Code was edited and the most recent build/test FAILED. Don't pass a red build — this \
+             is INCOMPLETE — UNLESS the assistant explicitly said the failure is pre-existing, \
+             expected, or unrelated to the change.\n--- end verification status ---"
+        }
+        Some(VerificationStatus::VerifiedGreen) => {
+            "\n\n--- verification status ---\n\
+             Code was edited and a build/test passed. Sanity-check only that the verification was \
+             RELEVANT to the change (e.g. tests covering the edited area, not just an unrelated \
+             build); don't manufacture extra requirements.\n--- end verification status ---"
+        }
+        // No code edited (precondition not met) or no gate configured →
+        // add nothing, so the critic behaves exactly as before.
+        Some(VerificationStatus::NoCodeEdited) | None => "",
+    }
+}
+
 /// Build the critic prompt. `rules` is the assistant's own system prompt /
 /// instructions (so the critic judges against the SAME constraints the
 /// agent had — dirge-bedj), minus any compaction summary (see
-/// [`strip_compaction_summary`]); `transcript` is what the agent did. The role
-/// lives in [`CRITIC_PREAMBLE`]; this carries the format + both bodies.
-pub fn build_prompt(rules: &str, transcript: &str) -> String {
+/// [`strip_compaction_summary`]); `transcript` is what the agent did;
+/// `verification` is the run's compile/lint/test signal (dirge-6q3w),
+/// `None` when no verifier gate is configured. The role lives in
+/// [`CRITIC_PREAMBLE`]; this carries the format + bodies.
+pub fn build_prompt(
+    rules: &str,
+    transcript: &str,
+    verification: Option<VerificationStatus>,
+) -> String {
     let rules = strip_compaction_summary(rules).trim();
     let rules_block = if rules.is_empty() {
         "(no special constraints provided)".to_string()
@@ -109,7 +159,8 @@ pub fn build_prompt(rules: &str, transcript: &str) -> String {
         "{CRITIC_FORMAT}\n\n\
          --- assistant instructions & constraints (judge within these; never demand a \
          forbidden/out-of-scope action) ---\n{rules_block}\n--- end instructions ---\n\n\
-         --- transcript ---\n{transcript}\n--- end transcript ---"
+         --- transcript ---\n{transcript}\n--- end transcript ---{}",
+        verification_block(verification)
     )
 }
 
@@ -143,12 +194,19 @@ pub fn parse_verdict(response: &str) -> Option<String> {
 
 /// Run the critic over a run transcript. `rules` is the assistant's own
 /// system prompt / instructions, passed so the critic judges within the
-/// SAME constraints the agent had (dirge-bedj). Returns a one-element vec
-/// with a [`CRITIC_TAG`]-prefixed follow-up message when the critic judged
-/// the work incomplete; empty otherwise (complete, or the call errored —
-/// fail open). Never panics on a critic error.
-pub async fn run_critic(critic: &CriticFn, rules: &str, transcript: &str) -> Vec<LoopMessage> {
-    let prompt = build_prompt(rules, transcript);
+/// SAME constraints the agent had (dirge-bedj); `verification` is the
+/// run's compile/lint/test signal so the critic can be pickier about
+/// unverified changes (dirge-6q3w). Returns a one-element vec with a
+/// [`CRITIC_TAG`]-prefixed follow-up message when the critic judged the
+/// work incomplete; empty otherwise (complete, or the call errored — fail
+/// open). Never panics on a critic error.
+pub async fn run_critic(
+    critic: &CriticFn,
+    rules: &str,
+    transcript: &str,
+    verification: Option<VerificationStatus>,
+) -> Vec<LoopMessage> {
+    let prompt = build_prompt(rules, transcript, verification);
     let response = match critic(prompt).await {
         Ok(r) => r,
         Err(e) => {
@@ -198,6 +256,7 @@ mod tests {
         let p = build_prompt(
             "RULE: never push to remote.",
             "user asked X; assistant edited foo.rs",
+            None,
         );
         assert!(p.contains("VERDICT: COMPLETE"));
         assert!(p.contains("VERDICT: INCOMPLETE"));
@@ -213,7 +272,7 @@ mod tests {
 
     #[test]
     fn empty_rules_render_a_placeholder_not_blank() {
-        let p = build_prompt("", "did stuff");
+        let p = build_prompt("", "did stuff", None);
         assert!(p.contains("no special constraints"));
     }
 
@@ -230,7 +289,7 @@ mod tests {
              ## Active Task\nFinish Phase 3: wire the Janet loader and add tests.",
             crate::agent::compression::COMPACTION_MARKER,
         );
-        let p = build_prompt(&rules, "user asked X; assistant edited foo.rs");
+        let p = build_prompt(&rules, "user asked X; assistant edited foo.rs", None);
         // The agent's genuine constraint (it precedes the summary) survives…
         assert!(
             p.contains("never push to remote"),
@@ -261,7 +320,7 @@ mod tests {
     #[test]
     fn build_prompt_caps_large_rules() {
         let huge = "x".repeat(MAX_RULES_CHARS + 5_000);
-        let p = build_prompt(&huge, "t");
+        let p = build_prompt(&huge, "t", None);
         assert!(p.contains("instructions truncated"));
         // The rules block is bounded (cap + the transcript/format scaffold,
         // well under the untruncated size).
@@ -277,7 +336,7 @@ mod tests {
         assert!(!lower.contains("summarizer"));
         // Format lives in the prompt, not the system preamble.
         assert!(!CRITIC_PREAMBLE.contains("VERDICT:"));
-        assert!(build_prompt("", "t").contains("VERDICT:"));
+        assert!(build_prompt("", "t", None).contains("VERDICT:"));
         // Must not demand forbidden actions, and must respect instructions.
         assert!(
             lower.contains("respect"),
@@ -290,12 +349,112 @@ mod tests {
         assert!(lower.contains("unsure"), "must keep the fail-open guidance");
     }
 
+    // dirge-6q3w: verification-status block.
+
+    /// No gate configured → prompt is byte-identical to the pre-feature
+    /// behavior (no verification block at all).
+    #[test]
+    fn no_verification_status_adds_no_block() {
+        let p = build_prompt("rules", "did stuff", None);
+        assert!(!p.contains("verification status"));
+    }
+
+    /// Precondition: no code edited this run → no verification pressure,
+    /// even though the gate is present. The critic shouldn't nag about
+    /// tests on a read-only / Q&A turn.
+    #[test]
+    fn no_code_edited_adds_no_block() {
+        let p = build_prompt("rules", "did stuff", Some(VerificationStatus::NoCodeEdited));
+        assert!(!p.contains("verification status"));
+    }
+
+    #[test]
+    fn unverified_block_pushes_to_run_a_check() {
+        let p = build_prompt(
+            "rules",
+            "edited foo.rs",
+            Some(VerificationStatus::Unverified),
+        );
+        assert!(p.contains("verification status"));
+        let lower = p.to_lowercase();
+        assert!(lower.contains("no build/test/lint was detected"));
+        assert!(lower.contains("concrete"), "must frame it as a real gap");
+    }
+
+    /// The unverified block must stay a soft nudge with an explicit escape
+    /// hatch, so the model never fabricates a test that can't be run.
+    #[test]
+    fn unverified_block_is_a_soft_nudge() {
+        let p = build_prompt(
+            "rules",
+            "edited foo.rs",
+            Some(VerificationStatus::Unverified),
+        );
+        let lower = p.to_lowercase();
+        assert!(lower.contains("nudge"), "must call itself a nudge");
+        assert!(
+            lower.contains("isn't testable") || lower.contains("nothing to run"),
+            "must offer a not-testable escape",
+        );
+        assert!(
+            lower.contains("never force a test that can't be run"),
+            "must forbid fabricating an unrunnable test",
+        );
+    }
+
+    #[test]
+    fn red_block_forbids_passing_a_red_build() {
+        let p = build_prompt(
+            "rules",
+            "edited foo.rs",
+            Some(VerificationStatus::VerifiedRed),
+        );
+        let lower = p.to_lowercase();
+        assert!(lower.contains("failed"));
+        assert!(lower.contains("incomplete"));
+    }
+
+    #[test]
+    fn green_block_stays_calibrated() {
+        let p = build_prompt(
+            "rules",
+            "edited foo.rs",
+            Some(VerificationStatus::VerifiedGreen),
+        );
+        let lower = p.to_lowercase();
+        assert!(lower.contains("passed"));
+        // Must not manufacture new requirements on a green run.
+        assert!(lower.contains("relevant"));
+    }
+
+    #[tokio::test]
+    async fn run_critic_threads_verification_into_prompt() {
+        use std::sync::Mutex;
+        let seen: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+        let seen2 = seen.clone();
+        let critic: CriticFn = Arc::new(move |prompt: String| {
+            *seen2.lock().unwrap() = prompt;
+            Box::pin(async { Ok("VERDICT: COMPLETE".to_string()) })
+        });
+        let _ = run_critic(
+            &critic,
+            "rules",
+            "edited foo.rs",
+            Some(VerificationStatus::Unverified),
+        )
+        .await;
+        assert!(
+            seen.lock().unwrap().contains("verification status"),
+            "the verification signal must reach the critic prompt",
+        );
+    }
+
     #[tokio::test]
     async fn run_critic_injects_followup_when_incomplete() {
         let critic: CriticFn = Arc::new(|_prompt| {
             Box::pin(async { Ok("VERDICT: INCOMPLETE\n- the test was never run".to_string()) })
         });
-        let msgs = run_critic(&critic, "rules", "did stuff").await;
+        let msgs = run_critic(&critic, "rules", "did stuff", None).await;
         assert_eq!(msgs.len(), 1);
         let content = match &msgs[0] {
             LoopMessage::User(u) => &u.content,
@@ -314,7 +473,7 @@ mod tests {
             *seen2.lock().unwrap() = prompt;
             Box::pin(async { Ok("VERDICT: COMPLETE".to_string()) })
         });
-        let _ = run_critic(&critic, "RULE: do not deploy", "did stuff").await;
+        let _ = run_critic(&critic, "RULE: do not deploy", "did stuff", None).await;
         assert!(
             seen.lock().unwrap().contains("do not deploy"),
             "the agent's constraints must reach the critic prompt",
@@ -325,14 +484,20 @@ mod tests {
     async fn run_critic_silent_when_complete() {
         let critic: CriticFn =
             Arc::new(|_p| Box::pin(async { Ok("VERDICT: COMPLETE".to_string()) }));
-        assert!(run_critic(&critic, "rules", "did stuff").await.is_empty());
+        assert!(
+            run_critic(&critic, "rules", "did stuff", None)
+                .await
+                .is_empty()
+        );
     }
 
     #[tokio::test]
     async fn run_critic_fails_open_on_error() {
         let critic: CriticFn = Arc::new(|_p| Box::pin(async { anyhow::bail!("provider down") }));
         assert!(
-            run_critic(&critic, "rules", "did stuff").await.is_empty(),
+            run_critic(&critic, "rules", "did stuff", None)
+                .await
+                .is_empty(),
             "a critic error must not block finalization"
         );
     }

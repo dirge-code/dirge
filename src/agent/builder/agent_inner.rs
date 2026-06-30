@@ -133,17 +133,18 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
     // I/O (open, migrate, possible legacy-markdown import). On slow
     // filesystems (NFS, network mounts) this blocks the async runtime
     // worker thread during agent construction. Move the synchronous
-    // load onto the blocking pool, mirroring the
-    // `skill::discover_skills` shape above. `unwrap_or_default()`
-    // collapses both a `spawn_blocking` JoinError and a load error
-    // into `None`, which matches the previous `Err(_) => None` branch.
+    // load onto the blocking pool behind `DB_LOAD_TIMEOUT`, mirroring the
+    // `git_branch` timeout above. The helper collapses a
+    // `spawn_blocking` JoinError, a load error, or a timeout into `Err`,
+    // which the `match` below collapses to `None` — matching the previous
+    // `Err(_) => None` branch (and now bounding how long a stuck DB can
+    // wedge `/prompt <name>`).
     let paths_for_mem = paths.clone();
     let memory_load_result: Result<crate::extras::memory_db::SqliteMemoryStore, String> =
-        tokio::task::spawn_blocking(move || {
+        spawn_blocking_with_timeout(DB_LOAD_TIMEOUT, move || {
             crate::extras::memory_db::SqliteMemoryStore::load(&paths_for_mem)
         })
-        .await
-        .unwrap_or_else(|_| Err("spawn_blocking join failed".to_string()));
+        .await;
     // dirge-fmau: route the preamble snapshot through the
     // `MemoryProvider` trait so a non-default backend's prompt block
     // appears too. The unsizing coercion from `Arc<MemoryToolStore>`
@@ -170,10 +171,11 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
     // distinct header, so durable user preferences reach the prompt
     // regardless of which project this is. Best-effort: a load failure just
     // omits the global block.
-    if let Ok(global) =
-        tokio::task::spawn_blocking(crate::extras::memory_db::SqliteMemoryStore::load_global)
-            .await
-            .unwrap_or_else(|_| Err("spawn_blocking join failed".to_string()))
+    if let Ok(global) = spawn_blocking_with_timeout(
+        DB_LOAD_TIMEOUT,
+        crate::extras::memory_db::SqliteMemoryStore::load_global,
+    )
+    .await
     {
         let global_provider: Arc<dyn crate::extras::memory_provider::MemoryProvider> =
             Arc::new(global);
@@ -187,55 +189,46 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
     // first querying the `spec` tool. Best-effort; synchronous DB I/O runs
     // on the blocking pool like the memory load above.
     let paths_for_spec = paths.clone();
-    if let Ok(block) = tokio::task::spawn_blocking(move || {
+    if let Ok(block) = spawn_blocking_with_timeout(DB_LOAD_TIMEOUT, move || {
         crate::extras::spec_db::SpecStore::open(&paths_for_spec)
             .map(|s| s.format_active_change_for_prompt())
     })
     .await
-    .unwrap_or_else(|_| Err("spawn_blocking join failed".to_string()))
         && !block.trim().is_empty()
     {
         preamble.push_str(&block);
     }
-    let skill_manager = crate::extras::skills::manager::SkillManager::new(&paths);
     let mut usage_store = crate::extras::skills::usage::UsageStore::load(&paths).ok();
 
-    // Inject available project skills into the preamble so the
-    // model knows what procedural knowledge exists for this project.
-    // Skills are listed with name + description; the model loads
-    // full content on demand via the `skill` tool.
+    // Inject available skills into the preamble so the model knows
+    // what procedural knowledge exists. dirge-rq65 follow-up: list
+    // from the SAME source as the loadable tool set
+    // (`skill::discover_skills`, which spans the global tiers
+    // ~/.claude|.opencode|.agents|.dirge/skills plus every project
+    // ancestor) rather than `SkillManager::list()`, which only reads
+    // the single project `.dirge/skills/`. Otherwise a global skill
+    // is loadable via the `skill` tool but never advertised in the
+    // preamble, so the model never knows to load it.
+    // Skills carry name + description; full content loads on demand.
     // Bumps view counters for each listed skill (best-effort).
-    match skill_manager.list() {
-        Ok(names) if !names.is_empty() => {
-            let mut skill_lines = Vec::new();
-            for name in &names {
-                if let Ok(content) = skill_manager.read_content(name)
-                    && let Some(spec) =
-                        crate::extras::skills::format::parse_skill_spec(&content, name)
-                {
-                    let desc = if spec.description.is_empty() {
-                        "(no description)".to_string()
-                    } else {
-                        spec.description.clone()
-                    };
-                    skill_lines.push(format!("  - **{name}**: {desc}"));
-                }
-            }
-            if !skill_lines.is_empty() {
-                preamble.push_str(PROJECT_SKILLS_PREAMBLE);
-                for line in &skill_lines {
-                    preamble.push_str(line);
-                    preamble.push('\n');
-                }
-                // Bump view counters for each skill listed in preamble (best-effort).
-                if let Some(ref mut u) = usage_store {
-                    for name in &names {
-                        u.record_view(name);
-                    }
-                }
+    let skills = crate::skill::discover_skills(
+        &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+    );
+    if !skills.is_empty() {
+        preamble.push_str(PROJECT_SKILLS_PREAMBLE);
+        for skill in &skills {
+            let desc = if skill.description.is_empty() {
+                "(no description)"
+            } else {
+                skill.description.as_str()
+            };
+            preamble.push_str(&format!("  - **{}**: {}\n", skill.name, desc));
+        }
+        if let Some(ref mut u) = usage_store {
+            for skill in &skills {
+                u.record_view(&skill.name);
             }
         }
-        _ => {}
     }
 
     // Inject mode-specific reminders
@@ -306,4 +299,56 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
     // Attaching them here too only duplicated every tool construction and
     // double-collected MCP tools at startup [dirge-tfip].
     (builder.build(), ToolCache::new(), memory_store)
+}
+
+/// Wall-clock bound for the blocking SQLite loads in `build_agent_inner`
+/// (memory, global memory, spec store). Generous above the usual sub-second
+/// open+migrate, but bounded so a stuck DB can't wedge `/prompt <name>` (which
+/// calls `rebuild_agent`). Looser than the 2 s `git_branch` bound since a
+/// first-run legacy import can legitimately take longer.
+const DB_LOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Run a blocking DB load on the blocking pool behind a bounded wall-clock
+/// timeout. A hung/locked SQLite (NFS, a competing writer, a corrupt WAL)
+/// would otherwise stall `build_agent_inner` — and thus `/prompt <name>`,
+/// which calls `rebuild_agent` — indefinitely. On timeout or join error we
+/// surface `Err`, matching the existing graceful-degradation path (the memory
+/// / spec block is simply omitted). Mirrors the `git_branch` timeout above.
+async fn spawn_blocking_with_timeout<T, F>(dur: std::time::Duration, f: F) -> Result<T, String>
+where
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+    T: Send + 'static,
+{
+    match tokio::time::timeout(dur, tokio::task::spawn_blocking(f)).await {
+        Ok(Ok(res)) => res,
+        Ok(Err(_)) => Err("spawn_blocking join failed".to_string()),
+        Err(_) => Err("db load timed out".to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::spawn_blocking_with_timeout;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn spawn_blocking_with_timeout_returns_value_when_it_completes_in_time() {
+        let res: Result<i32, String> =
+            spawn_blocking_with_timeout(Duration::from_secs(2), || Ok(42)).await;
+        assert_eq!(res, Ok(42));
+    }
+
+    #[tokio::test]
+    async fn spawn_blocking_with_timeout_falls_back_when_the_load_exceeds_the_bound() {
+        // A blocking op slower than the bound must surface as an Err, not hang the
+        // caller — /prompt <name> calls rebuild_agent, so a stuck SQLite must not
+        // be able to wedge agent construction.
+        let res: Result<i32, String> =
+            spawn_blocking_with_timeout(Duration::from_millis(50), || {
+                std::thread::sleep(Duration::from_millis(500));
+                Ok(42)
+            })
+            .await;
+        assert_eq!(res, Err("db load timed out".to_string()));
+    }
 }

@@ -9,7 +9,6 @@
 
 #[allow(unused_imports)]
 use crate::sync_util::LockExt;
-use compact_str::CompactString;
 use crossterm::style::Color;
 
 use crate::agent::tools::task::SubagentChatEvent;
@@ -18,7 +17,6 @@ use crate::plugin::PluginManager;
 use crate::session::{self, MessageRole, Session, ToolCallEntry, ToolCallState};
 #[cfg(feature = "plugin")]
 use crate::ui::events::sanitize_output;
-use crate::ui::markdown;
 use crate::ui::panel_data;
 use crate::ui::renderer::Renderer;
 #[cfg(feature = "plugin")]
@@ -82,20 +80,15 @@ pub(crate) fn render_agent_stream(
     if buf.is_empty() {
         return Ok(());
     }
-    // 8-col "<dirge> " handle + 1-col space — the per-line prefix the
-    // first styled entry will carry.
-    let max_width = renderer.content_width().saturating_sub(9);
-    let mut styled = markdown::markdown_to_styled(buf, max_width, base_color);
-    if !styled.is_empty() {
-        styled[0].text = CompactString::from(format!("<dirge> {}", styled[0].text));
+    // dirge-qy3y: route through the renderer's source-tracked stream API so the
+    // streamed markdown is a width-independent block that reflows on resize
+    // (tables especially). The renderer owns the open-block state (always the
+    // buffer tail), so the caller's `start_line` anchor is now vestigial; keep
+    // it set so any remaining readers see a non-None "stream is open" marker.
+    if start_line.is_none() {
+        *start_line = Some(renderer.buffer_len());
     }
-    if let Some(start) = *start_line {
-        renderer.replace_from(start, styled);
-    } else {
-        let start = renderer.buffer_len();
-        *start_line = Some(start);
-        renderer.replace_from(start, styled);
-    }
+    renderer.stream(buf, base_color, true);
     renderer.render_viewport()?;
     Ok(())
 }

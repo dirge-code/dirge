@@ -103,7 +103,7 @@ Available tools:
 - skill: Load a skill by name to get detailed instructions for a specific task or domain.";
 
 pub const TODO_TOOLS_PROMPT: &str = "\
-- write_todo_list: Create or update a structured task list to track progress in the current coding session. Use this for complex multi-step tasks. Replaces any existing todo list.";
+- write_todo_list: Lay out or update a multi-step plan; each item is a tracked issue on your persistent board (same board as the `issue` tool), matched by title. Use it for complex multi-step tasks. Items you omit aren't auto-closed — restate an item as completed/cancelled to close it.";
 
 /// Heading + lead-in injected into the agent preamble when the project
 /// has discoverable skills. The bullet list of skills is appended after
@@ -403,7 +403,7 @@ mod tests {
 
         for forbidden in forbidden_actions {
             assert!(
-                !words.iter().any(|w| *w == forbidden),
+                !words.contains(&forbidden),
                 "memory tool prompt mentions unsupported action '{}': {}",
                 forbidden,
                 memory_line
@@ -411,7 +411,7 @@ mod tests {
         }
         for action in real_actions {
             assert!(
-                words.iter().any(|w| *w == action),
+                words.contains(&action),
                 "memory tool prompt missing real action '{}': {}",
                 action,
                 memory_line

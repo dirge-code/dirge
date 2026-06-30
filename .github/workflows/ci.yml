@@ -28,6 +28,38 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
 
+  # dirge-clippy: lint gate. CI already promotes rustc warnings to errors
+  # via the top-level `RUSTFLAGS: "-D warnings"`, but clippy was never run,
+  # so clippy lints (incl. the deny-by-default `correctness` group) had no
+  # gate and accumulated. We lint the two configs CI actually ships:
+  # the batteries-included default set, and the Janet-free `windows-default`
+  # set (the only non-`plugin` / `loop` code path). `-D warnings` fails the
+  # build on any clippy lint. Extending coverage to `dap` / `sandbox-microvm`
+  # / `--all-features` is a follow-up (those need extra native deps in CI).
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          components: clippy
+
+      - name: Clippy (default features)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Clippy (windows-default)
+        run: cargo clippy --no-default-features --features windows-default --all-targets -- -D warnings
+
+  # The `validate_all_plugins_compile` Rust test (mod_tests.rs) loads every
+  # plugin against the full dirge harness surface.  It runs in the
+  # --all-features test variant below.  That's the canonical gate; there is
+  # no standalone janet -k check because the plugins reference harness/* and
+  # dap/* symbols that only exist inside the dirge Janet runtime.
+  #
+
   # dirge-9wtb: feature matrix.
   #
   # Default `cargo build` only compiles the code paths reachable
@@ -56,6 +88,8 @@ jobs:
             features: "--features acp"
           - name: plugin
             features: "--features plugin"
+          - name: dap
+            features: "--features dap,plugin"
           - name: mcp
             features: "--features mcp"
           - name: lsp
@@ -86,7 +120,7 @@ jobs:
         # CI time without commensurate coverage gain. Run tests on
         # default, plugin (covers plugin-only hook tests), and
         # all-features (worst-case interaction).
-        if: matrix.name == 'default' || matrix.name == 'plugin' || matrix.name == 'all-features'
+        if: matrix.name == 'default' || matrix.name == 'plugin' || matrix.name == 'dap' || matrix.name == 'all-features'
         run: cargo test --bin dirge ${{ matrix.features }}
 
   # Windows is only built at release time (release.yml, tag-triggered),

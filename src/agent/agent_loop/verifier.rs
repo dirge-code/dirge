@@ -23,6 +23,24 @@ use std::sync::{Arc, Mutex};
 use super::message::{LoopMessage, UserMessage};
 use super::result::LoopToolResult;
 
+/// A read-only snapshot of what the run did toward verifying its code
+/// changes, derived from the same signals that drive the cheap nudge.
+/// Fed to the LLM critic so it can be pickier about compile/lint/test
+/// without re-deriving the signal (dirge-6q3w). The `edited_code`
+/// precondition is baked in: [`VerificationStatus::NoCodeEdited`] means
+/// "verification not applicable this run" so the critic adds no pressure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerificationStatus {
+    /// No code file was edited this run — verification is N/A.
+    NoCodeEdited,
+    /// Code was edited and the most recent build/test command passed.
+    VerifiedGreen,
+    /// Code was edited and the most recent build/test command failed.
+    VerifiedRed,
+    /// Code was edited but no build/test/lint command was detected.
+    Unverified,
+}
+
 /// Display tag prefixing both verifier nudges. The UI keys on this to attribute
 /// the message to the system/critic rather than the user (it's injected as a
 /// user-role message so the model responds) [dirge-i75f]. The `*_NUDGE`
@@ -92,6 +110,23 @@ impl VerifierGate {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Read-only verification snapshot for the LLM critic (dirge-6q3w).
+    /// Unlike [`check_before_finalize`], this never mutates the gate (it
+    /// doesn't spend the one-shot nudge), so the cheap nudge and the
+    /// pickier critic can both consult it in the same finalization.
+    pub fn status(&self) -> VerificationStatus {
+        let inner = self.inner.lock_ignore_poison();
+        if !inner.edited_code {
+            VerificationStatus::NoCodeEdited
+        } else if inner.ran_verification && inner.verification_failed {
+            VerificationStatus::VerifiedRed
+        } else if inner.ran_verification {
+            VerificationStatus::VerifiedGreen
+        } else {
+            VerificationStatus::Unverified
         }
     }
 
@@ -357,6 +392,44 @@ mod tests {
             false,
         );
         assert!(nudge(&g).is_some());
+    }
+
+    #[test]
+    fn status_reflects_run_signals() {
+        let g = VerifierGate::new();
+        assert_eq!(g.status(), VerificationStatus::NoCodeEdited);
+
+        g.record_outcome("edit", &json!({"path": "src/a.rs"}), &ok_result(), false);
+        assert_eq!(g.status(), VerificationStatus::Unverified);
+
+        g.record_outcome(
+            "bash",
+            &json!({"command": "cargo test"}),
+            &failed_result(),
+            false,
+        );
+        assert_eq!(g.status(), VerificationStatus::VerifiedRed);
+
+        // Latest outcome wins — fix then re-run green.
+        g.record_outcome(
+            "bash",
+            &json!({"command": "cargo test"}),
+            &ok_result(),
+            false,
+        );
+        assert_eq!(g.status(), VerificationStatus::VerifiedGreen);
+    }
+
+    /// `status()` must NOT spend the one-shot nudge — the cheap gate and
+    /// the pickier critic both read it in the same finalization.
+    #[test]
+    fn status_does_not_consume_the_nudge() {
+        let g = VerifierGate::new();
+        g.record_outcome("edit", &json!({"path": "src/a.rs"}), &ok_result(), false);
+        assert_eq!(g.status(), VerificationStatus::Unverified);
+        // Reading status repeatedly leaves the nudge intact.
+        let _ = g.status();
+        assert!(nudge(&g).is_some(), "status() must not arm `fired`");
     }
 
     #[test]

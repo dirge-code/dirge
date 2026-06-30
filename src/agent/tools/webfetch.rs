@@ -689,8 +689,7 @@ mod tests {
         let long_word_count = 200;
         // Build a paragraph that, without wrapping, would be ~one extremely
         // long line.
-        let paragraph: String = std::iter::repeat("lorem")
-            .take(long_word_count)
+        let paragraph: String = std::iter::repeat_n("lorem", long_word_count)
             .collect::<Vec<_>>()
             .join(" ");
         let html = format!("<p>{}</p>", paragraph);

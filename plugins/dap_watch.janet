@@ -52,7 +52,7 @@
     "remove" (do
       (when (empty? rest)
         (break "usage: /dap-watch remove <index>"))
-      (def idx (math/parse-int rest))
+      (def idx (scan-number rest))
       (if (or (< idx 0) (>= idx (length watch-exprs)))
         (break (string "invalid index " idx " (0.." (- (length watch-exprs) 1) ")")))
       (def removed (get watch-exprs idx))

@@ -18,6 +18,12 @@ use crate::sync_util::LockExt;
 /// Populated by `register_plugin_commands` after plugin init.
 static PLUGIN_COMMANDS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
+/// User-configured alias command names (without leading `/`), from the
+/// `slash_aliases` config. Populated by `register_alias_commands` once at
+/// startup from `run_interactive`. Separate from `PLUGIN_COMMANDS`
+/// (config vs. plugin-discovered) but merged identically in `all_commands`.
+static ALIAS_COMMANDS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
 /// Register plugin command names for tab completion.
 /// Called from `main.rs` after plugin init. Only the `plugin` feature
 /// has anything to register — without it the setter is dead (the
@@ -27,6 +33,14 @@ static PLUGIN_COMMANDS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 #[cfg(feature = "plugin")]
 pub fn register_plugin_commands(cmds: Vec<String>) {
     *PLUGIN_COMMANDS.lock_ignore_poison() = cmds;
+}
+
+/// Register slash-alias names (without leading `/`) for tab completion.
+/// Called once from `run_interactive` right after `build_alias_map`.
+/// Gated to `slash-completion`, which owns the only reader (`all_commands`).
+#[cfg(feature = "slash-completion")]
+pub fn register_alias_commands(cmds: Vec<String>) {
+    *ALIAS_COMMANDS.lock_ignore_poison() = cmds;
 }
 
 /// All completable slash commands: built-ins + plugin-registered.
@@ -39,6 +53,13 @@ pub fn all_commands() -> Vec<String> {
         .collect();
     let guard = PLUGIN_COMMANDS.lock_ignore_poison();
     for name in guard.iter() {
+        let with_slash = format!("/{}", name);
+        if !cmds.contains(&with_slash) {
+            cmds.push(with_slash);
+        }
+    }
+    let alias_guard = ALIAS_COMMANDS.lock_ignore_poison();
+    for name in alias_guard.iter() {
         let with_slash = format!("/{}", name);
         if !cmds.contains(&with_slash) {
             cmds.push(with_slash);
@@ -115,7 +136,7 @@ static SUBCOMMAND_ENTRIES: &[(&str, &[&str])] = &[
         "/sandbox snapshot",
         &["save", "list", "restore", "delete", "help"],
     ),
-    ("/sessions", &["delete"]),
+    ("/sessions", &["list", "current", "switch", "delete"]),
     ("/tree", &[]),  // dynamic: leaf IDs
     ("/fork", &[]),  // dynamic: leaf IDs
     ("/clone", &[]), // dynamic: leaf IDs
@@ -159,6 +180,7 @@ static SUBCOMMAND_ENTRIES: &[(&str, &[&str])] = &[
         ],
     ),
     ("/panel", &["on", "off", "auto", "debug"]),
+    ("/plugins", &["load"]),
     ("/display", &[]), // dynamic: pane spec
     ("/kill", &[]),    // dynamic: subagent ID
     ("/cd", &[]),      // dynamic: directory path
@@ -610,5 +632,28 @@ mod tests {
     fn plugin_command_ghost_suffix() {
         register_plugin_commands(vec!["myplugin".to_string()]);
         assert_eq!(ghost_suffix("/mypl").as_deref(), Some("ugin"));
+    }
+
+    #[cfg(feature = "slash-completion")]
+    #[test]
+    fn alias_command_in_all_commands() {
+        register_alias_commands(vec!["exit".to_string()]);
+        let cmds = all_commands();
+        assert!(cmds.contains(&"/exit".to_string()));
+    }
+
+    #[cfg(feature = "slash-completion")]
+    #[test]
+    fn alias_command_completion_cycles() {
+        register_alias_commands(vec!["exit".to_string()]);
+        let r = try_complete("/ex", 3).unwrap();
+        assert_eq!(r.new_buffer, "/exit");
+    }
+
+    #[cfg(feature = "slash-completion")]
+    #[test]
+    fn alias_command_ghost_suffix() {
+        register_alias_commands(vec!["exit".to_string()]);
+        assert_eq!(ghost_suffix("/ex").as_deref(), Some("it"));
     }
 }

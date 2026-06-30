@@ -1361,3 +1361,101 @@ fn search_esc_from_input_editor_cancels() {
     assert!(!editor.is_in_search());
     assert_eq!(editor.buffer.as_str(), "draft text");
 }
+
+// ── dirge-7yea: undo (Ctrl+Z) ──────────────────────────────
+
+#[test]
+fn undo_reverts_a_paste() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "before ");
+    editor.handle_paste("L1\nL2\nL3\nL4");
+    assert!(editor.buffer.contains('\u{0001}'));
+    editor.handle_key(ctrl(KeyCode::Char('z')));
+    assert_eq!(editor.buffer.as_str(), "before ");
+    assert_eq!(editor.expanded().as_str(), "before ");
+    assert_eq!(editor.cursor, "before ".len());
+}
+
+#[test]
+fn undo_reverts_a_short_paste() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "x");
+    editor.handle_paste("hello world");
+    assert_eq!(editor.buffer.as_str(), "xhello world");
+    editor.handle_key(ctrl(KeyCode::Char('z')));
+    assert_eq!(editor.buffer.as_str(), "x");
+    assert_eq!(editor.cursor, 1);
+}
+
+#[test]
+fn undo_groups_typing_by_word() {
+    // A run of non-space chars collapses into one undo step; the
+    // space ends the group so the next word is its own step.
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "hello world");
+    editor.handle_key(ctrl(KeyCode::Char('z')));
+    assert_eq!(editor.buffer.as_str(), "hello ");
+    editor.handle_key(ctrl(KeyCode::Char('z')));
+    assert_eq!(editor.buffer.as_str(), "");
+}
+
+#[test]
+fn undo_with_empty_stack_is_noop() {
+    let mut editor = InputEditor::new();
+    editor.handle_key(ctrl(KeyCode::Char('z')));
+    assert_eq!(editor.buffer.as_str(), "");
+    assert_eq!(editor.cursor, 0);
+}
+
+#[test]
+fn undo_reverts_backspace() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "abc");
+    editor.handle_key(press(KeyCode::Backspace));
+    assert_eq!(editor.buffer.as_str(), "ab");
+    editor.handle_key(ctrl(KeyCode::Char('z')));
+    assert_eq!(editor.buffer.as_str(), "abc");
+}
+
+#[test]
+fn submit_clears_undo_history() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "hello");
+    editor.handle_key(press(KeyCode::Enter));
+    // Fresh draft; the pre-submit edits are no longer undoable.
+    type_str(&mut editor, "new");
+    editor.handle_key(ctrl(KeyCode::Char('z')));
+    assert_eq!(editor.buffer.as_str(), "");
+    // A second undo must not resurrect the submitted text.
+    editor.handle_key(ctrl(KeyCode::Char('z')));
+    assert_eq!(editor.buffer.as_str(), "");
+}
+
+#[test]
+fn history_navigation_is_not_undoable() {
+    // Recalling history (Up) and restoring the draft (Down) replace the
+    // buffer but aren't edits — Ctrl+Z must revert the actual typing,
+    // not the navigation.
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "old");
+    editor.handle_key(press(KeyCode::Enter));
+    type_str(&mut editor, "draft");
+    editor.handle_key(press(KeyCode::Up)); // recalls "old"
+    assert_eq!(editor.buffer.as_str(), "old");
+    editor.handle_key(press(KeyCode::Down)); // back to draft
+    assert_eq!(editor.buffer.as_str(), "draft");
+    // One undo removes the typed word, not the navigation.
+    editor.handle_key(ctrl(KeyCode::Char('z')));
+    assert_eq!(editor.buffer.as_str(), "");
+}
+
+#[test]
+fn undo_then_type_starts_fresh_group() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "foo");
+    editor.handle_key(ctrl(KeyCode::Char('z')));
+    assert_eq!(editor.buffer.as_str(), "");
+    type_str(&mut editor, "bar");
+    editor.handle_key(ctrl(KeyCode::Char('z')));
+    assert_eq!(editor.buffer.as_str(), "");
+}

@@ -195,6 +195,39 @@ pub(crate) struct UiState {
     pub(crate) plan_phase: Option<crate::agent::plan::runtime::PlanPhaseHandle>,
     /// Reviewer-loop state between implement turns.
     pub(crate) active_plan: Option<crate::agent::plan::runtime::ActivePlan>,
+    /// In-flight non-blocking compaction (summarizer LLM on a spawned task);
+    /// the `compaction_phase` select! arm installs the result. dirge-tv3p.
+    pub(crate) compaction_phase: Option<crate::ui::compaction::CompactionPhaseHandle>,
+    /// In-flight non-blocking `/plan` reviewer (the write-disabled reviewer runs
+    /// code on a spawned task); the `review_phase` arm applies the verdict.
+    /// dirge-4koy.
+    pub(crate) review_phase: Option<crate::agent::plan::runtime::ReviewPhaseHandle>,
+    /// In-flight non-blocking `/btw` side query (one-shot LLM on a spawned task);
+    /// the `btw_phase` arm renders the answer. dirge-nret.
+    pub(crate) btw_phase: Option<crate::ui::btw::BtwPhaseHandle>,
+    /// In-flight non-blocking `/wt-merge` (git merge on a blocking thread); the
+    /// `wt_merge_phase` arm runs the post-merge continuation. dirge-iagk.
+    /// Unconditional so the select! arm can be (select! rejects `#[cfg]` arms);
+    /// stays `None` in non-worktree builds.
+    pub(crate) wt_merge_phase: Option<crate::ui::wt_merge_phase::WtMergePhaseHandle>,
+
+    // ── PTY-backed interactive shell session (!cmd / !!cmd) ──────────
+    /// A live PTY-backed shell session for `!cmd` / `!!cmd` (no terminal
+    /// takeover — the TUI stays live). `Some` while the command runs: raw
+    /// keystrokes are forwarded to the PTY while the shell box is mounted,
+    /// and `Esc` `SIGKILL`s the whole process group. The session resolves on
+    /// its own when the child exits.
+    pub(crate) shell_session: Option<crate::ui::shell_session::ShellSession>,
+    /// VT100 screen parser fed the raw (escapes-intact) PTY output, rendered
+    /// into the live `[shell]` box. A real screen parser (rather than
+    /// concatenating ansi-stripped text) lets cursor-moving apps like
+    /// `gh auth login` redraw in place. None whenever no session is active.
+    pub(crate) shell_parser: Option<vt100::Parser>,
+    /// True once the bottom shell box has replaced the input box (mounted
+    /// after a short grace window so quick commands never flash a box).
+    pub(crate) shell_box_visible: bool,
+    /// Mount deadline; `Some` from spawn until the box mounts (grace window).
+    pub(crate) shell_mount_deadline: Option<std::time::Instant>,
 
     // ── Chats / subagents ────────────────────────────────────────────
     /// Per-chat-tab UI state (response/reasoning/chamber buffers).
@@ -305,6 +338,24 @@ pub(crate) struct CustomEntry {
     pub(crate) input_anchor: usize,
 }
 
+impl CustomEntry {
+    /// Append pasted text to the single-line answer buffer. The typed path
+    /// only ever pushes printable `Char`s (Enter submits), so a paste must
+    /// match that shape: whitespace controls (`\n`/`\r`/`\t`) flatten to a
+    /// space and other control bytes are dropped. Without this, a paste
+    /// while answering leaks into the main compose input (dirge-7543).
+    pub(crate) fn paste(&mut self, text: &str) {
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        for c in normalized.chars() {
+            match c {
+                '\n' | '\t' => self.buf.push(' '),
+                c if c.is_control() => {}
+                c => self.buf.push(c),
+            }
+        }
+    }
+}
+
 /// Copy discriminant of [`InputMode`]. The dispatcher routes on this so it
 /// can read the active mode without holding a borrow on `input_mode` (which
 /// would block the `mem::replace` used to take ownership of the reply
@@ -375,6 +426,14 @@ impl UiState {
 
             loop_label: None,
             plan_phase: None,
+            compaction_phase: None,
+            review_phase: None,
+            btw_phase: None,
+            wt_merge_phase: None,
+            shell_session: None,
+            shell_parser: None,
+            shell_box_visible: false,
+            shell_mount_deadline: None,
             active_plan: None,
 
             chat_ui_states: vec![ChatUiState::empty()],
@@ -406,6 +465,29 @@ mod tests {
     #[test]
     fn toggle_expands_when_collapsed_with_a_source() {
         assert_eq!(expand_toggle(None, true), ExpandToggle::Expand);
+    }
+
+    /// dirge-7543: pasting into a Q&A custom answer appends to the entry
+    /// buffer (single line) rather than leaking into the main compose input.
+    #[test]
+    fn custom_entry_paste_appends_and_flattens_whitespace() {
+        let mut e = CustomEntry {
+            buf: "ab".to_string(),
+            input_anchor: 0,
+        };
+        e.paste("cd\r\nef\tgh");
+        assert_eq!(e.buf, "abcd ef gh");
+    }
+
+    #[test]
+    fn custom_entry_paste_drops_non_whitespace_control_bytes() {
+        let mut e = CustomEntry {
+            buf: String::new(),
+            input_anchor: 0,
+        };
+        // \u{1} (PASTE_MARK-class), \u{7} bell — dropped; printable kept.
+        e.paste("x\u{1}y\u{7}z");
+        assert_eq!(e.buf, "xyz");
     }
 
     #[test]

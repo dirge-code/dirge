@@ -592,6 +592,55 @@ fn chamber_row_with_bg_right_border_aligns_with_tabs() {
     assert!(row.ends_with('│'));
 }
 
+/// dirge chamber-width fix: a chamber box must span the full painted chat
+/// band (`Layout::chat.width - 1`), not the gutter-blind, 120-capped
+/// `content_width`. With panels hidden the band reclaims both gutters, so
+/// the box must widen with it — otherwise a dead strip is left on the
+/// right where stale border glyphs showed.
+#[test]
+fn chamber_spans_full_chat_band_when_panels_hidden() {
+    use crate::ui::tool_display::chamber_widths;
+    let mut r = Renderer::new().expect("renderer");
+    // Wide gutter but below the panel auto-show threshold (152), so both
+    // side panels are hidden and the chat band reclaims their gutters.
+    r.set_test_cols(148);
+    assert!(
+        !r.left_panel_visible() && !r.right_panel_visible(),
+        "panels should be hidden at 148 cols"
+    );
+
+    let band = r.chat_band_width();
+    let (frame_w, inner) = chamber_widths(&r);
+    // Right │ lands on the last painted cell (ChatPane paints chat.width-1).
+    assert_eq!(frame_w, band - 1, "chamber must fill the painted band");
+    assert_eq!(inner + 4, frame_w);
+    // The band genuinely exceeds the old 120-capped content_width — i.e.
+    // the dead strip the artifacts lived in is gone.
+    assert!(
+        band > r.content_width(),
+        "band should reclaim gutters past the 120 cap (band={band}, content_width={})",
+        r.content_width(),
+    );
+}
+
+/// No regression when panels ARE shown: the band is capped at the panel
+/// layout width, so the chamber width is unchanged from the old behavior.
+#[test]
+fn chamber_width_unchanged_when_panels_shown() {
+    use crate::ui::tool_display::chamber_widths;
+    let mut r = Renderer::new().expect("renderer");
+    r.set_test_cols(200); // >= 152 and wide gutter → panels auto-show
+    assert!(
+        r.left_panel_visible() && r.right_panel_visible(),
+        "panels should be visible at 200 cols"
+    );
+    let (frame_w, _) = chamber_widths(&r);
+    // Panels take the gutter, so the band is the 120-cap and the chamber
+    // matches the pre-fix content_width-1.
+    assert_eq!(frame_w, r.chat_band_width() - 1);
+    assert_eq!(frame_w, r.content_width() - 1);
+}
+
 /// Chat window switching: next / prev index math wraps correctly.
 #[test]
 fn chat_index_next_prev_wraps() {
@@ -898,4 +947,85 @@ fn expanded_thinking_wrapped_rows_keep_the_bar() {
             "every wrapped thinking row must keep the bar (stay in the box): {row:?}"
         );
     }
+}
+
+// ============================================================
+// real_user_prompt — history seeding filter
+// ============================================================
+use crate::session::{MessageRole, SessionMessage};
+
+fn user_msg(content: &str) -> SessionMessage {
+    SessionMessage {
+        role: MessageRole::User,
+        content: compact_str::CompactString::new(content),
+        estimated_tokens: 0,
+        id: compact_str::CompactString::new("m"),
+        timestamp: 0,
+        tool_calls: Vec::new(),
+    }
+}
+
+#[test]
+fn real_user_prompt_passes_real_input() {
+    assert_eq!(
+        super::real_user_prompt(&user_msg("run tests")),
+        Some("run tests")
+    );
+}
+
+#[test]
+fn real_user_prompt_strips_system_reminder_wrapper() {
+    let m = user_msg("<system-reminder>\nctx\n</system-reminder>\n\nwhat's next?");
+    assert_eq!(super::real_user_prompt(&m), Some("what's next?"));
+}
+
+#[test]
+fn real_user_prompt_rejects_synthetic_turns() {
+    // Non-user role.
+    let mut m = user_msg("x");
+    m.role = MessageRole::Assistant;
+    assert_eq!(super::real_user_prompt(&m), None);
+    // Empty after strip.
+    assert_eq!(super::real_user_prompt(&user_msg("")), None);
+    assert_eq!(
+        super::real_user_prompt(&user_msg("<system-reminder>x</system-reminder>")),
+        None,
+    );
+    // Mid-turn steer + auto-continue markers.
+    assert_eq!(
+        super::real_user_prompt(&user_msg("[Mid-turn steer from user] hey")),
+        None,
+    );
+    assert_eq!(
+        super::real_user_prompt(&user_msg(
+            "Continue based on the background task results above."
+        )),
+        None,
+    );
+}
+
+// ============================================================
+// shell_overlay_rows — vt100 screen collapses cursor redraws
+// ============================================================
+
+/// The fix for the `gh auth login` rendering bug: an interactive prompt that
+/// redraws a line in place (cursor-up + erase-line + reprint) must update the
+/// same screen row, not append a second copy. A naive append of ansi-stripped
+/// text would stack every redraw (the screen filled with repeated menus); the
+/// vt100 screen parser shows only the final state.
+#[test]
+fn shell_overlay_rows_collapses_cursor_redraws() {
+    let mut p = vt100::Parser::new(4, 24, 0);
+    p.process(b"? pick one\r\n");
+    p.process(b"> GitHub.com\r\n");
+    // Emulate a survey redraw after pressing Down: move the cursor back up to
+    // the selection line, erase it, and reprint with the marker moved.
+    p.process(b"\x1b[1A"); // up 1
+    p.process(b"\x1b[2K"); // erase entire line
+    p.process(b"> Other");
+    let rows = shell_overlay_rows(&p);
+    let lines: Vec<&str> = rows.iter().map(|(s, _)| s.as_str()).collect();
+    assert_eq!(lines, vec!["? pick one", "> Other"]);
+    // The stale selection must not linger anywhere on the screen.
+    assert!(!lines.iter().any(|l| l.contains("GitHub.com")));
 }

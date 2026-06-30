@@ -44,6 +44,13 @@ pub enum Outcome {
     Ok,
     Error,
     Timeout,
+    /// A permission/approval refusal (dirge-c7sd). Split out from `Error`
+    /// because it is *not* mechanically recoverable: the model cannot fix
+    /// it by retrying, rephrasing, or "a different approach" — only the
+    /// user can, via `/allow` or a prompt. The failure tracker must not
+    /// fold it into the recovery-checkpoint streak (that nudge tells the
+    /// model to route around the wall, which is exactly wrong here).
+    Denied,
 }
 
 impl Outcome {
@@ -59,7 +66,12 @@ impl Outcome {
         if !is_error {
             return Outcome::Ok;
         }
-        if excerpt.contains("timed out after") || excerpt.contains("auto-killed after") {
+        // Policy refusal first: a denied call is not made retryable by a
+        // bigger timeout budget, so it outranks the timeout marker even
+        // when the reason text happens to mention one.
+        if crate::agent::tools::is_permission_denial(excerpt) {
+            Outcome::Denied
+        } else if excerpt.contains("timed out after") || excerpt.contains("auto-killed after") {
             Outcome::Timeout
         } else {
             Outcome::Error
@@ -136,6 +148,39 @@ mod tests {
         assert_eq!(
             Outcome::classify(false, "note: a prior run timed out after 5s"),
             Outcome::Ok
+        );
+    }
+
+    #[test]
+    fn classify_maps_permission_denials_to_denied() {
+        // Every denial form the enforce layer emits classifies as Denied,
+        // distinct from a mechanical Error the model could retry around.
+        for text in [
+            "Permission denied: writes outside project",
+            "Permission denied by user",
+            "Permission denied (non-interactive mode)",
+            "Auto-approval denied by approval_provider: file is outside the project directory",
+        ] {
+            assert_eq!(Outcome::classify(true, text), Outcome::Denied, "{text}");
+        }
+    }
+
+    #[test]
+    fn denial_text_on_a_success_is_still_ok() {
+        // Same guard as timeouts: the marker only matters on an error.
+        assert_eq!(
+            Outcome::classify(false, "Permission denied: (quoting a past run)"),
+            Outcome::Ok
+        );
+    }
+
+    #[test]
+    fn a_denial_that_also_timed_out_is_classified_denied() {
+        // Policy refusal takes precedence: a denied call is not something
+        // a longer timeout budget would fix.
+        assert_eq!(
+            Outcome::classify(true, "Permission denied: command timed out after 1s"),
+            Outcome::Denied
         );
     }
 }

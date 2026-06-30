@@ -37,6 +37,29 @@ const INIT_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg_attr(not(feature = "plugin"), allow(dead_code))]
 const DIALOG_POLL: Duration = Duration::from_millis(50);
 
+/// Wall-clock bound on `send_dialog` (dirge-u5ig). Dialogs were the one
+/// host call with NO timeout — `harness/confirm` / `harness/select` polled
+/// the reply forever, so a dialog whose responder never answers (headless
+/// without `--auto-confirm`, or a starved responder) pinned the single
+/// Janet worker permanently, which in turn wedges every later eval that
+/// serializes behind it. Unlike `LSP_QUERY_TIMEOUT` (30s) this is
+/// deliberately generous: in interactive mode a human answers the dialog,
+/// and a distracted user may take minutes. The bound only exists so a
+/// never-answered dialog can't pin the worker forever — it is not meant to
+/// rush a real human. After it elapses `send_dialog` returns `None` (the
+/// cfn treats that as "no answer", same as a shutdown-cancelled dialog).
+#[cfg_attr(not(feature = "plugin"), allow(dead_code))]
+const DIALOG_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Whether `send_dialog` should stop waiting: either the worker is shutting
+/// down, or the dialog has exceeded [`DIALOG_TIMEOUT`]. Split out so the
+/// give-up policy is unit-testable without a real hung responder (mirrors
+/// `lsp_should_abort`).
+#[cfg_attr(not(feature = "plugin"), allow(dead_code))]
+fn dialog_should_abort(elapsed: Duration, shutting_down: bool) -> bool {
+    shutting_down || elapsed >= DIALOG_TIMEOUT
+}
+
 /// Upper bound on how long a single `Worker::eval` will wait for the
 /// worker's reply. Generous (10 min) because `harness/confirm` /
 /// `harness/select` legitimately block the worker on user input — a
@@ -93,6 +116,14 @@ const HARNESS_INIT: &str = r#"
 (var harness-mutate-input nil)
 (var harness-replace-result nil)
 
+# Entity/relation record accumulators (experimental-graph-search).
+# Janet compressors call harness/record-entity and harness/record-relation
+# during on-tool-end. The host drains these after dispatch and persists
+# to SQLite. Tab-separated blobs (harness/-escape'd): kind\tname\textra\n
+# and source_kind\tsource_name\ttarget_kind\ttarget_name\trel_type\n.
+(var harness-recorded-entities "")
+(var harness-recorded-relations "")
+
 # harness/log is now a no-op. The return value of plugin commands
 # is what surfaces in chat — that's the supported surface for
 # plugin output.
@@ -125,6 +156,92 @@ const HARNESS_INIT: &str = r#"
   (when (string? json-str) (set harness-mutate-input json-str)))
 (defn harness/replace-result [output]
   (when (string? output) (set harness-replace-result output)))
+
+# Entity/relation recording for graph-search (#393).
+# Compressors call these from `on-tool-end` to persist structured facts.
+# The host drains `harness-recorded-entities` and `harness-recorded-relations`
+# after dispatch and writes them to the SQLite entity/relation tables.
+
+# Wire-format escape — used by every tab-separated harness blob.
+(defn- harness/-escape [s]
+  (->> s
+       (string/replace-all "\\" "\\\\")
+       (string/replace-all "\t" "\\t")
+       (string/replace-all "\n" "\\n")))
+
+(defn harness/record-entity [kind name &opt extra]
+  (when (and (string? kind) (string? name))
+    (let [escaped-name (harness/-escape name)
+          escaped-kind (harness/-escape kind)
+          escaped-extra (if (string? extra) (harness/-escape extra) "")]
+      (set harness-recorded-entities
+           (string harness-recorded-entities
+                  escaped-kind "\t" escaped-name "\t" escaped-extra "\n")))))
+(defn harness/record-relation [source-kind source-name target-kind target-name rel-type]
+  (when (and (string? source-kind) (string? source-name)
+             (string? target-kind) (string? target-name)
+             (string? rel-type))
+    (set harness-recorded-relations
+         (string harness-recorded-relations
+                (harness/-escape source-kind) "\t"
+                (harness/-escape source-name) "\t"
+                (harness/-escape target-kind) "\t"
+                (harness/-escape target-name) "\t"
+                (harness/-escape rel-type) "\n"))))
+
+# Entity bundle compression (N3). Takes a multi-line bundle text
+# (e.g. /graph traverse output) and compresses it: groups by
+# terminal kind, deduplicates per entity (shortest path kept),
+# produces a compact summary.
+(defn harness/compress-bundle [bundle-text &opt query]
+  (default query "")
+  (unless (string? bundle-text) (break "expected string"))
+  (def lines (filter |(not (empty? $)) (string/split "\n" bundle-text)))
+  (if (empty? lines) (break ""))
+  # Extract entity kind from terminal [...] in each line.
+  (defn terminal-kind [line]
+    (def parts (string/split "[" line))
+    (if (> (length parts) 1)
+      (let [last (last parts)]
+        (first (string/split "]" last)))
+      "unknown"))
+  # Extract entity name (last segment before terminal [kind]).
+  (defn terminal-name [line]
+    (def rev (reverse (string/split "[" line)))
+    (if (> (length rev) 2)
+      (let [before-bracket (get rev 1)]
+        (string/trim (last (string/split "→" before-bracket))))
+      (let [first-part (last (string/split "→" line))]
+        (string/trim (first (string/split "[" first-part))))))
+  # Per entity (name+kind), keep the shortest line.
+  (def deduped @{})
+  (each line lines
+    (def kind (terminal-kind line))
+    (def name (terminal-name line))
+    (def key (string kind ":" name))
+    (let [existing (get deduped key)]
+      (when (or (nil? existing) (< (length line) (length existing)))
+        (put deduped key line))))
+  # Group by kind.
+  (def by-kind @{})
+  (each [key line] (pairs deduped)
+    (def kind (terminal-kind line))
+    (let [lst (get by-kind kind)]
+      (if (nil? lst)
+        (put by-kind kind @[line])
+        (array/push lst line))))
+  # Build output.
+  (def buf @[""])
+  (def kind-counts @[])
+  (each kind (sort (keys by-kind))
+    (let [ents (get by-kind kind)]
+      (array/push kind-counts (string (length ents) " " kind))))
+  (array/push buf (string (length (keys deduped)) " entities: " (string/join kind-counts ", ")))
+  (each kind (sort (keys by-kind))
+    (array/push buf (string "  [" kind "]"))
+    (each line (get by-kind kind)
+      (array/push buf (string "    " line))))
+  (string/join buf "\n"))
 
 # Run-boundary slots. Plugins call `harness/set-next-model` from
 # inside `prepare-next-run` to swap the active model before the
@@ -181,15 +298,6 @@ const HARNESS_INIT: &str = r#"
   (when (string? content)
     (set harness-followup-messages
          (string harness-followup-messages content "\n"))))
-
-# Wire-format escape — used by every tab-separated harness blob.
-# Defined before any caller so the cond-arity helpers below
-# (harness/add-custom-message, harness/register-*) can reference it.
-(defn- harness/-escape [s]
-  (->> s
-       (string/replace-all "\\" "\\\\")
-       (string/replace-all "\t" "\\t")
-       (string/replace-all "\n" "\\n")))
 
 # Custom (UI-only) message queue. Plugins call this to push a
 # notification the user SEES in the chat but the model does NOT
@@ -537,6 +645,23 @@ const HARNESS_INIT: &str = r#"
                    (harness/-escape handler) "\t"
                    (harness/-escape desc) "\n")))))
 
+# Plugin keybinding overrides (dirge-rj3k / #476). Plugins call
+#   (harness/bind-key keys command)
+# to bind a key chord — or an emacs-style sequence like "ctrl-x ctrl-s" —
+# to a BUILT-IN command name (the same vocabulary the user's `keybindings`
+# config uses: the global KeyAction commands and the input-editor
+# InputAction commands), or "none" to unbind a default. The host merges
+# these OVER the built-in defaults and UNDER the user's config, so user
+# config always wins. This REMAPS built-ins; to bind a key to plugin CODE,
+# use register-shortcut instead.
+(var harness-keybindings-list "")
+(defn harness/bind-key [keys command]
+  (when (and (string? keys) (string? command))
+    (set harness-keybindings-list
+         (string harness-keybindings-list
+                 (harness/-escape keys) "\t"
+                 (harness/-escape command) "\n"))))
+
 # Per-invocation context slot set by the host before each plugin
 # tool handler runs (H2). Reads return the tool-call id the LLM
 # assigned to the current call — useful for correlating progress
@@ -599,7 +724,15 @@ const HARNESS_INIT: &str = r#"
                    (harness/-escape parameters) "\t"
                    (harness/-escape handler) "\t"
                    mode "\t"
-                   (harness/-escape prep) "\n")))))
+                    (harness/-escape prep) "\n")))))
+
+# (harness/json-extract json-str key) -> string | nil
+# Uses serde_json to extract a string value from a JSON object. Returns
+# nil if the key is missing, the JSON is invalid, or the value is not a
+# string. Much safer than hand-rolled quote-scanning.
+(defn harness/json-extract [json-str key]
+  (when (and (string? json-str) (string? key))
+    (harness/__json-extract json-str key)))
 "#;
 
 /// Janet-side aliases that defer the actual blocking work to the
@@ -618,8 +751,49 @@ const HARNESS_DIALOG_INIT: &str = r#"
     false))
 
 (defn harness/select [title opts]
-  (when (and (string? title) (indexed? opts))
+    (when (and (string? title) (indexed? opts))
     (harness/__select title opts)))
+"#;
+
+/// Janet wrapper for harness/__computer-use-exec. Takes a dict with
+/// :action (keyword) and action-specific fields. Example:
+///
+///   (harness/computer-use-exec
+///     {"action" "key" "keys" @[56 15]})
+///
+/// Returns a dict with :exit_code, :stdout, :stderr on success, or
+/// raises a Janet error on failure / channel disconnect.
+#[cfg(feature = "plugin")]
+const HARNESS_COMPUTER_USE_INIT: &str = r#"
+(defn harness/computer-use-exec [params]
+  (when (not (dictionary? params))
+    (error "harness/computer-use-exec: expected a dictionary"))
+  (let [action (get params "action")]
+    (when (not (string? action))
+      (error "harness/computer-use-exec: :action must be a string")))
+  (let [result (harness/__computer-use-exec params)]
+    (when (not result)
+      (error "harness/computer-use-exec: sandbox not available"))
+    result))
+
+(var harness/computer-use-deny-tools @{})
+
+(defn harness/set-computer-use-deny-tools [tools-vec]
+  "Replace the deny-tools set with a new list (called from Rust)."
+  (let [s @{}]
+    (each t tools-vec (put s (string t) true))
+    (set harness/computer-use-deny-tools s)))
+
+(defn harness/check-computer-action [action]
+  "Query the PDP for a desktop action. Returns \"deny\" or \"ask\".
+   Respects deny_tools: [computer] and deny_tools: [computer:<action>].
+   `harness/computer-use-deny-tools` is a var holding a table — reference it
+   directly; wrapping it in parens calls the table (arity error)."
+  (if (in harness/computer-use-deny-tools "computer")
+    "deny"
+    (if (in harness/computer-use-deny-tools (string "computer:" action))
+      "deny"
+      "ask")))
 "#;
 
 /// Janet wrappers for the LSP bridge. Installed after the C function is
@@ -718,6 +892,65 @@ const HARNESS_SANDBOX: &str = r#"
 pub struct LspRequest {
     pub request: String,
     pub reply: mpsc::Sender<String>,
+}
+
+/// A computer-use action forwarded from the Janet worker to the tokio
+/// runtime for sandboxed execution. Mirrors `DialogRequest` so a
+/// synchronous Janet `(harness/computer-use-exec ...)` call can drive
+/// async sandbox work.
+#[derive(Debug)]
+#[cfg_attr(not(feature = "plugin"), allow(dead_code))]
+pub struct SandboxExecRequest {
+    pub action: ComputerUseAction,
+    pub reply: mpsc::Sender<Result<SandboxExecOutput, String>>,
+}
+
+/// Actions the computer-use tool can perform, routed through the
+/// microVM sandbox.
+#[derive(Debug, Clone)]
+#[cfg_attr(not(feature = "plugin"), allow(dead_code))]
+pub enum ComputerUseAction {
+    Key { keys: Vec<i64> },
+    Type { text: String },
+    MouseMove { x: i64, y: i64 },
+    MouseClick { button: String },
+    Scroll { direction: String, amount: i64 },
+    Screenshot,
+    KeyChord { chord: String },
+    OpenUrl { url: String },
+}
+
+#[derive(Debug, Clone)]
+#[cfg_attr(not(feature = "plugin"), allow(dead_code))]
+pub struct SandboxExecOutput {
+    pub exit_code: i32,
+    pub merged: String,
+}
+
+/// Shared channel for sandbox exec requests. Set by main.rs before
+/// plugins load; the C function on the worker thread reads it to
+/// forward computer-use actions to the tokio runtime (which owns
+/// the sandbox handle that can SSH into the microVM).
+#[cfg(feature = "plugin")]
+static SANDBOX_EXEC_TX: std::sync::OnceLock<
+    tokio::sync::mpsc::UnboundedSender<SandboxExecRequest>,
+> = std::sync::OnceLock::new();
+
+/// Install the sandbox exec sender. Called once from main.rs after
+/// the sandbox is constructed, before plugins load.
+#[cfg(feature = "plugin")]
+pub fn install_sandbox_exec_tx(tx: tokio::sync::mpsc::UnboundedSender<SandboxExecRequest>) {
+    let _ = SANDBOX_EXEC_TX.set(tx);
+}
+
+// Manual binding for `janet_ckeywordv` — a C macro not generated
+// by bindgen. Janet uses `janet_symbol` (already in bindings) for
+// keywords; we compose it with `janet_wrap_keyword` like the C macro.
+#[cfg(feature = "plugin")]
+#[inline(always)]
+unsafe fn janet_ckeywordv(bytes: *const u8, len: i32) -> janetrs::lowlevel::Janet {
+    use janetrs::lowlevel::{janet_symbol, janet_wrap_keyword};
+    unsafe { janet_wrap_keyword(janet_symbol(bytes, len)) }
 }
 
 /// What the UI is being asked to render. Carries a one-shot reply
@@ -991,6 +1224,9 @@ fn worker_loop(
     if let Some(env) = client.env_mut() {
         env.add_c_fn(CFunOptions::new(c"__confirm", janet_confirm_cfn).namespace(c"harness"));
         env.add_c_fn(CFunOptions::new(c"__select", janet_select_cfn).namespace(c"harness"));
+        env.add_c_fn(
+            CFunOptions::new(c"__json-extract", janet_json_extract_cfn).namespace(c"harness"),
+        );
         // Only register the LSP bridge when the lsp feature is compiled
         // in. The Janet `harness/lsp` wrappers (HARNESS_LSP_INIT) guard on
         // this symbol's existence and degrade to nil when it's absent.
@@ -999,11 +1235,18 @@ fn worker_loop(
             env.add_c_fn(CFunOptions::new(c"__lsp", janet_lsp_cfn).namespace(c"harness"));
             env.add_c_fn(CFunOptions::new(c"__lsp-live", janet_lsp_live_cfn).namespace(c"harness"));
         }
-        // Register DAP C functions when both features are enabled.
-        #[cfg(feature = "dap")]
-        {
-            crate::dap::janet_bindings::register_dap_cfns(&mut client);
-        }
+        // Computer-use exec: forwards actions to the sandbox drainer.
+        // The C function reads SANDBOX_EXEC_TX; if the channel wasn't
+        // installed (e.g. --sandbox off), it returns nil gracefully.
+        env.add_c_fn(
+            CFunOptions::new(c"__computer-use-exec", janet_computer_use_exec_cfn)
+                .namespace(c"harness"),
+        );
+    }
+    // Register DAP C functions when both features are enabled.
+    #[cfg(feature = "dap")]
+    {
+        crate::dap::janet_bindings::register_dap_cfns(&mut client);
     }
 
     if let Err(e) = client.run(HARNESS_INIT) {
@@ -1012,6 +1255,10 @@ fn worker_loop(
     }
     if let Err(e) = client.run(HARNESS_DIALOG_INIT) {
         let _ = init_tx.send(Err(format!("harness dialog init failed: {e}")));
+        return;
+    }
+    if let Err(e) = client.run(HARNESS_COMPUTER_USE_INIT) {
+        let _ = init_tx.send(Err(format!("harness computer-use init failed: {e}")));
         return;
     }
     if let Err(e) = client.run(HARNESS_LSP_INIT) {
@@ -1226,6 +1473,56 @@ unsafe fn select_body(argc: i32, argv: *mut janetrs::lowlevel::Janet) -> janetrs
     }
 }
 
+#[cfg(feature = "plugin")]
+unsafe extern "C-unwind" fn janet_json_extract_cfn(
+    argc: i32,
+    argv: *mut janetrs::lowlevel::Janet,
+) -> janetrs::lowlevel::Janet {
+    use janetrs::lowlevel::*;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        json_extract_body(argc, argv)
+    }));
+    match result {
+        Ok(j) => j,
+        Err(payload) => {
+            let msg = panic_payload_to_string(&payload);
+            tracing::error!(
+                target: "dirge::plugin",
+                cfn = "harness/json-extract",
+                panic = %msg,
+                "FFI panic in json-extract cfn — returning nil",
+            );
+            unsafe { janet_wrap_nil() }
+        }
+    }
+}
+
+#[cfg(feature = "plugin")]
+unsafe fn json_extract_body(
+    argc: i32,
+    argv: *mut janetrs::lowlevel::Janet,
+) -> janetrs::lowlevel::Janet {
+    use janetrs::lowlevel::*;
+    if argc < 2 {
+        return unsafe { janet_wrap_nil() };
+    }
+    let json_str = match unsafe { read_string_arg(argv, 0) } {
+        Some(s) => s,
+        None => return unsafe { janet_wrap_nil() },
+    };
+    let key = match unsafe { read_string_arg(argv, 1) } {
+        Some(s) => s,
+        None => return unsafe { janet_wrap_nil() },
+    };
+    match serde_json::from_str::<serde_json::Value>(&json_str) {
+        Ok(serde_json::Value::Object(map)) => match map.get(&key) {
+            Some(serde_json::Value::String(s)) => unsafe { wrap_string(s) },
+            _ => unsafe { janet_wrap_nil() },
+        },
+        _ => unsafe { janet_wrap_nil() },
+    }
+}
+
 /// Send a dialog request, build it via the supplied closure (so we can
 /// move owned strings into the variant), and block on the reply.
 /// Returns `None` if the UI side dropped the channel OR the worker is
@@ -1245,7 +1542,10 @@ where
     // Poll for the reply. Wake every `DIALOG_POLL` to check the
     // worker-shutdown flag so a UI exit or `Worker::Drop` doesn't pin
     // us forever on `recv()`. The polling overhead is negligible
-    // compared to the time a human takes to answer a dialog.
+    // compared to the time a human takes to answer a dialog. Also bail
+    // after `DIALOG_TIMEOUT` so a dialog whose responder never answers
+    // can't pin the worker forever (dirge-u5ig).
+    let start = std::time::Instant::now();
     loop {
         match reply_rx.recv_timeout(DIALOG_POLL) {
             Ok(r) => return Some(r),
@@ -1257,7 +1557,14 @@ where
                         .map(|f| f.load(Ordering::SeqCst))
                         .unwrap_or(false)
                 });
-                if shutting_down {
+                if dialog_should_abort(start.elapsed(), shutting_down) {
+                    if !shutting_down {
+                        tracing::warn!(
+                            target: "dirge::plugin",
+                            timeout_secs = DIALOG_TIMEOUT.as_secs(),
+                            "harness dialog had no responder within timeout — returning nil",
+                        );
+                    }
                     return None;
                 }
             }
@@ -1357,9 +1664,9 @@ unsafe fn read_string_array_arg(
         // it sat at argv[idx]. Doable because read_string_arg only uses
         // the raw Janet, not its position.
         let elt_ptr = unsafe { data.add(idx) } as *mut janetrs::lowlevel::Janet;
-        match unsafe { read_string_arg(elt_ptr, 0) } {
-            Some(s) => out.push(s),
-            None => return None,
+        {
+            let s = unsafe { read_string_arg(elt_ptr, 0) }?;
+            out.push(s)
         }
     }
     Some(out)
@@ -1545,6 +1852,384 @@ fn send_lsp(tx: &tmpsc::UnboundedSender<LspRequest>, request: String) -> Option<
     }
 }
 
+/// Translate a `ComputerUseAction` into a safe SSH command string
+/// that runs inside the microVM. The command targets ydotool for
+/// input simulation — the microVM sandbox isolates it from the host.
+#[cfg(feature = "plugin")]
+pub fn build_safe_command(action: &ComputerUseAction) -> String {
+    match action {
+        ComputerUseAction::Key { keys } => {
+            let presses: Vec<String> = keys
+                .iter()
+                .flat_map(|k| [format!("{k}:1"), format!("{k}:0")])
+                .collect();
+            format!("DISPLAY=:99 ydotool key {}", presses.join(" "))
+        }
+        ComputerUseAction::Type { text } => {
+            // Single-quote the text and escape any embedded single quotes
+            let escaped = text.replace('\'', "'\\''");
+            format!("DISPLAY=:99 ydotool type '{}'", escaped)
+        }
+        ComputerUseAction::MouseMove { x, y } => {
+            format!("DISPLAY=:99 ydotool mousemove --absolute {x} {y}")
+        }
+        ComputerUseAction::MouseClick { button } => {
+            format!("DISPLAY=:99 ydotool click {button}")
+        }
+        ComputerUseAction::Scroll { direction, amount } => {
+            // ydotool scroll doesn't take a direction flag — just
+            // positive/negative amounts. We normalise here.
+            let normalised = match direction.as_str() {
+                "up" | "Up" => *amount,
+                "down" | "Down" => -amount,
+                other => return format!("echo 'unknown scroll direction: {other}'"),
+            };
+            format!(
+                "DISPLAY=:99 ydotool scroll {} {}",
+                normalised.max(0),
+                (-normalised).max(0)
+            )
+        }
+        ComputerUseAction::Screenshot => {
+            "DISPLAY=:99 import -window root /workspace/screenshot.png".to_string()
+        }
+        ComputerUseAction::KeyChord { chord } => {
+            format!("DISPLAY=:99 ydotool key {chord}")
+        }
+        ComputerUseAction::OpenUrl { url } => {
+            let escaped = url.replace('\'', "'\\''");
+            format!(
+                r#"for b in firefox-esr firefox chromium chromium-browser; do command -v "$b">/dev/null 2>&1 && {{ DISPLAY=:99 "$b" '{}' 1>/dev/null 2>&1 & break; }}; done"#,
+                escaped
+            )
+        }
+    }
+}
+
+/// Send a sandbox exec request and block on the result, polling the
+/// shutdown flag so `Worker::Drop` can unblock us (mirrors `send_dialog`).
+#[cfg(feature = "plugin")]
+fn send_sandbox_exec(
+    tx: &tmpsc::UnboundedSender<SandboxExecRequest>,
+    action: ComputerUseAction,
+) -> Option<Result<SandboxExecOutput, String>> {
+    let (reply_tx, reply_rx) = mpsc::channel();
+    tx.send(SandboxExecRequest {
+        action,
+        reply: reply_tx,
+    })
+    .ok()?;
+    let start = std::time::Instant::now();
+    loop {
+        match reply_rx.recv_timeout(DIALOG_POLL) {
+            Ok(r) => return Some(r),
+            Err(mpsc::RecvTimeoutError::Disconnected) => return None,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let shutting_down = SHUTDOWN.with(|cell| {
+                    cell.borrow()
+                        .as_ref()
+                        .map(|f| f.load(Ordering::SeqCst))
+                        .unwrap_or(false)
+                });
+                if lsp_should_abort(start.elapsed(), shutting_down) {
+                    if !shutting_down {
+                        tracing::warn!(
+                            target: "dirge::plugin",
+                            timeout_secs = LSP_QUERY_TIMEOUT.as_secs(),
+                            "harness/computer-use-exec query timed out — returning nil",
+                        );
+                    }
+                    return None;
+                }
+            }
+        }
+    }
+}
+
+/// C-function backing `harness/__computer-use-exec`. Takes a Janet
+/// dict with :action (string) and action-specific fields, sends a
+/// `SandboxExecRequest` to the tokio drainer, blocks on the result,
+/// and returns a dict {:exit_code :merged}. Panics are caught
+/// at the FFI boundary and collapse to nil.
+#[cfg(feature = "plugin")]
+unsafe extern "C-unwind" fn janet_computer_use_exec_cfn(
+    argc: i32,
+    argv: *mut janetrs::lowlevel::Janet,
+) -> janetrs::lowlevel::Janet {
+    use janetrs::lowlevel::*;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        computer_use_exec_body(argc, argv)
+    }));
+    match result {
+        Ok(j) => j,
+        Err(payload) => {
+            let msg = panic_payload_to_string(&payload);
+            tracing::error!(
+                target: "dirge::plugin",
+                cfn = "harness/computer-use-exec",
+                panic = %msg,
+                "FFI panic in computer-use-exec cfn — returning nil",
+            );
+            unsafe { janet_wrap_nil() }
+        }
+    }
+}
+
+#[cfg(feature = "plugin")]
+unsafe fn computer_use_exec_body(
+    _argc: i32,
+    argv: *mut janetrs::lowlevel::Janet,
+) -> janetrs::lowlevel::Janet {
+    use janetrs::lowlevel::*;
+
+    // Arg 0 is a Janet dictionary/table.
+    let v = unsafe { *argv.offset(0) };
+    let is_dict = unsafe { janet_checktype(v, JanetType_JANET_TABLE) } != 0
+        || unsafe { janet_checktype(v, JanetType_JANET_STRUCT) } != 0;
+    if !is_dict {
+        return unsafe { janet_wrap_nil() };
+    }
+
+    // Read :action string
+    let action_str = match unsafe { get_dict_string(v, "action") } {
+        Some(s) => s,
+        None => return unsafe { janet_wrap_nil() },
+    };
+
+    let action = match action_str.as_str() {
+        "key" => {
+            let keys = match unsafe { get_dict_int_array(v, "keys") } {
+                Some(k) => k,
+                None => return unsafe { janet_wrap_nil() },
+            };
+            ComputerUseAction::Key { keys }
+        }
+        "type" => {
+            let text = match unsafe { get_dict_string(v, "text") } {
+                Some(t) => t,
+                None => return unsafe { janet_wrap_nil() },
+            };
+            ComputerUseAction::Type { text }
+        }
+        "mouse_move" => {
+            let x = unsafe { get_dict_int(v, "x") }.unwrap_or(0);
+            let y = unsafe { get_dict_int(v, "y") }.unwrap_or(0);
+            ComputerUseAction::MouseMove { x, y }
+        }
+        "mouse_click" => {
+            let button = match unsafe { get_dict_string(v, "button") } {
+                Some(b) => b,
+                None => "left".to_string(),
+            };
+            ComputerUseAction::MouseClick { button }
+        }
+        "scroll" => {
+            let direction = match unsafe { get_dict_string(v, "direction") } {
+                Some(d) => d,
+                None => "down".to_string(),
+            };
+            let amount = unsafe { get_dict_int(v, "amount") }.unwrap_or(1);
+            ComputerUseAction::Scroll { direction, amount }
+        }
+        "screenshot" => ComputerUseAction::Screenshot,
+        "keychord" => {
+            let chord = match unsafe { get_dict_string(v, "chord") } {
+                Some(c) => c,
+                None => return unsafe { janet_wrap_nil() },
+            };
+            ComputerUseAction::KeyChord { chord }
+        }
+        "open_url" => {
+            let url = match unsafe { get_dict_string(v, "url") } {
+                Some(u) => u,
+                None => return unsafe { janet_wrap_nil() },
+            };
+            ComputerUseAction::OpenUrl { url }
+        }
+        _ => return unsafe { janet_wrap_nil() },
+    };
+
+    let result = match SANDBOX_EXEC_TX.get() {
+        Some(tx) => send_sandbox_exec(tx, action),
+        None => None,
+    };
+
+    match result {
+        Some(Ok(output)) => {
+            // Return a Janet table with :exit_code and :merged.
+            let table = unsafe { janet_table(0) };
+            let exit_code = unsafe { wrap_int(output.exit_code) };
+            let merged = unsafe { wrap_string(&output.merged) };
+            unsafe {
+                janet_table_put(
+                    table,
+                    janet_ckeywordv(c"exit_code".as_ptr() as *const u8, 9),
+                    exit_code,
+                );
+                janet_table_put(
+                    table,
+                    janet_ckeywordv(c"merged".as_ptr() as *const u8, 6),
+                    merged,
+                );
+            }
+            unsafe { janet_wrap_table(table) }
+        }
+        Some(Err(e)) => {
+            // Return an error table so Janet can inspect it
+            let table = unsafe { janet_table(0) };
+            let exit_code = unsafe { wrap_int(-1) };
+            let merged = unsafe { wrap_string(&e) };
+            unsafe {
+                janet_table_put(
+                    table,
+                    janet_ckeywordv(c"exit_code".as_ptr() as *const u8, 9),
+                    exit_code,
+                );
+                janet_table_put(
+                    table,
+                    janet_ckeywordv(c"merged".as_ptr() as *const u8, 6),
+                    merged,
+                );
+            }
+            unsafe { janet_wrap_table(table) }
+        }
+        None => unsafe { janet_wrap_nil() },
+    }
+}
+
+/// Wrap an `i32` as a Janet value, portably. `janet_wrap_integer` is only
+/// linkable on x86_64 (it's nanbox-specific); Janet numbers are f64-backed
+/// everywhere, so `janet_wrap_number` is the portable wrap and is exactly
+/// what `janetrs::Janet::integer` falls back to off x86_64. Using it on all
+/// arches keeps the plugin linking on aarch64 (macOS) — dirge-... .
+#[cfg(feature = "plugin")]
+unsafe fn wrap_int(value: i32) -> janetrs::lowlevel::Janet {
+    use janetrs::lowlevel::janet_wrap_number;
+    unsafe { janet_wrap_number(value as f64) }
+}
+
+/// True if `v` is Janet nil. Replaces non-portable raw `.pointer.is_null()`
+/// checks — the `Janet` union's field layout differs across Janet's
+/// nanbox/non-nanbox builds and arches, so probing `.pointer` directly
+/// doesn't compile on aarch64.
+#[cfg(feature = "plugin")]
+unsafe fn is_nil(v: janetrs::lowlevel::Janet) -> bool {
+    use janetrs::lowlevel::*;
+    unsafe { janet_checktype(v, JanetType_JANET_NIL) != 0 }
+}
+
+/// Look up `key` in a Janet table or struct, portably. Avoids casting the
+/// raw `Janet` union's `.pointer` field (not portable across arches) by
+/// unwrapping to the concrete container type first. Returns Janet nil when
+/// `v` is neither a table nor a struct, or the key is absent.
+#[cfg(feature = "plugin")]
+unsafe fn dict_get(v: janetrs::lowlevel::Janet, key: &str) -> janetrs::lowlevel::Janet {
+    use janetrs::lowlevel::*;
+    let k = unsafe { janet_ckeywordv(key.as_ptr(), key.len() as i32) };
+    if unsafe { janet_checktype(v, JanetType_JANET_TABLE) != 0 } {
+        let t = unsafe { janet_unwrap_table(v) };
+        if t.is_null() {
+            return unsafe { janet_wrap_nil() };
+        }
+        unsafe { janet_table_get(t, k) }
+    } else if unsafe { janet_checktype(v, JanetType_JANET_STRUCT) != 0 } {
+        let s = unsafe { janet_unwrap_struct(v) };
+        if s.is_null() {
+            return unsafe { janet_wrap_nil() };
+        }
+        unsafe { janet_struct_get(s, k) }
+    } else {
+        unsafe { janet_wrap_nil() }
+    }
+}
+
+/// Read a string value from a Janet dict/struct by key name.
+#[cfg(feature = "plugin")]
+unsafe fn get_dict_string(v: janetrs::lowlevel::Janet, key: &str) -> Option<String> {
+    use janetrs::lowlevel::*;
+    let out = unsafe { dict_get(v, key) };
+    if unsafe { is_nil(out) } {
+        return None;
+    }
+    if unsafe { janet_checktype(out, JanetType_JANET_STRING) } == 0
+        && unsafe { janet_checktype(out, JanetType_JANET_KEYWORD) } == 0
+    {
+        return None;
+    }
+    let raw = unsafe { janet_unwrap_string(out) };
+    if raw.is_null() {
+        return None;
+    }
+    let len = unsafe { (*janet_string_head(raw)).length } as usize;
+    let slice = unsafe { std::slice::from_raw_parts(raw, len) };
+    std::str::from_utf8(slice).ok().map(str::to_string)
+}
+
+/// Read an i64 from a Janet dict/struct by key name.
+#[cfg(feature = "plugin")]
+unsafe fn get_dict_int(v: janetrs::lowlevel::Janet, key: &str) -> Option<i64> {
+    use janetrs::lowlevel::*;
+    let out = unsafe { dict_get(v, key) };
+    if unsafe { is_nil(out) } {
+        return None;
+    }
+    if unsafe { janet_checktype(out, JanetType_JANET_NUMBER) } == 0 {
+        return None;
+    }
+    let n = unsafe { janet_unwrap_number(out) };
+    if n.is_finite() && n >= (i64::MIN as f64) && n <= (i64::MAX as f64) {
+        Some(n as i64)
+    } else {
+        None
+    }
+}
+
+/// Read an array of i64 values from a Janet dict/struct by key name.
+#[cfg(feature = "plugin")]
+unsafe fn get_dict_int_array(v: janetrs::lowlevel::Janet, key: &str) -> Option<Vec<i64>> {
+    use janetrs::lowlevel::*;
+    let out = unsafe { dict_get(v, key) };
+    if unsafe { is_nil(out) } {
+        return None;
+    }
+    let is_tuple = unsafe { janet_checktype(out, JanetType_JANET_TUPLE) } != 0;
+    let is_array = unsafe { janet_checktype(out, JanetType_JANET_ARRAY) } != 0;
+    if !is_tuple && !is_array {
+        return None;
+    }
+    let (data, len) = if is_tuple {
+        let raw = unsafe { janet_unwrap_tuple(out) };
+        if raw.is_null() {
+            return None;
+        }
+        let n = unsafe { (*janet_tuple_head(raw)).length } as usize;
+        (raw, n)
+    } else {
+        let arr = unsafe { janet_unwrap_array(out) };
+        if arr.is_null() {
+            return None;
+        }
+        let n = unsafe { (*arr).count } as usize;
+        (unsafe { (*arr).data } as *const Janet, n)
+    };
+    let slice = unsafe { std::slice::from_raw_parts(data, len) };
+    let mut out = Vec::with_capacity(len);
+    for (idx, _) in slice.iter().enumerate() {
+        let elt_ptr = unsafe { data.add(idx) as *mut Janet };
+        let elt = unsafe { *elt_ptr };
+        if unsafe { janet_checktype(elt, JanetType_JANET_NUMBER) } == 0 {
+            return None;
+        }
+        let n = unsafe { janet_unwrap_number(elt) };
+        if n.is_finite() && n >= (i64::MIN as f64) && n <= (i64::MAX as f64) {
+            out.push(n as i64);
+        } else {
+            return None;
+        }
+    }
+    Some(out)
+}
+
 #[cfg(all(test, feature = "plugin"))]
 mod tests {
     use super::*;
@@ -1562,6 +2247,54 @@ mod tests {
         // `undefined-fn` is genuinely unknown.
         let r = worker.eval("(undefined-fn 1)");
         assert!(r.is_err(), "expected Err, got {r:?}");
+    }
+
+    /// dirge-u5ig: the dialog give-up policy. Shutdown aborts immediately
+    /// regardless of elapsed; otherwise it waits until DIALOG_TIMEOUT so a
+    /// never-answered dialog can't pin the worker forever — but a human
+    /// gets the full (generous) window before then.
+    #[test]
+    fn dialog_should_abort_policy() {
+        // Shutting down → abort now, even at zero elapsed.
+        assert!(dialog_should_abort(Duration::ZERO, true));
+        // Not shutting down, well within the window → keep waiting.
+        assert!(!dialog_should_abort(Duration::from_secs(1), false));
+        assert!(!dialog_should_abort(
+            DIALOG_TIMEOUT - Duration::from_secs(1),
+            false
+        ));
+        // Past the window → give up.
+        assert!(dialog_should_abort(DIALOG_TIMEOUT, false));
+        assert!(dialog_should_abort(
+            DIALOG_TIMEOUT + Duration::from_secs(1),
+            false
+        ));
+        // The dialog window is far more generous than the LSP one — dialogs
+        // wait on a human, LSP waits on a server.
+        assert!(DIALOG_TIMEOUT > Duration::from_secs(30));
+    }
+
+    /// dirge-rj3k / #476: harness/bind-key accumulates tab-separated
+    /// (key, command) lines the host reads back as keybinding overrides.
+    #[test]
+    fn bind_key_accumulates_keybinding_overrides() {
+        let (mut worker, _dialog_rx, _lsp_rx) = Worker::try_spawn().unwrap();
+        worker
+            .eval(r#"(harness/bind-key "ctrl-t" "toggle_reasoning")"#)
+            .unwrap();
+        worker
+            .eval(r#"(harness/bind-key "ctrl-x ctrl-s" "scroll_to_top")"#)
+            .unwrap();
+        // Non-strings are ignored (no crash, no entry).
+        worker.eval("(harness/bind-key 5 6)").unwrap();
+        let list = worker.eval("harness-keybindings-list").unwrap();
+        assert!(list.contains("ctrl-t\ttoggle_reasoning"), "{list}");
+        assert!(list.contains("ctrl-x ctrl-s\tscroll_to_top"), "{list}");
+        assert_eq!(
+            list.lines().count(),
+            2,
+            "non-string call added nothing: {list}"
+        );
     }
 
     /// dirge-l6bf: a plugin must NOT be able to terminate the host process.

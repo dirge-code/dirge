@@ -249,6 +249,16 @@ impl PluginManager {
             .push(script.to_string());
     }
 
+    /// Whether any plugin function is registered for `hook`. Callers use
+    /// this to skip a worker round-trip entirely when a hook has no
+    /// subscribers — without it, `dispatch_tool_hook` evals on the single
+    /// Janet worker on EVERY tool call even with zero plugins loaded
+    /// (dirge-u5ig), needlessly serializing the headless loop behind the
+    /// worker (and its host-call servicing) per tool call.
+    pub fn has_hook(&self, hook: &str) -> bool {
+        self.hooks.get(hook).is_some_and(|names| !names.is_empty())
+    }
+
     pub fn take_pending_prompt(&mut self) -> Option<String> {
         self.take_string_slot("harness-pending")
     }
@@ -289,6 +299,19 @@ impl PluginManager {
     /// Reset the plugin-config slot to nil after a plugin finishes loading.
     pub fn clear_loading_plugin_config(&mut self) {
         let _ = self.worker.eval("(set harness-plugin-config nil)");
+    }
+
+    /// Push the active prompt's `deny_tools` list into the computer-use
+    /// Janet environment so `harness/check-computer-action` can gate
+    /// desktop actions against the permission PDP.
+    #[cfg(feature = "experimental-ui-computer-use")]
+    pub fn set_deny_tools_for_computer_use(&mut self, deny: &[String]) {
+        let items: Vec<String> = deny.iter().map(|t| format!("\"{t}\"")).collect();
+        let expr = format!(
+            "(harness/set-computer-use-deny-tools [{}])",
+            items.join(" ")
+        );
+        let _ = self.worker.eval(&expr);
     }
 
     pub fn dispatch(&mut self, hook: &str, context_janet: &str) -> Result<Vec<String>, String> {
@@ -454,6 +477,70 @@ impl PluginManager {
         raw.lines().filter_map(parse_custom_message_line).collect()
     }
 
+    /// Drain the `harness-recorded-entities` blob — entity rows
+    /// queued by Janet compressors via `(harness/record-entity ...)`.
+    /// Returns parsed `EntityRecord` entries for persistence.
+    #[cfg(feature = "experimental-graph-search")]
+    pub fn drain_entity_records(&mut self) -> Vec<EntityRecord> {
+        let raw = self
+            .worker
+            .eval("(if (string? harness-recorded-entities) harness-recorded-entities \"\")")
+            .unwrap_or_default();
+        let _ = self.worker.eval(r#"(set harness-recorded-entities "")"#);
+        raw.lines()
+            .filter_map(|line| {
+                let parts: Vec<&str> = line.splitn(3, '\t').collect();
+                if parts.len() >= 2 && !parts[0].is_empty() && !parts[1].is_empty() {
+                    Some(EntityRecord {
+                        kind: unescape_harness_field(parts[0]),
+                        name: unescape_harness_field(parts[1]),
+                        extra: if parts.get(2).is_none_or(|s| s.is_empty()) {
+                            None
+                        } else {
+                            Some(unescape_harness_field(parts[2]))
+                        },
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Drain the `harness-recorded-relations` blob — relation edges
+    /// queued by Janet compressors via `(harness/record-relation ...)`.
+    /// Returns parsed `RelationRecord` entries for persistence.
+    #[cfg(feature = "experimental-graph-search")]
+    pub fn drain_relation_records(&mut self) -> Vec<RelationRecord> {
+        let raw = self
+            .worker
+            .eval("(if (string? harness-recorded-relations) harness-recorded-relations \"\")")
+            .unwrap_or_default();
+        let _ = self.worker.eval(r#"(set harness-recorded-relations "")"#);
+        raw.lines()
+            .filter_map(|line| {
+                let parts: Vec<&str> = line.splitn(5, '\t').collect();
+                if parts.len() == 5
+                    && !parts[0].is_empty()
+                    && !parts[1].is_empty()
+                    && !parts[2].is_empty()
+                    && !parts[3].is_empty()
+                    && !parts[4].is_empty()
+                {
+                    Some(RelationRecord {
+                        source_kind: unescape_harness_field(parts[0]),
+                        source_name: unescape_harness_field(parts[1]),
+                        target_kind: unescape_harness_field(parts[2]),
+                        target_name: unescape_harness_field(parts[3]),
+                        rel_type: unescape_harness_field(parts[4]),
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
     /// Shared body for `drain_*_messages` — read the slot's
     /// string contents, split on newline, filter empty entries,
     /// clear the slot to `""`.
@@ -542,11 +629,35 @@ impl PluginManager {
         hook: &str,
         context_janet: &str,
     ) -> Result<ToolHookResult, String> {
+        // Fast path: no plugin subscribes to this hook, so there's nothing
+        // to clear or run. Skip the worker entirely (dirge-u5ig). This
+        // matters because the before/after tool hooks are wired whenever a
+        // PluginManager exists (always, in a plugin build) regardless of
+        // whether any hook is registered — without this guard every tool
+        // call paid two worker round-trips (start + end), serializing the
+        // headless loop behind the single Janet worker and its blocking
+        // host-call servicing for no benefit.
+        if !self.has_hook(hook) {
+            return Ok(ToolHookResult::default());
+        }
+
+        // Audit L6: tighter per-hook timeout than the default EVAL_TIMEOUT
+        // (10 min). A hung `on-tool-start` used to freeze every subsequent
+        // tool call for the full 10 min; 5s is enough headroom for any
+        // reasonable hook (most execute in < 100 ms) while still recovering
+        // quickly from a plugin stuck in `(while true)` or a blocking
+        // syscall. Used for the pre-clear and every hook eval below.
+        const HOOK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
         // Pre-clear so a stale (harness/block ...) left by an unrelated
-        // hook can't cause us to mis-block this tool.
-        let _ = self
-            .worker
-            .eval("(set harness-block nil) (set harness-mutate-input nil) (set harness-replace-result nil)");
+        // hook can't cause us to mis-block this tool. Bounded like the
+        // hooks below (HOOK_TIMEOUT) rather than the 30s interactive
+        // default — a wedged worker must not stretch the pre-clear out
+        // past the per-hook budget (dirge-u5ig).
+        let _ = self.worker.eval_with_timeout(
+            "(set harness-block nil) (set harness-mutate-input nil) (set harness-replace-result nil)",
+            HOOK_TIMEOUT,
+        );
 
         let names = match self.hooks.get(hook) {
             Some(names) => names.clone(),
@@ -580,14 +691,6 @@ impl PluginManager {
                 ctx = context_janet,
                 fname = name,
             );
-            // Audit L6: tighter per-hook timeout than the default
-            // EVAL_TIMEOUT (10 min). A hung `on-tool-start` used to
-            // freeze every subsequent tool call for the full 10 min;
-            // 5s is enough headroom for any reasonable hook (most
-            // execute in < 100 ms) while still recovering quickly
-            // from a plugin stuck in `(while true)` or a blocking
-            // syscall.
-            const HOOK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
             match self.worker.eval_with_timeout(&code, HOOK_TIMEOUT) {
                 Ok(s) => {
                     if let Some(msg) = s.strip_prefix("DIRGE_HOOK_ERR:") {
@@ -684,6 +787,34 @@ impl PluginManager {
             })
             .collect();
         dedup_last_wins(parsed, "slash command", |(c, _)| c.clone())
+    }
+
+    /// Plugin-registered keybinding overrides (dirge-rj3k / #476): the
+    /// `(key, command)` pairs a plugin bound via `harness/bind-key`. The
+    /// host merges these over the built-in defaults and under the user's
+    /// config (`ui::keymap::Keymaps::from_config`). Order is preserved; the
+    /// keymap layering resolves same-key collisions last-wins. Wire format
+    /// matches the other phase-9 registries (tab-separated, escape-encoded).
+    pub fn list_keybindings(&mut self) -> Vec<(String, String)> {
+        let raw = match self.worker.eval("harness-keybindings-list") {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        if raw.is_empty() {
+            return Vec::new();
+        }
+        raw.lines()
+            .filter_map(|line| {
+                let mut parts = line.split('\t');
+                let key = unescape_harness_field(parts.next()?);
+                let command = unescape_harness_field(parts.next()?);
+                if key.is_empty() || command.is_empty() {
+                    None
+                } else {
+                    Some((key, command))
+                }
+            })
+            .collect()
     }
 
     /// Invoke a registered handler fn by name with the user-provided args
@@ -1276,6 +1407,30 @@ pub struct CustomMessageEntry {
     /// keeps the message in the transcript (where plugin handlers
     /// can still observe it) but suppresses the visible row.
     pub display: bool,
+}
+
+/// One entry drained from `harness-recorded-entities` — produced by
+/// Janet compressors calling `(harness/record-entity kind name extra)`.
+/// The host persists these to the `entities` table at session close.
+#[cfg(feature = "experimental-graph-search")]
+#[derive(Debug, Clone)]
+pub struct EntityRecord {
+    pub kind: String,
+    pub name: String,
+    pub extra: Option<String>,
+}
+
+/// One entry drained from `harness-recorded-relations` — produced by
+/// Janet compressors calling `(harness/record-relation ...)`.
+/// The host persists these to the `relations` table at session close.
+#[cfg(feature = "experimental-graph-search")]
+#[derive(Debug, Clone)]
+pub struct RelationRecord {
+    pub source_kind: String,
+    pub source_name: String,
+    pub target_kind: String,
+    pub target_name: String,
+    pub rel_type: String,
 }
 
 /// Generic last-add-wins deduplicator for plugin registries.

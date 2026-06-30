@@ -108,6 +108,8 @@ pub struct LaunchArgs {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub program: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub module: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub args: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
@@ -127,6 +129,7 @@ impl Default for LaunchArgs {
     fn default() -> Self {
         Self {
             program: None,
+            module: None,
             args: None,
             cwd: None,
             env: None,

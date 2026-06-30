@@ -38,6 +38,9 @@ pub struct ChatPane<'a> {
     /// coordinates. Cells inside this range have REVERSED applied on
     /// top of their underlying style.
     selection: Option<SelectionRange>,
+    /// Brief tooltip text (e.g. "Copied!") shown briefly in the
+    /// bottom-right of the chat area. Empty means no tooltip.
+    tooltip: &'a str,
 }
 
 impl<'a> ChatPane<'a> {
@@ -48,6 +51,7 @@ impl<'a> ChatPane<'a> {
             scroll_offset,
             border_style: Style::default().fg(RColor::Green),
             selection: None,
+            tooltip: "",
         }
     }
 
@@ -60,6 +64,12 @@ impl<'a> ChatPane<'a> {
     /// Highlight cells inside the given selection range with REVERSED.
     pub fn selection(mut self, sel: SelectionRange) -> Self {
         self.selection = Some(sel);
+        self
+    }
+
+    /// Set a brief tooltip shown in the bottom-right corner of the chat.
+    pub fn tooltip(mut self, text: &'a str) -> Self {
+        self.tooltip = text;
         self
     }
 }
@@ -106,6 +116,22 @@ impl<'a> Widget for ChatPane<'a> {
             if let Some(sel) = self.selection {
                 let line_idx = start + i;
                 apply_selection_to_row(buf, l.chat.x, y, text_w, entry, line_idx, &sel);
+            }
+        }
+
+        // ── "Copied!" tooltip toast ──
+        if !self.tooltip.is_empty() {
+            let tooltip_w = self.tooltip.len() as u16 + 2; // padding on each side
+            if tooltip_w + 2 < l.chat.width {
+                let tooltip_x = l.chat.x + l.chat.width - tooltip_w - 1;
+                let tooltip_y = l.chat.y + l.chat.height.saturating_sub(1);
+                let style = Style::default().fg(RColor::White).bg(RColor::DarkGray);
+                for cx in tooltip_x..tooltip_x + tooltip_w {
+                    let cell = &mut buf[(cx, tooltip_y)];
+                    cell.set_symbol(" ");
+                    cell.set_style(style);
+                }
+                buf.set_string(tooltip_x + 1, tooltip_y, self.tooltip, style);
             }
         }
     }

@@ -423,18 +423,18 @@ async fn redirect_target_routes_through_write_rules() {
     );
 }
 
-/// Sibling check: a redirect target inside the working directory
-/// (non-external) passes the write-rules check. Without this, a
-/// regression that over-broadly denied all redirects could pass
-/// the negative case above and ship.
-///
-/// Uses an in-cwd path because the catch-all at
-/// `permission/checker.rs:434` upgrades unmatched-Allow to Ask
-/// for EXTERNAL paths — so `/tmp/x` (external to the test's cwd
-/// of the dirge repo) would test the external-path catch-all,
-/// not the write-rules-allow path we want to exercise here.
-/// M3 is intentionally tightening external bash-redirects to
-/// prompt; this test pins the in-cwd happy path.
+// Sibling check: a redirect target inside the working directory
+// (non-external) passes the write-rules check. Without this, a
+// regression that over-broadly denied all redirects could pass
+// the negative case above and ship.
+//
+// Uses an in-cwd path because the catch-all at
+// `permission/checker.rs:434` upgrades unmatched-Allow to Ask
+// for EXTERNAL paths — so `/tmp/x` (external to the test's cwd
+// of the dirge repo) would test the external-path catch-all,
+// not the write-rules-allow path we want to exercise here.
+// M3 is intentionally tightening external bash-redirects to
+// prompt; this test pins the in-cwd happy path.
 // F1 (dirge-dvy) — bash arg-side path checks. Pin that
 // file-mutating commands route their positional path args
 // through the write rules, independent of the bash command-
@@ -1166,4 +1166,20 @@ async fn coarse_external_redirect_is_gated() {
         }
         other => panic!("expected a Path resource, got {other:?}"),
     }
+}
+
+/// The base description must NOT include a CONTRACT hint — that is
+/// appended by `with_contract_hint`.  Duplicating would waste context
+/// budget and introduce drift between the two copies.
+#[tokio::test]
+async fn bash_description_has_exactly_one_contract_line() {
+    use crate::sandbox::{Sandbox, SandboxMode};
+    let tool = BashTool::new(None, None, Sandbox::new(SandboxMode::Off));
+    let def = tool.definition("".to_string()).await;
+    let count = def.description.matches("CONTRACT:").count();
+    assert_eq!(
+        count, 1,
+        "bash description must have exactly one CONTRACT: line, got {count}:\n{}",
+        def.description
+    );
 }

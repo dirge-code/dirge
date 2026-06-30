@@ -227,9 +227,15 @@ async fn poll_finalization_follow_up(
         *critic_done = true;
         if let Some(critic) = &config.critic_fn {
             let transcript = build_critic_transcript(new_messages);
+            // dirge-6q3w: hand the critic the run's compile/lint/test signal
+            // (read-only, doesn't spend the cheap verifier's one-shot nudge)
+            // so it can be pickier about unverified code changes. `None` when
+            // no verifier gate is configured → critic behaves as before.
+            let verification = config.verifier.as_ref().map(|v| v.status());
             // dirge-bedj: judge within the agent's own system prompt so the
             // critic never demands a forbidden action.
-            let msgs = super::critic::run_critic(critic, system_prompt, &transcript).await;
+            let msgs =
+                super::critic::run_critic(critic, system_prompt, &transcript, verification).await;
             if !msgs.is_empty() {
                 return (msgs, FollowUpSource::Critic);
             }
@@ -244,10 +250,16 @@ async fn poll_finalization_follow_up(
     //     set AND a judge is configured — off for default/interactive runs.
     if *goal_reacts < super::goal::MAX_GOAL_REACT
         && let Some(goal) = &config.goal
-        && let Some(judge) = &config.critic_fn
+        && let Some(judge) = &config.goal_fn
     {
         let transcript = build_critic_transcript(new_messages);
-        let msgs = super::goal::run_goal_gate(judge, goal, system_prompt, &transcript).await;
+        // dirge-6q3w: same read-only verification signal as the critic, but
+        // the goal judge treats it as a SOFT advisory (see
+        // `goal_verification_note`) so a non-testable task can't trap the
+        // bounded goal loop.
+        let verification = config.verifier.as_ref().map(|v| v.status());
+        let msgs =
+            super::goal::run_goal_gate(judge, goal, system_prompt, &transcript, verification).await;
         if !msgs.is_empty() {
             *goal_reacts += 1;
             return (msgs, FollowUpSource::Goal);
@@ -345,6 +357,10 @@ const MAX_CONSECUTIVE_COMPACTION_FAILURES: u32 = 3;
 /// puts the sweet spot at 2–5; the retriever returns fewer (or none)
 /// when the task matches fewer exemplars.
 const EXEMPLAR_TOP_K: usize = 3;
+
+/// Max live issues surfaced in the turn-start board reminder. The rest are
+/// summarized as a "+N more" hint so a large backlog can't flood context.
+const ISSUE_BOARD_TOP_N: usize = 7;
 
 /// What the LLM-summary stage of a compaction pass did, so `run_loop`
 /// can drive the circuit-breaker counter. (The cheap prune always runs
@@ -900,6 +916,25 @@ pub async fn run_agent_loop(
             Err(e) => {
                 tracing::debug!(target: "dirge::memory", error = %e, "pre-recall task join failed")
             }
+        }
+    }
+
+    // Native issue board: surface the agent's persistent kanban at the top of
+    // each user-initiated run, so it doesn't have to remember to list it. Like
+    // pre-recall, this is model-facing context only (never persisted) and is
+    // gated on `memory_provider` — the same safety net that excludes the forked
+    // review/curator runners (they build with `memory_provider: None`). Bounded
+    // to the top N live issues with a "see the rest" hint, so a large backlog
+    // can't flood the context.
+    if memory_provider.is_some() {
+        let db_path = std::env::current_dir()
+            .map(|c| crate::extras::dirge_paths::ProjectPaths::new(&c).session_db_path())
+            .unwrap_or_else(|_| std::path::PathBuf::from(".dirge/sessions/state.db"));
+        if let Ok(store) = crate::extras::issue_db::IssueStore::open_at(&db_path)
+            && let Ok(Some(block)) = store.board_reminder(ISSUE_BOARD_TOP_N)
+        {
+            let msg = LoopMessage::User(super::message::UserMessage { content: block });
+            context.messages.push(loop_message_to_value(&msg));
         }
     }
 
@@ -1901,8 +1936,24 @@ fn build_critic_transcript(new_messages: &[LoopMessage]) -> String {
                     })
                     .collect::<Vec<_>>()
                     .join(" ");
+                // dirge-kk3x: mark permission/approval denials distinctly so
+                // the critic reads them as a policy wall (out of scope), not a
+                // failure to demand the assistant fix or route around. Gate on
+                // `is_error` exactly like Outcome::classify does — a genuine
+                // enforce-layer denial is always an error result, whereas a
+                // SUCCESSFUL result whose text merely begins "Permission denied"
+                // (e.g. bash returns Ok(text) for a failed `ssh` whose output is
+                // "Permission denied (publickey).") must NOT be excused as
+                // out-of-scope, or the critic would pass genuinely unfinished work.
+                let denied = t.is_error && crate::agent::tools::is_permission_denial(&text);
                 let text: String = text.chars().take(PER_RESULT_CHARS).collect();
-                let tag = if t.is_error { "ERROR" } else { "result" };
+                let tag = if denied {
+                    "DENIED"
+                } else if t.is_error {
+                    "ERROR"
+                } else {
+                    "result"
+                };
                 blocks.push(format!("TOOL {} [{}]: {}\n", t.tool_name, tag, text.trim()));
             }
             _ => {}

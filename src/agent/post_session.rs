@@ -106,7 +106,12 @@ type Stage = (&'static str, Pin<Box<dyn Future<Output = ()> + Send>>);
 ///
 /// Replaces the three independent `spawn_*` calls that used to
 /// live in `done.rs`.
-pub fn spawn_post_session(agent: AnyAgent, paths: ProjectPaths, transcript: String) {
+pub fn spawn_post_session(
+    agent: AnyAgent,
+    paths: ProjectPaths,
+    digest: crate::agent::session_digest::SessionDigest,
+    base: String,
+) {
     tokio::spawn(async move {
         // dirge-ba0m: at most one orchestrator in flight per
         // process. A second idle Done while this one is still
@@ -127,6 +132,13 @@ pub fn spawn_post_session(agent: AnyAgent, paths: ProjectPaths, transcript: Stri
         // Releases the in-flight slot on drop (incl. panic / early
         // return). Held for the whole sequence.
         let _in_flight = InFlightGuard;
+        // dirge-6rtt: assemble the review transcript HERE, off the UI loop — the
+        // digest's `git diff --stat` shells out, and the caller built the
+        // (cheap, session-derived) digest on-thread. Doing it after the claim
+        // also skips the subprocess entirely when an orchestrator is already
+        // running.
+        let transcript =
+            crate::agent::session_digest::assemble_review_transcript(digest, &paths.root, base);
         let stages: Vec<Stage> = vec![
             (
                 "background-review",

@@ -140,7 +140,6 @@ pub(crate) struct AgentBuildDeps<'a> {
     pub plan_tx: &'a Option<PlanSwitchSender>,
     pub bg_store: &'a Option<BackgroundStore>,
     pub sandbox: &'a Sandbox,
-    pub user_tx: &'a tokio::sync::mpsc::UnboundedSender<crate::event::UserEvent>,
     #[cfg(feature = "mcp")]
     pub mcp_manager: Option<&'a McpClientManager>,
     #[cfg(feature = "semantic")]

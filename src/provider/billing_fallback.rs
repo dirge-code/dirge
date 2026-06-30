@@ -49,6 +49,7 @@ pub(crate) fn prompt_from_ask_sender(ask_tx: Option<AskSender>) -> BillingFallba
                 ask_tx.send(AskRequest {
                     tool: "openai_api_billing".to_string(),
                     input,
+                    reason: None,
                     reply,
                 }),
             )
@@ -470,6 +471,7 @@ mod tests {
         tx.try_send(AskRequest {
             tool: "already_queued".to_string(),
             input: "pending".to_string(),
+            reason: None,
             reply,
         })
         .unwrap();

@@ -527,3 +527,75 @@ pub(crate) fn sync_and_drain_via_sentinel(stdout: &mut dyn std::io::Write, budge
     // Restore blocking semantics for the shell.
     let _ = unsafe { libc::fcntl(fd_in, libc::F_SETFL, original_flags) };
 }
+
+/// Prepare the terminal for handing control to a subprocess attached to a PTY
+/// (interactive shell command, sandbox attach). Stops the crossterm input
+/// reader, drops out of the alternate screen, resets terminal modes, and
+/// drains any keystrokes the user typed so they can be forwarded to the
+/// subprocess.
+///
+/// Returns `Some(drained_stdin)` when `/dev/tty` is available — the TUI is now
+/// suspended and the caller MUST pair this with
+/// [`resume_tui_after_subprocess`]. Returns `None` when there is no
+/// controlling terminal: the input reader is already restored in that case so
+/// the caller may fall back to a non-interactive path.
+#[cfg(unix)]
+pub(crate) fn suspend_tui_for_subprocess(
+    user_tx: &tokio::sync::mpsc::UnboundedSender<crate::event::UserEvent>,
+) -> Option<Vec<u8>> {
+    EVENT_READER_SHUTDOWN.store(true, Ordering::Relaxed);
+    join_reader(Duration::from_millis(50));
+
+    let mut tty = match open_tty_for_write() {
+        Some(t) => t,
+        None => {
+            EVENT_READER_SHUTDOWN.store(false, Ordering::Relaxed);
+            EVENT_READER_EXITED.store(false, Ordering::Relaxed);
+            crate::ui::input_reader::spawn_input_reader(user_tx.clone());
+            return None;
+        }
+    };
+
+    // Reset terminal: default colors, disable mouse + bracketed paste, clear
+    // title, leave the alternate screen.
+    let _ = tty.write_all(
+        b"\x1b[0m\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1006l\x1b[?1015l\x1b[?2004l\x1b]0;\x1b\\\x1b[?1049l",
+    );
+    let _ = tty.flush();
+
+    let drained_stdin = drain_stdin_nonblocking();
+
+    let _ = tty.write_all(b"\x1b[?25h"); // show cursor for the subprocess
+    let _ = tty.flush();
+
+    Some(drained_stdin)
+}
+
+/// Counterpart to [`suspend_tui_for_subprocess`]: re-enters the alternate
+/// screen, restores TUI modes, forces a repaint, syncs against the terminal,
+/// and restarts the input reader.
+#[cfg(unix)]
+pub(crate) fn resume_tui_after_subprocess(
+    renderer: &mut crate::ui::renderer::Renderer,
+    user_tx: &tokio::sync::mpsc::UnboundedSender<crate::event::UserEvent>,
+) {
+    if let Some(mut tty) = open_tty_for_write() {
+        // Re-enter alternate screen, clear, hide cursor, re-enable mouse +
+        // bracketed paste.
+        let _ = tty.write_all(
+            b"\x1b[?1049h\x1b[2J\x1b[?25l\x1b[?2004h\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h",
+        );
+        let _ = tty.flush();
+    }
+
+    renderer.reset_tui();
+    renderer.set_needs_repaint();
+
+    if let Some(mut tty) = open_tty_for_write() {
+        sync_and_drain_via_sentinel(&mut tty, Duration::from_millis(100));
+    }
+
+    EVENT_READER_SHUTDOWN.store(false, Ordering::Relaxed);
+    EVENT_READER_EXITED.store(false, Ordering::Relaxed);
+    crate::ui::input_reader::spawn_input_reader(user_tx.clone());
+}

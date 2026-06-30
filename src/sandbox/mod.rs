@@ -99,6 +99,17 @@ impl Sandbox {
         }
     }
 
+    /// String label for the current sandbox mode.
+    #[cfg(feature = "plugin")]
+    pub fn mode_str(&self) -> &str {
+        match self.mode {
+            SandboxMode::Off => "off",
+            SandboxMode::Bwrap => "bwrap",
+            #[cfg(feature = "sandbox-microvm")]
+            SandboxMode::Microvm => "microvm",
+        }
+    }
+
     /// True when the sandbox is configured for microVM isolation.
     pub fn is_microvm(&self) -> bool {
         #[cfg(feature = "sandbox-microvm")]
@@ -286,7 +297,7 @@ impl Sandbox {
             .unwrap_or(false)
     }
 
-    pub fn wrap_command(&self, command: &str) -> Command {
+    fn build_command(&self, command: &str) -> Command {
         let mut cmd = if self.mode == SandboxMode::Off {
             // Off mode runs bash directly; it inherits the process cwd,
             // so we don't resolve / bind one.
@@ -360,15 +371,25 @@ impl Sandbox {
         // legitimate `KEY_BINDINGS` env var stripped) are acceptable
         // cost — the alternative is leaking credentials.
         scrub_env(&mut cmd);
+        cmd
+    }
 
-        // dirge-tc2q: force non-interactive defaults so tools that would
-        // otherwise prompt fail fast with a clear message instead of
-        // blocking. `detach_session` (exec.rs) already removes the
-        // controlling terminal so /dev/tty prompts can't hang; these turn
-        // the same situations into clean errors and cover the GUI-askpass
-        // / credential-manager paths that don't go through the tty. Set
-        // unconditionally — an agent has no human at the keyboard to
-        // answer a prompt regardless of the inherited environment.
+    /// Build the command for a headless interactive run (`!cmd` / `!!cmd`):
+    /// the same secret-scrubbing as [`wrap_command`] but WITHOUT the
+    /// non-interactive env defaults, so a command may legitimately read from
+    /// its stdin — which dirge forwards from the input box. Returns a
+    /// [`tokio::process::Command`] ready for `Stdio::piped()` (no PTY, no
+    /// screen takeover; the caller sets stdio + `detach_session`).
+    pub(crate) fn command_for_interactive(&self, command: &str) -> Command {
+        self.build_command(command)
+    }
+
+    /// Wrap `command` for the sandbox backend used by the AGENT's bash tool.
+    /// Builds via [`build_command`] then forces non-interactive defaults so
+    /// tools that would otherwise prompt fail fast instead of blocking — an
+    /// agent has no human at the keyboard to answer a prompt.
+    pub fn wrap_command(&self, command: &str) -> Command {
+        let mut cmd = self.build_command(command);
         cmd.env("GIT_TERMINAL_PROMPT", "0");
         cmd.env("GCM_INTERACTIVE", "Never");
         cmd.env("DEBIAN_FRONTEND", "noninteractive");

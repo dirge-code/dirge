@@ -1041,6 +1041,131 @@ mod tests {
             .expect("disconnect should succeed");
     }
 
+    /// Launch a Python module (python -m test_mod) via debugpy with module param.
+    /// Verifies the `module` field in launch args is handled correctly.
+    #[tokio::test]
+    async fn smoke_debugpy_launch_module() {
+        skip_if_missing!("python3", "debugpy");
+
+        let check = std::process::Command::new("python3")
+            .args(["-c", "import debugpy"])
+            .output();
+        if check.map_or(true, |o| !o.status.success()) {
+            eprintln!("SKIP: debugpy not installed");
+            return;
+        }
+
+        let fixtures_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("tests")
+            .join("dap")
+            .join("fixtures");
+        assert!(
+            fixtures_dir.join("test_mod").exists(),
+            "test_mod package must exist"
+        );
+
+        let client = super::DapClient::spawn_stdio(
+            "debugpy",
+            std::path::Path::new("python3"),
+            &["-m".to_string(), "debugpy.adapter".to_string()],
+            std::path::Path::new("."),
+        )
+        .await
+        .expect("debugpy adapter should spawn");
+
+        let (evt_tx, mut evt_rx) = tokio::sync::mpsc::unbounded_channel();
+        client
+            .on_event(
+                "stopped",
+                Box::new(move |body: serde_json::Value| {
+                    let _ = evt_tx.send(body);
+                }),
+            )
+            .await;
+        client
+            .on_event("output", Box::new(|_: serde_json::Value| {}))
+            .await;
+        client
+            .on_event("terminated", Box::new(|_: serde_json::Value| {}))
+            .await;
+
+        // 1. initialize
+        let caps: crate::dap::types::Capabilities = client
+            .request(
+                "initialize",
+                serde_json::json!({
+                    "adapterID": "debugpy",
+                    "clientID": "dirge-smoke",
+                    "linesStartAt1": true,
+                    "columnsStartAt1": true,
+                    "pathFormat": "path",
+                    "locale": "en-us"
+                }),
+                SMOKE_TIMEOUT,
+            )
+            .await
+            .expect("initialize should succeed");
+        assert!(caps.supports_configuration_done_request.unwrap_or(false));
+
+        // 2. launch with module (not program) — debugpy resolves via python -m
+        client
+            .notify(
+                "launch",
+                &serde_json::json!({
+                    "module": "test_mod",
+                    "cwd": fixtures_dir.to_string_lossy(),
+                    "stopOnEntry": true,
+                    "console": "internalConsole"
+                }),
+            )
+            .await
+            .expect("launch notify should succeed");
+
+        // 3. configurationDone
+        client
+            .request::<_, serde_json::Value>(
+                "configurationDone",
+                serde_json::json!({}),
+                SMOKE_TIMEOUT,
+            )
+            .await
+            .expect("configurationDone should succeed");
+
+        // 4. Wait for stopped event (stopOnEntry)
+        let stopped = tokio::time::timeout(SMOKE_TIMEOUT, evt_rx.recv())
+            .await
+            .expect("timed out waiting for stopped event")
+            .expect("adapter disconnected before stopped event");
+        assert_eq!(stopped["reason"], "entry", "expected stop-on-entry");
+
+        // 5. continue
+        client
+            .request::<_, serde_json::Value>(
+                "continue",
+                serde_json::json!({"threadId": stopped["threadId"]}),
+                SMOKE_TIMEOUT,
+            )
+            .await
+            .expect("continue should succeed");
+
+        // 6. terminate
+        client
+            .request::<_, serde_json::Value>("terminate", serde_json::json!({}), SMOKE_TIMEOUT)
+            .await
+            .expect("terminate should succeed");
+
+        // 7. disconnect
+        client
+            .request::<_, serde_json::Value>(
+                "disconnect",
+                serde_json::json!({"terminateDebuggee": true}),
+                SMOKE_TIMEOUT,
+            )
+            .await
+            .expect("disconnect should succeed");
+    }
+
     /// Launch C fixture via lldb-dap: initialize, launch, stop-on-entry,
     /// continue, terminate.
     #[tokio::test]

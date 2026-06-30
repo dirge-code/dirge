@@ -14,6 +14,51 @@ fn test_try_new_returns_ok() {
     assert!(PluginManager::try_new().is_ok());
 }
 
+/// dirge-u5ig: `has_hook` reflects registration so callers can skip the
+/// worker round-trip when nothing subscribes.
+#[cfg(feature = "plugin")]
+#[test]
+fn has_hook_tracks_registration() {
+    let mut mgr = PluginManager::try_new().unwrap();
+    assert!(!mgr.has_hook("on-tool-start"));
+    mgr.eval(r#"(defn noop [ctx] nil)"#).unwrap();
+    mgr.register("on-tool-start", "noop");
+    assert!(mgr.has_hook("on-tool-start"));
+    // A different, unregistered hook is still false.
+    assert!(!mgr.has_hook("on-tool-end"));
+}
+
+/// dirge-u5ig: with no hook registered, `dispatch_tool_hook` returns an
+/// empty result via the fast path WITHOUT touching the worker — the guard
+/// that stops every tool call paying a worker round-trip (and serializing
+/// the headless loop behind the single Janet worker) when no plugin
+/// subscribes. We prove the worker wasn't used by leaving a value in a
+/// harness slot first: the fast path skips the pre-clear, so the slot
+/// survives; the old path would have cleared it.
+#[cfg(feature = "plugin")]
+#[test]
+fn dispatch_tool_hook_skips_worker_when_no_hook_registered() {
+    let mut mgr = PluginManager::try_new().unwrap();
+    // Plant a slot value. If dispatch_tool_hook ran its pre-clear eval it
+    // would wipe this; the fast path must not.
+    mgr.eval(r#"(harness/block "planted")"#).unwrap();
+
+    let result = mgr
+        .dispatch_tool_hook("on-tool-start", "@{:tool \"x\"}")
+        .unwrap();
+    assert_eq!(
+        result,
+        crate::plugin::ToolHookResult::default(),
+        "no hook registered → empty result",
+    );
+
+    // The slot was NOT cleared — proves we skipped the worker pre-clear.
+    assert!(
+        mgr.has_pending_block(),
+        "fast path must not touch the worker (slot should survive)",
+    );
+}
+
 /// Dropping an idle worker must complete promptly (well under
 /// the `JOIN_TIMEOUT` upper bound). This is the regression guard
 /// for the bounded-join change in `Worker::Drop` — without the
@@ -2561,4 +2606,31 @@ fn nrepl_plugin_paren_repair_balances_delimiters() {
         mgr.eval(r#"(paren-repair `(str ")")`)"#).unwrap(),
         r#"(str ")")"#
     );
+}
+
+// --- Plugin compilation validation ------------------------------------
+
+/// **Every** `.janet` file under `plugins/` must compile cleanly
+/// against the full dirge harness surface (all features enabled) so
+/// startup warnings about "failed to load plugin" never regress.
+/// Standalone `janet -k` catches syntax errors, but only a full Rust
+/// eval with the dirge host can catch missing symbol references.
+#[cfg(all(feature = "plugin", feature = "dap", feature = "mcp", feature = "lsp"))]
+#[test]
+fn validate_all_plugins_compile() {
+    let plugin_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins");
+    let mut mgr = PluginManager::try_new().unwrap();
+    let mut count = 0usize;
+
+    for entry in std::fs::read_dir(&plugin_dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().map_or(false, |e| e == "janet") {
+            let source = std::fs::read_to_string(&path).unwrap();
+            mgr.eval(&source)
+                .unwrap_or_else(|e| panic!("{} failed to compile: {e}", path.display()));
+            count += 1;
+        }
+    }
+
+    assert!(count >= 20, "expected at least 20 plugins, found {count}");
 }

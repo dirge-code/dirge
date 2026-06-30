@@ -11,6 +11,7 @@ mod run;
 mod spawn;
 mod stream_dispatch;
 pub mod summarize;
+pub mod wire;
 
 pub use build::*;
 pub use dispatch::*;
@@ -89,9 +90,13 @@ pub struct AnyAgent {
     /// time when `ConfigRole::Critic` resolves (i.e. `critic_provider`
     /// is configured). Forwarded to `LoopConfig.critic_fn`. `None` = off.
     critic_fn: Option<crate::agent::agent_loop::critic::CriticFn>,
+    /// Goal gate's judge callback. Built at `build_agent` time from the
+    /// same critic provider as `critic_fn` but baking its own
+    /// `GOAL_PREAMBLE`; forwarded to `LoopConfig.goal_fn`. `None` = off.
+    goal_fn: Option<crate::agent::agent_loop::critic::CriticFn>,
     /// Goal gate: optional natural-language stop condition for autonomous
     /// runs (`--goal`). Forwarded to `LoopConfig.goal`; active only when a
-    /// `critic_fn` (the judge) is also present. `None` = off (default).
+    /// `goal_fn` (the judge) is also present. `None` = off (default).
     goal: Option<String>,
     /// dirge-008x: in-loop LLM compaction summarizer. Built at
     /// `build_agent` time from the main model and forwarded to
@@ -188,6 +193,7 @@ impl AnyAgent {
             escalation_stream_fn: None,
             escalation_provider_name: None,
             critic_fn: None,
+            goal_fn: None,
             goal: None,
             summarize_fn: None,
             context_depth_reminder_threshold: None,
@@ -338,6 +344,14 @@ impl AnyAgent {
     /// only when `ConfigRole::Critic` resolves (`critic_provider` set).
     pub fn with_critic(mut self, critic_fn: crate::agent::agent_loop::critic::CriticFn) -> Self {
         self.critic_fn = Some(critic_fn);
+        self
+    }
+
+    /// F6 tier 3: attach the goal gate's judge. Built from the same critic
+    /// provider as the critic but baking its own `GOAL_PREAMBLE`, so it's
+    /// independent of any critic preamble override or `critic: false` prompt.
+    pub fn with_goal_fn(mut self, goal_fn: crate::agent::agent_loop::critic::CriticFn) -> Self {
+        self.goal_fn = Some(goal_fn);
         self
     }
 

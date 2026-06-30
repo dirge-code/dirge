@@ -162,11 +162,10 @@ fn split_frontmatter(content: &str) -> Option<(String, String)> {
     let (fm, body) = if let Some(pos) = content.find("\n---") {
         let (a, b) = content.split_at(pos);
         (a.to_string(), b[4..].to_string())
-    } else if let Some(pos) = content.find("\r\n---") {
+    } else {
+        let pos = content.find("\r\n---")?;
         let (a, b) = content.split_at(pos);
         (a.to_string(), b[5..].to_string())
-    } else {
-        return None;
     };
 
     Some((fm, body))

@@ -121,7 +121,7 @@ pub(crate) async fn handle_tool_result(
             let (frame_w, _) = chamber_widths(ctx.renderer);
             let header = fit_banner_header(&upper, &raw_value, frame_w);
             ctx.renderer.write_line("", Color::White)?;
-            ctx.renderer.write_line(&header, c_tool())?;
+            ctx.renderer.write_line_raw(&header, c_tool())?;
             *ctx.tool_chamber_open = true;
             *ctx.last_tool_name = Some(resolved_name);
             *ctx.last_tool_call_id = Some(id.to_string());
@@ -180,7 +180,7 @@ pub(crate) async fn handle_tool_result(
             theme::dim(),
         )?;
         ctx.renderer
-            .write_line(&chamber_bottom(frame_w), theme::dim())?;
+            .write_line_raw(&chamber_bottom(frame_w), theme::dim())?;
         *ctx.tool_chamber_open = false;
     }
     if *ctx.tool_chamber_open && show_details {
@@ -234,9 +234,9 @@ pub(crate) async fn handle_tool_result(
                 format!("(unresolved tool) {}", first)
             };
             ctx.renderer
-                .write_line(&chamber_row(&row_text, inner), theme::dim())?;
+                .write_line_raw(&chamber_row(&row_text, inner), theme::dim())?;
             ctx.renderer
-                .write_line(&chamber_bottom(frame_w), theme::dim())?;
+                .write_line_raw(&chamber_bottom(frame_w), theme::dim())?;
             *ctx.tool_chamber_open = false;
             *ctx.chamber_top_start = None;
             *ctx.chamber_top_end = None;
@@ -281,7 +281,7 @@ pub(crate) async fn handle_tool_result(
                     if !l.is_empty() {
                         let txt = sanitize_output(l).into_string();
                         ctx.renderer
-                            .write_line(&chamber_row(&txt, inner), theme::result())?;
+                            .write_line_raw(&chamber_row(&txt, inner), theme::result())?;
                     }
                 }
                 // Colorized diff with opencode-style
@@ -300,22 +300,22 @@ pub(crate) async fn handle_tool_result(
                         // invisible on phosphor (same hue
                         // as agent text).
                         ctx.renderer
-                            .write_line(&chamber_row(&txt, inner), theme::accent())?;
+                            .write_line_raw(&chamber_row(&txt, inner), theme::accent())?;
                     } else if l.starts_with("@@") {
                         // Hunk position markers — use dim
                         // so they recede behind the +/-
                         // content lines below.
                         ctx.renderer
-                            .write_line(&chamber_row(&txt, inner), theme::dim())?;
+                            .write_line_raw(&chamber_row(&txt, inner), theme::dim())?;
                     } else if l.starts_with('+') {
                         ctx.renderer
-                            .write_line(&chamber_row_with_bg(&txt, inner, 22), Color::Green)?;
+                            .write_line_raw(&chamber_row_with_bg(&txt, inner, 22), Color::Green)?;
                     } else if l.starts_with('-') {
                         ctx.renderer
-                            .write_line(&chamber_row_with_bg(&txt, inner, 52), Color::Red)?;
+                            .write_line_raw(&chamber_row_with_bg(&txt, inner, 52), Color::Red)?;
                     } else {
                         ctx.renderer
-                            .write_line(&chamber_row(&txt, inner), theme::dim())?;
+                            .write_line_raw(&chamber_row(&txt, inner), theme::dim())?;
                     }
                 }
                 // Compact LSP diagnostics summary (one line) in place
@@ -324,7 +324,7 @@ pub(crate) async fn handle_tool_result(
                 if let Some(ds) = diag_start {
                     let summary = summarize_lsp_tail(&lines[ds..]);
                     ctx.renderer
-                        .write_line(&chamber_row(&summary, inner), theme::warn())?;
+                        .write_line_raw(&chamber_row(&summary, inner), theme::warn())?;
                     *ctx.last_collapsed = Some(CollapsedToolResult {
                         tool_name: resolved_name.clone(),
                         banner_value: sanitize_output(&banner_value).into_string(),
@@ -332,7 +332,7 @@ pub(crate) async fn handle_tool_result(
                     });
                 }
                 ctx.renderer
-                    .write_line(&chamber_bottom(frame_w), theme::dim())?;
+                    .write_line_raw(&chamber_bottom(frame_w), theme::dim())?;
                 *ctx.tool_chamber_open = false;
             } else {
                 // No diff section found, show normally

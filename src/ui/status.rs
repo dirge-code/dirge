@@ -102,9 +102,26 @@ impl StatusLine {
             None => dir.to_string(),
         };
 
-        let ctx = session.context_window;
+        // Denominator is the EFFECTIVE context window (`min(model window,
+        // context_target)`) — a true fullness meter that reads 0–100% and
+        // doesn't overflow. The previous denominator was the fold-trigger
+        // budget (~75% of the window), so once real usage passed 75% the gauge
+        // showed a confusing >100% (e.g. `90k/75k (120%)`). The loop still
+        // folds well before the window fills — ~75% (normal) and ~90%
+        // (turn-start) — so a compact `fold`/`fold!` marker flags when a fold
+        // is near/imminent instead of pushing the percentage past 100
+        // (dirge-l4rp, dirge-cx7t).
+        let ctx =
+            crate::agent::agent_loop::context_manager::effective_ctx_max(session.context_window);
         let used = session.total_estimated_tokens;
         let pct = (used * 100).checked_div(ctx).unwrap_or(0);
+        let pct_str = if pct >= 90 {
+            format!("{pct}% fold!")
+        } else if pct >= 75 {
+            format!("{pct}% fold")
+        } else {
+            format!("{pct}%")
+        };
 
         // TODO(cost-tracking): `session.total_cost` is always 0.0
         // because dirge doesn't yet have a per-provider pricing
@@ -157,17 +174,23 @@ impl StatusLine {
             None => String::new(),
         };
 
-        let session_badge = format!(" session:{}", crate::text::short_id(session.id.as_str()));
+        // dirge: a *distinct* glance id — `short_id`'s fixed 8 chars rendered
+        // every `compacted-<uuid>` session as "compacte". Full id via
+        // `/sessions current`.
+        let session_badge = format!(
+            " session:{}",
+            crate::text::session_glance_id(session.id.as_str())
+        );
 
         format!(
-            "{}{} | {}{} | {}/{} ({}%) | {}msgs | {}{}{}{}{}{}{}{}",
+            "{}{} | {}{} | {}/{} ({}) | {}msgs | {}{}{}{}{}{}{}{}",
             project_label,
             cost_str,
             session.model,
             loop_badge,
             fmt_tokens(used),
             fmt_tokens(ctx),
-            pct,
+            pct_str,
             session.messages.len(),
             state,
             compact_badge,
@@ -259,6 +282,35 @@ mod tests {
         let line = render(2, 3);
         assert!(line.contains("agents:2"), "expected agents:2 in: {line}");
         assert!(line.contains("shells:3"), "expected shells:3 in: {line}");
+    }
+
+    /// dirge-cx7t: the gauge denominator is the full effective window, so the
+    /// percentage reads 0–100% (not the old >100% past 75%), with a `fold`
+    /// marker flagging when a fold is near/imminent.
+    #[tokio::test]
+    async fn gauge_uses_full_window_and_marks_fold() {
+        let mut session = Session::new("openrouter", "test-model", 100_000);
+
+        // Comfortable: 50k of a 100k window → 50%, no marker, never >100%.
+        session.total_estimated_tokens = 50_000;
+        let line = StatusLine::render(&session, false, 0, None, None, None, None, None, None);
+        assert!(line.contains("/100k (50%)"), "full-window 50%: {line}");
+        assert!(!line.contains("fold"), "no fold marker at 50%: {line}");
+
+        // Normal-fold zone (≥75%): the `fold` hint appears, still ≤100%.
+        session.total_estimated_tokens = 80_000;
+        let line = StatusLine::render(&session, false, 0, None, None, None, None, None, None);
+        assert!(line.contains("(80% fold)"), "fold hint at 80%: {line}");
+
+        // Turn-start fold zone (≥90%): `fold!` — and crucially NOT the old
+        // confusing 120% (90k against the 75k budget).
+        session.total_estimated_tokens = 90_000;
+        let line = StatusLine::render(&session, false, 0, None, None, None, None, None, None);
+        assert!(line.contains("(90% fold!)"), "fold! at 90%: {line}");
+        assert!(
+            !line.contains("120%"),
+            "must not overflow past 100%: {line}"
+        );
     }
 
     /// The session id is shown at the end of the status line so the

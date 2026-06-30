@@ -63,8 +63,11 @@ pub fn tool_operation(tool: &str) -> Operation {
         "skill" => Operation::Skill,
         // Recursive sub-agent execution: high-risk, not auto-allowed.
         "task" => Operation::Agent,
-        // Internal no-effect tools: builtin-allowed.
-        "task_status" | "question" | "write_todo_list" => Operation::Meta,
+        // Internal bookkeeping tools, builtin-allowed: read-only meta
+        // (`task_status`, `question`) plus the agent's own task surfaces
+        // (`write_todo_list`, `issue`) — local, user-viewable (`/issues`),
+        // reversible, so the model shouldn't be prompted to track its work.
+        "task_status" | "question" | "write_todo_list" | "issue" => Operation::Meta,
         // Unknown (plugin/MCP) tools: not auto-allowed; fall to
         // configured rules or the default (Accept-coercible).
         _ => Operation::Other,
@@ -269,6 +272,10 @@ mod tests {
         assert_eq!(tool_operation("memory"), Operation::Memory);
         assert_eq!(tool_operation("skill"), Operation::Skill);
         assert_eq!(tool_operation("question"), Operation::Meta);
+        assert_eq!(tool_operation("write_todo_list"), Operation::Meta);
+        // The issue tracker is auto-allowed like the todo list — the model
+        // shouldn't have to ask to record its own work.
+        assert_eq!(tool_operation("issue"), Operation::Meta);
     }
 
     #[test]

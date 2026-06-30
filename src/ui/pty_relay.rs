@@ -29,6 +29,10 @@ pub(crate) struct PtyRelay {
     secondary_raw_fd: libc::c_int,
     child: std::process::Child,
     counters: RelayCounters,
+    /// When set, the relay records every byte the child writes to the PTY
+    /// here. Used by the interactive bang-command path to capture output
+    /// for the agent while still streaming it live to the user's terminal.
+    capture: Option<Vec<u8>>,
 }
 
 // ── relay byte accounting (timing-diagnostics feature) ───────────
@@ -220,6 +224,7 @@ impl PtyRelay {
             secondary_raw_fd,
             child,
             counters: RelayCounters::new(),
+            capture: None,
         })
     }
 
@@ -273,6 +278,13 @@ impl PtyRelay {
         mut self,
         mut tty: std::fs::File,
     ) -> io::Result<std::process::ExitStatus> {
+        self.run_loop(&mut tty)
+    }
+
+    /// Run the relay loop against an explicit tty. When `self.capture` is
+    /// `Some`, record every byte the child writes to the PTY so callers can
+    /// feed it back. Shared core of [`PtyRelay::relay`] / [`relay_to_fd`].
+    fn run_loop(&mut self, tty: &mut std::fs::File) -> io::Result<std::process::ExitStatus> {
         #[cfg(feature = "timing-diagnostics")]
         let t_relay_enter = std::time::Instant::now();
 
@@ -395,6 +407,9 @@ impl PtyRelay {
                     Ok(0) => return self.child.wait(),
                     Ok(n) => {
                         counters.pty_read(n);
+                        if let Some(c) = self.capture.as_mut() {
+                            c.extend_from_slice(&read_buf[..n]);
+                        }
                         if !echo_disabled {
                             echo_disabled = true;
                             disable_echo(self.secondary_raw_fd);
@@ -539,6 +554,9 @@ impl PtyRelay {
                     match self.primary.read(&mut read_buf) {
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
+                            if let Some(c) = self.capture.as_mut() {
+                                c.extend_from_slice(&read_buf[..n]);
+                            }
                             // Best-effort write to tty; ignore errors.
                             let _ = tty.write_all(&read_buf[..n]);
                         }
@@ -618,7 +636,7 @@ fn disable_echo(fd: libc::c_int) {
 
 /// Convert an owned `File` into a `Stdio` for `Command` plumbing.
 /// SAFETY: the caller must ensure the fd is valid and not used elsewhere.
-unsafe fn stdio_from_fd(file: std::fs::File) -> std::process::Stdio {
+pub(crate) unsafe fn stdio_from_fd(file: std::fs::File) -> std::process::Stdio {
     let fd = file.as_raw_fd();
     // Leak the OwnedFd we'd get from into_raw_fd, transferring ownership
     // to the Stdio (which will close it when the child drops).
@@ -626,4 +644,72 @@ unsafe fn stdio_from_fd(file: std::fs::File) -> std::process::Stdio {
     // Prevent the File's Drop from closing the fd.
     std::mem::forget(file);
     owned.into()
+}
+
+#[cfg(all(unix, test))]
+mod tests {
+    //! These run in the default test suite (no `sandbox-microvm` feature)
+    //! because they only need a PTY pair, not a microvm. They verify the
+    //! output-capture path used by interactive bang commands (`!`/`!!`).
+
+    use super::*;
+    use std::os::unix::io::FromRawFd;
+    use std::process::Command;
+
+    /// Open a PTY pair (primary, secondary) via posix_openpt. Mirrors the
+    /// helper in relay_tests/common.rs but kept local so this test runs
+    /// without the `sandbox-microvm` feature.
+    fn open_pty_pair() -> Option<(std::fs::File, std::fs::File)> {
+        let primary_fd = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) };
+        if primary_fd < 0 {
+            return None;
+        }
+        if unsafe { libc::grantpt(primary_fd) } < 0 || unsafe { libc::unlockpt(primary_fd) } < 0 {
+            unsafe { libc::close(primary_fd) };
+            return None;
+        }
+        let secondary_name = unsafe { libc::ptsname(primary_fd) };
+        if secondary_name.is_null() {
+            unsafe { libc::close(primary_fd) };
+            return None;
+        }
+        let secondary_fd = unsafe { libc::open(secondary_name, libc::O_RDWR | libc::O_NOCTTY) };
+        if secondary_fd < 0 {
+            unsafe { libc::close(primary_fd) };
+            return None;
+        }
+        Some((unsafe { std::fs::File::from_raw_fd(primary_fd) }, unsafe {
+            std::fs::File::from_raw_fd(secondary_fd)
+        }))
+    }
+
+    /// `run_loop` must capture everything the child writes to the PTY so the
+    /// interactive bang-command path can feed it back to the agent.
+    #[test]
+    fn run_loop_captures_child_stdout() {
+        // A fake "tty": the primary of a second PTY pair. It stays open for
+        // the relay's lifetime (its secondary is kept alive in `_sec`) so the
+        // loop doesn't see an immediate POLLHUP and kill the child.
+        let (tty, _sec) = match open_pty_pair() {
+            Some(p) => p,
+            None => return, // no PTY support in this environment
+        };
+        let mut tty = tty;
+
+        let mut cmd = Command::new("bash");
+        cmd.args(["-c", "printf 'CAPTURED_MARKER_42\\n'; exit 0"]);
+
+        let mut relay = PtyRelay::spawn(&mut cmd).expect("spawn relay");
+        relay.capture = Some(Vec::new());
+
+        let status = relay.run_loop(&mut tty).expect("relay loop");
+        assert!(status.success(), "child should exit 0");
+
+        let cap = relay.capture.take().expect("capture buffer");
+        let text = String::from_utf8_lossy(&cap);
+        assert!(
+            text.contains("CAPTURED_MARKER_42"),
+            "captured output should contain the marker, got: {text:?}"
+        );
+    }
 }

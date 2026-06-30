@@ -128,6 +128,8 @@ pub struct DebugArgs {
     pub context: Option<String>,
     #[serde(default)]
     pub restart: Option<bool>,
+    #[serde(default)]
+    pub env: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -279,7 +281,8 @@ impl Tool for DebugTool {
                     "thread_id": { "type": "integer", "description": "Thread ID (continue, step, pause, stack_trace)" },
                     "stop_on_entry": { "type": "boolean", "description": "Stop at program entry (launch)" },
                     "context": { "type": "string", "description": "Evaluation context: watch, repl, hover" },
-                    "restart": { "type": "boolean", "description": "Restart after disconnect (terminate)" }
+                    "restart": { "type": "boolean", "description": "Restart after disconnect (terminate)" },
+                    "env": { "type": "object", "description": "Environment variables as key-value pairs (launch)", "additionalProperties": { "type": "string" } }
                 },
                 "required": ["action"]
             }),
@@ -314,16 +317,23 @@ impl Tool for DebugTool {
                 }
 
                 let program_args = args.args.unwrap_or_default();
+                let mut extra = adapter.launch_defaults.clone();
+                if let Some(ref env) = args.env {
+                    if let Some(obj) = extra.as_object_mut() {
+                        obj.insert("env".to_string(), env.clone());
+                    }
+                }
                 let summary = mgr
                     .launch(
                         &adapter.name,
                         &adapter.resolved_command.to_string_lossy(),
                         &adapter.args,
                         cwd,
-                        program,
+                        Some(program),
+                        None,
                         &program_args,
                         args.stop_on_entry,
-                        Some(adapter.launch_defaults.clone()),
+                        Some(extra),
                         &signal,
                         timeout,
                         adapter.languages.clone(),

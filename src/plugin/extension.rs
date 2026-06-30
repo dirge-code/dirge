@@ -132,59 +132,12 @@ pub fn resolve_custom_message_render(
 /// `insert`). Returns `None` for malformed input so an unknown spec
 /// drops the binding silently rather than crashing.
 pub fn parse_key_spec(spec: &str) -> Option<(KeyCode, KeyModifiers)> {
-    let lower = spec.trim().to_ascii_lowercase();
-    if lower.is_empty() {
-        return None;
-    }
-    let parts: Vec<&str> = lower.split('-').collect();
-    let (key_part, mod_parts) = parts.split_last()?;
-    let mut mods = KeyModifiers::NONE;
-    for p in mod_parts {
-        match *p {
-            "ctrl" | "control" => mods |= KeyModifiers::CONTROL,
-            "alt" | "meta" => mods |= KeyModifiers::ALT,
-            "shift" => mods |= KeyModifiers::SHIFT,
-            _ => return None,
-        }
-    }
-    let code = match *key_part {
-        "enter" | "return" => KeyCode::Enter,
-        "esc" | "escape" => KeyCode::Esc,
-        "tab" => KeyCode::Tab,
-        "backspace" | "bs" => KeyCode::Backspace,
-        "space" => KeyCode::Char(' '),
-        "up" => KeyCode::Up,
-        "down" => KeyCode::Down,
-        "left" => KeyCode::Left,
-        "right" => KeyCode::Right,
-        "home" => KeyCode::Home,
-        "end" => KeyCode::End,
-        "pageup" | "pgup" => KeyCode::PageUp,
-        "pagedown" | "pgdn" => KeyCode::PageDown,
-        "delete" | "del" => KeyCode::Delete,
-        "insert" | "ins" => KeyCode::Insert,
-        s if s.starts_with('f') && s.len() > 1 => {
-            // L1: strict digit check — `f01` would otherwise parse
-            // as F(1) via lenient u8::from_str. We require the
-            // suffix to be ASCII digits with no leading zero.
-            let suffix = &s[1..];
-            if !suffix.chars().all(|c| c.is_ascii_digit()) {
-                return None;
-            }
-            if suffix.len() > 1 && suffix.starts_with('0') {
-                return None;
-            }
-            let n: u8 = suffix.parse().ok()?;
-            if (1..=12).contains(&n) {
-                KeyCode::F(n)
-            } else {
-                return None;
-            }
-        }
-        s if s.chars().count() == 1 => KeyCode::Char(s.chars().next()?),
-        _ => return None,
-    };
-    Some((code, mods))
+    // dirge-5kkx.2: one chord grammar for the whole app. Delegates to the
+    // always-compiled `ui::keymap::parse_chord` so the plugin and config
+    // paths can never drift (they previously diverged on `+` separators,
+    // `option`, leading-zero f-keys, etc.). `parse_chord` is a strict
+    // superset of the old plugin grammar.
+    crate::ui::keymap::parse_chord(spec)
 }
 
 /// Pre-parsed shortcut entry the UI layer holds across key events.

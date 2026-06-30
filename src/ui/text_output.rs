@@ -34,40 +34,6 @@ pub(crate) fn strip_leading_system_reminder(content: &str) -> &str {
     after.trim_start_matches(['\n', '\r', ' ', '\t'])
 }
 
-#[cfg(test)]
-mod strip_system_reminder_tests {
-    use super::strip_leading_system_reminder;
-
-    #[test]
-    fn passes_plain_text_through() {
-        assert_eq!(strip_leading_system_reminder("hello"), "hello");
-    }
-
-    #[test]
-    fn strips_block_and_trailing_blank_lines() {
-        let input = "<system-reminder>\nTask 1 done\n</system-reminder>\n\nwhat's next?";
-        assert_eq!(strip_leading_system_reminder(input), "what's next?");
-    }
-
-    #[test]
-    fn does_not_strip_mid_message_reminder() {
-        let input = "see <system-reminder>nope</system-reminder>";
-        assert_eq!(strip_leading_system_reminder(input), input);
-    }
-
-    #[test]
-    fn handles_leading_whitespace_before_reminder() {
-        let input = "  \n<system-reminder>x</system-reminder>\nhi";
-        assert_eq!(strip_leading_system_reminder(input), "hi");
-    }
-
-    #[test]
-    fn missing_close_tag_leaves_input_alone() {
-        let input = "<system-reminder>oops";
-        assert_eq!(strip_leading_system_reminder(input), input);
-    }
-}
-
 /// Print a (possibly multi-line) prefixed message to the chat log as a
 /// single visual block: the first line gets `prefix`, continuation lines
 /// are indented to align under it, blank lines stay blank (so an expanded
@@ -163,4 +129,38 @@ pub(crate) fn sanitize_single_line(s: &str, max_chars: usize) -> String {
         count += 1;
     }
     out
+}
+
+#[cfg(test)]
+mod strip_system_reminder_tests {
+    use super::strip_leading_system_reminder;
+
+    #[test]
+    fn passes_plain_text_through() {
+        assert_eq!(strip_leading_system_reminder("hello"), "hello");
+    }
+
+    #[test]
+    fn strips_block_and_trailing_blank_lines() {
+        let input = "<system-reminder>\nTask 1 done\n</system-reminder>\n\nwhat's next?";
+        assert_eq!(strip_leading_system_reminder(input), "what's next?");
+    }
+
+    #[test]
+    fn does_not_strip_mid_message_reminder() {
+        let input = "see <system-reminder>nope</system-reminder>";
+        assert_eq!(strip_leading_system_reminder(input), input);
+    }
+
+    #[test]
+    fn handles_leading_whitespace_before_reminder() {
+        let input = "  \n<system-reminder>x</system-reminder>\nhi";
+        assert_eq!(strip_leading_system_reminder(input), "hi");
+    }
+
+    #[test]
+    fn missing_close_tag_leaves_input_alone() {
+        let input = "<system-reminder>oops";
+        assert_eq!(strip_leading_system_reminder(input), input);
+    }
 }

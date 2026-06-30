@@ -11,10 +11,22 @@ pub mod pattern;
 /// Best-effort: a poisoned mutex falls through to `into_inner`,
 /// matching the recovery pattern used elsewhere on the checker.
 /// `None` perm (e.g. `--no-tools` builds) is a no-op.
+///
+/// Also pushes to the computer-use plugin when the feature is active,
+/// so `harness/check-computer-action` gates desktop actions against
+/// the same PDP deny_tools.
 pub fn apply_prompt_deny(perm: &Option<checker::PermCheck>, deny: &[String]) {
     if let Some(p) = perm {
         let mut guard = p.lock_ignore_poison();
         guard.set_prompt_deny_tools(deny.to_vec());
+    }
+    #[cfg(feature = "experimental-ui-computer-use")]
+    {
+        if let Some(pm) = crate::plugin::hook::global() {
+            let mut mgr = pm.lock_ignore_poison();
+            mgr.set_deny_tools_for_computer_use(deny);
+        }
+        // Without the `plugin` feature, the global is never set — no-op.
     }
 }
 

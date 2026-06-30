@@ -579,6 +579,78 @@ async fn build_agent_inner_emits_assembled_preamble() {
     }
 }
 
+/// dirge-rq65 follow-up — the system-prompt skill catalog must list
+/// skills from the SAME source as the loadable `skill` tool
+/// (`skill::discover_skills`, which spans the global tiers under
+/// `$HOME`), not from the project-only `SkillManager::list()`.
+/// Regression: a skill installed in `~/.dirge/skills/` is loadable
+/// but, pre-fix, was never advertised in the preamble because the
+/// listing read only the single project `.dirge/skills/`. Here we
+/// point `$HOME` at a temp dir holding a global skill and assert it
+/// shows up in the assembled preamble. `dirs::home_dir()` reads
+/// `$HOME` live on Unix; serialize the override so parallel tests
+/// don't observe the temporary HOME.
+// Serialization: `dirs::home_dir()` reads `$HOME` live, so the guard
+// below is intentionally held across this test's `.await`s.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn preamble_lists_global_tier_skills() {
+    use crate::context::ContextFiles;
+    use rig::client::CompletionClient;
+    use rig::providers::openai;
+    use std::sync::Mutex;
+
+    static HOME_LOCK: Mutex<()> = Mutex::new(());
+    let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let home = std::env::temp_dir().join(format!("dirge-preamble-home-{}", std::process::id()));
+    let skill_dir = home
+        .join(".dirge")
+        .join("skills")
+        .join("global-preamble-skill");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: global-preamble-skill\ndescription: advertised from the global tier\n---\nBody.\n",
+    )
+    .unwrap();
+
+    let cli = Cli::parse_from::<_, &str>(["dirge"]);
+    let cfg = Config::default();
+    let context = ContextFiles {
+        agents: None,
+        prompts: std::collections::HashMap::new(),
+        agent_defs: Default::default(),
+        current_agent: None,
+        current_prompt: None,
+        current_prompt_name: None,
+        current_prompt_deny_tools: Vec::new(),
+        prompt_layer: None,
+        agent_layer: None,
+        model_before_agent: None,
+    };
+    let client = openai::Client::new("test-key").expect("openai client builds");
+    let model = client.completion_model("gpt-4o");
+
+    let prev_home = std::env::var_os("HOME");
+    // SAFETY: guarded by HOME_LOCK; restored before the lock drops.
+    unsafe { std::env::set_var("HOME", &home) };
+    let (agent, _cache, _provider) =
+        build_agent_inner(model, &cli, &cfg, &context, "openai", "gpt-4o").await;
+    match prev_home {
+        Some(h) => unsafe { std::env::set_var("HOME", h) },
+        None => unsafe { std::env::remove_var("HOME") },
+    }
+
+    let preamble = agent.preamble.unwrap_or_default();
+    assert!(
+        preamble.contains("global-preamble-skill"),
+        "preamble must advertise a skill from the global ~/.dirge/skills tier; got:\n{preamble}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 /// dirge-5db6 — model-family steering keys off the ACTIVE model passed
 /// to `build_agent_inner`, not the launch-time CLI model. The CLI here
 /// carries no `--model`, so `cli.resolve_model` would resolve to a
