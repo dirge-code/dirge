@@ -309,9 +309,7 @@ pub(crate) fn spawn(
     let join = tokio::spawn(async move {
         // No TTY to write keystrokes to; drain the channel so it doesn't linger
         // for the session's lifetime.
-        let _drain = tokio::spawn(async move {
-            while input_rx.recv().await.is_some() {}
-        });
+        let _drain = tokio::spawn(async move { while input_rx.recv().await.is_some() {} });
 
         let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
         let cap = captured.clone();
@@ -371,9 +369,6 @@ fn kill_group(pid: Option<u32>) {
         }
     }
 }
-
-#[cfg(not(unix))]
-fn kill_group(_pid: Option<u32>) {}
 
 // ── PTY helpers ────────────────────────────────────────────────────────────
 
