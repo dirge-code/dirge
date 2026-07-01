@@ -113,6 +113,13 @@ impl SkillRow {
             + effectiveness_bonus(self.success_count, self.failure_count)
             + confidence_eviction_bonus(self.confidence)
     }
+
+    /// [`effective_salience`](Self::effective_salience) against the
+    /// current time — the form the curator (dirge-izju) uses to decide
+    /// archival.
+    pub fn effective_salience_now(&self) -> f64 {
+        self.effective_salience(&recent_use_cutoff())
+    }
 }
 
 /// Provenance. `learned` = agent-created (via the skill tool or
@@ -597,6 +604,16 @@ impl SkillStore {
             params![DECAY_FLOOR, DISUSE_DECAY, cutoff],
         )
         .map_err(|e| format!("Failed to apply skill disuse decay: {e}"))
+    }
+
+    /// Set a skill's raw salience directly. Test/curator seam for
+    /// simulating a decayed skill without waiting out the decay window.
+    pub fn set_salience_for_test(&self, name: &str, salience: f64) {
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute(
+            "UPDATE skills SET salience = ?1 WHERE name = ?2",
+            params![salience, name],
+        );
     }
 
     /// Archive a learned skill (soft state — never a hard delete, so it

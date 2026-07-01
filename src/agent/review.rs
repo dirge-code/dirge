@@ -320,7 +320,7 @@ pub(crate) async fn run_curator_review(
     // siblings, etc.
     let paths_for_report = paths.clone();
     let after_candidates = tokio::task::spawn_blocking(move || {
-        crate::extras::skills::usage::UsageStore::load(&paths_for_report)
+        crate::extras::skill_db::SkillStore::load(&paths_for_report)
             .ok()
             .map(|store| crate::extras::skills::curator::render_candidate_list(&store))
             .unwrap_or_else(|| String::from("(failed to render after-state)"))

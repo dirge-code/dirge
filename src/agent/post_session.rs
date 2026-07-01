@@ -217,7 +217,7 @@ async fn stage_skills_curator(agent: AnyAgent, paths: ProjectPaths) {
         let _ = curator.apply_automatic_transitions();
         // Render candidates AFTER mechanical transitions so
         // newly-stale skills are included.
-        crate::extras::skills::usage::UsageStore::load(&paths_for_blocking)
+        crate::extras::skill_db::SkillStore::load(&paths_for_blocking)
             .ok()
             .map(|store| crate::extras::skills::curator::render_candidate_list(&store))
     })

@@ -20,17 +20,23 @@
 //! `curator.py:1369-1555` (the `run_curator_review` loop).
 
 use std::path::PathBuf;
-use std::time::UNIX_EPOCH;
 
 use crate::extras::dirge_paths::ProjectPaths;
 
 // ── Default configuration ─────────────────────────────
 
-/// Days since last activity to mark a skill as stale.
-const STALE_AFTER_DAYS: u64 = 30;
+/// Disuse-decay window (dirge-izju): each run decays the salience of
+/// agent-created skills not consulted within this many days, so a skill
+/// nobody uses drifts toward the archival threshold. Runs are weekly, so
+/// ~one decay step (0.05) per idle fortnight.
+const DISUSE_DECAY_CUTOFF_DAYS: i64 = 14;
 
-/// Days of staleness before archiving a skill.
-const ARCHIVE_AFTER_STALE_DAYS: u64 = 90;
+/// Effective-salience at or below which an agent-created, unpinned skill
+/// is archived. A fresh skill starts at 0.5 and decays 0.05 per idle
+/// fortnight, so it takes months of total disuse to reach here — while a
+/// skill with a proven track record stays above it via the effectiveness
+/// bonus, so "recently effective" outlives "recently touched".
+const ARCHIVE_SALIENCE_THRESHOLD: f64 = 0.15;
 
 /// Minimum hours between curator runs.
 const INTERVAL_HOURS: u64 = 168; // 7 days
@@ -80,14 +86,17 @@ impl Curator {
         self.clock.should_run_now()
     }
 
-    /// Run automatic lifecycle transitions on all skills.
-    /// No LLM involved — pure time-based rules.
+    /// Run automatic lifecycle maintenance on all skills — no LLM.
+    /// dirge-izju: salience-driven, not age-based. Each run decays the
+    /// salience of unconsulted agent-created skills, then archives any
+    /// whose EFFECTIVE salience (decay folded with proven effectiveness
+    /// and confidence) has fallen to [`ARCHIVE_SALIENCE_THRESHOLD`]. So a
+    /// skill nobody uses drifts out of the library, a skill that keeps
+    /// working survives on its track record, and pinned or bundled
+    /// (non-agent) skills are left alone.
     ///
-    /// Returns a list of skills that should be considered for
-    /// consolidation review (stale for > ARCHIVE_AFTER_STALE_DAYS
-    /// but not yet archived).
+    /// Returns the names archived this run (informational).
     pub fn apply_automatic_transitions(&mut self) -> Result<Vec<String>, String> {
-        let now = now_secs();
         let skills_dir = self.paths.skills_dir();
 
         if !skills_dir.is_dir() {
@@ -95,11 +104,14 @@ impl Curator {
             return Ok(Vec::new());
         }
 
-        // Load usage tracking for pin/activity checks.
-        let mut usage = crate::extras::skills::usage::UsageStore::load(&self.paths).ok();
+        let store = crate::extras::skill_db::SkillStore::load(&self.paths).ok();
+        // Decay stale, unconsulted skills first so effective salience
+        // reflects current disuse before the threshold check.
+        if let Some(ref s) = store {
+            let _ = s.apply_disuse_decay(DISUSE_DECAY_CUTOFF_DAYS);
+        }
 
-        let mut stale_names: Vec<String> = Vec::new();
-        let mut reactivated: Vec<String> = Vec::new();
+        let mut archived: Vec<String> = Vec::new();
 
         for entry in std::fs::read_dir(&skills_dir)
             .map_err(|e| format!("Failed to read skills directory: {e}"))?
@@ -123,71 +135,38 @@ impl Curator {
                 None => continue,
             };
 
-            // Skip pinned skills — they're exempt from all auto-transitions.
-            if let Some(ref usage) = usage {
-                if usage.get(&name).map(|u| u.pinned).unwrap_or(false) {
-                    continue;
-                }
-                // Skip bundled skills (not agent-created).
-                if !usage.is_agent_created(&name) {
-                    // Bundled skill — skip transition but still track.
-                    continue;
-                }
+            let Some(ref s) = store else { continue };
+            // Only agent-created skills are curator-managed; bundled/user
+            // file skills are left untouched.
+            if !s.is_agent_created(&name) {
+                continue;
             }
-
-            // Get activity age from usage tracking if available,
-            // fall back to file modification time.
-            let age_seconds = if let Some(ref usage) = usage {
-                usage.activity_age_seconds(&name).unwrap_or_else(|| {
-                    // Fallback: compute from file modification time.
-                    file_mod_age(&path.join("SKILL.md"), now)
-                })
-            } else {
-                file_mod_age(&path.join("SKILL.md"), now)
+            let Some(row) = s.get(&name).ok().flatten() else {
+                continue;
             };
-
-            let age_days = age_seconds / 86400;
-
-            if age_days >= ARCHIVE_AFTER_STALE_DAYS {
-                // Archive this skill.
+            // Pinned skills are exempt.
+            if row.pinned {
+                continue;
+            }
+            if row.effective_salience_now() <= ARCHIVE_SALIENCE_THRESHOLD {
                 self.archive_skill(&name)?;
-                // Update usage state if loaded.
-                if let Some(ref mut u) = usage {
-                    let _ = u.set_state(&name, crate::extras::skills::usage::SkillState::Archived);
-                }
-            } else if age_days >= STALE_AFTER_DAYS {
-                stale_names.push(name.clone());
-                if let Some(ref mut u) = usage {
-                    let _ = u.set_state(&name, crate::extras::skills::usage::SkillState::Stale);
-                }
-            } else {
-                // Recent activity on a stale skill → reactivate.
-                let needs_reactivate = match usage.as_ref() {
-                    Some(u) => u
-                        .get(&name)
-                        .map(|r| matches!(r.state, crate::extras::skills::usage::SkillState::Stale))
-                        .unwrap_or(false),
-                    None => false,
-                };
-                if needs_reactivate && let Some(ref mut u) = usage {
-                    let _ = u.set_state(&name, crate::extras::skills::usage::SkillState::Active);
-                    reactivated.push(name);
-                }
+                let _ = s.archive(&name);
+                archived.push(name);
             }
         }
 
-        if !reactivated.is_empty() {
+        if !archived.is_empty() {
             tracing::info!(
                 target: "dirge::curator",
-                count = %reactivated.len(),
-                "Reactivated {} stale skills with recent activity",
-                reactivated.len()
+                count = %archived.len(),
+                "Archived {} fully-decayed agent skills",
+                archived.len()
             );
         }
 
         self.clock.mark_ran()?;
 
-        Ok(stale_names)
+        Ok(archived)
     }
 
     /// Move a skill to the `.archive/` directory.
@@ -302,48 +281,44 @@ pub const CURATOR_PROMPT: &str = "You are running as dirge's background skill CU
 /// (curator.py:~1350). One row per skill with the telemetry fields
 /// the curator uses to judge consolidation overlap.
 ///
-/// `usage` is the skill telemetry store. Only entries flagged as
-/// agent-created (i.e. `is_agent_created` returns true) appear, and
-/// pinned skills are flagged so the LLM can skip them per Hard Rule 3.
-pub fn render_candidate_list(usage: &crate::extras::skills::usage::UsageStore) -> String {
+/// `store` is the sqlite salience store. Only agent-created skills
+/// (`source = 'learned'`) appear, ordered by effective salience (most
+/// useful first) so the model sees the strongest skills at the top of
+/// its window; pinned skills are flagged so it can skip them per Hard
+/// Rule 3.
+pub fn render_candidate_list(store: &crate::extras::skill_db::SkillStore) -> String {
     use std::fmt::Write as _;
 
-    let mut rows: Vec<(&String, &crate::extras::skills::usage::SkillUsage)> = usage
-        .skill_names()
-        .filter(|name| usage.is_agent_created(name))
-        .filter_map(|name| usage.get(name).map(|u| (name, u)))
+    // `list_active` is already sorted by effective salience, best first.
+    let rows: Vec<_> = store
+        .list_active()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.source == "learned")
         .collect();
     if rows.is_empty() {
         return String::from("No agent-created skills — curator pass is a no-op.");
     }
-    // Sort by last activity (newest first) so the model sees fresh
-    // additions at the top of its window. Falls back to name for ties.
-    rows.sort_by(|a, b| {
-        let key_a = a.1.last_used_at.as_deref().unwrap_or("");
-        let key_b = b.1.last_used_at.as_deref().unwrap_or("");
-        key_b.cmp(key_a).then_with(|| a.0.cmp(b.0))
-    });
 
-    let mut out = String::from("Candidate skills (agent-created, sorted by last activity):\n");
-    for (name, u) in rows {
-        let activity = u
+    let mut out = String::from("Candidate skills (agent-created, sorted by salience):\n");
+    for r in rows {
+        let activity = r
             .last_used_at
             .as_deref()
-            .or(u.last_patched_at.as_deref())
-            .or(u.last_viewed_at.as_deref())
+            .or(r.last_patched_at.as_deref())
+            .or(r.last_viewed_at.as_deref())
             .unwrap_or("never");
-        let state = match u.state {
-            crate::extras::skills::usage::SkillState::Active => "active",
-            crate::extras::skills::usage::SkillState::Stale => "stale",
-            crate::extras::skills::usage::SkillState::Archived => "archived",
-        };
         let _ = writeln!(
             out,
-            "  - {name}  state={state}  pinned={}  use={}  view={}  patches={}  last_activity={activity}",
-            if u.pinned { "yes" } else { "no" },
-            u.use_count,
-            u.view_count,
-            u.patch_count,
+            "  - {name}  salience={sal:.2}  pinned={pin}  use={use_}  view={view}  patches={patch}  success={ok}  fail={bad}  last_activity={activity}",
+            name = r.name,
+            sal = r.effective_salience_now(),
+            pin = if r.pinned { "yes" } else { "no" },
+            use_ = r.use_count,
+            view = r.view_count,
+            patch = r.patch_count,
+            ok = r.success_count,
+            bad = r.failure_count,
         );
     }
     out
@@ -507,18 +482,9 @@ pub fn write_curator_report(
 
 // ── Helpers ───────────────────────────────────────────
 
+#[cfg(test)]
 fn now_secs() -> u64 {
     crate::time_util::now_unix_secs()
-}
-
-/// Fallback: compute file modification age in seconds.
-fn file_mod_age(path: &std::path::Path, now: u64) -> u64 {
-    std::fs::metadata(path)
-        .ok()
-        .and_then(|meta| meta.modified().ok())
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| now.saturating_sub(d.as_secs()))
-        .unwrap_or(now)
 }
 
 #[cfg(test)]
@@ -691,7 +657,7 @@ mod tests {
     #[test]
     fn render_candidate_list_empty_when_no_agent_skills() {
         let (paths, _dir) = temp_project();
-        let store = crate::extras::skills::usage::UsageStore::load(&paths).unwrap();
+        let store = crate::extras::skill_db::SkillStore::load(&paths).unwrap();
         let text = render_candidate_list(&store);
         assert!(
             text.contains("No agent-created skills"),
@@ -702,11 +668,12 @@ mod tests {
     #[test]
     fn render_candidate_list_lists_agent_created_only() {
         let (paths, _dir) = temp_project();
-        let mut store = crate::extras::skills::usage::UsageStore::load(&paths).unwrap();
+        let store = crate::extras::skill_db::SkillStore::load(&paths).unwrap();
         store.record_create("agent-a", "agent");
         store.record_create("agent-b", "agent");
-        // Bundled skill: no `created_by="agent"` flag.
-        store.record_view("bundled-x"); // creates entry with no created_by
+        // Bundled skill: no agent provenance (record_view alone leaves
+        // source='file').
+        store.record_view("bundled-x");
 
         let text = render_candidate_list(&store);
         assert!(text.contains("agent-a"), "agent-a should appear: {text}");
@@ -723,6 +690,7 @@ mod tests {
             text.contains("last_activity="),
             "missing last_activity column"
         );
+        assert!(text.contains("salience="), "missing salience column");
     }
 
     // ── dirge-3m4h: curator REPORT.md ─────────────────────
@@ -845,7 +813,7 @@ mod tests {
     #[test]
     fn render_candidate_list_flags_pinned() {
         let (paths, _dir) = temp_project();
-        let mut store = crate::extras::skills::usage::UsageStore::load(&paths).unwrap();
+        let store = crate::extras::skill_db::SkillStore::load(&paths).unwrap();
         store.record_create("pinned-skill", "agent");
         store.set_pinned("pinned-skill", true).unwrap();
 
@@ -854,5 +822,33 @@ mod tests {
             text.contains("pinned=yes"),
             "pinned skills must be flagged so the LLM can skip them: {text}"
         );
+    }
+
+    #[test]
+    fn salience_driven_archival_removes_fully_decayed_agent_skills() {
+        let (paths, dir) = temp_project();
+        create_skill_dir(&paths, "dead");
+        create_skill_dir(&paths, "kept");
+        create_skill_dir(&paths, "bundled");
+        {
+            let store = crate::extras::skill_db::SkillStore::load(&paths).unwrap();
+            // Two agent-created skills + one bundled (file) skill.
+            store.record_create("dead", "agent");
+            store.record_create("kept", "agent");
+            store.record_view("bundled"); // stays source='file'
+            // Simulate long disuse on "dead"; keep "kept" above threshold.
+            store.set_salience_for_test("dead", 0.12);
+            store.set_salience_for_test("kept", 0.6);
+        }
+        let mut curator = Curator::new(&paths).unwrap();
+        let archived = curator.apply_automatic_transitions().unwrap();
+        assert!(archived.contains(&"dead".to_string()), "dead should archive: {archived:?}");
+        assert!(!archived.contains(&"kept".to_string()), "kept survives");
+        assert!(!archived.contains(&"bundled".to_string()), "bundled is not curator-managed");
+        // The dead skill's directory moved to .archive/.
+        assert!(!paths.skills_dir().join("dead").is_dir());
+        assert!(paths.skills_dir().join(".archive").join("dead").is_dir());
+        assert!(paths.skills_dir().join("kept").is_dir());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

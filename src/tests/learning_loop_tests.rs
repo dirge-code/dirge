@@ -16,7 +16,6 @@ use crate::extras::session_search::SessionSearch;
 use crate::extras::skills::curator::Curator;
 use crate::extras::skills::guard;
 use crate::extras::skills::manager::SkillManager;
-use crate::extras::skills::usage::UsageStore;
 
 // ── Helpers ──────────────────────────────────────────────
 
@@ -322,8 +321,9 @@ fn skill_guard_blocks_whitespace_evasion() {
 
 #[test]
 fn usage_tracking_full_lifecycle() {
+    use crate::extras::skill_db::SkillStore;
     let (paths, _dir) = temp_project();
-    let mut store = UsageStore::load(&paths).unwrap();
+    let store = SkillStore::load(&paths).unwrap();
 
     // Create with agent provenance.
     store.record_create("my-skill", "agent");
@@ -333,39 +333,37 @@ fn usage_tracking_full_lifecycle() {
     // Record use bumps counters.
     store.record_use("my-skill");
     store.record_use("my-skill");
-    assert_eq!(store.get("my-skill").unwrap().use_count, 2);
+    assert_eq!(store.get("my-skill").unwrap().unwrap().use_count, 2);
 
     // Record view.
     store.record_view("my-skill");
-    assert_eq!(store.get("my-skill").unwrap().view_count, 1);
+    assert_eq!(store.get("my-skill").unwrap().unwrap().view_count, 1);
 
     // Record patch.
     store.record_patch("my-skill");
-    assert_eq!(store.get("my-skill").unwrap().patch_count, 1);
-
-    // Activity age should be recent.
-    let age = store.activity_age_seconds("my-skill");
-    assert!(age.is_some());
-    assert!(age.unwrap() < 5, "activity should be recent");
+    assert_eq!(store.get("my-skill").unwrap().unwrap().patch_count, 1);
 
     // Pinned support.
     store.set_pinned("my-skill", true).unwrap();
-    assert!(store.get("my-skill").unwrap().pinned);
+    assert!(store.get("my-skill").unwrap().unwrap().pinned);
 
-    // Round-trip through disk.
+    // Round-trip through the shared session DB.
     drop(store);
-    let store2 = UsageStore::load(&paths).unwrap();
-    assert_eq!(store2.get("my-skill").unwrap().use_count, 2);
-    assert_eq!(store2.get("my-skill").unwrap().patch_count, 1);
-    assert!(store2.get("my-skill").unwrap().pinned);
+    let store2 = SkillStore::load(&paths).unwrap();
+    let row = store2.get("my-skill").unwrap().unwrap();
+    assert_eq!(row.use_count, 2);
+    assert_eq!(row.patch_count, 1);
+    assert!(row.pinned);
 }
 
 #[test]
-fn usage_null_created_by_is_not_agent_created() {
+fn usage_unregistered_skill_is_not_agent_created() {
+    use crate::extras::skill_db::SkillStore;
     let (paths, _dir) = temp_project();
-    let mut store = UsageStore::load(&paths).unwrap();
+    let store = SkillStore::load(&paths).unwrap();
 
-    // Skills loaded via record_use without record_create get None created_by.
+    // A skill first seen via record_use (no record_create) stays a
+    // 'file' skill — not agent-created.
     store.record_use("unknown-origin");
     assert!(!store.is_agent_created("unknown-origin"));
 }
