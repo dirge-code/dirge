@@ -483,6 +483,268 @@ fn strip_field_label(s: &str) -> String {
     s.to_string()
 }
 
+// ── Run-diff capture (R2) ─────────────────────────────────────────────
+
+use std::path::Path;
+use std::process::Command;
+
+/// Upper bound on the diff fed to the reviewer, so a large refactor can't
+/// balloon the judge call. Generous — the material that matters (the
+/// changed hunks) usually fits — but bounded, with a truncation note so
+/// the model knows more was elided. Kept beside the critic's own
+/// `MAX_RULES_CHARS` sizing philosophy.
+const MAX_DIFF_BYTES: usize = 64_000;
+
+/// Capture the run's uncommitted changes as a single unified diff, ready
+/// for the reviewer: tracked edits (`git diff HEAD`) plus any new
+/// untracked files, exclude-filtered and size-capped. Returns `None` when
+/// there is nothing to review (clean tree, not a git repo, or git absent)
+/// — the gate treats `None` as "no diff, skip".
+///
+/// Thin git glue on purpose: the formatting/filtering/capping below is
+/// pure and unit-tested; this function is the one impure seam.
+pub fn capture_run_diff(repo: &Path) -> Option<String> {
+    let raw = raw_uncommitted_diff(repo);
+    let formatted = format_run_diff(&raw);
+    if formatted.trim().is_empty() {
+        None
+    } else {
+        Some(formatted)
+    }
+}
+
+/// Combine tracked and untracked changes into one raw diff string.
+/// Tracked: `git diff HEAD` (staged + unstaged vs the last commit),
+/// falling back to `git diff` + `git diff --cached` when there is no HEAD
+/// yet (a repo with no commits). Untracked: each `--others` file rendered
+/// as an addition via `git diff --no-index`.
+fn raw_uncommitted_diff(repo: &Path) -> String {
+    let mut out = String::new();
+
+    // `--no-ext-diff --no-color` force canonical unified output regardless
+    // of the user's git config — many devs set `diff.external` (e.g.
+    // difftastic), whose output is not a parseable unified diff.
+    match git_out(repo, &["diff", "--no-ext-diff", "--no-color", "HEAD"]) {
+        Some(d) if !d.trim().is_empty() => out.push_str(&d),
+        Some(_) => {}
+        // No HEAD (no commits yet) — union of unstaged and staged.
+        None => {
+            for args in [
+                &["diff", "--no-ext-diff", "--no-color"][..],
+                &["diff", "--no-ext-diff", "--no-color", "--cached"][..],
+            ] {
+                if let Some(d) = git_out(repo, args)
+                    && !d.trim().is_empty()
+                {
+                    out.push_str(&d);
+                }
+            }
+        }
+    }
+
+    // Untracked files: render each as an addition diff. `--no-index`
+    // exits non-zero when files differ (the normal case), so its stdout
+    // is captured regardless of exit status.
+    if let Some(list) = git_out(repo, &["ls-files", "--others", "--exclude-standard"]) {
+        for path in list.lines().filter(|l| !l.trim().is_empty()) {
+            if should_exclude(path) {
+                continue;
+            }
+            if let Some(d) = git_stdout_allow_fail(
+                repo,
+                &["diff", "--no-ext-diff", "--no-color", "--no-index", "--", "/dev/null", path],
+            )
+                && !d.trim().is_empty()
+            {
+                if !out.is_empty() && !out.ends_with('\n') {
+                    out.push('\n');
+                }
+                out.push_str(&d);
+            }
+        }
+    }
+
+    out
+}
+
+/// Run git in `repo`, returning trimmed-nonempty stdout only on success.
+/// `None` on non-zero exit or spawn failure (git missing / not a repo).
+fn git_out(repo: &Path, args: &[&str]) -> Option<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+/// Like [`git_out`] but returns stdout even on a non-zero exit — for
+/// `git diff --no-index`, which signals "files differ" with exit 1.
+fn git_stdout_allow_fail(repo: &Path, args: &[&str]) -> Option<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .ok()?;
+    let s = String::from_utf8_lossy(&out.stdout).to_string();
+    if s.trim().is_empty() { None } else { Some(s) }
+}
+
+/// Filter excluded files out of a raw diff, then size-cap it. Pure.
+fn format_run_diff(raw: &str) -> String {
+    cap_diff(&filter_diff_excludes(raw), MAX_DIFF_BYTES)
+}
+
+/// Drop per-file sections whose path is noise (lockfiles, generated
+/// output, vendored/build trees). Splits the diff on `diff --git`
+/// boundaries and keeps only sections whose path survives
+/// [`should_exclude`].
+fn filter_diff_excludes(diff: &str) -> String {
+    let sections = split_diff_sections(diff);
+    if sections.is_empty() {
+        return String::new();
+    }
+    let mut kept: Vec<String> = Vec::new();
+    for section in sections {
+        match section_path(&section) {
+            Some(path) if should_exclude(&path) => {}
+            _ => kept.push(section),
+        }
+    }
+    kept.join("\n")
+}
+
+/// Split a unified diff into per-file sections, each starting at a
+/// `diff --git ` line. Any preamble before the first such line is dropped
+/// (git diffs don't have one, but a `--no-index` concat might).
+fn split_diff_sections(diff: &str) -> Vec<String> {
+    let mut sections: Vec<String> = Vec::new();
+    let mut current: Option<String> = None;
+    for line in diff.lines() {
+        if line.starts_with("diff --git ") {
+            if let Some(sec) = current.take() {
+                sections.push(sec.trim_end().to_string());
+            }
+            current = Some(format!("{line}\n"));
+        } else if let Some(cur) = current.as_mut() {
+            cur.push_str(line);
+            cur.push('\n');
+        }
+    }
+    if let Some(sec) = current {
+        sections.push(sec.trim_end().to_string());
+    }
+    sections
+}
+
+/// Extract the file path a diff section applies to. Prefers the new-side
+/// (`+++ b/…`) path; falls back to the old-side (`--- a/…`) when the new
+/// side is `/dev/null` (a deletion), then to the `diff --git` header.
+fn section_path(section: &str) -> Option<String> {
+    let mut header_path: Option<String> = None;
+    let mut old_path: Option<String> = None;
+    for line in section.lines() {
+        if let Some(rest) = line.strip_prefix("+++ ") {
+            let p = strip_diff_path_prefix(rest.trim());
+            if p != "/dev/null" && !p.is_empty() {
+                return Some(p);
+            }
+        } else if let Some(rest) = line.strip_prefix("--- ") {
+            let p = strip_diff_path_prefix(rest.trim());
+            if p != "/dev/null" && !p.is_empty() {
+                old_path = Some(p);
+            }
+        } else if let Some(rest) = line.strip_prefix("diff --git ")
+            && header_path.is_none()
+        {
+            // "a/x b/y" — take the b-side token.
+            header_path = rest
+                .split_whitespace()
+                .next_back()
+                .map(strip_diff_path_prefix);
+        }
+    }
+    old_path.or(header_path)
+}
+
+/// Strip a leading `a/` or `b/` (git diff path prefix) and any trailing
+/// tab-quoted metadata. `/dev/null` passes through unchanged.
+fn strip_diff_path_prefix(p: &str) -> String {
+    let p = p.split('\t').next().unwrap_or(p);
+    p.strip_prefix("a/")
+        .or_else(|| p.strip_prefix("b/"))
+        .unwrap_or(p)
+        .to_string()
+}
+
+/// True when a path is review noise: dependency lockfiles, minified /
+/// generated output, and vendored/build directories. Excluding these
+/// keeps the reviewer focused on human-authored change and out of
+/// machine-generated churn (roborev applies the same idea via its
+/// configurable exclude patterns).
+fn should_exclude(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    let name = lower.rsplit('/').next().unwrap_or(&lower);
+
+    const LOCKFILES: [&str; 10] = [
+        "cargo.lock",
+        "package-lock.json",
+        "yarn.lock",
+        "pnpm-lock.yaml",
+        "poetry.lock",
+        "gemfile.lock",
+        "composer.lock",
+        "go.sum",
+        "flake.lock",
+        "uv.lock",
+    ];
+    if LOCKFILES.contains(&name) {
+        return true;
+    }
+
+    const SUFFIXES: [&str; 4] = [".min.js", ".min.css", ".map", ".snap"];
+    if SUFFIXES.iter().any(|s| lower.ends_with(s)) {
+        return true;
+    }
+
+    const DIR_MARKERS: [&str; 6] = [
+        "node_modules/",
+        "/target/",
+        "/dist/",
+        "/build/",
+        "/vendor/",
+        "/.git/",
+    ];
+    DIR_MARKERS.iter().any(|d| lower.contains(d))
+        || lower.starts_with("target/")
+        || lower.starts_with("dist/")
+        || lower.starts_with("vendor/")
+}
+
+/// Truncate a diff to `max` bytes on a char boundary, appending a note so
+/// the reviewer knows the tail was elided. Returns the input untouched
+/// when it already fits.
+fn cap_diff(diff: &str, max: usize) -> String {
+    if diff.len() <= max {
+        return diff.to_string();
+    }
+    let mut end = max;
+    while end > 0 && !diff.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}\n… (diff truncated — {} of {} bytes shown)",
+        &diff[..end],
+        end,
+        diff.len()
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -691,5 +953,168 @@ No issues found.";
         assert_eq!(strip_field_label("findings: no issues found."), "no issues found.");
         assert_eq!(strip_field_label("verdict: fail"), "fail");
         assert_eq!(strip_field_label("something else"), "something else");
+    }
+
+    // ── Run-diff capture (R2) ─────────────────────────────────────
+
+    #[test]
+    fn should_exclude_lockfiles_and_generated() {
+        for p in [
+            "Cargo.lock",
+            "web/package-lock.json",
+            "yarn.lock",
+            "go.sum",
+            "app/bundle.min.js",
+            "styles.min.css",
+            "out.js.map",
+            "node_modules/foo/index.js",
+            "target/debug/build.rs",
+            "vendor/lib/x.go",
+        ] {
+            assert!(should_exclude(p), "should exclude {p}");
+        }
+    }
+
+    #[test]
+    fn should_not_exclude_source_files() {
+        for p in ["src/main.rs", "lib/auth.ts", "cmd/app/main.go", "pkg/util.py"] {
+            assert!(!should_exclude(p), "should keep {p}");
+        }
+    }
+
+    #[test]
+    fn split_and_path_extraction() {
+        let diff = "\
+diff --git a/src/a.rs b/src/a.rs\n\
+index 111..222 100644\n\
+--- a/src/a.rs\n\
++++ b/src/a.rs\n\
+@@ -1 +1 @@\n\
+-old\n\
++new\n\
+diff --git a/Cargo.lock b/Cargo.lock\n\
+--- a/Cargo.lock\n\
++++ b/Cargo.lock\n\
+@@ -1 +1 @@\n\
+-x\n\
++y\n";
+        let sections = split_diff_sections(diff);
+        assert_eq!(sections.len(), 2);
+        assert_eq!(section_path(&sections[0]).as_deref(), Some("src/a.rs"));
+        assert_eq!(section_path(&sections[1]).as_deref(), Some("Cargo.lock"));
+    }
+
+    #[test]
+    fn section_path_handles_deletion_dev_null() {
+        let section = "\
+diff --git a/old.rs b/old.rs\n\
+deleted file mode 100644\n\
+--- a/old.rs\n\
++++ /dev/null\n";
+        assert_eq!(section_path(section).as_deref(), Some("old.rs"));
+    }
+
+    #[test]
+    fn filter_diff_excludes_drops_lockfile_keeps_source() {
+        let diff = "\
+diff --git a/src/a.rs b/src/a.rs\n\
+--- a/src/a.rs\n\
++++ b/src/a.rs\n\
+@@ -1 +1 @@\n\
+-old\n\
++new\n\
+diff --git a/Cargo.lock b/Cargo.lock\n\
+--- a/Cargo.lock\n\
++++ b/Cargo.lock\n\
+@@ -1 +1 @@\n\
+-x\n\
++y\n";
+        let filtered = filter_diff_excludes(diff);
+        assert!(filtered.contains("src/a.rs"), "source kept");
+        assert!(!filtered.contains("Cargo.lock"), "lockfile dropped");
+    }
+
+    #[test]
+    fn cap_diff_truncates_with_note_on_char_boundary() {
+        // Multibyte content to exercise the char-boundary walk-back.
+        let big = "é".repeat(1000); // 2 bytes each → 2000 bytes
+        let capped = cap_diff(&big, 101);
+        assert!(capped.contains("diff truncated"));
+        assert!(capped.contains("of 2000 bytes"));
+        // Must not have split a multibyte char (would panic on slice).
+        assert!(capped.starts_with('é'));
+    }
+
+    #[test]
+    fn cap_diff_leaves_small_input_untouched() {
+        assert_eq!(cap_diff("small", 100), "small");
+    }
+
+    // Git-backed integration: exercises the one impure seam.
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let mut full = vec![
+            "-c",
+            "user.email=test@dirge",
+            "-c",
+            "user.name=dirge",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "init.defaultBranch=main",
+        ];
+        full.extend_from_slice(args);
+        let out = Command::new("git")
+            .current_dir(dir)
+            .arg("-C")
+            .arg(dir)
+            .args(&full)
+            .output()
+            .expect("git runs");
+        String::from_utf8_lossy(&out.stdout).to_string()
+    }
+
+    fn temp_repo() -> std::path::PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("dirge-codereview-diff-{}-{}", std::process::id(), n));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        git(&root, &["init"]);
+        root
+    }
+
+    #[test]
+    fn capture_run_diff_is_none_on_clean_tree() {
+        let repo = temp_repo();
+        std::fs::write(repo.join("a.rs"), "fn main() {}\n").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-m", "base"]);
+        assert!(
+            capture_run_diff(&repo).is_none(),
+            "clean tree yields no diff"
+        );
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn capture_run_diff_includes_edits_and_untracked_excludes_lockfiles() {
+        let repo = temp_repo();
+        std::fs::write(repo.join("a.rs"), "fn main() {}\n").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-m", "base"]);
+
+        // A tracked edit, a new untracked source file, and a noisy lockfile.
+        std::fs::write(repo.join("a.rs"), "fn main() { let x = 1; }\n").unwrap();
+        std::fs::write(repo.join("b.rs"), "pub fn helper() {}\n").unwrap();
+        std::fs::write(repo.join("Cargo.lock"), "# lockfile churn\n").unwrap();
+
+        let diff = capture_run_diff(&repo).expect("dirty tree yields a diff");
+        assert!(diff.contains("a.rs"), "tracked edit present");
+        assert!(diff.contains("let x = 1"), "tracked edit body present");
+        assert!(diff.contains("b.rs"), "untracked new file present");
+        assert!(diff.contains("helper"), "untracked file body present");
+        assert!(!diff.contains("Cargo.lock"), "lockfile excluded");
+        let _ = std::fs::remove_dir_all(&repo);
     }
 }
