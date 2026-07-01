@@ -25,6 +25,7 @@ pub(crate) mod graph;
 pub(crate) mod help;
 pub(crate) mod issues;
 pub(crate) mod kill;
+pub(crate) mod learn;
 #[cfg(feature = "mcp")]
 pub(crate) mod mcp;
 pub(crate) mod memory;

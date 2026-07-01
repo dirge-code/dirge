@@ -11,6 +11,12 @@
 //! - All counter bumps are best-effort — failures never break the
 //!   underlying tool call
 //! - Provenance filter: only agent-created skills are curator-managed
+//!
+// The write path (record_create/use/view/patch) moved to the sqlite
+// salience store (dirge-a47a); the curator still reads this sidecar until
+// its salience cutover (dirge-izju) retires the whole module. Allow the
+// now-callerless writers in the interim.
+#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

@@ -4,6 +4,7 @@ pub mod builder;
 mod compaction_recall;
 pub mod compression;
 pub mod exemplars;
+pub mod learn;
 pub mod model_family;
 pub mod plan;
 pub mod post_session;
