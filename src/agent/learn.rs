@@ -77,9 +77,77 @@ Do this:
     )
 }
 
+/// Extract the command(s) under a SKILL.md's `## Verification` section
+/// (dirge-pb1p) — the single check that proves the skill works. Returns
+/// the section's non-empty body with fenced-code markers stripped, or
+/// `None` if there's no such section. Used to gate skill creation on a
+/// verification step and, later, to re-run it for effectiveness tracking.
+pub fn parse_verification(body: &str) -> Option<String> {
+    let mut lines = body.lines();
+    // Find the "## Verification" heading (case-insensitive, any depth ≥2).
+    for line in lines.by_ref() {
+        let h = line.trim_start_matches('#').trim();
+        if line.trim_start().starts_with("##") && h.eq_ignore_ascii_case("Verification") {
+            break;
+        }
+    }
+    let mut collected = Vec::new();
+    for line in lines {
+        // Stop at the next heading.
+        if line.trim_start().starts_with('#') {
+            break;
+        }
+        let t = line.trim();
+        // Drop code-fence markers; keep their contents.
+        if t.starts_with("```") {
+            continue;
+        }
+        if !t.is_empty() {
+            collected.push(t.to_string());
+        }
+    }
+    let joined = collected.join("\n");
+    if joined.trim().is_empty() {
+        None
+    } else {
+        Some(joined)
+    }
+}
+
+/// True if a SKILL.md body carries a non-empty `## Verification` section.
+/// The create-time gate (dirge-pb1p) requires this so every learned skill
+/// ships with a way to prove it still works.
+pub fn has_verification(body: &str) -> bool {
+    parse_verification(body).is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_verification_extracts_the_command() {
+        let body = "# Title\n\n## Procedure\n1. do a thing\n\n## Verification\n\
+                    ```\ncargo test --lib foo\n```\n";
+        assert_eq!(
+            parse_verification(body).as_deref(),
+            Some("cargo test --lib foo")
+        );
+        assert!(has_verification(body));
+    }
+
+    #[test]
+    fn parse_verification_absent_or_empty_is_none() {
+        assert!(parse_verification("# Title\n\n## Procedure\nstep\n").is_none());
+        assert!(parse_verification("## Verification\n\n## Next\nx").is_none());
+        assert!(!has_verification("no sections here"));
+    }
+
+    #[test]
+    fn parse_verification_stops_at_next_heading() {
+        let body = "## Verification\nrun the check\n## Pitfalls\nignore this";
+        assert_eq!(parse_verification(body).as_deref(), Some("run the check"));
+    }
 
     #[test]
     fn embeds_the_request_verbatim() {

