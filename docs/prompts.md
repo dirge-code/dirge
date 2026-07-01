@@ -54,9 +54,11 @@ the qualified form.
 Two optional keys steer the F6 in-loop critic (see [`config.md`](config.md),
 `critic_provider`) **per prompt**, without touching config:
 
-- `critic: false` — suppress the critic for this prompt only. The **goal
-  gate** (`--goal`) is unaffected: it has its own judge under its own fixed
-  preamble. `critic: true`, or omitting the key, inherits the global
+- `critic: false` — suppress the critic **and the diff-aware code reviewer**
+  for this prompt only (both share the `critic_provider` judge, so the flag
+  gates both; read-only/exploratory modes leave no diff to review anyway). The
+  **goal gate** (`--goal`) is unaffected: it has its own judge under its own
+  fixed preamble. `critic: true`, or omitting the key, inherits the global
   behavior.
 - `critic_preamble:` — override the critic's system preamble for this
   prompt. Wins over `critic_preamble` in config and the built-in. Inline
