@@ -409,7 +409,8 @@ mod tests {
         let tool = SkillTool::new(skills, mgr, None, None, None);
         let rt = make_runtime();
 
-        let content = "---\nname: dup\ndescription: D\n---\n\nbody\n\n## Verification\n\nrun the check\n";
+        let content =
+            "---\nname: dup\ndescription: D\n---\n\nbody\n\n## Verification\n\nrun the check\n";
         rt.block_on(tool.call(SkillArgs {
             action: "create".into(),
             name: Some("dup".into()),

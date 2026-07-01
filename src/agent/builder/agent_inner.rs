@@ -229,12 +229,7 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
                     .enumerate()
                     .map(|(i, r)| (r.name.as_str(), i))
                     .collect();
-                skills.sort_by_key(|s| {
-                    order
-                        .get(s.name.as_str())
-                        .copied()
-                        .unwrap_or(usize::MAX)
-                });
+                skills.sort_by_key(|s| order.get(s.name.as_str()).copied().unwrap_or(usize::MAX));
             }
         }
         preamble.push_str(PROJECT_SKILLS_PREAMBLE);

@@ -842,9 +842,15 @@ mod tests {
         }
         let mut curator = Curator::new(&paths).unwrap();
         let archived = curator.apply_automatic_transitions().unwrap();
-        assert!(archived.contains(&"dead".to_string()), "dead should archive: {archived:?}");
+        assert!(
+            archived.contains(&"dead".to_string()),
+            "dead should archive: {archived:?}"
+        );
         assert!(!archived.contains(&"kept".to_string()), "kept survives");
-        assert!(!archived.contains(&"bundled".to_string()), "bundled is not curator-managed");
+        assert!(
+            !archived.contains(&"bundled".to_string()),
+            "bundled is not curator-managed"
+        );
         // The dead skill's directory moved to .archive/.
         assert!(!paths.skills_dir().join("dead").is_dir());
         assert!(paths.skills_dir().join(".archive").join("dead").is_dir());

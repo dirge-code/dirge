@@ -740,7 +740,10 @@ fn slash_commands() -> Vec<(&'static str, &'static str)> {
         ("/help", "show this help"),
         ("/issues", "view the native issue board"),
         ("/kill", "kill a running subagent"),
-        ("/learn", "distill sources or this session into a reusable skill"),
+        (
+            "/learn",
+            "distill sources or this session into a reusable skill",
+        ),
         ("/memory", "reload the memory snapshot mid-session"),
         ("/mode", "view or set the permission/security mode"),
         ("/model", "list configured models, or switch to one"),

@@ -17,10 +17,12 @@
 //! separates agent-`learned` skills (DB-resident, subject to curation)
 //! from `file`-registered ones (dirge-izju; git-tracked, pinned exempt).
 //!
-// The telemetry + ranking APIs are wired into the skill tool and
-// preamble (dirge-a47a); the search/outcome/decay/archive APIs get their
-// callers with `/learn` (dirge-s99m) and the salience curator
-// (dirge-izju). Remove this allow when the curator round lands.
+// The store exposes a complete CRUD + ranking surface. The telemetry,
+// ranking, decay, and archive APIs are wired (skill tool, preamble,
+// curator); the DB-resident `create`/`invoke`/`search`/`set_pinned`
+// paths are validated by tests and stand ready for their UI callers (a
+// skill-search action, a pin command) rather than being wired
+// speculatively. Allow the still-unwired-but-tested surface.
 #![allow(dead_code)]
 
 use std::sync::Mutex;
@@ -440,9 +442,11 @@ impl SkillStore {
             .map_err(|e| format!("Failed to register skill: {e}"))?;
         }
         let rowid: i64 = conn
-            .query_row("SELECT id FROM skills WHERE name = ?1", params![name], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT id FROM skills WHERE name = ?1",
+                params![name],
+                |r| r.get(0),
+            )
             .map_err(|e| format!("Failed to read skill id: {e}"))?;
         conn.execute("DELETE FROM skills_fts WHERE rowid = ?1", params![rowid])
             .map_err(|e| format!("Failed to reindex skill: {e}"))?;
@@ -517,8 +521,7 @@ impl SkillStore {
         if changed == 0 {
             return Err(format!("No active skill named '{name}'"));
         }
-        Self::get_locked(&conn, name)?
-            .ok_or_else(|| format!("No active skill named '{name}'"))
+        Self::get_locked(&conn, name)?.ok_or_else(|| format!("No active skill named '{name}'"))
     }
 
     /// Record a confirmed outcome for a skill (dirge-ygm3's review pass
@@ -547,8 +550,7 @@ impl SkillStore {
         if changed == 0 {
             return Err(format!("No active skill named '{name}'"));
         }
-        Self::get_locked(&conn, name)?
-            .ok_or_else(|| format!("No active skill named '{name}'"))
+        Self::get_locked(&conn, name)?.ok_or_else(|| format!("No active skill named '{name}'"))
     }
 
     /// Full-text search over active skills, BM25-ranked. Ties break by
@@ -606,8 +608,9 @@ impl SkillStore {
         .map_err(|e| format!("Failed to apply skill disuse decay: {e}"))
     }
 
-    /// Set a skill's raw salience directly. Test/curator seam for
-    /// simulating a decayed skill without waiting out the decay window.
+    /// Set a skill's raw salience directly. Test seam for simulating a
+    /// decayed skill without waiting out the decay window.
+    #[cfg(test)]
     pub fn set_salience_for_test(&self, name: &str, salience: f64) {
         let conn = self.conn.lock().unwrap();
         let _ = conn.execute(
@@ -789,8 +792,13 @@ mod tests {
         assert_eq!(hits[0].name, "linter");
         // Re-register refreshes content without losing usage lineage.
         s.record_use("linter");
-        s.register_file_skill("linter", "Run the linter.", "Now uses cargo fmt too.", false)
-            .expect("re-register");
+        s.register_file_skill(
+            "linter",
+            "Run the linter.",
+            "Now uses cargo fmt too.",
+            false,
+        )
+        .expect("re-register");
         let row = s.get("linter").unwrap().unwrap();
         assert_eq!(row.use_count, 1, "usage lineage preserved across refresh");
         assert!(s.search("fmt").expect("search").len() == 1);
@@ -885,10 +893,22 @@ mod tests {
     #[test]
     fn search_orders_effective_first() {
         let s = store();
-        s.create("plain", "handles widgets", "widget body", SkillSource::Learned, None)
-            .expect("plain");
-        s.create("proven", "handles widgets", "widget body", SkillSource::Learned, None)
-            .expect("proven");
+        s.create(
+            "plain",
+            "handles widgets",
+            "widget body",
+            SkillSource::Learned,
+            None,
+        )
+        .expect("plain");
+        s.create(
+            "proven",
+            "handles widgets",
+            "widget body",
+            SkillSource::Learned,
+            None,
+        )
+        .expect("proven");
         for _ in 0..3 {
             s.record_outcome("proven", true).expect("ok");
         }
@@ -928,15 +948,15 @@ mod tests {
         // Both backdated; proven has a fresh success, pinned is user-pinned.
         {
             let conn = s.conn.lock().unwrap();
-            conn.execute(
-                "UPDATE skills SET created_at = '2000-01-01T00:00:00Z'",
-                [],
-            )
-            .unwrap();
+            conn.execute("UPDATE skills SET created_at = '2000-01-01T00:00:00Z'", [])
+                .unwrap();
         }
         s.record_outcome("proven", true).expect("recent success");
         let changed = s.apply_disuse_decay(14).expect("decay");
-        assert_eq!(changed, 0, "recently-successful and pinned skills are exempt");
+        assert_eq!(
+            changed, 0,
+            "recently-successful and pinned skills are exempt"
+        );
     }
 
     #[test]
