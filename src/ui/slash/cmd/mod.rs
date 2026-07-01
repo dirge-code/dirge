@@ -19,6 +19,7 @@ pub(crate) mod btw;
 pub(crate) mod cache;
 pub(crate) mod cd;
 pub(crate) mod clear;
+pub(crate) mod code_review;
 pub(crate) mod clone;
 pub(crate) mod fork;
 pub(crate) mod graph;

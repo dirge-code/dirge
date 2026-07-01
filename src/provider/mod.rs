@@ -281,6 +281,13 @@ impl AnyAgent {
         self.memory_provider.as_ref()
     }
 
+    /// The diff-aware code reviewer judge (dirge-iyf5), if a
+    /// `critic_provider` was configured. Used by the `/code-review` slash
+    /// command to run an on-demand review; `None` = reviewer not wired.
+    pub fn code_review_fn(&self) -> Option<&crate::agent::agent_loop::critic::CriticFn> {
+        self.code_review_fn.as_ref()
+    }
+
     /// dirge-9tfq: install the per-session background-task store so
     /// `spawn_runner` can wire the subagent-completion follow-up
     /// hook into the agent loop. Called by `build_agent` whenever a

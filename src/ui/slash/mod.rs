@@ -606,6 +606,7 @@ pub async fn handle_slash(
         "/display" => cmd::panel::cmd_display(&mut ctx, &parts).await?,
         "/btw" => cmd::btw::cmd_btw(&mut ctx, &parts).await?,
         "/learn" => cmd::learn::cmd_learn(&mut ctx, &parts).await?,
+        "/code-review" => cmd::code_review::cmd_code_review(&mut ctx).await?,
         "/cd" => cmd::cd::cmd_cd(&mut ctx, text).await?,
         "/undo" => cmd::undo::cmd_undo(&mut ctx).await?,
         "/retry" => cmd::retry::cmd_retry(&mut ctx).await?,
@@ -740,6 +741,10 @@ fn slash_commands() -> Vec<(&'static str, &'static str)> {
         ("/help", "show this help"),
         ("/issues", "view the native issue board"),
         ("/kill", "kill a running subagent"),
+        (
+            "/code-review",
+            "review the working-tree diff for issues (needs critic_provider)",
+        ),
         (
             "/learn",
             "distill sources or this session into a reusable skill",
