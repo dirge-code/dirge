@@ -933,23 +933,46 @@ fn dedupe_findings(findings: Vec<Finding>) -> Vec<Finding> {
     out
 }
 
-/// Render findings as a `[code-review]` follow-up the agent re-enters and
-/// acts on. `None` when there are no findings (clean review → finalize).
-///
-/// R3 surfaces every finding; R5 splits this into a blocking high/critical
-/// channel and an advisory medium/low one.
-pub fn findings_followup(findings: &[Finding]) -> Option<LoopMessage> {
-    if findings.is_empty() {
+/// Split findings into the blocking channel (`High`/`Critical` — the agent
+/// must fix or justify them before finalizing) and the advisory channel
+/// (`Medium`/`Low` — surfaced to the user, never blocks). This is the
+/// severity gate: it mirrors roborev's severity model, but where roborev
+/// only ranks a PR comment, dirge acts on the split — high/critical
+/// re-enter the loop, medium/low are FYI.
+pub fn partition_findings(findings: Vec<Finding>) -> (Vec<Finding>, Vec<Finding>) {
+    findings
+        .into_iter()
+        .partition(|f| matches!(f.severity, Severity::High | Severity::Critical))
+}
+
+/// Build the blocking `[code-review]` follow-up from high/critical
+/// findings — the agent re-enters and must fix each or justify why it
+/// doesn't apply. `None` when there is nothing blocking.
+pub fn blocking_followup(blocking: &[Finding]) -> Option<LoopMessage> {
+    if blocking.is_empty() {
         return None;
     }
-    let body = render_findings(findings);
+    let body = render_findings(blocking);
     Some(LoopMessage::User(UserMessage {
         content: format!(
-            "{CODE_REVIEW_TAG} A review of the diff you just made found these issues. Fix them, \
-             or explain why each doesn't apply (out of scope, intended, or something you were told \
-             not to do):\n{body}"
+            "{CODE_REVIEW_TAG} A review of the diff you just made found these high-severity \
+             issues. Fix each, or explain why it doesn't apply (out of scope, intended, or \
+             something you were told not to do):\n{body}"
         ),
     }))
+}
+
+/// Render the advisory (medium/low) findings as a non-blocking
+/// `SystemNotice` body. `None` when there is nothing to advise. The caller
+/// emits this to the user without re-entering the loop.
+pub fn advisory_notice(advisory: &[Finding]) -> Option<String> {
+    if advisory.is_empty() {
+        return None;
+    }
+    let body = render_findings(advisory);
+    Some(format!(
+        "{CODE_REVIEW_TAG} lower-severity notes on your changes (advisory — not blocking):\n{body}"
+    ))
 }
 
 /// Join finding bodies with the `---` separator, each led by its severity.
@@ -1395,32 +1418,50 @@ diff --git a/Cargo.lock b/Cargo.lock\n\
     }
 
     #[test]
-    fn findings_followup_none_when_clean() {
-        assert!(findings_followup(&[]).is_none());
+    fn partition_splits_blocking_from_advisory() {
+        let findings = vec![
+            Finding { severity: Severity::Critical, location: None, body: "Critical — x".into() },
+            Finding { severity: Severity::High, location: None, body: "High — y".into() },
+            Finding { severity: Severity::Medium, location: None, body: "Medium — z".into() },
+            Finding { severity: Severity::Low, location: None, body: "Low — w".into() },
+        ];
+        let (blocking, advisory) = partition_findings(findings);
+        assert_eq!(blocking.len(), 2, "critical + high block");
+        assert_eq!(advisory.len(), 2, "medium + low advise");
+        assert!(blocking.iter().all(|f| matches!(f.severity, Severity::High | Severity::Critical)));
+        assert!(advisory.iter().all(|f| matches!(f.severity, Severity::Medium | Severity::Low)));
     }
 
     #[test]
-    fn findings_followup_tags_and_lists() {
-        let findings = vec![
-            Finding {
-                severity: Severity::High,
-                location: Some("src/a.rs:1".into()),
-                body: "High — auth skipped".into(),
-            },
-            Finding {
-                severity: Severity::Low,
-                location: None,
-                body: "Low — nit".into(),
-            },
-        ];
-        let msg = findings_followup(&findings).expect("some");
+    fn blocking_followup_none_when_empty_and_tags_when_present() {
+        assert!(blocking_followup(&[]).is_none());
+        let blocking = vec![Finding {
+            severity: Severity::High,
+            location: Some("src/a.rs:1".into()),
+            body: "High — auth skipped".into(),
+        }];
+        let msg = blocking_followup(&blocking).expect("some");
         let content = match &msg {
             LoopMessage::User(u) => &u.content,
             _ => panic!("expected user message"),
         };
         assert!(content.starts_with(CODE_REVIEW_TAG));
         assert!(content.contains("auth skipped"));
-        assert!(content.contains("nit"));
+        assert!(content.to_lowercase().contains("fix each"));
+    }
+
+    #[test]
+    fn advisory_notice_none_when_empty_and_marks_non_blocking() {
+        assert!(advisory_notice(&[]).is_none());
+        let advisory = vec![Finding {
+            severity: Severity::Low,
+            location: None,
+            body: "Low — nit".into(),
+        }];
+        let text = advisory_notice(&advisory).expect("some");
+        assert!(text.starts_with(CODE_REVIEW_TAG));
+        assert!(text.contains("nit"));
+        assert!(text.to_lowercase().contains("advisory"));
     }
 
     // ── Two-pass verify/dedupe (R4) ───────────────────────────────

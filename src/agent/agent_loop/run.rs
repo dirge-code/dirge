@@ -200,6 +200,7 @@ fn todo_nudge_message(unfinished: usize) -> LoopMessage {
 /// verifier won't fire twice). This is the single authority for finalization
 /// precedence — previously four separate `if follow_up.is_empty()` blocks
 /// inline in the outer loop [dirge-vcsn].
+#[allow(clippy::too_many_arguments)]
 async fn poll_finalization_follow_up(
     config: &LoopConfig,
     system_prompt: &str,
@@ -208,6 +209,7 @@ async fn poll_finalization_follow_up(
     code_review_reacts: &mut u8,
     goal_reacts: &mut u8,
     todo_nudges: &mut u8,
+    emit: &mpsc::Sender<LoopEvent>,
 ) -> (Vec<LoopMessage>, FollowUpSource) {
     // 1. Caller hook (pi lines 256-262) — highest priority.
     if let Some(get) = &config.get_followup_messages {
@@ -272,9 +274,19 @@ async fn poll_finalization_follow_up(
             let findings =
                 super::code_review::run_code_review(review_fn, system_prompt, &diff, &transcript)
                     .await;
-            if let Some(msg) = super::code_review::findings_followup(&findings) {
+            if !findings.is_empty() {
+                // Count this engagement so a stubborn finding can't loop.
                 *code_review_reacts += 1;
-                return (vec![msg], FollowUpSource::CodeReview);
+                let (blocking, advisory) = super::code_review::partition_findings(findings);
+                // Medium/Low → surface as a non-blocking `<system>` notice.
+                if let Some(text) = super::code_review::advisory_notice(&advisory) {
+                    let _ = emit.send(LoopEvent::SystemNotice { content: text }).await;
+                }
+                // High/Critical → re-enter the loop; the agent must fix or
+                // justify. Advisory-only reviews fall through and finalize.
+                if let Some(msg) = super::code_review::blocking_followup(&blocking) {
+                    return (vec![msg], FollowUpSource::CodeReview);
+                }
             }
         }
     }
@@ -1879,6 +1891,7 @@ pub async fn run_loop(
             &mut code_review_reacts,
             &mut goal_reacts,
             &mut todo_nudges,
+            emit,
         )
         .await;
         if !follow_up.is_empty() {

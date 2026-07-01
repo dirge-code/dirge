@@ -140,9 +140,11 @@ pub fn format_time(rfc3339: &str) -> CompactString {
 /// Single source of truth for both the live view (`run_handlers::notices`) and
 /// scrollback (`render_session`) [dirge-i75f].
 pub(crate) fn finalization_nudge_body(content: &str) -> Option<&str> {
-    use crate::agent::agent_loop::{critic::CRITIC_TAG, run::TODO_NUDGE_TAG, verifier::VERIFY_TAG};
+    use crate::agent::agent_loop::{
+        code_review::CODE_REVIEW_TAG, critic::CRITIC_TAG, run::TODO_NUDGE_TAG, verifier::VERIFY_TAG,
+    };
     let trimmed = content.trim_start();
-    [CRITIC_TAG, VERIFY_TAG, TODO_NUDGE_TAG]
+    [CRITIC_TAG, VERIFY_TAG, TODO_NUDGE_TAG, CODE_REVIEW_TAG]
         .into_iter()
         .find_map(|tag| trimmed.strip_prefix(tag).map(str::trim_start))
 }
@@ -475,11 +477,16 @@ mod tests {
     #[test]
     fn finalization_nudge_body_recognizes_all_tags() {
         use crate::agent::agent_loop::{
-            critic::CRITIC_TAG, run::TODO_NUDGE_TAG, verifier::VERIFY_TAG,
+            code_review::CODE_REVIEW_TAG, critic::CRITIC_TAG, run::TODO_NUDGE_TAG,
+            verifier::VERIFY_TAG,
         };
         assert_eq!(
             finalization_nudge_body(&format!("{CRITIC_TAG} not done yet")),
             Some("not done yet")
+        );
+        assert_eq!(
+            finalization_nudge_body(&format!("{CODE_REVIEW_TAG} fix the auth check")),
+            Some("fix the auth check")
         );
         assert_eq!(
             finalization_nudge_body(&format!("{VERIFY_TAG} run the tests")),

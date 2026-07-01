@@ -3042,6 +3042,7 @@ async fn finalization_hook_short_circuits_lower_gates() {
     let mut goal_reacts = 0u8;
     let mut todo_nudges = 0u8;
     let mut code_review_reacts = 0u8;
+    let (review_emit, _review_emit_rx) = tokio::sync::mpsc::channel(64);
     let (msgs, source) = poll_finalization_follow_up(
         &config,
         "sys",
@@ -3050,6 +3051,7 @@ async fn finalization_hook_short_circuits_lower_gates() {
         &mut code_review_reacts,
         &mut goal_reacts,
         &mut todo_nudges,
+        &review_emit,
     )
     .await;
 
@@ -3072,6 +3074,7 @@ async fn finalization_all_gates_silent_yields_none() {
     let mut goal_reacts = 0u8;
     let mut todo_nudges = MAX_TODO_NUDGES; // todo gate bounded out
     let mut code_review_reacts = 0u8;
+    let (review_emit, _review_emit_rx) = tokio::sync::mpsc::channel(64);
     let (msgs, source) = poll_finalization_follow_up(
         &config,
         "sys",
@@ -3080,6 +3083,7 @@ async fn finalization_all_gates_silent_yields_none() {
         &mut code_review_reacts,
         &mut goal_reacts,
         &mut todo_nudges,
+        &review_emit,
     )
     .await;
 
@@ -3103,6 +3107,7 @@ async fn finalization_goal_unmet_reenters_and_counts() {
     let mut goal_reacts = 0u8;
     let mut todo_nudges = MAX_TODO_NUDGES;
     let mut code_review_reacts = 0u8;
+    let (review_emit, _review_emit_rx) = tokio::sync::mpsc::channel(64);
     let (msgs, source) = poll_finalization_follow_up(
         &config,
         "sys",
@@ -3111,6 +3116,7 @@ async fn finalization_goal_unmet_reenters_and_counts() {
         &mut code_review_reacts,
         &mut goal_reacts,
         &mut todo_nudges,
+        &review_emit,
     )
     .await;
 
@@ -3132,6 +3138,7 @@ async fn finalization_goal_met_finalizes() {
     let mut goal_reacts = 0u8;
     let mut todo_nudges = MAX_TODO_NUDGES;
     let mut code_review_reacts = 0u8;
+    let (review_emit, _review_emit_rx) = tokio::sync::mpsc::channel(64);
     let (msgs, source) = poll_finalization_follow_up(
         &config,
         "sys",
@@ -3140,6 +3147,7 @@ async fn finalization_goal_met_finalizes() {
         &mut code_review_reacts,
         &mut goal_reacts,
         &mut todo_nudges,
+        &review_emit,
     )
     .await;
 
@@ -3162,6 +3170,7 @@ async fn finalization_goal_bound_stops_reentry() {
     let mut goal_reacts = crate::agent::agent_loop::goal::MAX_GOAL_REACT;
     let mut todo_nudges = MAX_TODO_NUDGES;
     let mut code_review_reacts = 0u8;
+    let (review_emit, _review_emit_rx) = tokio::sync::mpsc::channel(64);
     let (msgs, source) = poll_finalization_follow_up(
         &config,
         "sys",
@@ -3170,6 +3179,7 @@ async fn finalization_goal_bound_stops_reentry() {
         &mut code_review_reacts,
         &mut goal_reacts,
         &mut todo_nudges,
+        &review_emit,
     )
     .await;
 
@@ -3189,6 +3199,7 @@ async fn finalization_goal_without_judge_is_inert() {
     let mut goal_reacts = 0u8;
     let mut todo_nudges = MAX_TODO_NUDGES;
     let mut code_review_reacts = 0u8;
+    let (review_emit, _review_emit_rx) = tokio::sync::mpsc::channel(64);
     let (msgs, source) = poll_finalization_follow_up(
         &config,
         "sys",
@@ -3197,6 +3208,7 @@ async fn finalization_goal_without_judge_is_inert() {
         &mut code_review_reacts,
         &mut goal_reacts,
         &mut todo_nudges,
+        &review_emit,
     )
     .await;
 
