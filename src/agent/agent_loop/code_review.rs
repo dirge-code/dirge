@@ -793,11 +793,57 @@ pub fn build_review_prompt(rules: &str, diff: &str, transcript: &str) -> String 
     )
 }
 
-/// Run the code reviewer over a diff and return findings, highest severity
-/// first. Fails OPEN: a judge error yields no findings (never blocks
-/// finalization on a confused/erroring reviewer). This is the single-pass
-/// core; R4 wraps it with a verify pass.
+/// Verify/dedupe instructions for the second pass, carried in the user
+/// prompt beside the candidate findings and the diff. Ported from
+/// roborev's `VerifyDedupePreamble` (`internal/review/synthesis.go`),
+/// adapted from its agentic "search the codebase" step to a toolless
+/// judgment "against the diff shown" — dirge's reviewer judge is a
+/// single-shot call with no tools, so verification is an adversarial
+/// re-read of the diff rather than a fresh codebase search. It keeps
+/// roborev's VERIFIED / FALSE_POSITIVE + consolidation contract and the
+/// `---`/severity output format so [`parse_findings`] re-parses the
+/// survivors.
+const VERIFY_INSTRUCTIONS: &str = "\
+You are verifying a set of candidate code-review findings against the diff that produced them. \
+Work only from the diff shown — do not assume code you cannot see. Be skeptical: a plausible-but-\
+unsupported finding wastes the author's time.\n\
+\n\
+1. Verify each candidate against the diff:\n\
+   - Keep it (VERIFIED) only if the diff clearly supports it — the cited location is in the diff \
+and the described problem is real.\n\
+   - Drop it (FALSE_POSITIVE) if it misreads the code, cites a location not in the diff, is \
+contradicted by another hunk, or is speculation about code not shown.\n\
+2. Consolidate: merge candidates that describe the same underlying issue into one finding.\n\
+3. Re-emit every SURVIVING finding using the output format below. If every candidate was a false \
+positive, state \"No issues found.\" on its own line and nothing else.";
+
+/// Run the diff-aware reviewer and return verified findings, highest
+/// severity first. Two passes (dirge chose two-pass from the start):
+///
+///   1. review — the reviewer reads the diff and emits candidate findings.
+///   2. verify — the same judge re-reads each candidate against the diff,
+///      drops false positives, and merges duplicates.
+///
+/// Then a mechanical [`dedupe_findings`] pass removes any exact duplicates
+/// the verify step missed. Fails OPEN throughout: a judge error in pass 1
+/// yields no findings; an error/ambiguous result in pass 2 falls back to
+/// the (deduped) pass-1 findings rather than silently dropping real work.
 pub async fn run_code_review(
+    review_fn: &CriticFn,
+    rules: &str,
+    diff: &str,
+    transcript: &str,
+) -> Vec<Finding> {
+    let candidates = review_pass(review_fn, rules, diff, transcript).await;
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    let verified = verify_pass(review_fn, diff, &candidates).await;
+    dedupe_findings(verified)
+}
+
+/// Pass 1: the reviewer reads the diff and emits candidate findings.
+async fn review_pass(
     review_fn: &CriticFn,
     rules: &str,
     diff: &str,
@@ -814,6 +860,77 @@ pub async fn run_code_review(
     let mut findings = parse_findings(&response);
     findings.sort_by_key(|f| std::cmp::Reverse(f.severity));
     findings
+}
+
+/// Pass 2: re-read each candidate against the diff, dropping false
+/// positives and merging duplicates. Fail-SAFE: on a judge error, or when
+/// the verify output is empty but doesn't read as a clean pass (a
+/// malformed re-emit), fall back to the pass-1 candidates rather than
+/// silently dropping them.
+async fn verify_pass(review_fn: &CriticFn, diff: &str, candidates: &[Finding]) -> Vec<Finding> {
+    let prompt = build_verify_prompt(candidates, diff);
+    let response = match review_fn(prompt).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(target: "dirge::code_review", error = %e, "verify pass failed; keeping unverified findings");
+            return candidates.to_vec();
+        }
+    };
+    let mut survivors = parse_findings(&response);
+    if survivors.is_empty() && !verdict_is_pass(&response) {
+        // Ambiguous verify output (no parseable findings, no clean-pass
+        // phrase) — don't silently drop; keep the pass-1 candidates.
+        tracing::debug!(target: "dirge::code_review", "verify output ambiguous; keeping pass-1 findings");
+        return candidates.to_vec();
+    }
+    survivors.sort_by_key(|f| std::cmp::Reverse(f.severity));
+    survivors
+}
+
+/// Build the verify-pass user prompt: the ported verify/dedupe
+/// instructions, the candidate findings, the diff to check them against,
+/// and the review output format so survivors are re-emitted parseably.
+pub fn build_verify_prompt(candidates: &[Finding], diff: &str) -> String {
+    let listed = candidates
+        .iter()
+        .enumerate()
+        .map(|(i, f)| format!("{}. [{}] {}", i + 1, f.severity.label(), f.body.trim()))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    format!(
+        "{VERIFY_INSTRUCTIONS}\n\n\
+         --- candidate findings ---\n{listed}\n--- end candidates ---\n\n\
+         --- diff ---\n{diff}\n--- end diff ---\n\n\
+         --- output format ---\n{REVIEW_FORMAT}"
+    )
+}
+
+/// Drop exact-ish duplicate findings the verify pass may have missed.
+/// Keeps the first occurrence keyed by (severity, location-or-body-head),
+/// normalized to alphanumerics — a cheap mechanical backstop to the LLM's
+/// consolidation, order-preserving.
+fn dedupe_findings(findings: Vec<Finding>) -> Vec<Finding> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(findings.len());
+    for f in findings {
+        let key_src = f
+            .location
+            .clone()
+            .unwrap_or_else(|| f.body.chars().take(80).collect());
+        let sig = format!(
+            "{}:{}",
+            f.severity.label(),
+            key_src
+                .to_ascii_lowercase()
+                .chars()
+                .filter(|c| c.is_alphanumeric())
+                .collect::<String>()
+        );
+        if seen.insert(sig) {
+            out.push(f);
+        }
+    }
+    out
 }
 
 /// Render findings as a `[code-review]` follow-up the agent re-enters and
@@ -1304,5 +1421,115 @@ diff --git a/Cargo.lock b/Cargo.lock\n\
         assert!(content.starts_with(CODE_REVIEW_TAG));
         assert!(content.contains("auth skipped"));
         assert!(content.contains("nit"));
+    }
+
+    // ── Two-pass verify/dedupe (R4) ───────────────────────────────
+
+    /// A judge stub that answers pass 1 and pass 2 differently.
+    fn two_pass_stub(pass1: &'static str, pass2: &'static str) -> CriticFn {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        std::sync::Arc::new(move |_p: String| {
+            let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let out = if n == 0 { pass1 } else { pass2 }.to_string();
+            Box::pin(async move { Ok(out) })
+        })
+    }
+
+    #[tokio::test]
+    async fn verify_pass_drops_false_positives() {
+        // Pass 1 finds two; verify keeps only the real one.
+        let review = two_pass_stub(
+            "- High — SQL injection in query().\n---\n- Low — misread nit.",
+            "Verified.\n- High — SQL injection in query().",
+        );
+        let f = run_code_review(&review, "r", "diff", "t").await;
+        assert_eq!(f.len(), 1, "false positive dropped");
+        assert_eq!(f[0].severity, Severity::High);
+    }
+
+    #[tokio::test]
+    async fn verify_pass_can_clear_all_findings() {
+        let review = two_pass_stub(
+            "- Medium — maybe a bug.",
+            "All candidates were speculation.\nNo issues found.",
+        );
+        assert!(
+            run_code_review(&review, "r", "diff", "t").await.is_empty(),
+            "verify cleared every finding"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_ambiguous_output_keeps_pass1_findings() {
+        // Pass 2 returns neither parseable findings nor a clean-pass
+        // phrase → fall back to pass 1 rather than silently dropping.
+        let review = two_pass_stub(
+            "- High — real bug in write().",
+            "hmm, let me think about this differently...",
+        );
+        let f = run_code_review(&review, "r", "diff", "t").await;
+        assert_eq!(f.len(), 1, "ambiguous verify keeps pass-1 findings");
+        assert_eq!(f[0].severity, Severity::High);
+    }
+
+    #[tokio::test]
+    async fn verify_error_keeps_pass1_findings() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let review: CriticFn = {
+            let calls = calls.clone();
+            std::sync::Arc::new(move |_p: String| {
+                let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async move {
+                    if n == 0 {
+                        Ok("- High — real bug.".to_string())
+                    } else {
+                        anyhow::bail!("verify provider down")
+                    }
+                })
+            })
+        };
+        let f = run_code_review(&review, "r", "diff", "t").await;
+        assert_eq!(f.len(), 1, "verify error must not drop pass-1 findings");
+    }
+
+    #[test]
+    fn build_verify_prompt_lists_candidates_and_diff() {
+        let candidates = vec![Finding {
+            severity: Severity::High,
+            location: Some("a.rs:1".into()),
+            body: "High — bug".into(),
+        }];
+        let p = build_verify_prompt(&candidates, "diff --git a/a.rs");
+        assert!(p.contains("FALSE_POSITIVE"), "verify contract present");
+        assert!(p.contains("High — bug"), "candidate listed");
+        assert!(p.contains("diff --git a/a.rs"), "diff embedded");
+        assert!(p.contains("`---`"), "output format embedded");
+    }
+
+    #[test]
+    fn dedupe_findings_collapses_duplicates() {
+        let findings = vec![
+            Finding {
+                severity: Severity::High,
+                location: Some("src/a.rs:10".into()),
+                body: "High — auth skipped".into(),
+            },
+            // Same severity+location → duplicate.
+            Finding {
+                severity: Severity::High,
+                location: Some("src/a.rs:10".into()),
+                body: "High — auth check missing".into(),
+            },
+            // Different location → kept.
+            Finding {
+                severity: Severity::High,
+                location: Some("src/b.rs:3".into()),
+                body: "High — other".into(),
+            },
+        ];
+        let out = dedupe_findings(findings);
+        assert_eq!(out.len(), 2, "one duplicate collapsed");
+        assert_eq!(out[0].location.as_deref(), Some("src/a.rs:10"));
+        assert_eq!(out[1].location.as_deref(), Some("src/b.rs:3"));
     }
 }
