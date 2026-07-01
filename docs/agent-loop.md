@@ -10,6 +10,19 @@ The loop solves the problem of running an LLM agent as a long-lived, cancellable
 
 A single user input opens one outer iteration. The outer iteration runs inner turns until the assistant produces a turn with no tool calls AND no pending messages remain. After that it polls `get_followup_messages`; if any are produced they become the next iteration's pending messages and the outer loop continues. When follow-ups are empty the loop emits `AgentEnd` and exits.
 
+### Finalization gates
+
+When the assistant tries to stop, `poll_finalization_follow_up` (in `run.rs`) consults a fixed priority order and returns **at most one** gate's follow-up per finalization:
+
+1. **Hook** — caller-supplied `get_followup_messages` (e.g. the `/plan` reviewer loop).
+2. **Verifier** — cheap, signal-based: code was edited but no build/test ran, or the last build/test failed. One nudge per run.
+3. **Critic** — bounded LLM judgment of *completeness* from the transcript. Once per run, opt-in via `critic_provider`.
+4. **Code reviewer** — diff-aware LLM review of *correctness* (dirge-iyf5). On a run that left uncommitted changes it captures the diff, runs a two-pass review (review → verify/dedupe), and splits findings by severity: **high/critical** re-enter the loop as a blocking `[code-review]` nudge (fix or justify), **medium/low** surface as a non-blocking `<system>` advisory. Reuses the `critic_provider` judge — same opt-in as the critic, off with no cost otherwise. Persists across finalizations bounded by `MAX_REVIEW_REACT`. Prompt craft and the finding/verdict model are ported from [roborev](https://go.kenn.io/roborev). Run it manually any time with `/code-review`.
+5. **Goal gate** — user-defined `--goal` stop condition, judged by the same provider, bounded by `MAX_GOAL_REACT`.
+6. **Todo nudge** — unfinished todos, bounded by `MAX_TODO_NUDGES`.
+
+Because only one gate fires per finalization, lower-priority gates are deferred a turn (intentional: a red build surfaces the verifier nudge now; the critic and reviewer run at the *next* finalization once it's green). All gates fail **open** — an errored judge never blocks finalization.
+
 ### Inner loop
 
 Each inner iteration is one assistant turn:

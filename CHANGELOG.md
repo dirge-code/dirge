@@ -6,6 +6,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **Diff-aware code reviewer.** A new finalization gate reviews the actual diff a
+  run produced (not just the transcript) and surfaces severity-ranked findings.
+  It runs two passes — review, then a verify/dedupe pass that drops false
+  positives — and splits the results: high/critical findings re-enter the loop
+  (fix or justify), medium/low surface as non-blocking advisories. Also runnable
+  on demand with `/code-review`. It reuses the `critic_provider` judge, so it's
+  the same opt-in as the critic with no cost when off. Prompt craft and the
+  finding/verdict model are ported from [roborev](https://go.kenn.io/roborev).
+
 ## [0.15.0] - 2026-07-01
 
 ### Added

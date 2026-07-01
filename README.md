@@ -266,6 +266,7 @@ authorization, delete the `auth.json` file and log in again.
 | `/clone <id-prefix>` | Switch the active branch to the entry without restoring text |
 | `/loop [prompt]` | Start iterative coding loop (needs the `loop` feature; otherwise prints a hint) |
 | `/plan <task>` | Run the phased explore→plan→implement→review workflow (opt-in via `phased_workflow_enabled`). See [docs/agent-loop.md](docs/agent-loop.md#phased-plan-workflow-plan) |
+| `/code-review` | Review the working-tree diff for issues (two-pass, severity-ranked; needs `critic_provider`). See [docs/agent-loop.md](docs/agent-loop.md#finalization-gates) |
 | `/worktree <name>` | Create a git worktree on branch |
 | `/wt-merge [branch]` | Merge worktree branch |
 | `/wt-exit` | Exit worktree |
