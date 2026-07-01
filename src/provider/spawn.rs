@@ -214,6 +214,10 @@ impl AnyAgent {
         // F6 tier 3: thread the bounded critic (only Some when
         // critic_provider is configured). `None` → no critic.
         cfg.critic_fn = self.critic_fn.clone();
+        // dirge-iyf5: diff-aware code reviewer (only Some when
+        // critic_provider is configured and the active prompt didn't
+        // disable it). `None` → no reviewer.
+        cfg.code_review_fn = self.code_review_fn.clone();
         cfg.goal_fn = self.goal_fn.clone();
         // Goal gate stop condition (`--goal`). Engages only when
         // `goal_fn` above is also present (it's the judge).

@@ -745,6 +745,105 @@ fn cap_diff(diff: &str, max: usize) -> String {
     )
 }
 
+// ── Prompt + orchestration (R3) ───────────────────────────────────────
+
+use super::critic::CriticFn;
+use super::message::{LoopMessage, UserMessage};
+
+/// Cap on the instructions/constraints block fed to the reviewer. Smaller
+/// than the critic's (16k) because the diff and transcript also compete for
+/// the judge's budget; the constraints that matter (AGENTS.md, prompt-mode
+/// rules) sit early in the system prompt.
+const MAX_RULES_CHARS: usize = 12_000;
+
+/// How many finalizations the reviewer may re-engage within one run. Like
+/// the goal gate's `MAX_GOAL_REACT`, this persists across finalization
+/// boundaries (so the agent can fix findings and be re-reviewed) but is
+/// bounded so a stubborn or unsatisfiable finding can't loop forever.
+pub const MAX_REVIEW_REACT: u8 = 3;
+
+/// Build the reviewer prompt: the response format, the assistant's own
+/// constraints (so the reviewer judges within them and never demands a
+/// forbidden action), the diff to review, and a transcript for intent.
+/// Mirrors the critic's `build_prompt` split — role in the preamble,
+/// format beside the material. Reuses the critic's compaction-summary
+/// stripper so a stale `## Active Task` can't leak in.
+pub fn build_review_prompt(rules: &str, diff: &str, transcript: &str) -> String {
+    let rules = super::critic::strip_compaction_summary(rules).trim();
+    let rules_block = if rules.is_empty() {
+        "(no special constraints provided)".to_string()
+    } else if rules.len() > MAX_RULES_CHARS {
+        let head: String = rules.chars().take(MAX_RULES_CHARS).collect();
+        format!("{head}\n…(instructions truncated)")
+    } else {
+        rules.to_string()
+    };
+    let transcript = if transcript.trim().is_empty() {
+        "(no transcript)"
+    } else {
+        transcript.trim()
+    };
+    format!(
+        "{REVIEW_FORMAT}\n\n\
+         --- assistant instructions & constraints (judge within these; never demand a \
+         forbidden/out-of-scope action) ---\n{rules_block}\n--- end instructions ---\n\n\
+         --- diff (the code changes to review) ---\n{diff}\n--- end diff ---\n\n\
+         --- transcript (what the assistant did, for intent) ---\n{transcript}\n\
+         --- end transcript ---"
+    )
+}
+
+/// Run the code reviewer over a diff and return findings, highest severity
+/// first. Fails OPEN: a judge error yields no findings (never blocks
+/// finalization on a confused/erroring reviewer). This is the single-pass
+/// core; R4 wraps it with a verify pass.
+pub async fn run_code_review(
+    review_fn: &CriticFn,
+    rules: &str,
+    diff: &str,
+    transcript: &str,
+) -> Vec<Finding> {
+    let prompt = build_review_prompt(rules, diff, transcript);
+    let response = match review_fn(prompt).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(target: "dirge::code_review", error = %e, "reviewer call failed; finalizing without it");
+            return Vec::new();
+        }
+    };
+    let mut findings = parse_findings(&response);
+    findings.sort_by_key(|f| std::cmp::Reverse(f.severity));
+    findings
+}
+
+/// Render findings as a `[code-review]` follow-up the agent re-enters and
+/// acts on. `None` when there are no findings (clean review → finalize).
+///
+/// R3 surfaces every finding; R5 splits this into a blocking high/critical
+/// channel and an advisory medium/low one.
+pub fn findings_followup(findings: &[Finding]) -> Option<LoopMessage> {
+    if findings.is_empty() {
+        return None;
+    }
+    let body = render_findings(findings);
+    Some(LoopMessage::User(UserMessage {
+        content: format!(
+            "{CODE_REVIEW_TAG} A review of the diff you just made found these issues. Fix them, \
+             or explain why each doesn't apply (out of scope, intended, or something you were told \
+             not to do):\n{body}"
+        ),
+    }))
+}
+
+/// Join finding bodies with the `---` separator, each led by its severity.
+fn render_findings(findings: &[Finding]) -> String {
+    findings
+        .iter()
+        .map(|f| format!("[{}] {}", f.severity.label(), f.body.trim()))
+        .collect::<Vec<_>>()
+        .join("\n\n---\n\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -867,7 +966,7 @@ No issues found.";
     fn parse_findings_sortable_highest_first() {
         let out = "- Low: nit.\n---\n- Critical — data loss.\n---\n- Medium — perf.";
         let mut f = parse_findings(out);
-        f.sort_by(|a, b| b.severity.cmp(&a.severity));
+        f.sort_by_key(|f| std::cmp::Reverse(f.severity));
         assert_eq!(f[0].severity, Severity::Critical);
         assert_eq!(f[1].severity, Severity::Medium);
         assert_eq!(f[2].severity, Severity::Low);
@@ -1116,5 +1215,94 @@ diff --git a/Cargo.lock b/Cargo.lock\n\
         assert!(diff.contains("helper"), "untracked file body present");
         assert!(!diff.contains("Cargo.lock"), "lockfile excluded");
         let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    // ── Prompt + orchestration (R3) ───────────────────────────────
+
+    #[test]
+    fn review_prompt_embeds_format_diff_and_constraints() {
+        let p = build_review_prompt(
+            "RULE: never push to remote.",
+            "diff --git a/x b/x\n+let y = 1;",
+            "user asked to add y",
+        );
+        assert!(p.contains("`---`"), "format contract present");
+        assert!(p.contains("let y = 1"), "diff embedded");
+        assert!(p.contains("never push to remote"), "constraints embedded");
+        assert!(p.contains("user asked to add y"), "transcript embedded");
+    }
+
+    #[test]
+    fn review_prompt_strips_compaction_summary_from_rules() {
+        let rules = format!(
+            "RULE: never push.\n\n{}\n## Active Task\nOld phase 3 work.",
+            crate::agent::compression::COMPACTION_MARKER,
+        );
+        let p = build_review_prompt(&rules, "diff", "t");
+        assert!(p.contains("never push"), "real rules survive");
+        assert!(!p.contains("Active Task"), "stale summary stripped");
+    }
+
+    #[test]
+    fn review_prompt_caps_large_rules() {
+        let huge = "x".repeat(MAX_RULES_CHARS + 5_000);
+        let p = build_review_prompt(&huge, "diff", "t");
+        assert!(p.contains("instructions truncated"));
+    }
+
+    #[tokio::test]
+    async fn run_code_review_parses_and_sorts_findings() {
+        let review: CriticFn = std::sync::Arc::new(|_prompt| {
+            Box::pin(async {
+                Ok("Summary.\n- Low: nit.\n---\n- Critical — data loss in write().".to_string())
+            })
+        });
+        let f = run_code_review(&review, "rules", "diff", "t").await;
+        assert_eq!(f.len(), 2);
+        assert_eq!(f[0].severity, Severity::Critical, "highest first");
+        assert_eq!(f[1].severity, Severity::Low);
+    }
+
+    #[tokio::test]
+    async fn run_code_review_fails_open_on_error() {
+        let review: CriticFn =
+            std::sync::Arc::new(|_p| Box::pin(async { anyhow::bail!("provider down") }));
+        assert!(run_code_review(&review, "r", "d", "t").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_code_review_clean_yields_no_findings() {
+        let review: CriticFn =
+            std::sync::Arc::new(|_p| Box::pin(async { Ok("No issues found.".to_string()) }));
+        assert!(run_code_review(&review, "r", "d", "t").await.is_empty());
+    }
+
+    #[test]
+    fn findings_followup_none_when_clean() {
+        assert!(findings_followup(&[]).is_none());
+    }
+
+    #[test]
+    fn findings_followup_tags_and_lists() {
+        let findings = vec![
+            Finding {
+                severity: Severity::High,
+                location: Some("src/a.rs:1".into()),
+                body: "High — auth skipped".into(),
+            },
+            Finding {
+                severity: Severity::Low,
+                location: None,
+                body: "Low — nit".into(),
+            },
+        ];
+        let msg = findings_followup(&findings).expect("some");
+        let content = match &msg {
+            LoopMessage::User(u) => &u.content,
+            _ => panic!("expected user message"),
+        };
+        assert!(content.starts_with(CODE_REVIEW_TAG));
+        assert!(content.contains("auth skipped"));
+        assert!(content.contains("nit"));
     }
 }

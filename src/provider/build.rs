@@ -411,10 +411,23 @@ pub async fn build_agent(
                                 "critic",
                                 critic_preamble.clone(),
                             ));
+                            // dirge-iyf5: the diff-aware code reviewer shares
+                            // the critic's judge client but bakes its own
+                            // REVIEW_PREAMBLE. Gated on the same prompt flag —
+                            // a `critic: false` (read-only/exploratory) prompt
+                            // suppresses both; those modes leave no diff anyway.
+                            agent = agent.with_code_review_fn(build_judge_fn(
+                                client.clone(),
+                                model_name.clone(),
+                                "code-review",
+                                std::sync::Arc::from(
+                                    crate::agent::agent_loop::code_review::REVIEW_PREAMBLE,
+                                ),
+                            ));
                             tracing::info!(
                                 target: "dirge::provider",
                                 alias = %alias,
-                                "in-loop critic wired",
+                                "in-loop critic + code reviewer wired",
                             );
                         } else {
                             tracing::info!(

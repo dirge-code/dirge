@@ -398,6 +398,13 @@ pub struct LoopConfig {
     /// finalization on substantive runs. `None` = no critic (default).
     pub critic_fn: Option<super::critic::CriticFn>,
 
+    /// Diff-aware code reviewer judge (dirge-iyf5). `Some` only when a
+    /// `critic_provider` is configured (it reuses that judge client with
+    /// `code_review::REVIEW_PREAMBLE`). At finalization, on a run that left
+    /// uncommitted changes, it reviews the diff and surfaces severity-ranked
+    /// findings. `None` = no reviewer (default).
+    pub code_review_fn: Option<super::critic::CriticFn>,
+
     /// Goal gate's judge callback. Decoupled from `critic_fn`: built at
     /// `build_agent` time from the same critic provider but baking its OWN
     /// `GOAL_PREAMBLE`, so a critic preamble override or a `critic: false`
@@ -601,6 +608,7 @@ impl Clone for LoopConfig {
             file_touch_tracker: self.file_touch_tracker.clone(),
             verifier: self.verifier.clone(),
             critic_fn: self.critic_fn.clone(),
+            code_review_fn: self.code_review_fn.clone(),
             goal_fn: self.goal_fn.clone(),
             goal: self.goal.clone(),
             max_turns: self.max_turns,

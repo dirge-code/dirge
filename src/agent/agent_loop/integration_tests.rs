@@ -85,6 +85,7 @@ fn build_config() -> LoopConfig {
         file_touch_tracker: None,
         verifier: None,
         critic_fn: None,
+        code_review_fn: None,
         goal_fn: None,
         goal: None,
         max_turns: None,

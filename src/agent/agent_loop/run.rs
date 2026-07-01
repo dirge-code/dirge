@@ -153,6 +153,9 @@ enum FollowUpSource {
     Verifier,
     /// Bounded LLM critic judgment (at most once per run).
     Critic,
+    /// Diff-aware code reviewer: findings on the run's diff. Re-enters the
+    /// loop, bounded by [`super::code_review::MAX_REVIEW_REACT`].
+    CodeReview,
     /// Goal gate: user-defined stop condition not yet met. Re-enters the
     /// loop, bounded by [`super::goal::MAX_GOAL_REACT`].
     Goal,
@@ -202,6 +205,7 @@ async fn poll_finalization_follow_up(
     system_prompt: &str,
     new_messages: &[LoopMessage],
     critic_done: &mut bool,
+    code_review_reacts: &mut u8,
     goal_reacts: &mut u8,
     todo_nudges: &mut u8,
 ) -> (Vec<LoopMessage>, FollowUpSource) {
@@ -238,6 +242,39 @@ async fn poll_finalization_follow_up(
                 super::critic::run_critic(critic, system_prompt, &transcript, verification).await;
             if !msgs.is_empty() {
                 return (msgs, FollowUpSource::Critic);
+            }
+        }
+    }
+    // 3.25 dirge-iyf5 — diff-aware code reviewer. Reviews the run's
+    //      uncommitted diff and surfaces severity-ranked findings. Unlike
+    //      the one-shot critic it PERSISTS across finalizations (bounded by
+    //      MAX_REVIEW_REACT) so the agent can fix findings and be
+    //      re-reviewed. The diff itself is the precondition: a clean tree
+    //      (no code changed on disk) skips the reviewer entirely, so a
+    //      read-only turn never pays for a git call + judge. Active only
+    //      when a `critic_provider` is configured (the reviewer reuses its
+    //      judge) — off with no cost for default sessions.
+    if *code_review_reacts < super::code_review::MAX_REVIEW_REACT
+        && config.code_review_fn.is_some()
+        && run_made_tool_calls(new_messages)
+        && let Some(review_fn) = &config.code_review_fn
+    {
+        let repo = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        // Diff capture shells out to git — do it off the async runtime.
+        let diff = tokio::task::spawn_blocking(move || {
+            super::code_review::capture_run_diff(&repo)
+        })
+        .await
+        .ok()
+        .flatten();
+        if let Some(diff) = diff {
+            let transcript = build_critic_transcript(new_messages);
+            let findings =
+                super::code_review::run_code_review(review_fn, system_prompt, &diff, &transcript)
+                    .await;
+            if let Some(msg) = super::code_review::findings_followup(&findings) {
+                *code_review_reacts += 1;
+                return (vec![msg], FollowUpSource::CodeReview);
             }
         }
     }
@@ -1051,6 +1088,10 @@ pub async fn run_loop(
     // F6 tier 3: the bounded LLM critic fires at most once per run.
     let mut critic_done = false;
 
+    // dirge-iyf5: the diff-aware code reviewer persists across
+    // finalizations (fix-then-re-review) bounded by MAX_REVIEW_REACT.
+    let mut code_review_reacts: u8 = 0;
+
     // Goal gate: counts re-entries so a user-defined stop condition that
     // never resolves can't loop past MAX_GOAL_REACT.
     let mut goal_reacts: u8 = 0;
@@ -1835,6 +1876,7 @@ pub async fn run_loop(
             &current_context.system_prompt,
             &new_messages,
             &mut critic_done,
+            &mut code_review_reacts,
             &mut goal_reacts,
             &mut todo_nudges,
         )

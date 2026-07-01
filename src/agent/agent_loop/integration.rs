@@ -397,6 +397,11 @@ pub struct LoopSpawnConfig {
     /// `LoopConfig.critic_fn`. `None` = off (default).
     pub critic_fn: Option<crate::agent::agent_loop::critic::CriticFn>,
 
+    /// Diff-aware code reviewer judge (dirge-iyf5), threaded into
+    /// `LoopConfig.code_review_fn`. Built from the same critic provider as
+    /// `critic_fn` but baking `code_review::REVIEW_PREAMBLE`. `None` = off.
+    pub code_review_fn: Option<crate::agent::agent_loop::critic::CriticFn>,
+
     /// Goal gate's judge callback, threaded into `LoopConfig.goal_fn`.
     /// `None` = off (default).
     pub goal_fn: Option<crate::agent::agent_loop::critic::CriticFn>,
@@ -458,6 +463,7 @@ impl LoopSpawnConfig {
             file_touch_tracker: None,
             verifier: None,
             critic_fn: None,
+            code_review_fn: None,
             goal_fn: None,
             goal: None,
             max_turns: None,
@@ -533,6 +539,7 @@ pub fn spawn_loop_runner(cfg: LoopSpawnConfig) -> LoopRunner {
         file_touch_tracker: cfg.file_touch_tracker.clone(),
         verifier: cfg.verifier.clone(),
         critic_fn: cfg.critic_fn.clone(),
+        code_review_fn: cfg.code_review_fn.clone(),
         goal_fn: cfg.goal_fn.clone(),
         goal: cfg.goal.clone(),
         max_turns: cfg.max_turns,

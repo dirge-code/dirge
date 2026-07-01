@@ -133,6 +133,7 @@ fn build_config() -> LoopConfig {
         file_touch_tracker: None,
         verifier: None,
         critic_fn: None,
+        code_review_fn: None,
         goal_fn: None,
         goal: None,
         max_turns: None,
@@ -3040,11 +3041,13 @@ async fn finalization_hook_short_circuits_lower_gates() {
     let mut critic_done = false;
     let mut goal_reacts = 0u8;
     let mut todo_nudges = 0u8;
+    let mut code_review_reacts = 0u8;
     let (msgs, source) = poll_finalization_follow_up(
         &config,
         "sys",
         &[],
         &mut critic_done,
+        &mut code_review_reacts,
         &mut goal_reacts,
         &mut todo_nudges,
     )
@@ -3068,11 +3071,13 @@ async fn finalization_all_gates_silent_yields_none() {
     let mut critic_done = false;
     let mut goal_reacts = 0u8;
     let mut todo_nudges = MAX_TODO_NUDGES; // todo gate bounded out
+    let mut code_review_reacts = 0u8;
     let (msgs, source) = poll_finalization_follow_up(
         &config,
         "sys",
         &[],
         &mut critic_done,
+        &mut code_review_reacts,
         &mut goal_reacts,
         &mut todo_nudges,
     )
@@ -3097,11 +3102,13 @@ async fn finalization_goal_unmet_reenters_and_counts() {
     let mut critic_done = true; // skip the one-shot critic
     let mut goal_reacts = 0u8;
     let mut todo_nudges = MAX_TODO_NUDGES;
+    let mut code_review_reacts = 0u8;
     let (msgs, source) = poll_finalization_follow_up(
         &config,
         "sys",
         &[],
         &mut critic_done,
+        &mut code_review_reacts,
         &mut goal_reacts,
         &mut todo_nudges,
     )
@@ -3124,11 +3131,13 @@ async fn finalization_goal_met_finalizes() {
     let mut critic_done = true;
     let mut goal_reacts = 0u8;
     let mut todo_nudges = MAX_TODO_NUDGES;
+    let mut code_review_reacts = 0u8;
     let (msgs, source) = poll_finalization_follow_up(
         &config,
         "sys",
         &[],
         &mut critic_done,
+        &mut code_review_reacts,
         &mut goal_reacts,
         &mut todo_nudges,
     )
@@ -3152,11 +3161,13 @@ async fn finalization_goal_bound_stops_reentry() {
     let mut critic_done = true;
     let mut goal_reacts = crate::agent::agent_loop::goal::MAX_GOAL_REACT;
     let mut todo_nudges = MAX_TODO_NUDGES;
+    let mut code_review_reacts = 0u8;
     let (msgs, source) = poll_finalization_follow_up(
         &config,
         "sys",
         &[],
         &mut critic_done,
+        &mut code_review_reacts,
         &mut goal_reacts,
         &mut todo_nudges,
     )
@@ -3177,11 +3188,13 @@ async fn finalization_goal_without_judge_is_inert() {
     let mut critic_done = true;
     let mut goal_reacts = 0u8;
     let mut todo_nudges = MAX_TODO_NUDGES;
+    let mut code_review_reacts = 0u8;
     let (msgs, source) = poll_finalization_follow_up(
         &config,
         "sys",
         &[],
         &mut critic_done,
+        &mut code_review_reacts,
         &mut goal_reacts,
         &mut todo_nudges,
     )
