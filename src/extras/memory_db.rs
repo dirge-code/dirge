@@ -37,6 +37,10 @@ use regex::Regex;
 use rusqlite::{Connection, params};
 
 use crate::extras::dirge_paths::ProjectPaths;
+use crate::extras::salience::{
+    DECAY_FLOOR, DEFAULT_CONFIDENCE, DISUSE_DECAY, RECENT_USE_BONUS, RECENT_USE_WINDOW_DAYS,
+    USE_REINFORCEMENT, confidence_eviction_bonus,
+};
 use crate::extras::session_db::{SessionDb, redact_for_fts};
 
 // ── UMP memory record types (port of universal-memory-protocol) ──────────
@@ -192,71 +196,26 @@ const DEFAULT_WORKING_HOT_RESERVE: usize = 400;
 /// Max results returned by the `search` action.
 const SEARCH_RESULT_LIMIT: usize = 8;
 
-// ── Usage-driven lifecycle (dirge-jyks) ──────────────────────────────
-
-/// How recently an entry must have been expanded to count as "in
-/// active use" for eviction decisions.
-const RECENT_USE_WINDOW_DAYS: i64 = 14;
-
-/// Effective-salience bonus for recently-used entries during
-/// eviction. 0.15 is half a kind-tier step: enough that a consulted
-/// `working` note (0.3 → 0.45) outlives an untouched `episodic` one
-/// (0.45 ties break by age), without letting use alone outrank a
-/// durable `identity` fact.
-const RECENT_USE_BONUS: f64 = 0.15;
-
-/// Salience reinforcement applied on each `expand` — being looked up
-/// IS the relevance signal. Capped at 1.0.
-const USE_REINFORCEMENT: f64 = 0.05;
-
-/// Periodic decay applied by the curator's mechanical pass to
-/// entries older than the stale window with no recent use. Floor at
-/// 0.1 so nothing decays to oblivion silently.
-const DISUSE_DECAY: f64 = 0.05;
-const DECAY_FLOOR: f64 = 0.1;
-
 // ── Procedural effectiveness (dirge-zygq) ────────────────────────────
 
 /// Procedural memories are playbooks whose value is whether they
 /// actually worked, not how recently they were tried. The background
 /// review pass records confirmed successes/failures (success_count /
 /// failure_count); this term folds the net record into the effective
-/// salience used for eviction and search ordering, so a playbook with
-/// a positive track record outranks one that's failed in practice.
+/// salience used for eviction and search ordering, so a playbook with a
+/// positive track record outranks one that's failed in practice.
 ///
-/// Log-damped like the `expand` usage signal and bounded by
-/// [`EFFECTIVENESS_CAP`] so outcomes nudge ranking without letting a
-/// hot playbook outrank a durable identity fact (0.75) on its record
-/// alone. With weight 0.15: net `log10(1+|net|)*0.15`, so +1 ≈ +0.045,
-/// +9 ≈ +0.15, +99 saturates at the +0.30 cap (intermediate records sit
-/// between — e.g. +19 ≈ +0.20); failures mirror negative. Returns 0 for
-/// every non-procedural kind (they carry no outcome signal) and for
-/// procedural entries with an even record.
-const EFFECTIVENESS_WEIGHT: f64 = 0.15;
-const EFFECTIVENESS_CAP: f64 = 0.3;
-
+/// The pure log-damped math lives in [`crate::extras::salience`]; this
+/// wrapper adds the memory-specific gate: only `procedural` entries
+/// carry an outcome signal, so every other kind returns 0.
 fn effectiveness_bonus(kind: &str, success_count: i64, failure_count: i64) -> f64 {
     if kind != "procedural" {
         return 0.0;
     }
-    let net = success_count - failure_count;
-    if net == 0 {
-        return 0.0;
-    }
-    let magnitude = ((1 + net.unsigned_abs()) as f64).log10() * EFFECTIVENESS_WEIGHT;
-    let bounded = magnitude.min(EFFECTIVENESS_CAP);
-    if net > 0 { bounded } else { -bounded }
+    crate::extras::salience::effectiveness_bonus(success_count, failure_count)
 }
 
-// ── Confidence axis + supersession (dirge-fa10) ──────────────────────
-
-/// Truth-likelihood of an entry, in [0,1]. Distinct from `salience`
-/// (importance) — a fact can be important but contested, or trivial but
-/// certain. Default for a freshly captured entry. v9 (dirge-lerb) once
-/// dropped this column for being write-only; it earns its place now by
-/// being read in eviction, search ordering, and curation, and written
-/// with meaning on the supersession path.
-const DEFAULT_CONFIDENCE: f64 = 0.6;
+// ── Supersession confidence (dirge-fa10) ─────────────────────────────
 
 /// Confidence of the successor written when a fact is superseded by a
 /// `natural` contradiction — the user simply updated a preference or a
@@ -268,22 +227,6 @@ const SUPERSEDE_CONFIDENCE: f64 = 0.7;
 /// the area is contested, so the replacement is held below a clean
 /// update — `SUPERSEDE_CONFIDENCE - SUPERSEDE_CONFIDENCE_PENALTY` = 0.5.
 const SUPERSEDE_CONFIDENCE_PENALTY: f64 = 0.2;
-
-/// Eviction weight on confidence. Its decisive role is as a TIEBREAK:
-/// among entries of equal salience (same kind), the lower-confidence one
-/// evicts first — and there even the small spread between the values the
-/// store actually writes (harsh 0.5, default 0.6, natural 0.7) is enough
-/// to order them deterministically. Across DIFFERENT kinds it's only a
-/// gentle nudge: 0.25 keeps the full [0,1] swing within ±0.1, below the
-/// 0.1–0.15 gaps between kind tiers, so a contested fact never jumps the
-/// kind hierarchy (a 0.2-confidence `identity` at 0.75-0.1=0.65 still
-/// outranks a certain `semantic` at 0.6). Centered on
-/// [`DEFAULT_CONFIDENCE`] so the common case stays neutral.
-const CONFIDENCE_EVICTION_WEIGHT: f64 = 0.25;
-
-fn confidence_eviction_bonus(confidence: f64) -> f64 {
-    (confidence - DEFAULT_CONFIDENCE) * CONFIDENCE_EVICTION_WEIGHT
-}
 
 fn char_limit_for(target: &str) -> usize {
     match target {
@@ -3723,8 +3666,9 @@ mod tests {
         assert!(up > 0.0 && down < 0.0);
         assert!((up + down).abs() < 1e-9, "sign-symmetric: {up} vs {down}");
         // Bounded by the cap no matter how lopsided the record.
-        assert!(effectiveness_bonus("procedural", 10_000, 0) <= EFFECTIVENESS_CAP + 1e-9);
-        assert!(effectiveness_bonus("procedural", 0, 10_000) >= -EFFECTIVENESS_CAP - 1e-9);
+        let cap = crate::extras::salience::EFFECTIVENESS_CAP;
+        assert!(effectiveness_bonus("procedural", 10_000, 0) <= cap + 1e-9);
+        assert!(effectiveness_bonus("procedural", 0, 10_000) >= -cap - 1e-9);
     }
 
     /// `mark` bumps the right counter and stamps `last_success_at`
