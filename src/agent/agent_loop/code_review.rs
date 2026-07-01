@@ -266,7 +266,10 @@ fn detect_block_severity(block: &str) -> Option<Severity> {
             || trimmed.starts_with('\u{2022}'); // •
         let mut check = if has_bullet {
             trimmed
-                .trim_start_matches(['-', '*', '\u{2022}', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '.', ')', ' '])
+                .trim_start_matches([
+                    '-', '*', '\u{2022}', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '.',
+                    ')', ' ',
+                ])
                 .to_string()
         } else {
             trimmed.to_string()
@@ -283,8 +286,7 @@ fn detect_block_severity(block: &str) -> Option<Severity> {
         // Branch 2: a "severity: <level>" field (e.g. "**Severity**: High").
         if let Some(rest) = check.strip_prefix("severity") {
             let rest = rest.trim_start();
-            let has_sep = rest.starts_with([':', '|', '—', '–'])
-                || rest.starts_with("- ");
+            let has_sep = rest.starts_with([':', '|', '—', '–']) || rest.starts_with("- ");
             if has_sep {
                 let level = rest.trim_start_matches([':', '-', '–', '—', '|', ' ']);
                 if let Some(sev) = Severity::from_prefix(level)
@@ -341,8 +343,9 @@ fn is_legend_entry(lines: &[&str], i: usize) -> bool {
         }
         let prev = strip_markdown(&strip_list_marker(prev));
         if prev.ends_with(':') || prev.ends_with('：') {
-            const INDICATORS: [&str; 7] =
-                ["severity", "level", "legend", "priority", "rubric", "rating", "scale"];
+            const INDICATORS: [&str; 7] = [
+                "severity", "level", "legend", "priority", "rubric", "rating", "scale",
+            ];
             if INDICATORS.iter().any(|w| prev.contains(w)) {
                 return true;
             }
@@ -568,9 +571,16 @@ fn raw_uncommitted_diff(repo: &Path) -> String {
             }
             if let Some(d) = git_stdout_allow_fail(
                 repo,
-                &["diff", "--no-ext-diff", "--no-color", "--no-index", "--", "/dev/null", path],
-            )
-                && !d.trim().is_empty()
+                &[
+                    "diff",
+                    "--no-ext-diff",
+                    "--no-color",
+                    "--no-index",
+                    "--",
+                    "/dev/null",
+                    path,
+                ],
+            ) && !d.trim().is_empty()
             {
                 if !out.is_empty() && !out.ends_with('\n') {
                     out.push('\n');
@@ -1015,9 +1025,15 @@ mod tests {
 
     #[test]
     fn severity_from_prefix_matches_leading_word() {
-        assert_eq!(Severity::from_prefix("Critical — x"), Some(Severity::Critical));
+        assert_eq!(
+            Severity::from_prefix("Critical — x"),
+            Some(Severity::Critical)
+        );
         assert_eq!(Severity::from_prefix("HIGH"), Some(Severity::High));
-        assert_eq!(Severity::from_prefix("medium issue"), Some(Severity::Medium));
+        assert_eq!(
+            Severity::from_prefix("medium issue"),
+            Some(Severity::Medium)
+        );
         assert_eq!(Severity::from_prefix("nope"), None);
     }
 
@@ -1094,7 +1110,8 @@ Medium — missing error handling on read.";
 
     #[test]
     fn parse_findings_reads_severity_field_form() {
-        let out = "- **Severity**: Critical\n- **Location**: src/auth.rs:42\n- **Problem**: token leak.";
+        let out =
+            "- **Severity**: Critical\n- **Location**: src/auth.rs:42\n- **Problem**: token leak.";
         let f = parse_findings(out);
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].severity, Severity::Critical);
@@ -1225,7 +1242,10 @@ No issues found.";
 
     #[test]
     fn strip_field_label_removes_known_labels() {
-        assert_eq!(strip_field_label("findings: no issues found."), "no issues found.");
+        assert_eq!(
+            strip_field_label("findings: no issues found."),
+            "no issues found."
+        );
         assert_eq!(strip_field_label("verdict: fail"), "fail");
         assert_eq!(strip_field_label("something else"), "something else");
     }
@@ -1252,7 +1272,12 @@ No issues found.";
 
     #[test]
     fn should_not_exclude_source_files() {
-        for p in ["src/main.rs", "lib/auth.ts", "cmd/app/main.go", "pkg/util.py"] {
+        for p in [
+            "src/main.rs",
+            "lib/auth.ts",
+            "cmd/app/main.go",
+            "pkg/util.py",
+        ] {
             assert!(!should_exclude(p), "should keep {p}");
         }
     }
@@ -1351,8 +1376,11 @@ diff --git a/Cargo.lock b/Cargo.lock\n\
     fn temp_repo() -> std::path::PathBuf {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let root =
-            std::env::temp_dir().join(format!("dirge-codereview-diff-{}-{}", std::process::id(), n));
+        let root = std::env::temp_dir().join(format!(
+            "dirge-codereview-diff-{}-{}",
+            std::process::id(),
+            n
+        ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         git(&root, &["init"]);
@@ -1456,16 +1484,40 @@ diff --git a/Cargo.lock b/Cargo.lock\n\
     #[test]
     fn partition_splits_blocking_from_advisory() {
         let findings = vec![
-            Finding { severity: Severity::Critical, location: None, body: "Critical — x".into() },
-            Finding { severity: Severity::High, location: None, body: "High — y".into() },
-            Finding { severity: Severity::Medium, location: None, body: "Medium — z".into() },
-            Finding { severity: Severity::Low, location: None, body: "Low — w".into() },
+            Finding {
+                severity: Severity::Critical,
+                location: None,
+                body: "Critical — x".into(),
+            },
+            Finding {
+                severity: Severity::High,
+                location: None,
+                body: "High — y".into(),
+            },
+            Finding {
+                severity: Severity::Medium,
+                location: None,
+                body: "Medium — z".into(),
+            },
+            Finding {
+                severity: Severity::Low,
+                location: None,
+                body: "Low — w".into(),
+            },
         ];
         let (blocking, advisory) = partition_findings(findings);
         assert_eq!(blocking.len(), 2, "critical + high block");
         assert_eq!(advisory.len(), 2, "medium + low advise");
-        assert!(blocking.iter().all(|f| matches!(f.severity, Severity::High | Severity::Critical)));
-        assert!(advisory.iter().all(|f| matches!(f.severity, Severity::Medium | Severity::Low)));
+        assert!(
+            blocking
+                .iter()
+                .all(|f| matches!(f.severity, Severity::High | Severity::Critical))
+        );
+        assert!(
+            advisory
+                .iter()
+                .all(|f| matches!(f.severity, Severity::Medium | Severity::Low))
+        );
     }
 
     #[test]

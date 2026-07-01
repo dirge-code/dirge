@@ -263,12 +263,10 @@ async fn poll_finalization_follow_up(
     {
         let repo = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         // Diff capture shells out to git — do it off the async runtime.
-        let diff = tokio::task::spawn_blocking(move || {
-            super::code_review::capture_run_diff(&repo)
-        })
-        .await
-        .ok()
-        .flatten();
+        let diff = tokio::task::spawn_blocking(move || super::code_review::capture_run_diff(&repo))
+            .await
+            .ok()
+            .flatten();
         if let Some(diff) = diff {
             let transcript = build_critic_transcript(new_messages);
             let findings =
