@@ -1110,6 +1110,30 @@ fn mode_reassert_payload_is_throttled() {
     );
 }
 
+/// `reassert_terminal_modes` is callable off the paint path (the idle event-
+/// loop timer drives it directly). It must arm the throttle on first use so a
+/// subsequent same-instant call is suppressed — proving the idle poll won't
+/// spam `/dev/tty` every loop tick. The write itself is a no-op in tests
+/// (`open_tty_for_write` returns None off a real terminal), so we assert on
+/// the throttle bookkeeping via the pure payload helper it shares.
+#[test]
+fn reassert_terminal_modes_arms_and_respects_throttle() {
+    let mut r = Renderer::new().expect("renderer");
+    // Fresh renderer: no prior assert, so a payload is due right now.
+    let t = std::time::Instant::now();
+    assert!(
+        super::mode_reassert_payload(None, t).is_some(),
+        "a never-asserted renderer is due for a reassert"
+    );
+    // Drive the method; it stamps `last_mode_reassert`, so an immediate
+    // re-poll (what the idle timer does each tick) is throttled out.
+    r.reassert_terminal_modes();
+    assert!(
+        r.mode_reassert_due_in_test().is_none(),
+        "back-to-back reassert must be throttled, not re-emitted every tick"
+    );
+}
+
 /// Scrollback eviction (front drain past MAX_SCROLLBACK) bumps the
 /// eviction generation — the counter the Ctrl+O collapse guard relies on
 /// to know an absolute line anchor has been invalidated.

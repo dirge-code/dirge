@@ -4596,6 +4596,19 @@ pub async fn run_interactive(
             // past the throttle window and let the loop-top `render_frame!` flush
             // it (no body needed — needs_paint is already set).
             _ = tokio::time::sleep(tokio::time::Duration::from_millis(16)), if renderer.needs_paint() => {}
+            // Self-heal terminal modes (SGR mouse capture + bracketed paste)
+            // while idle. `tui_redraw` re-asserts them on every paint, but an
+            // idle agent stops painting — and a mouse-capture leak (a bash-tool
+            // child that opened /dev/tty and emitted `?1000l` on exit) can't
+            // self-heal via a paint, because the lost wheel/drag events are the
+            // very ones that would trigger one. So the wheel scrolls the whole
+            // terminal and click-drag selection dies until a keystroke happens
+            // to repaint. Poll on the reassert interval while idle to close
+            // that window; the method throttles internally so this is cheap.
+            // Gated on `!ui.is_running` since the active path already re-asserts.
+            _ = tokio::time::sleep(tokio::time::Duration::from_secs(1)), if !ui.is_running => {
+                renderer.reassert_terminal_modes();
+            }
             else => {
                 tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
             }

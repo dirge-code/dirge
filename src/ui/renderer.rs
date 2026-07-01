@@ -684,14 +684,7 @@ impl Renderer {
         // /dev/tty, the same sink the guard's setup uses) heals it within one
         // interval. Done before the 8ms paint throttle below so it keeps
         // firing even while paints are coalesced.
-        let now = std::time::Instant::now();
-        if let Some(bytes) = mode_reassert_payload(self.last_mode_reassert, now) {
-            if let Some(mut tty) = crate::ui::terminal::open_tty_for_write() {
-                let _ = tty.write_all(bytes);
-                let _ = tty.flush();
-            }
-            self.last_mode_reassert = Some(now);
-        }
+        self.reassert_terminal_modes();
 
         // Re-clamp the scroll offset to the CURRENT geometry every frame. The
         // scroll mutators clamp at mutation time, but a terminal RESIZE changes
@@ -2330,6 +2323,38 @@ impl Renderer {
         } else {
             Ok(())
         }
+    }
+
+    /// Re-assert the global terminal modes dirge owns (SGR mouse capture +
+    /// bracketed paste) if the throttle interval has elapsed, writing directly
+    /// to `/dev/tty`. Throttled and idempotent — safe to call as often as the
+    /// caller likes; only the first call per [`MODE_REASSERT_INTERVAL`] emits.
+    ///
+    /// `tui_redraw` calls this every paint, which heals a mid-session leak
+    /// (a bash-tool child that opened `/dev/tty` and emitted `?1000l`/`?2004l`
+    /// on exit) within one interval — but *only while frames are painting*.
+    /// When the agent is idle the event loop stops painting, so the loop also
+    /// calls this on an idle timer: otherwise a leak that lands while idle
+    /// can't self-heal, since the lost wheel/drag events are exactly what
+    /// would trigger a paint. Keyboard scroll (PageUp/Down) still dirties a
+    /// frame and heals it — which is why, in the broken state, the keyboard
+    /// keeps working while the mouse stays dead.
+    pub fn reassert_terminal_modes(&mut self) {
+        let now = std::time::Instant::now();
+        if let Some(bytes) = mode_reassert_payload(self.last_mode_reassert, now) {
+            if let Some(mut tty) = crate::ui::terminal::open_tty_for_write() {
+                let _ = tty.write_all(bytes);
+                let _ = tty.flush();
+            }
+            self.last_mode_reassert = Some(now);
+        }
+    }
+
+    /// Test hook: the reassert payload that would be emitted *right now*,
+    /// given the current throttle stamp. `Some` = due, `None` = throttled.
+    #[cfg(test)]
+    pub(crate) fn mode_reassert_due_in_test(&self) -> Option<&'static [u8]> {
+        mode_reassert_payload(self.last_mode_reassert, std::time::Instant::now())
     }
 
     /// Flag the renderer for a full repaint (session + viewport + bottom)
