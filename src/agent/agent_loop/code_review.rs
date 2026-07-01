@@ -150,6 +150,15 @@ Only report vulnerabilities with a plausible exploit path visible in the diff. D
 sink.\n\
 - Missing encryption/hashing/signing/rate-limiting/audit-logging unless the reviewed code \
 handles sensitive assets and the absence creates a concrete abuse path.\n\
+- Dependency pinning, stale-dependency, or typosquatting concerns unless this diff introduces or \
+changes the dependency and there is specific evidence of risk.\n\
+- Error-message leakage unless the leaked value is sensitive and reachable by an unauthorized \
+actor.\n\
+- CI permission concerns unless untrusted code or input can influence the privileged workflow.\n\
+- Environment-variable exposure unless the reviewed code newly exposes env vars across a trust \
+boundary — returning them in an HTTP response, writing them to user-visible logs, embedding them \
+in generated artifacts, sending them to third-party services, or making them readable by \
+less-privileged users.\n\
 - Process environment variables being readable by local same-user code, child processes, or \
 same-user tooling. Local same-user access is not an attacker boundary by itself — a finding must \
 involve a weaker actor gaining access they did not already have.\n\
@@ -442,6 +451,13 @@ fn strip_markdown(s: &str) -> String {
 /// roborev's `stripListMarker`.
 fn strip_list_marker(s: &str) -> String {
     let s = s.trim();
+    // `•` (U+2022) as well as ASCII bullets — `detect_block_severity`
+    // strips it inline, so the shared helper must too, else a `•`-bulleted
+    // legend header or `No issues found.` line slips past the callers that
+    // route through here (extract_location, is_legend_entry, verdict_is_pass).
+    if let Some(rest) = s.strip_prefix('\u{2022}') {
+        return rest.trim().to_string();
+    }
     let bytes = s.as_bytes();
     if bytes.is_empty() {
         return s.to_string();
@@ -1025,6 +1041,11 @@ mod tests {
         assert!(p.contains("prefer no finding"));
         // The same-user env-var carve-out is the highest-value noise filter.
         assert!(p.contains("same-user"));
+        // The ported don't-report carve-outs that keep the security pass
+        // from flagging routine churn (roborev parity).
+        assert!(p.contains("typosquatting"));
+        assert!(p.contains("error-message leakage"));
+        assert!(p.contains("ci permission"));
     }
 
     #[test]
@@ -1182,9 +1203,24 @@ No issues found.";
     fn strip_list_marker_handles_bullets_and_numbers() {
         assert_eq!(strip_list_marker("- item"), "item");
         assert_eq!(strip_list_marker("* item"), "item");
+        assert_eq!(strip_list_marker("\u{2022} item"), "item");
         assert_eq!(strip_list_marker("1. item"), "item");
         assert_eq!(strip_list_marker("99) item"), "item");
         assert_eq!(strip_list_marker("plain"), "plain");
+    }
+
+    /// A `•`-bulleted legend must still be recognized as a legend (the
+    /// helper strips `•` now, matching detect_block_severity), so a
+    /// `•`-bulleted severity line under it isn't mistaken for a finding.
+    #[test]
+    fn bullet_char_legend_is_not_a_finding() {
+        let out = "\
+Severity scale:\n\
+\u{2022} high: breaks prod\n\
+\u{2022} low: cosmetic\n\
+\n\
+No issues found.";
+        assert!(parse_findings(out).is_empty());
     }
 
     #[test]
