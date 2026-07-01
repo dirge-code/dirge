@@ -270,12 +270,24 @@ pub async fn build_loop_tools(
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
     let paths = crate::extras::dirge_paths::ProjectPaths::new(&cwd);
     let skill_mgr = crate::extras::skills::manager::SkillManager::new(&paths);
-    let usage_store = crate::extras::skills::usage::UsageStore::load(&paths).ok();
+    let skill_store = crate::extras::skill_db::SkillStore::load(&paths)
+        .ok()
+        .map(Arc::new);
     let skills: Arc<[Skill]> = Arc::from(
         tokio::task::spawn_blocking(move || skill::discover_skills(&cwd))
             .await
             .unwrap_or_default(),
     );
+    // Register discovered on-disk skills so they're tracked + searchable
+    // in the salience store (dirge-a47a). Insert-time only seeds
+    // provenance; agent-created skills already carry source='learned'
+    // from their create event, so a plain refresh here won't downgrade
+    // them.
+    if let Some(store) = &skill_store {
+        for sk in skills.iter() {
+            let _ = store.register_file_skill(&sk.name, &sk.description, &sk.content, false);
+        }
+    }
 
     // dirge-dktb: same synchronous-I/O fix as `build_agent_inner`.
     // Off-load the disk read to the blocking pool so a slow
@@ -549,7 +561,7 @@ pub async fn build_loop_tools(
             tools::SkillTool::new(
                 Arc::clone(&skills),
                 skill_mgr,
-                usage_store.clone(),
+                skill_store.clone(),
                 permission.clone(),
                 ask_tx.clone(),
             ),

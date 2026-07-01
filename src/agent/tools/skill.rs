@@ -5,8 +5,8 @@ use rig::tool::Tool;
 use serde::Deserialize;
 
 use crate::agent::tools::{AskSender, PermCheck, ToolError, check_perm};
+use crate::extras::skill_db::SkillStore;
 use crate::extras::skills::manager::SkillManager;
-use crate::extras::skills::usage::UsageStore;
 use crate::skill::{self, Skill};
 
 /// Combined skill tool — load (read), create, edit, patch, delete, list.
@@ -16,14 +16,17 @@ pub struct SkillTool {
     pub ask_tx: Option<AskSender>,
     skills: Arc<[Skill]>,
     manager: SkillManager,
-    usage: Option<UsageStore>,
+    /// Salience/telemetry store (dirge-a47a) — the sqlite successor to
+    /// the `.usage.json` sidecar. Records views/uses/creates/patches and
+    /// feeds skill ranking.
+    store: Option<Arc<SkillStore>>,
 }
 
 impl SkillTool {
     pub fn new(
         skills: Arc<[Skill]>,
         manager: SkillManager,
-        usage: Option<UsageStore>,
+        store: Option<Arc<SkillStore>>,
         permission: Option<PermCheck>,
         ask_tx: Option<AskSender>,
     ) -> Self {
@@ -32,7 +35,7 @@ impl SkillTool {
             ask_tx,
             skills,
             manager,
-            usage,
+            store,
         }
     }
 }
@@ -133,9 +136,9 @@ impl Tool for SkillTool {
                     )));
                 };
                 // Bump the view and use counters (best-effort).
-                if let Some(mut u) = self.usage.clone() {
-                    u.record_view(name);
-                    u.record_use(name);
+                if let Some(store) = &self.store {
+                    store.record_view(name);
+                    store.record_use(name);
                 }
                 let mut output = format!("# {}\n", skill.name);
                 if !skill.description.is_empty() {
@@ -173,9 +176,10 @@ impl Tool for SkillTool {
                 self.manager
                     .create_from_content(name, content)
                     .map_err(ToolError::Msg)?;
-                // Bump create counter (best-effort).
-                if let Some(mut u) = self.usage.clone() {
-                    u.record_create(name, "agent");
+                // Register the new skill + mark agent provenance (best-effort).
+                if let Some(store) = &self.store {
+                    let _ = store.register_file_skill(name, "", content, true);
+                    store.record_create(name, "agent");
                 }
                 Ok(format!("Skill '{}' created.", name))
             }
@@ -191,9 +195,11 @@ impl Tool for SkillTool {
                 self.manager
                     .edit_from_content(name, content)
                     .map_err(ToolError::Msg)?;
-                // Bump patch counter (best-effort).
-                if let Some(mut u) = self.usage.clone() {
-                    u.record_patch(name);
+                // Refresh the FTS projection to the new body + bump the
+                // patch counter (best-effort).
+                if let Some(store) = &self.store {
+                    let _ = store.register_file_skill(name, "", content, true);
+                    store.record_patch(name);
                 }
                 Ok(format!("Skill '{}' updated.", name))
             }
@@ -213,8 +219,8 @@ impl Tool for SkillTool {
                     .patch(name, old_string, new_string)
                     .map_err(ToolError::Msg)?;
                 // Bump patch counter (best-effort).
-                if let Some(mut u) = self.usage.clone() {
-                    u.record_patch(name);
+                if let Some(store) = &self.store {
+                    store.record_patch(name);
                 }
                 Ok(format!("Skill '{}' patched.", name))
             }

@@ -17,9 +17,10 @@
 //! separates agent-`learned` skills (DB-resident, subject to curation)
 //! from `file`-registered ones (dirge-izju; git-tracked, pinned exempt).
 //!
-// dirge-a47a: this store is exercised only by its tests until the skill
-// tool + curator land next round and give every API a real caller.
-// Remove this allow when wiring R3 so genuine dead code resurfaces.
+// The telemetry + ranking APIs are wired into the skill tool and
+// preamble (dirge-a47a); the search/outcome/decay/archive APIs get their
+// callers with `/learn` (dirge-s99m) and the salience curator
+// (dirge-izju). Remove this allow when the curator round lands.
 #![allow(dead_code)]
 
 use std::sync::Mutex;
@@ -60,7 +61,11 @@ pub struct SkillRow {
     pub created_at: String,
     pub updated_at: String,
     pub last_used_at: Option<String>,
+    pub last_viewed_at: Option<String>,
+    pub last_patched_at: Option<String>,
     pub use_count: i64,
+    pub view_count: i64,
+    pub patch_count: i64,
     pub success_count: i64,
     pub failure_count: i64,
     pub last_success_at: Option<String>,
@@ -83,7 +88,11 @@ impl SkillRow {
             created_at: row.get("created_at")?,
             updated_at: row.get("updated_at")?,
             last_used_at: row.get("last_used_at")?,
+            last_viewed_at: row.get("last_viewed_at")?,
+            last_patched_at: row.get("last_patched_at")?,
             use_count: row.get("use_count")?,
+            view_count: row.get("view_count")?,
+            patch_count: row.get("patch_count")?,
             success_count: row.get("success_count")?,
             failure_count: row.get("failure_count")?,
             last_success_at: row.get("last_success_at")?,
@@ -106,8 +115,11 @@ impl SkillRow {
     }
 }
 
-/// Where a skill came from. `learned` skills are DB-resident and curated;
-/// `file` skills are registered from disk (dirge-izju) and pinned.
+/// Provenance. `learned` = agent-created (via the skill tool or
+/// `/learn`), so the curator manages it. `file` = a discovered on-disk
+/// skill the agent didn't author (bundled/user); the curator leaves it
+/// alone. Orthogonal to `pinned`, which is an explicit curation-exempt
+/// flag set by the user on either kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkillSource {
     Learned,
@@ -214,13 +226,12 @@ impl SkillStore {
 
         let uid = random_skill_id();
         let now = chrono::Utc::now().to_rfc3339();
-        let pinned = matches!(source, SkillSource::File);
         conn.execute(
             "INSERT INTO skills
                  (uid, name, description, content, source, skill_path, status,
                   tier, pinned, confidence, salience, created_at, updated_at,
-                  use_count, success_count, failure_count)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', 'hot', ?7, ?8, ?9, ?10, ?10, 0, 0, 0)",
+                  use_count, view_count, patch_count, success_count, failure_count)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', 'hot', 0, ?7, ?8, ?9, ?9, 0, 0, 0, 0, 0)",
             params![
                 uid,
                 name,
@@ -228,7 +239,6 @@ impl SkillStore {
                 content,
                 source.as_str(),
                 skill_path,
-                pinned as i64,
                 DEFAULT_CONFIDENCE,
                 SKILL_BASE_SALIENCE,
                 now,
@@ -244,6 +254,197 @@ impl SkillStore {
 
         Self::get_locked(&conn, name)?
             .ok_or_else(|| "Skill vanished immediately after insert".to_string())
+    }
+
+    // ── Telemetry superset (replaces the .usage.json UsageStore) ─────
+    //
+    // These mirror `UsageStore`'s best-effort counter bumps: they upsert
+    // a bare row for a skill first seen outside the `create` path (e.g. a
+    // pre-existing file skill invoked before it was registered), and swap
+    // JSON-sidecar storage for the sqlite skills table so telemetry and
+    // salience live together. Failures are logged, never propagated —
+    // telemetry must not break the underlying skill operation.
+
+    /// Insert a minimal row for `name` if none exists, so a best-effort
+    /// counter bump always has a row to land on. A skill first seen this
+    /// way is a `file` (not agent-created) skill with empty text until
+    /// [`register_file_skill`](Self::register_file_skill) fills it in.
+    fn ensure_row_locked(conn: &Connection, name: &str) -> Result<(), String> {
+        if Self::get_locked(conn, name)?.is_some() {
+            return Ok(());
+        }
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO skills
+                 (uid, name, description, content, source, status, tier,
+                  pinned, confidence, salience, created_at, updated_at)
+             VALUES (?1, ?2, '', '', 'file', 'active', 'hot', 0, ?3, ?4, ?5, ?5)",
+            params![
+                random_skill_id(),
+                name,
+                DEFAULT_CONFIDENCE,
+                SKILL_BASE_SALIENCE,
+                now,
+            ],
+        )
+        .map_err(|e| format!("Failed to ensure skill row: {e}"))?;
+        Ok(())
+    }
+
+    /// Record a skill invocation: bump `use_count`, stamp `last_used_at`,
+    /// and reinforce salience (capped at 1.0) — being reached for IS the
+    /// relevance signal. Best-effort.
+    pub fn record_use(&self, name: &str) {
+        if let Err(e) = self.bump_use(name) {
+            tracing::debug!(target: "dirge::skills", error = %e, "record_use failed");
+        }
+    }
+
+    fn bump_use(&self, name: &str) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_row_locked(&conn, name)?;
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE skills
+             SET use_count = use_count + 1, last_used_at = ?1,
+                 salience = MIN(1.0, salience + ?2)
+             WHERE name = ?3",
+            params![now, USE_REINFORCEMENT, name],
+        )
+        .map_err(|e| format!("bump use: {e}"))?;
+        Ok(())
+    }
+
+    /// Record a skill view (content read). Best-effort.
+    pub fn record_view(&self, name: &str) {
+        if let Err(e) = self.bump_counter(name, "view_count", "last_viewed_at") {
+            tracing::debug!(target: "dirge::skills", error = %e, "record_view failed");
+        }
+    }
+
+    /// Record a skill patch (content edited). Best-effort.
+    pub fn record_patch(&self, name: &str) {
+        if let Err(e) = self.bump_counter(name, "patch_count", "last_patched_at") {
+            tracing::debug!(target: "dirge::skills", error = %e, "record_patch failed");
+        }
+    }
+
+    fn bump_counter(&self, name: &str, counter: &str, stamp: &str) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_row_locked(&conn, name)?;
+        let now = chrono::Utc::now().to_rfc3339();
+        // `counter`/`stamp` are internal constants, never user input.
+        conn.execute(
+            &format!("UPDATE skills SET {counter} = {counter} + 1, {stamp} = ?1 WHERE name = ?2"),
+            params![now, name],
+        )
+        .map_err(|e| format!("bump {counter}: {e}"))?;
+        Ok(())
+    }
+
+    /// Record a skill creation event, marking provenance. `created_by ==
+    /// "agent"` flags the skill as agent-created (curator-managed);
+    /// anything else leaves it a `file` (bundled/user) skill. Best-effort
+    /// upsert — an existing row keeps its earlier provenance.
+    pub fn record_create(&self, name: &str, created_by: &str) {
+        if let Err(e) = self.do_record_create(name, created_by) {
+            tracing::debug!(target: "dirge::skills", error = %e, "record_create failed");
+        }
+    }
+
+    fn do_record_create(&self, name: &str, created_by: &str) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_row_locked(&conn, name)?;
+        if created_by == "agent" {
+            conn.execute(
+                "UPDATE skills SET source = 'learned' WHERE name = ?1",
+                params![name],
+            )
+            .map_err(|e| format!("record_create: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// Set the pinned flag (curation-exempt). Upserts a row if needed.
+    pub fn set_pinned(&self, name: &str, pinned: bool) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_row_locked(&conn, name)?;
+        conn.execute(
+            "UPDATE skills SET pinned = ?1 WHERE name = ?2",
+            params![pinned as i64, name],
+        )
+        .map_err(|e| format!("set_pinned: {e}"))?;
+        Ok(())
+    }
+
+    /// Provenance filter: only agent-created skills are curator-managed
+    /// (`source = 'learned'`). Bundled/user file skills return false.
+    pub fn is_agent_created(&self, name: &str) -> bool {
+        self.get(name)
+            .ok()
+            .flatten()
+            .map(|r| r.source == "learned")
+            .unwrap_or(false)
+    }
+
+    /// Register (upsert) a skill discovered on disk so it's tracked and
+    /// searchable: insert a row if absent, else refresh its description,
+    /// content, and FTS projection so ranking/search see the current
+    /// text. Preserves salience/usage lineage on an existing row.
+    /// `agent_created` seeds provenance only on first insert.
+    pub fn register_file_skill(
+        &self,
+        name: &str,
+        description: &str,
+        content: &str,
+        agent_created: bool,
+    ) -> Result<(), String> {
+        validate_skill_name(name)?;
+        let description = description.trim();
+        let content = redact_for_fts(content.trim());
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        let source = if agent_created { "learned" } else { "file" };
+        let existed = Self::get_locked(&conn, name)?.is_some();
+        if existed {
+            conn.execute(
+                "UPDATE skills SET description = ?1, content = ?2, updated_at = ?3
+                 WHERE name = ?4",
+                params![description, content, now, name],
+            )
+            .map_err(|e| format!("Failed to refresh skill: {e}"))?;
+        } else {
+            conn.execute(
+                "INSERT INTO skills
+                     (uid, name, description, content, source, status, tier,
+                      pinned, confidence, salience, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'active', 'hot', 0, ?6, ?7, ?8, ?8)",
+                params![
+                    random_skill_id(),
+                    name,
+                    description,
+                    content,
+                    source,
+                    DEFAULT_CONFIDENCE,
+                    SKILL_BASE_SALIENCE,
+                    now,
+                ],
+            )
+            .map_err(|e| format!("Failed to register skill: {e}"))?;
+        }
+        let rowid: i64 = conn
+            .query_row("SELECT id FROM skills WHERE name = ?1", params![name], |r| {
+                r.get(0)
+            })
+            .map_err(|e| format!("Failed to read skill id: {e}"))?;
+        conn.execute("DELETE FROM skills_fts WHERE rowid = ?1", params![rowid])
+            .map_err(|e| format!("Failed to reindex skill: {e}"))?;
+        conn.execute(
+            "INSERT INTO skills_fts(rowid, content) VALUES (?1, ?2)",
+            params![rowid, fts_projection(name, description, &content)],
+        )
+        .map_err(|e| format!("Failed to reindex skill: {e}"))?;
+        Ok(())
     }
 
     /// Fetch a skill by exact name (any status).
@@ -442,7 +643,10 @@ mod tests {
                  confidence REAL NOT NULL DEFAULT 0.6,
                  salience REAL NOT NULL DEFAULT 0.5,
                  created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-                 last_used_at TEXT, use_count INTEGER NOT NULL DEFAULT 0,
+                 last_used_at TEXT, last_viewed_at TEXT, last_patched_at TEXT,
+                 use_count INTEGER NOT NULL DEFAULT 0,
+                 view_count INTEGER NOT NULL DEFAULT 0,
+                 patch_count INTEGER NOT NULL DEFAULT 0,
                  success_count INTEGER NOT NULL DEFAULT 0,
                  failure_count INTEGER NOT NULL DEFAULT 0,
                  last_success_at TEXT, superseded_by TEXT, superseded_at TEXT);
@@ -497,7 +701,7 @@ mod tests {
     }
 
     #[test]
-    fn file_skills_are_pinned() {
+    fn file_source_is_not_agent_created_and_unpinned() {
         let s = store();
         let row = s
             .create(
@@ -508,11 +712,84 @@ mod tests {
                 Some("/repo/.dirge/skills/from-disk/SKILL.md"),
             )
             .expect("create file skill");
-        assert!(row.pinned);
+        // Provenance is orthogonal to pinning: a file skill is not
+        // agent-created and not auto-pinned.
+        assert!(!row.pinned);
+        assert!(!s.is_agent_created("from-disk"));
         assert_eq!(
             row.skill_path.as_deref(),
             Some("/repo/.dirge/skills/from-disk/SKILL.md")
         );
+        // A learned skill IS agent-created.
+        s.create("mine", "d", "b", SkillSource::Learned, None)
+            .expect("learned");
+        assert!(s.is_agent_created("mine"));
+    }
+
+    #[test]
+    fn telemetry_upserts_a_row_for_an_unregistered_skill() {
+        let s = store();
+        // No create() first — record_* must upsert a bare file row.
+        s.record_view("ghost");
+        s.record_use("ghost");
+        s.record_patch("ghost");
+        let row = s.get("ghost").expect("get").expect("row exists");
+        assert_eq!(row.view_count, 1);
+        assert_eq!(row.use_count, 1);
+        assert_eq!(row.patch_count, 1);
+        assert_eq!(row.source, "file");
+        assert!(!s.is_agent_created("ghost"));
+        // use reinforced salience; view/patch did not.
+        assert!((row.salience - (SKILL_BASE_SALIENCE + USE_REINFORCEMENT)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn record_create_marks_agent_provenance() {
+        let s = store();
+        s.record_view("x"); // creates a bare file row first
+        assert!(!s.is_agent_created("x"));
+        s.record_create("x", "agent");
+        assert!(s.is_agent_created("x"));
+        // Non-agent creators don't flip provenance.
+        s.record_create("y", "bundled");
+        assert!(!s.is_agent_created("y"));
+    }
+
+    #[test]
+    fn register_file_skill_upserts_and_indexes_for_search() {
+        let s = store();
+        s.register_file_skill(
+            "linter",
+            "Run the project linter.",
+            "Invoke cargo clippy across the workspace.",
+            false,
+        )
+        .expect("register");
+        assert!(!s.is_agent_created("linter"));
+        // Searchable by body after registration.
+        let hits = s.search("clippy").expect("search");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].name, "linter");
+        // Re-register refreshes content without losing usage lineage.
+        s.record_use("linter");
+        s.register_file_skill("linter", "Run the linter.", "Now uses cargo fmt too.", false)
+            .expect("re-register");
+        let row = s.get("linter").unwrap().unwrap();
+        assert_eq!(row.use_count, 1, "usage lineage preserved across refresh");
+        assert!(s.search("fmt").expect("search").len() == 1);
+        assert!(s.search("clippy").expect("search").is_empty());
+    }
+
+    #[test]
+    fn set_pinned_toggles_the_flag() {
+        let s = store();
+        s.create("s", "d", "b", SkillSource::Learned, None)
+            .expect("create");
+        assert!(!s.get("s").unwrap().unwrap().pinned);
+        s.set_pinned("s", true).expect("pin");
+        assert!(s.get("s").unwrap().unwrap().pinned);
+        s.set_pinned("s", false).expect("unpin");
+        assert!(!s.get("s").unwrap().unwrap().pinned);
     }
 
     #[test]
@@ -628,9 +905,10 @@ mod tests {
         let s = store();
         s.create("proven", "d", "b", SkillSource::Learned, None)
             .expect("proven");
-        s.create("pinned", "d", "b", SkillSource::File, Some("/p"))
+        s.create("pinned", "d", "b", SkillSource::Learned, None)
             .expect("pinned");
-        // Both backdated; proven has a fresh success, pinned is a file skill.
+        s.set_pinned("pinned", true).expect("pin");
+        // Both backdated; proven has a fresh success, pinned is user-pinned.
         {
             let conn = s.conn.lock().unwrap();
             conn.execute(
@@ -649,8 +927,9 @@ mod tests {
         let s = store();
         s.create("learned", "d", "b", SkillSource::Learned, None)
             .expect("learned");
-        s.create("filed", "d", "b", SkillSource::File, Some("/p"))
+        s.create("filed", "d", "b", SkillSource::Learned, None)
             .expect("filed");
+        s.set_pinned("filed", true).expect("pin");
         assert!(s.archive("learned").expect("archive learned"));
         assert_eq!(s.get("learned").unwrap().unwrap().status, "archived");
         assert!(!s.archive("filed").expect("refuse pinned"));

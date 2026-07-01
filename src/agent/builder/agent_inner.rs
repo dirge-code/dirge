@@ -198,7 +198,7 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
     {
         preamble.push_str(&block);
     }
-    let mut usage_store = crate::extras::skills::usage::UsageStore::load(&paths).ok();
+    let skill_store = crate::extras::skill_db::SkillStore::load(&paths).ok();
 
     // Inject available skills into the preamble so the model knows
     // what procedural knowledge exists. dirge-rq65 follow-up: list
@@ -211,10 +211,32 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
     // preamble, so the model never knows to load it.
     // Skills carry name + description; full content loads on demand.
     // Bumps view counters for each listed skill (best-effort).
-    let skills = crate::skill::discover_skills(
+    let mut skills = crate::skill::discover_skills(
         &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
     );
     if !skills.is_empty() {
+        // dirge-a47a: register each discovered skill, then order the
+        // listing by effective salience (most useful first) so the
+        // model's attention lands on the skills that actually work.
+        // Skills the store doesn't know about sort to the end.
+        if let Some(store) = &skill_store {
+            for sk in &skills {
+                let _ = store.register_file_skill(&sk.name, &sk.description, &sk.content, false);
+            }
+            if let Ok(active) = store.list_active() {
+                let order: std::collections::HashMap<&str, usize> = active
+                    .iter()
+                    .enumerate()
+                    .map(|(i, r)| (r.name.as_str(), i))
+                    .collect();
+                skills.sort_by_key(|s| {
+                    order
+                        .get(s.name.as_str())
+                        .copied()
+                        .unwrap_or(usize::MAX)
+                });
+            }
+        }
         preamble.push_str(PROJECT_SKILLS_PREAMBLE);
         for skill in &skills {
             let desc = if skill.description.is_empty() {
@@ -224,9 +246,9 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
             };
             preamble.push_str(&format!("  - **{}**: {}\n", skill.name, desc));
         }
-        if let Some(ref mut u) = usage_store {
+        if let Some(store) = &skill_store {
             for skill in &skills {
-                u.record_view(&skill.name);
+                store.record_view(&skill.name);
             }
         }
     }
