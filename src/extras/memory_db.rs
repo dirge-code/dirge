@@ -128,8 +128,9 @@ fn default_salience_for_kind(kind: MemoryKind) -> f64 {
 }
 
 /// Port of UMP id.ts `randomId()`: 128 random bits, base32-encoded
-/// (lowercase, no padding), prefixed with `urn:ump:`.
-fn random_entry_id() -> String {
+/// (lowercase, no padding), prefixed with `urn:ump:`. Shared with the
+/// skill store (dirge-70ht) so both stores mint ids the same way.
+pub(crate) fn random_entry_id() -> String {
     let bytes = uuid::Uuid::new_v4().into_bytes();
     let encoded = base32_encode(&bytes);
     format!("urn:ump:{}", encoded)

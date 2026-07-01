@@ -264,6 +264,11 @@ impl SessionDb {
     /// Must run under the exclusive transaction `migrate` opened —
     /// the version read below is only race-free while locked.
     fn run_pending_migrations(&self) -> Result<(), String> {
+        // Feature-independent, out of the version ladder (see
+        // `ensure_skills_tables`). Must run BEFORE the early-return so
+        // DBs already at SCHEMA_VERSION still gain the skills tables.
+        self.ensure_skills_tables()?;
+
         let current: u32 = self
             .conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
@@ -982,6 +987,66 @@ impl SessionDb {
             )
             .map_err(|e| format!("Migration v15 failed: {e}"))?;
 
+        Ok(())
+    }
+
+    /// Create the `skills` tables (dirge-70ht). Runs UNCONDITIONALLY on
+    /// every open, ahead of the version ladder, rather than as a numbered
+    /// migration. `SCHEMA_VERSION` is feature-gated (13 without
+    /// `experimental-graph-search`, 15 with it) so the graph tables can
+    /// be enabled on an existing DB later — an invariant that only holds
+    /// while a no-feature DB stays below v14. A feature-independent table
+    /// numbered above the gated ones would break that upgrade path (see
+    /// the notes on SCHEMA_VERSION), so skills instead follow the
+    /// idempotent `IF NOT EXISTS` pattern the memories table already uses
+    /// and stay out of the `user_version` namespace entirely.
+    ///
+    /// Schema mirrors `memories` (dirge-70ht reuses its salience engine):
+    /// a skill is a named, procedural-like memory with a success/failure
+    /// record. `source` distinguishes agent-`learned` (DB-resident) from
+    /// `file`-registered skills; `pinned` marks the eviction/archival
+    /// exemptions (file skills, user pins). `skills_fts` mirrors
+    /// `memories_fts` — a standalone fts5(content) table fed the redacted
+    /// name+description+content projection.
+    fn ensure_skills_tables(&self) -> Result<(), String> {
+        self.conn
+            .execute_batch(
+                "
+                CREATE TABLE IF NOT EXISTS skills (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    uid             TEXT NOT NULL UNIQUE,
+                    name            TEXT NOT NULL UNIQUE,
+                    description     TEXT NOT NULL,
+                    content         TEXT NOT NULL,
+                    source          TEXT NOT NULL DEFAULT 'learned'
+                                        CHECK(source IN ('learned','file')),
+                    skill_path      TEXT,
+                    status          TEXT NOT NULL DEFAULT 'active'
+                                        CHECK(status IN ('active','tombstoned','superseded','archived')),
+                    tier            TEXT NOT NULL DEFAULT 'hot'
+                                        CHECK(tier IN ('hot','breadcrumb')),
+                    pinned          INTEGER NOT NULL DEFAULT 0,
+                    confidence      REAL NOT NULL DEFAULT 0.6,
+                    salience        REAL NOT NULL DEFAULT 0.5,
+                    created_at      TEXT NOT NULL,
+                    updated_at      TEXT NOT NULL,
+                    last_used_at    TEXT,
+                    use_count       INTEGER NOT NULL DEFAULT 0,
+                    success_count   INTEGER NOT NULL DEFAULT 0,
+                    failure_count   INTEGER NOT NULL DEFAULT 0,
+                    last_success_at TEXT,
+                    superseded_by   TEXT,
+                    superseded_at   TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_skills_status ON skills(status);
+
+                CREATE VIRTUAL TABLE IF NOT EXISTS skills_fts USING fts5(
+                    content
+                );
+                ",
+            )
+            .map_err(|e| format!("Skills-table creation failed: {e}"))?;
         Ok(())
     }
 

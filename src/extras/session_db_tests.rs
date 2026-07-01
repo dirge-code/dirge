@@ -1186,3 +1186,67 @@ fn schema_v13_adds_confidence_and_supersession_columns() {
     assert_eq!(superseded_at, None, "superseded_at defaults NULL");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// dirge-70ht: the skills tables are created idempotently OUTSIDE the
+/// version ladder (feature-gated SCHEMA_VERSION can't host a
+/// feature-independent table above the graph migrations without breaking
+/// the enable-graph-later upgrade path). A fresh open must create them.
+#[test]
+fn skills_tables_created_on_fresh_open() {
+    let (db, _dir) = temp_db();
+    let table: i64 = db
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='skills'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(table, 1, "skills table must exist");
+    let fts: i64 = db
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name='skills_fts'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(fts, 1, "skills_fts must exist");
+}
+
+/// The skills tables must appear even for a DB already at SCHEMA_VERSION,
+/// where the migration ladder early-returns. Dropping them and bumping
+/// user_version to the ceiling simulates a DB created before skills
+/// existed; reopening must recreate them (proving `ensure_skills_tables`
+/// runs ahead of the early return).
+#[test]
+fn skills_tables_recreated_when_db_at_schema_version() {
+    let (db, dir) = temp_db();
+    let path = dir.join("state.db");
+    {
+        db.conn
+            .execute_batch(
+                "DROP TABLE skills;
+                 DROP TABLE skills_fts;",
+            )
+            .unwrap();
+        db.conn
+            .pragma_update(None, "user_version", SCHEMA_VERSION)
+            .unwrap();
+    }
+    drop(db);
+    let reopened = SessionDb::open(&path).unwrap();
+    let present: i64 = reopened
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='skills'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        present, 1,
+        "skills table must be recreated even when the version ladder is satisfied"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

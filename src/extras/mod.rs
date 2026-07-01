@@ -35,5 +35,6 @@ mod memory_retrieval_eval;
 pub mod salience;
 pub mod session_db;
 pub mod session_search;
+pub mod skill_db;
 pub mod skills;
 pub mod spec_db;
