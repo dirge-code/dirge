@@ -290,7 +290,7 @@ where
         ProviderKind::OpenAI if is_chatgpt_auth => {
             let mut b = openai::Client::builder()
                 .api_key(&key)
-                .http_client(CodexHttpClient::default());
+                .http_client(codex_http_client_for(&key));
             if let Some(base_url) = &base_url {
                 b = b.base_url(base_url);
             }
@@ -502,6 +502,43 @@ pub(crate) fn load_fresh_openai_oauth() -> anyhow::Result<Option<OpenAiOAuthCred
         store.save_openai(&refreshed)?;
         Ok(refreshed)
     })
+}
+
+/// True when the ChatGPT/Codex refresh seam should be attached: only when the
+/// outgoing bearer is Dirge's own OAuth access token, the sole ChatGPT-path
+/// credential Dirge can refresh. Env (`CODEX_ACCESS_TOKEN`) and legacy
+/// `codex login` file tokens carry a different bearer, so this returns false
+/// and they keep the pre-fix frozen-header behavior (dirge-30nl).
+fn codex_refresh_applies(loaded: &Option<OpenAiOAuthCredential>, bearer: &str) -> bool {
+    loaded
+        .as_ref()
+        .is_some_and(|credential| credential.access_token() == bearer)
+}
+
+/// Build the Codex transport for the ChatGPT/Codex OAuth path, attaching a
+/// mid-session refresh seam when the bearer is Dirge's refreshable OAuth token
+/// (dirge-30nl). Otherwise returns a plain client whose bearer stays as rig set
+/// it from the static api_key.
+fn codex_http_client_for(bearer: &str) -> CodexHttpClient {
+    let loaded = load_fresh_openai_oauth().ok().flatten();
+    if !codex_refresh_applies(&loaded, bearer) {
+        return CodexHttpClient::default();
+    }
+    let credential = loaded.expect("codex_refresh_applies guarantees Some");
+    let refresher: super::codex_http::CodexRefreshFn = std::sync::Arc::new(|| {
+        let credential = load_fresh_openai_oauth()?.ok_or_else(|| {
+            anyhow::anyhow!("stored OpenAI OAuth credential is no longer available")
+        })?;
+        Ok(super::auth::RefreshedAuth {
+            bearer_token: credential.access_token().to_string(),
+            expires_at_ms: Some(credential.expires_at_epoch_ms()),
+        })
+    });
+    CodexHttpClient::new_refreshable(
+        credential.access_token().to_string(),
+        Some(credential.expires_at_epoch_ms()),
+        refresher,
+    )
 }
 
 /// Load a fresh OpenAI OAuth credential, refreshing under a cross-process lock.
@@ -1038,6 +1075,21 @@ mod tests {
         .expect("fresh credential returned");
 
         assert_eq!(result.access_token(), "ACCESS-TOKEN");
+    }
+
+    #[test]
+    fn codex_refresh_applies_only_to_the_dirge_oauth_bearer() {
+        let credential = oauth("DIRGE-OAUTH-ACCESS");
+        // The outgoing bearer is Dirge's OAuth token -> refreshable.
+        assert!(codex_refresh_applies(
+            &Some(credential.clone()),
+            "DIRGE-OAUTH-ACCESS"
+        ));
+        // An env / legacy-file token differs from the stored OAuth access
+        // token -> stays frozen, no accidental override.
+        assert!(!codex_refresh_applies(&Some(credential), "CODEX-ENV-TOKEN"));
+        // No stored OAuth credential at all -> frozen.
+        assert!(!codex_refresh_applies(&None, "ANY"));
     }
 
     #[test]
