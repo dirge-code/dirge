@@ -89,7 +89,19 @@ pub enum Resource {
     },
     /// One shell command segment. `head` is the leading executable
     /// token (for command-pattern matching / display).
-    Command { raw: String, head: String },
+    ///
+    /// `complex` marks a whole-command claim the shell splitter refused
+    /// to decompose — a command substitution (`$(…)`, backticks,
+    /// `<(…)`), subshell, or arithmetic expansion. A complex command's
+    /// `head`/`raw` describe only its OUTER shape, so an allow rule that
+    /// matches the head (`echo **`) must NOT silently allow it: the
+    /// inner `$(rm -rf ~)` never gets its own claim. The allow deciders
+    /// treat `complex: true` as "prompt regardless" (dirge-g9qj).
+    Command {
+        raw: String,
+        head: String,
+        complex: bool,
+    },
     /// An MCP `server:tool` invocation.
     Mcp {
         server: String,
@@ -104,6 +116,37 @@ pub enum Resource {
 }
 
 impl Resource {
+    /// A simple shell command claim: the splitter fully decomposed it,
+    /// so allow rules may match its head. `head` is the leading token.
+    pub fn command(raw: impl Into<String>) -> Self {
+        let raw = raw.into();
+        let head = raw.split_whitespace().next().unwrap_or("").to_string();
+        Resource::Command {
+            raw,
+            head,
+            complex: false,
+        }
+    }
+
+    /// A whole-command claim the splitter refused to decompose
+    /// (substitution / subshell / arithmetic). Allow rules must not
+    /// silently allow it — the inner command is invisible (dirge-g9qj).
+    pub fn command_complex(raw: impl Into<String>) -> Self {
+        let raw = raw.into();
+        let head = raw.split_whitespace().next().unwrap_or("").to_string();
+        Resource::Command {
+            raw,
+            head,
+            complex: true,
+        }
+    }
+
+    /// Whether this is a complex (non-decomposed) shell command whose
+    /// allow-matching must be suppressed.
+    pub fn is_complex_command(&self) -> bool {
+        matches!(self, Resource::Command { complex: true, .. })
+    }
+
     /// The string a pattern matches against, and the value shown in
     /// the permission prompt for this resource.
     pub fn match_key(&self) -> &str {

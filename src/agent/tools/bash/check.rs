@@ -141,15 +141,12 @@ pub(super) async fn check_bash_segments(
         g.mode()
     };
     use crate::permission::engine::types::{AccessRequest, Claim, Operation, Resource};
-    let cmd_claim = |seg: &str| {
-        Claim::new(
-            Operation::Execute,
-            Resource::Command {
-                raw: seg.to_string(),
-                head: seg.split_whitespace().next().unwrap_or("").to_string(),
-            },
-        )
-    };
+    let cmd_claim = |seg: &str| Claim::new(Operation::Execute, Resource::command(seg));
+    // dirge-g9qj: a whole-command claim the splitter refused to
+    // decompose (substitution / subshell) must be marked complex so the
+    // allow deciders won't silently allow it on a matching head.
+    let complex_cmd_claim =
+        |seg: &str| Claim::new(Operation::Execute, Resource::command_complex(seg));
     let mut claims: Vec<Claim> = Vec::new();
 
     #[cfg(feature = "semantic-bash")]
@@ -186,7 +183,9 @@ pub(super) async fn check_bash_segments(
             // Subshell / command substitution / etc.: tree-sitter
             // declined to split — check the whole command as one
             // Execute claim so the user confirms the unfamiliar shape.
-            claims.push(cmd_claim(command));
+            // Marked complex so a matching allow rule (`echo **`) can't
+            // silently allow it (dirge-g9qj).
+            claims.push(complex_cmd_claim(command));
         } else {
             for segment in &segments {
                 claims.push(cmd_claim(segment));
@@ -214,7 +213,7 @@ pub(super) async fn check_bash_segments(
             || command.contains("$'")
             || command.contains("<<");
         if has_substitution {
-            claims.push(cmd_claim(command));
+            claims.push(complex_cmd_claim(command));
         } else {
             for segment in quote_aware_split(command) {
                 claims.push(cmd_claim(segment));
