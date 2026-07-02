@@ -902,15 +902,34 @@ async fn verify_pass(review_fn: &CriticFn, diff: &str, candidates: &[Finding]) -
             return candidates.to_vec();
         }
     };
-    let mut survivors = parse_findings(&response);
-    if survivors.is_empty() && !verdict_is_pass(&response) {
-        // Ambiguous verify output (no parseable findings, no clean-pass
-        // phrase) — don't silently drop; keep the pass-1 candidates.
+    // The verify contract is VERIFIED / FALSE_POSITIVE. Well-behaved
+    // output omits dropped candidates, but a common shape re-lists each
+    // candidate with an inline verdict while still carrying its severity
+    // label. Discard the FALSE_POSITIVE-annotated blocks before parsing so
+    // an explicitly-dropped candidate can't parse back as a survivor
+    // (dirge-uz95).
+    let (dropped, kept): (Vec<String>, Vec<String>) = split_finding_blocks(&response)
+        .into_iter()
+        .partition(|b| block_is_false_positive(b));
+    let mut survivors = parse_findings(&kept.join("\n---\n"));
+    if survivors.is_empty() && dropped.is_empty() && !verdict_is_pass(&response) {
+        // Ambiguous verify output (no parseable findings, no explicit
+        // FALSE_POSITIVE verdict, no clean-pass phrase) — don't silently
+        // drop; keep the pass-1 candidates. An explicit FALSE_POSITIVE
+        // annotation is NOT ambiguous, so it clears the finding.
         tracing::debug!(target: "dirge::code_review", "verify output ambiguous; keeping pass-1 findings");
         return candidates.to_vec();
     }
     survivors.sort_by_key(|f| std::cmp::Reverse(f.severity));
     survivors
+}
+
+/// True when a verify block carries the judge's FALSE_POSITIVE drop
+/// verdict. Matches the structured token (underscore form) case-
+/// insensitively so it fires on `FALSE_POSITIVE` / `false_positive` but
+/// NOT on prose like "guards against false positives" in a real finding.
+fn block_is_false_positive(block: &str) -> bool {
+    block.to_ascii_uppercase().contains("FALSE_POSITIVE")
 }
 
 /// Build the verify-pass user prompt: the ported verify/dedupe
@@ -1646,6 +1665,37 @@ diff --git a/Cargo.lock b/Cargo.lock\n\
         };
         let f = run_code_review(&review, "r", "diff", "t").await;
         assert_eq!(f.len(), 1, "verify error must not drop pass-1 findings");
+    }
+
+    /// dirge-uz95: the verify prompt asks for VERIFIED / FALSE_POSITIVE,
+    /// but a common LLM shape re-lists a dropped candidate with an inline
+    /// verdict while still carrying its severity label. That block must be
+    /// discarded, not parsed as a survivor that blocks finalization.
+    #[tokio::test]
+    async fn verify_drops_annotated_false_positive() {
+        let review = two_pass_stub(
+            "- High — SQL injection in query().",
+            "- High — SQL injection in query(). FALSE_POSITIVE: not present in the diff.",
+        );
+        assert!(
+            run_code_review(&review, "r", "diff", "t").await.is_empty(),
+            "annotated FALSE_POSITIVE must not survive"
+        );
+    }
+
+    /// dirge-uz95: mixed annotate-style verdicts — keep the VERIFIED
+    /// finding, drop the FALSE_POSITIVE one, even though both carry a
+    /// severity label.
+    #[tokio::test]
+    async fn verify_keeps_verified_drops_annotated_false_positive() {
+        let review = two_pass_stub(
+            "- High — SQLi in query().\n---\n- Low — nit in helper().",
+            "- High — SQLi in query(). VERIFIED.\n---\n\
+             - Low — nit in helper(). FALSE_POSITIVE: speculative.",
+        );
+        let f = run_code_review(&review, "r", "diff", "t").await;
+        assert_eq!(f.len(), 1, "only the verified finding survives");
+        assert_eq!(f[0].severity, Severity::High);
     }
 
     #[test]
