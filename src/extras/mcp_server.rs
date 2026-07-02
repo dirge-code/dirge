@@ -249,6 +249,92 @@ struct Envelope {
     duration_ms: u64,
 }
 
+/// SIGKILL a whole process group on drop. Mirrors
+/// [`crate::dap::client::DapProcessGuard`]: the delegated child is put in its
+/// own session (`setsid`, pgid == pid) so `kill(-pgid)` reaps it and its
+/// descendants when the delegation future is dropped (dirge-6iwq).
+#[cfg(unix)]
+struct ProcessGroupGuard {
+    pgid: u32,
+}
+
+#[cfg(unix)]
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        // Never signal group 0 (dirge's OWN group — suicide) or 1 (everything
+        // signalable). setsid() makes the child a leader with pgid == pid
+        // (> 1), but guard defensively against a 0/1 slipping in.
+        if self.pgid <= 1 {
+            return;
+        }
+        // SAFETY: kill(2) with a negative pid targets the process group.
+        unsafe {
+            let _ = libc::kill(-(self.pgid as libc::pid_t), libc::SIGKILL);
+        }
+    }
+}
+
+/// Run `cmd` isolated in its own process group with `kill_on_drop`, collecting
+/// its output. If the returned future is dropped before completion — the MCP
+/// client cancels the `delegate` tool call, or the server is shutting down
+/// mid-delegation — the guard SIGKILLs the whole group so the spawned,
+/// auto-approving dirge child can't keep running unsupervised (dirge-6iwq).
+async fn run_child_killable(
+    mut cmd: tokio::process::Command,
+) -> std::io::Result<std::process::Output> {
+    cmd.kill_on_drop(true)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    // Own session/process group so the guard's kill(-pgid) reaps the child and
+    // its (non-setsid) descendants, and so a runaway child can't grab dirge's
+    // controlling terminal.
+    #[cfg(unix)]
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        cmd.as_std_mut().pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    // `child` stays a live local (not moved into `wait_with_output`) so drop
+    // order on cancellation is deterministic: `_pg_guard` is declared right
+    // after `child`, and locals drop in reverse declaration order, so the
+    // group SIGKILL fires while the leader is still an un-reaped zombie pinning
+    // the pgid; `child` then drops and `kill_on_drop` reaps the leader.
+    let mut child = cmd.spawn()?;
+    #[cfg(unix)]
+    let _pg_guard = child.id().map(|pid| ProcessGroupGuard { pgid: pid });
+
+    // Drain both pipes concurrently with the wait so a child that fills a pipe
+    // buffer can't deadlock (mirrors what `wait_with_output` does internally).
+    let mut stdout_pipe = child.stdout.take();
+    let mut stderr_pipe = child.stderr.take();
+    let mut stdout_buf = Vec::new();
+    let mut stderr_buf = Vec::new();
+    use tokio::io::AsyncReadExt;
+    let read_out = async {
+        if let Some(p) = stdout_pipe.as_mut() {
+            let _ = p.read_to_end(&mut stdout_buf).await;
+        }
+    };
+    let read_err = async {
+        if let Some(p) = stderr_pipe.as_mut() {
+            let _ = p.read_to_end(&mut stderr_buf).await;
+        }
+    };
+    let (status, (), ()) = tokio::join!(child.wait(), read_out, read_err);
+
+    Ok(std::process::Output {
+        status: status?,
+        stdout: stdout_buf,
+        stderr: stderr_buf,
+    })
+}
+
 /// Spawn `dirge -p --session <id> --accept-all --output-format json <task>`
 /// in the project and parse its result envelope.
 async fn run_delegation(
@@ -280,8 +366,9 @@ async fn run_delegation(
     cmd.arg("--").arg(task);
     cmd.stdin(std::process::Stdio::null());
 
-    let out = cmd
-        .output()
+    // Cancel-safe: if this future is dropped (client cancel / server shutdown),
+    // the child's process group is SIGKILLed rather than left running (dirge-6iwq).
+    let out = run_child_killable(cmd)
         .await
         .map_err(|e| anyhow::anyhow!("spawn dirge: {e}"))?;
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -500,6 +587,71 @@ mod tests {
         let id = new_session_id();
         assert!(id.starts_with("mcp-"), "got {id}");
         assert!(id.len() > 4);
+    }
+
+    /// dirge-6iwq: when the delegation future is dropped (MCP client cancels
+    /// the tool call, or the server shuts down mid-run), the spawned child AND
+    /// its descendants must be SIGKILLed — otherwise an auto-approving dirge
+    /// (and the tools it spawned) keeps running unsupervised. The direct child
+    /// dies on `kill_on_drop` alone; this test checks a GRANDCHILD, which only
+    /// the process-group guard can reap. The child backgrounds a `sleep`
+    /// (grandchild, same process group) and records its pid, then `wait`s so
+    /// the future stays pending.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_delegation_future_kills_the_child_group() {
+        use std::time::Duration;
+        let dir = std::env::temp_dir().join(format!(
+            "dirge-mcp-kill-{}",
+            crate::agent::runner::uuid_v4_simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let gpidfile = dir.join("grandchild_pid");
+
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg(format!(
+                "sleep 300 & echo $! > {}; wait",
+                gpidfile.display()
+            ))
+            .stdin(std::process::Stdio::null());
+
+        // Own the future in a Box so `drop(fut)` drops the future itself (and
+        // runs the guard) — `tokio::pin!` would only drop a `Pin<&mut>` wrapper
+        // and leave the real future (and child) alive until end of scope.
+        let mut fut = Box::pin(run_child_killable(cmd));
+
+        // Poll the future while waiting for the grandchild pid to appear; the
+        // future must NOT complete (the child is `wait`ing on the grandchild).
+        let gpid: i32 = loop {
+            tokio::select! {
+                _ = &mut fut => panic!("child should still be waiting, not done"),
+                _ = tokio::time::sleep(Duration::from_millis(20)) => {
+                    if let Ok(s) = std::fs::read_to_string(&gpidfile)
+                        && let Ok(p) = s.trim().parse() {
+                        break p;
+                    }
+                }
+            }
+        };
+
+        // Cancel: dropping the future runs the process-group guard's SIGKILL.
+        drop(fut);
+
+        // The grandchild (`sleep 300`) shares the child's process group, so
+        // only `kill(-pgid)` reaps it. Without the guard it would orphan to
+        // init and keep running. Poll for its disappearance (init reaps it).
+        let mut gone = false;
+        for _ in 0..150 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            // SAFETY: signal 0 only probes for existence.
+            if unsafe { libc::kill(gpid as libc::pid_t, 0) } != 0 {
+                gone = true;
+                break;
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(gone, "grandchild (pid {gpid}) must be killed on cancel");
     }
 
     #[test]
