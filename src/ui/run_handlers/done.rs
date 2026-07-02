@@ -97,6 +97,10 @@ pub(crate) async fn handle_done(
     let question_tx = deps.question_tx;
     #[cfg(feature = "plugin")]
     let plan_tx = deps.plan_tx;
+    // dirge-qhfk stage 3a: bg_store's only remaining use in handle_done is the
+    // plugin-gated model-swap rebuild (finalize_idle_turn moved to
+    // finish_done, which reads deps.bg_store itself), so gate it now.
+    #[cfg(feature = "plugin")]
     let bg_store = deps.bg_store;
     #[cfg(feature = "plugin")]
     let sandbox = deps.sandbox;
@@ -305,6 +309,61 @@ pub(crate) async fn handle_done(
             let _ = mgr.eval("(set harness-response nil)");
         }
     }
+
+    finish_done(
+        ctx,
+        response,
+        tokens,
+        cost,
+        agent,
+        is_running,
+        deps,
+        plugin_followup,
+        agent_rx,
+        agent_abort,
+        agent_interject,
+        agent_cancel,
+        interjection_queue,
+        review_phase,
+        #[cfg(feature = "plugin")]
+        plugin_manager,
+        #[cfg(feature = "loop")]
+        loop_bits,
+    )
+    .await
+}
+
+/// Finalize a completed turn once the plugin `on-response`/`message-end`/
+/// `on-complete`/`prepare-next-run` chain has resolved: render + seal the
+/// response, persist the turn, run the post-done action (follow-up / loop /
+/// idle), drive the `/plan` reviewer, and finalize when idle. Split out of
+/// `handle_done` (dirge-qhfk stage 3a) so the off-loop done-chain completion
+/// arm can run the exact same tail after the plugin hooks finish on a task.
+/// `response` is already the FINAL text (message-end rewrite applied);
+/// `plugin_followup` is the on-response follow-up prompt, if any.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn finish_done(
+    ctx: &mut RunCtx<'_>,
+    response: CompactString,
+    tokens: u64,
+    cost: f64,
+    agent: &mut AnyAgent,
+    is_running: &mut bool,
+    deps: &AgentBuildDeps<'_>,
+    #[cfg_attr(not(feature = "plugin"), allow(unused_variables))] plugin_followup: Option<String>,
+    agent_rx: &mut Option<mpsc::Receiver<AgentEvent>>,
+    agent_abort: &mut Option<tokio::task::JoinHandle<()>>,
+    agent_interject: &mut Option<mpsc::Sender<()>>,
+    agent_cancel: &mut Option<mpsc::Sender<()>>,
+    interjection_queue: &std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+    review_phase: &mut Option<crate::agent::plan::runtime::ReviewPhaseHandle>,
+    // Used only by the experimental-graph-search entity/relation drain below.
+    #[cfg(feature = "plugin")]
+    #[cfg_attr(not(feature = "experimental-graph-search"), allow(unused_variables))]
+    plugin_manager: Option<&std::sync::Arc<std::sync::Mutex<PluginManager>>>,
+    #[cfg(feature = "loop")] loop_bits: LoopBits<'_>,
+) -> anyhow::Result<()> {
+    let bg_store = deps.bg_store;
 
     if !ctx.response_buf.is_empty() {
         // dirge-qy3y: final render through the source-tracked stream API (the
