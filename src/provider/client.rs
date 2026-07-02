@@ -1098,13 +1098,19 @@ mod tests {
         let store = OpenAiAuthStore::at(dir.auth_path());
         store
             .save_openai(&OpenAiOAuthCredential::new(
-                "ACCESS", "R0", None, None, i64::MAX,
+                "ACCESS",
+                "R0",
+                None,
+                None,
+                i64::MAX,
             ))
             .unwrap();
 
-        let result = load_fresh_openai_oauth_locked(&store, || 0, |_| {
-            panic!("a fresh credential must not be refreshed")
-        })
+        let result = load_fresh_openai_oauth_locked(
+            &store,
+            || 0,
+            |_| panic!("a fresh credential must not be refreshed"),
+        )
         .unwrap()
         .expect("fresh credential returned");
 
@@ -1120,7 +1126,13 @@ mod tests {
         let path = dir.auth_path();
         // Seed an expired credential whose single-use refresh token is "R0".
         OpenAiAuthStore::at(path.clone())
-            .save_openai(&OpenAiOAuthCredential::new("OLD-ACCESS", "R0", None, None, 0))
+            .save_openai(&OpenAiOAuthCredential::new(
+                "OLD-ACCESS",
+                "R0",
+                None,
+                None,
+                0,
+            ))
             .unwrap();
 
         let refreshes = Arc::new(AtomicUsize::new(0));

@@ -283,7 +283,9 @@ mod tests {
     use super::*;
 
     fn authorization(client: &CodexHttpClient, preexisting: Option<&str>) -> Option<String> {
-        let mut builder = Request::builder().method("POST").uri("https://api/responses");
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("https://api/responses");
         if let Some(bearer) = preexisting {
             builder = builder.header(http::header::AUTHORIZATION, bearer);
         }
