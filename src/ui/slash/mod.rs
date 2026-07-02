@@ -99,17 +99,6 @@ pub(super) struct SlashCtx<'a> {
 ///
 /// Matches opencode's `splitTurn` discipline
 /// (`session/compaction.ts:161-184`).
-fn align_cut_to_user_boundary(
-    messages: &[crate::session::SessionMessage],
-    cut_idx: usize,
-) -> usize {
-    let mut i = cut_idx;
-    while i < messages.len() && messages[i].role != MessageRole::User {
-        i += 1;
-    }
-    i
-}
-
 /// Outcome of `undo_last`. `removed` is the number of messages popped;
 /// `had_tool_calls` is set when at least one of the popped messages
 /// had tool calls attached — the caller should surface a warning
@@ -220,18 +209,12 @@ pub(crate) fn preemptive_compaction_due(total: u64, incoming: u64, max_tokens: u
     total > 0 && total.saturating_add(incoming) > max_tokens * PROACTIVE_COMPACTION_PERCENT / 100
 }
 
+/// Session-space compaction cut. Delegates to the canonical
+/// `session::compact::compaction_cut_idx` so the `/compress` path and the
+/// auto-fold persistence handler share ONE cut policy (dirge-4kgk — they must
+/// not drift, or one path reintroduces the loop-vs-session over-drain).
 fn compaction_cut_idx(session: &Session, cfg: &Config) -> usize {
-    let keep_recent = cfg.resolve_keep_recent_tokens();
-    let mut accumulated = 0u64;
-    let mut cut_idx = session.messages.len();
-    for (i, msg) in session.messages.iter().enumerate().rev() {
-        if accumulated >= keep_recent {
-            cut_idx = i + 1;
-            break;
-        }
-        accumulated = accumulated.saturating_add(msg.estimated_tokens);
-    }
-    align_cut_to_user_boundary(&session.messages, cut_idx)
+    crate::session::compact::compaction_cut_idx(session, cfg.resolve_keep_recent_tokens())
 }
 
 fn tokens_before_cut(session: &Session, cut_idx: usize) -> u64 {
@@ -833,6 +816,7 @@ mod tests {
     #[cfg(feature = "slash-completion")]
     use super::completion::all_commands;
     use super::*;
+    use crate::session::compact::align_cut_to_user_boundary;
     use crate::session::{Session, SessionMessage};
 
     #[test]
