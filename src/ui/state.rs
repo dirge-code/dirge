@@ -198,6 +198,9 @@ pub(crate) struct UiState {
     /// In-flight non-blocking compaction (summarizer LLM on a spawned task);
     /// the `compaction_phase` select! arm installs the result. dirge-tv3p.
     pub(crate) compaction_phase: Option<crate::ui::compaction::CompactionPhaseHandle>,
+    /// In-flight off-loop `on-prompt` hook dispatch; the `prompt_phase` arm
+    /// resolves the hint/replace and runs the submit tail. dirge-qhfk.
+    pub(crate) prompt_phase: Option<crate::ui::prompt_phase::PromptPhaseHandle>,
     /// In-flight non-blocking `/plan` reviewer (the write-disabled reviewer runs
     /// code on a spawned task); the `review_phase` arm applies the verdict.
     /// dirge-4koy.
@@ -427,6 +430,7 @@ impl UiState {
             loop_label: None,
             plan_phase: None,
             compaction_phase: None,
+            prompt_phase: None,
             review_phase: None,
             btw_phase: None,
             wt_merge_phase: None,

@@ -22,6 +22,7 @@ pub(crate) mod phase;
 pub(crate) mod picker;
 #[cfg(feature = "plugin")]
 mod plugin_tree;
+pub(crate) mod prompt_phase;
 #[cfg(unix)]
 pub(crate) mod pty_relay;
 #[cfg(unix)]
@@ -1632,6 +1633,12 @@ pub async fn run_interactive(
                                 if let Some(ph) = ui.compaction_phase.take() {
                                     ph.task.abort();
                                 }
+                                // dirge-qhfk: and an in-flight off-loop on-prompt
+                                // hook dispatch; its submit continuation is
+                                // discarded (is_running is cleared above).
+                                if let Some(ph) = ui.prompt_phase.take() {
+                                    ph.core.task.abort();
+                                }
                                 // dirge-4koy: likewise abort an in-flight `/plan`
                                 // reviewer (the write-disabled reviewer task);
                                 // its verdict continuation is discarded.
@@ -1747,6 +1754,10 @@ pub async fn run_interactive(
                             // dirge-tv3p: and an in-flight non-blocking compaction.
                             if let Some(ph) = ui.compaction_phase.take() {
                                 ph.task.abort();
+                            }
+                            // dirge-qhfk: and an in-flight off-loop on-prompt hook.
+                            if let Some(ph) = ui.prompt_phase.take() {
+                                ph.core.task.abort();
                             }
                             // dirge-4koy: and an in-flight `/plan` reviewer.
                             if let Some(ph) = ui.review_phase.take() {
@@ -2699,70 +2710,49 @@ pub async fn run_interactive(
                             } else {
                                 // User message will be rendered when the
                                 // agent loop emits AgentEvent::UserMessage.
-                                #[allow(unused_mut)]
-                                let mut plugin_hint: Option<String> = None;
-                                #[allow(unused_mut)]
-                                let mut plugin_replace: Option<String> = None;
+                                //
+                                // dirge-qhfk: dispatch `on-prompt` OFF the loop
+                                // thread so a hook opening a dialog can't
+                                // deadlock the loop that services dialog_rx. The
+                                // `prompt_phase` arm resolves the hook's
+                                // hint/replace and runs the shared submit tail.
+                                // Setting is_running=true routes further submits
+                                // to the steering queue (same as compaction), so
+                                // the in-flight phase can't be clobbered. With no
+                                // plugin there's no on-prompt — run the tail now.
                                 #[cfg(feature = "plugin")]
-                                if let Some(pm) = plugin_manager {
-                                    let mut mgr = pm.lock_ignore_poison();
-                                    match mgr.dispatch(
-                                        "on-prompt",
-                                        &format!(
-                                            "@{{:prompt \"{}\"}}",
-                                            crate::plugin::escape_janet_string(&text)
-                                        ),
-                                    ) {
-                                        Ok(results) if !results.is_empty() => {
-                                            for line in &results {
-                                                // Sanitize plugin output (ANSI injection defense).
-                                                let safe = sanitize_output(line);
-                                                renderer.write_line(
-                                                    &format!("[plugin] {}", safe),
-                                                    theme::dim(),
-                                                )?;
-                                            }
-                                            plugin_hint = Some(results.join("\n"));
-                                        }
-                                        Ok(_) => {}
-                                        Err(e) => {
-                                            renderer.write_line(
-                                                &format!("[plugin] on-prompt error: {e}"),
-                                                c_error(),
-                                            )?;
-                                        }
-                                    }
-                                    // A plugin hook may queue a follow-up prompt via
-                                    // harness/request-prompt; pick it up here.
-                                    if let Some(pending) = mgr.take_pending_prompt() {
-                                        plugin_hint = Some(pending);
-                                    }
-                                    // harness/replace-prompt rewrites the current
-                                    // turn entirely (distinct from request-prompt
-                                    // which queues a follow-up turn). Takes
-                                    // precedence over hint prepending below.
-                                    plugin_replace = mgr.take_pending_prompt_replace();
-                                }
+                                let deferred_to_prompt_hook = if let Some(pm) = plugin_manager {
+                                    ui.prompt_phase = Some(crate::ui::prompt_phase::spawn(
+                                        pm.clone(),
+                                        text.to_string(),
+                                    ));
+                                    ui.is_running = true;
+                                    renderer.set_avatar_state(avatar::AvatarState::Thinking);
+                                    true
+                                } else {
+                                    false
+                                };
+                                #[cfg(not(feature = "plugin"))]
+                                let deferred_to_prompt_hook = false;
 
-                                // dirge-qhfk: the submit tail (prompt build,
-                                // preemptive compaction, runner spawn) is shared
-                                // with the off-loop on-prompt completion arm.
-                                let mut ctx = make_run_ctx!();
-                                run_handlers::submit::submit_resolved_prompt(
-                                    &mut ctx,
-                                    &make_agent_build_deps!(),
-                                    &mut agent,
-                                    plugin_hint,
-                                    plugin_replace,
-                                    &text,
-                                    &mut ui.is_running,
-                                    &mut ui.agent_rx,
-                                    &mut ui.agent_abort,
-                                    &mut ui.agent_interject,
-                                    &mut ui.agent_cancel,
-                                    &ui.interjection_queue,
-                                    &mut ui.compaction_phase,
-                                )?;
+                                if !deferred_to_prompt_hook {
+                                    let mut ctx = make_run_ctx!();
+                                    run_handlers::submit::submit_resolved_prompt(
+                                        &mut ctx,
+                                        &make_agent_build_deps!(),
+                                        &mut agent,
+                                        None,
+                                        None,
+                                        &text,
+                                        &mut ui.is_running,
+                                        &mut ui.agent_rx,
+                                        &mut ui.agent_abort,
+                                        &mut ui.agent_interject,
+                                        &mut ui.agent_cancel,
+                                        &ui.interjection_queue,
+                                        &mut ui.compaction_phase,
+                                    )?;
+                                }
                             }
                         }
                         renderer.request_repaint();
@@ -3376,6 +3366,56 @@ pub async fn run_interactive(
                         renderer.request_repaint();
                     }
                 }
+            }
+            // dirge-qhfk: off-loop `on-prompt` hook. The dispatch ran on a
+            // spawned task so a hook opening a dialog couldn't freeze the loop;
+            // this arm prints its `[plugin]` output and runs the shared submit
+            // tail with the resolved hint/replace.
+            ev = async {
+                if let Some(ph) = &mut ui.prompt_phase {
+                    ph.core.rx.recv().await
+                } else {
+                    std::future::pending().await
+                }
+            } => {
+                use crate::ui::prompt_phase::PromptPhaseEvent;
+                let Some(handle) = ui.prompt_phase.take() else {
+                    continue;
+                };
+                let text = handle.text;
+                match ev {
+                    Some(PromptPhaseEvent::Ready(result)) => {
+                        for line in &result.lines {
+                            renderer.write_line(&format!("[plugin] {}", line), theme::dim())?;
+                        }
+                        for err in &result.errors {
+                            renderer.write_line(&format!("[plugin] {}", err), c_error())?;
+                        }
+                        let mut ctx = make_run_ctx!();
+                        run_handlers::submit::submit_resolved_prompt(
+                            &mut ctx,
+                            &make_agent_build_deps!(),
+                            &mut agent,
+                            result.hint,
+                            result.replace,
+                            &text,
+                            &mut ui.is_running,
+                            &mut ui.agent_rx,
+                            &mut ui.agent_abort,
+                            &mut ui.agent_interject,
+                            &mut ui.agent_cancel,
+                            &ui.interjection_queue,
+                            &mut ui.compaction_phase,
+                        )?;
+                    }
+                    None => {
+                        // Task aborted / channel closed without an event —
+                        // release the busy state so the loop accepts input.
+                        ui.is_running = false;
+                        renderer.set_avatar_state(avatar::AvatarState::Idle);
+                    }
+                }
+                renderer.request_repaint();
             }
             // dirge-tv3p: non-blocking compaction. The summarizer LLM runs on a
             // spawned task; this arm installs its result on the UI thread and
