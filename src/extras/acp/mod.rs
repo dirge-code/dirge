@@ -3,8 +3,8 @@ pub mod config;
 use std::sync::Arc;
 
 use agent_client_protocol::schema::*;
-use agent_client_protocol::{on_receive_notification, on_receive_request};
 use agent_client_protocol::{Agent, Client, ConnectionTo, Dispatch, Responder, Stdio};
+use agent_client_protocol::{on_receive_notification, on_receive_request};
 
 use crate::cli::Cli;
 use crate::config::Config;
@@ -49,10 +49,16 @@ type SessionMap = tokio::sync::Mutex<HashMap<String, AcpSession>>;
 
 /// The rig history for a session's prior turns (empty if the session is unknown
 /// — a prompt without a preceding `new_session`), plus the session's cwd.
-async fn history_and_cwd(sessions: &SessionMap, id: &str) -> (Vec<rig::completion::Message>, Option<PathBuf>) {
+async fn history_and_cwd(
+    sessions: &SessionMap,
+    id: &str,
+) -> (Vec<rig::completion::Message>, Option<PathBuf>) {
     let map = sessions.lock().await;
     match map.get(id) {
-        Some(s) => (crate::agent::runner::convert_history(&s.session), Some(s.cwd.clone())),
+        Some(s) => (
+            crate::agent::runner::convert_history(&s.session),
+            Some(s.cwd.clone()),
+        ),
         None => (Vec::new(), None),
     }
 }
@@ -918,7 +924,14 @@ mod tests {
         // Turn 1.
         let (h0, _) = history_and_cwd(&sessions, id).await;
         assert!(h0.is_empty(), "fresh session starts with no history");
-        finish_turn(&sessions, id, "what does foo do?", "foo does X.", Vec::new()).await;
+        finish_turn(
+            &sessions,
+            id,
+            "what does foo do?",
+            "foo does X.",
+            Vec::new(),
+        )
+        .await;
 
         // Turn 2 sees turn 1.
         let (h1, _) = history_and_cwd(&sessions, id).await;
@@ -977,7 +990,10 @@ mod tests {
         )
         .await;
 
-        assert!(cancel_run(&sessions, id).await, "an active run is cancelled");
+        assert!(
+            cancel_run(&sessions, id).await,
+            "an active run is cancelled"
+        );
         assert!(
             cancelled.load(std::sync::atomic::Ordering::SeqCst),
             "the cancel flag is set so the loop reports Cancelled"

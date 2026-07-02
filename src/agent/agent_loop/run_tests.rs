@@ -3135,7 +3135,10 @@ fn run_delta_to_review_skips_when_unchanged() {
     // Read-only turn over pre-existing WIP: diff identical to baseline → skip.
     // This is the bug — before, any ToolResult drove the judge on the whole
     // dirty tree even when the run touched nothing.
-    assert_eq!(run_delta_to_review(Some("wip diff"), Some("wip diff")), None);
+    assert_eq!(
+        run_delta_to_review(Some("wip diff"), Some("wip diff")),
+        None
+    );
 
     // Clean tree, nothing changed → nothing to review.
     assert_eq!(run_delta_to_review(None, None), None);
