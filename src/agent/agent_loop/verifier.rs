@@ -200,7 +200,7 @@ fn exit_code_line_is_failure(line: &str) -> bool {
 /// newlines means one real build in a chain still counts.
 fn is_verification_command(command: &str) -> bool {
     command
-        .split(|c: char| matches!(c, '&' | '|' | ';' | '\n'))
+        .split(['&', '|', ';', '\n'])
         .any(segment_is_verification)
 }
 

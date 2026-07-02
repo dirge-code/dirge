@@ -208,6 +208,7 @@ async fn poll_finalization_follow_up(
     critic_done: &mut bool,
     code_review_reacts: &mut u8,
     code_review_baseline: Option<&str>,
+    emitted_advisories: &mut std::collections::HashSet<String>,
     goal_reacts: &mut u8,
     todo_nudges: &mut u8,
     emit: &mpsc::Sender<LoopEvent>,
@@ -278,16 +279,20 @@ async fn poll_finalization_follow_up(
                 super::code_review::run_code_review(review_fn, system_prompt, diff, &transcript)
                     .await;
             if !findings.is_empty() {
-                // Count this engagement so a stubborn finding can't loop.
-                *code_review_reacts += 1;
-                let (blocking, advisory) = super::code_review::partition_findings(findings);
-                // Medium/Low → surface as a non-blocking `<system>` notice.
-                if let Some(text) = super::code_review::advisory_notice(&advisory) {
+                let reaction = decide_review_reaction(findings, emitted_advisories);
+                // Medium/Low → surface a non-blocking `<system>` notice, but
+                // only the first time this exact advisory comes up (dirge-jo0o).
+                if let Some(text) = reaction.advisory_to_emit {
                     let _ = emit.send(LoopEvent::SystemNotice { content: text }).await;
+                }
+                // Only a blocking engagement spends the react budget — an
+                // advisory-only review finalizes without burning it (dirge-jo0o).
+                if reaction.counts_against_budget {
+                    *code_review_reacts += 1;
                 }
                 // High/Critical → re-enter the loop; the agent must fix or
                 // justify. Advisory-only reviews fall through and finalize.
-                if let Some(msg) = super::code_review::blocking_followup(&blocking) {
+                if let Some(msg) = reaction.blocking_followup {
                     return (vec![msg], FollowUpSource::CodeReview);
                 }
             }
@@ -1107,6 +1112,12 @@ pub async fn run_loop(
     // finalizations (fix-then-re-review) bounded by MAX_REVIEW_REACT.
     let mut code_review_reacts: u8 = 0;
 
+    // dirge-jo0o: advisory (medium/low) notices already emitted this run, so a
+    // persistent low-severity finding is advised once rather than re-posted as
+    // a duplicate SystemNotice at every finalization.
+    let mut emitted_advisories: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+
     // dirge-1g3v: snapshot the working-tree diff at run start so the reviewer
     // can tell what THIS run changed. Without a baseline it diffed the whole
     // dirty tree, so a read-only turn over pre-existing WIP triggered the judge
@@ -1919,6 +1930,7 @@ pub async fn run_loop(
             &mut critic_done,
             &mut code_review_reacts,
             code_review_baseline.as_deref(),
+            &mut emitted_advisories,
             &mut goal_reacts,
             &mut todo_nudges,
             emit,
@@ -1979,6 +1991,44 @@ fn run_delta_to_review<'a>(current: Option<&'a str>, baseline: Option<&str>) -> 
     match current {
         Some(diff) if Some(diff) != baseline => Some(diff),
         _ => None,
+    }
+}
+
+/// One code-review engagement's outcome at finalization, split from the
+/// async diff/judge plumbing so the counting + advisory-dedup rules are
+/// unit-testable (dirge-jo0o).
+struct ReviewReaction {
+    /// Advisory (medium/low) notice to emit, or `None` when there is
+    /// nothing new to advise — no advisory findings, or an identical notice
+    /// already went out this run.
+    advisory_to_emit: Option<String>,
+    /// Blocking (high/critical) follow-up that re-enters the loop.
+    blocking_followup: Option<LoopMessage>,
+    /// Whether this engagement spends one unit of the bounded react budget.
+    counts_against_budget: bool,
+}
+
+/// Decide what a single code-review engagement does with its findings.
+///
+/// dirge-jo0o: the budget (`MAX_REVIEW_REACT`) exists to stop a *stubbern*
+/// blocking finding from looping forever, so only a blocking engagement
+/// spends it — an advisory-only review finalizes and must not burn budget.
+/// And a persistent medium/low finding must be advised once, not re-posted
+/// as a duplicate `SystemNotice` at every finalization: `emitted_advisories`
+/// remembers the exact notice text already sent this run.
+fn decide_review_reaction(
+    findings: Vec<super::code_review::Finding>,
+    emitted_advisories: &mut std::collections::HashSet<String>,
+) -> ReviewReaction {
+    let (blocking, advisory) = super::code_review::partition_findings(findings);
+    let advisory_to_emit = super::code_review::advisory_notice(&advisory)
+        .filter(|text| emitted_advisories.insert(text.clone()));
+    let blocking_followup = super::code_review::blocking_followup(&blocking);
+    let counts_against_budget = blocking_followup.is_some();
+    ReviewReaction {
+        advisory_to_emit,
+        blocking_followup,
+        counts_against_budget,
     }
 }
 

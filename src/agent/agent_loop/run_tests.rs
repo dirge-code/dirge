@@ -3187,6 +3187,7 @@ async fn finalization_hook_short_circuits_lower_gates() {
         &mut critic_done,
         &mut code_review_reacts,
         None, // code_review_baseline
+        &mut std::collections::HashSet::new(),
         &mut goal_reacts,
         &mut todo_nudges,
         &review_emit,
@@ -3200,6 +3201,84 @@ async fn finalization_hook_short_circuits_lower_gates() {
         "hook must short-circuit before the critic runs"
     );
     assert_eq!(todo_nudges, 0, "todo gate must not be reached");
+}
+
+// ── dirge-jo0o: code-review react counting + advisory dedup ──────────
+
+fn review_finding(
+    severity: crate::agent::agent_loop::code_review::Severity,
+    body: &str,
+) -> crate::agent::agent_loop::code_review::Finding {
+    crate::agent::agent_loop::code_review::Finding {
+        severity,
+        location: None,
+        body: body.to_string(),
+    }
+}
+
+/// An advisory-only (medium/low) review finalizes; it must NOT spend the
+/// bounded react budget — only a stubborn blocking finding should.
+#[test]
+fn advisory_only_review_does_not_count_against_budget() {
+    use crate::agent::agent_loop::code_review::Severity;
+    let mut seen = std::collections::HashSet::new();
+    let r = decide_review_reaction(vec![review_finding(Severity::Low, "nit")], &mut seen);
+    assert!(r.advisory_to_emit.is_some(), "advisory surfaced");
+    assert!(r.blocking_followup.is_none(), "nothing blocking");
+    assert!(
+        !r.counts_against_budget,
+        "advisory-only review must not burn the react budget"
+    );
+}
+
+/// A blocking (high/critical) review re-enters the loop and spends one unit
+/// of the react budget.
+#[test]
+fn blocking_review_counts_against_budget() {
+    use crate::agent::agent_loop::code_review::Severity;
+    let mut seen = std::collections::HashSet::new();
+    let r = decide_review_reaction(vec![review_finding(Severity::High, "SQLi")], &mut seen);
+    assert!(r.blocking_followup.is_some(), "high-severity blocks");
+    assert!(r.counts_against_budget, "blocking finding counts");
+}
+
+/// The same advisory text is emitted once, not re-posted every finalization.
+#[test]
+fn repeat_advisory_is_deduped() {
+    use crate::agent::agent_loop::code_review::Severity;
+    let mut seen = std::collections::HashSet::new();
+    let first = decide_review_reaction(
+        vec![review_finding(Severity::Medium, "same note")],
+        &mut seen,
+    );
+    assert!(first.advisory_to_emit.is_some(), "first advisory emits");
+    let second = decide_review_reaction(
+        vec![review_finding(Severity::Medium, "same note")],
+        &mut seen,
+    );
+    assert!(
+        second.advisory_to_emit.is_none(),
+        "identical advisory must not re-emit"
+    );
+    assert!(!second.counts_against_budget);
+}
+
+/// Mixed review: emit the advisory (first time), re-enter on the blocking
+/// finding, and count it.
+#[test]
+fn mixed_review_emits_advisory_and_blocks_and_counts() {
+    use crate::agent::agent_loop::code_review::Severity;
+    let mut seen = std::collections::HashSet::new();
+    let r = decide_review_reaction(
+        vec![
+            review_finding(Severity::High, "SQLi"),
+            review_finding(Severity::Low, "nit"),
+        ],
+        &mut seen,
+    );
+    assert!(r.advisory_to_emit.is_some(), "low surfaced as advisory");
+    assert!(r.blocking_followup.is_some(), "high blocks");
+    assert!(r.counts_against_budget);
 }
 
 /// With no hook/verifier/critic and the todo gate exhausted, the authority
@@ -3220,6 +3299,7 @@ async fn finalization_all_gates_silent_yields_none() {
         &mut critic_done,
         &mut code_review_reacts,
         None, // code_review_baseline
+        &mut std::collections::HashSet::new(),
         &mut goal_reacts,
         &mut todo_nudges,
         &review_emit,
@@ -3254,6 +3334,7 @@ async fn finalization_goal_unmet_reenters_and_counts() {
         &mut critic_done,
         &mut code_review_reacts,
         None, // code_review_baseline
+        &mut std::collections::HashSet::new(),
         &mut goal_reacts,
         &mut todo_nudges,
         &review_emit,
@@ -3286,6 +3367,7 @@ async fn finalization_goal_met_finalizes() {
         &mut critic_done,
         &mut code_review_reacts,
         None, // code_review_baseline
+        &mut std::collections::HashSet::new(),
         &mut goal_reacts,
         &mut todo_nudges,
         &review_emit,
@@ -3319,6 +3401,7 @@ async fn finalization_goal_bound_stops_reentry() {
         &mut critic_done,
         &mut code_review_reacts,
         None, // code_review_baseline
+        &mut std::collections::HashSet::new(),
         &mut goal_reacts,
         &mut todo_nudges,
         &review_emit,
@@ -3349,6 +3432,7 @@ async fn finalization_goal_without_judge_is_inert() {
         &mut critic_done,
         &mut code_review_reacts,
         None, // code_review_baseline
+        &mut std::collections::HashSet::new(),
         &mut goal_reacts,
         &mut todo_nudges,
         &review_emit,
