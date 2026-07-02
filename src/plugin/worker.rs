@@ -16,7 +16,7 @@
 
 use std::cell::RefCell;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 #[cfg_attr(not(feature = "plugin"), allow(unused_imports))]
 use std::thread::{self, JoinHandle};
@@ -1000,6 +1000,42 @@ thread_local! {
     /// `harness/select` call instead of hanging forever when the UI
     /// receiver has been dropped.
     static SHUTDOWN: RefCell<Option<Arc<AtomicBool>>> = const { RefCell::new(None) };
+
+    /// Shared with the Worker handle (mirrors `SHUTDOWN`). Incremented by
+    /// `send_dialog` while a `harness/confirm`/`harness/select` is waiting
+    /// for a human answer, decremented when it resolves. The host's
+    /// `eval_with_timeout` reads the shared `Arc` so it keeps waiting while
+    /// a dialog is genuinely in flight (up to the dialog budget) instead of
+    /// giving up at the tight per-hook timeout and letting the gated tool
+    /// run while the confirm is still on screen (dirge-hwzs).
+    static DIALOG_PENDING: RefCell<Option<Arc<AtomicUsize>>> = const { RefCell::new(None) };
+}
+
+/// RAII guard: marks a dialog in flight on the worker thread for the
+/// lifetime of a blocking `harness/confirm`/`harness/select` so the host
+/// eval loop knows to keep waiting. No-op off the worker thread (the
+/// thread-local is unset), so tests and non-dialog paths are unaffected.
+#[cfg(feature = "plugin")]
+struct DialogPendingGuard(Option<Arc<AtomicUsize>>);
+
+#[cfg(feature = "plugin")]
+impl DialogPendingGuard {
+    fn enter() -> Self {
+        let arc = DIALOG_PENDING.with(|cell| cell.borrow().clone());
+        if let Some(a) = &arc {
+            a.fetch_add(1, Ordering::SeqCst);
+        }
+        DialogPendingGuard(arc)
+    }
+}
+
+#[cfg(feature = "plugin")]
+impl Drop for DialogPendingGuard {
+    fn drop(&mut self) {
+        if let Some(a) = &self.0 {
+            a.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
 }
 
 #[cfg_attr(not(feature = "plugin"), allow(dead_code))]
@@ -1024,6 +1060,13 @@ pub struct Worker {
     /// `Arc` with the worker thread's `SHUTDOWN` thread-local.
     #[cfg_attr(not(feature = "plugin"), allow(dead_code))]
     shutdown: Arc<AtomicBool>,
+    /// Count of `harness/confirm`/`harness/select` dialogs the worker is
+    /// currently blocked on. Read by `eval_with_timeout` so a hook that
+    /// opens a confirm dialog is waited on (up to the dialog budget)
+    /// rather than timed out at the tight per-hook budget — which would
+    /// let the gated tool run while the dialog is unanswered (dirge-hwzs).
+    #[cfg_attr(not(feature = "plugin"), allow(dead_code))]
+    dialog_pending: Arc<AtomicUsize>,
 }
 
 impl Worker {
@@ -1050,10 +1093,21 @@ impl Worker {
         let (init_tx, init_rx) = mpsc::channel::<Result<(), String>>();
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = shutdown.clone();
+        let dialog_pending = Arc::new(AtomicUsize::new(0));
+        let dialog_pending_clone = dialog_pending.clone();
 
         let join = thread::Builder::new()
             .name("dirge-janet".to_string())
-            .spawn(move || worker_loop(cmd_rx, dialog_tx, lsp_tx, init_tx, shutdown_clone))
+            .spawn(move || {
+                worker_loop(
+                    cmd_rx,
+                    dialog_tx,
+                    lsp_tx,
+                    init_tx,
+                    shutdown_clone,
+                    dialog_pending_clone,
+                )
+            })
             .map_err(|e| format!("spawn janet worker: {e}"))?;
 
         // Block (with a watchdog timeout) until worker confirms init.
@@ -1065,6 +1119,7 @@ impl Worker {
                     cmd_tx,
                     join: Some(join),
                     shutdown,
+                    dialog_pending,
                 },
                 dialog_rx,
                 lsp_rx,
@@ -1099,6 +1154,7 @@ impl Worker {
                 cmd_tx,
                 join: None,
                 shutdown: Arc::new(AtomicBool::new(false)),
+                dialog_pending: Arc::new(AtomicUsize::new(0)),
             },
             dialog_rx,
             lsp_rx,
@@ -1143,14 +1199,41 @@ impl Worker {
                 reply,
             })
             .map_err(|_| "janet worker disconnected".to_string())?;
-        match rx.recv_timeout(effective) {
-            Ok(result) => result,
-            Err(mpsc::RecvTimeoutError::Timeout) => Err(format!(
-                "janet worker did not reply within {}s — plugin may be stuck in an infinite loop",
-                effective.as_secs(),
-            )),
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                Err("janet worker dropped reply channel".to_string())
+
+        // dirge-hwzs: the base timeout is deliberately tight (5s per tool
+        // hook) so a hook stuck in a loop or blocking syscall recovers
+        // fast. But a hook that opens `harness/confirm`/`harness/select`
+        // blocks on a HUMAN, who routinely takes longer than that — and
+        // giving up then let the gated tool run while the confirm was
+        // still on screen (a security gate failing OPEN). So when the base
+        // timeout elapses, keep waiting AS LONG AS a dialog is actually in
+        // flight (the worker sets `dialog_pending` around the blocking
+        // dialog call), bounded by the dialog budget so a genuinely wedged
+        // worker still can't pin us forever. No dialog pending → time out
+        // at the base as before.
+        let dialog_ceiling = effective + DIALOG_TIMEOUT + INTERACTIVE_EVAL_TIMEOUT;
+        let start = std::time::Instant::now();
+        let mut slice = effective;
+        loop {
+            match rx.recv_timeout(slice) {
+                Ok(result) => return result,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err("janet worker dropped reply channel".to_string());
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    let dialog_active = self.dialog_pending.load(Ordering::SeqCst) > 0;
+                    if dialog_active && start.elapsed() < dialog_ceiling {
+                        // A confirm/select is awaiting a human — keep
+                        // waiting, polling in small slices so we notice
+                        // promptly when it resolves (or the dialog aborts).
+                        slice = DIALOG_POLL;
+                        continue;
+                    }
+                    return Err(format!(
+                        "janet worker did not reply within {}s — plugin may be stuck in an infinite loop",
+                        start.elapsed().as_secs(),
+                    ));
+                }
             }
         }
     }
@@ -1199,6 +1282,7 @@ fn worker_loop(
     lsp_tx: tmpsc::UnboundedSender<LspRequest>,
     init_tx: mpsc::Sender<Result<(), String>>,
     shutdown: Arc<AtomicBool>,
+    dialog_pending: Arc<AtomicUsize>,
 ) {
     // Hand the dialog sender + shutdown flag to this thread's C functions
     // before we run any plugin code, otherwise harness/confirm/select
@@ -1206,6 +1290,7 @@ fn worker_loop(
     DIALOG_TX.with(|cell| *cell.borrow_mut() = Some(dialog_tx));
     LSP_TX.with(|cell| *cell.borrow_mut() = Some(lsp_tx));
     SHUTDOWN.with(|cell| *cell.borrow_mut() = Some(shutdown));
+    DIALOG_PENDING.with(|cell| *cell.borrow_mut() = Some(dialog_pending));
 
     let mut client = match JanetClient::init_with_default_env() {
         Ok(c) => c,
@@ -1326,6 +1411,7 @@ fn worker_loop(
     _lsp_tx: tmpsc::UnboundedSender<LspRequest>,
     _init_tx: mpsc::Sender<Result<(), String>>,
     _shutdown: Arc<AtomicBool>,
+    _dialog_pending: Arc<AtomicUsize>,
 ) {
     unreachable!("worker_loop should never run without the plugin feature");
 }
@@ -1538,6 +1624,13 @@ where
     let (reply_tx, reply_rx) = mpsc::channel();
     let req = build(reply_tx);
     tx.send(req).ok()?;
+
+    // Mark a dialog in flight so the host's eval loop keeps waiting for the
+    // human answer instead of timing out at the tight per-hook budget and
+    // running the gated tool while the confirm is still on screen
+    // (dirge-hwzs). Cleared when this scope exits (answer, timeout, or
+    // shutdown), so a hook stuck for a NON-dialog reason still times out.
+    let _pending = DialogPendingGuard::enter();
 
     // Poll for the reply. Wake every `DIALOG_POLL` to check the
     // worker-shutdown flag so a UI exit or `Worker::Drop` doesn't pin
@@ -2521,6 +2614,58 @@ mod tests {
         // Janet booleans stringify as "true" / "false".
         assert_eq!(r, "true");
         helper.join().unwrap();
+    }
+
+    /// dirge-hwzs: a hook that opens `harness/confirm` blocks on a human,
+    /// who takes longer than the tight per-hook eval budget. The eval must
+    /// keep waiting while the dialog is in flight (up to the dialog budget)
+    /// instead of giving up at the base timeout — otherwise the caller
+    /// (`dispatch_tool_hook`) sees no block and runs the gated tool while
+    /// the confirm is still on screen. Here the answer arrives well after
+    /// the 100 ms base timeout; the in-flight dialog must extend the wait.
+    #[test]
+    fn eval_waits_for_an_in_flight_confirm_past_the_base_timeout() {
+        let (mut worker, mut dialog_rx, _lsp_rx) = Worker::try_spawn().unwrap();
+
+        // Answer only after a delay far longer than the base timeout below.
+        let helper = std::thread::spawn(move || match dialog_rx.blocking_recv() {
+            Some(DialogRequest::Confirm { reply, .. }) => {
+                std::thread::sleep(Duration::from_millis(400));
+                let _ = reply.send(DialogReply::Confirm(true));
+            }
+            other => panic!("unexpected dialog request: {other:?}"),
+        });
+
+        // Base timeout (100 ms) ≪ the 400 ms answer delay. Pre-fix this
+        // returned a timeout Err; the in-flight-dialog extension makes it
+        // wait for the real answer.
+        let r = worker.eval_with_timeout(
+            r#"(harness/confirm "warn" "really?")"#,
+            Duration::from_millis(100),
+        );
+        helper.join().unwrap();
+        assert_eq!(
+            r.as_deref(),
+            Ok("true"),
+            "eval must wait for the confirm answer instead of timing out, got {r:?}"
+        );
+    }
+
+    /// dirge-hwzs companion: a hook stuck for a NON-dialog reason (no
+    /// dialog in flight) must still time out at the base budget so a
+    /// wedged plugin recovers fast. The dialog extension only applies
+    /// while a confirm/select is genuinely pending.
+    #[test]
+    fn eval_without_a_dialog_still_times_out_at_the_base() {
+        let (mut worker, _dialog_rx, _lsp_rx) = Worker::try_spawn().unwrap();
+        let start = std::time::Instant::now();
+        let r = worker.eval_with_timeout("(while true)", Duration::from_millis(150));
+        let elapsed = start.elapsed();
+        assert!(r.is_err(), "an infinite loop must time out, got {r:?}");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "no dialog pending → must give up near the base timeout, took {elapsed:?}"
+        );
     }
 
     #[test]

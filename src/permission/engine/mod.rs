@@ -365,10 +365,7 @@ mod tests {
         }
     }
     fn cmd(s: &str) -> Resource {
-        Resource::Command {
-            raw: s.to_string(),
-            head: s.split_whitespace().next().unwrap_or("").to_string(),
-        }
+        Resource::command(s)
     }
     fn path(p: &str) -> Resource {
         Resource::Path {

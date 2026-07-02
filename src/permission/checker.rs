@@ -213,10 +213,21 @@ impl PermissionChecker {
             engine::classify_path(input, &self.working_dir)
         } else {
             match tool {
-                "bash" | "shell" => Resource::Command {
-                    raw: input.to_string(),
-                    head: input.split_whitespace().next().unwrap_or("").to_string(),
-                },
+                // dirge-g9qj: mirror the runtime splitter — a command
+                // carrying a substitution / subshell is complex, so
+                // `/why` explains it as a prompt (not a head-rule allow).
+                "bash" | "shell" => {
+                    let complex = input.contains("$(")
+                        || input.contains('`')
+                        || input.contains("<(")
+                        || input.contains(">(")
+                        || input.contains("$'");
+                    if complex {
+                        Resource::command_complex(input)
+                    } else {
+                        Resource::command(input)
+                    }
+                }
                 "mcp_tool" => {
                     // input shape: "mcp_tool:<server>:<name>"
                     let mut parts = input.splitn(3, ':');
