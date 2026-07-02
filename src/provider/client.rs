@@ -306,13 +306,35 @@ where
         }
         ProviderKind::Anthropic => {
             if auth == ProviderAuth::Anthropic {
-                let bearer = auth_headers
-                    .as_ref()
-                    .map(|h| h.bearer_token.clone())
-                    .unwrap_or_else(|| key.clone());
-                let mut b = anthropic::Client::builder()
-                    .api_key(&key)
-                    .http_client(super::anthropic_http::AnthropicHttpClient::new(bearer));
+                // dirge-956a: hand the transport the bearer + its expiry and a
+                // refresher, so a long session that crosses token expiry
+                // re-resolves (and persists) a fresh credential instead of
+                // dying on a non-retryable 401. Fall back to a static,
+                // non-refreshing bearer if the expiry can't be read.
+                let http = match super::auth::resolve_anthropic_auth_with_expiry() {
+                    Ok(resolved) => {
+                        let refresher: super::anthropic_http::RefreshFn =
+                            std::sync::Arc::new(super::auth::resolve_anthropic_auth_with_expiry);
+                        super::anthropic_http::AnthropicHttpClient::new_refreshable(
+                            resolved.bearer_token,
+                            resolved.expires_at_ms,
+                            refresher,
+                        )
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "dirge::provider",
+                            error = %e,
+                            "could not resolve Anthropic OAuth expiry; mid-session token refresh disabled",
+                        );
+                        let bearer = auth_headers
+                            .as_ref()
+                            .map(|h| h.bearer_token.clone())
+                            .unwrap_or_else(|| key.clone());
+                        super::anthropic_http::AnthropicHttpClient::new(bearer)
+                    }
+                };
+                let mut b = anthropic::Client::builder().api_key(&key).http_client(http);
                 if let Some(base_url) = &base_url {
                     b = b.base_url(base_url);
                 }

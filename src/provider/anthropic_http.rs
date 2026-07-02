@@ -1,18 +1,72 @@
+use std::sync::{Arc, Mutex};
+
 use bytes::Bytes;
 use rig::http_client::{
     self, HttpClientExt, LazyBody, MultipartForm, Request, Response, StreamingResponse,
 };
 
+use crate::provider::auth::RefreshedAuth;
+
+/// Refreshes an expired Anthropic OAuth credential and returns the new bearer
+/// and its expiry. Boxed so tests can inject a fake; the live seam re-runs the
+/// same read/refresh/persist path the client build used (dirge-956a).
+pub(crate) type RefreshFn = Arc<dyn Fn() -> anyhow::Result<RefreshedAuth> + Send + Sync>;
+
+struct TokenState {
+    bearer: String,
+    /// `None` means "never refresh" — a static env token with no refresh
+    /// grant, or the `Default`/API-key path that doesn't send a bearer.
+    expires_at_ms: Option<i64>,
+}
+
+/// A bearer that can renew itself when it expires part-way through a long
+/// session (dirge-956a). Pre-fix the bearer was frozen at client build, so a
+/// run that crossed token expiry died on a non-retryable 401.
+pub(crate) struct RefreshableToken {
+    state: Mutex<TokenState>,
+    refresher: RefreshFn,
+}
+
+impl RefreshableToken {
+    /// Current bearer, refreshing first if it has expired. A refresh failure
+    /// keeps the stale token so the request fails exactly as it did before
+    /// this fix (no regression) rather than wedging the client; the next
+    /// request will try again. Refresh is rare (once per token lifetime) so
+    /// doing it synchronously here is acceptable.
+    fn bearer(&self) -> String {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(expires_at) = state.expires_at_ms {
+            let now = chrono::Utc::now().timestamp_millis();
+            if crate::auth::file_store::epoch_ms_is_expired(expires_at, now) {
+                match (self.refresher)() {
+                    Ok(fresh) => {
+                        state.bearer = fresh.bearer_token;
+                        state.expires_at_ms = fresh.expires_at_ms;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "dirge::provider",
+                            error = %e,
+                            "Anthropic OAuth token expired and refresh failed; sending the stale token",
+                        );
+                    }
+                }
+            }
+        }
+        state.bearer.clone()
+    }
+}
+
 /// Normalizes Anthropic OAuth requests at the transport boundary: swaps
 /// `x-api-key` for `Authorization: Bearer`, adds the Claude Code identity
 /// headers, and shapes the body. rig 0.37 exposes no per-request header seam.
 //
-// `bearer_token` is `Option` only to satisfy the `HttpClientExt: Default`
-// bound; a default instance never sends.
+// `token` is `Option` only to satisfy the `HttpClientExt: Default` bound; a
+// default instance never sends.
 #[derive(Clone, Default)]
 pub(crate) struct AnthropicHttpClient {
     inner: reqwest::Client,
-    bearer_token: Option<String>,
+    token: Option<Arc<RefreshableToken>>,
 }
 
 // Redacts the token so it can't leak via `{:?}`.
@@ -36,10 +90,40 @@ const ANTHROPIC_OAUTH_BETA: &str = "claude-code-20250219,oauth-2025-04-20";
 const CLAUDE_CODE_USER_AGENT: &str = "claude-cli/2.1.75";
 
 impl AnthropicHttpClient {
+    /// A static bearer with no refresh — the env-token path and tests. The
+    /// token is never renewed (no expiry, no refresher).
     pub(crate) fn new(bearer_token: String) -> Self {
         Self {
             inner: reqwest::Client::new(),
-            bearer_token: Some(bearer_token),
+            token: Some(Arc::new(RefreshableToken {
+                state: Mutex::new(TokenState {
+                    bearer: bearer_token,
+                    expires_at_ms: None,
+                }),
+                refresher: Arc::new(|| {
+                    Err(anyhow::anyhow!("no Anthropic OAuth refresher configured"))
+                }),
+            })),
+        }
+    }
+
+    /// The live OAuth path: seed with the bearer + expiry resolved at build,
+    /// plus a refresher that re-resolves (and persists) a fresh credential
+    /// once the token expires mid-session (dirge-956a).
+    pub(crate) fn new_refreshable(
+        bearer_token: String,
+        expires_at_ms: Option<i64>,
+        refresher: RefreshFn,
+    ) -> Self {
+        Self {
+            inner: reqwest::Client::new(),
+            token: Some(Arc::new(RefreshableToken {
+                state: Mutex::new(TokenState {
+                    bearer: bearer_token,
+                    expires_at_ms,
+                }),
+                refresher,
+            })),
         }
     }
 
@@ -47,9 +131,12 @@ impl AnthropicHttpClient {
     where
         T: Into<Bytes>,
     {
+        // Resolve the bearer up front — this is where a mid-session refresh
+        // fires if the token has expired (dirge-956a).
+        let bearer = self.token.as_ref().map(|t| t.bearer());
         let (mut parts, body) = req.into_parts();
         parts.headers.remove("x-api-key");
-        if let Some(token) = self.bearer_token.as_deref()
+        if let Some(token) = bearer.as_deref()
             && let Ok(value) = http::HeaderValue::from_str(&format!("Bearer {token}"))
         {
             parts.headers.insert(http::header::AUTHORIZATION, value);
@@ -72,7 +159,7 @@ impl AnthropicHttpClient {
         );
 
         let body = body.into();
-        let body = if is_messages_path(parts.uri.path()) && self.is_oauth_token() {
+        let body = if is_messages_path(parts.uri.path()) && is_oauth_bearer(bearer.as_deref()) {
             shape_oauth_messages_payload(body)
         } else {
             body
@@ -87,12 +174,13 @@ impl AnthropicHttpClient {
         }
         builder.body(body).map_err(http_client::Error::Protocol)
     }
+}
 
-    fn is_oauth_token(&self) -> bool {
-        self.bearer_token
-            .as_deref()
-            .is_some_and(|token| token.contains("sk-ant-oat"))
-    }
+/// An Anthropic OAuth access token (as opposed to an `sk-ant-api…` API key)
+/// is identified by the `sk-ant-oat` marker; only OAuth traffic gets the
+/// Claude Code payload shaping.
+fn is_oauth_bearer(bearer: Option<&str>) -> bool {
+    bearer.is_some_and(|token| token.contains("sk-ant-oat"))
 }
 
 impl HttpClientExt for AnthropicHttpClient {
@@ -502,6 +590,91 @@ fn split_assistant_tool_use_trailing_content(messages: &mut Vec<serde_json::Valu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn token(bearer: &str, expires_at_ms: Option<i64>, refresher: RefreshFn) -> RefreshableToken {
+        RefreshableToken {
+            state: Mutex::new(TokenState {
+                bearer: bearer.to_string(),
+                expires_at_ms,
+            }),
+            refresher,
+        }
+    }
+
+    /// dirge-956a: an expired bearer refreshes exactly once, swaps in the new
+    /// token, and caches the fresh expiry so a follow-up request doesn't
+    /// refresh again.
+    #[test]
+    fn expired_token_refreshes_once_and_caches_fresh_expiry() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_c = calls.clone();
+        let future = chrono::Utc::now().timestamp_millis() + 3_600_000;
+        let refresher: RefreshFn = Arc::new(move || {
+            calls_c.fetch_add(1, Ordering::SeqCst);
+            Ok(RefreshedAuth {
+                bearer_token: "sk-ant-oat-fresh".to_string(),
+                expires_at_ms: Some(future),
+            })
+        });
+        // expired an hour ago
+        let past = chrono::Utc::now().timestamp_millis() - 3_600_000;
+        let tok = token("sk-ant-oat-stale", Some(past), refresher);
+
+        assert_eq!(tok.bearer(), "sk-ant-oat-fresh");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // Second call sees the cached fresh (future) expiry — no re-refresh.
+        assert_eq!(tok.bearer(), "sk-ant-oat-fresh");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// A token that is still valid is used as-is; the refresher never fires.
+    #[test]
+    fn valid_token_is_not_refreshed() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_c = calls.clone();
+        let refresher: RefreshFn = Arc::new(move || {
+            calls_c.fetch_add(1, Ordering::SeqCst);
+            Ok(RefreshedAuth {
+                bearer_token: "unexpected".to_string(),
+                expires_at_ms: None,
+            })
+        });
+        let future = chrono::Utc::now().timestamp_millis() + 3_600_000;
+        let tok = token("sk-ant-oat-live", Some(future), refresher);
+
+        assert_eq!(tok.bearer(), "sk-ant-oat-live");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// A refresh failure keeps the stale token so the request fails the same
+    /// way it did pre-fix (no worse), rather than wedging the client.
+    #[test]
+    fn refresh_failure_falls_back_to_stale_token() {
+        let refresher: RefreshFn = Arc::new(|| anyhow::bail!("network down"));
+        let past = chrono::Utc::now().timestamp_millis() - 1;
+        let tok = token("sk-ant-oat-stale", Some(past), refresher);
+
+        assert_eq!(tok.bearer(), "sk-ant-oat-stale");
+    }
+
+    /// A static token with no expiry (env path) never refreshes.
+    #[test]
+    fn none_expiry_never_refreshes() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_c = calls.clone();
+        let refresher: RefreshFn = Arc::new(move || {
+            calls_c.fetch_add(1, Ordering::SeqCst);
+            Ok(RefreshedAuth {
+                bearer_token: "unexpected".to_string(),
+                expires_at_ms: None,
+            })
+        });
+        let tok = token("sk-ant-oat-static", None, refresher);
+
+        assert_eq!(tok.bearer(), "sk-ant-oat-static");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
 
     #[test]
     fn prepends_claude_code_block_to_system_array() {

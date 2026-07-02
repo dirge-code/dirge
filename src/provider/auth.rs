@@ -147,6 +147,16 @@ fn codex_auth_file_path() -> PathBuf {
         .join("auth.json")
 }
 
+/// An Anthropic OAuth bearer resolved together with its expiry. The expiry
+/// lets the transport know WHEN to refresh mid-session (dirge-956a); it is
+/// `None` for the static `ANTHROPIC_OAUTH_TOKEN` env path, which has no
+/// refresh token and so can never be renewed.
+#[derive(Clone)]
+pub(crate) struct RefreshedAuth {
+    pub bearer_token: String,
+    pub expires_at_ms: Option<i64>,
+}
+
 fn resolve_anthropic_auth() -> anyhow::Result<ProviderAuthHeaders> {
     resolve_anthropic_auth_from(
         std::env::var("ANTHROPIC_OAUTH_TOKEN").ok(),
@@ -154,16 +164,40 @@ fn resolve_anthropic_auth() -> anyhow::Result<ProviderAuthHeaders> {
     )
 }
 
+/// Thin wrapper that drops the expiry — kept so the resolver tests and any
+/// bearer-only caller read unchanged.
 fn resolve_anthropic_auth_from(
     oauth_token: Option<String>,
     credentials_file_path: PathBuf,
 ) -> anyhow::Result<ProviderAuthHeaders> {
+    let resolved = resolve_anthropic_auth_with_expiry_from(oauth_token, credentials_file_path)?;
+    Ok(ProviderAuthHeaders {
+        bearer_token: resolved.bearer_token,
+        chatgpt_account_id: None,
+    })
+}
+
+/// Resolve the Anthropic OAuth bearer AND its expiry, refreshing (and
+/// persisting) a stale file credential along the way. Shared by the initial
+/// client build and by the transport's mid-session refresh seam so both go
+/// through the exact same read → refresh-if-expired → persist path.
+pub(crate) fn resolve_anthropic_auth_with_expiry() -> anyhow::Result<RefreshedAuth> {
+    resolve_anthropic_auth_with_expiry_from(
+        std::env::var("ANTHROPIC_OAUTH_TOKEN").ok(),
+        anthropic_credentials_file_path(),
+    )
+}
+
+fn resolve_anthropic_auth_with_expiry_from(
+    oauth_token: Option<String>,
+    credentials_file_path: PathBuf,
+) -> anyhow::Result<RefreshedAuth> {
     if let Some(token) = oauth_token
         && !token.trim().is_empty()
     {
-        return Ok(ProviderAuthHeaders {
+        return Ok(RefreshedAuth {
             bearer_token: token.trim().to_string(),
-            chatgpt_account_id: None,
+            expires_at_ms: None,
         });
     }
 
@@ -187,6 +221,7 @@ fn resolve_anthropic_auth_from(
                 credentials_file_path.display()
             )
         })?;
+    let mut expires_at_ms = extract_i64_by_keys(&json, &["expiresAt", "expires_at", "expires"]);
 
     if anthropic_token_is_expired(&json)
         && let Some(refresh) = extract_string_by_keys(&json, &["refreshToken", "refresh_token"])
@@ -194,11 +229,12 @@ fn resolve_anthropic_auth_from(
         let refreshed = refresh_anthropic_token_sync(&refresh)?;
         crate::provider::anthropic_oauth::persist_credentials(&refreshed)?;
         bearer_token = refreshed.access_token;
+        expires_at_ms = Some(refreshed.expires_at);
     }
 
-    Ok(ProviderAuthHeaders {
+    Ok(RefreshedAuth {
         bearer_token,
-        chatgpt_account_id: None,
+        expires_at_ms,
     })
 }
 
