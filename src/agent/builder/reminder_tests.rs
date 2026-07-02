@@ -20,8 +20,18 @@ fn plan_mode_injects_plan_reminder() {
     let mut p = String::from("base");
     append_mode_reminder(&mut p, "plan", false);
     assert!(p.contains("PLAN mode"));
-    assert!(p.contains("PLAN.md"));
     assert!(p.contains("Do NOT write any code"));
+    // dirge-cw7w: plan mode DENIES write/edit/apply_patch and delivers the
+    // plan in chat. The reminder must NOT tell the model to save a file, or
+    // a compliant model attempts a denied write every session.
+    assert!(
+        !p.contains("Save it to PLAN.md"),
+        "plan reminder must not instruct a denied file write; got: {p:?}"
+    );
+    assert!(
+        p.to_lowercase().contains("chat"),
+        "plan reminder must tell the model to present the plan in chat; got: {p:?}"
+    );
 }
 
 #[test]

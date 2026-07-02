@@ -89,7 +89,7 @@ pub(crate) fn model_steering_fragment(family: ModelFamily) -> Option<&'static st
 pub(crate) fn append_mode_reminder(preamble: &mut String, prompt_name: &str, plan_exists: bool) {
     match prompt_name {
         "plan" => {
-            preamble.push_str("\n\n---\n\nYou are now in PLAN mode. Create a detailed implementation plan. Save it to PLAN.md in the current directory. Analyze the task, break it into concrete steps, consider edge cases and trade-offs. Do NOT write any code or run any commands until the user reviews and approves the plan.");
+            preamble.push_str("\n\n---\n\nYou are now in PLAN mode. Create a detailed implementation plan and present it in your chat reply for the user to review — do NOT save it to a file (write/edit/apply_patch are denied in plan mode). Analyze the task, break it into concrete steps, consider edge cases and trade-offs. Do NOT write any code or run any commands until the user reviews and approves the plan.");
         }
         "review" | "review-security" => {
             preamble.push_str("\n\n---\n\nYou are now in REVIEW mode. Review the code or plan carefully. Identify bugs, security issues, performance problems, and design flaws. Be thorough and specific. Provide actionable feedback.");
