@@ -443,6 +443,48 @@ fn resolve_parent_walks_lineage() {
 }
 
 #[test]
+fn fold_chain_resolves_through_canonical_db_ids() {
+    // dirge-g1ze: turns persist under `db_session_id(session.id)` and the
+    // fold handler inserts/links the rotated session under the SAME
+    // derivation. A message written after the fold and the parent link
+    // must therefore land on the same row, so lineage walks back to root.
+    use crate::text::db_session_id;
+    let (db, _dir) = temp_db();
+
+    // Original session; a turn is persisted under its canonical id.
+    let orig = "abcd1234ef567890"; // a plain uuid-like runtime id
+    let orig_db = db_session_id(orig);
+    db.insert_session(&orig_db, "cli", "gpt-5", "openai", "2025-01-15T10:00:00Z")
+        .unwrap();
+
+    // Two successive folds rotate to distinct `compacted-<hex>` ids.
+    let fold1 = "compacted-11112222";
+    let fold2 = "compacted-33334444";
+    let fold1_db = db_session_id(fold1);
+    let fold2_db = db_session_id(fold2);
+
+    // Distinct folds must not collapse to one row.
+    assert_ne!(fold1_db, fold2_db, "folds must key distinct rows");
+
+    // Fold handler: insert new, link to parent (canonical ids throughout).
+    db.insert_session(&fold1_db, "cli", "gpt-5", "openai", "2025-01-15T11:00:00Z")
+        .unwrap();
+    db.set_parent_session(&fold1_db, &orig_db).unwrap();
+    db.insert_session(&fold2_db, "cli", "gpt-5", "openai", "2025-01-15T12:00:00Z")
+        .unwrap();
+    db.set_parent_session(&fold2_db, &fold1_db).unwrap();
+
+    // A turn persisted AFTER the second fold uses the same derivation the
+    // fold handler inserted under — so it hits an existing, linked row.
+    db.insert_message(&db_session_id(fold2), "user", "post-fold turn", None, None, None, "2025-01-15T12:01:00Z")
+        .unwrap();
+
+    // Lineage walks all the way back to the original session.
+    assert_eq!(db.resolve_parent(&fold2_db).unwrap(), orig_db);
+    assert_eq!(db.resolve_parent(&fold1_db).unwrap(), orig_db);
+}
+
+#[test]
 fn fts5_search_finds_tool_names() {
     let (db, _dir) = temp_db();
     db.insert_session("sess-1", "cli", "gpt-5", "openai", "2025-01-15T10:00:00Z")

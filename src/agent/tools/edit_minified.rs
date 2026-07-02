@@ -140,6 +140,15 @@ impl Tool for EditMinifiedTool {
             crate::agent::tools::syntax_gate(std::path::Path::new(&resolved), &candidate)
                 .map_err(ToolError::Msg)?;
 
+        // dirge-weyc: record the pre-mutation bytes so /rewind can restore
+        // this file, same as every other mutator. `source` is the exact
+        // content the edit was based on, so capture it directly rather than
+        // re-reading. Without this, a rewind reverted every other file but
+        // left this one mutated — an inconsistent partially-reverted tree.
+        crate::agent::tools::snapshots::capture_bytes(
+            std::path::Path::new(&resolved),
+            source.as_bytes(),
+        );
         crate::fs_atomic::atomic_write(std::path::Path::new(&resolved), new_source.as_bytes())
             .await?;
         crate::agent::tools::modified::mark_modified(std::path::Path::new(&resolved));
@@ -221,6 +230,61 @@ mod tests {
             std::fs::read_to_string(&path).unwrap(),
             "fn main() {\n    let x = 42;\n    let y = 2;\n}\n"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "semantic-rust")]
+    #[tokio::test]
+    async fn rewind_restores_a_minified_edit() {
+        use crate::agent::tools::snapshots;
+        use crate::sync_util::LockExt;
+        // dirge-weyc: every other mutator captures a pre-mutation snapshot
+        // before writing; edit_minified didn't, so /rewind restored every
+        // other file but left this one mutated. The turn's snapshot must
+        // exist so restore reverts it.
+        let _g = snapshots::TEST_GATE.lock_ignore_poison();
+        snapshots::clear();
+
+        let dir = std::env::temp_dir().join(format!("dirge-editmin-rewind-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.rs");
+        let src = "fn main() {\n    let x = 1;\n    let y = 2;\n}\n";
+        std::fs::write(&path, src).unwrap();
+        let abs = path.to_string_lossy().to_string();
+        let resolved = crate::agent::tools::check_perm_path_resolve(&None, &None, "read", &abs)
+            .await
+            .unwrap();
+
+        let cache = ToolCache::new();
+        cache.mark_read(std::path::Path::new(&resolved));
+        let tool = tool_with_cache(cache);
+
+        snapshots::begin_turn("u1");
+        tool.call(EditArgs {
+            path: abs,
+            old_text: "let x=1".into(),
+            new_text: "let x = 42".into(),
+            replace_all: None,
+        })
+        .await
+        .unwrap();
+        // Edit landed.
+        assert_ne!(std::fs::read_to_string(&path).unwrap(), src);
+
+        // /rewind must restore the pre-edit bytes.
+        let restored = snapshots::restore_from("u1");
+        assert!(
+            restored.iter().any(|p| p == std::path::Path::new(&resolved)
+                || std::fs::canonicalize(p).ok() == std::fs::canonicalize(&resolved).ok()),
+            "edit_minified's file must be in the restore set; got {restored:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            src,
+            "rewind must revert edit_minified's change"
+        );
+
+        snapshots::clear();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

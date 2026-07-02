@@ -99,6 +99,22 @@ pub(crate) fn session_glance_id(id: &str) -> String {
     short_id(id)
 }
 
+/// The canonical Session-DB primary key for a runtime session id. MUST be
+/// used by every DB writer (turn persistence, session-end, the fold
+/// handler's insert + parent link) or a session's turns and its lineage
+/// land in different rows.
+///
+/// The old `format!("dirge-{}", short_id(id))` collapsed every
+/// `compacted-<uuid>` fold to the constant `dirge-compacte`, so all
+/// folded sessions in every conversation piled into one row and
+/// `resolve_parent` could never walk a fold (dirge-g1ze). Reuses
+/// `session_glance_id`, which keeps a `word-` prefix plus the unique tail
+/// head for rotated ids while leaving bare-uuid keys byte-identical to
+/// the old derivation (so existing rows still resolve).
+pub(crate) fn db_session_id(id: &str) -> String {
+    format!("dirge-{}", session_glance_id(id))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,6 +140,24 @@ mod tests {
         // Hyphenated uuid: first group is hex (not all-alpha) → first-8 head,
         // not mistaken for a word prefix.
         assert_eq!(session_glance_id("3f9a2b1c-4d5e-6f70"), "3f9a2b1c");
+    }
+
+    #[test]
+    fn db_session_id_is_distinct_across_folds() {
+        // dirge-g1ze: the DB key derived via `short_id` collapsed every
+        // `compacted-<uuid>` fold to "compacte", so all folded sessions in
+        // every conversation piled into one row. The canonical DB id must
+        // stay distinct across folds and forks.
+        assert_ne!(
+            db_session_id("compacted-3f9a2b1c"),
+            db_session_id("compacted-9e8d7c6b"),
+            "different folds must map to different DB ids"
+        );
+        assert_ne!(db_session_id("forked-aaaa1111"), db_session_id("forked-bbbb2222"));
+        // Stable: same input → same key (writers + parent links must agree).
+        assert_eq!(db_session_id("compacted-3f9a2b1c"), db_session_id("compacted-3f9a2b1c"));
+        // Every key carries the `dirge-` DB namespace prefix.
+        assert!(db_session_id("3f9a2b1c4d5e").starts_with("dirge-"));
     }
 
     #[test]

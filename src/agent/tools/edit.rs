@@ -294,6 +294,12 @@ impl Tool for EditTool {
         // differ from normalized_old (different whitespace/indent).
         // Replace by exact byte range instead of string.replace
         // (which would re-search normalized_old and not find it).
+        // dirge-do90: the buffer and old_text are normalized to `\n`, so
+        // new_text must be too before splicing. Otherwise a model-emitted
+        // `\r\n` survives into `new_content` and the CRLF re-encoding below
+        // (`\n` -> `\r\n`) turns it into `\r\r\n`. Matches the
+        // normalization edit_lines / apply_patch already do.
+        let normalized_new = args.new_text.replace("\r\n", "\n");
         let new_content = if do_replace_all {
             // For replace_all we splice every range in reverse
             // order so earlier offsets stay valid.
@@ -301,13 +307,13 @@ impl Tool for EditTool {
             let mut ranges = match_ranges.clone();
             ranges.sort_by_key(|r| std::cmp::Reverse(r.0));
             for (start, end) in ranges {
-                out.replace_range(start..end, &args.new_text);
+                out.replace_range(start..end, &normalized_new);
             }
             out
         } else {
             let (start, end) = match_ranges[0];
             let mut out = content.clone();
-            out.replace_range(start..end, &args.new_text);
+            out.replace_range(start..end, &normalized_new);
             out
         };
 
@@ -833,6 +839,46 @@ mod read_gate_tests {
             })
             .await;
         assert!(ok.is_ok(), "no cache ⇒ ungated; got {ok:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn crlf_file_edit_does_not_double_the_carriage_return() {
+        // dirge-do90: old_text and the buffer are normalized to \n, but
+        // new_text was spliced raw. When the model emits \r\n in new_text
+        // on a CRLF file, the final whole-buffer \n->\r\n turned each
+        // \r\n into \r\r\n. The tool advertises CRLF handling, so the
+        // result must stay clean CRLF.
+        let dir = std::env::temp_dir().join(format!("dirge-edit-crlf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("crlf.txt");
+        std::fs::write(&path, "line1\r\nline2\r\nline3\r\n").unwrap();
+
+        let tool = EditTool::new(None, None);
+        let ok = tool
+            .call(EditArgs {
+                path: path.to_string_lossy().to_string(),
+                old_text: "line2".to_string(),
+                // The model emits a CRLF inside the replacement.
+                new_text: "new2a\r\nnew2b".to_string(),
+                replace_all: None,
+            })
+            .await;
+        assert!(ok.is_ok(), "edit should succeed; got {ok:?}");
+
+        let out = std::fs::read(&path).unwrap();
+        assert!(
+            !out.windows(3).any(|w| w == b"\r\r\n"),
+            "CRLF edit must not produce \\r\\r\\n; got {:?}",
+            String::from_utf8_lossy(&out)
+        );
+        // Every newline stays a proper CRLF (no lone \n either).
+        let s = String::from_utf8_lossy(&out);
+        assert_eq!(
+            s,
+            "line1\r\nnew2a\r\nnew2b\r\nline3\r\n",
+            "CRLF must be preserved uniformly"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
