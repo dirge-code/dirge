@@ -603,7 +603,7 @@ fn canonicalize_path_pattern(pattern_str: &str, working_dir: &str) -> Option<Str
             return Some(out);
         }
     }
-    let canonical_head = std::fs::canonicalize(head_trimmed)
+    let canonical_head = dunce::canonicalize(head_trimmed)
         .ok()
         .map(|p| p.to_string_lossy().into_owned())
         .or_else(|| {
@@ -652,7 +652,7 @@ fn project_canonical_from_existing_ancestor(path: &str) -> Option<String> {
                     tail_components.push(name);
                 }
                 anchor = parent;
-                if let Ok(canonical) = std::fs::canonicalize(anchor) {
+                if let Ok(canonical) = dunce::canonicalize(anchor) {
                     let mut out = canonical;
                     for name in tail_components.iter().rev() {
                         out.push(name);

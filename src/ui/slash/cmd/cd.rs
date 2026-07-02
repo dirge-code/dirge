@@ -21,7 +21,7 @@ pub(crate) async fn cmd_cd(ctx: &mut SlashCtx<'_>, text: &str) -> anyhow::Result
     };
     match std::env::set_current_dir(&path) {
         Ok(()) => {
-            let canonical = std::fs::canonicalize(&path).unwrap_or(path);
+            let canonical = dunce::canonicalize(&path).unwrap_or(path);
             ctx.session.working_dir = CompactString::new(canonical.to_string_lossy().as_ref());
             if let Some(perm) = ctx.permission
                 && let Ok(mut guard) = perm.lock()

@@ -131,7 +131,7 @@ fn intern(store: &mut Store, bytes: Vec<u8>) -> Arc<Vec<u8>> {
 ///
 /// Call this from a mutating tool *before* writing.
 pub fn capture(path: &Path) {
-    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let canonical = crate::permission::path::canonical_or_self(path);
 
     // Read pre-state before locking the store (I/O outside the lock).
     let capture = match std::fs::metadata(&canonical) {
@@ -175,7 +175,7 @@ pub fn capture(path: &Path) {
 /// edit was based on. Use [`capture`] instead when the file may be
 /// absent (create) or when the pre-content isn't already available.
 pub fn capture_bytes(path: &Path, content: &[u8]) {
-    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let canonical = crate::permission::path::canonical_or_self(path);
     if content.len() as u64 > MAX_SNAPSHOT_BYTES {
         return;
     }

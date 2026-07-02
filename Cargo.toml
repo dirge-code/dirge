@@ -268,6 +268,10 @@ jsonschema = "0.46"
 janetrs = { version = "0.8", optional = true }
 html2text = "0.17"
 indexmap = "2"
+# Windows-safe canonicalize: returns non-verbatim paths (no `\\?\` prefix)
+# unless the path genuinely needs it (long/reserved). Drop-in for
+# std::fs::canonicalize; identical behavior on non-Windows.
+dunce = "1"
 lsp-types = { version = "0.97", optional = true }
 tree-sitter-elixir = { version = "0.3.5", optional = true }
 tree-sitter-sequel = { version = "0.3", optional = true }

@@ -1160,6 +1160,7 @@ dependencies = [
  "crossterm",
  "dap",
  "dirs",
+ "dunce",
  "futures",
  "hex",
  "html2text",

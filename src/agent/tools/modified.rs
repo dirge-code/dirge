@@ -40,7 +40,7 @@ const MAX_MODIFIED: usize = 256;
 /// Best-effort canonicalize; falls back to the path as given when the file
 /// doesn't exist yet or canonicalize fails.
 pub fn mark_modified(path: &Path) {
-    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let canonical = crate::permission::path::canonical_or_self(path);
     let mut set = MODIFIED_FILES.lock_ignore_poison();
     // IndexSet preserves insertion order and dedups; we want the most-recent
     // touch to surface at the end, so re-insert moves the entry.
