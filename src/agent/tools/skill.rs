@@ -51,6 +51,11 @@ pub struct SkillArgs {
     old_string: Option<String>,
     #[serde(default)]
     new_string: Option<String>,
+    /// dirge-ykli: explicit override to delete a protected (pinned or
+    /// bundled/user-authored) skill. Defaults false — protected skills
+    /// are refused so a prompt slip can't remove them.
+    #[serde(default)]
+    force: Option<bool>,
 }
 
 impl Tool for SkillTool {
@@ -103,6 +108,10 @@ impl Tool for SkillTool {
                     "new_string": {
                         "type": "string",
                         "description": "Replacement text. Required for 'patch'."
+                    },
+                    "force": {
+                        "type": "boolean",
+                        "description": "Only for 'delete': override the refusal to remove a pinned or bundled/user-authored skill. Those are managed in the repo, not by the agent — leave unset unless you are certain."
                     }
                 },
                 "required": ["action"]
@@ -242,8 +251,39 @@ impl Tool for SkillTool {
             "delete" => {
                 let name =
                     crate::agent::tools::required_nonblank(args.name.as_deref(), "name", "delete")?;
-                self.manager.delete(name).map_err(ToolError::Msg)?;
-                Ok(format!("Skill '{}' deleted.", name))
+                let force = args.force.unwrap_or(false);
+                // dirge-ykli: the curator's "never touch bundled/pinned"
+                // rules were prompt-only — the tool never consulted
+                // provenance, so one prompt slip could remove a
+                // user-authored or bundled skill. Refuse pinned or
+                // file-provenance skills unless the caller forces it.
+                if !force
+                    && let Some(store) = &self.store
+                    && let Ok(Some(row)) = store.get(name)
+                    && (row.pinned || row.source != "learned")
+                {
+                    let why = if row.pinned {
+                        "pinned"
+                    } else {
+                        "not agent-created (bundled or user-authored)"
+                    };
+                    return Err(ToolError::Msg(format!(
+                        "Refusing to delete skill '{name}': it is {why}. Bundled/user skills are \
+                         managed in the repo, not by the curator. Pass force=true to override."
+                    )));
+                }
+                // dirge-s1f2: the curator prompt promises deletion is a
+                // recoverable archive, but the tool did a permanent
+                // remove_dir_all. Move the directory to
+                // `.dirge/skills/.archive/` so it's restorable, and mark
+                // the DB row archived (best-effort).
+                self.manager.archive(name).map_err(ToolError::Msg)?;
+                if let Some(store) = &self.store {
+                    let _ = store.archive(name);
+                }
+                Ok(format!(
+                    "Skill '{name}' archived (recoverable under .dirge/skills/.archive/)."
+                ))
             }
 
             _ => Err(ToolError::Msg(format!(
@@ -310,6 +350,7 @@ mod tests {
             content: None,
             old_string: None,
             new_string: None,
+            force: None,
         }));
         assert!(result.is_ok());
         let output = result.unwrap();
@@ -330,6 +371,7 @@ mod tests {
             content: None,
             old_string: None,
             new_string: None,
+            force: None,
         }));
         assert!(result.is_err());
     }
@@ -350,6 +392,7 @@ mod tests {
             content: Some(content.into()),
             old_string: None,
             new_string: None,
+            force: None,
         }));
         assert!(result.is_ok(), "create failed: {:?}", result);
 
@@ -360,6 +403,7 @@ mod tests {
             content: None,
             old_string: None,
             new_string: None,
+            force: None,
         }));
         let output = result.unwrap();
         assert!(output.contains("my-skill"));
@@ -381,6 +425,7 @@ mod tests {
             content: Some("---\nname: bad/name\n---\n\nbody\n".into()),
             old_string: None,
             new_string: None,
+            force: None,
         }));
         assert!(result.is_err());
     }
@@ -398,6 +443,7 @@ mod tests {
             content: None,
             old_string: None,
             new_string: None,
+            force: None,
         }));
         assert!(result.is_err());
     }
@@ -417,6 +463,7 @@ mod tests {
             content: Some(content.into()),
             old_string: None,
             new_string: None,
+            force: None,
         }))
         .unwrap();
 
@@ -426,6 +473,7 @@ mod tests {
             content: Some(content.into()),
             old_string: None,
             new_string: None,
+            force: None,
         }));
         assert!(result.is_err());
     }
@@ -446,6 +494,7 @@ mod tests {
             content: Some(content.into()),
             old_string: None,
             new_string: None,
+            force: None,
         }))
         .unwrap();
 
@@ -455,6 +504,7 @@ mod tests {
             content: None,
             old_string: Some("Line one".into()),
             new_string: Some("Replaced line".into()),
+            force: None,
         }));
         assert!(result.is_ok(), "patch failed: {:?}", result);
 
@@ -480,6 +530,7 @@ mod tests {
             content: Some(content.into()),
             old_string: None,
             new_string: None,
+            force: None,
         }))
         .unwrap();
 
@@ -489,6 +540,7 @@ mod tests {
             content: None,
             old_string: Some("nonexistent".into()),
             new_string: Some("new".into()),
+            force: None,
         }));
         assert!(result.is_err());
     }
@@ -509,6 +561,7 @@ mod tests {
             content: Some(content.into()),
             old_string: None,
             new_string: None,
+            force: None,
         }))
         .unwrap();
 
@@ -518,6 +571,7 @@ mod tests {
             content: None,
             old_string: None,
             new_string: None,
+            force: None,
         }));
         assert!(result.is_ok(), "delete failed: {:?}", result);
 
@@ -528,9 +582,137 @@ mod tests {
             content: None,
             old_string: None,
             new_string: None,
+            force: None,
         }));
         let output = result.unwrap();
         assert!(!output.contains("todelete"));
+    }
+
+    fn store_backed_tool() -> (SkillTool, std::path::PathBuf, Arc<SkillStore>) {
+        let (mgr, dir) = temp_skills_dir();
+        let paths = ProjectPaths::new(&dir);
+        let store = Arc::new(SkillStore::load(&paths).unwrap());
+        let tool = SkillTool::new(make_skills(), mgr, Some(store.clone()), None, None);
+        (tool, dir, store)
+    }
+
+    fn create_skill(tool: &SkillTool, rt: &tokio::runtime::Runtime, name: &str) {
+        let content = format!(
+            "---\nname: {name}\ndescription: D\n---\n\nbody\n\n## Verification\n\ncheck\n"
+        );
+        rt.block_on(tool.call(SkillArgs {
+            action: "create".into(),
+            name: Some(name.into()),
+            content: Some(content),
+            old_string: None,
+            new_string: None,
+            force: None,
+        }))
+        .unwrap();
+    }
+
+    /// dirge-s1f2: the curator prompt tells the LLM deletion is a
+    /// recoverable archive, but the tool did a permanent remove_dir_all.
+    /// A `delete` must move the skill to `.archive/`, not destroy it.
+    #[test]
+    fn delete_archives_recoverably_instead_of_hard_delete() {
+        let (tool, dir, _store) = store_backed_tool();
+        let rt = make_runtime();
+        create_skill(&tool, &rt, "recoverable");
+
+        rt.block_on(tool.call(SkillArgs {
+            action: "delete".into(),
+            name: Some("recoverable".into()),
+            content: None,
+            old_string: None,
+            new_string: None,
+            force: None,
+        }))
+        .unwrap();
+
+        // Gone from the live library …
+        let out = rt
+            .block_on(tool.call(SkillArgs {
+                action: "list".into(),
+                name: None,
+                content: None,
+                old_string: None,
+                new_string: None,
+                force: None,
+            }))
+            .unwrap();
+        assert!(!out.contains("recoverable"));
+
+        // … but preserved under .archive/ (recoverable), not removed.
+        let archived = ProjectPaths::new(&dir)
+            .skills_dir()
+            .join(".archive")
+            .join("recoverable")
+            .join("SKILL.md");
+        assert!(
+            archived.is_file(),
+            "deleted skill must be archived, not hard-deleted; expected {archived:?}"
+        );
+    }
+
+    /// dirge-ykli: a pinned skill must not be deletable without an
+    /// explicit override — the "don't touch pinned" rule can't be
+    /// prompt-only.
+    #[test]
+    fn delete_refuses_pinned_skill_without_force() {
+        let (tool, _dir, store) = store_backed_tool();
+        let rt = make_runtime();
+        create_skill(&tool, &rt, "keepme");
+        store.set_pinned("keepme", true).unwrap();
+
+        let result = rt.block_on(tool.call(SkillArgs {
+            action: "delete".into(),
+            name: Some("keepme".into()),
+            content: None,
+            old_string: None,
+            new_string: None,
+            force: None,
+        }));
+        assert!(result.is_err(), "pinned skill must be refused; got {result:?}");
+
+        // Still present in the live library.
+        let out = rt
+            .block_on(tool.call(SkillArgs {
+                action: "list".into(),
+                name: None,
+                content: None,
+                old_string: None,
+                new_string: None,
+                force: None,
+            }))
+            .unwrap();
+        assert!(out.contains("keepme"), "refused delete must leave the skill intact");
+    }
+
+    /// dirge-ykli: a bundled / user-authored skill (source='file') must
+    /// not be deletable without an explicit override.
+    #[test]
+    fn delete_refuses_file_provenance_skill_without_force() {
+        let (tool, _dir, store) = store_backed_tool();
+        let rt = make_runtime();
+        // Register as a discovered on-disk skill would be — source='file'
+        // is seeded on FIRST insert, so this must precede any tool create.
+        store
+            .register_file_skill("bundled", "D", "body", false)
+            .unwrap();
+
+        let result = rt.block_on(tool.call(SkillArgs {
+            action: "delete".into(),
+            name: Some("bundled".into()),
+            content: None,
+            old_string: None,
+            new_string: None,
+            force: None,
+        }));
+        assert!(
+            result.is_err(),
+            "file-provenance skill must be refused; got {result:?}"
+        );
     }
 
     // ── definition ─────────────────────────────────────
@@ -575,6 +757,7 @@ mod tests {
             content: Some(content.into()),
             old_string: None,
             new_string: None,
+            force: None,
         }));
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Security scan"));
@@ -595,6 +778,7 @@ mod tests {
             content: Some(content.into()),
             old_string: None,
             new_string: None,
+            force: None,
         }));
         let err = result.unwrap_err().to_string();
         assert!(err.contains("Verification"), "gate message: {err}");
@@ -631,6 +815,7 @@ mod tests {
             content: None,
             old_string: None,
             new_string: None,
+            force: None,
         }));
         assert!(
             result.is_ok(),
