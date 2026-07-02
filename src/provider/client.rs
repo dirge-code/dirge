@@ -376,6 +376,12 @@ where
             );
             Ok(AnyClient::Glm(b.build()?))
         }
+        ProviderKind::OpenCode => {
+            let b = openai::CompletionsClient::builder()
+                .api_key(&key)
+                .base_url(base_url.as_deref().unwrap_or("https://opencode.ai/zen/v1"));
+            Ok(AnyClient::OpenCode(b.build()?))
+        }
         ProviderKind::Ollama => {
             let key: ollama::OllamaApiKey = key.as_str().into();
             let mut b = ollama::Client::builder().api_key(key);

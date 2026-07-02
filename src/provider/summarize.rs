@@ -114,6 +114,7 @@ pub(crate) async fn oneshot_with_model(
         super::AnyModel::Gemini(m) => run_oneshot(m, label, preamble, prompt, disable).await,
         super::AnyModel::DeepSeek(m) => run_oneshot(m, label, preamble, prompt, disable).await,
         super::AnyModel::Glm(m) => run_oneshot(m, label, preamble, prompt, disable).await,
+        super::AnyModel::OpenCode(m) => run_oneshot(m, label, preamble, prompt, disable).await,
         super::AnyModel::Ollama(m) => run_oneshot(m, label, preamble, prompt, disable).await,
         super::AnyModel::Custom(m) => run_oneshot(m, label, preamble, prompt, disable).await,
     }
@@ -131,6 +132,7 @@ fn oneshot_provider_kind(model: &super::AnyModel) -> &'static str {
         M::Gemini(_) => "gemini",
         M::DeepSeek(_) => "deepseek",
         M::Glm(_) => "glm",
+        M::OpenCode(_) => "opencode",
         M::Ollama(_) => "ollama",
         M::Custom(_) => "custom",
     }
@@ -148,7 +150,7 @@ fn reasoning_disable_for_kind(kind: &str) -> Option<serde_json::Value> {
     match kind {
         // vLLM / SGLang / DeepSeek-V3.1 convention for the hybrid models these
         // OpenAI-compatible endpoints serve.
-        "deepseek" | "glm" | "custom" | "openrouter" => {
+        "deepseek" | "glm" | "opencode" | "custom" | "openrouter" => {
             Some(serde_json::json!({ "chat_template_kwargs": { "thinking": false } }))
         }
         // Ollama's native per-request toggle.

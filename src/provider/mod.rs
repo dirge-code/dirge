@@ -172,6 +172,7 @@ pub(crate) enum AnyAgentInner {
     Gemini(Agent<gemini::completion::CompletionModel>),
     DeepSeek(Agent<openai::completion::CompletionModel>),
     Glm(Agent<openai::completion::CompletionModel>),
+    OpenCode(Agent<openai::completion::CompletionModel>),
     Ollama(Agent<ollama::CompletionModel>),
     Custom(Agent<openai::completion::CompletionModel>),
 }
@@ -450,6 +451,7 @@ impl AnyAgent {
             AnyAgentInner::Gemini(_) => "gemini",
             AnyAgentInner::DeepSeek(_) => "deepseek",
             AnyAgentInner::Glm(_) => "glm",
+            AnyAgentInner::OpenCode(_) => "opencode",
             AnyAgentInner::Ollama(_) => "ollama",
             AnyAgentInner::Custom(_) => "custom",
         }

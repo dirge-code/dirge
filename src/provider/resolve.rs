@@ -21,6 +21,7 @@ pub enum ProviderKind {
     DeepSeek,
     Glm,
     Ollama,
+    OpenCode,
     Custom,
 }
 
@@ -37,6 +38,7 @@ pub fn default_model_for(provider_name: &str) -> &'static str {
         Some(ProviderKind::Gemini) => "gemini-2.0-flash",
         Some(ProviderKind::DeepSeek) => "deepseek-v4-pro",
         Some(ProviderKind::Glm) => "glm-5.2",
+        Some(ProviderKind::OpenCode) => "deepseek-v4-flash",
         Some(ProviderKind::Ollama) => "llama3",
         // OpenRouter + Custom + unknown — keep the historical default
         // since OpenRouter wants the `vendor/model` form.
@@ -78,6 +80,7 @@ pub fn parse_provider(name: &str) -> Option<ProviderKind> {
         "gemini" | "google" => Some(ProviderKind::Gemini),
         "deepseek" => Some(ProviderKind::DeepSeek),
         "glm" | "zhipu" => Some(ProviderKind::Glm),
+        "opencode" => Some(ProviderKind::OpenCode),
         "ollama" => Some(ProviderKind::Ollama),
         "custom" => Some(ProviderKind::Custom),
         _ => None,
@@ -368,6 +371,7 @@ fn provider_env_var(kind: ProviderKind) -> &'static str {
         ProviderKind::Gemini => "GEMINI_API_KEY",
         ProviderKind::DeepSeek => "DEEPSEEK_API_KEY",
         ProviderKind::Glm => "GLM_API_KEY",
+        ProviderKind::OpenCode => "OPENCODE_API_KEY",
         ProviderKind::Ollama => "OLLAMA_API_KEY",
         ProviderKind::OpenRouter => "OPENROUTER_API_KEY",
         ProviderKind::Custom => "CUSTOM_API_KEY",
@@ -401,6 +405,7 @@ pub(crate) const PROVIDER_AUTODETECT_ORDER: &[(&str, &str)] = &[
     // after GLM_API_KEY so users with both set get the dirge-
     // primary one; users with only ZHIPU_API_KEY still get glm.
     ("ZHIPU_API_KEY", "glm"),
+    ("OPENCODE_API_KEY", "opencode"),
     ("OLLAMA_API_KEY", "ollama"),
     ("OPENROUTER_API_KEY", "openrouter"),
 ];
