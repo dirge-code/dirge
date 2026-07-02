@@ -1200,10 +1200,17 @@ impl SessionDb {
 }
 
 pub struct SearchResult {
+    /// dirge-uzw4: the matched message's id, so the discovery window can
+    /// anchor on the actual FTS hit instead of reconstructing (and missing)
+    /// it from the session's first message.
+    pub id: i64,
     pub session_id: String,
     pub content: String,
     #[allow(dead_code)] // populated from SQL, not yet read by consumers
     pub role: String,
+    // dirge-uzw4: no longer used for anchoring (the FTS join now returns
+    // the matched id), but kept in the result shape for callers/tests.
+    #[allow(dead_code)]
     pub timestamp: String,
 }
 
@@ -1285,6 +1292,23 @@ impl SessionDb {
         Ok(results)
     }
 
+    /// dirge-9eyo: fetch one session's (source, model, title, started_at)
+    /// by id directly. Discovery used to scan `list_sessions_rich(None)`
+    /// (LIMIT 50 ORDER BY last_active DESC), so a hit in an older session
+    /// silently got blank metadata. Errors if the session doesn't exist.
+    pub fn get_session_meta(
+        &self,
+        session_id: &str,
+    ) -> Result<(String, String, String, String), String> {
+        self.conn
+            .query_row(
+                "SELECT source, model, title, started_at FROM sessions WHERE id = ?1",
+                params![session_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .map_err(|_| format!("Session '{session_id}' not found"))
+    }
+
     pub fn search_messages(
         &self,
         query: &str,
@@ -1292,16 +1316,17 @@ impl SessionDb {
     ) -> Result<Vec<SearchResult>, String> {
         fn map_row(row: &rusqlite::Row) -> rusqlite::Result<SearchResult> {
             Ok(SearchResult {
-                session_id: row.get(0)?,
-                content: row.get(1)?,
-                role: row.get(2)?,
-                timestamp: row.get(3)?,
+                id: row.get(0)?,
+                session_id: row.get(1)?,
+                content: row.get(2)?,
+                role: row.get(3)?,
+                timestamp: row.get(4)?,
             })
         }
 
         let (sql, has_role) = if role_filter.is_some() {
             (
-                "SELECT m.session_id, m.content, m.role, m.timestamp
+                "SELECT m.id, m.session_id, m.content, m.role, m.timestamp
                  FROM messages_fts f
                  JOIN messages m ON f.rowid = m.id
                  WHERE messages_fts MATCH ?1 AND m.role = ?2
@@ -1311,7 +1336,7 @@ impl SessionDb {
             )
         } else {
             (
-                "SELECT m.session_id, m.content, m.role, m.timestamp
+                "SELECT m.id, m.session_id, m.content, m.role, m.timestamp
                  FROM messages_fts f
                  JOIN messages m ON f.rowid = m.id
                  WHERE messages_fts MATCH ?1
@@ -1352,16 +1377,17 @@ impl SessionDb {
     ) -> Result<Vec<SearchResult>, String> {
         fn map_row(row: &rusqlite::Row) -> rusqlite::Result<SearchResult> {
             Ok(SearchResult {
-                session_id: row.get(0)?,
-                content: row.get(1)?,
-                role: row.get(2)?,
-                timestamp: row.get(3)?,
+                id: row.get(0)?,
+                session_id: row.get(1)?,
+                content: row.get(2)?,
+                role: row.get(3)?,
+                timestamp: row.get(4)?,
             })
         }
 
         let (sql, has_role) = if role_filter.is_some() {
             (
-                "SELECT m.session_id, m.content, m.role, m.timestamp
+                "SELECT m.id, m.session_id, m.content, m.role, m.timestamp
                  FROM messages_fts_trigram f
                  JOIN messages m ON f.rowid = m.id
                  WHERE messages_fts_trigram MATCH ?1 AND m.role = ?2
@@ -1371,7 +1397,7 @@ impl SessionDb {
             )
         } else {
             (
-                "SELECT m.session_id, m.content, m.role, m.timestamp
+                "SELECT m.id, m.session_id, m.content, m.role, m.timestamp
                  FROM messages_fts_trigram f
                  JOIN messages m ON f.rowid = m.id
                  WHERE messages_fts_trigram MATCH ?1
@@ -1579,7 +1605,11 @@ impl SessionDb {
             )
             .map_err(|e| format!("Failed to count messages: {e}"))?;
 
-        let before = window.min(anchor_row.saturating_sub(1) as usize);
+        // dirge-uzw4: clamp at zero BEFORE the cast. A foreign/too-small
+        // anchor id makes anchor_row 0, and `0i64 - 1` cast to usize wraps
+        // to usize::MAX — which then makes `before`/`anchor_index` exceed
+        // the returned window.
+        let before = window.min((anchor_row - 1).max(0) as usize);
         let after = window.min((total - anchor_row).max(0) as usize);
         let offset = (anchor_row - before as i64 - 1).max(0);
 

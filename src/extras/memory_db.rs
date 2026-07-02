@@ -603,8 +603,13 @@ impl SqliteMemoryStore {
             out.push_str("\n</project_memory>\n");
         }
 
-        let crumbs: Vec<&SnapshotEntry> =
-            snapshot.iter().filter(|e| e.tier == "breadcrumb").collect();
+        // dirge-d04r: the overview renders in the block above by KIND
+        // regardless of tier, so a (buggily) demoted overview would show
+        // up here too — exclude it from the index to keep it single.
+        let crumbs: Vec<&SnapshotEntry> = snapshot
+            .iter()
+            .filter(|e| e.tier == "breadcrumb" && e.kind != "overview")
+            .collect();
         if !crumbs.is_empty() {
             out.push_str("\n<project_memory_index>\n");
             out.push_str(
@@ -972,37 +977,21 @@ impl SqliteMemoryStore {
         Ok(outcome)
     }
 
-    /// Insert `entry` into the hot tier within an open transaction,
-    /// demoting/archiving to make room under the working-reserve rules,
-    /// and return the new row id plus what compaction did. The caller is
-    /// responsible for duplicate/size validation and for committing.
-    /// Shared by `add_entry` and `supersede_entry` so the (subtle)
-    /// eviction policy lives in exactly one place.
-    fn insert_into_hot(
+    /// Demote least-salient hot rows until a `cost`-char entry fits the
+    /// hot budget, honoring the working reserve and never evicting the
+    /// overview. Returns how many rows were demoted. dirge-d04r: shared by
+    /// `insert_into_hot` and `restore_entry` so the (subtle) victim-
+    /// selection policy — including the overview exemption — lives in one
+    /// place instead of being re-implemented with a bare
+    /// `least_salient_index` that could demote the eviction-exempt overview.
+    fn make_room_in_hot(
         tx: &Connection,
         target: &str,
-        entry: &str,
-        kind: MemoryKind,
-        confidence: f64,
-    ) -> Result<(i64, CompactionOutcome), String> {
-        // Compact: demote the LEAST-salient hot entry first —
-        // kind-derived importance, so transient `working` notes go
-        // before durable `identity` / `semantic` facts — breaking ties
-        // by age. Each entry costs `len + 3` for its delimiter.
-        //
-        // dirge-vzlb: the working reserve overrides the pure-salience
-        // pick. While long-term content exceeds its share
-        // (`char_limit - reserve`) we demote a long-term entry even
-        // though a working note is less salient — that's what keeps
-        // working from being starved as invariants accumulate. Only
-        // once long-term is back within its share does the working
-        // overflow (the part past the reserve) become the victim.
-        // `.or_else` falls back to the other class so a single oversized
-        // entry can't deadlock the loop.
+        entry_cost: usize,
+        new_is_working: bool,
+    ) -> Result<usize, String> {
         let char_limit = char_limit_for(target);
-        let entry_cost = entry.len();
         let reserve = working_reserve_for(target);
-        let new_is_working = matches!(kind, MemoryKind::Working);
         let mut hot = Self::hot_rows(tx, target)?;
         let mut demoted = 0usize;
         while !hot.is_empty() {
@@ -1035,6 +1024,27 @@ impl SqliteMemoryStore {
             Self::demote_row(tx, removed.id)?;
             demoted += 1;
         }
+        Ok(demoted)
+    }
+
+    /// Insert `entry` into the hot tier within an open transaction,
+    /// demoting/archiving to make room under the working-reserve rules,
+    /// and return the new row id plus what compaction did. The caller is
+    /// responsible for duplicate/size validation and for committing.
+    /// Shared by `add_entry` and `supersede_entry` so the (subtle)
+    /// eviction policy lives in exactly one place.
+    fn insert_into_hot(
+        tx: &Connection,
+        target: &str,
+        entry: &str,
+        kind: MemoryKind,
+        confidence: f64,
+    ) -> Result<(i64, CompactionOutcome), String> {
+        // Make room under the working-reserve rules (demote the
+        // least-salient hot entry first, never the overview), then insert.
+        let entry_cost = entry.len();
+        let new_is_working = matches!(kind, MemoryKind::Working);
+        let demoted = Self::make_room_in_hot(tx, target, entry_cost, new_is_working)?;
 
         let id = Self::insert_row(tx, target, entry, kind, confidence)?;
         let archived = if demoted > 0 {
@@ -1261,22 +1271,14 @@ impl SqliteMemoryStore {
             return Err("An identical active entry already exists".to_string());
         }
 
-        // Same compaction rule as add: make room in the hot tier by
-        // demoting the least salient.
-        let char_limit = char_limit_for(target);
+        // dirge-d04r: make room with the SAME victim-selection as add —
+        // the overview is eviction-exempt. This used to re-implement the
+        // loop with a bare `least_salient_index`, which could demote the
+        // overview (contradicting its "never an eviction victim" guarantee)
+        // and leave it rendering twice.
         let entry_cost = revived.content.len();
-        let mut hot = Self::hot_rows(&tx, target)?;
-        let mut demoted = 0usize;
-        while !hot.is_empty() {
-            let current: usize = hot.iter().map(|r| r.content.len() + 3).sum();
-            if current + entry_cost <= char_limit {
-                break;
-            }
-            let victim = Self::least_salient_index(&hot);
-            let removed = hot.remove(victim);
-            Self::demote_row(&tx, removed.id)?;
-            demoted += 1;
-        }
+        let new_is_working = is_working_row(revived);
+        let demoted = Self::make_room_in_hot(&tx, target, entry_cost, new_is_working)?;
 
         let now = chrono::Utc::now().to_rfc3339();
         tx.execute(
@@ -2229,6 +2231,49 @@ mod tests {
             "overview must remain hot/verbatim after a flood",
         );
         assert!(prompt.contains("<project_overview>"));
+    }
+
+    #[test]
+    fn restore_never_demotes_the_overview() {
+        // dirge-d04r: restore_entry used a bare least_salient_index that,
+        // unlike insert_into_hot, could pick the eviction-exempt overview
+        // as the demotion victim. A small hot tier holding only the
+        // overview plus a large restored entry must NOT demote the
+        // overview (and it must never render twice).
+        let (paths, _dir) = temp_project();
+        let store = SqliteMemoryStore::load(&paths).unwrap();
+        store
+            .add_entry(
+                "memory",
+                "OVERVIEW: a Rust coding agent",
+                Some(MemoryKind::Overview),
+            )
+            .unwrap();
+        // A large fact that fits the budget alone but, together with the
+        // overview, overflows the hot tier — forcing the restore
+        // compaction loop to look for a victim.
+        let big = format!("bulky fact: {}", "y".repeat(2170));
+        store
+            .add_entry("memory", &big, Some(MemoryKind::Semantic))
+            .unwrap();
+        store.remove_entry("memory", &big).unwrap();
+        store.restore_entry("memory", &big).unwrap();
+
+        store.refresh_snapshot().unwrap();
+        let prompt = store.format_for_system_prompt();
+        assert!(
+            prompt.contains("<project_overview>")
+                && prompt.contains("OVERVIEW: a Rust coding agent"),
+            "overview must stay hot after a restore, got:\n{prompt}"
+        );
+        // And it must not have leaked into the breadcrumb index (the
+        // double-render symptom).
+        if let Some(idx) = prompt.find("<project_memory_index>") {
+            assert!(
+                !prompt[idx..].contains("OVERVIEW: a Rust coding agent"),
+                "overview must not appear in the breadcrumb index"
+            );
+        }
     }
 
     #[test]

@@ -199,15 +199,13 @@ impl SessionSearch {
         result: &SearchResult,
         root_id: &str,
     ) -> Result<DiscoveryHit, String> {
-        let session_meta = self.get_session_meta(&result.session_id)?;
+        let session_meta = self.db.get_session_meta(&result.session_id)?;
 
-        // Get message ID for the anchor.
-        let anchor_id = self.find_message_id_near(&result.session_id, &result.timestamp)?;
-
-        // Get anchored window.
+        // dirge-uzw4: anchor on the matched message itself (result.id from
+        // the FTS join), not a reconstructed guess.
         let view = self
             .db
-            .get_anchored_view(&result.session_id, anchor_id, DEFAULT_WINDOW)?;
+            .get_anchored_view(&result.session_id, result.id, DEFAULT_WINDOW)?;
 
         // Get bookends.
         let bookend_start = self.get_bookends(&result.session_id, true)?;
@@ -324,52 +322,6 @@ impl SessionSearch {
     }
 
     // ── Internal helpers ──────────────────────────────
-
-    /// Get session metadata: (source, model, title, started_at).
-    fn get_session_meta(
-        &self,
-        session_id: &str,
-    ) -> Result<(String, String, String, String), String> {
-        self.db
-            .get_anchored_view(session_id, 0, 0)
-            .map(|_v| {
-                // Just use the session list info — the anchored
-                // view is just a probe to verify the session exists.
-                // Actual metadata comes from list_sessions_rich query.
-                (String::new(), String::new(), String::new(), String::new())
-            })
-            .map_err(|_| format!("Session '{}' not found", session_id))?;
-
-        // Fall through to list_sessions_rich for metadata.
-        let all = self.db.list_sessions_rich(None)?;
-        for s in &all {
-            if s.id == session_id {
-                return Ok((
-                    s.source.clone(),
-                    s.model.clone(),
-                    s.title.clone(),
-                    s.started_at.clone(),
-                ));
-            }
-        }
-        Ok((String::new(), String::new(), String::new(), String::new()))
-    }
-
-    /// Find a message id near the given timestamp in a session.
-    fn find_message_id_near(&self, session_id: &str, timestamp: &str) -> Result<i64, String> {
-        let view = self.db.get_anchored_view(session_id, 1, 0)?;
-        if view.messages.is_empty() {
-            return Err(format!("No messages in session '{}'", session_id));
-        }
-        // Find the first message with timestamp >= target.
-        for m in &view.messages {
-            if *m.timestamp >= *timestamp {
-                return Ok(m.id);
-            }
-        }
-        // Fall back to the last message.
-        Ok(view.messages.last().map(|m| m.id).unwrap_or(1))
-    }
 
     /// Get the first or last few messages of a session.
     fn get_bookends(&self, session_id: &str, start: bool) -> Result<Vec<MessagePreview>, String> {
@@ -708,5 +660,118 @@ mod tests {
         // Message doesn't exist, but we trust the caller.
         let session = search.find_message_session("sess-1", 999).unwrap();
         assert_eq!(session, "sess-1");
+    }
+
+    // dirge-9eyo: metadata was looked up by scanning list_sessions_rich(None),
+    // which is LIMIT 50 ORDER BY last_active DESC. A hit in an OLDER session
+    // (past the 50 most-recent) silently got blank source/model/started_at.
+    #[test]
+    fn discover_populates_meta_for_a_session_past_the_recent_50() {
+        let (search, _dir) = temp_search();
+
+        // The matching session is the oldest — well outside the newest 50.
+        search
+            .db
+            .insert_session("old-hit", "acp", "gpt-5", "openai", "2020-01-01T00:00:00Z")
+            .unwrap();
+        search
+            .db
+            .insert_message(
+                "old-hit",
+                "user",
+                "quokka telemetry pipeline design",
+                None,
+                None,
+                None,
+                "2020-01-01T00:01:00Z",
+            )
+            .unwrap();
+
+        // 55 newer sessions push the hit past the LIMIT-50 window.
+        for i in 0..55 {
+            let id = format!("recent-{i:02}");
+            search
+                .db
+                .insert_session(
+                    &id,
+                    "cli",
+                    "gpt-5",
+                    "openai",
+                    &format!("2025-02-{:02}T10:00:00Z", i + 1),
+                )
+                .unwrap();
+            search
+                .db
+                .insert_message(
+                    &id,
+                    "user",
+                    "unrelated chatter",
+                    None,
+                    None,
+                    None,
+                    &format!("2025-02-{:02}T10:01:00Z", i + 1),
+                )
+                .unwrap();
+        }
+
+        let hits = search.discover("quokka telemetry").unwrap();
+        assert_eq!(hits.len(), 1, "the old session should still match");
+        let hit = &hits[0];
+        assert_eq!(hit.session_id, "old-hit");
+        assert_eq!(hit.source, "acp", "source must be populated, not blank");
+        assert_eq!(hit.model, "gpt-5", "model must be populated");
+        assert_eq!(
+            hit.started_at, "2020-01-01T00:00:00Z",
+            "started_at must come from the session row, not a blank fallback"
+        );
+    }
+
+    // dirge-uzw4: the "anchored window around the match" was actually anchored
+    // at the session's FIRST message, because search_messages never returned
+    // m.id and find_message_id_near reconstructed the anchor via
+    // get_anchored_view(session, 1, 0). The window must center on the match.
+    #[test]
+    fn discover_anchors_the_window_on_the_match_not_the_first_message() {
+        let (search, _dir) = temp_search();
+        search
+            .db
+            .insert_session("sess", "cli", "gpt-5", "openai", "2025-01-15T10:00:00Z")
+            .unwrap();
+        // 8 messages; the unique search term lives in the 6th (index 5),
+        // far from the session opening.
+        for i in 0..8 {
+            let content = if i == 5 {
+                "unique marker: basilisk migration".to_string()
+            } else {
+                format!("ordinary message {i}")
+            };
+            search
+                .db
+                .insert_message(
+                    "sess",
+                    "user",
+                    &content,
+                    None,
+                    None,
+                    None,
+                    &format!("2025-01-15T10:{:02}:00Z", i),
+                )
+                .unwrap();
+        }
+
+        let hits = search.discover("basilisk").unwrap();
+        assert_eq!(hits.len(), 1);
+        let hit = &hits[0];
+        assert!(
+            hit.before > 0,
+            "the match is mid-session, so the window must include messages before it (before={})",
+            hit.before
+        );
+        let anchored = &hit.messages[hit.anchor_index];
+        assert!(
+            anchored.content_preview.contains("basilisk"),
+            "the anchored message must be the FTS match, got: {:?}",
+            anchored.content_preview
+        );
     }
 }

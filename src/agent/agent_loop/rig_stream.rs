@@ -290,7 +290,25 @@ where
                         })
                         .collect::<Vec<_>>()
                         .join("\n");
-                    partial.content.push(ContentBlock::Thinking { text });
+                    // dirge-zf35: mirror the H-7 ToolCall dedupe. Some
+                    // providers stream `ReasoningDelta`s and THEN send a
+                    // complete `Reasoning` for the same content. If a
+                    // delta-built Thinking block is open, this complete
+                    // payload is the authoritative version of the SAME
+                    // block — replace it in place rather than pushing a
+                    // duplicate (which would double the transcript thinking
+                    // and the scavenge source).
+                    match current_thinking_idx {
+                        Some(idx)
+                            if matches!(
+                                partial.content.get(idx),
+                                Some(ContentBlock::Thinking { .. })
+                            ) =>
+                        {
+                            partial.content[idx] = ContentBlock::Thinking { text };
+                        }
+                        _ => partial.content.push(ContentBlock::Thinking { text }),
+                    }
                     current_thinking_idx = None;
                     current_text_idx = None;
                     yield StreamEvent::Delta {
@@ -838,6 +856,47 @@ mod tests {
             }
         ));
         assert!(matches!(events[2], StreamEvent::Done { .. }));
+    }
+
+    /// dirge-zf35: some providers stream `ReasoningDelta`s and THEN
+    /// emit a complete `Reasoning` for the same content. The complete
+    /// arm must replace the delta-built block (mirroring the H-7
+    /// ToolCall dedupe), not push a second Thinking block.
+    #[tokio::test]
+    async fn complete_reasoning_after_deltas_does_not_duplicate() {
+        let raw = raw_stream(vec![
+            Ok(StreamedAssistantContent::ReasoningDelta {
+                id: None,
+                reasoning: "Let me think".to_string(),
+            }),
+            Ok(StreamedAssistantContent::ReasoningDelta {
+                id: None,
+                reasoning: " about this".to_string(),
+            }),
+            Ok(StreamedAssistantContent::Reasoning(Reasoning::new(
+                "Let me think about this",
+            ))),
+        ]);
+        let events = drain(wrap_streamed_assistant(raw, None, None)).await;
+        match events.last().unwrap() {
+            StreamEvent::Done { message, .. } => {
+                let thinking: Vec<&String> = message
+                    .content
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::Thinking { text } => Some(text),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(
+                    thinking.len(),
+                    1,
+                    "delta-built + complete reasoning must collapse to one block, got {thinking:?}"
+                );
+                assert_eq!(thinking[0], "Let me think about this");
+            }
+            _ => panic!("expected Done last"),
+        }
     }
 
     /// Error chunk emits Error and stops the stream.

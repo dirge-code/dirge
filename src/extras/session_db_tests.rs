@@ -1300,3 +1300,38 @@ fn skills_tables_recreated_when_db_at_schema_version() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// dirge-uzw4: a foreign/too-small anchor id makes anchor_row 0, and the old
+// `anchor_row.saturating_sub(1) as usize` wrapped -1 to usize::MAX — so
+// `before` (and anchor_index) blew up past the number of returned messages.
+// Clamp at zero: an out-of-range anchor collapses to a zero-offset window.
+#[test]
+fn anchored_view_foreign_anchor_does_not_overflow_before() {
+    let (db, dir) = temp_db();
+    db.insert_session("s1", "cli", "gpt-5", "openai", "2025-01-15T10:00:00Z")
+        .unwrap();
+    for i in 0..3 {
+        db.insert_message(
+            "s1",
+            "user",
+            &format!("m{i}"),
+            None,
+            None,
+            None,
+            &format!("2025-01-15T10:0{i}:00Z"),
+        )
+        .unwrap();
+    }
+    // Anchor id 0 precedes every message → anchor_row = 0.
+    let view = db.get_anchored_view("s1", 0, 5).unwrap();
+    assert_eq!(
+        view.before, 0,
+        "before must clamp to 0 for a foreign anchor"
+    );
+    assert_eq!(view.anchor_index, 0);
+    assert!(
+        view.anchor_index <= view.messages.len(),
+        "anchor_index must stay within the returned window"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

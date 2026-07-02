@@ -419,6 +419,20 @@ const EXEMPLAR_TOP_K: usize = 3;
 /// summarized as a "+N more" hint so a large backlog can't flood context.
 const ISSUE_BOARD_TOP_N: usize = 7;
 
+/// dirge-x6yi: open the issue DB and build the turn-start board reminder.
+/// This is synchronous rusqlite I/O (open + query), so `run_agent_loop`
+/// hands it to `spawn_blocking` — a contended/locked `state.db` must not
+/// stall the whole loop task (mirrors the pre-recall search path). Returns
+/// `None` on any failure (missing/locked db, empty board); the reminder is
+/// best-effort context, never fatal.
+fn issue_board_reminder_block(db_path: &std::path::Path) -> Option<String> {
+    crate::extras::issue_db::IssueStore::open_at(db_path)
+        .ok()?
+        .board_reminder(ISSUE_BOARD_TOP_N)
+        .ok()
+        .flatten()
+}
+
 /// What the LLM-summary stage of a compaction pass did, so `run_loop`
 /// can drive the circuit-breaker counter. (The cheap prune always runs
 /// regardless of this outcome.)
@@ -987,8 +1001,9 @@ pub async fn run_agent_loop(
         let db_path = std::env::current_dir()
             .map(|c| crate::extras::dirge_paths::ProjectPaths::new(&c).session_db_path())
             .unwrap_or_else(|_| std::path::PathBuf::from(".dirge/sessions/state.db"));
-        if let Ok(store) = crate::extras::issue_db::IssueStore::open_at(&db_path)
-            && let Ok(Some(block)) = store.board_reminder(ISSUE_BOARD_TOP_N)
+        // dirge-x6yi: run the blocking open+query off the loop task.
+        if let Ok(Some(block)) =
+            tokio::task::spawn_blocking(move || issue_board_reminder_block(&db_path)).await
         {
             let msg = LoopMessage::User(super::message::UserMessage { content: block });
             context.messages.push(loop_message_to_value(&msg));
