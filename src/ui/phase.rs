@@ -69,6 +69,45 @@ impl<E: Send + 'static> PhaseHandle<E> {
     }
 }
 
+/// Fire a fire-and-forget plugin hook OFF the loop thread (dirge-qhfk).
+///
+/// For mid-run lifecycle hooks (`on-turn-start`/`-end`, `on-error`) whose
+/// results are ignored — the only effect is observation — so there is no
+/// completion arm. The blocking Janet dispatch runs on `spawn_blocking` so a
+/// hook that opens a dialog can't freeze the `current_thread` runtime: the
+/// loop keeps draining `dialog_rx` and the worker gets its reply. `body` runs
+/// with the manager locked; keep it to worker calls (no `renderer`/session).
+///
+/// Ordering note: detaching loosens the relative order of these observational
+/// hooks vs. the runner's tool hooks (both serialize on the manager mutex +
+/// single worker, so there's no corruption — only timing). A dialog opened
+/// from one of these hooks no longer pauses the turn; it is purely observed.
+#[cfg(feature = "plugin")]
+pub(crate) fn spawn_detached_plugin<F>(
+    pm: std::sync::Arc<std::sync::Mutex<crate::plugin::PluginManager>>,
+    label: &'static str,
+    body: F,
+) where
+    F: FnOnce(&mut crate::plugin::PluginManager) + Send + 'static,
+{
+    tokio::spawn(async move {
+        let joined = tokio::task::spawn_blocking(move || {
+            use crate::sync_util::LockExt;
+            let mut mgr = pm.lock_ignore_poison();
+            body(&mut mgr);
+        })
+        .await;
+        if let Err(e) = joined {
+            tracing::warn!(
+                target: "dirge::plugin",
+                hook = label,
+                error = %e,
+                "detached plugin hook task panicked",
+            );
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::PhaseHandle;
@@ -107,5 +146,40 @@ mod tests {
             let _ = tx.send(42).await;
         });
         assert_eq!(handle.rx.recv().await, Some(42));
+    }
+
+    // dirge-qhfk: a detached lifecycle hook must still FIRE (just off-loop) —
+    // the refactor must not silently no-op the hook. Observe a Janet var the
+    // hook sets, polling until the detached task lands.
+    #[cfg(feature = "plugin")]
+    #[tokio::test]
+    async fn detached_plugin_hook_still_fires() {
+        use crate::plugin::PluginManager;
+        use crate::sync_util::LockExt;
+        use std::sync::{Arc, Mutex};
+
+        let mut manager = PluginManager::try_new().unwrap();
+        manager.eval("(var fired false)").unwrap();
+        manager
+            .eval("(defn on-turn-start [ctx] (set fired true) nil)")
+            .unwrap();
+        // dispatch only fires REGISTERED handlers (load_plugin does this).
+        manager.register("on-turn-start", "on-turn-start");
+        let pm = Arc::new(Mutex::new(manager));
+
+        super::spawn_detached_plugin(pm.clone(), "on-turn-start", |mgr| {
+            let _ = mgr.dispatch("on-turn-start", "@{:index 0}");
+        });
+
+        // Poll (bounded) until the detached task has run the hook.
+        let mut fired = false;
+        for _ in 0..200 {
+            if pm.lock_ignore_poison().eval("fired").as_deref() == Ok("true") {
+                fired = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(fired, "detached on-turn-start hook never fired");
     }
 }

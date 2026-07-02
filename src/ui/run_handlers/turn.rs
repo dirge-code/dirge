@@ -36,9 +36,17 @@ pub(crate) fn handle_turn_start(
     current_turn_text.clear();
     *current_turn_index = index;
     if let Some(pm) = plugin_manager {
-        let mut mgr = pm.lock_ignore_poison();
-        let _ = mgr.dispatch("on-turn-start", &format!("@{{:index {}}}", index));
-        clear_tool_hook_slots(&mut mgr);
+        // dirge-qhfk: dispatch OFF the loop thread. Firing `on-turn-start`
+        // inline blocked the single runtime thread inside the Janet worker, so
+        // a hook opening a dialog deadlocked (the loop couldn't service
+        // dialog_rx). Results are ignored, so no completion arm — clear the
+        // tool-hook slots in the SAME detached task, after the hook, so the
+        // clear still follows the dispatch.
+        let ctx = format!("@{{:index {}}}", index);
+        crate::ui::phase::spawn_detached_plugin(pm.clone(), "on-turn-start", move |mgr| {
+            let _ = mgr.dispatch("on-turn-start", &ctx);
+            clear_tool_hook_slots(mgr);
+        });
     }
 }
 
@@ -54,27 +62,29 @@ pub(crate) fn handle_turn_end(
     if let Some(pm) = plugin_manager {
         // Flush tokens that didn't reach the batcher threshold so the final
         // partial update lands. `current_turn_text` already covers them
-        // (pushed in lockstep with the batcher).
-        if token_batcher.flush_remaining().is_some() {
-            let mut mgr = pm.lock_ignore_poison();
-            let _ = mgr.dispatch(
-                "on-message-update",
-                &format!(
-                    "@{{:index {} :partial \"{}\"}}",
-                    index,
-                    crate::plugin::escape_janet_string(current_turn_text),
-                ),
-            );
-        }
-        let mut mgr = pm.lock_ignore_poison();
-        let _ = mgr.dispatch(
-            "on-turn-end",
-            &format!(
-                "@{{:index {} :message \"{}\"}}",
-                index,
-                crate::plugin::escape_janet_string(current_turn_text),
-            ),
+        // (pushed in lockstep with the batcher). The flush mutates the
+        // loop-local batcher, so it stays ON-loop; only the dispatch detaches.
+        let flush_partial = token_batcher.flush_remaining().is_some();
+        // dirge-qhfk: dispatch OFF the loop thread (see handle_turn_start).
+        // The turn text is captured into the ctx strings now, so the detached
+        // task reads no loop-owned state. Both hooks + the slot-clear run in
+        // one task so their order (update → end → clear) is preserved.
+        let ctx_update = format!(
+            "@{{:index {} :partial \"{}\"}}",
+            index,
+            crate::plugin::escape_janet_string(current_turn_text),
         );
-        clear_tool_hook_slots(&mut mgr);
+        let ctx_end = format!(
+            "@{{:index {} :message \"{}\"}}",
+            index,
+            crate::plugin::escape_janet_string(current_turn_text),
+        );
+        crate::ui::phase::spawn_detached_plugin(pm.clone(), "on-turn-end", move |mgr| {
+            if flush_partial {
+                let _ = mgr.dispatch("on-message-update", &ctx_update);
+            }
+            let _ = mgr.dispatch("on-turn-end", &ctx_end);
+            clear_tool_hook_slots(mgr);
+        });
     }
 }

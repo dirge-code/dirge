@@ -71,19 +71,23 @@ pub(crate) async fn handle_error(
 
     #[cfg(feature = "plugin")]
     if let Some(pm) = plugin_manager {
-        let mut mgr = pm.lock().unwrap_or_else(|err| err.into_inner());
-        if let Err(dispatch_err) = mgr.dispatch(
-            "on-error",
-            &format!(
-                "@{{:error \"{}\"}}",
-                crate::plugin::escape_janet_string(&error)
-            ),
-        ) {
-            ctx.renderer.write_line(
-                &format!("[plugin] on-error error: {dispatch_err}"),
-                c_error(),
-            )?;
-        }
+        // dirge-qhfk: dispatch OFF the loop thread. Firing `on-error` inline
+        // blocked the single runtime thread inside the Janet worker, so a hook
+        // opening a dialog deadlocked. Results are ignored; a rare dispatch
+        // error goes to the log (the detached task has no `renderer`).
+        let ctx_err = format!(
+            "@{{:error \"{}\"}}",
+            crate::plugin::escape_janet_string(&error)
+        );
+        crate::ui::phase::spawn_detached_plugin(pm.clone(), "on-error", move |mgr| {
+            if let Err(dispatch_err) = mgr.dispatch("on-error", &ctx_err) {
+                tracing::warn!(
+                    target: "dirge::plugin",
+                    error = %dispatch_err,
+                    "on-error hook dispatch failed",
+                );
+            }
+        });
     }
 
     *is_running = false;
