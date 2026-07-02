@@ -196,11 +196,21 @@ async fn read_loop<R>(inner: Arc<Inner>, mut reader: R) -> io::Result<()>
 where
     R: AsyncBufRead + Send + Unpin,
 {
+    // dirge-syom: capture a non-EOF decode error and fall through to the
+    // shared cleanup below rather than returning early. A malformed frame
+    // (bad Content-Length, oversized body) must still mark `closed` and drain
+    // pending with ConnectionClosed; otherwise in-flight waiters burn their
+    // full timeout and every later request stalls too.
+    let mut exit_err: Option<io::Error> = None;
     loop {
         let frame = match decode_frame(&mut reader).await {
             Ok(b) => b,
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-            Err(e) => return Err(e),
+            Err(e) => {
+                tracing::warn!("dap: read loop aborting on decode error: {e}");
+                exit_err = Some(e);
+                break;
+            }
         };
         let msg: Value = match serde_json::from_slice(&frame) {
             Ok(v) => v,
@@ -216,7 +226,11 @@ where
     for (_, sender) in pending.drain() {
         let _ = sender.send(Err(RpcError::ConnectionClosed));
     }
-    Ok(())
+    drop(pending);
+    match exit_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 async fn dispatch(inner: &Arc<Inner>, msg: Value) {
@@ -310,6 +324,10 @@ pub struct DapClient {
     pub(crate) rpc: DapRpc,
     /// Task draining adapter stderr to tracing.
     _stderr_task: JoinHandle<()>,
+    /// dirge-syom: the frame-reader task. Held for the client's lifetime
+    /// (like `_stderr_task`) rather than discarded, so the read loop is tied
+    /// to the client and not left as an untracked detached task.
+    _read_task: JoinHandle<io::Result<()>>,
     pub capabilities: Mutex<Option<Capabilities>>,
     pub adapter_name: String,
 }
@@ -387,7 +405,7 @@ impl DapClient {
         };
 
         let reader = tokio::io::BufReader::new(stdout);
-        let (rpc, _read_task) = DapRpc::new(reader, stdin);
+        let (rpc, read_task) = DapRpc::new(reader, stdin);
 
         Ok(Self {
             _child: Some(child),
@@ -395,6 +413,7 @@ impl DapClient {
             _pg_guard: pg_guard,
             rpc,
             _stderr_task: stderr_task,
+            _read_task: read_task,
             capabilities: Mutex::new(None),
             adapter_name: adapter_name.to_string(),
         })
@@ -437,6 +456,7 @@ impl DapClient {
             _pg_guard: None,
             rpc,
             _stderr_task: tokio::spawn(std::future::ready(())),
+            _read_task: tokio::spawn(std::future::ready(Ok(()))),
             capabilities: Mutex::new(None),
             adapter_name: adapter_name.to_string(),
         }
@@ -563,6 +583,57 @@ mod tests {
         assert_eq!(event_body["reason"], "entry");
         assert_eq!(event_body["threadId"], 1);
         adapter.await.unwrap();
+    }
+
+    // dirge-syom: a malformed frame mid-session (bad Content-Length, oversized
+    // body) is a non-EOF decode error. It must still run the shared cleanup —
+    // drain pending with ConnectionClosed and set `closed` — instead of the
+    // read loop returning early and leaving in-flight waiters to burn their
+    // full timeout, with every later request stalling too.
+    #[tokio::test]
+    async fn malformed_frame_drains_pending_and_marks_closed() {
+        use tokio::io::AsyncWriteExt;
+        let (client_side, server_side) = tokio::io::duplex(4096);
+        let (client_read, client_write) = tokio::io::split(client_side);
+        let (_server_read, mut server_write) = tokio::io::split(server_side);
+
+        let client_reader = tokio::io::BufReader::new(client_read);
+        let (rpc, task) = DapRpc::new(client_reader, client_write);
+
+        // A request in flight, waiting on a response, with a long timeout.
+        let pending = tokio::spawn({
+            let rpc = rpc.clone();
+            async move {
+                rpc.request::<_, Value>("launch", serde_json::json!({}), Duration::from_secs(30))
+                    .await
+            }
+        });
+        tokio::task::yield_now().await;
+
+        // Non-numeric Content-Length → InvalidData (a non-EOF decode error).
+        server_write
+            .write_all(b"Content-Length: not-a-number\r\n\r\n")
+            .await
+            .unwrap();
+
+        let got = tokio::time::timeout(Duration::from_secs(5), pending)
+            .await
+            .expect("in-flight request should resolve promptly, not wait out its timeout")
+            .unwrap();
+        assert!(matches!(got, Err(RpcError::ConnectionClosed)));
+
+        // Marked closed → later requests fail instantly.
+        let later = rpc
+            .request::<_, Value>("launch", serde_json::json!({}), Duration::from_secs(30))
+            .await;
+        assert!(matches!(later, Err(RpcError::ConnectionClosed)));
+
+        // The read task exits (surfacing the decode error) after cleanup.
+        let task_result = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("read task should exit, not hang")
+            .unwrap();
+        assert!(task_result.is_err());
     }
 
     #[tokio::test]

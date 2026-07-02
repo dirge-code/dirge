@@ -174,6 +174,12 @@ async fn read_loop<R>(inner: Arc<Inner>, mut reader: R) -> io::Result<()>
 where
     R: AsyncBufRead + Send + Unpin,
 {
+    // dirge-syom: capture a non-EOF decode error and fall through to the
+    // shared cleanup below rather than returning early. A malformed frame
+    // (bad Content-Length, oversized body) must still mark `closed` and drain
+    // pending with ConnectionClosed; otherwise in-flight waiters burn their
+    // full timeout and every later request stalls too.
+    let mut exit_err: Option<io::Error> = None;
     loop {
         let frame = match decode_frame(&mut reader).await {
             Ok(b) => b,
@@ -181,7 +187,11 @@ where
                 // Clean shutdown — peer closed.
                 break;
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                tracing::warn!("lsp: read loop aborting on decode error: {e}");
+                exit_err = Some(e);
+                break;
+            }
         };
         let msg: Value = match serde_json::from_slice(&frame) {
             Ok(v) => v,
@@ -198,7 +208,11 @@ where
     for (_, sender) in pending.drain() {
         let _ = sender.send(Err(RpcError::ConnectionClosed));
     }
-    Ok(())
+    drop(pending);
+    match exit_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 async fn dispatch(inner: &Arc<Inner>, msg: Value) {
@@ -540,5 +554,53 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, RpcError::ConnectionClosed));
+    }
+
+    // dirge-syom: a malformed frame mid-session (bad Content-Length, oversized
+    // body) is a non-EOF decode error. It must still run the shared cleanup —
+    // drain pending with ConnectionClosed and set `closed` — instead of the
+    // read loop returning early and leaving in-flight waiters to burn their
+    // full timeout, with every later request stalling too.
+    #[tokio::test]
+    async fn malformed_frame_drains_pending_and_marks_closed() {
+        use tokio::io::AsyncWriteExt;
+        let (client, task, _server_reader, mut server_writer) = pair();
+
+        // A request in flight, waiting on a response, with a long timeout.
+        let pending = tokio::spawn({
+            let c = client.clone();
+            async move {
+                c.request::<_, Value>("op", json!({}), Duration::from_secs(30))
+                    .await
+            }
+        });
+        // Let the request register its pending entry before the bad frame.
+        tokio::task::yield_now().await;
+
+        // Server sends a frame with a non-numeric Content-Length → InvalidData.
+        server_writer
+            .write_all(b"Content-Length: not-a-number\r\n\r\n")
+            .await
+            .unwrap();
+
+        // The in-flight request fails fast, not after its 30s timeout.
+        let got = tokio::time::timeout(Duration::from_secs(5), pending)
+            .await
+            .expect("in-flight request should resolve promptly, not wait out its timeout")
+            .unwrap();
+        assert!(matches!(got, Err(RpcError::ConnectionClosed)));
+
+        // The client is marked closed, so later requests fail instantly.
+        let later = client
+            .request::<_, Value>("op", json!({}), Duration::from_secs(30))
+            .await;
+        assert!(matches!(later, Err(RpcError::ConnectionClosed)));
+
+        // The read task exits (surfacing the decode error) after cleanup.
+        let task_result = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("read task should exit, not hang")
+            .unwrap();
+        assert!(task_result.is_err());
     }
 }
