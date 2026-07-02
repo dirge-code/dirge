@@ -180,7 +180,10 @@ impl SkillManager {
     }
 
     /// Delete a skill directory and its contents. Destructive —
-    /// consider archiving instead for production use.
+    /// production deletes route through [`Self::archive`] instead
+    /// (recoverable); this permanent remove is kept for tests and future
+    /// explicit-purge callers (dirge-s1f2).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn delete(&self, name: &str) -> Result<(), String> {
         // SECURITY: reject traversal names before `remove_dir_all` —
         // a name like `../../foo` would otherwise delete a directory
@@ -233,7 +236,6 @@ impl SkillManager {
     }
 
     /// Archive a skill — move to `.archive/`. Does not delete.
-    #[allow(dead_code)]
     pub fn archive(&self, name: &str) -> Result<(), String> {
         // SECURITY: reject traversal names before moving directories.
         format::validate_name(name)?;
