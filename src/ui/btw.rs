@@ -15,18 +15,16 @@ use crate::provider::AnyModel;
 /// Handle to the spawned `/btw` task: the result channel the loop drains and the
 /// task itself so Ctrl+C can `abort()` it.
 pub(crate) struct BtwPhaseHandle {
-    pub rx: tokio::sync::mpsc::Receiver<Result<String, String>>,
-    pub task: tokio::task::JoinHandle<()>,
+    pub core: crate::ui::phase::PhaseHandle<Result<String, String>>,
 }
 
 /// Spawn the `/btw` completion off-thread. `model` is resolved on the UI thread
 /// (cheap) and moved into the task, which sends the answer (or a stringified
 /// error) back over a capacity-1 channel.
 pub(crate) fn spawn(model: AnyModel, query: String) -> BtwPhaseHandle {
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, String>>(1);
-    let task = tokio::spawn(async move {
+    let core = crate::ui::phase::PhaseHandle::spawn(1, move |tx| async move {
         let result = model.btw_query(query).await.map_err(|e| e.to_string());
         let _ = tx.send(result).await;
     });
-    BtwPhaseHandle { rx, task }
+    BtwPhaseHandle { core }
 }

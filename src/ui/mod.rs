@@ -1624,7 +1624,7 @@ pub async fn run_interactive(
                                 // `AbortRunnerOnDrop` guard cancels the inner
                                 // phase runner too (dirge-vuzz).
                                 if let Some(ph) = ui.plan_phase.take() {
-                                    ph.task.abort();
+                                    ph.core.task.abort();
                                 }
                                 // dirge-tv3p: abort an in-flight non-blocking
                                 // compaction (the summarizer task) too. Dropping
@@ -1632,7 +1632,7 @@ pub async fn run_interactive(
                                 // task cancels the LLM call. Any continuation
                                 // prompt is discarded with the handle.
                                 if let Some(ph) = ui.compaction_phase.take() {
-                                    ph.task.abort();
+                                    ph.core.task.abort();
                                 }
                                 // dirge-qhfk: and an in-flight off-loop on-prompt
                                 // hook dispatch; its submit continuation is
@@ -1650,15 +1650,15 @@ pub async fn run_interactive(
                                 // reviewer (the write-disabled reviewer task);
                                 // its verdict continuation is discarded.
                                 if let Some(ph) = ui.review_phase.take() {
-                                    ph.task.abort();
+                                    ph.core.task.abort();
                                 }
                                 // dirge-nret: and an in-flight `/btw` side query.
                                 if let Some(ph) = ui.btw_phase.take() {
-                                    ph.task.abort();
+                                    ph.core.task.abort();
                                 }
                                 // dirge-iagk: and an in-flight `/wt-merge`.
                                 if let Some(ph) = ui.wt_merge_phase.take() {
-                                    ph.task.abort();
+                                    ph.core.task.abort();
                                 }
                                 // Cooperative cancel first: lets the
                                 // retry loop and rig stream observe
@@ -1756,11 +1756,11 @@ pub async fn run_interactive(
                             ui.is_running = false;
                             // Abort an in-flight phased `/plan` task too (dirge-vuzz).
                             if let Some(ph) = ui.plan_phase.take() {
-                                ph.task.abort();
+                                ph.core.task.abort();
                             }
                             // dirge-tv3p: and an in-flight non-blocking compaction.
                             if let Some(ph) = ui.compaction_phase.take() {
-                                ph.task.abort();
+                                ph.core.task.abort();
                             }
                             // dirge-qhfk: and an in-flight off-loop on-prompt hook.
                             if let Some(ph) = ui.prompt_phase.take() {
@@ -1772,15 +1772,15 @@ pub async fn run_interactive(
                             }
                             // dirge-4koy: and an in-flight `/plan` reviewer.
                             if let Some(ph) = ui.review_phase.take() {
-                                ph.task.abort();
+                                ph.core.task.abort();
                             }
                             // dirge-nret: and an in-flight `/btw` side query.
                             if let Some(ph) = ui.btw_phase.take() {
-                                ph.task.abort();
+                                ph.core.task.abort();
                             }
                             // dirge-iagk: and an in-flight `/wt-merge`.
                             if let Some(ph) = ui.wt_merge_phase.take() {
-                                ph.task.abort();
+                                ph.core.task.abort();
                             }
                             if let Some(tx) = ui.agent_cancel.take() {
                                 let _ = tx.try_send(());
@@ -3338,7 +3338,7 @@ pub async fn run_interactive(
             // so a closed channel is handled instead of busy-looping the select.
             ev = async {
                 if let Some(ph) = &mut ui.plan_phase {
-                    ph.rx.recv().await
+                    ph.core.rx.recv().await
                 } else {
                     std::future::pending().await
                 }
@@ -3516,7 +3516,7 @@ pub async fn run_interactive(
             // doesn't busy-loop the select.
             ev = async {
                 if let Some(ph) = &mut ui.compaction_phase {
-                    ph.rx.recv().await
+                    ph.core.rx.recv().await
                 } else {
                     std::future::pending().await
                 }
@@ -3721,7 +3721,7 @@ pub async fn run_interactive(
             // Option directly so a closed channel doesn't busy-loop the select.
             ev = async {
                 if let Some(ph) = &mut ui.review_phase {
-                    ph.rx.recv().await
+                    ph.core.rx.recv().await
                 } else {
                     std::future::pending().await
                 }
@@ -3774,7 +3774,7 @@ pub async fn run_interactive(
             // doesn't busy-loop the select.
             btw_result = async {
                 if let Some(ph) = &mut ui.btw_phase {
-                    ph.rx.recv().await
+                    ph.core.rx.recv().await
                 } else {
                     std::future::pending().await
                 }
@@ -3814,7 +3814,7 @@ pub async fn run_interactive(
             // `#[cfg]` arms); the field is always `None` in non-worktree builds.
             wt_merge_result = async {
                 if let Some(ph) = &mut ui.wt_merge_phase {
-                    ph.rx.recv().await
+                    ph.core.rx.recv().await
                 } else {
                     std::future::pending().await
                 }

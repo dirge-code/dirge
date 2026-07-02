@@ -55,8 +55,7 @@ pub(crate) enum PlanPhaseEvent {
 /// plus the task itself, so Ctrl+C can `abort()` it (which drops the in-flight
 /// `collect_runner_text` guard and cancels the inner phase runner too).
 pub(crate) struct PlanPhaseHandle {
-    pub rx: tokio::sync::mpsc::Receiver<PlanPhaseEvent>,
-    pub task: tokio::task::JoinHandle<()>,
+    pub core: crate::ui::phase::PhaseHandle<PlanPhaseEvent>,
 }
 
 /// Drain a forked phase runner to completion and return its final assistant
@@ -105,8 +104,7 @@ pub(crate) enum ReviewPhaseEvent {
 /// branch can run the idle finalization (persist + post-session review) that
 /// `handle_done` deferred when it kept the loop busy for the reviewer.
 pub(crate) struct ReviewPhaseHandle {
-    pub rx: tokio::sync::mpsc::Receiver<ReviewPhaseEvent>,
-    pub task: tokio::task::JoinHandle<()>,
+    pub core: crate::ui::phase::PhaseHandle<ReviewPhaseEvent>,
     pub plan: String,
     pub cycles_left: usize,
     pub response: String,
@@ -128,16 +126,14 @@ pub(crate) fn spawn_review(
     tool_calls: Vec<crate::session::ToolCallEntry>,
 ) -> ReviewPhaseHandle {
     // Capacity 1: the task sends exactly one terminal event.
-    let (tx, rx) = tokio::sync::mpsc::channel::<ReviewPhaseEvent>(1);
-    let task = tokio::spawn(async move {
+    let core = crate::ui::phase::PhaseHandle::spawn(1, move |tx| async move {
         let result = collect_runner_text(runner)
             .await
             .map(|review| next_review_step(&review, cycles_left));
         let _ = tx.send(ReviewPhaseEvent::Done { result }).await;
     });
     ReviewPhaseHandle {
-        rx,
-        task,
+        core,
         plan,
         cycles_left,
         response,
@@ -235,7 +231,7 @@ mod tests {
         // Continuation inputs are carried for the UI arm.
         assert_eq!(handle.plan, "the plan");
         assert_eq!(handle.cycles_left, 3);
-        match handle.rx.recv().await.expect("a terminal event") {
+        match handle.core.rx.recv().await.expect("a terminal event") {
             ReviewPhaseEvent::Done { result } => {
                 assert!(matches!(result, Ok(ReviewStep::Approved)));
             }
@@ -246,7 +242,7 @@ mod tests {
     async fn spawn_review_surfaces_reviewer_error() {
         let runner = runner_replaying(vec![AgentEvent::Error("reviewer exploded".into())]);
         let mut handle = spawn_review(runner, "p".to_string(), 1, String::new(), Vec::new());
-        match handle.rx.recv().await.expect("a terminal event") {
+        match handle.core.rx.recv().await.expect("a terminal event") {
             ReviewPhaseEvent::Done { result } => {
                 assert_eq!(result, Err("reviewer exploded".to_string()));
             }

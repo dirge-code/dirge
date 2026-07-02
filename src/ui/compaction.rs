@@ -92,8 +92,7 @@ pub(crate) enum CompactionPhaseEvent {
 /// drains, the task (so Ctrl+C can `abort()` it), the install inputs captured
 /// on-thread, and the continuation.
 pub(crate) struct CompactionPhaseHandle {
-    pub rx: tokio::sync::mpsc::Receiver<CompactionPhaseEvent>,
-    pub task: tokio::task::JoinHandle<()>,
+    pub core: crate::ui::phase::PhaseHandle<CompactionPhaseEvent>,
     pub cut_idx: usize,
     pub tokens_before: u64,
     pub then: CompactionThen,
@@ -108,13 +107,11 @@ pub(crate) fn spawn_local(
     tokens_before: u64,
     then: CompactionThen,
 ) -> CompactionPhaseHandle {
-    let (tx, rx) = tokio::sync::mpsc::channel::<CompactionPhaseEvent>(1);
-    let task = tokio::spawn(async move {
+    let core = crate::ui::phase::PhaseHandle::spawn(1, move |tx| async move {
         let _ = tx.send(CompactionPhaseEvent::Done { summary }).await;
     });
     CompactionPhaseHandle {
-        rx,
-        task,
+        core,
         cut_idx,
         tokens_before,
         then,
@@ -129,8 +126,7 @@ pub(crate) fn spawn(req: CompactionRequest, then: CompactionThen) -> CompactionP
         tokens_before,
     } = req;
     // Capacity 1: the task sends exactly one terminal event.
-    let (tx, rx) = tokio::sync::mpsc::channel::<CompactionPhaseEvent>(1);
-    let task = tokio::spawn(async move {
+    let core = crate::ui::phase::PhaseHandle::spawn(1, move |tx| async move {
         let event = match crate::provider::run_compaction(model, prompt).await {
             Ok(summary) => CompactionPhaseEvent::Done { summary },
             Err(e) => CompactionPhaseEvent::Failed {
@@ -140,8 +136,7 @@ pub(crate) fn spawn(req: CompactionRequest, then: CompactionThen) -> CompactionP
         let _ = tx.send(event).await;
     });
     CompactionPhaseHandle {
-        rx,
-        task,
+        core,
         cut_idx,
         tokens_before,
         then,

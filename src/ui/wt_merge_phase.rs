@@ -16,8 +16,7 @@
 /// (so Ctrl+C can `abort()` it), and the parsed merge parameters the arm needs
 /// for the post-merge continuation.
 pub(crate) struct WtMergePhaseHandle {
-    pub rx: tokio::sync::mpsc::Receiver<Result<(), String>>,
-    pub task: tokio::task::JoinHandle<()>,
+    pub core: crate::ui::phase::PhaseHandle<Result<(), String>>,
     pub branch: String,
     pub target: String,
     pub main_path: String,
@@ -40,8 +39,7 @@ pub(crate) fn spawn(
         main_repo_path: std::path::PathBuf::from(&main_path),
     };
     let target_for_merge = target.clone();
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<(), String>>(1);
-    let task = tokio::spawn(async move {
+    let core = crate::ui::phase::PhaseHandle::spawn(1, move |tx| async move {
         let result = tokio::task::spawn_blocking(move || {
             crate::extras::git_worktree::merge_worktree(&info, &target_for_merge)
         })
@@ -50,8 +48,7 @@ pub(crate) fn spawn(
         let _ = tx.send(result).await;
     });
     WtMergePhaseHandle {
-        rx,
-        task,
+        core,
         branch,
         target,
         main_path,

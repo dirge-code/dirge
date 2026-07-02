@@ -79,18 +79,18 @@ pub(crate) async fn cmd_plan(
 
     // Channel capacity is small — the task emits a handful of progress lines
     // plus one terminal event; the UI loop drains it promptly.
-    let (tx, rx) = mpsc::channel::<PlanPhaseEvent>(8);
-    let task = tokio::spawn(run_phases_task(agent, request, transcript, cycles, tx));
+    let core = crate::ui::phase::PhaseHandle::spawn(8, move |tx| {
+        run_phases_task(agent, request, transcript, cycles, tx)
+    });
 
     // Show busy immediately (the typed line is already cleared), then hand the
     // handle to the loop, which drives the rest from its `select!`. Defensive:
     // abort any prior phase task we're replacing so it can't keep running
     // orphaned (shouldn't happen — /plan is gated while a run is active).
+    // Dropping the old handle aborts its task (PhaseHandle abort-on-drop).
     set_busy(ctx, true)?;
-    if let Some(old) = ctx.plan_phase.take() {
-        old.task.abort();
-    }
-    *ctx.plan_phase = Some(PlanPhaseHandle { rx, task });
+    ctx.plan_phase.take();
+    *ctx.plan_phase = Some(PlanPhaseHandle { core });
     Ok(())
 }
 
