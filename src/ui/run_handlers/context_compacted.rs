@@ -93,17 +93,23 @@ pub(crate) async fn handle_context_compacted(
     let origin = ctx.session.effective_origin().to_string();
     let mut intent = ctx.session.first_user_prompt().unwrap_or("").to_string();
     if let Ok(db) = crate::extras::session_db::SessionDb::open(&paths.session_db_path()) {
-        let old_sid = format!("dirge-{}", crate::text::short_id(ctx.session.id.as_str()));
+        let old_sid = crate::text::db_session_id(ctx.session.id.as_str());
+        // The rotated session's turns will persist under
+        // `db_session_id(new_session_id)` (agent_io), so the fold row must
+        // be inserted and linked under the SAME canonical key — otherwise
+        // the turns and the parent link land in different rows and
+        // `resolve_parent` can't walk the fold (dirge-g1ze).
+        let new_sid = crate::text::db_session_id(new_session_id);
         let _ = db.end_session(&old_sid, "compression");
         let now = chrono::Utc::now().to_rfc3339();
         let _ = db.insert_session(
-            new_session_id,
+            &new_sid,
             "cli",
             &ctx.session.model,
             &ctx.session.provider,
             &now,
         );
-        let _ = db.set_parent_session(new_session_id, &old_sid);
+        let _ = db.set_parent_session(&new_sid, &old_sid);
         // On a later fold the original ask is no longer in the live
         // messages; recover it from the write-once checkpoint slot.
         if let Some(cp) = db.get_checkpoint(&origin).ok().flatten()

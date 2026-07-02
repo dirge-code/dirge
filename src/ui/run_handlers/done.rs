@@ -507,7 +507,7 @@ pub(crate) async fn handle_done(
                     {
                         use crate::extras::entity_db;
                         let sid =
-                            format!("dirge-{}", crate::text::short_id(ctx.session.id.as_str()));
+                            crate::text::db_session_id(ctx.session.id.as_str());
                         for ent in &entities {
                             let _ = entity_db::upsert_entity(
                                 &db.conn,
@@ -547,7 +547,7 @@ pub(crate) async fn handle_done(
             if let Some(pm) = plugin_manager {
                 if let Ok(db) = crate::extras::session_db::SessionDb::open(&paths.session_db_path())
                 {
-                    let sid = format!("dirge-{}", crate::text::short_id(ctx.session.id.as_str()));
+                    let sid = crate::text::db_session_id(ctx.session.id.as_str());
                     if let Ok(context) =
                         crate::extras::entity_compress::build_graph_context(&db.conn, &sid)
                     {
