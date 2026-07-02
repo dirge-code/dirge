@@ -1867,6 +1867,18 @@ pub async fn run_loop(
                 }));
                 break 'outer;
             }
+
+            // dirge-j4dz: honor a graceful interjection at the tool-result
+            // boundary. The post-inner-loop check below only runs once the
+            // model STOPS emitting tool calls; a run that keeps calling
+            // tools (e.g. after a permission-denial cascade calls
+            // `interject()`) would otherwise never observe it and keep
+            // taking turns. History is well-formed here — this turn's tool
+            // results are appended and any missing ones backfilled — so
+            // breaking now is safe. Falls through to the outer break.
+            if signal.is_interjected() {
+                break;
+            }
         }
         // INNER END
 

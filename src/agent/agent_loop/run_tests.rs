@@ -1592,6 +1592,108 @@ async fn loop_preserves_history_across_turns() {
     );
 }
 
+/// dirge-j4dz: a graceful interjection raised DURING a run (e.g. the
+/// permission-denial cascade) must halt the loop at the next tool-result
+/// boundary. The stream here always returns a tool call, so without an
+/// in-loop `is_interjected()` check the run would spin until `max_turns`.
+/// With the fix it stops after the first turn.
+#[tokio::test]
+async fn interjection_halts_at_tool_result_boundary() {
+    use crate::agent::agent_loop::stream::{LlmContext, StreamFn};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // A tool that raises a graceful interjection when it runs — the same
+    // signal the permission-denial cascade sets — then returns normally.
+    #[derive(Debug)]
+    struct InterjectingTool {
+        signal: AbortSignal,
+    }
+    impl LoopTool for InterjectingTool {
+        fn name(&self) -> &str {
+            "noop"
+        }
+        fn description(&self) -> &str {
+            "Interjecting"
+        }
+        fn label(&self) -> &str {
+            "Noop"
+        }
+        fn parameters(&self) -> &Value {
+            static EMPTY: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+            EMPTY.get_or_init(|| serde_json::json!({"type": "object"}))
+        }
+        fn execute<'a>(
+            &'a self,
+            _id: &'a str,
+            args: Value,
+            _signal: AbortSignal,
+            _on_update: super::super::tool::LoopToolUpdate,
+        ) -> Pin<Box<dyn Future<Output = Result<super::super::LoopToolResult, String>> + Send + 'a>>
+        {
+            self.signal.interject();
+            Box::pin(async move {
+                Ok(super::super::LoopToolResult {
+                    content: vec![serde_json::json!({"type": "text", "text": "ok"})],
+                    details: args,
+                    terminate: None,
+                })
+            })
+        }
+    }
+
+    // Always returns a tool_use — a loop that ignores the interjection
+    // would keep taking turns forever (bounded only by max_turns).
+    let counter = std::sync::Arc::new(AtomicUsize::new(0));
+    let seen = counter.clone();
+    let factory: StreamFn = std::sync::Arc::new(move |_ctx: LlmContext, _opts| {
+        counter.fetch_add(1, Ordering::SeqCst);
+        let msg = tool_use_response("call-1", "noop", serde_json::json!({}));
+        let reason = msg.stop_reason;
+        Box::pin(futures::stream::iter(vec![
+            crate::agent::agent_loop::message::StreamEvent::Done {
+                reason,
+                message: msg,
+                usage: None,
+            },
+        ]))
+    });
+
+    let signal = AbortSignal::new();
+    let mut ctx = empty_context();
+    ctx.tools.push(PhaseSixArc::new(InterjectingTool {
+        signal: signal.clone(),
+    }));
+    let mut cfg = build_config();
+    cfg.tool_execution = ToolExecutionMode::Sequential;
+    // A high cap so a spinning loop is clearly distinguishable from the
+    // halt-after-one-turn behavior we want.
+    cfg.max_turns = Some(25);
+
+    let (tx, _rx) = mpsc::channel::<LoopEvent>(256);
+    let task = tokio::spawn(async move {
+        run_agent_loop(
+            vec![user("start")],
+            ctx,
+            cfg,
+            signal,
+            &tx,
+            &factory,
+            None,
+            None,
+        )
+        .await
+    });
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
+    assert!(result.is_ok(), "loop should exit promptly after interjection");
+
+    let turns = seen.load(Ordering::SeqCst);
+    assert_eq!(
+        turns, 1,
+        "interjection must halt at the first tool-result boundary; the model took {turns} turns"
+    );
+}
+
 /// Phase 6: full signal-chain regression. Cancel the signal
 /// mid-tool; tool aborts; loop's next LLM call's stream
 /// observes the same signal and exits via Error path; loop

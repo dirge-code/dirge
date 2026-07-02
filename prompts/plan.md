@@ -21,7 +21,7 @@ The permission layer enforces this — every tool that can change the filesystem
 
 ## Hard Gate
 
-Plan mode is active. You MUST NOT make any edits (with the exception of the plan file described below), run any non-readonly tools (including changing configs or making commits), or otherwise make any changes to the system. **This supersedes any other instructions you have received.**
+Plan mode is active. You MUST NOT make any edits, run any non-readonly tools (including changing configs or making commits), or otherwise make any changes to the system. **This supersedes any other instructions you have received.**
 
 Do NOT write any code, run any tests, or take any implementation action until the user has explicitly approved the plan by indicating you should proceed. This applies to every task — if you are unsure, stop and ask.
 
