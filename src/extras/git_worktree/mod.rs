@@ -9,54 +9,61 @@ pub struct WorktreeInfo {
 }
 
 pub fn detect() -> Option<WorktreeInfo> {
-    let output = Command::new("git")
-        .args(["rev-parse", "--git-common-dir"])
-        .output()
-        .ok()?;
+    detect_in(None)
+}
+
+/// Run `git [-C cwd] rev-parse <args…>`, returning trimmed stdout on success.
+/// `cwd = None` uses the process working directory (the [`detect`] path);
+/// `Some(dir)` targets a specific tree so the logic is testable against a real
+/// linked worktree without mutating the global cwd.
+fn git_rev_parse(cwd: Option<&Path>, args: &[&str]) -> Option<String> {
+    let mut cmd = Command::new("git");
+    if let Some(dir) = cwd {
+        cmd.arg("-C").arg(dir);
+    }
+    cmd.arg("rev-parse").args(args);
+    let output = cmd.output().ok()?;
     if !output.status.success() {
         return None;
     }
-    let common_dir = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
 
-    let output = Command::new("git")
-        .args(["rev-parse", "--git-dir"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let git_dir = String::from_utf8_lossy(&output.stdout).trim().to_string();
+/// Core of [`detect`], parameterized on the git working directory.
+fn detect_in(cwd: Option<&Path>) -> Option<WorktreeInfo> {
+    let common_dir = git_rev_parse(cwd, &["--git-common-dir"])?;
+    let git_dir = git_rev_parse(cwd, &["--git-dir"])?;
 
-    let worktree_path: PathBuf = Path::new(&git_dir).canonicalize().ok()?;
-
+    // In the main working tree both resolve to the same `.git`; only a linked
+    // worktree has a distinct per-worktree git dir. Nothing to merge back
+    // otherwise.
     if common_dir == git_dir {
         return None;
     }
 
-    let main_repo_path: PathBuf = Path::new(&common_dir).parent().map(|p| p.to_path_buf())?;
-    let main_repo_path = main_repo_path.canonicalize().ok()?;
+    // The worktree's working ROOT, not its git dir. `--git-dir` inside a
+    // linked worktree is `<main>/.git/worktrees/<name>`, so the old code's
+    // `.parent()` produced `<main>/.git/worktrees` — a non-worktree path that
+    // failed every downstream `-C` git call with "must be run in a work tree"
+    // (dirge-liba). `--show-toplevel` is the actual checkout directory.
+    let toplevel = git_rev_parse(cwd, &["--show-toplevel"])?;
+    let worktree_path = Path::new(&toplevel).canonicalize().ok()?;
 
-    let branch = current_branch().unwrap_or_default();
+    // `--git-common-dir` is absolute when reported from a linked worktree
+    // (points at `<main>/.git`); its parent is the main checkout.
+    let main_repo_path = Path::new(&common_dir).parent()?.canonicalize().ok()?;
+
+    let branch = current_branch_in(cwd).unwrap_or_default();
 
     Some(WorktreeInfo {
         branch,
-        worktree_path: worktree_path
-            .parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or(worktree_path),
+        worktree_path,
         main_repo_path,
     })
 }
 
-pub fn current_branch() -> Option<String> {
-    let output = Command::new("git")
-        .args(["rev-parse", "--abbrev-ref", "HEAD"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+fn current_branch_in(cwd: Option<&Path>) -> Option<String> {
+    let branch = git_rev_parse(cwd, &["--abbrev-ref", "HEAD"])?;
     if branch == "HEAD" { None } else { Some(branch) }
 }
 
@@ -426,6 +433,45 @@ mod merge_tests {
             err.contains("uncommitted"),
             "error names the dirty state: {err}"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// dirge-liba: `detect` must resolve a linked worktree's real working
+    /// root via `--show-toplevel`, not `<main>/.git/worktrees` (the old
+    /// `--git-dir`.parent() bug, which failed every downstream `-C` git call
+    /// with "must be run in a work tree"). Exercised through `detect_in` so
+    /// no process-cwd mutation is needed; round-trips against a real linked
+    /// worktree.
+    #[test]
+    fn detect_in_linked_worktree_resolves_real_paths() {
+        let (info, root) = setup();
+        let detected =
+            detect_in(Some(&info.worktree_path)).expect("linked worktree must be detected");
+        assert_eq!(
+            detected.worktree_path,
+            info.worktree_path.canonicalize().unwrap(),
+            "worktree_path must be the checkout root, not the git dir"
+        );
+        assert_eq!(
+            detected.main_repo_path,
+            info.main_repo_path.canonicalize().unwrap(),
+        );
+        assert_eq!(detected.branch, "feature");
+        // The old bogus path failed is_dirty with exit 128; the fixed path
+        // resolves to a real work tree so the status query succeeds (clean).
+        assert!(
+            !is_dirty(&detected.worktree_path).expect("is_dirty must run in the worktree"),
+            "freshly-added worktree is clean"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The main working tree shares its `.git` with no per-worktree git dir,
+    /// so `detect` returns `None` — nothing to merge back.
+    #[test]
+    fn detect_in_main_worktree_returns_none() {
+        let (info, root) = setup();
+        assert!(detect_in(Some(&info.main_repo_path)).is_none());
         let _ = std::fs::remove_dir_all(&root);
     }
 }
