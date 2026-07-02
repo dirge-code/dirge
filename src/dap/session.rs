@@ -130,6 +130,11 @@ struct DapSession {
     cached_frames: Vec<StackFrame>,
     /// Cached for TUI debug panel snapshots (last variables request).
     cached_variables: Vec<Variable>,
+    /// dirge-vept: threadId from the most recent stopped event. The Janet
+    /// bridge calls step/continue/stackTrace with thread_id 0 (unspecified);
+    /// strict adapters (debugpy) reject an id of 0 with "thread not found", so
+    /// the session substitutes this last stopped thread when a caller passes 0.
+    last_stopped_thread_id: Option<u32>,
     languages: Vec<String>,
 }
 
@@ -194,14 +199,35 @@ impl DapSession {
 
     /// Wait for a stopped event with timeout.
     async fn wait_for_stopped(&mut self, timeout: Duration) -> Result<StoppedEventBody, ToolError> {
-        tokio::time::timeout(timeout, self.events.stopped.recv())
+        let stopped = tokio::time::timeout(timeout, self.events.stopped.recv())
             .await
             .map_err(|_| {
                 ToolError::Msg(format!(
                     "timed out after {timeout:?} waiting for stopped event"
                 ))
             })?
-            .ok_or_else(|| ToolError::Msg("debug adapter disconnected".into()))
+            .ok_or_else(|| ToolError::Msg("debug adapter disconnected".into()))?;
+        self.record_stopped_thread(&stopped);
+        Ok(stopped)
+    }
+
+    /// dirge-vept: remember the thread the adapter last stopped on, so a
+    /// later step/continue/stackTrace with the 0 sentinel can target it.
+    fn record_stopped_thread(&mut self, stopped: &StoppedEventBody) {
+        if let Some(tid) = stopped.thread_id {
+            self.last_stopped_thread_id = Some(tid as u32);
+        }
+    }
+
+    /// dirge-vept: resolve a caller-supplied thread id. A `requested` of 0
+    /// means "unspecified" (the Janet bridge hardcodes it); fall back to the
+    /// last stopped thread. A non-zero id is honored verbatim.
+    fn resolve_thread_id(&self, requested: u32) -> u32 {
+        if requested == 0 {
+            self.last_stopped_thread_id.unwrap_or(requested)
+        } else {
+            requested
+        }
     }
 }
 
@@ -381,6 +407,7 @@ impl DapSessionManager {
             cached_threads: Vec::new(),
             cached_frames: Vec::new(),
             cached_variables: Vec::new(),
+            last_stopped_thread_id: stopped.thread_id.map(|id| id as u32),
             languages,
         };
         session.drain_output();
@@ -479,6 +506,10 @@ impl DapSessionManager {
             cached_threads: Vec::new(),
             cached_frames: Vec::new(),
             cached_variables: Vec::new(),
+            last_stopped_thread_id: stopped
+                .as_ref()
+                .and_then(|s| s.thread_id)
+                .map(|id| id as u32),
             languages,
         };
         session.drain_output();
@@ -575,7 +606,7 @@ impl DapSessionManager {
             .ok_or_else(|| ToolError::Msg("no active debug session".into()))?;
 
         let args = ContinueArgs {
-            thread_id,
+            thread_id: session.resolve_thread_id(thread_id),
             single_thread: None,
         };
 
@@ -592,6 +623,7 @@ impl DapSessionManager {
             s = session.events.stopped.recv() => {
                 if let Some(stopped) = s {
                     session.status = SessionStatus::Stopped;
+                    session.record_stopped_thread(&stopped);
                     (Some(stopped.reason.as_str().to_string()), stopped.thread_id.map(|id| id as u32))
                 } else {
                     return Err(ToolError::Msg("debug adapter disconnected".into()));
@@ -662,6 +694,9 @@ impl DapSessionManager {
             .as_mut()
             .ok_or_else(|| ToolError::Msg("no active debug session".into()))?;
 
+        // dirge-vept: substitute the last stopped thread when the bridge
+        // passes the 0 sentinel.
+        let thread_id = session.resolve_thread_id(thread_id);
         let args = match command {
             "next" => serde_json::to_value(NextArgs {
                 thread_id,
@@ -745,7 +780,8 @@ impl DapSessionManager {
             .ok_or_else(|| ToolError::Msg("no active debug session".into()))?;
 
         let args = StackTraceArgs {
-            thread_id,
+            // dirge-vept: 0 from the bridge means the last stopped thread.
+            thread_id: session.resolve_thread_id(thread_id),
             start_frame: None,
             levels,
             format: None,
@@ -1236,6 +1272,125 @@ mod tests {
         // terminate
         let term = mgr.terminate(Duration::from_secs(5)).await.unwrap();
         assert_eq!(term.status, SessionStatus::Terminated);
+    }
+
+    /// dirge-vept: a fake adapter that stops on thread 42 at entry, then on
+    /// `continue` echoes back the `threadId` it actually received (in the next
+    /// stopped event's threadId). Lets a test observe what thread id the
+    /// manager sent, proving the 0-sentinel was substituted.
+    async fn fake_echo_thread_adapter(
+        mut reader: impl AsyncBufRead + Unpin,
+        mut writer: impl AsyncWrite + Unpin,
+    ) {
+        // initialize
+        let frame = decode_frame(&mut reader).await.unwrap();
+        let msg: Value = serde_json::from_slice(&frame).unwrap();
+        let seq = msg["seq"].as_u64().unwrap();
+        let resp = serde_json::json!({
+            "type": "response", "seq": 1, "request_seq": seq, "success": true,
+            "command": "initialize",
+            "body": { "supportsConfigurationDoneRequest": true }
+        });
+        encode_frame(&mut writer, &serde_json::to_vec(&resp).unwrap())
+            .await
+            .unwrap();
+
+        // launch → success → stopped on thread 42
+        let frame = decode_frame(&mut reader).await.unwrap();
+        let msg: Value = serde_json::from_slice(&frame).unwrap();
+        let seq = msg["seq"].as_u64().unwrap();
+        let resp = serde_json::json!({
+            "type": "response", "seq": 2, "request_seq": seq, "success": true,
+            "command": "launch",
+        });
+        encode_frame(&mut writer, &serde_json::to_vec(&resp).unwrap())
+            .await
+            .unwrap();
+        let evt = serde_json::json!({
+            "type": "event", "seq": 3, "event": "stopped",
+            "body": { "reason": "entry", "threadId": 42 }
+        });
+        encode_frame(&mut writer, &serde_json::to_vec(&evt).unwrap())
+            .await
+            .unwrap();
+
+        // configurationDone (notify — no response)
+        let frame = decode_frame(&mut reader).await.unwrap();
+        let msg: Value = serde_json::from_slice(&frame).unwrap();
+        assert_eq!(msg["command"], "configurationDone");
+
+        // continue → echo the received threadId into the next stopped event.
+        let frame = decode_frame(&mut reader).await.unwrap();
+        let msg: Value = serde_json::from_slice(&frame).unwrap();
+        assert_eq!(msg["command"], "continue");
+        let seq = msg["seq"].as_u64().unwrap();
+        let received_tid = msg["arguments"]["threadId"].as_u64().unwrap();
+        let resp = serde_json::json!({
+            "type": "response", "seq": 4, "request_seq": seq, "success": true,
+            "command": "continue", "body": { "allThreadsContinued": true }
+        });
+        encode_frame(&mut writer, &serde_json::to_vec(&resp).unwrap())
+            .await
+            .unwrap();
+        let evt = serde_json::json!({
+            "type": "event", "seq": 5, "event": "stopped",
+            "body": { "reason": "breakpoint", "threadId": received_tid }
+        });
+        encode_frame(&mut writer, &serde_json::to_vec(&evt).unwrap())
+            .await
+            .unwrap();
+    }
+
+    fn client_with_echo_thread_adapter() -> DapClient {
+        let (client_side, server_side) = tokio::io::duplex(4096);
+        let (client_read, client_write) = tokio::io::split(client_side);
+        let (server_read, server_write) = tokio::io::split(server_side);
+        let client_reader = tokio::io::BufReader::new(client_read);
+        let (rpc, _read_task) = DapRpc::new(client_reader, client_write);
+        tokio::spawn(async move {
+            fake_echo_thread_adapter(tokio::io::BufReader::new(server_read), server_write).await;
+        });
+        DapClient::from_rpc(rpc, "fake-adapter")
+    }
+
+    /// dirge-vept: the Janet bridge calls `continue_(0, …)`. A `thread_id` of
+    /// 0 is the "unspecified" sentinel and must be substituted with the last
+    /// stopped thread (42 here), or strict adapters (debugpy) reject it with
+    /// "thread not found". The echo adapter reports the id it received.
+    #[tokio::test]
+    async fn continue_with_zero_thread_substitutes_last_stopped() {
+        let mgr = DapSessionManager::new();
+        let signal = AbortSignal::new();
+        let client = client_with_echo_thread_adapter();
+
+        let summary = mgr
+            .launch_with_client(
+                "fake-adapter",
+                "/tmp",
+                Some("p"),
+                None,
+                &[],
+                Some(true),
+                None,
+                &signal,
+                client,
+                Duration::from_secs(5),
+                vec![],
+            )
+            .await
+            .unwrap();
+        assert_eq!(summary.thread_id, Some(42));
+
+        // Bridge passes 0; the manager must send the last stopped thread.
+        let outcome = mgr
+            .continue_(0, &signal, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.thread_id,
+            Some(42),
+            "continue(0) must target the last stopped thread, not 0"
+        );
     }
 
     /// Session summary reflects the active session.
