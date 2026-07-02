@@ -228,6 +228,7 @@ pub async fn build_agent(
         AnyModel::Gemini(m) => build_inner!(m, Gemini),
         AnyModel::DeepSeek(m) => build_inner!(m, DeepSeek),
         AnyModel::Glm(m) => build_inner!(m, Glm),
+        AnyModel::OpenCode(m) => build_inner!(m, OpenCode),
         AnyModel::Ollama(m) => build_inner!(m, Ollama),
         AnyModel::Custom(m) => build_inner!(m, Custom),
     };

@@ -31,6 +31,7 @@ pub enum AnyClient {
     Gemini(gemini::Client),
     DeepSeek(openai::CompletionsClient),
     Glm(openai::CompletionsClient),
+    OpenCode(openai::CompletionsClient),
     Ollama(ollama::Client),
     Custom(openai::CompletionsClient),
 }
@@ -52,6 +53,7 @@ impl AnyClient {
             AnyClient::Gemini(c) => AnyModel::Gemini(c.completion_model(name)),
             AnyClient::DeepSeek(c) => AnyModel::DeepSeek(c.completion_model(name)),
             AnyClient::Glm(c) => AnyModel::Glm(c.completion_model(name)),
+            AnyClient::OpenCode(c) => AnyModel::OpenCode(c.completion_model(name)),
             AnyClient::Ollama(c) => AnyModel::Ollama(c.completion_model(name)),
             AnyClient::Custom(c) => AnyModel::Custom(c.completion_model(name)),
         }
@@ -152,6 +154,7 @@ pub enum AnyModel {
     Gemini(gemini::completion::CompletionModel),
     DeepSeek(openai::completion::CompletionModel),
     Glm(openai::completion::CompletionModel),
+    OpenCode(openai::completion::CompletionModel),
     Ollama(ollama::CompletionModel),
     Custom(openai::completion::CompletionModel),
 }
@@ -207,6 +210,7 @@ impl AnyModel {
             AnyModel::Gemini(m) => one_shot!(m),
             AnyModel::DeepSeek(m) => one_shot!(m),
             AnyModel::Glm(m) => one_shot!(m),
+            AnyModel::OpenCode(m) => one_shot!(m),
             AnyModel::Ollama(m) => one_shot!(m),
             AnyModel::Custom(m) => one_shot!(m),
         }
@@ -269,6 +273,7 @@ impl AnyModel {
             AnyModel::Gemini(m) => m.model.clone(),
             AnyModel::DeepSeek(m) => m.model.clone(),
             AnyModel::Glm(m) => m.model.clone(),
+            AnyModel::OpenCode(m) => m.model.clone(),
             AnyModel::Ollama(m) => m.model.clone(),
             AnyModel::Custom(m) => m.model.clone(),
         }

@@ -346,6 +346,16 @@ where
             );
             Ok(AnyClient::Glm(b.build()?))
         }
+        ProviderKind::OpenCode => {
+            let default_url = match provider_name.to_ascii_lowercase().as_str() {
+                "opencode-go" => "https://opencode.ai/zen/go/v1",
+                _ => "https://opencode.ai/zen/v1",
+            };
+            let b = openai::CompletionsClient::builder()
+                .api_key(&key)
+                .base_url(base_url.as_deref().unwrap_or(default_url));
+            Ok(AnyClient::OpenCode(b.build()?))
+        }
         ProviderKind::Ollama => {
             let key: ollama::OllamaApiKey = key.as_str().into();
             let mut b = ollama::Client::builder().api_key(key);
