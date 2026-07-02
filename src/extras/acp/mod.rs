@@ -2,8 +2,8 @@ pub mod config;
 
 use std::sync::Arc;
 
-use agent_client_protocol::on_receive_request;
 use agent_client_protocol::schema::*;
+use agent_client_protocol::{on_receive_notification, on_receive_request};
 use agent_client_protocol::{Agent, Client, ConnectionTo, Dispatch, Responder, Stdio};
 
 use crate::cli::Cli;
@@ -14,15 +14,117 @@ use crate::permission::ask::AskSender;
 use crate::permission::checker::{PermCheck, PermissionChecker};
 use crate::permission::{PermissionConfig, SecurityMode};
 use crate::sandbox::Sandbox;
+use crate::session::{MessageRole, Session, ToolCallEntry, ToolCallState};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Per-`SessionId` conversation state (dirge-5wqc). Before this the ACP bridge
+/// was stateless: every prompt built a fresh agent with an empty history, so a
+/// multi-turn editor conversation lost all context each turn, and there was no
+/// handle to cancel an in-flight run.
+struct AcpSession {
+    /// Accumulated conversation. `convert_history` turns it into the rig
+    /// history fed to `spawn_runner` on the next prompt.
+    session: Session,
+    /// The client-declared working directory for this session.
+    cwd: PathBuf,
+    /// Abort/cancel handles for the currently-running prompt, if any.
+    run: Option<AcpRun>,
+}
+
+/// Cancellation handles for one in-flight prompt run.
+struct AcpRun {
+    /// The runner task — `abort()` stops it at the next await point.
+    task: tokio::task::JoinHandle<()>,
+    /// Cooperative cancel: flips the runner's `AbortSignal` so in-flight LLM
+    /// calls / tools bail at their next check.
+    cancel_tx: tokio::sync::mpsc::Sender<()>,
+    /// Set by [`cancel_run`] so the streaming loop reports `Cancelled` rather
+    /// than `EndTurn` once the aborted runner's event channel closes.
+    cancelled: Arc<AtomicBool>,
+}
+
+type SessionMap = tokio::sync::Mutex<HashMap<String, AcpSession>>;
+
+/// The rig history for a session's prior turns (empty if the session is unknown
+/// — a prompt without a preceding `new_session`), plus the session's cwd.
+async fn history_and_cwd(sessions: &SessionMap, id: &str) -> (Vec<rig::completion::Message>, Option<PathBuf>) {
+    let map = sessions.lock().await;
+    match map.get(id) {
+        Some(s) => (crate::agent::runner::convert_history(&s.session), Some(s.cwd.clone())),
+        None => (Vec::new(), None),
+    }
+}
+
+/// Register the in-flight run so `session/cancel` can reach it. Creates a
+/// default session entry if the client skipped `new_session`. Aborts any run
+/// it replaces (editors serialize turns, so this is belt-and-suspenders).
+async fn register_run(sessions: &SessionMap, id: &str, provider: &str, model: &str, run: AcpRun) {
+    let mut map = sessions.lock().await;
+    let entry = map.entry(id.to_string()).or_insert_with(|| AcpSession {
+        session: Session::new(provider, model, 0),
+        cwd: std::env::current_dir().unwrap_or_default(),
+        run: None,
+    });
+    if let Some(prev) = entry.run.replace(run) {
+        prev.task.abort();
+    }
+}
+
+/// Append a completed turn — the user prompt plus the assistant's full-fidelity
+/// reply (text + tool calls) — to the session so the next prompt resumes with
+/// context. Mirrors the headless `--session` persistence in `main.rs`. Clears
+/// the run handle.
+async fn finish_turn(
+    sessions: &SessionMap,
+    id: &str,
+    prompt: &str,
+    response: &str,
+    tool_calls: Vec<ToolCallEntry>,
+) {
+    let mut map = sessions.lock().await;
+    if let Some(s) = map.get_mut(id) {
+        s.session.add_message(MessageRole::User, prompt);
+        s.session
+            .add_message_with_tool_calls(MessageRole::Assistant, response, tool_calls);
+        s.run = None;
+    }
+}
+
+/// Abort the in-flight run for `id`, if any (the ACP `session/cancel` handler).
+/// Flags cancellation BEFORE aborting so the streaming loop observes it, sends
+/// the cooperative cancel, then hard-aborts the task. Returns whether a run was
+/// actually cancelled.
+async fn cancel_run(sessions: &SessionMap, id: &str) -> bool {
+    let mut map = sessions.lock().await;
+    let Some(s) = map.get_mut(id) else {
+        return false;
+    };
+    if let Some(run) = s.run.take() {
+        run.cancelled.store(true, Ordering::SeqCst);
+        let _ = run.cancel_tx.try_send(());
+        run.task.abort();
+        true
+    } else {
+        false
+    }
+}
 
 struct AcpState {
     cli: Cli,
     cfg: Config,
     context: ContextFiles,
+    sessions: SessionMap,
 }
 
 pub async fn serve(cli: Cli, cfg: Config, context: ContextFiles) -> anyhow::Result<()> {
-    let state = Arc::new(AcpState { cli, cfg, context });
+    let state = Arc::new(AcpState {
+        cli,
+        cfg,
+        context,
+        sessions: tokio::sync::Mutex::new(HashMap::new()),
+    });
 
     Agent
         .builder()
@@ -56,6 +158,25 @@ pub async fn serve(cli: Cli, cfg: Config, context: ContextFiles) -> anyhow::Resu
                 }
             },
             on_receive_request!(),
+        )
+        .on_receive_notification(
+            {
+                let state = state.clone();
+                move |notif: CancelNotification, _cx| {
+                    let state = state.clone();
+                    async move {
+                        // dirge-5wqc: the editor's cancel button sends
+                        // `session/cancel`. Previously the catch-all answered
+                        // "Unhandled" while the runner kept executing. Abort the
+                        // in-flight run for this session instead.
+                        let id = notif.session_id.to_string();
+                        let cancelled = cancel_run(&state.sessions, &id).await;
+                        tracing::info!("ACP session/cancel for {} (cancelled={})", id, cancelled);
+                        Ok(())
+                    }
+                }
+            },
+            on_receive_notification!(),
         )
         .on_receive_dispatch(
             |dispatch: Dispatch<AgentRequest, AgentNotification>, cx: ConnectionTo<Client>| {
@@ -105,7 +226,18 @@ async fn handle_new_session(
         req.cwd.display()
     );
 
-    let _ = state;
+    // dirge-5wqc: record the session so its conversation history accumulates
+    // across prompts (and store the client's cwd instead of dropping it).
+    let provider = state.cli.resolve_provider(&state.cfg);
+    let model = state.cli.resolve_model(&state.cfg).to_string();
+    state.sessions.lock().await.insert(
+        session_id.to_string(),
+        AcpSession {
+            session: Session::new(&provider, &model, 0),
+            cwd: req.cwd.clone(),
+            run: None,
+        },
+    );
 
     let resp = NewSessionResponse::new(session_id);
     responder.respond(resp)
@@ -210,8 +342,42 @@ async fn run_prompt(
     )
     .await;
 
-    let runner = agent.spawn_runner(prompt_text.to_string(), vec![], None);
+    // dirge-5wqc: resume the session's prior turns so the conversation keeps
+    // context across prompts, and honor the client-declared cwd. The cwd set is
+    // best-effort: the process working directory is global, so two sessions in
+    // different directories would race it — but editors drive one turn at a
+    // time, so in practice a session always runs in its own directory.
+    let id_key = session_id.to_string();
+    let (history, cwd) = history_and_cwd(&state.sessions, &id_key).await;
+    if let Some(cwd) = cwd
+        && cwd.is_dir()
+    {
+        let _ = std::env::set_current_dir(&cwd);
+    }
+
+    let runner = agent.spawn_runner(prompt_text.to_string(), history, None);
     let mut rx = runner.event_rx;
+
+    // dirge-5wqc: register the in-flight run so `session/cancel` can abort it.
+    let cancelled = Arc::new(AtomicBool::new(false));
+    register_run(
+        &state.sessions,
+        &id_key,
+        &provider_str,
+        &model_str,
+        AcpRun {
+            task: runner.task,
+            cancel_tx: runner.cancel_tx,
+            cancelled: cancelled.clone(),
+        },
+    )
+    .await;
+
+    // Accumulate the assistant turn (text + tool calls) so `finish_turn`
+    // persists a full-fidelity reply into the session history — mirrors the
+    // headless loop in `provider/run.rs`.
+    let mut full_response = String::new();
+    let mut turn_tool_calls: Vec<ToolCallEntry> = Vec::new();
 
     // F5: correlate rig tool-call ids with ACP ids so parallel
     // calls pair with their results correctly. See
@@ -220,6 +386,7 @@ async fn run_prompt(
     while let Some(event) = rx.recv().await {
         match event {
             AgentEvent::Token(text) => {
+                full_response.push_str(&text);
                 let chunk =
                     ContentChunk::new(ContentBlock::Text(TextContent::new(text.to_string())));
                 let notif = SessionNotification::new(
@@ -238,6 +405,15 @@ async fn run_prompt(
                 let _ = cx.send_notification(notif);
             }
             AgentEvent::ToolCall { id, name, args } => {
+                // Record for history; the matching ToolResult flips it to
+                // Completed. An unanswered call stays Interrupted so
+                // convert_history re-emits it and the model sees no orphan.
+                turn_tool_calls.push(ToolCallEntry {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                    args: args.clone(),
+                    state: ToolCallState::Interrupted,
+                });
                 let args_str = args.to_string();
                 let acp_id = ToolCallId::new(uuid::Uuid::new_v4().to_string());
                 correlator.record(id.as_str(), acp_id.clone());
@@ -266,6 +442,23 @@ async fn run_prompt(
                 }
             }
             AgentEvent::ToolResult { id, output, kind } => {
+                // Flip the accumulated call to Completed for history. Match by
+                // rig id, or fall back to the most recent Interrupted call for
+                // providers that don't emit ids (same as provider/run.rs).
+                let rig_id = id.as_str();
+                let target = if !rig_id.is_empty() {
+                    turn_tool_calls.iter_mut().rev().find(|e| e.id == rig_id)
+                } else {
+                    turn_tool_calls
+                        .iter_mut()
+                        .rev()
+                        .find(|e| matches!(e.state, ToolCallState::Interrupted))
+                };
+                if let Some(entry) = target {
+                    entry.state = ToolCallState::Completed {
+                        result: output.to_string(),
+                    };
+                }
                 let id = correlator
                     .resolve(id.as_str())
                     .unwrap_or_else(|| ToolCallId::new(String::new()));
@@ -288,7 +481,9 @@ async fn run_prompt(
                 );
                 let _ = cx.send_notification(notif);
             }
-            AgentEvent::Done { .. } => {
+            AgentEvent::Done { response, .. } => {
+                // `Done.response` is the authoritative full text.
+                full_response = response.to_string();
                 break;
             }
             AgentEvent::Error(_) => {
@@ -355,7 +550,27 @@ async fn run_prompt(
         }
     }
 
-    let _ = responder.respond(PromptResponse::new(StopReason::EndTurn));
+    // dirge-5wqc: persist the turn (user prompt + assistant reply w/ tool
+    // calls) so the NEXT prompt in this session resumes with full context.
+    // Runs even on cancel/error so a partial turn stays in history rather than
+    // vanishing — matching the interactive UI's interrupt behavior.
+    finish_turn(
+        &state.sessions,
+        &id_key,
+        prompt_text,
+        &full_response,
+        turn_tool_calls,
+    )
+    .await;
+
+    // The ACP spec requires `Cancelled` when the client sent `session/cancel`,
+    // even though the aborted runner just closed its channel without a `Done`.
+    let reason = if cancelled.load(Ordering::SeqCst) {
+        StopReason::Cancelled
+    } else {
+        StopReason::EndTurn
+    };
+    let _ = responder.respond(PromptResponse::new(reason));
     Ok(())
 }
 
@@ -654,6 +869,133 @@ mod tests {
         let mut c = ToolCallCorrelator::default();
         assert_eq!(c.resolve("missing"), None);
         assert_eq!(c.resolve(""), None);
+    }
+
+    /// dirge-5wqc: a fresh in-memory session map with one session already
+    /// present, for the state-management tests below.
+    fn session_map_with(id: &str) -> SessionMap {
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            id.to_string(),
+            AcpSession {
+                session: crate::session::Session::new("p", "m", 0),
+                cwd: std::env::temp_dir(),
+                run: None,
+            },
+        );
+        tokio::sync::Mutex::new(map)
+    }
+
+    /// Extract the plain text of every User message in a converted history.
+    fn user_texts(history: &[rig::completion::Message]) -> Vec<String> {
+        history
+            .iter()
+            .filter_map(|m| match m {
+                rig::completion::Message::User { content } => Some(
+                    content
+                        .iter()
+                        .filter_map(|c| match c {
+                            rig::message::UserContent::Text(t) => Some(t.text.clone()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join(""),
+                ),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// dirge-5wqc: the core statelessness bug. Two turns through `finish_turn`
+    /// must accumulate — the second prompt's `convert_history` sees BOTH prior
+    /// user turns, not an empty history. Before the fix, every prompt ran with
+    /// `vec![]` so the editor conversation lost all context each turn.
+    #[tokio::test]
+    async fn finish_turn_accumulates_multi_turn_history() {
+        let id = "sess-1";
+        let sessions = session_map_with(id);
+
+        // Turn 1.
+        let (h0, _) = history_and_cwd(&sessions, id).await;
+        assert!(h0.is_empty(), "fresh session starts with no history");
+        finish_turn(&sessions, id, "what does foo do?", "foo does X.", Vec::new()).await;
+
+        // Turn 2 sees turn 1.
+        let (h1, _) = history_and_cwd(&sessions, id).await;
+        let texts1 = user_texts(&h1);
+        assert!(
+            texts1.iter().any(|t| t.contains("what does foo do?")),
+            "second prompt must see the first user turn, got {texts1:?}"
+        );
+        finish_turn(&sessions, id, "now change it", "changed.", Vec::new()).await;
+
+        // Turn 3 sees both.
+        let (h2, _) = history_and_cwd(&sessions, id).await;
+        let texts2 = user_texts(&h2);
+        assert!(
+            texts2.iter().any(|t| t.contains("what does foo do?"))
+                && texts2.iter().any(|t| t.contains("now change it")),
+            "history must retain both prior turns, got {texts2:?}"
+        );
+    }
+
+    /// An unknown session (a prompt without a preceding `new_session`) yields an
+    /// empty history rather than panicking.
+    #[tokio::test]
+    async fn history_for_unknown_session_is_empty() {
+        let sessions: SessionMap = tokio::sync::Mutex::new(std::collections::HashMap::new());
+        let (h, cwd) = history_and_cwd(&sessions, "nope").await;
+        assert!(h.is_empty());
+        assert!(cwd.is_none());
+    }
+
+    /// dirge-5wqc: `session/cancel` must abort the in-flight run — flip the
+    /// cancellation flag, fire the cooperative cancel, and abort the task.
+    /// Before the fix the cancel notification hit the "Unhandled" catch-all and
+    /// the runner kept executing.
+    #[tokio::test]
+    async fn cancel_run_aborts_and_flags() {
+        let id = "sess-c";
+        let sessions = session_map_with(id);
+
+        // A long-lived stand-in for the runner task.
+        let task = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        });
+        let (cancel_tx, mut cancel_rx) = tokio::sync::mpsc::channel::<()>(4);
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        register_run(
+            &sessions,
+            id,
+            "p",
+            "m",
+            AcpRun {
+                task,
+                cancel_tx,
+                cancelled: cancelled.clone(),
+            },
+        )
+        .await;
+
+        assert!(cancel_run(&sessions, id).await, "an active run is cancelled");
+        assert!(
+            cancelled.load(std::sync::atomic::Ordering::SeqCst),
+            "the cancel flag is set so the loop reports Cancelled"
+        );
+        assert!(
+            cancel_rx.try_recv().is_ok(),
+            "the cooperative cancel signal was sent"
+        );
+
+        // A second cancel is a no-op (the run was already taken).
+        assert!(!cancel_run(&sessions, id).await, "no run left to cancel");
+    }
+
+    /// Cancelling an unknown session is a harmless no-op.
+    #[tokio::test]
+    async fn cancel_run_unknown_session_is_false() {
+        let sessions: SessionMap = tokio::sync::Mutex::new(std::collections::HashMap::new());
+        assert!(!cancel_run(&sessions, "ghost").await);
     }
 
     /// Multiple concurrent asks all get responded to.
