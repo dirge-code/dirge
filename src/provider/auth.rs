@@ -224,12 +224,35 @@ fn resolve_anthropic_auth_with_expiry_from(
     let mut expires_at_ms = extract_i64_by_keys(&json, &["expiresAt", "expires_at", "expires"]);
 
     if anthropic_token_is_expired(&json)
-        && let Some(refresh) = extract_string_by_keys(&json, &["refreshToken", "refresh_token"])
+        && extract_string_by_keys(&json, &["refreshToken", "refresh_token"]).is_some()
     {
-        let refreshed = refresh_anthropic_token_sync(&refresh)?;
-        crate::provider::anthropic_oauth::persist_credentials(&refreshed)?;
-        bearer_token = refreshed.access_token;
-        expires_at_ms = Some(refreshed.expires_at);
+        // The refresh token is single-use; two processes refreshing the same
+        // stale credential would leave the loser persisting a dead token over
+        // the winner's fresh one. Serialize load→refresh→save across processes
+        // and re-read under the lock — a concurrent process may have already
+        // refreshed while we blocked (dirge-m1o5).
+        let _lock = crate::auth::file_lock::FileLock::acquire_for(&credentials_file_path);
+        let current = std::fs::read_to_string(&credentials_file_path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+            .unwrap_or_else(|| json.clone());
+        if anthropic_token_is_expired(&current) {
+            if let Some(refresh) =
+                extract_string_by_keys(&current, &["refreshToken", "refresh_token"])
+            {
+                let refreshed = refresh_anthropic_token_sync(&refresh)?;
+                crate::provider::anthropic_oauth::persist_credentials(&refreshed)?;
+                bearer_token = refreshed.access_token;
+                expires_at_ms = Some(refreshed.expires_at);
+            }
+        } else {
+            // Someone else refreshed while we waited; adopt their fresh values.
+            if let Some(token) = extract_string_by_keys(&current, &["accessToken", "access_token"])
+            {
+                bearer_token = token;
+            }
+            expires_at_ms = extract_i64_by_keys(&current, &["expiresAt", "expires_at", "expires"]);
+        }
     }
 
     Ok(RefreshedAuth {

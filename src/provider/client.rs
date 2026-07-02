@@ -497,11 +497,34 @@ where
 
 pub(crate) fn load_fresh_openai_oauth() -> anyhow::Result<Option<OpenAiOAuthCredential>> {
     let store = OpenAiAuthStore::default();
-    fresh_openai_oauth_at(store.load_openai()?, current_epoch_ms(), |credential| {
+    load_fresh_openai_oauth_locked(&store, current_epoch_ms, |credential| {
         let refreshed = refresh_openai_credential(credential)?;
         store.save_openai(&refreshed)?;
         Ok(refreshed)
     })
+}
+
+/// Load a fresh OpenAI OAuth credential, refreshing under a cross-process lock.
+///
+/// OpenAI rotates the refresh token on every use, so two Dirge processes that
+/// both refresh the same stale credential would have the loser persist a
+/// now-dead refresh token over the winner's fresh one — the next expiry then
+/// fails and forces a re-login. Take an advisory lock on the auth file around
+/// load→refresh→save and re-check freshness after acquiring it, so a process
+/// that lost the race adopts the winner's result instead of refreshing again
+/// (dirge-m1o5). The fast path (fresh or absent credential) skips the lock.
+fn load_fresh_openai_oauth_locked(
+    store: &OpenAiAuthStore,
+    now: impl Fn() -> i64,
+    refresh_and_save: impl FnOnce(&OpenAiOAuthCredential) -> anyhow::Result<OpenAiOAuthCredential>,
+) -> anyhow::Result<Option<OpenAiOAuthCredential>> {
+    match store.load_openai()? {
+        Some(credential) if credential.is_fresh_at(now()) => return Ok(Some(credential)),
+        None => return Ok(None),
+        _ => {}
+    }
+    let _lock = crate::auth::file_lock::FileLock::acquire_for(store.path());
+    fresh_openai_oauth_at(store.load_openai()?, now(), refresh_and_save)
 }
 
 fn fresh_openai_oauth_at(
@@ -585,6 +608,30 @@ mod tests {
 
     fn no_env(_: &str) -> Option<String> {
         None
+    }
+
+    struct TestDir(std::path::PathBuf);
+
+    impl TestDir {
+        fn new(tag: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "dirge_client_oauth_{tag}_{}_{}",
+                std::process::id(),
+                uuid::Uuid::new_v4().simple()
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn auth_path(&self) -> std::path::PathBuf {
+            self.0.join("auth.json")
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 
     fn oauth(access_token: &str) -> OpenAiOAuthCredential {
@@ -991,6 +1038,77 @@ mod tests {
         .expect("fresh credential returned");
 
         assert_eq!(result.access_token(), "ACCESS-TOKEN");
+    }
+
+    #[test]
+    fn locked_load_takes_fast_path_for_fresh_credential() {
+        let dir = TestDir::new("fast");
+        let store = OpenAiAuthStore::at(dir.auth_path());
+        store
+            .save_openai(&OpenAiOAuthCredential::new(
+                "ACCESS", "R0", None, None, i64::MAX,
+            ))
+            .unwrap();
+
+        let result = load_fresh_openai_oauth_locked(&store, || 0, |_| {
+            panic!("a fresh credential must not be refreshed")
+        })
+        .unwrap()
+        .expect("fresh credential returned");
+
+        assert_eq!(result.access_token(), "ACCESS");
+    }
+
+    #[test]
+    fn concurrent_locked_refresh_rotates_token_exactly_once() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = TestDir::new("m1o5");
+        let path = dir.auth_path();
+        // Seed an expired credential whose single-use refresh token is "R0".
+        OpenAiAuthStore::at(path.clone())
+            .save_openai(&OpenAiOAuthCredential::new("OLD-ACCESS", "R0", None, None, 0))
+            .unwrap();
+
+        let refreshes = Arc::new(AtomicUsize::new(0));
+        let now = || 1_900_000_000_000_i64;
+
+        let handles: Vec<_> = (0..6)
+            .map(|_| {
+                let path = path.clone();
+                let refreshes = refreshes.clone();
+                std::thread::spawn(move || {
+                    let store = OpenAiAuthStore::at(path);
+                    load_fresh_openai_oauth_locked(&store, now, |cred| {
+                        // Single-use: the token being rotated is still the
+                        // original — no one clobbered it back to "R0".
+                        assert_eq!(cred.refresh_token(), "R0");
+                        refreshes.fetch_add(1, Ordering::SeqCst);
+                        let refreshed =
+                            OpenAiOAuthCredential::new("NEW-ACCESS", "R1", None, None, i64::MAX);
+                        store.save_openai(&refreshed)?;
+                        Ok(refreshed)
+                    })
+                    .unwrap()
+                })
+            })
+            .collect();
+
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        assert_eq!(
+            refreshes.load(Ordering::SeqCst),
+            1,
+            "the stale credential must be refreshed exactly once across processes"
+        );
+        for result in &results {
+            let cred = result.as_ref().expect("a fresh credential");
+            assert_eq!(cred.access_token(), "NEW-ACCESS");
+        }
+        // The winner's rotated refresh token survives; it isn't overwritten.
+        let stored = OpenAiAuthStore::at(path).load_openai().unwrap().unwrap();
+        assert_eq!(stored.refresh_token(), "R1");
     }
 
     #[test]

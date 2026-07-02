@@ -1,4 +1,6 @@
 pub(crate) mod command;
+// Advisory cross-process lock serializing OAuth refresh writes (dirge-m1o5).
+pub(crate) mod file_lock;
 // Shared 0600 file-store + expiry + account-id helpers used by both OAuth stores.
 pub(crate) mod file_store;
 // Staged for downstream CLI/provider beads; this child owns the tested protocol flow.
