@@ -36,6 +36,7 @@ pub(super) mod interjected;
 pub(super) mod notices;
 pub(super) mod plan_review;
 pub(super) mod streaming;
+pub(super) mod submit;
 pub(super) mod tool_call;
 pub(super) mod tool_result;
 #[cfg(feature = "plugin")]

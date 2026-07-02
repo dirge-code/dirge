@@ -2699,8 +2699,6 @@ pub async fn run_interactive(
                             } else {
                                 // User message will be rendered when the
                                 // agent loop emits AgentEvent::UserMessage.
-                                let history = crate::agent::runner::convert_history(session);
-
                                 #[allow(unused_mut)]
                                 let mut plugin_hint: Option<String> = None;
                                 #[allow(unused_mut)]
@@ -2746,119 +2744,25 @@ pub async fn run_interactive(
                                     plugin_replace = mgr.take_pending_prompt_replace();
                                 }
 
-                                let prompt = if let Some(replacement) = plugin_replace {
-                                    // Echo the rewrite so the user can see what
-                                    // the LLM is actually receiving — otherwise
-                                    // it looks like their message vanished.
-                                    renderer.write_line(
-                                        "[plugin] prompt rewritten:",
-                                        theme::dim(),
-                                    )?;
-                                    for line in replacement.lines() {
-                                        renderer.write_line(
-                                            &format!("  {}", sanitize_output(line)),
-                                            theme::dim(),
-                                        )?;
-                                    }
-                                    replacement
-                                } else if let Some(hint) = plugin_hint {
-                                    format!("{}\n\n{}", hint, text)
-                                } else {
-                                    text.to_string()
-                                };
-
-                                // Phase 8: track the user prompt for
-                                // session DB persistence.
-                                ui.last_user_prompt = text.to_string();
-
-                                // Batch2-1 (audit fix): preemptive
-                                // compaction check. Estimate the new
-                                // prompt's token cost; if
-                                // projected_total > 85% of the budget,
-                                // compact BEFORE sending so we don't
-                                // pay an extra round-trip + provider
-                                // ContextOverflow error on the way to
-                                // reactive auto-compact. Reactive
-                                // recovery still lives at the
-                                // ContextOverflow arm in case our
-                                // estimate undershoots.
-                                let reserve_for_check = cfg.resolve_reserve_tokens();
-                                let max_tokens_for_check =
-                                    session.context_window.saturating_sub(reserve_for_check);
-                                let est_new_tokens =
-                                    crate::session::Session::estimate_tokens(&prompt);
-                                // `compact_enabled = false` opts out of proactive
-                                // compaction (this is the only site that still
-                                // honors it now that the eager post-turn pass is
-                                // gone — dirge-21sb). Reactive overflow recovery
-                                // stays ungated: it's emergency rescue, not
-                                // proactive, matching the old eager/reactive split.
-                                let preemptive_fired = cfg.resolve_compact_enabled()
-                                    && crate::ui::slash::preemptive_compaction_due(
-                                        session.total_estimated_tokens,
-                                        est_new_tokens,
-                                        max_tokens_for_check,
-                                    );
-                                // dirge-tv3p: when preemptive compaction fires,
-                                // run the summarizer OFF-thread (it was a 10-60s
-                                // inline freeze) and defer this turn to the
-                                // `compaction_phase` arm, which installs the
-                                // summary then resends the prompt. `deferred`
-                                // skips the inline runner-spawn below.
-                                let mut deferred_to_compaction = false;
-                                let history = if preemptive_fired {
-                                    renderer.write_line(
-                                        "▒░ preemptive compaction (context near limit) ░▒",
-                                        theme::accent(),
-                                    )?;
-                                    // forced=true: the preemptive trigger above
-                                    // already decided (at 85%, factoring the
-                                    // incoming prompt), so bypass prepare's
-                                    // stricter within-limits gate — otherwise it
-                                    // no-ops in the 85–100% band (dirge-rz4i).
-                                    match crate::ui::slash::prepare_compaction(
-                                        None, true, &agent, &client, &mut renderer, session, cfg,
-                                    ) {
-                                        Ok(crate::ui::slash::CompactionDecision::Ready(req)) => {
-                                            ui.compaction_phase = Some(crate::ui::compaction::spawn(
-                                                    *req,
-                                                crate::ui::compaction::CompactionThen::SendPrompt {
-                                                    run_prompt: prompt.clone(),
-                                                    record_text: text.to_string(),
-                                                },
-                                            ));
-                                            ui.is_running = true;
-                                            renderer.set_avatar_state(avatar::AvatarState::Thinking);
-                                            deferred_to_compaction = true;
-                                            history
-                                        }
-                                        Ok(crate::ui::slash::CompactionDecision::NoOp) => {
-                                            crate::agent::runner::convert_history(session)
-                                        }
-                                        Err(e) => {
-                                            renderer.write_line(
-                                                &format!("preemptive compaction failed (will retry reactively if needed): {e}"),
-                                                c_error(),
-                                            )?;
-                                            crate::agent::runner::convert_history(session)
-                                        }
-                                    }
-                                } else {
-                                    history
-                                };
-
-                                if !deferred_to_compaction {
-                                    let runner = agent.clone().spawn_runner(
-                                        crate::agent::tools::background::prepend_pending_notifications(&prompt, bg_store.as_ref()),
-                                        history,
-                                        Some(ui.interjection_queue.clone()),
-                                    );
-                                    runner.install_into(&mut ui.agent_rx, &mut ui.agent_abort, &mut ui.agent_interject, &mut ui.agent_cancel, &mut ui.is_running);
-
-                                    session.add_message(MessageRole::User, &text);
-                                    begin_snapshot_turn(session);
-                                    renderer.set_avatar_state(avatar::AvatarState::Idle);
-                                }
+                                // dirge-qhfk: the submit tail (prompt build,
+                                // preemptive compaction, runner spawn) is shared
+                                // with the off-loop on-prompt completion arm.
+                                let mut ctx = make_run_ctx!();
+                                run_handlers::submit::submit_resolved_prompt(
+                                    &mut ctx,
+                                    &make_agent_build_deps!(),
+                                    &mut agent,
+                                    plugin_hint,
+                                    plugin_replace,
+                                    &text,
+                                    &mut ui.is_running,
+                                    &mut ui.agent_rx,
+                                    &mut ui.agent_abort,
+                                    &mut ui.agent_interject,
+                                    &mut ui.agent_cancel,
+                                    &ui.interjection_queue,
+                                    &mut ui.compaction_phase,
+                                )?;
                             }
                         }
                         renderer.request_repaint();
@@ -4887,7 +4791,7 @@ fn modified_visible_rows(rect: Option<ratatui::layout::Rect>) -> usize {
 /// run triggered by one must have a matching snapshot turn or
 /// rewinding to it would restore nothing and its edits would fold
 /// into the previous turn's bucket.
-fn begin_snapshot_turn(session: &crate::session::Session) {
+pub(crate) fn begin_snapshot_turn(session: &crate::session::Session) {
     if let Some(uid) = session.messages.last().map(|m| m.id.clone()) {
         crate::agent::tools::snapshots::begin_turn(&uid);
     }
