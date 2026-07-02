@@ -3127,6 +3127,35 @@ fn todo_nudge_message_pluralizes() {
     assert!(many.contains("3 unfinished todos "), "plural: {many}");
 }
 
+/// dirge-1g3v: the reviewer engages only on what THIS run changed. Given the
+/// current working-tree diff and the run-start baseline, `run_delta_to_review`
+/// yields the diff to review, or `None` to skip.
+#[test]
+fn run_delta_to_review_skips_when_unchanged() {
+    // Read-only turn over pre-existing WIP: diff identical to baseline → skip.
+    // This is the bug — before, any ToolResult drove the judge on the whole
+    // dirty tree even when the run touched nothing.
+    assert_eq!(run_delta_to_review(Some("wip diff"), Some("wip diff")), None);
+
+    // Clean tree, nothing changed → nothing to review.
+    assert_eq!(run_delta_to_review(None, None), None);
+
+    // Agent created changes on a clean tree → review them.
+    assert_eq!(
+        run_delta_to_review(Some("new diff"), None),
+        Some("new diff")
+    );
+
+    // Agent added to pre-existing WIP → the diff differs → review.
+    assert_eq!(
+        run_delta_to_review(Some("wip + more"), Some("wip")),
+        Some("wip + more")
+    );
+
+    // Agent reverted the WIP back to clean → no current diff → nothing to review.
+    assert_eq!(run_delta_to_review(None, Some("wip")), None);
+}
+
 /// Highest-priority gate (the caller hook) short-circuits the lower gates:
 /// when it yields a follow-up, the critic is never consulted (`critic_done`
 /// stays false) and the todo gate isn't reached. This locks the precedence.
@@ -3154,6 +3183,7 @@ async fn finalization_hook_short_circuits_lower_gates() {
         &[],
         &mut critic_done,
         &mut code_review_reacts,
+        None, // code_review_baseline
         &mut goal_reacts,
         &mut todo_nudges,
         &review_emit,
@@ -3186,6 +3216,7 @@ async fn finalization_all_gates_silent_yields_none() {
         &[],
         &mut critic_done,
         &mut code_review_reacts,
+        None, // code_review_baseline
         &mut goal_reacts,
         &mut todo_nudges,
         &review_emit,
@@ -3219,6 +3250,7 @@ async fn finalization_goal_unmet_reenters_and_counts() {
         &[],
         &mut critic_done,
         &mut code_review_reacts,
+        None, // code_review_baseline
         &mut goal_reacts,
         &mut todo_nudges,
         &review_emit,
@@ -3250,6 +3282,7 @@ async fn finalization_goal_met_finalizes() {
         &[],
         &mut critic_done,
         &mut code_review_reacts,
+        None, // code_review_baseline
         &mut goal_reacts,
         &mut todo_nudges,
         &review_emit,
@@ -3282,6 +3315,7 @@ async fn finalization_goal_bound_stops_reentry() {
         &[],
         &mut critic_done,
         &mut code_review_reacts,
+        None, // code_review_baseline
         &mut goal_reacts,
         &mut todo_nudges,
         &review_emit,
@@ -3311,6 +3345,7 @@ async fn finalization_goal_without_judge_is_inert() {
         &[],
         &mut critic_done,
         &mut code_review_reacts,
+        None, // code_review_baseline
         &mut goal_reacts,
         &mut todo_nudges,
         &review_emit,

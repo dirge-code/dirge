@@ -1421,6 +1421,33 @@ diff --git a/Cargo.lock b/Cargo.lock\n\
         let _ = std::fs::remove_dir_all(&repo);
     }
 
+    /// dirge-1g3v: the run-start baseline the reviewer diffs against relies on
+    /// `capture_run_diff` being byte-stable for an unchanged tree — two
+    /// captures with no edits between them must be identical, so a read-only
+    /// turn over pre-existing WIP compares equal to its baseline and skips.
+    #[test]
+    fn capture_run_diff_is_stable_across_unchanged_tree() {
+        let repo = temp_repo();
+        std::fs::write(repo.join("a.rs"), "fn main() {}\n").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-m", "base"]);
+
+        // Pre-existing WIP: a tracked edit and an untracked file, uncommitted.
+        std::fs::write(repo.join("a.rs"), "fn main() { let x = 1; }\n").unwrap();
+        std::fs::write(repo.join("b.rs"), "pub fn helper() {}\n").unwrap();
+
+        let baseline = capture_run_diff(&repo).expect("dirty tree yields a diff");
+        // No changes between captures — a read-only turn.
+        let after = capture_run_diff(&repo).expect("still dirty");
+        assert_eq!(baseline, after, "identical tree → identical diff");
+
+        // A real edit makes them differ (the reviewer should engage here).
+        std::fs::write(repo.join("a.rs"), "fn main() { let x = 2; }\n").unwrap();
+        let changed = capture_run_diff(&repo).expect("still dirty");
+        assert_ne!(baseline, changed, "an edit changes the diff");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
     // ── Prompt + orchestration (R3) ───────────────────────────────
 
     #[test]

@@ -207,6 +207,7 @@ async fn poll_finalization_follow_up(
     new_messages: &[LoopMessage],
     critic_done: &mut bool,
     code_review_reacts: &mut u8,
+    code_review_baseline: Option<&str>,
     goal_reacts: &mut u8,
     todo_nudges: &mut u8,
     emit: &mpsc::Sender<LoopEvent>,
@@ -251,11 +252,13 @@ async fn poll_finalization_follow_up(
     //      uncommitted diff and surfaces severity-ranked findings. Unlike
     //      the one-shot critic it PERSISTS across finalizations (bounded by
     //      MAX_REVIEW_REACT) so the agent can fix findings and be
-    //      re-reviewed. The diff itself is the precondition: a clean tree
-    //      (no code changed on disk) skips the reviewer entirely, so a
-    //      read-only turn never pays for a git call + judge. Active only
-    //      when a `critic_provider` is configured (the reviewer reuses its
-    //      judge) — off with no cost for default sessions.
+    //      re-reviewed. The precondition is a change on disk SINCE RUN START:
+    //      the current working-tree diff is compared against the run-start
+    //      baseline (dirge-1g3v), so a read-only turn — even one over
+    //      pre-existing uncommitted WIP — has an unchanged diff and skips the
+    //      reviewer entirely, never paying for a judge call. Active only when
+    //      a `critic_provider` is configured (the reviewer reuses its judge) —
+    //      off with no cost for default sessions.
     if *code_review_reacts < super::code_review::MAX_REVIEW_REACT
         && config.code_review_fn.is_some()
         && run_made_tool_calls(new_messages)
@@ -267,10 +270,12 @@ async fn poll_finalization_follow_up(
             .await
             .ok()
             .flatten();
-        if let Some(diff) = diff {
+        // Review only what THIS run changed: skip when the diff is identical to
+        // the run-start baseline (nothing touched on disk this turn).
+        if let Some(diff) = run_delta_to_review(diff.as_deref(), code_review_baseline) {
             let transcript = build_critic_transcript(new_messages);
             let findings =
-                super::code_review::run_code_review(review_fn, system_prompt, &diff, &transcript)
+                super::code_review::run_code_review(review_fn, system_prompt, diff, &transcript)
                     .await;
             if !findings.is_empty() {
                 // Count this engagement so a stubborn finding can't loop.
@@ -1102,6 +1107,20 @@ pub async fn run_loop(
     // finalizations (fix-then-re-review) bounded by MAX_REVIEW_REACT.
     let mut code_review_reacts: u8 = 0;
 
+    // dirge-1g3v: snapshot the working-tree diff at run start so the reviewer
+    // can tell what THIS run changed. Without a baseline it diffed the whole
+    // dirty tree, so a read-only turn over pre-existing WIP triggered the judge
+    // and could block the loop. Only needed when the reviewer is armed.
+    let code_review_baseline: Option<String> = if config.code_review_fn.is_some() {
+        let repo = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        tokio::task::spawn_blocking(move || super::code_review::capture_run_diff(&repo))
+            .await
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+
     // Goal gate: counts re-entries so a user-defined stop condition that
     // never resolves can't loop past MAX_GOAL_REACT.
     let mut goal_reacts: u8 = 0;
@@ -1899,6 +1918,7 @@ pub async fn run_loop(
             &new_messages,
             &mut critic_done,
             &mut code_review_reacts,
+            code_review_baseline.as_deref(),
             &mut goal_reacts,
             &mut todo_nudges,
             emit,
@@ -1945,6 +1965,21 @@ fn run_made_tool_calls(new_messages: &[LoopMessage]) -> bool {
     new_messages
         .iter()
         .any(|m| matches!(m, LoopMessage::ToolResult(_)))
+}
+
+/// dirge-1g3v: the diff-aware reviewer engages only on what THIS run changed.
+/// Given the working-tree diff now (`current`) and the run-start baseline
+/// (`baseline`), return the diff to review, or `None` to skip. An identical
+/// diff means the turn touched nothing on disk (e.g. a read-only 'explain
+/// this' turn over pre-existing WIP), so the judge is skipped — as the gate's
+/// own comment intends ("no code changed on disk"). Without this, any
+/// `ToolResult` (read-only included) drove the judge over the entire dirty
+/// tree, spending judge calls and blocking the loop up to `MAX_REVIEW_REACT`.
+fn run_delta_to_review<'a>(current: Option<&'a str>, baseline: Option<&str>) -> Option<&'a str> {
+    match current {
+        Some(diff) if Some(diff) != baseline => Some(diff),
+        _ => None,
+    }
 }
 
 /// Build a compact transcript of one run for the F6 critic: the user
