@@ -18,6 +18,7 @@ pub(crate) mod notifications;
 pub(crate) mod panel_data;
 mod panel_render;
 pub(crate) mod permission_ui;
+pub(crate) mod phase;
 pub(crate) mod picker;
 #[cfg(feature = "plugin")]
 mod plugin_tree;
