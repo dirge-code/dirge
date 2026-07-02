@@ -153,9 +153,15 @@ mod tests {
             db_session_id("compacted-9e8d7c6b"),
             "different folds must map to different DB ids"
         );
-        assert_ne!(db_session_id("forked-aaaa1111"), db_session_id("forked-bbbb2222"));
+        assert_ne!(
+            db_session_id("forked-aaaa1111"),
+            db_session_id("forked-bbbb2222")
+        );
         // Stable: same input → same key (writers + parent links must agree).
-        assert_eq!(db_session_id("compacted-3f9a2b1c"), db_session_id("compacted-3f9a2b1c"));
+        assert_eq!(
+            db_session_id("compacted-3f9a2b1c"),
+            db_session_id("compacted-3f9a2b1c")
+        );
         // Every key carries the `dirge-` DB namespace prefix.
         assert!(db_session_id("3f9a2b1c4d5e").starts_with("dirge-"));
     }

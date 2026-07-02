@@ -506,8 +506,7 @@ pub(crate) async fn handle_done(
                         crate::extras::session_db::SessionDb::open(&paths.session_db_path())
                     {
                         use crate::extras::entity_db;
-                        let sid =
-                            crate::text::db_session_id(ctx.session.id.as_str());
+                        let sid = crate::text::db_session_id(ctx.session.id.as_str());
                         for ent in &entities {
                             let _ = entity_db::upsert_entity(
                                 &db.conn,

@@ -1685,7 +1685,10 @@ async fn interjection_halts_at_tool_result_boundary() {
     });
 
     let result = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
-    assert!(result.is_ok(), "loop should exit promptly after interjection");
+    assert!(
+        result.is_ok(),
+        "loop should exit promptly after interjection"
+    );
 
     let turns = seen.load(Ordering::SeqCst);
     assert_eq!(

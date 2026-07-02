@@ -464,7 +464,9 @@ pub(super) fn coarse_mutation_paths(command: &str) -> Vec<String> {
         // Skip leading env assignments / exec wrappers so `FOO=1 rm …`
         // and `nohup rm …` still surface their operands (dirge-8zem).
         let start = crate::permission::engine::types::exec_head_index(&toks);
-        let Some(&head) = toks.get(start) else { continue };
+        let Some(&head) = toks.get(start) else {
+            continue;
+        };
         let base = head.rsplit('/').next().unwrap_or(head);
         if !COARSE_MUTATORS.contains(&base) {
             continue;

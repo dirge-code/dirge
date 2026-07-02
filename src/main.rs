@@ -1953,8 +1953,10 @@ mod resolve_mode_tests {
     #[test]
     fn cli_restrictive_beats_config_yolo() {
         let cli = cli::Cli::parse_from(["dirge", "--restrictive"]);
-        let mut cfg = config::Config::default();
-        cfg.yolo = Some(true);
+        let cfg = config::Config {
+            yolo: Some(true),
+            ..Default::default()
+        };
         assert_eq!(
             resolve_mode(&cli, &cfg),
             SecurityMode::Restrictive,
@@ -1967,8 +1969,10 @@ mod resolve_mode_tests {
     #[test]
     fn cli_yolo_beats_config_restrictive() {
         let cli = cli::Cli::parse_from(["dirge", "--yolo"]);
-        let mut cfg = config::Config::default();
-        cfg.restrictive = Some(true);
+        let cfg = config::Config {
+            restrictive: Some(true),
+            ..Default::default()
+        };
         assert_eq!(resolve_mode(&cli, &cfg), SecurityMode::Yolo);
     }
 
@@ -1976,8 +1980,10 @@ mod resolve_mode_tests {
     #[test]
     fn config_yolo_applies_without_cli_flag() {
         let cli = cli::Cli::parse_from(["dirge"]);
-        let mut cfg = config::Config::default();
-        cfg.yolo = Some(true);
+        let cfg = config::Config {
+            yolo: Some(true),
+            ..Default::default()
+        };
         assert_eq!(resolve_mode(&cli, &cfg), SecurityMode::Yolo);
     }
 
@@ -1985,8 +1991,10 @@ mod resolve_mode_tests {
     #[test]
     fn config_default_mode_applies_without_cli_flag() {
         let cli = cli::Cli::parse_from(["dirge"]);
-        let mut cfg = config::Config::default();
-        cfg.default_permission_mode = Some("restrictive".to_string());
+        let cfg = config::Config {
+            default_permission_mode: Some("restrictive".to_string()),
+            ..Default::default()
+        };
         assert_eq!(resolve_mode(&cli, &cfg), SecurityMode::Restrictive);
     }
 

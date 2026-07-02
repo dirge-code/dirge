@@ -476,8 +476,16 @@ fn fold_chain_resolves_through_canonical_db_ids() {
 
     // A turn persisted AFTER the second fold uses the same derivation the
     // fold handler inserted under — so it hits an existing, linked row.
-    db.insert_message(&db_session_id(fold2), "user", "post-fold turn", None, None, None, "2025-01-15T12:01:00Z")
-        .unwrap();
+    db.insert_message(
+        &db_session_id(fold2),
+        "user",
+        "post-fold turn",
+        None,
+        None,
+        None,
+        "2025-01-15T12:01:00Z",
+    )
+    .unwrap();
 
     // Lineage walks all the way back to the original session.
     assert_eq!(db.resolve_parent(&fold2_db).unwrap(), orig_db);

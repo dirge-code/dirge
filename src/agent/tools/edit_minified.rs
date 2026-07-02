@@ -235,6 +235,10 @@ mod tests {
 
     #[cfg(feature = "semantic-rust")]
     #[tokio::test]
+    // TEST_GATE serializes tests that share the global snapshot store; the
+    // guard is intentionally held across the awaits below (this is single-
+    // threaded test setup, not a contended runtime lock).
+    #[allow(clippy::await_holding_lock)]
     async fn rewind_restores_a_minified_edit() {
         use crate::agent::tools::snapshots;
         use crate::sync_util::LockExt;

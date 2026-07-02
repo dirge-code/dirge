@@ -597,9 +597,8 @@ mod tests {
     }
 
     fn create_skill(tool: &SkillTool, rt: &tokio::runtime::Runtime, name: &str) {
-        let content = format!(
-            "---\nname: {name}\ndescription: D\n---\n\nbody\n\n## Verification\n\ncheck\n"
-        );
+        let content =
+            format!("---\nname: {name}\ndescription: D\n---\n\nbody\n\n## Verification\n\ncheck\n");
         rt.block_on(tool.call(SkillArgs {
             action: "create".into(),
             name: Some(name.into()),
@@ -673,7 +672,10 @@ mod tests {
             new_string: None,
             force: None,
         }));
-        assert!(result.is_err(), "pinned skill must be refused; got {result:?}");
+        assert!(
+            result.is_err(),
+            "pinned skill must be refused; got {result:?}"
+        );
 
         // Still present in the live library.
         let out = rt
@@ -686,7 +688,10 @@ mod tests {
                 force: None,
             }))
             .unwrap();
-        assert!(out.contains("keepme"), "refused delete must leave the skill intact");
+        assert!(
+            out.contains("keepme"),
+            "refused delete must leave the skill intact"
+        );
     }
 
     /// dirge-ykli: a bundled / user-authored skill (source='file') must

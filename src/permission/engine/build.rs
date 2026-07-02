@@ -423,7 +423,11 @@ mod tests {
             SecurityMode::Standard,
             vec![Resource::command("echo hi")],
         ));
-        assert_eq!(plain.effect, Effect::Allow, "session grant covers plain echo");
+        assert_eq!(
+            plain.effect,
+            Effect::Allow,
+            "session grant covers plain echo"
+        );
         // The complex form is not.
         let d = e.authorize(&req(
             Operation::Execute,

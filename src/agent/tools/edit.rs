@@ -875,8 +875,7 @@ mod read_gate_tests {
         // Every newline stays a proper CRLF (no lone \n either).
         let s = String::from_utf8_lossy(&out);
         assert_eq!(
-            s,
-            "line1\r\nnew2a\r\nnew2b\r\nline3\r\n",
+            s, "line1\r\nnew2a\r\nnew2b\r\nline3\r\n",
             "CRLF must be preserved uniformly"
         );
         let _ = std::fs::remove_dir_all(&dir);
