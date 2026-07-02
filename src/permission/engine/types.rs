@@ -117,10 +117,12 @@ pub enum Resource {
 
 impl Resource {
     /// A simple shell command claim: the splitter fully decomposed it,
-    /// so allow rules may match its head. `head` is the leading token.
+    /// so allow rules may match its head. `head` is the leading token of
+    /// the REAL command — leading env assignments and exec wrappers are
+    /// stripped (dirge-8zem) so it reflects what actually runs.
     pub fn command(raw: impl Into<String>) -> Self {
         let raw = raw.into();
-        let head = raw.split_whitespace().next().unwrap_or("").to_string();
+        let head = command_head(&raw);
         Resource::Command {
             raw,
             head,
@@ -133,7 +135,7 @@ impl Resource {
     /// silently allow it — the inner command is invisible (dirge-g9qj).
     pub fn command_complex(raw: impl Into<String>) -> Self {
         let raw = raw.into();
-        let head = raw.split_whitespace().next().unwrap_or("").to_string();
+        let head = command_head(&raw);
         Resource::Command {
             raw,
             head,
@@ -170,8 +172,150 @@ impl Resource {
                 let r = resolved.to_str().unwrap_or(raw);
                 if r == raw { vec![r] } else { vec![r, raw] }
             }
+            // A command is also tested with its leading env assignments
+            // and exec wrappers stripped, so a head-anchored rule
+            // (`rm -rf /**`, or a user's `git *`) still matches
+            // `FOO=1 rm -rf /` / `nohup rm -rf /` (dirge-8zem). The raw
+            // form is kept too — it's what the prompt displays.
+            Resource::Command { raw, .. } => {
+                let stripped = strip_exec_prefix(raw);
+                if stripped.is_empty() || stripped == raw.as_str() {
+                    vec![raw]
+                } else {
+                    vec![raw, stripped]
+                }
+            }
             _ => vec![self.match_key()],
         }
+    }
+}
+
+/// The leading token of the real command, with env assignments and exec
+/// wrappers stripped. Empty when the command is only wrappers.
+fn command_head(raw: &str) -> String {
+    strip_exec_prefix(raw)
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_string()
+}
+
+/// `NAME=value` where NAME is a valid shell identifier — a leading
+/// environment assignment that prefixes (but doesn't change) a command.
+fn is_env_assignment(tok: &str) -> bool {
+    match tok.split_once('=') {
+        Some((name, _)) if !name.is_empty() => {
+            let mut chars = name.chars();
+            let first = chars.next().unwrap();
+            (first.is_ascii_alphabetic() || first == '_')
+                && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        }
+        _ => false,
+    }
+}
+
+fn basename(tok: &str) -> &str {
+    tok.rsplit('/').next().unwrap_or(tok)
+}
+
+/// Index into `tokens` of the real command head, skipping leading env
+/// assignments (`FOO=1`) and known exec wrappers (`nohup`/`time`/`nice`/
+/// `timeout`/`env`) together with the wrapper args they consume. Returns
+/// `tokens.len()` when nothing but wrappers remain. Shared by rule
+/// matching and the bash mutation-path extractor so both see through the
+/// same prefixes (dirge-8zem).
+pub fn exec_head_index(tokens: &[&str]) -> usize {
+    let mut i = 0;
+    loop {
+        while i < tokens.len() && is_env_assignment(tokens[i]) {
+            i += 1;
+        }
+        if i >= tokens.len() {
+            return i;
+        }
+        match basename(tokens[i]) {
+            "nohup" | "setsid" => i += 1,
+            "time" => {
+                i += 1;
+                while i < tokens.len() && tokens[i].starts_with('-') {
+                    i += 1;
+                }
+            }
+            "env" => {
+                i += 1;
+                while i < tokens.len() {
+                    let t = tokens[i];
+                    if matches!(t, "-u" | "-C" | "-S" | "--unset" | "--chdir") {
+                        i += 2;
+                    } else if t.starts_with('-') || is_env_assignment(t) {
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            "nice" => {
+                i += 1;
+                while i < tokens.len() {
+                    let t = tokens[i];
+                    if matches!(t, "-n" | "--adjustment") {
+                        i += 2;
+                    } else if t.starts_with('-') {
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            "timeout" => {
+                i += 1;
+                while i < tokens.len() && tokens[i].starts_with('-') {
+                    if matches!(tokens[i], "-s" | "--signal" | "-k" | "--kill-after") {
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                // the DURATION positional
+                if i < tokens.len() {
+                    i += 1;
+                }
+            }
+            _ => return i,
+        }
+    }
+}
+
+/// The command with any leading env assignments / exec wrappers removed,
+/// as a byte-subslice of `cmd` (so quoting and spacing after the prefix
+/// are preserved). Returns `cmd` unchanged when there is no prefix, or
+/// when the command is nothing but wrappers.
+pub fn strip_exec_prefix(cmd: &str) -> &str {
+    let bytes = cmd.as_bytes();
+    let mut offsets: Vec<usize> = Vec::new();
+    let mut toks: Vec<&str> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        let start = i;
+        while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        offsets.push(start);
+        toks.push(&cmd[start..i]);
+    }
+    let idx = exec_head_index(&toks);
+    if idx == 0 {
+        return cmd;
+    }
+    match offsets.get(idx) {
+        Some(&off) => &cmd[off..],
+        None => cmd,
     }
 }
 

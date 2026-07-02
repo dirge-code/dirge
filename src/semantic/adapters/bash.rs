@@ -210,6 +210,36 @@ mod tests {
             "segment should NOT include the redirect target; got: {segments:?}"
         );
     }
+
+    #[test]
+    fn mutation_paths_see_through_env_assignment() {
+        // dirge-8zem: a leading `FOO=1` makes the command node's first
+        // named child a `variable_assignment`, so the old head-derivation
+        // treated `FOO=1` as the head, `rm` was skipped, and `/etc/passwd`
+        // never routed through the Edit gate.
+        let p = crate::semantic::adapters::bash::extract_mutation_paths("FOO=1 rm -rf /etc/passwd");
+        assert!(
+            p.contains(&"/etc/passwd".to_string()),
+            "env-prefixed rm must still surface its operand; got: {p:?}"
+        );
+    }
+
+    #[test]
+    fn mutation_paths_see_through_exec_wrappers() {
+        for (cmd, want) in [
+            ("nohup rm -rf /etc/x", "/etc/x"),
+            ("time rm /etc/y", "/etc/y"),
+            ("nice -n 5 rm /etc/z", "/etc/z"),
+            ("timeout 10 rm -rf /etc/w", "/etc/w"),
+            ("env FOO=1 rm /etc/v", "/etc/v"),
+        ] {
+            let p = crate::semantic::adapters::bash::extract_mutation_paths(cmd);
+            assert!(
+                p.contains(&want.to_string()),
+                "wrapper-prefixed mutator {cmd:?} must surface {want:?}; got: {p:?}"
+            );
+        }
+    }
 }
 
 /// C4 (audit fix): extract redirect target paths from a bash
@@ -317,15 +347,15 @@ fn collect_mutation_paths(
         // Skip anything else (redirections, variable assignments,
         // etc. — those have their own node kinds and aren't paths
         // here).
-        let mut head: Option<String> = None;
-        let mut args: Vec<String> = Vec::new();
+        // Gather the ordered token texts (head + positional args +
+        // leading `variable_assignment` nodes), skipping redirections
+        // (handled by the redirect_targets extractor — including them
+        // here would double-prompt).
+        let mut tokens: Vec<String> = Vec::new();
         for i in 0..node.named_child_count() {
             let Some(child) = node.named_child(i) else {
                 continue;
             };
-            // Don't walk into redirections — they were handled by
-            // the redirect_targets extractor and including them
-            // here would double-prompt.
             if child.kind() == "file_redirect"
                 || child.kind() == "heredoc_redirect"
                 || child.kind() == "herestring_redirect"
@@ -336,30 +366,37 @@ fn collect_mutation_paths(
                 Ok(t) => t.trim().to_string(),
                 Err(_) => continue,
             };
-            if head.is_none() {
-                head = Some(text);
+            if text.is_empty() {
                 continue;
             }
-            // Skip flag args (`-r`, `--recursive`).
-            if text.starts_with('-') {
-                continue;
-            }
-            // Skip chmod permission specs (`+x`, `u+x`).
-            if matches!(head.as_deref(), Some("chmod")) && text.starts_with('+') {
-                continue;
-            }
-            args.push(unquote_simple(&text));
+            tokens.push(text);
         }
 
-        if let Some(h) = head {
+        // Skip leading env assignments (`FOO=1`) and exec wrappers
+        // (`nohup`/`time`/`nice`/`timeout`/`env`) so the operand of the
+        // REAL command still routes through the Edit gate (dirge-8zem).
+        let refs: Vec<&str> = tokens.iter().map(|s| s.as_str()).collect();
+        let start = crate::permission::engine::types::exec_head_index(&refs);
+        if let Some(h) = tokens.get(start) {
             // Strip path prefix on the head so absolute paths like
-            // `/bin/rm` still match the basename rule. Skip empty
-            // heads.
-            let basename = std::path::Path::new(&h)
+            // `/bin/rm` still match the basename rule.
+            let basename = std::path::Path::new(h)
                 .file_name()
                 .and_then(|f| f.to_str())
                 .unwrap_or(h.as_str());
             if mutators.contains(&basename) {
+                let mut args: Vec<String> = Vec::new();
+                for text in &tokens[start + 1..] {
+                    // Skip flag args (`-r`, `--recursive`).
+                    if text.starts_with('-') {
+                        continue;
+                    }
+                    // Skip chmod permission specs (`+x`, `u+x`).
+                    if basename == "chmod" && text.starts_with('+') {
+                        continue;
+                    }
+                    args.push(unquote_simple(text));
+                }
                 // chmod / chown: drop the first positional arg
                 // (mode spec / owner spec — not a path).
                 let path_args: &[String] = if matches!(basename, "chmod" | "chown") {

@@ -461,6 +461,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn env_and_wrapper_prefixes_do_not_defeat_a_head_anchored_deny() {
+        // dirge-8zem: a leading `FOO=1` assignment or an exec wrapper
+        // (`nohup`/`time`/`nice`/`timeout`) shifts the head token so the
+        // default `rm -rf /**` deny no longer matches the raw string and
+        // the hard Deny silently downgrades to Ask. Rule matching must
+        // see through the prefix.
+        let e = Engine::from_config(&PermissionConfig::default());
+        for raw in [
+            "FOO=1 rm -rf /",
+            "FOO=1 BAR=2 rm -rf /etc",
+            "nohup rm -rf /",
+            "time rm -rf /usr",
+            "nice -n 10 rm -rf /",
+            "timeout 5 rm -rf /var",
+            "env FOO=1 rm -rf /",
+            "/usr/bin/env rm -rf /",
+        ] {
+            let d = e.authorize(&req(
+                Operation::Execute,
+                "bash",
+                SecurityMode::Standard,
+                vec![Resource::command(raw)],
+            ));
+            assert_eq!(
+                d.effect,
+                Effect::Deny,
+                "prefixed destructive command {raw:?} must still hit the deny rule"
+            );
+        }
+    }
+
+    #[test]
+    fn stripping_a_wrapper_prefix_does_not_over_deny() {
+        // The prefix strip must not turn a benign command into a denied
+        // one: `nohup rm -rf ./local` is not a system-root delete.
+        let e = Engine::from_config(&PermissionConfig::default());
+        let d = e.authorize(&req(
+            Operation::Execute,
+            "bash",
+            SecurityMode::Standard,
+            vec![Resource::command("nohup rm -rf ./local")],
+        ));
+        assert_ne!(
+            d.effect,
+            Effect::Deny,
+            "a local recursive delete behind a wrapper must not be denied by the /** rule"
+        );
+    }
+
     fn rule(
         op: crate::permission::OpSpec,
         m: &str,
