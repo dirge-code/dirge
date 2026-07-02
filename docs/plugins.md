@@ -244,7 +244,10 @@ with a `tracing::warn`.
 ### Dialogs
 
 These block the Janet worker until the UI thread returns. Safe from any
-hook or command.
+hook or command — lifecycle hooks dispatch off the UI loop, so the loop
+stays free to render the dialog and return the reply. The one exception is
+`on-message-update`, which fires per streamed token batch and runs inline;
+opening a dialog there is unsupported (and would be nonsensical).
 
 | Function | Signature | Effect |
 |----------|-----------|--------|
@@ -255,7 +258,8 @@ hook or command.
 
 Query the running language servers from a plugin. Like dialogs these
 block the Janet worker until the async query returns, so they are safe to
-call from any hook or command.
+call from any hook or command (except `on-message-update`, which runs
+inline — see the Dialogs note above).
 
 Feature-detect with `(harness/lsp?)` and fall back gracefully. The
 predicate is **true only when LSP is both compiled in and active at

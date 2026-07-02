@@ -744,7 +744,12 @@ const HARNESS_DIALOG_INIT: &str = r#"
 # (harness/select  "title" array-of-options) -> string | nil
 #
 # Both block the worker thread (not the UI thread) until the host
-# replies, so they are safe to call from any plugin hook.
+# replies. dirge-qhfk: the host dispatches lifecycle hooks OFF the UI
+# loop, so a dialog opened from any of them (on-prompt, on-turn-start/end,
+# on-response, message-end, on-complete, prepare-next-run, on-error) or a
+# tool hook keeps the loop free to service the reply. The ONE exception is
+# `on-message-update`: it fires per streamed token batch and still runs
+# inline, so opening a dialog there is unsupported (and nonsensical).
 (defn harness/confirm [title question]
   (if (and (string? title) (string? question))
     (harness/__confirm title question)
