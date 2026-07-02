@@ -377,6 +377,22 @@ fn value_to_rig_message_for_provider(
             let content = value.get("content").and_then(|c| c.as_str())?;
             Some(Message::user(content))
         }
+        // dirge-vcu1: a compaction fold replaces the conversation middle
+        // with a `role: "system"` summary (and mid-session memory
+        // reinjects use the same shape). `default_convert_to_llm`
+        // deliberately keeps these, but this converter used to drop them
+        // (`_ => None`), so after any fold the summary — and the whole
+        // folded middle it stands in for — silently never reached the
+        // model. Map it to a `user` message: it stays in the history at
+        // its cut-boundary position (the cache-warm system prefix stays
+        // stable) and reaches every provider. Mapping to
+        // `Message::System` instead would let rig's Anthropic provider
+        // hoist the mutable summary into the top-level system field,
+        // busting the prompt cache on every post-fold turn.
+        "system" => {
+            let content = value.get("content").and_then(|c| c.as_str())?;
+            Some(Message::user(content))
+        }
         "assistant" => {
             let blocks = value.get("content").and_then(|c| c.as_array())?;
             let include_reasoning = !provider_requires_openai_reasoning_ids(provider_name);
@@ -864,6 +880,37 @@ mod tests {
                 other => panic!("expected ToolResult, got {other:?}"),
             },
             other => panic!("expected User, got {other:?}"),
+        }
+    }
+
+    /// dirge-vcu1: a `system`-role message (compaction fold summary,
+    /// mid-session memory reinject) must survive into the outgoing
+    /// request, not be dropped. It maps to a `user` message so it stays
+    /// in the message history at its position (keeping the cache-warm
+    /// system prefix stable) and reaches every provider uniformly —
+    /// rig's Anthropic provider would otherwise hoist a `Message::System`
+    /// into the top-level system field, busting the prompt cache.
+    #[test]
+    fn system_role_summary_reaches_the_request() {
+        // Mirrors the compaction fold's `role: "system"` summary message.
+        let summary = "[CONTEXT COMPACTION — REFERENCE ONLY] …\n## Active Task\nfinish the port";
+        let v = serde_json::json!({
+            "role": "system",
+            "content": summary,
+        });
+        for provider in [None, Some("anthropic"), Some("openai")] {
+            let msg = value_to_rig_message_for_provider(&v, provider)
+                .unwrap_or_else(|| panic!("system message dropped for provider {provider:?}"));
+            match msg {
+                Message::User { content } => match content.first() {
+                    UserContent::Text(t) => assert!(
+                        t.text.contains("Active Task"),
+                        "summary body must be preserved"
+                    ),
+                    other => panic!("expected text user content, got {other:?}"),
+                },
+                other => panic!("expected User message, got {other:?}"),
+            }
         }
     }
 
