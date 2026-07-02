@@ -460,13 +460,16 @@ const COARSE_MUTATORS: &[&str] = &[
 pub(super) fn coarse_mutation_paths(command: &str) -> Vec<String> {
     let mut out = Vec::new();
     for segment in quote_aware_split(command) {
-        let mut toks = segment.split_whitespace();
-        let Some(head) = toks.next() else { continue };
+        let toks: Vec<&str> = segment.split_whitespace().collect();
+        // Skip leading env assignments / exec wrappers so `FOO=1 rm …`
+        // and `nohup rm …` still surface their operands (dirge-8zem).
+        let start = crate::permission::engine::types::exec_head_index(&toks);
+        let Some(&head) = toks.get(start) else { continue };
         let base = head.rsplit('/').next().unwrap_or(head);
         if !COARSE_MUTATORS.contains(&base) {
             continue;
         }
-        for t in toks {
+        for &t in &toks[start + 1..] {
             if t.starts_with('-') {
                 continue; // flag
             }

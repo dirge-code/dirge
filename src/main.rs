@@ -111,33 +111,72 @@ fn resolve_mode(cli: &cli::Cli, cfg: &config::Config) -> SecurityMode {
         );
     }
 
-    if cli.yolo || cfg.yolo.unwrap_or(false) {
-        SecurityMode::Yolo
-    } else if cli.accept_all || cfg.accept_all.unwrap_or(false) {
-        SecurityMode::Accept
-    } else if cli.restrictive || cfg.restrictive.unwrap_or(false) {
-        SecurityMode::Restrictive
+    // An explicit CLI permission flag is authoritative and must win over
+    // any config setting. Otherwise a project `.dirge/config.json` with
+    // `yolo: true` could silently override `dirge --restrictive` and
+    // escalate an untrusted repo — the opposite of what the user asked
+    // for. Config booleans / `default_permission_mode` apply only when the
+    // user passed no permission flag at all.
+    let cli_mode = if cli.yolo {
+        Some(SecurityMode::Yolo)
+    } else if cli.accept_all {
+        Some(SecurityMode::Accept)
+    } else if cli.restrictive {
+        Some(SecurityMode::Restrictive)
+    } else {
+        None
+    };
+
+    let config_mode = resolve_config_mode(cfg);
+
+    if let Some(m) = cli_mode {
+        // Surface the override so a user whose config expected a different
+        // mode isn't silently ignored.
+        if let Some(cm) = config_mode
+            && cm != m
+        {
+            eprintln!(
+                "warning: config requests {cm:?} permission mode but the CLI flag \
+                 selects {m:?}; the CLI flag takes precedence."
+            );
+        }
+        return m;
+    }
+
+    config_mode.unwrap_or(SecurityMode::Standard)
+}
+
+/// Resolve the permission mode requested by config alone (no CLI flags).
+/// Returns `None` when config expresses no preference. Boolean flags take
+/// precedence over `default_permission_mode`, in the order
+/// `yolo > accept > restrictive`.
+fn resolve_config_mode(cfg: &config::Config) -> Option<SecurityMode> {
+    if cfg.yolo.unwrap_or(false) {
+        Some(SecurityMode::Yolo)
+    } else if cfg.accept_all.unwrap_or(false) {
+        Some(SecurityMode::Accept)
+    } else if cfg.restrictive.unwrap_or(false) {
+        Some(SecurityMode::Restrictive)
     } else if let Some(m) = &cfg.default_permission_mode {
         match m.as_str() {
-            "yolo" => SecurityMode::Yolo,
-            "accept" => SecurityMode::Accept,
-            "restrictive" => SecurityMode::Restrictive,
-            "standard" => SecurityMode::Standard,
+            "yolo" => Some(SecurityMode::Yolo),
+            "accept" => Some(SecurityMode::Accept),
+            "restrictive" => Some(SecurityMode::Restrictive),
+            "standard" => Some(SecurityMode::Standard),
             other => {
                 // Unknown value silently mapped to Standard before
                 // this — a typo like `restritctive` ended up as
                 // Standard and the user never knew. Warn explicitly
                 // and name the valid values.
                 eprintln!(
-                    "warning: unknown default_permission_mode {:?} in config; using standard. \
+                    "warning: unknown default_permission_mode {other:?} in config; using standard. \
                      Valid values: yolo, accept, restrictive, standard.",
-                    other,
                 );
-                SecurityMode::Standard
+                Some(SecurityMode::Standard)
             }
         }
     } else {
-        SecurityMode::Standard
+        None
     }
 }
 
@@ -1899,5 +1938,63 @@ mod session_id_tests {
         let command = cli.command.as_ref().unwrap();
 
         assert!(!command_is_config_free(command));
+    }
+}
+
+#[cfg(test)]
+mod resolve_mode_tests {
+    use super::*;
+    use clap::Parser;
+
+    /// dirge-rb3f — an explicit CLI permission flag must win over any
+    /// config boolean. A project `.dirge/config.json` with `yolo: true`
+    /// must NOT be able to escalate a session the user launched with
+    /// `--restrictive`.
+    #[test]
+    fn cli_restrictive_beats_config_yolo() {
+        let cli = cli::Cli::parse_from(["dirge", "--restrictive"]);
+        let mut cfg = config::Config::default();
+        cfg.yolo = Some(true);
+        assert_eq!(
+            resolve_mode(&cli, &cfg),
+            SecurityMode::Restrictive,
+            "explicit --restrictive must override config yolo=true"
+        );
+    }
+
+    /// A CLI flag wins over config even in the permissive direction —
+    /// the rule is "CLI decides when present", not "most permissive".
+    #[test]
+    fn cli_yolo_beats_config_restrictive() {
+        let cli = cli::Cli::parse_from(["dirge", "--yolo"]);
+        let mut cfg = config::Config::default();
+        cfg.restrictive = Some(true);
+        assert_eq!(resolve_mode(&cli, &cfg), SecurityMode::Yolo);
+    }
+
+    /// With no CLI flag, config booleans still select the mode.
+    #[test]
+    fn config_yolo_applies_without_cli_flag() {
+        let cli = cli::Cli::parse_from(["dirge"]);
+        let mut cfg = config::Config::default();
+        cfg.yolo = Some(true);
+        assert_eq!(resolve_mode(&cli, &cfg), SecurityMode::Yolo);
+    }
+
+    /// With no CLI flag, `default_permission_mode` still applies.
+    #[test]
+    fn config_default_mode_applies_without_cli_flag() {
+        let cli = cli::Cli::parse_from(["dirge"]);
+        let mut cfg = config::Config::default();
+        cfg.default_permission_mode = Some("restrictive".to_string());
+        assert_eq!(resolve_mode(&cli, &cfg), SecurityMode::Restrictive);
+    }
+
+    /// No CLI flag and no config yields Standard.
+    #[test]
+    fn no_flags_yields_standard() {
+        let cli = cli::Cli::parse_from(["dirge"]);
+        let cfg = config::Config::default();
+        assert_eq!(resolve_mode(&cli, &cfg), SecurityMode::Standard);
     }
 }
