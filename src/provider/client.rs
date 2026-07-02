@@ -201,7 +201,7 @@ where
         );
     }
     let auth_headers = match (auth, resolved_auth_headers) {
-        (ProviderAuth::ChatGpt, Some(headers)) => Some(headers),
+        (ProviderAuth::ChatGpt | ProviderAuth::Anthropic, Some(headers)) => Some(headers),
         _ => resolve_auth_headers(auth)?,
     };
     let is_chatgpt_auth = auth == ProviderAuth::ChatGpt;
@@ -261,15 +261,17 @@ where
         _ => info.base_url,
     };
 
-    // A Codex login token is higher-value than a per-provider API key, so it
-    // must never leave over plaintext. `allow_insecure` is intentionally not
-    // honored for either explicit ChatGPT auth or native Dirge OAuth fallback.
-    if (is_chatgpt_auth || uses_openai_oauth)
+    // An OAuth login token — Codex/ChatGPT bearer, native Dirge OAuth, or an
+    // Anthropic `sk-ant-oat` bearer — is higher-value than a per-provider API
+    // key, so it must never leave over plaintext. `allow_insecure` is
+    // intentionally not honored for any of them.
+    let uses_anthropic_oauth = auth == ProviderAuth::Anthropic;
+    if (is_chatgpt_auth || uses_openai_oauth || uses_anthropic_oauth)
         && let Some(url) = base_url.as_deref()
         && !url.starts_with("https://")
     {
         anyhow::bail!(
-            "ChatGPT (Codex) auth requires an https base URL, but got `{url}`. The Codex login \
+            "OAuth login auth requires an https base URL, but got `{url}`. The OAuth bearer \
              token is too sensitive to send over http:// — `allow_insecure` is ignored here."
         );
     }
@@ -408,6 +410,23 @@ fn create_client_with_chatgpt_auth_headers(
         None,
         providers,
         Some(ProviderAuth::ChatGpt),
+        Some(headers),
+        |name| std::env::var(name).ok(),
+        load_fresh_openai_oauth,
+    )
+}
+
+#[cfg(test)]
+fn create_client_with_anthropic_auth_headers(
+    provider_name: &str,
+    providers: &HashMap<String, ProviderEntry>,
+    headers: ProviderAuthHeaders,
+) -> anyhow::Result<AnyClient> {
+    create_client_with_resolved_auth(
+        provider_name,
+        None,
+        providers,
+        Some(ProviderAuth::Anthropic),
         Some(headers),
         |name| std::env::var(name).ok(),
         load_fresh_openai_oauth,
@@ -586,6 +605,13 @@ mod tests {
         ProviderAuthHeaders {
             bearer_token: "test-token".to_string(),
             chatgpt_account_id: Some("acct-test".to_string()),
+        }
+    }
+
+    fn test_anthropic_headers() -> ProviderAuthHeaders {
+        ProviderAuthHeaders {
+            bearer_token: "sk-ant-oat-test".to_string(),
+            chatgpt_account_id: None,
         }
     }
 
@@ -1078,6 +1104,45 @@ mod tests {
             Err(e) => e.to_string(),
         };
         assert!(msg.contains("https base URL"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn anthropic_oauth_refuses_insecure_base_url_even_with_allow_insecure() {
+        let providers = HashMap::from([(
+            "anthropic".to_string(),
+            ProviderEntry {
+                base_url: Some("http://proxy.local/anthropic".to_string()),
+                allow_insecure: true,
+                ..Default::default()
+            },
+        )]);
+        let msg = match create_client_with_anthropic_auth_headers(
+            "anthropic",
+            &providers,
+            test_anthropic_headers(),
+        ) {
+            Ok(_) => panic!("http base url must be refused under anthropic oauth"),
+            Err(e) => e.to_string(),
+        };
+        assert!(msg.contains("https base URL"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn anthropic_oauth_allows_https_base_url() {
+        let providers = HashMap::from([(
+            "anthropic".to_string(),
+            ProviderEntry {
+                base_url: Some("https://proxy.example.com/anthropic".to_string()),
+                ..Default::default()
+            },
+        )]);
+        let client = create_client_with_anthropic_auth_headers(
+            "anthropic",
+            &providers,
+            test_anthropic_headers(),
+        )
+        .unwrap();
+        assert!(matches!(client, AnyClient::AnthropicOauth(_)));
     }
 
     #[test]
