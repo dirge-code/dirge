@@ -48,13 +48,14 @@ impl std::fmt::Debug for TokenResponse {
     }
 }
 
-pub(crate) async fn login_and_persist() -> anyhow::Result<PathBuf> {
-    let verifier = oauth_pkce::verifier();
-    let challenge = oauth_pkce::challenge(&verifier);
-    let listener = TcpListener::bind(("127.0.0.1", CALLBACK_PORT))
-        .with_context(|| format!("failed to bind OAuth callback port {CALLBACK_PORT}"))?;
+struct AuthorizeRequest {
+    url: String,
+    state: String,
+    verifier: String,
+}
 
-    let authorize_url = format!(
+fn authorize_url(challenge: &str, state: &str) -> String {
+    format!(
         "{AUTHORIZE_URL}?{}",
         url::form_urlencoded::Serializer::new(String::new())
             .append_pair("code", "true")
@@ -62,17 +63,43 @@ pub(crate) async fn login_and_persist() -> anyhow::Result<PathBuf> {
             .append_pair("response_type", "code")
             .append_pair("redirect_uri", REDIRECT_URI)
             .append_pair("scope", SCOPES)
-            .append_pair("code_challenge", &challenge)
+            .append_pair("code_challenge", challenge)
             .append_pair("code_challenge_method", "S256")
-            .append_pair("state", &verifier)
+            .append_pair("state", state)
             .finish()
-    );
+    )
+}
+
+fn prepare_authorize_request() -> AuthorizeRequest {
+    let verifier = oauth_pkce::verifier();
+    let challenge = oauth_pkce::challenge(&verifier);
+    // Independent CSRF state — must not be the verifier. Reusing the verifier
+    // as `state` would embed the PKCE secret in the authorize URL (terminal,
+    // browser history, URL-logging proxy) and echo it in the localhost
+    // redirect, letting an observer of either complete the exchange.
+    let state = oauth_pkce::state();
+    let url = authorize_url(&challenge, &state);
+    AuthorizeRequest {
+        url,
+        state,
+        verifier,
+    }
+}
+
+pub(crate) async fn login_and_persist() -> anyhow::Result<PathBuf> {
+    let AuthorizeRequest {
+        url: authorize_url,
+        state,
+        verifier,
+    } = prepare_authorize_request();
+    let listener = TcpListener::bind(("127.0.0.1", CALLBACK_PORT))
+        .with_context(|| format!("failed to bind OAuth callback port {CALLBACK_PORT}"))?;
 
     eprintln!("Open this URL to authenticate with Anthropic:\n\n{authorize_url}\n");
     eprintln!("Waiting for browser redirect on {REDIRECT_URI} ...");
 
-    let (code, state) = wait_for_callback(listener, &verifier)?;
-    let credentials = exchange_authorization_code(&code, &state, &verifier).await?;
+    let (code, returned_state) = wait_for_callback(listener, &state)?;
+    let credentials = exchange_authorization_code(&code, &returned_state, &verifier).await?;
     let path = persist_credentials(&credentials)?;
     Ok(path)
 }
@@ -165,6 +192,28 @@ fn wait_for_callback(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authorize_request_uses_independent_state_and_hides_verifier() {
+        let req = prepare_authorize_request();
+        assert_ne!(
+            req.state, req.verifier,
+            "state must not be the PKCE verifier"
+        );
+        assert!(
+            !req.url.contains(&req.verifier),
+            "raw PKCE verifier must never appear in the authorize URL: {}",
+            req.url
+        );
+        assert!(
+            req.url.contains(&oauth_pkce::challenge(&req.verifier)),
+            "the S256 challenge should be present in the authorize URL"
+        );
+        assert!(
+            req.url.contains(&format!("state={}", req.state)),
+            "the independent state should be carried in the authorize URL"
+        );
+    }
 
     #[test]
     fn pkce_challenge_uses_s256_url_safe_no_pad() {

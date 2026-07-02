@@ -13,6 +13,14 @@ pub(crate) fn verifier() -> String {
     )
 }
 
+/// A random CSRF `state` value, independent of the PKCE verifier. Kept only in
+/// memory and compared against the redirect echo; unlike the verifier it never
+/// needs to stay secret, but it must NOT be derived from the verifier — reusing
+/// the verifier as `state` would publish the PKCE secret in the authorize URL.
+pub(crate) fn state() -> String {
+    verifier()
+}
+
 pub(crate) fn challenge(verifier: &str) -> String {
     let digest = Sha256::digest(verifier.as_bytes());
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
