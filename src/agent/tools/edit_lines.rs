@@ -217,11 +217,15 @@ impl Tool for EditLinesTool {
         }
 
         let bytes = tokio::fs::read(&resolved_path).await?;
-        let has_crlf = bytes.windows(2).any(|w| w == b"\r\n");
-        let content = String::from_utf8_lossy(&bytes).replace("\r\n", "\n");
+        // Shared decode seam: refuses non-UTF-8 (dirge-yga0) and strips a
+        // leading BOM before hashing (dirge-2hqv) so line 1 hashes to the same
+        // value read showed — read strips the BOM too, so without this any
+        // edit_lines touching line 1 of a BOM file was falsely rejected.
+        let src = crate::agent::tools::text_io::decode_for_edit(&bytes).map_err(ToolError::Msg)?;
+        let content = &src.content;
 
         let new_content = apply_line_edit(
-            &content,
+            content,
             args.start_line,
             args.end_line,
             &args.expected_hashes,
@@ -229,13 +233,12 @@ impl Tool for EditLinesTool {
         )
         .map_err(ToolError::Msg)?;
 
-        // Re-apply CRLF if the file used it, so we don't silently
-        // rewrite line endings.
-        let candidate = if has_crlf {
-            new_content.replace('\n', "\r\n")
-        } else {
-            new_content
-        };
+        // Restore the original BOM + line endings via the shared seam, instead
+        // of the old `has_crlf = any CRLF` flip that rewrote mixed-ending
+        // files wholesale to CRLF (dirge-k32l).
+        let reencoded = src.reencode(&new_content);
+        let mixed_ending_note = reencoded.note;
+        let candidate = reencoded.text;
 
         // Tree-sitter pre-write validation: refuse syntactically
         // broken results so the model sees the error this turn.
@@ -274,6 +277,10 @@ impl Tool for EditLinesTool {
             new_span,
         );
         crate::agent::tools::append_repair_note(&mut msg, syntax_note);
+        if let Some(note) = mixed_ending_note {
+            msg.push('\n');
+            msg.push_str(&note);
+        }
         Ok(msg)
     }
 }
@@ -290,6 +297,97 @@ mod tests {
             .take(end - start + 1)
             .map(line_hash)
             .collect()
+    }
+
+    struct TmpFile {
+        path: String,
+    }
+    impl TmpFile {
+        fn new(name: &str, bytes: &[u8]) -> Self {
+            let path = format!("/tmp/dirge-editlines-{}", name);
+            let _ = std::fs::remove_file(&path);
+            std::fs::write(&path, bytes).unwrap();
+            Self { path }
+        }
+    }
+    impl Drop for TmpFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    // dirge-2hqv: read strips the BOM before hashing, so an edit_lines whose
+    // range includes line 1 must strip it too — otherwise line 1's hash never
+    // matches and the edit is falsely rejected. The BOM must survive the write.
+    #[tokio::test]
+    async fn edits_line_one_of_a_bom_file_and_preserves_the_bom() {
+        let tf = TmpFile::new(
+            "bom-line1.txt",
+            "\u{FEFF}alpha\r\nbeta\r\ngamma\r\n".as_bytes(),
+        );
+        // Hash matches what read would show: BOM stripped, LF-normalized.
+        let h = hashes_for("alpha\nbeta\ngamma\n", 1, 1);
+        let tool = EditLinesTool::new(None, None);
+        let out = tool
+            .call(EditLinesArgs {
+                path: tf.path.clone(),
+                start_line: 1,
+                end_line: 1,
+                expected_hashes: h,
+                new_text: "ALPHA".to_string(),
+            })
+            .await
+            .expect("edit_lines should accept line 1 of a BOM file");
+        assert!(out.contains("Replaced lines 1-1"), "got: {out}");
+        // BOM + CRLF preserved, content changed.
+        let disk = std::fs::read(&tf.path).unwrap();
+        assert_eq!(disk, "\u{FEFF}ALPHA\r\nbeta\r\ngamma\r\n".as_bytes());
+    }
+
+    // dirge-k32l: a mixed-ending file must not be wholesale flipped to CRLF.
+    #[tokio::test]
+    async fn mixed_ending_file_is_not_flipped_wholesale() {
+        // 3 LF-only lines, 1 CRLF → LF dominates.
+        let tf = TmpFile::new("mixed.txt", b"a\nb\nc\r\nd\n");
+        let h = hashes_for("a\nb\nc\nd\n", 2, 2);
+        let tool = EditLinesTool::new(None, None);
+        let out = tool
+            .call(EditLinesArgs {
+                path: tf.path.clone(),
+                start_line: 2,
+                end_line: 2,
+                expected_hashes: h,
+                new_text: "B".to_string(),
+            })
+            .await
+            .unwrap();
+        let disk = std::fs::read(&tf.path).unwrap();
+        // The lone CRLF was normalized to LF (dominant), NOT every line flipped
+        // to CRLF as the old `has_crlf = any CRLF` code did.
+        assert_eq!(disk, b"a\nB\nc\nd\n");
+        assert!(out.contains("mixed line endings"), "got: {out}");
+    }
+
+    // dirge-yga0: a non-UTF-8 file is refused, not lossily rewritten with
+    // replacement chars in bytes the edit never touched.
+    #[tokio::test]
+    async fn non_utf8_file_is_refused() {
+        let tf = TmpFile::new("binary.bin", b"ok\n\xffbytes\n");
+        let tool = EditLinesTool::new(None, None);
+        let err = tool
+            .call(EditLinesArgs {
+                path: tf.path.clone(),
+                start_line: 1,
+                end_line: 1,
+                expected_hashes: vec![line_hash("ok")],
+                new_text: "OK".to_string(),
+            })
+            .await
+            .expect_err("non-UTF-8 file must be refused");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("not valid UTF-8"), "got: {msg}");
+        // Bytes untouched.
+        assert_eq!(std::fs::read(&tf.path).unwrap(), b"ok\n\xffbytes\n");
     }
 
     #[test]

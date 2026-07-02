@@ -176,8 +176,11 @@ impl Tool for EditTool {
             )));
         }
         let bytes = tokio::fs::read(&resolved_path).await?;
-        let has_crlf = bytes.windows(2).any(|w| w == b"\r\n");
-        let content = String::from_utf8_lossy(&bytes).replace("\r\n", "\n");
+        // Shared decode seam: refuses non-UTF-8 (dirge-yga0), strips a leading
+        // BOM (dirge-2hqv), and records the line-ending shape for a faithful
+        // write-back instead of the old `has_crlf = any CRLF` flip (dirge-k32l).
+        let src = crate::agent::tools::text_io::decode_for_edit(&bytes).map_err(ToolError::Msg)?;
+        let content = src.content.clone();
         let normalized_old = args.old_text.replace("\r\n", "\n");
 
         // B3-9 (audit fix): replacer cascade. Previously dirge did
@@ -327,11 +330,10 @@ impl Tool for EditTool {
             None => String::new(),
         };
 
-        let candidate = if has_crlf {
-            new_content.replace('\n', "\r\n")
-        } else {
-            new_content
-        };
+        // Restore the original BOM + line endings via the shared seam.
+        let reencoded = src.reencode(&new_content);
+        let mixed_ending_note = reencoded.note;
+        let candidate = reencoded.text;
 
         // Phase-2 tree-sitter validation: refuse to write
         // syntactically-broken edits so the model sees the error
@@ -378,6 +380,10 @@ impl Tool for EditTool {
             format!("Applied edit{}", fallback_note)
         };
         crate::agent::tools::append_repair_note(&mut result, syntax_note);
+        if let Some(note) = mixed_ending_note {
+            result.push('\n');
+            result.push_str(&note);
+        }
         // Mention the line delta when adding/removing lines so the
         // LLM can confirm the size of change without re-reading
         // the diff block. For replace_all the per-replacement
@@ -878,6 +884,58 @@ mod read_gate_tests {
             s, "line1\r\nnew2a\r\nnew2b\r\nline3\r\n",
             "CRLF must be preserved uniformly"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // dirge-yga0: editing a file with pre-existing non-UTF-8 bytes must be
+    // refused, not lossily rewritten (which would turn those bytes into
+    // U+FFFD far from the edit).
+    #[tokio::test]
+    async fn non_utf8_file_is_refused() {
+        let dir = std::env::temp_dir().join(format!("dirge-edit-bin-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("b.bin");
+        std::fs::write(&path, b"alpha\n\xffbeta\n").unwrap();
+
+        let tool = EditTool::new(None, None);
+        let err = tool
+            .call(EditArgs {
+                path: path.to_string_lossy().to_string(),
+                old_text: "alpha".to_string(),
+                new_text: "ALPHA".to_string(),
+                replace_all: None,
+            })
+            .await
+            .expect_err("non-UTF-8 file must be refused");
+        assert!(err.to_string().contains("not valid UTF-8"), "got {err}");
+        // Bytes untouched.
+        assert_eq!(std::fs::read(&path).unwrap(), b"alpha\n\xffbeta\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // dirge-k32l: a mixed-ending file must not have its LF-only lines flipped
+    // to CRLF. The dominant ending wins and the tool reports the normalization.
+    #[tokio::test]
+    async fn mixed_ending_file_is_not_flipped_wholesale() {
+        let dir = std::env::temp_dir().join(format!("dirge-edit-mixed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("m.txt");
+        // 3 LF lines, 1 CRLF → LF dominates.
+        std::fs::write(&path, b"a\nb\nc\r\nd\n").unwrap();
+
+        let tool = EditTool::new(None, None);
+        let out = tool
+            .call(EditArgs {
+                path: path.to_string_lossy().to_string(),
+                old_text: "b".to_string(),
+                new_text: "B".to_string(),
+                replace_all: None,
+            })
+            .await
+            .unwrap();
+        // The lone CRLF normalized to LF (dominant); NOT every line → CRLF.
+        assert_eq!(std::fs::read(&path).unwrap(), b"a\nB\nc\nd\n");
+        assert!(out.contains("mixed line endings"), "got {out}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

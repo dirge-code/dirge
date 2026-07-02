@@ -118,21 +118,16 @@ async fn apply_update(path: &str, old_text: &str, new_text: &str) -> Result<Stri
             MAX_APPLY_PATCH_BYTES,
         ));
     }
-    let original = tokio::fs::read_to_string(path)
+    let original_bytes = tokio::fs::read(path)
         .await
         .map_err(|e| format!("read failed: {}", e))?;
-
-    // CRLF normalization to match `edit.rs`. The LLM almost always
-    // generates `\n` in `old_text` even when the file is CRLF on
-    // disk; without normalization the literal substring match fails.
-    // We normalize a working copy for matching but preserve the
-    // original's line endings on the write-back.
-    let crlf = original.contains("\r\n");
-    let normalized = if crlf {
-        original.replace("\r\n", "\n")
-    } else {
-        original.clone()
-    };
+    // Shared decode seam (dirge-ol03): refuses non-UTF-8 (dirge-yga0), strips a
+    // leading BOM (dirge-2hqv), and records the line-ending shape so a
+    // mixed-ending file isn't wholesale flipped to CRLF on write (dirge-k32l).
+    // The LLM almost always generates `\n` in `old_text` even when the file is
+    // CRLF on disk, so match against the LF-normalized `content`.
+    let src = crate::agent::tools::text_io::decode_for_edit(&original_bytes)?;
+    let normalized = &src.content;
     let needle = old_text.replace("\r\n", "\n");
 
     if !normalized.contains(&needle) {
@@ -148,33 +143,33 @@ async fn apply_update(path: &str, old_text: &str, new_text: &str) -> Result<Stri
         ));
     }
 
-    let replacement = if crlf {
-        new_text.replace("\r\n", "\n")
-    } else {
-        new_text.to_string()
-    };
+    // Matching happens against LF-normalized content, so normalize the
+    // replacement too before splicing.
+    let replacement = new_text.replace("\r\n", "\n");
     let updated_normalized = normalized.replacen(&needle, &replacement, 1);
-    // Restore CRLF line endings on write-back so we don't silently
-    // re-format the user's file.
-    let candidate = if crlf {
-        updated_normalized.replace('\n', "\r\n")
-    } else {
-        updated_normalized
-    };
+    // Restore the original BOM + line endings via the shared seam so we don't
+    // silently re-format the user's file.
+    let reencoded = src.reencode(&updated_normalized);
+    let mixed_ending_note = reencoded.note;
+    let candidate = reencoded.text;
     // Phase-2 tree-sitter validation on the updated content before write.
     // dirge-p5fu: a purely unclosed-delimiter imbalance is mechanically
     // closed (parity with the JSON truncation repair) and reported, rather
     // than rejected. See docs/AGENTIC_LOOP_PLAN.md §2.
     let (to_write, syntax_note) =
         crate::agent::tools::syntax_gate(std::path::Path::new(path), &candidate)?;
-    // Snapshot pre-update content for /rewind, reusing the bytes we
-    // already read into `original` rather than re-reading from disk.
-    crate::agent::tools::snapshots::capture_bytes(std::path::Path::new(path), original.as_bytes());
+    // Snapshot pre-update content for /rewind, reusing the bytes we already
+    // read rather than re-reading from disk.
+    crate::agent::tools::snapshots::capture_bytes(std::path::Path::new(path), &original_bytes);
     crate::fs_atomic::atomic_write(std::path::Path::new(path), to_write.as_bytes())
         .await
         .map_err(|e| format!("write failed: {}", e))?;
     let mut msg = format!("updated {}", path);
     crate::agent::tools::append_repair_note(&mut msg, syntax_note);
+    if let Some(note) = mixed_ending_note {
+        msg.push('\n');
+        msg.push_str(&note);
+    }
     Ok(msg)
 }
 
@@ -262,6 +257,7 @@ impl Tool for ApplyPatchTool {
         }
 
         let mut results = Vec::new();
+        let mut failed = false;
 
         for op in &args.operations {
             // Plan-mode restriction is enforced at the permission-
@@ -334,6 +330,7 @@ impl Tool for ApplyPatchTool {
                     MAX_CREATE_SIZE,
                     content.len()
                 ));
+                failed = true;
                 break;
             }
 
@@ -350,6 +347,7 @@ impl Tool for ApplyPatchTool {
                      update matches the current on-disk contents",
                     op_path
                 ));
+                failed = true;
                 break;
             }
 
@@ -403,6 +401,7 @@ impl Tool for ApplyPatchTool {
                 }
                 Err(e) => {
                     results.push(format!("FAILED: {}", e));
+                    failed = true;
                     break;
                 }
             }
@@ -416,7 +415,17 @@ impl Tool for ApplyPatchTool {
             cache.clear();
         }
 
-        Ok(results.join("\n"))
+        // dirge-tc9l: a mid-batch failure must be an Err, not Ok("FAILED:..").
+        // The consecutive-failure recovery checkpoint, repeat-loop guard, and
+        // critic transcript labeling all key off errored tool results; an Ok
+        // return made a model looping on a failing op invisible to every one
+        // of those interventions. Keep the per-op text (prior successes + the
+        // failure) as the error message so the model still sees what happened.
+        let joined = results.join("\n");
+        if failed {
+            return Err(ToolError::Msg(joined));
+        }
+        Ok(joined)
     }
 }
 
@@ -441,6 +450,63 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.path);
         }
+    }
+
+    // dirge-tc9l: a mid-batch failure must surface as Err so the
+    // consecutive-failure recovery checkpoint, repeat-loop guard, and critic
+    // transcript labeling (which all key off errored tool results) actually
+    // see it. Returning Ok("FAILED: ...") hid the failure from every one of
+    // them. The successful op's text is kept in the error message.
+    #[tokio::test]
+    async fn batch_ending_in_failure_returns_err() {
+        let tf = TestFile::new("tc9l-batch.txt");
+        std::fs::write(&tf.path, "hello world").unwrap();
+        let tool = ApplyPatchTool::new(None, None);
+        let out = tool
+            .call(ApplyPatchArgs {
+                operations: vec![
+                    // Succeeds.
+                    PatchOp::Update {
+                        path: tf.path.clone(),
+                        old_text: "hello".to_string(),
+                        new_text: "goodbye".to_string(),
+                    },
+                    // Fails: old_text no longer present.
+                    PatchOp::Update {
+                        path: tf.path.clone(),
+                        old_text: "nonexistent".to_string(),
+                        new_text: "x".to_string(),
+                    },
+                ],
+            })
+            .await;
+        let err = out.expect_err("a failing op must make the batch return Err");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("FAILED"), "err should keep per-op text: {msg}");
+        // The earlier op stays applied (documented behavior) and its text is
+        // preserved in the message.
+        assert!(
+            msg.contains("updated"),
+            "err should keep prior success: {msg}"
+        );
+        assert_eq!(std::fs::read_to_string(&tf.path).unwrap(), "goodbye world");
+    }
+
+    #[tokio::test]
+    async fn all_succeeding_batch_returns_ok() {
+        let tf = TestFile::new("tc9l-ok.txt");
+        std::fs::write(&tf.path, "alpha").unwrap();
+        let tool = ApplyPatchTool::new(None, None);
+        let out = tool
+            .call(ApplyPatchArgs {
+                operations: vec![PatchOp::Update {
+                    path: tf.path.clone(),
+                    old_text: "alpha".to_string(),
+                    new_text: "beta".to_string(),
+                }],
+            })
+            .await;
+        assert!(out.is_ok(), "a fully-successful batch must return Ok");
     }
 
     #[tokio::test]
@@ -568,8 +634,12 @@ mod tests {
                     },
                 ],
             })
-            .await
-            .unwrap();
+            .await;
+
+        // dirge-tc9l: a batch ending in failure returns Err (was Ok before), so
+        // the recovery machinery sees it. The message keeps both the success
+        // and the failure text.
+        let msg = format!("{:?}", result.expect_err("batch with a failing op → Err"));
 
         // A was created.
         assert!(Path::new(&a.path).exists(), "A must remain applied");
@@ -585,8 +655,8 @@ mod tests {
             "C must not run after failure"
         );
         // Report names both the success and the failure.
-        assert!(result.contains("created"), "got: {result}");
-        assert!(result.contains("FAILED"), "got: {result}");
+        assert!(msg.contains("created"), "got: {msg}");
+        assert!(msg.contains("FAILED"), "got: {msg}");
     }
 
     // Regression: create previously had no size cap; the agent could write
@@ -605,11 +675,12 @@ mod tests {
                     content: too_big,
                 }],
             })
-            .await
-            .unwrap();
+            .await;
 
-        assert!(result.contains("FAILED"), "got: {result}");
-        assert!(result.contains("exceeds"), "got: {result}");
+        // dirge-tc9l: a rejected op is now an Err, not Ok("FAILED: ...").
+        let msg = format!("{:?}", result.expect_err("oversized create → Err"));
+        assert!(msg.contains("FAILED"), "got: {msg}");
+        assert!(msg.contains("exceeds"), "got: {msg}");
         assert!(
             !Path::new(&tf.path).exists(),
             "no file should exist after size-limit rejection"

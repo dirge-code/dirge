@@ -34,6 +34,7 @@ pub(crate) mod snapshots;
 mod spec;
 pub mod task;
 mod task_status;
+pub(crate) mod text_io;
 pub(crate) mod todo;
 pub mod tool_search;
 mod webfetch;
