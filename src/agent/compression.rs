@@ -512,8 +512,11 @@ fn summarize_tool_result(tool_name: &str, content: &str) -> String {
                 .next()
                 .map(|l| l.trim_start_matches("$ ").trim_start_matches("> "))
                 .unwrap_or("?");
-            let cmd_short = if cmd.len() > 80 {
-                format!("{}…", &cmd[..77])
+            // Truncate by chars, not bytes: a byte-index slice panics
+            // when a multibyte char (CJK/emoji/accented path) straddles
+            // the cut, and this runs on every fold (dirge-tpak).
+            let cmd_short = if cmd.chars().count() > 80 {
+                format!("{}…", cmd.chars().take(77).collect::<String>())
             } else {
                 cmd.to_string()
             };
@@ -899,6 +902,24 @@ mod tests {
     #[test]
     fn summary_prefix_starts_with_compaction_marker() {
         assert!(SUMMARY_PREFIX.starts_with(COMPACTION_MARKER));
+    }
+
+    /// dirge-tpak: the bash-command preview truncates by byte index after
+    /// a byte-length check, so a multibyte char straddling byte 77 (CJK,
+    /// emoji, accented path) panics. Since this runs on every fold and
+    /// overflow recovery, the panic kills the loop before the rotated
+    /// session saves. Must not panic and must stay a valid string.
+    #[test]
+    fn bash_summary_does_not_panic_on_multibyte_command() {
+        // A long command whose byte 77 lands mid-emoji.
+        let cmd = format!("echo {}", "🚀".repeat(40));
+        let content = format!("{cmd}\nsome output\nmore output");
+        let summary = summarize_tool_result("bash", &content);
+        assert!(summary.starts_with("[bash] ran `"));
+        // A CJK path at the boundary must also be safe.
+        let cmd2 = format!("cat {}", "日本語のファイル/".repeat(10));
+        let summary2 = summarize_tool_result("bash", &cmd2);
+        assert!(summary2.contains("[bash] ran `"));
     }
 
     /// #443: the prefix must keep the marker AND warn that work described in
