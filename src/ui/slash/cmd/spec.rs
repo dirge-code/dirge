@@ -7,12 +7,18 @@
 use crate::ui::slash::{SlashCtx, c_result};
 use crate::ui::theme;
 
+/// Anchor the spec store on the session's working dir, matching /issues,
+/// /graph, and /clear. dirge-s5oh: this used to build ProjectPaths from the
+/// process cwd, so after `/sessions <id>` into a session saved elsewhere
+/// (swap_to_session updates session.working_dir but never `set_current_dir`),
+/// /spec read the cwd project's store while its siblings read the session
+/// project's — two commands over the "same" session DB disagreeing.
+fn resolve_project_paths(working_dir: &str) -> crate::extras::dirge_paths::ProjectPaths {
+    crate::extras::dirge_paths::ProjectPaths::new(std::path::Path::new(working_dir))
+}
+
 pub(crate) async fn cmd_spec(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyhow::Result<()> {
-    let paths = std::env::current_dir()
-        .map(|c| crate::extras::dirge_paths::ProjectPaths::new(&c))
-        .unwrap_or_else(|_| {
-            crate::extras::dirge_paths::ProjectPaths::new(std::path::Path::new("."))
-        });
+    let paths = resolve_project_paths(ctx.session.working_dir.as_str());
     let store = match crate::extras::spec_db::SpecStore::open(&paths) {
         Ok(s) => s,
         Err(e) => {
@@ -179,4 +185,38 @@ fn show_specs(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // dirge-s5oh: /spec must anchor its ProjectPaths on the session's
+    // working_dir (like /issues, /graph, /clear), not the process cwd.
+    #[test]
+    fn resolves_paths_from_the_given_working_dir_not_process_cwd() {
+        // If an explicit project-root override is active, anchoring is
+        // env-driven and this assertion doesn't apply.
+        if crate::extras::dirge_paths::project_root_override().is_some() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("dirge-spec-s5oh-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let canon = dir.canonicalize().unwrap();
+
+        let paths = resolve_project_paths(dir.to_str().unwrap());
+        // No .git above /tmp → project root is the working_dir itself.
+        assert_eq!(
+            paths.root, canon,
+            "spec must anchor on the session working_dir"
+        );
+        // And specifically not the process cwd (the s5oh bug).
+        assert_ne!(
+            paths.root,
+            std::env::current_dir().unwrap(),
+            "spec must not fall back to the process cwd"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

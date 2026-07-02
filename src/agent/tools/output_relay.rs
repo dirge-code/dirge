@@ -195,7 +195,11 @@ fn build_transient_path(tool: &str) -> PathBuf {
 ///
 /// `header_note` is prepended outside the summary block — e.g.
 /// `bash` uses it to surface the exit code. May be empty.
-fn format_summary(tool: &str, full: &str, path: &Path, header_note: &str) -> String {
+/// `path` is `Some` only when the full output was successfully written to
+/// disk. dirge-2hdc: on a write failure it's `None`, and the trailer says the
+/// output couldn't be stored instead of pointing the model at a file that was
+/// never created (which made it burn turns reading a nonexistent path).
+fn format_summary(tool: &str, full: &str, path: Option<&Path>, header_note: &str) -> String {
     let lines: Vec<&str> = full.split_inclusive('\n').collect();
     let total = lines.len();
 
@@ -206,7 +210,6 @@ fn format_summary(tool: &str, full: &str, path: &Path, header_note: &str) -> Str
     let tail: String = lines[tail_start..].concat();
     let elided = tail_start.saturating_sub(head_end);
 
-    let path_display = path.display();
     let mut out = String::new();
     if !header_note.is_empty() {
         out.push_str(header_note);
@@ -225,12 +228,21 @@ fn format_summary(tool: &str, full: &str, path: &Path, header_note: &str) -> Str
     if !out.ends_with('\n') {
         out.push('\n');
     }
-    out.push_str(&format!(
-        "\n[{tool} output relayed: {total} lines, {bytes} bytes total. \
-         Full output stored at {path_display}. \
-         Use the `read` tool with `offset`/`limit` to inspect specific portions.]",
-        bytes = full.len(),
-    ));
+    match path {
+        Some(path) => out.push_str(&format!(
+            "\n[{tool} output relayed: {total} lines, {bytes} bytes total. \
+             Full output stored at {path_display}. \
+             Use the `read` tool with `offset`/`limit` to inspect specific portions.]",
+            bytes = full.len(),
+            path_display = path.display(),
+        )),
+        None => out.push_str(&format!(
+            "\n[{tool} output relayed: {total} lines, {bytes} bytes total. \
+             The full output could not be stored to disk, so the elided portion \
+             is unavailable — do not try to read it from a file.]",
+            bytes = full.len(),
+        )),
+    }
     out
 }
 
@@ -295,8 +307,14 @@ pub fn relay_if_large(tool: &str, output: String, header_note: &str) -> RelayOut
     // shallow walk of `~/.dirge/transient`) and self-healing.
     cleanup_aged(&transient_base());
 
-    let summary_path: &Path = &path;
-    let text = format_summary(tool, &output, summary_path, header_note);
+    // Only hand format_summary the path when the write actually succeeded, so
+    // the model isn't told to read a file that doesn't exist (dirge-2hdc).
+    let text = format_summary(
+        tool,
+        &output,
+        wrote_ok.then_some(path.as_path()),
+        header_note,
+    );
     RelayOutcome {
         text,
         relayed_to: if wrote_ok { Some(path) } else { None },
@@ -433,6 +451,45 @@ mod tests {
         if let Some(p) = outcome.relayed_to {
             let _ = std::fs::remove_file(&p);
         }
+    }
+
+    // dirge-2hdc: when the transient write failed, the summary must NOT tell
+    // the model to read a file that was never written — otherwise it burns
+    // turns reading a nonexistent path. With no path we say the full output
+    // couldn't be stored.
+    #[test]
+    fn summary_without_path_does_not_point_at_a_file() {
+        let payload: String = (0..500).map(|i| format!("LINE{i}\n")).collect();
+        let out = format_summary("bash", &payload, None, "");
+        // Head/tail still present.
+        assert!(out.contains("LINE0"));
+        assert!(out.contains("LINE499"));
+        // No read-a-file hint, since there is no file.
+        assert!(
+            !out.contains("stored at"),
+            "must not claim a stored file: {out}"
+        );
+        assert!(
+            !out.contains("`read`"),
+            "must not send the model to the read tool: {out}"
+        );
+        assert!(
+            out.contains("could not be stored"),
+            "must say the output was not stored: {out}"
+        );
+    }
+
+    // The Some(path) branch keeps the read hint + path.
+    #[test]
+    fn summary_with_path_points_at_the_file() {
+        let payload: String = (0..500).map(|i| format!("LINE{i}\n")).collect();
+        let p = std::path::PathBuf::from("/tmp/dirge-relay-example.txt");
+        let out = format_summary("bash", &payload, Some(&p), "");
+        assert!(
+            out.contains("stored at /tmp/dirge-relay-example.txt"),
+            "{out}"
+        );
+        assert!(out.contains("`read`"), "{out}");
     }
 
     /// Header note (bash exit code) renders at the top of the
