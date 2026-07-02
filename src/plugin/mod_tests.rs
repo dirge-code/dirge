@@ -2240,6 +2240,38 @@ fn load_plugin_isolates_bare_hooks_across_plugins() {
     assert!(out.contains(&"from-beta".to_string()));
 }
 
+/// dirge-awwr: a plugin that does NOT define a given bare hook must not
+/// inherit an earlier plugin's leftover bare hook. Pre-fix the loader
+/// aliased bare -> `{stem}-hook` but never unbound the bare symbol from the
+/// shared env, so beta's scan found alpha's leftover bare `on-prompt` and
+/// re-registered it as `beta-on-prompt` — firing alpha's hook once per
+/// subsequently-loaded plugin (doubled notifications/timers).
+#[test]
+fn load_plugin_does_not_leak_bare_hook_to_later_plugin() {
+    let p1 = tmpfile("alpha-leak", r#"(defn on-prompt [ctx] "from-alpha")"#);
+    // beta defines a DIFFERENT bare hook, never on-prompt.
+    let p2 = tmpfile("beta-leak", r#"(defn on-response [ctx] "from-beta")"#);
+    let mut mgr = PluginManager::try_new().unwrap();
+    super::load_plugin(&mut mgr, &p1).unwrap();
+    let beta = super::load_plugin(&mut mgr, &p2).unwrap();
+    let _ = std::fs::remove_file(&p1);
+    let _ = std::fs::remove_file(&p2);
+
+    // beta never defined on-prompt, so it must not register one.
+    assert!(
+        !beta.hooks_registered.contains(&"on-prompt".to_string()),
+        "beta inherited alpha's bare on-prompt: {:?}",
+        beta.hooks_registered
+    );
+    // on-prompt fires exactly once (alpha), not once per loaded plugin.
+    let out = mgr.dispatch("on-prompt", "@{:prompt \"x\"}").unwrap();
+    assert_eq!(
+        out,
+        vec!["from-alpha".to_string()],
+        "on-prompt double-fired: {out:?}"
+    );
+}
+
 /// Multi-line and tab-containing Janet error messages must not
 /// break the `level\tmsg\n` notification format. drain_notifications
 /// splits on `\n` per entry and on the first `\t` per level/msg,

@@ -123,13 +123,23 @@ pub fn load_plugin(
         let prefixed = format!("{}-{}", stem, hook);
         let escaped_hook = super::escape_janet_string(hook);
         let escaped_prefixed = super::escape_janet_string(&prefixed);
+        // dirge-awwr: after promoting the bare hook to `{stem}-{hook}`, UNBIND
+        // the bare symbol from the shared env. Otherwise it lingers and the
+        // next plugin's scan (which reads the same `curenv`) finds this
+        // plugin's leftover bare hook, aliases it under ITS own stem, and
+        // registers it again — firing this plugin's hook once per
+        // subsequently-loaded plugin. Only unbind if we promoted it (or it was
+        // already promoted), so a plugin that legitimately redefines the bare
+        // symbol still lands in its own prefixed slot first.
         let alias_code = format!(
             r#"(let [env (curenv)
                     bare-sym (symbol "{bare}")
                     prefixed-sym (symbol "{prefixed}")
                     bare-entry (get env bare-sym)]
-                 (when (and bare-entry (not (get env prefixed-sym)))
-                   (put env prefixed-sym bare-entry)))"#,
+                 (when bare-entry
+                   (when (not (get env prefixed-sym))
+                     (put env prefixed-sym bare-entry))
+                   (put env bare-sym nil)))"#,
             bare = escaped_hook,
             prefixed = escaped_prefixed,
         );
