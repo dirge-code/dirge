@@ -135,8 +135,21 @@ pub(crate) async fn handle_context_compacted(
         // summary so it reaches resumed context through the existing
         // summary-injection path.
         let anchored = anchor_summary_with_intent(&intent, summary);
+        // dirge-4kgk: `first_kept_index` arrives in LOOP space (the agent
+        // loop's `current_context.messages`, where every tool_result is its
+        // own entry). `compress_reporting` drains `session.messages`, where
+        // tool results are embedded in their assistant message — a much
+        // shorter vec. Feeding the loop-space index straight in over-drains
+        // and destroys the recent verbatim tail, so a crash-resume recovers
+        // only the lossy summary. Recompute the cut in session space using
+        // the same keep-recent policy as the `/compress` path.
+        let _ = first_kept_index;
+        let session_cut = crate::session::compact::compaction_cut_idx(
+            ctx.session,
+            ctx.cfg.resolve_keep_recent_tokens(),
+        );
         ctx.session
-            .compress_reporting(anchored, first_kept_index, token_savings);
+            .compress_reporting(anchored, session_cut, token_savings);
     }
     // dirge-hs61: capture the outgoing id, do ALL the mutations (id
     // rotation + disk save), THEN fire the on_session_switch hook. Pre-fix

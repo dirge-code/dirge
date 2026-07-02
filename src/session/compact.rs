@@ -212,3 +212,135 @@ pub(crate) fn compress_reporting(
     session.updated_at = CompactString::new(chrono::Utc::now().to_rfc3339());
     sibling_pruned_count
 }
+
+/// Smallest index `>= cut_idx` whose message is a User turn, clamped to
+/// `messages.len()` when none is found at or after `cut_idx`. Cutting the
+/// session on a user boundary guarantees the kept tail never begins with an
+/// orphaned tool_result (which would 400 the next request) — same discipline
+/// as the loop-space `compression::compute_compress_window`. Snapping FORWARD
+/// only ever keeps a whole recent turn, never half of a tool_use↔result pair.
+pub(crate) fn align_cut_to_user_boundary(messages: &[SessionMessage], cut_idx: usize) -> usize {
+    let mut i = cut_idx;
+    while i < messages.len() && messages[i].role != MessageRole::User {
+        i += 1;
+    }
+    i
+}
+
+/// Compute the SESSION-SPACE compaction cut: the index of the first message
+/// to KEEP verbatim, chosen so the kept tail holds roughly `keep_recent_tokens`
+/// of the most recent conversation, aligned to a user boundary.
+///
+/// This is the canonical cut used by BOTH the `/compress` slash path and the
+/// auto-fold persistence handler. The distinction matters for dirge-4kgk: the
+/// agent loop reports its fold boundary in LOOP space (`current_context.messages`,
+/// where every tool_result is its own entry), but `compress_reporting` drains
+/// `session.messages` (tool results embedded in their assistant message, far
+/// fewer entries). Feeding a loop-space index straight into the session vec
+/// over-drains and destroys the verbatim tail; recompute the cut here in
+/// session space instead.
+pub(crate) fn compaction_cut_idx(session: &Session, keep_recent_tokens: u64) -> usize {
+    let mut accumulated = 0u64;
+    let mut cut_idx = session.messages.len();
+    for (i, msg) in session.messages.iter().enumerate().rev() {
+        if accumulated >= keep_recent_tokens {
+            cut_idx = i + 1;
+            break;
+        }
+        accumulated = accumulated.saturating_add(msg.estimated_tokens);
+    }
+    align_cut_to_user_boundary(&session.messages, cut_idx)
+}
+
+#[cfg(test)]
+mod cut_tests {
+    use super::*;
+    use crate::session::{ToolCallEntry, ToolCallState};
+
+    fn three_tools(prefix: &str) -> Vec<ToolCallEntry> {
+        (0..3)
+            .map(|i| ToolCallEntry {
+                id: format!("{prefix}-{i}"),
+                name: "bash".to_string(),
+                args: serde_json::json!({ "command": "echo hi" }),
+                state: ToolCallState::Completed {
+                    result: "ok".repeat(20),
+                },
+            })
+            .collect()
+    }
+
+    /// dirge-4kgk: the auto-fold handler must cut the session in SESSION
+    /// space. A tool-heavy conversation expands to many more LOOP entries
+    /// than session messages; feeding a loop-space index to `compress_reporting`
+    /// over-drains and destroys the recent verbatim tail. The session-space
+    /// cut keeps it.
+    #[test]
+    fn compaction_cut_is_session_space_and_keeps_recent_tail() {
+        let mut s = Session::new("p", "m", 128_000);
+        // Old, token-heavy head + tool-heavy middle (each assistant here
+        // expands to 1 + 3 = 4 loop entries).
+        s.add_message(MessageRole::User, &"original ask ".repeat(40));
+        s.add_message_with_tool_calls(
+            MessageRole::Assistant,
+            &"working on it ".repeat(40),
+            three_tools("a"),
+        );
+        s.add_message_with_tool_calls(
+            MessageRole::Assistant,
+            &"still working ".repeat(40),
+            three_tools("b"),
+        );
+        // Small, recent verbatim tail that MUST survive a fold.
+        s.add_message(MessageRole::User, "recent question");
+        s.add_message(MessageRole::Assistant, "recent answer");
+
+        // Loop space is strictly larger than session space because each
+        // tool_result becomes its own loop entry.
+        let loop_len = crate::agent::runner::convert_history(&s).len();
+        assert!(
+            loop_len > s.messages.len(),
+            "expected loop expansion ({loop_len}) > session len ({})",
+            s.messages.len()
+        );
+
+        // keep_recent picked to retain just the two small tail messages.
+        let cut = compaction_cut_idx(&s, 20);
+        assert!(cut > 0 && cut < s.messages.len(), "cut={cut}");
+        assert!(
+            s.messages[cut..]
+                .iter()
+                .any(|m| m.content.contains("recent question")),
+            "recent user turn must be in the kept tail"
+        );
+        assert!(
+            s.messages[cut..]
+                .iter()
+                .any(|m| m.content.contains("recent answer")),
+            "recent assistant turn must be in the kept tail"
+        );
+
+        // Fix: compressing at the session-space cut preserves the tail.
+        let mut fixed = s.clone();
+        compress(&mut fixed, "SUMMARY".to_string(), cut, 0);
+        assert!(
+            fixed
+                .messages
+                .iter()
+                .any(|m| m.content.contains("recent answer")),
+            "session-space cut must keep the verbatim tail"
+        );
+
+        // Regression: applying the LOOP-space index (the pre-fix bug) clamps
+        // to the session length and drains everything, destroying the tail.
+        let mut buggy = s.clone();
+        compress(&mut buggy, "SUMMARY".to_string(), loop_len, 0);
+        assert!(
+            !buggy
+                .messages
+                .iter()
+                .any(|m| m.content.contains("recent answer")),
+            "a loop-space index over-drains and loses the tail (the bug)"
+        );
+    }
+}
