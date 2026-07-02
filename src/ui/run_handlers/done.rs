@@ -19,6 +19,7 @@ use compact_str::CompactString;
 use crossterm::style::Color;
 use tokio::sync::mpsc;
 
+#[cfg(feature = "plugin")]
 use crate::context::ContextFiles;
 use crate::event::AgentEvent;
 #[cfg(feature = "plugin")]
@@ -42,29 +43,75 @@ pub(crate) struct LoopBits<'a> {
     pub label: &'a mut Option<String>,
 }
 
-// False positive for `await_holding_lock`: the plugin-manager guard
-// IS held during dispatch calls (sync) but is explicitly `drop(mgr)`-ed
-// at line 209 BEFORE the `build_agent(...).await` at line 236, and
-// re-acquired in a new scope at line 263. Clippy can't trace the
-// `drop()` so it flags the outer `let mut mgr` as held across the
-// await even though it isn't.
-// `unused_mut` allowed: `response`'s `mut` is consumed only by the
-// plugin-gated `message-end` rewrite, so non-plugin builds see it
-// as unused.
-#[allow(clippy::too_many_arguments, clippy::await_holding_lock, unused_mut)]
+/// Apply a `prepare-next-run` model swap on-loop (dirge-qhfk stage 3b).
+/// Rebuilds the agent for the new model so the next user prompt runs against
+/// it, updating the session's model/provider/context-window. No-op for an
+/// empty model or one equal to the current. Extracted from handle_done so the
+/// off-loop `done_phase` arm can run it after the hook chain resolves.
+#[cfg(feature = "plugin")]
+pub(crate) async fn apply_next_model(
+    ctx: &mut RunCtx<'_>,
+    agent: &mut AnyAgent,
+    context: &mut ContextFiles,
+    deps: &AgentBuildDeps<'_>,
+    next_model: &str,
+) -> anyhow::Result<()> {
+    let trimmed = next_model.trim();
+    // Validate: empty string is a misconfiguration; don't replace the active
+    // model with nothing, and skip a no-op swap to the same model.
+    if trimmed.is_empty() || trimmed == ctx.session.model.as_str() {
+        return Ok(());
+    }
+    let new_model_compact = CompactString::new(trimmed);
+    let model_obj = deps.client.completion_model(new_model_compact.to_string());
+    *agent = crate::provider::build_agent(
+        model_obj,
+        ctx.cli,
+        ctx.cfg,
+        context,
+        deps.permission.clone(),
+        deps.ask_tx.clone(),
+        deps.question_tx.clone(),
+        deps.plan_tx.clone(),
+        deps.bg_store.clone(),
+        #[cfg(feature = "lsp")]
+        deps.lsp_manager.cloned(),
+        deps.sandbox.clone(),
+        #[cfg(feature = "mcp")]
+        deps.mcp_manager,
+        #[cfg(feature = "semantic")]
+        deps.semantic_manager,
+        Some(ctx.session.id.to_string()),
+    )
+    .await;
+    let old_model = ctx.session.model.clone();
+    ctx.session.model = new_model_compact.clone();
+    ctx.session.provider = ctx.cli.resolve_provider(ctx.cfg);
+    // Re-resolve context window for the new model — mirrors `/model` so a
+    // 128k→1M jump (or vice versa) updates the status indicator.
+    let new_ctx = ctx.cfg.resolve_context_window(new_model_compact.as_str());
+    if new_ctx != ctx.session.context_window {
+        ctx.session.context_window = new_ctx;
+    }
+    ctx.renderer.write_line(
+        &format!("[plugin] swapped model: {old_model} → {new_model_compact}"),
+        c_agent(),
+    )?;
+    Ok(())
+}
+
+// dirge-qhfk stage 3b: handle_done no longer holds the plugin-manager lock
+// across an await — the on-response/message-end/on-complete/prepare-next-run
+// chain (plus its model-swap rebuild) moved OFF the loop into `done_phase`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_done(
     ctx: &mut RunCtx<'_>,
-    // dirge-lsoq: `mut` so the `message-end` plugin hook can rewrite
-    // the finalized assistant text before it is stored/persisted.
-    mut response: CompactString,
+    response: CompactString,
     tokens: u64,
     cost: f64,
     was_reasoning: &mut bool,
     is_running: &mut bool,
     agent: &mut AnyAgent,
-    // Used only by the plugin-gated model-swap rebuild below; mark it used in
-    // no-plugin builds so `-D warnings` stays clean.
-    #[cfg_attr(not(feature = "plugin"), allow(unused_variables))] context: &mut ContextFiles,
     // dirge-4y4l: the ~10 build_agent inputs bundled (see AgentBuildDeps).
     deps: &AgentBuildDeps<'_>,
     agent_rx: &mut Option<mpsc::Receiver<AgentEvent>>,
@@ -79,37 +126,11 @@ pub(crate) async fn handle_done(
     #[cfg(feature = "plugin")] plugin_manager: Option<
         &std::sync::Arc<std::sync::Mutex<PluginManager>>,
     >,
+    // dirge-qhfk: the off-loop Done hook chain is parked here; the `done_phase`
+    // arm applies the model swap and runs finish_done once it resolves.
+    #[cfg(feature = "plugin")] done_phase: &mut Option<crate::ui::done_phase::DonePhaseHandle>,
     #[cfg(feature = "loop")] loop_bits: LoopBits<'_>,
 ) -> anyhow::Result<()> {
-    // Rebind the bundled deps to locals so the body below reads unchanged.
-    // Most of these feed ONLY the plugin-gated model-swap rebuild below (a
-    // plugin's `prepare-next-run` setting `harness-next-model`), so they're
-    // gated to `plugin` — otherwise a no-plugin build (e.g. windows-default)
-    // sees them unused and `-D warnings` fails. `bg_store` stays ungated: it
-    // also feeds `finalize_idle_turn`.
-    #[cfg(feature = "plugin")]
-    let client = deps.client;
-    #[cfg(feature = "plugin")]
-    let permission = deps.permission;
-    #[cfg(feature = "plugin")]
-    let ask_tx = deps.ask_tx;
-    #[cfg(feature = "plugin")]
-    let question_tx = deps.question_tx;
-    #[cfg(feature = "plugin")]
-    let plan_tx = deps.plan_tx;
-    // dirge-qhfk stage 3a: bg_store's only remaining use in handle_done is the
-    // plugin-gated model-swap rebuild (finalize_idle_turn moved to
-    // finish_done, which reads deps.bg_store itself), so gate it now.
-    #[cfg(feature = "plugin")]
-    let bg_store = deps.bg_store;
-    #[cfg(feature = "plugin")]
-    let sandbox = deps.sandbox;
-    #[cfg(all(feature = "mcp", feature = "plugin"))]
-    let mcp_manager = deps.mcp_manager;
-    #[cfg(all(feature = "semantic", feature = "plugin"))]
-    let semantic_manager = deps.semantic_manager;
-    #[cfg(all(feature = "lsp", feature = "plugin"))]
-    let lsp_manager = deps.lsp_manager;
     *was_reasoning = false;
     // A successful turn must not leave a chamber
     // half-painted. If anything slipped through
@@ -152,164 +173,33 @@ pub(crate) async fn handle_done(
     #[cfg(feature = "experimental-ui-terminal-tab")]
     ctx.renderer.set_last_tool_name("");
 
-    #[allow(unused_mut, unused_variables)]
-    let mut plugin_followup: Option<String> = None;
+    // dirge-qhfk stage 3b: run the on-response/message-end/on-complete/
+    // prepare-next-run chain OFF the loop so a hook opening a dialog can't
+    // freeze the single-threaded runtime that services dialog_rx. The turn's
+    // runner is finished (Done was terminal), so tear it down now — otherwise
+    // the loop would re-poll the closed channel while the phase runs. Keep
+    // is_running=true so further submits queue as steering rather than starting
+    // a new turn mid-chain. The done_phase arm applies the model swap and runs
+    // finish_done once the chain resolves.
     #[cfg(feature = "plugin")]
     if let Some(pm) = plugin_manager {
-        let mut mgr = pm.lock_ignore_poison();
-        match mgr.dispatch(
-            "on-response",
-            &format!(
-                "@{{:response \"{}\"}}",
-                crate::plugin::escape_janet_string(&response)
-            ),
-        ) {
-            Ok(results) if !results.is_empty() => {
-                for line in &results {
-                    // Sanitize plugin output (ANSI injection defense).
-                    let safe = crate::ui::events::sanitize_output(line);
-                    ctx.renderer
-                        .write_line(&format!("[plugin] {}", safe), theme::dim())?;
-                }
-                plugin_followup = Some(results.join("\n"));
-            }
-            Ok(_) => {}
-            Err(e) => {
-                ctx.renderer
-                    .write_line(&format!("[plugin] on-response error: {e}"), c_error())?;
-            }
+        if let Some(h) = agent_abort.take() {
+            h.abort();
         }
-        // Check for pending prompts queued by on-response
-        if let Some(pending) = mgr.take_pending_prompt() {
-            plugin_followup = Some(pending);
-        }
-        // dirge-lsoq: fire `message-end` so a plugin can rewrite the
-        // finalized assistant text via `harness/rewrite-message`. The
-        // text already streamed to the screen; this rewrites what is
-        // STORED + persisted (session DB, store_response), enabling
-        // post-hoc redaction/annotation of stored history.
-        match mgr.dispatch(
-            "message-end",
-            &format!(
-                "@{{:message \"{}\"}}",
-                crate::plugin::escape_janet_string(&response)
-            ),
-        ) {
-            Ok(_) => {
-                if let Some(rewritten) = mgr.take_message_rewrite() {
-                    response = compact_str::CompactString::new(&rewritten);
-                }
-            }
-            Err(e) => {
-                ctx.renderer
-                    .write_line(&format!("[plugin] message-end error: {e}"), c_error())?;
-            }
-        }
-        mgr.store_response(&response);
-        // Fire on-complete after on-response so
-        // plugins can react to "turn fully done."
-        // Previously this hook was in HOOK_NAMES
-        // (so plugins defining it got auto-aliased)
-        // but no host site dispatched — silent fail.
-        match mgr.dispatch("on-complete", "@{}") {
-            Ok(_) => {}
-            Err(e) => {
-                ctx.renderer
-                    .write_line(&format!("[plugin] on-complete error: {e}"), c_error())?;
-            }
-        }
-        // Fire `prepare-next-run` so plugins can
-        // signal session-level state changes for
-        // the next run. Closes the gap vs pi's
-        // `prepareNextTurn` for the auto-apply
-        // piece: when `harness-next-model` is
-        // set, the agent is rebuilt with the new
-        // model RIGHT HERE so the next user
-        // prompt runs against it without
-        // requiring `/model X`.
-        //
-        // Scope difference vs pi: pi fires
-        // `prepareNextTurn` between TURNS within
-        // a single agent run (and can swap model
-        // mid-stream). dirge fires
-        // `prepare-next-run` only between RUNS
-        // (after Done). Mid-stream swap requires
-        // breaking rig's multi-turn stream and
-        // restarting with a new agent — that
-        // would lose partial assistant state, so
-        // we keep the swap at run boundaries.
-        match mgr.dispatch("prepare-next-run", "@{}") {
-            Ok(_) => {}
-            Err(e) => {
-                ctx.renderer
-                    .write_line(&format!("[plugin] prepare-next-run error: {e}"), c_error())?;
-            }
-        }
-        let pending_next_model = mgr.take_pending_next_model();
-        // Release the plugin-manager guard before any `.await` below —
-        // `std::sync::MutexGuard` is `!Send`, and the agent rebuild
-        // path awaits a future. Re-acquire after the await for the
-        // final `set harness-response nil`.
-        drop(mgr);
-        if let Some(next_model) = pending_next_model {
-            // Validate: empty string is a
-            // misconfiguration. Don't replace the
-            // active model with nothing.
-            let trimmed = next_model.trim();
-            if !trimmed.is_empty() && trimmed != ctx.session.model.as_str() {
-                let new_model_compact = CompactString::new(trimmed);
-                let model_obj = client.completion_model(new_model_compact.to_string());
-                *agent = crate::provider::build_agent(
-                    model_obj,
-                    ctx.cli,
-                    ctx.cfg,
-                    context,
-                    permission.clone(),
-                    ask_tx.clone(),
-                    question_tx.clone(),
-                    plan_tx.clone(),
-                    bg_store.clone(),
-                    #[cfg(feature = "lsp")]
-                    lsp_manager.cloned(),
-                    sandbox.clone(),
-                    #[cfg(feature = "mcp")]
-                    mcp_manager,
-                    #[cfg(feature = "semantic")]
-                    semantic_manager,
-                    Some(ctx.session.id.to_string()),
-                )
-                .await;
-                let old_model = ctx.session.model.clone();
-                ctx.session.model = new_model_compact.clone();
-                ctx.session.provider = ctx.cli.resolve_provider(ctx.cfg);
-                // Re-resolve context window for
-                // the new model — mirrors the
-                // `/model` slash behavior so a
-                // 128k→1M jump (or vice versa)
-                // updates the status indicator.
-                let new_ctx = ctx.cfg.resolve_context_window(new_model_compact.as_str());
-                if new_ctx != ctx.session.context_window {
-                    ctx.session.context_window = new_ctx;
-                }
-                ctx.renderer.write_line(
-                    &format!(
-                        "[plugin] swapped model: {} → {}",
-                        old_model, new_model_compact,
-                    ),
-                    c_agent(),
-                )?;
-            }
-        }
-        // Clear `harness-response` so the next hook
-        // doesn't see stale text from this turn. Re-acquire the
-        // lock here since we released it above to satisfy
-        // `clippy::await_holding_lock`.
-        {
-            let mut mgr = pm.lock_ignore_poison();
-            let _ = mgr.eval("(set harness-response nil)");
-        }
+        *agent_rx = None;
+        *agent_interject = None;
+        *agent_cancel = None;
+        *done_phase = Some(crate::ui::done_phase::spawn(
+            pm.clone(),
+            response,
+            tokens,
+            cost,
+        ));
+        return Ok(());
     }
 
+    // No plugin (feature off or no manager): no hook chain, rewrite, or model
+    // swap — run the tail directly with the response as-is.
     finish_done(
         ctx,
         response,
@@ -318,7 +208,7 @@ pub(crate) async fn handle_done(
         agent,
         is_running,
         deps,
-        plugin_followup,
+        None,
         agent_rx,
         agent_abort,
         agent_interject,

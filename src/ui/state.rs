@@ -201,6 +201,10 @@ pub(crate) struct UiState {
     /// In-flight off-loop `on-prompt` hook dispatch; the `prompt_phase` arm
     /// resolves the hint/replace and runs the submit tail. dirge-qhfk.
     pub(crate) prompt_phase: Option<crate::ui::prompt_phase::PromptPhaseHandle>,
+    /// In-flight off-loop Done hook chain (on-response/message-end/on-complete/
+    /// prepare-next-run); the `done_phase` arm applies the model swap and runs
+    /// the finish_done tail. dirge-qhfk.
+    pub(crate) done_phase: Option<crate::ui::done_phase::DonePhaseHandle>,
     /// In-flight non-blocking `/plan` reviewer (the write-disabled reviewer runs
     /// code on a spawned task); the `review_phase` arm applies the verdict.
     /// dirge-4koy.
@@ -431,6 +435,7 @@ impl UiState {
             plan_phase: None,
             compaction_phase: None,
             prompt_phase: None,
+            done_phase: None,
             review_phase: None,
             btw_phase: None,
             wt_merge_phase: None,

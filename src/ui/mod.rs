@@ -7,6 +7,7 @@ pub(crate) mod buffer;
 mod chat_state;
 pub(crate) mod colors;
 pub(crate) mod compaction;
+pub(crate) mod done_phase;
 pub(crate) mod events;
 pub(crate) mod gitstatus;
 mod highlight;
@@ -1639,6 +1640,12 @@ pub async fn run_interactive(
                                 if let Some(ph) = ui.prompt_phase.take() {
                                     ph.core.task.abort();
                                 }
+                                // dirge-qhfk: and an in-flight off-loop Done hook
+                                // chain; its model-swap + finalize is discarded
+                                // (the partial turn is persisted below).
+                                if let Some(ph) = ui.done_phase.take() {
+                                    ph.core.task.abort();
+                                }
                                 // dirge-4koy: likewise abort an in-flight `/plan`
                                 // reviewer (the write-disabled reviewer task);
                                 // its verdict continuation is discarded.
@@ -1757,6 +1764,10 @@ pub async fn run_interactive(
                             }
                             // dirge-qhfk: and an in-flight off-loop on-prompt hook.
                             if let Some(ph) = ui.prompt_phase.take() {
+                                ph.core.task.abort();
+                            }
+                            // dirge-qhfk: and an in-flight off-loop Done hook chain.
+                            if let Some(ph) = ui.done_phase.take() {
                                 ph.core.task.abort();
                             }
                             // dirge-4koy: and an in-flight `/plan` reviewer.
@@ -3072,7 +3083,6 @@ pub async fn run_interactive(
                             &mut ui.was_reasoning,
                             &mut ui.is_running,
                             &mut agent,
-                            context,
                             &make_agent_build_deps!(),
                             &mut ui.agent_rx,
                             &mut ui.agent_abort,
@@ -3082,6 +3092,8 @@ pub async fn run_interactive(
                             &mut ui.review_phase,
                             #[cfg(feature = "plugin")]
                             plugin_manager,
+                            #[cfg(feature = "plugin")]
+                            &mut ui.done_phase,
                             #[cfg(feature = "loop")]
                             loop_bits,
                         ).await?;
@@ -3411,6 +3423,85 @@ pub async fn run_interactive(
                     None => {
                         // Task aborted / channel closed without an event —
                         // release the busy state so the loop accepts input.
+                        ui.is_running = false;
+                        renderer.set_avatar_state(avatar::AvatarState::Idle);
+                    }
+                }
+                renderer.request_repaint();
+            }
+            // dirge-qhfk: off-loop Done hook chain. The on-response /
+            // message-end / on-complete / prepare-next-run chain ran on a
+            // spawned task so a hook opening a dialog couldn't freeze the loop;
+            // this arm prints the collected `[plugin]` output, applies any
+            // model swap on-loop, and runs the shared finish_done tail with the
+            // (possibly rewritten) response.
+            ev = async {
+                if let Some(ph) = &mut ui.done_phase {
+                    ph.core.rx.recv().await
+                } else {
+                    std::future::pending().await
+                }
+            } => {
+                use crate::ui::done_phase::DonePhaseEvent;
+                let Some(handle) = ui.done_phase.take() else {
+                    continue;
+                };
+                let tokens = handle.tokens;
+                let cost = handle.cost;
+                match ev {
+                    Some(DonePhaseEvent::Ready(result)) => {
+                        for line in &result.lines {
+                            renderer.write_line(&format!("[plugin] {}", line), theme::dim())?;
+                        }
+                        for err in &result.errors {
+                            renderer.write_line(&format!("[plugin] {}", err), c_error())?;
+                        }
+                        // Apply a prepare-next-run model swap on-loop (agent
+                        // rebuild) before the tail runs.
+                        #[cfg(feature = "plugin")]
+                        if let Some(next_model) = result.next_model {
+                            let mut ctx = make_run_ctx!();
+                            run_handlers::done::apply_next_model(
+                                &mut ctx,
+                                &mut agent,
+                                context,
+                                &make_agent_build_deps!(),
+                                &next_model,
+                            )
+                            .await?;
+                        }
+                        let mut ctx = make_run_ctx!();
+                        #[cfg(feature = "loop")]
+                        let loop_bits = run_handlers::done::LoopBits {
+                            state: &mut loop_state,
+                            label: &mut ui.loop_label,
+                        };
+                        run_handlers::done::finish_done(
+                            &mut ctx,
+                            result.response,
+                            tokens,
+                            cost,
+                            &mut agent,
+                            &mut ui.is_running,
+                            &make_agent_build_deps!(),
+                            result.followup,
+                            &mut ui.agent_rx,
+                            &mut ui.agent_abort,
+                            &mut ui.agent_interject,
+                            &mut ui.agent_cancel,
+                            &ui.interjection_queue,
+                            &mut ui.review_phase,
+                            #[cfg(feature = "plugin")]
+                            plugin_manager,
+                            #[cfg(feature = "loop")]
+                            loop_bits,
+                        )
+                        .await?;
+                    }
+                    None => {
+                        // Task aborted / channel closed without a result (only
+                        // reachable if the task was cancelled out-of-band) —
+                        // release the busy state so the loop returns to idle.
                         ui.is_running = false;
                         renderer.set_avatar_state(avatar::AvatarState::Idle);
                     }
