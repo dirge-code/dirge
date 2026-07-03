@@ -293,11 +293,20 @@ where
                     // dirge-zf35: mirror the H-7 ToolCall dedupe. Some
                     // providers stream `ReasoningDelta`s and THEN send a
                     // complete `Reasoning` for the same content. If a
-                    // delta-built Thinking block is open, this complete
-                    // payload is the authoritative version of the SAME
-                    // block — replace it in place rather than pushing a
-                    // duplicate (which would double the transcript thinking
-                    // and the scavenge source).
+                    // delta-built Thinking block is open, fold this
+                    // complete payload into the SAME block rather than
+                    // pushing a duplicate (which would double the
+                    // transcript thinking and the scavenge source).
+                    //
+                    // But the complete event is NOT always the full
+                    // accumulated text: Anthropic sends the whole block,
+                    // while rig's Gemini provider only promotes the final
+                    // (thought_signature-bearing) chunk to a complete
+                    // `Reasoning` — the earlier chunks arrived as
+                    // `ReasoningDelta`s. Blindly replacing would drop
+                    // them. So: replace only when the complete text
+                    // subsumes what we accumulated; otherwise treat it as
+                    // the final delta and append.
                     match current_thinking_idx {
                         Some(idx)
                             if matches!(
@@ -305,7 +314,15 @@ where
                                 Some(ContentBlock::Thinking { .. })
                             ) =>
                         {
-                            partial.content[idx] = ContentBlock::Thinking { text };
+                            if let Some(ContentBlock::Thinking { text: acc }) =
+                                partial.content.get_mut(idx)
+                            {
+                                if acc.is_empty() || text.starts_with(acc.as_str()) {
+                                    *acc = text;
+                                } else {
+                                    acc.push_str(&text);
+                                }
+                            }
                         }
                         _ => partial.content.push(ContentBlock::Thinking { text }),
                     }
@@ -892,6 +909,87 @@ mod tests {
                     thinking.len(),
                     1,
                     "delta-built + complete reasoning must collapse to one block, got {thinking:?}"
+                );
+                assert_eq!(thinking[0], "Let me think about this");
+            }
+            _ => panic!("expected Done last"),
+        }
+    }
+
+    /// Gemini shape: non-signature thought parts stream as
+    /// `ReasoningDelta`s, and the complete `Reasoning` event carries
+    /// only the FINAL chunk (the thought_signature-bearing part), not
+    /// the full accumulated text. The complete arm must APPEND that
+    /// trailing chunk, not overwrite the accumulated block with it.
+    #[tokio::test]
+    async fn complete_reasoning_final_chunk_appends_to_deltas() {
+        let raw = raw_stream(vec![
+            Ok(StreamedAssistantContent::ReasoningDelta {
+                id: None,
+                reasoning: "chunk A".to_string(),
+            }),
+            Ok(StreamedAssistantContent::ReasoningDelta {
+                id: None,
+                reasoning: "chunk B".to_string(),
+            }),
+            Ok(StreamedAssistantContent::Reasoning(Reasoning::new(
+                "chunk C",
+            ))),
+        ]);
+        let events = drain(wrap_streamed_assistant(raw, None, None)).await;
+        match events.last().unwrap() {
+            StreamEvent::Done { message, .. } => {
+                let thinking: Vec<&String> = message
+                    .content
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::Thinking { text } => Some(text),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(
+                    thinking.len(),
+                    1,
+                    "expected one Thinking block, got {thinking:?}"
+                );
+                assert_eq!(
+                    thinking[0], "chunk Achunk Bchunk C",
+                    "complete Reasoning carrying only the final chunk must append, not overwrite"
+                );
+            }
+            _ => panic!("expected Done last"),
+        }
+    }
+
+    /// Complete `Reasoning` that extends the accumulated deltas
+    /// (starts with them) is authoritative — replace, don't append a
+    /// duplicated prefix.
+    #[tokio::test]
+    async fn complete_reasoning_superset_replaces_deltas() {
+        let raw = raw_stream(vec![
+            Ok(StreamedAssistantContent::ReasoningDelta {
+                id: None,
+                reasoning: "Let me".to_string(),
+            }),
+            Ok(StreamedAssistantContent::Reasoning(Reasoning::new(
+                "Let me think about this",
+            ))),
+        ]);
+        let events = drain(wrap_streamed_assistant(raw, None, None)).await;
+        match events.last().unwrap() {
+            StreamEvent::Done { message, .. } => {
+                let thinking: Vec<&String> = message
+                    .content
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::Thinking { text } => Some(text),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(
+                    thinking.len(),
+                    1,
+                    "expected one Thinking block, got {thinking:?}"
                 );
                 assert_eq!(thinking[0], "Let me think about this");
             }
