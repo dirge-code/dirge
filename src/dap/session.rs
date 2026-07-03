@@ -7,6 +7,7 @@
 use crate::sync_util::LockExt;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
@@ -230,6 +231,20 @@ impl DapSession {
         while self.events.stopped.try_recv().is_ok() {}
     }
 
+    /// Drain queued stopped events, returning the most recent one. `pause`
+    /// uses this instead of the plain drain: a queued stop with no waiter can
+    /// be a genuine never-reported halt (e.g. a breakpoint hit after a
+    /// timed-out continue, status still Running). Pausing an already-stopped
+    /// program produces no new event, so discarding the drained stop would
+    /// lose it — the wait times out and the status sticks at Running.
+    fn drain_stopped_latest(&mut self) -> Option<StoppedEventBody> {
+        let mut latest = None;
+        while let Ok(evt) = self.events.stopped.try_recv() {
+            latest = Some(evt);
+        }
+        latest
+    }
+
     /// Drain and check for terminated/exited events.
     fn drain_termination(&mut self) {
         if self.events.terminated.try_recv().is_ok() {
@@ -288,7 +303,10 @@ impl DapSession {
 // ---------------------------------------------------------------------------
 
 pub struct DapSessionManager {
-    active: Mutex<Option<DapSession>>,
+    /// In an `Arc` so `continue_` can hand the stop-wait (phases 2+3) to a
+    /// spawned task that outlives a cancelled caller — see dirge-acgj notes
+    /// in `continue_`.
+    active: Arc<Mutex<Option<DapSession>>>,
     next_id: std::sync::atomic::AtomicU64,
     /// Last successfully-built panel snapshot. The session methods hold
     /// `active` across their adapter round-trip, so the UI's `try_lock` in
@@ -301,7 +319,7 @@ pub struct DapSessionManager {
 impl DapSessionManager {
     pub fn new() -> Self {
         Self {
-            active: Mutex::new(None),
+            active: Arc::new(Mutex::new(None)),
             next_id: std::sync::atomic::AtomicU64::new(1),
             last_snapshot: std::sync::Mutex::new(None),
         }
@@ -707,6 +725,17 @@ impl DapSessionManager {
                 .as_mut()
                 .ok_or_else(|| ToolError::Msg("no active debug session".into()))?;
 
+            // A previous continue is still parked on its stop-wait and owns
+            // the event stream; the session holds the dead placeholder.
+            // Proceeding would issue a real continue, park on the dead
+            // receivers (instant false "disconnected"), and clear
+            // `stop_wait_in_flight` out from under the first waiter.
+            if session.stop_wait_in_flight {
+                return Err(ToolError::Msg(
+                    "a continue is already waiting for the next stop; its result will reflect this request".into(),
+                ));
+            }
+
             // dirge-un0g: clear stops queued from a prior halt so we wait for
             // the fresh one this continue induces, not a stale event.
             session.drain_stopped();
@@ -727,64 +756,78 @@ impl DapSessionManager {
             std::mem::replace(&mut session.events, EventReceivers::dead())
         };
 
-        // Phase 2: wait for the stop with the lock released.
-        enum StopOutcome {
-            Stopped(StoppedEventBody),
-            Terminated,
-            Disconnected,
-            TimedOut,
-        }
-        let outcome = tokio::select! {
-            s = receivers.stopped.recv() => match s {
-                Some(stopped) => StopOutcome::Stopped(stopped),
-                None => StopOutcome::Disconnected,
-            },
-            _ = receivers.terminated.recv() => StopOutcome::Terminated,
-            _ = tokio::time::sleep(timeout) => StopOutcome::TimedOut,
-        };
-
-        // Phase 3: re-acquire, restore the receivers, record the result.
-        let mut active = self.active.lock().await;
-        let session = active
-            .as_mut()
-            .ok_or_else(|| ToolError::Msg("debug session ended during continue".into()))?;
-        session.events = receivers;
-        session.stop_wait_in_flight = false;
-
-        let (stop_reason, stop_thread_id) = match outcome {
-            StopOutcome::Stopped(stopped) => {
-                session.status = SessionStatus::Stopped;
-                session.record_stopped_thread(&stopped);
-                (
-                    Some(stopped.reason.as_str().to_string()),
-                    stopped.thread_id.map(|id| id as u32),
-                )
+        // Phases 2+3 run in a spawned task so they survive caller drop: the
+        // agent tool executor drops the tool future on cancel, and a drop
+        // mid-park would destroy the live receivers and leave
+        // `stop_wait_in_flight` set forever — every later step/pause
+        // deflected by the guard, every continue parked on dead channels.
+        // Dropping the JoinHandle below merely detaches the task; it still
+        // restores the receivers and clears the flag whenever the adapter
+        // eventually stops, terminates, or the timeout fires.
+        let active = Arc::clone(&self.active);
+        let park = tokio::spawn(async move {
+            // Phase 2: wait for the stop with the lock released.
+            enum StopOutcome {
+                Stopped(StoppedEventBody),
+                Terminated,
+                Disconnected,
+                TimedOut,
             }
-            StopOutcome::Terminated => {
-                session.status = SessionStatus::Terminated;
-                (Some("terminated".into()), None)
-            }
-            StopOutcome::Disconnected => {
-                return Err(ToolError::Msg("debug adapter disconnected".into()));
-            }
-            StopOutcome::TimedOut => {
-                return Err(ToolError::Msg(format!(
-                    "timed out after {timeout:?} waiting for stop after continue"
-                )));
-            }
-        };
+            let outcome = tokio::select! {
+                s = receivers.stopped.recv() => match s {
+                    Some(stopped) => StopOutcome::Stopped(stopped),
+                    None => StopOutcome::Disconnected,
+                },
+                _ = receivers.terminated.recv() => StopOutcome::Terminated,
+                _ = tokio::time::sleep(timeout) => StopOutcome::TimedOut,
+            };
 
-        session.drain_output();
-        session.drain_termination();
+            // Phase 3: re-acquire, restore the receivers, record the result.
+            let mut active = active.lock().await;
+            let session = active
+                .as_mut()
+                .ok_or_else(|| ToolError::Msg("debug session ended during continue".into()))?;
+            session.events = receivers;
+            session.stop_wait_in_flight = false;
 
-        Ok(ContinueOutcome {
-            status: session.status.clone(),
-            output: session.output.clone(),
-            output_truncated: session.output_truncated,
-            exit_code: session.exit_code,
-            stop_reason,
-            thread_id: stop_thread_id,
-        })
+            let (stop_reason, stop_thread_id) = match outcome {
+                StopOutcome::Stopped(stopped) => {
+                    session.status = SessionStatus::Stopped;
+                    session.record_stopped_thread(&stopped);
+                    (
+                        Some(stopped.reason.as_str().to_string()),
+                        stopped.thread_id.map(|id| id as u32),
+                    )
+                }
+                StopOutcome::Terminated => {
+                    session.status = SessionStatus::Terminated;
+                    (Some("terminated".into()), None)
+                }
+                StopOutcome::Disconnected => {
+                    return Err(ToolError::Msg("debug adapter disconnected".into()));
+                }
+                StopOutcome::TimedOut => {
+                    return Err(ToolError::Msg(format!(
+                        "timed out after {timeout:?} waiting for stop after continue"
+                    )));
+                }
+            };
+
+            session.drain_output();
+            session.drain_termination();
+
+            Ok(ContinueOutcome {
+                status: session.status.clone(),
+                output: session.output.clone(),
+                output_truncated: session.output_truncated,
+                exit_code: session.exit_code,
+                stop_reason,
+                thread_id: stop_thread_id,
+            })
+        });
+
+        park.await
+            .map_err(|e| ToolError::Msg(format!("continue stop-wait task failed: {e}")))?
     }
 
     /// Step over (next).
@@ -887,9 +930,23 @@ impl DapSessionManager {
             .as_mut()
             .ok_or_else(|| ToolError::Msg("no active debug session".into()))?;
 
-        // dirge-un0g: clear stops queued from a prior halt so this pause waits
-        // for the fresh one it induces, not a stale event.
-        session.drain_stopped();
+        // A queued stop here can be a genuine never-reported halt (breakpoint
+        // hit after a timed-out continue, with nothing waiting on the
+        // channel). Pausing an already-stopped program yields no new event,
+        // so the plain dirge-un0g drain would eat the stop and the wait below
+        // would time out with the status stuck at Running. Treat the most
+        // recent drained stop as the pause result instead.
+        if let Some(stopped) = session.drain_stopped_latest() {
+            session.status = SessionStatus::Stopped;
+            session.record_stopped_thread(&stopped);
+            session.drain_output();
+            session.drain_termination();
+
+            let mut summary = session.summary();
+            summary.stop_reason = Some(stopped.reason.as_str().to_string());
+            summary.thread_id = stopped.thread_id.map(|id| id as u32);
+            return Ok(summary);
+        }
 
         let args = PauseArgs { thread_id };
         session
@@ -2153,5 +2210,358 @@ mod tests {
         release_tx.send(()).unwrap();
         let outcome = cont.await.unwrap().unwrap();
         assert_eq!(outcome.stop_reason.as_deref(), Some("breakpoint"));
+    }
+
+    /// A second continue issued while the first is parked on its stop-wait
+    /// must be rejected in phase 1, under the lock, before any request
+    /// reaches the adapter — otherwise it swaps out the dead placeholder as
+    /// its "receivers" (instant false disconnect) and clears
+    /// `stop_wait_in_flight` out from under the first waiter.
+    #[tokio::test]
+    async fn second_continue_while_parked_is_rejected() {
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let mgr = std::sync::Arc::new(DapSessionManager::new());
+        let signal = AbortSignal::new();
+        let client = client_with_free_running_adapter(release_rx);
+
+        mgr.launch_with_client(
+            "fake-adapter",
+            "/tmp",
+            Some("p"),
+            None,
+            &[],
+            Some(true),
+            None,
+            &signal,
+            client,
+            Duration::from_secs(5),
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        // Park the first continue.
+        let mgr2 = mgr.clone();
+        let cont = tokio::spawn(async move {
+            let signal = AbortSignal::new();
+            mgr2.continue_(1, &signal, Duration::from_secs(5)).await
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // The second continue must bail with the guard error, quickly.
+        let err = mgr
+            .continue_(1, &signal, Duration::from_secs(1))
+            .await
+            .expect_err("a second concurrent continue must be rejected");
+        assert!(
+            err.to_string().contains("already waiting"),
+            "unexpected error: {err}"
+        );
+
+        // The first continue is unaffected: release the stop, it reports it.
+        release_tx.send(()).unwrap();
+        let outcome = cont.await.unwrap().unwrap();
+        assert_eq!(outcome.stop_reason.as_deref(), Some("breakpoint"));
+    }
+
+    /// Launch handshake, then `continue` (respond, withhold the stop until
+    /// `release` fires), then a `next` step (respond → stopped(step)). Lets a
+    /// test cancel the parked continue and verify the session recovers once
+    /// the adapter finally stops.
+    fn client_with_cancel_recovery_adapter(
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) -> DapClient {
+        let (client_side, server_side) = tokio::io::duplex(4096);
+        let (client_read, client_write) = tokio::io::split(client_side);
+        let (server_read, server_write) = tokio::io::split(server_side);
+        let client_reader = tokio::io::BufReader::new(client_read);
+        let (rpc, _read_task) = DapRpc::new(client_reader, client_write);
+        tokio::spawn(async move {
+            let mut reader = tokio::io::BufReader::new(server_read);
+            let mut writer = server_write;
+
+            // initialize
+            let frame = decode_frame(&mut reader).await.unwrap();
+            let msg: Value = serde_json::from_slice(&frame).unwrap();
+            let seq = msg["seq"].as_u64().unwrap();
+            encode_frame(
+                &mut writer,
+                &serde_json::to_vec(&serde_json::json!({
+                    "type": "response", "seq": 1, "request_seq": seq, "success": true,
+                    "command": "initialize",
+                    "body": { "supportsConfigurationDoneRequest": true }
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+            // launch → stopped(entry, 1)
+            let frame = decode_frame(&mut reader).await.unwrap();
+            let msg: Value = serde_json::from_slice(&frame).unwrap();
+            assert_eq!(msg["command"], "launch");
+            encode_frame(
+                &mut writer,
+                &serde_json::to_vec(&serde_json::json!({
+                    "type": "event", "seq": 2, "event": "stopped",
+                    "body": { "reason": "entry", "threadId": 1 }
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+            // configurationDone
+            let frame = decode_frame(&mut reader).await.unwrap();
+            let msg: Value = serde_json::from_slice(&frame).unwrap();
+            assert_eq!(msg["command"], "configurationDone");
+
+            // continue → respond, withhold the stop until released.
+            let frame = decode_frame(&mut reader).await.unwrap();
+            let msg: Value = serde_json::from_slice(&frame).unwrap();
+            assert_eq!(msg["command"], "continue");
+            let seq = msg["seq"].as_u64().unwrap();
+            encode_frame(
+                &mut writer,
+                &serde_json::to_vec(&serde_json::json!({
+                    "type": "response", "seq": 3, "request_seq": seq, "success": true,
+                    "command": "continue", "body": { "allThreadsContinued": true }
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+            let _ = release.await;
+            encode_frame(
+                &mut writer,
+                &serde_json::to_vec(&serde_json::json!({
+                    "type": "event", "seq": 4, "event": "stopped",
+                    "body": { "reason": "breakpoint", "threadId": 1 }
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+            // A later step must still work: next → respond → stopped(step).
+            let frame = decode_frame(&mut reader).await.unwrap();
+            let msg: Value = serde_json::from_slice(&frame).unwrap();
+            assert_eq!(msg["command"], "next");
+            let seq = msg["seq"].as_u64().unwrap();
+            encode_frame(
+                &mut writer,
+                &serde_json::to_vec(&serde_json::json!({
+                    "type": "response", "seq": 5, "request_seq": seq, "success": true,
+                    "command": "next"
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+            encode_frame(
+                &mut writer,
+                &serde_json::to_vec(&serde_json::json!({
+                    "type": "event", "seq": 6, "event": "stopped",
+                    "body": { "reason": "step", "threadId": 1 }
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+            // Hold the connection open.
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        DapClient::from_rpc(rpc, "fake-adapter")
+    }
+
+    /// The agent tool executor drops the tool future on cancel. Dropping a
+    /// parked `continue_` must not destroy the live event receivers or leave
+    /// `stop_wait_in_flight` set — the detached stop-wait must still restore
+    /// state when the adapter eventually stops, and a later step must work.
+    #[tokio::test]
+    async fn cancelled_continue_leaves_session_usable() {
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let mgr = std::sync::Arc::new(DapSessionManager::new());
+        let signal = AbortSignal::new();
+        let client = client_with_cancel_recovery_adapter(release_rx);
+
+        mgr.launch_with_client(
+            "fake-adapter",
+            "/tmp",
+            Some("p"),
+            None,
+            &[],
+            Some(true),
+            None,
+            &signal,
+            client,
+            Duration::from_secs(5),
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        // Park a continue, then drop its future mid-park (what the tool
+        // executor's cancel race does).
+        let mgr2 = mgr.clone();
+        let cont = tokio::spawn(async move {
+            let signal = AbortSignal::new();
+            mgr2.continue_(1, &signal, Duration::from_secs(5)).await
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        cont.abort();
+        let _ = cont.await;
+
+        // Adapter finally reports the stop the continue induced.
+        release_tx.send(()).unwrap();
+
+        // The detached stop-wait must consume it, restore the receivers, and
+        // clear stop_wait_in_flight. Poll until the status flips.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let summary = mgr.active_summary().await.expect("session still active");
+            if summary.status == SessionStatus::Stopped {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "stop never recorded after cancelled continue; session wedged"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        // A later step must succeed — not deflected by a stuck
+        // stop_wait_in_flight, not parked on dead receivers.
+        let summary = mgr
+            .step_over(1, &signal, Duration::from_secs(3))
+            .await
+            .expect("step after a cancelled continue must succeed");
+        assert_eq!(summary.stop_reason.as_deref(), Some("step"));
+    }
+
+    /// Launch handshake, then queues a never-reported stopped event
+    /// (breakpoint on thread 5). If a pause request arrives anyway (the buggy
+    /// path), respond success but send no event so the wait times out instead
+    /// of hanging.
+    fn client_with_queued_stop_adapter() -> DapClient {
+        let (client_side, server_side) = tokio::io::duplex(4096);
+        let (client_read, client_write) = tokio::io::split(client_side);
+        let (server_read, server_write) = tokio::io::split(server_side);
+        let client_reader = tokio::io::BufReader::new(client_read);
+        let (rpc, _read_task) = DapRpc::new(client_reader, client_write);
+        tokio::spawn(async move {
+            let mut reader = tokio::io::BufReader::new(server_read);
+            let mut writer = server_write;
+
+            // initialize
+            let frame = decode_frame(&mut reader).await.unwrap();
+            let msg: Value = serde_json::from_slice(&frame).unwrap();
+            let seq = msg["seq"].as_u64().unwrap();
+            encode_frame(
+                &mut writer,
+                &serde_json::to_vec(&serde_json::json!({
+                    "type": "response", "seq": 1, "request_seq": seq, "success": true,
+                    "command": "initialize",
+                    "body": { "supportsConfigurationDoneRequest": true }
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+            // launch → stopped(entry, 1)
+            let frame = decode_frame(&mut reader).await.unwrap();
+            let msg: Value = serde_json::from_slice(&frame).unwrap();
+            assert_eq!(msg["command"], "launch");
+            encode_frame(
+                &mut writer,
+                &serde_json::to_vec(&serde_json::json!({
+                    "type": "event", "seq": 2, "event": "stopped",
+                    "body": { "reason": "entry", "threadId": 1 }
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+            // configurationDone
+            let frame = decode_frame(&mut reader).await.unwrap();
+            let msg: Value = serde_json::from_slice(&frame).unwrap();
+            assert_eq!(msg["command"], "configurationDone");
+
+            // A genuine stop nobody waited for (e.g. breakpoint hit after a
+            // timed-out continue). It sits queued in the stopped channel.
+            encode_frame(
+                &mut writer,
+                &serde_json::to_vec(&serde_json::json!({
+                    "type": "event", "seq": 3, "event": "stopped",
+                    "body": { "reason": "breakpoint", "threadId": 5 }
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+            // Buggy path only: answer a pause but never send a stop, so the
+            // wait times out rather than hanging the test.
+            if let Ok(frame) = decode_frame(&mut reader).await {
+                let msg: Value = serde_json::from_slice(&frame).unwrap();
+                if msg["command"] == "pause" {
+                    let seq = msg["seq"].as_u64().unwrap();
+                    let _ = encode_frame(
+                        &mut writer,
+                        &serde_json::to_vec(&serde_json::json!({
+                            "type": "response", "seq": 4, "request_seq": seq,
+                            "success": true, "command": "pause"
+                        }))
+                        .unwrap(),
+                    )
+                    .await;
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        DapClient::from_rpc(rpc, "fake-adapter")
+    }
+
+    /// A stop queued with no waiter (status still Running) must not be eaten
+    /// by pause's stale-stop drain: pausing an already-stopped program yields
+    /// no new event, so the drained stop IS the pause result.
+    #[tokio::test]
+    async fn pause_returns_a_drained_never_reported_stop() {
+        let mgr = DapSessionManager::new();
+        let signal = AbortSignal::new();
+        let client = client_with_queued_stop_adapter();
+
+        let summary = mgr
+            .launch_with_client(
+                "fake-adapter",
+                "/tmp",
+                Some("p"),
+                None,
+                &[],
+                Some(true),
+                None,
+                &signal,
+                client,
+                Duration::from_secs(5),
+                vec![],
+            )
+            .await
+            .unwrap();
+        assert_eq!(summary.stop_reason.as_deref(), Some("entry"));
+
+        // Let the never-reported stop land in the channel.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let summary = mgr
+            .pause(1, Duration::from_secs(2))
+            .await
+            .expect("pause must report the drained stop, not time out");
+        assert_eq!(summary.status, SessionStatus::Stopped);
+        assert_eq!(summary.stop_reason.as_deref(), Some("breakpoint"));
+        assert_eq!(summary.thread_id, Some(5));
     }
 } // mod tests
