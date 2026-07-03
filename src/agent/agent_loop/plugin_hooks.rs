@@ -379,7 +379,7 @@ pub fn get_steering_messages_from_plugin_manager(
             };
             let mut out: Vec<LoopMessage> = Vec::with_capacity(steering.len() + custom.len());
             for content in steering {
-                out.push(LoopMessage::User(UserMessage { content }));
+                out.push(LoopMessage::User(UserMessage::text(content)));
             }
             for entry in custom {
                 // Custom-shaped Value carries role="custom" so
@@ -418,7 +418,7 @@ pub fn get_followup_messages_from_plugin_manager(
             };
             drained
                 .into_iter()
-                .map(|content| LoopMessage::User(UserMessage { content }))
+                .map(|content| LoopMessage::User(UserMessage::text(content)))
                 .collect()
         })
     })
@@ -937,7 +937,7 @@ mod tests {
         let texts: Vec<String> = messages
             .iter()
             .filter_map(|m| match m {
-                LoopMessage::User(u) => Some(u.content.clone()),
+                LoopMessage::User(u) => Some(u.text_joined()),
                 _ => None,
             })
             .collect();
@@ -963,7 +963,7 @@ mod tests {
         let messages = hook().await;
         assert_eq!(messages.len(), 1);
         match &messages[0] {
-            LoopMessage::User(u) => assert_eq!(u.content, "next turn"),
+            LoopMessage::User(u) => assert_eq!(u.text_joined(), "next turn"),
             _ => panic!("expected User"),
         }
     }
@@ -1023,7 +1023,7 @@ mod tests {
         // Two messages — User first, then Custom.
         assert_eq!(messages.len(), 2);
         match &messages[0] {
-            LoopMessage::User(u) => assert_eq!(u.content, "real user input"),
+            LoopMessage::User(u) => assert_eq!(u.text_joined(), "real user input"),
             other => panic!("expected User; got {other:?}"),
         }
         match &messages[1] {

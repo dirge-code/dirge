@@ -334,7 +334,7 @@ pub fn followup_from_background_store(
                 }
             }
             body.push_str("</system-reminder>");
-            vec![LoopMessage::User(UserMessage { content: body })]
+            vec![LoopMessage::User(UserMessage::text(body))]
         })
     })
 }
@@ -965,12 +965,13 @@ mod tests {
         let LoopMessage::User(u) = &messages[0] else {
             panic!("expected User message, got {:?}", messages[0]);
         };
+        let body = u.text_joined();
         // System-reminder wrapper present.
-        assert!(u.content.starts_with("<system-reminder>\n"));
-        assert!(u.content.ends_with("</system-reminder>"));
+        assert!(body.starts_with("<system-reminder>\n"));
+        assert!(body.ends_with("</system-reminder>"));
         // Task id + completion marker + result text all present.
-        assert!(u.content.contains("[task abc123] completed:"));
-        assert!(u.content.contains("the answer is 42"));
+        assert!(body.contains("[task abc123] completed:"));
+        assert!(body.contains("the answer is 42"));
 
         // Queue drained — second poll returns empty so the outer loop
         // can exit naturally on a clean board.
@@ -997,13 +998,14 @@ mod tests {
         let LoopMessage::User(u) = &messages[0] else {
             panic!("expected User message");
         };
-        assert!(u.content.contains("[task xyz789] failed:"));
-        assert!(u.content.contains("connection reset by peer"));
+        let body = u.text_joined();
+        assert!(body.contains("[task xyz789] failed:"));
+        assert!(body.contains("connection reset by peer"));
         // Must NOT use the "completed" marker for failures.
         assert!(
-            !u.content.contains("completed:"),
+            !body.contains("completed:"),
             "failures must not be tagged 'completed': {}",
-            u.content,
+            body,
         );
     }
 
@@ -1027,14 +1029,15 @@ mod tests {
         let LoopMessage::User(u) = &messages[0] else {
             panic!("expected User");
         };
+        let body = u.text_joined();
         // All three tasks present.
-        assert!(u.content.contains("[task t0] completed: result-0"));
-        assert!(u.content.contains("[task t1] completed: result-1"));
-        assert!(u.content.contains("[task t2] completed: result-2"));
+        assert!(body.contains("[task t0] completed: result-0"));
+        assert!(body.contains("[task t1] completed: result-1"));
+        assert!(body.contains("[task t2] completed: result-2"));
         // FIFO ordering preserved.
-        let i0 = u.content.find("t0").unwrap();
-        let i1 = u.content.find("t1").unwrap();
-        let i2 = u.content.find("t2").unwrap();
+        let i0 = body.find("t0").unwrap();
+        let i1 = body.find("t1").unwrap();
+        let i2 = body.find("t2").unwrap();
         assert!(i0 < i1 && i1 < i2);
     }
 

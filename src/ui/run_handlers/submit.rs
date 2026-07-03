@@ -35,6 +35,7 @@ pub(crate) fn submit_resolved_prompt(
     hint: Option<String>,
     replace: Option<String>,
     text: &str,
+    images: Vec<crate::agent::agent_loop::message::ImageRef>,
     is_running: &mut bool,
     agent_rx: &mut Option<mpsc::Receiver<AgentEvent>>,
     agent_abort: &mut Option<JoinHandle<()>>,
@@ -103,6 +104,7 @@ pub(crate) fn submit_resolved_prompt(
                     CompactionThen::SendPrompt {
                         run_prompt: prompt.clone(),
                         record_text: text.to_string(),
+                        images: images.clone(),
                     },
                 ));
                 *is_running = true;
@@ -127,12 +129,16 @@ pub(crate) fn submit_resolved_prompt(
 
     if !deferred_to_compaction {
         let runner = agent.clone().spawn_runner(
-            crate::agent::tools::background::prepend_pending_notifications(
-                &prompt,
-                deps.bg_store.as_ref(),
-            ),
+            crate::provider::Prompt {
+                text: crate::agent::tools::background::prepend_pending_notifications(
+                    &prompt,
+                    deps.bg_store.as_ref(),
+                ),
+                images: images.clone(),
+            },
             history,
             Some(interjection_queue.clone()),
+            Some(ctx.session.assets_dir()),
         );
         runner.install_into(
             agent_rx,
@@ -142,7 +148,8 @@ pub(crate) fn submit_resolved_prompt(
             is_running,
         );
 
-        ctx.session.add_message(MessageRole::User, text);
+        ctx.session
+            .add_message_with_images(MessageRole::User, text, images);
         crate::ui::begin_snapshot_turn(ctx.session);
         ctx.renderer.set_avatar_state(avatar::AvatarState::Idle);
     }

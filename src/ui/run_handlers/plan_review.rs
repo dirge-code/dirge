@@ -110,9 +110,13 @@ pub(crate) fn apply_review_verdict(
         last_user_prompt.clone_from(&retry_prompt);
         session.add_message(MessageRole::User, &retry_prompt);
         let runner = agent.clone().spawn_runner(
-            prepend_pending_notifications(&retry_prompt, bg_store.as_ref()),
+            crate::provider::Prompt::text(prepend_pending_notifications(
+                &retry_prompt,
+                bg_store.as_ref(),
+            )),
             crate::agent::runner::convert_history(session),
             Some(interjection_queue.clone()),
+            None,
         );
         runner.install_into(
             agent_rx,

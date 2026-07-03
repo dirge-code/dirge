@@ -63,6 +63,13 @@ pub struct ProviderEntry {
     /// network. Only enable for local-only proxies (ollama, vllm, etc.)
     /// that are NOT reachable from other hosts.
     pub allow_insecure: bool,
+    /// Explicit override for image (multimodal) support on this
+    /// provider. `Some(true)`/`Some(false)` wins over the model-name
+    /// heuristic; `None` (default) defers to the heuristic. Use this to
+    /// enable pasting for a vision model behind a generic provider
+    /// type, or to disable it for a text-only model under a normally
+    /// multimodal provider.
+    pub multimodal: Option<bool>,
     /// Per-provider override for the streaming chunk timeout. Same
     /// units / semantics as the top-level `stream_chunk_timeout_secs`
     /// but takes precedence for this specific provider.
@@ -97,6 +104,162 @@ impl ProviderEntry {
     /// integer, missing) return `None`.
     pub fn options_temperature(&self) -> Option<f64> {
         self.options.as_ref()?.get("temperature")?.as_f64()
+    }
+}
+
+/// A model's known image-input support, used by [`supports_images`].
+enum ImageSupport {
+    /// Known vision model (gpt-4o, claude-3, gemini-2, …).
+    Yes,
+    /// Known text-only model (gpt-3.5, bare gpt-4, …).
+    No,
+    /// Not in the table — defer to the provider-type default or the
+    /// explicit override.
+    Unknown,
+}
+
+fn model_image_support(model: &str) -> ImageSupport {
+    let m = model.to_ascii_lowercase();
+    // Known text-only families — checked first so a multimodal
+    // provider doesn't mis-report a text-only model.
+    if m.starts_with("gpt-3.5")
+        || m == "gpt-4"
+        || m.starts_with("gpt-4-32k")
+        || m.starts_with("gpt-4-0613")
+        || m.starts_with("gpt-4-0314")
+        || m.starts_with("o1-mini")
+        || m.starts_with("o1-preview")
+        || m.starts_with("deepseek")
+    {
+        return ImageSupport::No;
+    }
+    // Known vision-capable model families.
+    let yes = m.contains("claude-3")
+        || m.contains("claude-4")
+        || m.contains("claude-opus")
+        || m.contains("claude-sonnet")
+        || m.contains("claude-haiku")
+        || m.starts_with("gpt-4o")
+        || m.contains("gpt-4-turbo")
+        || m.contains("gpt-4-vision")
+        || m.contains("gpt-4.1")
+        || m.contains("gpt-4.5")
+        || m.contains("gemini-1.5")
+        || m.contains("gemini-2")
+        || m.contains("gemini-pro")
+        || m.contains("-vl")
+        || m.contains("vision")
+        || m.contains("llava")
+        || m.contains("pixtral")
+        || m.starts_with("glm-4v");
+    if yes {
+        ImageSupport::Yes
+    } else {
+        ImageSupport::Unknown
+    }
+}
+
+/// Default image support for a provider type, consulted only when the
+/// model name is unrecognized.
+fn provider_type_supports_images(provider_type: Option<&str>) -> bool {
+    matches!(
+        provider_type.map(|s| s.to_ascii_lowercase()).as_deref(),
+        Some("anthropic") | Some("openai") | Some("gemini") | Some("openrouter")
+    )
+}
+
+/// Resolve whether the active provider/model accepts image inputs —
+/// used to gate the paste-image UX. Resolution order (per the
+/// image-paste design):
+/// 1. explicit `multimodal` override on the provider entry (forces
+///    either way — the realistic reason the field exists),
+/// 2. known-model table (`Yes`/`No`); a known text-only model under a
+///    normally-multimodal provider still resolves `false`,
+/// 3. provider-type default.
+pub fn supports_images(
+    provider_type: Option<&str>,
+    model: Option<&str>,
+    multimodal_override: Option<bool>,
+) -> bool {
+    if let Some(b) = multimodal_override {
+        return b;
+    }
+    if let Some(m) = model {
+        match model_image_support(m) {
+            ImageSupport::Yes => return true,
+            ImageSupport::No => return false,
+            ImageSupport::Unknown => {}
+        }
+    }
+    provider_type_supports_images(provider_type)
+}
+
+#[cfg(test)]
+mod image_support_tests {
+    use super::*;
+
+    #[test]
+    fn override_wins() {
+        assert!(supports_images(Some("openai"), Some("gpt-3.5"), Some(true)));
+        assert!(!supports_images(
+            Some("openai"),
+            Some("gpt-4o"),
+            Some(false)
+        ));
+    }
+
+    #[test]
+    fn known_vision_model_yes() {
+        assert!(supports_images(Some("openai"), Some("gpt-4o"), None));
+        assert!(supports_images(
+            Some("anthropic"),
+            Some("claude-3-5-sonnet-20241022"),
+            None
+        ));
+        assert!(supports_images(
+            Some("gemini"),
+            Some("gemini-2.0-flash"),
+            None
+        ));
+    }
+
+    #[test]
+    fn known_text_only_model_no_even_under_vision_provider() {
+        assert!(!supports_images(
+            Some("openai"),
+            Some("gpt-3.5-turbo"),
+            None
+        ));
+        assert!(!supports_images(Some("openai"), Some("gpt-4"), None));
+        assert!(!supports_images(Some("openai"), Some("gpt-4-0613"), None));
+    }
+
+    #[test]
+    fn unknown_model_falls_back_to_provider_type() {
+        // Unknown model under a vision provider → true.
+        assert!(supports_images(
+            Some("openai"),
+            Some("my-custom-model"),
+            None
+        ));
+        // Unknown model under ollama/unknown → false.
+        assert!(!supports_images(
+            Some("ollama"),
+            Some("my-custom-model"),
+            None
+        ));
+        assert!(!supports_images(None, None, None));
+    }
+
+    #[test]
+    fn override_enables_local_model() {
+        // ollama with a vision model, forced on via override.
+        assert!(supports_images(
+            Some("ollama"),
+            Some("llama3.2-vision"),
+            None
+        ));
+        assert!(supports_images(Some("ollama"), Some("qwen2.5"), Some(true)));
     }
 }
 

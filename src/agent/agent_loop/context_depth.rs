@@ -147,7 +147,7 @@ impl FileTouchTracker {
         inner.emitted_for_streak = true;
         let body = format_reminder(inner.consecutive, &inner.last_files, &inner.active_task);
         let wrapped = format!("{}\n{}", MID_TURN_STEER_WRAPPER, body);
-        vec![LoopMessage::User(UserMessage { content: wrapped })]
+        vec![LoopMessage::User(UserMessage::text(wrapped))]
     }
 
     /// The current working-set files (the `last_files` overlap), sorted
@@ -315,7 +315,7 @@ mod tests {
         let msgs = t.poll_reminder();
         assert_eq!(msgs.len(), 1);
         let content = match &msgs[0] {
-            LoopMessage::User(u) => u.content.clone(),
+            LoopMessage::User(u) => u.text_joined(),
             _ => panic!("expected User"),
         };
         assert!(content.starts_with(MID_TURN_STEER_WRAPPER));

@@ -12,8 +12,31 @@ use crate::sync_util::LockExt;
 use rig::completion::Message;
 
 use super::{AnyAgent, AnyAgentInner};
+use crate::agent::agent_loop::message::ImageRef;
 use crate::agent::runner::AgentRunner;
 use crate::agent::tools::ToolCache;
+
+/// A user turn's prompt bundle: the text plus any pasted images. The
+/// active (fresh) turn is the `prompt` argument to `spawn_runner`,
+/// separate from history. Images are refs only — their bytes live in
+/// the session's asset dir and are reified to base64 at the provider
+/// boundary. Resume turns carry their images through history as
+/// `dirge-asset:` sentinels, not here.
+#[derive(Debug, Clone, Default)]
+pub struct Prompt {
+    pub text: String,
+    pub images: Vec<ImageRef>,
+}
+
+impl Prompt {
+    /// A text-only prompt — the common case for the ~16 spawn sites.
+    pub fn text(s: impl Into<String>) -> Self {
+        Self {
+            text: s.into(),
+            images: Vec::new(),
+        }
+    }
+}
 
 /// Filter a loop-tool registry down to a caller-supplied allow-list, preserving
 /// registration order. Single tested place for the hard tool restriction every
@@ -74,11 +97,12 @@ impl AnyAgent {
 
     pub fn spawn_runner(
         self,
-        prompt: String,
+        prompt: Prompt,
         history: Vec<Message>,
         steering_queue: Option<
             std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
         >,
+        asset_dir: Option<std::path::PathBuf>,
     ) -> AgentRunner {
         use crate::agent::agent_loop::{
             LoopSpawnConfig, retrying_stream_fn, retrying_stream_fn_with_non_retryable,
@@ -185,7 +209,7 @@ impl AnyAgent {
         // user/assistant/toolResult shapes).
         let loop_history = rig_history_to_loop_messages(history);
 
-        let mut cfg = LoopSpawnConfig::minimal(stream_fn, prompt.clone());
+        let mut cfg = LoopSpawnConfig::minimal(stream_fn, prompt.text.clone());
         cfg.system_prompt = system_prompt;
         cfg.history = loop_history;
         cfg.tools = self.loop_tools;
@@ -194,6 +218,11 @@ impl AnyAgent {
         cfg.steering_queue = steering_queue;
         cfg.tool_def_filter = tool_def_filter;
         cfg.dynamic_tool_search = self.dynamic_tool_search;
+        // Fresh-paste images ride on the active turn; the loop seeds
+        // them as `UserPart::Image` parts. `asset_dir` lets the rig
+        // boundary resolve every image ref (active + history) to base64.
+        cfg.initial_prompt_images = prompt.images;
+        cfg.asset_dir = asset_dir;
         // Phase 4 part 1: thread the escalation route — when set,
         // the loop's `stream_assistant_response` swaps to this
         // StreamFn for the call immediately following a repair or
@@ -205,9 +234,9 @@ impl AnyAgent {
         // session seeded with the current prompt as the active
         // task. `None` keeps the feature off — byte-identical to
         // today.
-        cfg.file_touch_tracker = self
-            .context_depth_reminder_threshold
-            .map(|t| crate::agent::agent_loop::context_depth::FileTouchTracker::new(t, prompt));
+        cfg.file_touch_tracker = self.context_depth_reminder_threshold.map(|t| {
+            crate::agent::agent_loop::context_depth::FileTouchTracker::new(t, prompt.text)
+        });
         // F6: pre-finalization verifier gate, always on (baked-in). Nudges
         // to verify before finishing when code was edited but not run.
         cfg.verifier = Some(crate::agent::agent_loop::verifier::VerifierGate::new());

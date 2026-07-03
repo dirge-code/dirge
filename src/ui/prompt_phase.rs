@@ -39,6 +39,8 @@ pub(crate) struct PromptPhaseHandle {
     pub core: PhaseHandle<PromptPhaseEvent>,
     #[cfg_attr(not(feature = "plugin"), allow(dead_code))]
     pub text: String,
+    #[cfg_attr(not(feature = "plugin"), allow(dead_code))]
+    pub images: Vec<crate::agent::agent_loop::message::ImageRef>,
 }
 
 /// Spawn the `on-prompt` dispatch off-loop. The blocking Janet call runs on
@@ -48,6 +50,7 @@ pub(crate) struct PromptPhaseHandle {
 pub(crate) fn spawn(
     pm: std::sync::Arc<std::sync::Mutex<crate::plugin::PluginManager>>,
     text: String,
+    images: Vec<crate::agent::agent_loop::message::ImageRef>,
 ) -> PromptPhaseHandle {
     let task_text = text.clone();
     let core = PhaseHandle::spawn(1, move |tx| async move {
@@ -65,7 +68,7 @@ pub(crate) fn spawn(
         });
         let _ = tx.send(PromptPhaseEvent::Ready(result)).await;
     });
-    PromptPhaseHandle { core, text }
+    PromptPhaseHandle { core, text, images }
 }
 
 /// Run the `on-prompt` hook and collect its outputs. Mirrors the original
@@ -126,7 +129,7 @@ mod tests {
         manager.register("on-prompt", "on-prompt");
         let pm = Arc::new(Mutex::new(manager));
 
-        let mut handle = spawn(pm, "hello".to_string());
+        let mut handle = spawn(pm, "hello".to_string(), Vec::new());
         assert_eq!(handle.text, "hello");
         let ev = tokio::time::timeout(Duration::from_secs(5), handle.core.rx.recv())
             .await

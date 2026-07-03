@@ -6,6 +6,18 @@ fn session_dir() -> PathBuf {
     dirs_path().join("sessions")
 }
 
+/// Per-session asset directory: `<sessions>/assets/<id>/`. Holds the
+/// PNG bytes referenced by `SessionMessage.images` (`<asset_id>.png`
+/// each). Removed wholesale when the session is deleted. The session
+/// id is re-validated so a malformed id can't escape the assets root.
+pub(crate) fn assets_dir_for(id: &str) -> PathBuf {
+    // `validate_session_id` is infallible-by-convention here (the id
+    // is already validated at session creation); fall back to the
+    // plain join if it ever fails rather than panicking on a path.
+    let _ = validate_session_id(id);
+    session_dir().join("assets").join(id)
+}
+
 #[cfg(not(test))]
 fn home_fallback() -> PathBuf {
     std::env::var("HOME")
@@ -273,6 +285,12 @@ pub fn delete_session(id: &str) -> anyhow::Result<()> {
     let path = dir.join(format!("{}.json", id));
     if path.exists() {
         std::fs::remove_file(path)?;
+    }
+    // Drop the session's image assets (whole dir). Best-effort: a
+    // missing assets dir (pre-image sessions) is not an error.
+    let assets = assets_dir_for(id);
+    if assets.exists() {
+        std::fs::remove_dir_all(assets)?;
     }
     Ok(())
 }
@@ -736,6 +754,7 @@ mod tests {
                     id: compact_str::CompactString::new("m"),
                     timestamp: 0,
                     tool_calls: Vec::new(),
+                    images: Vec::new(),
                 })
                 .collect();
             let path = dir.join(format!("{id}.json"));
@@ -830,6 +849,7 @@ mod tests {
                     id: compact_str::CompactString::new("m"),
                     timestamp: 0,
                     tool_calls: Vec::new(),
+                    images: Vec::new(),
                 })
                 .collect();
             std::fs::write(
@@ -905,6 +925,7 @@ mod tests {
             id: compact_str::CompactString::new("m1"),
             timestamp: 1,
             tool_calls: vec![tc],
+            images: Vec::new(),
         };
         s.messages.push(msg.clone());
         s.message_store
@@ -1541,6 +1562,58 @@ mod tests {
             msg.contains("o such file") || msg.contains("No such file"),
             "error must mention missing file: {msg}"
         );
+    }
+
+    /// `write_asset` creates `<assets_dir>/<asset_id>.png` and the
+    /// bytes round-trip. `assets_dir` is scoped to the session id.
+    #[test]
+    fn write_asset_persists_png() {
+        use crate::agent::agent_loop::message::AssetId;
+        use crate::session::Session;
+        let id = unique_test_id("asset-write");
+        let mut s = Session::new("p", "m", 0);
+        s.id = compact_str::CompactString::from(id.clone());
+        let asset = AssetId("img1".to_string());
+        let bytes = [0x89, b'P', b'N', b'G'];
+        let path = s.write_asset(&asset, &bytes).expect("write");
+        assert!(path.ends_with("img1.png"), "{path:?}");
+        assert_eq!(std::fs::read(&path).expect("read back"), bytes);
+        assert!(s.assets_dir().ends_with(&id), "{:?}", s.assets_dir());
+        let _ = std::fs::remove_dir_all(assets_dir_for(&id));
+    }
+
+    /// `delete_session` removes the session's assets dir wholesale.
+    #[test]
+    fn delete_session_removes_assets() {
+        use crate::agent::agent_loop::message::AssetId;
+        use crate::session::Session;
+        let id = unique_test_id("asset-delete");
+        let mut s = Session::new("p", "m", 0);
+        s.id = compact_str::CompactString::from(id.clone());
+        s.write_asset(&AssetId("a".to_string()), &[1, 2, 3])
+            .expect("write");
+        let assets = assets_dir_for(&id);
+        assert!(assets.exists(), "asset dir created");
+        save_session(&mut s).expect("save");
+        delete_session(&id).expect("delete");
+        assert!(!assets.exists(), "assets dir removed on delete: {assets:?}");
+    }
+
+    /// A pre-image session message (no `images` field) deserializes
+    /// with images defaulting to empty.
+    #[test]
+    fn legacy_session_message_without_images_deserializes() {
+        let json = serde_json::json!({
+            "role": "user",
+            "content": "hi",
+            "estimated_tokens": 1,
+            "id": "x",
+            "timestamp": 0,
+            "tool_calls": []
+        });
+        let m: crate::session::SessionMessage =
+            serde_json::from_value(json).expect("deserialize legacy");
+        assert!(m.images.is_empty(), "images default to empty");
     }
 
     /// Branch summaries survive save/load (Phase 4 — pruned subtree

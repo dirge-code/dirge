@@ -368,6 +368,12 @@ pub struct LoopConfig {
     /// telemetry falls back to an `unknown` placeholder.
     pub model_name: Option<String>,
 
+    /// Session asset dir, threaded from `spawn_runner` →
+    /// `LoopSpawnConfig.asset_dir` → here, then copied into each
+    /// `LlmContext.asset_dir` the loop builds. The rig boundary
+    /// reads image assets from here. `None` for sessionless paths.
+    pub asset_dir: Option<std::path::PathBuf>,
+
     /// Port of Reasonix flash-first: hard-code a cheap model for
     /// mechanical auxiliary calls (fold summaries, healing
     /// truncation). When `Some`, summarisation and related tasks
@@ -707,6 +713,7 @@ impl Clone for LoopConfig {
             metadata: self.metadata.clone(),
             provider_name: self.provider_name.clone(),
             model_name: self.model_name.clone(),
+            asset_dir: self.asset_dir.clone(),
             compact_model: self.compact_model.clone(),
             storm_mutating_tools: self.storm_mutating_tools.clone(),
             storm_exempt_tools: self.storm_exempt_tools.clone(),
@@ -760,6 +767,7 @@ impl LoopConfig {
             metadata: std::collections::HashMap::new(),
             provider_name: None,
             model_name: None,
+            asset_dir: None,
             compact_model: None,
             storm_mutating_tools: None,
             storm_exempt_tools: None,

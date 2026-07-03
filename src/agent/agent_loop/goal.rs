@@ -160,14 +160,12 @@ pub async fn run_goal_gate(
         Vec::new()
     );
     match parse_goal_verdict(&response) {
-        Some(remaining) => vec![LoopMessage::User(UserMessage {
-            content: format!(
-                "{GOAL_TAG} The stop condition for this run is not satisfied yet: \"{goal}\". \
-                 Outstanding:\n{remaining}\n\
-                 Keep working until it holds, or — if it can't be met (out of scope, blocked, or \
-                 something you were told not to do) — say so explicitly and stop."
-            ),
-        })],
+        Some(remaining) => vec![LoopMessage::User(UserMessage::text(format!(
+            "{GOAL_TAG} The stop condition for this run is not satisfied yet: \"{goal}\". \
+             Outstanding:\n{remaining}\n\
+             Keep working until it holds, or — if it can't be met (out of scope, blocked, or \
+             something you were told not to do) — say so explicitly and stop."
+        )))],
         None => Vec::new(),
     }
 }
@@ -308,9 +306,10 @@ mod tests {
         });
         let msgs = run_goal_gate(&judge, "commit the work", "", "edited foo.rs", None).await;
         assert_eq!(msgs.len(), 1);
-        let LoopMessage::User(UserMessage { content }) = &msgs[0] else {
+        let LoopMessage::User(u) = &msgs[0] else {
             panic!("goal gate must re-enter as a user-role message");
         };
+        let content = u.text_joined();
         assert!(content.starts_with(GOAL_TAG));
         assert!(content.contains("commit the work"));
         assert!(content.contains("still need to commit"));

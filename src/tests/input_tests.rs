@@ -1459,3 +1459,55 @@ fn undo_then_type_starts_fresh_group() {
     editor.handle_key(ctrl(KeyCode::Char('z')));
     assert_eq!(editor.buffer.as_str(), "");
 }
+
+/// A pasted image becomes a `[image]` placeholder; on submit the
+/// image bytes are drained into `pending_images` while the flattened
+/// text has the marker removed.
+#[test]
+fn image_paste_submission_drains_images() {
+    use crate::ui::input::PendingImage;
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "look: ");
+    editor.handle_paste_image(PendingImage {
+        bytes: vec![0x89, b'P', b'N', b'G'],
+        media_type: "image/png".to_string(),
+    });
+    type_str(&mut editor, " and another ");
+    editor.handle_paste_image(PendingImage {
+        bytes: vec![1, 2, 3],
+        media_type: "image/png".to_string(),
+    });
+
+    let (disp, _) = editor.display();
+    assert!(
+        disp.contains("[image]"),
+        "display shows placeholder: {disp}"
+    );
+
+    // Submit via Enter drains pending_images in order.
+    let text = editor.handle_key(press(KeyCode::Enter)).expect("submitted");
+    assert_eq!(text.as_str(), "look:  and another ");
+    assert_eq!(
+        editor.pending_images.len(),
+        2,
+        "both images drained in order"
+    );
+    assert_eq!(editor.pending_images[0].bytes, vec![0x89, b'P', b'N', b'G']);
+    assert_eq!(editor.pending_images[1].bytes, vec![1, 2, 3]);
+}
+
+/// Undo reverts an image paste just like a text paste.
+#[test]
+fn image_paste_undo_reverts_marker_and_slot() {
+    use crate::ui::input::PendingImage;
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "hi");
+    editor.handle_paste_image(PendingImage {
+        bytes: vec![9],
+        media_type: "image/png".to_string(),
+    });
+    assert!(editor.buffer.as_str().contains('\u{1}'));
+    editor.handle_key(ctrl(KeyCode::Char('z')));
+    assert_eq!(editor.buffer.as_str(), "hi");
+    assert!(editor.pending_images.is_empty(), "no images after undo");
+}

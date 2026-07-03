@@ -965,6 +965,7 @@ fn user_msg(content: &str) -> SessionMessage {
         id: compact_str::CompactString::new("m"),
         timestamp: 0,
         tool_calls: Vec::new(),
+        images: Vec::new(),
     }
 }
 

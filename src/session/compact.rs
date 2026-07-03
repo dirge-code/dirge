@@ -59,6 +59,7 @@ pub(crate) fn compress_reporting(
         id: summary_id.clone(),
         timestamp: summary_ts,
         tool_calls: Vec::new(),
+        images: Vec::new(),
     };
 
     let dropped_ids: Vec<CompactString> = session.messages[..first_kept_index]

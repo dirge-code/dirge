@@ -190,7 +190,7 @@ impl FailureTracker {
             if due {
                 inner.last_denial_emitted_at = inner.denials;
                 let body = format_permission_checkpoint(inner.denials, &inner.recent_denials);
-                out.push(LoopMessage::User(UserMessage { content: body }));
+                out.push(LoopMessage::User(UserMessage::text(body)));
             }
         }
 
@@ -203,7 +203,7 @@ impl FailureTracker {
             if due {
                 inner.last_emitted_at = inner.escalation;
                 let body = format_checkpoint(inner.consecutive, inner.timeouts, &inner.recent);
-                out.push(LoopMessage::User(UserMessage { content: body }));
+                out.push(LoopMessage::User(UserMessage::text(body)));
             }
         }
         out
@@ -303,7 +303,7 @@ mod tests {
 
     fn content_of(msgs: &[LoopMessage]) -> String {
         match msgs.first() {
-            Some(LoopMessage::User(u)) => u.content.clone(),
+            Some(LoopMessage::User(u)) => u.text_joined(),
             _ => panic!("expected one User message"),
         }
     }

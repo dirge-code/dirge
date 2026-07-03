@@ -132,12 +132,15 @@ pub(crate) async fn handle_interjected(
         ctx.session.add_message(MessageRole::User, &combined);
 
         let runner = agent.clone().spawn_runner(
-            crate::agent::tools::background::prepend_pending_notifications(
-                &combined,
-                bg_store.as_ref(),
+            crate::provider::Prompt::text(
+                crate::agent::tools::background::prepend_pending_notifications(
+                    &combined,
+                    bg_store.as_ref(),
+                ),
             ),
             history,
             Some(interjection_queue.clone()),
+            None,
         );
         runner.install_into(
             agent_rx,

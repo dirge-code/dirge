@@ -1109,6 +1109,7 @@ async fn main() -> anyhow::Result<()> {
                             // validator in `install_plugin_providers`
                             // will reject it.
                             allow_insecure: false,
+                            multimodal: None,
                             // `harness/register-provider` doesn't expose
                             // a literal api_key or options map — plugins
                             // declare the env var name and the request

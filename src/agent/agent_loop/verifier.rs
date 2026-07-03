@@ -148,9 +148,7 @@ impl VerifierGate {
         match nudge {
             Some(text) => {
                 inner.fired = true;
-                vec![LoopMessage::User(UserMessage {
-                    content: text.to_string(),
-                })]
+                vec![LoopMessage::User(UserMessage::text(text))]
             }
             None => Vec::new(),
         }
@@ -364,7 +362,7 @@ mod tests {
             .into_iter()
             .next()
             .map(|m| match m {
-                LoopMessage::User(u) => u.content,
+                LoopMessage::User(u) => u.text_joined(),
                 _ => panic!("expected user message"),
             })
     }

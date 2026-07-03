@@ -171,6 +171,7 @@ async fn build_stream_fn_is_multi_callable() {
     let ctx = LlmContext {
         system_prompt: String::new(),
         messages: vec![],
+        asset_dir: None,
     };
     let mut s = stream_fn(
         ctx,
@@ -183,6 +184,7 @@ async fn build_stream_fn_is_multi_callable() {
     let ctx2 = LlmContext {
         system_prompt: String::new(),
         messages: vec![],
+        asset_dir: None,
     };
     let mut s2 = stream_fn(
         ctx2,
@@ -296,6 +298,7 @@ async fn any_model_filtered_stream_fn_hides_unloaded_dynamic_tools() {
         LlmContext {
             system_prompt: String::new(),
             messages: vec![serde_json::json!({"role": "user", "content": "hi"})],
+            asset_dir: None,
         },
         StreamOptions::from_signal(AbortSignal::new()),
     );
@@ -709,6 +712,7 @@ fn sm(role: MessageRole, content: &str, tool_calls: Vec<ToolCallEntry>) -> Sessi
         id: CompactString::from("test-id"),
         timestamp: 0,
         tool_calls,
+        images: Vec::new(),
     }
 }
 
@@ -861,6 +865,7 @@ fn custom_provider_http_allowed_with_allow_insecure() {
             provider_type: Some("custom".to_string()),
             base_url: Some("http://localhost:11434/v1".to_string()),
             allow_insecure: true,
+            multimodal: None,
             ..Default::default()
         },
     )]);
@@ -946,6 +951,7 @@ fn config_alias_of_builtin_name_with_base_url_is_accepted() {
             provider_type: Some("openai".to_string()),
             base_url: Some("http://localhost:11434/v1".to_string()),
             allow_insecure: true,
+            multimodal: None,
             ..Default::default()
         },
     )]);

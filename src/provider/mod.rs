@@ -14,6 +14,7 @@ mod stream_dispatch;
 pub mod summarize;
 pub mod wire;
 
+pub use self::spawn::Prompt;
 pub use build::*;
 pub use dispatch::*;
 pub use resolve::*;

@@ -176,7 +176,12 @@ impl AnyAgent {
         // — Arc internals + refcounts), spawn a runner, and drain the
         // event channel collecting text. Use the max_turns-stamped
         // `agent` from above so the cap is honored.
-        let runner = agent.spawn_runner(effective_prompt.clone(), history, None);
+        let runner = agent.spawn_runner(
+            crate::provider::Prompt::text(effective_prompt.clone()),
+            history,
+            None,
+            None,
+        );
         let task = runner.task;
         let mut event_rx = runner.event_rx;
 

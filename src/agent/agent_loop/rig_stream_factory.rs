@@ -53,7 +53,10 @@ use std::sync::Arc;
 use rig::OneOrMany;
 #[cfg(test)]
 use rig::completion::CompletionError;
-use rig::completion::message::{AssistantContent, Message, Reasoning, ToolCall, ToolFunction};
+use rig::completion::message::{
+    AssistantContent, DocumentSourceKind, Image, ImageMediaType, Message, Reasoning, Text,
+    ToolCall, ToolFunction, UserContent,
+};
 use rig::completion::{CompletionModel, CompletionRequestBuilder, GetTokenUsage, ToolDefinition};
 use serde_json::Value;
 
@@ -204,7 +207,7 @@ where
         let rig_messages: Vec<Message> = ctx
             .messages
             .iter()
-            .filter_map(|message| value_to_rig_message_for_provider(message, provider))
+            .filter_map(|message| value_to_rig_message_for_provider(message, provider, ctx.asset_dir.as_deref()))
             .collect();
 
         // 2. Split: last is prompt; rest is chat_history.
@@ -401,15 +404,117 @@ pub fn filter_tool_defs(
     }
 }
 
+/// Map a MIME media-type string (e.g. `"image/png"`) to rig's
+/// `ImageMediaType`. v1 only ever persists `image/png`; the other
+/// arms exist so a future non-PNG ref degrades to `None` (rig treats
+/// a missing media type as provider-default) instead of panicking.
+fn image_media_type(media_type: &str) -> Option<ImageMediaType> {
+    match media_type {
+        "image/png" => Some(ImageMediaType::PNG),
+        "image/jpeg" => Some(ImageMediaType::JPEG),
+        "image/gif" => Some(ImageMediaType::GIF),
+        "image/webp" => Some(ImageMediaType::WEBP),
+        _ => None,
+    }
+}
+
+/// Build a multipart `Message::User` from serialized `UserPart`
+/// objects. Text parts become `UserContent::Text`; image parts are
+/// reified from the asset dir as base64 `UserContent::Image`. A part
+/// whose asset can't be read (missing file or no asset dir) degrades
+/// to a `UserContent::Text` placeholder so the turn still flows.
+/// Returns `None` only when there are no usable parts at all.
+fn build_user_content(parts: &[Value], asset_dir: Option<&std::path::Path>) -> Option<Message> {
+    let mut user_parts: Vec<UserContent> = Vec::new();
+    for p in parts {
+        let obj = match p.as_object() {
+            Some(o) => o,
+            None => continue,
+        };
+        let kind = obj.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        match kind {
+            "text" => {
+                if let Some(t) = obj.get("text").and_then(|t| t.as_str()) {
+                    user_parts.push(UserContent::Text(Text {
+                        text: t.to_string(),
+                    }));
+                }
+            }
+            "image" => {
+                let asset_id = obj.get("assetId").and_then(|v| v.as_str()).unwrap_or("");
+                let media_type = obj
+                    .get("mediaType")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("image/png");
+                match resolve_image(asset_id, media_type, asset_dir) {
+                    Some(img) => user_parts.push(UserContent::Image(img)),
+                    None => user_parts.push(UserContent::Text(Text {
+                        text: format!("[image unavailable: {asset_id}]"),
+                    })),
+                }
+            }
+            _ => {}
+        }
+    }
+    let content = OneOrMany::many(user_parts).ok()?;
+    Some(Message::User { content })
+}
+
+/// True iff `id` is a safe asset filename stem: non-empty and only
+/// `[A-Za-z0-9_-]`. Asset ids are server-generated UUID stems, but the
+/// value round-trips through the durable session JSON, so a tampered id
+/// (e.g. `../../etc/secret`) must never reach `Path::join` — it would
+/// read an arbitrary `.png`-suffixed file and ship it to the provider.
+fn is_safe_asset_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// Read `<asset_dir>/<asset_id>.png`, base64-encode it, and wrap in a
+/// rig `Image`. `None` if the asset dir is absent, the id is unsafe, or
+/// the file is missing/unreadable — the caller degrades to a placeholder.
+fn resolve_image(
+    asset_id: &str,
+    media_type: &str,
+    asset_dir: Option<&std::path::Path>,
+) -> Option<Image> {
+    use base64::Engine;
+    let dir = asset_dir?;
+    if !is_safe_asset_id(asset_id) {
+        return None;
+    }
+    let path = dir.join(format!("{asset_id}.png"));
+    let bytes = std::fs::read(&path).ok()?;
+    let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    Some(Image {
+        data: DocumentSourceKind::Base64(data),
+        media_type: image_media_type(media_type),
+        detail: None,
+        additional_params: None,
+    })
+}
+
 fn value_to_rig_message_for_provider(
     value: &Value,
     provider_name: Option<&str>,
+    asset_dir: Option<&std::path::Path>,
 ) -> Option<Message> {
     let role = value.get("role").and_then(|r| r.as_str())?;
     match role {
         "user" => {
-            let content = value.get("content").and_then(|c| c.as_str())?;
-            Some(Message::user(content))
+            // Content is either a legacy/transient string (→ single text
+            // part) or an array of serialized `UserPart` objects. Image
+            // parts are resolved to a base64 `UserContent::Image` from
+            // the asset dir; a missing file/dir degrades to a text
+            // placeholder rather than dropping the part.
+            let content = value.get("content")?;
+            match content {
+                Value::String(s) => Some(Message::user(s.clone())),
+                Value::Array(parts) => build_user_content(parts, asset_dir),
+                _ => None,
+            }
         }
         // dirge-vcu1: a compaction fold replaces the conversation middle
         // with a `role: "system"` summary (and mid-session memory
@@ -506,7 +611,7 @@ fn value_to_rig_message_for_provider(
 /// - ToolResult: `{"role": "toolResult", "toolCallId": ..., "content": [<blocks>], ...}`
 #[cfg(test)]
 fn value_to_rig_message(value: &Value) -> Option<Message> {
-    value_to_rig_message_for_provider(value, None)
+    value_to_rig_message_for_provider(value, None, None)
 }
 
 fn provider_requires_openai_reasoning_ids(provider_name: Option<&str>) -> bool {
@@ -695,6 +800,173 @@ mod tests {
         }
     }
 
+    /// User-role value with the new multipart `content` array (a single
+    /// text part) still converts to `Message::User` with that text.
+    /// Image parts are resolved to bytes once the asset dir is threaded
+    /// into the converter (a later task); text parts must work today.
+    #[test]
+    fn user_value_multipart_text_array_converts() {
+        let v = serde_json::json!({
+            "role": "user",
+            "content": [{"type": "text", "text": "hello world"}],
+        });
+        let msg = value_to_rig_message(&v).expect("must convert");
+        match msg {
+            Message::User { content } => match content.first() {
+                UserContent::Text(t) => assert_eq!(t.text, "hello world"),
+                _ => panic!("expected text"),
+            },
+            _ => panic!("expected User"),
+        }
+    }
+
+    /// Multipart user value with an image part resolves the asset from
+    /// the asset dir and emits a base64 `UserContent::Image` (PNG) in
+    /// order after the text part.
+    #[test]
+    fn converter_image_part_resolves_to_base64_block() {
+        use base64::Engine;
+        use rig::completion::message::DocumentSourceKind;
+        let dir = std::env::temp_dir().join(format!(
+            "dirge-conv-img-{}",
+            crate::agent::runner::uuid_v4_simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let png_bytes = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 9, 9, 9];
+        std::fs::write(dir.join("abc.png"), png_bytes).unwrap();
+
+        let v = serde_json::json!({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "look"},
+                {"type": "image", "assetId": "abc", "mediaType": "image/png"},
+            ],
+        });
+        let msg = value_to_rig_message_for_provider(&v, None, Some(&dir)).expect("must convert");
+        match msg {
+            Message::User { content } => {
+                let parts: Vec<_> = content.into_iter().collect();
+                assert_eq!(parts.len(), 2, "text + image");
+                match &parts[0] {
+                    UserContent::Text(t) => assert_eq!(t.text, "look"),
+                    _ => panic!("expected text first"),
+                }
+                match &parts[1] {
+                    UserContent::Image(img) => match &img.data {
+                        DocumentSourceKind::Base64(b64) => {
+                            let decoded = base64::engine::general_purpose::STANDARD
+                                .decode(b64)
+                                .unwrap();
+                            assert_eq!(decoded.as_slice(), &png_bytes[..]);
+                            assert_eq!(
+                                img.media_type,
+                                Some(rig::completion::message::ImageMediaType::PNG)
+                            );
+                        }
+                        other => panic!("expected base64, got {other:?}"),
+                    },
+                    _ => panic!("expected image"),
+                }
+            }
+            _ => panic!("expected User"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An image part whose asset file is missing degrades to a text
+    /// placeholder — never panics, never silently drops.
+    #[test]
+    fn converter_missing_asset_emits_placeholder() {
+        let dir = std::env::temp_dir().join(format!(
+            "dirge-conv-missing-{}",
+            crate::agent::runner::uuid_v4_simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let v = serde_json::json!({
+            "role": "user",
+            "content": [{"type": "image", "assetId": "nope", "mediaType": "image/png"}],
+        });
+        let msg = value_to_rig_message_for_provider(&v, None, Some(&dir)).expect("must convert");
+        match msg {
+            Message::User { content } => match content.first() {
+                UserContent::Text(t) => {
+                    assert!(
+                        t.text.contains("[image unavailable: nope]"),
+                        "got: {}",
+                        t.text
+                    )
+                }
+                _ => panic!("expected placeholder text"),
+            },
+            _ => panic!("expected User"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// No asset dir available (no session) — image parts degrade to a
+    /// placeholder rather than failing the whole message.
+    #[test]
+    fn converter_no_asset_dir_emits_placeholder() {
+        let v = serde_json::json!({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "hi"},
+                {"type": "image", "assetId": "x", "mediaType": "image/png"},
+            ],
+        });
+        let msg = value_to_rig_message_for_provider(&v, None, None).expect("must convert");
+        match msg {
+            Message::User { content } => {
+                let parts: Vec<_> = content.into_iter().collect();
+                assert_eq!(parts.len(), 2);
+                match &parts[1] {
+                    UserContent::Text(t) => assert!(t.text.contains("[image unavailable")),
+                    _ => panic!("expected placeholder for missing asset dir"),
+                }
+            }
+            _ => panic!("expected User"),
+        }
+    }
+
+    /// A tampered asset id carrying path-traversal characters must never
+    /// reach `Path::join` — it degrades to a placeholder instead of a
+    /// file read. Guards against a hand-edited session JSON exfiltrating
+    /// an arbitrary `.png` file to the provider.
+    #[test]
+    fn converter_path_traversal_asset_id_rejected() {
+        let root = std::env::temp_dir().join(format!(
+            "dirge-conv-trav-{}",
+            crate::agent::runner::uuid_v4_simple()
+        ));
+        let dir = root.join("inner");
+        std::fs::create_dir_all(&dir).unwrap();
+        // A naive `dir.join("../secret.png")` would escape `inner/` and
+        // read this sibling file. Validation must reject the id first.
+        std::fs::write(root.join("secret.png"), b"exfiltrated").unwrap();
+        for id in ["../secret", "..\\secret", "/etc/passwd", "", ".", "a/b"] {
+            let v = serde_json::json!({
+                "role": "user",
+                "content": [
+                    {"type": "image", "assetId": id, "mediaType": "image/png"},
+                ],
+            });
+            let msg =
+                value_to_rig_message_for_provider(&v, None, Some(&dir)).expect("must convert");
+            match msg {
+                Message::User { content } => match content.first() {
+                    UserContent::Text(t) => assert!(
+                        t.text.contains("[image unavailable"),
+                        "traversal id {id:?} must yield a placeholder, got: {}",
+                        t.text
+                    ),
+                    other => panic!("expected placeholder for {id:?}, got {other:?}"),
+                },
+                _ => panic!("expected User"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// Assistant with a single text block converts cleanly.
     #[test]
     fn assistant_text_block_converts() {
@@ -767,7 +1039,7 @@ mod tests {
         });
 
         assert!(
-            value_to_rig_message_for_provider(&v, Some("openai")).is_none(),
+            value_to_rig_message_for_provider(&v, Some("openai"), None).is_none(),
             "OpenAI Responses rejects historical reasoning without provider-generated IDs"
         );
     }
@@ -788,7 +1060,8 @@ mod tests {
             ],
         });
 
-        let msg = value_to_rig_message_for_provider(&v, Some("openai")).expect("must convert");
+        let msg =
+            value_to_rig_message_for_provider(&v, Some("openai"), None).expect("must convert");
         match msg {
             Message::Assistant { content, .. } => {
                 let parts: Vec<_> = content.into_iter().collect();
@@ -822,7 +1095,8 @@ mod tests {
             "isError": true,
         });
 
-        let msg = value_to_rig_message_for_provider(&v, Some("openai")).expect("must convert");
+        let msg =
+            value_to_rig_message_for_provider(&v, Some("openai"), None).expect("must convert");
         match msg {
             Message::User { content } => match content.first() {
                 UserContent::ToolResult(tr) => {
@@ -851,7 +1125,7 @@ mod tests {
             "content": summary,
         });
         for provider in [None, Some("anthropic"), Some("openai")] {
-            let msg = value_to_rig_message_for_provider(&v, provider)
+            let msg = value_to_rig_message_for_provider(&v, provider, None)
                 .unwrap_or_else(|| panic!("system message dropped for provider {provider:?}"));
             match msg {
                 Message::User { content } => match content.first() {
@@ -1067,6 +1341,7 @@ mod tests {
         let ctx = LlmContext {
             system_prompt: "test preamble".to_string(),
             messages: vec![serde_json::json!({"role": "user", "content": "hi"})],
+            asset_dir: None,
         };
         let mut stream = factory(
             ctx,
@@ -1100,6 +1375,7 @@ mod tests {
         let ctx = LlmContext {
             system_prompt: String::new(),
             messages: Vec::new(),
+            asset_dir: None,
         };
         let mut stream = factory(
             ctx,

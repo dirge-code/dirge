@@ -714,6 +714,7 @@ fn compress_records_branch_summary_for_pruned_siblings() {
             id: sib1_id.clone(),
             timestamp: 100,
             tool_calls: Vec::new(),
+            images: Vec::new(),
         },
     );
     s.message_store.insert(
@@ -725,6 +726,7 @@ fn compress_records_branch_summary_for_pruned_siblings() {
             id: sib2_id.clone(),
             timestamp: 200,
             tool_calls: Vec::new(),
+            images: Vec::new(),
         },
     );
 
@@ -908,6 +910,51 @@ fn convert_history_pairs_interrupted_tool_calls_with_error_marker() {
     );
 }
 
+/// A user message carrying image refs round-trips through
+/// `convert_history` as a multipart `Message::User`: the text part
+/// plus one `UserContent::Image` per ref, each carrying a
+/// `dirge-asset:<uuid>` sentinel URL (no bytes). The sentinel is
+/// reified to base64 only at the provider boundary, so the resume
+/// path carries no image bytes.
+#[test]
+fn convert_history_emits_image_sentinel_for_image_message() {
+    use crate::agent::agent_loop::message::{AssetId, ImageRef};
+    use rig::completion::message::{DocumentSourceKind, UserContent};
+
+    let mut s = Session::new("p", "m", 0);
+    s.add_message_with_images(
+        MessageRole::User,
+        "look at this",
+        vec![ImageRef {
+            asset_id: AssetId("abc123".to_string()),
+            media_type: "image/png".to_string(),
+        }],
+    );
+
+    let history = crate::agent::runner::convert_history(&s);
+    assert_eq!(history.len(), 1, "single user turn: {:#?}", history);
+    match &history[0] {
+        rig::completion::Message::User { content } => {
+            let parts: Vec<_> = content.iter().collect();
+            assert_eq!(parts.len(), 2, "text + one image part");
+            match parts[0] {
+                UserContent::Text(t) => assert_eq!(t.text, "look at this"),
+                _ => panic!("expected text part first"),
+            }
+            match parts[1] {
+                UserContent::Image(img) => match &img.data {
+                    DocumentSourceKind::Url(url) => {
+                        assert_eq!(url, "dirge-asset:abc123", "sentinel carries the asset id");
+                    }
+                    other => panic!("expected sentinel URL, got {other:?}"),
+                },
+                _ => panic!("expected image part"),
+            }
+        }
+        _ => panic!("expected User message"),
+    }
+}
+
 /// Phase 2 — compress drops a parent that has a sibling branch
 /// underneath. The sibling subtree must also be pruned;
 /// otherwise its nodes have `parent` pointing at a removed id
@@ -955,6 +1002,7 @@ fn compress_prunes_sibling_branches_rooted_at_dropped_messages() {
             id: sib1_id.clone(),
             timestamp: 0,
             tool_calls: Vec::new(),
+            images: Vec::new(),
         },
     );
     s.message_store.insert(
@@ -966,6 +1014,7 @@ fn compress_prunes_sibling_branches_rooted_at_dropped_messages() {
             id: sib2_id.clone(),
             timestamp: 0,
             tool_calls: Vec::new(),
+            images: Vec::new(),
         },
     );
 

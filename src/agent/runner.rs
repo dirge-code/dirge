@@ -109,7 +109,47 @@ pub fn convert_history(session: &Session) -> Vec<Message> {
 
     for msg in &session.messages[first_kept..] {
         match msg.role {
-            MessageRole::User => messages.push(Message::user(msg.content.to_string())),
+            MessageRole::User => {
+                if msg.images.is_empty() {
+                    messages.push(Message::user(msg.content.to_string()));
+                } else {
+                    // Multipart: text part first (if any), then one
+                    // `dirge-asset:<uuid>` sentinel Image per ref. The
+                    // sentinel smuggles the asset id through rig without
+                    // carrying bytes; `value_to_rig_message_for_provider`
+                    // reifies it to base64 at the provider boundary.
+                    use rig::completion::message::{
+                        DocumentSourceKind, Image, ImageMediaType, Text, UserContent,
+                    };
+                    let mut parts: Vec<UserContent> = Vec::new();
+                    if !msg.content.is_empty() {
+                        parts.push(UserContent::Text(Text {
+                            text: msg.content.to_string(),
+                        }));
+                    }
+                    for img in &msg.images {
+                        let media_type = match img.media_type.as_str() {
+                            "image/png" => Some(ImageMediaType::PNG),
+                            "image/jpeg" => Some(ImageMediaType::JPEG),
+                            "image/gif" => Some(ImageMediaType::GIF),
+                            "image/webp" => Some(ImageMediaType::WEBP),
+                            _ => None,
+                        };
+                        parts.push(UserContent::Image(Image {
+                            data: DocumentSourceKind::Url(format!(
+                                "dirge-asset:{}",
+                                img.asset_id.0
+                            )),
+                            media_type,
+                            detail: None,
+                            additional_params: None,
+                        }));
+                    }
+                    if let Ok(content) = OneOrMany::many(parts) {
+                        messages.push(Message::User { content });
+                    }
+                }
+            }
             MessageRole::System => messages.push(Message::system(msg.content.to_string())),
             MessageRole::Assistant => {
                 // Phase 3: if this assistant message has structured

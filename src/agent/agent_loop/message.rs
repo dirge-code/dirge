@@ -249,14 +249,103 @@ impl DeltaPhase {
 ///
 /// Naming: pi uses `message_start` / `message_end` / `message_update`
 /// — those map to `MessageStart` / `MessageEnd` / `MessageUpdate`
-/// here, with serde rename for wire-format parity.
+/// Opaque handle to a stored image asset. The inner string is a
+/// UUID stem that resolves to `<session>/assets/<id>.png` at the
+/// rig boundary (the single byte-reader). Server-generated, never
+/// user-supplied, so it carries no path-traversal surface.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct AssetId(pub String);
+
+impl AssetId {
+    pub fn new() -> Self {
+        Self(crate::agent::runner::uuid_v4_simple())
+    }
+}
+
+impl Default for AssetId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A reference to a stored image. Carries no bytes — the asset is
+/// re-read from disk at the rig boundary every turn it remains in
+/// context. `media_type` is always `image/png` in v1.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageRef {
+    pub asset_id: AssetId,
+    pub media_type: String,
+}
+
+/// One part of an ordered, multipart user message. A single message
+/// may interleave text and image parts; the provider sees them in
+/// order. `tag = "type"` serializes each part as a tagged object so
+/// the forward converter can walk a `Vec<Value>` uniformly.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum UserPart {
+    Text {
+        text: String,
+    },
+    #[serde(rename_all = "camelCase")]
+    Image {
+        asset_id: AssetId,
+        media_type: String,
+    },
+}
+
+impl UserPart {
+    pub fn text(s: impl Into<String>) -> Self {
+        Self::Text { text: s.into() }
+    }
+
+    pub fn image(r: ImageRef) -> Self {
+        Self::Image {
+            asset_id: r.asset_id,
+            media_type: r.media_type,
+        }
+    }
+}
+
 /// Plain user-side message. Port of pi `UserMessage` (from
-/// `@earendil-works/pi-ai`). Phase 2 surface — `content` is a
-/// raw string for now (pi supports content blocks for images
-/// etc., deferred until a real consumer wants them).
-#[derive(Debug, Clone, PartialEq)]
+/// `@earendil-works/pi-ai`). `content` is an ordered list of parts
+/// so a single user turn can carry interleaved text and images.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UserMessage {
-    pub content: String,
+    pub content: Vec<UserPart>,
+}
+
+impl UserMessage {
+    /// A single text part — the common case. Lets the ~25 historical
+    /// construction sites stay one-liners after the `String` →
+    /// `Vec<UserPart>` migration.
+    pub fn text(s: impl Into<String>) -> Self {
+        Self {
+            content: vec![UserPart::text(s)],
+        }
+    }
+
+    /// Concatenate every text part with `"\n"`, skipping image parts.
+    /// For sites that previously read the single-string `content` as
+    /// one blob (logging, task-query extraction, the file-touch tracker).
+    pub fn text_joined(&self) -> String {
+        self.content
+            .iter()
+            .filter_map(|p| match p {
+                UserPart::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// True iff no part is an image (the message is plain text).
+    pub fn is_text_only(&self) -> bool {
+        self.content
+            .iter()
+            .all(|p| matches!(p, UserPart::Text { .. }))
+    }
 }
 
 /// Tool-result message appended to the transcript after a tool
@@ -348,9 +437,18 @@ pub fn tool_result_to_value(t: &ToolResultMessage) -> Value {
 /// source of truth (was copied verbatim in run.rs and integration.rs).
 pub fn loop_message_to_value(msg: &LoopMessage) -> Value {
     match msg {
+        // Backward-compat shaping: a text-only message serializes its
+        // `content` as a plain string — the historical shape every reader
+        // of user content (retry de-dup, steering mocks, heal, etc.)
+        // expects. Only a multipart message (one carrying an image part)
+        // serializes `content` as an array of part objects.
+        LoopMessage::User(u) if u.is_text_only() => serde_json::json!({
+            "role": "user",
+            "content": u.text_joined(),
+        }),
         LoopMessage::User(u) => serde_json::json!({
             "role": "user",
-            "content": u.content,
+            "content": serde_json::to_value(&u.content).unwrap_or(Value::Null),
         }),
         LoopMessage::Assistant(a) => assistant_to_value(a),
         LoopMessage::ToolResult(t) => tool_result_to_value(t),
@@ -694,13 +792,28 @@ mod tests {
     /// transcript-format change for `convertToLlm`, so it must be deliberate.
     #[test]
     fn loop_message_to_value_shapes() {
-        let user = loop_message_to_value(&LoopMessage::User(UserMessage {
-            content: "hello".to_string(),
-        }));
+        // Text-only user message → backward-compat plain-string content.
+        let user = loop_message_to_value(&LoopMessage::User(UserMessage::text("hello")));
         assert_eq!(
             user,
             serde_json::json!({"role": "user", "content": "hello"})
         );
+
+        // A multipart message (image part present) → array of part objects.
+        let multipart = loop_message_to_value(&LoopMessage::User(UserMessage {
+            content: vec![
+                UserPart::text("see this"),
+                UserPart::image(ImageRef {
+                    asset_id: AssetId("x".to_string()),
+                    media_type: "image/png".to_string(),
+                }),
+            ],
+        }));
+        assert_eq!(
+            multipart["content"][0],
+            serde_json::json!({"type": "text", "text": "see this"})
+        );
+        assert_eq!(multipart["content"][1]["type"], "image");
 
         let asst = AssistantMessage {
             content: vec![ContentBlock::Text {
@@ -893,13 +1006,7 @@ mod tests {
     /// `LoopMessage::role()` strings match pi's literal roles.
     #[test]
     fn loop_message_role_strings() {
-        assert_eq!(
-            LoopMessage::User(UserMessage {
-                content: "hi".to_string()
-            })
-            .role(),
-            "user"
-        );
+        assert_eq!(LoopMessage::User(UserMessage::text("hi")).role(), "user");
         assert_eq!(
             LoopMessage::Assistant(AssistantMessage::new(vec![], StopReason::Stop)).role(),
             "assistant"
@@ -916,5 +1023,53 @@ mod tests {
             "toolResult"
         );
         assert_eq!(LoopMessage::Custom(Value::Null).role(), "custom");
+    }
+
+    #[test]
+    fn userpart_text_serde_roundtrip() {
+        let part = UserPart::text("hello");
+        let json = serde_json::to_value(&part).unwrap();
+        assert_eq!(json, serde_json::json!({"type": "text", "text": "hello"}));
+        let back: UserPart = serde_json::from_value(json).unwrap();
+        assert_eq!(part, back);
+    }
+
+    #[test]
+    fn userpart_image_serde_roundtrip() {
+        let part = UserPart::image(ImageRef {
+            asset_id: AssetId("abc".to_string()),
+            media_type: "image/png".to_string(),
+        });
+        let json = serde_json::to_value(&part).unwrap();
+        // asset_id / media_type serialize camelCase; the newtype AssetId
+        // collapses to its inner string.
+        assert_eq!(
+            json,
+            serde_json::json!({"type": "image", "assetId": "abc", "mediaType": "image/png"})
+        );
+        let back: UserPart = serde_json::from_value(json).unwrap();
+        assert_eq!(part, back);
+    }
+
+    #[test]
+    fn user_message_text_helpers() {
+        let m = UserMessage::text("hello");
+        assert!(m.is_text_only());
+        assert_eq!(m.text_joined(), "hello");
+        assert_eq!(m.content.len(), 1);
+
+        let multi = UserMessage {
+            content: vec![
+                UserPart::text("line one"),
+                UserPart::image(ImageRef {
+                    asset_id: AssetId::new(),
+                    media_type: "image/png".to_string(),
+                }),
+                UserPart::text("line two"),
+            ],
+        };
+        assert!(!multi.is_text_only());
+        // image parts carry no text — text_joined skips them.
+        assert_eq!(multi.text_joined(), "line one\nline two");
     }
 }

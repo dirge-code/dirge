@@ -83,6 +83,7 @@ fn build_config() -> LoopConfig {
         metadata: std::collections::HashMap::new(),
         provider_name: None,
         model_name: None,
+        asset_dir: None,
         compact_model: None,
         storm_mutating_tools: None,
         storm_exempt_tools: None,
@@ -117,9 +118,7 @@ fn empty_context() -> Context {
 }
 
 fn user(text: &str) -> LoopMessage {
-    LoopMessage::User(UserMessage {
-        content: text.to_string(),
-    })
+    LoopMessage::User(UserMessage::text(text))
 }
 
 fn text_response(text: &str) -> AssistantMessage {
@@ -609,7 +608,7 @@ async fn ywj_get_steering_messages_injects_user_message_at_boundary() {
     let user_contents: Vec<String> = messages
         .iter()
         .filter_map(|m| match m {
-            LoopMessage::User(u) => Some(u.content.clone()),
+            LoopMessage::User(u) => Some(u.text_joined()),
             _ => None,
         })
         .collect();
@@ -682,7 +681,7 @@ async fn ywj_get_followup_messages_reenters_outer_loop() {
     let user_contents: Vec<String> = messages
         .iter()
         .filter_map(|m| match m {
-            LoopMessage::User(u) => Some(u.content.clone()),
+            LoopMessage::User(u) => Some(u.text_joined()),
             _ => None,
         })
         .collect();

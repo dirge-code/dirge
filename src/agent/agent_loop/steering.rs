@@ -69,13 +69,7 @@ pub fn steering_from_queue(
             drained
                 .into_iter()
                 .map(|content| {
-                    LoopMessage::User(UserMessage {
-                        // Port of Reasonix loop.ts:740-743 —
-                        // wrap every steering message with the
-                        // mid-turn preamble so the model doesn't
-                        // abandon the current task.
-                        content: format_steer_user_message(&content),
-                    })
+                    LoopMessage::User(UserMessage::text(format_steer_user_message(&content)))
                 })
                 .collect()
         })
@@ -112,7 +106,7 @@ mod tests {
         let contents: Vec<_> = messages
             .iter()
             .map(|m| match m {
-                LoopMessage::User(u) => u.content.clone(),
+                LoopMessage::User(u) => u.text_joined(),
                 _ => panic!("expected User"),
             })
             .collect();
@@ -140,7 +134,7 @@ mod tests {
         assert_eq!(m1.len(), 1);
         assert!(matches!(
             &m1[0],
-            LoopMessage::User(u) if u.content.starts_with(MID_TURN_STEER_WRAPPER) && u.content.ends_with("first")
+            LoopMessage::User(u) if u.text_joined().starts_with(MID_TURN_STEER_WRAPPER) && u.text_joined().ends_with("first")
         ));
 
         // One left.
@@ -150,7 +144,7 @@ mod tests {
         assert_eq!(m2.len(), 1);
         assert!(matches!(
             &m2[0],
-            LoopMessage::User(u) if u.content.contains("second")
+            LoopMessage::User(u) if u.text_joined().contains("second")
         ));
 
         // Empty now.
@@ -183,7 +177,7 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert!(matches!(
             &messages[0],
-            LoopMessage::User(u) if u.content.starts_with(MID_TURN_STEER_WRAPPER) && u.content.ends_with("mid-run")
+            LoopMessage::User(u) if u.text_joined().starts_with(MID_TURN_STEER_WRAPPER) && u.text_joined().ends_with("mid-run")
         ));
     }
 
@@ -371,6 +365,7 @@ mod tests {
             metadata: std::collections::HashMap::new(),
             provider_name: None,
             model_name: None,
+            asset_dir: None,
             compact_model: None,
             storm_mutating_tools: None,
             storm_exempt_tools: None,
@@ -405,9 +400,7 @@ mod tests {
 
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
         let messages = run_agent_loop(
-            vec![LoopMessage::User(UserMessage {
-                content: "start".to_string(),
-            })],
+            vec![LoopMessage::User(UserMessage::text("start"))],
             ctx,
             config,
             AbortSignal::new(),
@@ -428,7 +421,7 @@ mod tests {
         let user_contents: Vec<String> = messages
             .iter()
             .filter_map(|m| match m {
-                LoopMessage::User(u) => Some(u.content.clone()),
+                LoopMessage::User(u) => Some(u.text_joined()),
                 _ => None,
             })
             .collect();

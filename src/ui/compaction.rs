@@ -32,6 +32,7 @@ pub(crate) enum CompactionThen {
     SendPrompt {
         run_prompt: String,
         record_text: String,
+        images: Vec<crate::agent::agent_loop::message::ImageRef>,
     },
     /// Reactive overflow recovery: the prompt already overflowed and is ALREADY
     /// in the session. After a successful compaction we RESUME the task rather

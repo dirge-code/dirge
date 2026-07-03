@@ -264,6 +264,7 @@ mod tests {
             id: crate::session::new_message_id(),
             timestamp: 0,
             tool_calls: calls,
+            images: Vec::new(),
         }
     }
 

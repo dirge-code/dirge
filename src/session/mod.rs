@@ -8,6 +8,8 @@ use compact_str::CompactString;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+pub use crate::agent::agent_loop::message::{AssetId, ImageRef};
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageRole {
@@ -85,6 +87,15 @@ pub struct SessionMessage {
     /// with pre-Phase-3 session files.
     #[serde(default)]
     pub tool_calls: Vec<ToolCallEntry>,
+    /// Image assets attached to this user message, as opaque
+    /// `ImageRef` handles (never inline bytes). The asset bytes live
+    /// in `<data-dir>/sessions/<session-id>/assets/<asset-id>.png`
+    /// and are re-read at the rig boundary every turn the image is in
+    /// context. Empty for assistant/system messages and for user
+    /// messages that carry no images. Defaulted on deserialize so
+    /// pre-image session files load without migration.
+    #[serde(default)]
+    pub images: Vec<ImageRef>,
 }
 
 /// Generate a fresh message id. Extracted for `#[serde(default = ...)]`.
@@ -577,6 +588,53 @@ impl Session {
         self.add_message_with_tool_calls(role, content, Vec::new());
     }
 
+    /// Same as `add_message` but attaches image refs to the new
+    /// message. Image refs (not bytes) are persisted; the asset
+    /// bytes live in the session's `assets/` dir and are re-read at
+    /// the rig boundary. Empty `images` is equivalent to
+    /// `add_message`. Only meaningful for `User` turns today.
+    pub fn add_message_with_images(
+        &mut self,
+        role: MessageRole,
+        content: &str,
+        images: Vec<ImageRef>,
+    ) {
+        self.add_message(role, content);
+        if images.is_empty() {
+            return;
+        }
+        if let Some(last) = self.messages.last_mut() {
+            last.images = images.clone();
+            let id = last.id.clone();
+            if let Some(m) = self.message_store.get_mut(&id) {
+                m.images = images;
+            }
+        }
+    }
+
+    /// This session's image-asset directory
+    /// (`<data>/sessions/assets/<id>/`). Holds `<asset_id>.png` for
+    /// each `ImageRef` in `messages`. Created on first `write_asset`;
+    /// removed wholesale by `delete_session`.
+    pub fn assets_dir(&self) -> std::path::PathBuf {
+        crate::session::storage::assets_dir_for(&self.id)
+    }
+
+    /// Persist an image asset's bytes as `<assets_dir>/<asset_id>.png`.
+    /// Called on submit (not on paste). Creates the assets dir if
+    /// needed. Returns the written path on success.
+    pub fn write_asset(
+        &mut self,
+        asset_id: &AssetId,
+        bytes: &[u8],
+    ) -> std::io::Result<std::path::PathBuf> {
+        let dir = self.assets_dir();
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(format!("{}.png", asset_id.0));
+        std::fs::write(&path, bytes)?;
+        Ok(path)
+    }
+
     /// The conversation's stable identity. Returns `origin_id` when set,
     /// otherwise falls back to `id` (a never-folded or pre-`origin_id`
     /// session is its own origin). This is the key for resume tip
@@ -661,6 +719,7 @@ impl Session {
             id: id.clone(),
             timestamp,
             tool_calls,
+            images: Vec::new(),
         };
         self.messages.push(msg.clone());
         self.message_store.insert(id.clone(), msg);

@@ -1796,6 +1796,7 @@ fn test_plugin_provider_visible_through_resolve_provider_info() {
             api_key_env: Some("PLUGIN_TEST_KEY".to_string()),
             // test URL is http (not https) — must opt into insecure
             allow_insecure: true,
+            multimodal: None,
             ..Default::default()
         },
     );
@@ -1835,6 +1836,7 @@ fn test_config_provider_overrides_plugin_provider() {
             base_url: Some("http://from-config".to_string()),
             // test URL is http — opt into insecure
             allow_insecure: true,
+            multimodal: None,
             ..Default::default()
         },
     );

@@ -245,10 +245,10 @@ impl EventBridge {
                         let prompt_text = messages
                             .iter()
                             .find_map(|m| match m {
-                                LoopMessage::User(u) => Some(u.content.as_str()),
+                                LoopMessage::User(u) => Some(u.text_joined()),
                                 _ => None,
                             })
-                            .unwrap_or("");
+                            .unwrap_or_default();
                         vec![AgentEvent::ContextOverflow {
                             prompt: CompactString::from(prompt_text),
                             error: CompactString::from(error_text),
@@ -325,7 +325,7 @@ impl EventBridge {
                 match message {
                     LoopMessage::User(u) => {
                         vec![AgentEvent::UserMessage {
-                            content: CompactString::from(u.content),
+                            content: CompactString::from(u.text_joined()),
                         }]
                     }
                     LoopMessage::Custom(payload) => {

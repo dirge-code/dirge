@@ -348,12 +348,15 @@ pub(crate) async fn finish_done(
             let followup_prompt = text + "\n\nContinue.";
             ctx.last_user_prompt.clone_from(&followup_prompt);
             let runner = agent.clone().spawn_runner(
-                crate::agent::tools::background::prepend_pending_notifications(
-                    &followup_prompt,
-                    bg_store.as_ref(),
+                crate::provider::Prompt::text(
+                    crate::agent::tools::background::prepend_pending_notifications(
+                        &followup_prompt,
+                        bg_store.as_ref(),
+                    ),
                 ),
                 crate::agent::runner::convert_history(ctx.session),
                 Some(interjection_queue.clone()),
+                None,
             );
             runner.install_into(
                 agent_rx,
@@ -385,12 +388,15 @@ pub(crate) async fn finish_done(
                 let prompt = ls.build_prompt();
                 ctx.last_user_prompt.clone_from(&prompt);
                 let runner = agent.clone().spawn_runner(
-                    crate::agent::tools::background::prepend_pending_notifications(
-                        &prompt,
-                        bg_store.as_ref(),
+                    crate::provider::Prompt::text(
+                        crate::agent::tools::background::prepend_pending_notifications(
+                            &prompt,
+                            bg_store.as_ref(),
+                        ),
                     ),
                     Vec::new(),
                     Some(interjection_queue.clone()),
+                    None,
                 );
                 runner.install_into(
                     agent_rx,
@@ -590,12 +596,15 @@ pub(crate) fn finalize_idle_turn(
         session.add_message(MessageRole::User, &combined);
 
         let runner = agent.clone().spawn_runner(
-            crate::agent::tools::background::prepend_pending_notifications(
-                &combined,
-                bg_store.as_ref(),
+            crate::provider::Prompt::text(
+                crate::agent::tools::background::prepend_pending_notifications(
+                    &combined,
+                    bg_store.as_ref(),
+                ),
             ),
             history,
             Some(interjection_queue.clone()),
+            None,
         );
         runner.install_into(
             agent_rx,

@@ -1038,13 +1038,11 @@ pub fn blocking_followup(blocking: &[Finding]) -> Option<LoopMessage> {
         return None;
     }
     let body = render_findings(blocking);
-    Some(LoopMessage::User(UserMessage {
-        content: format!(
-            "{CODE_REVIEW_TAG} A review of the diff you just made found these high-severity \
-             issues. Fix each, or explain why it doesn't apply (out of scope, intended, or \
-             something you were told not to do):\n{body}"
-        ),
-    }))
+    Some(LoopMessage::User(UserMessage::text(format!(
+        "{CODE_REVIEW_TAG} A review of the diff you just made found these high-severity \
+         issues. Fix each, or explain why it doesn't apply (out of scope, intended, or \
+         something you were told not to do):\n{body}"
+    ))))
 }
 
 /// Render the advisory (medium/low) findings as a non-blocking
@@ -1647,7 +1645,7 @@ diff --git a/Cargo.lock b/Cargo.lock\n\
         }];
         let msg = blocking_followup(&blocking).expect("some");
         let content = match &msg {
-            LoopMessage::User(u) => &u.content,
+            LoopMessage::User(u) => u.text_joined(),
             _ => panic!("expected user message"),
         };
         assert!(content.starts_with(CODE_REVIEW_TAG));

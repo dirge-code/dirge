@@ -62,9 +62,7 @@ fn agent_start_no_op_agent_end_emits_done() {
     assert!(bridge.translate(LoopEvent::AgentStart).is_empty());
 
     let messages = vec![
-        LoopMessage::User(UserMessage {
-            content: "hi".to_string(),
-        }),
+        LoopMessage::User(UserMessage::text("hi")),
         LoopMessage::Assistant(assistant_with_text("final answer")),
     ];
     let out = bridge.translate(LoopEvent::AgentEnd { messages });
@@ -96,9 +94,7 @@ fn agent_end_context_length_error_emits_context_overflow() {
     a.stop_reason = StopReason::Error;
     a.error_message = Some("prompt is too long: maximum context length exceeded".to_string());
     let messages = vec![
-        LoopMessage::User(UserMessage {
-            content: "summarize this huge doc".to_string(),
-        }),
+        LoopMessage::User(UserMessage::text("summarize this huge doc")),
         LoopMessage::Assistant(a),
     ];
     let out = bridge.translate(LoopEvent::AgentEnd { messages });
@@ -124,9 +120,7 @@ fn agent_end_non_context_error_emits_error() {
     a.stop_reason = StopReason::Error;
     a.error_message = Some("401 unauthorized: invalid api key".to_string());
     let messages = vec![
-        LoopMessage::User(UserMessage {
-            content: "hi".to_string(),
-        }),
+        LoopMessage::User(UserMessage::text("hi")),
         LoopMessage::Assistant(a),
     ];
     let out = bridge.translate(LoopEvent::AgentEnd { messages });
@@ -152,9 +146,7 @@ fn agent_end_cancellation_emits_interjected_not_error() {
     a.stop_reason = StopReason::Error;
     a.error_message = Some("stream aborted by cancellation signal".to_string());
     let messages = vec![
-        LoopMessage::User(UserMessage {
-            content: "do a long thing".to_string(),
-        }),
+        LoopMessage::User(UserMessage::text("do a long thing")),
         LoopMessage::Assistant(a),
     ];
     let out = bridge.translate(LoopEvent::AgentEnd { messages });
@@ -217,9 +209,7 @@ fn agent_end_aborted_emits_done() {
 #[test]
 fn agent_end_no_assistant_done_empty_response() {
     let mut bridge = EventBridge::new();
-    let messages = vec![LoopMessage::User(UserMessage {
-        content: "hi".to_string(),
-    })];
+    let messages = vec![LoopMessage::User(UserMessage::text("hi"))];
     let out = bridge.translate(LoopEvent::AgentEnd { messages });
     match &out[0] {
         AgentEvent::Done { response, .. } => {
@@ -444,9 +434,7 @@ fn message_start_custom_emits_custom_message_event() {
 #[test]
 fn message_start_end_behavior() {
     let mut bridge = EventBridge::new();
-    let user_msg = LoopMessage::User(UserMessage {
-        content: "hi".to_string(),
-    });
+    let user_msg = LoopMessage::User(UserMessage::text("hi"));
     // User messages now emit UserMessage.
     let events = bridge.translate(LoopEvent::MessageStart {
         message: user_msg.clone(),

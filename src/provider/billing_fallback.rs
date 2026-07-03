@@ -211,6 +211,7 @@ mod tests {
         LlmContext {
             system_prompt: String::new(),
             messages: vec![serde_json::json!({"role": "user", "content": "hi"})],
+            asset_dir: None,
         }
     }
 

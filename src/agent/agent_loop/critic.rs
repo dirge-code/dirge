@@ -276,20 +276,16 @@ pub async fn run_critic(
     );
     match parse_verdict(&response) {
         Verdict::Complete => Vec::new(),
-        Verdict::Incomplete(issues) => vec![LoopMessage::User(UserMessage {
-            content: format!(
-                "{CRITIC_TAG} A review of your work found it may not be done yet. Address these \
-                 before reporting complete, or explain why they don't apply (e.g. they're out of \
-                 scope or something you were told not to do):\n{issues}"
-            ),
-        })],
-        Verdict::Abstain(missing) => vec![LoopMessage::User(UserMessage {
-            content: format!(
-                "{CRITIC_TAG} A review could not confirm this is correct from the spec and \
-                 evidence available. Rather than assume it's done, add a focused test (or state \
-                 the missing spec detail) that would prove it, then continue.\n{missing}"
-            ),
-        })],
+        Verdict::Incomplete(issues) => vec![LoopMessage::User(UserMessage::text(format!(
+            "{CRITIC_TAG} A review of your work found it may not be done yet. Address these \
+             before reporting complete, or explain why they don't apply (e.g. they're out of \
+             scope or something you were told not to do):\n{issues}"
+        )))],
+        Verdict::Abstain(missing) => vec![LoopMessage::User(UserMessage::text(format!(
+            "{CRITIC_TAG} A review could not confirm this is correct from the spec and \
+             evidence available. Rather than assume it's done, add a focused test (or state \
+             the missing spec detail) that would prove it, then continue.\n{missing}"
+        )))],
     }
 }
 
@@ -590,7 +586,7 @@ mod tests {
         let msgs = run_critic(&critic, "rules", "did stuff", None).await;
         assert_eq!(msgs.len(), 1);
         let content = match &msgs[0] {
-            LoopMessage::User(u) => &u.content,
+            LoopMessage::User(u) => u.text_joined(),
             _ => panic!("expected user message"),
         };
         assert!(content.starts_with(CRITIC_TAG));

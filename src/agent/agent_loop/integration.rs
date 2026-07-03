@@ -166,6 +166,7 @@ pub fn rig_message_to_loop_messages(m: rig::completion::Message) -> Vec<LoopMess
             // ToolResult parts (which each become their own
             // ToolResult message).
             let mut text_parts: Vec<String> = Vec::new();
+            let mut image_parts: Vec<super::message::UserPart> = Vec::new();
             let mut tool_results: Vec<LoopMessage> = Vec::new();
             for part in content.into_iter() {
                 match part {
@@ -194,17 +195,47 @@ pub fn rig_message_to_loop_messages(m: rig::completion::Message) -> Vec<LoopMess
                             is_error: false,
                         }));
                     }
-                    // Image/Audio/Video/Document — rare in dirge's
+                    UserContent::Image(img) => {
+                        // The only images dirge pushes into history are
+                        // `dirge-asset:<uuid>` sentinels emitted by
+                        // `convert_history`. Reconstruct the `ImageRef`
+                        // from the sentinel. A real (non-sentinel) image
+                        // URL is unexpected in dirge's flow — skip it
+                        // with a warn rather than dropping silently.
+                        match &img.data {
+                            rig::completion::message::DocumentSourceKind::Url(url)
+                                if url.starts_with("dirge-asset:") =>
+                            {
+                                let asset_id = url["dirge-asset:".len()..].to_string();
+                                image_parts.push(super::message::UserPart::image(
+                                    super::message::ImageRef {
+                                        asset_id: super::message::AssetId(asset_id),
+                                        media_type: "image/png".to_string(),
+                                    },
+                                ));
+                            }
+                            _ => {
+                                tracing::warn!(
+                                    target: "agent_loop",
+                                    "non-sentinel image content in history; dropping"
+                                );
+                            }
+                        }
+                    }
+                    // Audio/Video/Document — rare in dirge's
                     // history. Drop with a no-op; chat history is
                     // text-centric.
                     _ => {}
                 }
             }
             let mut out = Vec::new();
-            if !text_parts.is_empty() {
-                out.push(LoopMessage::User(UserMessage {
-                    content: text_parts.join("\n"),
-                }));
+            if !text_parts.is_empty() || !image_parts.is_empty() {
+                let mut content: Vec<super::message::UserPart> = text_parts
+                    .into_iter()
+                    .map(super::message::UserPart::text)
+                    .collect();
+                content.extend(image_parts);
+                out.push(LoopMessage::User(UserMessage { content }));
             }
             out.extend(tool_results);
             out
@@ -312,6 +343,12 @@ pub struct LoopSpawnConfig {
     /// User prompt that starts this run.
     pub initial_prompt: String,
 
+    /// Images attached to the starting user turn (fresh-paste path).
+    /// Each becomes a `UserPart::Image` on the active-turn message.
+    /// Empty for text-only runs and for resume (images there arrive
+    /// via history, as `dirge-asset:` sentinels).
+    pub initial_prompt_images: Vec<super::message::ImageRef>,
+
     /// Tool registry. Built via `RigToolAdapter::new(rig_tool)`
     /// for each existing dirge tool, or constructed directly from
     /// a custom `impl LoopTool`.
@@ -348,6 +385,11 @@ pub struct LoopSpawnConfig {
     /// repair_kind)`. `None` is acceptable — telemetry falls back
     /// to `"unknown"`.
     pub model_name: Option<String>,
+
+    /// Session asset dir — copied into every `LlmContext.asset_dir`
+    /// the loop builds, so the rig boundary can resolve `UserPart::Image`
+    /// refs to base64. `None` for sessionless paths (headless/-p).
+    pub asset_dir: Option<std::path::PathBuf>,
 
     /// LOOP-9 — optional summarizer callback forwarded to
     /// `LoopConfig.summarize_fn` so the run-loop's compaction path
@@ -459,9 +501,11 @@ impl LoopSpawnConfig {
             system_prompt: String::new(),
             history: Vec::new(),
             initial_prompt: prompt.into(),
+            initial_prompt_images: Vec::new(),
             tools: Vec::new(),
             provider_name: None,
             model_name: None,
+            asset_dir: None,
             #[cfg(feature = "plugin")]
             plugin_mgr: None,
             steering_queue: None,
@@ -533,6 +577,7 @@ pub fn spawn_loop_runner(cfg: LoopSpawnConfig) -> LoopRunner {
         metadata: std::collections::HashMap::new(),
         provider_name: cfg.provider_name.clone(),
         model_name: cfg.model_name.clone(),
+        asset_dir: cfg.asset_dir.clone(),
         compact_model: None,
         storm_mutating_tools: None,
         storm_exempt_tools: None,
@@ -641,8 +686,18 @@ pub fn spawn_loop_runner(cfg: LoopSpawnConfig) -> LoopRunner {
         messages: cfg.history.iter().map(loop_message_to_value).collect(),
         tools: cfg.tools,
     };
+    // Seed the active-turn user message from `initial_prompt`, appending
+    // a `UserPart::Image` per fresh-paste image (the resume path carries
+    // its images through history as `dirge-asset:` sentinels instead).
+    let initial_content = {
+        let mut parts = vec![super::message::UserPart::text(cfg.initial_prompt.clone())];
+        for img in &cfg.initial_prompt_images {
+            parts.push(super::message::UserPart::image(img.clone()));
+        }
+        parts
+    };
     let prompts = vec![LoopMessage::User(UserMessage {
-        content: cfg.initial_prompt,
+        content: initial_content,
     })];
     let stream_fn = cfg.stream_fn;
     let summarize_fn = cfg.summarize_fn.clone();
@@ -773,6 +828,53 @@ mod tests {
     use crate::agent::agent_loop::tool::LoopToolUpdate;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A rig `Message::User` carrying a `dirge-asset:<uuid>` sentinel
+    /// image part is reconstructed by `rig_message_to_loop_messages`
+    /// into a `UserPart::Image` (asset id + media type), no bytes.
+    #[test]
+    fn rig_to_loop_reconstructs_imageref_from_sentinel() {
+        use crate::agent::agent_loop::message::{
+            AssetId, ImageRef, LoopMessage, UserMessage, UserPart,
+        };
+        use rig::OneOrMany;
+        use rig::completion::message::{
+            DocumentSourceKind, Image, ImageMediaType, Text, UserContent,
+        };
+
+        let m = rig::completion::Message::User {
+            content: OneOrMany::many(vec![
+                UserContent::Text(Text {
+                    text: "hi".to_string(),
+                }),
+                UserContent::Image(Image {
+                    data: DocumentSourceKind::Url("dirge-asset:abc".to_string()),
+                    media_type: Some(ImageMediaType::PNG),
+                    detail: None,
+                    additional_params: None,
+                }),
+            ])
+            .unwrap(),
+        };
+        let out = super::rig_message_to_loop_messages(m);
+        assert_eq!(out.len(), 1, "one user message: {:#?}", out);
+        match &out[0] {
+            LoopMessage::User(um) => {
+                assert_eq!(um.content.len(), 2);
+                match &um.content[1] {
+                    UserPart::Image {
+                        asset_id,
+                        media_type,
+                    } => {
+                        assert_eq!(asset_id.0, "abc");
+                        assert_eq!(media_type, "image/png");
+                    }
+                    _ => panic!("expected image part"),
+                }
+            }
+            _ => panic!("expected User loop message"),
+        }
+    }
 
     /// Drain the event channel.
     async fn drain(mut rx: mpsc::Receiver<AgentEvent>) -> Vec<AgentEvent> {
@@ -1281,9 +1383,7 @@ mod tests {
         use std::sync::Mutex;
         // Custom message intermixed with normal history.
         let history = vec![
-            LoopMessage::User(UserMessage {
-                content: "first user".to_string(),
-            }),
+            LoopMessage::User(UserMessage::text("first user")),
             LoopMessage::Custom(serde_json::json!({
                 "role": "custom",
                 "content": "UI-only notification",

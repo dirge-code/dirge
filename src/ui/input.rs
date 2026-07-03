@@ -52,7 +52,7 @@ enum EditKind {
 struct UndoSnapshot {
     buffer: CompactString,
     cursor: usize,
-    pastes: Vec<Option<CompactString>>,
+    pastes: Vec<Option<PasteSlot>>,
 }
 
 fn prev_char_boundary(s: &str, idx: usize) -> usize {
@@ -252,6 +252,25 @@ const PASTE_COLLAPSE_LINES: usize = 4;
 /// input — so its presence reliably marks a placeholder block.
 const PASTE_MARK: char = '\x01';
 
+/// One paste slot referenced by a `\x01<idx>\x01` marker. Most pastes
+/// are multi-line text; an image paste (Ctrl+V with an image on the
+/// clipboard) stores the raw bytes here until submit, when they're
+/// written to the session asset dir and attached to the prompt.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PasteSlot {
+    Text(CompactString),
+    Image(PendingImage),
+}
+
+/// An image awaiting submit. The bytes live in the slot until the turn
+/// is sent; on submit they're persisted via `Session::write_asset` and
+/// referenced by an `ImageRef` (asset id) on the prompt.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingImage {
+    pub bytes: Vec<u8>,
+    pub media_type: String,
+}
+
 pub struct InputEditor {
     pub buffer: CompactString,
     pub cursor: usize,
@@ -269,7 +288,13 @@ pub struct InputEditor {
     /// Pasted text bodies indexed by the digits appearing between `\x01` marks
     /// in the buffer. `None` entries are tombstones for expanded pastes (so
     /// existing indices remain valid).
-    pastes: Vec<Option<CompactString>>,
+    pastes: Vec<Option<PasteSlot>>,
+    /// Image slots drained out of `pastes` at submit time (Enter), for
+    /// the caller to persist + attach to the prompt. Cleared by the
+    /// caller after it consumes them. `handle_key` clears `pastes`
+    /// before returning, so this is the only channel for the submit
+    /// images to escape.
+    pub pending_images: Vec<PendingImage>,
     /// Current slash-command completion state, for rendering a preview.
     #[cfg(feature = "slash-completion")]
     pub completion: Option<CompletionResult>,
@@ -447,6 +472,7 @@ impl InputEditor {
             last_action_was_kill: false,
             yank_state: None,
             pastes: Vec::new(),
+            pending_images: Vec::new(),
             #[cfg(feature = "slash-completion")]
             completion: None,
             wrap_w: 0,
@@ -508,7 +534,7 @@ impl InputEditor {
         &mut self,
         buffer: CompactString,
         cursor: usize,
-        pastes: Vec<Option<CompactString>>,
+        pastes: Vec<Option<PasteSlot>>,
         kind: EditKind,
     ) {
         let coalesce = matches!(kind, EditKind::Insert | EditKind::InsertBoundary)
@@ -555,6 +581,26 @@ impl InputEditor {
         let pre_cursor = self.cursor;
         let pre_pastes = self.pastes.clone();
         self.handle_paste_inner(text);
+        if self.buffer != pre_buffer || self.pastes != pre_pastes {
+            self.record_undo(pre_buffer, pre_cursor, pre_pastes, EditKind::Other);
+        }
+    }
+
+    /// Insert a pasted image as a `[image]` placeholder slot. The bytes
+    /// stay in the slot until [`submission`]; on send they're persisted
+    /// to the session asset dir and attached to the prompt. Ignored
+    /// while the file picker is active (same guard as text paste).
+    pub fn handle_paste_image(&mut self, image: PendingImage) {
+        if self.picker.as_ref().is_some_and(|p| p.active) {
+            return;
+        }
+        let pre_buffer = self.buffer.clone();
+        let pre_cursor = self.cursor;
+        let pre_pastes = self.pastes.clone();
+        let idx = self.pastes.len();
+        self.pastes.push(Some(PasteSlot::Image(image)));
+        let marker = format!("{}{}{}", PASTE_MARK, idx, PASTE_MARK);
+        self.insert_str(&marker);
         if self.buffer != pre_buffer || self.pastes != pre_pastes {
             self.record_undo(pre_buffer, pre_cursor, pre_pastes, EditKind::Other);
         }
@@ -609,20 +655,27 @@ impl InputEditor {
                 self.pastes
                     .get(*idx)
                     .and_then(|opt| opt.as_ref())
-                    .map(|s| s.as_str() == cleaned.as_str())
+                    // Only text slots auto-expand; image slots have no
+                    // inline text form.
+                    .and_then(|slot| match slot {
+                        PasteSlot::Text(s) => Some(s.as_str() == cleaned.as_str()),
+                        PasteSlot::Image(_) => None,
+                    })
                     .unwrap_or(false)
             })
         {
-            let body = self.pastes[idx].take().unwrap();
-            self.buffer.replace_range(start..end, body.as_str());
-            // Place cursor at end of expanded text.
-            self.cursor = start + body.len();
+            if let Some(PasteSlot::Text(body)) = self.pastes[idx].take() {
+                self.buffer.replace_range(start..end, body.as_str());
+                // Place cursor at end of expanded text.
+                self.cursor = start + body.len();
+            }
             self.history_pos = None;
             self.reset_kill_accumulation();
             return;
         }
         let idx = self.pastes.len();
-        self.pastes.push(Some(CompactString::from(cleaned)));
+        self.pastes
+            .push(Some(PasteSlot::Text(CompactString::from(cleaned))));
         let marker = format!("{}{}{}", PASTE_MARK, idx, PASTE_MARK);
         self.insert_str(&marker);
     }
@@ -689,7 +742,10 @@ impl InputEditor {
                 .pastes
                 .get(*idx)
                 .and_then(|o| o.as_ref())
-                .map(|s| placeholder_display(s.as_str()))
+                .map(|slot| match slot {
+                    PasteSlot::Text(s) => placeholder_display(s.as_str()),
+                    PasteSlot::Image(_) => "[image]".to_string(),
+                })
                 .unwrap_or_default();
             let marker_len = end - start;
             if cursor >= *end {
@@ -713,7 +769,7 @@ impl InputEditor {
     /// Expand markers in `s` using `pastes` for bodies. Free-function form
     /// so it can also be used to flatten markers in kill-ring entries
     /// before we clear `pastes`.
-    fn expand_with_pastes(s: &str, pastes: &[Option<CompactString>]) -> String {
+    fn expand_with_pastes(s: &str, pastes: &[Option<PasteSlot>]) -> String {
         let blocks = marker_blocks(s);
         if blocks.is_empty() {
             return s.to_string();
@@ -722,7 +778,10 @@ impl InputEditor {
         let mut cur = 0;
         for (start, end, idx) in blocks {
             out.push_str(&s[cur..start]);
-            if let Some(Some(body)) = pastes.get(idx) {
+            // Image slots have no inline text form — they're attached
+            // as separate parts at submit, so they vanish from the
+            // flattened text (the marker is simply dropped here).
+            if let Some(Some(PasteSlot::Text(body))) = pastes.get(idx) {
                 out.push_str(body);
             }
             cur = end;
@@ -752,7 +811,10 @@ impl InputEditor {
                 .pastes
                 .get(idx)
                 .and_then(|o| o.as_ref())
-                .map(|s| placeholder_display(s))
+                .map(|slot| match slot {
+                    PasteSlot::Text(s) => placeholder_display(s.as_str()),
+                    PasteSlot::Image(_) => "[image]".to_string(),
+                })
                 .unwrap_or_else(|| "[expanded]".to_string());
             // Adjust the displayed cursor position if it lies after this block.
             if cursor_in_line >= end {
@@ -1468,9 +1530,19 @@ impl InputEditor {
                         *entry = expanded.into();
                     }
                 }
+                // Drain image slots out before clearing, so the caller
+                // can persist + attach them to the prompt at send time.
+                self.pending_images = self
+                    .pastes
+                    .iter()
+                    .filter_map(|o| match o {
+                        Some(PasteSlot::Image(i)) => Some(i.clone()),
+                        _ => None,
+                    })
+                    .collect();
                 self.pastes.clear();
                 self.reset_kill_accumulation();
-                if submitted.is_empty() {
+                if submitted.is_empty() && self.pending_images.is_empty() {
                     None
                 } else {
                     Some(submitted)

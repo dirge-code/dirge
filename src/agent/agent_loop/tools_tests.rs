@@ -215,6 +215,7 @@ fn build_config() -> LoopConfig {
         metadata: std::collections::HashMap::new(),
         provider_name: None,
         model_name: None,
+        asset_dir: None,
         compact_model: None,
         storm_mutating_tools: None,
         storm_exempt_tools: None,

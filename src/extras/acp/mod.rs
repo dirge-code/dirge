@@ -393,7 +393,12 @@ async fn run_prompt(
         let _ = std::env::set_current_dir(&cwd);
     }
 
-    let runner = agent.spawn_runner(prompt_text.to_string(), history, None);
+    let runner = agent.spawn_runner(
+        crate::provider::Prompt::text(prompt_text.to_string()),
+        history,
+        None,
+        None,
+    );
     let mut rx = runner.event_rx;
 
     // dirge-5wqc: register the in-flight run so `session/cancel` can abort it.
