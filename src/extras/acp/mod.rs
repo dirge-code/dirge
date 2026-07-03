@@ -33,8 +33,17 @@ struct AcpSession {
     run: Option<AcpRun>,
 }
 
+/// Monotonic source for [`AcpRun::generation`] stamps.
+static NEXT_RUN_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 /// Cancellation handles for one in-flight prompt run.
 struct AcpRun {
+    /// Which registration this run belongs to, stamped by [`register_run`].
+    /// `finish_turn` only clears the session's run slot when the finishing
+    /// turn's generation matches, so an aborted run (replaced by an
+    /// overlapping prompt on the same session) can't null out its
+    /// replacement's cancel handles on the way down.
+    generation: u64,
     /// The runner task — `abort()` stops it at the next await point.
     task: tokio::task::JoinHandle<()>,
     /// Cooperative cancel: flips the runner's `AbortSignal` so in-flight LLM
@@ -66,7 +75,17 @@ async fn history_and_cwd(
 /// Register the in-flight run so `session/cancel` can reach it. Creates a
 /// default session entry if the client skipped `new_session`. Aborts any run
 /// it replaces (editors serialize turns, so this is belt-and-suspenders).
-async fn register_run(sessions: &SessionMap, id: &str, provider: &str, model: &str, run: AcpRun) {
+/// Returns the generation stamped onto the run; the caller passes it back to
+/// [`finish_turn`] so a replaced run can't clear its replacement's slot.
+async fn register_run(
+    sessions: &SessionMap,
+    id: &str,
+    provider: &str,
+    model: &str,
+    mut run: AcpRun,
+) -> u64 {
+    let generation = NEXT_RUN_GENERATION.fetch_add(1, Ordering::Relaxed);
+    run.generation = generation;
     let mut map = sessions.lock().await;
     let entry = map.entry(id.to_string()).or_insert_with(|| AcpSession {
         session: Session::new(provider, model, 0),
@@ -76,15 +95,22 @@ async fn register_run(sessions: &SessionMap, id: &str, provider: &str, model: &s
     if let Some(prev) = entry.run.replace(run) {
         prev.task.abort();
     }
+    generation
 }
 
 /// Append a completed turn — the user prompt plus the assistant's full-fidelity
 /// reply (text + tool calls) — to the session so the next prompt resumes with
 /// context. Mirrors the headless `--session` persistence in `main.rs`. Clears
-/// the run handle.
+/// the run handle — but only if the stored run still belongs to this turn
+/// (`generation` matches). An overlapping prompt on the same session replaces
+/// the run via `register_run` and aborts the old task; the aborted turn's loop
+/// still exits through here, and without the guard it would null out the
+/// replacement's cancel handles, making the new run uncancellable
+/// (dirge-5wqc regression, overlap case).
 async fn finish_turn(
     sessions: &SessionMap,
     id: &str,
+    generation: u64,
     prompt: &str,
     response: &str,
     tool_calls: Vec<ToolCallEntry>,
@@ -94,7 +120,9 @@ async fn finish_turn(
         s.session.add_message(MessageRole::User, prompt);
         s.session
             .add_message_with_tool_calls(MessageRole::Assistant, response, tool_calls);
-        s.run = None;
+        if s.run.as_ref().is_some_and(|r| r.generation == generation) {
+            s.run = None;
+        }
     }
 }
 
@@ -366,12 +394,13 @@ async fn run_prompt(
 
     // dirge-5wqc: register the in-flight run so `session/cancel` can abort it.
     let cancelled = Arc::new(AtomicBool::new(false));
-    register_run(
+    let generation = register_run(
         &state.sessions,
         &id_key,
         &provider_str,
         &model_str,
         AcpRun {
+            generation: 0, // stamped by register_run
             task: runner.task,
             cancel_tx: runner.cancel_tx,
             cancelled: cancelled.clone(),
@@ -563,6 +592,7 @@ async fn run_prompt(
     finish_turn(
         &state.sessions,
         &id_key,
+        generation,
         prompt_text,
         &full_response,
         turn_tool_calls,
@@ -927,6 +957,7 @@ mod tests {
         finish_turn(
             &sessions,
             id,
+            0,
             "what does foo do?",
             "foo does X.",
             Vec::new(),
@@ -940,7 +971,7 @@ mod tests {
             texts1.iter().any(|t| t.contains("what does foo do?")),
             "second prompt must see the first user turn, got {texts1:?}"
         );
-        finish_turn(&sessions, id, "now change it", "changed.", Vec::new()).await;
+        finish_turn(&sessions, id, 0, "now change it", "changed.", Vec::new()).await;
 
         // Turn 3 sees both.
         let (h2, _) = history_and_cwd(&sessions, id).await;
@@ -983,6 +1014,7 @@ mod tests {
             "p",
             "m",
             AcpRun {
+                generation: 0,
                 task,
                 cancel_tx,
                 cancelled: cancelled.clone(),
@@ -1005,6 +1037,79 @@ mod tests {
 
         // A second cancel is a no-op (the run was already taken).
         assert!(!cancel_run(&sessions, id).await, "no run left to cancel");
+    }
+
+    /// A test stand-in for a registered run: a long-sleeping task plus fresh
+    /// cancel channel and flag. Returns the run and its cancelled flag.
+    fn stub_run() -> (AcpRun, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        let task = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        });
+        let (cancel_tx, _cancel_rx) = tokio::sync::mpsc::channel::<()>(4);
+        // Leak the receiver so try_send doesn't hit a closed channel.
+        std::mem::forget(_cancel_rx);
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        (
+            AcpRun {
+                generation: 0,
+                task,
+                cancel_tx,
+                cancelled: cancelled.clone(),
+            },
+            cancelled,
+        )
+    }
+
+    /// Overlap regression (dirge-5wqc reintroduction): prompt B replaces
+    /// prompt A's run via `register_run` (which aborts A's task). A's loop
+    /// exits and calls `finish_turn` with its own — now stale — generation.
+    /// That must NOT clear B's run: B stays cancellable, and only B's own
+    /// `finish_turn` (matching generation) clears the slot.
+    #[tokio::test]
+    async fn finish_turn_stale_generation_keeps_replacement_run() {
+        let id = "sess-overlap";
+        let sessions = session_map_with(id);
+
+        let (run_a, _) = stub_run();
+        let gen_a = register_run(&sessions, id, "p", "m", run_a).await;
+        let (run_b, cancelled_b) = stub_run();
+        let gen_b = register_run(&sessions, id, "p", "m", run_b).await;
+        assert_ne!(gen_a, gen_b, "each registration gets a fresh generation");
+
+        // Aborted A's loop exits and finishes its (partial) turn.
+        finish_turn(&sessions, id, gen_a, "prompt A", "partial", Vec::new()).await;
+
+        // A's history is still recorded...
+        let (h, _) = history_and_cwd(&sessions, id).await;
+        assert!(
+            user_texts(&h).iter().any(|t| t.contains("prompt A")),
+            "the aborted turn still lands in history"
+        );
+        // ...but B's run handle survives: session/cancel still reaches B.
+        assert!(
+            cancel_run(&sessions, id).await,
+            "B must remain cancellable after A's stale finish_turn"
+        );
+        assert!(
+            cancelled_b.load(std::sync::atomic::Ordering::SeqCst),
+            "the cancel hit B's flag"
+        );
+    }
+
+    /// The matching-generation path still clears the slot: after B's own
+    /// `finish_turn`, there is no run left to cancel.
+    #[tokio::test]
+    async fn finish_turn_matching_generation_clears_run() {
+        let id = "sess-own";
+        let sessions = session_map_with(id);
+
+        let (run, _) = stub_run();
+        let generation = register_run(&sessions, id, "p", "m", run).await;
+        finish_turn(&sessions, id, generation, "prompt", "reply", Vec::new()).await;
+        assert!(
+            !cancel_run(&sessions, id).await,
+            "the finished run's slot is cleared"
+        );
     }
 
     /// Cancelling an unknown session is a harmless no-op.
