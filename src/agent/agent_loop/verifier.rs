@@ -204,19 +204,49 @@ fn is_verification_command(command: &str) -> bool {
         .any(segment_is_verification)
 }
 
-fn segment_is_verification(segment: &str) -> bool {
-    // Build/test/lint tool + subcommand words.
-    const WORD_MARKERS: &[&str] = &[
-        "test", "build", "check", "lint", "compile", "cargo", "npm", "pnpm", "yarn", "pytest",
-        "tox", "make", "gradle", "mvn", "ctest", "cmake", "rustc", "tsc", "jest", "vitest",
-        "mocha", "clippy",
-    ];
-    // Subcommands that do no building/testing. Their presence disqualifies
-    // the segment even when the tool name (npm/cargo/yarn) is a marker.
-    const NON_VERIFY: &[&str] = &["checkout", "install", "add", "remove", "uninstall"];
-    // Two-word markers whose leading word isn't a marker on its own.
-    const PAIR_MARKERS: &[(&str, &str)] = &[("go", "vet"), ("go", "run"), ("go", "test")];
+/// Build/test/lint tool + subcommand words. Includes linters/formatters
+/// invoked by bare name (`eslint .`, `golangci-lint run`).
+const WORD_MARKERS: &[&str] = &[
+    "test",
+    "build",
+    "check",
+    "lint",
+    "compile",
+    "cargo",
+    "npm",
+    "pnpm",
+    "yarn",
+    "pytest",
+    "tox",
+    "make",
+    "gradle",
+    "mvn",
+    "ctest",
+    "cmake",
+    "rustc",
+    "tsc",
+    "jest",
+    "vitest",
+    "mocha",
+    "clippy",
+    "eslint",
+    "golangci-lint",
+    "prettier",
+    "ruff",
+    "flake8",
+    "mypy",
+    "shellcheck",
+    "rubocop",
+];
 
+/// Subcommands that do no building/testing. Their presence disqualifies
+/// the segment even when the tool name (npm/cargo/yarn) is a marker.
+const NON_VERIFY: &[&str] = &["checkout", "install", "add", "remove", "uninstall"];
+
+/// Two-word markers whose leading word isn't a marker on its own.
+const PAIR_MARKERS: &[(&str, &str)] = &[("go", "vet"), ("go", "run"), ("go", "test")];
+
+fn segment_is_verification(segment: &str) -> bool {
     let tokens: Vec<String> = segment
         .split_whitespace()
         .map(|t| t.to_ascii_lowercase())
@@ -224,12 +254,47 @@ fn segment_is_verification(segment: &str) -> bool {
     if tokens.iter().any(|t| NON_VERIFY.contains(&t.as_str())) {
         return false;
     }
-    if tokens.iter().any(|t| WORD_MARKERS.contains(&t.as_str())) {
+    // Whole-word markers. A `--check`-style flag is its dash-stripped
+    // word, so `prettier --check .` and `cmake --build` register.
+    if tokens
+        .iter()
+        .any(|t| WORD_MARKERS.contains(&t.trim_start_matches('-')))
+    {
         return true;
     }
-    tokens
+    if tokens
         .windows(2)
         .any(|w| PAIR_MARKERS.contains(&(w[0].as_str(), w[1].as_str())))
+    {
+        return true;
+    }
+    // The command word may be a path to a repo script: match markers
+    // inside its basename, split on `-`/`_`/`.`, accepting a plural form,
+    // so `./run-tests.sh` and `scripts/lint.sh` register. Only the
+    // executed word gets this treatment — an argument like `ls tests/`
+    // must not count (dirge-eg37).
+    command_word(&tokens).is_some_and(script_name_is_verification)
+}
+
+/// First token that isn't a `VAR=value` environment prefix.
+fn command_word(tokens: &[String]) -> Option<&str> {
+    tokens.iter().map(|t| t.as_str()).find(|t| !t.contains('='))
+}
+
+/// True when a path-shaped command word (`./run-tests.sh`,
+/// `scripts/lint.sh`) names a verification script: its basename, split on
+/// `-`/`_`/`.`, carries a marker word (singular or plural).
+fn script_name_is_verification(token: &str) -> bool {
+    if !token.contains('/') {
+        return false;
+    }
+    let basename = token.rsplit('/').next().unwrap_or(token);
+    basename.split(['-', '_', '.']).any(|piece| {
+        WORD_MARKERS.contains(&piece)
+            || piece
+                .strip_suffix('s')
+                .is_some_and(|p| WORD_MARKERS.contains(&p))
+    })
 }
 
 /// True if any path argument names a source-code file (by extension).
@@ -567,6 +632,30 @@ mod tests {
                 g.status(),
                 VerificationStatus::Unverified,
                 "`{cmd}` must not count as verification"
+            );
+        }
+    }
+
+    /// Linters/formatters invoked by name and repo test scripts are
+    /// verification even though no marker appears as a standalone word:
+    /// `eslint .`, `golangci-lint run`, `prettier --check .`,
+    /// `./run-tests.sh`.
+    #[test]
+    fn linters_and_scripts_count_as_verification() {
+        for cmd in [
+            "eslint .",
+            "golangci-lint run",
+            "prettier --check .",
+            "./run-tests.sh",
+            "scripts/lint.sh --fast",
+        ] {
+            let g = VerifierGate::new();
+            g.record_outcome("edit", &json!({"path": "src/a.rs"}), &ok_result(), false);
+            g.record_outcome("bash", &json!({"command": cmd}), &ok_result(), false);
+            assert_eq!(
+                g.status(),
+                VerificationStatus::VerifiedGreen,
+                "`{cmd}` should register as verification"
             );
         }
     }

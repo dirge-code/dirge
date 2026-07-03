@@ -253,47 +253,55 @@ fn detect_block_severity(block: &str) -> Option<Severity> {
     let lines: Vec<&str> = lower.lines().collect();
 
     for (i, raw) in lines.iter().enumerate() {
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        // Strip a leading bullet/number marker, then markdown.
-        let first = trimmed.as_bytes()[0];
-        let has_bullet = first == b'-'
-            || first == b'*'
-            || first.is_ascii_digit()
-            || trimmed.starts_with('\u{2022}'); // •
-        let mut check = if has_bullet {
-            trimmed
-                .trim_start_matches([
-                    '-', '*', '\u{2022}', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '.',
-                    ')', ' ',
-                ])
-                .to_string()
-        } else {
-            trimmed.to_string()
-        };
-        check = strip_markdown(&check);
-
-        // Branch 1: the text starts with a severity word + separator.
-        if let Some(sev) = severity_word_with_separator(&check)
+        if let Some(sev) = line_severity(raw)
             && !is_legend_entry(&lines, i)
         {
             return Some(sev);
         }
+    }
+    None
+}
 
-        // Branch 2: a "severity: <level>" field (e.g. "**Severity**: High").
-        if let Some(rest) = check.strip_prefix("severity") {
-            let rest = rest.trim_start();
-            let has_sep = rest.starts_with([':', '|', '—', '–']) || rest.starts_with("- ");
-            if has_sep {
-                let level = rest.trim_start_matches([':', '-', '–', '—', '|', ' ']);
-                if let Some(sev) = Severity::from_prefix(level)
-                    && !is_legend_entry(&lines, i)
-                {
-                    return Some(sev);
-                }
+/// Severity label carried by a single line, if it reads as the opening of
+/// a finding: leading bullet/number and markdown stripped, then either a
+/// severity word + separator or a `Severity: <level>` field. Case-
+/// insensitive; does NOT apply the legend check (that needs block
+/// context — see [`detect_block_severity`]).
+fn line_severity(raw: &str) -> Option<Severity> {
+    let trimmed = raw.trim().to_ascii_lowercase();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    // Strip a leading bullet/number marker, then markdown.
+    let first = trimmed.as_bytes()[0];
+    let has_bullet =
+        first == b'-' || first == b'*' || first.is_ascii_digit() || trimmed.starts_with('\u{2022}'); // •
+    let mut check = if has_bullet {
+        trimmed
+            .trim_start_matches([
+                '-', '*', '\u{2022}', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '.', ')',
+                ' ',
+            ])
+            .to_string()
+    } else {
+        trimmed
+    };
+    check = strip_markdown(&check);
+
+    // Branch 1: the text starts with a severity word + separator.
+    if let Some(sev) = severity_word_with_separator(&check) {
+        return Some(sev);
+    }
+
+    // Branch 2: a "severity: <level>" field (e.g. "**Severity**: High").
+    if let Some(rest) = check.strip_prefix("severity") {
+        let rest = rest.trim_start();
+        let has_sep = rest.starts_with([':', '|', '—', '–']) || rest.starts_with("- ");
+        if has_sep {
+            let level = rest.trim_start_matches([':', '-', '–', '—', '|', ' ']);
+            if let Some(sev) = Severity::from_prefix(level) {
+                return Some(sev);
             }
         }
     }
@@ -905,18 +913,32 @@ async fn verify_pass(review_fn: &CriticFn, diff: &str, candidates: &[Finding]) -
     // The verify contract is VERIFIED / FALSE_POSITIVE. Well-behaved
     // output omits dropped candidates, but a common shape re-lists each
     // candidate with an inline verdict while still carrying its severity
-    // label. Discard the FALSE_POSITIVE-annotated blocks before parsing so
-    // an explicitly-dropped candidate can't parse back as a survivor
-    // (dirge-uz95).
-    let (dropped, kept): (Vec<String>, Vec<String>) = split_finding_blocks(&response)
-        .into_iter()
-        .partition(|b| block_is_false_positive(b));
+    // label — sometimes without `---` separators between them. Attribute
+    // the verdict per finding SEGMENT (a new segment starts at each
+    // severity-labeled line), not per block, so one FALSE_POSITIVE can't
+    // discard a judge-VERIFIED finding sharing its block (dirge-uz95).
+    let mut dropped = 0usize;
+    let mut kept: Vec<String> = Vec::new();
+    for block in split_finding_blocks(&response) {
+        let kept_segments: Vec<String> = split_on_severity_lines(&block)
+            .into_iter()
+            .filter(|seg| {
+                let fp = segment_is_false_positive(seg);
+                dropped += fp as usize;
+                !fp
+            })
+            .collect();
+        if !kept_segments.is_empty() {
+            kept.push(kept_segments.concat());
+        }
+    }
     let mut survivors = parse_findings(&kept.join("\n---\n"));
-    if survivors.is_empty() && dropped.is_empty() && !verdict_is_pass(&response) {
-        // Ambiguous verify output (no parseable findings, no explicit
-        // FALSE_POSITIVE verdict, no clean-pass phrase) — don't silently
-        // drop; keep the pass-1 candidates. An explicit FALSE_POSITIVE
-        // annotation is NOT ambiguous, so it clears the finding.
+    if survivors.is_empty() && dropped < candidates.len() && !verdict_is_pass(&response) {
+        // Ambiguous verify output: nothing parseable survived, no
+        // clean-pass phrase, and the explicit FALSE_POSITIVE verdicts
+        // don't account for every candidate — don't silently drop; keep
+        // the pass-1 candidates. Only enough explicit FALSE_POSITIVE
+        // annotations (or a clean pass) clears the findings.
         tracing::debug!(target: "dirge::code_review", "verify output ambiguous; keeping pass-1 findings");
         return candidates.to_vec();
     }
@@ -924,12 +946,43 @@ async fn verify_pass(review_fn: &CriticFn, diff: &str, candidates: &[Finding]) -
     survivors
 }
 
-/// True when a verify block carries the judge's FALSE_POSITIVE drop
+/// Split a verify block into finding-granular segments: a new segment
+/// starts at each severity-labeled line (see [`line_severity`]). Preamble
+/// before the first severity line stays its own segment, and a legend
+/// echo keeps its header adjacent since [`verify_pass`] re-concatenates
+/// kept segments block-wise. Segments keep their trailing newlines.
+fn split_on_severity_lines(block: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    for line in block.lines() {
+        if line_severity(line).is_some() && !current.trim().is_empty() {
+            segments.push(std::mem::take(&mut current));
+        }
+        current.push_str(line);
+        current.push('\n');
+    }
+    if !current.trim().is_empty() {
+        segments.push(current);
+    }
+    segments
+}
+
+/// True when a verify segment carries the judge's FALSE_POSITIVE drop
 /// verdict. Matches the structured token (underscore form) case-
 /// insensitively so it fires on `FALSE_POSITIVE` / `false_positive` but
 /// NOT on prose like "guards against false positives" in a real finding.
-fn block_is_false_positive(block: &str) -> bool {
-    block.to_ascii_uppercase().contains("FALSE_POSITIVE")
+/// A segment that ALSO carries a VERIFIED/CONFIRMED marker is
+/// contradictory — treat it as kept (fail closed) rather than clearing a
+/// possibly-real blocking finding.
+fn segment_is_false_positive(segment: &str) -> bool {
+    let upper = segment.to_ascii_uppercase();
+    if !upper.contains("FALSE_POSITIVE") {
+        return false;
+    }
+    // "UNVERIFIED" must not read as a VERIFIED marker.
+    let contradicted =
+        upper.replace("UNVERIFIED", "").contains("VERIFIED") || upper.contains("CONFIRMED");
+    !contradicted
 }
 
 /// Build the verify-pass user prompt: the ported verify/dedupe
@@ -1696,6 +1749,56 @@ diff --git a/Cargo.lock b/Cargo.lock\n\
         let f = run_code_review(&review, "r", "diff", "t").await;
         assert_eq!(f.len(), 1, "only the verified finding survives");
         assert_eq!(f[0].severity, Severity::High);
+    }
+
+    /// A verify response that omits `---` separators must still attribute
+    /// FALSE_POSITIVE per finding, not per block — the judge-VERIFIED
+    /// blocking finding survives even though it shares a block with a
+    /// dropped one.
+    #[tokio::test]
+    async fn verify_unseparated_verdicts_keep_verified_finding() {
+        let review = two_pass_stub(
+            "- High — SQLi in query().\n---\n- Low — nit in helper().",
+            "- High — SQLi in query(). VERIFIED.\n\
+             - Low — nit in helper(). FALSE_POSITIVE: speculative.",
+        );
+        let f = run_code_review(&review, "r", "diff", "t").await;
+        assert_eq!(
+            f.len(),
+            1,
+            "verified finding must survive unseparated output"
+        );
+        assert_eq!(f[0].severity, Severity::High);
+    }
+
+    /// A segment carrying BOTH a VERIFIED and a FALSE_POSITIVE marker is
+    /// contradictory — keep it (fail closed) rather than clearing a
+    /// possibly-real blocking finding.
+    #[tokio::test]
+    async fn verify_mixed_verdict_segment_fails_closed() {
+        let review = two_pass_stub(
+            "- High — SQLi in query().",
+            "- High — SQLi in query(). VERIFIED (the FALSE_POSITIVE call \
+             in my draft was wrong).",
+        );
+        let f = run_code_review(&review, "r", "diff", "t").await;
+        assert_eq!(f.len(), 1, "contradictory verdict must fail closed");
+        assert_eq!(f[0].severity, Severity::High);
+    }
+
+    /// One explicit FALSE_POSITIVE must not vouch for the whole response:
+    /// when the other candidate's re-emit parses to nothing (no severity
+    /// label), fall back to the pass-1 candidates instead of silently
+    /// clearing everything.
+    #[tokio::test]
+    async fn verify_partial_drop_with_unparseable_rest_keeps_candidates() {
+        let review = two_pass_stub(
+            "- High — SQLi in query().\n---\n- Medium — race in flush().",
+            "Candidate 1: FALSE_POSITIVE — not in the diff.\n---\n\
+             Candidate 2 still stands.",
+        );
+        let f = run_code_review(&review, "r", "diff", "t").await;
+        assert_eq!(f.len(), 2, "unaccounted candidates must not be dropped");
     }
 
     #[test]
