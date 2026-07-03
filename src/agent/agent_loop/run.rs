@@ -1275,11 +1275,11 @@ pub async fn run_loop(
             // fold, the per-result snip cap, and the post-usage decision.
             // The model's advertised window — an explicit `context_window`
             // config override wins over the built-in lookup table — then
-            // capped to the working budget: effective context degrades well
-            // before a large window is full, so dirge folds/forms memory to
-            // stay inside the budget (default 100k) rather than trusting the
-            // full window. Every downstream tier (fold / snip / turn-start /
-            // incremental checkpoint) reads this capped value.
+            // capped to the working budget when one is configured (see
+            // `context_target` in config.json). By default there is no cap,
+            // so the model's advertised window is used as-is. Every
+            // downstream tier (fold / snip / turn-start / incremental
+            // checkpoint) reads this value.
             let model_window = context_manager::context_window_override().unwrap_or_else(|| {
                 config
                     .model_name

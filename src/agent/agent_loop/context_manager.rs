@@ -245,14 +245,14 @@ pub fn init_fold_threshold(override_fraction: Option<f64>) {
     let _ = FOLD_THRESHOLD_OVERRIDE.set(override_fraction);
 }
 
-/// Default working-context budget in tokens. Effective context is a
-/// fraction of a model's advertised window — quality degrades well before
-/// the limit, with the "smart zone" running out around 100k regardless of
-/// the advertised size (RULER / Chroma context-rot research; see
-/// garrit.xyz/posts/2026-05-06-dont-trust-large-context-windows). So dirge
-/// caps the budget it actually works within, rather than trusting a large
-/// window, and folds/forms memory to stay inside it.
-pub const DEFAULT_CONTEXT_TARGET: u64 = 100_000;
+/// Default working-context budget in tokens. The effective context for
+/// compaction math is `min(model_window, context_target)`. Set to 250k as a
+/// reasonable middle ground: newer models (DeepSeek V4, Claude Opus 4.6,
+/// Gemini 2.5 Pro) handle this well, while smaller local models stay capped
+/// at their actual window via the `min` — the full model-table lookup still
+/// applies below this. Set an explicit `context_target` in config.json to
+/// lower it (e.g. 100_000) for stricter folding on cost-sensitive routes.
+pub const DEFAULT_CONTEXT_TARGET: u64 = 250_000;
 
 /// Floor for a configured target — below this the agent can't get useful
 /// work done between folds.
@@ -265,7 +265,7 @@ const MIN_CONTEXT_TARGET: u64 = 16_000;
 static CONTEXT_TARGET: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 
 /// Resolve a configured target to the value to install: `None` →
-/// [`DEFAULT_CONTEXT_TARGET`]; a set value is floored at
+/// [`DEFAULT_CONTEXT_TARGET`] (250k); a set value is floored at
 /// [`MIN_CONTEXT_TARGET`]. Pure, so the floor/default logic is testable
 /// without touching the process global.
 pub fn resolve_context_target(configured: Option<u64>) -> u64 {
@@ -275,23 +275,23 @@ pub fn resolve_context_target(configured: Option<u64>) -> u64 {
 }
 
 /// Install the working-context budget process-wide. Idempotent (first call
-/// wins).
+/// wins). `None` (the default) uses [`DEFAULT_CONTEXT_TARGET`] (250k).
 pub fn init_context_target(target: Option<u64>) {
     let _ = CONTEXT_TARGET.set(resolve_context_target(target));
 }
 
 /// The configured working-context budget (tokens). Default
-/// [`DEFAULT_CONTEXT_TARGET`].
+/// [`DEFAULT_CONTEXT_TARGET`] (250_000).
 pub fn context_target() -> u64 {
     *CONTEXT_TARGET.get().unwrap_or(&DEFAULT_CONTEXT_TARGET)
 }
 
 /// The effective context window for all compaction math: the smaller of
-/// the model's advertised window and the configured budget. Capping here
-/// means every existing tier (fold / aggressive / force / turn-start /
-/// incremental checkpoint) operates within the budget, so the live context
-/// stays in the model's smart zone no matter how large the window claims
-/// to be.
+/// the model's advertised window and the configured budget. When a budget
+/// is configured, every existing tier (fold / aggressive / force / turn-start
+/// / incremental checkpoint) operates within the budget, keeping the live
+/// context in
+/// the model's smart zone no matter how large the window claims to be.
 pub fn effective_ctx_max(model_window: u64) -> u64 {
     model_window.min(context_target())
 }
@@ -707,18 +707,36 @@ mod tests {
         assert_eq!(resolve_context_target(Some(50_000)), 50_000);
         // A tiny configured target is floored so the agent can still work.
         assert_eq!(resolve_context_target(Some(1_000)), MIN_CONTEXT_TARGET);
-        // A target above any model window is kept; min(window, target)
+        // A target above the default is kept; min(window, target)
         // applies the real cap later.
-        assert_eq!(resolve_context_target(Some(250_000)), 250_000);
+        assert_eq!(resolve_context_target(Some(500_000)), 500_000);
+    }
+
+    #[test]
+    fn default_budget_caps_at_250k() {
+        // DEFAULT_CONTEXT_TARGET is 250k. Models with window >= 250k are
+        // capped at 250k.
+        assert_eq!(effective_ctx_max(1_000_000), 250_000);
+        assert_eq!(effective_ctx_max(2_000_000), 250_000);
+        // Models with window < 250k use their own window.
+        assert_eq!(effective_ctx_max(128_000), 128_000);
+        // Fold threshold at 0.75 * 250k = 187_500.
+        assert_eq!(
+            decide_after_usage(Some(187_501), 250_000, false).kind,
+            PostUsageDecisionKind::Fold
+        );
+        assert_eq!(
+            decide_after_usage(Some(187_500), 250_000, false).kind,
+            PostUsageDecisionKind::None
+        );
     }
 
     #[test]
     fn capped_budget_folds_within_the_target() {
-        // With a 100k working budget — what `effective_ctx_max` yields for a
-        // big model — the normal fold fires at 0.75 * 100k = 75k, keeping
-        // the live context in the smart zone no matter how large the
-        // advertised window is.
-        let budget = DEFAULT_CONTEXT_TARGET;
+        // With a 100k working budget the normal fold fires at 0.75 * 100k
+        // = 75k, keeping the live context in the smart zone no matter how
+        // large the advertised window is.
+        let budget = 100_000u64;
         assert_eq!(
             decide_after_usage(Some(74_000), budget, false).kind,
             PostUsageDecisionKind::None

@@ -537,14 +537,12 @@ pub struct Config {
     /// `0.3..=0.75`; out-of-range or unset keeps the `0.75` default.
     /// Installed process-wide at startup.
     pub compaction_fold_threshold: Option<f64>,
-    /// Working-context budget in tokens (default 100_000). The compaction
+    /// Working-context budget in tokens (default: 250_000). The compaction
     /// decision treats the effective window as `min(model_window, this)`, so
-    /// the live context is folded — and memory formed — to stay within the
-    /// budget instead of trusting a model's full advertised window, whose
-    /// effective quality degrades well before it fills (the "smart zone"
-    /// runs out around 100k regardless of size). Floored at 16k; a value
-    /// above the model's real window is a no-op (the window wins). Installed
-    /// process-wide at startup.
+    /// models below 250k use their own window while larger models are capped.
+    /// Set lower (e.g. 100_000) for stricter folding on cost-sensitive
+    /// routes. Floored at 16k; a value above the model's real window is a
+    /// no-op (the window wins). Installed process-wide at startup.
     pub context_target: Option<u64>,
     /// Incremental background checkpoint (MiMo-style): refresh the durable
     /// session checkpoint at 20%-interval usage thresholds, in the
