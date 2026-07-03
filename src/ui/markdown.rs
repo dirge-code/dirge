@@ -69,21 +69,43 @@ fn iter_visible_chars(s: &str) -> Vec<(usize, char)> {
 }
 
 fn word_wrap(text: &str, max_width: usize) -> Vec<CompactString> {
+    use unicode_width::UnicodeWidthChar;
     if text.is_empty() {
         return vec![CompactString::new("")];
     }
-    // ANSI-aware: count VISIBLE chars (ignoring escape sequences) for
-    // the width budget. Wrap by visible-char index, then slice the
-    // original string by the corresponding byte offsets so escapes
-    // ride along with the text they wrap.
+    // ANSI-aware AND width-aware: the budget is terminal cells, not
+    // `char` count (dirge-p054). A CJK ideograph or emoji paints 2
+    // cols but is 1 `char`; budgeting by char count lets a 120-char
+    // CJK line claim to fit 120 cols and clip mid-content. Escape
+    // sequences still contribute 0 (they're skipped by
+    // `iter_visible_chars`). Wrap by visible-char index, then slice the
+    // original string by byte offsets so escapes ride along.
     let visible = iter_visible_chars(text);
-    if visible.len() <= max_width {
+    let cell_widths: Vec<usize> = visible
+        .iter()
+        .map(|&(_, c)| UnicodeWidthChar::width(c).unwrap_or(0))
+        .collect();
+    let total: usize = cell_widths.iter().sum();
+    if total <= max_width {
         return vec![CompactString::from(text)];
     }
     let mut lines: Vec<CompactString> = Vec::new();
     let mut start_visible = 0usize;
     while start_visible < visible.len() {
-        let end_visible = (start_visible + max_width).min(visible.len());
+        // Advance until the next char's cell width would overflow the
+        // budget. Always take at least one char (`end > start_visible`
+        // guard) so a lone double-width glyph in a 1-col budget still
+        // makes progress instead of looping forever.
+        let mut end_visible = start_visible;
+        let mut used = 0usize;
+        while end_visible < visible.len() {
+            let w = cell_widths[end_visible];
+            if used + w > max_width && end_visible > start_visible {
+                break;
+            }
+            used += w;
+            end_visible += 1;
+        }
         // Word boundary: walk backward to the last space at or before
         // `end_visible`. If none, hard-break at end_visible.
         let mut break_at = end_visible;
@@ -1029,6 +1051,29 @@ mod tests {
         let s = word_wrap(styled, 20);
         // Same number of wrapped rows; visible-char budgets match.
         assert_eq!(p.len(), s.len(), "ANSI-styled wrap must match plain wrap");
+    }
+
+    /// dirge-p054: the wrap budget is terminal cells, not `char` count.
+    /// Eight CJK ideographs are 16 cells wide but only 8 `char`s — a
+    /// char-count budget of 8 accepts the whole line (overflowing to 16
+    /// cols); a width budget must split into two 4-char rows (4×2 = 8).
+    #[test]
+    fn word_wrap_budgets_by_display_width_not_char_count() {
+        let cjk = "一二三四五六七八";
+        let lines = word_wrap(cjk, 8);
+        assert_eq!(lines.len(), 2, "double-width text must wrap by cells");
+        assert_eq!(lines[0].chars().count(), 4);
+        assert_eq!(lines[1].chars().count(), 4);
+    }
+
+    /// A lone double-width glyph in a 1-cell budget must still advance
+    /// (emit the glyph) rather than loop forever producing empty rows.
+    #[test]
+    fn word_wrap_advances_on_wide_glyph_in_narrow_budget() {
+        let lines = word_wrap("字字", 1);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].as_str(), "字");
+        assert_eq!(lines[1].as_str(), "字");
     }
 
     /// Bold (`**x**`) emits an ANSI `\x1b[1m` open inside the

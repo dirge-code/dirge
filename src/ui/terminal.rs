@@ -35,6 +35,82 @@ pub fn set_log_path(path: Option<std::path::PathBuf>) {
     let _ = LOG_PATH.set(path);
 }
 
+/// Terminal reset emitted before printing a panic notice: SGR default,
+/// disable mouse + bracketed paste, clear title, leave the alternate
+/// screen, show the cursor. Same modes `new` sets, in reverse — matches
+/// the suspend path's sequence with a trailing cursor-show.
+const PANIC_RESET_SEQ: &[u8] = b"\x1b[0m\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1006l\x1b[?1015l\x1b[?2004l\x1b]0;\x1b\\\x1b[?1049l\x1b[?25h";
+
+/// Set once `install_panic_hook` has chained onto the process hook, so
+/// repeated `TerminalGuard::new` calls (tests, embedded use) don't stack
+/// duplicate hooks.
+static PANIC_HOOK_INSTALLED: AtomicBool = AtomicBool::new(false);
+
+/// Where the default hook's panic backtrace actually landed. With fd 1/2
+/// redirected to the log for the session, the message the default hook
+/// prints to stderr goes to that file, not the screen — so point the
+/// user at it.
+fn log_path_hint() -> String {
+    match LOG_PATH.get().and_then(|opt| opt.clone()) {
+        Some(p) => p.display().to_string(),
+        None => "stderr (run with --verbose or DIRGE_LOG to capture a log file)".to_string(),
+    }
+}
+
+/// Build the on-tty panic notice. Pure (no I/O) so it can be tested; the
+/// hook writes the returned string to /dev/tty after the terminal reset.
+/// Every line carries `\r\n` — raw mode is off by the time this prints,
+/// so a bare `\n` would stair-step across the cooked screen.
+fn format_panic_notice(payload: &str, location: Option<&str>, log_hint: &str) -> String {
+    let at = location.unwrap_or("unknown location");
+    format!(
+        "\r\n\x1b[1;31mdirge panicked:\x1b[0m {payload}\r\n  at {at}\r\n  full backtrace in the log: {log_hint}\r\n"
+    )
+}
+
+/// Install a panic hook that restores the terminal and surfaces the
+/// panic on /dev/tty before delegating to the previous hook (dirge-9ny9).
+///
+/// `panic = unwind` means `TerminalGuard::drop` also resets the terminal
+/// as the stack unwinds, but the default hook writes its message to
+/// stderr — redirected to the log during the session — so a UI-thread
+/// panic otherwise makes the TUI vanish with nothing shown and no hint
+/// where to look. The hook fires at the panic point (before unwinding,
+/// so raw mode and the alt screen are still up): reset the terminal so
+/// the notice lands on a clean cooked screen, print the message + log
+/// path to the controlling terminal, then chain the previous hook (whose
+/// stderr output populates the log with the full backtrace).
+///
+/// Idempotent — installs at most once per process.
+pub fn install_panic_hook() {
+    if PANIC_HOOK_INSTALLED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if let Some(mut tty) = open_tty_for_write() {
+            let _ = tty.write_all(PANIC_RESET_SEQ);
+            let _ = tty.flush();
+        }
+        let _ = terminal::disable_raw_mode();
+
+        let payload = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "Box<dyn Any>".to_string());
+        let location = info.location().map(|l| l.to_string());
+        let notice = format_panic_notice(&payload, location.as_deref(), &log_path_hint());
+        if let Some(mut tty) = open_tty_for_write() {
+            let _ = tty.write_all(notice.as_bytes());
+            let _ = tty.flush();
+        }
+
+        previous(info);
+    }));
+}
+
 /// Shared shutdown signal between the input-reader background thread
 /// in `ui::mod` and `TerminalGuard::drop`. The reader polls this with
 /// each `event::poll` tick; the guard sets it before tearing down so
@@ -75,6 +151,12 @@ impl TerminalGuard {
         // guard in the same process (test harness, embedded use).
         EVENT_READER_SHUTDOWN.store(false, Ordering::Relaxed);
         EVENT_READER_EXITED.store(false, Ordering::Relaxed);
+
+        // dirge-9ny9: chain a panic hook that resets the terminal and
+        // prints the panic + log path to /dev/tty. Must be in place
+        // before the fd redirect below, or a panic during setup would
+        // vanish into the log with nothing on screen.
+        install_panic_hook();
 
         // Open /dev/tty for all subsequent setup writes AND for
         // ratatui's backend to use later. If /dev/tty isn't
@@ -598,4 +680,32 @@ pub(crate) fn resume_tui_after_subprocess(
     EVENT_READER_SHUTDOWN.store(false, Ordering::Relaxed);
     EVENT_READER_EXITED.store(false, Ordering::Relaxed);
     crate::ui::input_reader::spawn_input_reader(user_tx.clone());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn panic_notice_carries_message_location_and_log() {
+        let notice = format_panic_notice(
+            "index out of bounds: the len is 0 but the index is 3",
+            Some("src/ui/mod.rs:42:9"),
+            "/home/x/.dirge/dirge.log",
+        );
+        assert!(notice.contains("dirge panicked"));
+        assert!(notice.contains("index out of bounds"));
+        assert!(notice.contains("src/ui/mod.rs:42:9"));
+        assert!(notice.contains("/home/x/.dirge/dirge.log"));
+        // Written to a cooked terminal after reset — every line needs a
+        // carriage return or it stair-steps across the screen.
+        assert!(notice.contains("\r\n"));
+    }
+
+    #[test]
+    fn panic_notice_tolerates_unknown_location() {
+        let notice = format_panic_notice("boom", None, "stderr");
+        assert!(notice.contains("boom"));
+        assert!(notice.contains("stderr"));
+    }
 }

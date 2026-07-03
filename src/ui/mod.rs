@@ -2218,15 +2218,29 @@ pub async fn run_interactive(
                                 let handler = hit.handler.clone();
                                 let spec = hit.spec.clone();
                                 if let Some(pm_arc) = crate::plugin::hook::global() {
-                                    let result = {
-                                        let mut mgr = pm_arc.lock_ignore_poison();
-                                        mgr.invoke_command(&handler, &spec)
-                                    };
-                                    if let Ok(Some(msg)) = result {
-                                        renderer.write_line(
-                                            &format!("[plugin] {}", sanitize_output(&msg)),
-                                            theme::dim(),
-                                        )?;
+                                    // dirge-w11c: try_lock (not lock) so a
+                                    // plugin-bound key pressed while a plugin
+                                    // tool holds the manager mutex is dropped
+                                    // with a "busy" line instead of freezing
+                                    // the UI on a synchronous Janet eval —
+                                    // mirrors the loop-top drains (H-R1).
+                                    match pm_arc.try_lock_ignore_poison() {
+                                        Some(mut mgr) => {
+                                            let result = mgr.invoke_command(&handler, &spec);
+                                            drop(mgr);
+                                            if let Ok(Some(msg)) = result {
+                                                renderer.write_line(
+                                                    &format!("[plugin] {}", sanitize_output(&msg)),
+                                                    theme::dim(),
+                                                )?;
+                                            }
+                                        }
+                                        None => {
+                                            renderer.write_line(
+                                                "[plugin] busy — shortcut ignored (a plugin task is running)",
+                                                theme::dim(),
+                                            )?;
+                                        }
                                     }
                                 }
                                 renderer.request_repaint();
