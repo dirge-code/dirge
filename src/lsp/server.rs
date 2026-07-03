@@ -48,7 +48,14 @@ pub fn nearest_root(
     // the loop would walk past stop_at all the way to `/`, picking
     // up the nearest Cargo.toml it finds. Guard: cursor must start
     // with stop_at as prefix; otherwise bail immediately.
-    if !cursor.starts_with(&stop_at) {
+    //
+    // NOT a raw `Path::starts_with`: on Windows `canonical_or_self`
+    // (dunce) yields mixed forms within one tree — simplified for short
+    // paths, verbatim `\\?\C:\...` for >MAX_PATH or reserved-name
+    // components — and a component-wise prefix test never matches
+    // across forms, silently disabling root detection for that file.
+    // Same reason the loop's stop_at comparison is normalized.
+    if !crate::permission::path::path_starts_with(&cursor, &stop_at) {
         return None;
     }
     loop {
@@ -62,7 +69,7 @@ pub fn nearest_root(
                 return Some(cursor);
             }
         }
-        if cursor == stop_at {
+        if crate::permission::path::paths_equivalent(&cursor, &stop_at) {
             break;
         }
         match cursor.parent() {
@@ -96,7 +103,10 @@ pub fn rust_workspace_root(file: &Path, stop_at: &Path) -> Option<PathBuf> {
         {
             return Some(cursor);
         }
-        if cursor == stop_at_canon {
+        // Normalized comparison for the same Windows mixed-form reason
+        // as in `nearest_root` — a verbatim cursor never `==` a
+        // simplified stop_at, and the walk would escape the boundary.
+        if crate::permission::path::paths_equivalent(&cursor, &stop_at_canon) {
             break;
         }
         match cursor.parent() {

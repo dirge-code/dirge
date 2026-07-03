@@ -72,6 +72,36 @@ pub(crate) fn path_is_within(child: &str, base: &str) -> bool {
     child == base || child.starts_with(&format!("{base}/"))
 }
 
+/// Drop-in replacement for `Path::starts_with` when the two sides may
+/// come back from canonicalization in different Windows forms. dunce
+/// returns MIXED forms within one tree: short paths get simplified
+/// (`C:\proj`) while >MAX_PATH or reserved-name (aux/nul) paths stay
+/// verbatim (`\\?\C:\...`). `Path::starts_with` compares prefix
+/// components (`VerbatimDisk` vs `Disk`) and returns false, so prefix
+/// guards silently fail. Compares the [`normalize_for_prefix`] forms
+/// instead, boundary-safe. Unlike [`path_is_within`] a root `base`
+/// matches (same as `Path::starts_with`) — callers like the LSP
+/// root walk own their boundary semantics. No-op normalization on
+/// Unix, so behavior there is identical to `Path::starts_with`.
+pub(crate) fn path_starts_with(child: &Path, base: &Path) -> bool {
+    let child = normalize_for_prefix(&child.to_string_lossy());
+    let base = normalize_for_prefix(&base.to_string_lossy());
+    let base = base.trim_end_matches('/');
+    if base.is_empty() {
+        // `base` was the filesystem root (`/`): every absolute path is
+        // under it, matching `Path::starts_with`.
+        return child.starts_with('/');
+    }
+    child == base || child.starts_with(&format!("{base}/"))
+}
+
+/// Path equality over the [`normalize_for_prefix`] forms — the `==`
+/// analogue of [`path_starts_with`], for the same mixed
+/// verbatim-vs-simplified reason. No-op normalization on Unix.
+pub(crate) fn paths_equivalent(a: &Path, b: &Path) -> bool {
+    normalize_for_prefix(&a.to_string_lossy()) == normalize_for_prefix(&b.to_string_lossy())
+}
+
 /// `c:` / `Z:` — a normalized drive root with no path component.
 fn is_drive_root(s: &str) -> bool {
     let b = s.as_bytes();
@@ -215,6 +245,85 @@ pub fn validate_path(path: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn path_starts_with_basic_and_boundary() {
+        assert!(path_starts_with(
+            Path::new("/proj/src/a.rs"),
+            Path::new("/proj")
+        ));
+        assert!(path_starts_with(Path::new("/proj"), Path::new("/proj")));
+        // Boundary-safe: a sibling sharing a name prefix is NOT within.
+        assert!(!path_starts_with(
+            Path::new("/proj-other/a.rs"),
+            Path::new("/proj")
+        ));
+        assert!(!path_starts_with(
+            Path::new("/elsewhere/a.rs"),
+            Path::new("/proj")
+        ));
+        // Unlike `path_is_within`, a root base matches (Path::starts_with
+        // semantics — nearest_root callers may legitimately stop at `/`).
+        assert!(path_starts_with(Path::new("/a/b"), Path::new("/")));
+    }
+
+    #[test]
+    fn paths_equivalent_basic() {
+        assert!(paths_equivalent(
+            Path::new("/proj/src"),
+            Path::new("/proj/src")
+        ));
+        assert!(!paths_equivalent(
+            Path::new("/proj/src"),
+            Path::new("/proj")
+        ));
+    }
+
+    /// The LSP regression: dunce returns MIXED forms within one tree on
+    /// Windows — short paths simplified (`C:\proj`), >MAX_PATH or
+    /// reserved-name (aux/nul) paths verbatim (`\\?\C:\...`). A raw
+    /// `Path::starts_with` compares VerbatimDisk vs Disk prefix components
+    /// and always fails, so `nearest_root` bailed and LSP root detection
+    /// silently stopped for that file.
+    #[cfg(windows)]
+    #[test]
+    fn path_starts_with_windows_verbatim_vs_simplified() {
+        assert!(path_starts_with(
+            Path::new(r"\\?\C:\proj\aux\src\a.rs"),
+            Path::new(r"C:\proj"),
+        ));
+        assert!(path_starts_with(
+            Path::new(r"C:\proj\src\a.rs"),
+            Path::new(r"\\?\C:\proj"),
+        ));
+        // Drive-letter case and mixed separators.
+        assert!(path_starts_with(
+            Path::new(r"\\?\c:\proj/src/a.rs"),
+            Path::new(r"C:\proj"),
+        ));
+        // Boundary still enforced under normalization.
+        assert!(!path_starts_with(
+            Path::new(r"\\?\C:\proj-other\a.rs"),
+            Path::new(r"C:\proj"),
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn paths_equivalent_windows_verbatim_vs_simplified() {
+        assert!(paths_equivalent(
+            Path::new(r"\\?\C:\proj"),
+            Path::new(r"C:\proj")
+        ));
+        assert!(paths_equivalent(
+            Path::new(r"\\?\c:\proj"),
+            Path::new(r"C:\proj")
+        ));
+        assert!(!paths_equivalent(
+            Path::new(r"\\?\C:\proj2"),
+            Path::new(r"C:\proj")
+        ));
+    }
 
     #[test]
     fn path_is_within_basic_and_boundary() {
