@@ -247,8 +247,22 @@ impl SkillManager {
         std::fs::create_dir_all(&archive_dir)
             .map_err(|e| format!("Failed to create archive dir: {e}"))?;
         let dest = archive_dir.join(name);
+        // A previously archived copy must not wedge delete forever
+        // (delete → recreate → delete). Move the old copy aside under a
+        // timestamp suffix so the plain name always holds the latest.
         if dest.exists() {
-            return Err(format!("Skill '{}' already archived", name));
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            let mut aside = archive_dir.join(format!("{name}-{ts}"));
+            let mut n = 1u32;
+            while aside.exists() {
+                aside = archive_dir.join(format!("{name}-{ts}-{n}"));
+                n += 1;
+            }
+            std::fs::rename(&dest, &aside)
+                .map_err(|e| format!("Failed to move aside archived skill '{}': {}", name, e))?;
         }
         std::fs::rename(&src, &dest)
             .map_err(|e| format!("Failed to archive skill '{}': {}", name, e))
@@ -358,6 +372,36 @@ mod tests {
         assert!(content.contains("description: Test"));
         assert!(content.contains("Content here"));
         assert!(content.contains("tags: [test]"));
+    }
+
+    // ── archive ────────────────────────────────────────
+
+    #[test]
+    fn archive_recreate_archive_does_not_wedge() {
+        // Delete routes through archive; a skill deleted, recreated,
+        // and deleted again must not fail forever on the existing
+        // `.archive/<name>` entry.
+        let (mgr, _dir) = temp_manager();
+        mgr.create("cycle", "v1", "body v1", &[]).unwrap();
+        mgr.archive("cycle").unwrap();
+        mgr.create("cycle", "v2", "body v2", &[]).unwrap();
+        mgr.archive("cycle").unwrap_or_else(|e| {
+            panic!("second archive must succeed, got: {e}");
+        });
+        // The most recent copy sits under the plain name, so restore
+        // brings back v2; the older copy is preserved under a suffix.
+        mgr.restore("cycle").unwrap();
+        let content =
+            std::fs::read_to_string(mgr.skills_dir.join("cycle").join("SKILL.md")).unwrap();
+        assert!(content.contains("v2"), "restore returns the latest copy");
+        let archived: Vec<String> = std::fs::read_dir(mgr.skills_dir.join(".archive"))
+            .unwrap()
+            .filter_map(|e| Some(e.ok()?.file_name().to_string_lossy().into_owned()))
+            .collect();
+        assert!(
+            archived.iter().any(|n| n.starts_with("cycle-")),
+            "older archived copy preserved under a suffixed name, got: {archived:?}"
+        );
     }
 
     // ── edit ───────────────────────────────────────────

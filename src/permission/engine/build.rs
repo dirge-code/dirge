@@ -498,6 +498,67 @@ mod tests {
     }
 
     #[test]
+    fn env_and_wrapper_prefixes_do_not_ride_an_allow_rule() {
+        use crate::permission::OpSpec;
+        // The stripped view exists so DENY rules see through prefixes
+        // (dirge-8zem). Allow rules must keep matching the raw string
+        // only: `PATH=/tmp/evil git push` resolves git from an
+        // attacker-controlled dir, and `./env git push` executes a
+        // cwd-local `env` — neither is the `git *` the user allowed.
+        let cfg = PermissionConfig {
+            rules: vec![rule(OpSpec::Execute, "git *", Action::Allow)],
+            ..Default::default()
+        };
+        let e = Engine::from_config(&cfg);
+        let plain = e.authorize(&req(
+            Operation::Execute,
+            "bash",
+            SecurityMode::Standard,
+            vec![Resource::command("git push")],
+        ));
+        assert_eq!(plain.effect, Effect::Allow, "plain form rides the rule");
+        for raw in [
+            "PATH=/tmp/evil git push",
+            "LD_PRELOAD=/tmp/x.so git push",
+            "env PATH=/tmp/evil git push",
+            "./env git push",
+            "nohup git push",
+        ] {
+            let d = e.authorize(&req(
+                Operation::Execute,
+                "bash",
+                SecurityMode::Standard,
+                vec![Resource::command(raw)],
+            ));
+            assert_eq!(
+                d.effect,
+                Effect::Ask,
+                "prefixed {raw:?} must not ride the git allow rule"
+            );
+        }
+    }
+
+    #[test]
+    fn session_grant_does_not_ride_a_wrapper_prefix() {
+        // Same bypass through the session allowlist: an "allow always"
+        // grant on `git *` must not cover a prefixed form that executes
+        // something else.
+        let mut e = Engine::from_config(&PermissionConfig::default());
+        e.allow_always(Operation::Execute, "git *");
+        let d = e.authorize(&req(
+            Operation::Execute,
+            "bash",
+            SecurityMode::Standard,
+            vec![Resource::command("PATH=/tmp/evil git push")],
+        ));
+        assert_eq!(
+            d.effect,
+            Effect::Ask,
+            "a session grant must not silently allow an env-prefixed command"
+        );
+    }
+
+    #[test]
     fn stripping_a_wrapper_prefix_does_not_over_deny() {
         // The prefix strip must not turn a benign command into a denied
         // one: `nohup rm -rf ./local` is not a system-root delete.

@@ -162,21 +162,31 @@ impl Resource {
     }
 
     /// Every string form a configured pattern should be tested
-    /// against. Paths expose BOTH the canonical resolved form and the
-    /// raw input, so a user rule written against either (literal
-    /// `/etc/**`, a symlinked root, or a relative path) matches —
-    /// mirroring the old `check_path` `matches(abs) || matches(raw)`.
+    /// against for ALLOW purposes. Paths expose BOTH the canonical
+    /// resolved form and the raw input, so a user rule written against
+    /// either (literal `/etc/**`, a symlinked root, or a relative path)
+    /// matches — mirroring the old `check_path` `matches(abs) ||
+    /// matches(raw)`. Commands expose only the raw string: an
+    /// env/wrapper prefix (`PATH=/tmp/evil git push`, `./env git push`)
+    /// changes WHAT executes, so it must not ride a `git *` allow.
     pub fn match_candidates(&self) -> Vec<&str> {
         match self {
             Resource::Path { raw, resolved, .. } => {
                 let r = resolved.to_str().unwrap_or(raw);
                 if r == raw { vec![r] } else { vec![r, raw] }
             }
-            // A command is also tested with its leading env assignments
-            // and exec wrappers stripped, so a head-anchored rule
-            // (`rm -rf /**`, or a user's `git *`) still matches
-            // `FOO=1 rm -rf /` / `nohup rm -rf /` (dirge-8zem). The raw
-            // form is kept too — it's what the prompt displays.
+            _ => vec![self.match_key()],
+        }
+    }
+
+    /// Candidates for DENY matching. Commands additionally expose the
+    /// form with leading env assignments and exec wrappers stripped, so
+    /// a head-anchored deny (`rm -rf /**`) still matches
+    /// `FOO=1 rm -rf /` / `nohup rm -rf /` (dirge-8zem). Widening is
+    /// safe on the deny side (worst case: over-deny); the allow side
+    /// must use [`Self::match_candidates`] instead.
+    pub fn deny_match_candidates(&self) -> Vec<&str> {
+        match self {
             Resource::Command { raw, .. } => {
                 let stripped = strip_exec_prefix(raw);
                 if stripped.is_empty() || stripped == raw.as_str() {
@@ -185,7 +195,7 @@ impl Resource {
                     vec![raw, stripped]
                 }
             }
-            _ => vec![self.match_key()],
+            _ => self.match_candidates(),
         }
     }
 }

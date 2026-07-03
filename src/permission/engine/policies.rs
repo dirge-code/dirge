@@ -71,12 +71,17 @@ pub struct Rule {
 
 impl Rule {
     fn matches(&self, req: &AccessRequest, op: Operation, resource: &Resource) -> bool {
+        // A deny rule sees through env/wrapper prefixes (dirge-8zem);
+        // an allow (or ask) rule matches the raw form only — a prefix
+        // changes what actually executes, so it must not ride an allow.
+        let cands = if self.effect == Effect::Deny {
+            resource.deny_match_candidates()
+        } else {
+            resource.match_candidates()
+        };
         self.op.matches(op)
             && self.tool.as_deref().is_none_or(|t| t == req.tool)
-            && resource
-                .match_candidates()
-                .iter()
-                .any(|k| self.pattern.matches(k))
+            && cands.iter().any(|k| self.pattern.matches(k))
     }
 }
 
@@ -212,9 +217,11 @@ impl Decider for ConfiguredRulePolicy {
     }
     fn applies_to(&self, op: Operation, resource: &Resource) -> bool {
         // Coarse: op + pattern (the tool narrowing is applied in
-        // `decide`, which has the full request). A false positive here
-        // only means `decide` runs and returns None — harmless.
-        let cands = resource.match_candidates();
+        // `decide`, which has the full request). Uses the widest
+        // candidate set so a deny rule matching only the stripped form
+        // isn't missed. A false positive here only means `decide` runs
+        // and returns None — harmless.
+        let cands = resource.deny_match_candidates();
         self.rules
             .iter()
             .any(|r| r.op.matches(op) && cands.iter().any(|k| r.pattern.matches(k)))
