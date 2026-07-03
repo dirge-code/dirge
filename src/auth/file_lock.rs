@@ -11,6 +11,16 @@
 
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+/// How long a contended acquire waits before proceeding without the lock.
+/// Bounds the cross-process wedge when the current holder is stuck (e.g. a
+/// hung refresh POST): losing serialization is recoverable, a deadlocked
+/// process is not.
+const ACQUIRE_DEADLINE: Duration = Duration::from_secs(60);
+
+/// Poll interval for the non-blocking retry loop in `acquire_for`.
+const RETRY_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Exclusive advisory lock held for the lifetime of the guard. Released when
 /// dropped (implicitly, when the underlying file is closed).
@@ -37,43 +47,78 @@ fn open_lock_file(path: &Path) -> Option<File> {
         .ok()
 }
 
+/// Outcome of a single non-blocking lock attempt.
+enum TryLock {
+    Acquired,
+    /// Another holder owns the lock; retrying may succeed.
+    Contended,
+    /// Syscall failed or the platform lacks advisory locking; retrying is
+    /// pointless — fail open immediately.
+    Unsupported,
+}
+
 impl FileLock {
-    /// Acquire the exclusive lock guarding `target`, blocking until it is
-    /// available. Fail-open: returns a no-op guard if the lock can't be taken.
+    /// Acquire the exclusive lock guarding `target`, waiting up to
+    /// [`ACQUIRE_DEADLINE`] for the current holder to release it. Fail-open:
+    /// returns a no-op guard if the lock can't be taken (open failure,
+    /// unsupported platform, or a holder stuck past the deadline).
     pub(crate) fn acquire_for(target: &Path) -> Self {
-        let file = open_lock_file(&lock_path(target)).filter(|file| flock_exclusive(file, true));
-        Self { _file: file }
+        Self::acquire_for_with_deadline(target, ACQUIRE_DEADLINE)
+    }
+
+    fn acquire_for_with_deadline(target: &Path, deadline: Duration) -> Self {
+        let Some(file) = open_lock_file(&lock_path(target)) else {
+            return Self { _file: None };
+        };
+        let start = Instant::now();
+        loop {
+            match try_flock_exclusive(&file) {
+                TryLock::Acquired => return Self { _file: Some(file) },
+                TryLock::Unsupported => return Self { _file: None },
+                TryLock::Contended => {}
+            }
+            let elapsed = start.elapsed();
+            if elapsed >= deadline {
+                return Self { _file: None };
+            }
+            std::thread::sleep(RETRY_INTERVAL.min(deadline - elapsed));
+        }
     }
 
     /// Non-blocking acquire. `Some` if the lock was taken (or degraded to a
-    /// no-op because the lock file couldn't be opened), `None` if another
-    /// holder currently owns it. Test-only — production always blocks.
+    /// no-op because the lock file couldn't be opened / locking is
+    /// unsupported), `None` if another holder currently owns it. Test-only —
+    /// production waits via `acquire_for`.
     #[cfg(test)]
     pub(crate) fn try_acquire_for(target: &Path) -> Option<Self> {
         match open_lock_file(&lock_path(target)) {
-            Some(file) => flock_exclusive(&file, false).then_some(Self { _file: Some(file) }),
+            Some(file) => match try_flock_exclusive(&file) {
+                TryLock::Acquired => Some(Self { _file: Some(file) }),
+                TryLock::Contended => None,
+                TryLock::Unsupported => Some(Self { _file: None }),
+            },
             None => Some(Self { _file: None }),
         }
     }
 }
 
-/// `true` if the lock was acquired, `false` if it is contended (non-blocking)
-/// or the syscall failed / is unsupported.
 #[cfg(unix)]
-fn flock_exclusive(file: &File, block: bool) -> bool {
+fn try_flock_exclusive(file: &File) -> TryLock {
     use std::os::unix::io::AsRawFd;
-    let mut op = libc::LOCK_EX;
-    if !block {
-        op |= libc::LOCK_NB;
-    }
     // SAFETY: `file` outlives the call; flock only reads the fd.
-    unsafe { libc::flock(file.as_raw_fd(), op) == 0 }
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return TryLock::Acquired;
+    }
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(code) if code == libc::EWOULDBLOCK || code == libc::EINTR => TryLock::Contended,
+        _ => TryLock::Unsupported,
+    }
 }
 
 #[cfg(not(unix))]
-fn flock_exclusive(_file: &File, _block: bool) -> bool {
+fn try_flock_exclusive(_file: &File) -> TryLock {
     // No portable advisory lock; degrade to the prior unsynchronized behavior.
-    false
+    TryLock::Unsupported
 }
 
 #[cfg(all(test, unix))]
@@ -119,6 +164,28 @@ mod tests {
             FileLock::try_acquire_for(t.target()).is_some(),
             "the lock must be re-acquirable after the holder is dropped"
         );
+    }
+
+    #[test]
+    fn bounded_acquire_returns_degraded_guard_when_deadline_expires() {
+        use std::time::{Duration, Instant};
+
+        let t = TempTarget::new("deadline");
+        let held = FileLock::try_acquire_for(t.target()).expect("first acquire should succeed");
+
+        let start = Instant::now();
+        let guard = FileLock::acquire_for_with_deadline(t.target(), Duration::from_millis(200));
+        let elapsed = start.elapsed();
+
+        assert!(
+            guard._file.is_none(),
+            "a contended acquire past the deadline must degrade to a no-op guard"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "bounded acquire must return promptly after the deadline, took {elapsed:?}"
+        );
+        drop(held);
     }
 
     #[test]

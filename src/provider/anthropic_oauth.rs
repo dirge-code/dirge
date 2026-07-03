@@ -10,6 +10,10 @@ const TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
 const CALLBACK_PORT: u16 = 53692;
 const REDIRECT_URI: &str = "http://localhost:53692/callback";
 const SCOPES: &str = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
+/// Bound on each token-endpoint POST. Without it a dead TCP connection hangs
+/// the refresh forever, wedging every caller waiting on the token mutex and
+/// the cross-process auth-file lock (mirrors `openai_device::REQUEST_TIMEOUT`).
+const TOKEN_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct AnthropicOAuthCredentials {
@@ -110,6 +114,7 @@ pub(crate) async fn refresh_token(
 ) -> anyhow::Result<AnthropicOAuthCredentials> {
     let response = reqwest::Client::new()
         .post(TOKEN_URL)
+        .timeout(TOKEN_REQUEST_TIMEOUT)
         .json(&serde_json::json!({
             "grant_type": "refresh_token",
             "client_id": CLIENT_ID,
@@ -129,6 +134,7 @@ async fn exchange_authorization_code(
 ) -> anyhow::Result<AnthropicOAuthCredentials> {
     let response = reqwest::Client::new()
         .post(TOKEN_URL)
+        .timeout(TOKEN_REQUEST_TIMEOUT)
         .json(&serde_json::json!({
             "grant_type": "authorization_code",
             "client_id": CLIENT_ID,
