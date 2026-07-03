@@ -47,7 +47,10 @@ fn open_lock_file(path: &Path) -> Option<File> {
         .ok()
 }
 
-/// Outcome of a single non-blocking lock attempt.
+/// Outcome of a single non-blocking lock attempt. On platforms without
+/// advisory locking (`cfg(not(unix))`) `try_flock_exclusive` only ever
+/// returns `Unsupported`, so the other variants go unconstructed there.
+#[cfg_attr(not(unix), allow(dead_code))]
 enum TryLock {
     Acquired,
     /// Another holder owns the lock; retrying may succeed.
