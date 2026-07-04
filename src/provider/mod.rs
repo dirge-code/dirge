@@ -95,6 +95,11 @@ pub struct AnyAgent {
     /// `code_review::REVIEW_PREAMBLE`; forwarded to
     /// `LoopConfig.code_review_fn`. `None` = off.
     code_review_fn: Option<crate::agent::agent_loop::critic::CriticFn>,
+    /// How the armed reviewer engages at finalization when
+    /// `code_review_fn` is `Some`. Resolved in `build_agent` (prompt
+    /// `code_review` front-matter wins over `Config::code_review`) and
+    /// forwarded to `LoopConfig.code_review_mode`. Defaults to `Advisory`.
+    code_review_mode: crate::agent::agent_loop::types::CodeReviewMode,
     /// Goal gate's judge callback. Built at `build_agent` time from the
     /// same critic provider as `critic_fn` but baking its own
     /// `GOAL_PREAMBLE`; forwarded to `LoopConfig.goal_fn`. `None` = off.
@@ -199,6 +204,7 @@ impl AnyAgent {
             escalation_provider_name: None,
             critic_fn: None,
             code_review_fn: None,
+            code_review_mode: crate::agent::agent_loop::types::CodeReviewMode::default(),
             goal_fn: None,
             goal: None,
             summarize_fn: None,
@@ -368,6 +374,18 @@ impl AnyAgent {
         code_review_fn: crate::agent::agent_loop::critic::CriticFn,
     ) -> Self {
         self.code_review_fn = Some(code_review_fn);
+        self
+    }
+
+    /// dirge-iyf5: set how the armed diff-aware reviewer engages at
+    /// finalization (`Off` would skip arming it entirely — prefer leaving
+    /// `code_review_fn` unset for that). Only meaningful once
+    /// [`with_code_review_fn`](Self::with_code_review_fn) arms the judge.
+    pub fn with_code_review_mode(
+        mut self,
+        code_review_mode: crate::agent::agent_loop::types::CodeReviewMode,
+    ) -> Self {
+        self.code_review_mode = code_review_mode;
         self
     }
 

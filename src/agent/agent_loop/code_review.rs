@@ -493,7 +493,7 @@ const MAX_DIFF_BYTES: usize = 64_000;
 /// filtered-but-PRE-cap text, so such an edit still changes it — only the
 /// equality/skip decision changed; the bounded text still goes to the
 /// reviewer unchanged.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunDiff {
     /// The bounded diff sent to the reviewer (filtered + capped).
     pub capped: String,
@@ -1057,6 +1057,21 @@ pub fn advisory_notice(advisory: &[Finding]) -> Option<String> {
     let body = render_findings(advisory);
     Some(format!(
         "{CODE_REVIEW_TAG} lower-severity notes on your changes (advisory — not blocking):\n{body}"
+    ))
+}
+
+/// Render ALL findings (every severity) as one non-blocking `SystemNotice`
+/// body for background advisory mode (dirge-iyf5). Unlike
+/// [`advisory_notice`], which is fed only the medium/low split, this
+/// surfaces high/critical findings too — advisory mode reports them for the
+/// user's attention but never re-enters the loop. `None` when empty.
+pub fn background_review_notice(findings: &[Finding]) -> Option<String> {
+    if findings.is_empty() {
+        return None;
+    }
+    let body = render_findings(findings);
+    Some(format!(
+        "{CODE_REVIEW_TAG} review of the changes you just made (advisory — not blocking):\n{body}"
     ))
 }
 
@@ -1652,6 +1667,53 @@ diff --git a/Cargo.lock b/Cargo.lock\n\
         assert!(text.starts_with(CODE_REVIEW_TAG));
         assert!(text.contains("nit"));
         assert!(text.to_lowercase().contains("advisory"));
+    }
+
+    #[test]
+    fn background_review_notice_surfaces_all_severities_non_blocking() {
+        // Background advisory mode reports high/critical too (it never
+        // re-enters, so nothing else would surface them to the user).
+        assert!(background_review_notice(&[]).is_none());
+        let findings = vec![
+            Finding {
+                severity: Severity::Critical,
+                location: None,
+                body: "Critical — data loss".into(),
+            },
+            Finding {
+                severity: Severity::Low,
+                location: None,
+                body: "Low — nit".into(),
+            },
+        ];
+        let text = background_review_notice(&findings).expect("some");
+        assert!(text.starts_with(CODE_REVIEW_TAG));
+        assert!(text.contains("data loss"), "includes the critical finding");
+        assert!(text.contains("nit"), "includes the low finding");
+        assert!(
+            text.to_lowercase().contains("not blocking"),
+            "flags itself non-blocking"
+        );
+    }
+
+    #[test]
+    fn code_review_mode_from_wire_parses_vocabulary() {
+        use crate::agent::agent_loop::types::CodeReviewMode;
+        assert_eq!(CodeReviewMode::from_wire("off"), Some(CodeReviewMode::Off));
+        assert_eq!(
+            CodeReviewMode::from_wire("  Advisory "),
+            Some(CodeReviewMode::Advisory)
+        );
+        assert_eq!(
+            CodeReviewMode::from_wire("BLOCKING"),
+            Some(CodeReviewMode::Blocking)
+        );
+        // Empty is the default; unknown is None so callers can warn + fall back.
+        assert_eq!(
+            CodeReviewMode::from_wire(""),
+            Some(CodeReviewMode::Advisory)
+        );
+        assert_eq!(CodeReviewMode::from_wire("loud"), None);
     }
 
     // ── Two-pass verify/dedupe (R4) ───────────────────────────────

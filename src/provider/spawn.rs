@@ -218,6 +218,9 @@ impl AnyAgent {
         // critic_provider is configured and the active prompt didn't
         // disable it). `None` → no reviewer.
         cfg.code_review_fn = self.code_review_fn.clone();
+        // dirge-iyf5: engagement mode for the armed reviewer above
+        // (Blocking = legacy sync re-entry, Advisory = background notice).
+        cfg.code_review_mode = self.code_review_mode;
         cfg.goal_fn = self.goal_fn.clone();
         // Goal gate stop condition (`--goal`). Engages only when
         // `goal_fn` above is also present (it's the judge).

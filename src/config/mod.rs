@@ -564,6 +564,16 @@ pub struct Config {
     /// prompt's own `critic_preamble` frontmatter overrides it. Unset
     /// (default) = built-in critic stance. See `resolve_critic_preamble`.
     pub critic_preamble: Option<String>,
+    /// How the diff-aware code reviewer engages at finalization. One of
+    /// `off` / `advisory` / `blocking` (case-insensitive, trimmed).
+    /// `advisory` *(default)* runs the review detached in the background
+    /// and surfaces findings as a non-blocking notice — it never holds up
+    /// a turn. `blocking` awaits the review and re-enters the loop on
+    /// high/critical findings (the legacy behaviour). `off` disables it
+    /// entirely. A prompt's `code_review` front-matter overrides this
+    /// per-prompt; only meaningful when a `critic_provider` is set. See
+    /// [`resolve_code_review_mode`](Self::resolve_code_review_mode).
+    pub code_review: Option<String>,
     /// dirge-0g6i: optional provider for LLM auto-approval. When set, a
     /// permission prompt is routed to this model (with a safety prompt)
     /// which replies ALLOW/DENY instead of asking the human. Unset
@@ -746,6 +756,28 @@ impl Config {
         self.critic_preamble
             .as_deref()
             .unwrap_or(crate::agent::agent_loop::critic::CRITIC_PREAMBLE)
+    }
+
+    /// Resolve the diff-aware reviewer's engagement mode from
+    /// [`code_review`](Self::code_review): `off`/`advisory`/`blocking`,
+    /// parsed case-insensitively and trimmed. `None` and an empty value
+    /// resolve to the default `Advisory`. An unrecognized non-empty value
+    /// also resolves to `Advisory` but logs a warning, so a typo never
+    /// silently disables the reviewer.
+    pub fn resolve_code_review_mode(&self) -> crate::agent::agent_loop::types::CodeReviewMode {
+        use crate::agent::agent_loop::types::CodeReviewMode;
+        let Some(raw) = self.code_review.as_deref() else {
+            return CodeReviewMode::default();
+        };
+        CodeReviewMode::from_wire(raw).unwrap_or_else(|| {
+            tracing::warn!(
+                target: "dirge::config",
+                value = raw.trim(),
+                "unrecognized `code_review` value; falling back to `advisory` \
+                 (valid: off | advisory | blocking)"
+            );
+            CodeReviewMode::Advisory
+        })
     }
 
     /// Resolve the provider_type for an entry — the entry's
@@ -1286,6 +1318,46 @@ mod tests {
             cfg.resolve_critic_preamble(),
             crate::agent::agent_loop::critic::CRITIC_PREAMBLE,
         );
+    }
+
+    #[test]
+    fn code_review_field_absent_and_parses() {
+        let cfg: Config = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(cfg.code_review.is_none());
+
+        let cfg: Config = serde_json::from_str(r#"{ "code_review": "blocking" }"#).unwrap();
+        assert_eq!(cfg.code_review.as_deref(), Some("blocking"));
+    }
+
+    #[test]
+    fn resolve_code_review_mode_each_string_and_default() {
+        use crate::agent::agent_loop::types::CodeReviewMode;
+
+        // Each documented string (case-insensitive, trimmed) maps through.
+        let mk = |raw: &str| {
+            Config::deserialize(serde_json::json!({ "code_review": raw }))
+                .unwrap()
+                .resolve_code_review_mode()
+        };
+        assert_eq!(mk("off"), CodeReviewMode::Off);
+        assert_eq!(mk("OFF"), CodeReviewMode::Off);
+        assert_eq!(mk("  Blocking  "), CodeReviewMode::Blocking);
+        assert_eq!(mk("advisory"), CodeReviewMode::Advisory);
+
+        // Absent / empty → default Advisory.
+        let cfg: Config = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(cfg.resolve_code_review_mode(), CodeReviewMode::Advisory);
+        let cfg: Config = serde_json::from_str(r#"{ "code_review": "   " }"#).unwrap();
+        assert_eq!(cfg.resolve_code_review_mode(), CodeReviewMode::Advisory);
+    }
+
+    #[test]
+    fn resolve_code_review_mode_unknown_warns_and_defaults() {
+        use crate::agent::agent_loop::types::CodeReviewMode;
+        // An unrecognized non-empty value must NOT silently map to Off —
+        // it falls back to Advisory (the safe, non-disabling default).
+        let cfg: Config = serde_json::from_str(r#"{ "code_review": "nuclear" }"#).unwrap();
+        assert_eq!(cfg.resolve_code_review_mode(), CodeReviewMode::Advisory);
     }
 
     /// Cross-session Up-arrow history depth: absent by default (→3),

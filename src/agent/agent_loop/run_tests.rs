@@ -133,6 +133,7 @@ fn build_config() -> LoopConfig {
         verifier: None,
         critic_fn: None,
         code_review_fn: None,
+        code_review_mode: crate::agent::agent_loop::types::CodeReviewMode::default(),
         goal_fn: None,
         goal: None,
         max_turns: None,
@@ -3224,6 +3225,7 @@ async fn finalization_hook_short_circuits_lower_gates() {
         &mut code_review_reacts,
         None, // code_review_baseline
         &mut std::collections::HashSet::new(),
+        &std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         &mut goal_reacts,
         &mut todo_nudges,
         &review_emit,
@@ -3336,6 +3338,7 @@ async fn finalization_all_gates_silent_yields_none() {
         &mut code_review_reacts,
         None, // code_review_baseline
         &mut std::collections::HashSet::new(),
+        &std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         &mut goal_reacts,
         &mut todo_nudges,
         &review_emit,
@@ -3371,6 +3374,7 @@ async fn finalization_goal_unmet_reenters_and_counts() {
         &mut code_review_reacts,
         None, // code_review_baseline
         &mut std::collections::HashSet::new(),
+        &std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         &mut goal_reacts,
         &mut todo_nudges,
         &review_emit,
@@ -3404,6 +3408,7 @@ async fn finalization_goal_met_finalizes() {
         &mut code_review_reacts,
         None, // code_review_baseline
         &mut std::collections::HashSet::new(),
+        &std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         &mut goal_reacts,
         &mut todo_nudges,
         &review_emit,
@@ -3438,6 +3443,7 @@ async fn finalization_goal_bound_stops_reentry() {
         &mut code_review_reacts,
         None, // code_review_baseline
         &mut std::collections::HashSet::new(),
+        &std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         &mut goal_reacts,
         &mut todo_nudges,
         &review_emit,
@@ -3469,6 +3475,7 @@ async fn finalization_goal_without_judge_is_inert() {
         &mut code_review_reacts,
         None, // code_review_baseline
         &mut std::collections::HashSet::new(),
+        &std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         &mut goal_reacts,
         &mut todo_nudges,
         &review_emit,

@@ -391,6 +391,7 @@ mod tests {
             verifier: None,
             critic_fn: None,
             code_review_fn: None,
+            code_review_mode: crate::agent::agent_loop::types::CodeReviewMode::default(),
             goal_fn: None,
             goal: None,
             max_turns: None,

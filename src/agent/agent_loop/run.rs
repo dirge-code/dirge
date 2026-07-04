@@ -53,7 +53,7 @@ use super::message::{
 use super::storm::StormBreaker;
 use super::stream::{StreamFn, stream_assistant_response};
 use super::tool::AbortSignal;
-use super::types::{Context, LoopConfig};
+use super::types::{CodeReviewMode, Context, LoopConfig};
 use crate::sync_util::LockExt;
 
 /// Phase 4 part 2: poll the configured `get_steering_messages`
@@ -210,6 +210,10 @@ async fn poll_finalization_follow_up(
     code_review_reacts: &mut u8,
     code_review_baseline: Option<&super::code_review::RunDiff>,
     emitted_advisories: &mut std::collections::HashSet<String>,
+    // Shared with the detached advisory task (Arc so a background review
+    // spawned from an earlier finalization and the next one dedup against
+    // the same set). dirge-iyf5.
+    advisory_dedup: &std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     goal_reacts: &mut u8,
     todo_nudges: &mut u8,
     emit: &mpsc::Sender<LoopEvent>,
@@ -261,42 +265,110 @@ async fn poll_finalization_follow_up(
     //      reviewer entirely, never paying for a judge call. Active only when
     //      a `critic_provider` is configured (the reviewer reuses its judge) —
     //      off with no cost for default sessions.
-    if *code_review_reacts < super::code_review::MAX_REVIEW_REACT
-        && config.code_review_fn.is_some()
+    //      dirge-iyf5: `config.code_review_mode` decides HOW it engages.
+    //      `Off` never arms `code_review_fn` (build.rs), so the `is_some()`
+    //      guard already excludes it. `Blocking` is the synchronous,
+    //      re-entering path below. `Advisory` (the default) runs the whole
+    //      capture+review detached in the background so finalization never
+    //      waits and never re-enters — findings surface as one notice.
+    if config.code_review_fn.is_some()
+        && config.code_review_mode != CodeReviewMode::Off
         && run_made_tool_calls(new_messages)
         && let Some(review_fn) = &config.code_review_fn
     {
-        let repo = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        // Diff capture shells out to git — do it off the async runtime.
-        let diff = tokio::task::spawn_blocking(move || super::code_review::capture_run_diff(&repo))
-            .await
-            .ok()
-            .flatten();
-        // Review only what THIS run changed: skip when the diff is identical to
-        // the run-start baseline (nothing touched on disk this turn).
-        if let Some(diff) = run_delta_to_review(diff.as_ref(), code_review_baseline) {
-            let transcript = build_critic_transcript(new_messages);
-            let findings =
-                super::code_review::run_code_review(review_fn, system_prompt, diff, &transcript)
+        match config.code_review_mode {
+            CodeReviewMode::Blocking
+                if *code_review_reacts < super::code_review::MAX_REVIEW_REACT =>
+            {
+                let repo =
+                    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                // Diff capture shells out to git — do it off the async runtime.
+                let diff = tokio::task::spawn_blocking(move || {
+                    super::code_review::capture_run_diff(&repo)
+                })
+                .await
+                .ok()
+                .flatten();
+                // Review only what THIS run changed: skip when the diff is
+                // identical to the run-start baseline (nothing touched on disk).
+                if let Some(diff) = run_delta_to_review(diff.as_ref(), code_review_baseline) {
+                    let transcript = build_critic_transcript(new_messages);
+                    let findings = super::code_review::run_code_review(
+                        review_fn,
+                        system_prompt,
+                        diff,
+                        &transcript,
+                    )
                     .await;
-            if !findings.is_empty() {
-                let reaction = decide_review_reaction(findings, emitted_advisories);
-                // Medium/Low → surface a non-blocking `<system>` notice, but
-                // only the first time this exact advisory comes up (dirge-jo0o).
-                if let Some(text) = reaction.advisory_to_emit {
-                    let _ = emit.send(LoopEvent::SystemNotice { content: text }).await;
-                }
-                // Only a blocking engagement spends the react budget — an
-                // advisory-only review finalizes without burning it (dirge-jo0o).
-                if reaction.counts_against_budget {
-                    *code_review_reacts += 1;
-                }
-                // High/Critical → re-enter the loop; the agent must fix or
-                // justify. Advisory-only reviews fall through and finalize.
-                if let Some(msg) = reaction.blocking_followup {
-                    return (vec![msg], FollowUpSource::CodeReview);
+                    if !findings.is_empty() {
+                        let reaction = decide_review_reaction(findings, emitted_advisories);
+                        // Medium/Low → surface a non-blocking `<system>` notice,
+                        // but only the first time this exact advisory comes up.
+                        if let Some(text) = reaction.advisory_to_emit {
+                            let _ = emit.send(LoopEvent::SystemNotice { content: text }).await;
+                        }
+                        // Only a blocking engagement spends the react budget — an
+                        // advisory-only review finalizes without burning it.
+                        if reaction.counts_against_budget {
+                            *code_review_reacts += 1;
+                        }
+                        // High/Critical → re-enter the loop; the agent must fix
+                        // or justify. Advisory-only reviews fall through.
+                        if let Some(msg) = reaction.blocking_followup {
+                            return (vec![msg], FollowUpSource::CodeReview);
+                        }
+                    }
                 }
             }
+            CodeReviewMode::Advisory => {
+                // Detached: capture + review + emit run off the finalization
+                // path, so a tight debug loop is never held up. ALL findings
+                // (high/critical included) surface as one non-blocking notice;
+                // the loop is never re-entered and the react budget is untouched.
+                let review_fn = review_fn.clone();
+                let system_prompt = system_prompt.to_string();
+                let transcript = build_critic_transcript(new_messages);
+                let baseline = code_review_baseline.cloned();
+                let emit = emit.clone();
+                let dedup = advisory_dedup.clone();
+                tokio::spawn(async move {
+                    let repo =
+                        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                    let diff = tokio::task::spawn_blocking(move || {
+                        super::code_review::capture_run_diff(&repo)
+                    })
+                    .await
+                    .ok()
+                    .flatten();
+                    let Some(diff) = run_delta_to_review(diff.as_ref(), baseline.as_ref()) else {
+                        return;
+                    };
+                    let findings = super::code_review::run_code_review(
+                        &review_fn,
+                        &system_prompt,
+                        diff,
+                        &transcript,
+                    )
+                    .await;
+                    let Some(notice) = super::code_review::background_review_notice(&findings)
+                    else {
+                        return;
+                    };
+                    // Dedup against the shared set so the same advisory isn't
+                    // repeated across finalizations. Lock is released before the
+                    // await (no lock held across `.send`).
+                    {
+                        let mut seen = dedup.lock().unwrap_or_else(|e| e.into_inner());
+                        if !seen.insert(notice.clone()) {
+                            return;
+                        }
+                    }
+                    let _ = emit.send(LoopEvent::SystemNotice { content: notice }).await;
+                });
+            }
+            // Off is excluded by the guard above; Blocking with an exhausted
+            // budget falls through without re-reviewing.
+            _ => {}
         }
     }
     // 3.5 Goal gate — user-defined stop condition. Unlike the one-shot
@@ -1133,6 +1205,11 @@ pub async fn run_loop(
     // a duplicate SystemNotice at every finalization.
     let mut emitted_advisories: std::collections::HashSet<String> =
         std::collections::HashSet::new();
+    // dirge-iyf5: background advisory reviews (default mode) dedup against
+    // this shared set — a detached task from an earlier finalization and the
+    // next one must not both surface the same finding.
+    let advisory_dedup: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
 
     // dirge-1g3v: snapshot the working-tree diff at run start so the reviewer
     // can tell what THIS run changed. Without a baseline it diffed the whole
@@ -1950,6 +2027,7 @@ pub async fn run_loop(
             &mut code_review_reacts,
             code_review_baseline.as_ref(),
             &mut emitted_advisories,
+            &advisory_dedup,
             &mut goal_reacts,
             &mut todo_nudges,
             emit,

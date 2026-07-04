@@ -62,6 +62,11 @@ pub struct Prompt {
     /// `config.critic_preamble` and the built-in `CRITIC_PREAMBLE`. An
     /// empty value is treated as unset. `None` = inherit.
     pub critic_preamble: Option<String>,
+    /// Per-prompt override of the code-reviewer engagement mode. Same
+    /// vocabulary as `config.code_review` (`off` / `advisory` /
+    /// `blocking`), resolved in `build_agent` where it wins over the
+    /// config-level setting. `None` = inherit the config/default.
+    pub code_review: Option<String>,
     /// Tier this prompt was loaded from. `parse_frontmatter` defaults to
     /// `Embedded`; the global/project loaders override it.
     pub source: PromptSource,
@@ -106,6 +111,7 @@ fn parse_frontmatter(raw: &str) -> Prompt {
     let mut description: Option<String> = None;
     let mut critic: Option<bool> = None;
     let mut critic_preamble: Option<String> = None;
+    let mut code_review: Option<String> = None;
     let lines: Vec<&str> = front.lines().collect();
     let mut i = 0;
     while i < lines.len() {
@@ -175,6 +181,12 @@ fn parse_frontmatter(raw: &str) -> Prompt {
                 "true" => critic = Some(true),
                 _ => {}
             },
+            "code_review" => {
+                let v = value.trim_matches(|c| c == '"' || c == '\'');
+                if !v.is_empty() {
+                    code_review = Some(v.to_string());
+                }
+            }
             "critic_preamble" => {
                 if (value == "|" || value == "|-") && i < lines.len() {
                     // YAML block scalar: collect the following indented lines
@@ -215,6 +227,7 @@ fn parse_frontmatter(raw: &str) -> Prompt {
         description,
         critic,
         critic_preamble,
+        code_review,
         ..Default::default()
     }
 }
@@ -434,6 +447,23 @@ mod tests {
         let raw = "---\ncritic: true\n---\nbody\n";
         let p = parse_frontmatter(raw);
         assert_eq!(p.critic, Some(true));
+    }
+
+    #[test]
+    fn frontmatter_parses_code_review_override() {
+        // The per-prompt override wins over config in build_agent; here we
+        // only assert the front-matter is captured as the raw string.
+        let raw = "---\ncode_review: blocking\n---\nbody\n";
+        let p = parse_frontmatter(raw);
+        assert_eq!(p.code_review.as_deref(), Some("blocking"));
+    }
+
+    #[test]
+    fn frontmatter_empty_code_review_is_unset() {
+        // Empty value inherits the config/default rather than forcing a mode.
+        let raw = "---\ncode_review:\n---\nbody\n";
+        let p = parse_frontmatter(raw);
+        assert!(p.code_review.is_none());
     }
 
     /// #429: plan mode must be a comprehensive read-only lock — every tool

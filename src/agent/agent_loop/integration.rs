@@ -402,6 +402,11 @@ pub struct LoopSpawnConfig {
     /// `critic_fn` but baking `code_review::REVIEW_PREAMBLE`. `None` = off.
     pub code_review_fn: Option<crate::agent::agent_loop::critic::CriticFn>,
 
+    /// Engagement mode for the armed reviewer above (dirge-iyf5):
+    /// `Advisory` runs detached in the background, `Blocking` awaits and
+    /// re-enters. Forwarded to `LoopConfig.code_review_mode`.
+    pub code_review_mode: crate::agent::agent_loop::types::CodeReviewMode,
+
     /// Goal gate's judge callback, threaded into `LoopConfig.goal_fn`.
     /// `None` = off (default).
     pub goal_fn: Option<crate::agent::agent_loop::critic::CriticFn>,
@@ -464,6 +469,7 @@ impl LoopSpawnConfig {
             verifier: None,
             critic_fn: None,
             code_review_fn: None,
+            code_review_mode: crate::agent::agent_loop::types::CodeReviewMode::default(),
             goal_fn: None,
             goal: None,
             max_turns: None,
@@ -539,6 +545,7 @@ pub fn spawn_loop_runner(cfg: LoopSpawnConfig) -> LoopRunner {
         verifier: cfg.verifier.clone(),
         critic_fn: cfg.critic_fn.clone(),
         code_review_fn: cfg.code_review_fn.clone(),
+        code_review_mode: cfg.code_review_mode,
         goal_fn: cfg.goal_fn.clone(),
         goal: cfg.goal.clone(),
         max_turns: cfg.max_turns,

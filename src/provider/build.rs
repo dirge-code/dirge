@@ -396,6 +396,14 @@ pub async fn build_agent(
                     .as_deref()
                     .and_then(|name| context.prompts.get(name));
                 let critic_disabled = active_prompt.and_then(|p| p.critic) == Some(false);
+                // dirge-iyf5: the diff-aware reviewer's engagement mode.
+                // A prompt-level `code_review` front-matter value wins over
+                // the config-level `code_review`; an unrecognized prompt
+                // value falls back to the config resolution.
+                let code_review_mode = active_prompt
+                    .and_then(|p| p.code_review.as_deref())
+                    .and_then(crate::agent::agent_loop::types::CodeReviewMode::from_wire)
+                    .unwrap_or_else(|| cfg.resolve_code_review_mode());
                 let critic_preamble: std::sync::Arc<str> =
                     match active_prompt.and_then(|p| p.critic_preamble.as_deref()) {
                         Some(p) => std::sync::Arc::from(p),
@@ -428,18 +436,26 @@ pub async fn build_agent(
                             // REVIEW_PREAMBLE. Gated on the same prompt flag —
                             // a `critic: false` (read-only/exploratory) prompt
                             // suppresses both; those modes leave no diff anyway.
-                            agent = agent.with_code_review_fn(build_judge_fn(
-                                client.clone(),
-                                model_name.clone(),
-                                "code-review",
-                                std::sync::Arc::from(
-                                    crate::agent::agent_loop::code_review::REVIEW_PREAMBLE,
-                                ),
-                            ));
+                            // `code_review = off` leaves the judge unarmed
+                            // entirely (no diff capture, no review, zero cost);
+                            // advisory/blocking arm it and forward the mode.
+                            use crate::agent::agent_loop::types::CodeReviewMode;
+                            if code_review_mode != CodeReviewMode::Off {
+                                agent = agent.with_code_review_fn(build_judge_fn(
+                                    client.clone(),
+                                    model_name.clone(),
+                                    "code-review",
+                                    std::sync::Arc::from(
+                                        crate::agent::agent_loop::code_review::REVIEW_PREAMBLE,
+                                    ),
+                                ));
+                                agent = agent.with_code_review_mode(code_review_mode);
+                            }
                             tracing::info!(
                                 target: "dirge::provider",
                                 alias = %alias,
-                                "in-loop critic + code reviewer wired",
+                                code_review = code_review_mode.as_str(),
+                                "in-loop critic wired; code reviewer armed per mode",
                             );
                         } else {
                             tracing::info!(

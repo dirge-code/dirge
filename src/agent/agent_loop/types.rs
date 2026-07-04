@@ -139,6 +139,53 @@ pub struct TurnUpdate {
     pub thinking_level: Option<ThinkingLevel>,
 }
 
+/// How the diff-aware code reviewer engages at finalization
+/// (dirge-iyf5). Resolved from `config.code_review` with a prompt-level
+/// `code_review` front-matter override winning — see
+/// [`crate::config::Config::resolve_code_review_mode`].
+///
+/// - `Off` — the reviewer is not armed: no diff capture, no judge call,
+///   zero cost.
+/// - `Advisory` *(default)* — the review runs detached in the background
+///   after finalization and surfaces ALL findings (high/critical included)
+///   as a single non-blocking `SystemNotice`. It never re-enters the loop
+///   and never spends the react budget, so a tight debug loop is never
+///   held up waiting on it.
+/// - `Blocking` — the legacy synchronous behaviour: the finalization path
+///   awaits the diff + review, high/critical findings re-enter the loop
+///   (fix or justify), medium/low surface as a one-shot advisory. Bounded
+///   by `code_review::MAX_REVIEW_REACT`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CodeReviewMode {
+    Off,
+    #[default]
+    Advisory,
+    Blocking,
+}
+
+impl CodeReviewMode {
+    /// Lowercase wire name matching `resolve_code_review_mode`'s vocabulary.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CodeReviewMode::Off => "off",
+            CodeReviewMode::Advisory => "advisory",
+            CodeReviewMode::Blocking => "blocking",
+        }
+    }
+
+    /// Parse a wire value (case-insensitive, trimmed). Empty string is
+    /// treated as `Advisory` (the default). Returns `None` for an
+    /// unrecognized non-empty value so callers can warn + fall back.
+    pub fn from_wire(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "" | "advisory" => Some(CodeReviewMode::Advisory),
+            "off" => Some(CodeReviewMode::Off),
+            "blocking" => Some(CodeReviewMode::Blocking),
+            _ => None,
+        }
+    }
+}
+
 /// Loop configuration. Port of pi `AgentLoopConfig` (types.ts:135).
 ///
 /// Phase 1 lands the subset of hooks `stream_assistant_response`
@@ -392,10 +439,18 @@ pub struct LoopConfig {
 
     /// Diff-aware code reviewer judge (dirge-iyf5). `Some` only when a
     /// `critic_provider` is configured (it reuses that judge client with
-    /// `code_review::REVIEW_PREAMBLE`). At finalization, on a run that left
+    /// `code_review::REVIEW_PREAMBLE`) AND the resolved
+    /// [`CodeReviewMode`] is not `Off`. At finalization, on a run that left
     /// uncommitted changes, it reviews the diff and surfaces severity-ranked
     /// findings. `None` = no reviewer (default).
     pub code_review_fn: Option<super::critic::CriticFn>,
+
+    /// How the armed code reviewer engages at finalization. Only meaningful
+    /// when [`code_review_fn`](Self::code_review_fn) is `Some`. Resolved at
+    /// `build_agent` time from the prompt-level `code_review` front-matter
+    /// override (if any) else `Config::resolve_code_review_mode`; the
+    /// default is [`CodeReviewMode::Advisory`].
+    pub code_review_mode: CodeReviewMode,
 
     /// Goal gate's judge callback. Decoupled from `critic_fn`: built at
     /// `build_agent` time from the same critic provider but baking its OWN
@@ -567,6 +622,7 @@ impl std::fmt::Debug for LoopConfig {
                 "code_review_fn",
                 &self.code_review_fn.as_ref().map(|_| "<reviewer>"),
             )
+            .field("code_review_mode", &self.code_review_mode)
             .field("goal_fn", &self.goal_fn.as_ref().map(|_| "<judge>"))
             .field("goal", &self.goal)
             .field("max_turns", &self.max_turns)
@@ -611,6 +667,7 @@ impl Clone for LoopConfig {
             verifier: self.verifier.clone(),
             critic_fn: self.critic_fn.clone(),
             code_review_fn: self.code_review_fn.clone(),
+            code_review_mode: self.code_review_mode,
             goal_fn: self.goal_fn.clone(),
             goal: self.goal.clone(),
             max_turns: self.max_turns,
@@ -663,6 +720,7 @@ impl LoopConfig {
             verifier: None,
             critic_fn: None,
             code_review_fn: None,
+            code_review_mode: CodeReviewMode::Advisory,
             goal_fn: None,
             goal: None,
             max_turns: None,
