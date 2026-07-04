@@ -97,6 +97,20 @@ enum SourceBlock {
     /// reproduces it exactly; it just doesn't re-wrap (it's re-rendered by its
     /// own owner each interaction anyway).
     Raw { rows: Vec<LineEntry> },
+    /// A tool chamber that re-boxes to the current width on resize (dirge-ghpf).
+    /// Holds width-independent inputs; `render_block` calls a pure layout
+    /// function to produce the `╭─╮ … ╰─╯` cells at the current width.
+    /// `include_header` is false for the normal path (header is a separate
+    /// Raw/ChamberTop block written at ToolCall time) and true for collapsed
+    /// expand (Ctrl+O) where the chamber is appended whole.
+    ToolChamber {
+        tool_name: String,
+        banner_value: String,
+        output: String,
+        max_chars: usize,
+        max_lines: usize,
+        include_header: bool,
+    },
 }
 
 /// A source block plus its cached rendered-row count at the width the `buffer`
@@ -1800,6 +1814,32 @@ impl Renderer {
                 styled
             }
             SourceBlock::Raw { rows } => rows.clone(),
+            SourceBlock::ToolChamber {
+                tool_name,
+                banner_value,
+                output,
+                max_chars,
+                max_lines,
+                include_header,
+            } => {
+                let frame_w =
+                    crate::ui::tool_display::chamber_widths_for_width(self.chat_band_width()).0;
+                crate::ui::tool_display::layout_tool_chamber(
+                    tool_name,
+                    banner_value,
+                    output,
+                    *max_chars,
+                    *max_lines,
+                    *include_header,
+                    frame_w,
+                )
+                .into_iter()
+                .map(|(text, color)| LineEntry {
+                    text: CompactString::from(text),
+                    color,
+                })
+                .collect()
+            }
         }
     }
 
@@ -1815,6 +1855,47 @@ impl Renderer {
         }
         self.source.push(Block { src: block, rows });
         self.enforce_cap();
+    }
+
+    /// Append a tool chamber as a single structured `ToolChamber` source
+    /// block. `rows` are the pre-rendered chamber lines at the current width;
+    /// they're pushed to the buffer immediately (so the UI updates now) while
+    /// the structured inputs are stored in `source` for later re-rendering on
+    /// resize.
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_tool_chamber(
+        &mut self,
+        tool_name: String,
+        banner_value: String,
+        output: String,
+        max_chars: usize,
+        max_lines: usize,
+        include_header: bool,
+        rows: Vec<(String, Color)>,
+    ) -> io::Result<()> {
+        self.commit_partial();
+        self.commit_stream();
+        let block = SourceBlock::ToolChamber {
+            tool_name,
+            banner_value,
+            output,
+            max_chars,
+            max_lines,
+            include_header,
+        };
+        let len = rows.len();
+        for (text, color) in &rows {
+            self.push_buffer_line(LineEntry {
+                text: CompactString::from(text.as_str()),
+                color: *color,
+            });
+        }
+        self.source.push(Block {
+            src: block,
+            rows: len,
+        });
+        self.enforce_cap();
+        Ok(())
     }
 
     /// dirge-qy3y: update the open in-flight streamed block (or open a new

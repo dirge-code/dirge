@@ -343,6 +343,7 @@ pub(crate) async fn handle_tool_result(
                     &output,
                     max_chars,
                     max_lines,
+                    false,
                 )?;
                 *ctx.tool_chamber_open = false;
             }
@@ -354,6 +355,7 @@ pub(crate) async fn handle_tool_result(
                 &output,
                 max_chars,
                 max_lines,
+                false,
             )?;
             *ctx.tool_chamber_open = false;
         }

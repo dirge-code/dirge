@@ -241,16 +241,29 @@ pub(crate) fn tool_skips_collapse(tool_name: &str) -> bool {
     )
 }
 
-/// Render a tool result chamber. Returns `Some(CollapsedToolResult)` if
-/// truncated.
-pub(crate) fn render_tool_output(
-    renderer: &mut Renderer,
+/// Pure layout for a tool chamber body (and optionally header) at a given
+/// width. Returns `(text, color)` pairs — one per line — ready to become
+/// `LineEntry` rows. This has NO side effects; it is called both by the live
+/// rendering path (which wraps it with collapse-state tracking) and by
+/// `Renderer::render_block` on resize/rebuild (which only needs the rows).
+pub(crate) fn layout_tool_chamber(
     tool_name: &str,
     banner_value: &str,
     output: &str,
     max_chars: usize,
     max_lines: usize,
-) -> anyhow::Result<Option<CollapsedToolResult>> {
+    include_header: bool,
+    frame_w: usize,
+) -> Vec<(String, Color)> {
+    let inner = frame_w.saturating_sub(4);
+    let mut rows: Vec<(String, Color)> = Vec::new();
+
+    if include_header {
+        let upper = tool_name.to_ascii_uppercase();
+        let header = fit_banner_header(&upper, banner_value, frame_w);
+        rows.push((header, theme::tool()));
+    }
+
     let sanitized = sanitize_output(output);
     let total_chars = sanitized.chars().count();
     let char_sliced: String = if total_chars <= max_chars {
@@ -270,7 +283,6 @@ pub(crate) fn render_tool_output(
     let shown_lines = total_lines.min(line_cap);
     let hidden_lines = total_lines.saturating_sub(shown_lines);
 
-    let (frame_w, inner) = chamber_widths(renderer);
     let body_is_empty = char_sliced.trim().is_empty();
     if body_is_empty {
         let placeholder = match tool_name {
@@ -279,37 +291,96 @@ pub(crate) fn render_tool_output(
             "bash" => "(no output)",
             _ => "(no output)",
         };
-        renderer.write_line_raw(&chamber_row(placeholder, inner), theme::dim())?;
-    }
-    // dirge-hukk: syntax-highlight `read` boxes (file content) by the file's
-    // extension. Unknown/extensionless files fall through to the plain path.
-    if let Some(lang) = read_highlight_lang(tool_name, banner_value) {
+        rows.push((chamber_row(placeholder, inner), theme::dim()));
+    } else if let Some(lang) = read_highlight_lang(tool_name, banner_value) {
         let highlighted = crate::ui::highlight::highlight_code(&char_sliced, &lang);
         for spans in highlighted.iter().take(shown_lines) {
             let ansi = spans_to_ansi(spans);
-            renderer.write_line_raw(
-                &chamber_row_styled(&ansi, inner, theme::result()),
+            rows.push((
+                chamber_row_styled(&ansi, inner, theme::result()),
                 theme::result(),
-            )?;
+            ));
         }
     } else {
         for line in &lines[..shown_lines] {
-            renderer.write_line_raw(&chamber_row(line, inner), theme::result())?;
+            rows.push((chamber_row(line, inner), theme::result()));
         }
     }
+
     if hidden_lines > 0 {
         let note = format!(
             "↓ {} more line{} (Ctrl+O to expand)",
             hidden_lines,
             if hidden_lines == 1 { "" } else { "s" }
         );
-        renderer.write_line_raw(&chamber_row(&note, inner), theme::dim())?;
+        rows.push((chamber_row(&note, inner), theme::dim()));
     }
     if chars_truncated > 0 {
         let note = format!("░ +{} chars truncated (output too large)", chars_truncated);
-        renderer.write_line_raw(&chamber_row(&note, inner), theme::dim())?;
+        rows.push((chamber_row(&note, inner), theme::dim()));
     }
-    renderer.write_line_raw(&chamber_bottom(frame_w), theme::dim())?;
+    rows.push((chamber_bottom(frame_w), theme::dim()));
+    rows
+}
+
+/// Render a tool result chamber. Returns `Some(CollapsedToolResult)` if
+/// truncated. When `include_header` is true, the chamber header (`╭─…─╮`) is
+/// included in the structured block (used by Ctrl+O expand); otherwise only
+/// the body + bottom rows are recorded (the header was already written at
+/// ToolCall time).
+pub(crate) fn render_tool_output(
+    renderer: &mut Renderer,
+    tool_name: &str,
+    banner_value: &str,
+    output: &str,
+    max_chars: usize,
+    max_lines: usize,
+    include_header: bool,
+) -> anyhow::Result<Option<CollapsedToolResult>> {
+    // Compute collapse state BEFORE calling the pure layout — this is the
+    // side-effecting analysis (did we truncate?) that `layout_tool_chamber`
+    // mirrors for the actual row production.
+    let sanitized = sanitize_output(output);
+    let total_chars = sanitized.chars().count();
+    let char_sliced: String = if total_chars <= max_chars {
+        sanitized.into_string()
+    } else {
+        sanitized.chars().take(max_chars).collect()
+    };
+    let chars_truncated = total_chars.saturating_sub(char_sliced.chars().count());
+
+    let lines: Vec<&str> = char_sliced.lines().collect();
+    let total_lines = lines.len();
+    let line_cap = if tool_skips_collapse(tool_name) {
+        usize::MAX
+    } else {
+        max_lines
+    };
+    let shown_lines = total_lines.min(line_cap);
+    let hidden_lines = total_lines.saturating_sub(shown_lines);
+
+    let (frame_w, _inner) = chamber_widths(renderer);
+
+    // Pure layout: the same function `render_block` calls on resize.
+    let rows = layout_tool_chamber(
+        tool_name,
+        banner_value,
+        output,
+        max_chars,
+        max_lines,
+        include_header,
+        frame_w,
+    );
+
+    renderer.write_tool_chamber(
+        tool_name.to_string(),
+        sanitize_output(banner_value).into_string(),
+        output.to_string(),
+        max_chars,
+        max_lines,
+        include_header,
+        rows,
+    )?;
 
     if hidden_lines > 0 || chars_truncated > 0 {
         Ok(Some(CollapsedToolResult {
@@ -328,11 +399,10 @@ pub(crate) fn render_collapsed_in_full(
     collapsed: &CollapsedToolResult,
     max_chars: usize,
 ) -> anyhow::Result<()> {
-    let upper = collapsed.tool_name.to_ascii_uppercase();
-    let (frame_w, _) = chamber_widths(renderer);
-    let header = fit_banner_header(&upper, &collapsed.banner_value, frame_w);
+    // Write a blank separator line first (not part of the chamber box).
     renderer.write_line("", Color::White)?;
-    renderer.write_line_raw(&header, theme::tool())?;
+    // Pass include_header=true so the ToolChamber block includes the
+    // `╭─ TOOL ─ "value" ─╮` header — the pure layout produces everything.
     let _ = render_tool_output(
         renderer,
         &collapsed.tool_name,
@@ -340,19 +410,20 @@ pub(crate) fn render_collapsed_in_full(
         &collapsed.full_output,
         max_chars,
         usize::MAX,
+        true,
     )?;
     Ok(())
 }
 
 pub(crate) fn chamber_widths(renderer: &Renderer) -> (usize, usize) {
-    // Span the full painted chat band: `ChatPane` draws each row at
-    // `chat.x` for up to `chat.width - 1` columns, so a chamber row of
-    // `chat.width - 1` lands its right │ exactly on the last painted
-    // cell. Using the gutter-blind, 120-capped `content_width` here left
-    // the box short of the band on wide terminals (panels hidden),
-    // leaving a dead strip where stale border glyphs showed.
-    let frame_w = renderer.chat_band_width().saturating_sub(1).max(20);
-    let inner = frame_w.saturating_sub(4); // `│ ` + ` │`
+    chamber_widths_for_width(renderer.chat_band_width())
+}
+
+/// Same as `chamber_widths` but takes a raw `chat_band_width` instead of a
+/// `Renderer` — usable from `render_block` during pure re-rendering.
+pub(crate) fn chamber_widths_for_width(chat_band_width: usize) -> (usize, usize) {
+    let frame_w = chat_band_width.saturating_sub(1).max(20);
+    let inner = frame_w.saturating_sub(4);
     (frame_w, inner)
 }
 
@@ -845,8 +916,9 @@ mod tests {
             .map(|i| format!("line {i}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let collapsed = render_tool_output(&mut renderer, "grep", "pattern", &output, 10_000, 4)
-            .expect("render ok");
+        let collapsed =
+            render_tool_output(&mut renderer, "grep", "pattern", &output, 10_000, 4, false)
+                .expect("render ok");
         let c = collapsed.expect("grep should collapse past 4 lines");
         assert_eq!(c.tool_name, "grep");
         assert_eq!(c.banner_value, "pattern");
@@ -861,8 +933,9 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         for tool in ["edit", "read", "question", "task", "task_status"] {
-            let collapsed = render_tool_output(&mut renderer, tool, "arg", &output, 10_000, 4)
-                .expect("render ok");
+            let collapsed =
+                render_tool_output(&mut renderer, tool, "arg", &output, 10_000, 4, false)
+                    .expect("render ok");
             assert!(
                 collapsed.is_none(),
                 "exempt tool `{}` must not collapse",
@@ -878,9 +951,16 @@ mod tests {
             .map(|i| format!("op {i} applied"))
             .collect::<Vec<_>>()
             .join("\n");
-        let collapsed =
-            render_tool_output(&mut renderer, "apply_patch", "20 ops", &output, 10_000, 4)
-                .expect("render ok");
+        let collapsed = render_tool_output(
+            &mut renderer,
+            "apply_patch",
+            "20 ops",
+            &output,
+            10_000,
+            4,
+            false,
+        )
+        .expect("render ok");
         assert!(
             collapsed.is_some(),
             "apply_patch must collapse past max_lines"
@@ -891,9 +971,16 @@ mod tests {
     fn render_tool_output_stashes_on_char_truncation_alone() {
         let mut renderer = crate::ui::renderer::Renderer::new().expect("renderer");
         let long_single_line = "a".repeat(50_000);
-        let collapsed =
-            render_tool_output(&mut renderer, "grep", "pattern", &long_single_line, 500, 4)
-                .expect("render ok");
+        let collapsed = render_tool_output(
+            &mut renderer,
+            "grep",
+            "pattern",
+            &long_single_line,
+            500,
+            4,
+            false,
+        )
+        .expect("render ok");
         let c = collapsed.expect("char-truncation alone must still stash for Ctrl+O");
         assert_eq!(c.full_output.len(), 50_000);
     }
@@ -901,19 +988,36 @@ mod tests {
     #[test]
     fn render_tool_output_empty_body_gets_placeholder() {
         let mut renderer = crate::ui::renderer::Renderer::new().expect("renderer");
-        render_tool_output(&mut renderer, "glob", "**/*.nonexistent", "", 10_000, 100)
-            .expect("render ok");
+        render_tool_output(
+            &mut renderer,
+            "glob",
+            "**/*.nonexistent",
+            "",
+            10_000,
+            100,
+            false,
+        )
+        .expect("render ok");
         let body_text: Vec<&str> = renderer.buffer_lines();
         assert!(body_text.iter().any(|l| l.contains("(no matches)")));
 
         let mut renderer = crate::ui::renderer::Renderer::new().expect("renderer");
-        render_tool_output(&mut renderer, "read", "empty.txt", "   \n\n  ", 10_000, 100)
-            .expect("render ok");
+        render_tool_output(
+            &mut renderer,
+            "read",
+            "empty.txt",
+            "   \n\n  ",
+            10_000,
+            100,
+            false,
+        )
+        .expect("render ok");
         let body_text: Vec<&str> = renderer.buffer_lines();
         assert!(body_text.iter().any(|l| l.contains("(empty file)")));
 
         let mut renderer = crate::ui::renderer::Renderer::new().expect("renderer");
-        render_tool_output(&mut renderer, "weird_tool", "x", "", 10_000, 100).expect("render ok");
+        render_tool_output(&mut renderer, "weird_tool", "x", "", 10_000, 100, false)
+            .expect("render ok");
         let body_text: Vec<&str> = renderer.buffer_lines();
         assert!(body_text.iter().any(|l| l.contains("(no output)")));
     }
@@ -928,6 +1032,7 @@ mod tests {
             "1 entries (1 files):\n  [file]  foo.txt",
             10_000,
             4,
+            false,
         )
         .expect("render ok");
         assert!(collapsed.is_none());
@@ -1045,5 +1150,73 @@ mod tests {
                 );
             }
         }
+    }
+
+    // dirge-ghpf: the pure layout function is deterministic and
+    // side-effect-free. Calling it with the same inputs produces the same
+    // rows each time.
+    #[test]
+    fn layout_tool_chamber_is_deterministic() {
+        let rows1 = layout_tool_chamber("grep", "pattern", "a\nb\nc", 1000, 100, false, 80);
+        let rows2 = layout_tool_chamber("grep", "pattern", "a\nb\nc", 1000, 100, false, 80);
+        assert_eq!(rows1.len(), rows2.len());
+        for (a, b) in rows1.iter().zip(rows2.iter()) {
+            assert_eq!(a.0, b.0, "row text must be deterministic");
+            assert_eq!(a.1, b.1, "row color must be deterministic");
+        }
+    }
+
+    // dirge-ghpf: chamber re-renders at different widths, producing
+    // width-appropriate borders and row content.
+    #[test]
+    fn layout_tool_chamber_width_adaptive() {
+        let narrow = layout_tool_chamber("grep", "pattern", "hello world", 1000, 100, false, 40);
+        let wide = layout_tool_chamber("grep", "pattern", "hello world", 1000, 100, false, 120);
+
+        // Both produce non-empty rows ending with the bottom.
+        assert!(!narrow.is_empty());
+        assert!(!wide.is_empty());
+
+        // Bottom row: narrow < wide.
+        let narrow_bottom = narrow.last().unwrap();
+        let wide_bottom = wide.last().unwrap();
+        assert!(
+            crate::ui::wrap::visible_width(&narrow_bottom.0)
+                < crate::ui::wrap::visible_width(&wide_bottom.0),
+            "narrow bottom should be shorter than wide bottom"
+        );
+
+        // Body rows have │ framing at both edges.
+        let body_narrow = &narrow[0];
+        assert!(body_narrow.0.starts_with('│'), "narrow body starts with │");
+        assert!(body_narrow.0.ends_with('│'), "narrow body ends with │");
+        let body_wide = &wide[0];
+        assert!(body_wide.0.starts_with('│'), "wide body starts with │");
+        assert!(body_wide.0.ends_with('│'), "wide body ends with │");
+
+        // Wide body row is longer than narrow body row.
+        assert!(
+            crate::ui::wrap::visible_width(&body_narrow.0)
+                < crate::ui::wrap::visible_width(&body_wide.0),
+            "wide body should be wider than narrow body ({} vs {})",
+            crate::ui::wrap::visible_width(&body_narrow.0),
+            crate::ui::wrap::visible_width(&body_wide.0),
+        );
+    }
+
+    // dirge-ghpf: include_header=true renders the ╭─ header row.
+    #[test]
+    fn layout_tool_chamber_include_header() {
+        let rows = layout_tool_chamber("grep", "*.rs", "a\nb", 1000, 100, true, 80);
+        assert!(!rows.is_empty());
+        let header = &rows[0].0;
+        assert!(
+            header.starts_with('╭'),
+            "first row should be header starting with ╭, got: {header}"
+        );
+        assert!(
+            header.contains("GREP"),
+            "header should contain uppercased tool name, got: {header}"
+        );
     }
 }

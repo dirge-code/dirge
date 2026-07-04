@@ -1273,3 +1273,96 @@ fn raw_rows_do_not_rewrap_on_narrowing() {
     );
     assert_eq!(r.buffer_lines()[0], row, "raw row preserved verbatim");
 }
+
+// dirge-ghpf: ToolChamber source blocks DO reflow on resize — unlike Raw
+// blocks which stay frozen at the original width. A chamber recorded at one
+// width should re-render with width-appropriate borders after narrowing.
+#[test]
+fn tool_chamber_reflows_on_narrowing() {
+    let mut r = Renderer::new().expect("renderer");
+    r.set_test_cols(120);
+    let frame_w = crate::ui::tool_display::chamber_widths_for_width(r.chat_band_width()).0;
+    r.write_tool_chamber(
+        "grep".into(),
+        "pattern".into(),
+        "hello world\nfoo bar".into(),
+        10_000,
+        100,
+        false,
+        crate::ui::tool_display::layout_tool_chamber(
+            "grep",
+            "pattern",
+            "hello world\nfoo bar",
+            10_000,
+            100,
+            false,
+            frame_w,
+        ),
+    )
+    .unwrap();
+
+    let before = r.buffer_len();
+    assert!(
+        before >= 3,
+        "chamber should have body rows + bottom (got {before})"
+    );
+
+    // Narrow the terminal.
+    r.set_test_cols(50);
+    r.rebuild();
+
+    let after = r.buffer_len();
+    assert!(
+        after >= 3,
+        "chamber should still have body rows + bottom after narrowing (got {after})"
+    );
+
+    // The rows should now be at the narrower width — verify the bottom row
+    // ends with ╯ and its visible width matches the new narrow width.
+    let lines = r.buffer_lines();
+    let bottom = lines.last().unwrap();
+    assert!(
+        bottom.contains('╰') || bottom.contains('╯'),
+        "bottom row missing bottom glyphs"
+    );
+    let bottom_width = crate::ui::wrap::visible_width(bottom);
+    assert!(
+        bottom_width <= 50,
+        "bottom row should fit in <50 cols after narrowing, got {bottom_width}: {bottom}"
+    );
+}
+
+// dirge-ghpf: ToolChamber at same width via rebuild produces identical buffer.
+#[test]
+fn tool_chamber_rebuild_idempotent() {
+    let mut r = Renderer::new().expect("renderer");
+    r.set_test_cols(80);
+    // Use the same frame_w that rebuild will compute internally.
+    let frame_w = crate::ui::tool_display::chamber_widths_for_width(r.chat_band_width()).0;
+    r.write_tool_chamber(
+        "read".into(),
+        "foo.rs".into(),
+        "line1\nline2".into(),
+        10_000,
+        100,
+        false,
+        crate::ui::tool_display::layout_tool_chamber(
+            "read",
+            "foo.rs",
+            "line1\nline2",
+            10_000,
+            100,
+            false,
+            frame_w,
+        ),
+    )
+    .unwrap();
+
+    let before: Vec<String> = r.buffer_lines().iter().map(|s| s.to_string()).collect();
+    r.rebuild();
+    let after: Vec<String> = r.buffer_lines().iter().map(|s| s.to_string()).collect();
+    assert_eq!(
+        before, after,
+        "rebuild at the same width must reproduce the buffer exactly",
+    );
+}

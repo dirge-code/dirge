@@ -317,6 +317,7 @@ pub(crate) fn render_tool_calls_replay(
             &body,
             max_chars,
             max_lines,
+            false,
         )?;
     }
     Ok(())
