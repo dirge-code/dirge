@@ -81,6 +81,12 @@ pub enum KeyAction {
     /// Cycle the active prompt layer to the next available prompt. Silent —
     /// updates the status-bar badge without writing to the chat log.
     CyclePrompt,
+    /// Force a full terminal re-assert + repaint (dirge-173j): re-enter the
+    /// alternate screen, re-enable mouse capture + bracketed paste, and
+    /// repaint. The escape hatch for the case where the terminal was dropped
+    /// to the main screen and mouse reporting died (wheel scrolls native
+    /// scrollback, selection uncaptured) — conventional Ctrl+L "redraw".
+    RedrawTerminal,
 }
 
 impl Command for KeyAction {
@@ -152,6 +158,11 @@ impl Command for KeyAction {
             KeyAction::CyclePrompt,
             "cycle_prompt",
             &[(KeyCode::Tab, KeyModifiers::SHIFT)],
+        ),
+        (
+            KeyAction::RedrawTerminal,
+            "redraw_terminal",
+            &[(KeyCode::Char('l'), KeyModifiers::CONTROL)],
         ),
     ];
 }
@@ -713,6 +724,11 @@ mod tests {
         assert_eq!(
             km.resolve(&ev(KeyCode::Char('a'), KeyModifiers::NONE)),
             None
+        );
+        // dirge-173j: Ctrl+L is the terminal-redraw escape hatch.
+        assert_eq!(
+            km.resolve(&ev(KeyCode::Char('l'), KeyModifiers::CONTROL)),
+            Some(KeyAction::RedrawTerminal)
         );
     }
 

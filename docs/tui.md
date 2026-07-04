@@ -52,6 +52,7 @@ kill-subagent) are **rebindable** via the `keybindings` config — see
 | Shift+Tab | Cycle the active prompt layer to the next prompt (silent; status badge updates) |
 | PgUp/PgDn | Scroll chat history |
 | Ctrl+Home/End | Jump chat to top/bottom |
+| Ctrl+L | Redraw: re-enter the alternate screen, re-enable mouse capture + bracketed paste, and full-repaint. Recovers if the terminal was dropped to the main screen (mouse wheel scrolls native scrollback, selection stops being captured). |
 | `! cmd` | Run shell command (visible, injected into chat) |
 | `!! cmd` | Run shell command (invisible) |
 | Mouse drag | Select text (copies to clipboard on release) |

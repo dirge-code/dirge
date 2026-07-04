@@ -1062,6 +1062,30 @@ fn mode_reassert_payload_re_enables_mouse_and_paste() {
     assert!(!s.contains("\x1b[?25"), "must not touch cursor visibility");
 }
 
+/// The explicit redraw escape hatch (Ctrl+L, dirge-173j) DOES re-enter the
+/// alternate screen — that is what recovers a session dropped to the main
+/// screen — and wraps the clear+re-entry in a synchronized update so it
+/// doesn't flicker. This is the payload that periodic self-heal must NOT use.
+#[test]
+fn full_reassert_re_enters_alt_screen_synchronized() {
+    let s = std::str::from_utf8(super::TERMINAL_FULL_REASSERT).unwrap();
+    assert!(
+        s.contains("\x1b[?1049h"),
+        "must re-enter the alternate screen"
+    );
+    assert!(s.contains("\x1b[?1000h"), "must re-enable mouse tracking");
+    assert!(
+        s.contains("\x1b[?1006h"),
+        "must re-enable SGR mouse encoding"
+    );
+    assert!(s.contains("\x1b[?2004h"), "must re-enable bracketed paste");
+    // Synchronized-update brackets around the disruptive clear/re-entry.
+    assert!(
+        s.starts_with("\x1b[?2026h") && s.ends_with("\x1b[?2026l"),
+        "clear + alt re-entry must be wrapped in a synchronized update"
+    );
+}
+
 /// The throttle: re-assert on the first paint, then suppress until the
 /// interval elapses, then re-assert again. A leak that lands between paints
 /// is healed within one interval.

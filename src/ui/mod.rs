@@ -2194,6 +2194,16 @@ pub async fn run_interactive(
                                         renderer.request_repaint();
                                         continue;
                                     }
+                                    Some(KeyAction::RedrawTerminal) => {
+                                        // Escape hatch (dirge-173j): re-enter the
+                                        // alt screen + mouse capture + paste and
+                                        // repaint, recovering from a terminal that
+                                        // was dropped to the main screen (dead
+                                        // mouse / native-scrollback wheel).
+                                        renderer.force_terminal_reassert();
+                                        renderer.request_repaint();
+                                        continue;
+                                    }
                                     _ => {}
                                 }
 
