@@ -6,6 +6,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- Mouse/selection breaking after switching away from and back to the terminal
+  window now recovers automatically. Focus reporting is enabled, and on
+  focus-in dirge re-asserts the terminal modes (re-enter the alternate screen,
+  mouse capture, bracketed paste) wrapped in a synchronized update, so the alt
+  screen is restored the instant the window regains focus — no keypress. The
+  wheel-scrolls-native-scrollback / dead-selection state that used to require a
+  manual Ctrl+L now heals itself. Ctrl+L remains as a manual backstop.
+
 ## [0.18.0] - 2026-07-04
 
 Three focused changes on top of 0.17.0: the diff-aware code reviewer is now

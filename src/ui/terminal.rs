@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use crossterm::ExecutableCommand;
 use crossterm::cursor::Hide;
-use crossterm::event::{EnableBracketedPaste, EnableMouseCapture};
+use crossterm::event::{EnableBracketedPaste, EnableFocusChange, EnableMouseCapture};
 use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen};
 
 /// A handle to `/dev/tty` opened once by `TerminalGuard::new` and
@@ -232,6 +232,14 @@ impl TerminalGuard {
         // bypass-modifier: Option/Alt+drag on macOS terminals, Shift
         // +drag on most Linux terminals.
         tty_writer.execute(EnableMouseCapture)?;
+        // Focus reporting (`?1004h`): the terminal sends `\x1b[I` on
+        // focus-in / `\x1b[O` on focus-out, which crossterm delivers as
+        // FocusGained / FocusLost. dirge-ph60 uses FocusGained to
+        // auto-recover the terminal modes — switching away from and back to
+        // the window is the common moment the alt screen gets dropped, and
+        // re-asserting on focus-in heals it without the manual Ctrl+L. The
+        // teardown/suspend paths already emit `?1004l` to turn it back off.
+        tty_writer.execute(EnableFocusChange)?;
         // Hide the hardware cursor by default. While the agent streams output,
         // the renderer issues many MoveTo calls and the visible cursor would
         // flicker across the screen. draw_bottom re-shows it only after
@@ -735,9 +743,11 @@ pub(crate) fn resume_tui_after_subprocess(
 ) {
     if let Some(mut tty) = open_tty_for_write() {
         // Re-enter alternate screen, clear, hide cursor, re-enable mouse +
-        // bracketed paste.
+        // bracketed paste + focus reporting (`?1004h`, dirge-ph60 — the
+        // suspend path emitted `?1004l`, so re-arm it or FocusGained
+        // recovery goes dark after any sandbox attach).
         let _ = tty.write_all(
-            b"\x1b[?1049h\x1b[2J\x1b[?25l\x1b[?2004h\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h",
+            b"\x1b[?1049h\x1b[2J\x1b[?25l\x1b[?2004h\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h\x1b[?1004h",
         );
         let _ = tty.flush();
     }

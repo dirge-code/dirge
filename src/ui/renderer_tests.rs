@@ -1079,6 +1079,13 @@ fn full_reassert_re_enters_alt_screen_synchronized() {
         "must re-enable SGR mouse encoding"
     );
     assert!(s.contains("\x1b[?2004h"), "must re-enable bracketed paste");
+    // dirge-ph60: focus reporting must be re-armed too, or the next
+    // FocusGained-driven recovery never fires — the automatic self-heal
+    // depends on the terminal continuing to report focus changes.
+    assert!(
+        s.contains("\x1b[?1004h"),
+        "must re-enable focus reporting so FocusGained recovery keeps firing"
+    );
     // Synchronized-update brackets around the disruptive clear/re-entry.
     assert!(
         s.starts_with("\x1b[?2026h") && s.ends_with("\x1b[?2026l"),

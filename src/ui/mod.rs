@@ -1504,6 +1504,22 @@ pub async fn run_interactive(
                                 renderer.request_repaint();
                                 continue;
                             }
+                            UserEvent::FocusGained => {
+                                // dirge-ph60: switching away from and back to
+                                // the terminal window is the common trigger
+                                // for the alt screen being dropped (dead
+                                // mouse, wheel scrolls native scrollback). On
+                                // focus-in, run the full re-assert — re-enter
+                                // the alt screen + mouse capture + paste +
+                                // focus reporting, wrapped in synchronized
+                                // output so it's invisible on a ?2026 terminal.
+                                // Idempotent when nothing broke, so it's safe
+                                // to fire on every focus-in. Replaces the
+                                // manual Ctrl+L hatch as the primary recovery.
+                                renderer.force_terminal_reassert();
+                                renderer.request_repaint();
+                                continue;
+                            }
                             UserEvent::Key(key) => {
                                 // PTY shell box mounted: raw keystrokes route straight to
                                 // the child's PTY. Esc hard-kills the process group;

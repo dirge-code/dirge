@@ -288,4 +288,13 @@ pub enum UserEvent {
         row: u16,
         col: u16,
     },
+    /// Terminal window regained focus (dirge-ph60). Requires focus
+    /// reporting (`?1004h`, enabled in `TerminalGuard::new`). Switching
+    /// away from and back to the window is the common trigger for the
+    /// terminal dropping dirge out of the alternate screen — so on focus-in
+    /// the loop runs a full terminal re-assert, recovering the alt screen +
+    /// mouse capture automatically (wrapped in synchronized output, so on a
+    /// `?2026`-capable terminal the recovery is invisible). No payload — the
+    /// bare event is just the kick to re-assert.
+    FocusGained,
 }

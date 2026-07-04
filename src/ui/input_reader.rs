@@ -126,6 +126,18 @@ pub(crate) fn spawn_input_reader(user_tx: tokio::sync::mpsc::UnboundedSender<Use
                         break;
                     }
                 }
+                // dirge-ph60: window regained focus. Requires focus
+                // reporting (`?1004h`) enabled at startup. The loop treats
+                // this as a cue to re-assert the terminal modes — refocusing
+                // is the common moment the alt screen gets dropped. FocusLost
+                // needs no action, so it falls through to the catch-all.
+                Ok(event::Event::FocusGained) => {
+                    if let Err(tokio::sync::mpsc::error::SendError(_)) =
+                        user_tx.send(UserEvent::FocusGained)
+                    {
+                        break;
+                    }
+                }
                 Err(_) => break,
                 _ => {}
             }

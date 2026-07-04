@@ -166,17 +166,22 @@ const SHELL_BOX_MAX_ROWS: u16 = 12;
 /// frame by `draw_bottom`).
 const TERMINAL_MODE_REASSERT: &[u8] = b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h\x1b[?2004h";
 
-/// Full terminal re-assert for the explicit redraw escape hatch (Ctrl+L,
-/// dirge-173j). Unlike [`TERMINAL_MODE_REASSERT`] this DOES re-enter the
-/// alternate screen (`?1049h`) and clear it, recovering a session that was
-/// dropped to the main screen (dead mouse / native-scrollback wheel). The
+/// Full terminal re-assert (dirge-ph60, dirge-173j). Unlike
+/// [`TERMINAL_MODE_REASSERT`] this DOES re-enter the alternate screen
+/// (`?1049h`) and clear it, recovering a session that was dropped to the
+/// main screen (dead mouse / native-scrollback wheel), and re-arms focus
+/// reporting (`?1004h`) so the automatic recovery keeps firing. The
 /// clear+re-enter is wrapped in a synchronized update (`?2026h`/`?2026l`) so
 /// terminals that support it show no flicker; the immediate full repaint
-/// (`reset_tui`) restores content on the ones that don't. Only emitted on an
-/// explicit keypress — never on the periodic self-heal — so re-entry can't
-/// flicker during normal use. Mirrors the mode set in
+/// (`reset_tui`) restores content on the ones that don't.
+///
+/// Fired automatically on `FocusGained` (the common trigger: switching away
+/// from and back to the window drops the alt screen) and manually on Ctrl+L
+/// as a last-resort hatch. Not emitted on the periodic mouse-only self-heal,
+/// so the alt-screen re-entry only happens at discrete moments (focus /
+/// keypress), never per-second. Mirrors the mode set in
 /// [`crate::ui::terminal::resume_tui_after_subprocess`].
-const TERMINAL_FULL_REASSERT: &[u8] = b"\x1b[?2026h\x1b[?1049h\x1b[2J\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h\x1b[?2004h\x1b[?2026l";
+const TERMINAL_FULL_REASSERT: &[u8] = b"\x1b[?2026h\x1b[?1049h\x1b[2J\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h\x1b[?2004h\x1b[?1004h\x1b[?2026l";
 
 /// How often [`tui_redraw`](Renderer::tui_redraw) re-asserts the terminal
 /// modes. Long enough that the extra `/dev/tty` write is negligible, short
