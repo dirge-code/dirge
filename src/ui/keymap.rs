@@ -483,6 +483,8 @@ pub enum InputAction {
     LineDown,
     /// Undo the last edit to the input buffer (dirge-7yea).
     Undo,
+    /// Open current buffer in $EDITOR
+    ExternalEditor,
 }
 
 impl Command for InputAction {
@@ -606,6 +608,11 @@ impl Command for InputAction {
             InputAction::Undo,
             "undo",
             &[(KeyCode::Char('z'), KeyModifiers::CONTROL)],
+        ),
+        (
+            InputAction::ExternalEditor,
+            "external_editor",
+            &[(KeyCode::Char('g'), KeyModifiers::CONTROL)],
         ),
     ];
 }

@@ -931,6 +931,93 @@ impl InputEditor {
         }
     }
 
+    /// Check if this key resolves to the external editor action.
+    /// Used by the event loop to pre-emptively suspend the TUI before
+    /// calling `handle_key()`, so the input reader thread is stopped
+    /// before the editor spawns.
+    #[cfg(unix)]
+    pub fn is_external_editor_key(&self, key: &KeyEvent) -> bool {
+        self.keymap.resolve_lenient(key) == Some(InputAction::ExternalEditor)
+    }
+
+    /// Spawn $EDITOR with the current buffer in a temporary file.
+    /// On successful exit, replace the buffer with the file contents.
+    /// Errors are reported via the notification channel.
+    ///
+    /// NOTE: Caller MUST suspend the TUI (stop input reader, reset terminal)
+    /// before calling this, and resume after. See
+    /// `suspend_tui_for_subprocess` / `resume_tui_after_subprocess` in
+    /// `terminal.rs`.
+    fn open_in_external_editor(&mut self) -> Option<CompactString> {
+        let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+
+        let dir = std::env::temp_dir().join(format!("dirge-input-{}.txt", std::process::id()));
+        if std::fs::write(&dir, &self.buffer).is_err() {
+            crate::ui::notifications::notify_send(crate::ui::notifications::Notification::Error(
+                format!("External editor: failed to write temp file"),
+            ));
+            return None;
+        }
+
+        // Restore stdout/stderr to /dev/tty so the child editor
+        // inherits the terminal, not the redirected log file.
+        let tty_fd = unsafe { libc::open(b"/dev/tty\0".as_ptr() as *const _, libc::O_RDWR) };
+        let saved_stdout = unsafe { libc::dup(1) };
+        let saved_stderr = unsafe { libc::dup(2) };
+        if tty_fd >= 0 {
+            unsafe {
+                libc::dup2(tty_fd, 1);
+                libc::dup2(tty_fd, 2);
+            }
+        }
+
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("{} {}", editor, dir.display()))
+            .status();
+
+        // Restore stdout/stderr to the log file.
+        if tty_fd >= 0 {
+            unsafe {
+                libc::dup2(saved_stdout, 1);
+                libc::dup2(saved_stderr, 2);
+                libc::close(tty_fd);
+            }
+        }
+
+        let content = match status {
+            Ok(s) if s.success() => {
+                std::fs::read_to_string(&dir).unwrap_or_else(|_| self.buffer.to_string())
+            }
+            Ok(s) => {
+                crate::ui::notifications::notify_send(
+                    crate::ui::notifications::Notification::Error(format!(
+                        "External editor exited with: {}",
+                        s.code().map(|c| format!("code {}", c)).unwrap_or_else(|| "signal".into())
+                    )),
+                );
+                self.buffer.to_string()
+            }
+            Err(e) => {
+                crate::ui::notifications::notify_send(
+                    crate::ui::notifications::Notification::Error(format!(
+                        "External editor: failed to spawn {}: {}",
+                        editor, e
+                    )),
+                );
+                self.buffer.to_string()
+            }
+        };
+
+        let _ = std::fs::remove_file(&dir);
+
+        if content != self.buffer {
+            self.set_text(&content);
+        }
+
+        None
+    }
+
     /// Apply a resolved rebindable editing command (dirge-8fkp). The
     /// bodies are the historical hardcoded `handle_key` arms moved behind
     /// the [`InputAction`] enum unchanged, so the default keymap reproduces
@@ -1185,6 +1272,9 @@ impl InputEditor {
             InputAction::Undo => {
                 self.undo();
                 None
+            }
+            InputAction::ExternalEditor => {
+                self.open_in_external_editor()
             }
         }
     }
