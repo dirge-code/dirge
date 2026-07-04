@@ -45,10 +45,13 @@ pub enum BottomBody<'a> {
     /// frame's top border (e.g. `[ALERT]`); `lines` paint inside
     /// the inner band, one per row. Colors are crossterm-flavored
     /// (matches the rest of the renderer state) — converted to
-    /// ratatui at paint time.
+    /// ratatui at paint time. `scroll` is the wrapped-row offset into
+    /// the body when it overflows the box (the last line — action keys
+    /// — stays pinned to the bottom); 0 shows the top.
     Overlay {
         title: &'a str,
         lines: &'a [(String, crossterm::style::Color)],
+        scroll: usize,
     },
 }
 
@@ -120,9 +123,11 @@ impl<'a> Widget for BottomStrip<'a> {
                 ghost,
                 self.border_style,
             ),
-            Some(BottomBody::Overlay { title, lines }) => {
-                paint_overlay_box(buf, l.input_box, title, lines, self.border_style)
-            }
+            Some(BottomBody::Overlay {
+                title,
+                lines,
+                scroll,
+            }) => paint_overlay_box(buf, l.input_box, title, lines, *scroll, self.border_style),
             None => paint_empty_box(buf, l.input_box, self.border_style),
         }
         // right_margin: blank — explicitly clear so stale right
@@ -366,6 +371,7 @@ fn paint_overlay_box(
     area: Rect,
     title: &str,
     lines: &[(String, crossterm::style::Color)],
+    scroll: usize,
     _style: Style,
 ) {
     // Alert box border is yellow regardless of the supplied frame
@@ -409,21 +415,31 @@ fn paint_overlay_box(
         }
     }
 
-    // Layout: head visual rows fill from the top. If the combined
-    // head + sticky doesn't fit `inner_h`, truncate the END of head
-    // with a "…" indicator so the sticky (action keys) row is
-    // always shown.
+    // Layout: head visual rows fill from the top; the sticky tail
+    // (action keys) always anchors to the bottom. When the head
+    // overflows the available rows we DON'T silently drop the tail of
+    // the command — the user must be able to read the whole thing
+    // before approving it (dirge-coy3 / #587). Instead we reserve one
+    // row for a scroll-status line and window the head by `scroll`, so
+    // the full command is reachable with the keyboard.
     let sticky_len = sticky_last.len();
     let head_budget = inner_h.saturating_sub(sticky_len);
 
-    let need_ellipsis = head_visual.len() > head_budget;
-    let head_keep = if need_ellipsis {
+    let overflow = head_visual.len() > head_budget;
+    // With overflow, one row goes to the scroll-status line.
+    let content_rows = if overflow {
         head_budget.saturating_sub(1)
     } else {
         head_budget
     };
-    let head_to_show: Vec<&(String, crossterm::style::Color)> =
-        head_visual.iter().take(head_keep).collect();
+    let max_scroll = head_visual.len().saturating_sub(content_rows);
+    let scroll = scroll.min(max_scroll);
+    let end = (scroll + content_rows).min(head_visual.len());
+    let head_to_show: &[(String, crossterm::style::Color)] = if head_visual.is_empty() {
+        &[]
+    } else {
+        &head_visual[scroll..end]
+    };
 
     // Paint head rows LEFT-aligned with 1 leading space of padding.
     let mut row_idx = 0usize;
@@ -433,10 +449,19 @@ fn paint_overlay_box(
         buf.set_stringn(area.x + 2, y, text, inner_w.saturating_sub(2), st);
         row_idx += 1;
     }
-    if need_ellipsis && row_idx < inner_h {
+    // Scroll-status line: tells the user there's more and how to reach
+    // it, so a long command is never presented as if it were complete.
+    if overflow && row_idx < inner_h {
+        let above = scroll;
+        let below = max_scroll.saturating_sub(scroll);
+        let hint = if below > 0 {
+            format!("↓ {below} more line(s) — ↑/↓ PgUp/PgDn · Ctrl+O to scroll")
+        } else {
+            format!("↑ {above} line(s) above — ↑/↓ PgUp/PgDn to scroll")
+        };
         let y = area.y + 1 + row_idx as u16;
         let dim = Style::default().fg(RColor::DarkGray);
-        buf.set_stringn(area.x + 2, y, "…", inner_w.saturating_sub(2), dim);
+        buf.set_stringn(area.x + 2, y, &hint, inner_w.saturating_sub(2), dim);
         row_idx += 1;
     }
     // Paint the sticky tail rows (action keys) at the BOTTOM of the
@@ -471,6 +496,34 @@ pub fn overlay_wrapped_row_count(
         total += soft_wrap(text, wrap_w, "  ").len();
     }
     total
+}
+
+/// Wrapped-row counts for the overlay body, split as `(head, tail)`:
+/// every line except the last (the head — e.g. the command detail) and
+/// the last line alone (the sticky action-keys row). Mirrors the wrap
+/// width + per-line hanging indent used by [`paint_overlay_box`], so the
+/// renderer can compute an accurate maximum scroll offset for a body that
+/// overflows the box. Used by [`crate::ui::renderer`] to clamp the alert
+/// scroll (dirge-coy3).
+pub fn overlay_head_tail_wrapped(
+    lines: &[(String, crossterm::style::Color)],
+    outer_width: u16,
+) -> (usize, usize) {
+    let inner_w = (outer_width as usize).saturating_sub(2);
+    let wrap_w = inner_w.saturating_sub(2).max(1);
+    use crate::ui::wrap::soft_wrap;
+    let last_idx = lines.len().saturating_sub(1);
+    let (mut head, mut tail) = (0usize, 0usize);
+    for (i, (text, _)) in lines.iter().enumerate() {
+        let cont_indent = " ".repeat(label_prefix_width(text));
+        let n = soft_wrap(text, wrap_w, &cont_indent).len();
+        if i == last_idx {
+            tail += n;
+        } else {
+            head += n;
+        }
+    }
+    (head, tail)
 }
 
 fn paint_status(buf: &mut Buffer, area: Rect, status: &str) {
@@ -626,6 +679,7 @@ mod tests {
                 let widget = BottomStrip::new(&layout).body(BottomBody::Overlay {
                     title: "[ALERT]",
                     lines: &lines,
+                    scroll: 0,
                 });
                 f.render_widget(widget, area);
             })
@@ -646,6 +700,89 @@ mod tests {
             body0.contains("PERMISSION REQUIRED"),
             "got body0 {:?}",
             body0
+        );
+    }
+
+    /// dirge-coy3 (#587): a command taller than the box must stay fully
+    /// readable — the action-keys row is pinned to the bottom, a scroll
+    /// hint shows there's more, and scrolling reveals the hidden tail
+    /// (rather than silently dropping it under a bare "…").
+    #[test]
+    fn overlay_scrolls_long_command_and_pins_action_keys() {
+        use crossterm::style::Color as CC;
+        // 6 head lines + the action-keys row into a 4-row inner box:
+        // it overflows, so the body must scroll.
+        let mut lines: Vec<(String, CC)> = vec![("command: cd /a/b/c".to_string(), CC::Yellow)];
+        for i in 0..5 {
+            lines.push((format!("cmd-line-{i}"), CC::Yellow));
+        }
+        lines.push((
+            "[y] allow once  [a] allow always  [n] deny  [ESC] abort".to_string(),
+            CC::Yellow,
+        ));
+
+        let render_at = |scroll: usize| -> Vec<String> {
+            let layout = Layout::new(160, 30, 4);
+            let mut backend = TestBackend::new(160, 30);
+            let mut terminal = Terminal::new(backend.clone()).unwrap();
+            terminal
+                .draw(|f| {
+                    let area = f.area();
+                    let widget = BottomStrip::new(&layout).body(BottomBody::Overlay {
+                        title: "[ALERT]",
+                        lines: &lines,
+                        scroll,
+                    });
+                    f.render_widget(widget, area);
+                })
+                .unwrap();
+            backend = terminal.backend().clone();
+            let area = layout.input_box;
+            (0..area.height)
+                .map(|dy| {
+                    row_chars(&backend, area.y + dy, area.x, area.width)
+                        .into_iter()
+                        .collect::<String>()
+                })
+                .collect()
+        };
+
+        // At the top: the command's first line shows, the LAST head line
+        // (cmd-line-4) is hidden, the action keys are pinned at the bottom,
+        // and a scroll hint tells the user there's more.
+        let top = render_at(0);
+        let joined_top = top.join("\n");
+        assert!(
+            joined_top.contains("command: cd /a/b/c"),
+            "top view must show the command start: {joined_top:?}"
+        );
+        assert!(
+            !joined_top.contains("cmd-line-4"),
+            "the tail must be hidden at scroll=0, not silently dropped: {joined_top:?}"
+        );
+        assert!(
+            joined_top.contains("more line(s)") || joined_top.contains("scroll"),
+            "a scroll hint must indicate hidden content: {joined_top:?}"
+        );
+        // Action keys pinned to the bottom inner row regardless of scroll.
+        let bottom_inner = &top[top.len() - 2];
+        assert!(
+            bottom_inner.contains("[y] allow once"),
+            "action keys must be pinned at the bottom: {bottom_inner:?}"
+        );
+
+        // Scrolled down: the previously-hidden tail line becomes visible,
+        // and the action keys are STILL pinned.
+        let scrolled = render_at(999); // clamps to max internally
+        let joined_scrolled = scrolled.join("\n");
+        assert!(
+            joined_scrolled.contains("cmd-line-4"),
+            "scrolling must reveal the command tail: {joined_scrolled:?}"
+        );
+        let bottom_inner_s = &scrolled[scrolled.len() - 2];
+        assert!(
+            bottom_inner_s.contains("[y] allow once"),
+            "action keys stay pinned after scrolling: {bottom_inner_s:?}"
         );
     }
 

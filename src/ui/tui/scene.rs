@@ -512,6 +512,7 @@ mod tests {
             body: BottomBody::Overlay {
                 title: "[ALERT]",
                 lines: &overlay_lines,
+                scroll: 0,
             },
             status: "permission required",
             show_left_panel: true,

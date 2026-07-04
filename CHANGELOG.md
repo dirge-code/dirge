@@ -20,6 +20,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   width (and clipped) after narrowing. The whole chamber — top border, body,
   colorized diffs, LSP-tail rows, and bottom border — reflows together, so the
   box never ends up with a mismatched header (dirge-ghpf).
+- Permission prompt no longer hides part of a long or multi-line command. The
+  alert box now scrolls: the command detail can be paged with ↑/↓, PgUp/PgDn,
+  or Ctrl+O while the `[y]/[a]/[n]/[ESC]` action row stays pinned, and a status
+  line shows how much is off-screen. Previously a tall command was cut with a
+  bare `…` and the modal swallowed scroll keys, so you had to approve a `bash`
+  command you couldn't fully read (#587).
 
 ## [0.18.1] - 2026-07-04
 

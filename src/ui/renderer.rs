@@ -543,6 +543,16 @@ pub struct Renderer {
     /// (text, color); painter centers text horizontally within the
     /// frame's inner band.
     alert_overlay: Option<Vec<(String, Color)>>,
+    /// Wrapped-row scroll offset into the alert overlay body when the
+    /// command (or other detail) is too tall for the box. The action-keys
+    /// row stays pinned; this scrolls only the head so a long/multi-line
+    /// command can be read in full before deciding (dirge-coy3). Reset to 0
+    /// whenever a new overlay is set.
+    alert_scroll: usize,
+    /// Max valid `alert_scroll` for the current overlay + box geometry,
+    /// recomputed each paint. Lets the scroll handlers clamp and lets
+    /// PageDown jump straight to the bottom of a long command.
+    alert_max_scroll: usize,
     /// Live PTY output for an active `!cmd`/`!!cmd` shell session, shown in the
     /// input-box frame as an overlay titled `[shell]` while the session runs.
     shell_overlay: Option<Vec<(String, Color)>>,
@@ -675,6 +685,8 @@ impl Renderer {
             #[cfg(feature = "dap")]
             debug_panel_data: None,
             alert_overlay: None,
+            alert_scroll: 0,
+            alert_max_scroll: 0,
             picker_overlay: None,
             rewind_overlay: None,
             alert_title: String::new(),
@@ -787,6 +799,8 @@ impl Renderer {
             left_panel_info,
             subagent_status,
             alert_overlay,
+            alert_scroll,
+            alert_max_scroll,
             picker_overlay,
             alert_title,
             avatar_state,
@@ -835,11 +849,13 @@ impl Renderer {
             BottomBody::Overlay {
                 title: alert_title.as_str(),
                 lines: lines.as_slice(),
+                scroll: *alert_scroll,
             }
         } else if let Some(lines) = self.shell_overlay.as_ref() {
             BottomBody::Overlay {
                 title: "[shell]",
                 lines: lines.as_slice(),
+                scroll: 0,
             }
         } else {
             // dirge-5w9v: scroll the editor so the cursor's wrapped row
@@ -894,7 +910,23 @@ impl Renderer {
             // Leave at least 4 rows for the chat (+ 5 fixed rows
             // of frames/status), so input_rows ≤ rows - 9.
             let ceiling = (rows_q as i32 - 9).max(1) as u16;
-            (wrapped as u16).clamp(1, ceiling)
+            let rows = (wrapped as u16).clamp(1, ceiling);
+            // Mirror the painter's head/tail split so the scroll handlers
+            // (dirge-coy3) know how far a too-tall command can scroll. When
+            // the head overflows, the painter reserves one row for the
+            // scroll-status line, so content rows = head_budget - 1.
+            let (head, tail) =
+                crate::ui::tui::bottom::overlay_head_tail_wrapped(lines, probe.input_box.width);
+            let inner_h = rows as usize;
+            let head_budget = inner_h.saturating_sub(tail);
+            let content_rows = if head > head_budget {
+                head_budget.saturating_sub(1)
+            } else {
+                head_budget
+            };
+            *alert_max_scroll = head.saturating_sub(content_rows);
+            *alert_scroll = (*alert_scroll).min(*alert_max_scroll);
+            rows
         } else if let Some(lines) = self.shell_overlay.as_ref() {
             let probe = crate::ui::tui::layout::Layout::with_panels(
                 cols_q,
@@ -1302,6 +1334,10 @@ impl Renderer {
     /// within `MAX_INPUT_VISIBLE_LINES` — taller overlays clip.
     pub fn set_alert_overlay(&mut self, rows: Vec<(String, Color)>) {
         self.alert_overlay = Some(rows);
+        // A fresh prompt always opens showing the TOP of the detail (the
+        // command's first line), so reset any scroll left from a prior one.
+        self.alert_scroll = 0;
+        self.alert_max_scroll = 0;
         if self.alert_title.is_empty() {
             self.alert_title = "[ALERT]".to_string();
         }
@@ -1311,9 +1347,49 @@ impl Renderer {
 
     pub fn clear_alert_overlay(&mut self) {
         self.alert_overlay = None;
+        self.alert_scroll = 0;
+        self.alert_max_scroll = 0;
         self.alert_title.clear();
         self.last_paint = None;
         self.needs_paint = true;
+    }
+
+    /// Scroll the alert overlay body down by `n` wrapped rows, clamped to
+    /// the last computed maximum (dirge-coy3). Used by the permission modal
+    /// so a command taller than the box can be read in full before deciding.
+    /// Returns true if the offset changed (caller repaints).
+    pub fn alert_scroll_down(&mut self, n: usize) -> bool {
+        let next = self
+            .alert_scroll
+            .saturating_add(n)
+            .min(self.alert_max_scroll);
+        if next != self.alert_scroll {
+            self.alert_scroll = next;
+            self.last_paint = None;
+            self.needs_paint = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Scroll the alert overlay body up by `n` wrapped rows (toward the top).
+    pub fn alert_scroll_up(&mut self, n: usize) -> bool {
+        let next = self.alert_scroll.saturating_sub(n);
+        if next != self.alert_scroll {
+            self.alert_scroll = next;
+            self.last_paint = None;
+            self.needs_paint = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Whether the current alert overlay overflows its box (i.e. scrolling
+    /// is meaningful). Lets the modal decide whether to consume scroll keys.
+    pub fn alert_is_scrollable(&self) -> bool {
+        self.alert_max_scroll > 0
     }
 
     /// Set the live shell-session overlay (bottom box showing PTY output while

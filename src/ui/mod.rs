@@ -1046,6 +1046,44 @@ pub async fn run_interactive(
                         }
                     }
                     state::ModalKind::Permission => {
+                        // dirge-coy3 (#587): when the command preview is taller
+                        // than the box, the arrow / paging keys — and Ctrl+O,
+                        // which users reach for — scroll the command instead of
+                        // deciding, so the WHOLE command is readable before
+                        // y/a/n. Only intercept when actually scrollable, so on a
+                        // short prompt these keys don't silently eat a keypress.
+                        if renderer.alert_is_scrollable() {
+                            const ALERT_SCROLL_PAGE: usize = 5;
+                            let is_ctrl_o = key.code == KeyCode::Char('o')
+                                && key.modifiers.contains(KeyModifiers::CONTROL);
+                            let scroll_key = match key.code {
+                                KeyCode::Up => {
+                                    renderer.alert_scroll_up(1);
+                                    true
+                                }
+                                KeyCode::Down => {
+                                    renderer.alert_scroll_down(1);
+                                    true
+                                }
+                                KeyCode::PageUp => {
+                                    renderer.alert_scroll_up(ALERT_SCROLL_PAGE);
+                                    true
+                                }
+                                KeyCode::PageDown => {
+                                    renderer.alert_scroll_down(ALERT_SCROLL_PAGE);
+                                    true
+                                }
+                                _ if is_ctrl_o => {
+                                    renderer.alert_scroll_down(ALERT_SCROLL_PAGE);
+                                    true
+                                }
+                                _ => false,
+                            };
+                            if scroll_key {
+                                renderer.request_repaint();
+                                continue;
+                            }
+                        }
                         // Phase 1: map the keystroke to a decision. Ctrl+C /
                         // Ctrl+D = "I want out" → Deny. The `a` branch also
                         // prints the will-allow line (or downgrades to allow-
