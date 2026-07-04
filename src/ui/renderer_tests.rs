@@ -1332,6 +1332,54 @@ fn tool_chamber_reflows_on_narrowing() {
     );
 }
 
+/// dirge-ghpf integration guard: a full chamber assembled the way the
+/// handlers do — a reflowing TOP (`write_chamber_top`), a body row, and a
+/// BOTTOM — must re-box AS A UNIT on resize. Before the header was made a
+/// reflowing block, the top stayed at the old width while the body/bottom
+/// narrowed, leaving a mismatched box; this asserts every chamber line
+/// shares one width at 120 AND at 50.
+#[test]
+fn full_chamber_top_body_bottom_reflow_in_lockstep() {
+    use crate::ui::wrap::visible_width;
+    let mut r = Renderer::new().expect("renderer");
+    r.set_test_cols(120);
+    r.write_chamber_top("BASH".into(), "echo hi".into(), Color::White)
+        .unwrap();
+    r.write_chamber_row("hello world".into(), Color::White, None)
+        .unwrap();
+    r.write_chamber_bottom(Color::White).unwrap();
+
+    let widths_wide: Vec<usize> = r.buffer_lines().iter().map(|l| visible_width(l)).collect();
+    assert_eq!(
+        widths_wide.len(),
+        3,
+        "expected top+row+bottom: {widths_wide:?}"
+    );
+    assert!(
+        widths_wide.iter().all(|&w| w == widths_wide[0]),
+        "chamber lines not uniform width at 120: {widths_wide:?}"
+    );
+    let wide = widths_wide[0];
+
+    // Narrow the terminal and reflow.
+    r.set_test_cols(50);
+    r.rebuild();
+
+    let lines = r.buffer_lines();
+    let widths_narrow: Vec<usize> = lines.iter().map(|l| visible_width(l)).collect();
+    assert!(
+        widths_narrow.iter().all(|&w| w == widths_narrow[0]),
+        "chamber lines mismatched after narrowing (top must re-box with body): {widths_narrow:?}"
+    );
+    assert!(
+        widths_narrow[0] < wide,
+        "chamber did not narrow (was {wide}, now {})",
+        widths_narrow[0]
+    );
+    assert!(lines[0].contains('╭'), "top border missing after reflow");
+    assert!(lines[2].contains('╯'), "bottom border missing after reflow");
+}
+
 // dirge-ghpf: ToolChamber at same width via rebuild produces identical buffer.
 #[test]
 fn tool_chamber_rebuild_idempotent() {

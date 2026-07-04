@@ -14,6 +14,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   summary line, `=full` also logs the prompt body; off by default, emitted at
   INFO on `dirge::wire` (dirge-iis0).
 
+### Fixed
+- Tool chambers now re-box to the terminal width on resize, like the rest of
+  the scrollback. Previously a chamber laid out at a wide width stayed that
+  width (and clipped) after narrowing. The whole chamber — top border, body,
+  colorized diffs, LSP-tail rows, and bottom border — reflows together, so the
+  box never ends up with a mismatched header (dirge-ghpf).
+
 ## [0.18.1] - 2026-07-04
 
 ### Fixed

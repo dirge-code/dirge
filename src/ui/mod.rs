@@ -1198,10 +1198,8 @@ pub async fn run_interactive(
                                     let upper = reopen_name.to_ascii_uppercase();
                                     let raw_value =
                                         sanitize_output(&ask_req.input).into_string();
-                                    let (frame_w, _) = chamber_widths(&renderer);
-                                    let header =
-                                        fit_banner_header(&upper, &raw_value, frame_w);
-                                    renderer.write_line_raw(&header, c_tool())?;
+                                    // dirge-ghpf: reflowing chamber TOP.
+                                    renderer.write_chamber_top(upper, raw_value, c_tool())?;
                                     ui.last_tool_name = Some(reopen_name);
                                     ui.tool_chamber_open = true;
                                 }
@@ -3967,12 +3965,13 @@ pub async fn run_interactive(
                         // row, no chamber bottom. Now the chamber-close is
                         // driven by what's actually on the screen.
                         let pending_chamber_tool: Option<String> = if ui.tool_chamber_open {
-                            let (frame_w, inner) = chamber_widths(&renderer);
-                            renderer.write_line(
-                                &chamber_row("awaiting permission…", inner),
+                            // dirge-ghpf: reflowing chamber row + bottom.
+                            renderer.write_chamber_row(
+                                "awaiting permission…".to_string(),
                                 theme::dim(),
+                                None,
                             )?;
-                            renderer.write_line_raw(&chamber_bottom(frame_w), c_tool())?;
+                            renderer.write_chamber_bottom(c_tool())?;
                             ui.tool_chamber_open = false;
                             ui.chamber_top_start = None;
                             ui.chamber_top_end = None;

@@ -31,7 +31,6 @@ use crate::ui::avatar;
 use crate::ui::colors::{c_agent, c_error};
 use crate::ui::run_handlers::{AgentBuildDeps, RunCtx};
 use crate::ui::theme;
-use crate::ui::tool_display::{chamber_bottom, chamber_widths};
 
 /// Optional loop-feature state passed through to `handle_done`.
 /// Behind `cfg(feature = "loop")` we hand the real mutable state;
@@ -160,9 +159,8 @@ pub(crate) async fn handle_done(
                 ctx.renderer.replace_from(start, Vec::new());
             }
         } else {
-            let (frame_w, _) = chamber_widths(ctx.renderer);
-            ctx.renderer
-                .write_line_raw(&chamber_bottom(frame_w), theme::dim())?;
+            // dirge-ghpf: reflowing chamber bottom.
+            ctx.renderer.write_chamber_bottom(theme::dim())?;
         }
         *ctx.tool_chamber_open = false;
         *ctx.chamber_top_start = None;

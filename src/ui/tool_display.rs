@@ -171,12 +171,12 @@ pub(crate) fn close_tool_chamber_abort(
     tool_chamber_open: &mut bool,
 ) -> anyhow::Result<()> {
     if last_tool_name.is_some() || *tool_chamber_open {
-        let (frame_w, inner) = chamber_widths(renderer);
-        renderer.write_line_raw(
-            &chamber_row_centered("⚠ tool denied · aborted · no result", inner),
+        // dirge-ghpf: reflowing centered row + bottom.
+        renderer.write_chamber_row_centered(
+            "⚠ tool denied · aborted · no result".to_string(),
             theme::perm(),
         )?;
-        renderer.write_line_raw(&chamber_bottom(frame_w), theme::dim())?;
+        renderer.write_chamber_bottom(theme::dim())?;
         *last_tool_name = None;
         *tool_chamber_open = false;
     }
@@ -201,8 +201,8 @@ pub(crate) fn close_tool_chamber_passive(
                 renderer.replace_from(start, Vec::new());
             }
         } else {
-            let (frame_w, _inner) = chamber_widths(renderer);
-            renderer.write_line_raw(&chamber_bottom(frame_w), theme::dim())?;
+            // dirge-ghpf: reflowing chamber bottom.
+            renderer.write_chamber_bottom(theme::dim())?;
         }
         *last_tool_name = None;
         *tool_chamber_open = false;

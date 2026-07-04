@@ -294,15 +294,16 @@ pub(crate) fn render_tool_calls_replay(
     max_lines: usize,
 ) -> anyhow::Result<()> {
     use crate::session::ToolCallState;
-    use crate::ui::tool_display::{
-        chamber_widths, fit_banner_header, format_tool_banner_value, render_tool_output,
-    };
+    use crate::ui::tool_display::{format_tool_banner_value, render_tool_output};
     for tc in tool_calls {
         let banner_value = format_tool_banner_value(&tc.name, &tc.args);
-        let (frame_w, _) = chamber_widths(renderer);
-        let header = fit_banner_header(&tc.name.to_ascii_uppercase(), &banner_value, frame_w);
         renderer.write_line("", Color::Reset)?;
-        renderer.write_line_raw(&header, theme::tool())?;
+        // dirge-ghpf: reflowing chamber TOP (was a fixed-width raw line).
+        renderer.write_chamber_top(
+            tc.name.to_ascii_uppercase(),
+            banner_value.clone(),
+            theme::tool(),
+        )?;
         // Body mirrors `convert_history`'s state→text mapping so the replayed
         // chamber matches what the model re-sees on resume.
         let body = match &tc.state {

@@ -18,9 +18,7 @@ use crate::ui::colors::{c_agent, c_tool};
 use crate::ui::events::sanitize_output;
 use crate::ui::panel_data::tool_call_label;
 use crate::ui::run_handlers::RunCtx;
-use crate::ui::tool_display::{
-    chamber_widths, close_tool_chamber_passive, fit_banner_header, format_tool_banner_value,
-};
+use crate::ui::tool_display::{close_tool_chamber_passive, format_tool_banner_value};
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn handle_tool_call(
@@ -121,10 +119,9 @@ pub(crate) fn handle_tool_call(
     ctx.renderer.write_line("", Color::White)?;
     let raw_value = format_tool_banner_value(name, args);
     let raw_value = sanitize_output(&raw_value).into_string();
-    let (frame_w, _) = chamber_widths(&*ctx.renderer);
-    let header = fit_banner_header(&upper, &raw_value, frame_w);
-    // dirge-qy3y: chamber border — raw (no resize re-wrap; see write_line_raw).
-    ctx.renderer.write_line_raw(&header, c_tool())?;
+    // dirge-ghpf: chamber TOP as a reflowing block so it re-boxes on resize
+    // in lockstep with the body below (was a fixed-width raw line).
+    ctx.renderer.write_chamber_top(upper, raw_value, c_tool())?;
     *ctx.chamber_top_end = Some(ctx.renderer.buffer_len());
     *ctx.tool_chamber_open = true;
     tracing::trace!(

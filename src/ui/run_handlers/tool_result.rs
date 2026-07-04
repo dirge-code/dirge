@@ -15,8 +15,7 @@ use crate::ui::events::sanitize_output;
 use crate::ui::run_handlers::RunCtx;
 use crate::ui::theme;
 use crate::ui::tool_display::{
-    CollapsedToolResult, chamber_bottom, chamber_row, chamber_row_with_bg, chamber_widths,
-    close_tool_chamber_passive, fit_banner_header, format_tool_banner_value, lsp_block_start,
+    CollapsedToolResult, close_tool_chamber_passive, format_tool_banner_value, lsp_block_start,
     render_tool_output, summarize_lsp_tail,
 };
 
@@ -118,10 +117,9 @@ pub(crate) async fn handle_tool_result(
             let upper = resolved_name.to_ascii_uppercase();
             let raw_value = format_tool_banner_value(&resolved_name, &resolved_args);
             let raw_value = sanitize_output(&raw_value).into_string();
-            let (frame_w, _) = chamber_widths(ctx.renderer);
-            let header = fit_banner_header(&upper, &raw_value, frame_w);
             ctx.renderer.write_line("", Color::White)?;
-            ctx.renderer.write_line_raw(&header, c_tool())?;
+            // dirge-ghpf: reflowing chamber TOP.
+            ctx.renderer.write_chamber_top(upper, raw_value, c_tool())?;
             *ctx.tool_chamber_open = true;
             *ctx.last_tool_name = Some(resolved_name);
             *ctx.last_tool_call_id = Some(id.to_string());
@@ -174,13 +172,13 @@ pub(crate) async fn handle_tool_result(
         // empty box with no content. Then close
         // with a bare bottom so a stale `╭─`
         // doesn't swallow the next paint.
-        let (frame_w, inner) = chamber_widths(ctx.renderer);
-        ctx.renderer.write_line(
-            &chamber_row("(body hidden — show_tool_details=false)", inner),
+        // dirge-ghpf: reflowing chamber row + bottom.
+        ctx.renderer.write_chamber_row(
+            "(body hidden — show_tool_details=false)".to_string(),
             theme::dim(),
+            None,
         )?;
-        ctx.renderer
-            .write_line_raw(&chamber_bottom(frame_w), theme::dim())?;
+        ctx.renderer.write_chamber_bottom(theme::dim())?;
         *ctx.tool_chamber_open = false;
     }
     if *ctx.tool_chamber_open && show_details {
@@ -225,7 +223,6 @@ pub(crate) async fn handle_tool_result(
         // doesn't orphan. Skip the rest of branch
         // (a).
         if resolved_name.is_empty() {
-            let (frame_w, inner) = chamber_widths(ctx.renderer);
             let trimmed = output.trim();
             let row_text = if trimmed.is_empty() {
                 "(unresolved tool, no output)".to_string()
@@ -233,10 +230,10 @@ pub(crate) async fn handle_tool_result(
                 let first = trimmed.lines().next().unwrap_or("");
                 format!("(unresolved tool) {}", first)
             };
+            // dirge-ghpf: reflowing chamber row + bottom.
             ctx.renderer
-                .write_line_raw(&chamber_row(&row_text, inner), theme::dim())?;
-            ctx.renderer
-                .write_line_raw(&chamber_bottom(frame_w), theme::dim())?;
+                .write_chamber_row(row_text, theme::dim(), None)?;
+            ctx.renderer.write_chamber_bottom(theme::dim())?;
             *ctx.tool_chamber_open = false;
             *ctx.chamber_top_start = None;
             *ctx.chamber_top_end = None;
@@ -259,7 +256,8 @@ pub(crate) async fn handle_tool_result(
             let lines: Vec<&str> = output.lines().collect();
             let diff_start = lines.iter().position(|l| l.starts_with("--- a/"));
             if let Some(pre) = diff_start {
-                let (frame_w, inner) = chamber_widths(ctx.renderer);
+                // dirge-ghpf: all chamber rows below are reflowing blocks so
+                // the colorized diff re-boxes with the header on resize.
                 // The edit tool appends an `LSP errors detected …`
                 // block after the diff. That block is the agent's
                 // to act on, but in the chat it's often a wall of
@@ -280,8 +278,7 @@ pub(crate) async fn handle_tool_result(
                 for l in &lines[..pre] {
                     if !l.is_empty() {
                         let txt = sanitize_output(l).into_string();
-                        ctx.renderer
-                            .write_line_raw(&chamber_row(&txt, inner), theme::result())?;
+                        ctx.renderer.write_chamber_row(txt, theme::result(), None)?;
                     }
                 }
                 // Colorized diff with opencode-style
@@ -299,23 +296,19 @@ pub(crate) async fn handle_tool_result(
                         // hardcoded `Color::Cyan` which is
                         // invisible on phosphor (same hue
                         // as agent text).
-                        ctx.renderer
-                            .write_line_raw(&chamber_row(&txt, inner), theme::accent())?;
+                        ctx.renderer.write_chamber_row(txt, theme::accent(), None)?;
                     } else if l.starts_with("@@") {
                         // Hunk position markers — use dim
                         // so they recede behind the +/-
                         // content lines below.
-                        ctx.renderer
-                            .write_line_raw(&chamber_row(&txt, inner), theme::dim())?;
+                        ctx.renderer.write_chamber_row(txt, theme::dim(), None)?;
                     } else if l.starts_with('+') {
                         ctx.renderer
-                            .write_line_raw(&chamber_row_with_bg(&txt, inner, 22), Color::Green)?;
+                            .write_chamber_row(txt, Color::Green, Some(22))?;
                     } else if l.starts_with('-') {
-                        ctx.renderer
-                            .write_line_raw(&chamber_row_with_bg(&txt, inner, 52), Color::Red)?;
+                        ctx.renderer.write_chamber_row(txt, Color::Red, Some(52))?;
                     } else {
-                        ctx.renderer
-                            .write_line_raw(&chamber_row(&txt, inner), theme::dim())?;
+                        ctx.renderer.write_chamber_row(txt, theme::dim(), None)?;
                     }
                 }
                 // Compact LSP diagnostics summary (one line) in place
@@ -324,15 +317,14 @@ pub(crate) async fn handle_tool_result(
                 if let Some(ds) = diag_start {
                     let summary = summarize_lsp_tail(&lines[ds..]);
                     ctx.renderer
-                        .write_line_raw(&chamber_row(&summary, inner), theme::warn())?;
+                        .write_chamber_row(summary, theme::warn(), None)?;
                     *ctx.last_collapsed = Some(CollapsedToolResult {
                         tool_name: resolved_name.clone(),
                         banner_value: sanitize_output(&banner_value).into_string(),
                         full_output: output.to_string(),
                     });
                 }
-                ctx.renderer
-                    .write_line_raw(&chamber_bottom(frame_w), theme::dim())?;
+                ctx.renderer.write_chamber_bottom(theme::dim())?;
                 *ctx.tool_chamber_open = false;
             } else {
                 // No diff section found, show normally
