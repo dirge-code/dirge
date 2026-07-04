@@ -92,7 +92,7 @@ where
     M: CompletionModel + Clone + Send + Sync + 'static,
     M::StreamingResponse: Clone + Unpin + Send + Sync + GetTokenUsage + 'static,
 {
-    rig_stream_fn_from_model_with_provider(model, tools, chunk_timeout, None)
+    rig_stream_fn_from_model_with_provider(model, tools, chunk_timeout, None, None)
 }
 
 /// Provider-aware variant: takes the provider name (e.g.
@@ -109,12 +109,20 @@ pub fn rig_stream_fn_from_model_with_provider<M>(
     tools: Vec<ToolDefinition>,
     chunk_timeout: Option<std::time::Duration>,
     provider_name: Option<String>,
+    model_name: Option<String>,
 ) -> StreamFn
 where
     M: CompletionModel + Clone + Send + Sync + 'static,
     M::StreamingResponse: Clone + Unpin + Send + Sync + GetTokenUsage + 'static,
 {
-    rig_stream_fn_from_model_with_filter(model, tools, chunk_timeout, provider_name, None)
+    rig_stream_fn_from_model_with_filter(
+        model,
+        tools,
+        chunk_timeout,
+        provider_name,
+        model_name,
+        None,
+    )
 }
 
 /// Phase-3 dynamic-tool-search variant: takes an optional
@@ -134,6 +142,7 @@ pub fn rig_stream_fn_from_model_with_filter<M>(
     tools: Vec<ToolDefinition>,
     chunk_timeout: Option<std::time::Duration>,
     provider_name: Option<String>,
+    model_name: Option<String>,
     tool_def_filter: Option<std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>>,
 ) -> StreamFn
 where
@@ -142,11 +151,13 @@ where
 {
     let tools = Arc::new(tools);
     let provider_name = Arc::new(provider_name);
+    let model_name = Arc::new(model_name);
     let filter = Arc::new(tool_def_filter);
     Arc::new(move |ctx: LlmContext, opts: super::stream::StreamOptions| {
         let model = model.clone();
         let tools = tools.clone();
         let provider_name = provider_name.clone();
+        let model_name = model_name.clone();
         let filter = filter.clone();
         invoke_one_stream(
             model,
@@ -155,6 +166,7 @@ where
             chunk_timeout,
             opts,
             provider_name,
+            model_name,
             filter,
         )
     })
@@ -169,6 +181,7 @@ where
 /// Errors from message conversion / the `model.stream` call
 /// surface as a single `Error` event so the caller's loop
 /// observes them uniformly.
+#[allow(clippy::too_many_arguments)]
 fn invoke_one_stream<M>(
     model: M,
     tools: Arc<Vec<ToolDefinition>>,
@@ -176,6 +189,7 @@ fn invoke_one_stream<M>(
     chunk_timeout: Option<std::time::Duration>,
     opts: super::stream::StreamOptions,
     provider_name: Arc<Option<String>>,
+    model_name: Arc<Option<String>>,
     tool_def_filter: Arc<
         Option<std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>>,
     >,
@@ -249,11 +263,15 @@ where
         // DIRGE_DUMP_REQUESTS is set. `additional` carrying reasoning params is
         // the per-provider signal that thinking is enabled for this request.
         if crate::provider::wire::enabled() {
+            let model = model_name.as_ref().as_deref().unwrap_or("default");
             let tool_names: Vec<String> = outgoing_tools.iter().map(|t| t.name.clone()).collect();
+            let messages_bytes: usize = ctx.messages.iter().map(|m| m.to_string().len()).sum();
             crate::provider::wire::dump_turn(
                 provider,
+                model,
                 &system_prompt,
                 history_len,
+                messages_bytes,
                 &tool_names,
                 additional.is_some(),
             );

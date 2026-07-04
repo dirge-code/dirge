@@ -97,8 +97,14 @@ pub(crate) async fn oneshot_with_model(
         prompt = head_tail_truncate(&prompt, ONESHOT_PROMPT_BUDGET_BYTES);
     }
     // dirge-wire: opt-in dump so a mystery side-LLM call (which prompt, which
-    // purpose) is visible. No-op unless DIRGE_DUMP_REQUESTS is set.
-    crate::provider::wire::dump_oneshot(label, preamble, &prompt);
+    // purpose, which model) is visible. No-op unless DIRGE_DUMP_REQUESTS is set.
+    crate::provider::wire::dump_oneshot(
+        label,
+        oneshot_provider_kind(&model),
+        &model.name(),
+        preamble,
+        &prompt,
+    );
     // dirge-zt8p: disable extended reasoning for this one-shot (see
     // `reasoning_disable_for_kind`). Computed before the consuming match.
     let disable = reasoning_disable_for_kind(oneshot_provider_kind(&model));

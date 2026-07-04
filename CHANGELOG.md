@@ -6,6 +6,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- `DIRGE_DUMP_REQUESTS` request-dump lines now carry the `provider` and `model`
+  each request went to, plus `messages_bytes` for the conversation history —
+  so when debugging multi-provider or mid-turn side-completion behavior you can
+  see which backend served each call, not just the byte sizes. `=1` logs the
+  summary line, `=full` also logs the prompt body; off by default, emitted at
+  INFO on `dirge::wire` (dirge-iis0).
+
 ## [0.18.1] - 2026-07-04
 
 ### Fixed

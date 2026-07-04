@@ -24,6 +24,7 @@ macro_rules! dispatch_stream_fn {
         tools = $tools:expr ,
         timeout = $timeout:expr ,
         provider = $provider:expr ,
+        model_name = $model_name:expr ,
         filter = $filter:expr $(,)?
     ) => {{
         use $crate::agent::agent_loop::rig_stream_fn_from_model_with_filter as __stream_fn;
@@ -37,12 +38,15 @@ macro_rules! dispatch_stream_fn {
         // concrete variant, so force the canonical identity here regardless of
         // alias. Non-OpenAI providers keep their passed identity.
         match $value {
-            $enum::OpenRouter($bind) => __stream_fn($model, $tools, $timeout, $provider, $filter),
+            $enum::OpenRouter($bind) => {
+                __stream_fn($model, $tools, $timeout, $provider, $model_name, $filter)
+            }
             $enum::OpenAI($bind) => __stream_fn(
                 $model,
                 $tools,
                 $timeout,
                 Some("openai".to_string()),
+                $model_name,
                 $filter,
             ),
             $enum::ChatGptOpenAI($bind) => __stream_fn(
@@ -50,6 +54,7 @@ macro_rules! dispatch_stream_fn {
                 $tools,
                 $timeout,
                 Some("openai".to_string()),
+                $model_name,
                 $filter,
             ),
             $enum::OpenAICodex($bind) => __stream_fn(
@@ -57,18 +62,33 @@ macro_rules! dispatch_stream_fn {
                 $tools,
                 $timeout,
                 Some("openai".to_string()),
+                $model_name,
                 $filter,
             ),
-            $enum::Anthropic($bind) => __stream_fn($model, $tools, $timeout, $provider, $filter),
-            $enum::AnthropicOauth($bind) => {
-                __stream_fn($model, $tools, $timeout, $provider, $filter)
+            $enum::Anthropic($bind) => {
+                __stream_fn($model, $tools, $timeout, $provider, $model_name, $filter)
             }
-            $enum::Gemini($bind) => __stream_fn($model, $tools, $timeout, $provider, $filter),
-            $enum::DeepSeek($bind) => __stream_fn($model, $tools, $timeout, $provider, $filter),
-            $enum::Glm($bind) => __stream_fn($model, $tools, $timeout, $provider, $filter),
-            $enum::OpenCode($bind) => __stream_fn($model, $tools, $timeout, $provider, $filter),
-            $enum::Ollama($bind) => __stream_fn($model, $tools, $timeout, $provider, $filter),
-            $enum::Custom($bind) => __stream_fn($model, $tools, $timeout, $provider, $filter),
+            $enum::AnthropicOauth($bind) => {
+                __stream_fn($model, $tools, $timeout, $provider, $model_name, $filter)
+            }
+            $enum::Gemini($bind) => {
+                __stream_fn($model, $tools, $timeout, $provider, $model_name, $filter)
+            }
+            $enum::DeepSeek($bind) => {
+                __stream_fn($model, $tools, $timeout, $provider, $model_name, $filter)
+            }
+            $enum::Glm($bind) => {
+                __stream_fn($model, $tools, $timeout, $provider, $model_name, $filter)
+            }
+            $enum::OpenCode($bind) => {
+                __stream_fn($model, $tools, $timeout, $provider, $model_name, $filter)
+            }
+            $enum::Ollama($bind) => {
+                __stream_fn($model, $tools, $timeout, $provider, $model_name, $filter)
+            }
+            $enum::Custom($bind) => {
+                __stream_fn($model, $tools, $timeout, $provider, $model_name, $filter)
+            }
         }
     }};
 }

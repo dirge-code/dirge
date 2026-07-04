@@ -45,13 +45,17 @@ pub fn enabled() -> bool {
 /// Dump a SIDE-LLM one-shot request — the tool-less completions that share
 /// `summarize::oneshot_with_model` (summarizer, critic, approval evaluator,
 /// goal). `purpose` is the call's label (the "why"); these never carry tools.
-pub fn dump_oneshot(purpose: &str, preamble: &str, prompt: &str) {
+/// `provider` is the canonical provider kind (e.g. "anthropic", "openai");
+/// `model` is the model identifier string.
+pub fn dump_oneshot(purpose: &str, provider: &str, model: &str, preamble: &str, prompt: &str) {
     match dump_mode() {
         DumpMode::Off => {}
         DumpMode::Summary => tracing::info!(
             target: "dirge::wire",
             purpose,
             kind = "one-shot",
+            provider,
+            model,
             tools = 0,
             preamble_bytes = preamble.len(),
             prompt_bytes = prompt.len(),
@@ -61,6 +65,8 @@ pub fn dump_oneshot(purpose: &str, preamble: &str, prompt: &str) {
             target: "dirge::wire",
             purpose,
             kind = "one-shot",
+            provider,
+            model,
             tools = 0,
             preamble_bytes = preamble.len(),
             prompt_bytes = prompt.len(),
@@ -73,12 +79,15 @@ pub fn dump_oneshot(purpose: &str, preamble: &str, prompt: &str) {
 
 /// Dump a MAIN-LOOP / agent request — turns, escalation, subagents, and forked
 /// review/curator runs all flow through the rig stream factory. `provider` is
-/// the resolved provider alias; `tool_names` distinguishes a tool-carrying turn
-/// from a stripped one.
+/// the resolved provider alias; `model` is the model identifier; `tool_names`
+/// distinguishes a tool-carrying turn from a stripped one; `messages_bytes` is
+/// the approximate byte size of the conversation history sent in the request.
 pub fn dump_turn(
     provider: Option<&str>,
+    model: &str,
     system_prompt: &str,
     history_len: usize,
+    messages_bytes: usize,
     tool_names: &[String],
     reasoning: bool,
 ) {
@@ -89,8 +98,10 @@ pub fn dump_turn(
             purpose = "turn",
             kind = "agent",
             provider = provider.unwrap_or("default"),
+            model,
             system_bytes = system_prompt.len(),
             history_len,
+            messages_bytes,
             tool_count = tool_names.len(),
             tools = ?tool_names,
             reasoning,
@@ -101,8 +112,10 @@ pub fn dump_turn(
             purpose = "turn",
             kind = "agent",
             provider = provider.unwrap_or("default"),
+            model,
             system_bytes = system_prompt.len(),
             history_len,
+            messages_bytes,
             tool_count = tool_names.len(),
             tools = ?tool_names,
             reasoning,
@@ -110,6 +123,42 @@ pub fn dump_turn(
             "provider request",
         ),
     }
+}
+
+/// Format a SUMMARY-LINE string for one-shot requests. Only used in
+/// unit tests — production goes through tracing.
+#[allow(dead_code)]
+pub fn format_oneshot_summary(
+    purpose: &str,
+    provider: &str,
+    model: &str,
+    preamble: &str,
+    prompt: &str,
+) -> String {
+    format!(
+        "oneshot purpose=\"{purpose}\" provider={provider} model={model} tools=0 preamble_bytes={} prompt_bytes={}",
+        preamble.len(),
+        prompt.len(),
+    )
+}
+
+/// Format a SUMMARY-LINE string for agent turn requests.
+/// Only used in unit tests — production goes through tracing.
+#[allow(dead_code)]
+pub fn format_turn_summary(
+    provider: &str,
+    model: &str,
+    system_prompt: &str,
+    history_len: usize,
+    messages_bytes: usize,
+    tool_names: &[String],
+    reasoning: bool,
+) -> String {
+    format!(
+        "turn provider={provider} model={model} system_bytes={} history_len={history_len} messages_bytes={messages_bytes} tool_count={} tools={tool_names:?} reasoning={reasoning}",
+        system_prompt.len(),
+        tool_names.len(),
+    )
 }
 
 #[cfg(test)]
@@ -146,5 +195,47 @@ mod tests {
             assert!(matches!(dump_mode(), DumpMode::Full))
         });
         with_env(Some("2"), || assert!(matches!(dump_mode(), DumpMode::Full)));
+    }
+
+    #[test]
+    fn format_oneshot_summary_produces_expected() {
+        let out = format_oneshot_summary(
+            "critic",
+            "anthropic",
+            "claude-sonnet-4-20250514",
+            "You are a code critic.",
+            "Review this diff:\nfn main() {}",
+        );
+        assert!(out.starts_with("oneshot "));
+        assert!(out.contains(r#"purpose="critic""#));
+        assert!(out.contains("provider=anthropic"));
+        assert!(out.contains("model=claude-sonnet-4-20250514"));
+        assert!(out.contains("tools=0"));
+        assert!(out.contains("preamble_bytes=22"));
+        assert!(out.contains("prompt_bytes=30"));
+    }
+
+    #[test]
+    fn format_turn_summary_produces_expected() {
+        let tools = vec!["bash".to_string(), "read".to_string()];
+        let out = format_turn_summary(
+            "openrouter",
+            "o4-mini",
+            "You are an AI coding agent.",
+            12,
+            8432,
+            &tools,
+            true,
+        );
+        assert!(out.starts_with("turn "));
+        assert!(out.contains("provider=openrouter"));
+        assert!(out.contains("model=o4-mini"));
+        assert!(out.contains("system_bytes=27"));
+        assert!(out.contains("history_len=12"));
+        assert!(out.contains("messages_bytes=8432"));
+        assert!(out.contains("tool_count=2"));
+        assert!(out.contains("reasoning=true"));
+        assert!(out.contains("bash"));
+        assert!(out.contains("read"));
     }
 }

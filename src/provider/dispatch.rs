@@ -419,6 +419,7 @@ impl AnyModel {
             tools = tools,
             timeout = Some(chunk_timeout),
             provider = provider_name,
+            model_name = Some(self.name()),
             filter = tool_def_filter,
         }
     }

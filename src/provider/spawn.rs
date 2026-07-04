@@ -491,6 +491,7 @@ impl AnyAgent {
     ) -> crate::agent::agent_loop::StreamFn {
         let chunk_timeout = self.chunk_timeout;
         let provider = Some(self.provider_name().to_string());
+        let model_name = Self::model_name_opt(&self.model_name);
         // dirge-iy20: single provider list in `stream_dispatch`. Each
         // arm clones `tools`/passes `tool_def_filter` by move — only
         // one arm runs, so the moves are exclusive.
@@ -500,6 +501,7 @@ impl AnyAgent {
             tools = tools.clone(),
             timeout = Some(chunk_timeout),
             provider = provider,
+            model_name = model_name,
             filter = tool_def_filter,
         }
     }
