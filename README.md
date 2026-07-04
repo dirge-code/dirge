@@ -45,6 +45,39 @@ The study covers conversational memory, not code semantics. For structural
 code questions dirge reaches for tree-sitter [semantic tools](docs/semantic.md)
 and [LSP](docs/lsp.md) rather than embeddings.
 
+## A 100k context budget, on purpose
+
+dirge caps the working context at **100k tokens by default**
+([`context_target`](docs/config.md)), even on models that advertise 200k, 1M,
+or larger windows. The compaction decision treats the effective window as
+`min(model_window, context_target)`, so history folds to stay inside *your*
+budget rather than the model's full advertised size.
+
+This is deliberate, not a limitation. Effective context quality degrades well
+before the advertised window fills — the usable "smart zone" runs out around
+100k tokens regardless of whether the model claims 200k or 1M ([Chroma's
+context-rot research](https://garrit.xyz/posts/2026-05-06-dont-trust-large-context-windows)).
+Earlier, dirge computed compaction as a fraction of the *full* window, which let
+a session on a large-window model drift deep into the degradation zone before
+folding. Budgeting to 100k keeps the live context in the smart zone — with the
+default fold fraction it sits around 75k — so answer quality stays high and the
+per-turn token bill stays bounded instead of scaling with an unused million-token
+window. It also keeps cheaper models, which fall off fastest at long context, on
+the rails.
+
+A smaller live window would normally mean forgetting older work. dirge doesn't,
+because durable knowledge lives *outside* the live context. When history folds
+at the budget, dirge writes a resumable checkpoint and forms project memory —
+facts and pitfalls persisted in the session DB, not the transcript. Memory is
+two-tiered: salient entries stay inline; the rest demote to a one-line
+breadcrumb index the agent dereferences or searches (FTS5) on demand, so
+specifics are recovered when needed instead of billed on every turn. A
+post-session orchestrator then extracts learnings into memory and skills and
+curates them. The result: long-horizon continuity with a small, high-quality
+window — the model reasons over ~100k of live context while the distilled state
+of a much longer session rides alongside it in memory. See
+[docs/config.md](docs/config.md#context-window--compaction) for the knobs.
+
 ## Installation
 
 > The crate is published as **`dirge-agent`** (the short `dirge` name was
