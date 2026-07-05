@@ -32,6 +32,7 @@ kill-subagent) are **rebindable** via the `keybindings` config — see
 | Ctrl+P / Up | History previous (multi-line: previous logical line, history at boundary) |
 | Ctrl+F | Reverse-i-search through history (bash-style): type to narrow, Ctrl+F to cycle, Enter to accept, Esc to cancel |
 | Shift+Enter / Meta+Enter / Ctrl+J | Insert newline (input box expands; Ctrl+J works in any terminal) |
+| Ctrl+G / `/edit` | Open the input buffer in `$EDITOR` (spawns temp file; replaces buffer on save) |
 | Tab | Insert 2 spaces |
 | `@<query>` | File picker (Tab/Enter select, Esc cancel) |
 | Paste (≥4 lines) | Collapses to `[N lines pasted]`; re-paste same content to expand inline |
