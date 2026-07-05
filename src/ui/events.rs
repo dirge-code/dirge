@@ -141,12 +141,19 @@ pub fn format_time(rfc3339: &str) -> CompactString {
 /// scrollback (`render_session`) [dirge-i75f].
 pub(crate) fn finalization_nudge_body(content: &str) -> Option<&str> {
     use crate::agent::agent_loop::{
-        code_review::CODE_REVIEW_TAG, critic::CRITIC_TAG, run::TODO_NUDGE_TAG, verifier::VERIFY_TAG,
+        code_review::CODE_REVIEW_TAG, critic::CRITIC_TAG, run::RESUME_NUDGE_TAG,
+        run::TODO_NUDGE_TAG, verifier::VERIFY_TAG,
     };
     let trimmed = content.trim_start();
-    [CRITIC_TAG, VERIFY_TAG, TODO_NUDGE_TAG, CODE_REVIEW_TAG]
-        .into_iter()
-        .find_map(|tag| trimmed.strip_prefix(tag).map(str::trim_start))
+    [
+        CRITIC_TAG,
+        VERIFY_TAG,
+        TODO_NUDGE_TAG,
+        CODE_REVIEW_TAG,
+        RESUME_NUDGE_TAG,
+    ]
+    .into_iter()
+    .find_map(|tag| trimmed.strip_prefix(tag).map(str::trim_start))
 }
 
 pub fn render_session(

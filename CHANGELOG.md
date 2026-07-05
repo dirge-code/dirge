@@ -6,6 +6,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- The agent no longer silently halts after a failed tool call. When the model's
+  last action was a rejected/errored tool call and it then stopped with a
+  text-only reply, a deterministic nudge now re-prompts it to complete the step
+  (or explain why it can't) instead of waiting for the user to say "continue".
+  Bounded and self-limiting — it only fires when a tool-error immediately
+  precedes the stopped turn, so it can't loop, and runs before the LLM critic
+  so obvious failures are handled without a judge call. Ambiguous "is it
+  actually done?" cases remain the critic's job (dirge-rwru).
+
 ## [0.18.3] - 2026-07-04
 
 ### Changed

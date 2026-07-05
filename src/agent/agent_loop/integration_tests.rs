@@ -1289,7 +1289,8 @@ async fn kwz_repair_exhaustion_arms_escalation_stream() {
     let default_stream: StreamFn = std::sync::Arc::new(move |_ctx, _opts| {
         let n = default_calls_clone.fetch_add(1, Ordering::SeqCst);
         // Call 0: invalid tool call (missing required `name`).
-        // Subsequent calls (shouldn't occur): bail with text.
+        // Call 1: the resume-after-failure continuation (dirge-rwru) —
+        // bail with text so the run finalizes.
         let batch = if n == 0 {
             vec![StreamEvent::Done {
                 reason: StopReason::ToolUse,
@@ -1334,12 +1335,17 @@ async fn kwz_repair_exhaustion_arms_escalation_stream() {
     .await;
     drop(tx);
 
-    // The default stream ran once (the failing tool-call turn);
-    // the escalation stream ran once (the next turn).
+    // The default stream ran twice: (1) the failing tool-call turn, and
+    // (2) the resume-after-failure nudge (dirge-rwru) — the escalation turn
+    // responded text-only to the unresolved tool error, so the deterministic
+    // resume nudge fired once to push the model to complete the failed step;
+    // its continuation consumes the (already-taken) escalation arm and falls
+    // back to the default stream. The escalation stream ran once (the
+    // repair-exhaustion retry).
     assert_eq!(
         default_calls.load(Ordering::SeqCst),
-        1,
-        "default stream invoked exactly once",
+        2,
+        "default stream: failing turn + one resume-after-failure continuation",
     );
     assert_eq!(
         escalation_calls.load(Ordering::SeqCst),

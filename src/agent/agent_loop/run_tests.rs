@@ -3215,6 +3215,7 @@ async fn finalization_hook_short_circuits_lower_gates() {
     let mut critic_done = false;
     let mut goal_reacts = 0u8;
     let mut todo_nudges = 0u8;
+    let mut resume_nudges: u8 = 0;
     let mut code_review_reacts = 0u8;
     let (review_emit, _review_emit_rx) = tokio::sync::mpsc::channel(64);
     let (msgs, source) = poll_finalization_follow_up(
@@ -3228,6 +3229,7 @@ async fn finalization_hook_short_circuits_lower_gates() {
         &std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         &mut goal_reacts,
         &mut todo_nudges,
+        &mut resume_nudges,
         &review_emit,
     )
     .await;
@@ -3328,6 +3330,7 @@ async fn finalization_all_gates_silent_yields_none() {
     let mut critic_done = false;
     let mut goal_reacts = 0u8;
     let mut todo_nudges = MAX_TODO_NUDGES; // todo gate bounded out
+    let mut resume_nudges: u8 = 0;
     let mut code_review_reacts = 0u8;
     let (review_emit, _review_emit_rx) = tokio::sync::mpsc::channel(64);
     let (msgs, source) = poll_finalization_follow_up(
@@ -3341,6 +3344,7 @@ async fn finalization_all_gates_silent_yields_none() {
         &std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         &mut goal_reacts,
         &mut todo_nudges,
+        &mut resume_nudges,
         &review_emit,
     )
     .await;
@@ -3364,6 +3368,7 @@ async fn finalization_goal_unmet_reenters_and_counts() {
     let mut critic_done = true; // skip the one-shot critic
     let mut goal_reacts = 0u8;
     let mut todo_nudges = MAX_TODO_NUDGES;
+    let mut resume_nudges: u8 = 0;
     let mut code_review_reacts = 0u8;
     let (review_emit, _review_emit_rx) = tokio::sync::mpsc::channel(64);
     let (msgs, source) = poll_finalization_follow_up(
@@ -3377,6 +3382,7 @@ async fn finalization_goal_unmet_reenters_and_counts() {
         &std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         &mut goal_reacts,
         &mut todo_nudges,
+        &mut resume_nudges,
         &review_emit,
     )
     .await;
@@ -3398,6 +3404,7 @@ async fn finalization_goal_met_finalizes() {
     let mut critic_done = true;
     let mut goal_reacts = 0u8;
     let mut todo_nudges = MAX_TODO_NUDGES;
+    let mut resume_nudges: u8 = 0;
     let mut code_review_reacts = 0u8;
     let (review_emit, _review_emit_rx) = tokio::sync::mpsc::channel(64);
     let (msgs, source) = poll_finalization_follow_up(
@@ -3411,6 +3418,7 @@ async fn finalization_goal_met_finalizes() {
         &std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         &mut goal_reacts,
         &mut todo_nudges,
+        &mut resume_nudges,
         &review_emit,
     )
     .await;
@@ -3433,6 +3441,7 @@ async fn finalization_goal_bound_stops_reentry() {
     let mut critic_done = true;
     let mut goal_reacts = crate::agent::agent_loop::goal::MAX_GOAL_REACT;
     let mut todo_nudges = MAX_TODO_NUDGES;
+    let mut resume_nudges: u8 = 0;
     let mut code_review_reacts = 0u8;
     let (review_emit, _review_emit_rx) = tokio::sync::mpsc::channel(64);
     let (msgs, source) = poll_finalization_follow_up(
@@ -3446,6 +3455,7 @@ async fn finalization_goal_bound_stops_reentry() {
         &std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         &mut goal_reacts,
         &mut todo_nudges,
+        &mut resume_nudges,
         &review_emit,
     )
     .await;
@@ -3465,6 +3475,7 @@ async fn finalization_goal_without_judge_is_inert() {
     let mut critic_done = true;
     let mut goal_reacts = 0u8;
     let mut todo_nudges = MAX_TODO_NUDGES;
+    let mut resume_nudges: u8 = 0;
     let mut code_review_reacts = 0u8;
     let (review_emit, _review_emit_rx) = tokio::sync::mpsc::channel(64);
     let (msgs, source) = poll_finalization_follow_up(
@@ -3478,6 +3489,7 @@ async fn finalization_goal_without_judge_is_inert() {
         &std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         &mut goal_reacts,
         &mut todo_nudges,
+        &mut resume_nudges,
         &review_emit,
     )
     .await;
@@ -3629,4 +3641,131 @@ fn issue_board_reminder_block_reads_board_and_tolerates_missing_db() {
     assert!(super::issue_board_reminder_block(&dir.join("nope.db")).is_none());
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── last_action_failed_and_stopped ──────────────────────────────────────
+
+/// Helper: construct a `LoopMessage::ToolResult` for test use.
+fn tool_err(id: &str, name: &str, is_error: bool) -> LoopMessage {
+    LoopMessage::ToolResult(crate::agent::agent_loop::message::ToolResultMessage {
+        tool_call_id: id.to_string(),
+        tool_name: name.to_string(),
+        content: vec![crate::agent::agent_loop::message::ContentBlock::Text {
+            text: "error output".to_string(),
+        }],
+        details: serde_json::json!({}),
+        is_error,
+    })
+}
+
+fn asst_no_tools(text: &str) -> LoopMessage {
+    LoopMessage::Assistant(crate::agent::agent_loop::message::AssistantMessage::new(
+        vec![crate::agent::agent_loop::message::ContentBlock::Text {
+            text: text.to_string(),
+        }],
+        crate::agent::agent_loop::message::StopReason::Stop,
+    ))
+}
+
+fn asst_with_tool(id: &str, name: &str, args: serde_json::Value) -> LoopMessage {
+    LoopMessage::Assistant(crate::agent::agent_loop::message::AssistantMessage::new(
+        vec![crate::agent::agent_loop::message::ContentBlock::ToolCall {
+            id: id.to_string(),
+            name: name.to_string(),
+            arguments: args,
+        }],
+        crate::agent::agent_loop::message::StopReason::ToolUse,
+    ))
+}
+
+#[test]
+fn last_action_failed_and_stopped_true_on_error_tool_then_text() {
+    // Tail: ToolResult(is_error=true), Assistant(no tool calls)
+    let msgs = vec![
+        user("do it"),
+        asst_with_tool("c1", "read", serde_json::json!({"path": "/x"})),
+        tool_err("c1", "read", true),
+        asst_no_tools("failed, let me stop"),
+    ];
+    assert!(last_action_failed_and_stopped(&msgs));
+}
+
+#[test]
+fn last_action_failed_and_stopped_false_when_all_tool_results_ok() {
+    // Tail: ToolResult(is_error=false), Assistant(no tools)
+    let msgs = vec![
+        user("do it"),
+        asst_with_tool("c1", "read", serde_json::json!({"path": "/x"})),
+        tool_err("c1", "read", false),
+        asst_no_tools("done"),
+    ];
+    assert!(!last_action_failed_and_stopped(&msgs));
+}
+
+#[test]
+fn last_action_failed_and_stopped_false_when_no_tool_result_before_final_assistant() {
+    // Tail: Assistant(text), Assistant(text) — the anti-loop / model-replied-to-nudge case.
+    let msgs = vec![
+        user("go"),
+        asst_with_tool("c1", "read", serde_json::json!({"path": "/x"})),
+        tool_err("c1", "read", true),
+        asst_no_tools("nudged reply 1"),
+        asst_no_tools("nudged reply 2"),
+    ];
+    assert!(!last_action_failed_and_stopped(&msgs));
+}
+
+#[test]
+fn last_action_failed_and_stopped_false_when_last_assistant_has_tool_calls() {
+    let msgs = vec![
+        user("go"),
+        tool_err("c1", "read", true),
+        asst_with_tool("c2", "write", serde_json::json!({"path": "/y"})),
+    ];
+    assert!(!last_action_failed_and_stopped(&msgs));
+}
+
+#[test]
+fn last_action_failed_and_stopped_false_when_last_is_not_assistant() {
+    let msgs = vec![
+        user("go"),
+        asst_with_tool("c1", "read", serde_json::json!({})),
+        tool_err("c1", "read", true),
+    ];
+    assert!(!last_action_failed_and_stopped(&msgs));
+}
+
+#[test]
+fn last_action_failed_and_stopped_false_on_empty() {
+    let msgs: Vec<LoopMessage> = vec![];
+    assert!(!last_action_failed_and_stopped(&msgs));
+}
+
+#[test]
+fn last_action_failed_and_stopped_detects_error_among_mixed_results() {
+    // Multiple ToolResults, one success then one error.
+    let msgs = vec![
+        user("go"),
+        asst_with_tool("c1", "read", serde_json::json!({"path": "/a"})),
+        tool_err("c1", "read", false),
+        asst_with_tool("c2", "write", serde_json::json!({"path": "/b"})),
+        tool_err("c2", "write", true),
+        asst_no_tools("write failed, stopping"),
+    ];
+    assert!(last_action_failed_and_stopped(&msgs));
+}
+
+// ── bounded resume counter (MAX_RESUME_NUDGE) ───────────────────────────
+
+#[test]
+fn last_action_failed_and_stopped_bounded() {
+    // When resume_nudges is already at MAX_RESUME_NUDGE, the gate must not fire.
+    let msgs = vec![
+        user("do it"),
+        asst_with_tool("c1", "read", serde_json::json!({"path": "/x"})),
+        tool_err("c1", "read", true),
+        asst_no_tools("failed"),
+    ];
+    let resume_nudges = MAX_RESUME_NUDGE;
+    assert!(!(resume_nudges < MAX_RESUME_NUDGE && last_action_failed_and_stopped(&msgs)));
 }

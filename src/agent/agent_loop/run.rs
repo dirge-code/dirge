@@ -150,6 +150,9 @@ enum FollowUpSource {
     /// Caller-supplied `get_followup_messages` hook (e.g. the `/plan`
     /// reviewer loop). Highest priority.
     Hook,
+    /// Deterministic resume: the model's last action was a failed tool call
+    /// and it stopped without retrying. Cheap, no LLM call, always-on.
+    ResumeAfterFailure,
     /// Verifier gate: code was edited but nothing was run to check it.
     Verifier,
     /// Bounded LLM critic judgment (at most once per run).
@@ -172,6 +175,14 @@ enum FollowUpSource {
 /// input [dirge-i75f].
 pub(crate) const TODO_NUDGE_TAG: &str = "[todo]";
 
+/// Display tag prefixing the resume-after-failure nudge, so the UI can strip
+/// it and attribute the injected message to the system rather than the user.
+pub(crate) const RESUME_NUDGE_TAG: &str = "[resume]";
+
+/// Upper bound on consecutive resume-after-failure nudges, so a model that
+/// repeatedly stops after broken tool calls can't loop forever.
+const MAX_RESUME_NUDGE: u8 = 3;
+
 /// Stable prefix of the max-agent-turns truncation notice. The
 /// headless result path (`provider::run`) matches on this to mark the
 /// run truncated in its JSON envelope (dirge-18v2) — sharing the
@@ -189,6 +200,41 @@ fn todo_nudge_message(unfinished: usize) -> LoopMessage {
             if unfinished == 1 { "" } else { "s" }
         ),
     })
+}
+
+/// True when the model's most recent action was a FAILED tool call and it
+/// then stopped: the tail of the run is a contiguous group of ToolResult
+/// messages containing at least one `is_error == true`, immediately
+/// followed by a final Assistant turn that made NO tool calls. Returns
+/// false otherwise. This is deliberately narrow so it only fires on a
+/// definitive failure-stop and CANNOT loop: once the model replies to the
+/// nudge with text (no new tool call), the error group is no longer
+/// immediately before the final Assistant turn, so it stops matching.
+fn last_action_failed_and_stopped(new_messages: &[LoopMessage]) -> bool {
+    if new_messages.is_empty() {
+        return false;
+    }
+    // The LAST message must be an Assistant with NO tool calls.
+    let Some(LoopMessage::Assistant(last)) = new_messages.last() else {
+        return false;
+    };
+    if !extract_tool_calls_from(last).is_empty() {
+        return false;
+    }
+    // Walk backwards from the message before the final Assistant,
+    // collecting the contiguous run of ToolResult messages.
+    let mut error_tail = false;
+    for msg in new_messages[..new_messages.len() - 1].iter().rev() {
+        match msg {
+            LoopMessage::ToolResult(tr) => {
+                if tr.is_error {
+                    error_tail = true;
+                }
+            }
+            _ => break,
+        }
+    }
+    error_tail
 }
 
 /// Poll the finalization gates in strict priority order and return the first
@@ -216,6 +262,7 @@ async fn poll_finalization_follow_up(
     advisory_dedup: &std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     goal_reacts: &mut u8,
     todo_nudges: &mut u8,
+    resume_nudges: &mut u8,
     emit: &mpsc::Sender<LoopEvent>,
 ) -> (Vec<LoopMessage>, FollowUpSource) {
     // 1. Caller hook (pi lines 256-262) — highest priority.
@@ -224,6 +271,23 @@ async fn poll_finalization_follow_up(
         if !msgs.is_empty() {
             return (msgs, FollowUpSource::Hook);
         }
+    }
+    // 1.5 Deterministic resume-after-failure: fires when the model's last
+    //     action was a failed tool call and it stopped without retrying.
+    //     Cheap, no LLM call, always-on. Bounded by MAX_RESUME_NUDGE.
+    if *resume_nudges < MAX_RESUME_NUDGE && last_action_failed_and_stopped(new_messages) {
+        *resume_nudges += 1;
+        return (
+            vec![LoopMessage::User(super::message::UserMessage {
+                content: format!(
+                    "{RESUME_NUDGE_TAG} Your last tool call failed or was rejected and you stopped without \
+                     completing that step. Do not end here. Re-issue the call with corrected arguments and \
+                     finish the work; if it genuinely cannot be done, say so plainly and report what you \
+                     found. Don't just describe what you would do — do it."
+                ),
+            })],
+            FollowUpSource::ResumeAfterFailure,
+        );
     }
     // 2. F6 verifier gate — one-time "verify before done" when code was edited
     //    but nothing was run to check it.
@@ -1247,6 +1311,9 @@ pub async fn run_loop(
     // todos (bounded by MAX_TODO_NUDGES; vix caps at 3, session.go:1551).
     let mut todo_nudges: u8 = 0;
 
+    // Deterministic resume-after-failure (bounded by MAX_RESUME_NUDGE).
+    let mut resume_nudges: u8 = 0;
+
     'outer: loop {
         // Storm: fresh intent on each new user turn.
         // Port of Reasonix loop.ts:621 `this.repair.resetStorm()`.
@@ -2030,6 +2097,7 @@ pub async fn run_loop(
             &advisory_dedup,
             &mut goal_reacts,
             &mut todo_nudges,
+            &mut resume_nudges,
             emit,
         )
         .await;
