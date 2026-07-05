@@ -48,6 +48,9 @@ pub(crate) enum SlashOutcome {
     DeferBtw {
         query: String,
     },
+    /// `/edit`: open the input buffer in `$EDITOR`.
+    #[cfg(unix)]
+    DeferExternalEditor,
     /// `/wt-merge`: merge the worktree branch back into a target.
     #[cfg(feature = "git-worktree")]
     DeferWtMerge(cmd::wt_defer::WtMerge),
@@ -665,6 +668,7 @@ pub async fn handle_slash(
         "/learn" => return cmd::learn::cmd_learn(&mut ctx, &parts).await,
         "/code-review" => cmd::code_review::cmd_code_review(&mut ctx).await?,
         "/cd" => cmd::cd::cmd_cd(&mut ctx, text).await?,
+        "/edit" => return Ok(SlashOutcome::DeferExternalEditor),
         "/undo" => cmd::undo::cmd_undo(&mut ctx).await?,
         "/retry" => cmd::retry::cmd_retry(&mut ctx).await?,
         "/allow" => cmd::allow::cmd_allow(&mut ctx, &parts, text).await?,
@@ -798,6 +802,8 @@ fn slash_commands() -> Vec<(&'static str, &'static str)> {
         ),
         ("/compress", "summarize and compact the conversation"),
         ("/display", "choose which panes (left/main/right) to show"),
+        #[cfg(unix)]
+        ("/edit", "open the input buffer in $EDITOR"),
         (
             "/fork",
             "fork the conversation at a message; restore the original prompt",

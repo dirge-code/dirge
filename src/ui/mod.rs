@@ -2634,6 +2634,14 @@ pub async fn run_interactive(
                                                 ui.is_running = true;
                                                 renderer.set_avatar_state(avatar::AvatarState::Thinking);
                                             }
+                                            #[cfg(unix)]
+                                            Ok(SlashOutcome::DeferExternalEditor) => {
+                                                if let Some(d) = terminal::suspend_tui_for_subprocess(&user_tx) {
+                                                    input.open_in_external_editor();
+                                                    terminal::resume_tui_after_subprocess(&mut renderer, &user_tx);
+                                                    let _ = d;
+                                                }
+                                            }
                                             #[cfg(feature = "git-worktree")]
                                             Ok(SlashOutcome::DeferWtMerge(m)) => {
                                                 // dirge-2qke / dirge-72ea: perform the merge

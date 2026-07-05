@@ -948,7 +948,7 @@ impl InputEditor {
     /// before calling this, and resume after. See
     /// `suspend_tui_for_subprocess` / `resume_tui_after_subprocess` in
     /// `terminal.rs`.
-    fn open_in_external_editor(&mut self) -> Option<CompactString> {
+    pub(crate) fn open_in_external_editor(&mut self) -> Option<CompactString> {
         let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
 
         let dir = std::env::temp_dir().join(format!("dirge-input-{}.txt", std::process::id()));
