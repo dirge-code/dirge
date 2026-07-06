@@ -1,3 +1,4 @@
+pub mod adapter;
 pub(crate) mod anthropic_http;
 pub(crate) mod anthropic_oauth;
 pub(crate) mod auth;

@@ -144,33 +144,10 @@ fn oneshot_provider_kind(model: &super::AnyModel) -> &'static str {
     }
 }
 
-/// dirge-zt8p: provider-appropriate request params that turn OFF the model's
-/// extended-reasoning trace for the tool-less one-shots (summarizer / critic /
-/// approval). Those tasks don't benefit from a thinking trace, and on
-/// reasoning-by-default models (DeepSeek / Qwen / GLM hybrids behind an
-/// OpenAI-compatible API) it roughly doubles latency. Returns `None` when the
-/// provider has no disable knob, already defaults to no-thinking (Anthropic), or
-/// where forcing it risks rejecting a valid request (OpenAI o-series has no
-/// "off", and non-reasoning GPT models already don't think).
-///
-/// Hosted DeepSeek and GLM APIs use the `thinking:{type:"disabled"}` toggle;
-/// self-hosted vLLM / SGLang backends (opencode, custom, openrouter) use the
-/// `chat_template_kwargs` convention instead.
+/// dirge-zt8p: provider-specific params to disable extended reasoning
+/// for tool-less one-shots. Delegates to the consolidated adapter mapping.
 fn reasoning_disable_for_kind(kind: &str) -> Option<serde_json::Value> {
-    match kind {
-        // Hosted DeepSeek / GLM: disable via the thinking-API toggle.
-        "deepseek" | "glm" => Some(serde_json::json!({ "thinking": { "type": "disabled" } })),
-        // Self-hosted vLLM / SGLang backends (opencode/custom/openrouter): the
-        // chat_template_kwargs convention.
-        "opencode" | "custom" | "openrouter" => {
-            Some(serde_json::json!({ "chat_template_kwargs": { "thinking": false } }))
-        }
-        // Ollama's native per-request toggle.
-        "ollama" => Some(serde_json::json!({ "think": false })),
-        // Gemini 2.5: a zero thinking budget disables it.
-        "gemini" => Some(serde_json::json!({ "thinking_config": { "thinking_budget": 0 } })),
-        _ => None,
-    }
+    crate::provider::adapter::reasoning_profile(Some(kind)).disable_params()
 }
 
 /// Trim a prompt to `budget` bytes by keeping a head + tail slice

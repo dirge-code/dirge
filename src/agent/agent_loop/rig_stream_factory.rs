@@ -619,67 +619,12 @@ pub fn build_provider_additional_params(
     let mut additional = serde_json::Map::new();
 
     // ----- reasoning per provider -----
-    if let Some(level) = opts.reasoning {
-        match provider_name {
-            Some("anthropic") => {
-                // Budget-based thinking. Pi uses adaptive-effort
-                // for Opus 4.6+ and Sonnet 4.6; we'd need model-
-                // id sniffing to dispatch. For now use budget
-                // mode with sensible per-level defaults that
-                // adaptive-thinking models also accept.
-                let budget = budget_for_level(level, opts.thinking_budgets.as_ref());
-                if budget > 0 {
-                    additional.insert(
-                        "thinking".to_string(),
-                        serde_json::json!({
-                            "type": "enabled",
-                            "budget_tokens": budget,
-                        }),
-                    );
-                }
-            }
-            Some("deepseek") => {
-                // DeepSeek's hosted API honors a top-level
-                // `reasoning_effort` string (not nested inside
-                // `reasoning`). Supports "max" tier above "high".
-                if let Some(effort) = thinking_level_to_deepseek_effort(level) {
-                    additional.insert("reasoning_effort".to_string(), serde_json::json!(effort));
-                }
-            }
-            Some("openai" | "glm" | "custom" | "openrouter") => {
-                // OpenAI Responses / openai-compat reasoning.
-                if let Some(effort) = thinking_level_to_openai_effort(level) {
-                    additional.insert(
-                        "reasoning".to_string(),
-                        serde_json::json!({ "effort": effort }),
-                    );
-                }
-            }
-            Some("gemini") => {
-                let budget = budget_for_level(level, opts.thinking_budgets.as_ref());
-                if budget > 0 {
-                    additional.insert(
-                        "thinking_config".to_string(),
-                        serde_json::json!({ "thinking_budget": budget }),
-                    );
-                }
-            }
-            Some("ollama") | None => {
-                // Generic fallback. Local Ollama models vary;
-                // pass the level under a conventional key.
-                additional.insert(
-                    "reasoning_level".to_string(),
-                    serde_json::to_value(level).unwrap_or(serde_json::Value::Null),
-                );
-            }
-            Some(_) => {
-                // Unknown provider — fall back to generic key.
-                additional.insert(
-                    "reasoning_level".to_string(),
-                    serde_json::to_value(level).unwrap_or(serde_json::Value::Null),
-                );
-            }
-        }
+    if let Some(level) = opts.reasoning
+        && let Some(serde_json::Value::Object(m)) =
+            crate::provider::adapter::reasoning_profile(provider_name)
+                .effort_params(level, opts.thinking_budgets.as_ref())
+    {
+        additional.extend(m);
     }
 
     // ----- headers (provider-agnostic) -----
@@ -726,59 +671,6 @@ fn merged_request_headers(
             .or_insert_with(|| format!("Bearer {key}"));
     }
     headers
-}
-
-/// Map our `ThinkingLevel` enum to OpenAI Responses `reasoning.
-/// effort` strings ("low" | "medium" | "high"). `Off` → None
-/// (no reasoning key in the request).
-///
-/// Pi's `Minimal` / `Xhigh` are clamped to the nearest OpenAI
-/// effort since OpenAI's API only accepts the three.
-fn thinking_level_to_openai_effort(level: super::types::ThinkingLevel) -> Option<&'static str> {
-    use super::types::ThinkingLevel as TL;
-    match level {
-        TL::Off => None,
-        TL::Minimal | TL::Low => Some("low"),
-        TL::Medium => Some("medium"),
-        TL::High | TL::Xhigh => Some("high"),
-    }
-}
-
-/// DeepSeek's hosted API honors a top-level `reasoning_effort` string and
-/// supports a "max" tier above "high" (which OpenAI rejects). Verified:
-/// low→max gives a clean ~2x reasoning-depth separation, whereas the
-/// nested `reasoning:{effort}` shape is ignored.
-fn thinking_level_to_deepseek_effort(level: super::types::ThinkingLevel) -> Option<&'static str> {
-    use super::types::ThinkingLevel as TL;
-    match level {
-        TL::Off => None,
-        TL::Minimal | TL::Low => Some("low"),
-        TL::Medium => Some("medium"),
-        TL::High => Some("high"),
-        TL::Xhigh => Some("max"),
-    }
-}
-
-/// Token budget for a thinking level. Reads from the caller's
-/// `ThinkingBudgets` if provided, falling back to defaults
-/// reasonable for token-budget reasoning models (Anthropic
-/// budget mode, Gemini 2.x).
-///
-/// Defaults match the rough scale pi uses (`providers/simple-
-/// options.ts:33-...`): minimal 1024, low 2048, medium 4096,
-/// high 16384. `Off` returns 0 — caller skips the key entirely.
-fn budget_for_level(
-    level: super::types::ThinkingLevel,
-    budgets: Option<&super::types::ThinkingBudgets>,
-) -> u32 {
-    use super::types::ThinkingLevel as TL;
-    match level {
-        TL::Off => 0,
-        TL::Minimal => budgets.and_then(|b| b.minimal).unwrap_or(1024),
-        TL::Low => budgets.and_then(|b| b.low).unwrap_or(2048),
-        TL::Medium => budgets.and_then(|b| b.medium).unwrap_or(4096),
-        TL::High | TL::Xhigh => budgets.and_then(|b| b.high).unwrap_or(16384),
-    }
 }
 
 #[cfg(test)]
@@ -1348,21 +1240,6 @@ mod tests {
         let opts = opts_with_reasoning(ThinkingLevel::Off);
         let v = build_provider_additional_params(Some("deepseek"), &opts);
         assert!(v.is_none());
-    }
-
-    /// Unit-test every ThinkingLevel → deepseek effort mapping.
-    #[test]
-    fn thinking_level_to_deepseek_effort_all_variants() {
-        use crate::agent::agent_loop::types::ThinkingLevel as TL;
-        assert_eq!(thinking_level_to_deepseek_effort(TL::Off), None);
-        assert_eq!(thinking_level_to_deepseek_effort(TL::Minimal), Some("low"));
-        assert_eq!(thinking_level_to_deepseek_effort(TL::Low), Some("low"));
-        assert_eq!(
-            thinking_level_to_deepseek_effort(TL::Medium),
-            Some("medium")
-        );
-        assert_eq!(thinking_level_to_deepseek_effort(TL::High), Some("high"));
-        assert_eq!(thinking_level_to_deepseek_effort(TL::Xhigh), Some("max"));
     }
 
     /// OpenAI with High reasoning still returns the nested
