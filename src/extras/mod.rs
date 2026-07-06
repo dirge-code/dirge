@@ -29,6 +29,7 @@ pub mod fts;
 pub mod issue_db;
 pub mod memory_curator;
 pub mod memory_db;
+pub mod memory_graduation;
 pub mod memory_hybrid;
 pub mod memory_provider;
 #[cfg(test)]

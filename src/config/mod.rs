@@ -465,6 +465,10 @@ pub struct Config {
     pub keep_recent_tokens: Option<u64>,
     pub max_agent_turns: Option<usize>,
     pub compact_enabled: Option<bool>,
+    /// dirge-4nix: recurrence-weighted salience graduation for the memory
+    /// curator. Detect near-duplicate entries and boost the representative's
+    /// salience. Default true when absent. Set to `false` to disable.
+    pub memory_graduation: Option<bool>,
     /// Unified provider map. Keyed by alias; the alias is what
     /// `provider` / `review_provider` / `escalation_provider` /
     /// `summarization_provider` / `subagent_provider` reference.

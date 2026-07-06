@@ -431,6 +431,17 @@ impl SqliteMemoryStore {
     /// the per-project [`load`](Self::load) and the global
     /// [`load_global_at`](Self::load_global_at).
     fn from_connection(conn: Connection) -> Result<Self, String> {
+        // dirge-4nix: idempotent ledger for recurrence graduation so
+        // a cluster is only boosted once.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS graduation_ledger (
+                cluster_hash TEXT PRIMARY KEY,
+                graduated_at TEXT NOT NULL
+            )",
+            [],
+        )
+        .map_err(|e| format!("Failed to create graduation_ledger: {e}"))?;
+
         // Frozen snapshot — defense-in-depth re-scan before the text
         // is injected into the SYSTEM PROMPT (the highest-trust
         // surface). Rows normally pass the write-path scan, but the
@@ -1326,6 +1337,49 @@ impl SqliteMemoryStore {
             "success_count": row.success_count + i64::from(success),
             "failure_count": row.failure_count + i64::from(!success),
         }))
+    }
+
+    /// Add `delta` to an entry's salience, capped at `cap`, updating
+    /// `updated_at`. Does NOT touch use_count/last_used_at (unlike
+    /// `expand_entry`). dirge-4nix: targeted salience nudge for
+    /// recurrence graduation.
+    pub fn bump_salience(&self, uid: &str, delta: f64, cap: f64) -> Result<(), String> {
+        let conn = self.conn.lock_ignore_poison();
+        let now = chrono::Utc::now().to_rfc3339();
+        let changed = conn
+            .execute(
+                "UPDATE memories SET salience = MIN(?1, salience + ?2), updated_at = ?3 WHERE uid = ?4",
+                params![cap, delta, now, uid],
+            )
+            .map_err(|e| format!("Failed to bump salience: {e}"))?;
+        if changed == 0 {
+            return Err(format!("Entry not found: {uid}"));
+        }
+        Ok(())
+    }
+
+    /// Check whether a cluster hash has already been graduated.
+    pub fn is_graduated(&self, cluster_hash: &str) -> Result<bool, String> {
+        let conn = self.conn.lock_ignore_poison();
+        let exists: bool = conn
+            .query_row(
+                "SELECT 1 FROM graduation_ledger WHERE cluster_hash = ?1 LIMIT 1",
+                params![cluster_hash],
+                |_| Ok(()),
+            )
+            .is_ok();
+        Ok(exists)
+    }
+
+    /// Record a cluster hash as graduated so it isn't boosted again.
+    pub fn record_graduation(&self, cluster_hash: &str, at_iso: &str) -> Result<(), String> {
+        let conn = self.conn.lock_ignore_poison();
+        conn.execute(
+            "INSERT OR IGNORE INTO graduation_ledger (cluster_hash, graduated_at) VALUES (?1, ?2)",
+            params![cluster_hash, at_iso],
+        )
+        .map_err(|e| format!("Failed to record graduation: {e}"))?;
+        Ok(())
     }
 
     /// Full-text search over all ACTIVE entries, both targets and
@@ -4413,5 +4467,138 @@ mod tests {
             (conf - DEFAULT_CONFIDENCE).abs() < 1e-9,
             "view surfaces confidence"
         );
+    }
+    // ── dirge-4nix: bump_salience + graduation ledger ──
+
+    #[test]
+    fn bump_salience_raises_salience() {
+        let (paths, _dir) = temp_project();
+        let store = SqliteMemoryStore::load(&paths).unwrap();
+        store
+            .add_entry("memory", "test entry for bump", None)
+            .unwrap();
+        let conn = raw_conn(&paths);
+        let before: f64 = conn
+            .query_row(
+                "SELECT salience FROM memories WHERE content = 'test entry for bump'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let uid: String = conn
+            .query_row(
+                "SELECT uid FROM memories WHERE content = 'test entry for bump'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        store.bump_salience(&uid, 0.05, 0.9).unwrap();
+        let after: f64 = conn
+            .query_row(
+                "SELECT salience FROM memories WHERE uid = ?1",
+                rusqlite::params![uid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            (after - before - 0.05).abs() < 1e-9,
+            "salience should rise by 0.05"
+        );
+    }
+
+    #[test]
+    fn bump_salience_respects_cap() {
+        let (paths, _dir) = temp_project();
+        let store = SqliteMemoryStore::load(&paths).unwrap();
+        store.add_entry("memory", "capped entry", None).unwrap();
+        let conn = raw_conn(&paths);
+        let uid: String = conn
+            .query_row(
+                "SELECT uid FROM memories WHERE content = 'capped entry'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "UPDATE memories SET salience = 0.89 WHERE uid = ?1",
+            rusqlite::params![uid],
+        )
+        .unwrap();
+        store.bump_salience(&uid, 0.05, 0.9).unwrap();
+        let after: f64 = conn
+            .query_row(
+                "SELECT salience FROM memories WHERE uid = ?1",
+                rusqlite::params![uid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!((after - 0.9).abs() < 1e-9, "salience capped at 0.9");
+    }
+
+    #[test]
+    fn bump_salience_noop_on_unknown_uid() {
+        let (paths, _dir) = temp_project();
+        let store = SqliteMemoryStore::load(&paths).unwrap();
+        let err = store
+            .bump_salience("nonexistent-uid", 0.05, 0.9)
+            .unwrap_err();
+        assert!(err.contains("not found"), "unknown uid: {err}");
+    }
+
+    #[test]
+    fn bump_salience_does_not_change_use_count() {
+        let (paths, _dir) = temp_project();
+        let store = SqliteMemoryStore::load(&paths).unwrap();
+        store
+            .add_entry("memory", "no use count change", None)
+            .unwrap();
+        let conn = raw_conn(&paths);
+        let uid: String = conn
+            .query_row(
+                "SELECT uid FROM memories WHERE content = 'no use count change'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let before: i64 = conn
+            .query_row(
+                "SELECT use_count FROM memories WHERE uid = ?1",
+                rusqlite::params![uid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        store.bump_salience(&uid, 0.05, 0.9).unwrap();
+        let after: i64 = conn
+            .query_row(
+                "SELECT use_count FROM memories WHERE uid = ?1",
+                rusqlite::params![uid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(after, before, "use_count unchanged");
+    }
+
+    #[test]
+    fn graduation_ledger_is_graduated_and_record() {
+        let (paths, _dir) = temp_project();
+        let store = SqliteMemoryStore::load(&paths).unwrap();
+        assert!(!store.is_graduated("abc123def456").unwrap());
+        store
+            .record_graduation("abc123def456", "2025-06-01T12:00:00Z")
+            .unwrap();
+        assert!(store.is_graduated("abc123def456").unwrap());
+    }
+
+    #[test]
+    fn graduation_record_is_idempotent() {
+        let (paths, _dir) = temp_project();
+        let store = SqliteMemoryStore::load(&paths).unwrap();
+        store
+            .record_graduation("idempotent-hash", "2025-06-01T12:00:00Z")
+            .unwrap();
+        store
+            .record_graduation("idempotent-hash", "2025-06-02T12:00:00Z")
+            .unwrap();
+        assert!(store.is_graduated("idempotent-hash").unwrap());
     }
 }

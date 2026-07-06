@@ -37,6 +37,16 @@ pub const USE_REINFORCEMENT: f64 = 0.05;
 pub const DISUSE_DECAY: f64 = 0.05;
 pub const DECAY_FLOOR: f64 = 0.1;
 
+// ── Recurrence-weighted graduation (dirge-4nix) ──────────────────────
+
+/// Salience bump for each additional member beyond the first in a
+/// recurrence cluster. A cluster of size N adds
+/// RECURRENCE_SALIENCE_STEP * (N - 1) to the representative,
+/// capped at SALIENCE_CAP.
+pub const RECURRENCE_SALIENCE_STEP: f64 = 0.05;
+/// Absolute ceiling on salience from recurrence graduation.
+pub const SALIENCE_CAP: f64 = 0.9;
+
 // ── Procedural effectiveness (dirge-zygq) ────────────────────────────
 
 /// Weight on the log-damped net success/failure record. With 0.15:

@@ -124,6 +124,9 @@ pub struct MemoryCurator {
     /// Shared scheduler clock (dirge-rwrg): session-count first-run
     /// gate + 7-day interval, state at `.dirge/memory/.curator_state`.
     clock: crate::extras::curator_clock::CuratorClock,
+    /// dirge-4nix: recurrence-weighted graduation enabled (config
+    /// `memory_graduation`). Default true.
+    pub graduation_enabled: bool,
 }
 
 impl MemoryCurator {
@@ -137,6 +140,7 @@ impl MemoryCurator {
         Ok(Self {
             paths: paths.clone(),
             clock,
+            graduation_enabled: true,
         })
     }
 
@@ -246,6 +250,73 @@ impl MemoryCurator {
             .map(|t| t.to_string())
             .collect();
 
+        // 4b. dirge-4nix: recurrence-weighted salience graduation.
+        //     Detect near-duplicate clusters among active entries and
+        //     boost the representative's salience. The ledger prevents
+        //     re-boosting the same cluster every run. Fail-open: a
+        //     per-cluster DB error logs a warning and continues.
+        let mut graduated: Vec<GraduationRecord> = Vec::new();
+        if self.graduation_enabled {
+            let inputs: Vec<crate::extras::memory_graduation::GraduationInput> = entries
+                .iter()
+                .map(|e| crate::extras::memory_graduation::GraduationInput {
+                    uid: e.uid.clone(),
+                    target: e.target.clone(),
+                    content: e.content.clone(),
+                    use_count: e.use_count,
+                    created_at: e.created_at.clone(),
+                })
+                .collect();
+            let clusters = crate::extras::memory_graduation::recurrence_clusters(
+                &inputs,
+                crate::extras::memory_graduation::MIN_JACCARD,
+                crate::extras::memory_graduation::MIN_TOKENS,
+                crate::extras::memory_graduation::MIN_CLUSTER_SIZE,
+            );
+            let now_iso = &started_at_iso;
+            for cluster in &clusters {
+                if store.is_graduated(&cluster.hash).unwrap_or(false) {
+                    continue;
+                }
+                let boost =
+                    crate::extras::salience::RECURRENCE_SALIENCE_STEP * (cluster.size - 1) as f64;
+                match store.bump_salience(
+                    &cluster.rep_uid,
+                    boost,
+                    crate::extras::salience::SALIENCE_CAP,
+                ) {
+                    Ok(()) => {
+                        if let Err(e) = store.record_graduation(&cluster.hash, now_iso) {
+                            tracing::warn!(
+                                target: "dirge::memory_curator",
+                                cluster_hash = %cluster.hash,
+                                error = %e,
+                                "graduation ledger write failed — continuing pass",
+                            );
+                        }
+                        graduated.push(GraduationRecord {
+                            target: entries
+                                .iter()
+                                .find(|e| e.uid == cluster.rep_uid)
+                                .map(|e| e.target.clone())
+                                .unwrap_or_default(),
+                            rep_uid: cluster.rep_uid.clone(),
+                            size: cluster.size,
+                            boost,
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "dirge::memory_curator",
+                            rep_uid = %cluster.rep_uid,
+                            error = %e,
+                            "salience bump failed — continuing pass",
+                        );
+                    }
+                }
+            }
+        }
+
         // 5. Update the scheduler clock.
         self.clock.mark_ran()?;
 
@@ -257,6 +328,7 @@ impl MemoryCurator {
             pressure_targets,
             stale_candidates,
             promotion_candidates,
+            graduated,
         };
 
         // 4. Write audit report.
@@ -280,7 +352,7 @@ impl MemoryCurator {
 /// today; LLM pass in PR-2) can introspect what the mechanical
 /// pass observed. Also rendered as Markdown to disk for human
 /// review.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MechanicalReport {
     pub started_at_iso: String,
     pub total_entries: usize,
@@ -297,6 +369,8 @@ pub struct MechanicalReport {
     /// their session. The LLM pass decides which have proven durable
     /// and re-kinds those to `procedural`/`semantic`.
     pub promotion_candidates: Vec<PromotionCandidate>,
+    /// dirge-4nix: recurrence clusters graduated this pass.
+    pub graduated: Vec<GraduationRecord>,
 }
 
 /// A `working`-kind entry the curator surfaces for possible promotion.
@@ -325,6 +399,15 @@ pub struct StaleCandidate {
     pub use_count: i64,
 }
 
+/// dirge-4nix: one recurrence cluster that was graduated this pass.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GraduationRecord {
+    pub target: String,
+    pub rep_uid: String,
+    pub size: usize,
+    pub boost: f64,
+}
+
 impl MechanicalReport {
     /// Render as Markdown for `REPORT.md`. Keep it scan-friendly
     /// — the audit report's job is "show me at a glance what
@@ -350,6 +433,11 @@ impl MechanicalReport {
             "- Working promotion candidates: {}",
             self.promotion_candidates.len(),
         );
+        let _ = writeln!(
+            out,
+            "- Recurrence clusters graduated: {}",
+            self.graduated.len(),
+        );
 
         if !self.stale_candidates.is_empty() {
             let _ = writeln!(
@@ -367,6 +455,19 @@ impl MechanicalReport {
                     c.use_count,
                     c.entry_id,
                     c.preview.replace('|', "\\|"),
+                );
+            }
+        }
+
+        if !self.graduated.is_empty() {
+            let _ = writeln!(out, "\n## Recurrence clusters graduated\n",);
+            let _ = writeln!(out, "| Target | Size | Boost | Rep UID |");
+            let _ = writeln!(out, "|---|---|---|---|");
+            for g in &self.graduated {
+                let _ = writeln!(
+                    out,
+                    "| `{}` | {} | +{:.3} | `{}` |",
+                    g.target, g.size, g.boost, g.rep_uid,
                 );
             }
         }
@@ -569,13 +670,21 @@ mod tests {
     use super::*;
 
     fn temp_project() -> (ProjectPaths, std::path::PathBuf) {
+        // Uniqueness must not rest on the clock: `process::id()` is constant
+        // across a test binary and two parallel tests can read the same
+        // nanosecond tick, collide on the dir, and have one test's
+        // `remove_dir_all` wipe the other's DB mid-write. A per-process atomic
+        // counter guarantees a distinct dir per call.
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
-            "dirge-memory-curator-test-{}-{}",
+            "dirge-memory-curator-test-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            seq,
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -897,6 +1006,7 @@ mod tests {
             pressure_targets: vec![],
             stale_candidates: vec![],
             promotion_candidates: vec![],
+            graduated: vec![],
         };
         let md = report.to_markdown();
         assert!(
@@ -916,6 +1026,7 @@ mod tests {
             pressure_targets: vec![],
             stale_candidates: stale,
             promotion_candidates: vec![],
+            graduated: vec![],
         }
     }
 
@@ -1141,5 +1252,111 @@ mod tests {
             "long preview must end with '...': {long:?}",
         );
         assert!(long.len() <= 80, "preview must cap length: {}", long.len());
+    }
+    // ── dirge-4nix: recurrence graduation integration ──
+
+    #[test]
+    fn graduation_boosts_representative_and_ledger_dedups() {
+        let (paths, _tmp) = temp_project();
+        std::fs::create_dir_all(paths.sessions_dir()).unwrap();
+        // Ensure the session-count gate is satisfied.
+        seed_sessions(&paths, 12);
+
+        let store = crate::extras::memory_db::SqliteMemoryStore::load(&paths).unwrap();
+        // Seed 3 near-identical entries in the same target.
+        let base = "dirge uses SQLite for long term persistent memory storage and retrieval";
+        store.add_entry("memory", base, None).unwrap();
+        store
+            .add_entry(
+                "memory",
+                "dirge uses SQLite for long term persistent memory storage and retrieval system",
+                None,
+            )
+            .unwrap();
+        store
+            .add_entry(
+                "memory",
+                "dirge uses SQLite for long term persistent memory storage and retrieval approach",
+                None,
+            )
+            .unwrap();
+        // Add one unrelated entry.
+        store
+            .add_entry("memory", "completely different fact about the sky", None)
+            .unwrap();
+        drop(store);
+
+        // Run mechanical pass with graduation enabled.
+        let mut curator = MemoryCurator::new(&paths).unwrap();
+        curator.graduation_enabled = true;
+        let report = curator.run_mechanical_pass().unwrap();
+
+        // Expect one cluster of size 3.
+        assert!(
+            !report.graduated.is_empty(),
+            "should graduate at least one cluster"
+        );
+        let g = &report.graduated[0];
+        assert_eq!(g.size, 3);
+        assert!((g.boost - 0.1).abs() < 1e-9, "boost = 0.05 * 2 = 0.1");
+
+        // Check that the representative's salience was boosted.
+        let conn = crate::extras::memory_db::raw_conn(&paths);
+        let rep_salience: f64 = conn
+            .query_row(
+                "SELECT salience FROM memories WHERE uid = ?1",
+                rusqlite::params![g.rep_uid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            rep_salience > 0.5,
+            "rep salience should be > default 0.5 after boost"
+        );
+
+        // Check the unrelated entry was untouched.
+        let unrelated_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM graduation_ledger", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(unrelated_count, 1, "exactly one ledger row");
+
+        // Second pass: should NOT boost again (ledger dedup).
+        let mut curator2 = MemoryCurator::new(&paths).unwrap();
+        curator2.graduation_enabled = true;
+        let report2 = curator2.run_mechanical_pass().unwrap();
+        assert!(
+            report2.graduated.is_empty(),
+            "second pass must not re-graduate same cluster"
+        );
+    }
+
+    #[test]
+    fn graduation_disabled_skips_entirely() {
+        let (paths, _tmp) = temp_project();
+        std::fs::create_dir_all(paths.sessions_dir()).unwrap();
+        seed_sessions(&paths, 12);
+
+        let store = crate::extras::memory_db::SqliteMemoryStore::load(&paths).unwrap();
+        let base = "dirge uses SQLite for long term persistent memory storage and retrieval";
+        store.add_entry("memory", base, None).unwrap();
+        store
+            .add_entry(
+                "memory",
+                "dirge uses SQLite for long term persistent memory storage and retrieval system",
+                None,
+            )
+            .unwrap();
+        drop(store);
+
+        let mut curator = MemoryCurator::new(&paths).unwrap();
+        curator.graduation_enabled = false;
+        let report = curator.run_mechanical_pass().unwrap();
+        assert!(report.graduated.is_empty(), "disabled → no graduation");
+
+        let conn = crate::extras::memory_db::raw_conn(&paths);
+        let ledger_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM graduation_ledger", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ledger_rows, 0, "disabled → no ledger rows");
     }
 }

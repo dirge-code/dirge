@@ -111,6 +111,7 @@ pub fn spawn_post_session(
     paths: ProjectPaths,
     digest: crate::agent::session_digest::SessionDigest,
     base: String,
+    graduation_enabled: bool,
 ) {
     tokio::spawn(async move {
         // dirge-ba0m: at most one orchestrator in flight per
@@ -154,7 +155,11 @@ pub fn spawn_post_session(
             ),
             (
                 "memory-curator",
-                Box::pin(stage_memory_curator(agent.clone(), paths.clone())),
+                Box::pin(stage_memory_curator(
+                    agent.clone(),
+                    paths.clone(),
+                    graduation_enabled,
+                )),
             ),
         ];
         run_stages_sequentially(stages, STAGE_TIMEOUT).await;
@@ -234,7 +239,7 @@ async fn stage_skills_curator(agent: AnyAgent, paths: ProjectPaths) {
 /// mechanical pass (off-thread, reconcile + stale identification),
 /// then the LLM consolidation pass if it surfaced stale
 /// candidates. Gated by the curator's own 7-day `should_run_now`.
-async fn stage_memory_curator(agent: AnyAgent, paths: ProjectPaths) {
+async fn stage_memory_curator(agent: AnyAgent, paths: ProjectPaths, graduation_enabled: bool) {
     let paths_for_blocking = paths.clone();
     let mechanical_report = tokio::task::spawn_blocking(move || {
         let mut curator =
@@ -252,6 +257,7 @@ async fn stage_memory_curator(agent: AnyAgent, paths: ProjectPaths) {
         if !curator.should_run_now() {
             return None;
         }
+        curator.graduation_enabled = graduation_enabled;
         match curator.run_mechanical_pass() {
             Ok(report) => {
                 tracing::info!(

@@ -166,5 +166,6 @@ pub(crate) fn apply_review_verdict(
         agent_interject,
         agent_cancel,
         is_running,
+        true,
     )
 }

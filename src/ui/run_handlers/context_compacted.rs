@@ -224,7 +224,13 @@ pub(crate) async fn handle_context_compacted(
         // build the digest on-thread, defer its git subprocess to the task.
         let base = crate::agent::review::build_transcript(ctx.session);
         let digest = crate::agent::session_digest::SessionDigest::from_session(ctx.session);
-        crate::agent::post_session::spawn_post_session(agent.clone(), paths, digest, base);
+        crate::agent::post_session::spawn_post_session(
+            agent.clone(),
+            paths,
+            digest,
+            base,
+            ctx.cfg.memory_graduation.unwrap_or(true),
+        );
     }
     Ok(())
 }

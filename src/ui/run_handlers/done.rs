@@ -521,6 +521,7 @@ pub(crate) async fn finish_done(
             agent_interject,
             agent_cancel,
             is_running,
+            ctx.cfg.memory_graduation.unwrap_or(true),
         )?;
     }
     Ok(())
@@ -547,6 +548,7 @@ pub(crate) fn finalize_idle_turn(
     agent_interject: &mut Option<mpsc::Sender<()>>,
     agent_cancel: &mut Option<mpsc::Sender<()>>,
     is_running: &mut bool,
+    graduation_enabled: bool,
 ) -> anyhow::Result<()> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
     let paths = crate::extras::dirge_paths::ProjectPaths::new(&cwd);
@@ -568,7 +570,13 @@ pub(crate) fn finalize_idle_turn(
     // skills curator, then memory curator, strictly ordered inside ONE detached
     // task so a skill the review creates is flushed before the curator reads it
     // and the three runners never fire concurrently. Fire-and-forget.
-    crate::agent::post_session::spawn_post_session(agent.clone(), paths, digest, base);
+    crate::agent::post_session::spawn_post_session(
+        agent.clone(),
+        paths,
+        digest,
+        base,
+        graduation_enabled,
+    );
 
     // Drain the interjection queue: concatenate all queued messages into one
     // new user turn and launch it against the now-stable agent/cwd. No
