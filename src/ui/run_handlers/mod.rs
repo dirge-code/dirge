@@ -91,6 +91,9 @@ pub(super) struct RunCtx<'a> {
     pub last_user_prompt: &'a mut String,
     pub cli: &'a Cli,
     pub cfg: &'a Config,
+    /// Editor follow-along dedup: the last (abs_path, line) opened
+    /// so repeated reads don't spawn a burst of editor processes.
+    pub last_editor_follow: &'a mut Option<(String, Option<usize>)>,
     /// In-flight `/plan` workflow state (P3e-b). `Some` while a phased run is
     /// mid-flight so the `Done` handler runs the reviewer loop after the
     /// implement turn; `None` on the normal single-agent path.

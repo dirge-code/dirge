@@ -8,6 +8,7 @@ mod chat_state;
 pub(crate) mod colors;
 pub(crate) mod compaction;
 pub(crate) mod done_phase;
+mod editor_follow;
 pub(crate) mod events;
 pub(crate) mod gitstatus;
 mod highlight;
@@ -568,6 +569,7 @@ pub async fn run_interactive(
                 last_user_prompt: &mut ui.last_user_prompt,
                 cli,
                 cfg,
+                last_editor_follow: &mut ui.last_editor_follow,
                 active_plan: &mut ui.active_plan,
             }
         };

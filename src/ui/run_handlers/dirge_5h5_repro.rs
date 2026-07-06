@@ -202,6 +202,7 @@ fn make_ctx<'a>(
         last_user_prompt: &mut state.last_user_prompt,
         cli,
         cfg,
+        last_editor_follow: &mut state.last_editor_follow,
         active_plan: &mut state.active_plan,
     }
 }
@@ -226,6 +227,7 @@ struct State {
     expand_target: crate::ui::state::ExpandTarget,
     expansion_anchor: Option<(usize, usize, u64)>,
     last_user_prompt: String,
+    last_editor_follow: Option<(String, Option<usize>)>,
     active_plan: Option<crate::agent::plan::runtime::ActivePlan>,
 }
 
@@ -249,6 +251,7 @@ impl State {
             expand_target: crate::ui::state::ExpandTarget::None,
             expansion_anchor: None,
             last_user_prompt: String::new(),
+            last_editor_follow: None,
             active_plan: None,
         }
     }

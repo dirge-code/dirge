@@ -183,6 +183,10 @@ pub(crate) struct UiState {
     /// place instead of leaving a frozen snapshot. Cleared on collapse, on a
     /// new turn, or when the expansion targets a completed burst / tool output.
     pub(crate) live_thinking_expanded: bool,
+    /// Editor follow-along dedup: the last (abs_path, line) opened via
+    /// `editor_open_command` so we don't spawn a burst of editor processes
+    /// for repeated reads of the same file.
+    pub(crate) last_editor_follow: Option<(String, Option<usize>)>,
 
     // ── User toggles ─────────────────────────────────────────────────
     pub(crate) show_reasoning: bool,
@@ -427,6 +431,7 @@ impl UiState {
             expand_target: ExpandTarget::None,
             expansion_anchor: None,
             live_thinking_expanded: false,
+            last_editor_follow: None,
 
             show_reasoning: false,
             todo_tools_enabled: false,

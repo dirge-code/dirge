@@ -6,6 +6,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- External editor for composing messages: `Ctrl+G` or `/edit` opens `$EDITOR`
+  with the current input buffer and replaces it on save. Thanks @blob42 (#592).
+- Opt-in editor follow-along: set `editor_open_command` (a `{path}`/`{line}`
+  template, e.g. `zed {path}:{line}` or `code --goto {path}:{line}`) and dirge
+  opens the file it's reading/editing in your GUI editor — detached and
+  non-blocking, so the editor follows along like Zed's AI panel. Off by
+  default; deduped so repeat reads don't spawn a burst (#572).
+
 ## [0.18.4] - 2026-07-05
 
 ### Fixed

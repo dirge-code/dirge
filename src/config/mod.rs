@@ -652,6 +652,14 @@ pub struct Config {
     #[cfg(feature = "mcp")]
     pub mcp_servers: Option<HashMap<String, McpServerConfig>>,
 
+    /// Opt-in editor follow-along: a command template with `{path}` and
+    /// `{line}` placeholders. When set, dirge opens files it reads or
+    /// edits in this external GUI editor (detached, non-blocking), so
+    /// the editor "follows along" like Zed's AI panel.
+    /// Example: `"zed {path}:{line}"` or `"code --goto {path}:{line}"`.
+    /// `None` (default) disables the feature entirely.
+    pub editor_open_command: Option<String>,
+
     /// ACP server config map when compiled with the `acp` feature.
     /// Used by the editor-integration server; dirge's ACP transport
     /// is stdio-only — the TCP / Unix-socket forms live here for

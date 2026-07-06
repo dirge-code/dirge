@@ -136,5 +136,21 @@ pub(crate) fn handle_tool_call(
     );
     // Note: on-tool-start fires from HookedToolDyn now, around the actual
     // tool invocation — the UI no longer dispatches it here.
+
+    // ── Editor follow-along (best-effort, opt-in) ─────────────────
+    if let Some(template) = &ctx.cfg.editor_open_command
+        && !template.trim().is_empty()
+        && let Some((path, line)) = crate::ui::editor_follow::file_target_for_tool(name, args)
+    {
+        let cwd = ctx.session.working_dir.as_str();
+        let abs_path = crate::permission::checker::resolve_absolute(&path, cwd);
+        let target = (abs_path.clone(), line);
+        if *ctx.last_editor_follow != Some(target.clone()) {
+            let argv = crate::ui::editor_follow::build_editor_open_argv(template, &abs_path, line);
+            crate::ui::editor_follow::spawn_editor_follow(&argv);
+            *ctx.last_editor_follow = Some(target);
+        }
+    }
+
     Ok(())
 }

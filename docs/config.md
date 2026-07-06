@@ -118,6 +118,7 @@ Accepted top-level keys:
 | `memory`                  | object  | Long-term memory retrieval tuning. See [Hybrid memory retrieval](#hybrid-memory-retrieval) below. Absent = the builtin BM25 store. |
 | `mcp_servers`             | object  | MCP server map when compiled with the `mcp` feature. When omitted, defaults to a single Exa Web Search server; see below.                                                   |
 | `acp_servers`             | object  | ACP server config map when compiled with the `acp` feature. See the ACP section below.                                                                                       |
+| `editor_open_command`     | string  | Opt-in editor follow-along: a command template with `{path}` and `{line}` placeholders (e.g. `"zed {path}:{line}"`, `"code --goto {path}:{line}"`). When set, dirge opens files it reads or edits in this external GUI editor, detached and non-blocking — the editor "follows along" like Zed's AI panel. `None` (unset) disables the feature entirely. |
 
 ### Context window & compaction
 
