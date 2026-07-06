@@ -819,13 +819,22 @@ pub async fn run_interactive(
                                     _ => QStep::Stay,
                                 }
                             } else {
-                                // Option-select.
-                                match key.code {
-                                    KeyCode::Up | KeyCode::Char('k') => {
+                                // Option-select. Decision is pure (dirge-72h2);
+                                // this arm just applies it to the state.
+                                let action = option_select_action(
+                                    key.code,
+                                    multi,
+                                    custom,
+                                    q.cursor,
+                                    num_options,
+                                    q.custom_text.is_some(),
+                                );
+                                match action {
+                                    OptionAction::CursorUp => {
                                         q.cursor = q.cursor.saturating_sub(1);
                                         QStep::Stay
                                     }
-                                    KeyCode::Down | KeyCode::Char('j') => {
+                                    OptionAction::CursorDown => {
                                         let max = if custom {
                                             num_options
                                         } else {
@@ -836,18 +845,27 @@ pub async fn run_interactive(
                                         }
                                         QStep::Stay
                                     }
-                                    KeyCode::Enter => {
-                                        if custom && q.cursor == num_options {
-                                            // Enter free-form custom-text entry.
-                                            renderer
-                                                .write_line("  enter your answer:", c_perm())?;
-                                            let input_anchor = renderer.buffer_len();
-                                            q.entry = Some(state::CustomEntry {
-                                                buf: String::new(),
-                                                input_anchor,
-                                            });
-                                            QStep::Stay
-                                        } else if multi {
+                                    OptionAction::Toggle => {
+                                        if q.cursor < num_options {
+                                            q.selected[q.cursor] = !q.selected[q.cursor];
+                                        }
+                                        QStep::Stay
+                                    }
+                                    OptionAction::OpenEntry => {
+                                        // Free-form custom-text entry, seeded
+                                        // with any existing answer so it can be
+                                        // edited rather than retyped.
+                                        renderer.write_line("  enter your answer:", c_perm())?;
+                                        let input_anchor = renderer.buffer_len();
+                                        let seed = q.custom_text.clone().unwrap_or_default();
+                                        q.entry = Some(state::CustomEntry {
+                                            buf: seed,
+                                            input_anchor,
+                                        });
+                                        QStep::Stay
+                                    }
+                                    OptionAction::Confirm => {
+                                        if multi {
                                             let mut picked: Vec<String> = question
                                                 .options
                                                 .iter()
@@ -869,25 +887,16 @@ pub async fn run_interactive(
                                                 QStep::Next
                                             }
                                         } else {
+                                            // Confirm only ever lands on an
+                                            // option row for single-select
+                                            // (the custom row maps to OpenEntry).
                                             let label = question.options[q.cursor].label.clone();
                                             q.answers.push(vec![label]);
                                             QStep::Next
                                         }
                                     }
-                                    KeyCode::Char(' ') => {
-                                        if multi && q.cursor < num_options {
-                                            q.selected[q.cursor] = !q.selected[q.cursor];
-                                            QStep::Stay
-                                        } else if !multi && q.cursor < num_options {
-                                            let label = question.options[q.cursor].label.clone();
-                                            q.answers.push(vec![label]);
-                                            QStep::Next
-                                        } else {
-                                            QStep::Stay
-                                        }
-                                    }
-                                    KeyCode::Esc => QStep::Rejected,
-                                    _ => QStep::Stay,
+                                    OptionAction::Reject => QStep::Rejected,
+                                    OptionAction::Ignore => QStep::Stay,
                                 }
                             }
                         };
@@ -4766,6 +4775,83 @@ enum QStep {
     Rejected,
 }
 
+/// dirge-72h2: the effect of one keystroke on the option-select view of a
+/// question modal. Pure (unit-tested); the event loop maps it onto the
+/// `QuestionState` and rendering. `cursor == num_options` addresses the
+/// "(custom)" row when the question allows a custom answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OptionAction {
+    /// Move the cursor up one row (caller clamps).
+    CursorUp,
+    /// Move the cursor down one row (caller clamps).
+    CursorDown,
+    /// Multi-select: toggle the checkbox on the current option row.
+    Toggle,
+    /// Open the free-form custom-answer editor (seeded with any existing
+    /// custom text so it can be edited rather than retyped).
+    OpenEntry,
+    /// Finalize the current question: single-select picks the cursor row's
+    /// option; multi-select collects the checked options plus custom text.
+    Confirm,
+    /// Esc — reject the whole questionnaire.
+    Reject,
+    /// Keystroke does nothing in this view.
+    Ignore,
+}
+
+/// Map a keystroke to an [`OptionAction`]. The tricky case this encodes is
+/// the multi-select "(custom)" row: Enter opens the editor while nothing has
+/// been typed, but once a custom answer exists Enter *confirms* (matching the
+/// "Enter confirm" footer) instead of re-opening the editor forever; Space
+/// (re)opens the editor so the answer can be edited in place.
+fn option_select_action(
+    key: KeyCode,
+    multi: bool,
+    custom: bool,
+    cursor: usize,
+    num_options: usize,
+    has_custom_text: bool,
+) -> OptionAction {
+    let on_custom_row = custom && cursor == num_options;
+    match key {
+        KeyCode::Up | KeyCode::Char('k') => OptionAction::CursorUp,
+        KeyCode::Down | KeyCode::Char('j') => OptionAction::CursorDown,
+        KeyCode::Esc => OptionAction::Reject,
+        KeyCode::Enter => {
+            if on_custom_row {
+                // Single-select: Enter always opens the editor (typing then
+                // auto-submits). Multi-select: open only when empty; once
+                // there is custom text, Enter confirms the questionnaire.
+                if !multi || !has_custom_text {
+                    OptionAction::OpenEntry
+                } else {
+                    OptionAction::Confirm
+                }
+            } else {
+                // Option row: single-select picks it, multi-select confirms
+                // the whole set.
+                OptionAction::Confirm
+            }
+        }
+        KeyCode::Char(' ') => {
+            if on_custom_row {
+                // (Re)open the custom editor to type or edit the answer.
+                OptionAction::OpenEntry
+            } else if cursor < num_options {
+                if multi {
+                    OptionAction::Toggle
+                } else {
+                    // Single-select has no checkboxes; Space picks like Enter.
+                    OptionAction::Confirm
+                }
+            } else {
+                OptionAction::Ignore
+            }
+        }
+        _ => OptionAction::Ignore,
+    }
+}
+
 /// #387 follow-up: write a question's header + soft-wrapped stem and
 /// return the buffer index where its option block begins (the `anchor`
 /// the dispatcher `replace_from`s on every keystroke). Extracted from the
@@ -4849,12 +4935,16 @@ fn render_question_options(
             });
         }
     }
+    let footer = if !multi {
+        "  ↑↓ navigate  Enter select  Esc reject all"
+    } else if custom && cursor == num_options {
+        // On the custom row Space edits the answer rather than toggling.
+        "  ↑↓ navigate  Space edit  Enter confirm  Esc reject all"
+    } else {
+        "  ↑↓ navigate  Space toggle  Enter confirm  Esc reject all"
+    };
     lines.push(LineEntry {
-        text: compact_str::CompactString::new(if multi {
-            "  ↑↓ navigate  Space toggle  Enter confirm  Esc reject all"
-        } else {
-            "  ↑↓ navigate  Enter select  Esc reject all"
-        }),
+        text: compact_str::CompactString::new(footer),
         color: c_perm(),
     });
     renderer.replace_from(anchor, lines);

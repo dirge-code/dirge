@@ -1032,3 +1032,122 @@ fn shell_overlay_rows_collapses_cursor_redraws() {
     // The stale selection must not linger anywhere on the screen.
     assert!(!lines.iter().any(|l| l.contains("GitHub.com")));
 }
+
+// ============================================================
+// option_select_action — question-modal keystroke mapping (dirge-72h2)
+// ============================================================
+
+use crossterm::event::KeyCode as KC;
+
+// Multi-select, cursor on an option row.
+
+#[test]
+fn opt_multi_space_toggles_option() {
+    // Space on an option row toggles its checkbox.
+    let a = option_select_action(KC::Char(' '), true, true, 0, 3, false);
+    assert_eq!(a, OptionAction::Toggle);
+}
+
+#[test]
+fn opt_multi_enter_on_option_confirms() {
+    let a = option_select_action(KC::Enter, true, true, 1, 3, false);
+    assert_eq!(a, OptionAction::Confirm);
+}
+
+// Multi-select, cursor on the (custom) row.
+
+#[test]
+fn opt_multi_custom_row_enter_opens_editor_when_empty() {
+    // No custom text yet: Enter starts typing.
+    let a = option_select_action(KC::Enter, true, true, 3, 3, false);
+    assert_eq!(a, OptionAction::OpenEntry);
+}
+
+#[test]
+fn opt_multi_custom_row_enter_confirms_once_text_entered() {
+    // The bug: after typing a custom answer, Enter must confirm — not
+    // re-open the editor forever.
+    let a = option_select_action(KC::Enter, true, true, 3, 3, true);
+    assert_eq!(a, OptionAction::Confirm);
+}
+
+#[test]
+fn opt_multi_custom_row_space_reopens_editor() {
+    // Space on the custom row (re)opens the editor to edit the answer,
+    // whether or not text already exists.
+    assert_eq!(
+        option_select_action(KC::Char(' '), true, true, 3, 3, false),
+        OptionAction::OpenEntry
+    );
+    assert_eq!(
+        option_select_action(KC::Char(' '), true, true, 3, 3, true),
+        OptionAction::OpenEntry
+    );
+}
+
+// Single-select.
+
+#[test]
+fn opt_single_enter_on_option_confirms() {
+    let a = option_select_action(KC::Enter, false, false, 2, 4, false);
+    assert_eq!(a, OptionAction::Confirm);
+}
+
+#[test]
+fn opt_single_space_on_option_confirms() {
+    // Single-select has no checkboxes: Space picks the option like Enter.
+    let a = option_select_action(KC::Char(' '), false, false, 2, 4, false);
+    assert_eq!(a, OptionAction::Confirm);
+}
+
+#[test]
+fn opt_single_custom_row_enter_opens_editor() {
+    // Single-select custom row always opens the editor (typing auto-submits).
+    let a = option_select_action(KC::Enter, false, true, 4, 4, false);
+    assert_eq!(a, OptionAction::OpenEntry);
+}
+
+// Navigation / rejection, shared across modes.
+
+#[test]
+fn opt_arrow_and_vim_navigation() {
+    assert_eq!(
+        option_select_action(KC::Up, true, true, 1, 3, false),
+        OptionAction::CursorUp
+    );
+    assert_eq!(
+        option_select_action(KC::Char('k'), true, true, 1, 3, false),
+        OptionAction::CursorUp
+    );
+    assert_eq!(
+        option_select_action(KC::Down, true, true, 1, 3, false),
+        OptionAction::CursorDown
+    );
+    assert_eq!(
+        option_select_action(KC::Char('j'), true, true, 1, 3, false),
+        OptionAction::CursorDown
+    );
+}
+
+#[test]
+fn opt_esc_rejects() {
+    assert_eq!(
+        option_select_action(KC::Esc, true, true, 0, 3, false),
+        OptionAction::Reject
+    );
+}
+
+#[test]
+fn opt_unhandled_key_is_ignored() {
+    assert_eq!(
+        option_select_action(KC::Tab, true, true, 0, 3, false),
+        OptionAction::Ignore
+    );
+}
+
+#[test]
+fn opt_space_off_options_without_custom_is_ignored() {
+    // No custom row and cursor somehow at num_options: Space does nothing.
+    let a = option_select_action(KC::Char(' '), true, false, 3, 3, false);
+    assert_eq!(a, OptionAction::Ignore);
+}
