@@ -354,7 +354,10 @@ impl BuiltinAllowPolicy {
 
             // Execute / Network / Mcp / Agent (recursive task) / Plugin
             // are never builtin-allowed; Other (unknown) falls to
-            // configured rules or the default.
+            // configured rules or the default. Safe-bash defaults
+            // (git status/log/diff, cargo, test runners, …) live in
+            // `default_bash_rules()` as configured rules, deliberately
+            // distinct from this policy.
             Operation::Execute
             | Operation::Network
             | Operation::Mcp

@@ -510,6 +510,44 @@ mod tests {
         }
     }
 
+    /// dirge-k265: review modes deny the file-mutating tools + webfetch,
+    /// but must NOT deny `bash` — a whole-tool bash deny (precedence #1)
+    /// pre-empts the read-only-git default rules, so the reviewer couldn't
+    /// even run `git diff`. Effectful bash is instead governed by the normal
+    /// Ask path (default_bash_rules + approval_provider), not a hard wall.
+    #[test]
+    fn review_prompts_deny_writes_but_allow_bash_inspection() {
+        for file in ["review.md", "review-security.md"] {
+            let raw = EMBEDDED
+                .get_file(file)
+                .and_then(|f| f.contents_utf8())
+                .unwrap_or_else(|| panic!("embedded {file} present"));
+            let p = parse_frontmatter(raw);
+            for required in ["edit", "write", "apply_patch", "webfetch"] {
+                assert!(
+                    p.deny_tools
+                        .iter()
+                        .any(|d| d.eq_ignore_ascii_case(required)),
+                    "{file} must deny {required:?}; deny_tools = {:?}",
+                    p.deny_tools,
+                );
+            }
+            assert!(
+                !p.deny_tools.iter().any(|d| d.eq_ignore_ascii_case("bash")),
+                "{file} must NOT deny bash (blocks read-only git); deny_tools = {:?}",
+                p.deny_tools,
+            );
+            for d in &p.deny_tools {
+                assert!(
+                    crate::agent::tools::BUILTIN_TOOL_NAMES
+                        .iter()
+                        .any(|k| k.eq_ignore_ascii_case(d)),
+                    "{file} deny_tools entry {d:?} isn't a known built-in (would warn at load)",
+                );
+            }
+        }
+    }
+
     #[test]
     fn frontmatter_tolerates_quoted_tool_names_and_whitespace() {
         let raw = "---\ndeny_tools: [ \"edit\" , 'write' ,  bash ]\n---\nbody\n";

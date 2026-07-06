@@ -10,12 +10,12 @@ restrictions enforced at the permission layer. Switch at runtime with
 |--------|-------------|
 | **`code`** (default) | Coding mode with full tool access, TDD workflow |
 | **`plan`** | Planning-only mode — `edit`/`write`/`apply_patch`/`bash`/`webfetch` are denied at the permission layer (via `deny_tools` frontmatter). Plan is delivered as the chat reply; the user saves it to disk if desired. |
-| **`review`** | Code review mode — same deny list as plan; findings delivered in chat |
+| **`review`** | Code review mode — `edit`/`write`/`apply_patch`/`webfetch` denied, but `bash` stays so the reviewer can inspect read-only (`git diff`, `git log`, `grep`); effectful commands still prompt. Findings delivered in chat |
 | **`debug`** | Debug mode — finds root cause before proposing fixes |
 | **`ask`** | Read-only mode — `edit`/`write`/`apply_patch`/`bash`/`webfetch` denied via deny_tools |
 | **`brainstorm`** | Design-only mode — explores ideas and presents designs without code |
 | **`frontend-design`** | Frontend design mode — distinctive, production-grade UI |
-| **`review-security`** | Security review mode — same deny list as plan/review; finds exploitable vulnerabilities |
+| **`review-security`** | Security review mode — same deny list as `review` (`bash` kept for read-only inspection); finds exploitable vulnerabilities |
 | **`simplify`** | Code simplification mode — refines for clarity without changing behavior |
 | **`write-prompt`** | Prompt writing mode — creates and optimizes agent prompts |
 | **`default`** | Default system prompt — the base built-in prompt |
