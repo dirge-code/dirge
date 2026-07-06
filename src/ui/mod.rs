@@ -2347,17 +2347,11 @@ pub async fn run_interactive(
                                 // stopped before the editor process spawns.
                                 #[cfg(unix)]
                                 let external_editor_active = input.is_external_editor_key(&key);
+                                // `None` (no /dev/tty — can't suspend) falls through to
+                                // handle_key, which reports the failure via notification.
                                 #[cfg(unix)]
                                 let _drained_stdin = if external_editor_active {
-                                    match terminal::suspend_tui_for_subprocess(&user_tx) {
-                                        Some(d) => Some(d),
-                                        None => {
-                                            // No /dev/tty — can't suspend. Fall through
-                                            // to handle_key which will report the error
-                                            // via notification.
-                                            None
-                                        }
-                                    }
+                                    terminal::suspend_tui_for_subprocess(&user_tx)
                                 } else {
                                     None
                                 };

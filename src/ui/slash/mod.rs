@@ -668,6 +668,7 @@ pub async fn handle_slash(
         "/learn" => return cmd::learn::cmd_learn(&mut ctx, &parts).await,
         "/code-review" => cmd::code_review::cmd_code_review(&mut ctx).await?,
         "/cd" => cmd::cd::cmd_cd(&mut ctx, text).await?,
+        #[cfg(unix)]
         "/edit" => return Ok(SlashOutcome::DeferExternalEditor),
         "/undo" => cmd::undo::cmd_undo(&mut ctx).await?,
         "/retry" => cmd::retry::cmd_retry(&mut ctx).await?,
