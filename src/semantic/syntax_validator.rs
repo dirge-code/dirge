@@ -721,6 +721,73 @@ pub fn repair_delimiters(path: &Path, content: &str) -> Option<(String, String)>
     Some((repaired, note))
 }
 
+/// Mechanically remove a TRAILING run of extra closing delimiters — the
+/// symmetric partner of [`repair_delimiters`] for the over-close case (the
+/// model appended too many `)`, the exact "diff -1 / one extra closer" loop
+/// dirge-1m36 was filed for).
+///
+/// Safety mirrors the unclosed path:
+/// - Fires only when the imbalance is a stray closer (over-close), never an
+///   unclosed opener (that is [`repair_delimiters`]) or a mismatched pair.
+/// - Removes ONLY the last non-whitespace char, and ONLY when it is a closer
+///   AND the file is still over-closed. The moment balancing would require
+///   removing a NON-closer — i.e. the stray closer is MID-FILE with real code
+///   after it — it aborts and leaves the precise summary for the model. That
+///   is the structural guard: a mid-file stray is never silently removed
+///   (removing it would change what the trailing forms belong to).
+/// - Re-lexes after every removal, so a `)` inside a string / `\)` char
+///   literal is never miscounted, and re-validates the final result with
+///   [`check_syntax`]; returns only if clean.
+fn repair_overclose(path: &Path, content: &str) -> Option<(String, String)> {
+    let rules = lex_rules_for_path(path)?;
+    // Only the over-close case; unclosed / mismatched are handled elsewhere.
+    if !matches!(
+        delimiter_balance(content, rules),
+        DelimiterBalance::Stray(..)
+    ) {
+        return None;
+    }
+    const MAX_REMOVE: usize = 256;
+    let mut cur = content.to_string();
+    let mut removed = 0usize;
+    loop {
+        match delimiter_balance(&cur, rules) {
+            DelimiterBalance::Balanced => break,
+            DelimiterBalance::Stray(..) => {
+                if removed >= MAX_REMOVE {
+                    return None;
+                }
+                let end = cur.trim_end().len();
+                if end == 0 {
+                    return None;
+                }
+                // Only remove a genuine trailing closer. If the last real char
+                // is anything else, the extra closer is mid-file — abort and
+                // let the precise delimiter summary guide the model.
+                if !matches!(cur.as_bytes()[end - 1], b')' | b']' | b'}') {
+                    return None;
+                }
+                cur.remove(end - 1); // ASCII closer → char boundary
+                removed += 1;
+            }
+            // Removing trailing closers turned it unclosed → not a clean
+            // trailing over-close; leave it.
+            DelimiterBalance::Unclosed(_) => return None,
+        }
+    }
+    if removed == 0 {
+        return None;
+    }
+    if check_syntax(path, &cur).is_err() {
+        return None;
+    }
+    let note = format!(
+        "auto-removed {removed} extra trailing closing delimiter(s) to balance the file. \
+         If that placement is wrong, resend the corrected text."
+    );
+    Some((cur, note))
+}
+
 /// Validate `content`; on a delimiter imbalance, try a mechanical close
 /// before giving up. The single entry point the edit tools call.
 pub enum SyntaxOutcome {
@@ -738,15 +805,25 @@ pub enum SyntaxOutcome {
 pub fn validate_or_repair(path: &Path, content: &str) -> SyntaxOutcome {
     match check_syntax(path, content) {
         Ok(()) => SyntaxOutcome::Clean,
-        Err(errors) => match repair_delimiters(path, content) {
-            Some((repaired, note)) => SyntaxOutcome::Repaired {
-                content: repaired,
-                note,
-            },
-            None => SyntaxOutcome::Rejected {
-                message: format_errors(path, content, &errors),
-            },
-        },
+        Err(errors) => {
+            // Try the unclosed (append) repair, then the over-close (trailing
+            // remove) repair; both are conservative and re-validated.
+            if let Some((repaired, note)) = repair_delimiters(path, content) {
+                SyntaxOutcome::Repaired {
+                    content: repaired,
+                    note,
+                }
+            } else if let Some((repaired, note)) = repair_overclose(path, content) {
+                SyntaxOutcome::Repaired {
+                    content: repaired,
+                    note,
+                }
+            } else {
+                SyntaxOutcome::Rejected {
+                    message: format_errors(path, content, &errors),
+                }
+            }
+        }
     }
 }
 
@@ -906,6 +983,84 @@ int main(void) {
         );
     }
 
+    // ── Mechanical over-close repair (dirge-1m36) ────────────────
+
+    #[test]
+    fn repair_removes_single_trailing_extra_closer() {
+        let path = PathBuf::from("/tmp/x.janet");
+        let (repaired, note) =
+            repair_overclose(&path, "(defn f [x]\n  (+ x 1))\n)").expect("trailing extra closer");
+        assert_eq!(repaired, "(defn f [x]\n  (+ x 1))\n");
+        assert!(check_syntax(&path, &repaired).is_ok());
+        assert!(note.contains("auto-removed 1"), "note: {note}");
+    }
+
+    #[test]
+    fn repair_removes_run_of_trailing_extra_closers() {
+        let path = PathBuf::from("/tmp/x.janet");
+        // The exact failure mode: a pile of extra closers at EOF.
+        let (repaired, _) =
+            repair_overclose(&path, "(let [o (* py w)])))))))").expect("many extras");
+        assert_eq!(repaired, "(let [o (* py w)])");
+        assert!(check_syntax(&path, &repaired).is_ok());
+    }
+
+    #[test]
+    fn repair_overclose_rejects_mid_file_stray() {
+        // `(a))` then real code after the extra `)` — removing a trailing
+        // closer would break `(b)` before fixing the mid-file stray, so we
+        // must abort and leave the precise summary for the model.
+        let path = PathBuf::from("/tmp/x.janet");
+        assert!(
+            repair_overclose(&path, "(a))\n(b)").is_none(),
+            "mid-file stray must not be auto-removed"
+        );
+    }
+
+    #[test]
+    fn repair_overclose_ignores_unclosed_and_balanced() {
+        let path = PathBuf::from("/tmp/x.janet");
+        assert!(repair_overclose(&path, "(a) (b)").is_none(), "balanced");
+        assert!(repair_overclose(&path, "(a (b").is_none(), "unclosed");
+    }
+
+    #[test]
+    fn repair_overclose_does_not_touch_closer_in_string_or_char() {
+        let path = PathBuf::from("/tmp/x.janet");
+        // The real content ends in a string containing `)`; the ONE extra
+        // closer is after it. The string's `)` must survive.
+        let (repaired, _) =
+            repair_overclose(&path, "(def x \"a)b\"))").expect("one trailing extra");
+        assert_eq!(repaired, "(def x \"a)b\")");
+        assert!(check_syntax(&path, &repaired).is_ok());
+    }
+
+    #[test]
+    fn validate_or_repair_repairs_trailing_overclose() {
+        let path = PathBuf::from("/tmp/x.janet");
+        match validate_or_repair(&path, "(+ 1 2))") {
+            SyntaxOutcome::Repaired { content, note } => {
+                assert_eq!(content, "(+ 1 2)");
+                assert!(note.contains("auto-removed"));
+            }
+            _ => panic!("expected Repaired for a trailing over-close"),
+        }
+    }
+
+    #[test]
+    fn validate_or_repair_rejects_mid_file_stray_with_location() {
+        let path = PathBuf::from("/tmp/x.janet");
+        match validate_or_repair(&path, "(a))\n(b)") {
+            SyntaxOutcome::Rejected { message } => {
+                assert!(
+                    message.contains("unexpected") && message.contains("line"),
+                    "reject must localize the stray: {message}"
+                );
+            }
+            _ => panic!("expected Rejected for a mid-file stray"),
+        }
+    }
+
     #[test]
     fn repair_ignores_delimiters_in_strings_and_comments() {
         // The `)` in the string and the `)` in the `#` comment must NOT be
@@ -1009,12 +1164,19 @@ int main(void) {
             validate_or_repair(&path, "fn main() {\n  let x = 1;\n"),
             SyntaxOutcome::Repaired { .. }
         ));
-        // Stray closer → unrepairable → rejected with the summary.
-        match validate_or_repair(&path, "fn main() {}}\n") {
+        // A TRAILING over-close (extra `}` at EOF) is now mechanically
+        // removed (dirge-1m36), symmetric with the unclosed append.
+        assert!(matches!(
+            validate_or_repair(&path, "fn main() {}}\n"),
+            SyntaxOutcome::Repaired { .. }
+        ));
+        // A MID-FILE stray (real code after the extra `}`) is still rejected
+        // with the localized summary — auto-removing it would be unsafe.
+        match validate_or_repair(&path, "fn a() {}}\nfn b() {}\n") {
             SyntaxOutcome::Rejected { message } => {
                 assert!(message.contains("Syntax check failed"), "{message}")
             }
-            _ => panic!("stray closer must be rejected, not repaired"),
+            _ => panic!("mid-file stray closer must be rejected, not repaired"),
         }
     }
 
