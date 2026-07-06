@@ -8,6 +8,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tool::McpTool;
 
+use crate::agent::agent_loop::types::InjectionScanMode;
 use crate::permission::ask::AskSender;
 use crate::permission::checker::PermCheck;
 
@@ -183,6 +184,7 @@ impl McpClientManager {
                     reconnect_lock: reconnect_lock.clone(),
                     permission: permission.clone(),
                     ask_tx: ask_tx.clone(),
+                    injection_scan_mode: InjectionScanMode::default(),
                 });
             }
         }

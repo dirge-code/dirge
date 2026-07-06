@@ -186,6 +186,52 @@ impl CodeReviewMode {
     }
 }
 
+/// How the ingestion-time injection scanner handles untrusted tool results.
+/// Resolved from `config.injection_scan` — see
+/// [`crate::config::Config::resolve_injection_scan_mode`].
+///
+/// - `Off` — no scanning, results pass through unchanged. Only use when you
+///   are certain every tool result is trusted (e.g. a sandboxed internal
+///   codebase).
+/// - `Advisory` *(default)* — scan every untrusted result and fence positive
+///   hits with a `<system-reminder>` warning. The body is still shown so the
+///   model sees the content but is structurally warned.
+/// - `Block` — same as Advisory, but when ≥2 high-severity findings are
+///   present the body is withheld entirely (replaced with a quarantine
+///   notice). The tool result still succeeds — the model knows the tool
+///   executed but the output was quarantined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InjectionScanMode {
+    Off,
+    #[default]
+    Advisory,
+    Block,
+}
+
+impl InjectionScanMode {
+    /// Lowercase wire name matching `resolve_injection_scan_mode`'s vocabulary.
+    #[allow(dead_code)]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            InjectionScanMode::Off => "off",
+            InjectionScanMode::Advisory => "advisory",
+            InjectionScanMode::Block => "block",
+        }
+    }
+
+    /// Parse a wire value (case-insensitive, trimmed). Empty string is
+    /// treated as `Advisory` (the default). Returns `None` for an
+    /// unrecognized non-empty value so callers can warn + fall back.
+    pub fn from_wire(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "" | "advisory" => Some(InjectionScanMode::Advisory),
+            "off" => Some(InjectionScanMode::Off),
+            "block" => Some(InjectionScanMode::Block),
+            _ => None,
+        }
+    }
+}
+
 /// Loop configuration. Port of pi `AgentLoopConfig` (types.ts:135).
 ///
 /// Phase 1 lands the subset of hooks `stream_assistant_response`

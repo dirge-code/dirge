@@ -572,6 +572,13 @@ pub struct Config {
     /// per-prompt; only meaningful when a `critic_provider` is set. See
     /// [`resolve_code_review_mode`](Self::resolve_code_review_mode).
     pub code_review: Option<String>,
+    /// How the ingestion-time injection scanner handles untrusted tool
+    /// results (read, MCP, websearch). One of `off` / `advisory` / `block`
+    /// (case-insensitive, trimmed). `advisory` *(default)* fences positive
+    /// hits with a warning; `block` additionally withholds the body when
+    /// ≥2 high-severity findings are present. `off` skips scanning
+    /// entirely. See [`resolve_injection_scan_mode`].
+    pub injection_scan: Option<String>,
     /// dirge-0g6i: optional provider for LLM auto-approval. When set, a
     /// permission prompt is routed to this model (with a safety prompt)
     /// which replies ALLOW/DENY instead of asking the human. Unset
@@ -783,6 +790,29 @@ impl Config {
                  (valid: off | advisory | blocking)"
             );
             CodeReviewMode::Advisory
+        })
+    }
+
+    /// Resolve the ingestion-time injection scan mode from
+    /// [`injection_scan`](Self::injection_scan): `off`/`advisory`/`block`,
+    /// parsed case-insensitively and trimmed. `None` and an empty value
+    /// resolve to the safe default `Advisory`. An unrecognized non-empty
+    /// value also resolves to `Advisory` but logs a warning.
+    pub fn resolve_injection_scan_mode(
+        &self,
+    ) -> crate::agent::agent_loop::types::InjectionScanMode {
+        use crate::agent::agent_loop::types::InjectionScanMode;
+        let Some(raw) = self.injection_scan.as_deref() else {
+            return InjectionScanMode::default();
+        };
+        InjectionScanMode::from_wire(raw).unwrap_or_else(|| {
+            tracing::warn!(
+                target: "dirge::config",
+                value = raw.trim(),
+                "unrecognized `injection_scan` value; falling back to `advisory` \
+                 (valid: off | advisory | block)"
+            );
+            InjectionScanMode::Advisory
         })
     }
 
@@ -1364,6 +1394,54 @@ mod tests {
         // it falls back to Advisory (the safe, non-disabling default).
         let cfg: Config = serde_json::from_str(r#"{ "code_review": "nuclear" }"#).unwrap();
         assert_eq!(cfg.resolve_code_review_mode(), CodeReviewMode::Advisory);
+    }
+
+    #[test]
+    fn injection_scan_field_absent_and_parses() {
+        let cfg: Config = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(cfg.injection_scan.is_none());
+
+        let cfg: Config = serde_json::from_str(r#"{ "injection_scan": "block" }"#).unwrap();
+        assert_eq!(cfg.injection_scan.as_deref(), Some("block"));
+    }
+
+    #[test]
+    fn resolve_injection_scan_mode_each_string_and_default() {
+        use crate::agent::agent_loop::types::InjectionScanMode;
+
+        let mk = |raw: &str| {
+            Config::deserialize(serde_json::json!({ "injection_scan": raw }))
+                .unwrap()
+                .resolve_injection_scan_mode()
+        };
+        assert_eq!(mk("off"), InjectionScanMode::Off);
+        assert_eq!(mk("OFF"), InjectionScanMode::Off);
+        assert_eq!(mk("  Block  "), InjectionScanMode::Block);
+        assert_eq!(mk("advisory"), InjectionScanMode::Advisory);
+
+        // Absent / empty → default Advisory.
+        let cfg: Config = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(
+            cfg.resolve_injection_scan_mode(),
+            InjectionScanMode::Advisory
+        );
+        let cfg: Config = serde_json::from_str(r#"{ "injection_scan": "   " }"#).unwrap();
+        assert_eq!(
+            cfg.resolve_injection_scan_mode(),
+            InjectionScanMode::Advisory
+        );
+    }
+
+    #[test]
+    fn resolve_injection_scan_mode_unknown_warns_and_defaults() {
+        use crate::agent::agent_loop::types::InjectionScanMode;
+        // An unrecognized non-empty value must NOT silently map to Off —
+        // it falls back to Advisory (the safe default).
+        let cfg: Config = serde_json::from_str(r#"{ "injection_scan": "nuclear" }"#).unwrap();
+        assert_eq!(
+            cfg.resolve_injection_scan_mode(),
+            InjectionScanMode::Advisory
+        );
     }
 
     /// Cross-session Up-arrow history depth: absent by default (→3),

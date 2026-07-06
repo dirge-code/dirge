@@ -351,6 +351,7 @@ pub async fn build_loop_tools(
     let mut tools: Vec<Arc<dyn LoopTool>> = Vec::new();
 
     // Read-only — leave at default (Parallel).
+    let injection_scan = cfg.resolve_injection_scan_mode();
     tools.push(
         wrap(
             tools::ReadTool::with_cache(
@@ -359,7 +360,8 @@ pub async fn build_loop_tools(
                 cache.clone(),
                 #[cfg(feature = "lsp")]
                 lsp_manager.clone(),
-            ),
+            )
+            .with_injection_scan(injection_scan),
             None,
         )
         .await,
@@ -655,7 +657,8 @@ pub async fn build_loop_tools(
         let key = crate::config::exa_api_key();
         tools.push(
             wrap(
-                tools::WebSearchTool::new(permission.clone(), ask_tx.clone(), key),
+                tools::WebSearchTool::new(permission.clone(), ask_tx.clone(), key)
+                    .with_injection_scan(injection_scan),
                 None,
             )
             .await,
@@ -736,7 +739,7 @@ pub async fn build_loop_tools(
             if shadows_builtin(&name, &format!("MCP server '{}'", mcp_tool.server_name)) {
                 continue;
             }
-            tools.push(wrap(mcp_tool, None).await);
+            tools.push(wrap(mcp_tool.with_injection_scan(injection_scan), None).await);
         }
     }
 

@@ -2,7 +2,9 @@ use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use serde::Deserialize;
 
+use crate::agent::agent_loop::types::InjectionScanMode;
 use crate::agent::tools::{AskSender, PermCheck, ToolError, check_perm};
+use crate::extras::content_guard::guard_untrusted_result;
 
 /// One result returned by the DuckDuckGo HTML fallback. The Exa
 /// path returns a single pre-formatted string (Exa formats the
@@ -27,6 +29,8 @@ pub struct WebSearchTool {
     /// Review #10: previously read per-call via `std::env::var`,
     /// inconsistent with how `exa_key` was captured.
     parallel_key: Option<String>,
+    /// Ingestion-time injection scan mode for websearch results (dirge-5ig9).
+    pub injection_scan_mode: InjectionScanMode,
 }
 
 impl WebSearchTool {
@@ -50,7 +54,14 @@ impl WebSearchTool {
             ask_tx,
             exa_key,
             parallel_key,
+            injection_scan_mode: InjectionScanMode::default(),
         }
+    }
+
+    /// Set the injection scan mode (dirge-5ig9). Chain after construction.
+    pub fn with_injection_scan(mut self, mode: InjectionScanMode) -> Self {
+        self.injection_scan_mode = mode;
+        self
     }
 }
 
@@ -158,17 +169,18 @@ impl Tool for WebSearchTool {
         // never silently breaks.
         let exa_key = self.exa_key.as_deref();
         let parallel_key = self.parallel_key.as_deref();
+        let mode = self.injection_scan_mode;
 
         let primary_result = call_provider(&client, primary, exa_key, parallel_key, &args).await;
         if let Ok(text) = primary_result {
-            return Ok(text);
+            return Ok(guard_untrusted_result(text, "web search", mode));
         }
         let primary_err = primary_result.unwrap_err();
 
         let secondary_result =
             call_provider(&client, secondary, exa_key, parallel_key, &args).await;
         if let Ok(text) = secondary_result {
-            return Ok(text);
+            return Ok(guard_untrusted_result(text, "web search", mode));
         }
         let secondary_err = secondary_result.unwrap_err();
 
@@ -177,7 +189,7 @@ impl Tool for WebSearchTool {
         // the user can diagnose without chasing the wrong cause
         // (review #7 — was only `primary_err` before).
         match duckduckgo_search(&client, &args).await {
-            Ok(text) => Ok(text),
+            Ok(text) => Ok(guard_untrusted_result(text, "web search", mode)),
             Err(ddg_err) => Err(ToolError::Msg(format!(
                 "all websearch backends failed — primary ({primary:?}): {primary_err}; secondary ({secondary:?}): {secondary_err}; ddg: {ddg_err}"
             ))),

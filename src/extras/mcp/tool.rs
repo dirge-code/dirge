@@ -12,7 +12,9 @@ use rmcp::ServiceError;
 use rmcp::model::{CallToolRequestParams, JsonObject, RawContent};
 use tokio::sync::Mutex;
 
+use crate::agent::agent_loop::types::InjectionScanMode;
 use crate::agent::tools::check_perm;
+use crate::extras::content_guard::guard_untrusted_result;
 use crate::extras::mcp::client::{SharedConnection, raw_connect};
 use crate::extras::mcp::config::McpServerConfig;
 use crate::permission::ask::AskSender;
@@ -56,6 +58,16 @@ pub struct McpTool {
     pub reconnect_lock: Arc<Mutex<u64>>,
     pub permission: Option<PermCheck>,
     pub ask_tx: Option<AskSender>,
+    /// Ingestion-time injection scan mode for MCP results (dirge-5ig9).
+    pub injection_scan_mode: InjectionScanMode,
+}
+
+impl McpTool {
+    /// Set the injection scan mode (dirge-5ig9).
+    pub fn with_injection_scan(mut self, mode: InjectionScanMode) -> Self {
+        self.injection_scan_mode = mode;
+        self
+    }
 }
 
 /// Classify a [`ServiceError`] as transport-class (worth reconnecting)
@@ -149,6 +161,7 @@ impl ToolDyn for McpTool {
         let reconnect_lock = self.reconnect_lock.clone();
         let permission = self.permission.clone();
         let ask_tx = self.ask_tx.clone();
+        let injection_scan_mode = self.injection_scan_mode;
 
         Box::pin(async move {
             // Adversarial-review finding #1: MCP tools pass the
@@ -330,7 +343,7 @@ impl ToolDyn for McpTool {
                     MCP_RESULT_CAP_BYTES, server_name, tool_name,
                 ));
             }
-            Ok(content)
+            Ok(guard_untrusted_result(content, "MCP", injection_scan_mode))
         })
     }
 }
