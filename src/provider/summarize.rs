@@ -152,11 +152,17 @@ fn oneshot_provider_kind(model: &super::AnyModel) -> &'static str {
 /// provider has no disable knob, already defaults to no-thinking (Anthropic), or
 /// where forcing it risks rejecting a valid request (OpenAI o-series has no
 /// "off", and non-reasoning GPT models already don't think).
+///
+/// Hosted DeepSeek and GLM APIs use the `thinking:{type:"disabled"}` toggle;
+/// self-hosted vLLM / SGLang backends (opencode, custom, openrouter) use the
+/// `chat_template_kwargs` convention instead.
 fn reasoning_disable_for_kind(kind: &str) -> Option<serde_json::Value> {
     match kind {
-        // vLLM / SGLang / DeepSeek-V3.1 convention for the hybrid models these
-        // OpenAI-compatible endpoints serve.
-        "deepseek" | "glm" | "opencode" | "custom" | "openrouter" => {
+        // Hosted DeepSeek / GLM: disable via the thinking-API toggle.
+        "deepseek" | "glm" => Some(serde_json::json!({ "thinking": { "type": "disabled" } })),
+        // Self-hosted vLLM / SGLang backends (opencode/custom/openrouter): the
+        // chat_template_kwargs convention.
+        "opencode" | "custom" | "openrouter" => {
             Some(serde_json::json!({ "chat_template_kwargs": { "thinking": false } }))
         }
         // Ollama's native per-request toggle.
@@ -289,9 +295,16 @@ mod tests {
 
     #[test]
     fn reasoning_disable_shapes_per_provider() {
-        // OpenAI-compatible hybrids (incl. ds4-style custom endpoints) get the
-        // chat_template_kwargs toggle.
-        for kind in ["deepseek", "glm", "custom", "openrouter"] {
+        // Hosted DeepSeek / GLM: thinking:{type:"disabled"} toggle.
+        for kind in ["deepseek", "glm"] {
+            assert_eq!(
+                reasoning_disable_for_kind(kind),
+                Some(serde_json::json!({ "thinking": { "type": "disabled" } })),
+                "{kind} should disable thinking via thinking:{{type:disabled}}",
+            );
+        }
+        // Self-hosted vLLM / SGLang backends: chat_template_kwargs convention.
+        for kind in ["opencode", "custom", "openrouter"] {
             assert_eq!(
                 reasoning_disable_for_kind(kind),
                 Some(serde_json::json!({ "chat_template_kwargs": { "thinking": false } })),

@@ -588,10 +588,13 @@ pub fn loop_tool_to_rig_definition(tool: &dyn LoopTool) -> ToolDefinition {
 ///     "budget_tokens": N } }` for budget-based reasoning. Pi's
 ///     adaptive-thinking effort mode (Opus 4.6+, Sonnet 4.6) is
 ///     a follow-up — needs model-id sniffing.
-///   - "openai" / "deepseek" / "glm" / "custom" (all
-///     openai-shaped): `{ "reasoning": { "effort": "low" |
-///     "medium" | "high" } }` per OpenAI Responses spec. Maps
-///     ThinkingLevel:
+///   - "deepseek": `{ "reasoning_effort": "low" | "medium" |
+///     "high" | "max" }` — top-level string, not nested inside
+///     `reasoning`. DeepSeek's hosted API supports a "max" tier
+///     above "high".
+///   - "openai" / "glm" / "custom" (all openai-shaped):
+///     `{ "reasoning": { "effort": "low" | "medium" | "high" } }`
+///     per OpenAI Responses spec. Maps ThinkingLevel:
 ///       - Off / Minimal / Low → "low"
 ///       - Medium → "medium"
 ///       - High / Xhigh → "high"
@@ -635,7 +638,15 @@ pub fn build_provider_additional_params(
                     );
                 }
             }
-            Some("openai" | "deepseek" | "glm" | "custom" | "openrouter") => {
+            Some("deepseek") => {
+                // DeepSeek's hosted API honors a top-level
+                // `reasoning_effort` string (not nested inside
+                // `reasoning`). Supports "max" tier above "high".
+                if let Some(effort) = thinking_level_to_deepseek_effort(level) {
+                    additional.insert("reasoning_effort".to_string(), serde_json::json!(effort));
+                }
+            }
+            Some("openai" | "glm" | "custom" | "openrouter") => {
                 // OpenAI Responses / openai-compat reasoning.
                 if let Some(effort) = thinking_level_to_openai_effort(level) {
                     additional.insert(
@@ -730,6 +741,21 @@ fn thinking_level_to_openai_effort(level: super::types::ThinkingLevel) -> Option
         TL::Minimal | TL::Low => Some("low"),
         TL::Medium => Some("medium"),
         TL::High | TL::Xhigh => Some("high"),
+    }
+}
+
+/// DeepSeek's hosted API honors a top-level `reasoning_effort` string and
+/// supports a "max" tier above "high" (which OpenAI rejects). Verified:
+/// low→max gives a clean ~2x reasoning-depth separation, whereas the
+/// nested `reasoning:{effort}` shape is ignored.
+fn thinking_level_to_deepseek_effort(level: super::types::ThinkingLevel) -> Option<&'static str> {
+    use super::types::ThinkingLevel as TL;
+    match level {
+        TL::Off => None,
+        TL::Minimal | TL::Low => Some("low"),
+        TL::Medium => Some("medium"),
+        TL::High => Some("high"),
+        TL::Xhigh => Some("max"),
     }
 }
 
@@ -1258,12 +1284,35 @@ mod tests {
         }
     }
 
-    /// DeepSeek, GLM, OpenRouter, Custom share OpenAI's
-    /// effort-based reasoning shape.
+    /// DeepSeek gets top-level `reasoning_effort` string (not
+    /// nested inside `reasoning`).
+    #[test]
+    fn deepseek_reasoning_maps_to_top_level_effort() {
+        for (level, expected) in [
+            (ThinkingLevel::Low, "low"),
+            (ThinkingLevel::Medium, "medium"),
+            (ThinkingLevel::High, "high"),
+            (ThinkingLevel::Xhigh, "max"),
+        ] {
+            let opts = opts_with_reasoning(level);
+            let v = build_provider_additional_params(Some("deepseek"), &opts).unwrap();
+            assert_eq!(
+                v["reasoning_effort"], expected,
+                "deepseek level {level:?} should map to top-level reasoning_effort={expected}"
+            );
+            assert!(
+                v.get("reasoning").is_none(),
+                "deepseek must not have nested reasoning key for level {level:?}"
+            );
+        }
+    }
+
+    /// GLM, Custom, OpenRouter share OpenAI's nested
+    /// effort-based reasoning shape (deepseek is separate).
     #[test]
     fn openai_compat_providers_share_effort_shape() {
         let opts = opts_with_reasoning(ThinkingLevel::Medium);
-        for provider in ["deepseek", "glm", "custom", "openrouter"] {
+        for provider in ["glm", "custom", "openrouter"] {
             let v = build_provider_additional_params(Some(provider), &opts).unwrap();
             assert_eq!(
                 v["reasoning"]["effort"], "medium",
@@ -1291,6 +1340,39 @@ mod tests {
         let opts = opts_with_reasoning(ThinkingLevel::Off);
         let v = build_provider_additional_params(Some("openai"), &opts);
         assert!(v.is_none());
+    }
+
+    /// DeepSeek Off → no reasoning_effort key.
+    #[test]
+    fn deepseek_off_omits_reasoning_effort() {
+        let opts = opts_with_reasoning(ThinkingLevel::Off);
+        let v = build_provider_additional_params(Some("deepseek"), &opts);
+        assert!(v.is_none());
+    }
+
+    /// Unit-test every ThinkingLevel → deepseek effort mapping.
+    #[test]
+    fn thinking_level_to_deepseek_effort_all_variants() {
+        use crate::agent::agent_loop::types::ThinkingLevel as TL;
+        assert_eq!(thinking_level_to_deepseek_effort(TL::Off), None);
+        assert_eq!(thinking_level_to_deepseek_effort(TL::Minimal), Some("low"));
+        assert_eq!(thinking_level_to_deepseek_effort(TL::Low), Some("low"));
+        assert_eq!(
+            thinking_level_to_deepseek_effort(TL::Medium),
+            Some("medium")
+        );
+        assert_eq!(thinking_level_to_deepseek_effort(TL::High), Some("high"));
+        assert_eq!(thinking_level_to_deepseek_effort(TL::Xhigh), Some("max"));
+    }
+
+    /// OpenAI with High reasoning still returns the nested
+    /// `{"reasoning":{"effort":"high"}}` shape (unchanged).
+    #[test]
+    fn openai_high_still_uses_nested_reasoning_effort() {
+        let opts = opts_with_reasoning(ThinkingLevel::High);
+        let v = build_provider_additional_params(Some("openai"), &opts).unwrap();
+        assert_eq!(v["reasoning"]["effort"], "high");
+        assert!(v.get("reasoning_effort").is_none());
     }
 
     /// Gemini uses `thinking_config: { thinking_budget }`
