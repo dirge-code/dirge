@@ -101,6 +101,14 @@ pub struct AnyAgent {
     /// `code_review` front-matter wins over `Config::code_review`) and
     /// forwarded to `LoopConfig.code_review_mode`. Defaults to `Advisory`.
     code_review_mode: crate::agent::agent_loop::types::CodeReviewMode,
+    /// How the open-issues finalization gate engages. Resolved in
+    /// `build_agent` from `Config::resolve_open_issues_gate_mode`;
+    /// forwarded to `LoopConfig.open_issues_gate_mode`. Defaults to `Off`
+    /// (opt-in — nagging is intrusive).
+    open_issues_gate_mode: crate::agent::agent_loop::types::GateMode,
+    /// Active session id forwarded to `LoopConfig.session_id` for the
+    /// open-issues gate and session-scoped tools. `None` in sub-runners.
+    session_id: Option<String>,
     /// Goal gate's judge callback. Built at `build_agent` time from the
     /// same critic provider as `critic_fn` but baking its own
     /// `GOAL_PREAMBLE`; forwarded to `LoopConfig.goal_fn`. `None` = off.
@@ -207,6 +215,8 @@ impl AnyAgent {
             critic_fn: None,
             code_review_fn: None,
             code_review_mode: crate::agent::agent_loop::types::CodeReviewMode::default(),
+            open_issues_gate_mode: crate::agent::agent_loop::types::GateMode::Off,
+            session_id: None,
             goal_fn: None,
             goal: None,
             summarize_fn: None,
@@ -388,6 +398,21 @@ impl AnyAgent {
         code_review_mode: crate::agent::agent_loop::types::CodeReviewMode,
     ) -> Self {
         self.code_review_mode = code_review_mode;
+        self
+    }
+
+    /// dirge-ksjl: set the open-issues finalization gate mode.
+    pub fn with_open_issues_gate_mode(
+        mut self,
+        mode: crate::agent::agent_loop::types::GateMode,
+    ) -> Self {
+        self.open_issues_gate_mode = mode;
+        self
+    }
+
+    /// dirge-ksjl: attach the active session id.
+    pub fn with_session_id(mut self, session_id: Option<String>) -> Self {
+        self.session_id = session_id;
         self
     }
 

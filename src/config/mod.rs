@@ -572,6 +572,15 @@ pub struct Config {
     /// per-prompt; only meaningful when a `critic_provider` is set. See
     /// [`resolve_code_review_mode`](Self::resolve_code_review_mode).
     pub code_review: Option<String>,
+    /// How the open-issues finalization gate engages. One of `off` /
+    /// `advisory` / `blocking` (case-insensitive, trimmed). `off` *(default
+    /// — unlike code-review, this gate is opt-in because nagging is
+    /// intrusive)* emits nothing. `advisory` surfaces a one-shot
+    /// `SystemNotice` when this session left issues open. `blocking`
+    /// re-enters the loop (bounded) so the agent can't finish until it
+    /// closes or defers its session-scoped issues. See
+    /// [`resolve_open_issues_gate_mode`](Self::resolve_open_issues_gate_mode).
+    pub open_issues_gate: Option<String>,
     /// How the ingestion-time injection scanner handles untrusted tool
     /// results (read, MCP, websearch). One of `off` / `advisory` / `block`
     /// (case-insensitive, trimmed). `advisory` *(default)* fences positive
@@ -790,6 +799,30 @@ impl Config {
                  (valid: off | advisory | blocking)"
             );
             CodeReviewMode::Advisory
+        })
+    }
+
+    /// [`open_issues_gate`](Self::open_issues_gate): `off`/`advisory`/`blocking`,
+    /// parsed case-insensitively and trimmed. `None` and an empty value
+    /// resolve to `Off` (opt-in — nagging is intrusive). An unrecognized
+    /// non-empty value also resolves to `Off` but logs a warning.
+    pub fn resolve_open_issues_gate_mode(&self) -> crate::agent::agent_loop::types::GateMode {
+        use crate::agent::agent_loop::types::GateMode;
+        let Some(raw) = self.open_issues_gate.as_deref() else {
+            return GateMode::Off;
+        };
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return GateMode::Off;
+        }
+        GateMode::from_wire(trimmed).unwrap_or_else(|| {
+            tracing::warn!(
+                target: "dirge::config",
+                value = trimmed,
+                "unrecognized `open_issues_gate` value; falling back to `off` \
+                 (valid: off | advisory | blocking)"
+            );
+            GateMode::Off
         })
     }
 
@@ -1385,6 +1418,35 @@ mod tests {
         assert_eq!(cfg.resolve_code_review_mode(), CodeReviewMode::Advisory);
         let cfg: Config = serde_json::from_str(r#"{ "code_review": "   " }"#).unwrap();
         assert_eq!(cfg.resolve_code_review_mode(), CodeReviewMode::Advisory);
+    }
+
+    #[test]
+    fn resolve_open_issues_gate_mode_each_string_and_default() {
+        use crate::agent::agent_loop::types::GateMode;
+
+        let mk = |raw: &str| {
+            Config::deserialize(serde_json::json!({ "open_issues_gate": raw }))
+                .unwrap()
+                .resolve_open_issues_gate_mode()
+        };
+        assert_eq!(mk("off"), GateMode::Off);
+        assert_eq!(mk("OFF"), GateMode::Off);
+        assert_eq!(mk("  Blocking  "), GateMode::Blocking);
+        assert_eq!(mk("advisory"), GateMode::Advisory);
+
+        // Absent / empty → default Off (opt-in, unlike code-review).
+        let cfg: Config = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(cfg.resolve_open_issues_gate_mode(), GateMode::Off);
+        let cfg: Config = serde_json::from_str(r#"{ "open_issues_gate": "   " }"#).unwrap();
+        assert_eq!(cfg.resolve_open_issues_gate_mode(), GateMode::Off);
+    }
+
+    #[test]
+    fn resolve_open_issues_gate_mode_unknown_warns_and_defaults() {
+        use crate::agent::agent_loop::types::GateMode;
+        // Unrecognized → Off (safe; nagging is intrusive).
+        let cfg: Config = serde_json::from_str(r#"{ "open_issues_gate": "nuclear" }"#).unwrap();
+        assert_eq!(cfg.resolve_open_issues_gate_mode(), GateMode::Off);
     }
 
     #[test]

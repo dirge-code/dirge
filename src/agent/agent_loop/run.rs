@@ -53,7 +53,7 @@ use super::message::{
 use super::storm::StormBreaker;
 use super::stream::{StreamFn, stream_assistant_response};
 use super::tool::AbortSignal;
-use super::types::{CodeReviewMode, Context, LoopConfig};
+use super::types::{CodeReviewMode, Context, GateMode, LoopConfig};
 use crate::sync_util::LockExt;
 
 /// Phase 4 part 2: poll the configured `get_steering_messages`
@@ -133,6 +133,10 @@ fn storm_for_config(config: &LoopConfig) -> StormBreaker {
 /// cycle.
 const MAX_TODO_NUDGES: u8 = 3;
 
+/// Upper bound on consecutive open-issues nudges, so the agent can't loop
+/// forever if it can't or won't close the remaining issues.
+const MAX_OPEN_ISSUES_NUDGES: u8 = 2;
+
 /// Consecutive errored tool results before the failure tracker injects a
 /// recovery checkpoint. Tuned low — the tool-repair literature finds the
 /// gains from corrective reflection concentrate over the first few
@@ -165,6 +169,9 @@ enum FollowUpSource {
     Goal,
     /// Unfinished-todo nudge (bounded by [`MAX_TODO_NUDGES`]).
     Todo,
+    /// Open-issues nudge — this session left tracked issues open
+    /// (bounded by [`MAX_OPEN_ISSUES_NUDGES`]).
+    OpenIssues,
     /// No gate fired — the run may finalize.
     None,
 }
@@ -174,6 +181,10 @@ enum FollowUpSource {
 /// injected as a user-role message so the model responds, but it isn't user
 /// input [dirge-i75f].
 pub(crate) const TODO_NUDGE_TAG: &str = "[todo]";
+
+/// Display tag prefixing the open-issues nudge, so the UI can strip it and
+/// attribute the injected message to the system rather than the user.
+pub(crate) const OPEN_ISSUES_NUDGE_TAG: &str = "[open-issues]";
 
 /// Display tag prefixing the resume-after-failure nudge, so the UI can strip
 /// it and attribute the injected message to the system rather than the user.
@@ -263,6 +274,11 @@ async fn poll_finalization_follow_up(
     goal_reacts: &mut u8,
     todo_nudges: &mut u8,
     resume_nudges: &mut u8,
+    // dirge-ksjl: open-issues gate — session-scoped issue count nudge.
+    open_issues_gate_mode: GateMode,
+    issue_db_path: Option<&std::path::Path>,
+    session_id: Option<&str>,
+    open_issues_nudges: &mut u8,
     emit: &mpsc::Sender<LoopEvent>,
 ) -> (Vec<LoopMessage>, FollowUpSource) {
     // 1. Caller hook (pi lines 256-262) — highest priority.
@@ -466,6 +482,90 @@ async fn poll_finalization_follow_up(
         if unfinished > 0 {
             *todo_nudges += 1;
             return (vec![todo_nudge_message(unfinished)], FollowUpSource::Todo);
+        }
+    }
+    // 5. dirge-ksjl — open-issues gate: nudge when this session left issues
+    //    open. Session-scoped (not the global board), lowest priority.
+    //    Advisory emits a one-shot SystemNotice; blocking re-enters the loop
+    //    bounded by MAX_OPEN_ISSUES_NUDGES.
+    if open_issues_gate_mode != GateMode::Off
+        && let Some(db_path) = issue_db_path
+    {
+        // Clone to PathBuf for 'static spawn_blocking captures.
+        let db_path_buf = db_path.to_path_buf();
+        let session_owned = session_id.map(|s| s.to_string());
+        let count = tokio::task::spawn_blocking(move || {
+            crate::extras::issue_db::IssueStore::open_at(&db_path_buf)
+                .ok()
+                .and_then(|store| {
+                    store
+                        .board_for_session(session_owned.as_deref(), None)
+                        .ok()
+                        .map(|issues| issues.len())
+                })
+                .unwrap_or(0)
+        })
+        .await
+        .unwrap_or(0);
+        if count > 0 {
+            match open_issues_gate_mode {
+                GateMode::Advisory => {
+                    // One-shot notice (fires at most once per run), then fall
+                    // through — does not re-enter the loop.
+                    if *open_issues_nudges == 0 {
+                        *open_issues_nudges += 1;
+                        let _ = emit
+                            .send(LoopEvent::SystemNotice {
+                                content: format!(
+                                    "{count} issue(s) from this session are still open — \
+                                     close or defer them when done."
+                                ),
+                            })
+                            .await;
+                    }
+                }
+                GateMode::Blocking => {
+                    if *open_issues_nudges < MAX_OPEN_ISSUES_NUDGES {
+                        *open_issues_nudges += 1;
+                        // Build the nudge listing up to ~5 open session issue titles.
+                        let db_path_buf2 = db_path.to_path_buf();
+                        let sid = session_id.map(|s| s.to_string());
+                        let titles = tokio::task::spawn_blocking(move || {
+                            crate::extras::issue_db::IssueStore::open_at(&db_path_buf2)
+                                .ok()
+                                .and_then(|store| {
+                                    store.board_for_session(sid.as_deref(), Some(5)).ok()
+                                })
+                                .unwrap_or_default()
+                                .into_iter()
+                                .map(|i| i.title)
+                                .collect::<Vec<_>>()
+                        })
+                        .await
+                        .unwrap_or_default();
+                        let title_list = if titles.is_empty() {
+                            String::new()
+                        } else {
+                            let mut s = String::from("\n\nStill open:\n");
+                            for t in &titles {
+                                s.push_str(&format!("- {t}\n"));
+                            }
+                            s
+                        };
+                        return (
+                            vec![LoopMessage::User(super::message::UserMessage {
+                                content: format!(
+                                    "{OPEN_ISSUES_NUDGE_TAG} {count} issue(s) you worked on \
+                                     this session are still open. Close the ones you finished \
+                                     (or explicitly defer them), then continue:{title_list}"
+                                ),
+                            })],
+                            FollowUpSource::OpenIssues,
+                        );
+                    }
+                }
+                GateMode::Off => unreachable!("gated above"),
+            }
         }
     }
     (Vec::new(), FollowUpSource::None)
@@ -1314,6 +1414,18 @@ pub async fn run_loop(
     // Deterministic resume-after-failure (bounded by MAX_RESUME_NUDGE).
     let mut resume_nudges: u8 = 0;
 
+    // dirge-ksjl: open-issues gate counter (bounded by MAX_OPEN_ISSUES_NUDGES).
+    let mut open_issues_nudges: u8 = 0;
+
+    // Compute the issue db path once for both the issue-board reminder and
+    // the open-issues gate. Fail-open: absent db → None, gate is inert.
+    let issue_db_path: Option<std::path::PathBuf> = {
+        let p = std::env::current_dir()
+            .map(|c| crate::extras::dirge_paths::ProjectPaths::new(&c).session_db_path())
+            .unwrap_or_else(|_| std::path::PathBuf::from(".dirge/sessions/state.db"));
+        std::fs::metadata(&p).ok().map(|_| p)
+    };
+
     'outer: loop {
         // Storm: fresh intent on each new user turn.
         // Port of Reasonix loop.ts:621 `this.repair.resetStorm()`.
@@ -2098,6 +2210,10 @@ pub async fn run_loop(
             &mut goal_reacts,
             &mut todo_nudges,
             &mut resume_nudges,
+            config.open_issues_gate_mode,
+            issue_db_path.as_deref(),
+            config.session_id.as_deref(),
+            &mut open_issues_nudges,
             emit,
         )
         .await;

@@ -86,6 +86,8 @@ fn build_config() -> LoopConfig {
         critic_fn: None,
         code_review_fn: None,
         code_review_mode: crate::agent::agent_loop::types::CodeReviewMode::default(),
+        open_issues_gate_mode: crate::agent::agent_loop::types::GateMode::Off,
+        session_id: None,
         goal_fn: None,
         goal: None,
         max_turns: None,

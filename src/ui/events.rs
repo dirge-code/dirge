@@ -141,8 +141,8 @@ pub fn format_time(rfc3339: &str) -> CompactString {
 /// scrollback (`render_session`) [dirge-i75f].
 pub(crate) fn finalization_nudge_body(content: &str) -> Option<&str> {
     use crate::agent::agent_loop::{
-        code_review::CODE_REVIEW_TAG, critic::CRITIC_TAG, run::RESUME_NUDGE_TAG,
-        run::TODO_NUDGE_TAG, verifier::VERIFY_TAG,
+        code_review::CODE_REVIEW_TAG, critic::CRITIC_TAG, run::OPEN_ISSUES_NUDGE_TAG,
+        run::RESUME_NUDGE_TAG, run::TODO_NUDGE_TAG, verifier::VERIFY_TAG,
     };
     let trimmed = content.trim_start();
     [
@@ -151,6 +151,7 @@ pub(crate) fn finalization_nudge_body(content: &str) -> Option<&str> {
         TODO_NUDGE_TAG,
         CODE_REVIEW_TAG,
         RESUME_NUDGE_TAG,
+        OPEN_ISSUES_NUDGE_TAG,
     ]
     .into_iter()
     .find_map(|tag| trimmed.strip_prefix(tag).map(str::trim_start))
@@ -486,8 +487,8 @@ mod tests {
     #[test]
     fn finalization_nudge_body_recognizes_all_tags() {
         use crate::agent::agent_loop::{
-            code_review::CODE_REVIEW_TAG, critic::CRITIC_TAG, run::TODO_NUDGE_TAG,
-            verifier::VERIFY_TAG,
+            code_review::CODE_REVIEW_TAG, critic::CRITIC_TAG, run::OPEN_ISSUES_NUDGE_TAG,
+            run::TODO_NUDGE_TAG, verifier::VERIFY_TAG,
         };
         assert_eq!(
             finalization_nudge_body(&format!("{CRITIC_TAG} not done yet")),
@@ -506,6 +507,12 @@ mod tests {
                 "{TODO_NUDGE_TAG} You still have 6 unfinished todos"
             )),
             Some("You still have 6 unfinished todos")
+        );
+        assert_eq!(
+            finalization_nudge_body(&format!(
+                "{OPEN_ISSUES_NUDGE_TAG} 3 issue(s) you worked on this session are still open"
+            )),
+            Some("3 issue(s) you worked on this session are still open")
         );
         // Genuine user input is not a nudge.
         assert_eq!(finalization_nudge_body("fix the parser bug"), None);

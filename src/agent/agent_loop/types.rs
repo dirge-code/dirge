@@ -139,37 +139,31 @@ pub struct TurnUpdate {
     pub thinking_level: Option<ThinkingLevel>,
 }
 
-/// How the diff-aware code reviewer engages at finalization
-/// (dirge-iyf5). Resolved from `config.code_review` with a prompt-level
-/// `code_review` front-matter override winning — see
-/// [`crate::config::Config::resolve_code_review_mode`].
+/// Tri-state gate mode reused by code-review (dirge-iyf5), open-issues
+/// (dirge-ksjl), and any future opt-in finalization gates that need an
+/// on/off/nagging toggle.
 ///
-/// - `Off` — the reviewer is not armed: no diff capture, no judge call,
-///   zero cost.
-/// - `Advisory` *(default)* — the review runs detached in the background
-///   after finalization and surfaces ALL findings (high/critical included)
-///   as a single non-blocking `SystemNotice`. It never re-enters the loop
-///   and never spends the react budget, so a tight debug loop is never
-///   held up waiting on it.
-/// - `Blocking` — the legacy synchronous behaviour: the finalization path
-///   awaits the diff + review, high/critical findings re-enter the loop
-///   (fix or justify), medium/low surface as a one-shot advisory. Bounded
-///   by `code_review::MAX_REVIEW_REACT`.
+/// - `Off` — the gate is not armed: zero cost.
+/// - `Advisory` *(default)* — surface findings/reminders as a non-blocking
+///   `SystemNotice`. It never re-enters the loop and never spends a react
+///   budget, so a tight debug loop is never held up waiting on it.
+/// - `Blocking` — await the gate and re-enter the loop on relevant
+///   findings, bounded by a per-gate react cap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum CodeReviewMode {
+pub enum GateMode {
     Off,
     #[default]
     Advisory,
     Blocking,
 }
 
-impl CodeReviewMode {
+impl GateMode {
     /// Lowercase wire name matching `resolve_code_review_mode`'s vocabulary.
     pub fn as_str(self) -> &'static str {
         match self {
-            CodeReviewMode::Off => "off",
-            CodeReviewMode::Advisory => "advisory",
-            CodeReviewMode::Blocking => "blocking",
+            GateMode::Off => "off",
+            GateMode::Advisory => "advisory",
+            GateMode::Blocking => "blocking",
         }
     }
 
@@ -178,13 +172,17 @@ impl CodeReviewMode {
     /// unrecognized non-empty value so callers can warn + fall back.
     pub fn from_wire(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
-            "" | "advisory" => Some(CodeReviewMode::Advisory),
-            "off" => Some(CodeReviewMode::Off),
-            "blocking" => Some(CodeReviewMode::Blocking),
+            "" | "advisory" => Some(GateMode::Advisory),
+            "off" => Some(GateMode::Off),
+            "blocking" => Some(GateMode::Blocking),
             _ => None,
         }
     }
 }
+
+/// Backwards-compatible alias — every existing `CodeReviewMode::…`
+/// reference resolves to `GateMode::…`.
+pub type CodeReviewMode = GateMode;
 
 /// How the ingestion-time injection scanner handles untrusted tool results.
 /// Resolved from `config.injection_scan` — see
@@ -498,6 +496,16 @@ pub struct LoopConfig {
     /// default is [`CodeReviewMode::Advisory`].
     pub code_review_mode: CodeReviewMode,
 
+    /// How the open-issues finalization gate engages. Default `Off`
+    /// (opt-in). Resolved at `build_agent` time from
+    /// `Config::resolve_open_issues_gate_mode`.
+    pub open_issues_gate_mode: GateMode,
+
+    /// Active session id for the open-issues gate and tools that need
+    /// session-scoping. `None` in review/curator sub-runners and most
+    /// tests — the gate is inert without it.
+    pub session_id: Option<String>,
+
     /// Goal gate's judge callback. Decoupled from `critic_fn`: built at
     /// `build_agent` time from the same critic provider but baking its OWN
     /// `GOAL_PREAMBLE`, so a critic preamble override or a `critic: false`
@@ -669,6 +677,8 @@ impl std::fmt::Debug for LoopConfig {
                 &self.code_review_fn.as_ref().map(|_| "<reviewer>"),
             )
             .field("code_review_mode", &self.code_review_mode)
+            .field("open_issues_gate_mode", &self.open_issues_gate_mode)
+            .field("session_id", &self.session_id)
             .field("goal_fn", &self.goal_fn.as_ref().map(|_| "<judge>"))
             .field("goal", &self.goal)
             .field("max_turns", &self.max_turns)
@@ -714,6 +724,8 @@ impl Clone for LoopConfig {
             critic_fn: self.critic_fn.clone(),
             code_review_fn: self.code_review_fn.clone(),
             code_review_mode: self.code_review_mode,
+            open_issues_gate_mode: self.open_issues_gate_mode,
+            session_id: self.session_id.clone(),
             goal_fn: self.goal_fn.clone(),
             goal: self.goal.clone(),
             max_turns: self.max_turns,
@@ -767,6 +779,8 @@ impl LoopConfig {
             critic_fn: None,
             code_review_fn: None,
             code_review_mode: CodeReviewMode::Advisory,
+            open_issues_gate_mode: GateMode::Off,
+            session_id: None,
             goal_fn: None,
             goal: None,
             max_turns: None,
@@ -898,5 +912,22 @@ mod tests {
                 "Debug impl omits `{field}`\noutput: {rendered}"
             );
         }
+    }
+
+    /// `CodeReviewMode` is a type alias for `GateMode` — they are the same
+    /// type, not a newtype wrapper (dirge-hsvw).
+    #[test]
+    fn code_review_mode_is_gate_mode() {
+        // The alias means these are the SAME type — this compiles only if
+        // CodeReviewMode = GateMode.
+        let _: GateMode = CodeReviewMode::Off;
+        let _: GateMode = CodeReviewMode::Advisory;
+        let _: GateMode = CodeReviewMode::Blocking;
+        let _: CodeReviewMode = GateMode::Off;
+        let _: CodeReviewMode = GateMode::Advisory;
+        let _: CodeReviewMode = GateMode::Blocking;
+        // as_str and from_wire are defined on GateMode.
+        assert_eq!(CodeReviewMode::Advisory.as_str(), "advisory");
+        assert_eq!(CodeReviewMode::from_wire("off"), Some(GateMode::Off));
     }
 }

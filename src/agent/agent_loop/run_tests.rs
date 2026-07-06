@@ -7,7 +7,9 @@ use crate::agent::agent_loop::message::{StreamEvent, UserMessage};
 use crate::agent::agent_loop::result::AfterToolCallResult;
 use crate::agent::agent_loop::stream::StreamFn;
 use crate::agent::agent_loop::tool::{AbortSignal, LoopTool, LoopToolUpdate};
-use crate::agent::agent_loop::types::{ConvertToLlmFn, LoopConfig, ToolExecutionMode, TurnUpdate};
+use crate::agent::agent_loop::types::{
+    ConvertToLlmFn, GateMode, LoopConfig, ToolExecutionMode, TurnUpdate,
+};
 use std::pin::Pin;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -134,6 +136,8 @@ fn build_config() -> LoopConfig {
         critic_fn: None,
         code_review_fn: None,
         code_review_mode: crate::agent::agent_loop::types::CodeReviewMode::default(),
+        open_issues_gate_mode: crate::agent::agent_loop::types::GateMode::Off,
+        session_id: None,
         goal_fn: None,
         goal: None,
         max_turns: None,
@@ -3230,6 +3234,10 @@ async fn finalization_hook_short_circuits_lower_gates() {
         &mut goal_reacts,
         &mut todo_nudges,
         &mut resume_nudges,
+        GateMode::Off,
+        None,
+        None,
+        &mut 0u8,
         &review_emit,
     )
     .await;
@@ -3345,6 +3353,10 @@ async fn finalization_all_gates_silent_yields_none() {
         &mut goal_reacts,
         &mut todo_nudges,
         &mut resume_nudges,
+        GateMode::Off,
+        None,
+        None,
+        &mut 0u8,
         &review_emit,
     )
     .await;
@@ -3383,6 +3395,10 @@ async fn finalization_goal_unmet_reenters_and_counts() {
         &mut goal_reacts,
         &mut todo_nudges,
         &mut resume_nudges,
+        GateMode::Off,
+        None,
+        None,
+        &mut 0u8,
         &review_emit,
     )
     .await;
@@ -3419,6 +3435,10 @@ async fn finalization_goal_met_finalizes() {
         &mut goal_reacts,
         &mut todo_nudges,
         &mut resume_nudges,
+        GateMode::Off,
+        None,
+        None,
+        &mut 0u8,
         &review_emit,
     )
     .await;
@@ -3456,6 +3476,10 @@ async fn finalization_goal_bound_stops_reentry() {
         &mut goal_reacts,
         &mut todo_nudges,
         &mut resume_nudges,
+        GateMode::Off,
+        None,
+        None,
+        &mut 0u8,
         &review_emit,
     )
     .await;
@@ -3490,6 +3514,10 @@ async fn finalization_goal_without_judge_is_inert() {
         &mut goal_reacts,
         &mut todo_nudges,
         &mut resume_nudges,
+        GateMode::Off,
+        None,
+        None,
+        &mut 0u8,
         &review_emit,
     )
     .await;
@@ -3497,6 +3525,314 @@ async fn finalization_goal_without_judge_is_inert() {
     assert!(msgs.is_empty());
     assert_eq!(source, FollowUpSource::None);
     assert_eq!(goal_reacts, 0);
+}
+
+/// Open-issues gate Off → inert (FollowUpSource::None).
+#[tokio::test]
+async fn open_issues_gate_off_is_inert() {
+    let config = build_config();
+    let mut critic_done = true;
+    let mut goal_reacts = 0u8;
+    let mut todo_nudges = MAX_TODO_NUDGES;
+    let mut resume_nudges: u8 = 0;
+    let mut open_issues_nudges: u8 = 0;
+    let mut code_review_reacts = 0u8;
+    let (review_emit, _review_emit_rx) = tokio::sync::mpsc::channel(64);
+
+    // Create a temp DB with open issues for this session.
+    let dir = temp_dir("open-issues-off");
+    let db_path = dir.join("state.db");
+    let store = crate::extras::issue_db::IssueStore::open_at(&db_path).unwrap();
+    let sid = "open-issues-off-sess";
+    store
+        .create("wire up telemetry", "", None, Some(sid))
+        .unwrap();
+
+    let (msgs, source) = poll_finalization_follow_up(
+        &config,
+        "sys",
+        &[],
+        &mut critic_done,
+        &mut code_review_reacts,
+        None,
+        &mut std::collections::HashSet::new(),
+        &std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        &mut goal_reacts,
+        &mut todo_nudges,
+        &mut resume_nudges,
+        GateMode::Off, // opt-out
+        Some(db_path.as_path()),
+        Some(sid),
+        &mut open_issues_nudges,
+        &review_emit,
+    )
+    .await;
+
+    assert!(msgs.is_empty(), "Off mode should be inert");
+    assert_eq!(source, FollowUpSource::None);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Open-issues gate blocking with N session issues open → returns a
+/// `[open-issues]` nudge (FollowUpSource::OpenIssues) listing titles.
+#[tokio::test]
+async fn open_issues_gate_blocking_with_session_open_issues_nudges() {
+    use crate::agent::agent_loop::run::OPEN_ISSUES_NUDGE_TAG;
+    let config = build_config();
+    let mut critic_done = true;
+    let mut goal_reacts = 0u8;
+    let mut todo_nudges = MAX_TODO_NUDGES;
+    let mut resume_nudges: u8 = 0;
+    let mut open_issues_nudges: u8 = 0;
+    let mut code_review_reacts = 0u8;
+    let (review_emit, _review_emit_rx) = tokio::sync::mpsc::channel(64);
+
+    let dir = temp_dir("open-issues-blocking");
+    let db_path = dir.join("state.db");
+    let store = crate::extras::issue_db::IssueStore::open_at(&db_path).unwrap();
+    let sid = "open-issues-blocking-sess";
+    store
+        .create("wire up telemetry", "", None, Some(sid))
+        .unwrap();
+    store
+        .create("add metrics dashboard", "", None, Some(sid))
+        .unwrap();
+
+    let (msgs, source) = poll_finalization_follow_up(
+        &config,
+        "sys",
+        &[],
+        &mut critic_done,
+        &mut code_review_reacts,
+        None,
+        &mut std::collections::HashSet::new(),
+        &std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        &mut goal_reacts,
+        &mut todo_nudges,
+        &mut resume_nudges,
+        GateMode::Blocking,
+        Some(db_path.as_path()),
+        Some(sid),
+        &mut open_issues_nudges,
+        &review_emit,
+    )
+    .await;
+
+    assert_eq!(source, FollowUpSource::OpenIssues);
+    assert_eq!(open_issues_nudges, 1);
+    assert_eq!(msgs.len(), 1);
+    let content = match &msgs[0] {
+        LoopMessage::User(u) => &u.content,
+        _ => panic!("expected User message"),
+    };
+    assert!(
+        content.starts_with(OPEN_ISSUES_NUDGE_TAG),
+        "expected [open-issues] tag, got: {content}"
+    );
+    assert!(content.contains("wire up telemetry"), "{content}");
+    assert!(content.contains("add metrics dashboard"), "{content}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Blocking bound stops re-entry after MAX_OPEN_ISSUES_NUDGES.
+#[tokio::test]
+async fn open_issues_gate_blocking_has_bound() {
+    let config = build_config();
+    let mut critic_done = true;
+    let mut goal_reacts = 0u8;
+    let mut todo_nudges = MAX_TODO_NUDGES;
+    let mut resume_nudges: u8 = 0;
+    let mut open_issues_nudges: u8 = MAX_OPEN_ISSUES_NUDGES; // already at bound
+    let mut code_review_reacts = 0u8;
+    let (review_emit, _review_emit_rx) = tokio::sync::mpsc::channel(64);
+
+    let dir = temp_dir("open-issues-bound");
+    let db_path = dir.join("state.db");
+    let store = crate::extras::issue_db::IssueStore::open_at(&db_path).unwrap();
+    let sid = "open-issues-bound-sess";
+    store
+        .create("wire up telemetry", "", None, Some(sid))
+        .unwrap();
+
+    let (msgs, source) = poll_finalization_follow_up(
+        &config,
+        "sys",
+        &[],
+        &mut critic_done,
+        &mut code_review_reacts,
+        None,
+        &mut std::collections::HashSet::new(),
+        &std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        &mut goal_reacts,
+        &mut todo_nudges,
+        &mut resume_nudges,
+        GateMode::Blocking,
+        Some(db_path.as_path()),
+        Some(sid),
+        &mut open_issues_nudges,
+        &review_emit,
+    )
+    .await;
+
+    assert!(msgs.is_empty(), "bounded gate should be inert");
+    assert_eq!(source, FollowUpSource::None);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Zero open session issues → inert (FollowUpSource::None).
+#[tokio::test]
+async fn open_issues_gate_zero_open_session_issues_is_inert() {
+    let config = build_config();
+    let mut critic_done = true;
+    let mut goal_reacts = 0u8;
+    let mut todo_nudges = MAX_TODO_NUDGES;
+    let mut resume_nudges: u8 = 0;
+    let mut open_issues_nudges: u8 = 0;
+    let mut code_review_reacts = 0u8;
+    let (review_emit, _review_emit_rx) = tokio::sync::mpsc::channel(64);
+
+    let dir = temp_dir("open-issues-zero");
+    let db_path = dir.join("state.db");
+    let _store = crate::extras::issue_db::IssueStore::open_at(&db_path).unwrap();
+    // No issues for this session.
+    let sid = "open-issues-zero-sess";
+
+    let (msgs, source) = poll_finalization_follow_up(
+        &config,
+        "sys",
+        &[],
+        &mut critic_done,
+        &mut code_review_reacts,
+        None,
+        &mut std::collections::HashSet::new(),
+        &std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        &mut goal_reacts,
+        &mut todo_nudges,
+        &mut resume_nudges,
+        GateMode::Blocking,
+        Some(db_path.as_path()),
+        Some(sid),
+        &mut open_issues_nudges,
+        &review_emit,
+    )
+    .await;
+
+    assert!(msgs.is_empty(), "zero open issues should be inert");
+    assert_eq!(source, FollowUpSource::None);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Missing db → inert (fail-open).
+#[tokio::test]
+async fn open_issues_gate_missing_db_is_inert() {
+    let config = build_config();
+    let mut critic_done = true;
+    let mut goal_reacts = 0u8;
+    let mut todo_nudges = MAX_TODO_NUDGES;
+    let mut resume_nudges: u8 = 0;
+    let mut open_issues_nudges: u8 = 0;
+    let mut code_review_reacts = 0u8;
+    let (review_emit, _review_emit_rx) = tokio::sync::mpsc::channel(64);
+
+    let (msgs, source) = poll_finalization_follow_up(
+        &config,
+        "sys",
+        &[],
+        &mut critic_done,
+        &mut code_review_reacts,
+        None,
+        &mut std::collections::HashSet::new(),
+        &std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        &mut goal_reacts,
+        &mut todo_nudges,
+        &mut resume_nudges,
+        GateMode::Blocking,
+        None, // no db
+        Some("some-sess"),
+        &mut open_issues_nudges,
+        &review_emit,
+    )
+    .await;
+
+    assert!(msgs.is_empty(), "missing db should be inert (fail-open)");
+    assert_eq!(source, FollowUpSource::None);
+}
+
+/// Advisory mode emits a SystemNotice when issues are open but does
+/// NOT re-enter the loop.
+#[tokio::test]
+async fn open_issues_gate_advisory_emits_notice_but_does_not_reenter() {
+    let config = build_config();
+    let mut critic_done = true;
+    let mut goal_reacts = 0u8;
+    let mut todo_nudges = MAX_TODO_NUDGES;
+    let mut resume_nudges: u8 = 0;
+    let mut open_issues_nudges: u8 = 0;
+    let mut code_review_reacts = 0u8;
+    let (review_emit, mut review_emit_rx) = tokio::sync::mpsc::channel(64);
+
+    let dir = temp_dir("open-issues-advisory");
+    let db_path = dir.join("state.db");
+    let store = crate::extras::issue_db::IssueStore::open_at(&db_path).unwrap();
+    let sid = "open-issues-advisory-sess";
+    store
+        .create("wire up telemetry", "", None, Some(sid))
+        .unwrap();
+
+    let (msgs, source) = poll_finalization_follow_up(
+        &config,
+        "sys",
+        &[],
+        &mut critic_done,
+        &mut code_review_reacts,
+        None,
+        &mut std::collections::HashSet::new(),
+        &std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        &mut goal_reacts,
+        &mut todo_nudges,
+        &mut resume_nudges,
+        GateMode::Advisory,
+        Some(db_path.as_path()),
+        Some(sid),
+        &mut open_issues_nudges,
+        &review_emit,
+    )
+    .await;
+
+    // Advisory does NOT re-enter (returns empty messages).
+    assert!(msgs.is_empty(), "advisory should not re-enter");
+    assert_eq!(source, FollowUpSource::None);
+    assert_eq!(open_issues_nudges, 1, "counts the advisory");
+
+    // Check that a SystemNotice was emitted.
+    match review_emit_rx.try_recv() {
+        Ok(crate::agent::agent_loop::message::LoopEvent::SystemNotice { content }) => {
+            assert!(
+                content.contains("issue(s) from this session are still open"),
+                "{content}"
+            );
+        }
+        other => panic!("expected SystemNotice, got {other:?}"),
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn temp_dir(suffix: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "dirge-ksjl-{}-{}-{suffix}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
 }
 
 /// A tool that always fails. Distinct args per call so the storm

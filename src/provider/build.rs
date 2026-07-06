@@ -490,6 +490,11 @@ pub async fn build_agent(
         agent = agent.with_context_depth_reminder(threshold);
     }
 
+    // dirge-ksjl — open-issues finalization gate mode, resolved from
+    // config. Default is Off (opt-in; nagging is intrusive).
+    agent = agent.with_open_issues_gate_mode(cfg.resolve_open_issues_gate_mode());
+    agent = agent.with_session_id(session_id);
+
     // dirge-9tfq — install the BackgroundStore on the agent so
     // `spawn_runner` can thread it into `LoopSpawnConfig.bg_store`,
     // wiring the subagent-completion follow-up path. Done after
