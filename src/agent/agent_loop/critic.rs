@@ -22,6 +22,17 @@ use std::sync::Arc;
 use super::message::{LoopMessage, UserMessage};
 use super::verifier::VerificationStatus;
 
+/// Parsed critic verdict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Verdict {
+    /// Work is done, or fail-open (empty/ambiguous response).
+    Complete,
+    /// Concrete issues that must be addressed.
+    Incomplete(String),
+    /// Cannot verify from spec/evidence available — missing info or test.
+    Abstain(String),
+}
+
 /// Truncate `rules` to at most `max` CHARS (not bytes), appending `note`
 /// when truncation happens. Counting by chars stops a multibyte system prompt
 /// from tripping a byte-based cap and being needlessly shortened — the old
@@ -96,15 +107,22 @@ other way. Judge the rest of the work as if that action were correctly deferred 
 - A block marked `[CONTEXT COMPACTION — REFERENCE ONLY]` (or a `## Active Task` lifted from one) \
 describes ALREADY-COMPLETED prior work — never treat it as an outstanding requirement. Judge only \
 the latest request and the transcript.\n\
-- Do NOT invent new requirements, scope, or \"nice to haves\". If you are unsure, PASS — a false \
-block wastes a whole turn.";
+- Do NOT invent new requirements, scope, or \"nice to haves\". If you cannot determine correctness from \
+the spec and evidence available, ABSTAIN — say what's missing (e.g. no test covering this change, \
+unclear acceptance criteria). An abstention is safer than a false pass. If you are unsure whether \
+there's a real gap, PASS — a false block wastes a whole turn.";
 
 /// Response-format instruction. Kept in the user prompt (not the system
 /// preamble) so the verdict shape sits directly beside the transcript.
 const CRITIC_FORMAT: &str = "\
 Respond in EXACTLY this format and nothing else:\n\
-On the first line, either `VERDICT: COMPLETE` or `VERDICT: INCOMPLETE`.\n\
-If INCOMPLETE, follow with a short bullet list of the specific, concrete, in-scope issues to fix.";
+On the first line, one of: `VERDICT: COMPLETE`, `VERDICT: INCOMPLETE`, or `VERDICT: ABSTAIN`.\n\
+- COMPLETE: the work is done and correct.\n\
+- INCOMPLETE: concrete, in-scope gaps remain. Follow with a short bullet list.\n\
+- ABSTAIN: the spec or evidence available is insufficient to judge correctness. \
+Say what test or spec detail is missing (e.g. no test covering the change, \
+acceptance criteria unclear). Do NOT pass: an ABSTAIN is still a block, \
+but one the assistant resolves by adding evidence rather than fixing gaps.";
 
 /// Cap on the instructions/constraints block fed to the critic, so a large
 /// system prompt (tool docs + project context) doesn't balloon the critic
@@ -194,31 +212,43 @@ pub fn build_prompt(
     )
 }
 
-/// Parse the critic's raw response into a verdict. `Some(issues)` means
-/// the critic judged the work incomplete (with the issue text); `None`
-/// means complete — or the response was empty/ambiguous, in which case we
+/// Parse the critic's raw response into a verdict. `Verdict::Complete` means
+/// the work is done — or the response was empty/ambiguous, in which case we
 /// fail OPEN (don't block finalization on a confused critic).
-pub fn parse_verdict(response: &str) -> Option<String> {
+/// `Verdict::Incomplete(issues)` means concrete gaps to fix.
+/// `Verdict::Abstain(missing)` means the critic cannot verify from available
+/// spec/evidence — the model should write a held-out test or clarify the spec.
+///
+/// ORDER of precedence on the first non-empty line: INCOMPLETE > ABSTAIN >
+/// Complete (fail-open). A line containing both INCOMPLETE and ABSTAIN
+/// resolves to Incomplete (the safer, action-forcing state).
+pub fn parse_verdict(response: &str) -> Verdict {
     let trimmed = response.trim();
     if trimmed.is_empty() {
-        return None;
+        return Verdict::Complete;
     }
     // Look at the first non-empty line for the verdict token.
     let first = trimmed.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
     let upper = first.to_ascii_uppercase();
     if upper.contains("INCOMPLETE") {
-        // Everything after the first line is the issue list; fall back to
-        // the whole response if the model put issues on the first line.
         let rest = trimmed
             .split_once('\n')
             .map(|(_, x)| x)
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .unwrap_or(trimmed);
-        Some(rest.to_string())
+        Verdict::Incomplete(rest.to_string())
+    } else if upper.contains("ABSTAIN") || upper.contains("INSUFFICIENT") {
+        let rest = trimmed
+            .split_once('\n')
+            .map(|(_, x)| x)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(trimmed);
+        Verdict::Abstain(rest.to_string())
     } else {
-        // "COMPLETE", or anything that isn't a clear INCOMPLETE → pass.
-        None
+        // "COMPLETE", or anything that isn't a clear INCOMPLETE/ABSTAIN → pass.
+        Verdict::Complete
     }
 }
 
@@ -245,14 +275,21 @@ pub async fn run_critic(
         Vec::new()
     );
     match parse_verdict(&response) {
-        Some(issues) => vec![LoopMessage::User(UserMessage {
+        Verdict::Complete => Vec::new(),
+        Verdict::Incomplete(issues) => vec![LoopMessage::User(UserMessage {
             content: format!(
                 "{CRITIC_TAG} A review of your work found it may not be done yet. Address these \
                  before reporting complete, or explain why they don't apply (e.g. they're out of \
                  scope or something you were told not to do):\n{issues}"
             ),
         })],
-        None => Vec::new(),
+        Verdict::Abstain(missing) => vec![LoopMessage::User(UserMessage {
+            content: format!(
+                "{CRITIC_TAG} A review could not confirm this is correct from the spec and \
+                 evidence available. Rather than assume it's done, add a focused test (or state \
+                 the missing spec detail) that would prove it, then continue.\n{missing}"
+            ),
+        })],
     }
 }
 
@@ -285,24 +322,65 @@ mod tests {
     }
 
     #[test]
-    fn parse_complete_returns_none() {
-        assert!(parse_verdict("VERDICT: COMPLETE").is_none());
-        assert!(parse_verdict("verdict: complete\n(looks good)").is_none());
+    fn parse_complete_returns_complete() {
+        assert_eq!(parse_verdict("VERDICT: COMPLETE"), Verdict::Complete);
+        assert_eq!(
+            parse_verdict("verdict: complete\n(looks good)"),
+            Verdict::Complete
+        );
     }
 
     #[test]
-    fn parse_incomplete_returns_issues() {
+    fn parse_incomplete_returns_incomplete_with_issues() {
         let v = parse_verdict("VERDICT: INCOMPLETE\n- missing test\n- error path unhandled");
-        let issues = v.expect("should be incomplete");
-        assert!(issues.contains("missing test"));
-        assert!(issues.contains("error path"));
+        match v {
+            Verdict::Incomplete(issues) => {
+                assert!(issues.contains("missing test"));
+                assert!(issues.contains("error path"));
+            }
+            other => panic!("expected Incomplete, got {other:?}"),
+        }
     }
 
     #[test]
-    fn parse_empty_or_ambiguous_fails_open() {
-        assert!(parse_verdict("").is_none());
-        assert!(parse_verdict("   \n  ").is_none());
-        assert!(parse_verdict("I think it's probably fine?").is_none());
+    fn parse_empty_or_ambiguous_returns_complete() {
+        assert_eq!(parse_verdict(""), Verdict::Complete);
+        assert_eq!(parse_verdict("   \n  "), Verdict::Complete);
+        assert_eq!(
+            parse_verdict("I think it's probably fine?"),
+            Verdict::Complete
+        );
+    }
+
+    #[test]
+    fn parse_abstain_returns_abstain_with_detail() {
+        let v = parse_verdict("VERDICT: ABSTAIN\nNo test covers the retry-on-timeout path.");
+        match v {
+            Verdict::Abstain(detail) => {
+                assert!(detail.contains("retry-on-timeout"));
+            }
+            other => panic!("expected Abstain, got {other:?}"),
+        }
+        // INSUFFICIENT is an accepted synonym.
+        let v2 = parse_verdict("VERDICT: INSUFFICIENT\nSpec unclear on error format.");
+        match v2 {
+            Verdict::Abstain(detail) => {
+                assert!(detail.contains("error format"));
+            }
+            other => panic!("expected Abstain, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_incomplete_before_abstain_priority() {
+        // First line mentions both — INCOMPLETE wins.
+        let v = parse_verdict("VERDICT: INCOMPLETE, or perhaps ABSTAIN\nmissing tests");
+        match v {
+            Verdict::Incomplete(issues) => {
+                assert!(issues.contains("missing tests"));
+            }
+            other => panic!("expected Incomplete (priority over ABSTAIN), got {other:?}"),
+        }
     }
 
     #[test]
@@ -314,6 +392,7 @@ mod tests {
         );
         assert!(p.contains("VERDICT: COMPLETE"));
         assert!(p.contains("VERDICT: INCOMPLETE"));
+        assert!(p.contains("VERDICT: ABSTAIN"));
         assert!(p.contains("edited foo.rs"));
         // dirge-bedj: the agent's own constraints are included so the
         // critic judges within them.
@@ -516,6 +595,33 @@ mod tests {
         };
         assert!(content.starts_with(CRITIC_TAG));
         assert!(content.contains("test was never run"));
+    }
+
+    #[tokio::test]
+    async fn run_critic_abstain_injects_test_request_nudge() {
+        let critic: CriticFn = Arc::new(|_prompt| {
+            Box::pin(async {
+                Ok("VERDICT: ABSTAIN\nNo test covers the retry-on-timeout path.".to_string())
+            })
+        });
+        let msgs = run_critic(&critic, "rules", "did stuff", None).await;
+        assert_eq!(msgs.len(), 1);
+        let content = match &msgs[0] {
+            LoopMessage::User(u) => &u.content,
+            _ => panic!("expected user message"),
+        };
+        assert!(
+            content.starts_with(CRITIC_TAG),
+            "abstain nudge must use CRITIC_TAG"
+        );
+        assert!(
+            content.contains("could not confirm"),
+            "abstain nudge must say 'could not confirm', got: {content}"
+        );
+        assert!(
+            content.contains("retry-on-timeout"),
+            "abstain nudge must carry the critic's detail, got: {content}"
+        );
     }
 
     #[tokio::test]
