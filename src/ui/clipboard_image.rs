@@ -7,7 +7,10 @@
 //! - macOS: `pngpaste <tmpfile>` (writes the clipboard image to a file)
 //! - Linux/Wayland: `wl-paste -t image/png`
 //! - Linux/X11: `xclip -selection clipboard -t image/png -o`
+//! - Windows: PowerShell + `System.Windows.Forms` clipboard, saved as PNG
+//!   to a temp file (no native clipboard CLI ships with Windows).
 
+#[cfg(any(unix, windows))]
 use std::process::Command;
 
 /// Hard cap on a pasted image (20 MiB). Matches the design doc and
@@ -78,7 +81,47 @@ fn capture_stdout(cmd: &[&str]) -> Option<Vec<u8>> {
     Some(out.stdout)
 }
 
-#[cfg(not(any(target_os = "macos", unix)))]
+#[cfg(windows)]
+fn read_png_bytes() -> Option<Vec<u8>> {
+    // Windows ships no clipboard CLI, so shell out to PowerShell + the
+    // .NET `System.Windows.Forms.Clipboard`. `-STA` is required: OLE
+    // clipboard access throws from an MTA thread. `GetImage()` returns
+    // null when no image is present (=> None, text-paste fallback).
+    let path = std::env::temp_dir().join(format!(
+        "dirge-clip-{}.png",
+        crate::agent::runner::uuid_v4_simple()
+    ));
+    // Embed the path in a PowerShell single-quoted string; the only
+    // special char there is `'` itself (escaped by doubling).
+    let ps_path = path.to_str()?.replace('\'', "''");
+    let script = format!(
+        "Add-Type -AssemblyName System.Windows.Forms; \
+         Add-Type -AssemblyName System.Drawing; \
+         $i = [System.Windows.Forms.Clipboard]::GetImage(); \
+         if (-not $i) {{ exit 1 }}; \
+         $i.Save('{ps_path}', [System.Drawing.Imaging.ImageFormat]::Png); \
+         exit 0"
+    );
+    let status = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-STA",
+            "-Command",
+            script.as_str(),
+        ])
+        .status()
+        .ok()?;
+    if !status.success() {
+        let _ = std::fs::remove_file(&path);
+        return None;
+    }
+    let bytes = std::fs::read(&path).ok();
+    let _ = std::fs::remove_file(&path);
+    bytes
+}
+
+#[cfg(not(any(target_os = "macos", unix, windows)))]
 fn read_png_bytes() -> Option<Vec<u8>> {
     None
 }
