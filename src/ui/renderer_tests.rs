@@ -1070,6 +1070,30 @@ fn mode_reassert_payload_re_enables_mouse_paste_and_focus() {
     // clear/flicker) or toggle cursor visibility (managed per frame).
     assert!(!s.contains("\x1b[?1049h"), "must not re-enter alt screen");
     assert!(!s.contains("\x1b[?25"), "must not touch cursor visibility");
+    // dirge-1f2a: this is also the FocusGained recovery payload — it must not
+    // clear the screen (the `2J` / `?1049h`-clear is the VTE flash + synthetic-
+    // focus loop source).
+    assert!(!s.contains("\x1b[2J"), "must not clear the screen");
+}
+
+/// dirge-1f2a: the automatic FocusGained recovery must be the LIGHT path — it
+/// re-arms modes and lets the caller repaint, but does NOT rebuild the backend
+/// or dirty a full frame the way the Ctrl+L `force_terminal_reassert` does.
+/// That, plus the mode-only payload (no `?1049h`), is what stops the
+/// gnome-terminal / VTE 0.76 strobe on every alt-tab.
+#[test]
+fn reassert_modes_light_does_not_churn_a_repaint() {
+    let mut r = Renderer::new().expect("renderer");
+    r.needs_paint = false;
+    r.reassert_modes_light();
+    assert!(
+        !r.needs_paint,
+        "light reassert must not force a full repaint/backend rebuild"
+    );
+    assert!(
+        r.last_mode_reassert.is_some(),
+        "light reassert records the mode re-arm timestamp"
+    );
 }
 
 /// The explicit redraw escape hatch (Ctrl+L, dirge-173j) DOES re-enter the

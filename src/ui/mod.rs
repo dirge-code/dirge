@@ -1553,17 +1553,18 @@ pub async fn run_interactive(
                             }
                             UserEvent::FocusGained => {
                                 // dirge-ph60: switching away from and back to
-                                // the terminal window is the common trigger
-                                // for the alt screen being dropped (dead
-                                // mouse, wheel scrolls native scrollback). On
-                                // focus-in, run the full re-assert — re-enter
-                                // the alt screen + mouse capture + paste +
-                                // focus reporting, wrapped in synchronized
-                                // output so it's invisible on a ?2026 terminal.
-                                // Idempotent when nothing broke, so it's safe
-                                // to fire on every focus-in. Replaces the
-                                // manual Ctrl+L hatch as the primary recovery.
-                                renderer.force_terminal_reassert();
+                                // the terminal window can leave a mode dropped
+                                // (dead mouse, wheel scrolls native scrollback).
+                                // dirge-1f2a: recover with a MODE-ONLY re-assert
+                                // — re-arm mouse capture + paste + focus
+                                // reporting, then repaint. Do NOT re-enter the
+                                // alt screen: `?1049h` re-enters+clears it,
+                                // which on VTE 0.76 (gnome-terminal) both
+                                // flashes and emits a synthetic FocusGained,
+                                // strobing on every alt-tab. We never leave the
+                                // alt screen on a focus change, so re-entry was
+                                // never needed. Ctrl+L keeps the full hatch.
+                                renderer.reassert_modes_light();
                                 renderer.request_repaint();
                                 continue;
                             }

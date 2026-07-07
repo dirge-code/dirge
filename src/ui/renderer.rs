@@ -2758,13 +2758,18 @@ impl Renderer {
         }
     }
 
-    /// Escape hatch (dirge-173j): force a FULL terminal re-assert —
-    /// re-enter the alternate screen, re-enable mouse capture + bracketed
-    /// paste — then rebuild the backend so the next frame fully repaints.
-    /// Recovers a session stranded in the main screen (dead mouse, wheel
-    /// scrolls native scrollback, selection uncaptured) regardless of what
-    /// leaked the reset. Bound to Ctrl+L; never fires on the periodic
-    /// self-heal, so the alt-screen re-entry can't flicker during normal use.
+    /// Manual escape hatch (dirge-173j): force a FULL terminal re-assert —
+    /// re-enter *and clear* the alternate screen (`?1049h`), re-enable mouse
+    /// capture + bracketed paste — then rebuild the backend so the next frame
+    /// fully repaints. Recovers a session stranded in the main screen (dead
+    /// mouse, wheel scrolls native scrollback, selection uncaptured) regardless
+    /// of what leaked the reset.
+    ///
+    /// Bound to Ctrl+L ONLY. The automatic `FocusGained` recovery uses
+    /// [`reassert_modes_light`](Renderer::reassert_modes_light) instead —
+    /// `?1049h`'s clear + synthetic-focus side effect made this flicker/strobe
+    /// on VTE when fired on every alt-tab (dirge-1f2a). Never fires on the
+    /// periodic self-heal.
     pub fn force_terminal_reassert(&mut self) {
         let now = std::time::Instant::now();
         if let Some(last) = self.last_full_reassert
@@ -2781,6 +2786,31 @@ impl Renderer {
         self.tui_terminal = build_tui_terminal();
         self.needs_paint = true;
         self.last_full_reassert = Some(std::time::Instant::now());
+        self.last_mode_reassert = Some(std::time::Instant::now());
+    }
+
+    /// Lightweight recovery for the automatic `FocusGained` path: re-arm SGR
+    /// mouse capture, bracketed paste, and focus reporting via
+    /// [`TERMINAL_MODE_REASSERT`] — WITHOUT re-entering the alternate screen
+    /// (`?1049h`) or clearing it (`2J`), and without rebuilding the backend.
+    ///
+    /// This is the fix for the gnome-terminal / VTE 0.76 strobe (dirge-1f2a).
+    /// The full re-assert's `?1049h` re-enters *and clears* the alt screen; on
+    /// VTE that both flashes and makes the terminal emit a *synthetic*
+    /// `FocusGained` as a side effect of processing `?1049h` — and since
+    /// focus-in fires on every window switch, that fed a self-reinforcing loop
+    /// (the #606 throttle bounded it, but the visible flash on each real
+    /// alt-tab remained). dirge never *leaves* the alt screen on a focus
+    /// change, so re-entering it was never needed: re-arming the modes and
+    /// letting the caller repaint fully recovers a dead mouse / dropped paste.
+    /// No `?1049h` means this can't trigger the synthetic-focus loop, so it is
+    /// deliberately un-throttled. The manual Ctrl+L hatch still uses
+    /// [`force_terminal_reassert`] for a genuine full recovery + clear.
+    pub fn reassert_modes_light(&mut self) {
+        if let Some(mut tty) = crate::ui::terminal::open_tty_for_write() {
+            let _ = tty.write_all(TERMINAL_MODE_REASSERT);
+            let _ = tty.flush();
+        }
         self.last_mode_reassert = Some(std::time::Instant::now());
     }
 
