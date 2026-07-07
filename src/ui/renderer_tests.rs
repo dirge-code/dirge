@@ -1038,12 +1038,12 @@ fn footer_shows_both_directions_when_scrolled() {
 
 // ── terminal-mode self-healing (fix/mouse-capture-self-heal) ──────────
 
-/// The re-assert payload re-enables exactly the modes dirge owns and that a
-/// child program can clobber: SGR mouse capture (so wheel + click reach the
-/// app) and bracketed paste. This is what heals "the whole UI scrolls off"
-/// — a leaked `?1000l` is undone by the next due paint re-emitting `?1000h`.
+/// The re-assert payload re-enables exactly the modes dirge owns and that an
+/// external reset can clobber: SGR mouse capture (so wheel + click reach the
+/// app), bracketed paste, AND focus reporting. This is what heals "the whole
+/// UI scrolls off" and — critically — keeps the event-driven recovery alive.
 #[test]
-fn mode_reassert_payload_re_enables_mouse_and_paste() {
+fn mode_reassert_payload_re_enables_mouse_paste_and_focus() {
     let now = std::time::Instant::now();
     let bytes = super::mode_reassert_payload(None, now).expect("first paint always re-asserts");
     let s = std::str::from_utf8(bytes).unwrap();
@@ -1056,6 +1056,16 @@ fn mode_reassert_payload_re_enables_mouse_and_paste() {
         "must re-enable SGR mouse encoding"
     );
     assert!(s.contains("\x1b[?2004h"), "must re-enable bracketed paste");
+    // The genuine fix (dirge-tc2q follow-up): focus reporting MUST be in the
+    // periodic payload. The primary recovery is FocusGained →
+    // force_terminal_reassert, but that event can't fire while focus
+    // reporting is off. An external reset that turns ?1004 off would
+    // otherwise strand the app until a manual Ctrl+L — re-arming it here
+    // means FocusGained starts firing again within one interval.
+    assert!(
+        s.contains("\x1b[?1004h"),
+        "must re-enable focus reporting so the FocusGained recovery stays armed"
+    );
     // Must NOT re-enter the alternate screen (would risk a per-second
     // clear/flicker) or toggle cursor visibility (managed per frame).
     assert!(!s.contains("\x1b[?1049h"), "must not re-enter alt screen");

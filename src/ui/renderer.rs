@@ -198,15 +198,29 @@ const SHELL_BOX_MAX_ROWS: u16 = 12;
 
 /// Global terminal modes dirge owns and must keep asserted for its whole
 /// session: SGR mouse capture (`?1000`/`?1002`/`?1003`/`?1006`) so wheel +
-/// click reach the app, and bracketed paste (`?2004`). These are set once
-/// at startup ([`crate::ui::terminal::TerminalGuard::new`]); this is the
-/// exact same set, re-emitted periodically so a mid-session reset can't
-/// leave them off permanently. Both are idempotent with no visual effect
-/// when already enabled, so re-emitting on a throttle is safe. Notably this
-/// does NOT include the alternate screen (`?1049h`) — re-entering it can
+/// click reach the app, bracketed paste (`?2004`), and focus reporting
+/// (`?1004`). These are set once at startup
+/// ([`crate::ui::terminal::TerminalGuard::new`]); this is the exact same
+/// set, re-emitted periodically so a mid-session reset can't leave them off
+/// permanently. All are idempotent with no visual effect when already
+/// enabled, so re-emitting on a throttle is safe. Notably this does NOT
+/// include the alternate screen (`?1049h`) — re-entering it can
 /// clear/flicker on some terminals — nor cursor visibility (managed per
 /// frame by `draw_bottom`).
-const TERMINAL_MODE_REASSERT: &[u8] = b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h\x1b[?2004h";
+///
+/// `?1004h` is included specifically to keep the event-driven recovery
+/// alive: the primary heal path is `FocusGained → force_terminal_reassert`,
+/// but that event only fires while focus reporting is armed. An external
+/// reset (terminal "reset", tmux detach/reattach, a multiplexer that
+/// drops private modes) can turn `?1004` off, and once it's off no
+/// `FocusGained` ever arrives — so the whole reactive chain goes dark
+/// and only a manual Ctrl+L recovers. Periodically re-arming `?1004h`
+/// means the loss self-heals within one interval and `FocusGained` starts
+/// firing again. (dirge's own children can't be the clobberer: bash-tool
+/// and shell-session children are detached via `setsid()` with no
+/// controlling terminal, so a `/dev/tty` open fails with ENXIO — see
+/// `bash::exec::detach_session` and the `dirge-tc2q` test.)
+const TERMINAL_MODE_REASSERT: &[u8] = b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h\x1b[?2004h\x1b[?1004h";
 
 /// Full terminal re-assert (dirge-ph60, dirge-173j). Unlike
 /// [`TERMINAL_MODE_REASSERT`] this DOES re-enter the alternate screen
@@ -448,14 +462,15 @@ pub struct Renderer {
     /// 8ms repaint throttle to prevent /dev/tty write contention between
     /// keystroke-driven repaints — the root cause of typing stutter.
     last_paint: Option<std::time::Instant>,
-    /// Timestamp of the last terminal-mode re-assertion (SGR mouse capture +
-    /// bracketed paste). Those modes are enabled once at startup, but a
-    /// child program run via the bash tool (a pager / TUI) can reset them
-    /// mid-session by emitting `?1000l`/`?2004l` on exit — and there's no
-    /// other path that turns them back on, so the loss is permanent (wheel
-    /// scroll falls through to the terminal, selection stops reaching the
-    /// app). `tui_redraw` re-emits them on a throttle so dirge self-heals
-    /// within one interval of any such leak. `None` until the first paint.
+    /// Timestamp of the last terminal-mode re-assertion (SGR mouse capture,
+    /// bracketed paste, focus reporting). Those modes are enabled once at
+    /// startup, but an external reset (terminal reset, tmux/screen detach)
+    /// can turn them off mid-session — and with focus reporting off there's
+    /// no other path that turns them back on (the `FocusGained` recovery
+    /// can't fire), so the loss is permanent (wheel scroll falls through to
+    /// the terminal, selection stops reaching the app). `tui_redraw`
+    /// re-emits them on a throttle so dirge self-heals within one interval
+    /// of any such reset. `None` until the first paint.
     last_mode_reassert: Option<std::time::Instant>,
     /// Bumped each time scrollback eviction drains lines from the FRONT of
     /// `buffer`, which shifts every absolute line index down. Consumers
@@ -748,17 +763,20 @@ impl Renderer {
         use crate::ui::tui::bottom::{AvatarSpec, BottomBody};
         use crate::ui::tui::scene::{Scene, render_frame};
 
-        // Self-heal the global terminal modes (SGR mouse capture + bracketed
-        // paste). They're enabled once at startup, but a child program run
-        // through the bash tool — a pager or TUI (`git log` → `less`, `fzf`,
-        // `vim`, …) — opens /dev/tty and on exit emits `?1000l`/`?2004l` to
-        // restore ITS state, silently turning dirge's off. With no other
-        // re-enable path the loss is permanent: wheel scroll falls through to
-        // the terminal (the whole UI scrolls) and click/drag selection stops
-        // reaching the app. Re-emitting on a throttle (writing to a fresh
-        // /dev/tty, the same sink the guard's setup uses) heals it within one
-        // interval. Done before the 8ms paint throttle below so it keeps
-        // firing even while paints are coalesced.
+        // Self-heal the global terminal modes (SGR mouse capture, bracketed
+        // paste, focus reporting). They're enabled once at startup, but an
+        // external reset — a terminal "reset", a tmux/screen detach+reattach,
+        // a multiplexer that drops private modes — can turn them off
+        // mid-session. With no re-enable path the loss is permanent: wheel
+        // scroll falls through to the terminal (the whole UI scrolls) and
+        // click/drag selection stops reaching the app. The focus-reporting
+        // mode (`?1004h`) matters most: the primary recovery is
+        // `FocusGained → force_terminal_reassert`, but that event can't fire
+        // while focus reporting is off — so re-arming it here keeps the
+        // reactive chain alive. Re-emitting on a throttle (writing to a fresh
+        // /dev/tty, the same sink the guard's setup uses) heals any loss
+        // within one interval. Done before the 8ms paint throttle below so it
+        // keeps firing even while paints are coalesced.
         self.reassert_terminal_modes();
 
         // Re-clamp the scroll offset to the CURRENT geometry every frame. The
@@ -2695,20 +2713,28 @@ impl Renderer {
         }
     }
 
-    /// Re-assert the global terminal modes dirge owns (SGR mouse capture +
-    /// bracketed paste) if the throttle interval has elapsed, writing directly
-    /// to `/dev/tty`. Throttled and idempotent — safe to call as often as the
-    /// caller likes; only the first call per [`MODE_REASSERT_INTERVAL`] emits.
+    /// Re-assert the global terminal modes dirge owns (SGR mouse capture,
+    /// bracketed paste, focus reporting) if the throttle interval has
+    /// elapsed, writing directly to `/dev/tty`. Throttled and idempotent —
+    /// safe to call as often as the caller likes; only the first call per
+    /// [`MODE_REASSERT_INTERVAL`] emits.
     ///
-    /// `tui_redraw` calls this every paint, which heals a mid-session leak
-    /// (a bash-tool child that opened `/dev/tty` and emitted `?1000l`/`?2004l`
-    /// on exit) within one interval — but *only while frames are painting*.
-    /// When the agent is idle the event loop stops painting, so the loop also
-    /// calls this on an idle timer: otherwise a leak that lands while idle
-    /// can't self-heal, since the lost wheel/drag events are exactly what
-    /// would trigger a paint. Keyboard scroll (PageUp/Down) still dirties a
-    /// frame and heals it — which is why, in the broken state, the keyboard
-    /// keeps working while the mouse stays dead.
+    /// The primary recovery for a dropped alt screen is event-driven
+    /// (`FocusGained → force_terminal_reassert`); this periodic re-assert's
+    /// main job is to keep that chain alive by re-arming focus reporting
+    /// (`?1004h`), which an external reset (terminal reset, multiplexer
+    /// detach) can turn off. Once focus reporting is off, no `FocusGained`
+    /// ever arrives — so without this the reactive path goes dark and only
+    /// a manual Ctrl+L recovers. It also re-arms mouse capture + paste as a
+    /// safety net for terminals that don't report focus at all.
+    ///
+    /// `tui_redraw` calls this every paint, which heals a reset within one
+    /// interval — but *only while frames are painting*. When the agent is
+    /// idle the event loop stops painting, so the loop also calls this on an
+    /// idle timer: otherwise a reset that lands while idle can't self-heal.
+    /// Keyboard scroll (PageUp/Down) still dirties a frame and heals it —
+    /// which is why, in the broken state, the keyboard keeps working while
+    /// the mouse stays dead.
     pub fn reassert_terminal_modes(&mut self) {
         let now = std::time::Instant::now();
         if let Some(bytes) = mode_reassert_payload(self.last_mode_reassert, now) {
