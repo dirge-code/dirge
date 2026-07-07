@@ -1474,3 +1474,24 @@ fn tool_chamber_rebuild_idempotent() {
         "rebuild at the same width must reproduce the buffer exactly",
     );
 }
+
+/// `terminal_size()` returns the cached value (one /dev/tty open per paint
+/// instead of ~8). When `test_cols` is set, the override still wins.
+#[test]
+fn terminal_size_uses_cached_tty_size() {
+    let mut r = Renderer::new().expect("renderer");
+
+    // Set the cache directly and assert terminal_size returns it.
+    r.cached_tty_size = (120, 40);
+    let (cols, rows) = r.terminal_size();
+    assert_eq!((cols, rows), (120, 40), "should return cached (cols, rows)");
+
+    // test_cols override must win over the cache.
+    r.set_test_cols(80);
+    let (cols, rows) = r.terminal_size();
+    assert_eq!(
+        (cols, rows),
+        (80, 24),
+        "test_cols override must take precedence over cache"
+    );
+}

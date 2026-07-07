@@ -494,6 +494,10 @@ pub struct Renderer {
     /// production, where the real tty size is queried.
     #[cfg(test)]
     test_cols: Option<u16>,
+    /// Terminal (cols, rows), cached so a paint doesn't re-`open("/dev/tty")`
+    /// ~8x. Refreshed at the top of `tui_redraw` and in `rebuild` (resize);
+    /// the size only changes on resize (dirge-jisr).
+    cached_tty_size: (u16, u16),
     buffer: Vec<LineEntry>,
     /// dirge-qy3y: width-independent source-of-truth for `buffer`. Every
     /// committed region appends a [`SourceBlock`]; `buffer` is the wrapped
@@ -685,6 +689,7 @@ impl Renderer {
             eviction_generation: 0,
             #[cfg(test)]
             test_cols: None,
+            cached_tty_size: crate::ui::terminal::tty_size(),
             buffer: Vec::new(),
             source: Vec::new(),
             streaming: false,
@@ -771,6 +776,9 @@ impl Renderer {
     /// initialised — keeps tests that construct `Renderer::new()`
     /// against captured stdout from blowing up on `draw`.
     pub(crate) fn tui_redraw(&mut self) -> io::Result<()> {
+        // Refresh cached terminal size once per paint (dirge-jisr).
+        self.cached_tty_size = crate::ui::terminal::tty_size();
+
         use crate::ui::avatar;
         use crate::ui::tui::bottom::{AvatarSpec, BottomBody};
         use crate::ui::tui::scene::{Scene, render_frame};
@@ -926,7 +934,7 @@ impl Renderer {
         // above the alert. The editor stays clamped at MAX so the
         // user can't accidentally crowd the chat by pasting a 50-
         // line block.
-        let (cols_q, rows_q) = crate::ui::terminal::tty_size();
+        let (cols_q, rows_q) = self.cached_tty_size;
         let effective_input_rows = if let Some(lines) = alert_overlay.as_ref() {
             let probe = crate::ui::tui::layout::Layout::with_panels(
                 cols_q,
@@ -1519,7 +1527,7 @@ impl Renderer {
         if let Some(cols) = self.test_cols {
             return (cols, 24);
         }
-        crate::ui::terminal::tty_size()
+        self.cached_tty_size
     }
 
     /// Test-only: force the reported terminal width so width-dependent paths
@@ -2306,6 +2314,9 @@ impl Renderer {
     /// reflows to the new width instead of keeping its original wrap. The
     /// scroll anchor (lines-from-bottom) is preserved across the rebuild.
     pub fn rebuild(&mut self) {
+        // Refresh terminal size on resize-driven rebuild (dirge-jisr).
+        self.cached_tty_size = crate::ui::terminal::tty_size();
+
         let old_len = self.buffer.len();
         let mut blocks = std::mem::take(&mut self.source);
         let mut buffer = Vec::new();
