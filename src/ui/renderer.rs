@@ -220,7 +220,8 @@ const SHELL_BOX_MAX_ROWS: u16 = 12;
 /// and shell-session children are detached via `setsid()` with no
 /// controlling terminal, so a `/dev/tty` open fails with ENXIO — see
 /// `bash::exec::detach_session` and the `dirge-tc2q` test.)
-const TERMINAL_MODE_REASSERT: &[u8] = b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h\x1b[?2004h\x1b[?1004h";
+const TERMINAL_MODE_REASSERT: &[u8] =
+    b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h\x1b[?2004h\x1b[?1004h";
 
 /// Full terminal re-assert (dirge-ph60, dirge-173j). Unlike
 /// [`TERMINAL_MODE_REASSERT`] this DOES re-enter the alternate screen
