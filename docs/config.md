@@ -124,8 +124,9 @@ Accepted top-level keys:
 ### Desktop Notifications
 
 Desktop notifications are off unless `desktop_notifications.enabled` is set.
-On macOS, dirge uses `notify-rust` to show a system notification banner; Linux
-and Windows backend files are present but currently no-op.
+On macOS, dirge uses `notify-rust` to show a system notification banner through
+the Terminal notification sender; Linux and Windows backend files are present
+but currently no-op.
 
 ```json
 {
