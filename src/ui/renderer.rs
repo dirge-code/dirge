@@ -230,6 +230,13 @@ const TERMINAL_FULL_REASSERT: &[u8] = b"\x1b[?2026h\x1b[?1049h\x1b[2J\x1b[?1000h
 /// enough that a leaked reset self-heals before it's annoying.
 const MODE_REASSERT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// How soon after a full re-assert (FocusGained / Ctrl+L) we may fire another.
+/// The tightest feedback loop is `?1004h` (focus-reporting enable) in
+/// [`TERMINAL_FULL_REASSERT`] → terminal replies with `ESC[I]` (FocusGained)
+/// → handler calls [`force_terminal_reassert`](Renderer::force_terminal_reassert)
+/// again. 500ms is well below human perception but breaks that microsecond loop.
+const FULL_REASSERT_THROTTLE: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Decide whether the terminal modes are due for re-assertion, returning
 /// the bytes to emit (or `None` when the throttle hasn't elapsed). Pure so
 /// the throttle + payload are unit-testable without a live terminal: a
@@ -457,6 +464,9 @@ pub struct Renderer {
     /// app). `tui_redraw` re-emits them on a throttle so dirge self-heals
     /// within one interval of any such leak. `None` until the first paint.
     last_mode_reassert: Option<std::time::Instant>,
+    /// Timestamp of the most recent [`force_terminal_reassert`] — throttles
+    /// the FocusGained → full-reassert → `?1004h` → FocusGained feedback loop.
+    last_full_reassert: Option<std::time::Instant>,
     /// Bumped each time scrollback eviction drains lines from the FRONT of
     /// `buffer`, which shifts every absolute line index down. Consumers
     /// holding an absolute index across appends (the Ctrl+O expansion
@@ -655,6 +665,7 @@ impl Renderer {
             needs_paint: false,
             last_paint: None,
             last_mode_reassert: None,
+            last_full_reassert: None,
             eviction_generation: 0,
             #[cfg(test)]
             test_cols: None,
@@ -2728,6 +2739,12 @@ impl Renderer {
     /// leaked the reset. Bound to Ctrl+L; never fires on the periodic
     /// self-heal, so the alt-screen re-entry can't flicker during normal use.
     pub fn force_terminal_reassert(&mut self) {
+        let now = std::time::Instant::now();
+        if let Some(last) = self.last_full_reassert
+            && now.saturating_duration_since(last) < FULL_REASSERT_THROTTLE
+        {
+            return;
+        }
         if let Some(mut tty) = crate::ui::terminal::open_tty_for_write() {
             let _ = tty.write_all(TERMINAL_FULL_REASSERT);
             let _ = tty.flush();
@@ -2736,6 +2753,7 @@ impl Renderer {
         // repaints against the freshly-cleared alt buffer (no stale diff).
         self.tui_terminal = build_tui_terminal();
         self.needs_paint = true;
+        self.last_full_reassert = Some(std::time::Instant::now());
         self.last_mode_reassert = Some(std::time::Instant::now());
     }
 

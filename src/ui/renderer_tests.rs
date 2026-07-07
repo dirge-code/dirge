@@ -1093,6 +1093,32 @@ fn full_reassert_re_enters_alt_screen_synchronized() {
     );
 }
 
+/// The full re-assert (FocusGained / Ctrl+L) must be throttled to break the
+/// `?1004h` → terminal `ESC[I]` → `FocusGained` → `force_terminal_reassert`
+/// → `?1004h` feedback loop. A second call within [`FULL_REASSERT_THROTTLE`]
+/// skips the write and backend rebuild entirely.
+#[test]
+fn force_terminal_reassert_is_throttled_against_feedback_loop() {
+    let mut r = Renderer::new().expect("renderer");
+
+    // First call: proceeds — the throttle is fresh (None).
+    r.force_terminal_reassert();
+    assert!(
+        r.needs_paint,
+        "first re-assert must dirty the frame for repaint"
+    );
+
+    // Simulate a FocusGained event arriving in the same tick (the
+    // feedback loop): reset the dirty flag and call again.
+    r.needs_paint = false;
+    r.force_terminal_reassert();
+    assert!(
+        !r.needs_paint,
+        "back-to-back force_terminal_reassert must be throttled — \
+         the ?1004h → FocusGained → re-assert loop must break here"
+    );
+}
+
 /// The throttle: re-assert on the first paint, then suppress until the
 /// interval elapses, then re-assert again. A leak that lands between paints
 /// is healed within one interval.
