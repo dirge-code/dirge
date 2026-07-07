@@ -4,7 +4,8 @@
 //! or a clipboard without an image yields `None` (graceful), so the
 //! paste binding can fall back to plain text.
 //!
-//! - macOS: `pngpaste <tmpfile>` (writes the clipboard image to a file)
+//! - macOS: `osascript` reads the clipboard as `«class PNGf»` and writes
+//!   it to a temp file — ships with every macOS, no `brew install pngpaste`
 //! - Linux/Wayland: `wl-paste -t image/png`
 //! - Linux/X11: `xclip -selection clipboard -t image/png -o`
 //! - Windows: PowerShell + `System.Windows.Forms` clipboard, saved as PNG
@@ -46,14 +47,36 @@ pub fn is_within_size_limit(bytes: &[u8]) -> bool {
 
 #[cfg(target_os = "macos")]
 fn read_png_bytes() -> Option<Vec<u8>> {
-    // `pngpaste` has no stdout mode; write to a temp file, read it,
-    // then remove it. Non-zero exit (no image on clipboard / tool
-    // missing) => None.
+    // AppleScript coerces the clipboard to PNG (`«class PNGf»`) and
+    // writes it to a temp file, which we read and remove. `osascript`
+    // is a system binary present on every macOS, so there's nothing to
+    // install (unlike `pngpaste`). The clipboard is coerced *before* the
+    // file is opened, so a clipboard with no image errors out before any
+    // temp file is created; any non-zero exit => None (text-paste
+    // fallback).
     let path = std::env::temp_dir().join(format!(
-        "dirge-clip-{}",
+        "dirge-clip-{}.png",
         crate::agent::runner::uuid_v4_simple()
     ));
-    let status = Command::new("pngpaste").arg(&path).status().ok()?;
+    // `path` is embedded in an AppleScript string literal; escape the two
+    // chars that are special there. A UUID temp path contains neither,
+    // but escape defensively since the id still reaches the script.
+    let as_path = path.to_str()?.replace('\\', "\\\\").replace('"', "\\\"");
+    let status = Command::new("osascript")
+        .args([
+            "-e",
+            "set thePng to (the clipboard as «class PNGf»)",
+            "-e",
+            &format!("set fh to open for access (POSIX file \"{as_path}\") with write permission"),
+            "-e",
+            "set eof fh to 0",
+            "-e",
+            "write thePng to fh",
+            "-e",
+            "close access fh",
+        ])
+        .status()
+        .ok()?;
     if !status.success() {
         let _ = std::fs::remove_file(&path);
         return None;

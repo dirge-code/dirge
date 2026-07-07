@@ -4,6 +4,20 @@ All notable changes to dirge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- Paste a clipboard image into the prompt (Ctrl+V) and send it to a
+  multimodal provider. User messages are now multipart, so a turn can
+  interleave text and images. Images are stored once under the session's
+  `assets/` dir and re-read at the provider boundary each turn they stay
+  in context, keeping transcripts small. The paste UX is gated by whether
+  the active provider/model supports vision (with a `multimodal` override
+  on the provider entry for local vision models). Clipboard capture uses
+  the platform's built-in scripting host — `osascript` on macOS,
+  PowerShell on Windows — or `wl-paste`/`xclip` on Linux; no image on the
+  clipboard falls back to a normal text paste.
+
 ## [0.18.13] - 2026-07-07
 
 ### Fixed

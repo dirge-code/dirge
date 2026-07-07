@@ -603,7 +603,7 @@ mod tests {
         let msgs = run_critic(&critic, "rules", "did stuff", None).await;
         assert_eq!(msgs.len(), 1);
         let content = match &msgs[0] {
-            LoopMessage::User(u) => &u.content,
+            LoopMessage::User(u) => u.text_joined(),
             _ => panic!("expected user message"),
         };
         assert!(

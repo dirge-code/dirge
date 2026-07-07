@@ -551,13 +551,13 @@ async fn poll_finalization_follow_up(
                             s
                         };
                         return (
-                            vec![LoopMessage::User(super::message::UserMessage {
-                                content: format!(
+                            vec![LoopMessage::User(super::message::UserMessage::text(
+                                format!(
                                     "{OPEN_ISSUES_NUDGE_TAG} {count} issue(s) you worked on \
                                      this session are still open. Close the ones you finished \
                                      (or explicitly defer them), then continue:{title_list}"
                                 ),
-                            })],
+                            ))],
                             FollowUpSource::OpenIssues,
                         );
                     }

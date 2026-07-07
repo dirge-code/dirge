@@ -116,7 +116,7 @@ pub(crate) fn apply_review_verdict(
             )),
             crate::agent::runner::convert_history(session),
             Some(interjection_queue.clone()),
-            None,
+            Some(session.assets_dir()),
         );
         runner.install_into(
             agent_rx,

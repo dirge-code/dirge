@@ -11,11 +11,16 @@ fn session_dir() -> PathBuf {
 /// each). Removed wholesale when the session is deleted. The session
 /// id is re-validated so a malformed id can't escape the assets root.
 pub(crate) fn assets_dir_for(id: &str) -> PathBuf {
-    // `validate_session_id` is infallible-by-convention here (the id
-    // is already validated at session creation); fall back to the
-    // plain join if it ever fails rather than panicking on a path.
-    let _ = validate_session_id(id);
-    session_dir().join("assets").join(id)
+    // Enforce validation: a malformed id (traversal chars, `..`) is
+    // remapped to a fixed in-root placeholder so it can never escape the
+    // assets root via `Path::join`. Legit ids are server-generated UUIDs
+    // validated at creation, so this only ever triggers on a tampered id.
+    let base = session_dir().join("assets");
+    if validate_session_id(id).is_ok() {
+        base.join(id)
+    } else {
+        base.join("_invalid")
+    }
 }
 
 #[cfg(not(test))]

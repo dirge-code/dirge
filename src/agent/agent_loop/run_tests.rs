@@ -3620,7 +3620,7 @@ async fn open_issues_gate_blocking_with_session_open_issues_nudges() {
     assert_eq!(open_issues_nudges, 1);
     assert_eq!(msgs.len(), 1);
     let content = match &msgs[0] {
-        LoopMessage::User(u) => &u.content,
+        LoopMessage::User(u) => u.text_joined(),
         _ => panic!("expected User message"),
     };
     assert!(

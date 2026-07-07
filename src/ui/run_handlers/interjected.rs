@@ -140,7 +140,7 @@ pub(crate) async fn handle_interjected(
             ),
             history,
             Some(interjection_queue.clone()),
-            None,
+            Some(ctx.session.assets_dir()),
         );
         runner.install_into(
             agent_rx,

@@ -356,7 +356,7 @@ pub(crate) async fn finish_done(
                 ),
                 crate::agent::runner::convert_history(ctx.session),
                 Some(interjection_queue.clone()),
-                None,
+                Some(ctx.session.assets_dir()),
             );
             runner.install_into(
                 agent_rx,
@@ -604,7 +604,7 @@ pub(crate) fn finalize_idle_turn(
             ),
             history,
             Some(interjection_queue.clone()),
-            None,
+            Some(session.assets_dir()),
         );
         runner.install_into(
             agent_rx,

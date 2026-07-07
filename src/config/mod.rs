@@ -129,7 +129,9 @@ fn model_image_support(model: &str) -> ImageSupport {
         || m.starts_with("gpt-4-0314")
         || m.starts_with("o1-mini")
         || m.starts_with("o1-preview")
-        || m.starts_with("deepseek")
+        // Text-only DeepSeek, but not the vision variants (deepseek-vl*),
+        // which must fall through to the `-vl`/`vision` checks below.
+        || (m.starts_with("deepseek") && !m.contains("-vl") && !m.contains("vision"))
     {
         return ImageSupport::No;
     }
@@ -232,6 +234,18 @@ mod image_support_tests {
         ));
         assert!(!supports_images(Some("openai"), Some("gpt-4"), None));
         assert!(!supports_images(Some("openai"), Some("gpt-4-0613"), None));
+        // Text-only DeepSeek stays No...
+        assert!(!supports_images(
+            Some("deepseek"),
+            Some("deepseek-chat"),
+            None
+        ));
+        // ...but the vision variant is not swallowed by the exclusion.
+        assert!(supports_images(
+            Some("deepseek"),
+            Some("deepseek-vl2"),
+            None
+        ));
     }
 
     #[test]

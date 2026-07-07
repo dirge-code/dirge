@@ -660,7 +660,7 @@ pub async fn run_interactive(
                     ),
                     history,
                     Some(ui.interjection_queue.clone()),
-                    None,
+                    Some(session.assets_dir()),
                 );
                 runner.install_into(
                     &mut ui.agent_rx,
@@ -2817,7 +2817,7 @@ pub async fn run_interactive(
                                                         crate::provider::Prompt::text(crate::agent::tools::background::prepend_pending_notifications(&run_text, bg_store.as_ref())),
                                                         history,
                                                         Some(ui.interjection_queue.clone()),
-                                                        None,
+                                                        Some(session.assets_dir()),
                                                     );
                                                     runner.install_into(&mut ui.agent_rx, &mut ui.agent_abort, &mut ui.agent_interject, &mut ui.agent_cancel, &mut ui.is_running);
                                                     begin_snapshot_turn(session);
@@ -3085,7 +3085,7 @@ pub async fn run_interactive(
                                         )),
                                         history,
                                         Some(ui.interjection_queue.clone()),
-                                        None,
+                                        Some(session.assets_dir()),
                                     );
                                     runner.install_into(
                                         &mut ui.agent_rx,
@@ -3572,7 +3572,7 @@ pub async fn run_interactive(
                                     crate::provider::Prompt::text(crate::agent::tools::background::prepend_pending_notifications(&kickoff.impl_prompt, bg_store.as_ref())),
                                     history,
                                     Some(ui.interjection_queue.clone()),
-                                    None,
+                                    Some(session.assets_dir()),
                                 );
                                 runner.install_into(&mut ui.agent_rx, &mut ui.agent_abort, &mut ui.agent_interject, &mut ui.agent_cancel, &mut ui.is_running);
                                 ui.active_plan = Some(kickoff.active);
@@ -3875,7 +3875,7 @@ pub async fn run_interactive(
                                     crate::provider::Prompt::text(crate::agent::tools::background::prepend_pending_notifications(&prompt, bg_store.as_ref())),
                                     history,
                                     Some(ui.interjection_queue.clone()),
-                                    None,
+                                    Some(session.assets_dir()),
                                 );
                                 runner.install_into(&mut ui.agent_rx, &mut ui.agent_abort, &mut ui.agent_interject, &mut ui.agent_cancel, &mut ui.is_running);
                                 ui.last_collapsed = None;
@@ -3895,7 +3895,7 @@ pub async fn run_interactive(
                                     crate::provider::Prompt::text(crate::agent::tools::background::prepend_pending_notifications(RESUME_NUDGE, bg_store.as_ref())),
                                     history,
                                     Some(ui.interjection_queue.clone()),
-                                    None,
+                                    Some(session.assets_dir()),
                                 );
                                 runner.install_into(&mut ui.agent_rx, &mut ui.agent_abort, &mut ui.agent_interject, &mut ui.agent_cancel, &mut ui.is_running);
                                 session.add_message(MessageRole::User, RESUME_NUDGE);
@@ -4681,7 +4681,7 @@ pub async fn run_interactive(
                                     bg_store.as_ref(),
                                 );
                             ui.last_user_prompt.clone_from(&synth_prompt);
-                            let runner = agent.clone().spawn_runner(crate::provider::Prompt::text(composed), history, Some(ui.interjection_queue.clone()), None);
+                            let runner = agent.clone().spawn_runner(crate::provider::Prompt::text(composed), history, Some(ui.interjection_queue.clone()), Some(session.assets_dir()));
                             runner.install_into(&mut ui.agent_rx, &mut ui.agent_abort, &mut ui.agent_interject, &mut ui.agent_cancel, &mut ui.is_running);
                             renderer.request_repaint();
                         }

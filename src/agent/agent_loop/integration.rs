@@ -690,7 +690,14 @@ pub fn spawn_loop_runner(cfg: LoopSpawnConfig) -> LoopRunner {
     // a `UserPart::Image` per fresh-paste image (the resume path carries
     // its images through history as `dirge-asset:` sentinels instead).
     let initial_content = {
-        let mut parts = vec![super::message::UserPart::text(cfg.initial_prompt.clone())];
+        // Drop an empty caption when images are present — a bare
+        // `text("")` ahead of an image serializes to an empty text
+        // content block the provider rejects. Keep it when there are no
+        // images so a genuinely empty turn still has one (text) part.
+        let mut parts = Vec::new();
+        if !cfg.initial_prompt.is_empty() || cfg.initial_prompt_images.is_empty() {
+            parts.push(super::message::UserPart::text(cfg.initial_prompt.clone()));
+        }
         for img in &cfg.initial_prompt_images {
             parts.push(super::message::UserPart::image(img.clone()));
         }

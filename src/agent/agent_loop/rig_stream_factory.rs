@@ -434,7 +434,15 @@ fn build_user_content(parts: &[Value], asset_dir: Option<&std::path::Path>) -> O
         let kind = obj.get("type").and_then(|t| t.as_str()).unwrap_or("");
         match kind {
             "text" => {
-                if let Some(t) = obj.get("text").and_then(|t| t.as_str()) {
+                // Skip empty text parts. A caption-less image paste seeds
+                // the turn with an empty text part ahead of the image;
+                // Anthropic (the flagship vision provider) rejects an
+                // empty text content block with a 400, aborting the turn.
+                // Mirrors the `!msg.content.is_empty()` guard on the
+                // resume path in `runner::convert_history`.
+                if let Some(t) = obj.get("text").and_then(|t| t.as_str())
+                    && !t.is_empty()
+                {
                     user_parts.push(UserContent::Text(Text {
                         text: t.to_string(),
                     }));
@@ -922,6 +930,37 @@ mod tests {
                 match &parts[1] {
                     UserContent::Text(t) => assert!(t.text.contains("[image unavailable")),
                     _ => panic!("expected placeholder for missing asset dir"),
+                }
+            }
+            _ => panic!("expected User"),
+        }
+    }
+
+    /// A caption-less image paste seeds an empty text part ahead of the
+    /// image. That empty part must be dropped — Anthropic rejects an
+    /// empty text content block with a 400, aborting the turn. Only the
+    /// image part (here a placeholder, no asset dir) should survive.
+    #[test]
+    fn converter_drops_empty_text_part() {
+        let v = serde_json::json!({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": ""},
+                {"type": "image", "assetId": "x", "mediaType": "image/png"},
+            ],
+        });
+        let msg = value_to_rig_message_for_provider(&v, None, None).expect("must convert");
+        match msg {
+            Message::User { content } => {
+                let parts: Vec<_> = content.into_iter().collect();
+                assert_eq!(parts.len(), 1, "empty text part must be dropped");
+                match &parts[0] {
+                    UserContent::Text(t) => assert!(
+                        t.text.contains("[image unavailable"),
+                        "sole part should be the image placeholder, got: {}",
+                        t.text
+                    ),
+                    _ => panic!("expected the image part to survive"),
                 }
             }
             _ => panic!("expected User"),
