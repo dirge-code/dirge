@@ -7,6 +7,7 @@ pub(crate) mod buffer;
 mod chat_state;
 pub(crate) mod colors;
 pub(crate) mod compaction;
+pub(crate) mod desktop_notify;
 pub(crate) mod done_phase;
 mod editor_follow;
 pub(crate) mod events;
@@ -4209,6 +4210,12 @@ pub async fn run_interactive(
                             req: ask_req,
                             pending_chamber_tool,
                         });
+                        crate::ui::desktop_notify::notify(
+                            cfg,
+                            crate::ui::desktop_notify::DesktopNotifyEvent::InputRequired(
+                                crate::ui::desktop_notify::InputRequiredKind::Permission,
+                            ),
+                        );
                         renderer.request_repaint();
                     }
                     Some(notif) = async {
@@ -4641,6 +4648,12 @@ pub async fn run_interactive(
                                 anchor,
                                 entry: None,
                             });
+                            crate::ui::desktop_notify::notify(
+                                cfg,
+                                crate::ui::desktop_notify::DesktopNotifyEvent::InputRequired(
+                                    crate::ui::desktop_notify::InputRequiredKind::Question,
+                                ),
+                            );
                         }
                         renderer.request_repaint();
                     }
@@ -4680,7 +4693,10 @@ pub async fn run_interactive(
                                     &format!("[plugin {}] {}", safe_title, safe_question),
                                     c_perm(),
                                 )?;
-                                renderer.write_line("  (y) yes  (n) no  (ESC) cancel = no", c_perm())?;
+                                renderer.write_line(
+                                    "  (y) yes  (n) no  (ESC) cancel = no",
+                                    c_perm(),
+                                )?;
                                 ui.input_mode = state::InputMode::DialogConfirm { reply };
                             }
                             DialogRequest::Select { title, options, reply } => {
@@ -4694,12 +4710,23 @@ pub async fn run_interactive(
                                     c_perm(),
                                 )?;
                                 for (i, opt) in options.iter().enumerate() {
-                                    renderer.write_line(&format!("  {}: {}", i + 1, opt), c_perm())?;
+                                    renderer
+                                        .write_line(&format!("  {}: {}", i + 1, opt), c_perm())?;
                                 }
-                                renderer.write_line("  (1-9) select  (ESC) cancel", c_perm())?;
-                                ui.input_mode = state::InputMode::DialogSelect { reply, options };
+                                renderer.write_line(
+                                    "  (1-9) select  (ESC) cancel",
+                                    c_perm(),
+                                )?;
+                                ui.input_mode =
+                                    state::InputMode::DialogSelect { reply, options };
                             }
                         }
+                        crate::ui::desktop_notify::notify(
+                            cfg,
+                            crate::ui::desktop_notify::DesktopNotifyEvent::InputRequired(
+                                crate::ui::desktop_notify::InputRequiredKind::PluginDialog,
+                            ),
+                        );
                         renderer.request_repaint();
                     }
                     Some(plan_req) = async {
