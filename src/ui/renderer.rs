@@ -252,6 +252,17 @@ const MODE_REASSERT_INTERVAL: std::time::Duration = std::time::Duration::from_se
 /// again. 500ms is well below human perception but breaks that microsecond loop.
 const FULL_REASSERT_THROTTLE: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// How soon after a mode-only re-assert the automatic `FocusGained` path may
+/// fire another. Same feedback loop as [`FULL_REASSERT_THROTTLE`], but for the
+/// light path: some terminals (e.g. Ghostty) reply to the `?1004h` in
+/// [`TERMINAL_MODE_REASSERT`] with a `FocusGained`, so an unthrottled
+/// `reassert_modes_light` on every `FocusGained` spins tight — re-arm →
+/// echo → re-arm — saturating the UI loop and starving repaints (dirge-np9o).
+/// The echo returns within milliseconds, so a short throttle collapses the
+/// cascade to one re-arm while still recovering promptly on a genuine,
+/// seconds-apart focus change.
+const LIGHT_REASSERT_THROTTLE: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// Decide whether the terminal modes are due for re-assertion, returning
 /// the bytes to emit (or `None` when the throttle hasn't elapsed). Pure so
 /// the throttle + payload are unit-testable without a live terminal: a
@@ -270,6 +281,18 @@ fn mode_reassert_payload(
         Some(TERMINAL_MODE_REASSERT)
     } else {
         None
+    }
+}
+
+/// Whether the automatic `FocusGained` light re-assert may fire, given the
+/// last mode re-assert (from any path — the periodic per-paint/idle re-assert
+/// shares this stamp) and now. A `None` last (nothing re-armed yet) always
+/// fires; otherwise it waits [`LIGHT_REASSERT_THROTTLE`] so a terminal that
+/// echoes `FocusGained` on `?1004h` can't drive an unbounded re-arm loop.
+fn light_reassert_due(last: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    match last {
+        None => true,
+        Some(t) => now.saturating_duration_since(t) >= LIGHT_REASSERT_THROTTLE,
     }
 }
 
@@ -2818,11 +2841,18 @@ impl Renderer {
     /// deliberately un-throttled. The manual Ctrl+L hatch still uses
     /// [`force_terminal_reassert`] for a genuine full recovery + clear.
     pub fn reassert_modes_light(&mut self) {
+        let now = std::time::Instant::now();
+        // Throttle: a terminal that echoes `FocusGained` on the `?1004h` in
+        // TERMINAL_MODE_REASSERT would otherwise drive an unbounded re-arm →
+        // echo → re-arm loop through the FocusGained handler (dirge-np9o).
+        if !light_reassert_due(self.last_mode_reassert, now) {
+            return;
+        }
         if let Some(mut tty) = crate::ui::terminal::open_tty_for_write() {
             let _ = tty.write_all(TERMINAL_MODE_REASSERT);
             let _ = tty.flush();
         }
-        self.last_mode_reassert = Some(std::time::Instant::now());
+        self.last_mode_reassert = Some(now);
     }
 
     /// Test hook: the reassert payload that would be emitted *right now*,

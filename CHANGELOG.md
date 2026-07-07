@@ -4,6 +4,18 @@ All notable changes to dirge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.19.1] - 2026-07-07
+
+### Fixed
+- Slow startup / laggy rendering on terminals that echo focus events (e.g.
+  Ghostty). Such terminals reply with a `FocusGained` whenever focus reporting
+  (`?1004h`) is enabled; dirge's `FocusGained` handler re-armed the terminal
+  modes — including `?1004h` — unthrottled, so the reply drove an unbounded
+  re-arm → echo → re-arm loop that saturated the UI loop and delayed output
+  (MCP server logs could take ~a minute to appear). The mode-only re-assert is
+  now throttled the same way the full re-assert already was. Terminals that
+  don't echo focus (e.g. iTerm2) were unaffected either way (dirge-np9o).
+
 ## [0.19.0] - 2026-07-07
 
 ### Added

@@ -1096,6 +1096,57 @@ fn reassert_modes_light_does_not_churn_a_repaint() {
     );
 }
 
+/// dirge-np9o: the light-reassert throttle predicate. A terminal (e.g.
+/// Ghostty) that echoes `FocusGained` on the `?1004h` in the mode-reassert
+/// payload would otherwise drive an unbounded re-arm → echo → re-arm loop.
+/// The echo returns within milliseconds, so once we've just re-armed, the
+/// next few are suppressed; a genuine (seconds-apart) focus change still fires.
+#[test]
+fn light_reassert_due_throttles_the_focus_echo_loop() {
+    let now = std::time::Instant::now();
+    // Nothing re-armed yet → always fire.
+    assert!(super::light_reassert_due(None, now));
+    // Just re-armed (the echo arrives ~instantly) → suppressed.
+    assert!(!super::light_reassert_due(Some(now), now));
+    // Within the throttle window → still suppressed.
+    let recent = now
+        .checked_sub(std::time::Duration::from_millis(100))
+        .unwrap();
+    assert!(!super::light_reassert_due(Some(recent), now));
+    // Past the throttle window (a real, human-spaced focus change) → fire.
+    let stale = now
+        .checked_sub(std::time::Duration::from_millis(300))
+        .unwrap();
+    assert!(super::light_reassert_due(Some(stale), now));
+}
+
+/// dirge-np9o: a second `reassert_modes_light` right after the first is a
+/// no-op — it must NOT re-arm (which is what re-emits `?1004h` and, on an
+/// echoing terminal, feeds the loop). The recorded timestamp stays put.
+#[test]
+fn reassert_modes_light_is_throttled_back_to_back() {
+    let mut r = Renderer::new().expect("renderer");
+    let t0 = std::time::Instant::now();
+    r.last_mode_reassert = Some(t0);
+    r.reassert_modes_light(); // t0 is ~now → throttled
+    assert_eq!(
+        r.last_mode_reassert,
+        Some(t0),
+        "a throttled light reassert must not re-arm modes (would feed the echo loop)"
+    );
+
+    // But once the throttle window has passed, it re-arms again.
+    let stale = t0
+        .checked_sub(std::time::Duration::from_millis(300))
+        .unwrap();
+    r.last_mode_reassert = Some(stale);
+    r.reassert_modes_light();
+    assert!(
+        r.last_mode_reassert.is_some_and(|t| t > stale),
+        "a stale light reassert must re-arm and advance the timestamp"
+    );
+}
+
 /// The explicit redraw escape hatch (Ctrl+L, dirge-173j) DOES re-enter the
 /// alternate screen — that is what recovers a session dropped to the main
 /// screen — and wraps the clear+re-entry in a synchronized update so it
