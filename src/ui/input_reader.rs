@@ -119,9 +119,9 @@ pub(crate) fn spawn_input_reader(user_tx: tokio::sync::mpsc::UnboundedSender<Use
                         break;
                     }
                 }
-                Ok(event::Event::Resize(_, _)) => {
+                Ok(event::Event::Resize(cols, rows)) => {
                     if let Err(tokio::sync::mpsc::error::SendError(_)) =
-                        user_tx.send(UserEvent::Resize)
+                        user_tx.send(UserEvent::Resize(cols, rows))
                     {
                         break;
                     }

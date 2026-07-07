@@ -1296,6 +1296,11 @@ pub async fn run_interactive(
     let (user_tx, mut user_rx) = mpsc::unbounded_channel::<UserEvent>();
     input_reader::spawn_input_reader(user_tx.clone());
 
+    // Guard against no-op / duplicate resizes: crossterm (and terminals
+    // that fire Resize on focus/other events) emit resizes with unchanged
+    // dimensions, and rebuild() re-renders the entire scrollback.
+    let mut last_resize_dims: Option<(u16, u16)> = None;
+
     loop {
         // Refresh the info panel snapshot once per iteration so it stays
         // close to current as the agent edits files, runs MCP tools, etc.
@@ -1533,7 +1538,19 @@ pub async fn run_interactive(
                                 renderer.request_repaint();
                                 continue;
                             }
-                            UserEvent::Resize => {
+                            UserEvent::Resize(cols, rows) => {
+                                // Skip no-op / duplicate resizes: crossterm
+                                // (and terminals that fire Resize on focus
+                                // and other events) emit resizes with
+                                // unchanged dimensions, and rebuild()
+                                // re-renders the entire scrollback.
+                                if !crate::event::resize_changed(
+                                    last_resize_dims,
+                                    (cols, rows),
+                                ) {
+                                    continue;
+                                }
+                                last_resize_dims = Some((cols, rows));
                                 // Terminal dimensions changed — repaint everything so
                                 // wrap, panel clipping, and input box rows recompute
                                 // at the new size instead of waiting for the next

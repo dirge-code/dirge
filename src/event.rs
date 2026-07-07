@@ -250,10 +250,12 @@ pub enum AgentEvent {
 pub enum UserEvent {
     Key(crossterm::event::KeyEvent),
     Paste(String),
-    /// Terminal was resized. Carries no payload — the renderer queries
-    /// `crossterm::terminal::size()` directly; the variant is just a kick
-    /// to repaint at the new dimensions.
-    Resize,
+    /// Terminal was resized to `(cols, rows)`. The renderer uses these
+    /// dimensions to reflow scrollback; the explicit payload also lets
+    /// the handler skip no-op / duplicate resizes from crossterm and
+    /// terminals that fire `Resize` on focus and other non-size-change
+    /// events.
+    Resize(u16, u16),
     /// Mouse wheel scrolled up — scroll the output pane up by one line.
     /// Mouse capture is on (see `TerminalGuard::new`) so the wheel reaches
     /// the app instead of being absorbed by the terminal, which under the
@@ -297,4 +299,33 @@ pub enum UserEvent {
     /// `?2026`-capable terminal the recovery is invisible). No payload — the
     /// bare event is just the kick to re-assert.
     FocusGained,
+}
+
+/// Returns `true` when `new_dims` differ from `last`. `None` → first
+/// resize — always `true`. `Some(same)` → no-op duplicate → `false`.
+/// Pure so the guard is unit-testable.
+pub fn resize_changed(last: Option<(u16, u16)>, new: (u16, u16)) -> bool {
+    last != Some(new)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resize_changed_first_always_true() {
+        assert!(resize_changed(None, (80, 24)));
+    }
+
+    #[test]
+    fn resize_changed_same_is_false() {
+        assert!(!resize_changed(Some((80, 24)), (80, 24)));
+    }
+
+    #[test]
+    fn resize_changed_different_is_true() {
+        assert!(resize_changed(Some((80, 24)), (120, 40)));
+        assert!(resize_changed(Some((80, 24)), (80, 40)));
+        assert!(resize_changed(Some((80, 24)), (120, 24)));
+    }
 }
