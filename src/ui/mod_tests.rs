@@ -1151,3 +1151,29 @@ fn opt_space_off_options_without_custom_is_ignored() {
     let a = option_select_action(KC::Char(' '), true, false, 3, 3, false);
     assert_eq!(a, OptionAction::Ignore);
 }
+
+// ============================================================
+// panel_refresh_due — ambient-panel throttle (dirge-b14h)
+// ============================================================
+
+#[test]
+fn panel_refresh_due_none_is_true() {
+    assert!(panel_refresh_due(
+        None,
+        std::time::Instant::now(),
+        PANEL_REFRESH_INTERVAL
+    ));
+}
+
+#[test]
+fn panel_refresh_due_within_interval_is_false() {
+    let now = std::time::Instant::now();
+    assert!(!panel_refresh_due(Some(now), now, PANEL_REFRESH_INTERVAL));
+}
+
+#[test]
+fn panel_refresh_due_past_interval_is_true() {
+    let now = std::time::Instant::now();
+    let past = now - PANEL_REFRESH_INTERVAL;
+    assert!(panel_refresh_due(Some(past), now, PANEL_REFRESH_INTERVAL));
+}

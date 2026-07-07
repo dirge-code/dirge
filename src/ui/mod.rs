@@ -176,6 +176,12 @@ fn shell_overlay_rows(parser: &vt100::Parser) -> Vec<(String, crossterm::style::
 /// Max logical lines passed to the shell box (the painter soft-wraps further).
 const SHELL_OVERLAY_MAX_LINES: usize = 64;
 
+/// Minimum interval between ambient panel snapshot refreshes. The loop
+/// wakes per token during streaming (50-200 Hz), but the panels show
+/// session tokens / git / tool activity that are fine one interval stale
+/// (dirge-b14h).
+const PANEL_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
 // Interactive entry point — every collaborator (client, agent, CLI,
 // config, session, context, hooks, plugin manager, …) is threaded in
 // explicitly so the TUI loop owns no globals. Refactoring into a
@@ -1300,6 +1306,7 @@ pub async fn run_interactive(
     // that fire Resize on focus/other events) emit resizes with unchanged
     // dimensions, and rebuild() re-renders the entire scrollback.
     let mut last_resize_dims: Option<(u16, u16)> = None;
+    let mut last_panel_refresh: Option<std::time::Instant> = None;
 
     loop {
         // Refresh the info panel snapshot once per iteration so it stays
@@ -1307,31 +1314,39 @@ pub async fn run_interactive(
         // Done at loop top (not after each redraw) to avoid touching the
         // 40-odd individual draw sites; the data shown lags one event in
         // the worst case, which is fine for ambient status.
-        renderer.set_panel_data(build_panel_data(
-            session,
-            Some(&sysload),
-            #[cfg(feature = "mcp")]
-            mcp_manager.as_ref(),
-            #[cfg(feature = "lsp")]
-            lsp_manager.as_ref(),
-        ));
-        #[cfg(feature = "dap")]
-        {
-            let debug_data = crate::dap::session::DAP_MANAGER
-                .lock()
-                .ok()
-                .and_then(|g| g.as_ref().and_then(|m| m.debug_snapshot()));
-            renderer.set_debug_panel_data(debug_data);
-        }
-        // Refresh the left-panel vitals (context gauge, activity ticker,
-        // git snapshot) alongside the right panel.
-        {
-            let activity: Vec<String> = ui.tool_activity.iter().cloned().collect();
-            renderer.set_left_panel_info(build_left_panel_info(
+        //
+        // Throttled to PANEL_REFRESH_INTERVAL (dirge-b14h): during token
+        // streaming the loop wakes 50-200x/sec, but the panels only need
+        // to be "recent-ish" — a <=100ms lag is imperceptible.
+        let now = std::time::Instant::now();
+        if panel_refresh_due(last_panel_refresh, now, PANEL_REFRESH_INTERVAL) {
+            last_panel_refresh = Some(now);
+            renderer.set_panel_data(build_panel_data(
                 session,
-                &activity,
-                gitstat.snapshot(),
+                Some(&sysload),
+                #[cfg(feature = "mcp")]
+                mcp_manager.as_ref(),
+                #[cfg(feature = "lsp")]
+                lsp_manager.as_ref(),
             ));
+            #[cfg(feature = "dap")]
+            {
+                let debug_data = crate::dap::session::DAP_MANAGER
+                    .lock()
+                    .ok()
+                    .and_then(|g| g.as_ref().and_then(|m| m.debug_snapshot()));
+                renderer.set_debug_panel_data(debug_data);
+            }
+            // Refresh the left-panel vitals (context gauge, activity ticker,
+            // git snapshot) alongside the right panel.
+            {
+                let activity: Vec<String> = ui.tool_activity.iter().cloned().collect();
+                renderer.set_left_panel_info(build_left_panel_info(
+                    session,
+                    &activity,
+                    gitstat.snapshot(),
+                ));
+            }
         }
 
         // H-R1: loop-top PM acquisitions use `try_lock` so a
@@ -4818,6 +4833,20 @@ enum OptionAction {
     Reject,
     /// Keystroke does nothing in this view.
     Ignore,
+}
+
+/// Whether the ambient panel snapshot is due to refresh. Throttles the
+/// per-token loop-top recompute (dirge-b14h): the panels show session
+/// tokens / git / tool activity, which are fine one refresh-interval stale.
+fn panel_refresh_due(
+    last: Option<std::time::Instant>,
+    now: std::time::Instant,
+    interval: std::time::Duration,
+) -> bool {
+    match last {
+        None => true,
+        Some(t) => now.duration_since(t) >= interval,
+    }
 }
 
 /// Map a keystroke to an [`OptionAction`]. The tricky case this encodes is
