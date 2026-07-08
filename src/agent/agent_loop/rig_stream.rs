@@ -443,12 +443,25 @@ where
                 }
                 Ok(StreamedAssistantContent::Final(r)) => {
                     let u = r.token_usage();
-                    token_usage = Some(super::message::TokenUsage {
-                        input_tokens: u.input_tokens,
-                        output_tokens: u.output_tokens,
-                        cached_input_tokens: u.cached_input_tokens,
-                        cache_creation_input_tokens: u.cache_creation_input_tokens,
-                    });
+                    // rig 0.39 changed `token_usage()` from `Option<Usage>`
+                    // to `Usage`, using all-zeros as its "provider didn't
+                    // report" sentinel (the old `None`). Preserve that
+                    // distinction: an unreported turn must stay `None` so the
+                    // downstream guard in stream.rs doesn't emit a
+                    // `LoopEvent::Usage` for it and dilute the cache-hit ratio
+                    // with an empty turn.
+                    if u.input_tokens != 0
+                        || u.output_tokens != 0
+                        || u.cached_input_tokens != 0
+                        || u.cache_creation_input_tokens != 0
+                    {
+                        token_usage = Some(super::message::TokenUsage {
+                            input_tokens: u.input_tokens,
+                            output_tokens: u.output_tokens,
+                            cached_input_tokens: u.cached_input_tokens,
+                            cache_creation_input_tokens: u.cache_creation_input_tokens,
+                        });
+                    }
                 }
                 Err(err) => {
                     yield StreamEvent::Error {
@@ -1873,5 +1886,47 @@ mod tests {
         assert_eq!(usage.input_tokens, 1000);
         assert_eq!(usage.cached_input_tokens, 800);
         assert_eq!(usage.cache_creation_input_tokens, 0);
+    }
+
+    /// rig 0.39 returns an all-zeros `Usage` (not `None`) when a provider
+    /// doesn't report token usage. `Done.usage` must stay `None` in that
+    /// case so the loop's usage guard skips it — emitting a zero-usage
+    /// event would dilute the session cache-hit ratio with empty turns.
+    #[tokio::test]
+    async fn final_response_with_unreported_usage_stays_none() {
+        #[derive(Clone, Debug)]
+        struct NoUsageResponse;
+        impl GetTokenUsage for NoUsageResponse {
+            fn token_usage(&self) -> rig::completion::Usage {
+                rig::completion::Usage::default()
+            }
+        }
+
+        let raw: Pin<
+            Box<
+                dyn Stream<
+                        Item = Result<StreamedAssistantContent<NoUsageResponse>, CompletionError>,
+                    > + Send,
+            >,
+        > = Box::pin(futures::stream::iter(vec![
+            Ok(StreamedAssistantContent::Text(Text {
+                text: "hi".to_string(),
+                additional_params: None,
+            })),
+            Ok(StreamedAssistantContent::Final(NoUsageResponse)),
+        ]));
+
+        let events = drain(wrap_streamed_assistant(raw, None, None)).await;
+        let usage = events
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::Done { usage, .. } => Some(*usage),
+                _ => None,
+            })
+            .expect("a Done event");
+        assert!(
+            usage.is_none(),
+            "unreported (all-zeros) usage must map to None, got {usage:?}"
+        );
     }
 }
