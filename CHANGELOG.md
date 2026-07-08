@@ -4,6 +4,16 @@ All notable changes to dirge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.19.2] - 2026-07-08
+
+### Fixed
+- `cargo install dirge-agent` failed to compile against rig. rig ships
+  breaking API changes in patch releases (0.37.1 added a required
+  `Text.additional_params` field), and `cargo install` resolves without the
+  lockfile, so the caret dependency drifted onto an incompatible rig. rig and
+  rig-core are now pinned to an exact version so published installs build
+  against the rig dirge was tested with (dirge-omgq, GH #616).
+
 ## [0.19.1] - 2026-07-07
 
 ### Fixed

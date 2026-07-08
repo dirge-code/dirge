@@ -3,7 +3,7 @@
 # taken on crates.io. The installed BINARY is still `dirge` (see [[bin]]),
 # so users run: `cargo install dirge-agent` then the `dirge` command.
 name = "dirge-agent"
-version = "0.19.1"
+version = "0.19.2"
 edition = "2024"
 # MSRV: edition 2024 needs 1.85, but the dependency tree (time, serde_with,
 # darling, instability) requires 1.88 — pin there so older toolchains fail
@@ -185,14 +185,20 @@ libc = "0.2"
 # cargo-audit findings. The `rustls` feature on rig-core ensures the
 # reqwest TLS backend stays on the modern rustls 0.23 → webpki 0.103
 # stack rather than the legacy 0.21 pathway.
-rig = { version = "0.39", default-features = false, features = ["rmcp"] }
+# Pinned to an exact version, not a caret. rig ships breaking API
+# changes in patch/minor releases (0.37.0 -> 0.37.1 added a required
+# `Text.additional_params` field), and `cargo install dirge-agent`
+# resolves without our Cargo.lock, so a caret would let a published
+# dirge drift onto an incompatible rig and fail to build (GH #616).
+# Bump this deliberately when adopting a new rig.
+rig = { version = "=0.39.0", default-features = false, features = ["rmcp"] }
 # Explicit dep to pin feature flags. Without this, rig (our only
 # dep on rig-core) enables `derive` and `reqwest` via its own
 # feature resolution, but we want `rustls` explicitly declared so
 # future readers understand the TLS backend choice is deliberate.
 # cargo-machete reports this as unused — the package.metadata
 # block at the top of this file suppresses that false positive.
-rig-core = { version = "0.39", default-features = false, features = ["reqwest", "derive", "rustls"] }
+rig-core = { version = "=0.39.0", default-features = false, features = ["reqwest", "derive", "rustls"] }
 # Macros for emitting `Stream<Item = …>` from async generator-style
 # code blocks. Used by `agent_loop::rig_stream` to wrap rig's
 # `StreamingCompletionResponse` into our pi-style `StreamEvent`
