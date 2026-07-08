@@ -530,8 +530,8 @@ mod tests {
     struct TestResponse;
 
     impl GetTokenUsage for TestResponse {
-        fn token_usage(&self) -> Option<rig::completion::Usage> {
-            None
+        fn token_usage(&self) -> rig::completion::Usage {
+            rig::completion::Usage::default()
         }
     }
 
@@ -572,10 +572,12 @@ mod tests {
     async fn wraps_simple_text_response() {
         let raw = raw_stream(vec![
             Ok(StreamedAssistantContent::Text(Text {
-                text: "Hello".to_string(),
+                text: "Hello".to_string(),,
+                additional_params: None,
             })),
             Ok(StreamedAssistantContent::Text(Text {
-                text: " world".to_string(),
+                text: " world".to_string(),,
+                additional_params: None,
             })),
         ]);
         let events = drain(wrap_streamed_assistant(raw, None, None)).await;
@@ -1003,11 +1005,13 @@ mod tests {
     async fn wraps_error_emits_error_and_stops() {
         let raw = raw_stream(vec![
             Ok(StreamedAssistantContent::Text(Text {
-                text: "partial".to_string(),
+                text: "partial".to_string(),,
+                additional_params: None,
             })),
             Err(CompletionError::ProviderError("bad upstream".to_string())),
             Ok(StreamedAssistantContent::Text(Text {
-                text: " more text".to_string(),
+                text: " more text".to_string(),,
+                additional_params: None,
             })),
         ]);
         let events = drain(wrap_streamed_assistant(raw, None, None)).await;
@@ -1272,7 +1276,8 @@ mod tests {
         let raw = raw_stream(vec![
             Ok(StreamedAssistantContent::Reasoning(r1)),
             Ok(StreamedAssistantContent::Text(Text {
-                text: "between".to_string(),
+                text: "between".to_string(),,
+                additional_params: None,
             })),
             Ok(StreamedAssistantContent::Reasoning(r2)),
         ]);
@@ -1440,14 +1445,16 @@ mod tests {
     async fn wraps_mixed_content_resets_block_indices() {
         let raw = raw_stream(vec![
             Ok(StreamedAssistantContent::Text(Text {
-                text: "hi ".to_string(),
+                text: "hi ".to_string(),,
+                additional_params: None,
             })),
             Ok(StreamedAssistantContent::ReasoningDelta {
                 id: None,
                 reasoning: "thinking".to_string(),
             }),
             Ok(StreamedAssistantContent::Text(Text {
-                text: "done".to_string(),
+                text: "done".to_string(),,
+                additional_params: None,
             })),
         ]);
         let events = drain(wrap_streamed_assistant(raw, None, None)).await;
@@ -1496,7 +1503,8 @@ mod tests {
             if n == 0 {
                 Some((
                     Ok(StreamedAssistantContent::Text(Text {
-                        text: "first chunk".to_string(),
+                        text: "first chunk".to_string(),,
+                        additional_params: None,
                     })),
                     1,
                 ))
@@ -1544,7 +1552,8 @@ mod tests {
     #[tokio::test]
     async fn chunk_timeout_none_disables_timeout() {
         let raw = raw_stream(vec![Ok(StreamedAssistantContent::Text(Text {
-            text: "ok".to_string(),
+            text: "ok".to_string(),,
+            additional_params: None,
         }))]);
         let events = drain(wrap_streamed_assistant(raw, None, None)).await;
         // Normal completion — no Error.
@@ -1593,7 +1602,8 @@ mod tests {
                         tokio::time::sleep(Duration::from_secs(20)).await;
                         Some((
                             Ok(StreamedAssistantContent::Text(Text {
-                                text: "thinking…".to_string(),
+                                text: "thinking…".to_string(),,
+                                additional_params: None,
                             })),
                             2,
                         ))
@@ -1605,7 +1615,8 @@ mod tests {
                         tokio::time::sleep(Duration::from_secs(20)).await;
                         Some((
                             Ok(StreamedAssistantContent::Text(Text {
-                                text: "more thinking…".to_string(),
+                                text: "more thinking…".to_string(),,
+                                additional_params: None,
                             })),
                             3,
                         ))
@@ -1733,10 +1744,12 @@ mod tests {
         use crate::agent::agent_loop::tool::AbortSignal;
         let raw = raw_stream(vec![
             Ok(StreamedAssistantContent::Text(Text {
-                text: "first".to_string(),
+                text: "first".to_string(),,
+                additional_params: None,
             })),
             Ok(StreamedAssistantContent::Text(Text {
-                text: " second".to_string(),
+                text: " second".to_string(),,
+                additional_params: None,
             })),
         ]);
         let signal = AbortSignal::new();
@@ -1772,7 +1785,8 @@ mod tests {
     #[tokio::test]
     async fn signal_none_does_not_affect_stream() {
         let raw = raw_stream(vec![Ok(StreamedAssistantContent::Text(Text {
-            text: "ok".to_string(),
+            text: "ok".to_string(),,
+            additional_params: None,
         }))]);
         let events = drain(wrap_streamed_assistant(raw, None, None)).await;
         // Normal completion — no Error.
@@ -1792,10 +1806,12 @@ mod tests {
     async fn chunk_timeout_does_not_fire_on_fast_stream() {
         let raw = raw_stream(vec![
             Ok(StreamedAssistantContent::Text(Text {
-                text: "fast 1".to_string(),
+                text: "fast 1".to_string(),,
+                additional_params: None,
             })),
             Ok(StreamedAssistantContent::Text(Text {
-                text: " 2".to_string(),
+                text: " 2".to_string(),,
+                additional_params: None,
             })),
         ]);
         // Tight timeout (10ms) but all events fire
@@ -1823,13 +1839,13 @@ mod tests {
         #[derive(Clone, Debug)]
         struct UsageResponse;
         impl GetTokenUsage for UsageResponse {
-            fn token_usage(&self) -> Option<rig::completion::Usage> {
+            fn token_usage(&self) -> rig::completion::Usage {
                 let mut u = rig::completion::Usage::new();
                 u.input_tokens = 1000;
                 u.output_tokens = 50;
                 u.cached_input_tokens = 800;
                 u.cache_creation_input_tokens = 0;
-                Some(u)
+                u
             }
         }
 
@@ -1840,7 +1856,8 @@ mod tests {
             >,
         > = Box::pin(futures::stream::iter(vec![
             Ok(StreamedAssistantContent::Text(Text {
-                text: "hi".to_string(),
+                text: "hi".to_string(),,
+                additional_params: None,
             })),
             Ok(StreamedAssistantContent::Final(UsageResponse)),
         ]));
