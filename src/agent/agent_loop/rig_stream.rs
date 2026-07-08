@@ -572,11 +572,11 @@ mod tests {
     async fn wraps_simple_text_response() {
         let raw = raw_stream(vec![
             Ok(StreamedAssistantContent::Text(Text {
-                text: "Hello".to_string(),,
+                text: "Hello".to_string(),
                 additional_params: None,
             })),
             Ok(StreamedAssistantContent::Text(Text {
-                text: " world".to_string(),,
+                text: " world".to_string(),
                 additional_params: None,
             })),
         ]);
@@ -1005,12 +1005,12 @@ mod tests {
     async fn wraps_error_emits_error_and_stops() {
         let raw = raw_stream(vec![
             Ok(StreamedAssistantContent::Text(Text {
-                text: "partial".to_string(),,
+                text: "partial".to_string(),
                 additional_params: None,
             })),
             Err(CompletionError::ProviderError("bad upstream".to_string())),
             Ok(StreamedAssistantContent::Text(Text {
-                text: " more text".to_string(),,
+                text: " more text".to_string(),
                 additional_params: None,
             })),
         ]);
@@ -1276,7 +1276,7 @@ mod tests {
         let raw = raw_stream(vec![
             Ok(StreamedAssistantContent::Reasoning(r1)),
             Ok(StreamedAssistantContent::Text(Text {
-                text: "between".to_string(),,
+                text: "between".to_string(),
                 additional_params: None,
             })),
             Ok(StreamedAssistantContent::Reasoning(r2)),
@@ -1445,7 +1445,7 @@ mod tests {
     async fn wraps_mixed_content_resets_block_indices() {
         let raw = raw_stream(vec![
             Ok(StreamedAssistantContent::Text(Text {
-                text: "hi ".to_string(),,
+                text: "hi ".to_string(),
                 additional_params: None,
             })),
             Ok(StreamedAssistantContent::ReasoningDelta {
@@ -1453,7 +1453,7 @@ mod tests {
                 reasoning: "thinking".to_string(),
             }),
             Ok(StreamedAssistantContent::Text(Text {
-                text: "done".to_string(),,
+                text: "done".to_string(),
                 additional_params: None,
             })),
         ]);
@@ -1503,7 +1503,7 @@ mod tests {
             if n == 0 {
                 Some((
                     Ok(StreamedAssistantContent::Text(Text {
-                        text: "first chunk".to_string(),,
+                        text: "first chunk".to_string(),
                         additional_params: None,
                     })),
                     1,
@@ -1552,7 +1552,7 @@ mod tests {
     #[tokio::test]
     async fn chunk_timeout_none_disables_timeout() {
         let raw = raw_stream(vec![Ok(StreamedAssistantContent::Text(Text {
-            text: "ok".to_string(),,
+            text: "ok".to_string(),
             additional_params: None,
         }))]);
         let events = drain(wrap_streamed_assistant(raw, None, None)).await;
@@ -1602,7 +1602,7 @@ mod tests {
                         tokio::time::sleep(Duration::from_secs(20)).await;
                         Some((
                             Ok(StreamedAssistantContent::Text(Text {
-                                text: "thinking…".to_string(),,
+                                text: "thinking…".to_string(),
                                 additional_params: None,
                             })),
                             2,
@@ -1615,7 +1615,7 @@ mod tests {
                         tokio::time::sleep(Duration::from_secs(20)).await;
                         Some((
                             Ok(StreamedAssistantContent::Text(Text {
-                                text: "more thinking…".to_string(),,
+                                text: "more thinking…".to_string(),
                                 additional_params: None,
                             })),
                             3,
@@ -1744,11 +1744,11 @@ mod tests {
         use crate::agent::agent_loop::tool::AbortSignal;
         let raw = raw_stream(vec![
             Ok(StreamedAssistantContent::Text(Text {
-                text: "first".to_string(),,
+                text: "first".to_string(),
                 additional_params: None,
             })),
             Ok(StreamedAssistantContent::Text(Text {
-                text: " second".to_string(),,
+                text: " second".to_string(),
                 additional_params: None,
             })),
         ]);
@@ -1785,7 +1785,7 @@ mod tests {
     #[tokio::test]
     async fn signal_none_does_not_affect_stream() {
         let raw = raw_stream(vec![Ok(StreamedAssistantContent::Text(Text {
-            text: "ok".to_string(),,
+            text: "ok".to_string(),
             additional_params: None,
         }))]);
         let events = drain(wrap_streamed_assistant(raw, None, None)).await;
@@ -1806,11 +1806,11 @@ mod tests {
     async fn chunk_timeout_does_not_fire_on_fast_stream() {
         let raw = raw_stream(vec![
             Ok(StreamedAssistantContent::Text(Text {
-                text: "fast 1".to_string(),,
+                text: "fast 1".to_string(),
                 additional_params: None,
             })),
             Ok(StreamedAssistantContent::Text(Text {
-                text: " 2".to_string(),,
+                text: " 2".to_string(),
                 additional_params: None,
             })),
         ]);
@@ -1856,7 +1856,7 @@ mod tests {
             >,
         > = Box::pin(futures::stream::iter(vec![
             Ok(StreamedAssistantContent::Text(Text {
-                text: "hi".to_string(),,
+                text: "hi".to_string(),
                 additional_params: None,
             })),
             Ok(StreamedAssistantContent::Final(UsageResponse)),
