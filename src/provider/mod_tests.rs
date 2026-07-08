@@ -81,6 +81,34 @@ fn auto_detect_glm_api_key_wins_over_zhipu_when_both_set() {
     assert_eq!(auto_detect_provider_from(env), Some("glm"));
 }
 
+/// No stored `dirge auth` login → no provider implied, so the
+/// caller falls through to the openrouter default.
+#[test]
+fn auth_detect_returns_none_when_no_login_present() {
+    assert_eq!(auth_detect_provider_from(false, false), None);
+}
+
+/// A stored `dirge auth openai` login makes openai the provider
+/// even with no API-key env var set (GH #617).
+#[test]
+fn auth_detect_picks_openai_when_openai_login_present() {
+    assert_eq!(auth_detect_provider_from(true, false), Some("openai"));
+}
+
+/// A stored `dirge auth anthropic` login makes anthropic the
+/// provider, mirroring the openai case.
+#[test]
+fn auth_detect_picks_anthropic_when_anthropic_login_present() {
+    assert_eq!(auth_detect_provider_from(false, true), Some("anthropic"));
+}
+
+/// With both logins present, openai wins — a stable order matching
+/// the env-autodetect list where openai precedes anthropic.
+#[test]
+fn auth_detect_prefers_openai_when_both_logins_present() {
+    assert_eq!(auth_detect_provider_from(true, true), Some("openai"));
+}
+
 /// `provider_env_var_fallbacks` lists canonical alternatives
 /// for GLM (Zhipu's name), Anthropic (OAuth token), and Gemini
 /// (Google's canonical form). Other providers have no

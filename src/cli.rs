@@ -312,6 +312,41 @@ pub enum SandboxAction {
     },
 }
 
+/// Where the resolved provider name came from. Kept separate from the
+/// resolution so the precedence is unit-testable without touching the
+/// environment or credential stores, and so each source can log
+/// differently (see [`Cli::resolve_provider`]).
+#[derive(Debug, PartialEq)]
+enum ProviderPick<'a> {
+    /// `--provider` flag or `provider` in config.
+    Explicit(&'a str),
+    /// Autodetected from an API-key env var.
+    Env(&'a str),
+    /// Implied by a stored `dirge auth` OAuth login.
+    Auth(&'a str),
+    /// Nothing set — the hard `openrouter` default.
+    Default,
+}
+
+/// Precedence for provider selection: explicit config wins, then an env
+/// API key, then a stored `dirge auth` login, then the default. Pure so
+/// the ordering is testable; the caller supplies the detection results.
+fn pick_provider<'a>(
+    explicit: Option<&'a str>,
+    env_detected: Option<&'a str>,
+    auth_detected: Option<&'a str>,
+) -> ProviderPick<'a> {
+    if let Some(p) = explicit {
+        ProviderPick::Explicit(p)
+    } else if let Some(e) = env_detected {
+        ProviderPick::Env(e)
+    } else if let Some(a) = auth_detected {
+        ProviderPick::Auth(a)
+    } else {
+        ProviderPick::Default
+    }
+}
+
 impl Cli {
     pub fn resolve_model(&self, cfg: &config::Config) -> CompactString {
         if let Some(m) = self.model.as_deref() {
@@ -339,22 +374,34 @@ impl Cli {
     }
 
     pub fn resolve_provider(&self, cfg: &config::Config) -> CompactString {
-        if let Some(p) = self.provider.as_deref().or(cfg.provider.as_deref()) {
-            return CompactString::new(p);
+        let explicit = self.provider.as_deref().or(cfg.provider.as_deref());
+        match pick_provider(
+            explicit,
+            crate::provider::auto_detect_provider(),
+            crate::provider::auth_detect_provider(),
+        ) {
+            ProviderPick::Explicit(p) => CompactString::new(p),
+            // PROV-4: log when autodetect picks a provider from env vars
+            // so users with multiple API keys set understand which one
+            // is being used. Resolution order is fixed and deepseek wins
+            // over openrouter if both are present — surprising silent
+            // behavior previously.
+            ProviderPick::Env(detected) => {
+                eprintln!(
+                    "info: provider auto-detected from environment: {detected} (set `--provider` or `provider` in config.json to override)",
+                );
+                CompactString::new(detected)
+            }
+            // GH #617: a stored `dirge auth` login is enough to launch,
+            // even with no API-key env var or `provider` in config.
+            ProviderPick::Auth(authed) => {
+                eprintln!(
+                    "info: provider selected from stored `dirge auth` login: {authed} (set `--provider` or `provider` in config.json to override)",
+                );
+                CompactString::new(authed)
+            }
+            ProviderPick::Default => CompactString::new("openrouter"),
         }
-        // PROV-4: log when autodetect picks a provider from env vars
-        // so users with multiple API keys set understand which one
-        // is being used. Resolution order is fixed and deepseek wins
-        // over openrouter if both are present — surprising silent
-        // behavior previously.
-        if let Some(detected) = crate::provider::auto_detect_provider() {
-            eprintln!(
-                "info: provider auto-detected from environment: {} (set `--provider` or `provider` in config.json to override)",
-                detected,
-            );
-            return CompactString::new(detected);
-        }
-        CompactString::new("openrouter")
     }
 
     pub fn resolve_max_tokens(&self, cfg: &config::Config) -> u64 {
@@ -429,6 +476,32 @@ mod tests {
             }) => {}
             other => panic!("expected auth openai command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn pick_provider_prefers_explicit_over_everything() {
+        let pick = pick_provider(Some("glm"), Some("openai"), Some("anthropic"));
+        assert!(matches!(pick, ProviderPick::Explicit("glm")));
+    }
+
+    #[test]
+    fn pick_provider_uses_env_when_no_explicit() {
+        let pick = pick_provider(None, Some("openai"), Some("anthropic"));
+        assert!(matches!(pick, ProviderPick::Env("openai")));
+    }
+
+    /// GH #617: with no explicit config and no env key, a stored
+    /// `dirge auth` login is used before the openrouter default.
+    #[test]
+    fn pick_provider_uses_auth_login_when_no_explicit_or_env() {
+        let pick = pick_provider(None, None, Some("openai"));
+        assert!(matches!(pick, ProviderPick::Auth("openai")));
+    }
+
+    #[test]
+    fn pick_provider_falls_back_to_default_when_nothing_set() {
+        let pick = pick_provider(None, None, None);
+        assert!(matches!(pick, ProviderPick::Default));
     }
 
     #[test]

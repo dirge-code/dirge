@@ -428,6 +428,37 @@ pub(crate) fn auto_detect_provider_from<F: Fn(&str) -> Option<String>>(
     None
 }
 
+/// Provider implied by a stored `dirge auth` OAuth login. Consulted
+/// after env-var autodetect and before the hard `openrouter` default so
+/// that a user who ran `dirge auth openai` (or `dirge auth anthropic`) but
+/// set no API-key env var and no `provider` in config launches against the
+/// account they logged in to, instead of being asked for an OpenRouter key
+/// (GH #617). Reads the local credential stores only — no network.
+pub fn auth_detect_provider() -> Option<&'static str> {
+    let openai = crate::auth::store::OpenAiAuthStore::default()
+        .load_openai()
+        .ok()
+        .flatten()
+        .is_some();
+    let anthropic = std::env::var("ANTHROPIC_OAUTH_TOKEN").is_ok_and(|v| !v.is_empty())
+        || crate::provider::anthropic_oauth::credentials_file_path().exists();
+    auth_detect_provider_from(openai, anthropic)
+}
+
+/// Pure core of [`auth_detect_provider`]: pick a provider from which
+/// OAuth logins are present. OpenAI wins over Anthropic when both exist —
+/// arbitrary but stable, matching the env-autodetect order where openai
+/// precedes anthropic.
+pub(crate) fn auth_detect_provider_from(openai: bool, anthropic: bool) -> Option<&'static str> {
+    if openai {
+        Some("openai")
+    } else if anthropic {
+        Some("anthropic")
+    } else {
+        None
+    }
+}
+
 /// Per-provider fallback env vars consulted AFTER the primary
 /// (returned by `provider_env_var`) and after any explicit
 /// `api_key_env_override`. Lets users with the upstream-canonical

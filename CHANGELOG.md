@@ -13,6 +13,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   lockfile, so the caret dependency drifted onto an incompatible rig. rig and
   rig-core are now pinned to an exact version so published installs build
   against the rig dirge was tested with (dirge-omgq, GH #616).
+- `dirge auth openai` (or `dirge auth anthropic`) alone wasn't enough to
+  launch dirge: provider selection consulted only `--provider`/config and
+  API-key env vars before defaulting to OpenRouter, so a user who logged in
+  via OAuth but set no env key was still asked for an OpenRouter key. Provider
+  resolution now falls back to a stored `dirge auth` login before the
+  OpenRouter default (dirge-ppie, GH #617).
 
 ## [0.19.1] - 2026-07-07
 
