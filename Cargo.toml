@@ -231,7 +231,7 @@ ansi-to-tui = "8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "process", "fs", "io-util"] }
-anyhow = "1"
+anyhow = "1.0.103"
 # Already transitive via rig's `http_client` API (rig re-exports `bytes::Bytes`
 # in the request/response types). Declared directly so `provider::codex_http`
 # can name `Bytes` when normalizing the Codex `/responses` body — no new crate
@@ -253,7 +253,7 @@ dirs = "6"
 compact_str = { version = "0.9", features = ["serde"] }
 smallvec = "1"
 regex = "1"
-ignore = "0.4"
+ignore = "0.4.27"
 pulldown-cmark = "0.13"
 include_dir = "0.7"
 http = "1"
