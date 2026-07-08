@@ -1253,6 +1253,38 @@ fn reassert_terminal_modes_arms_and_respects_throttle() {
     );
 }
 
+/// When the user is mid-drag selecting text, `reassert_terminal_modes` must
+/// not write to /dev/tty: re-sending mouse-tracking enable sequences
+/// (?1003h et al.) resets internal tracking state on some terminals,
+/// dropping the drag so MouseUp never fires and copy_to_clipboard is never
+/// called.
+#[test]
+fn reassert_terminal_modes_suppressed_during_selection() {
+    let mut r = Renderer::new().expect("renderer");
+    r.selection_active = true;
+    // The method arms the throttle on write, so a no-write call leaves
+    // last_mode_reassert at None — a subsequent payload probe must still
+    // show a payload is due (we didn't arm the throttle).
+    r.reassert_terminal_modes();
+    assert!(
+        r.mode_reassert_due_in_test().is_some(),
+        "selection guard must skip the write entirely, leaving throttle unarmed"
+    );
+}
+
+/// Same guard for the FocusGained path: `reassert_modes_light` must not
+/// write to /dev/tty mid-drag.
+#[test]
+fn reassert_modes_light_suppressed_during_selection() {
+    let mut r = Renderer::new().expect("renderer");
+    r.selection_active = true;
+    r.reassert_modes_light();
+    assert!(
+        r.mode_reassert_due_in_test().is_some(),
+        "selection guard must skip the light reassert, leaving throttle unarmed"
+    );
+}
+
 /// Scrollback eviction (front drain past MAX_SCROLLBACK) bumps the
 /// eviction generation — the counter the Ctrl+O collapse guard relies on
 /// to know an absolute line anchor has been invalidated.

@@ -2782,6 +2782,13 @@ impl Renderer {
     /// which is why, in the broken state, the keyboard keeps working while
     /// the mouse stays dead.
     pub fn reassert_terminal_modes(&mut self) {
+        // Don't write to /dev/tty while the user is mid-drag selecting
+        // text: re-sending mouse-tracking enable sequences (?1003h et al.)
+        // resets internal tracking state on some terminals, dropping the
+        // drag so MouseUp never fires and copy_to_clipboard is never called.
+        if self.selection_active {
+            return;
+        }
         let now = std::time::Instant::now();
         if let Some(bytes) = mode_reassert_payload(self.last_mode_reassert, now) {
             if let Some(mut tty) = crate::ui::terminal::open_tty_for_write() {
@@ -2841,6 +2848,11 @@ impl Renderer {
     /// deliberately un-throttled. The manual Ctrl+L hatch still uses
     /// [`force_terminal_reassert`] for a genuine full recovery + clear.
     pub fn reassert_modes_light(&mut self) {
+        // Same guard as reassert_terminal_modes: writing mode-enable
+        // sequences to /dev/tty mid-drag drops the selection.
+        if self.selection_active {
+            return;
+        }
         let now = std::time::Instant::now();
         // Throttle: a terminal that echoes `FocusGained` on the `?1004h` in
         // TERMINAL_MODE_REASSERT would otherwise drive an unbounded re-arm →
