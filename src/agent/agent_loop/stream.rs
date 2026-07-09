@@ -35,7 +35,8 @@ use futures::stream::StreamExt;
 use tokio::sync::mpsc;
 
 use super::message::{
-    AssistantMessage, LoopEvent, LoopMessage, StopReason, StreamEvent, assistant_to_value,
+    AssistantMessage, ContentBlock, LoopEvent, LoopMessage, StopReason, StreamEvent,
+    assistant_to_value,
 };
 use super::tool::AbortSignal;
 use super::types::{Context, LoopConfig};
@@ -222,11 +223,16 @@ pub async fn stream_assistant_response(
 
     // 5. Iterate events.
     let mut added_partial = false;
+    // Latest partial snapshot — captured on Start/Delta so a
+    // mid-stream `Error` can preserve whatever streamed instead of
+    // finalizing an empty turn (see the Error arm).
+    let mut last_partial: Option<AssistantMessage> = None;
     let mut final_message: Option<(AssistantMessage, Option<super::message::TokenUsage>)> = None;
 
     while let Some(event) = stream.next().await {
         match event {
             StreamEvent::Start { partial } => {
+                last_partial = Some(partial.clone());
                 context.messages.push(assistant_to_value(&partial));
                 added_partial = true;
                 let _ = emit
@@ -236,6 +242,7 @@ pub async fn stream_assistant_response(
                     .await;
             }
             StreamEvent::Delta { partial, phase } => {
+                last_partial = Some(partial.clone());
                 if added_partial {
                     // Replace the last context message with the
                     // updated partial. Pi: `context.messages[
@@ -271,8 +278,23 @@ pub async fn stream_assistant_response(
                 break;
             }
             StreamEvent::Error { error } => {
+                // Preserve whatever streamed before the error rather
+                // than discarding it. A transient mid-stream failure
+                // ("error decoding response body") must not erase the
+                // model's in-progress work from the transcript — the
+                // run-level recovery in run.rs relies on the partial
+                // being here so the run can continue instead of dying
+                // on an empty turn.
+                let mut content = last_partial.take().map(|p| p.content).unwrap_or_default();
+                // The stream was cut mid-flight, so any tool-call
+                // block in the partial never executed (tool dispatch
+                // happens only after this fn returns). An unexecuted
+                // tool_use would orphan it (no matching tool_result)
+                // and break the next turn's API call, so strip
+                // tool-call blocks and keep text/thinking.
+                content.retain(|b| !matches!(b, ContentBlock::ToolCall { .. }));
                 let finalised = AssistantMessage {
-                    content: Vec::new(),
+                    content,
                     stop_reason: StopReason::Error,
                     error_message: Some(error),
                 };
@@ -931,5 +953,128 @@ mod tests {
             }
         }
         assert!(saw_escalation, "expected EscalationActivated event");
+    }
+
+    /// Regression: a mid-stream `Error` arriving AFTER the model has
+    /// streamed text must preserve the partial content in the returned
+    /// assistant message — not finalize an empty turn. Without this, a
+    /// transient transport blip ("error decoding response body")
+    /// silently erases the model's in-progress work from the transcript,
+    /// so the run can't recover and the user sees an empty turn.
+    #[tokio::test]
+    async fn error_after_streamed_text_preserves_partial() {
+        use crate::agent::agent_loop::message::DeltaPhase;
+        let stream_fn: StreamFn = Arc::new(|_ctx, _opts| {
+            let partial = AssistantMessage::new(
+                vec![ContentBlock::Text {
+                    text: "working on it".to_string(),
+                }],
+                StopReason::Stop,
+            );
+            Box::pin(futures::stream::iter(vec![
+                StreamEvent::Start {
+                    partial: AssistantMessage::new(Vec::new(), StopReason::Stop),
+                },
+                StreamEvent::Delta {
+                    partial,
+                    phase: DeltaPhase::TextDelta,
+                },
+                StreamEvent::Error {
+                    error: "error decoding response body".to_string(),
+                },
+            ]))
+        });
+        let mut ctx = Context::default();
+        let (tx, _rx) = mpsc::channel::<LoopEvent>(64);
+        let (msg, _usage) = stream_assistant_response(
+            &mut ctx,
+            &build_config(identity_converter()),
+            AbortSignal::new(),
+            &tx,
+            &stream_fn,
+        )
+        .await;
+
+        assert_eq!(msg.stop_reason, StopReason::Error);
+        let text: String = msg
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            text, "working on it",
+            "streamed partial must be preserved on a mid-stream Error"
+        );
+        assert_eq!(
+            msg.error_message.as_deref(),
+            Some("error decoding response body"),
+        );
+    }
+
+    /// A tool-call block in the streamed partial was never executed —
+    /// the stream errored before dispatch. Keeping it would orphan the
+    /// tool_use (no matching tool_result) and break the next turn's API
+    /// call. The preserved partial must strip tool-call blocks and keep
+    /// text/thinking.
+    #[tokio::test]
+    async fn error_after_streamed_content_strips_incomplete_tool_call() {
+        use crate::agent::agent_loop::message::DeltaPhase;
+        let stream_fn: StreamFn = Arc::new(|_ctx, _opts| {
+            let partial = AssistantMessage::new(
+                vec![
+                    ContentBlock::Text {
+                        text: "let me read the file".to_string(),
+                    },
+                    ContentBlock::ToolCall {
+                        id: "call-1".to_string(),
+                        name: "read".to_string(),
+                        arguments: serde_json::json!({"path": "x.rs"}),
+                    },
+                ],
+                StopReason::ToolUse,
+            );
+            Box::pin(futures::stream::iter(vec![
+                StreamEvent::Start {
+                    partial: AssistantMessage::new(Vec::new(), StopReason::Stop),
+                },
+                StreamEvent::Delta {
+                    partial,
+                    phase: DeltaPhase::ToolCallDelta,
+                },
+                StreamEvent::Error {
+                    error: "error decoding response body".to_string(),
+                },
+            ]))
+        });
+        let mut ctx = Context::default();
+        let (tx, _rx) = mpsc::channel::<LoopEvent>(64);
+        let (msg, _usage) = stream_assistant_response(
+            &mut ctx,
+            &build_config(identity_converter()),
+            AbortSignal::new(),
+            &tx,
+            &stream_fn,
+        )
+        .await;
+
+        assert_eq!(msg.stop_reason, StopReason::Error);
+        assert!(
+            msg.content
+                .iter()
+                .all(|b| !matches!(b, ContentBlock::ToolCall { .. })),
+            "unexecuted tool-call blocks must be stripped from the preserved partial"
+        );
+        let text: String = msg
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "let me read the file");
     }
 }

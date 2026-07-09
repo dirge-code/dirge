@@ -194,6 +194,21 @@ pub(crate) const RESUME_NUDGE_TAG: &str = "[resume]";
 /// repeatedly stops after broken tool calls can't loop forever.
 const MAX_RESUME_NUDGE: u8 = 3;
 
+/// Run-level recovery nudge reinjected (bounded by
+/// [`MAX_TRANSIENT_RECOVERIES`]) when a transient mid-stream error
+/// ("error decoding response body", network blip, rate-limit) kills an
+/// assistant turn AFTER content has already streamed. The streaming
+/// retry layer can't replay the turn (the partial is already on
+/// screen), so the run loop recovers instead: the preserved partial
+/// stays in the transcript and this nudge tells the model to continue
+/// rather than restart from scratch.
+const TRANSIENT_RECOVERY_NUDGE: &str = "Your previous response was cut off by a transient connection error before it finished. Continue from where you left off — do not repeat what you already said.";
+
+/// Upper bound on consecutive transient-error recoveries, so a
+/// genuinely dead network can't loop the run forever. Past this the
+/// error surfaces as terminal (the run ends, as it did before recovery).
+const MAX_TRANSIENT_RECOVERIES: u8 = 3;
+
 /// Stable prefix of the max-agent-turns truncation notice. The
 /// headless result path (`provider::run`) matches on this to mark the
 /// run truncated in its JSON envelope (dirge-18v2) — sharing the
@@ -1412,6 +1427,11 @@ pub async fn run_loop(
     // Deterministic resume-after-failure (bounded by MAX_RESUME_NUDGE).
     let mut resume_nudges: u8 = 0;
 
+    // Run-level recovery from a transient mid-stream error (bounded by
+    // MAX_TRANSIENT_RECOVERIES). Counts consecutive recoveries so a
+    // truly dead network still terminates.
+    let mut transient_recoveries: u8 = 0;
+
     // dirge-ksjl: open-issues gate counter (bounded by MAX_OPEN_ISSUES_NUDGES).
     let mut open_issues_nudges: u8 = 0;
 
@@ -1436,8 +1456,14 @@ pub async fn run_loop(
 
         let mut has_more_tool_calls = true;
 
-        // Pi line 174: INNER LOOP.
-        while has_more_tool_calls || !pending_messages.is_empty() {
+        // Pi line 174: INNER LOOP. `recovery_pending` forces one more
+        // iteration after a transient mid-stream error is recovered at
+        // the run level (see the error/aborted short-circuit below) —
+        // the nudge rides in context.messages, so the flag alone drives
+        // the next turn when no tool calls or steering are pending.
+        let mut recovery_pending = false;
+        while has_more_tool_calls || !pending_messages.is_empty() || recovery_pending {
+            recovery_pending = false;
             // Circuit-breaker bookkeeping is at-most-once per iteration:
             // a single iteration can run BOTH the turn-start fold and the
             // (ungated) post-usage ExitWithSummary pass, and counting two
@@ -1630,6 +1656,56 @@ pub async fn run_loop(
                 assistant_msg.stop_reason,
                 StopReason::Error | StopReason::Aborted
             ) {
+                // Run-level recovery: a transient mid-stream failure
+                // (network blip, "error decoding response body",
+                // rate-limit) that arrived AFTER the model had already
+                // streamed content can't be silently retried by the
+                // stream layer (the partial is already on screen), but
+                // it shouldn't kill the whole run either. The partial is
+                // already preserved in the transcript (stream.rs Error
+                // arm), so nudge the model to continue and take another
+                // turn — bounded by MAX_TRANSIENT_RECOVERIES so a truly
+                // dead network still terminates. Aborted (explicit
+                // cancel) and non-transient errors (auth, context-length)
+                // still terminate as before.
+                let transient = assistant_msg.stop_reason == StopReason::Error
+                    && transient_recoveries < MAX_TRANSIENT_RECOVERIES
+                    && assistant_msg
+                        .error_message
+                        .as_deref()
+                        .map(|e| {
+                            use crate::agent::recovery::{ErrorKind, classify_error};
+                            matches!(classify_error(e), ErrorKind::Network | ErrorKind::RateLimit)
+                        })
+                        .unwrap_or(false);
+                if transient {
+                    transient_recoveries += 1;
+                    // LLM-facing only: not routed through pending_messages
+                    // (which render as user turns) so it doesn't surface as
+                    // a `<you>` line. Mirrors the stall-recovery nudge in
+                    // retry.rs.
+                    current_context.messages.push(serde_json::json!({
+                        "role": "user",
+                        "content": TRANSIENT_RECOVERY_NUDGE,
+                    }));
+                    let _ = emit
+                        .send(LoopEvent::RetryNotice {
+                            attempt: transient_recoveries as u32,
+                            delay_ms: 0,
+                            error: assistant_msg
+                                .error_message
+                                .clone()
+                                .unwrap_or_else(|| "transient stream error".to_string()),
+                        })
+                        .await;
+                    // No tool calls ran (the stream errored before
+                    // dispatch). Force one more inner iteration so the
+                    // nudge drives the next assistant turn.
+                    has_more_tool_calls = false;
+                    recovery_pending = true;
+                    continue;
+                }
+
                 let _ = emit
                     .send(LoopEvent::TurnEnd {
                         message: assistant_msg.clone(),

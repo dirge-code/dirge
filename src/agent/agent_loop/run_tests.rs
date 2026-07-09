@@ -153,6 +153,171 @@ fn empty_context() -> Context {
     }
 }
 
+/// Regression: a transient mid-stream error ("error decoding response
+/// body") arriving AFTER the model has streamed content must NOT kill
+/// the run. The streaming retry layer can't replay the turn (the
+/// partial is already on screen), but the run loop recovers: it keeps
+/// the preserved partial, nudges the model to continue, and the next
+/// turn proceeds — instead of tearing down to idle and dropping any
+/// queued steering.
+#[tokio::test]
+async fn transient_midstream_error_recovers_instead_of_terminating() {
+    use crate::agent::agent_loop::message::{DeltaPhase, LoopEvent};
+    let call = std::sync::Arc::new(AtomicUsize::new(0));
+    let factory: StreamFn = std::sync::Arc::new({
+        let call = call.clone();
+        move |_ctx, _opts| {
+            let n = call.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                // First call: stream some text, then die mid-stream
+                // with a transient transport error.
+                let partial = AssistantMessage::new(
+                    vec![ContentBlock::Text {
+                        text: "working on it".to_string(),
+                    }],
+                    StopReason::Stop,
+                );
+                Box::pin(futures::stream::iter(vec![
+                    StreamEvent::Start {
+                        partial: AssistantMessage::new(Vec::new(), StopReason::Stop),
+                    },
+                    StreamEvent::Delta {
+                        partial,
+                        phase: DeltaPhase::TextDelta,
+                    },
+                    StreamEvent::Error {
+                        error: "error decoding response body".to_string(),
+                    },
+                ]))
+            } else {
+                // Recovery turn: complete normally.
+                let msg = AssistantMessage::new(
+                    vec![ContentBlock::Text {
+                        text: "all done now".to_string(),
+                    }],
+                    StopReason::Stop,
+                );
+                Box::pin(futures::stream::iter(vec![StreamEvent::Done {
+                    reason: StopReason::Stop,
+                    message: msg,
+                    usage: None,
+                }]))
+            }
+        }
+    });
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+    let messages = run_agent_loop(
+        vec![LoopMessage::User(UserMessage::text("start"))],
+        empty_context(),
+        build_config(),
+        AbortSignal::new(),
+        &tx,
+        &factory,
+        None,
+        None,
+    )
+    .await;
+
+    // The run recovered past the error: the final assistant turn
+    // completed instead of the run dying on the errored turn.
+    let last_text = messages.iter().rev().find_map(|m| match m {
+        LoopMessage::Assistant(a) => a.content.iter().find_map(|b| match b {
+            ContentBlock::Text { text } => Some(text.clone()),
+            _ => None,
+        }),
+        _ => None,
+    });
+    assert_eq!(
+        last_text.as_deref(),
+        Some("all done now"),
+        "run must continue past a transient error and complete the recovery turn"
+    );
+
+    // A retry/recovery banner was surfaced so the UI isn't silent.
+    let mut saw_retry = false;
+    while let Ok(evt) = rx.try_recv() {
+        if matches!(evt, LoopEvent::RetryNotice { .. }) {
+            saw_retry = true;
+        }
+    }
+    assert!(
+        saw_retry,
+        "recovery should surface a RetryNotice banner instead of dying silently"
+    );
+}
+
+/// A sustained outage (every call fails transiently) must still
+/// terminate — the recovery budget caps consecutive recoveries so a
+/// dead network can't loop the run forever. After the budget is spent
+/// the error surfaces as terminal, exactly as it did before recovery.
+#[tokio::test]
+async fn sustained_transient_error_terminates_after_budget() {
+    use crate::agent::agent_loop::message::DeltaPhase;
+    let calls = std::sync::Arc::new(AtomicUsize::new(0));
+    let factory: StreamFn = std::sync::Arc::new({
+        let calls = calls.clone();
+        move |_ctx, _opts| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            let partial = AssistantMessage::new(
+                vec![ContentBlock::Text {
+                    text: "halfway".to_string(),
+                }],
+                StopReason::Stop,
+            );
+            Box::pin(futures::stream::iter(vec![
+                StreamEvent::Start {
+                    partial: AssistantMessage::new(Vec::new(), StopReason::Stop),
+                },
+                StreamEvent::Delta {
+                    partial,
+                    phase: DeltaPhase::TextDelta,
+                },
+                StreamEvent::Error {
+                    error: "error decoding response body".to_string(),
+                },
+            ]))
+        }
+    });
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(64);
+    let messages = run_agent_loop(
+        vec![LoopMessage::User(UserMessage::text("start"))],
+        empty_context(),
+        build_config(),
+        AbortSignal::new(),
+        &tx,
+        &factory,
+        None,
+        None,
+    )
+    .await;
+
+    // Recovered MAX_TRANSIENT_RECOVERIES times, then one final terminal
+    // error — not an unbounded loop.
+    let total_calls = calls.load(Ordering::SeqCst);
+    assert_eq!(
+        total_calls,
+        (MAX_TRANSIENT_RECOVERIES as usize) + 1,
+        "run must stop after the recovery budget is exhausted, not loop forever"
+    );
+
+    // The run terminated on a real error (not a clean Stop).
+    let last = messages
+        .iter()
+        .rev()
+        .find_map(|m| match m {
+            LoopMessage::Assistant(a) => Some(a),
+            _ => None,
+        })
+        .expect("an assistant message exists");
+    assert_eq!(
+        last.stop_reason,
+        StopReason::Error,
+        "after the budget the error must surface as terminal"
+    );
+}
+
 /// LOOP-9 integration: `run_compaction_pass` end-to-end. Feed
 /// a long conversation, a mock summarizer, and assert that
 /// (a) the older messages were dropped, (b) a SUMMARY_PREFIX
