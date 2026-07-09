@@ -165,6 +165,22 @@ experimental-graph-search = []
 # tree rather than orphaning bash's children.
 libc = "0.2"
 
+# Native desktop notification backend for the opt-in OS notification feature.
+# notify-rust is cross-platform; the backend it compiles is target-gated inside
+# the crate, so the feature set differs per platform:
+#   - macOS: mac-notification-sys (built in on the macOS target; no feature).
+#   - Windows: WinRT toast (built in on the Windows target; no feature).
+#   - Linux: needs a D-Bus backend. `z` = zbus, a pure-Rust client, so we avoid
+#     a system libdbus build/link dependency.
+[target.'cfg(target_os = "macos")'.dependencies]
+notify-rust = { version = "4", default-features = false }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+notify-rust = { version = "4", default-features = false }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+notify-rust = { version = "4", default-features = false, features = ["z"] }
+
 [dependencies]
 # CVE-2026 audit (2026-05-27): rig's default features pull a
 # sprawling transitive tree:

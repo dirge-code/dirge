@@ -436,6 +436,17 @@ pub struct PluginSettings {
     pub auto_start: Option<bool>,
 }
 
+/// Optional desktop notification settings. The block is absent/off by default;
+/// when enabled, individual event classes default to on so a minimal
+/// `{ "enabled": true }` does the useful thing.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct DesktopNotificationConfig {
+    pub enabled: Option<bool>,
+    pub on_completion: Option<bool>,
+    pub on_input_required: Option<bool>,
+}
+
 /// `lsp = true`  → enable built-in servers with default commands.
 /// `lsp = false` → disable LSP entirely.
 /// `lsp = { server-id = { … } }` → enable defaults, overriding the named
@@ -662,6 +673,9 @@ pub struct Config {
     /// the `.janet` file stem under a plugin search dir). Absent entry =
     /// enabled, not auto-started (backward compatible).
     pub plugins: Option<HashMap<String, PluginSettings>>,
+    /// Optional OS-level desktop notifications for turn completion and
+    /// prompts waiting on human input. Absent/off by default.
+    pub desktop_notifications: Option<DesktopNotificationConfig>,
     pub permission: Option<serde_json::Value>,
     pub restrictive: Option<bool>,
     pub accept_all: Option<bool>,
@@ -1816,6 +1830,27 @@ mod tests {
         let empty: Config = serde_json::from_str("{}").unwrap();
         assert!(empty.plugin_enabled("anything"));
         assert!(!empty.plugin_auto_start("anything"));
+    }
+
+    #[test]
+    fn desktop_notifications_are_absent_by_default_and_parse() {
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert!(cfg.desktop_notifications.is_none());
+
+        let cfg: Config = serde_json::from_str(
+            r#"{
+                "desktop_notifications": {
+                    "enabled": true,
+                    "on_completion": false,
+                    "on_input_required": true
+                }
+            }"#,
+        )
+        .unwrap();
+        let desktop = cfg.desktop_notifications.expect("desktop notifications");
+        assert_eq!(desktop.enabled, Some(true));
+        assert_eq!(desktop.on_completion, Some(false));
+        assert_eq!(desktop.on_input_required, Some(true));
     }
 
     #[test]

@@ -108,6 +108,7 @@ Accepted top-level keys:
 | `show_tool_details`       | boolean | Show tool-result output in the TUI. Default: `true`.                                                                                                                         |
 | `show_edit_diff`          | boolean | Show colorized diff output for `edit` tool results (`-` red, `+` green, `@@` cyan). Default: `true`.                                                                        |
 | `show_reasoning`          | boolean | Show the model's thinking/reasoning by default, instead of having to press `Ctrl+O` each turn. Default: `false`.                                                            |
+| `desktop_notifications`   | object  | Optional OS-level desktop notifications. Off when absent. Set `{ "enabled": true }` to notify on completed runs and prompts waiting for input. Backed by `notify-rust` on macOS, Linux, and Windows. |
 | `max_sessions`            | integer | How many of the most-recent prior sessions in the same project (same working dir) to mine for Up-arrow / Ctrl+F command history, seeded ahead of the current session's prompts. Default: `3`. Set `0` to keep recall to the current session only. See [Command history](#command-history-cross-session-recall). |
 | `display`                 | string  | Preferred startup pane layout: a `\|`/`,`/space-separated subset of `left`, `main`, `right` (e.g. `"main\|right"`, `"main"`). The main pane is always shown; this picks which side panels appear. Override at runtime with `/display`. Default: automatic (side panels shown at ≥152 cols). |
 | `tool_result_max_chars`   | integer | Hard ceiling on characters per tool result. Default: `500`. Combined with `tool_result_max_lines` (lines applied first; chars trim what's left).                                |
@@ -119,6 +120,30 @@ Accepted top-level keys:
 | `mcp_servers`             | object  | MCP server map when compiled with the `mcp` feature. When omitted, defaults to a single Exa Web Search server; see below.                                                   |
 | `acp_servers`             | object  | ACP server config map when compiled with the `acp` feature. See the ACP section below.                                                                                       |
 | `editor_open_command`     | string  | Opt-in editor follow-along: a command template with `{path}` and `{line}` placeholders (e.g. `"zed {path}:{line}"`, `"code --goto {path}:{line}"`). When set, dirge opens files it reads or edits in this external GUI editor, detached and non-blocking — the editor "follows along" like Zed's AI panel. `None` (unset) disables the feature entirely. |
+
+### Desktop Notifications
+
+Desktop notifications are off unless `desktop_notifications.enabled` is set.
+dirge uses `notify-rust` on macOS, Linux, and Windows: a system notification
+banner on macOS (sent through the Terminal sender), a freedesktop D-Bus
+notification on Linux (needs a running notification daemon), and a WinRT toast
+on Windows. On macOS the banner is attributed to Terminal and on Windows to
+PowerShell, since dirge doesn't register its own notification identity.
+
+```json
+{
+  "desktop_notifications": {
+    "enabled": true,
+    "on_completion": true,
+    "on_input_required": true
+  }
+}
+```
+
+When enabled, omitted `on_completion` / `on_input_required` keys default to
+`true`. `on_completion` fires only when a run actually returns to idle, not when
+an automatic follow-up, reviewer pass, loop iteration, or queued interjection
+continues immediately.
 
 ### Context window & compaction
 

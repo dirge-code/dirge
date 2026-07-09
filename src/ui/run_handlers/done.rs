@@ -529,6 +529,12 @@ pub(crate) async fn finish_done(
             is_running,
             ctx.cfg.memory_graduation.unwrap_or(true),
         )?;
+        if !*is_running {
+            crate::ui::desktop_notify::notify(
+                ctx.cfg,
+                crate::ui::desktop_notify::DesktopNotifyEvent::Completion,
+            );
+        }
     }
     Ok(())
 }
