@@ -167,7 +167,11 @@ pub(crate) async fn handle_done(
         *ctx.chamber_top_end = None;
     }
     *ctx.last_tool_name = None;
-    ctx.renderer.set_avatar_state(avatar::AvatarState::Done);
+    // The idle `Done` face is deferred until the turn actually settles idle
+    // (finish_done's tail / finalize_idle_turn). Painting it here — before the
+    // plugin hook chain and `/plan` reviewer decide whether the runner stays
+    // busy — showed `(^_^)` while `is_running` was still true, so typed
+    // messages queued behind an idle-looking avatar (GH #621).
     #[cfg(feature = "experimental-ui-terminal-tab")]
     ctx.renderer.set_last_tool_name("");
 
@@ -187,6 +191,10 @@ pub(crate) async fn handle_done(
         *agent_rx = None;
         *agent_interject = None;
         *agent_cancel = None;
+        // is_running stays true while the hook chain runs off-loop, so keep a
+        // working face rather than the idle `Done` (GH #621).
+        ctx.renderer
+            .set_avatar_state(avatar::AvatarState::settled(true));
         *done_phase = Some(crate::ui::done_phase::spawn(
             pm.clone(),
             response,
@@ -536,6 +544,11 @@ pub(crate) async fn finish_done(
             );
         }
     }
+    // Settle the avatar to match the real run state: idle `Done` only when
+    // nothing (a `/plan` reviewer, a drained interjection, a loop/plugin
+    // follow-up) kept the runner busy; otherwise a working face (GH #621).
+    ctx.renderer
+        .set_avatar_state(avatar::AvatarState::settled(*is_running));
     Ok(())
 }
 

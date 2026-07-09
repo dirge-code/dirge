@@ -52,6 +52,22 @@ impl AvatarState {
             _ => Self::Reading,
         }
     }
+
+    /// Face to show once a turn's terminal event has been handled, chosen from
+    /// whether the runner is still busy. `Done` (`^_^`) only when the session
+    /// is genuinely idle; if a follow-up keeps `is_running` true (a plugin
+    /// hook chain, a `/plan` reviewer, a drained interjection turn, or a
+    /// background review) show a working face instead. Without this the idle
+    /// `Done` face was painted at the top of finalization while the runner
+    /// stayed busy, so typed messages queued behind an idle-looking avatar and
+    /// could be dropped when the deferred work finished (GH #621).
+    pub fn settled(is_running: bool) -> Self {
+        if is_running {
+            Self::Thinking
+        } else {
+            Self::Done
+        }
+    }
 }
 
 /// Width of the avatar in terminal columns. Used by the avatar
@@ -212,5 +228,21 @@ mod tests {
                 tool,
             );
         }
+    }
+
+    /// Regression guard for GH #621: the `Done` `(^_^)` face must only appear
+    /// when the session is genuinely idle. While a follow-up keeps the runner
+    /// busy (plugin hook chain, `/plan` reviewer, drained interjection, or a
+    /// background review) the settled face must be a working one, so a typed
+    /// message isn't silently queued behind an idle-looking avatar.
+    #[test]
+    fn settled_shows_done_only_when_idle() {
+        assert_eq!(AvatarState::settled(false), AvatarState::Done);
+        assert_eq!(AvatarState::settled(true), AvatarState::Thinking);
+        assert_ne!(
+            AvatarState::settled(true),
+            AvatarState::Done,
+            "a busy runner must never settle on the idle Done face",
+        );
     }
 }

@@ -3984,7 +3984,10 @@ pub async fn run_interactive(
                             &mut ui.agent_cancel,
                             &mut ui.is_running,
                         )?;
-                        renderer.set_avatar_state(avatar::AvatarState::Idle);
+                        // apply_review_verdict settles the avatar itself (idle
+                        // Done, or a working face when it relaunched/drained) —
+                        // don't force Idle here or a drained interjection turn
+                        // would show idle while running (GH #621).
                         renderer.request_repaint();
                     }
                     // dirge-nret: the spawned `/btw` side query streams its answer here,

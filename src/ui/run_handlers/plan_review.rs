@@ -130,6 +130,9 @@ pub(crate) fn apply_review_verdict(
             plan,
             cycles_left: cycles_left - 1,
         });
+        // The re-implement runner keeps the loop busy — keep a working face
+        // rather than the idle `Done` (GH #621).
+        renderer.set_avatar_state(crate::ui::avatar::AvatarState::settled(*is_running));
         return Ok(());
     }
 
@@ -171,5 +174,10 @@ pub(crate) fn apply_review_verdict(
         agent_cancel,
         is_running,
         true,
-    )
+    )?;
+    // finalize_idle_turn drains any queued interjections into a fresh turn
+    // (re-arming is_running); settle the avatar to match — idle `Done` only
+    // when nothing was drained (GH #621).
+    renderer.set_avatar_state(crate::ui::avatar::AvatarState::settled(*is_running));
+    Ok(())
 }
