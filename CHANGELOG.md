@@ -4,6 +4,17 @@ All notable changes to dirge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- The input box was unreadable on a light terminal: the composer text is white
+  and relied on the theme's dark background fill, which `plain` (and any
+  light/`reset` background) doesn't paint, so it vanished against a light
+  terminal. The input box now paints its own dark surface (`input_bg`, default
+  `#222222` on both presets) over the background fill, keeping it a dark field
+  regardless of the terminal theme. Themeable via `input_bg` in a custom theme;
+  set `"input_bg": "reset"` to opt out (GH #628).
+
 ## [0.19.4] - 2026-07-09
 
 ### Fixed

@@ -75,6 +75,10 @@ pub struct Scene<'a> {
     /// Terminal background fill (theme-configurable). `Color::Reset` = no fill
     /// (keep the terminal's own background).
     pub background: crossterm::style::Color,
+    /// Input-box surface, painted over `background` behind the composer so it
+    /// stays a dark field even under a light terminal / light theme (#628).
+    /// `Color::Reset` = no override (composer uses `background`).
+    pub input_bg: crossterm::style::Color,
     /// Active picker overlay (file completion / rewind list), painted over the
     /// bottom rows of the chat region just above the input box. `None` when no
     /// picker is open [dirge-92em].
@@ -179,6 +183,21 @@ pub fn render_frame(scene: &Scene, f: &mut Frame<'_>) {
         f.buffer_mut().set_style(
             area,
             Style::default().bg(crossterm_to_ratatui(scene.background)),
+        );
+    }
+
+    // Input-box dark surface (#628). Painted AFTER the whole-frame fill so it
+    // overrides it: the composer keeps a dark "input field" look — and its
+    // white text stays readable — even when `background` is light or unset
+    // (light terminal / light custom theme). Only the editor gets this; the
+    // permission overlay keeps its own (yellow) styling. Bg-only patch leaves
+    // the border/prompt/text foregrounds intact.
+    if matches!(scene.body, BottomBody::Editor { .. })
+        && scene.input_bg != crossterm::style::Color::Reset
+    {
+        f.buffer_mut().set_style(
+            layout.input_box,
+            Style::default().bg(crossterm_to_ratatui(scene.input_bg)),
         );
     }
 
@@ -352,6 +371,7 @@ pub fn empty_scene<'a>(
         show_right_panel: true,
         frame_color: crossterm::style::Color::Green,
         background: crossterm::style::Color::Reset,
+        input_bg: crossterm::style::Color::Reset,
         picker: None,
         tooltip: "",
     }
@@ -483,6 +503,89 @@ mod tests {
         );
     }
 
+    /// #628: the input editor keeps its own dark surface even when the terminal
+    /// / theme background is light (or unset), so the white composer text stays
+    /// readable. The dark input_bg is painted over the global fill and must win
+    /// inside the input box, while the chat area keeps the (light) background.
+    #[test]
+    fn input_box_stays_dark_under_light_background() {
+        let buf: Vec<LineEntry> = Vec::new();
+        let pd = PanelData::default();
+        let info = LeftPanelInfo::default();
+        let subs: Vec<SubagentStatusRow> = Vec::new();
+        let mut scene = empty_scene(&buf, &pd, &info, &subs, "ready");
+
+        let light = crossterm::style::Color::White;
+        let dark = crossterm::style::Color::Rgb {
+            r: 0x22,
+            g: 0x22,
+            b: 0x22,
+        };
+        scene.background = light;
+        scene.input_bg = dark;
+
+        let layout = Layout::with_panels(
+            160,
+            30,
+            scene.input_rows,
+            scene.show_left_panel,
+            scene.show_right_panel,
+        );
+        let mut t = Terminal::new(TestBackend::new(160, 30)).unwrap();
+        t.draw(|f| render_frame(&scene, f)).unwrap();
+        let backend = t.backend();
+        let ib = layout.input_box;
+
+        // Interior cell of the input box carries the dark surface, not the
+        // light terminal background.
+        assert_eq!(
+            backend.buffer().cell((ib.x + 2, ib.y + 1)).unwrap().bg,
+            crossterm_to_ratatui(dark),
+            "input box interior must use the dark input surface",
+        );
+        // A chat-area cell still shows the light background.
+        assert_eq!(
+            backend.buffer().cell((5, 5)).unwrap().bg,
+            crossterm_to_ratatui(light),
+            "chat area keeps the theme background",
+        );
+    }
+
+    /// `input_bg = Reset` opts out: the input box then matches the global
+    /// background like everything else (no dark override).
+    #[test]
+    fn input_box_reset_input_bg_uses_global_background() {
+        let buf: Vec<LineEntry> = Vec::new();
+        let pd = PanelData::default();
+        let info = LeftPanelInfo::default();
+        let subs: Vec<SubagentStatusRow> = Vec::new();
+        let mut scene = empty_scene(&buf, &pd, &info, &subs, "ready");
+
+        let bg = crossterm::style::Color::Rgb {
+            r: 0x10,
+            g: 0x20,
+            b: 0x30,
+        };
+        scene.background = bg;
+        scene.input_bg = crossterm::style::Color::Reset;
+
+        let layout = Layout::with_panels(
+            160,
+            30,
+            scene.input_rows,
+            scene.show_left_panel,
+            scene.show_right_panel,
+        );
+        let mut t = Terminal::new(TestBackend::new(160, 30)).unwrap();
+        t.draw(|f| render_frame(&scene, f)).unwrap();
+        let ib = layout.input_box;
+        assert_eq!(
+            t.backend().buffer().cell((ib.x + 2, ib.y + 1)).unwrap().bg,
+            crossterm_to_ratatui(bg),
+            "Reset input_bg must fall back to the global background",
+        );
+    }
+
     /// When an overlay is active, the editor is REPLACED inside
     /// the bottom frame — no second box anywhere.
     #[test]
@@ -519,6 +622,7 @@ mod tests {
             show_right_panel: true,
             frame_color: crossterm::style::Color::Green,
             background: crossterm::style::Color::Reset,
+            input_bg: crossterm::style::Color::Reset,
             picker: None,
             tooltip: "",
         };
@@ -814,6 +918,7 @@ mod tests {
             show_right_panel: true,
             frame_color: crossterm::style::Color::Green,
             background: crossterm::style::Color::Reset,
+            input_bg: crossterm::style::Color::Reset,
             picker: None,
             tooltip: "",
         };
@@ -847,6 +952,7 @@ mod tests {
             show_right_panel: true,
             frame_color: crossterm::style::Color::Green,
             background: crossterm::style::Color::Reset,
+            input_bg: crossterm::style::Color::Reset,
             picker: None,
             tooltip: "",
         };

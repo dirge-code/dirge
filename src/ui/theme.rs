@@ -89,6 +89,12 @@ pub struct Theme {
     /// (no fill) — the right choice for `plain` and for users on a custom
     /// terminal palette who don't want dirge overriding it.
     pub background: Color,
+    /// Input-box surface. Painted behind the bottom composer box (over the
+    /// `background` fill) so the composer keeps a dark "input field" look even
+    /// when the terminal — or a light custom theme — has a light background;
+    /// otherwise the white composer text is unreadable (#628). `Color::Reset`
+    /// opts out (the input box uses `background` / the terminal default).
+    pub input_bg: Color,
     /// Human-readable name surfaced in the banner ("PHOSPHOR", "PLAIN").
     pub label: &'static str,
 }
@@ -225,6 +231,14 @@ impl Theme {
                 g: 0x22,
                 b: 0x22,
             },
+            // Same charcoal as the scene fill — the composer is part of the
+            // dark surface, and pinning it explicitly keeps it dark even under
+            // a light terminal / custom theme.
+            input_bg: Color::Rgb {
+                r: 0x22,
+                g: 0x22,
+                b: 0x22,
+            },
             label: "PHOSPHOR",
         }
     }
@@ -258,6 +272,14 @@ impl Theme {
             banner_secondary: Color::DarkGrey,
             // Keep the terminal's own background — `plain` shouldn't override it.
             background: Color::Reset,
+            // ...but the composer still needs a dark surface so its white text
+            // is readable on a light terminal (#628). This is the one spot
+            // `plain` paints a background; set `"input_bg": "reset"` to opt out.
+            input_bg: Color::Rgb {
+                r: 0x22,
+                g: 0x22,
+                b: 0x22,
+            },
             label: "PLAIN",
         }
     }
@@ -288,6 +310,7 @@ struct ThemeJson {
     banner_primary: Option<ColorValue>,
     banner_secondary: Option<ColorValue>,
     background: Option<ColorValue>,
+    input_bg: Option<ColorValue>,
     label: Option<String>,
 }
 
@@ -397,6 +420,7 @@ impl ThemeJson {
             banner_primary: pick(self.banner_primary, base.banner_primary),
             banner_secondary: pick(self.banner_secondary, base.banner_secondary),
             background: pick(self.background, base.background),
+            input_bg: pick(self.input_bg, base.input_bg),
             label,
         })
     }
@@ -569,6 +593,9 @@ pub fn banner_secondary() -> Color {
 pub fn background() -> Color {
     themed(current().background)
 }
+pub fn input_bg() -> Color {
+    themed(current().input_bg)
+}
 
 /// Whether the given color should render with the Bold attribute to
 /// fake the CRT phosphor "bloom" effect. Bright phosphor tones glow;
@@ -688,6 +715,47 @@ mod tests {
     fn presets_are_distinct() {
         assert_ne!(Theme::phosphor().agent, Theme::plain().agent);
         assert_ne!(Theme::phosphor().accent, Theme::plain().accent);
+    }
+
+    /// #628: every shipped preset keeps a dark input surface so the white
+    /// composer text stays readable on a light terminal. The default must be a
+    /// real (non-Reset) dark color, not the terminal background.
+    #[test]
+    fn input_bg_defaults_dark_for_all_presets() {
+        fn is_dark(c: Color) -> bool {
+            match c {
+                Color::Rgb { r, g, b } => (r as u32 + g as u32 + b as u32) < 300,
+                _ => false,
+            }
+        }
+        for t in [Theme::phosphor(), Theme::plain()] {
+            assert!(
+                is_dark(t.input_bg),
+                "theme {} must ship a dark input surface, got {:?}",
+                t.label,
+                t.input_bg,
+            );
+        }
+    }
+
+    /// `input_bg` is themeable via the JSON override like every other role.
+    #[test]
+    fn theme_json_overrides_input_bg() {
+        let json = r##"{"input_bg": "#101418"}"##;
+        let overrides: ThemeJson = serde_json::from_str(json).unwrap();
+        let theme = overrides.merge_into(Theme::phosphor(), "T").unwrap();
+        assert!(matches!(
+            theme.input_bg,
+            Color::Rgb {
+                r: 0x10,
+                g: 0x14,
+                b: 0x18,
+            }
+        ));
+        // Absent field inherits the phosphor base.
+        let base = Theme::phosphor();
+        let empty: ThemeJson = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty.merge_into(base, "T").unwrap().input_bg, base.input_bg);
     }
 
     /// Errors and warnings must stay in the red/yellow family across

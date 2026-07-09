@@ -1074,6 +1074,7 @@ impl Renderer {
             show_right_panel,
             frame_color,
             background: crate::ui::theme::background(),
+            input_bg: crate::ui::theme::input_bg(),
             picker: picker_overlay.as_ref(),
             right_panel_mode: *right_panel_mode,
             tooltip,

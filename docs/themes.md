@@ -56,6 +56,7 @@ A fully-custom palette:
   "divider": "darkgray",
   "banner_primary":   "#aa88ff",
   "banner_secondary": "darkmagenta",
+  "input_bg": "#1a1a22",
   "label":  "MIDNIGHT"
 }
 ```
@@ -99,6 +100,7 @@ Each color field accepts three forms:
 | `banner_primary` | Welcome banner primary stroke |
 | `banner_secondary` | Welcome banner border / decorations |
 | `background` | Terminal background fill, painted behind every cell (foregrounds preserved). Use `"reset"` to keep the terminal's own background — that's the `plain` default; `phosphor` uses a near-black `#222222`. |
+| `input_bg` | Background of the bottom input box, painted over `background`. Keeps the composer a dark field so `user_input` (white) stays readable even on a light terminal / light theme. Both presets default to `#222222`; use `"reset"` to opt out and match `background`. |
 | `label` | Human-readable name shown in the banner |
 
 ### Activating
