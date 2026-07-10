@@ -997,6 +997,37 @@ mod gating_corpus {
         );
     }
 
+    /// dirge-k0oa: a redirect/mutation target the SHELL expands (`~`,
+    /// `$VAR`, `${VAR}`) must NOT be auto-allowed as an in-cwd literal.
+    /// We classify targets lexically (bash is never run), so
+    /// `echo x > $HOME/.bashrc` would otherwise resolve to the in-cwd
+    /// literal `<cwd>/$HOME/.bashrc` and auto-allow — while bash expands
+    /// `$HOME` and writes the real `~/.bashrc` OUTSIDE the project. Any
+    /// such target is forced through the external-dir gate so the write
+    /// is confirmed. (`echo`/`cp` are default-allowed, so the target's
+    /// classification is the only gate here.)
+    #[tokio::test]
+    async fn shell_expanded_redirect_target_is_gated() {
+        for cmd in [
+            "echo pwned > $HOME/.bashrc",
+            "echo pwned > ${HOME}/.bashrc",
+            "echo pwned > ~/.bashrc",
+            "cp secret $HOME/stolen",
+            "echo pwned > $PWD/../escape",
+        ] {
+            assert!(
+                !gated(cmd).await,
+                "shell-expanded target escapes the project — must prompt: {cmd:?}"
+            );
+        }
+        // A plain in-cwd literal with no expansion must still auto-allow
+        // (no over-prompt regression).
+        assert!(
+            gated("echo ok > local.txt").await,
+            "plain in-cwd relative write must stay allowed"
+        );
+    }
+
     // --- dirge-0g6i: LLM auto-approval at the enforce chokepoint. The
     // evaluator lives on the checker (no global), so each test wires
     // its own stub and stays isolated.
@@ -1165,6 +1196,70 @@ async fn coarse_external_redirect_is_gated() {
             assert!(!in_cwd, "/etc/passwd must classify as outside the cwd");
         }
         other => panic!("expected a Path resource, got {other:?}"),
+    }
+}
+
+/// dirge-k0oa (coarse build): a redirect/mutation target the SHELL
+/// expands (`$VAR`, `~`) reaches `coarse_redirect_targets` /
+/// `coarse_mutation_paths` as a literal string still containing the
+/// metacharacter (`$HOME/.bashrc`, `~/.bashrc`). The plain `$VAR` form
+/// does NOT trip `has_substitution` (only `$(`/backtick/`<<`/… do), so
+/// without the expansion guard it classifies as the in-cwd literal
+/// `<cwd>/$HOME/.bashrc` and auto-allows while bash writes outside the
+/// project. `target_expands_outside_cwd` must flag it.
+#[cfg(not(feature = "semantic-bash"))]
+#[test]
+fn coarse_shell_expanded_targets_flagged() {
+    assert_eq!(
+        coarse_redirect_targets("echo pwned > $HOME/.bashrc"),
+        vec!["$HOME/.bashrc".to_string()],
+        "the raw $VAR target must survive extraction"
+    );
+    assert!(target_expands_outside_cwd("$HOME/.bashrc"));
+    assert!(target_expands_outside_cwd("${HOME}/.bashrc"));
+    assert!(target_expands_outside_cwd("~/.bashrc"));
+    assert!(
+        coarse_mutation_paths("cp secret $HOME/stolen")
+            .iter()
+            .any(|t| target_expands_outside_cwd(t))
+    );
+    // A plain in-cwd literal is NOT flagged (no over-prompt).
+    assert!(!target_expands_outside_cwd("local.txt"));
+    assert!(!target_expands_outside_cwd("subdir/out.txt"));
+}
+
+/// dirge-k0oa: the shell-expansion predicate — flags targets bash
+/// expands before writing (leading `~`, embedded `$`, backtick command
+/// substitution) and leaves plain literal paths alone. Runs in every
+/// build config (both the semantic and coarse redirect gates rely on it).
+#[test]
+fn target_expands_outside_cwd_predicate() {
+    // Flagged — bash expands these to a runtime path we didn't resolve.
+    for t in [
+        "~",
+        "~/.bashrc",
+        "~user/x",
+        "$HOME/.bashrc",
+        "${HOME}/.bashrc",
+        "$PWD/../escape",
+        "dir/$VAR",
+        "out`whoami`.log",
+    ] {
+        assert!(target_expands_outside_cwd(t), "should be flagged: {t:?}");
+    }
+    // Not flagged — plain literals with no shell expansion.
+    for t in [
+        "local.txt",
+        "subdir/out.txt",
+        "/etc/passwd",
+        "target/test-out.txt",
+        "file~backup", // mid-token `~` is NOT tilde expansion in bash
+        ".bashrc",
+    ] {
+        assert!(
+            !target_expands_outside_cwd(t),
+            "should NOT be flagged: {t:?}"
+        );
     }
 }
 
