@@ -47,6 +47,13 @@ pub(crate) fn truncate_rules<'a>(rules: &'a str, max: usize, note: &str) -> Cow<
     }
 }
 
+/// Wall-clock bound on a single judge LLM call (critic / goal-gate /
+/// code-review). A provider that opens a stream then stalls without
+/// erroring would otherwise freeze finalization forever; on expiry the
+/// judge fails OPEN (same as an error), mirroring COMPACTION_SUMMARY_TIMEOUT
+/// (dirge-ax46).
+pub(crate) const JUDGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// Run a judge-style completion, failing open on error. Centralizes the
 /// `Ok(r) => r, Err(e) => { warn + return default }` shape shared by the
 /// critic, goal-gate, and code-review passes. `target` must be a string
@@ -54,10 +61,23 @@ pub(crate) fn truncate_rules<'a>(rules: &'a str, max: usize, note: &str) -> Cow<
 /// `default` from the enclosing function on error.
 macro_rules! run_judge {
     ($judge:expr, $prompt:expr, $target:literal, $msg:literal, $default:expr) => {
-        match $judge($prompt).await {
-            Ok(r) => r,
-            Err(e) => {
+        match ::tokio::time::timeout(
+            $crate::agent::agent_loop::critic::JUDGE_TIMEOUT,
+            $judge($prompt),
+        )
+        .await
+        {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
                 tracing::warn!(target: $target, error = %e, $msg);
+                return $default;
+            }
+            Err(_) => {
+                tracing::warn!(
+                    target: $target,
+                    timeout_secs = $crate::agent::agent_loop::critic::JUDGE_TIMEOUT.as_secs(),
+                    "judge call timed out; failing open"
+                );
                 return $default;
             }
         }

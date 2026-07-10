@@ -112,6 +112,29 @@ fn resolve_target(effective_dir: &str, target: &str) -> String {
     }
 }
 
+/// dirge-k0oa: whether a redirect/mutation TARGET is one the shell will
+/// EXPAND before it writes — a leading `~` (tilde / `~user` / `~+` home
+/// expansion), an embedded `$` (parameter, command, or arithmetic
+/// substitution), or a backtick (command substitution).
+///
+/// Permission classification resolves targets LEXICALLY against the cwd
+/// (bash is never run), so `echo x > $HOME/.bashrc` otherwise resolves to
+/// the in-cwd literal `<cwd>/$HOME/.bashrc`, classifies `in_cwd`, and
+/// auto-allows — while bash expands `$HOME` and writes the real
+/// `~/.bashrc` OUTSIDE the project. That is a permission-containment
+/// bypass (`echo`/`cp`/… match a default allow, so the target's
+/// classification is the only remaining gate). Callers force any flagged
+/// target out of the in-cwd fast path so the external-dir gate confirms
+/// the write instead of silently allowing it.
+///
+/// Only a LEADING `~` expands (bash does no tilde expansion on a mid-word
+/// `~`, e.g. `file~backup`). `$` and backtick are checked anywhere. Errs
+/// toward prompting on a single-quoted literal like `'$x'` (rare) — the
+/// safe direction.
+pub(super) fn target_expands_outside_cwd(target: &str) -> bool {
+    target.starts_with('~') || target.contains('$') || target.contains('`')
+}
+
 pub(super) async fn check_bash_segments(
     permission: &Option<PermCheck>,
     ask_tx: &Option<AskSender>,
@@ -174,10 +197,21 @@ pub(super) async fn check_bash_segments(
         let effective_dir = fold_cd_dirs(&working_dir, &segments);
         let path_claim = |target: &str| {
             let resolved = resolve_target(&effective_dir, target);
-            Claim::new(
-                Operation::Edit,
-                crate::permission::engine::classify_path(&resolved, &working_dir),
-            )
+            let mut resource = crate::permission::engine::classify_path(&resolved, &working_dir);
+            // dirge-k0oa: a target bash EXPANDS (`~`, `$VAR`, backtick) was
+            // resolved lexically here, not by the shell — so its "in-cwd"
+            // classification is untrustworthy (`$HOME/.bashrc` looks in-tree
+            // but writes the real home dir). Force it off the in-cwd/dev-null
+            // fast path so the external-dir gate confirms the write.
+            if target_expands_outside_cwd(target)
+                && let Resource::Path {
+                    in_cwd, dev_null, ..
+                } = &mut resource
+            {
+                *in_cwd = false;
+                *dev_null = false;
+            }
+            Claim::new(Operation::Edit, resource)
         };
         if complex {
             // Subshell / command substitution / etc.: tree-sitter
@@ -230,10 +264,20 @@ pub(super) async fn check_bash_segments(
                 g.working_dir().to_string()
             };
             let path_claim = |target: &str| {
-                Claim::new(
-                    Operation::Edit,
-                    crate::permission::engine::classify_path(target, &working_dir),
-                )
+                let mut resource = crate::permission::engine::classify_path(target, &working_dir);
+                // dirge-k0oa: same shell-expansion guard as the semantic path
+                // — a `$VAR`/`~` target (which does NOT trip `has_substitution`)
+                // must not ride the in-cwd fast path, since bash expands it to
+                // a location we didn't resolve.
+                if target_expands_outside_cwd(target)
+                    && let Resource::Path {
+                        in_cwd, dev_null, ..
+                    } = &mut resource
+                {
+                    *in_cwd = false;
+                    *dev_null = false;
+                }
+                Claim::new(Operation::Edit, resource)
             };
             for target in coarse_redirect_targets(command) {
                 claims.push(path_claim(&target));

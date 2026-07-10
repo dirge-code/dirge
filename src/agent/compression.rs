@@ -678,7 +678,7 @@ fn serialize_turns_for_summary(turns: &[Value]) -> String {
     let mut out = String::new();
     for (i, turn) in turns.iter().enumerate() {
         let role = turn.get("role").and_then(|v| v.as_str()).unwrap_or("?");
-        let content = turn.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        let content = content_text(turn.get("content"));
         out.push_str(&format!("[{i}] {role}: "));
         if content.len() > 2000 {
             let truncated: String = content.chars().take(2000).collect();
@@ -687,7 +687,7 @@ fn serialize_turns_for_summary(turns: &[Value]) -> String {
                 content.len()
             ));
         } else {
-            out.push_str(content);
+            out.push_str(&content);
             out.push('\n');
         }
     }
@@ -1849,5 +1849,25 @@ mod tests {
         // Session id rotates.
         let new_id = rotate_session_id();
         assert!(new_id.starts_with("compacted-"));
+    }
+
+    /// dirge-h1gz: production tool-result messages carry `content` as a
+    /// JSON block array (`[{"type":"text","text":"..."}]`), not a plain
+    /// string. `serialize_turns_for_summary` must flatten the blocks so
+    /// the compaction summarizer actually sees tool output (command
+    /// results, error messages, file paths), not an empty string.
+    #[test]
+    fn serialize_turns_includes_block_array_tool_results() {
+        let turn = serde_json::json!({
+            "role": "tool",
+            "content": [{"type": "text", "text": "BUILD FAILED: missing semicolon"}],
+        });
+        let out = serialize_turns_for_summary(&[turn]);
+        assert!(
+            out.contains("BUILD FAILED: missing semicolon"),
+            "expected block-array tool result text in serialized output, got: {out:?}"
+        );
+        // Format prefix preserved: "[0] tool: ".
+        assert!(out.starts_with("[0] tool: "));
     }
 }

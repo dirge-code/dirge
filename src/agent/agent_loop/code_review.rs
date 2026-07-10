@@ -1904,4 +1904,25 @@ diff --git a/Cargo.lock b/Cargo.lock\n\
         assert_eq!(out[0].location.as_deref(), Some("src/a.rs:10"));
         assert_eq!(out[1].location.as_deref(), Some("src/b.rs:3"));
     }
+
+    #[tokio::test(start_paused = true)]
+    async fn judge_timeout_fails_open_to_empty() {
+        // A reviewer that stalls far past JUDGE_TIMEOUT but WOULD return
+        // findings if it ever completed. Under the paused clock the 120s judge
+        // timeout fires before the 10_000s stall, so run_code_review fails open
+        // to no findings instead of hanging (dirge-ax46). Without the timeout,
+        // the harness auto-advances through the stall and parses the findings,
+        // so this assertion fails (RED).
+        let review: CriticFn = std::sync::Arc::new(|_prompt| {
+            Box::pin(async {
+                tokio::time::sleep(std::time::Duration::from_secs(10_000)).await;
+                Ok("- High — real bug.".to_string())
+            })
+        });
+        let f = run_code_review(&review, "r", "diff", "t").await;
+        assert!(
+            f.is_empty(),
+            "a timed-out reviewer must fail open to no findings"
+        );
+    }
 }
