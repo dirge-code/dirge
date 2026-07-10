@@ -26,6 +26,50 @@ const CONTENT_LENGTH_PREFIX: &str = "Content-Length:";
 /// than enough headroom.
 const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 
+/// Header-section limits (dirge-e5iw). A single header line and the whole
+/// header block are both bounded so a misconfigured adapter — or a stream
+/// desynced by a partial-frame bug — that never emits the blank-line
+/// terminator can't grow the header buffer without bound and OOM. The
+/// body already had [`MAX_BODY_BYTES`]; the header path used an unbounded
+/// `read_line` and accepted unlimited header lines. Real LSP/DAP frames
+/// carry two short header lines; 8 KiB per line and 64 KiB total is
+/// generous headroom.
+const MAX_HEADER_LINE_BYTES: usize = 8 * 1024;
+const MAX_HEADER_TOTAL_BYTES: usize = 64 * 1024;
+
+/// Read one header line (up to and including `\n`) into `line`, erroring
+/// with `InvalidData` if it exceeds `max` bytes rather than buffering
+/// unbounded (dirge-e5iw). Returns the number of bytes read; `Ok(0)` at
+/// EOF. Reads raw bytes via `fill_buf`/`consume` and lossy-decodes —
+/// headers are ASCII, so this is exact for well-formed input.
+async fn read_header_line<R>(reader: &mut R, line: &mut String, max: usize) -> io::Result<usize>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            break; // EOF
+        }
+        let newline_pos = available.iter().position(|&b| b == b'\n');
+        let end = newline_pos.map(|i| i + 1).unwrap_or(available.len());
+        if buf.len() + end > max {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("frame header line exceeds {max} bytes (missing terminator?)"),
+            ));
+        }
+        buf.extend_from_slice(&available[..end]);
+        reader.consume(end);
+        if newline_pos.is_some() {
+            break;
+        }
+    }
+    *line = String::from_utf8_lossy(&buf).into_owned();
+    Ok(buf.len())
+}
+
 /// Write a single framed message to `writer`. The caller passes the
 /// raw JSON body as bytes; framing prepends `Content-Length` + the
 /// blank line and flushes.
@@ -49,14 +93,25 @@ where
 {
     let mut content_length: Option<usize> = None;
     let mut line = String::new();
+    let mut header_total: usize = 0;
 
     loop {
-        line.clear();
-        let n = reader.read_line(&mut line).await?;
+        // Bounded per-line read (dirge-e5iw): a header line that never
+        // terminates errors instead of buffering unbounded.
+        let n = read_header_line(&mut *reader, &mut line, MAX_HEADER_LINE_BYTES).await?;
         if n == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "stream closed before complete frame header",
+            ));
+        }
+        // Bound the whole header block too, so a flood of tiny header
+        // lines can't OOM (dirge-e5iw).
+        header_total = header_total.saturating_add(n);
+        if header_total > MAX_HEADER_TOTAL_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("frame header block exceeds {MAX_HEADER_TOTAL_BYTES} bytes"),
             ));
         }
         let trimmed = line.trim_end_matches(['\r', '\n']);
@@ -198,6 +253,42 @@ mod tests {
         let err = decode_frame(&mut reader).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("exceeds cap"));
+    }
+
+    // Regression (dirge-e5iw): a header "line" that never terminates
+    // (misconfigured adapter, or a desynced stream) must NOT grow the
+    // header buffer without bound. The body already had MAX_BODY_BYTES;
+    // the header path used an unbounded read_line. Error past the
+    // per-line header cap instead of OOMing.
+    #[tokio::test]
+    async fn decode_errors_on_unbounded_header_line() {
+        // 100 KiB with no newline: one never-terminating header line.
+        let frame = "x".repeat(100 * 1024);
+        let mut reader = BufReader::new(frame.as_bytes());
+        let err = decode_frame(&mut reader).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("header"),
+            "expected a header-cap error, got: {err}"
+        );
+    }
+
+    // Regression (dirge-e5iw): unlimited SHORT header lines are also
+    // bounded by a total-header cap so a flood of tiny headers can't OOM.
+    #[tokio::test]
+    async fn decode_errors_on_too_many_header_lines() {
+        let mut frame = String::new();
+        for _ in 0..10_000 {
+            frame.push_str("X-Pad: y\r\n");
+        }
+        frame.push_str("Content-Length: 5\r\n\r\nhello");
+        let mut reader = BufReader::new(frame.as_bytes());
+        let err = decode_frame(&mut reader).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("header"),
+            "expected a header-cap error, got: {err}"
+        );
     }
 
     #[tokio::test]

@@ -291,12 +291,136 @@ async fn dispatch<P: Protocol>(inner: &Arc<Inner<P::Error>>, msg: Value) {
         }
         Incoming::ReverseRequest { ack } => {
             if let Ok(bytes) = serde_json::to_vec(&ack) {
-                let mut writer = inner.writer.lock().await;
-                let _ = encode_frame(&mut *writer, &bytes).await;
+                // dirge-dxpn: bound the ack write with WRITE_TIMEOUT like
+                // every other write. This ack is issued FROM the read loop
+                // while holding the writer mutex; an unbounded write to a
+                // peer whose stdin pipe is full (it is flooding stdout, not
+                // draining) blocks the read loop forever — reading stops, so
+                // the peer never drains its stdin, a mutual pipe deadlock
+                // that wedges the connection permanently. On expiry the
+                // write future is dropped, releasing the lock so the loop
+                // resumes reading.
+                match timeout(WRITE_TIMEOUT, async {
+                    let mut writer = inner.writer.lock().await;
+                    encode_frame(&mut *writer, &bytes).await
+                })
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        tracing::warn!("{}: reverse-request ack write failed: {e}", P::name());
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            "{}: reverse-request ack write timed out after {:?}; \
+                             dropping ack to unblock the read loop",
+                            P::name(),
+                            WRITE_TIMEOUT,
+                        );
+                    }
+                }
             }
         }
         Incoming::Ignore => {
             tracing::warn!("{}: ignoring frame", P::name());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::AsyncWrite;
+
+    /// A writer whose writes never complete — models a peer whose stdin
+    /// pipe is full (it is flooding stdout, not draining it). A framed
+    /// write parks on it forever.
+    struct BlockingWriter;
+    impl AsyncWrite for BlockingWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Pending
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestErr;
+    impl From<io::Error> for TestErr {
+        fn from(_: io::Error) -> Self {
+            TestErr
+        }
+    }
+    impl From<serde_json::Error> for TestErr {
+        fn from(_: serde_json::Error) -> Self {
+            TestErr
+        }
+    }
+    impl RpcErr for TestErr {
+        fn connection_closed() -> Self {
+            TestErr
+        }
+        fn timeout(_: Duration) -> Self {
+            TestErr
+        }
+    }
+
+    struct TestProto;
+    impl Protocol for TestProto {
+        type Error = TestErr;
+        fn name() -> &'static str {
+            "test"
+        }
+        fn build_request(_: u64, _: &str, _: Value) -> Value {
+            Value::Null
+        }
+        fn build_notification(_: u64, _: &str, _: Value) -> Value {
+            Value::Null
+        }
+        fn classify(_: &Value) -> Incoming<Self::Error> {
+            Incoming::ReverseRequest {
+                ack: serde_json::json!({"id": 1, "result": null}),
+            }
+        }
+    }
+
+    /// dirge-dxpn: the reverse-request ack is written from inside the read
+    /// loop while holding the writer mutex. Against a peer whose stdin pipe
+    /// is full the write blocks; because reading has stopped, the peer can
+    /// never drain — a mutual pipe deadlock that used to wedge the loop
+    /// permanently (and made concurrent `request()` callers eat the
+    /// writer-lock timeout). The ack write is now bounded by WRITE_TIMEOUT,
+    /// so `dispatch` returns (dropping the ack) instead of hanging.
+    #[tokio::test(start_paused = true)]
+    async fn reverse_request_ack_is_bounded_by_write_timeout() {
+        let inner = Arc::new(Inner::<TestErr> {
+            next_id: AtomicU64::new(1),
+            pending: Mutex::new(HashMap::new()),
+            handlers: Mutex::new(HashMap::new()),
+            writer: Mutex::new(Box::new(BlockingWriter)),
+            closed: AtomicBool::new(false),
+        });
+        // Guard well past WRITE_TIMEOUT. With the fix the inner deadline
+        // fires first (virtual clock) and dispatch completes; without it
+        // dispatch parks forever and this outer guard fires → Err.
+        let result = tokio::time::timeout(
+            WRITE_TIMEOUT + Duration::from_secs(30),
+            dispatch::<TestProto>(&inner, Value::Null),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "reverse-request ack must not block the read loop indefinitely",
+        );
     }
 }
