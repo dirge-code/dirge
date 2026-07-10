@@ -852,6 +852,13 @@ impl InputEditor {
         if text.is_empty() {
             return;
         }
+        // dirge-wncc: a real kill mutates the buffer, invalidating the byte
+        // offsets a prior Yank recorded in `yank_state`. Clear it so a
+        // following YankPop can't operate on a stale range (emacs
+        // semantics: yank-pop only follows a yank / yank-pop). Unlike the
+        // other buffer mutations, the kill actions route through here and
+        // never call `reset_kill_accumulation`.
+        self.yank_state = None;
         if self.last_action_was_kill && !self.kill_ring.is_empty() {
             let entry = &mut self.kill_ring[0];
             match direction {
@@ -1243,7 +1250,19 @@ impl InputEditor {
             InputAction::YankPop => {
                 if let Some(ref state) = self.yank_state {
                     let range_end = state.cursor + state.len;
-                    if self.kill_ring.len() > 1 && range_end <= self.buffer.len() {
+                    // dirge-wncc: verify the previously-yanked text is still
+                    // intact at the recorded range before replacing it.
+                    // `str::get` returns None if the range isn't on char
+                    // boundaries (an intervening kill/insert shifted offsets),
+                    // so this can't panic; the content check also prevents
+                    // clobbering unrelated text that happens to sit at the
+                    // same byte range. Was a bare `range_end <= len` byte check.
+                    let intact = self
+                        .buffer
+                        .get(state.cursor..range_end)
+                        .zip(self.kill_ring.get(state.index))
+                        .is_some_and(|(slice, yanked)| slice == yanked.as_str());
+                    if self.kill_ring.len() > 1 && intact {
                         let next = (state.index + 1) % self.kill_ring.len();
                         if let Some(text) = self.kill_ring.get(next) {
                             let text = text.clone();
@@ -1930,6 +1949,71 @@ mod tests {
         // Ctrl+W kills the word before the cursor (cursor at end).
         e.handle_key(ev(KeyCode::Char('w'), KeyModifiers::CONTROL));
         assert_eq!(e.buffer.as_str(), "foo bar ");
+    }
+
+    /// dirge-wncc: a kill (Ctrl+W here) after a yank mutates the buffer
+    /// but went through `push_kill`, which did NOT clear `yank_state`.
+    /// A later YankPop then operated on stale byte offsets. push_kill now
+    /// clears yank_state, so YankPop after a kill is inert (emacs
+    /// semantics: yank-pop only follows a yank / yank-pop).
+    #[test]
+    fn kill_after_yank_clears_yank_state() {
+        let mut e = InputEditor::new();
+        e.insert_str("alpha");
+        e.handle_key(ev(KeyCode::Char('a'), KeyModifiers::CONTROL)); // to start
+        e.handle_key(ev(KeyCode::Char('k'), KeyModifiers::CONTROL)); // kill "alpha"
+        e.handle_key(ev(KeyCode::Char('y'), KeyModifiers::CONTROL)); // yank it back
+        assert!(e.yank_state.is_some(), "yank must set yank_state");
+        e.handle_key(ev(KeyCode::Char('w'), KeyModifiers::CONTROL)); // kill word back
+        assert!(
+            e.yank_state.is_none(),
+            "a kill after a yank must clear yank_state"
+        );
+        // A following YankPop is now a no-op (nothing to pop).
+        e.handle_key(ev(KeyCode::Char('y'), KeyModifiers::ALT));
+        assert_eq!(e.buffer.as_str(), "");
+    }
+
+    /// dirge-wncc: even if a stale yank_state survives, YankPop must never
+    /// panic or corrupt text — its guard verifies the recorded range is
+    /// still on char boundaries AND still holds the yanked text.
+    #[test]
+    fn yankpop_with_stale_offsets_is_safe() {
+        // Multibyte: range_end lands INSIDE 'é' (bytes 1..3). A raw
+        // replace_range(0..2) would panic "not a char boundary".
+        let mut e = InputEditor::new();
+        e.kill_ring = vec!["hi".into(), "second".into()];
+        e.buffer = "héllo".into();
+        e.cursor = 0;
+        e.yank_state = Some(YankState {
+            index: 0,
+            cursor: 0,
+            len: 2,
+        });
+        e.handle_key(ev(KeyCode::Char('y'), KeyModifiers::ALT)); // must not panic
+        assert_eq!(
+            e.buffer.as_str(),
+            "héllo",
+            "stale YankPop must not mutate the buffer"
+        );
+
+        // ASCII: boundaries valid but the recorded text no longer matches
+        // what's there → must not silently clobber unrelated bytes.
+        let mut e = InputEditor::new();
+        e.kill_ring = vec!["hello".into(), "second".into()];
+        e.buffer = "XXXXX".into();
+        e.cursor = 0;
+        e.yank_state = Some(YankState {
+            index: 0,
+            cursor: 0,
+            len: 3,
+        });
+        e.handle_key(ev(KeyCode::Char('y'), KeyModifiers::ALT));
+        assert_eq!(
+            e.buffer.as_str(),
+            "XXXXX",
+            "stale YankPop must not corrupt unrelated text"
+        );
     }
 
     #[test]
