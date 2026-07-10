@@ -168,8 +168,31 @@ fn persist_credentials_to_path(
     credentials: &AnthropicOAuthCredentials,
     path: PathBuf,
 ) -> anyhow::Result<PathBuf> {
-    let json = serde_json::json!({ "claudeAiOauth": credentials });
-    crate::auth::file_store::save_json_0600(&path, &json)?;
+    // Read-modify-write: `~/.claude/.credentials.json` is shared with the
+    // `claude` CLI, whose `claudeAiOauth` object carries fields dirge does not
+    // own (e.g. `scopes`, `subscriptionType`) and which may sit alongside
+    // sibling top-level keys. A full overwrite on every refresh dropped them
+    // (dirge-wpk8). The caller already holds the cross-process file lock.
+    let mut root: serde_json::Value = std::fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({}));
+    let oauth = root
+        .as_object_mut()
+        .expect("root is defaulted to an object")
+        .entry(String::from("claudeAiOauth"))
+        .or_insert_with(|| serde_json::json!({}));
+    if !oauth.is_object() {
+        *oauth = serde_json::json!({});
+    }
+    let fresh = serde_json::to_value(credentials)?;
+    if let (Some(fresh_map), Some(oauth_map)) = (fresh.as_object(), oauth.as_object_mut()) {
+        for (key, value) in fresh_map {
+            oauth_map.insert(key.clone(), value.clone());
+        }
+    }
+    crate::auth::file_store::save_json_0600(&path, &root)?;
     Ok(path)
 }
 
@@ -309,6 +332,56 @@ mod tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600);
         }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn persist_preserves_foreign_credential_fields() {
+        let creds = AnthropicOAuthCredentials {
+            access_token: "new".to_string(),
+            refresh_token: "new2".to_string(),
+            expires_at: 999,
+        };
+        let dir = std::env::temp_dir().join(format!(
+            "dirge-anthropic-oauth-merge-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".credentials.json");
+
+        // Pre-existing Claude Code credential carries dirge's three fields PLUS
+        // fields dirge does not own (scopes, subscriptionType) and a sibling
+        // top-level key someOtherTool. A dirge token refresh must update only
+        // accessToken/refreshToken/expiresAt and leave the rest intact
+        // (dirge-wpk8).
+        std::fs::write(
+            &path,
+            r#"{"claudeAiOauth":{"accessToken":"old","refreshToken":"old","expiresAt":1,"scopes":["a","b"],"subscriptionType":"pro"},"someOtherTool":{"k":"v"}}"#,
+        )
+        .unwrap();
+
+        let returned = persist_credentials_to_path(&creds, path.clone()).unwrap();
+        assert_eq!(returned, path);
+
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+
+        // dirge's three fields are updated.
+        assert_eq!(value["claudeAiOauth"]["accessToken"], "new");
+        assert_eq!(value["claudeAiOauth"]["refreshToken"], "new2");
+        assert_eq!(value["claudeAiOauth"]["expiresAt"], 999);
+
+        // Foreign fields inside claudeAiOauth survive.
+        assert_eq!(
+            value["claudeAiOauth"]["scopes"],
+            serde_json::json!(["a", "b"])
+        );
+        assert_eq!(value["claudeAiOauth"]["subscriptionType"], "pro");
+
+        // Sibling top-level key survives.
+        assert_eq!(value["someOtherTool"]["k"], "v");
 
         std::fs::remove_dir_all(&dir).ok();
     }
