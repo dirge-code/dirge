@@ -188,8 +188,8 @@ fn spawn_abort_watcher(
     });
 }
 
-/// v1 read-only tool universe for a tooled subagent. Verified against the
-/// registration list in `build_loop_tools`. A readonly subagent can read
+/// Read-only tool universe for a readonly tooled subagent. Verified against
+/// the registration list in `build_loop_tools`. A readonly subagent can read
 /// files, search, and browse the web — but never mutate, recurse, write
 /// durable state, or attribute work to a session.
 const SUBAGENT_READONLY_BASE: &[&str] = &[
@@ -202,6 +202,37 @@ const SUBAGENT_READONLY_BASE: &[&str] = &[
     "repo_overview",
     "websearch",
     "webfetch",
+];
+
+/// Read-write tool universe for a readwrite tooled subagent: the readonly
+/// base PLUS the write/bash family, so a subagent can edit the code tree and
+/// run builds/tests directly. The leaky tools (durable state / session
+/// attribution / recursion / interactive) are STILL stripped by
+/// [`SUBAGENT_FORCED_EXCLUDES`] after this universe is chosen — readwrite can
+/// edit the repo, not write agent state or attribute to a session. So the
+/// dirge-mifq leakage gate holds for both tiers.
+const SUBAGENT_READWRITE_BASE: &[&str] = &[
+    // readonly universe
+    "read",
+    "read_minified",
+    "grep",
+    "find_files",
+    "glob",
+    "list_dir",
+    "repo_overview",
+    "websearch",
+    "webfetch",
+    // write family — edit the code tree + run builds/tests. `edit_minified`
+    // is feature-gated under `semantic`; filter_loop_tools just no-matches it
+    // when the feature is off, so listing it is harmless.
+    "write",
+    "edit",
+    "edit_lines",
+    "edit_minified",
+    "apply_patch",
+    "bash",
+    "bash_output",
+    "kill_shell",
 ];
 
 /// Non-negotiable safety floor stripped from EVERY tooled subagent's allow-list,
@@ -244,26 +275,25 @@ const SUBAGENT_DEFAULT_PREAMBLE: &str = "You are a subagent working on a specifi
 /// Resolve a profile's subagent policy into the exact allow-list for the
 /// tooled fork.
 ///
-/// Returns `Ok(None)` for a tool-less subagent (the unchanged `btw_query`
-/// path). `Ok(Some)` is the filtered tool set. `Err` flags a reserved tier
-/// (`ReadWrite`) that v1 does not wire — callers should warn + fall back to
-/// tool-less rather than spawn.
+/// Returns `None` for a tool-less subagent (the unchanged `btw_query`
+/// path). `Some` is the filtered tool set. Both tiers resolve:
+/// `Readonly` uses [`SUBAGENT_READONLY_BASE`] (reads + search + web),
+/// `ReadWrite` uses [`SUBAGENT_READWRITE_BASE`] (readonly + write/bash).
 ///
-/// Readonly invariant: the final set is intersected with
-/// [`SUBAGENT_READONLY_BASE`], so `allow` can never escalate a readonly
-/// subagent to mutation; `deny` narrows; [`SUBAGENT_FORCED_EXCLUDES`] is then
-/// stripped as the mandatory floor.
+/// Tier invariant: the final set is intersected with the tier's universe, so
+/// `allow` can never escalate past the tier (a readonly profile can't
+/// `allow` its way to `edit`); `deny` narrows; [`SUBAGENT_FORCED_EXCLUDES`]
+/// is then stripped as the mandatory floor, so EVEN readwrite can't reach a
+/// session-attributing / durable-state / recursive / interactive tool.
 pub fn resolve_subagent_allow(
     p: &crate::context::agent_defs::SubagentToolPolicy,
-) -> Result<Option<Vec<String>>, String> {
+) -> Option<Vec<String>> {
     use crate::context::agent_defs::SubagentToolTier;
     use std::collections::BTreeSet;
     let universe: &[&str] = match p.tier {
-        SubagentToolTier::Toolless => return Ok(None),
-        SubagentToolTier::ReadWrite => {
-            return Err("subagent tier 'readwrite' is reserved and not enabled in v1".into());
-        }
+        SubagentToolTier::Toolless => return None,
         SubagentToolTier::Readonly => SUBAGENT_READONLY_BASE,
+        SubagentToolTier::ReadWrite => SUBAGENT_READWRITE_BASE,
     };
     let mut set: BTreeSet<String> = universe.iter().map(|s| s.to_ascii_lowercase()).collect();
     // `allow` can only keep items already in the tier universe; additions
@@ -280,7 +310,7 @@ pub fn resolve_subagent_allow(
     for x in SUBAGENT_FORCED_EXCLUDES {
         set.remove(&x.to_ascii_lowercase());
     }
-    Ok(Some(set.into_iter().collect()))
+    Some(set.into_iter().collect())
 }
 
 /// Per-subagent turn cap, honoring a profile override or the default.
@@ -858,16 +888,32 @@ impl Tool for TaskTool {
             }
 
             // If any profile opted its subagent into tools, tell the model so
-            // it can pick a tooled profile for work that needs file access.
+            // it can pick a tooled profile for work that needs repo access.
             if SUBAGENT_ROUTES
                 .get()
                 .is_some_and(|m| m.values().any(|r| r.tool_allow.is_some()))
             {
-                description.push_str(
-                    " Some profiles enable a tooled subagent (read-only tools: read, grep, \
-                     glob, list_dir, etc. — no mutation, no recursion) that can investigate the \
-                     repo directly; pick such a profile for research/exploration subtasks.",
-                );
+                let has_write = SUBAGENT_ROUTES.get().is_some_and(|m| {
+                    m.values().any(|r| {
+                        r.tool_allow
+                            .as_ref()
+                            .is_some_and(|a| a.iter().any(|t| t == "write" || t == "edit"))
+                    })
+                });
+                if has_write {
+                    description.push_str(
+                        " Some profiles enable a read-write tooled subagent (read, grep, glob, \
+                         edit, write, bash — no recursion, no session-scoped tools) that can \
+                         investigate AND edit the repo directly; pick such a profile for \
+                         implementation subtasks. Others are read-only.",
+                    );
+                } else {
+                    description.push_str(
+                        " Some profiles enable a read-only tooled subagent (read, grep, glob, \
+                         list_dir, etc. — no mutation, no recursion) that can investigate the \
+                         repo directly; pick such a profile for research/exploration subtasks.",
+                    );
+                }
             }
         }
 
@@ -1218,16 +1264,17 @@ mod tests {
     /// a fresh rig agent from the model alone with NO tools attached. This pins
     /// that invariant: the one-shot `btw_query_with` must stay tool-less.
     ///
-    /// A TOOLED subagent path now EXISTS (v1: readonly tier, opt-in via a
-    /// profile's `subagent.tools`). It is NOT covered by the `btw_query`
-    /// assertion below — instead it closes the dirge-mifq leakage class by
-    /// construction: `resolve_subagent_allow` intersects the allow-list with
-    /// `SUBAGENT_READONLY_BASE` and strips `SUBAGENT_FORCED_EXCLUDES`
+    /// The TOOLED subagent path (readonly OR readwrite tier, opt-in via a
+    /// profile's `subagent.tools`) is NOT covered by the `btw_query` assertion
+    /// below — instead it closes the dirge-mifq leakage class by construction:
+    /// `resolve_subagent_allow` intersects the allow-list with the tier's
+    /// universe and strips `SUBAGENT_FORCED_EXCLUDES`
     /// (session_search/memory/skill/issue/graph/todo/... + recursion + interactive),
     /// and the tooled fork runs under a FRESH child session id. So a tooled
-    /// subagent literally cannot reach a session-attributing tool. When a
-    /// future tier re-enables any forced-excluded tool, this test's resolver
-    /// assertion fails and forces the session-id audit.
+    /// subagent literally cannot reach a session-attributing tool — and this
+    /// holds for BOTH tiers: a readwrite subagent can edit the repo, but it
+    /// still can't write durable agent state or attribute to a session. This
+    /// test asserts that for both tiers below.
     ///
     /// `TaskTool` itself still holds no tool registry / session_id / agent
     /// handle — the tooled fork reaches the live agent through the
@@ -1267,10 +1314,11 @@ mod tests {
              require auditing session_id propagation per dirge-mifq."
         );
 
-        // Tooled path (v1 readonly): the resolved allow-list must never contain
-        // a session-attributing / recursive / interactive tool, even if a
-        // profile tried to `allow` one. This is the dirge-mifq gate for the
-        // tooled shape.
+        // Tooled path: the resolved allow-list must never contain a session-
+        // attributing / recursive / interactive tool, even if a profile tried
+        // to `allow` one. This is the dirge-mifq gate for the tooled shape —
+        // and it MUST hold for BOTH tiers (readonly AND readwrite). The forced
+        // floor is tier-independent by design.
         let leaky = [
             "session_search",
             "memory",
@@ -1285,20 +1333,22 @@ mod tests {
             "plan_enter",
             "plan_exit",
         ];
-        let policy = crate::context::agent_defs::SubagentToolPolicy {
-            tier: crate::context::agent_defs::SubagentToolTier::Readonly,
-            allow: leaky.iter().map(|s| s.to_string()).collect(), // try to smuggle them in
-            deny: Vec::new(),
-            max_turns: None,
-        };
-        let resolved = resolve_subagent_allow(&policy)
-            .expect("readonly resolves")
-            .expect("readonly yields a tool set");
-        for l in leaky {
-            assert!(
-                !resolved.iter().any(|t| t == l),
-                "readonly subagent allow-list must exclude {l:?} (dirge-mifq); got {resolved:?}"
-            );
+        use crate::context::agent_defs::{SubagentToolPolicy, SubagentToolTier};
+        for tier in [SubagentToolTier::Readonly, SubagentToolTier::ReadWrite] {
+            let policy = SubagentToolPolicy {
+                tier: tier.clone(),
+                allow: leaky.iter().map(|s| s.to_string()).collect(), // try to smuggle
+                deny: Vec::new(),
+                max_turns: None,
+            };
+            let resolved = resolve_subagent_allow(&policy)
+                .unwrap_or_else(|| panic!("{tier:?} should yield a tool set"));
+            for l in leaky {
+                assert!(
+                    !resolved.iter().any(|t| t == l),
+                    "{tier:?} subagent allow-list must exclude {l:?} (dirge-mifq); got {resolved:?}"
+                );
+            }
         }
     }
 
@@ -1311,7 +1361,7 @@ mod tests {
             tier: SubagentToolTier::Readonly,
             ..Default::default()
         };
-        let mut got = resolve_subagent_allow(&p).unwrap().unwrap();
+        let mut got = resolve_subagent_allow(&p).unwrap();
         got.sort();
         let mut want: Vec<String> = SUBAGENT_READONLY_BASE
             .iter()
@@ -1328,17 +1378,65 @@ mod tests {
             tier: SubagentToolTier::Toolless,
             ..Default::default()
         };
-        assert_eq!(resolve_subagent_allow(&p).unwrap(), None);
+        assert_eq!(resolve_subagent_allow(&p), None);
     }
 
     #[test]
-    fn resolve_readwrite_is_reserved_error() {
+    fn resolve_readwrite_includes_writes_and_excludes_leaky() {
         use crate::context::agent_defs::{SubagentToolPolicy, SubagentToolTier};
+        // readwrite = readonly universe + the write/bash family. A readwrite
+        // subagent can edit the code tree and run builds/tests directly.
         let p = SubagentToolPolicy {
             tier: SubagentToolTier::ReadWrite,
             ..Default::default()
         };
-        assert!(resolve_subagent_allow(&p).is_err());
+        let got = resolve_subagent_allow(&p).expect("readwrite yields a tool set");
+        // write/bash family present
+        for w in ["write", "edit", "edit_lines", "apply_patch", "bash"] {
+            assert!(
+                got.iter().any(|t| t == w),
+                "readwrite must include {w}: {got:?}"
+            );
+        }
+        // readonly base still present
+        assert!(got.iter().any(|t| t == "read"));
+        assert!(got.iter().any(|t| t == "grep"));
+        // leaky tools STILL excluded regardless of tier (dirge-mifq) — readwrite
+        // can edit the repo, not write durable agent state or attribute to a
+        // session.
+        for l in [
+            "session_search",
+            "memory",
+            "skill",
+            "issue",
+            "graph",
+            "write_todo_list",
+            "spec",
+            "task",
+            "task_status",
+            "question",
+        ] {
+            assert!(
+                !got.iter().any(|t| t == l),
+                "readwrite must still exclude {l:?} (dirge-mifq): {got:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn deny_narrows_readwrite_base() {
+        use crate::context::agent_defs::{SubagentToolPolicy, SubagentToolTier};
+        let p = SubagentToolPolicy {
+            tier: SubagentToolTier::ReadWrite,
+            deny: vec!["bash".into(), "edit".into()],
+            ..Default::default()
+        };
+        let got = resolve_subagent_allow(&p).unwrap();
+        assert!(!got.iter().any(|t| t == "bash"));
+        assert!(!got.iter().any(|t| t == "edit"));
+        // other write tools remain
+        assert!(got.iter().any(|t| t == "write"));
+        assert!(got.iter().any(|t| t == "apply_patch"));
     }
 
     #[test]
@@ -1349,7 +1447,7 @@ mod tests {
             deny: vec!["webfetch".into(), "grep".into()],
             ..Default::default()
         };
-        let got = resolve_subagent_allow(&p).unwrap().unwrap();
+        let got = resolve_subagent_allow(&p).unwrap();
         assert!(!got.iter().any(|t| t == "webfetch"));
         assert!(!got.iter().any(|t| t == "grep"));
         // untouched base tools remain
@@ -1366,7 +1464,7 @@ mod tests {
             allow: vec!["bash".into(), "edit".into(), "write".into()],
             ..Default::default()
         };
-        let got = resolve_subagent_allow(&p).unwrap().unwrap();
+        let got = resolve_subagent_allow(&p).unwrap();
         assert!(!got.iter().any(|t| t == "bash"));
         assert!(!got.iter().any(|t| t == "edit"));
         assert!(!got.iter().any(|t| t == "write"));

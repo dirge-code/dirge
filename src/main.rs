@@ -1253,15 +1253,9 @@ async fn main() -> anyhow::Result<()> {
                 let model = context::agent_defs::resolve_model_alias(&cfg, def.model.as_deref())
                     .map(|m| client.completion_model(m));
                 // Resolve the profile's subagent tool policy into the exact
-                // allow-list for a tooled fork. A reserved tier (readwrite)
-                // or a tool-less profile yields `None` → unchanged btw path.
-                let tool_allow = match agent::tools::task::resolve_subagent_allow(&def.subagent) {
-                    Ok(v) => v,
-                    Err(msg) => {
-                        tracing::warn!(agent = %def.name, "{msg}; falling back to tool-less");
-                        None
-                    }
-                };
+                // allow-list for a tooled fork. `None` (tool-less profile) →
+                // the unchanged btw path; `Some` selects the tooled fork.
+                let tool_allow = agent::tools::task::resolve_subagent_allow(&def.subagent);
                 let max_turns = agent::tools::task::resolve_subagent_max_turns(&def.subagent);
                 (
                     def.name.clone(),

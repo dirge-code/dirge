@@ -89,11 +89,14 @@ impl ToolPolicy {
     }
 }
 
-/// Capability tier for a `task(agent=…)` subagent's tool set. v1 wires only
-/// `Toolless` (the unchanged one-shot `btw_query` default) and `Readonly`
-/// (a real filtered agent loop with the read-only tool universe). `ReadWrite`
-/// is reserved: it parses and is stored, but the resolver refuses it until a
-/// later phase lands the session-id/permission audit (dirge-mifq).
+/// Capability tier for a `task(agent=…)` subagent's tool set:
+/// `Toolless` (the unchanged one-shot `btw_query` default), `Readonly`
+/// (a real filtered agent loop with the read-only tool universe), and
+/// `ReadWrite` (readonly PLUS the write/bash family — a subagent can
+/// edit the code tree and run builds/tests directly). Durable-state /
+/// session-attribution / recursion / interactive tools stay stripped
+/// regardless of tier (see `SUBAGENT_FORCED_EXCLUDES`), so even
+/// `ReadWrite` can't write agent state or attribute to a session.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum SubagentToolTier {
     /// No tools — the subagent runs a one-shot `btw_query` (unchanged default).
@@ -101,7 +104,7 @@ pub enum SubagentToolTier {
     Toolless,
     /// Read-only tool set (read/grep/glob/…); no mutation, no recursion.
     Readonly,
-    /// Reserved — the resolver errors if named. Implementation tiers come later.
+    /// Read-write tool set — readonly + write/edit/bash/apply_patch.
     ReadWrite,
 }
 
@@ -503,7 +506,7 @@ mod tests {
         assert_eq!(def.subagent.tier, SubagentToolTier::Readonly);
         assert_eq!(def.subagent.deny, vec!["grep"]);
         assert_eq!(def.subagent.max_turns, Some(40));
-        // readwrite is recognized as the reserved tier (parses; resolver errors at runtime)
+        // readwrite is recognized as the read-write tier (parses; resolver yields the write/bash family)
         let rw = AgentConfig {
             subagent: Some(SubagentConfig {
                 tools: Some("readwrite".into()),

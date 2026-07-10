@@ -54,7 +54,7 @@ All frontmatter keys are optional:
 | `reasoning` | Reasoning-effort hint (`low` / `medium` / `high`). |
 | `temperature` | Sampling temperature. |
 | `description` | One-line summary shown in `/agents`. |
-| `subagent_tools` | Opt this profile's `task(agent=…)` subagent into tools: `readonly` (read-only tool universe) or `toolless` (the default one-shot). See *Tooled subagents* below. |
+| `subagent_tools` | Opt this profile's `task(agent=…)` subagent into tools: `readonly` (read-only tool universe), `readwrite` (readonly + write/edit/bash — can edit the repo), or `toolless` (the default one-shot). See *Tooled subagents* below. |
 | `subagent_max_turns` | Cap the tooled subagent's loop (default `25`). |
 | `subagent_deny` | Narrow the tool set further within the tier (e.g. `[webfetch]`). |
 
@@ -168,23 +168,29 @@ loop** with tools, instead of the tool-less one-shot. Set `subagent.tools`
   `list_dir`, `repo_overview`, `websearch`, `webfetch` (web tools only when
   enabled in config). It can investigate the repo directly and report back —
   ideal for research/exploration subtasks.
-- **`readwrite`** — reserved; parses but the resolver refuses it until a
-  later phase lands the session-id/permission audit.
+- **`readwrite`** — the subagent runs a real loop with the read-only universe
+  PLUS the write family: `write`, `edit`, `edit_lines`, `edit_minified`,
+  `apply_patch`, `bash`, `bash_output`, `kill_shell`. It can edit the code
+  tree and run builds/tests directly — ideal for delegating implementation
+  subtasks to a subagent.
 
-The tool set is **intersected with the readonly universe**, so `allow` can
-never escalate the subagent to mutation and `deny` only narrows. A mandatory
-floor is then stripped from every tooled subagent regardless of tier or
-`allow`: recursion (`task`, `task_status`), durable writes (`memory`,
-`skill`, `spec`), session-attribution tools (`session_search`, `issue`,
-`write_todo_list`, `graph`), and interactive tools (`question`, `plan_enter`,
-`plan_exit`). The subagent runs under a fresh child session id and a bounded
-turn cap (`subagent.max_turns`, default `25`), so it can't recurse, write
-side effects out of band, or loop forever.
+The tool set is **intersected with the tier's universe**, so `allow` can
+never escalate past the tier (a readonly profile can't `allow` its way to
+`edit`) and `deny` only narrows. A mandatory floor is then stripped from
+every tooled subagent regardless of tier or `allow`: recursion (`task`,
+`task_status`), durable writes (`memory`, `skill`, `spec`),
+session-attribution tools (`session_search`, `issue`, `write_todo_list`,
+`graph`), and interactive tools (`question`, `plan_enter`, `plan_exit`).
+So even a `readwrite` subagent can edit the repo but can't write durable
+agent state or attribute to a session. The subagent runs under a fresh
+child session id and a bounded turn cap (`subagent.max_turns`, default
+`25`), so it can't recurse, write side effects out of band, or loop
+forever.
 
-Permissions inherit the parent agent: in-cwd reads are auto-allowed, and a
-read outside the cwd surfaces a permission prompt through the parent UI. If a
-profile pinned a model, the tooled subagent runs on that model; otherwise it
-uses the live agent's.
+Permissions inherit the parent agent: in-cwd reads/edits are auto-allowed,
+and a path outside the cwd surfaces a permission prompt through the parent
+UI. If a profile pinned a model, the tooled subagent runs on that model;
+otherwise it uses the live agent's.
 
 ## Relationship to the built-in critic and roles
 
