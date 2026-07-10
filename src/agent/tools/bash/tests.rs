@@ -207,6 +207,103 @@ async fn run_with_timeout_interleaves_stdout_stderr() {
     );
 }
 
+/// dirge-do5l: non-UTF-8 bytes in the stream must NOT truncate output.
+/// `read_line` fails `InvalidData` on invalid UTF-8; the drain loop used
+/// to treat that as EOF (`Err(_) => so = None`), silently dropping
+/// everything after the first bad byte. A valid line AFTER an invalid
+/// one must survive (lossy-decoded), and the exit stays 0.
+#[tokio::test]
+async fn run_with_timeout_preserves_output_after_non_utf8() {
+    let cmd = {
+        let mut c = Command::new("bash");
+        // `bad\xff` (invalid UTF-8) on line 1, `goodline` on line 2.
+        c.arg("-c").arg(r"printf 'bad\xff\ngoodline\n'");
+        c
+    };
+    let out = run_with_timeout(cmd, 5).await.expect("should succeed");
+    assert!(
+        out.merged.contains("goodline"),
+        "output after a non-UTF-8 byte must be preserved, got: {:?}",
+        out.merged
+    );
+    assert_eq!(out.exit_code, 0);
+}
+
+/// dirge-yw3o: a single newline-free line larger than the drain cap must
+/// engage the cap, not buffer the whole thing. `read_line` buffered the
+/// entire line into memory before the cap check, so `base64 -w0` /
+/// `tr -d '\n'` on a big input OOMed — the exact outcome the cap exists
+/// to prevent. The capped chunk reader bounds a single giant line.
+#[tokio::test]
+async fn run_with_timeout_caps_single_newline_free_line() {
+    let cmd = {
+        let mut c = Command::new("bash");
+        // 400 KiB of 'a' with NO newline — one giant line (> 256 KiB cap).
+        c.arg("-c").arg("head -c 409600 /dev/zero | tr '\\0' a");
+        c
+    };
+    let out = run_with_timeout(cmd, 10).await.expect("should succeed");
+    assert!(
+        out.merged.len() < 409600,
+        "single giant line must be capped, buffered {} bytes",
+        out.merged.len()
+    );
+    assert!(
+        out.merged.contains("exceeded cap"),
+        "expected the drain-cap overflow marker on a capped giant line"
+    );
+}
+
+/// dirge-yw3o: the capped reader returns a long newline-free line in
+/// `max`-sized chunks and never buffers past the cap, then reads the
+/// remaining short lines whole and reports EOF once.
+#[tokio::test]
+async fn read_chunk_capped_splits_long_line_into_bounded_chunks() {
+    use super::exec::read_chunk_capped;
+    use tokio::io::BufReader;
+    // 40 'a' + '\n' + "hi\n": one over-cap line, then a short line.
+    let mut data = vec![b'a'; 40];
+    data.push(b'\n');
+    data.extend_from_slice(b"hi\n");
+    let mut r = BufReader::new(&data[..]);
+    let mut buf = Vec::new();
+    let cap = 16;
+
+    let n = read_chunk_capped(&mut r, &mut buf, cap).await.unwrap();
+    assert_eq!((n, buf.len()), (16, 16), "first chunk capped at 16");
+    read_chunk_capped(&mut r, &mut buf, cap).await.unwrap();
+    assert_eq!(buf.len(), 16, "second chunk capped at 16");
+    read_chunk_capped(&mut r, &mut buf, cap).await.unwrap();
+    assert_eq!(
+        buf,
+        {
+            let mut v = vec![b'a'; 8];
+            v.push(b'\n');
+            v
+        },
+        "remaining 8 'a' + newline, under the cap"
+    );
+    read_chunk_capped(&mut r, &mut buf, cap).await.unwrap();
+    assert_eq!(buf, b"hi\n", "next whole short line");
+    let n = read_chunk_capped(&mut r, &mut buf, cap).await.unwrap();
+    assert_eq!(n, 0, "EOF");
+}
+
+/// dirge-do5l: the reader passes raw bytes through untouched — invalid
+/// UTF-8 is not rejected (the drain loop lossy-decodes it), so nothing
+/// downstream of a bad byte is dropped.
+#[tokio::test]
+async fn read_chunk_capped_preserves_non_utf8_bytes() {
+    use super::exec::read_chunk_capped;
+    use tokio::io::BufReader;
+    let data = [b'x', 0xff, b'y', b'\n'];
+    let mut r = BufReader::new(&data[..]);
+    let mut buf = Vec::new();
+    read_chunk_capped(&mut r, &mut buf, 64).await.unwrap();
+    assert_eq!(buf, vec![b'x', 0xff, b'y', b'\n']);
+    assert_eq!(String::from_utf8_lossy(&buf), "x\u{fffd}y\n");
+}
+
 /// dirge-tc2q: the bash child must run in its OWN session so it has no
 /// controlling terminal. That's what makes interactive credential
 /// prompts fail fast: git/ssh open `/dev/tty` (NOT stdin, which we

@@ -20,6 +20,62 @@ pub(crate) struct InterleavedOutput {
     pub exit_code: i32,
 }
 
+/// Per-line read ceiling for the drain loops. A newline-free line longer
+/// than this comes back in `MAX_LINE_BYTES` chunks so a `base64 -w0
+/// huge.bin` / `tr -d '\n' < huge.log` line can't buffer unbounded and
+/// OOM (dirge-yw3o). Mirrors the per-line cap in read.rs.
+const MAX_LINE_BYTES: usize = 16 * 1024;
+
+/// Read up to and including the next `\n` from `reader` into `buf`, but
+/// never buffer more than `max` bytes per call — a line longer than
+/// `max` is returned in `max`-sized chunks (dirge-yw3o).
+///
+/// Reads RAW bytes rather than `read_line`, so non-UTF-8 output no longer
+/// fails with `InvalidData` — which the drain loops treated as EOF,
+/// silently dropping everything after the first invalid byte (dirge-do5l).
+/// Callers lossy-decode the returned bytes. Returns `Ok(0)` only at true
+/// EOF (an unterminated final line is returned once, then `Ok(0)`).
+pub(super) async fn read_chunk_capped<R>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    max: usize,
+) -> std::io::Result<usize>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    use tokio::io::AsyncBufReadExt;
+    buf.clear();
+    loop {
+        // Check the cap BEFORE awaiting more input: once a capped chunk
+        // is ready we must return it, not block waiting for a newline
+        // that may never come.
+        if buf.len() >= max {
+            return Ok(buf.len());
+        }
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(buf.len()); // EOF
+        }
+        let newline_pos = available.iter().position(|&b| b == b'\n');
+        let slice = match newline_pos {
+            Some(i) => &available[..=i],
+            None => available,
+        };
+        let slice_len = slice.len();
+        let take = slice_len.min(max - buf.len());
+        buf.extend_from_slice(&slice[..take]);
+        // The `available`/`slice` borrow of `reader` ends above; only
+        // owned values (`take`, `slice_len`, `newline_pos`) are used past
+        // the `consume`.
+        reader.consume(take);
+        if newline_pos.is_some() && take == slice_len {
+            return Ok(buf.len());
+        }
+        // Otherwise: cap hit mid-slice (loop → cap guard returns) or no
+        // newline yet and still under cap (loop pulls more).
+    }
+}
+
 /// On Unix, SIGKILL the bash process group on drop. Used to clean up
 /// grandchildren when the agent task is aborted (Ctrl+C) — tokio's
 /// `kill_on_drop` only signals the immediate child, leaving descendants
@@ -151,7 +207,6 @@ pub(crate) async fn run_with_timeout(
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let drain = async move {
-        use tokio::io::AsyncBufReadExt;
         let mut merged = String::new();
         let mut so = stdout.map(tokio::io::BufReader::new);
         let mut se = stderr.map(tokio::io::BufReader::new);
@@ -173,20 +228,25 @@ pub(crate) async fn run_with_timeout(
             if !has_so && !has_se {
                 break;
             }
-            let mut so_buf = String::new();
-            let mut se_buf = String::new();
+            let mut so_buf: Vec<u8> = Vec::new();
+            let mut se_buf: Vec<u8> = Vec::new();
             // Build futures lazily; each is "noop" if its reader
             // is None. We funnel both into `Result<usize>` so the
-            // select! arms have matching types.
+            // select! arms have matching types. `read_chunk_capped`
+            // reads raw bytes (do5l) with a per-line ceiling (yw3o).
             let so_fut = async {
                 match so.as_mut() {
-                    Some(r) => r.read_line(&mut so_buf).await.map(Some),
+                    Some(r) => read_chunk_capped(r, &mut so_buf, MAX_LINE_BYTES)
+                        .await
+                        .map(Some),
                     None => Ok::<_, std::io::Error>(None),
                 }
             };
             let se_fut = async {
                 match se.as_mut() {
-                    Some(r) => r.read_line(&mut se_buf).await.map(Some),
+                    Some(r) => read_chunk_capped(r, &mut se_buf, MAX_LINE_BYTES)
+                        .await
+                        .map(Some),
                     None => Ok::<_, std::io::Error>(None),
                 }
             };
@@ -196,7 +256,7 @@ pub(crate) async fn run_with_timeout(
                     Ok(Some(0)) | Ok(None) | Err(_) => { so = None; }
                     Ok(Some(n)) => {
                         if merged.len() < DRAIN_CAP_BYTES {
-                            merged.push_str(&so_buf);
+                            merged.push_str(&String::from_utf8_lossy(&so_buf));
                         } else {
                             overflow_bytes = overflow_bytes.saturating_add(n);
                         }
@@ -206,7 +266,7 @@ pub(crate) async fn run_with_timeout(
                     Ok(Some(0)) | Ok(None) | Err(_) => { se = None; }
                     Ok(Some(n)) => {
                         if merged.len() < DRAIN_CAP_BYTES {
-                            merged.push_str(&se_buf);
+                            merged.push_str(&String::from_utf8_lossy(&se_buf));
                         } else {
                             overflow_bytes = overflow_bytes.saturating_add(n);
                         }
@@ -355,7 +415,6 @@ pub(super) fn spawn_streaming_shell(
             let store = store.clone();
             let id = id.clone();
             async move {
-                use tokio::io::AsyncBufReadExt;
                 let mut so = stdout.map(tokio::io::BufReader::new);
                 let mut se = stderr.map(tokio::io::BufReader::new);
                 loop {
@@ -364,17 +423,24 @@ pub(super) fn spawn_streaming_shell(
                     if !has_so && !has_se {
                         break;
                     }
-                    let mut so_buf = String::new();
-                    let mut se_buf = String::new();
+                    let mut so_buf: Vec<u8> = Vec::new();
+                    let mut se_buf: Vec<u8> = Vec::new();
+                    // Raw byte reads with a per-line ceiling: non-UTF-8
+                    // output survives lossy-decoded (do5l) and a giant
+                    // newline-free line can't buffer unbounded (yw3o).
                     let so_fut = async {
                         match so.as_mut() {
-                            Some(r) => r.read_line(&mut so_buf).await.map(Some),
+                            Some(r) => read_chunk_capped(r, &mut so_buf, MAX_LINE_BYTES)
+                                .await
+                                .map(Some),
                             None => Ok::<_, std::io::Error>(None),
                         }
                     };
                     let se_fut = async {
                         match se.as_mut() {
-                            Some(r) => r.read_line(&mut se_buf).await.map(Some),
+                            Some(r) => read_chunk_capped(r, &mut se_buf, MAX_LINE_BYTES)
+                                .await
+                                .map(Some),
                             None => Ok::<_, std::io::Error>(None),
                         }
                     };
@@ -382,11 +448,11 @@ pub(super) fn spawn_streaming_shell(
                         biased;
                         r = so_fut, if has_so => match r {
                             Ok(Some(0)) | Ok(None) | Err(_) => { so = None; }
-                            Ok(Some(_)) => store.append(&id, &so_buf),
+                            Ok(Some(_)) => store.append(&id, &String::from_utf8_lossy(&so_buf)),
                         },
                         r = se_fut, if has_se => match r {
                             Ok(Some(0)) | Ok(None) | Err(_) => { se = None; }
-                            Ok(Some(_)) => store.append(&id, &se_buf),
+                            Ok(Some(_)) => store.append(&id, &String::from_utf8_lossy(&se_buf)),
                         },
                     }
                 }
