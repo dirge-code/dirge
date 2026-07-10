@@ -1021,15 +1021,20 @@ pub(crate) fn backfill_missing_tool_results(
             tool_call_id: c.id.clone(),
             tool_name: c.name.clone(),
             content: vec![ContentBlock::Text {
-                text: "[tool call not executed: it was suppressed as a repeated/looping call, or \
-                       the run was interrupted. Do NOT repeat it — try a different approach.]"
-                    .to_string(),
+                text: SUPPRESSED_CALL_NOTE.to_string(),
             }],
             details: Value::Null,
             is_error: true,
         })
         .collect()
 }
+
+/// Text of the synthetic result the storm breaker/interrupt path backfills
+/// for a suppressed or unexecuted tool call. Hoisted to a const so the
+/// resume-after-failure gate can recognize it and refuse to re-issue the
+/// call (dirge-g3xv).
+pub(crate) const SUPPRESSED_CALL_NOTE: &str = "[tool call not executed: it was suppressed as a repeated/looping call, or \
+     the run was interrupted. Do NOT repeat it — try a different approach.]";
 
 /// Faithful port of pi `executeToolCalls` (agent-loop.ts:370-388).
 pub async fn execute_tool_calls(

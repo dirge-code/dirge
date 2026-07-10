@@ -4161,6 +4161,21 @@ fn tool_err(id: &str, name: &str, is_error: bool) -> LoopMessage {
     })
 }
 
+/// Like `tool_err` but with caller-controlled result text — lets a test feed
+/// a permission-denial excerpt or a storm-breaker backfill stub verbatim
+/// (dirge-g3xv).
+fn tool_err_text(id: &str, name: &str, is_error: bool, text: &str) -> LoopMessage {
+    LoopMessage::ToolResult(crate::agent::agent_loop::message::ToolResultMessage {
+        tool_call_id: id.to_string(),
+        tool_name: name.to_string(),
+        content: vec![crate::agent::agent_loop::message::ContentBlock::Text {
+            text: text.to_string(),
+        }],
+        details: serde_json::json!({}),
+        is_error,
+    })
+}
+
 fn asst_no_tools(text: &str) -> LoopMessage {
     LoopMessage::Assistant(crate::agent::agent_loop::message::AssistantMessage::new(
         vec![crate::agent::agent_loop::message::ContentBlock::Text {
@@ -4254,6 +4269,67 @@ fn last_action_failed_and_stopped_detects_error_among_mixed_results() {
         asst_with_tool("c2", "write", serde_json::json!({"path": "/b"})),
         tool_err("c2", "write", true),
         asst_no_tools("write failed, stopping"),
+    ];
+    assert!(last_action_failed_and_stopped(&msgs));
+}
+
+// dirge-g3xv: permission denials and storm-breaker backfill stubs are NOT
+// retryable — the resume-after-failure gate must not arm for them.
+#[test]
+fn last_action_failed_and_stopped_false_on_permission_denial() {
+    // A permission/approval refusal is only unblockable by the user; re-issuing
+    // re-prompts. The gate must not arm (RED currently: true).
+    let msgs = vec![
+        user("go"),
+        asst_with_tool("c1", "bash", serde_json::json!({})),
+        tool_err_text("c1", "bash", true, "Permission denied by user"),
+        asst_no_tools("you denied it"),
+    ];
+    assert!(!last_action_failed_and_stopped(&msgs));
+}
+
+#[test]
+fn last_action_failed_and_stopped_false_on_suppressed_backfill_stub() {
+    // The backfill stub literally means "do NOT repeat". Re-issuing re-triggers
+    // the suppressed call, so the gate must not arm (RED currently: true).
+    let msgs = vec![
+        user("go"),
+        asst_with_tool("c1", "bash", serde_json::json!({})),
+        tool_err_text(
+            "c1",
+            "bash",
+            true,
+            crate::agent::agent_loop::tools::SUPPRESSED_CALL_NOTE,
+        ),
+        asst_no_tools("ok, stopping"),
+    ];
+    assert!(!last_action_failed_and_stopped(&msgs));
+}
+
+#[test]
+fn last_action_failed_and_stopped_true_on_genuine_error() {
+    // A genuine, mechanically-recoverable failure (bad edit args) still arms the
+    // gate. Regression guard — should already pass and keep passing.
+    let msgs = vec![
+        user("go"),
+        asst_with_tool("c1", "edit", serde_json::json!({})),
+        tool_err_text("c1", "edit", true, "old_string not found in file"),
+        asst_no_tools("gave up"),
+    ];
+    assert!(last_action_failed_and_stopped(&msgs));
+}
+
+#[test]
+fn last_action_failed_and_stopped_true_when_mixed_denial_and_genuine() {
+    // A denial result AND a genuine-error result in the same tail: a real
+    // retryable failure is still present, so the gate arms.
+    let msgs = vec![
+        user("go"),
+        asst_with_tool("c1", "bash", serde_json::json!({})),
+        tool_err_text("c1", "bash", true, "Permission denied by user"),
+        asst_with_tool("c2", "edit", serde_json::json!({})),
+        tool_err_text("c2", "edit", true, "old_string not found in file"),
+        asst_no_tools("stopping"),
     ];
     assert!(last_action_failed_and_stopped(&msgs));
 }

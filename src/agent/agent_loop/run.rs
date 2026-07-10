@@ -251,7 +251,7 @@ fn last_action_failed_and_stopped(new_messages: &[LoopMessage]) -> bool {
     for msg in new_messages[..new_messages.len() - 1].iter().rev() {
         match msg {
             LoopMessage::ToolResult(tr) => {
-                if tr.is_error {
+                if is_retryable_failure(tr) {
                     error_tail = true;
                 }
             }
@@ -259,6 +259,25 @@ fn last_action_failed_and_stopped(new_messages: &[LoopMessage]) -> bool {
         }
     }
     error_tail
+}
+
+/// A failed tool result the model could plausibly fix by retrying. Excludes
+/// permission/approval refusals (Outcome::Denied — only the user can unblock)
+/// and storm-breaker backfill stubs (already "do not repeat"), so the
+/// resume-after-failure nudge never re-issues a denied or suppressed call
+/// (dirge-g3xv).
+fn is_retryable_failure(tr: &super::message::ToolResultMessage) -> bool {
+    if !tr.is_error {
+        return false;
+    }
+    let excerpt = tool_result_excerpt(&tr.content);
+    if super::activity::Outcome::classify(true, &excerpt) == super::activity::Outcome::Denied {
+        return false;
+    }
+    if excerpt.contains(super::tools::SUPPRESSED_CALL_NOTE) {
+        return false;
+    }
+    true
 }
 
 /// Poll the finalization gates in strict priority order and return the first
