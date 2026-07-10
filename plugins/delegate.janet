@@ -18,11 +18,13 @@
 # attribute to a session — those stay stripped regardless of tier.)
 #
 # dirge plugins can't make their own LLM calls, so (like orchestrator)
-# this is prompt steering: `/delegate` injects the delegation contract
-# as the next turn; `on-tool-start` keeps a dispatch + reconcile tally
-# the model can't lose mid-loop; `on-response` re-surfaces it so the
-# model remembers what's pending when subagent results land as a
-# <system-reminder>.
+# this is prompt steering. `/delegate` engages a mode; while it's on,
+# the `on-prompt` hook PREPENDS the delegation contract to whatever you
+# type next (your typed task follows as the goal). A plugin command
+# can't launch a run on its own, so the flow is two-step: engage, then
+# type the task. `on-tool-start` keeps a dispatch + reconcile tally the
+# model can't lose mid-loop; `on-response` re-surfaces it so the model
+# remembers what's pending when subagent results land as a <system-reminder>.
 #
 # ── ONE-TIME SETUP ──────────────────────────────────────────────
 # A read-write profile whose system prompt emphasizes doing the work
@@ -44,11 +46,13 @@
 # delegation degrades gracefully (just without fan-out).
 #
 # ── USAGE ───────────────────────────────────────────────────────
-#   /delegate <task>   start delegation mode for <task>
-#   /delegations       show dispatches + reconcile fixes this run
-#   /delegate-off      exit delegation mode (keeps the ledger)
+#   /delegate           engage delegation mode (bare — no task arg)
+#   <type your task as a normal message, press Enter — it runs with
+#    the contract prepended; your typed text is the goal>
+#   /delegations        show dispatches + reconcile fixes this run
+#   /delegate-off       exit delegation mode (keeps the ledger)
 
-(def hooks ["on-init" "on-tool-start" "on-response"])
+(def hooks ["on-init" "on-prompt" "on-tool-start" "on-response"])
 
 # The profile the contract dispatches code work to. Change to match.
 (def coder-profile "coder")
@@ -71,7 +75,7 @@
 # The main model reads this and drives the loop; the plugin keeps the
 # tally visible, it doesn't enforce the loop mechanically.
 
-(defn delegation-contract [task]
+(defn delegation-contract []
   (string
     "DELEGATION MODE — you are a planner + reconciler. The subagents do the implementation; you hold the plan and the review.\n\n"
     "Your main thread holds the write tools too, but you use them to FIX, not to author the bulk of the work. The subagents are READ-WRITE: they edit the code tree and run builds/tests directly.\n\n"
@@ -93,7 +97,7 @@
     "- Your plan is the source of truth, not the subagent's output. A change that builds but contradicts the plan is a bug — fix it.\n"
     "- One subtask = one prompt = one cohesive change. Don't bundle unrelated edits.\n"
     "- Prefer dispatch over inline authoring. A quick one-line fix is fine inline; a multi-file change is a subtask.\n\n"
-    "GOAL: " task))
+    "The user's message below is the task. Delegate it."))
 
 # ── Helpers ─────────────────────────────────────────────────────
 
@@ -169,22 +173,36 @@
 
 # ── Commands ────────────────────────────────────────────────────
 
+# ── on-prompt (contract injection) ──────────────────────────────
+# While delegation mode is on, prepend the contract to the user's typed
+# message. The host turns the returned string into
+#   "<contract>\n\n<typed text>"
+# so the typed task is preserved after the contract (it is the goal).
+# Returns nil when inactive → no prepend.
+(defn delegate-on-prompt [_ctx]
+  (if active
+    (delegation-contract)
+    nil))
+
 (defn delegate-handler [args]
-  (def task (if (string? args) (string/trim args) ""))
-  (if (= task "")
-    (string "usage: /delegate <task>\n"
-            "Delegates code work to read-write subagents (they edit "
-            "directly); you verify against your plan and fix/re-dispatch "
-            "on mistakes. Requires a read-write coder profile (see "
-            "plugin header).")
-    (do
-      (set active true)
-      (set ledger @[])
-      (set fixes 0)
-      (set dispatch-count 0)
-      (harness/request-prompt (delegation-contract task))
-      (string "Delegation mode engaged for: " task "\n"
-              "(plan → dispatch to `" coder-profile "` → reconcile)…"))))
+  # Bare mode toggle — a plugin command can't launch a run on its own,
+  # so /delegate just engages the mode; the on-prompt hook prepends the
+  # contract to the task you type next. Any arg is ignored with a note.
+  (def arg (if (string? args) (string/trim args) ""))
+  (set active true)
+  (set ledger @[])
+  (set fixes 0)
+  (set dispatch-count 0)
+  (string
+    "DELEGATION MODE engaged.\n"
+    "Type your task as a normal message and press Enter — I'll plan,\n"
+    "dispatch code work to `" coder-profile "` subagents (they edit directly),\n"
+    "then review, verify, and fix/re-dispatch on this thread.\n"
+    (if (> (length arg) 0)
+      (string "(note: /delegate takes no task — I ignored \""
+              arg "\"; type your task as the next message.)\n")
+      "")
+    "(/delegate-off to exit; /delegations to review.)"))
 
 (defn delegations-handler [_args]
   (let [nd (length ledger)]

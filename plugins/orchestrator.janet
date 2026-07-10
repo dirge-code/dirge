@@ -11,13 +11,13 @@
 # and the final implementation.
 #
 # dirge plugins can't make their own LLM calls, so this is prompt
-# steering: `/orchestrate` injects the orchestration contract as the
-# next turn, and `on-tool-start` keeps a reliable dispatch ledger the
-# model can't lose track of. Reconciliation discipline lives in the
-# contract (the plugin can't reliably observe subagent completion —
-# results arrive as a <system-reminder> in the model's context, not a
-# hook), while `on-response` re-surfaces the ledger so the orchestrator
-# remembers what it fanned out when results land.
+# steering. `/orchestrate` engages a mode; while it's on, the `on-prompt`
+# hook PREPENDS the orchestration contract to whatever you type next
+# (your typed task follows the contract as the actual goal). A plugin
+# command can't launch a run on its own, so the flow is two-step: engage
+# the mode, then type the task. `on-tool-start` keeps a reliable dispatch
+# ledger the model can't lose track of; `on-response` re-surfaces it so
+# the orchestrator remembers what it fanned out when results land.
 #
 # ── ONE-TIME SETUP ──────────────────────────────────────────────
 # Create a read-only agent profile so `task(agent="research")` runs a
@@ -41,12 +41,14 @@
 # proceed inline, so orchestration still works (just without fan-out).
 #
 # ── USAGE ───────────────────────────────────────────────────────
-#   /orchestrate <task>   start orchestration mode for <task>
-#   /ledger               show dispatches recorded this run
-#   /orchestrate-off      exit orchestration mode (stops the ledger
-#                         reminder; keeps the ledger for review)
+#   /orchestrate         engage orchestration mode (bare — no task arg)
+#   <type your task as a normal message, press Enter — it runs with
+#    the contract prepended; your typed text is the goal>
+#   /ledger              show dispatches recorded this run
+#   /orchestrate-off     exit orchestration mode (stops the ledger
+#                        reminder; keeps the ledger for review)
 
-(def hooks ["on-init" "on-tool-start" "on-response"])
+(def hooks ["on-init" "on-prompt" "on-tool-start" "on-response"])
 
 # The profile the contract dispatches to. Change to match yours.
 (def research-profile "research")
@@ -61,7 +63,7 @@
 # plugin's job is to keep the arc visible, not to enforce it
 # mechanically (which a prompt can't do reliably).
 
-(defn orchestration-contract [task]
+(defn orchestration-contract []
   (string
     "ORCHESTRATION MODE — you are an orchestrator + reconciler, not a lone implementer.\n\n"
     "Your main thread holds the WRITE tools (edit/write/bash) and is for: PLANNING, WORK BREAKDOWN, DECISIONS, and the FINAL IMPLEMENTATION. Keep it clean of long investigation loops.\n\n"
@@ -77,7 +79,7 @@
     "Rules:\n"
     "- Prefer dispatch over inline investigation. One quick read is fine; a multi-step exploration is a subtask.\n"
     "- One subtask = one prompt. Don't bundle unrelated investigations.\n\n"
-    "GOAL: " task))
+    "The user's message below is the task to orchestrate."))
 
 # ── Helpers ─────────────────────────────────────────────────────
 
@@ -147,20 +149,37 @@
 
 # ── Commands ────────────────────────────────────────────────────
 
+# ── on-prompt (contract injection) ──────────────────────────────
+# While orchestration mode is on, prepend the contract to the user's
+# typed message. The host turns the returned string into
+#   "<contract>\n\n<typed text>"
+# so the task the user types is preserved after the contract (it is the
+# goal). Returns nil when inactive → no prepend. Fires once per typed
+# prompt while active.
+(defn orchestrator-on-prompt [_ctx]
+  (if active
+    (orchestration-contract)
+    nil))
+
 (defn orchestrate-handler [args]
-  (def task (if (string? args) (string/trim args) ""))
-  (if (= task "")
-    (string "usage: /orchestrate <task>\n"
-            "Starts orchestration mode: plan → dispatch read-only "
-            "investigation to tooled subagents → reconcile + implement.\n"
-            "Requires a read-only agent profile (see plugin header).")
-    (do
-      (set active true)
-      (set ledger @[])
-      (set dispatch-count 0)
-      (harness/request-prompt (orchestration-contract task))
-      (string "Orchestration mode engaged for: " task "\n"
-              "(plan → dispatch to `" research-profile "` → reconcile)…"))))
+  # Bare mode toggle — a plugin command can't launch a run on its own,
+  # so /orchestrate just engages the mode; the on-prompt hook prepends
+  # the contract to the task you type next. Any arg is ignored with a
+  # note (the task is a normal message, not a command arg).
+  (def arg (if (string? args) (string/trim args) ""))
+  (set active true)
+  (set ledger @[])
+  (set dispatch-count 0)
+  (string
+    "ORCHESTRATION MODE engaged.\n"
+    "Type your task as a normal message and press Enter — I'll plan,\n"
+    "dispatch read-only investigation to `" research-profile "` subagents,\n"
+    "then reconcile + implement on this thread.\n"
+    (if (> (length arg) 0)
+      (string "(note: /orchestrate takes no task — I ignored \""
+              arg "\"; type your task as the next message.)\n")
+      "")
+    "(/orchestrate-off to exit; /ledger to review dispatches.)"))
 
 (defn ledger-handler [_args]
   (if (= (length ledger) 0)
