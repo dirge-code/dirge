@@ -978,14 +978,16 @@ impl Renderer {
             // scroll-status line, so content rows = head_budget - 1.
             let (head, tail) =
                 crate::ui::tui::bottom::overlay_head_tail_wrapped(lines, probe.input_box.width);
-            let inner_h = rows as usize;
-            let head_budget = inner_h.saturating_sub(tail);
-            let content_rows = if head > head_budget {
-                head_budget.saturating_sub(1)
-            } else {
-                head_budget
-            };
-            *alert_max_scroll = head.saturating_sub(content_rows);
+            // The painter's inner height is the POST `Layout::with_panels`
+            // clamp to MAX_INPUT_ROWS — `rows` here is only the pre-clamp
+            // ceiling. Computing scroll geometry from the un-clamped value
+            // made a long command look like it fit (max_scroll=0) while the
+            // painter reported "N more lines", so the keys did nothing
+            // (dirge-agbo). Route both the renderer and the painter through
+            // the same `overlay_scroll_geom` helper with this clamped height.
+            let inner_h = rows.min(crate::ui::tui::layout::MAX_INPUT_ROWS) as usize;
+            *alert_max_scroll =
+                crate::ui::tui::bottom::overlay_scroll_geom(head, tail, inner_h).max_scroll;
             *alert_scroll = (*alert_scroll).min(*alert_max_scroll);
             rows
         } else if let Some(lines) = self.shell_overlay.as_ref() {

@@ -366,6 +366,35 @@ fn label_prefix_width(text: &str) -> usize {
     }
 }
 
+/// Scroll geometry for an overlay whose head wraps to `head` rows with
+/// `tail` sticky rows, painted in an inner box of `inner_h` rows.
+///
+/// `content_rows` is how many head rows fit (one is yielded to the
+/// scroll-status line on overflow); `max_scroll` is the furthest the
+/// head can be scrolled so the tail of a long command is reachable.
+///
+/// The renderer (to clamp the scroll keys) and the painter (to window
+/// the body) MUST pass the SAME `inner_h` — the post-`Layout` clamp
+/// painted height — or the scroll keys and the "N more lines" hint
+/// disagree (dirge-agbo).
+pub(crate) struct OverlayScrollGeom {
+    pub content_rows: usize,
+    pub max_scroll: usize,
+}
+
+pub(crate) fn overlay_scroll_geom(head: usize, tail: usize, inner_h: usize) -> OverlayScrollGeom {
+    let head_budget = inner_h.saturating_sub(tail);
+    let content_rows = if head > head_budget {
+        head_budget.saturating_sub(1)
+    } else {
+        head_budget
+    };
+    OverlayScrollGeom {
+        content_rows,
+        max_scroll: head.saturating_sub(content_rows),
+    }
+}
+
 fn paint_overlay_box(
     buf: &mut Buffer,
     area: Rect,
@@ -423,16 +452,10 @@ fn paint_overlay_box(
     // row for a scroll-status line and window the head by `scroll`, so
     // the full command is reachable with the keyboard.
     let sticky_len = sticky_last.len();
-    let head_budget = inner_h.saturating_sub(sticky_len);
-
-    let overflow = head_visual.len() > head_budget;
-    // With overflow, one row goes to the scroll-status line.
-    let content_rows = if overflow {
-        head_budget.saturating_sub(1)
-    } else {
-        head_budget
-    };
-    let max_scroll = head_visual.len().saturating_sub(content_rows);
+    let geom = overlay_scroll_geom(head_visual.len(), sticky_len, inner_h);
+    let content_rows = geom.content_rows;
+    let max_scroll = geom.max_scroll;
+    let overflow = head_visual.len() > inner_h.saturating_sub(sticky_len);
     let scroll = scroll.min(max_scroll);
     let end = (scroll + content_rows).min(head_visual.len());
     let head_to_show: &[(String, crossterm::style::Color)] = if head_visual.is_empty() {
@@ -838,5 +861,36 @@ mod tests {
             .into_iter()
             .collect();
         assert!(row.starts_with("ready [code]"), "got status {:?}", row);
+    }
+
+    /// The renderer (scroll-key clamp) and the painter (body windowing)
+    /// must derive scroll geometry from the SAME inner height. inner_h=8
+    /// is the real painted height after `Layout::with_panels` clamps
+    /// input_rows to `MAX_INPUT_ROWS` (=8); 19 was the renderer's old
+    /// (wrong) pre-clamp value that made a long command look
+    /// non-scrollable (dirge-agbo).
+    #[test]
+    fn overlay_scroll_geom_uses_painted_height() {
+        // Long alert on a small box: the tail of the command is
+        // reachable by scrolling.
+        let g = overlay_scroll_geom(18, 0, 8);
+        assert_eq!(g.content_rows, 7);
+        assert_eq!(g.max_scroll, 11);
+        assert!(g.max_scroll > 0);
+
+        // The pre-fix mistake, documented: computing against the
+        // un-clamped height (19) makes the overlay look like it fits,
+        // so max_scroll collapses to 0 — i.e. not scrollable.
+        assert_eq!(overlay_scroll_geom(18, 0, 19).max_scroll, 0);
+
+        // Short alert: nothing to scroll.
+        assert_eq!(overlay_scroll_geom(5, 0, 8).max_scroll, 0);
+
+        // With a 2-row sticky tail: head_budget = 8 - 2 = 6, one row
+        // yields to the scroll-status line, so content_rows = 5 and the
+        // reachable scroll grows to 13.
+        let g = overlay_scroll_geom(18, 2, 8);
+        assert_eq!(g.content_rows, 5);
+        assert_eq!(g.max_scroll, 13);
     }
 }
