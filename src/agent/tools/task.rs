@@ -243,6 +243,7 @@ const SUBAGENT_READWRITE_BASE: &[&str] = &[
 ///     — the dirge-mifq leakage class, blocked until the session-id audit,
 ///   - interactive (`question`/`plan_enter`/`plan_exit`) — would block the
 ///     parent UI mid-turn.
+///
 /// Disjoint from `SUBAGENT_READONLY_BASE`, so a no-op for the readonly tier
 /// today, but defense-in-depth for future tiers.
 const SUBAGENT_FORCED_EXCLUDES: &[&str] = &[
@@ -614,6 +615,7 @@ impl TaskTool {
     /// first live producer for the dormant `ToolCall`/`ToolResult`/`Reasoning`
     /// variants. `background` selects detached (returns a task_id) vs inline
     /// (blocks the parent's tool call), mirroring the tool-less path's shape.
+    #[allow(clippy::too_many_arguments)]
     async fn run_tooled(
         &self,
         route_model: Option<AnyModel>,
