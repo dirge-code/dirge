@@ -11,7 +11,7 @@
 use crate::sync_util::LockExt;
 use rig::completion::Message;
 
-use super::{AnyAgent, AnyAgentInner};
+use super::{AnyAgent, AnyAgentInner, AnyModel};
 use crate::agent::agent_loop::message::ImageRef;
 use crate::agent::runner::AgentRunner;
 use crate::agent::tools::ToolCache;
@@ -479,6 +479,64 @@ impl AnyAgent {
 
         let loop_runner = spawn_loop_runner(cfg);
         (loop_runner.into_agent_runner(), review_cache)
+    }
+
+    /// Fork a filtered runner for a tooled subagent. Thin sibling of
+    /// [`spawn_filtered_runner_with_cache`]: an isolated `ToolCache`, NO
+    /// transcript (isolated child scope — the subagent sees only its prompt),
+    /// a fresh child session id, and a bounded turn cap. The tool set is the
+    /// hard allow-list produced by `resolve_subagent_allow` (readonly base
+    /// minus the mandatory floor), so a subagent literally cannot reach tools
+    /// outside it.
+    ///
+    /// Because the retained tools are the parent's already-built instances,
+    /// each one still carries the parent's `PermCheck` — cwd reads are
+    /// auto-allowed, novel paths surface a prompt through the parent UI. No
+    /// subagent-scoped checker is constructed in v1.
+    pub fn spawn_subagent_runner(
+        &self,
+        prompt: String,
+        system_prompt: String,
+        allowed: &[String],
+        child_session_id: &str,
+        max_turns: usize,
+        // Profile-pinned model. `Some` builds the stream_fn from this model
+        // (so a profile's model choice applies to its tooled subagent too);
+        // `None` uses the live agent's model. Either way the TOOL SET comes
+        // from the live agent (the parent's filtered registry).
+        model_override: Option<&AnyModel>,
+    ) -> crate::agent::runner::AgentRunner {
+        use crate::agent::agent_loop::{LoopSpawnConfig, retrying_stream_fn, spawn_loop_runner};
+        use crate::agent::recovery::RecoveryPolicy;
+
+        let names: Vec<&str> = allowed.iter().map(String::as_str).collect();
+        let tools = filter_loop_tools(&self.loop_tools, &names);
+        let tool_defs = Self::tool_defs_for(&tools);
+        let provider = self.provider_name().to_string();
+        let inner_stream_fn = match model_override {
+            Some(m) => {
+                m.build_stream_fn_with_filter(tool_defs, self.chunk_timeout, Some(provider), None)
+            }
+            None => self.build_stream_fn(tool_defs),
+        };
+        let stream_fn = retrying_stream_fn(inner_stream_fn, RecoveryPolicy::default());
+
+        let mut cfg = LoopSpawnConfig::minimal(stream_fn, prompt);
+        cfg.system_prompt = system_prompt;
+        cfg.tools = tools;
+        cfg.provider_name = Some(self.provider_name().to_string());
+        cfg.model_name = match model_override {
+            Some(m) => Some(m.name()),
+            None => Self::model_name_opt(&self.model_name),
+        };
+        // Forward-safe: a fresh child id, parent-linked in spirit. Inert in v1
+        // — every tool that would consume a session id is force-excluded from
+        // `allowed`, so the id attributes nothing until the dirge-mifq audit
+        // opens those tools in a later tier.
+        cfg.session_id = Some(child_session_id.to_string());
+        cfg.max_turns = Some(max_turns);
+
+        spawn_loop_runner(cfg).into_agent_runner()
     }
 
     /// Phase 4.5h-2: produce a `StreamFn` from this agent's

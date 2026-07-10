@@ -164,6 +164,130 @@ pub fn unregister_subagent_abort(id: &str) {
     map.remove(id);
 }
 
+/// Bridge a registered `AbortSignal` (driven by `/kill` / Ctrl+K) to a tooled
+/// subagent's `AgentRunner`. The tool-less path polls the signal inline
+/// (`tokio::select!` around `btw_query`); the tooled path drives a real
+/// `AgentRunner`, so this watcher translates the registry's cancel flag into
+/// the runner's cooperative `cancel_tx` + a hard `JoinHandle::abort()`. The
+/// drain's `AbortRunnerOnDrop` is the drop-time safety net; this watcher is
+/// the external-trigger path. Both are needed.
+fn spawn_abort_watcher(
+    abort: AbortSignal,
+    handle: tokio::task::AbortHandle,
+    cancel_tx: tokio::sync::mpsc::Sender<()>,
+) {
+    tokio::spawn(async move {
+        loop {
+            if abort.is_cancelled() {
+                let _ = cancel_tx.try_send(()); // cooperative: clean cancelled event
+                handle.abort(); // hard kill at the next .await
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    });
+}
+
+/// v1 read-only tool universe for a tooled subagent. Verified against the
+/// registration list in `build_loop_tools`. A readonly subagent can read
+/// files, search, and browse the web — but never mutate, recurse, write
+/// durable state, or attribute work to a session.
+const SUBAGENT_READONLY_BASE: &[&str] = &[
+    "read",
+    "read_minified",
+    "grep",
+    "find_files",
+    "glob",
+    "list_dir",
+    "repo_overview",
+    "websearch",
+    "webfetch",
+];
+
+/// Non-negotiable safety floor stripped from EVERY tooled subagent's allow-list,
+/// regardless of tier or profile `allow`. Covers three classes:
+///   - recursion (`task`/`task_status`) — no fan-out,
+///   - durable writes (`memory`/`skill`/`spec`) — no side effects out of band,
+///   - session-attribution (`write_todo_list`/`session_search`/`issue`/`graph`)
+///     — the dirge-mifq leakage class, blocked until the session-id audit,
+///   - interactive (`question`/`plan_enter`/`plan_exit`) — would block the
+///     parent UI mid-turn.
+/// Disjoint from `SUBAGENT_READONLY_BASE`, so a no-op for the readonly tier
+/// today, but defense-in-depth for future tiers.
+const SUBAGENT_FORCED_EXCLUDES: &[&str] = &[
+    "task",
+    "task_status",
+    "memory",
+    "skill",
+    "spec",
+    "write_todo_list",
+    "session_search",
+    "issue",
+    "graph",
+    "question",
+    "plan_enter",
+    "plan_exit",
+];
+
+/// Default per-subagent turn cap. A tooled subagent loops until it stops or
+/// this many assistant turns elapse, whichever is first. Prevents a runaway
+/// loop from burning the full background timeout. Per-profile overridable via
+/// `subagent.max_turns`.
+pub const SUBAGENT_DEFAULT_MAX_TURNS: usize = 25;
+
+/// Default system prompt for a tooled subagent whose profile set no prompt
+/// body. The tool-less path frames the task inside the prompt; the tooled
+/// path has a real system-prompt slot, so the subagent identity lives here
+/// and the task is the user message.
+const SUBAGENT_DEFAULT_PREAMBLE: &str = "You are a subagent working on a specific subtask. Complete it thoroughly using the tools available to you. You cannot spawn further subagents.";
+
+/// Resolve a profile's subagent policy into the exact allow-list for the
+/// tooled fork.
+///
+/// Returns `Ok(None)` for a tool-less subagent (the unchanged `btw_query`
+/// path). `Ok(Some)` is the filtered tool set. `Err` flags a reserved tier
+/// (`ReadWrite`) that v1 does not wire — callers should warn + fall back to
+/// tool-less rather than spawn.
+///
+/// Readonly invariant: the final set is intersected with
+/// [`SUBAGENT_READONLY_BASE`], so `allow` can never escalate a readonly
+/// subagent to mutation; `deny` narrows; [`SUBAGENT_FORCED_EXCLUDES`] is then
+/// stripped as the mandatory floor.
+pub fn resolve_subagent_allow(
+    p: &crate::context::agent_defs::SubagentToolPolicy,
+) -> Result<Option<Vec<String>>, String> {
+    use crate::context::agent_defs::SubagentToolTier;
+    use std::collections::BTreeSet;
+    let universe: &[&str] = match p.tier {
+        SubagentToolTier::Toolless => return Ok(None),
+        SubagentToolTier::ReadWrite => {
+            return Err("subagent tier 'readwrite' is reserved and not enabled in v1".into());
+        }
+        SubagentToolTier::Readonly => SUBAGENT_READONLY_BASE,
+    };
+    let mut set: BTreeSet<String> = universe.iter().map(|s| s.to_ascii_lowercase()).collect();
+    // `allow` can only keep items already in the tier universe; additions
+    // outside it are silently dropped (can't escalate past the tier).
+    for a in &p.allow {
+        let a = a.to_ascii_lowercase();
+        if universe.iter().any(|u| u.eq_ignore_ascii_case(&a)) {
+            set.insert(a);
+        }
+    }
+    for d in &p.deny {
+        set.remove(&d.to_ascii_lowercase());
+    }
+    for x in SUBAGENT_FORCED_EXCLUDES {
+        set.remove(&x.to_ascii_lowercase());
+    }
+    Ok(Some(set.into_iter().collect()))
+}
+
+/// Per-subagent turn cap, honoring a profile override or the default.
+pub fn resolve_subagent_max_turns(p: &crate::context::agent_defs::SubagentToolPolicy) -> usize {
+    p.max_turns.unwrap_or(SUBAGENT_DEFAULT_MAX_TURNS)
+}
+
 /// dirge-ykeu Phase 4: a pre-resolved subagent routing for one agent profile.
 /// Built once at startup (in `main`, where the client + config + registry are
 /// all available) so `TaskTool` needs neither the client nor the config to
@@ -175,6 +299,14 @@ pub struct SubagentRoute {
     pub model: Option<AnyModel>,
     /// System prompt override for the subagent. `None` → default preamble.
     pub preamble: Option<String>,
+    /// `None` → tool-less subagent (the unchanged `btw_query` one-shot path).
+    /// `Some` → the exact tool allow-list for a tooled fork; the subagent runs
+    /// a real filtered agent loop with this set (readonly base minus the
+    /// mandatory floor, narrowed by any profile `deny`).
+    pub tool_allow: Option<Vec<String>>,
+    /// Per-subagent turn cap. Honors a profile `subagent.max_turns` override
+    /// else [`SUBAGENT_DEFAULT_MAX_TURNS`]. Only consumed on the tooled path.
+    pub max_turns: usize,
 }
 
 /// Process-global map of profile name → routing. Set once at interactive
@@ -285,6 +417,110 @@ pub fn clear_abort_registry_for_test() {
     map.clear();
 }
 
+/// Truncate a string to one line of at most `max` chars, collapsing whitespace.
+fn one_line(s: &str, max: usize) -> String {
+    let collapsed: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= max {
+        collapsed
+    } else {
+        let truncated: String = collapsed.chars().take(max).collect();
+        format!("{truncated}…")
+    }
+}
+
+/// One-line summary of a tool-call's JSON args for the chat-window ticker.
+fn summarize_json_args(args: &serde_json::Value, max: usize) -> String {
+    let raw = match args {
+        serde_json::Value::Null => String::new(),
+        // Prefer a compact `key=val` rendering for object args (the common case).
+        serde_json::Value::Object(map) => map
+            .iter()
+            .map(|(k, v)| format!("{k}={}", value_brief(v)))
+            .collect::<Vec<_>>()
+            .join(" "),
+        other => other.to_string(),
+    };
+    one_line(&raw, max)
+}
+
+/// Brief rendering of a JSON value for the args summary (strings unquoted,
+/// arrays/objects shown by length).
+fn value_brief(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Null => "null".into(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::Array(a) => format!("[{}]", a.len()),
+        serde_json::Value::Object(o) => format!("{{+{}}}", o.len()),
+    }
+}
+
+/// Drain a tooled subagent's `AgentRunner` to completion, relaying each
+/// event into the subagent chat-window channel. This is the first live
+/// producer for the dormant `SubagentChatEvent::{Token,Reasoning,ToolCall,
+/// ToolResult,Complete,Failed}` variants (dirge-781c). Mirrors
+/// `plan::runtime::collect_runner_text` but emits per-event instead of
+/// silently consuming.
+///
+/// Returns the final assistant text (`Done.response`, falling back to the
+/// accumulated token stream) or the first error. `AbortRunnerOnDrop` is held
+/// for the drain so a cancelled/early-returning caller actually kills the fork.
+async fn drain_subagent_runner(
+    runner: crate::agent::runner::AgentRunner,
+    id: &str,
+    emit: impl Fn(SubagentChatEvent),
+) -> Result<String, String> {
+    use crate::agent::runner::AbortRunnerOnDrop;
+    use crate::event::AgentEvent;
+
+    let crate::agent::runner::AgentRunner {
+        event_rx,
+        task,
+        cancel_tx,
+        ..
+    } = runner;
+    let _guard = AbortRunnerOnDrop { task, cancel_tx };
+    let mut rx = event_rx;
+    let mut text = String::new();
+    while let Some(event) = rx.recv().await {
+        match event {
+            AgentEvent::Token(t) => {
+                text.push_str(&t);
+                emit(SubagentChatEvent::Token {
+                    id: id.to_string(),
+                    text: t.to_string(),
+                });
+            }
+            AgentEvent::Reasoning(t) => emit(SubagentChatEvent::Reasoning {
+                id: id.to_string(),
+                text: t.to_string(),
+            }),
+            AgentEvent::ToolCall { name, args, .. } => emit(SubagentChatEvent::ToolCall {
+                id: id.to_string(),
+                tool_name: name.to_string(),
+                args_summary: summarize_json_args(&args, 120),
+            }),
+            AgentEvent::ToolResult { output, .. } => emit(SubagentChatEvent::ToolResult {
+                id: id.to_string(),
+                tool_name: String::new(), // AgentEvent carries no name here
+                output_summary: one_line(&output, 120),
+            }),
+            AgentEvent::Done { response, .. } => {
+                return Ok(if response.is_empty() {
+                    text
+                } else {
+                    response.to_string()
+                });
+            }
+            AgentEvent::Error(msg) => return Err(msg.to_string()),
+            AgentEvent::ContextOverflow { error, .. } => return Err(error.to_string()),
+            _ => {}
+        }
+    }
+    Err("subagent runner ended without Done".to_string())
+}
+
 pub struct TaskTool {
     pub permission: Option<PermCheck>,
     pub ask_tx: Option<AskSender>,
@@ -339,6 +575,223 @@ impl TaskTool {
         }
         if let Some(sink) = subagent_chat_sink() {
             let _ = sink.try_send(event);
+        }
+    }
+
+    /// Tooled subagent path (v1: readonly tier). Forks a filtered runner off
+    /// the live agent (its tool registry, optionally the profile's model) and
+    /// drains it, relaying each event into the subagent chat window — the
+    /// first live producer for the dormant `ToolCall`/`ToolResult`/`Reasoning`
+    /// variants. `background` selects detached (returns a task_id) vs inline
+    /// (blocks the parent's tool call), mirroring the tool-less path's shape.
+    async fn run_tooled(
+        &self,
+        route_model: Option<AnyModel>,
+        route_preamble: Option<String>,
+        allowed: Vec<String>,
+        max_turns: usize,
+        background: bool,
+        prompt: String,
+        agent_name: Option<String>,
+    ) -> Result<String, ToolError> {
+        let agent = crate::provider::current_agent().ok_or_else(|| {
+            ToolError::Msg(
+                "tooled subagents require a live interactive agent; this path (headless/test) \
+                 does not support them. Use a tool-less profile or omit `agent`."
+                    .into(),
+            )
+        })?;
+
+        if background {
+            let running = self.bg_store.running_count();
+            let cap = BackgroundStore::max_concurrent();
+            if running >= cap {
+                return Err(ToolError::Msg(format!(
+                    "background subagent cap reached ({}/{} in flight). Wait for one to finish \
+                     (use task_status) or run inline (background=false). Capping prevents fan-out \
+                     from burning the API budget.",
+                    running, cap,
+                )));
+            }
+            let task_id = Uuid::new_v4().to_string();
+            self.bg_store.insert(task_id.clone());
+            self.bg_store.notify_started(&task_id);
+            self.emit_chat(SubagentChatEvent::Spawn {
+                id: task_id.clone(),
+                prompt: prompt.clone(),
+                agent: agent_name.clone(),
+            });
+            let abort = AbortSignal::new();
+            register_subagent_abort(&task_id, abort.clone());
+
+            let store = self.bg_store.clone();
+            let chat_sink = self.chat_sink.clone();
+            let tid_for_task = task_id.clone();
+            let preamble_for_task = route_preamble.clone();
+            let allowed_for_task = allowed.clone();
+            let model_for_task = route_model.clone();
+            let abort_for_task = abort.clone();
+
+            const SUBAGENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+            let store_for_task = store.clone();
+            let handle = tokio::spawn(async move {
+                let child_sid = format!("sub-{}", crate::agent::runner::uuid_v4_simple());
+                let system_prompt = preamble_for_task
+                    .as_deref()
+                    .unwrap_or(SUBAGENT_DEFAULT_PREAMBLE)
+                    .to_string();
+                let runner = agent.spawn_subagent_runner(
+                    prompt.clone(),
+                    system_prompt,
+                    &allowed_for_task,
+                    &child_sid,
+                    max_turns,
+                    model_for_task.as_ref(),
+                );
+                spawn_abort_watcher(
+                    abort_for_task.clone(),
+                    runner.task.abort_handle(),
+                    runner.cancel_tx.clone(),
+                );
+                let chat_sink_drain = chat_sink.clone();
+                let emit = move |ev: SubagentChatEvent| {
+                    if let Some(sink) = &chat_sink_drain {
+                        let _ = sink.try_send(ev);
+                    } else if let Some(sink) = subagent_chat_sink() {
+                        let _ = sink.try_send(ev);
+                    }
+                };
+                let drained = drain_subagent_runner(runner, &tid_for_task, emit);
+                let outer = tokio::time::timeout(SUBAGENT_TIMEOUT, drained).await;
+                let aborted = abort_for_task.is_cancelled();
+                let (state, chat_event) = match outer {
+                    Ok(Ok(text)) => (
+                        TaskState::Completed(text.clone()),
+                        SubagentChatEvent::Token {
+                            id: tid_for_task.clone(),
+                            text: text.clone(),
+                        },
+                    ),
+                    Ok(Err(e)) => {
+                        let aborted_msg = "aborted by user".to_string();
+                        if aborted {
+                            (
+                                TaskState::Failed(aborted_msg.clone()),
+                                SubagentChatEvent::Aborted {
+                                    id: tid_for_task.clone(),
+                                },
+                            )
+                        } else {
+                            (
+                                TaskState::Failed(e.clone()),
+                                SubagentChatEvent::Failed {
+                                    id: tid_for_task.clone(),
+                                    error: e,
+                                },
+                            )
+                        }
+                    }
+                    Err(_) => {
+                        let msg =
+                            format!("subagent timed out after {}s", SUBAGENT_TIMEOUT.as_secs());
+                        (
+                            TaskState::Failed(msg.clone()),
+                            SubagentChatEvent::Failed {
+                                id: tid_for_task.clone(),
+                                error: msg,
+                            },
+                        )
+                    }
+                };
+                // Emit the streaming Token first (on success) then the
+                // terminal event, mirroring the btw background path so the UI
+                // renders the payload through the same code path.
+                let final_event = match &chat_event {
+                    SubagentChatEvent::Token { id, text } => {
+                        if let Some(sink) = &chat_sink {
+                            let _ = sink.try_send(chat_event.clone());
+                        } else if let Some(sink) = subagent_chat_sink() {
+                            let _ = sink.try_send(chat_event.clone());
+                        }
+                        SubagentChatEvent::Complete {
+                            id: id.clone(),
+                            result: text.clone(),
+                        }
+                    }
+                    _ => chat_event.clone(),
+                };
+                if let Some(sink) = chat_sink {
+                    let _ = sink.try_send(final_event);
+                } else if let Some(sink) = subagent_chat_sink() {
+                    let _ = sink.try_send(final_event);
+                }
+                unregister_subagent_abort(&tid_for_task);
+                store_for_task.notify(&tid_for_task, state);
+            });
+            store.attach_handle(&task_id, handle);
+
+            Ok(format!(
+                "background task started — task_id: {}\n\nThe subagent runs in the background. \
+                 Completion will be delivered automatically as a <system-reminder> at the start \
+                 of your next turn. Do NOT poll task_status or sleep waiting — continue with \
+                 other work.",
+                task_id
+            ))
+        } else {
+            let task_id = Uuid::new_v4().to_string();
+            self.emit_chat(SubagentChatEvent::Spawn {
+                id: task_id.clone(),
+                prompt: prompt.clone(),
+                agent: agent_name.clone(),
+            });
+            let abort = AbortSignal::new();
+            register_subagent_abort(&task_id, abort.clone());
+
+            let child_sid = format!("sub-{}", crate::agent::runner::uuid_v4_simple());
+            let system_prompt = route_preamble
+                .as_deref()
+                .unwrap_or(SUBAGENT_DEFAULT_PREAMBLE)
+                .to_string();
+            let runner = agent.spawn_subagent_runner(
+                prompt.clone(),
+                system_prompt,
+                &allowed,
+                &child_sid,
+                max_turns,
+                route_model.as_ref(),
+            );
+            spawn_abort_watcher(
+                abort.clone(),
+                runner.task.abort_handle(),
+                runner.cancel_tx.clone(),
+            );
+
+            let result = drain_subagent_runner(runner, &task_id, |ev| self.emit_chat(ev)).await;
+            unregister_subagent_abort(&task_id);
+            let aborted = abort.is_cancelled();
+            match result {
+                Ok(text) => {
+                    self.emit_chat(SubagentChatEvent::Complete {
+                        id: task_id.clone(),
+                        result: text.clone(),
+                    });
+                    let outcome =
+                        crate::agent::tools::output_relay::relay_if_large("task", text, "");
+                    Ok(outcome.text)
+                }
+                Err(e) => {
+                    if aborted {
+                        self.emit_chat(SubagentChatEvent::Aborted { id: task_id });
+                        Err(ToolError::Msg("Subagent aborted by user".to_string()))
+                    } else {
+                        self.emit_chat(SubagentChatEvent::Failed {
+                            id: task_id,
+                            error: e.clone(),
+                        });
+                        Err(ToolError::Msg(format!("Subagent error: {e}")))
+                    }
+                }
+            }
         }
     }
 }
@@ -403,6 +856,19 @@ impl Tool for TaskTool {
                     }),
                 );
             }
+
+            // If any profile opted its subagent into tools, tell the model so
+            // it can pick a tooled profile for work that needs file access.
+            if SUBAGENT_ROUTES
+                .get()
+                .is_some_and(|m| m.values().any(|r| r.tool_allow.is_some()))
+            {
+                description.push_str(
+                    " Some profiles enable a tooled subagent (read-only tools: read, grep, \
+                     glob, list_dir, etc. — no mutation, no recursion) that can investigate the \
+                     repo directly; pick such a profile for research/exploration subtasks.",
+                );
+            }
         }
 
         ToolDefinition {
@@ -418,9 +884,11 @@ impl Tool for TaskTool {
         // dirge-ykeu Phase 4: resolve an optional agent profile to a model +
         // system-prompt override. An explicit `agent=` that can't be resolved
         // is an error (don't silently fall back to the default subagent —
-        // the model asked for a specific persona).
-        let (route_model, route_preamble) = match args.agent.as_deref() {
-            None => (None, None),
+        // the model asked for a specific persona). `tool_allow` is `Some`
+        // when the profile opted its subagent into tools (v1: readonly tier);
+        // that selects the tooled fork below instead of the tool-less one-shot.
+        let (route_model, route_preamble, tool_allow, max_turns) = match args.agent.as_deref() {
+            None => (None, None, None, SUBAGENT_DEFAULT_MAX_TURNS),
             Some(name) => {
                 if !subagent_routes_available() {
                     return Err(ToolError::Msg(format!(
@@ -429,7 +897,7 @@ impl Tool for TaskTool {
                     )));
                 }
                 match subagent_route(name) {
-                    Some(r) => (r.model, r.preamble),
+                    Some(r) => (r.model, r.preamble, r.tool_allow, r.max_turns),
                     None => {
                         return Err(ToolError::Msg(format!(
                             "unknown agent profile '{}'. Available: {}.",
@@ -440,6 +908,24 @@ impl Tool for TaskTool {
                 }
             }
         };
+
+        // Tooled subagent (v1 readonly tier): fork a filtered runner off the
+        // live agent. Everything below this branch is the unchanged tool-less
+        // `btw_query` path, so the dirge-mifq regression stays green.
+        if let Some(allowed) = tool_allow {
+            return self
+                .run_tooled(
+                    route_model,
+                    route_preamble,
+                    allowed,
+                    max_turns,
+                    args.background.unwrap_or(false),
+                    args.prompt,
+                    args.agent,
+                )
+                .await;
+        }
+
         // The profile's model (when it pinned one) else the default subagent.
         let model = route_model.unwrap_or_else(|| self.model.clone());
 
@@ -727,46 +1213,39 @@ mod tests {
         );
     }
 
-    /// dirge-mifq — Subagents spawned by `TaskTool` go through
-    /// `AnyModel::btw_query`, which builds a fresh rig agent from
-    /// the model alone with NO tools attached. This pins the
-    /// invariant: TaskTool itself must not hold a tool registry,
-    /// session_id, agent handle, or any state that would let a
-    /// subagent reach the parent's `session_search`, `memory`, or
-    /// `skill` tools. If a future change adds tools to subagents,
-    /// the session-search-includes-current-session class of bugs
-    /// (dirge-502b) re-emerges and the new tools must be considered
-    /// for session_id propagation.
+    /// dirge-mifq — The DEFAULT subagent path (no `agent=`, or a profile that
+    /// doesn't opt into tools) goes through `AnyModel::btw_query`, which builds
+    /// a fresh rig agent from the model alone with NO tools attached. This pins
+    /// that invariant: the one-shot `btw_query_with` must stay tool-less.
     ///
-    /// The compiler enforces this — adding a `tools: ...` field to
-    /// `TaskTool` would not break this test directly, but the
-    /// review surface forces the change to be visible. If you do
-    /// add tool support to subagents, also (a) audit btw_query for
-    /// session_search wiring, (b) decide subagent session_id
-    /// policy (inherit parent? Fresh? Excluded?), (c) update this
-    /// test to cover the new shape.
+    /// A TOOLED subagent path now EXISTS (v1: readonly tier, opt-in via a
+    /// profile's `subagent.tools`). It is NOT covered by the `btw_query`
+    /// assertion below — instead it closes the dirge-mifq leakage class by
+    /// construction: `resolve_subagent_allow` intersects the allow-list with
+    /// `SUBAGENT_READONLY_BASE` and strips `SUBAGENT_FORCED_EXCLUDES`
+    /// (session_search/memory/skill/issue/graph/todo/... + recursion + interactive),
+    /// and the tooled fork runs under a FRESH child session id. So a tooled
+    /// subagent literally cannot reach a session-attributing tool. When a
+    /// future tier re-enables any forced-excluded tool, this test's resolver
+    /// assertion fails and forces the session-id audit.
+    ///
+    /// `TaskTool` itself still holds no tool registry / session_id / agent
+    /// handle — the tooled fork reaches the live agent through the
+    /// process-global `provider::current_agent()`, not a captured field.
     #[test]
     fn subagent_path_is_stateless_no_session_search_leakage() {
         // The fields a TaskTool legitimately holds today. Anything
         // beyond this set is a red flag for subagent-tool leakage.
-        // (Using `_ =` to silence the dead-binding lint while
-        // documenting the inventory.)
         let _expected_fields = ["permission", "ask_tx", "model", "bg_store", "chat_sink"];
 
         // Construct a TaskTool — if a future field is required,
-        // this won't compile until the new field is provided. That
-        // failure mode points the reader at this test, which then
-        // forces the session_id audit per the docstring above.
+        // this won't compile until the new field is provided.
         let _tool: TaskTool = mock_tool();
 
-        // The btw_query path lives in provider/dispatch.rs. The build
+        // The tool-less path lives in provider/dispatch.rs. The build
         // inside `btw_query_with` (which `btw_query` delegates to) is
         // `AgentBuilder::new(m).preamble(...).build()` with no `.tool(...)`
-        // calls — verify by source inspection that no tool-attaching call
-        // has crept in. We pin on `btw_query_with` because that's where the
-        // real AgentBuilder lives (dirge-ykeu Phase 4 added the profile
-        // preamble override there); the bare `btw_query` is now a thin
-        // delegate.
+        // calls — verify by source inspection that none has crept in.
         let provider_src = include_str!("../../provider/dispatch.rs");
         let btw_idx = provider_src
             .find("pub async fn btw_query_with")
@@ -787,6 +1266,238 @@ mod tests {
             "btw_query_with must not attach tools to the subagent — that would \
              require auditing session_id propagation per dirge-mifq."
         );
+
+        // Tooled path (v1 readonly): the resolved allow-list must never contain
+        // a session-attributing / recursive / interactive tool, even if a
+        // profile tried to `allow` one. This is the dirge-mifq gate for the
+        // tooled shape.
+        let leaky = [
+            "session_search",
+            "memory",
+            "skill",
+            "issue",
+            "graph",
+            "write_todo_list",
+            "spec",
+            "task",
+            "task_status",
+            "question",
+            "plan_enter",
+            "plan_exit",
+        ];
+        let policy = crate::context::agent_defs::SubagentToolPolicy {
+            tier: crate::context::agent_defs::SubagentToolTier::Readonly,
+            allow: leaky.iter().map(|s| s.to_string()).collect(), // try to smuggle them in
+            deny: Vec::new(),
+            max_turns: None,
+        };
+        let resolved = resolve_subagent_allow(&policy)
+            .expect("readonly resolves")
+            .expect("readonly yields a tool set");
+        for l in leaky {
+            assert!(
+                !resolved.iter().any(|t| t == l),
+                "readonly subagent allow-list must exclude {l:?} (dirge-mifq); got {resolved:?}"
+            );
+        }
+    }
+
+    // --- resolve_subagent_allow: the readonly allow-list contract (v1) ---
+
+    #[test]
+    fn resolve_readonly_base_is_expected_universe() {
+        use crate::context::agent_defs::{SubagentToolPolicy, SubagentToolTier};
+        let p = SubagentToolPolicy {
+            tier: SubagentToolTier::Readonly,
+            ..Default::default()
+        };
+        let mut got = resolve_subagent_allow(&p).unwrap().unwrap();
+        got.sort();
+        let mut want: Vec<String> = SUBAGENT_READONLY_BASE
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        want.sort();
+        assert_eq!(got, want, "readonly base must match the verified universe");
+    }
+
+    #[test]
+    fn resolve_toolless_returns_none() {
+        use crate::context::agent_defs::{SubagentToolPolicy, SubagentToolTier};
+        let p = SubagentToolPolicy {
+            tier: SubagentToolTier::Toolless,
+            ..Default::default()
+        };
+        assert_eq!(resolve_subagent_allow(&p).unwrap(), None);
+    }
+
+    #[test]
+    fn resolve_readwrite_is_reserved_error() {
+        use crate::context::agent_defs::{SubagentToolPolicy, SubagentToolTier};
+        let p = SubagentToolPolicy {
+            tier: SubagentToolTier::ReadWrite,
+            ..Default::default()
+        };
+        assert!(resolve_subagent_allow(&p).is_err());
+    }
+
+    #[test]
+    fn deny_narrows_readonly_base() {
+        use crate::context::agent_defs::{SubagentToolPolicy, SubagentToolTier};
+        let p = SubagentToolPolicy {
+            tier: SubagentToolTier::Readonly,
+            deny: vec!["webfetch".into(), "grep".into()],
+            ..Default::default()
+        };
+        let got = resolve_subagent_allow(&p).unwrap().unwrap();
+        assert!(!got.iter().any(|t| t == "webfetch"));
+        assert!(!got.iter().any(|t| t == "grep"));
+        // untouched base tools remain
+        assert!(got.iter().any(|t| t == "read"));
+        assert!(got.iter().any(|t| t == "glob"));
+    }
+
+    #[test]
+    fn allow_cannot_escalate_past_readonly() {
+        use crate::context::agent_defs::{SubagentToolPolicy, SubagentToolTier};
+        // Asking for mutating tools on a readonly profile must be a no-op.
+        let p = SubagentToolPolicy {
+            tier: SubagentToolTier::Readonly,
+            allow: vec!["bash".into(), "edit".into(), "write".into()],
+            ..Default::default()
+        };
+        let got = resolve_subagent_allow(&p).unwrap().unwrap();
+        assert!(!got.iter().any(|t| t == "bash"));
+        assert!(!got.iter().any(|t| t == "edit"));
+        assert!(!got.iter().any(|t| t == "write"));
+        // but the readonly base is still fully present
+        assert!(got.iter().any(|t| t == "read"));
+    }
+
+    #[test]
+    fn resolve_max_turns_honors_override_and_default() {
+        use crate::context::agent_defs::{SubagentToolPolicy, SubagentToolTier};
+        let none = SubagentToolPolicy {
+            tier: SubagentToolTier::Readonly,
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_subagent_max_turns(&none),
+            SUBAGENT_DEFAULT_MAX_TURNS
+        );
+        let over = SubagentToolPolicy {
+            tier: SubagentToolTier::Readonly,
+            max_turns: Some(7),
+            ..Default::default()
+        };
+        assert_eq!(resolve_subagent_max_turns(&over), 7);
+    }
+
+    #[test]
+    fn one_line_and_summarize_helpers_truncate() {
+        assert_eq!(one_line("hello   world", 100), "hello world");
+        let long = "a ".repeat(200);
+        assert!(one_line(&long, 50).chars().count() <= 51); // 50 + ellipsis
+        // Object-arg summary is iteration-order independent (serde_json Map
+        // ordering is feature-dependent); assert on the set of key=val tokens.
+        let args = serde_json::json!({"path": "/tmp/x", "n": 3});
+        let got = summarize_json_args(&args, 120);
+        let tokens: Vec<&str> = got.split(' ').collect();
+        assert!(tokens.contains(&"path=/tmp/x"), "got: {got}");
+        assert!(tokens.contains(&"n=3"), "got: {got}");
+    }
+
+    /// dirge-781c: `drain_subagent_runner` is the first live producer for the
+    /// dormant `SubagentChatEvent::{Token,Reasoning,ToolCall,ToolResult}`
+    /// variants. Feed a replay runner a Token → Reasoning → ToolCall →
+    /// ToolResult → Done stream and assert each maps to the right chat event
+    /// in order, with the final Done text returned. Mirrors the
+    /// `runner_replaying` pattern in `plan::runtime::tests`.
+    #[tokio::test]
+    async fn drain_relays_events_to_chat_window() {
+        use crate::agent::runner::AgentRunner;
+        use crate::event::{AgentEvent, ToolContent};
+        use std::sync::{Arc, Mutex};
+        use tokio::sync::mpsc;
+
+        fn replay(events: Vec<AgentEvent>) -> AgentRunner {
+            let (tx, event_rx) = mpsc::channel(events.len().max(1));
+            for e in events {
+                tx.try_send(e).expect("test channel sized to fit events");
+            }
+            drop(tx); // close → drain loop terminates at channel end
+            let (interject_tx, _) = mpsc::channel(1);
+            let (cancel_tx, _) = mpsc::channel(1);
+            let task = tokio::spawn(async {});
+            AgentRunner {
+                event_rx,
+                task,
+                interject_tx,
+                cancel_tx,
+            }
+        }
+
+        let runner = replay(vec![
+            AgentEvent::Token("hello ".into()),
+            AgentEvent::Token("world".into()),
+            AgentEvent::Reasoning("thinking".into()),
+            AgentEvent::ToolCall {
+                id: "c1".into(),
+                name: "read".into(),
+                args: serde_json::json!({"path": "/tmp/x"}),
+            },
+            AgentEvent::ToolResult {
+                id: "c1".into(),
+                output: "file contents".into(),
+                kind: ToolContent::Text,
+            },
+            AgentEvent::Done {
+                response: "hello world".into(),
+                tokens: 5,
+                cost: 0.0,
+            },
+        ]);
+
+        let collected: Arc<Mutex<Vec<SubagentChatEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = collected.clone();
+        let text = drain_subagent_runner(runner, "sub-1", move |ev| {
+            sink.lock().unwrap().push(ev);
+        })
+        .await
+        .expect("drain returns the Done response text");
+
+        assert_eq!(text, "hello world");
+        let events = collected.lock().unwrap();
+        use SubagentChatEvent::*;
+        assert!(matches!(
+            &events[0],
+            Token { id, text } if id == "sub-1" && text == "hello "
+        ));
+        assert!(matches!(
+            &events[1],
+            Token { id, text } if id == "sub-1" && text == "world"
+        ));
+        assert!(matches!(
+            &events[2],
+            Reasoning { id, text } if id == "sub-1" && text == "thinking"
+        ));
+        assert!(matches!(
+            &events[3],
+            ToolCall { id, tool_name, args_summary }
+                if id == "sub-1" && tool_name == "read" && args_summary.contains("path=/tmp/x")
+        ));
+        assert!(matches!(
+            &events[4],
+            ToolResult { id, output_summary, .. }
+                if id == "sub-1" && output_summary.contains("file contents")
+        ));
+        // The drain relays per-step events only — the caller emits the
+        // terminal Complete/Failed after, so exactly 5 events here.
+        assert_eq!(
+            events.len(),
+            5,
+            "drain relays 5 step events, no terminal: {events:?}"
+        );
     }
 
     // dirge-ykeu Phase 4: with a routing table installed, the `task` tool
@@ -802,6 +1513,8 @@ mod tests {
             SubagentRoute {
                 model: None,
                 preamble: Some("You are a reviewer.".to_string()),
+                tool_allow: None,
+                max_turns: SUBAGENT_DEFAULT_MAX_TURNS,
             },
         );
         set_subagent_routes(routes);

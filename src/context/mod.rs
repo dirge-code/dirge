@@ -287,7 +287,9 @@ mod composition_tests {
     //! prompt body, the prompt owns the "mode" name, and `/agent off`
     //! cleanly restores the prompt layer.
     use super::*;
-    use crate::context::agent_defs::{AgentDefinition, AgentSource, ToolPolicy};
+    use crate::context::agent_defs::{
+        AgentDefinition, AgentSource, SubagentToolPolicy, ToolPolicy,
+    };
 
     fn empty() -> ContextFiles {
         ContextFiles {
@@ -318,6 +320,7 @@ mod composition_tests {
             reasoning: None,
             temperature: None,
             description: None,
+            subagent: SubagentToolPolicy::default(),
             source: AgentSource::ProjectFile,
         }
     }

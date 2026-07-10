@@ -19,6 +19,27 @@ pub use build::*;
 pub use dispatch::*;
 pub use resolve::*;
 
+/// Process-global handle to the most recently built interactive agent.
+/// Tooled subagents (`TaskTool` tooled branch) fork a filtered runner off
+/// this via `spawn_subagent_runner`. Set at the tail of `build_agent` (every
+/// rebuild path — `/agent`, `/model`, `/cd`, compaction — routes through it,
+/// so the handle tracks the live agent). `None` on headless / test paths;
+/// the tooled branch reports the feature unavailable there. Tool-less
+/// subagents (the default) never read it.
+static CURRENT_AGENT: std::sync::Mutex<Option<std::sync::Arc<AnyAgent>>> =
+    std::sync::Mutex::new(None);
+
+/// Publish the live agent for tooled-subagent forking. Called by `build_agent`.
+pub fn set_current_agent(a: std::sync::Arc<AnyAgent>) {
+    *CURRENT_AGENT.lock_ignore_poison() = Some(a);
+}
+
+/// Snapshot of the live agent, if one has been built. `None` on headless /
+/// test paths — the tooled subagent branch surfaces a clear error there.
+pub fn current_agent() -> Option<std::sync::Arc<AnyAgent>> {
+    CURRENT_AGENT.lock_ignore_poison().clone()
+}
+
 #[allow(unused_imports)]
 use crate::sync_util::LockExt;
 use rig::agent::Agent;

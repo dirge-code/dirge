@@ -54,6 +54,9 @@ All frontmatter keys are optional:
 | `reasoning` | Reasoning-effort hint (`low` / `medium` / `high`). |
 | `temperature` | Sampling temperature. |
 | `description` | One-line summary shown in `/agents`. |
+| `subagent_tools` | Opt this profile's `task(agent=…)` subagent into tools: `readonly` (read-only tool universe) or `toolless` (the default one-shot). See *Tooled subagents* below. |
+| `subagent_max_turns` | Cap the tooled subagent's loop (default `25`). |
+| `subagent_deny` | Narrow the tool set further within the tier (e.g. `[webfetch]`). |
 
 A frontmatter-less file is treated as a body-only profile (just a system
 prompt).
@@ -69,6 +72,15 @@ The same shape as a JSON object, for profiles you'd rather keep in config:
       "model": "haiku",
       "deny_tools": ["bash", "write", "edit", "apply_patch"],
       "description": "read-only reviewer on a cheap fast model"
+    },
+    "researcher": {
+      "model": "haiku",
+      "subagent": {
+        "tools": "readonly",
+        "max_turns": 15,
+        "deny": ["webfetch"]
+      },
+      "description": "tooled subagent that reads the repo directly"
     },
     "architect": {
       "model": "opus",
@@ -137,12 +149,42 @@ profile that isn't defined is a hard error (no silent fallback). The default
 subagent (no `agent=`) runs on `subagent_provider`'s model when that role key is
 configured, otherwise the main model.
 
-Profiles are resolved into subagent routes once at startup. Two current limits:
-subagents are **tool-less** (a profile's `deny_tools`/`allow_tools` doesn't
-apply to a subagent, which has no tools to begin with), and the profile's
-`reasoning`/`temperature` aren't applied on the subagent path — only the model
-and system prompt are. Routing `/plan` phases to named profiles, and
-cross-provider client switching, remain follow-ups.
+Profiles are resolved into subagent routes once at startup. By default
+subagents are **tool-less** (a one-shot query — a profile's
+`deny_tools`/`allow_tools` doesn't apply, since the subagent has no tools),
+and the profile's `reasoning`/`temperature` aren't applied on the subagent
+path — only the model and system prompt are. Routing `/plan` phases to named
+profiles, and cross-provider client switching, remain follow-ups.
+
+### Tooled subagents (opt-in)
+
+A profile can opt its `task(agent=…)` subagent into a **real filtered agent
+loop** with tools, instead of the tool-less one-shot. Set `subagent.tools`
+(frontmatter `subagent_tools`, or the `subagent` block in `config.json`):
+
+- **`toolless`** (default) — unchanged one-shot, no tools.
+- **`readonly`** — the subagent runs a real loop with the read-only tool
+  universe: `read`, `read_minified`, `grep`, `find_files`, `glob`,
+  `list_dir`, `repo_overview`, `websearch`, `webfetch` (web tools only when
+  enabled in config). It can investigate the repo directly and report back —
+  ideal for research/exploration subtasks.
+- **`readwrite`** — reserved; parses but the resolver refuses it until a
+  later phase lands the session-id/permission audit.
+
+The tool set is **intersected with the readonly universe**, so `allow` can
+never escalate the subagent to mutation and `deny` only narrows. A mandatory
+floor is then stripped from every tooled subagent regardless of tier or
+`allow`: recursion (`task`, `task_status`), durable writes (`memory`,
+`skill`, `spec`), session-attribution tools (`session_search`, `issue`,
+`write_todo_list`, `graph`), and interactive tools (`question`, `plan_enter`,
+`plan_exit`). The subagent runs under a fresh child session id and a bounded
+turn cap (`subagent.max_turns`, default `25`), so it can't recurse, write
+side effects out of band, or loop forever.
+
+Permissions inherit the parent agent: in-cwd reads are auto-allowed, and a
+read outside the cwd surfaces a permission prompt through the parent UI. If a
+profile pinned a model, the tooled subagent runs on that model; otherwise it
+uses the live agent's.
 
 ## Relationship to the built-in critic and roles
 

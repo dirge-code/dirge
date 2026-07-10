@@ -89,6 +89,67 @@ impl ToolPolicy {
     }
 }
 
+/// Capability tier for a `task(agent=…)` subagent's tool set. v1 wires only
+/// `Toolless` (the unchanged one-shot `btw_query` default) and `Readonly`
+/// (a real filtered agent loop with the read-only tool universe). `ReadWrite`
+/// is reserved: it parses and is stored, but the resolver refuses it until a
+/// later phase lands the session-id/permission audit (dirge-mifq).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum SubagentToolTier {
+    /// No tools — the subagent runs a one-shot `btw_query` (unchanged default).
+    #[default]
+    Toolless,
+    /// Read-only tool set (read/grep/glob/…); no mutation, no recursion.
+    Readonly,
+    /// Reserved — the resolver errors if named. Implementation tiers come later.
+    ReadWrite,
+}
+
+/// Per-profile policy for what tools a `task(agent=…)` subagent may use.
+/// Layered over [`SubagentToolTier`]: the tier fixes the tool universe,
+/// `allow`/`deny` are raw overrides (for readonly, `allow` cannot escalate
+/// past the tier and `deny` narrows), and `max_turns` bounds the loop.
+/// Defaults to a tool-less subagent.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SubagentToolPolicy {
+    pub tier: SubagentToolTier,
+    pub allow: Vec<String>,
+    pub deny: Vec<String>,
+    pub max_turns: Option<usize>,
+}
+
+/// `config.json` `agents.<name>.subagent` block (serde). Mirrors the `.md`
+/// frontmatter's `subagent_*` keys so both sources describe the same shape.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct SubagentConfig {
+    /// Tier name: "readonly" | "toolless" (omitted/unknown → toolless).
+    pub tools: Option<String>,
+    pub allow: Option<Vec<String>>,
+    pub deny: Option<Vec<String>>,
+    pub max_turns: Option<usize>,
+}
+
+/// Map a tier name to its enum. Tolerant: known names map to variants,
+/// anything else (incl. empty) → `Toolless` with a warning so a typo is
+/// visible rather than silently upgrading a subagent.
+fn parse_subagent_tier(raw: &str, agent_name: &str) -> SubagentToolTier {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "toolless" | "none" | "off" | "false" => SubagentToolTier::Toolless,
+        "readonly" | "read-only" | "read" => SubagentToolTier::Readonly,
+        "readwrite" | "read-write" | "rw" | "full" => SubagentToolTier::ReadWrite,
+        other => {
+            tracing::warn!(
+                target: "dirge::agents",
+                agent = %agent_name,
+                tier = %other,
+                "unknown subagent tier; falling back to toolless"
+            );
+            SubagentToolTier::Toolless
+        }
+    }
+}
+
 /// Where a definition came from — drives precedence and the `/agents` listing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentSource {
@@ -121,6 +182,9 @@ pub struct AgentDefinition {
     pub temperature: Option<f64>,
     /// One-line summary for the `/agents` listing.
     pub description: Option<String>,
+    /// What tools a `task(agent="<name>")` subagent may use. Defaults to
+    /// tool-less (today's behavior); opt into `Readonly` per-profile.
+    pub subagent: SubagentToolPolicy,
     pub source: AgentSource,
 }
 
@@ -136,6 +200,8 @@ pub struct AgentConfig {
     pub reasoning: Option<String>,
     pub temperature: Option<f64>,
     pub description: Option<String>,
+    /// Per-profile subagent tool policy. Omitted → tool-less subagent.
+    pub subagent: Option<SubagentConfig>,
 }
 
 /// `deny_tools` wins when both are present (conservative); else `allow_tools`;
@@ -158,6 +224,7 @@ fn normalize_names(names: Vec<String>) -> Vec<String> {
 
 impl AgentConfig {
     fn into_definition(self, name: &str, source: AgentSource) -> AgentDefinition {
+        let s = self.subagent.unwrap_or_default();
         AgentDefinition {
             name: name.to_string(),
             prompt: self.prompt.filter(|p| !p.trim().is_empty()),
@@ -166,6 +233,16 @@ impl AgentConfig {
             reasoning: self.reasoning,
             temperature: self.temperature,
             description: self.description,
+            subagent: SubagentToolPolicy {
+                tier: s
+                    .tools
+                    .as_deref()
+                    .map(|t| parse_subagent_tier(t, name))
+                    .unwrap_or_default(),
+                allow: s.allow.unwrap_or_default(),
+                deny: s.deny.unwrap_or_default(),
+                max_turns: s.max_turns,
+            },
             source,
         }
     }
@@ -273,6 +350,7 @@ pub(crate) fn parse_agent_md(name: &str, raw: &str, source: AgentSource) -> Agen
         reasoning: None,
         temperature: None,
         description: None,
+        subagent: SubagentToolPolicy::default(),
         source,
     };
 
@@ -298,6 +376,10 @@ pub(crate) fn parse_agent_md(name: &str, raw: &str, source: AgentSource) -> Agen
 
     let mut allow: Option<Vec<String>> = None;
     let mut deny: Option<Vec<String>> = None;
+    let mut sub_tier: Option<String> = None;
+    let mut sub_allow: Option<Vec<String>> = None;
+    let mut sub_deny: Option<Vec<String>> = None;
+    let mut sub_max_turns: Option<usize> = None;
     for line in front.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -314,10 +396,23 @@ pub(crate) fn parse_agent_md(name: &str, raw: &str, source: AgentSource) -> Agen
             "temperature" => def.temperature = value.parse::<f64>().ok(),
             "deny_tools" => deny = Some(parse_inline_list(value)),
             "allow_tools" => allow = Some(parse_inline_list(value)),
+            "subagent_tools" if !value.is_empty() => sub_tier = Some(value.to_string()),
+            "subagent_max_turns" => sub_max_turns = value.parse::<usize>().ok(),
+            "subagent_allow" => sub_allow = Some(parse_inline_list(value)),
+            "subagent_deny" => sub_deny = Some(parse_inline_list(value)),
             _ => {}
         }
     }
     def.tools = policy_from(allow, deny);
+    def.subagent = SubagentToolPolicy {
+        tier: sub_tier
+            .as_deref()
+            .map(|t| parse_subagent_tier(t, name))
+            .unwrap_or_default(),
+        allow: sub_allow.unwrap_or_default(),
+        deny: sub_deny.unwrap_or_default(),
+        max_turns: sub_max_turns,
+    };
     def
 }
 
@@ -368,6 +463,57 @@ mod tests {
         assert_eq!(
             def.prompt.as_deref(),
             Some("Find where X is handled. Read-only.")
+        );
+        // Default profile → tool-less subagent (unchanged behavior).
+        assert_eq!(def.subagent.tier, SubagentToolTier::Toolless);
+    }
+
+    #[test]
+    fn subagent_frontmatter_enables_readonly_tier() {
+        let raw = "---\nmodel: haiku\nsubagent_tools: readonly\nsubagent_max_turns: 12\nsubagent_deny: [webfetch]\n---\nbody";
+        let def = parse_agent_md("researcher", raw, AgentSource::GlobalFile);
+        assert_eq!(def.subagent.tier, SubagentToolTier::Readonly);
+        assert_eq!(def.subagent.max_turns, Some(12));
+        assert_eq!(def.subagent.deny, vec!["webfetch"]);
+    }
+
+    #[test]
+    fn subagent_frontmatter_unknown_tier_warns_and_falls_back() {
+        let raw = "---\nsubagent_tools: banana\n---\nbody";
+        let def = parse_agent_md("x", raw, AgentSource::Config);
+        assert_eq!(
+            def.subagent.tier,
+            SubagentToolTier::Toolless,
+            "an unknown tier name must fall back to tool-less, never escalate"
+        );
+    }
+
+    #[test]
+    fn subagent_config_json_into_definition() {
+        let cfg = AgentConfig {
+            subagent: Some(SubagentConfig {
+                tools: Some("read-only".into()),
+                deny: Some(vec!["grep".into()]),
+                max_turns: Some(40),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let def = cfg.into_definition("res", AgentSource::Config);
+        assert_eq!(def.subagent.tier, SubagentToolTier::Readonly);
+        assert_eq!(def.subagent.deny, vec!["grep"]);
+        assert_eq!(def.subagent.max_turns, Some(40));
+        // readwrite is recognized as the reserved tier (parses; resolver errors at runtime)
+        let rw = AgentConfig {
+            subagent: Some(SubagentConfig {
+                tools: Some("readwrite".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            rw.into_definition("rw", AgentSource::Config).subagent.tier,
+            SubagentToolTier::ReadWrite
         );
     }
 

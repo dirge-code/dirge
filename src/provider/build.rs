@@ -606,6 +606,15 @@ pub async fn build_agent(
     }
     agent = agent.with_goal(cli.goal.clone());
 
+    // Tooled-subagent support: publish a handle to the freshly built agent so
+    // `TaskTool` can fork a filtered runner (`spawn_subagent_runner`) without
+    // the tool having been constructed with the agent in hand (it can't — it
+    // is built *inside* `build_loop_tools`, before `AnyAgent::new`). Mirrors
+    // the existing `SUBAGENT_ROUTES` process-global. Every rebuild path
+    // (`/agent`, `/model`, `/cd`, compaction) routes through `build_agent`, so
+    // this stays current. Opt-in: only the tooled branch reads it.
+    crate::provider::set_current_agent(std::sync::Arc::new(agent.clone()));
+
     agent
 }
 
