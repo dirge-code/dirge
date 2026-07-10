@@ -126,6 +126,19 @@ where
     (inner, task)
 }
 
+/// A failed or timed-out frame write may have left a partial frame in the
+/// pipe; a Content-Length stream cannot resync after that. Mark the client
+/// closed and fail every pending waiter so no later request writes over the
+/// desynced stream and in-flight callers don't burn their full timeout.
+/// (dirge-j0zx)
+async fn fail_transport<E: RpcErr>(inner: &Inner<E>) {
+    inner.closed.store(true, Ordering::SeqCst);
+    let mut pending = inner.pending.lock().await;
+    for (_, sender) in pending.drain() {
+        let _ = sender.send(Err(E::connection_closed()));
+    }
+}
+
 /// Send a request and await its response. Shared by the LSP/DAP adapters.
 ///
 /// Tiny race window if a peer close interleaves with a request: the `closed`
@@ -161,14 +174,11 @@ where
     match send_result {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
-            // Write failed — roll the pending entry back so we don't leak it
-            // (and so the id isn't resolved by a late response later).
-            inner.pending.lock().await.remove(&id);
+            fail_transport(inner).await;
             return Err(P::Error::from(e));
         }
         Err(_) => {
-            // Write deadline elapsed (wedged peer / full pipe) — same rollback.
-            inner.pending.lock().await.remove(&id);
+            fail_transport(inner).await;
             return Err(P::Error::timeout(WRITE_TIMEOUT));
         }
     }
@@ -210,8 +220,14 @@ where
     .await
     {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(e)) => Err(P::Error::from(e)),
-        Err(_) => Err(P::Error::timeout(WRITE_TIMEOUT)),
+        Ok(Err(e)) => {
+            fail_transport(inner).await;
+            Err(P::Error::from(e))
+        }
+        Err(_) => {
+            fail_transport(inner).await;
+            Err(P::Error::timeout(WRITE_TIMEOUT))
+        }
     }
 }
 
@@ -298,5 +314,128 @@ async fn dispatch<P: Protocol>(inner: &Arc<Inner<P::Error>>, msg: Value) {
         Incoming::Ignore => {
             tracing::warn!("{}: ignoring frame", P::name());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, AsyncWrite, BufReader, ReadBuf};
+
+    #[derive(Debug, PartialEq)]
+    enum TestErr {
+        Closed,
+        Timeout,
+        Io,
+        Serde,
+    }
+
+    impl From<io::Error> for TestErr {
+        fn from(_: io::Error) -> Self {
+            TestErr::Io
+        }
+    }
+    impl From<serde_json::Error> for TestErr {
+        fn from(_: serde_json::Error) -> Self {
+            TestErr::Serde
+        }
+    }
+    impl RpcErr for TestErr {
+        fn connection_closed() -> Self {
+            TestErr::Closed
+        }
+        fn timeout(_d: Duration) -> Self {
+            TestErr::Timeout
+        }
+    }
+
+    struct TestProto;
+    impl Protocol for TestProto {
+        type Error = TestErr;
+        fn name() -> &'static str {
+            "test"
+        }
+        fn build_request(id: u64, method: &str, params: Value) -> Value {
+            serde_json::json!({"id": id, "method": method, "params": params})
+        }
+        fn build_notification(id: u64, method: &str, params: Value) -> Value {
+            serde_json::json!({"id": id, "method": method, "params": params})
+        }
+        fn classify(_msg: &Value) -> Incoming<TestErr> {
+            Incoming::Ignore
+        }
+    }
+
+    /// Always fails a write so `request`/`notify` hit their write-failure arm.
+    struct FailingWriter;
+    impl AsyncWrite for FailingWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "boom")))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Never yields bytes and never returns EOF, so the read loop parks
+    /// forever and never sets `closed` itself — the test must observe the
+    /// write path setting it.
+    struct ParkedReader;
+    impl AsyncRead for ParkedReader {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    #[tokio::test]
+    async fn write_failure_closes_transport() {
+        let (inner, task) = new::<TestProto, _, _>(BufReader::new(ParkedReader), FailingWriter);
+
+        // First request hits the failing writer; the transport must be marked
+        // closed so no later request writes a fresh frame over the now-desynced
+        // Content-Length stream. (dirge-j0zx)
+        let r = request::<TestProto, _, Value>(
+            &inner,
+            "m",
+            serde_json::json!({}),
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(r.is_err());
+
+        // This is the assertion that fails on current (unfixed) code.
+        assert!(
+            inner.closed.load(Ordering::SeqCst),
+            "write failure must close the transport"
+        );
+
+        // A subsequent request must fail fast with connection_closed() rather
+        // than attempting another write over the desynced stream.
+        let r2 = request::<TestProto, _, Value>(
+            &inner,
+            "m",
+            serde_json::json!({}),
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(
+            matches!(r2, Err(TestErr::Closed)),
+            "second request must fail fast as closed"
+        );
+
+        task.abort();
     }
 }
