@@ -125,7 +125,7 @@ impl McpClientManager {
         })?;
         let conn = self.connections.get(name).cloned();
 
-        let (new_peer, new_rs) = client::raw_connect(name, &cfg)
+        let (new_peer, new_rs, new_guard) = client::raw_connect(name, &cfg)
             .await
             .map_err(|e| anyhow::anyhow!("reconnect to '{name}' failed: {e}"))?;
 
@@ -137,7 +137,7 @@ impl McpClientManager {
         if let Some(conn) = conn {
             // Swap into the existing shared container so previously-
             // handed-out McpTool clones see the new peer.
-            conn.replace(new_peer, new_rs).await;
+            conn.replace(new_peer, new_rs, new_guard).await;
         } else {
             // No prior connection (server failed to start originally).
             // Create a fresh shared container + start a fresh
@@ -146,6 +146,7 @@ impl McpClientManager {
                 name.to_string(),
                 new_peer,
                 new_rs,
+                new_guard,
             ));
             self.connections.insert(name.to_string(), conn);
             self.reconnect_locks

@@ -415,8 +415,8 @@ async fn try_call_with_reconnect(
             let reconnect_result =
                 tokio::time::timeout(reconnect_budget, raw_connect(server_name, cfg)).await;
             match reconnect_result {
-                Ok(Ok((new_peer, new_rs))) => {
-                    connection.replace(new_peer, new_rs).await;
+                Ok(Ok((new_peer, new_rs, new_guard))) => {
+                    connection.replace(new_peer, new_rs, new_guard).await;
                     *gen_guard += 1;
                     tracing::info!(
                         target: "dirge::mcp",

@@ -203,6 +203,12 @@ impl Spawner for ProcessSpawner {
             for (k, v) in &cmd.env {
                 command.env(k, v);
             }
+            // dirge-wupp: isolate the server in its own session (no
+            // controlling terminal, new process group) so it can't corrupt
+            // dirge's TUI and so the ProcessGroupGuard below can SIGKILL its
+            // whole subtree — `kill_on_drop` alone reaps only the direct
+            // child, orphaning e.g. tsserver / jdtls's java worker.
+            crate::child_guard::detach_session(&mut command);
 
             let mut child = command.spawn().map_err(|e| {
                 std::io::Error::new(
@@ -243,11 +249,19 @@ impl Spawner for ProcessSpawner {
                 Box::new(tokio::io::BufReader::new(stdout));
             let writer: Box<dyn AsyncWrite + Send + Unpin> = Box::new(stdin);
 
+            // dirge-wupp: pgid == pid after `detach_session`, so a group
+            // SIGKILL reaps the server AND its descendants. The guard is
+            // FIRST in the tuple so it drops first — its `kill(-pgid)` fires
+            // while the leader child is still un-reaped; the child's own
+            // `kill_on_drop` then redundantly signals the (already dead)
+            // direct child.
+            let pg_guard = crate::child_guard::ProcessGroupGuard::from_pid(child.id());
+
             Ok(Spawned {
                 reader,
                 writer,
                 init_options: cmd.init_options.clone(),
-                guard: Box::new(child),
+                guard: Box::new((pg_guard, child)),
             })
         })
     }

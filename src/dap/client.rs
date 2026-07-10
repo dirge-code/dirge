@@ -187,36 +187,6 @@ impl DapRpc {
 // DAP client — wraps DapRpc with process lifecycle
 // ---------------------------------------------------------------------------
 
-/// Process-group cleanup guard. When the DapClient is dropped, this
-/// sends SIGKILL to the adapter's entire process group, not just the
-/// direct child. Mirrors [`crate::agent::tools::bash::PgKillGuard`].
-///
-/// On Unix, `setsid()` in `spawn_stdio` isolates the adapter in its
-/// own session with no controlling terminal. The adapter's PGID equals
-/// its PID. `kill_on_drop(true)` only reaps the direct child; this guard
-/// sends SIGKILL to `-pgid`, which kills the adapter and its descendants
-/// (the debuggee and its children).
-#[cfg(unix)]
-struct DapProcessGuard {
-    pgid: u32,
-}
-
-#[cfg(unix)]
-impl Drop for DapProcessGuard {
-    fn drop(&mut self) {
-        // Never signal group 0 or 1: `kill(-0, …)` targets dirge's OWN
-        // process group (suicide) and `kill(-1, …)` every process we can
-        // signal. `setsid()` makes the adapter's pgid == its PID (always
-        // > 1 in practice), but guard defensively against a 0/1 slipping in.
-        if self.pgid <= 1 {
-            return;
-        }
-        unsafe {
-            let _ = libc::kill(-(self.pgid as libc::pid_t), libc::SIGKILL);
-        }
-    }
-}
-
 /// Handle to a running debug adapter process.
 pub struct DapClient {
     /// Process-group cleanup guard. Not armed in tests.
@@ -225,9 +195,9 @@ pub struct DapClient {
     /// declaration order): the group SIGKILL (`kill(-pgid)`) must fire
     /// while the leader child is still un-reaped, because the live zombie
     /// pins the PID/PGID and prevents the kernel from recycling it for an
-    /// unrelated group between the two drops.
-    #[cfg(unix)]
-    _pg_guard: Option<DapProcessGuard>,
+    /// unrelated group between the two drops. (dirge-wupp: now the shared
+    /// [`crate::child_guard::ProcessGroupGuard`] — inert off Unix.)
+    _pg_guard: Option<crate::child_guard::ProcessGroupGuard>,
     /// Held so `kill_on_drop` works when the client goes out of scope.
     /// `None` only in tests (where RPC runs over duplex channels).
     _child: Option<tokio::process::Child>,
@@ -259,32 +229,16 @@ impl DapClient {
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
 
-        // Isolate the adapter in its own session so it has no
-        // controlling terminal. process_group(0) alone only creates
-        // a new process group — the adapter still shares dirge's
-        // session and can call tcsetpgrp() to steal the foreground,
-        // which stops dirge with SIGTTOU and corrupts the TUI.
-        //
-        // setsid() creates a new session with no controlling terminal.
-        // /dev/tty opens fail with ENXIO; tcsetpgrp() fails; the
-        // adapter cannot interfere with dirge's terminal at all.
-        // It also creates a new process group (PGID = PID), so
-        // the DapProcessGuard kill(-pgid, SIGKILL) still works.
-        #[cfg(unix)]
-        unsafe {
-            use std::os::unix::process::CommandExt;
-            cmd.as_std_mut().pre_exec(|| {
-                if libc::setsid() == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
+        // Isolate the adapter in its own session so it has no controlling
+        // terminal (a bare process_group(0) still shares dirge's session and
+        // could tcsetpgrp()-steal the foreground, stopping dirge with SIGTTOU
+        // and corrupting the TUI). setsid() also gives PGID == PID so the
+        // ProcessGroupGuard's kill(-pgid) reaches the whole subtree.
+        crate::child_guard::detach_session(&mut cmd);
 
         let mut child = cmd.spawn()?;
 
-        #[cfg(unix)]
-        let pg_guard = child.id().map(|pid| DapProcessGuard { pgid: pid });
+        let pg_guard = crate::child_guard::ProcessGroupGuard::from_pid(child.id());
 
         let stdin = child
             .stdin
@@ -319,7 +273,6 @@ impl DapClient {
 
         Ok(Self {
             _child: Some(child),
-            #[cfg(unix)]
             _pg_guard: pg_guard,
             rpc,
             _stderr_task: stderr_task,
@@ -362,7 +315,6 @@ impl DapClient {
     pub(crate) fn from_rpc(rpc: DapRpc, adapter_name: &str) -> Self {
         Self {
             _child: None,
-            #[cfg(unix)]
             _pg_guard: None,
             rpc,
             _stderr_task: tokio::spawn(std::future::ready(())),

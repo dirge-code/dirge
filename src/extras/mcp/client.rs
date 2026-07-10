@@ -8,6 +8,15 @@ use tokio::sync::{Mutex, RwLock};
 
 use super::config::McpServerConfig;
 
+/// A live MCP running service plus the process-group guard that SIGKILLs
+/// its child's whole subtree on drop (dirge-wupp). Bundled in one `Option`
+/// so the guard drops in lockstep with the `RunningService` — on reconnect
+/// (`replace`) and shutdown alike — without a second field to keep in sync.
+type Connection = (
+    RunningService<RoleClient, ()>,
+    Option<crate::child_guard::ProcessGroupGuard>,
+);
+
 /// Co-owned (peer, running_service) pair for one MCP server.
 ///
 /// Every `McpTool` from the same server holds the same
@@ -30,8 +39,9 @@ pub struct SharedConnection {
     peer: RwLock<Peer<RoleClient>>,
     /// `Option` so the consuming-`Drop` of `RunningService::cancel`
     /// can take it out cleanly during shutdown. `None` after the
-    /// connection has been explicitly shut down.
-    running_service: Mutex<Option<RunningService<RoleClient, ()>>>,
+    /// connection has been explicitly shut down. Bundled with the
+    /// process-group guard (see [`Connection`]).
+    running_service: Mutex<Option<Connection>>,
 }
 
 impl SharedConnection {
@@ -42,11 +52,12 @@ impl SharedConnection {
         server_name: String,
         peer: Peer<RoleClient>,
         rs: RunningService<RoleClient, ()>,
+        pg_guard: Option<crate::child_guard::ProcessGroupGuard>,
     ) -> Self {
         Self {
             server_name,
             peer: RwLock::new(peer),
-            running_service: Mutex::new(Some(rs)),
+            running_service: Mutex::new(Some((rs, pg_guard))),
         }
     }
 
@@ -63,6 +74,7 @@ impl SharedConnection {
         &self,
         new_peer: Peer<RoleClient>,
         new_rs: RunningService<RoleClient, ()>,
+        new_guard: Option<crate::child_guard::ProcessGroupGuard>,
     ) {
         // Order: take running_service first (Option swap), then peer
         // (RwLock write). Both consumed before the OLD running_service
@@ -70,13 +82,15 @@ impl SharedConnection {
         // signal fires on the old transport.
         let _old = {
             let mut rs_guard = self.running_service.lock().await;
-            (*rs_guard).replace(new_rs)
+            (*rs_guard).replace((new_rs, new_guard))
         };
         *self.peer.write().await = new_peer;
         // `_old` drops here. If it was `Some`, that `RunningService`'s
         // `DropGuard` cancels its cancellation_token; the background
         // task observes the cancel + closes the transport; the
-        // TokioChildProcess transport's drop reaps the child.
+        // TokioChildProcess transport's drop reaps the direct child; and
+        // the bundled `ProcessGroupGuard` SIGKILLs the rest of its group
+        // (grandchildren) — dirge-wupp.
     }
 
     /// Explicit shutdown — drops the running service synchronously
@@ -118,8 +132,13 @@ async fn connect_inner(
     server_name: String,
     config: &McpServerConfig,
 ) -> anyhow::Result<Arc<SharedConnection>> {
-    let (peer, rs) = raw_connect(&server_name, config).await?;
-    Ok(Arc::new(SharedConnection::new(server_name, peer, rs)))
+    let (peer, rs, pg_guard) = raw_connect(&server_name, config).await?;
+    Ok(Arc::new(SharedConnection::new(
+        server_name,
+        peer,
+        rs,
+        pg_guard,
+    )))
 }
 
 /// Build a new `RunningService` + extract its peer, without wrapping
@@ -132,7 +151,11 @@ async fn connect_inner(
 pub async fn raw_connect(
     server_name: &str,
     config: &McpServerConfig,
-) -> anyhow::Result<(Peer<RoleClient>, RunningService<RoleClient, ()>)> {
+) -> anyhow::Result<(
+    Peer<RoleClient>,
+    RunningService<RoleClient, ()>,
+    Option<crate::child_guard::ProcessGroupGuard>,
+)> {
     match config {
         McpServerConfig::Command {
             command,
@@ -145,6 +168,12 @@ pub async fn raw_connect(
             for (k, v) in env {
                 cmd.env(k, v);
             }
+            // dirge-wupp: isolate the server in its own session (no
+            // controlling terminal, new process group). Reinforces the
+            // stderr-capture defense below (the child can't reach dirge's
+            // TTY at all) and lets the ProcessGroupGuard reap its whole
+            // subtree — rmcp's transport drop kills only the direct child.
+            crate::child_guard::detach_session(&mut cmd);
             // CRITICAL: capture stderr instead of inheriting it.
             // See lengthy explanation below at the original
             // call site — terminal-query bytes from the child must
@@ -153,6 +182,9 @@ pub async fn raw_connect(
                 rmcp::transport::child_process::TokioChildProcess::builder(cmd)
                     .stderr(Stdio::piped())
                     .spawn()?;
+            // pgid == pid after `detach_session`; capture it before the
+            // transport is moved into `serve_client`.
+            let pg_guard = crate::child_guard::ProcessGroupGuard::from_pid(transport.id());
             if let Some(child_stderr) = stderr {
                 spawn_stderr_forwarder(server_name.to_string(), child_stderr);
             }
@@ -160,7 +192,7 @@ pub async fn raw_connect(
                 .await
                 .map_err(|e| anyhow::anyhow!("MCP connection failed for '{server_name}': {e}"))?;
             let peer = rs.peer().clone();
-            Ok((peer, rs))
+            Ok((peer, rs, pg_guard))
         }
         McpServerConfig::Url {
             url,
@@ -176,7 +208,8 @@ pub async fn raw_connect(
                 anyhow::anyhow!("MCP HTTP connection failed for '{server_name}': {e}")
             })?;
             let peer = rs.peer().clone();
-            Ok((peer, rs))
+            // HTTP transports spawn no child — nothing to group-kill.
+            Ok((peer, rs, None))
         }
     }
 }
