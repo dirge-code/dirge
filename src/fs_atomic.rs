@@ -80,6 +80,16 @@ pub fn atomic_write_sync(target: &Path, content: &[u8]) -> io::Result<()> {
     atomic_write_inner(target, content, /* private */ true)
 }
 
+/// Synchronous atomic write for PROJECT files: new files inherit the umask
+/// (≈0644) rather than being forced owner-only, matching the async
+/// [`atomic_write`] used by `write`/`edit`/`apply_patch`. For sync callers
+/// that restore project files under a lock — the `/rewind` restore path
+/// (dirge-nmbs) — so a crash mid-restore can't leave a truncated file and an
+/// existing file's mode (e.g. +x) is preserved across the swap.
+pub fn atomic_write_sync_project(target: &Path, content: &[u8]) -> io::Result<()> {
+    atomic_write_inner(target, content, /* private */ false)
+}
+
 /// dirge-i5pu: shared impl. `private` controls the new-file mode — `true`
 /// forces owner-only 0600 (session/memory state); `false` lets new files
 /// inherit the umask (≈0644), which is correct for agent-created PROJECT

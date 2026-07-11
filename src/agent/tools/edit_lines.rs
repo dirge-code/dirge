@@ -208,15 +208,10 @@ impl Tool for EditLinesTool {
             )));
         }
 
-        const MAX_EDIT_BYTES: u64 = 100 * 1024 * 1024;
-        if let Ok(meta) = tokio::fs::metadata(&resolved_path).await
-            && meta.len() > MAX_EDIT_BYTES
-        {
-            return Err(ToolError::Msg(format!(
-                "file too large for edit_lines: {} bytes (cap {} bytes)",
-                meta.len(),
-                MAX_EDIT_BYTES,
-            )));
+        // Shared size cap (dirge-ygzn).
+        if let Ok(meta) = tokio::fs::metadata(&resolved_path).await {
+            crate::agent::tools::text_io::check_edit_size("edit_lines", meta.len())
+                .map_err(ToolError::Msg)?;
         }
 
         let bytes = tokio::fs::read(&resolved_path).await?;

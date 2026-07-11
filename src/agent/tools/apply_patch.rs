@@ -7,8 +7,8 @@ use crate::agent::tools::cache::ToolCache;
 use crate::agent::tools::{AskSender, PermCheck, ToolError, check_perm_path_resolve};
 
 /// Max content size for a single create op (1 MiB). Audit L5 noted
-/// the dual cap with `MAX_APPLY_PATCH_BYTES` (100 MiB) — both apply
-/// to creates and the tighter wins. Intentional: creating a 50 MB
+/// the dual cap with the shared `text_io::MAX_EDIT_BYTES` (100 MiB) — both
+/// apply to creates and the tighter wins. Intentional: creating a 50 MB
 /// file from inside an LLM tool call is almost always a bug; the
 /// large cap exists for update / read paths on legitimately large
 /// files. The tight create cap protects the LLM from accidentally
@@ -66,10 +66,7 @@ pub struct ApplyPatchArgs {
     pub operations: Vec<PatchOp>,
 }
 
-/// Cap apply_patch read/write at 100 MiB. The tool isn't meant for
-/// binary blobs or generated artifacts; an LLM pointing it at a
-/// gigabyte file should fail fast rather than OOM the process.
-const MAX_APPLY_PATCH_BYTES: u64 = 100 * 1024 * 1024;
+use crate::agent::tools::text_io::{MAX_EDIT_BYTES, check_edit_size};
 
 async fn apply_create(path: &str, content: &str) -> Result<String, String> {
     let p = Path::new(path);
@@ -83,11 +80,11 @@ async fn apply_create(path: &str, content: &str) -> Result<String, String> {
             .await
             .map_err(|e| format!("failed to create parent dir: {}", e))?;
     }
-    if content.len() as u64 > MAX_APPLY_PATCH_BYTES {
+    if content.len() as u64 > MAX_EDIT_BYTES {
         return Err(format!(
             "create content too large: {} bytes (cap {} bytes)",
             content.len(),
-            MAX_APPLY_PATCH_BYTES,
+            MAX_EDIT_BYTES,
         ));
     }
     // Phase-2 tree-sitter validation: refuse to create
@@ -109,14 +106,8 @@ async fn apply_update(path: &str, old_text: &str, new_text: &str) -> Result<Stri
     // Pre-check size before reading the file into memory. The
     // metadata call is cheap (single stat); rejecting here avoids
     // a multi-GB allocation in `read_to_string`.
-    if let Ok(meta) = tokio::fs::metadata(path).await
-        && meta.len() > MAX_APPLY_PATCH_BYTES
-    {
-        return Err(format!(
-            "file too large for apply_patch: {} bytes (cap {} bytes); use bash + sed/awk for huge files",
-            meta.len(),
-            MAX_APPLY_PATCH_BYTES,
-        ));
+    if let Ok(meta) = tokio::fs::metadata(path).await {
+        check_edit_size("apply_patch", meta.len())?;
     }
     let original_bytes = tokio::fs::read(path)
         .await

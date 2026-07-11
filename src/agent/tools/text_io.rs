@@ -14,6 +14,29 @@
 //! then calls [`SourceText::reencode`] — it can't skip BOM handling or pick a
 //! different line-ending policy by accident.
 
+/// Largest on-disk file the in-place editors will read into memory.
+///
+/// These tools operate on source files, not generated blobs or logs; a model
+/// pointing one at a gigabyte file should fail fast with a clear message rather
+/// than OOM the process. Consolidated here (dirge-ygzn) so `edit`,
+/// `edit_lines`, `edit_minified`, and `apply_patch` share one limit and one
+/// message shape instead of four hand-rolled copies that drift.
+pub(crate) const MAX_EDIT_BYTES: u64 = 100 * 1024 * 1024;
+
+/// Reject a file that exceeds [`MAX_EDIT_BYTES`] with a model-facing message.
+/// `tool` names the caller ("edit", "apply_patch", …) so the error points at
+/// the tool the model actually invoked.
+pub(crate) fn check_edit_size(tool: &str, len: u64) -> Result<(), String> {
+    if len > MAX_EDIT_BYTES {
+        Err(format!(
+            "file too large for {tool}: {len} bytes (cap {MAX_EDIT_BYTES} bytes); \
+             use bash with sed/awk for huge files"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 /// The line-ending shape of a file, detected at decode time so write-back can
 /// restore it instead of blanket-normalizing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,6 +166,17 @@ impl SourceText {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // dirge-ygzn: the shared size guard replaces four copy-pasted
+    // meta.len()>CAP stanzas; one limit, one message shape.
+    #[test]
+    fn edit_size_guard_allows_under_cap_and_names_the_tool() {
+        assert!(check_edit_size("edit", MAX_EDIT_BYTES).is_ok());
+        assert!(check_edit_size("edit", 0).is_ok());
+        let err = check_edit_size("apply_patch", MAX_EDIT_BYTES + 1).unwrap_err();
+        assert!(err.contains("apply_patch"), "got: {err}");
+        assert!(err.contains("too large"), "got: {err}");
+    }
 
     #[test]
     fn lf_file_round_trips_unchanged() {

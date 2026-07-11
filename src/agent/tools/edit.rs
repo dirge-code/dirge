@@ -161,19 +161,12 @@ impl Tool for EditTool {
             )));
         }
 
-        // Pre-check size before reading. The edit tool isn't meant
-        // for huge generated artifacts; cap at 100 MiB so an LLM
-        // pointing it at a gigabyte log file fails fast rather
-        // than OOM-ing the process. Matches the apply_patch cap.
-        const MAX_EDIT_BYTES: u64 = 100 * 1024 * 1024;
-        if let Ok(meta) = tokio::fs::metadata(&resolved_path).await
-            && meta.len() > MAX_EDIT_BYTES
-        {
-            return Err(ToolError::Msg(format!(
-                "file too large for edit: {} bytes (cap {} bytes); use bash with sed/awk for huge files",
-                meta.len(),
-                MAX_EDIT_BYTES,
-            )));
+        // Pre-check size before reading (shared cap; dirge-ygzn). The edit
+        // tool isn't meant for huge generated artifacts — fail fast rather
+        // than OOM the process.
+        if let Ok(meta) = tokio::fs::metadata(&resolved_path).await {
+            crate::agent::tools::text_io::check_edit_size("edit", meta.len())
+                .map_err(ToolError::Msg)?;
         }
         let bytes = tokio::fs::read(&resolved_path).await?;
         // Shared decode seam: refuses non-UTF-8 (dirge-yga0), strips a leading
@@ -384,19 +377,22 @@ impl Tool for EditTool {
             result.push('\n');
             result.push_str(&note);
         }
-        // Mention the line delta when adding/removing lines so the
-        // LLM can confirm the size of change without re-reading
-        // the diff block. For replace_all the per-replacement
-        // delta multiplies by the number of replacements — the
-        // user wants the FILE delta, not the per-instance delta.
-        let old_lines = args.old_text.lines().count();
+        // Mention the line delta when adding/removing lines so the LLM can
+        // confirm the size of change without re-reading the diff block.
+        //
+        // dirge-r6v6: charge the delta (and, below, the diff) against the
+        // bytes ACTUALLY replaced — the matched range(s) — not args.old_text.
+        // When a fuzzy fallback fires, the whitespace-normalized matcher tries
+        // blocks up to +5 lines, so the matched block can be a different size
+        // than old_text; charging old_text would report the wrong delta and
+        // show `-` lines that were never in the file. For replace_all the
+        // blocks can individually differ in size, so the total is summed per
+        // range rather than multiplied by the match count.
         let new_lines = args.new_text.lines().count();
-        let per_replacement_delta = new_lines as i64 - old_lines as i64;
-        let total_delta = if do_replace_all {
-            per_replacement_delta * (match_positions.len() as i64)
-        } else {
-            per_replacement_delta
-        };
+        let (first_start, first_end) = match_ranges[0];
+        let matched_block = &content[first_start..first_end];
+        let total_delta =
+            replacement_line_delta(&content, &match_ranges, &args.new_text, do_replace_all);
         if total_delta != 0 {
             result.push_str(&format!(" ({:+} lines)", total_delta));
         }
@@ -406,15 +402,14 @@ impl Tool for EditTool {
         // useful diffs for any non-trivial edit. Bump to 200 lines
         // per side which covers the vast majority of real edits;
         // edits larger than that are likely refactors where the
-        // "edit + diff" pattern isn't the right tool anyway.
-        // `old_lines` / `new_lines` already computed above for the
-        // delta summary.
-        if old_lines <= 200 && new_lines <= 200 {
+        // "edit + diff" pattern isn't the right tool anyway. Gate on the
+        // matched block (the real removed text), not old_text.
+        if matched_block.lines().count() <= 200 && new_lines <= 200 {
             result.push_str(&Self::show_diff(
                 &args.path,
                 &content,
                 byte_pos,
-                &args.old_text,
+                matched_block,
                 &args.new_text,
             ));
         }
@@ -466,6 +461,30 @@ impl Tool for EditTool {
 // end_byte) byte ranges in `content` that match `find` under the
 // helper's normalization. Empty Vec = no matches. The cascade
 // tries each in priority order in the call site above.
+
+/// dirge-r6v6: line delta of an edit, charged against the bytes actually
+/// replaced (the matched `ranges`) rather than args.old_text. A fuzzy
+/// fallback can match a block of a different size than old_text, so charging
+/// old_text drifts the model's picture of the change. For replace_all each
+/// range can be a different size (the whitespace-normalized matcher tries
+/// blocks up to +5 lines), so the total is summed per range.
+fn replacement_line_delta(
+    content: &str,
+    ranges: &[(usize, usize)],
+    new_text: &str,
+    replace_all: bool,
+) -> i64 {
+    let new_lines = new_text.lines().count() as i64;
+    if replace_all {
+        ranges
+            .iter()
+            .map(|&(s, e)| new_lines - content[s..e].lines().count() as i64)
+            .sum()
+    } else {
+        let (s, e) = ranges[0];
+        new_lines - content[s..e].lines().count() as i64
+    }
+}
 
 /// dirge-nj6d: reduce a set of (start, end) byte ranges to a disjoint
 /// subset. Sorts by start and greedily keeps a range only if it begins
@@ -678,6 +697,48 @@ fn find_indentation_flexible_matches(content: &str, find: &str) -> Option<Vec<(u
 #[cfg(test)]
 mod fuzzy_tests {
     use super::*;
+
+    // dirge-r6v6: the delta is charged against the matched block, not the
+    // old_text the caller sent. A fuzzy fallback can match a larger block.
+    #[test]
+    fn replacement_delta_uses_matched_block_line_count() {
+        let content = "keep\nalpha\nbeta\ngamma\nkeep\n";
+        // The block actually replaced is the 3 middle lines.
+        assert_eq!(&content[5..22], "alpha\nbeta\ngamma\n");
+        let ranges = vec![(5usize, 22usize)];
+        // Replacing a 3-line block with 1 line ⇒ -2, no matter what
+        // 1-line old_text the model approximated it with.
+        assert_eq!(replacement_line_delta(content, &ranges, "one\n", false), -2);
+    }
+
+    #[test]
+    fn replacement_delta_sums_per_range_for_replace_all() {
+        // Two matched blocks of different sizes (2 and 3 lines), each
+        // replaced by a single line ⇒ (1-2) + (1-3) = -3. A multiply-by-count
+        // would be wrong when the blocks differ in size.
+        let content = "a\nb\nX\nc\nd\ne\nX\n";
+        assert_eq!(&content[0..4], "a\nb\n");
+        assert_eq!(&content[6..12], "c\nd\ne\n");
+        let ranges = vec![(0usize, 4usize), (6usize, 12usize)];
+        assert_eq!(replacement_line_delta(content, &ranges, "z", true), -3);
+    }
+
+    // dirge-r6v6: the diff's `-` lines and the following context come from the
+    // matched block, so a fuzzy match doesn't print removed lines never in the
+    // file or misplace the trailing context.
+    #[test]
+    fn show_diff_removes_matched_block_lines() {
+        let content = "ctx0\nalpha\nbeta\ngamma\ntail\n";
+        let byte_pos = content.find("alpha").unwrap();
+        let matched_block = "alpha\nbeta\ngamma";
+        let diff = EditTool::show_diff("f.rs", content, byte_pos, matched_block, "one");
+        assert!(diff.contains("-alpha\n"), "diff: {diff}");
+        assert!(diff.contains("-beta\n"), "diff: {diff}");
+        assert!(diff.contains("-gamma\n"), "diff: {diff}");
+        assert!(diff.contains("+one\n"), "diff: {diff}");
+        // Trailing context is the line AFTER the 3-line block, not after 1.
+        assert!(diff.contains(" tail\n"), "diff: {diff}");
+    }
 
     #[test]
     fn line_trimmed_matches_indent_drift() {

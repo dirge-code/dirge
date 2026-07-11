@@ -21,9 +21,6 @@ use crate::agent::tools::{AskSender, EditArgs, PermCheck, ToolError, require_and
 use crate::lsp::manager::LspManager;
 use crate::semantic::minify::{MinifiedEditError, apply_minified_edit};
 
-/// Cap on the file size we'll read+minify for an edit (mirrors `edit`).
-const MAX_EDIT_BYTES: u64 = 100 * 1024 * 1024;
-
 pub struct EditMinifiedTool {
     permission: Option<PermCheck>,
     ask_tx: Option<AskSender>,
@@ -112,14 +109,10 @@ impl Tool for EditMinifiedTool {
             )));
         }
 
-        if let Ok(meta) = tokio::fs::metadata(&resolved).await
-            && meta.len() > MAX_EDIT_BYTES
-        {
-            return Err(ToolError::Msg(format!(
-                "file too large for edit_minified: {} bytes (cap {})",
-                meta.len(),
-                MAX_EDIT_BYTES
-            )));
+        // Shared size cap (dirge-ygzn).
+        if let Ok(meta) = tokio::fs::metadata(&resolved).await {
+            crate::agent::tools::text_io::check_edit_size("edit_minified", meta.len())
+                .map_err(ToolError::Msg)?;
         }
 
         let source = tokio::fs::read_to_string(&resolved).await.map_err(|e| {

@@ -232,7 +232,14 @@ pub fn restore_from(turn_id: &str) -> Vec<PathBuf> {
     let mut restored = Vec::new();
     for (path, cap) in &targets {
         let ok = match cap {
-            Capture::Content(bytes) => std::fs::write(path, bytes.as_slice()).is_ok(),
+            // dirge-nmbs: restore through the same atomic write-temp-then-rename
+            // path every mutating tool uses, so a crash mid-/rewind of a large
+            // file can't leave it truncated and an existing file's mode (+x) is
+            // preserved across the swap. Project semantics (umask perms), not
+            // the owner-only 0600 the session/memory state uses.
+            Capture::Content(bytes) => {
+                crate::fs_atomic::atomic_write_sync_project(path, bytes.as_slice()).is_ok()
+            }
             Capture::Absent => match std::fs::remove_file(path) {
                 Ok(_) => true,
                 // Already gone is a successful "restore to absent".
@@ -303,6 +310,30 @@ mod tests {
             let restored = restore_from("u1");
             assert_eq!(restored.len(), 1);
             assert_eq!(std::fs::read_to_string(&p).unwrap(), "original");
+        });
+    }
+
+    // dirge-nmbs: restore goes through the atomic project write, which
+    // preserves an existing file's mode across the swap (a truncating
+    // std::fs::write would keep the mode too, but the atomic path is what
+    // guards against a crash leaving the file half-written).
+    #[cfg(unix)]
+    #[test]
+    fn restore_preserves_executable_bit() {
+        use std::os::unix::fs::PermissionsExt;
+        isolated(|dir| {
+            let p = dir.join("hook.sh");
+            std::fs::write(&p, "#!/bin/sh\necho pre").unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+            begin_turn("u1");
+            capture(&p); // pre-state
+            std::fs::write(&p, "#!/bin/sh\necho mutated").unwrap();
+
+            restore_from("u1");
+            assert_eq!(std::fs::read_to_string(&p).unwrap(), "#!/bin/sh\necho pre");
+            let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o755, "restore dropped the +x bit");
         });
     }
 
