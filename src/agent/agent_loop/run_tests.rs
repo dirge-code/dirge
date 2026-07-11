@@ -570,6 +570,46 @@ fn slot_with(summary: &str, boundary: usize, generation: u64) -> super::Checkpoi
     })))
 }
 
+/// dirge-ioym: a detached checkpoint (like the detached advisory review) used
+/// to hold a STRONG clone of the loop event sender, so the per-turn channel —
+/// and the runner task the pump joins on — stayed open until the bounded but
+/// slow background call finished, blocking a drain-to-close consumer well past
+/// AgentEnd. The detached tasks now hold WEAK senders, so the channel closes
+/// as soon as the run's own sender drops.
+#[tokio::test(start_paused = true)]
+async fn detached_checkpoint_weak_sender_does_not_hold_channel_open() {
+    use crate::agent::compression::SummarizeFn;
+
+    let (tx, mut rx) = mpsc::channel::<LoopEvent>(8);
+    // A summarizer that stalls far past the run — with a strong sender the
+    // recv below would block on it instead of seeing the channel close.
+    let sfn: SummarizeFn = std::sync::Arc::new(|_prompt: String| {
+        Box::pin(async {
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            Ok("a summary that never arrives in time".to_string())
+        })
+    });
+    let slot = empty_checkpoint_slot();
+    super::spawn_incremental_checkpoint(
+        sfn,
+        vec![serde_json::json!({"role": "user", "content": "hello"})],
+        tx.downgrade(),
+        slot,
+        1,
+    );
+    // The run ends: its (only strong) sender drops.
+    drop(tx);
+
+    // The channel must close now, not wait on the stalled detached task.
+    match tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv()).await {
+        Ok(None) => {}
+        Ok(Some(ev)) => panic!("unexpected late event before the run drained: {ev:?}"),
+        Err(_) => {
+            panic!("channel stayed open — the detached checkpoint held it past the run's end")
+        }
+    }
+}
+
 /// Round 1 fast path: when the slot holds a fresh checkpoint (matching the
 /// current epoch) and reusing it clears the fold target, the fold splices it
 /// in WITHOUT calling the inline summarizer, then bumps the epoch and clears

@@ -441,7 +441,11 @@ async fn poll_finalization_follow_up(
                 let system_prompt = system_prompt.to_string();
                 let transcript = build_critic_transcript(new_messages);
                 let baseline = code_review_baseline.cloned();
-                let emit = emit.clone();
+                // dirge-ioym: a WEAK sender — the review runs off the
+                // finalization path (a bounded but slow judge call), so a
+                // strong clone would keep the per-turn event channel open past
+                // AgentEnd and stall a drain-to-close consumer on the judge.
+                let emit = emit.downgrade();
                 let dedup = advisory_dedup.clone();
                 tokio::spawn(async move {
                     let repo =
@@ -475,7 +479,14 @@ async fn poll_finalization_follow_up(
                             return;
                         }
                     }
-                    let _ = emit.send(LoopEvent::SystemNotice { content: notice }).await;
+                    // Only deliver while the run's channel is still live
+                    // (upgrade fails once the run ends). A live consumer that
+                    // stops at AgentEnd doesn't see advisory results anyway;
+                    // routing them to a consumer that outlives the turn is a
+                    // separate change (dirge-ioym follow-up).
+                    if let Some(emit) = emit.upgrade() {
+                        let _ = emit.send(LoopEvent::SystemNotice { content: notice }).await;
+                    }
                 });
             }
             // Off is excluded by the guard above; Blocking with an exhausted
@@ -771,7 +782,13 @@ const CHECKPOINT_SUMMARY_TIMEOUT: std::time::Duration = std::time::Duration::fro
 fn spawn_incremental_checkpoint(
     sfn: crate::agent::compression::SummarizeFn,
     messages: Vec<serde_json::Value>,
-    emit: mpsc::Sender<LoopEvent>,
+    // dirge-ioym: a WEAK sender. A detached checkpoint outlives the turn (its
+    // summarizer call is bounded but slow), and a strong clone would keep the
+    // per-turn event channel — and the runner task the pump joins on — open
+    // until it finished, so a drain-to-close consumer blocked past AgentEnd.
+    // Upgrading fails once the run's sender drops, so the refresh is delivered
+    // only while the run is still live and skipped otherwise.
+    emit: mpsc::WeakSender<LoopEvent>,
     slot: CheckpointSlot,
     generation: u64,
 ) {
@@ -797,7 +814,9 @@ fn spawn_incremental_checkpoint(
                     generation,
                 });
             }
-            let _ = emit.send(LoopEvent::CheckpointRefresh { summary }).await;
+            if let Some(emit) = emit.upgrade() {
+                let _ = emit.send(LoopEvent::CheckpointRefresh { summary }).await;
+            }
         }
     });
 }
@@ -2138,7 +2157,7 @@ pub async fn run_loop(
                                 spawn_incremental_checkpoint(
                                     sfn.clone(),
                                     current_context.messages.clone(),
-                                    emit.clone(),
+                                    emit.downgrade(),
                                     checkpoint_slot.clone(),
                                     checkpoint_generation,
                                 );
