@@ -2563,6 +2563,7 @@ impl Renderer {
                 }
                 self.col = 0;
             } else if !segment.is_empty() {
+                use unicode_width::UnicodeWidthChar;
                 let chars: Vec<char> = segment.chars().collect();
                 let mut idx = 0;
                 while idx < chars.len() {
@@ -2572,11 +2573,36 @@ impl Renderer {
                         self.col = 0;
                         continue;
                     }
-                    let end = (idx + avail).min(chars.len());
+                    // dirge-m0sp: fill by DISPLAY width, not char count — a
+                    // wide CJK/emoji glyph is 2 columns. Take chars until the
+                    // next one wouldn't fit the remaining columns.
+                    let mut used = 0usize;
+                    let mut end = idx;
+                    while end < chars.len() {
+                        let w = UnicodeWidthChar::width(chars[end]).unwrap_or(0);
+                        if used + w > avail {
+                            break;
+                        }
+                        used += w;
+                        end += 1;
+                    }
+                    if end == idx {
+                        // The next glyph doesn't fit the remaining columns.
+                        if self.col > 0 {
+                            // Wrap to a fresh line and retry with a full budget.
+                            self.commit_partial();
+                            self.col = 0;
+                            continue;
+                        }
+                        // A single glyph wider than the whole line — place it
+                        // anyway so we always make progress.
+                        used = UnicodeWidthChar::width(chars[idx]).unwrap_or(0);
+                        end = idx + 1;
+                    }
                     let chunk: String = chars[idx..end].iter().collect();
                     self.partial_color = color;
                     self.partial.push_str(&chunk);
-                    self.col = self.col.saturating_add(chunk.chars().count() as u16);
+                    self.col = self.col.saturating_add(used as u16);
                     idx = end;
                     if idx < chars.len() {
                         self.commit_partial();

@@ -701,6 +701,38 @@ fn buffer_pos_at_clamps_past_eol() {
     assert_eq!(pos, Some((0, 5)));
 }
 
+/// dirge-m0sp: `Renderer::write`'s streaming soft-wrap chunked by
+/// `chars().count()` against the column budget and advanced `self.col` by
+/// char count, so a run of wide (CJK/emoji) glyphs — 2 display columns
+/// each — streamed to ~2x the terminal width before wrapping. The live
+/// (uncommitted) partial must never exceed one line's display width.
+#[test]
+fn write_wraps_wide_glyphs_by_display_width() {
+    use unicode_width::UnicodeWidthStr;
+    let mut r = Renderer::new().unwrap();
+    r.set_test_cols(24);
+    let max = r.max_line_width();
+    // A run of wide glyphs whose CHAR count fits the line (<= max) but whose
+    // DISPLAY width is ~2x it — a char-based wrap wouldn't break it.
+    let wide: String = "日".repeat(max);
+    r.write(&wide, Color::White).unwrap();
+    assert!(
+        UnicodeWidthStr::width(r.partial.as_str()) <= max,
+        "live partial is {} cols, exceeds the {}-col line",
+        UnicodeWidthStr::width(r.partial.as_str()),
+        max
+    );
+    // Committed rows fit the line too.
+    r.commit_partial();
+    for row in r.buffer.iter().filter(|e| e.text.contains('日')) {
+        assert!(
+            UnicodeWidthStr::width(row.text.as_str()) <= max,
+            "committed row {:?} overflows the line",
+            row.text
+        );
+    }
+}
+
 // --- B3-8: display-width-aware column mapping --------------
 
 #[test]
