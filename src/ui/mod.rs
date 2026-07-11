@@ -274,6 +274,11 @@ pub async fn run_interactive(
     // updates a dedicated chat window per subagent so the user can
     // switch to it via Ctrl-N/P/X.
     mut subagent_chat_rx: tokio::sync::mpsc::Receiver<crate::agent::tools::task::SubagentChatEvent>,
+    // dirge-kdwz: background advisory-review notices. The detached review's
+    // notice lands after the turn's AgentEnd (once the per-turn event channel
+    // is gone), so it arrives here on a session-lived channel selected on
+    // across turns.
+    mut review_notice_rx: tokio::sync::mpsc::Receiver<String>,
     // ui-redesign: shared system-load snapshot. Polled in the
     // background; read at panel paint time. Cheap clone (Arc bump).
     sysload: crate::ui::sysload::SharedSysLoad,
@@ -4476,6 +4481,15 @@ pub async fn run_interactive(
                             ));
                             renderer.request_repaint();
                         }
+                    }
+                    Some(notice) = review_notice_rx.recv() => {
+                        // dirge-kdwz: a background advisory-review notice
+                        // arriving after the turn's AgentEnd (the review's
+                        // judge call outlives the turn). Render it through the
+                        // same path as AgentEvent::SystemNotice so Advisory
+                        // review mode's findings surface even though the
+                        // per-turn event channel was dropped at Done.
+                        run_handlers::notices::handle_system_notice(&mut renderer, &notice)?;
                     }
                     Some(chat_evt) = subagent_chat_rx.recv() => {
                         // dirge-ov2 Phase E: subagent chat lifecycle.

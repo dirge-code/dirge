@@ -479,12 +479,15 @@ async fn poll_finalization_follow_up(
                             return;
                         }
                     }
-                    // Only deliver while the run's channel is still live
-                    // (upgrade fails once the run ends). A live consumer that
-                    // stops at AgentEnd doesn't see advisory results anyway;
-                    // routing them to a consumer that outlives the turn is a
-                    // separate change (dirge-ioym follow-up).
-                    if let Some(emit) = emit.upgrade() {
+                    // dirge-kdwz: deliver on the session-lived review-notice
+                    // sink so the UI sees it even though the per-turn channel
+                    // is gone by now (the review's judge call finishes after
+                    // AgentEnd). Fall back to the (weak) per-turn sender for
+                    // consumers without a sink — headless, tests — which stop
+                    // at Done and wouldn't render it anyway.
+                    if let Some(sink) = super::code_review::review_notice_sink() {
+                        let _ = sink.send(notice).await;
+                    } else if let Some(emit) = emit.upgrade() {
                         let _ = emit.send(LoopEvent::SystemNotice { content: notice }).await;
                     }
                 });

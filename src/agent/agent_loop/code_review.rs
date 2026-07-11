@@ -1066,6 +1066,32 @@ pub fn background_review_notice(findings: &[Finding]) -> Option<String> {
     ))
 }
 
+/// dirge-kdwz: a SESSION-lived sink for background advisory-review notices.
+/// The detached review runs a (bounded but slow) judge call off the
+/// finalization path, so its notice lands AFTER the turn's AgentEnd — by
+/// which point the interactive UI has already dropped the per-turn event
+/// channel (`handle_done` nulls `agent_rx`) and headless has broken at
+/// Done, so the notice reached no live consumer and Advisory mode was a
+/// silent no-op. Routing it through a process-global sink set once at
+/// interactive startup (mirrors `task::set_subagent_chat_sink`) delivers it
+/// to a receiver the UI selects on across turns. Unset in headless/tests,
+/// where the detached review falls back to the per-turn (weak) sender.
+static REVIEW_NOTICE_SINK: std::sync::OnceLock<tokio::sync::mpsc::Sender<String>> =
+    std::sync::OnceLock::new();
+
+/// Install the session-lived review-notice sink. First writer wins; a
+/// re-set is logged and ignored (tests / hot reload may try twice).
+pub fn set_review_notice_sink(sink: tokio::sync::mpsc::Sender<String>) {
+    if REVIEW_NOTICE_SINK.set(sink).is_err() {
+        tracing::debug!("review notice sink already set; ignoring re-set");
+    }
+}
+
+/// The session-lived review-notice sender, if one was installed.
+pub fn review_notice_sink() -> Option<tokio::sync::mpsc::Sender<String>> {
+    REVIEW_NOTICE_SINK.get().cloned()
+}
+
 /// Join finding bodies with the `---` separator, each led by its severity.
 fn render_findings(findings: &[Finding]) -> String {
     findings
@@ -1920,6 +1946,30 @@ diff --git a/Cargo.lock b/Cargo.lock\n\
         assert!(
             f.is_empty(),
             "a timed-out reviewer must fail open to no findings"
+        );
+    }
+
+    /// dirge-kdwz: the session-lived review-notice sink delivers a notice to
+    /// a receiver decoupled from the per-turn event channel — the path the
+    /// detached advisory review now uses so its notice reaches the UI after
+    /// the turn's AgentEnd. (The OnceLock sink is set exactly once per test
+    /// binary; no other test installs it.)
+    #[tokio::test]
+    async fn review_notice_sink_delivers_out_of_band() {
+        assert!(
+            review_notice_sink().is_none(),
+            "unset by default so headless/tests fall back to the per-turn sender"
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(4);
+        set_review_notice_sink(tx);
+        let sink = review_notice_sink().expect("sink installed");
+        sink.send("[code-review] advisory note".to_string())
+            .await
+            .unwrap();
+        assert_eq!(
+            rx.recv().await.as_deref(),
+            Some("[code-review] advisory note"),
+            "a notice sent to the session sink reaches its receiver"
         );
     }
 }

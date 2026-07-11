@@ -1745,6 +1745,14 @@ async fn main() -> anyhow::Result<()> {
             );
         crate::agent::tools::task::set_subagent_chat_sink(subagent_chat_tx);
 
+        // dirge-kdwz: session-lived channel for background advisory-review
+        // notices. The detached review's judge call finishes AFTER the turn's
+        // AgentEnd, so its notice can't ride the per-turn event channel (the
+        // UI drops that at Done). This receiver is selected on across turns so
+        // Advisory review mode's findings actually surface.
+        let (review_notice_tx, review_notice_rx) = tokio::sync::mpsc::channel::<String>(8);
+        crate::agent::agent_loop::code_review::set_review_notice_sink(review_notice_tx);
+
         // ui-redesign: spawn the system-load poller. The handle is
         // a cheap Arc; cloning into run_interactive lets the panel
         // painter read snapshots without crossing the channel.
@@ -1819,6 +1827,7 @@ async fn main() -> anyhow::Result<()> {
             plugin_manager.as_ref(),
             dialog_rx,
             subagent_chat_rx,
+            review_notice_rx,
             sysload,
         )
         .await?;
