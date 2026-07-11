@@ -262,6 +262,24 @@ fn is_overview_row(row: &ActiveRow) -> bool {
     row.kind == "overview"
 }
 
+/// dirge-9ggd: rendered byte cost of one hot entry in the system-prompt
+/// snapshot. The hot render (`render_snapshot`) emits each entry as
+/// `[{kind}] {content}` joined by [`ENTRY_DELIMITER`]. The budget/eviction and
+/// usage-reporting sites used to estimate this three different ways —
+/// `content.len()+3` (make_room / breadcrumbs) and `Σcontent + (n-1)*delimiter`
+/// (success/usage) — and NONE counted the `[kind]` tag, so with several entries
+/// the reported usage sat below the real prompt and eviction under-charged.
+/// This is the single formula all of them now share.
+fn render_cost(kind: &str, content: &str) -> usize {
+    // "[" + kind + "] " tag (3 fixed) + content + the entry delimiter.
+    3 + kind.len() + content.len() + ENTRY_DELIMITER.len()
+}
+
+/// [`render_cost`] for a stored row.
+fn entry_render_cost(row: &ActiveRow) -> usize {
+    render_cost(&row.kind, &row.content)
+}
+
 // Threat patterns + the invisible-Unicode set now live in `content_guard`;
 // `scan_for_threats` below delegates to `content_guard::scan_content` so the
 // memory and skills stores share one unioned pattern set.
@@ -773,7 +791,7 @@ impl SqliteMemoryStore {
         let limit = breadcrumb_limit_for(target);
         let mut archived = 0usize;
         while !crumbs.is_empty() {
-            let current: usize = crumbs.iter().map(|r| r.content.len() + 3).sum();
+            let current: usize = crumbs.iter().map(entry_render_cost).sum();
             if current <= limit {
                 break;
             }
@@ -948,14 +966,14 @@ impl SqliteMemoryStore {
         let mut hot = Self::hot_rows(tx, target)?;
         let mut demoted = 0usize;
         while !hot.is_empty() {
-            let hot_total: usize = hot.iter().map(|r| r.content.len() + 3).sum();
+            let hot_total: usize = hot.iter().map(entry_render_cost).sum();
             if hot_total + entry_cost <= char_limit {
                 break;
             }
             let working_total: usize = hot
                 .iter()
                 .filter(|r| is_working_row(r))
-                .map(|r| r.content.len() + 3)
+                .map(entry_render_cost)
                 .sum::<usize>()
                 + if new_is_working { entry_cost } else { 0 };
             let longterm_total = (hot_total + entry_cost) - working_total;
@@ -995,7 +1013,9 @@ impl SqliteMemoryStore {
     ) -> Result<(i64, CompactionOutcome), String> {
         // Make room under the working-reserve rules (demote the
         // least-salient hot entry first, never the overview), then insert.
-        let entry_cost = entry.len();
+        // Charge the NEW entry the same rendered cost the hot rows are charged
+        // (dirge-9ggd) so the budget math is symmetric.
+        let entry_cost = render_cost(kind.as_str(), entry);
         let new_is_working = matches!(kind, MemoryKind::Working);
         let demoted = Self::make_room_in_hot(tx, target, entry_cost, new_is_working)?;
 
@@ -1271,7 +1291,7 @@ impl SqliteMemoryStore {
         // loop with a bare `least_salient_index`, which could demote the
         // overview (contradicting its "never an eviction victim" guarantee)
         // and leave it rendering twice.
-        let entry_cost = revived.content.len();
+        let entry_cost = entry_render_cost(revived);
         let new_is_working = is_working_row(revived);
         let demoted = Self::make_room_in_hot(&tx, target, entry_cost, new_is_working)?;
 
@@ -1561,8 +1581,8 @@ impl SqliteMemoryStore {
         let all_rows = Self::active_rows(conn, target)?;
         let rows: Vec<&ActiveRow> = all_rows.iter().filter(|r| r.tier == "hot").collect();
         let entries: Vec<&str> = rows.iter().map(|r| r.content.as_str()).collect();
-        let current: usize = entries.iter().map(|e| e.len()).sum::<usize>()
-            + entries.len().saturating_sub(1) * ENTRY_DELIMITER.len();
+        // dirge-9ggd: charge the same rendered cost eviction does.
+        let current: usize = rows.iter().copied().map(entry_render_cost).sum();
         let limit = char_limit_for(target);
         let pct = if limit > 0 {
             ((current as f64 / limit as f64) * 100.0).min(100.0) as u32
@@ -1835,8 +1855,8 @@ impl SqliteMemoryStore {
             Ok(r) => r,
             Err(_) => return 0,
         };
-        let current: usize = rows.iter().map(|r| r.content.len()).sum::<usize>()
-            + rows.len().saturating_sub(1) * ENTRY_DELIMITER.len();
+        // dirge-9ggd: charge the same rendered cost eviction does.
+        let current: usize = rows.iter().map(entry_render_cost).sum();
         let limit = char_limit_for(target);
         if limit == 0 {
             return 0;
@@ -3003,6 +3023,35 @@ mod tests {
         let fact_pos = block.find("the fact").unwrap();
         let pit_pos = block.find("the pitfall").unwrap();
         assert!(fact_pos < pit_pos, "memory block renders first: {block}");
+    }
+
+    /// dirge-9ggd: the shared render-cost helper must equal the bytes the
+    /// snapshot actually emits per hot entry — `[{kind}] {content}` plus the
+    /// entry delimiter. All four budget/eviction/usage sites call it, so if it
+    /// drifts from the render the reported usage stops matching the prompt.
+    #[test]
+    fn render_cost_matches_snapshot_entry_bytes() {
+        let kind = "semantic";
+        let content = "uses tokio for async";
+        let rendered = format!("[{kind}] {content}{ENTRY_DELIMITER}");
+        assert_eq!(render_cost(kind, content), rendered.len());
+
+        // The live render really does use that per-entry shape — guards the
+        // premise so a render change can't silently desync the accounting.
+        // The prompt snapshot is frozen at load, so add then reload.
+        let (paths, _dir) = temp_project();
+        {
+            let store = SqliteMemoryStore::load(&paths).unwrap();
+            store
+                .add_entry("memory", content, Some(MemoryKind::Semantic))
+                .unwrap();
+        }
+        let store = SqliteMemoryStore::load(&paths).unwrap();
+        let block = store.format_for_system_prompt();
+        assert!(
+            block.contains(&format!("[{kind}] {content}")),
+            "snapshot render shape drifted from render_cost: {block}"
+        );
     }
 
     // ── Persistence / concurrency ────────────────────────────────
