@@ -544,6 +544,51 @@ pub fn parse_bash_segments_full(command: &str) -> Result<(Vec<String>, bool), St
     }
 }
 
+/// dirge-p3vf: coarse, string-level test for shell constructs that must be
+/// checked as one opaque command rather than split into per-command allow
+/// claims — command/process substitution, ANSI-C quoting, and heredocs.
+///
+/// Pure and feature-independent. Used by the non-`semantic-bash` enforcement
+/// split AND, via [`command_is_complex`], the `/why` explainer — so the two
+/// can't drift. They used to disagree on heredocs (`<<`): enforcement flagged
+/// them, `/why` didn't, so `/why` explained a heredoc as a head-rule allow
+/// when the runtime actually prompts.
+// Under `semantic-bash` the enforcement split and `command_is_complex` both
+// take the tree-sitter path, so this coarse scan is only reached in the
+// non-semantic build (and unit tests).
+#[cfg_attr(feature = "semantic-bash", allow(dead_code))]
+pub fn coarse_complex_syntax(command: &str) -> bool {
+    command.contains("$(")
+        || command.contains('`')
+        || command.contains("<(")
+        || command.contains(">(")
+        || command.contains("$'")
+        || command.contains("<<")
+}
+
+/// Whether `command` is "complex" — the splitter can't safely decompose it
+/// into per-command claims, so it's checked as one whole-command `Execute`
+/// claim and allow rules must not silently match its head (dirge-g9qj).
+///
+/// Mirrors exactly what the enforcement splitter decides in THIS build: the
+/// tree-sitter constructs under `semantic-bash`, the coarse syntax scan
+/// otherwise. The `/why` explainer calls this so its explanation matches what
+/// enforcement will actually do (dirge-p3vf).
+pub fn command_is_complex(command: &str) -> bool {
+    #[cfg(feature = "semantic-bash")]
+    {
+        // Parse failure ⇒ complex (checked whole), matching the enforcement
+        // path which pushes the entire command as one claim on error.
+        parse_bash_segments_full(command)
+            .map(|(_, complex)| complex)
+            .unwrap_or(true)
+    }
+    #[cfg(not(feature = "semantic-bash"))]
+    {
+        coarse_complex_syntax(command)
+    }
+}
+
 #[cfg(feature = "semantic-bash")]
 fn has_complex_constructs(node: tree_sitter::Node) -> bool {
     for i in 0..node.child_count() {
@@ -662,5 +707,44 @@ fn collect_segments(node: tree_sitter::Node, source: &[u8], out: &mut Vec<String
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod complexity_tests {
+    use super::coarse_complex_syntax;
+    #[cfg(not(feature = "semantic-bash"))]
+    use super::command_is_complex;
+
+    // dirge-p3vf: the coarse classifier flags every construct the runtime
+    // checks as one opaque command, INCLUDING heredocs — which the old `/why`
+    // string-match omitted.
+    #[test]
+    fn coarse_flags_heredoc_and_substitutions() {
+        assert!(coarse_complex_syntax("cat <<EOF"));
+        assert!(coarse_complex_syntax("echo $(whoami)"));
+        assert!(coarse_complex_syntax("echo `id`"));
+        assert!(coarse_complex_syntax("diff <(a) <(b)"));
+        assert!(coarse_complex_syntax("tee >(cat)"));
+        assert!(coarse_complex_syntax("printf $'\\n'"));
+        // Plain pipelines / lists are decomposable, not complex.
+        assert!(!coarse_complex_syntax("ls -la | grep foo"));
+        assert!(!coarse_complex_syntax("echo a && echo b"));
+    }
+
+    // In the default (non-semantic-bash) build, enforcement and the `/why`
+    // explainer both route through the coarse scan — they can't disagree.
+    #[cfg(not(feature = "semantic-bash"))]
+    #[test]
+    fn command_is_complex_matches_coarse_without_semantic() {
+        for cmd in ["cat <<EOF", "echo $(id)", "ls -la", "echo hi && pwd"] {
+            assert_eq!(
+                command_is_complex(cmd),
+                coarse_complex_syntax(cmd),
+                "cmd: {cmd}"
+            );
+        }
+        assert!(command_is_complex("cat <<EOF"));
+        assert!(!command_is_complex("ls -la"));
     }
 }

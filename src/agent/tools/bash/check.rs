@@ -239,13 +239,9 @@ pub(super) async fn check_bash_segments(
     {
         // Coarse, quote-aware split when tree-sitter isn't compiled in;
         // command-substitution / heredoc / ANSI-C quoting are checked as
-        // one whole-command claim.
-        let has_substitution = command.contains("$(")
-            || command.contains('`')
-            || command.contains("<(")
-            || command.contains(">(")
-            || command.contains("$'")
-            || command.contains("<<");
+        // one whole-command claim. Shared with the `/why` explainer
+        // (dirge-p3vf) so enforcement and explanation can't drift.
+        let has_substitution = bash::coarse_complex_syntax(command);
         if has_substitution {
             claims.push(complex_cmd_claim(command));
         } else {

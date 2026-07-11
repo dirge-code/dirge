@@ -482,9 +482,10 @@ fn mcp_tool_defaults_to_ask_when_unconfigured() {
 
 /// Review #1: Accept mode previously coerced `Ask → Allow` for
 /// every non-path tool, silently bypassing the new default-Ask
-/// for `mcp_tool`. The coercion now special-cases
-/// `is_high_risk_non_path_tool` so MCP / shell keep their Ask
-/// even under `--accept`. (For bash, the legacy bash rule table
+/// for `mcp_tool`. The coercion is now gated by `accept_eligible`
+/// (engine/mod.rs) — which excludes Mcp/Execute/Network/Agent/Plugin
+/// operations — so MCP / shell keep their Ask even under `--accept`.
+/// (For bash, the legacy bash rule table
 /// already auto-allows safe commands by name; the special case
 /// here matters when an explicit user config sets bash to Ask —
 /// Accept mode must not silently undo that.)
@@ -1613,4 +1614,35 @@ fn explain_renders_decision_trace() {
         report.contains("builtin-allow"),
         "names builtin-allow as decider: {report}",
     );
+}
+
+/// dirge-p3vf: `/why` must classify a command's complexity the same way
+/// enforcement does. The old string-match diverged — it missed subshells
+/// (which the tree-sitter splitter flags) and heredocs (which the coarse
+/// splitter flags) — so `/why` explained a complex command as a head-rule
+/// allow while the runtime actually prompts. Both now route through the shared
+/// `command_is_complex`, so the classification matches enforcement in this
+/// build (subshell under `semantic-bash`, heredoc otherwise).
+#[test]
+fn why_classifies_complex_command_like_enforcement() {
+    let checker = PermissionChecker::new(
+        &PermissionConfig::default(),
+        SecurityMode::Standard,
+        Some(std::path::PathBuf::from("/tmp/proj")),
+    );
+    // A construct the enforcement splitter treats as one opaque command in
+    // THIS build. The old string-match missed both of these.
+    #[cfg(feature = "semantic-bash")]
+    let complex_cmd = "(cd /tmp && rm x)"; // subshell — tree-sitter flags it
+    #[cfg(not(feature = "semantic-bash"))]
+    let complex_cmd = "cat <<EOF\nhi\nEOF"; // heredoc — coarse scan flags it
+
+    let req = checker.build_request("bash", complex_cmd, false);
+    assert!(
+        req.claims[0].resource.is_complex_command(),
+        "complex command must not be head-allowed by /why: {complex_cmd}",
+    );
+    // A plain command stays decomposable.
+    let plain = checker.build_request("bash", "cat file.txt", false);
+    assert!(!plain.claims[0].resource.is_complex_command());
 }

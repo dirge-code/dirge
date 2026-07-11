@@ -11,25 +11,6 @@
 
 use crate::permission::pattern::Pattern;
 
-/// Tools that execute external code with broad effects. Accept mode
-/// does NOT coerce `Ask → Allow` for these — the "I trust the agent
-/// inside cwd" rationale that justifies the coercion for other
-/// non-path tools doesn't generalize to shell + MCP servers.
-pub(crate) fn is_high_risk_non_path_tool(tool: &str) -> bool {
-    matches!(
-        tool,
-        // Shell / external execution
-        "mcp_tool" | "bash"
-        // Network exfiltration
-        | "webfetch"
-        // Recursive agent execution
-        | "task"
-        // Persistent state mutation (memory, skills, patches)
-        // that persists across sessions
-        | "memory" | "skill" | "apply_patch"
-    )
-}
-
 /// Tool names where the input is a filesystem path. For these, `*` keeps
 /// classic glob semantics (one segment, doesn't cross `/`). Everything else
 /// is treated as shell/text where `*` means "any chars including /".

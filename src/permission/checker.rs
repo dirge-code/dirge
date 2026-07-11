@@ -213,16 +213,13 @@ impl PermissionChecker {
             engine::classify_path(input, &self.working_dir)
         } else {
             match tool {
-                // dirge-g9qj: mirror the runtime splitter — a command
-                // carrying a substitution / subshell is complex, so
-                // `/why` explains it as a prompt (not a head-rule allow).
+                // dirge-g9qj / dirge-p3vf: use the SAME complexity classifier
+                // the runtime splitter uses (tree-sitter under semantic-bash,
+                // the coarse syntax scan otherwise), so `/why` explains a
+                // complex command as a prompt — not a head-rule allow — and
+                // never disagrees with enforcement (it used to miss heredocs).
                 "bash" | "shell" => {
-                    let complex = input.contains("$(")
-                        || input.contains('`')
-                        || input.contains("<(")
-                        || input.contains(">(")
-                        || input.contains("$'");
-                    if complex {
+                    if crate::semantic::adapters::bash::command_is_complex(input) {
                         Resource::command_complex(input)
                     } else {
                         Resource::command(input)
