@@ -142,6 +142,27 @@ where
     Ok(Some(AnyClient::OpenAI(client)))
 }
 
+/// dirge-ro8g: pick the effective auth mode. An EXPLICIT choice (config
+/// `auth:` or a top-level default) always wins. Otherwise the default is
+/// `ApiKey`, EXCEPT for the anthropic provider when an OAuth login is
+/// present (`anthropic_oauth_present`) — then it's `Anthropic`, so the
+/// stored `dirge auth anthropic` login / `ANTHROPIC_OAUTH_TOKEN` is used
+/// via `resolve_anthropic_auth` instead of being ignored or mis-sent as an
+/// x-api-key.
+fn effective_auth(
+    explicit: Option<ProviderAuth>,
+    kind: ProviderKind,
+    anthropic_oauth_present: bool,
+) -> ProviderAuth {
+    match explicit {
+        Some(auth) => auth,
+        None if kind == ProviderKind::Anthropic && anthropic_oauth_present => {
+            ProviderAuth::Anthropic
+        }
+        None => ProviderAuth::ApiKey,
+    }
+}
+
 /// dirge-pkh1: resolve a provider's base URL with ONE precedence for every
 /// provider — config (`config_url`, already scheme-validated upstream in
 /// `resolve.rs`) > provider env var > hard default.
@@ -237,7 +258,20 @@ where
         )
     })?;
 
-    let auth = info.auth.or(default_auth).unwrap_or(ProviderAuth::ApiKey);
+    // dirge-ro8g: for the anthropic provider, a present OAuth login — a
+    // stored `dirge auth anthropic` creds file OR an exported
+    // ANTHROPIC_OAUTH_TOKEN — implies OAuth auth when the user chose none
+    // explicitly. Without this the ApiKey default never consults the login
+    // and bails "No API key found for Anthropic", and the sk-ant-oat bearer
+    // would otherwise be mis-sent as an x-api-key.
+    let anthropic_oauth_present = info.kind == ProviderKind::Anthropic
+        && (env("ANTHROPIC_OAUTH_TOKEN").is_some_and(|v| !v.trim().is_empty())
+            || super::anthropic_oauth::credentials_file_path().exists());
+    let auth = effective_auth(
+        info.auth.or(default_auth),
+        info.kind,
+        anthropic_oauth_present,
+    );
     // A top-level `auth: chatgpt` applies to every provider. Refuse non-OpenAI
     // early so a Codex bearer token is never sent to another provider.
     if auth == ProviderAuth::ChatGpt && info.kind != ProviderKind::OpenAI {
@@ -722,6 +756,33 @@ mod tests {
 
     fn no_env(_: &str) -> Option<String> {
         None
+    }
+
+    // ── dirge-ro8g: anthropic-OAuth presence implies Anthropic auth ──
+
+    #[test]
+    fn anthropic_oauth_presence_implies_anthropic_auth() {
+        use crate::config::ProviderAuth;
+        // No explicit auth + anthropic + OAuth present → Anthropic.
+        assert_eq!(
+            effective_auth(None, ProviderKind::Anthropic, true),
+            ProviderAuth::Anthropic
+        );
+        // No OAuth present → the ApiKey default.
+        assert_eq!(
+            effective_auth(None, ProviderKind::Anthropic, false),
+            ProviderAuth::ApiKey
+        );
+        // An EXPLICIT api_key choice is honored even with OAuth present.
+        assert_eq!(
+            effective_auth(Some(ProviderAuth::ApiKey), ProviderKind::Anthropic, true),
+            ProviderAuth::ApiKey
+        );
+        // A non-anthropic provider never gets Anthropic auth implied.
+        assert_eq!(
+            effective_auth(None, ProviderKind::DeepSeek, true),
+            ProviderAuth::ApiKey
+        );
     }
 
     // ── dirge-pkh1: base-URL resolution precedence + scheme validation ──

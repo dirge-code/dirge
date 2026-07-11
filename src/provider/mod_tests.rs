@@ -109,26 +109,25 @@ fn auth_detect_prefers_openai_when_both_logins_present() {
     assert_eq!(auth_detect_provider_from(true, true), Some("openai"));
 }
 
-/// `provider_env_var_fallbacks` lists canonical alternatives
-/// for GLM (Zhipu's name), Anthropic (OAuth token), and Gemini
-/// (Google's canonical form). Other providers have no
-/// alternatives.
+/// `provider_env_var_fallbacks` lists canonical API-KEY alternatives for
+/// GLM (Zhipu's name) and Gemini (Google's canonical form). Anthropic has
+/// none: ANTHROPIC_OAUTH_TOKEN is an OAuth bearer, not an api key, and now
+/// routes through ProviderAuth::Anthropic (dirge-ro8g). Other providers
+/// have no alternatives.
 #[test]
 fn fallback_list_covers_canonical_alternatives() {
     assert_eq!(
         provider_env_var_fallbacks(ProviderKind::Glm),
         &["ZHIPU_API_KEY"]
     );
-    // B3-3: Anthropic OAuth, Google's two canonical names.
-    assert_eq!(
-        provider_env_var_fallbacks(ProviderKind::Anthropic),
-        &["ANTHROPIC_OAUTH_TOKEN"]
-    );
     assert_eq!(
         provider_env_var_fallbacks(ProviderKind::Gemini),
         &["GOOGLE_GENERATIVE_AI_API_KEY", "GOOGLE_API_KEY"]
     );
     for kind in [
+        // dirge-ro8g: Anthropic no longer treats ANTHROPIC_OAUTH_TOKEN as
+        // an API-key fallback.
+        ProviderKind::Anthropic,
         ProviderKind::OpenAI,
         ProviderKind::DeepSeek,
         ProviderKind::OpenRouter,

@@ -473,13 +473,15 @@ pub(crate) fn provider_env_var_fallbacks(kind: ProviderKind) -> &'static [&'stat
         // (matches the provider name), but accepting the
         // canonical form means users don't have to alias.
         ProviderKind::Glm => &["ZHIPU_API_KEY"],
-        // B3-3 (audit fix): Anthropic users on Claude.ai OAuth
-        // have ANTHROPIC_OAUTH_TOKEN exported by the official
-        // setup tools. Pi (env-api-keys.ts:97-99) treats it as a
-        // higher-priority alternative. Without this dirge users
-        // had to manually export ANTHROPIC_API_KEY to use the
-        // same token.
-        ProviderKind::Anthropic => &["ANTHROPIC_OAUTH_TOKEN"],
+        // dirge-ro8g: ANTHROPIC_OAUTH_TOKEN is an OAuth bearer
+        // (`sk-ant-oat…`), NOT an x-api-key — it needs the Bearer
+        // header + oauth beta + payload shaping that
+        // AnthropicHttpClient adds, so sending it as an API key is
+        // rejected. Its presence now implies ProviderAuth::Anthropic
+        // (see client.rs `effective_auth`), routing it through
+        // `resolve_anthropic_auth`. So it must NOT be an API-key
+        // fallback here (was `&["ANTHROPIC_OAUTH_TOKEN"]`).
+        ProviderKind::Anthropic => &[],
         // Google's generative-language SDK (and the official
         // gemini-cli) uses GOOGLE_GENERATIVE_AI_API_KEY. dirge's
         // primary GEMINI_API_KEY matches the provider name in the
@@ -558,5 +560,22 @@ where
             "No API key found for {kind:?}. Set {env_var} (or one of: {}) or pass --api-key.{keyless_hint}",
             fallbacks.join(", ")
         )
+    }
+}
+
+#[cfg(test)]
+mod ro8g_tests {
+    use super::*;
+
+    /// dirge-ro8g: ANTHROPIC_OAUTH_TOKEN is an OAuth bearer (needs the
+    /// Bearer header + oauth beta + payload shaping AnthropicHttpClient
+    /// adds), NOT an x-api-key. It must not appear in the API-key fallback
+    /// list — its presence now routes through ProviderAuth::Anthropic.
+    #[test]
+    fn anthropic_oauth_token_is_not_an_api_key_fallback() {
+        assert!(
+            !provider_env_var_fallbacks(ProviderKind::Anthropic).contains(&"ANTHROPIC_OAUTH_TOKEN"),
+            "ANTHROPIC_OAUTH_TOKEN must not be treated as an API key"
+        );
     }
 }
