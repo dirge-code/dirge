@@ -339,7 +339,7 @@ async fn transient_blips_separated_by_healthy_turns_do_not_accumulate() {
     let counter = std::sync::Arc::new(AtomicUsize::new(0));
     let factory: StreamFn = std::sync::Arc::new(move |_ctx, _opts| {
         let n = counter.fetch_add(1, Ordering::SeqCst);
-        let blip = n % 2 == 0 && n <= 6;
+        let blip = n.is_multiple_of(2) && n <= 6;
         if blip {
             let partial = AssistantMessage::new(
                 vec![ContentBlock::Text {
