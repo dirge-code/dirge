@@ -241,8 +241,14 @@ impl Tool for SkillTool {
                 self.manager
                     .patch(name, old_string, new_string)
                     .map_err(ToolError::Msg)?;
-                // Bump patch counter (best-effort).
                 if let Some(store) = &self.store {
+                    // dirge-vo6p(c): patch mutates SKILL.md on disk but the DB
+                    // content/FTS were never refreshed, so search matched stale
+                    // text until the next session. Re-register from the patched
+                    // file (description re-derived from its frontmatter).
+                    if let Ok(content) = self.manager.read_content(name) {
+                        let _ = store.register_file_skill(name, "", &content, false);
+                    }
                     store.record_patch(name);
                 }
                 Ok(format!("Skill '{}' patched.", name))
@@ -783,6 +789,42 @@ mod tests {
         assert!(
             result.is_err(),
             "file-provenance skill must be refused; got {result:?}"
+        );
+    }
+
+    /// dirge-vo6p(c): the `patch` action mutated SKILL.md on disk but never
+    /// refreshed the DB content/FTS, so search kept matching the pre-patch
+    /// text until the next session. After a patch the new text must be
+    /// searchable and the stale text gone.
+    #[test]
+    fn patch_refreshes_db_content_for_search() {
+        let (tool, _dir, store) = store_backed_tool();
+        let rt = make_runtime();
+        create_skill(&tool, &rt, "searchme");
+        assert_eq!(
+            store.search("body").unwrap().len(),
+            1,
+            "original body text is searchable after create"
+        );
+
+        rt.block_on(tool.call(SkillArgs {
+            action: "patch".into(),
+            name: Some("searchme".into()),
+            content: None,
+            old_string: Some("body".into()),
+            new_string: Some("ripgrepmarker".into()),
+            force: None,
+        }))
+        .unwrap();
+
+        assert_eq!(
+            store.search("ripgrepmarker").unwrap().len(),
+            1,
+            "patched text must be searchable in the DB"
+        );
+        assert!(
+            store.search("body").unwrap().is_empty(),
+            "stale pre-patch text must no longer match"
         );
     }
 

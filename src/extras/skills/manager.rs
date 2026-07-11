@@ -207,7 +207,6 @@ impl SkillManager {
     }
 
     /// Read a skill's full SKILL.md content.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn read_content(&self, name: &str) -> Result<String, String> {
         let path = self.skills_dir.join(name).join("SKILL.md");
         std::fs::read_to_string(&path).map_err(|e| format!("Failed to read skill '{}': {e}", name))
