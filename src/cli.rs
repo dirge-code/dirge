@@ -382,34 +382,54 @@ impl Cli {
     }
 
     pub fn resolve_provider(&self, cfg: &config::Config) -> CompactString {
-        let explicit = self.provider.as_deref().or(cfg.provider.as_deref());
-        match pick_provider(
-            explicit,
-            crate::provider::auto_detect_provider(),
-            crate::provider::auth_detect_provider(),
-        ) {
-            ProviderPick::Explicit(p) => CompactString::new(p),
-            // PROV-4: log when autodetect picks a provider from env vars
-            // so users with multiple API keys set understand which one
-            // is being used. Resolution order is fixed and deepseek wins
-            // over openrouter if both are present — surprising silent
-            // behavior previously.
-            ProviderPick::Env(detected) => {
-                eprintln!(
-                    "info: provider auto-detected from environment: {detected} (set `--provider` or `provider` in config.json to override)",
-                );
-                CompactString::new(detected)
-            }
-            // GH #617: a stored `dirge auth` login is enough to launch,
-            // even with no API-key env var or `provider` in config.
-            ProviderPick::Auth(authed) => {
-                eprintln!(
-                    "info: provider selected from stored `dirge auth` login: {authed} (set `--provider` or `provider` in config.json to override)",
-                );
-                CompactString::new(authed)
-            }
-            ProviderPick::Default => CompactString::new("openrouter"),
+        // An explicit `--provider` / config `provider` always wins and needs
+        // no detection or notice — return it directly.
+        if let Some(p) = self.provider.as_deref().or(cfg.provider.as_deref()) {
+            return CompactString::new(p);
         }
+
+        // dirge-qj75: no explicit provider — auto-detect ONCE per process and
+        // cache. resolve_provider is re-invoked on every agent (re)build (loop
+        // model-swaps, plan toggles) and by several session handlers; without
+        // this the disk probes (OpenAI auth store + a `~/.claude/.credentials
+        // .json` stat) re-ran and the auto-detect notice reprinted each time —
+        // landing mid-alt-screen in the TUI. Caching also pins the choice so a
+        // mid-run env change can't diverge a rebuilt agent's provider (and its
+        // chunk-timeout) from the client already in use.
+        static DETECTED: std::sync::OnceLock<CompactString> = std::sync::OnceLock::new();
+        DETECTED
+            .get_or_init(|| {
+                match pick_provider(
+                    None,
+                    crate::provider::auto_detect_provider(),
+                    crate::provider::auth_detect_provider(),
+                ) {
+                    // PROV-4: log when autodetect picks a provider from env vars
+                    // so users with multiple API keys set understand which one
+                    // is being used. Resolution order is fixed and deepseek wins
+                    // over openrouter if both are present — surprising silent
+                    // behavior previously.
+                    ProviderPick::Env(detected) => {
+                        eprintln!(
+                            "info: provider auto-detected from environment: {detected} (set `--provider` or `provider` in config.json to override)",
+                        );
+                        CompactString::new(detected)
+                    }
+                    // GH #617: a stored `dirge auth` login is enough to launch,
+                    // even with no API-key env var or `provider` in config.
+                    ProviderPick::Auth(authed) => {
+                        eprintln!(
+                            "info: provider selected from stored `dirge auth` login: {authed} (set `--provider` or `provider` in config.json to override)",
+                        );
+                        CompactString::new(authed)
+                    }
+                    ProviderPick::Default => CompactString::new("openrouter"),
+                    // Unreachable: `explicit` is None here, so pick_provider
+                    // never returns Explicit. Handle defensively.
+                    ProviderPick::Explicit(p) => CompactString::new(p),
+                }
+            })
+            .clone()
     }
 
     pub fn resolve_max_tokens(&self, cfg: &config::Config) -> u64 {
@@ -514,6 +534,27 @@ mod tests {
     fn pick_provider_falls_back_to_default_when_nothing_set() {
         let pick = pick_provider(None, None, None);
         assert!(matches!(pick, ProviderPick::Default));
+    }
+
+    /// dirge-qj75: an explicit `--provider` is returned verbatim — no
+    /// detection probes, no auto-detect notice — no matter the env/auth state.
+    #[test]
+    fn resolve_provider_returns_explicit_flag_verbatim() {
+        let cli = Cli::try_parse_from(["dirge", "--provider", "glm"]).unwrap();
+        let cfg = config::Config::default();
+        assert_eq!(cli.resolve_provider(&cfg).as_str(), "glm");
+    }
+
+    /// dirge-qj75: with no CLI flag, the config `provider` is the explicit
+    /// source and likewise bypasses detection.
+    #[test]
+    fn resolve_provider_uses_config_provider_when_no_flag() {
+        let cli = Cli::try_parse_from(["dirge"]).unwrap();
+        let cfg = config::Config {
+            provider: Some("deepseek".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(cli.resolve_provider(&cfg).as_str(), "deepseek");
     }
 
     #[test]

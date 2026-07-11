@@ -99,7 +99,13 @@ fn resolve_chatgpt_auth_from_with_dirge_oauth(
         Ok(Some(credential)) => {
             return Ok(ProviderAuthHeaders {
                 bearer_token: credential.access_token().to_string(),
-                chatgpt_account_id: credential.account_id().map(str::to_string),
+                // dirge-l7xy: fall back to the CHATGPT_ACCOUNT_ID env value when
+                // the credential carries no account id, mirroring the env-token
+                // branch — otherwise setting the env var did nothing here.
+                chatgpt_account_id: credential
+                    .account_id()
+                    .map(str::to_string)
+                    .or_else(|| normalize_optional_string(chatgpt_account_id.clone())),
                 // Dirge's own OAuth token — refreshable mid-session.
                 chatgpt_bearer_is_dirge_oauth: true,
             });
@@ -143,7 +149,11 @@ fn resolve_chatgpt_auth_from_with_dirge_oauth(
             "account_id",
             "accountId",
         ],
-    );
+    )
+    // dirge-l7xy: a legacy auth.json whose token lacks an account id used to
+    // fail with "set CHATGPT_ACCOUNT_ID", but setting it did nothing because
+    // this branch read only the file. Fall back to the env value.
+    .or_else(|| normalize_optional_string(chatgpt_account_id));
 
     Ok(ProviderAuthHeaders {
         bearer_token,
@@ -469,6 +479,59 @@ mod tests {
         assert!(!headers.chatgpt_bearer_is_dirge_oauth);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// dirge-l7xy: a legacy auth.json whose token lacks an account id used to
+    /// fail with "set CHATGPT_ACCOUNT_ID", but the file branch read only the
+    /// file — so setting the env var didn't help. It's now a fallback.
+    #[test]
+    fn env_account_id_fills_in_for_accountless_codex_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "dirge-chatgpt-auth-envfallback-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("auth.json");
+        // No account_id anywhere in the file.
+        std::fs::write(&path, r#"{ "tokens": { "access_token": "codex-token" } }"#).unwrap();
+
+        let headers = resolve_chatgpt_auth_from_with_dirge_oauth(
+            None,
+            Some("acct-env".to_string()),
+            path,
+            || Ok(None),
+        )
+        .unwrap();
+
+        assert_eq!(headers.bearer_token, "codex-token");
+        assert_eq!(headers.chatgpt_account_id.as_deref(), Some("acct-env"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// dirge-l7xy: same fallback on the Dirge-OAuth branch — a credential with
+    /// no account id picks up CHATGPT_ACCOUNT_ID rather than sending none.
+    #[test]
+    fn env_account_id_fills_in_for_accountless_dirge_oauth() {
+        let headers = resolve_chatgpt_auth_from_with_dirge_oauth(
+            None,
+            Some("acct-env".to_string()),
+            PathBuf::from("/should/not/be/read"),
+            || {
+                Ok(Some(OpenAiOAuthCredential::new(
+                    "dirge-token",
+                    "refresh-token",
+                    None,
+                    None, // credential carries no account id
+                    i64::MAX,
+                )))
+            },
+        )
+        .unwrap();
+
+        assert_eq!(headers.bearer_token, "dirge-token");
+        assert_eq!(headers.chatgpt_account_id.as_deref(), Some("acct-env"));
+        assert!(headers.chatgpt_bearer_is_dirge_oauth);
     }
 
     #[test]
