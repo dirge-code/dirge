@@ -348,27 +348,35 @@ fn pick_provider<'a>(
 }
 
 impl Cli {
+    /// The provider entry that model / temperature / explicitness resolve
+    /// from. When `--provider` / `DIRGE_PROVIDER` overrides the config
+    /// default, that is the OVERRIDING provider's own entry (absent →
+    /// `None`); the config `Default` role — which tracks `cfg.provider` —
+    /// must NOT be consulted, or `--provider openai` would still load the
+    /// config-default provider's model/temperature and send it to OpenAI
+    /// (404). Without an override, the `Default` role's entry (dirge-314i).
+    pub(crate) fn resolution_entry(&self, cfg: &config::Config) -> Option<config::ProviderEntry> {
+        if let Some(provider) = self.provider.as_deref().filter(|p| !p.is_empty()) {
+            return cfg.providers.as_ref().and_then(|providers| {
+                providers
+                    .get(provider)
+                    .or_else(|| providers.get(&provider.to_ascii_lowercase()))
+                    .cloned()
+            });
+        }
+        cfg.resolve_role(config::ConfigRole::Default)
+            .map(|(_, entry)| entry)
+    }
+
     pub fn resolve_model(&self, cfg: &config::Config) -> CompactString {
         if let Some(m) = self.model.as_deref() {
             return CompactString::new(m);
         }
-        // When `--provider` overrides the config default, take the model from
-        // THAT provider's entry — otherwise `--provider ollama` switches the
-        // endpoint but still loads the config default provider's model (the
-        // `Default` role below tracks `cfg.provider`, not the CLI override).
-        if let Some(provider) = self.provider.as_deref().filter(|p| !p.is_empty())
-            && let Some(providers) = cfg.providers.as_ref()
-            && let Some(entry) = providers
-                .get(provider)
-                .or_else(|| providers.get(&provider.to_ascii_lowercase()))
-            && let Some(m) = entry.model.as_deref()
-        {
-            return CompactString::new(m);
-        }
-        if let Some((_, entry)) = cfg.resolve_role(config::ConfigRole::Default)
-            && let Some(m) = entry.model
-        {
-            return CompactString::new(m);
+        // Model comes from the effective provider entry (the `--provider`
+        // override's, or the `Default` role's) — never a cross-provider
+        // fall-through to the config default (dirge-314i).
+        if let Some(m) = self.resolution_entry(cfg).and_then(|e| e.model) {
+            return CompactString::new(&m);
         }
         CompactString::new("deepseek/deepseek-v4-flash")
     }
@@ -415,8 +423,12 @@ impl Cli {
         if let Some(t) = self.temperature {
             return Some(t);
         }
-        if let Some((_, entry)) = cfg.resolve_role(config::ConfigRole::Default)
-            && let Some(t) = entry.options_temperature()
+        // Same effective-entry rule as the model: a `--provider` override
+        // reads temperature from ITS entry, not the config-default provider's
+        // (dirge-314i).
+        if let Some(t) = self
+            .resolution_entry(cfg)
+            .and_then(|e| e.options_temperature())
         {
             return Some(t);
         }
@@ -589,6 +601,63 @@ mod tests {
             cli.resolve_model(&cfg_with_glm_default_and_ollama()),
             "llama3.1"
         );
+    }
+
+    #[test]
+    fn resolve_model_override_to_provider_without_entry_does_not_leak_config_default() {
+        // dirge-314i: `--provider openai` with NO openai entry must NOT fall
+        // through to the config-default (glm) provider's model — sending
+        // glm-5.2 to an OpenAI client 404s. resolution_entry returns None, so
+        // the model is NOT the config default's; main.rs then sees
+        // model_explicit=false and picks OpenAI's own default via
+        // default_model_for_alias.
+        let cli = Cli::parse_from(["dirge", "--provider", "openai"]);
+        let got = cli.resolve_model(&cfg_with_glm_default_and_ollama());
+        assert_ne!(
+            got, "glm-5.2",
+            "override to a provider without an entry must not load the config-default model"
+        );
+        // And with no explicit model, the override provider yields no
+        // config_model, so it is treated as NOT explicit.
+        assert!(
+            cli.resolution_entry(&cfg_with_glm_default_and_ollama())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn resolve_temperature_override_ignores_config_default_providers_temp() {
+        // dirge-314i: give the config-default (glm) a temperature via options;
+        // override to `openai` (no entry). resolve_temperature must NOT return
+        // glm's — it falls through to config.temperature / unset instead.
+        let mut providers = std::collections::HashMap::new();
+        providers.insert(
+            "glm".to_string(),
+            config::ProviderEntry {
+                model: Some("glm-5.2".to_string()),
+                options: Some(
+                    serde_json::json!({ "temperature": 0.9 })
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
+                ..Default::default()
+            },
+        );
+        let cfg = config::Config {
+            provider: Some("glm".to_string()),
+            providers: Some(providers),
+            ..Default::default()
+        };
+        let cli = Cli::parse_from(["dirge", "--provider", "openai"]);
+        assert_eq!(
+            cli.resolve_temperature(&cfg),
+            None,
+            "override to a provider without an entry must not inherit glm's temperature"
+        );
+        // Sanity: without the override, glm's temperature IS used.
+        let cli_no_override = Cli::parse_from(["dirge"]);
+        assert_eq!(cli_no_override.resolve_temperature(&cfg), Some(0.9));
     }
 
     #[test]

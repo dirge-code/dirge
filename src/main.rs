@@ -736,9 +736,12 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let provider = cli.resolve_provider(&cfg);
-    let config_model = cfg
-        .resolve_role(config::ConfigRole::Default)
-        .and_then(|(_, e)| e.model);
+    // dirge-314i: read the model from the EFFECTIVE provider entry (the
+    // `--provider` override's, or the Default role's). Reading the Default
+    // role here made a `--provider openai` override inherit glm's model and
+    // flagged it `explicit`, so the Codex-default substitution and
+    // per-alias default were both skipped and glm-5.2 went to OpenAI (404).
+    let config_model = cli.resolution_entry(&cfg).and_then(|e| e.model);
     // dirge-ovjk: whether the model was explicitly chosen (via --model or a
     // provider entry's `model`) vs defaulted. The Codex-default substitution
     // must fire only for the defaulted case, so an explicit `gpt-4o` under a
