@@ -240,6 +240,25 @@ mod tests {
             );
         }
     }
+
+    /// dirge-3yak: the semantic mutator list had drifted from the coarse
+    /// one — `truncate`, `install`, `shred` were missing, so their path
+    /// operands never routed through the Edit gate in the default build.
+    /// Both extractors now share one list.
+    #[test]
+    fn mutation_paths_cover_truncate_install_shred() {
+        for (cmd, want) in [
+            ("truncate -s 0 /etc/passwd", "/etc/passwd"),
+            ("shred /etc/shadow", "/etc/shadow"),
+            ("install /dev/null /etc/hosts", "/etc/hosts"),
+        ] {
+            let p = crate::semantic::adapters::bash::extract_mutation_paths(cmd);
+            assert!(
+                p.contains(&want.to_string()),
+                "mutator {cmd:?} must surface {want:?}; got: {p:?}"
+            );
+        }
+    }
 }
 
 /// C4 (audit fix): extract redirect target paths from a bash
@@ -307,9 +326,8 @@ pub fn extract_redirect_targets(command: &str) -> Vec<String> {
 /// Skip arg index 0 for those commands.
 #[cfg(feature = "semantic-bash")]
 pub fn extract_mutation_paths(command: &str) -> Vec<String> {
-    const FILE_MUTATORS: &[&str] = &[
-        "rm", "cp", "mv", "mkdir", "rmdir", "touch", "chmod", "chown", "ln", "tee", "dd",
-    ];
+    // Single source of truth shared with the coarse fallback (dirge-3yak).
+    use crate::permission::engine::types::FILE_MUTATORS;
 
     use tree_sitter::Parser;
     let lang: tree_sitter::Language = tree_sitter_bash::LANGUAGE.into();

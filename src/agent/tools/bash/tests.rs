@@ -571,6 +571,41 @@ async fn rm_arg_path_routes_through_write_rules() {
     );
 }
 
+/// dirge-3yak: `truncate`/`install`/`shred` had drifted OUT of the
+/// semantic mutator list, so in the default build their path operands
+/// never hit the write gate — a `bash: {"truncate *": allow}` (or any
+/// execute allow covering them) let `truncate -s0 /etc/passwd` clobber an
+/// out-of-tree file the edit rules were meant to protect. Now gated.
+#[cfg(feature = "semantic-bash")]
+#[tokio::test]
+async fn truncate_install_shred_arg_paths_route_through_write_rules() {
+    use crate::permission::{
+        Action, OpSpec, PermissionConfig, SecurityMode, checker::PermissionChecker,
+    };
+    for cmd in [
+        "truncate -s 0 /etc/passwd",
+        "shred /etc/passwd",
+        "install /dev/null /etc/passwd",
+    ] {
+        // Permissive execute for the tool; restrictive edit on /etc.
+        let head = cmd.split_whitespace().next().unwrap();
+        let config = PermissionConfig {
+            rules: vec![
+                rule(OpSpec::Execute, &format!("{head} *"), Action::Allow),
+                rule(OpSpec::Edit, "/etc/**", Action::Deny),
+            ],
+            ..Default::default()
+        };
+        let checker = PermissionChecker::new(&config, SecurityMode::Standard, None);
+        let perm = std::sync::Arc::new(std::sync::Mutex::new(checker));
+        let result = check_bash_segments(&Some(perm), &None, cmd).await;
+        assert!(
+            result.is_err(),
+            "{cmd:?} must hit the write deny rule even when execute is allowed; got {result:?}",
+        );
+    }
+}
+
 /// chmod's FIRST arg (the mode spec like `777` or `u+x`) is
 /// NOT treated as a path. Only subsequent positional args go
 /// through the write check.

@@ -228,6 +228,19 @@ fn basename(tok: &str) -> &str {
     tok.rsplit('/').next().unwrap_or(tok)
 }
 
+/// File-mutating commands whose positional path operands must route
+/// through an Edit claim (so the write deny-lists + external-dir gate
+/// govern them). The SINGLE source of truth for both bash extractors —
+/// the tree-sitter one (`semantic::adapters::bash::extract_mutation_paths`)
+/// and the coarse fallback (`agent::tools::bash::check::coarse_mutation_paths`).
+/// They had drifted (`truncate`/`install`/`shred` were missing from the
+/// semantic list), so those commands bypassed the write gate in the default
+/// build — dirge-3yak. Keep them consuming this one list.
+pub const FILE_MUTATORS: &[&str] = &[
+    "rm", "cp", "mv", "mkdir", "rmdir", "touch", "chmod", "chown", "ln", "tee", "dd", "truncate",
+    "install", "shred",
+];
+
 /// Index into `tokens` of the real command head, skipping leading env
 /// assignments (`FOO=1`) and known exec wrappers (`nohup`/`time`/`nice`/
 /// `timeout`/`env`) together with the wrapper args they consume. Returns

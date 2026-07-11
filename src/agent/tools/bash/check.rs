@@ -486,14 +486,6 @@ pub(super) fn coarse_redirect_targets(command: &str) -> Vec<String> {
     targets
 }
 
-/// Known file-mutating commands whose path operands must route through
-/// an Edit claim on the no-`semantic-bash` build.
-#[cfg(not(feature = "semantic-bash"))]
-const COARSE_MUTATORS: &[&str] = &[
-    "rm", "cp", "mv", "mkdir", "rmdir", "touch", "chmod", "chown", "ln", "dd", "truncate", "tee",
-    "install", "shred",
-];
-
 /// dirge-9bqy: coarse mutation-path scan for the no-`semantic-bash`
 /// build. For each split segment whose command head is a known mutator,
 /// treat non-flag operands as write targets so the write rules + external-
@@ -512,7 +504,8 @@ pub(super) fn coarse_mutation_paths(command: &str) -> Vec<String> {
             continue;
         };
         let base = head.rsplit('/').next().unwrap_or(head);
-        if !COARSE_MUTATORS.contains(&base) {
+        // Single source of truth shared with the semantic extractor (dirge-3yak).
+        if !crate::permission::engine::types::FILE_MUTATORS.contains(&base) {
             continue;
         }
         for &t in &toks[start + 1..] {
