@@ -383,14 +383,21 @@ pub(crate) fn scan_untrusted(content: &str) -> InjectionReport {
 
     // 4. LinkExfiltration.
     for (re, label) in LINK_EXFIL_PATTERNS.iter() {
-        // For data: URIs, only flag if the MIME is NOT image/ or font/.
-        if let Some(m) = re.find(content) {
-            let matched = m.as_str();
-            if *label == "data: URI"
-                && (matched.starts_with("data:image/") || matched.starts_with("data:font/"))
-            {
-                continue;
-            }
+        let flagged = if *label == "data: URI" {
+            // dirge-9iof: inspect EVERY data: match, not just the first. A
+            // single content can carry an allowlisted `data:image/` and a
+            // LATER `data:text/html,<script>`; the old `re.find` +
+            // `continue` stopped at the first (allowlisted) match and never
+            // saw the payload. Flag if ANY match is outside the image/font
+            // allowlist.
+            re.find_iter(content).any(|m| {
+                let matched = m.as_str();
+                !(matched.starts_with("data:image/") || matched.starts_with("data:font/"))
+            })
+        } else {
+            re.is_match(content)
+        };
+        if flagged {
             report
                 .hits
                 .push((InjectionCategory::LinkExfiltration, label));
@@ -599,6 +606,26 @@ mod tests {
             !report
                 .categories()
                 .contains(&InjectionCategory::LinkExfiltration)
+        );
+    }
+
+    #[test]
+    fn scan_untrusted_data_image_does_not_mask_later_html_payload() {
+        // dirge-9iof: a first, allowlisted data:image/ must NOT suppress a
+        // LATER data:text/html,<script> in the same content. The scanner
+        // used `re.find` (first match only) and `continue`d past the whole
+        // pattern once the first match was allowlisted.
+        let report = scan_untrusted(
+            "inline image data:image/png;base64,iVBORw0KGgo= then \
+             data:text/html,<script>alert(1)</script>",
+        );
+        assert!(
+            report
+                .categories()
+                .contains(&InjectionCategory::LinkExfiltration),
+            "a later data:text/html payload must be flagged even after an \
+             allowlisted data:image/, got: {:?}",
+            report.hits
         );
     }
 
