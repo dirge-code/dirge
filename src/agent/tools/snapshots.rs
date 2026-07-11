@@ -100,11 +100,25 @@ pub fn begin_turn(turn_id: &str) {
         turn_id: turn_id.to_string(),
         captures: IndexMap::new(),
     });
-    // Evict oldest turns past the cap; pool entries they alone
-    // referenced drop when their Arcs go.
+    // Evict oldest turns past the cap.
     while s.turns.len() > MAX_TURNS {
         s.turns.remove(0);
     }
+    // dirge-7dob: then release any pool content the evicted turns alone
+    // held — the pool's own strong Arc keeps a blob's refcount above zero
+    // otherwise, so without this a long run accumulates every unique
+    // pre-edit blob forever (MAX_TURNS caps buckets, not the pool).
+    prune_pool(&mut s);
+}
+
+/// dirge-7dob: drop pooled content no live turn bucket still references.
+/// `intern` keeps a strong Arc in the pool for every blob, so evicting or
+/// rewinding a bucket never brings a content's refcount to zero on its
+/// own; `strong_count == 1` means only the pool holds it now. Runs under
+/// the store lock, so no concurrent `intern`/`restore` can be mid-flight
+/// with a bucket-less clone that would make the count read high.
+fn prune_pool(store: &mut Store) {
+    store.pool.retain(|_, arc| Arc::strong_count(arc) > 1);
 }
 
 /// Intern `bytes` through the dedup pool, returning a shared handle.
@@ -231,8 +245,12 @@ pub fn restore_from(turn_id: &str) -> Vec<PathBuf> {
         }
     }
 
-    // Drop the rewound turns.
+    // Drop the rewound turns, then release any pool content they alone
+    // held (dirge-7dob). `targets` still owns Arc clones of that content,
+    // so drop it first or the strong_count check would keep them.
+    drop(targets);
     s.turns.truncate(idx);
+    prune_pool(&mut s);
     restored
 }
 
@@ -438,6 +456,57 @@ mod tests {
                 s.pool.len(),
                 1,
                 "identical content must dedup to one object"
+            );
+        });
+    }
+
+    fn pool_len() -> usize {
+        STORE.lock_ignore_poison().pool.len()
+    }
+
+    // dirge-7dob: the pool held a strong Arc per interned blob, so evicting
+    // a turn bucket never dropped its content's refcount to zero — the pool
+    // grew without bound (every unique pre-edit, up to 8 MiB) for the life
+    // of the process. Evicting the turn that alone held a blob must drop it.
+    #[test]
+    fn pool_prunes_content_from_evicted_turns() {
+        isolated(|dir| {
+            let p = dir.join("a.txt");
+            std::fs::write(&p, "unique-old-content").unwrap();
+            begin_turn("u0");
+            capture(&p);
+            std::fs::write(&p, "mutated").unwrap();
+            assert_eq!(pool_len(), 1, "content is pooled after capture");
+
+            // Push past the retention cap so u0 is evicted.
+            for i in 0..(MAX_TURNS + 1) {
+                begin_turn(&format!("t{i}"));
+            }
+            assert_eq!(
+                pool_len(),
+                0,
+                "the evicted turn's pooled content must be dropped, not leaked"
+            );
+        });
+    }
+
+    // A /rewind that drops turn buckets must likewise release the pool
+    // content those buckets alone referenced.
+    #[test]
+    fn pool_prunes_content_after_rewind() {
+        isolated(|dir| {
+            let p = dir.join("a.txt");
+            std::fs::write(&p, "pre-rewind").unwrap();
+            begin_turn("u1");
+            capture(&p);
+            std::fs::write(&p, "post").unwrap();
+            assert_eq!(pool_len(), 1);
+
+            restore_from("u1"); // drops the u1 bucket
+            assert_eq!(
+                pool_len(),
+                0,
+                "rewound turn's pooled content must be released"
             );
         });
     }

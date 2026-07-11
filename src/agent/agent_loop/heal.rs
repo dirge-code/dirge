@@ -33,68 +33,40 @@ pub const DEFAULT_MAX_RESULT_CHARS: usize = 40_000;
 // Port of `shrinkOversizedToolResults` (shrink.ts:17-32)
 // ================================================================
 
-/// Shrink any tool-result message whose content string exceeds
-/// `max_chars`. Matches both `role: "tool"` (heal shape) and
-/// `role: "toolResult"` (loop transcript shape).
-/// LOOP-7: added toolResult role support.
+/// Shrink any tool-result message whose content exceeds `max_chars`.
+/// Matches both `role: "tool"` (heal shape) and `role: "toolResult"`
+/// (loop transcript shape).
+///
+/// dirge-unqq: delegates to [`compression::cap_oversized_tool_results`],
+/// which caps BOTH the scalar-string shape AND the block-array shape
+/// (`content: [{type:"text", text:"..."}, ...]`) production tool results
+/// use. The old `as_str()`-only path saw `""` for the block-array shape,
+/// so on every real resume (rig_history_to_loop_messages ->
+/// heal_loaded_messages) the shrink silently no-oped and the reported
+/// counts under-counted. It also measured bytes against a char budget.
 pub fn shrink_oversized_tool_results(messages: &[Value], max_chars: usize) -> HealResult {
+    use crate::agent::compression;
+    // The capper takes a token budget and multiplies it back out by
+    // CHARS_PER_TOKEN; div_ceil keeps the effective char cap >= max_chars.
+    let max_tokens = (max_chars as u64).div_ceil(compression::CHARS_PER_TOKEN);
+    let capped = compression::cap_oversized_tool_results(messages, max_tokens);
+
+    // Report what actually changed (both shapes) for the heal log.
     let mut healed_count = 0usize;
     let mut chars_saved = 0usize;
-    let out: Vec<Value> = messages
-        .iter()
-        .map(|msg| {
-            let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
-            if role != "tool" && role != "toolResult" {
-                return msg.clone();
-            }
-            let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
-            if content.len() <= max_chars {
-                return msg.clone();
-            }
+    for (before, after) in messages.iter().zip(&capped) {
+        let before_len = compression::content_chars(before.get("content"));
+        let after_len = compression::content_chars(after.get("content"));
+        if after_len < before_len {
             healed_count += 1;
-            chars_saved += content.len().saturating_sub(max_chars);
-            let truncated = truncate_for_model(content, max_chars);
-            let mut m = msg.clone();
-            m["content"] = Value::String(truncated);
-            m
-        })
-        .collect();
+            chars_saved += before_len - after_len;
+        }
+    }
     HealResult {
-        messages: out,
+        messages: capped,
         healed_count,
         chars_saved,
     }
-}
-
-/// Truncate a string to `max_chars` while keeping the beginning
-/// more useful than the end.
-fn truncate_for_model(content: &str, max_chars: usize) -> String {
-    if content.len() <= max_chars || max_chars < 2 {
-        return content.to_string();
-    }
-    let head_pct = 0.7;
-    let head_chars = (max_chars as f64 * head_pct) as usize;
-    let tail_chars = max_chars.saturating_sub(head_chars);
-    let head = &content[..content
-        .char_indices()
-        .nth(head_chars)
-        .map(|(i, _)| i)
-        .unwrap_or(content.len())
-        .min(content.len())];
-    let tail = if tail_chars > 0 {
-        let tail_start = content
-            .char_indices()
-            .nth_back(tail_chars.saturating_sub(1))
-            .map(|(i, _)| i)
-            .unwrap_or(content.len());
-        &content[tail_start..]
-    } else {
-        ""
-    };
-    format!(
-        "{head}\n...[truncated {} chars]...\n{tail}",
-        content.len() - max_chars,
-    )
 }
 
 // ================================================================
@@ -300,6 +272,27 @@ mod tests {
         let r = shrink_oversized_tool_results(&msgs, 40_000);
         assert_eq!(r.healed_count, 0);
         assert_eq!(r.messages[0]["content"].as_str().unwrap(), long);
+    }
+
+    // dirge-unqq: the loop-transcript shape — tool result content is a
+    // block array, not a scalar string. The old as_str()-only path saw ""
+    // and silently no-oped on every real resume, so healed_count and
+    // chars_saved under-reported. Delegating to the compression cap fixes
+    // both shapes.
+    #[test]
+    fn shrink_truncates_block_array_tool_results() {
+        let long = "y".repeat(100_000);
+        let msgs = vec![tool_result_msg(&long, "c1", "grep")];
+        let r = shrink_oversized_tool_results(&msgs, 40_000);
+        assert_eq!(r.healed_count, 1, "block-array tool result must be shrunk");
+        assert!(
+            r.chars_saved > 50_000,
+            "chars_saved must reflect the cut, got {}",
+            r.chars_saved
+        );
+        let text = r.messages[0]["content"][0]["text"].as_str().unwrap();
+        assert!(text.len() <= 40_100, "block text capped near the budget");
+        assert!(text.contains("truncated"));
     }
 
     #[test]

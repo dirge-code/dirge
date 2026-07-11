@@ -135,7 +135,7 @@ pub fn snip_bought_enough(freed: u64, ctx_max: u64, aggressive: bool) -> bool {
 /// the context-budget ladder, while the *post-response* decision uses the
 /// API's exact `prompt_tokens`. The two are different measurement points, not
 /// two estimators — see [`crate::agent::agent_loop::context_manager`].
-const CHARS_PER_TOKEN: u64 = 4;
+pub(crate) const CHARS_PER_TOKEN: u64 = 4;
 
 /// Hard floor for a compression model's context window (64K).
 #[allow(dead_code)]
@@ -193,7 +193,7 @@ pub fn estimate_messages_tokens(messages: &[Value]) -> u64 {
     (total_chars as u64).div_ceil(CHARS_PER_TOKEN)
 }
 
-fn content_chars(content: Option<&Value>) -> usize {
+pub(crate) fn content_chars(content: Option<&Value>) -> usize {
     match content {
         Some(Value::String(s)) => s.len(),
         Some(Value::Array(blocks)) => blocks.iter().filter_map(text_of_block).map(str::len).sum(),
