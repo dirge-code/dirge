@@ -142,6 +142,58 @@ where
     Ok(Some(AnyClient::OpenAI(client)))
 }
 
+/// dirge-pkh1: resolve a provider's base URL with ONE precedence for every
+/// provider — config (`config_url`, already scheme-validated upstream in
+/// `resolve.rs`) > provider env var > hard default.
+///
+/// Previously DeepSeek/GLM used `env > default` and IGNORED config, Custom
+/// used `config > env`, and everyone else was config-only — so a user who
+/// set `providers.deepseek.base_url` to a proxy was silently ignored. And
+/// the env-var URLs skipped `resolve.rs`'s https check entirely, so an
+/// http:// value in `DEEPSEEK_BASE_URL` / `GLM_BASE_URL` / `CUSTOM_BASE_URL`
+/// sent the API key in plaintext. Env-sourced URLs are https-checked here
+/// (they carry no `allow_insecure`); config URLs already passed their check,
+/// and the built-in defaults are https by construction.
+///
+/// `env` is injected so precedence is unit-testable without touching the
+/// process environment. OpenAI-OAuth / ChatGPT base URLs force the Codex
+/// endpoint in the caller and never come through here.
+fn resolve_provider_base_url(
+    kind: ProviderKind,
+    config_url: Option<String>,
+    env: impl Fn(&str) -> Option<String>,
+) -> anyhow::Result<Option<String>> {
+    if let Some(cfg) = config_url {
+        return Ok(Some(cfg)); // config wins — the user's explicit, validated intent
+    }
+    let (env_var, default): (Option<&str>, Option<&str>) = match kind {
+        ProviderKind::DeepSeek => (
+            Some("DEEPSEEK_BASE_URL"),
+            Some("https://api.deepseek.com/v1"),
+        ),
+        ProviderKind::Glm => (
+            Some("GLM_BASE_URL"),
+            Some("https://open.bigmodel.cn/api/coding/paas/v4"),
+        ),
+        ProviderKind::Custom => (Some("CUSTOM_BASE_URL"), None),
+        _ => (None, None),
+    };
+    if let Some(var) = env_var
+        && let Some(url) = env(var).filter(|u| !u.is_empty())
+    {
+        if !url.starts_with("https://") {
+            anyhow::bail!(
+                "${var} is `{url}`, but only https:// base URLs are accepted from the \
+                 environment (an http:// endpoint sends the API key in plaintext). Use \
+                 https://, or configure a `custom` provider with `allow_insecure: true` \
+                 for a local-only http endpoint."
+            );
+        }
+        return Ok(Some(url));
+    }
+    Ok(default.map(str::to_string))
+}
+
 #[cfg(test)]
 fn create_client_with<F, G>(
     provider_name: &str,
@@ -221,7 +273,9 @@ where
             info.api_key_literal.as_deref(),
             info.api_key_env.as_deref(),
             api_key,
-            env,
+            // Borrow so `env` stays available for the base-URL resolver below
+            // (`&F` implements `Fn` when `F: Fn`).
+            &env,
             load_openai_oauth,
         )?
     };
@@ -243,22 +297,15 @@ where
     let openai_oauth_account_id = credential.openai_oauth_account_id().map(str::to_string);
     let key = credential.into_secret();
     let base_url = match info.kind {
-        ProviderKind::DeepSeek => Some(
-            std::env::var("DEEPSEEK_BASE_URL")
-                .unwrap_or_else(|_| "https://api.deepseek.com/v1".to_string()),
-        ),
-        ProviderKind::Glm => Some(
-            std::env::var("GLM_BASE_URL")
-                .unwrap_or_else(|_| "https://open.bigmodel.cn/api/coding/paas/v4".to_string()),
-        ),
-        ProviderKind::Custom => info
-            .base_url
-            .or_else(|| std::env::var("CUSTOM_BASE_URL").ok()),
+        // OAuth / ChatGPT force the Codex endpoint (config may still point a
+        // ChatGPT client at a proxy); everyone else goes through the one
+        // shared config > env > default resolver (dirge-pkh1).
         ProviderKind::OpenAI if uses_openai_oauth => Some(CHATGPT_CODEX_BASE_URL.to_string()),
         ProviderKind::OpenAI if is_chatgpt_auth => info
             .base_url
+            .clone()
             .or_else(|| Some(CHATGPT_CODEX_BASE_URL.to_string())),
-        _ => info.base_url,
+        _ => resolve_provider_base_url(info.kind, info.base_url.clone(), &env)?,
     };
 
     // An OAuth login token — Codex/ChatGPT bearer, native Dirge OAuth, or an
@@ -675,6 +722,74 @@ mod tests {
 
     fn no_env(_: &str) -> Option<String> {
         None
+    }
+
+    // ── dirge-pkh1: base-URL resolution precedence + scheme validation ──
+
+    #[test]
+    fn base_url_config_wins_over_env_and_default() {
+        // DeepSeek/GLM used to IGNORE config base_url; now it wins.
+        let got = resolve_provider_base_url(
+            ProviderKind::DeepSeek,
+            Some("https://proxy.internal/v1".to_string()),
+            |_| Some("https://env.example/v1".to_string()),
+        )
+        .unwrap();
+        assert_eq!(got.as_deref(), Some("https://proxy.internal/v1"));
+    }
+
+    #[test]
+    fn base_url_env_wins_over_default_when_no_config() {
+        let got = resolve_provider_base_url(ProviderKind::Glm, None, |v| {
+            (v == "GLM_BASE_URL").then(|| "https://glm.proxy/v4".to_string())
+        })
+        .unwrap();
+        assert_eq!(got.as_deref(), Some("https://glm.proxy/v4"));
+    }
+
+    #[test]
+    fn base_url_falls_back_to_default() {
+        assert_eq!(
+            resolve_provider_base_url(ProviderKind::DeepSeek, None, no_env)
+                .unwrap()
+                .as_deref(),
+            Some("https://api.deepseek.com/v1")
+        );
+        assert_eq!(
+            resolve_provider_base_url(ProviderKind::Glm, None, no_env)
+                .unwrap()
+                .as_deref(),
+            Some("https://open.bigmodel.cn/api/coding/paas/v4")
+        );
+    }
+
+    #[test]
+    fn base_url_env_http_is_rejected() {
+        let err = resolve_provider_base_url(ProviderKind::DeepSeek, None, |_| {
+            Some("http://api.deepseek.com/v1".to_string())
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("https://"), "{err}");
+    }
+
+    #[test]
+    fn base_url_custom_config_over_env_no_default() {
+        let cfg = resolve_provider_base_url(
+            ProviderKind::Custom,
+            Some("https://cfg.example".to_string()),
+            |_| Some("https://env.example".to_string()),
+        )
+        .unwrap();
+        assert_eq!(cfg.as_deref(), Some("https://cfg.example"));
+        let env_only = resolve_provider_base_url(ProviderKind::Custom, None, |v| {
+            (v == "CUSTOM_BASE_URL").then(|| "https://env.example".to_string())
+        })
+        .unwrap();
+        assert_eq!(env_only.as_deref(), Some("https://env.example"));
+        assert_eq!(
+            resolve_provider_base_url(ProviderKind::Custom, None, no_env).unwrap(),
+            None
+        );
     }
 
     struct TestDir(std::path::PathBuf);
