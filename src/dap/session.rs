@@ -1135,21 +1135,30 @@ impl DapSessionManager {
     /// Disconnect from the debug adapter.
     pub async fn disconnect(&self, restart: bool, timeout: Duration) -> Result<(), ToolError> {
         let mut active = self.active.lock().await;
+        let mut result = Ok(());
         if let Some(session) = active.as_mut() {
             let args = DisconnectArgs {
                 restart: Some(restart),
                 terminate_debuggee: None,
                 extra: Default::default(),
             };
-            session
+            // dirge-ibq5: clear the slot even if the request fails. A crashed
+            // adapter returns ConnectionClosed here; propagating that with `?`
+            // BEFORE clearing left the dead session stuck active forever — the
+            // panel kept showing it and every op errored until a new launch
+            // called terminate_active. Mirror terminate_active: attempt the
+            // request, mark Terminated, and always clear `active`. The
+            // transport error is still returned so the caller learns it failed.
+            result = session
                 .client
                 .request::<_, Value>("disconnect", &args, timeout)
                 .await
-                .map_err(rpc_to_tool_error)?;
+                .map(|_: Value| ())
+                .map_err(rpc_to_tool_error);
             session.status = SessionStatus::Terminated;
         }
         *active = None;
-        Ok(())
+        result
     }
 
     /// Restart a stack frame — re-execute from the beginning of the frame.
@@ -1417,6 +1426,114 @@ mod tests {
         encode_frame(&mut writer, &serde_json::to_vec(&resp).unwrap())
             .await
             .unwrap();
+    }
+
+    /// dirge-ibq5: a fake adapter that completes the launch handshake, then
+    /// RETURNS — dropping its transport so a subsequent request (e.g.
+    /// `disconnect`) fails like a crashed adapter would.
+    async fn fake_launch_then_die(
+        mut reader: impl AsyncBufRead + Unpin,
+        mut writer: impl AsyncWrite + Unpin,
+    ) {
+        // initialize
+        let frame = decode_frame(&mut reader).await.unwrap();
+        let msg: Value = serde_json::from_slice(&frame).unwrap();
+        let seq = msg["seq"].as_u64().unwrap();
+        let resp = serde_json::json!({
+            "type": "response", "seq": 1, "request_seq": seq, "success": true,
+            "command": "initialize",
+            "body": { "supportsConfigurationDoneRequest": true }
+        });
+        encode_frame(&mut writer, &serde_json::to_vec(&resp).unwrap())
+            .await
+            .unwrap();
+
+        // launch
+        let frame = decode_frame(&mut reader).await.unwrap();
+        let msg: Value = serde_json::from_slice(&frame).unwrap();
+        let seq = msg["seq"].as_u64().unwrap();
+        let resp = serde_json::json!({
+            "type": "response", "seq": 2, "request_seq": seq, "success": true,
+            "command": "launch",
+        });
+        encode_frame(&mut writer, &serde_json::to_vec(&resp).unwrap())
+            .await
+            .unwrap();
+
+        // stopped (stopOnEntry)
+        let evt = serde_json::json!({
+            "type": "event", "seq": 3, "event": "stopped",
+            "body": { "reason": "entry", "threadId": 1 }
+        });
+        encode_frame(&mut writer, &serde_json::to_vec(&evt).unwrap())
+            .await
+            .unwrap();
+
+        // configurationDone
+        let frame = decode_frame(&mut reader).await.unwrap();
+        let msg: Value = serde_json::from_slice(&frame).unwrap();
+        let seq = msg["seq"].as_u64().unwrap();
+        let resp = serde_json::json!({
+            "type": "response", "seq": 4, "request_seq": seq, "success": true,
+            "command": "configurationDone",
+        });
+        encode_frame(&mut writer, &serde_json::to_vec(&resp).unwrap())
+            .await
+            .unwrap();
+        // Return — transport drops, the adapter is now "dead".
+    }
+
+    /// dirge-ibq5: disconnecting a crashed adapter must clear the active slot,
+    /// not leave the session stuck active. The disconnect request fails
+    /// (transport gone), but `active` is cleared so subsequent ops see no
+    /// session instead of erroring against a dead one forever.
+    #[cfg(feature = "dap")]
+    #[tokio::test]
+    async fn disconnect_clears_active_even_when_adapter_is_dead() {
+        let mgr = DapSessionManager::new();
+        let signal = AbortSignal::new();
+
+        let (client_side, server_side) = tokio::io::duplex(4096);
+        let (client_read, client_write) = tokio::io::split(client_side);
+        let (server_read, server_write) = tokio::io::split(server_side);
+        let (rpc, _read_task) = DapRpc::new(tokio::io::BufReader::new(client_read), client_write);
+        tokio::spawn(async move {
+            fake_launch_then_die(tokio::io::BufReader::new(server_read), server_write).await;
+        });
+        let client = DapClient::from_rpc(rpc, "fake-adapter");
+
+        let summary = mgr
+            .launch_with_client(
+                "fake-adapter",
+                "/tmp",
+                Some("prog"),
+                None,
+                &[],
+                Some(true),
+                None,
+                &signal,
+                client,
+                Duration::from_secs(5),
+                vec![],
+            )
+            .await
+            .expect("launch should succeed against the fake adapter");
+        assert_eq!(summary.status, SessionStatus::Stopped);
+
+        // Adapter is dead now; the disconnect request fails, but the slot must
+        // still be cleared (return value may be Err — we only care about state).
+        let _ = mgr.disconnect(false, Duration::from_secs(2)).await;
+
+        // Proof the slot is cleared: an op needing an active session reports
+        // none, rather than erroring against the dead adapter.
+        let err = mgr
+            .terminate(Duration::from_secs(2))
+            .await
+            .expect_err("no session should remain active");
+        assert!(
+            err.to_string().contains("no active debug session"),
+            "active session was not cleared; got: {err}"
+        );
     }
 
     /// Build a DapClient over duplex channels connected to a fake adapter.
