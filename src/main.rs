@@ -410,6 +410,25 @@ fn resume_staleness_warnings(
     out
 }
 
+/// dirge-08kq: whether a resume should adopt the session's SAVED provider
+/// (so the built client matches the model being restored) rather than the
+/// provider freshly re-resolved from CLI/config/env. True only on a plain
+/// resume, with no explicit `--provider`/`DIRGE_PROVIDER` override, when the
+/// session recorded a provider that differs from the re-resolved one — the
+/// case where a changed config default or a new `*_API_KEY` (shifting
+/// autodetect) would otherwise send the saved model to the wrong client.
+fn should_adopt_session_provider(
+    has_cli_provider_override: bool,
+    resumed: bool,
+    session_provider: &str,
+    resolved_provider: &str,
+) -> bool {
+    resumed
+        && !has_cli_provider_override
+        && !session_provider.is_empty()
+        && session_provider != resolved_provider
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     let mut cli = cli::Cli::parse();
@@ -735,7 +754,7 @@ async fn main() -> anyhow::Result<()> {
         context.set_prompt_layer(Some(default_prompt.to_string()), Some(body), deny);
     }
 
-    let provider = cli.resolve_provider(&cfg);
+    let mut provider = cli.resolve_provider(&cfg);
     // dirge-314i: read the model from the EFFECTIVE provider entry (the
     // `--provider` override's, or the Default role's). Reading the Default
     // role here made a `--provider openai` override inherit glm's model and
@@ -864,6 +883,26 @@ async fn main() -> anyhow::Result<()> {
         // can lead the agent to act on outdated `git status` /
         // `read` output that no longer matches reality.
         warn_on_stale_resume(&session);
+    }
+
+    // dirge-08kq: a plain resume restores the saved MODEL below (via
+    // resolve_startup_model), but the client is built from `provider`,
+    // freshly re-resolved from CLI/config/env — so after a config-default
+    // change or a new *_API_KEY shifted autodetect, a saved `gpt-4o` hit
+    // e.g. a DeepSeek client and 404'd with no warning. On a plain resume
+    // without an explicit `--provider`, adopt the session's saved provider
+    // so the client matches the model being restored.
+    if should_adopt_session_provider(
+        cli.provider.is_some(),
+        resumed,
+        &session.provider,
+        &provider,
+    ) {
+        eprintln!(
+            "info: resuming with the session's saved provider `{}` (CLI/config/env would use `{}`); pass --provider to override.",
+            session.provider, provider
+        );
+        provider = session.provider.clone();
     }
 
     // Restore the active prompt from the loaded session so resumed
@@ -2222,6 +2261,34 @@ mod parse_permission_config_tests {
 #[cfg(test)]
 mod resume_staleness_tests {
     use super::*;
+
+    // dirge-08kq: adopt the session's saved provider on a plain resume so
+    // the client matches the restored model.
+    #[test]
+    fn adopt_session_provider_on_plain_resume_with_mismatch() {
+        // Plain resume, no --provider, saved provider differs → adopt it.
+        assert!(should_adopt_session_provider(
+            false, true, "openai", "deepseek"
+        ));
+    }
+
+    #[test]
+    fn keep_resolved_provider_when_not_adopting() {
+        // Explicit --provider override wins even on resume.
+        assert!(!should_adopt_session_provider(
+            true, true, "openai", "deepseek"
+        ));
+        // Fresh start (not resumed) never adopts.
+        assert!(!should_adopt_session_provider(
+            false, false, "openai", "deepseek"
+        ));
+        // Same provider — nothing to change.
+        assert!(!should_adopt_session_provider(
+            false, true, "deepseek", "deepseek"
+        ));
+        // Session recorded no provider (pre-fix / ephemeral) — don't adopt "".
+        assert!(!should_adopt_session_provider(false, true, "", "deepseek"));
+    }
 
     // Fixed reference instant so the age math is deterministic.
     fn now() -> chrono::DateTime<chrono::Utc> {
