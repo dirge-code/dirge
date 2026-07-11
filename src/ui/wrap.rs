@@ -21,6 +21,61 @@
 
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+/// ANSI-aware iterator over the PAINTING characters of `s`: yields
+/// `(byte_offset, char)` for every character the terminal actually draws,
+/// skipping `\x1b[…m` (and other CSI) escape sequences entirely. The byte
+/// offset indexes into `s`, so a caller can slice the original string (escapes
+/// riding along) around a chosen character.
+///
+/// dirge-g007: the single source of the SGR-skip + UTF-8 walk. `visible_width`
+/// sums it and markdown's word-wrap collects it for byte-offset slicing — both
+/// used to hand-roll this same loop, so the SGR-miscount fix had to be repeated
+/// per site.
+pub fn visible_chars(s: &str) -> VisibleChars<'_> {
+    VisibleChars { s, i: 0 }
+}
+
+/// Iterator returned by [`visible_chars`]. Allocation-free so hot wrap-budget
+/// paths (`visible_width` per token) don't allocate.
+pub struct VisibleChars<'a> {
+    s: &'a str,
+    i: usize,
+}
+
+impl Iterator for VisibleChars<'_> {
+    type Item = (usize, char);
+
+    fn next(&mut self) -> Option<(usize, char)> {
+        let bytes = self.s.as_bytes();
+        while self.i < bytes.len() {
+            // Skip a CSI escape (`ESC [` … final byte 0x40..=0x7E) as
+            // zero-width — color/bold/underline state, not painted cells.
+            if bytes[self.i] == 0x1b && self.i + 1 < bytes.len() && bytes[self.i + 1] == b'[' {
+                let mut j = self.i + 2;
+                while j < bytes.len() && !(0x40..=0x7e).contains(&bytes[j]) {
+                    j += 1;
+                }
+                self.i = j.saturating_add(1).min(bytes.len());
+                continue;
+            }
+            let step = match bytes[self.i] {
+                b if b < 0x80 => 1,
+                b if b < 0xC0 => 1,
+                b if b < 0xE0 => 2,
+                b if b < 0xF0 => 3,
+                _ => 4,
+            };
+            let start = self.i;
+            let end = (start + step).min(bytes.len());
+            self.i = end;
+            if let Some(ch) = self.s[start..end].chars().next() {
+                return Some((start, ch));
+            }
+        }
+        None
+    }
+}
+
 /// Display width of `s` with ANSI SGR escape sequences treated as
 /// zero-width. The terminal interprets `\x1b[…m` as state changes
 /// (color / bold / underline) without emitting visible characters,
@@ -30,33 +85,9 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 /// ordinary ASCII — that miscount caused chamber rows with embedded
 /// SGR (diff backgrounds, syntax highlighting) to wrap or pad wrong.
 pub fn visible_width(s: &str) -> usize {
-    let bytes = s.as_bytes();
-    let mut total = 0usize;
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
-            // CSI sequence. Skip to a final byte (0x40..=0x7E).
-            let mut j = i + 2;
-            while j < bytes.len() && !(0x40..=0x7e).contains(&bytes[j]) {
-                j += 1;
-            }
-            i = j.saturating_add(1).min(bytes.len());
-            continue;
-        }
-        let step = match bytes[i] {
-            b if b < 0x80 => 1,
-            b if b < 0xC0 => 1,
-            b if b < 0xE0 => 2,
-            b if b < 0xF0 => 3,
-            _ => 4,
-        };
-        let end = (i + step).min(bytes.len());
-        if let Some(ch) = s[i..end].chars().next() {
-            total += ch.width().unwrap_or(0);
-        }
-        i = end;
-    }
-    total
+    visible_chars(s)
+        .map(|(_, ch)| ch.width().unwrap_or(0))
+        .sum()
 }
 
 /// Soft-wrap `text` to `max_width` columns. Returns one entry per
@@ -366,6 +397,26 @@ mod tests {
     fn short_line_returns_unchanged() {
         let out = soft_wrap("hello world", 80, "");
         assert_eq!(out, vec!["hello world"]);
+    }
+
+    /// dirge-g007: the shared visible-char walk yields the painting chars with
+    /// their byte offsets and skips SGR escapes — the exact contract both
+    /// `visible_width` and markdown's word-wrap depend on.
+    #[test]
+    fn visible_chars_yields_offsets_and_skips_sgr() {
+        let s = "a\x1b[31mb\x1b[0mç"; // 'a', red 'b', reset, 2-byte 'ç'
+        let got: Vec<(usize, char)> = visible_chars(s).collect();
+        assert_eq!(
+            got.iter().map(|&(_, c)| c).collect::<Vec<_>>(),
+            vec!['a', 'b', 'ç']
+        );
+        // Every offset indexes the start of its char in the ORIGINAL string,
+        // so a caller can slice around a wrap point with escapes riding along.
+        for &(off, ch) in &got {
+            assert_eq!(s[off..].chars().next(), Some(ch));
+        }
+        // visible_width sums the same walk (escapes contribute 0).
+        assert_eq!(visible_width(s), 3);
     }
 
     #[test]

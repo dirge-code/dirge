@@ -33,40 +33,10 @@ pub(super) fn ansi_fg(c: Color) -> String {
     }
 }
 
-/// Walk a string char-by-char skipping ANSI SGR escapes
-/// (`\x1b[…m`). Returns visible characters in order so the wrap math
-/// can count display cells correctly. Inline emphasis / inline code
-/// / link spans put ANSI escapes inside the accumulator; counting
-/// those as width would wrap the prose 5 cols too early per `\x1b[…m`.
-fn iter_visible_chars(s: &str) -> Vec<(usize, char)> {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(s.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        // Skip ANSI SGR / CSI: ESC `[` … `m` (or any final byte 0x40–0x7e).
-        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
-            let mut j = i + 2;
-            while j < bytes.len() && !(0x40..=0x7e).contains(&bytes[j]) {
-                j += 1;
-            }
-            i = j.saturating_add(1).min(bytes.len());
-            continue;
-        }
-        let step = match bytes[i] {
-            b if b < 0x80 => 1,
-            b if b < 0xC0 => 1,
-            b if b < 0xE0 => 2,
-            b if b < 0xF0 => 3,
-            _ => 4,
-        };
-        // Reconstruct the char from the slice.
-        if let Some(c) = s[i..i + step.min(bytes.len() - i)].chars().next() {
-            out.push((i, c));
-        }
-        i += step;
-    }
-    out
-}
+// dirge-g007: the ANSI-aware visible-character walk lives in `ui::wrap`
+// (`visible_chars`), shared with `visible_width`, so the SGR-skip fix is
+// single-sourced instead of re-implemented here.
+use crate::ui::wrap::visible_chars;
 
 fn word_wrap(text: &str, max_width: usize) -> Vec<CompactString> {
     use unicode_width::UnicodeWidthChar;
@@ -80,7 +50,7 @@ fn word_wrap(text: &str, max_width: usize) -> Vec<CompactString> {
     // sequences still contribute 0 (they're skipped by
     // `iter_visible_chars`). Wrap by visible-char index, then slice the
     // original string by byte offsets so escapes ride along.
-    let visible = iter_visible_chars(text);
+    let visible: Vec<(usize, char)> = visible_chars(text).collect();
     let cell_widths: Vec<usize> = visible
         .iter()
         .map(|&(_, c)| UnicodeWidthChar::width(c).unwrap_or(0))
@@ -152,7 +122,7 @@ fn flush_prefixed(
     if acc.is_empty() {
         return;
     }
-    let prefix_w = iter_visible_chars(prefix).len();
+    let prefix_w = visible_chars(prefix).count();
     let inner_w = max_width.saturating_sub(prefix_w).max(1);
     for line in acc.split('\n') {
         let trimmed = line.trim_end_matches('\r');
@@ -560,7 +530,7 @@ pub fn markdown_to_styled(text: &str, max_width: usize, base_color: Color) -> Ve
                     // ANSI-aware (visible-char width, escapes ride with their
                     // text) and breaks at spaces between tokens, so the
                     // per-span coloring survives the wrap.
-                    let gutter_w = iter_visible_chars(gutter).len();
+                    let gutter_w = visible_chars(gutter).count();
                     let inner_w = max_width.saturating_sub(gutter_w).max(1);
                     for spans in highlighted {
                         if spans.is_empty() {
