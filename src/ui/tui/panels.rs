@@ -405,7 +405,13 @@ pub fn compute_modified_rect(data: &PanelData, area: Rect) -> Option<Rect> {
     for body_lines in [sysload_lines, mcp_lines, lsp_lines, todos_lines] {
         let h = 2 + body_lines as u16;
         if y + h > area.y + area.height {
-            return None;
+            // dirge-7nwn: mirror `RightPanel::render`, which BREAKS here (stops
+            // stacking fixed panels) and still paints MODIFIED into the space
+            // left at this `y`. Returning None instead left the painted
+            // MODIFIED box un-hit-testable on short terminals — dead wheel
+            // scroll and a force-reset offset. Break so both stop at the same
+            // `y` and the remaining-space math below matches the painter.
+            break;
         }
         y += h + 1; // blank spacer
     }
@@ -1324,6 +1330,45 @@ mod tests {
             rect.height
         );
         assert!(rect.height >= 3);
+    }
+
+    /// dirge-7nwn: on a short terminal a tall fixed sub-panel (here a long MCP
+    /// list) overflows before MODIFIED, but there's still room below the panels
+    /// that fit. `RightPanel::render` BREAKs and paints MODIFIED in that space;
+    /// `compute_modified_rect` used to `return None`, so the painted box was
+    /// un-hit-testable (dead wheel scroll, force-reset offset). Both must now
+    /// agree: compute returns a rect and the painted [MODIFIED] title lands
+    /// inside it.
+    #[test]
+    fn modified_rect_matches_painter_when_a_fixed_panel_overflows() {
+        let data = PanelData {
+            mcp: (0..10).map(|i| (format!("srv{i}"), true)).collect(),
+            modified: vec!["a.rs".into(), "b.rs".into()],
+            ..Default::default()
+        };
+        // 12 rows: SYSTEM LOAD fits (y 1..4), MCP (h=12) overflows → break at
+        // y=5, leaving 7 rows for MODIFIED.
+        let area = Rect::new(0, 0, 40, 12);
+        let rect = compute_modified_rect(&data, area)
+            .expect("MODIFIED is painted, so a hit-test rect must exist");
+
+        let backend = TestBackend::new(40, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| f.render_widget(RightPanel::new(&data), area))
+            .unwrap();
+        let backend = terminal.backend().clone();
+        let row = |y: u16| -> String {
+            (rect.x..rect.x + rect.width)
+                .map(|x| backend.buffer().cell((x, y)).unwrap().symbol().to_string())
+                .collect()
+        };
+        // The painted [MODIFIED] title falls within the compute rect's rows.
+        let title_in_rect = (rect.y..rect.y + rect.height).any(|y| row(y).contains("[MODIFIED]"));
+        assert!(
+            title_in_rect,
+            "painted MODIFIED box must lie within the hit-test rect"
+        );
     }
 
     /// dirge-sb2n (A): the rendered MODIFIED box is exactly 3 rows tall

@@ -633,11 +633,15 @@ impl InputEditor {
         // visible warning so the user knows.
         const MAX_PASTE_BYTES: usize = 1_048_576; // 1 MB
         if cleaned.len() > MAX_PASTE_BYTES {
-            let truncated: String = cleaned.chars().take(MAX_PASTE_BYTES).collect();
-            self.insert_str(&truncated);
+            // dirge-n9c7: cut at the last char boundary at or below the BYTE
+            // cap. The old `chars().take(MAX_PASTE_BYTES)` counted characters,
+            // so a non-ASCII paste kept up to ~4x the limit and the notice
+            // (charging `.len()`, bytes) mislabeled it as chars.
+            let cut = crate::text::char_boundary_at_or_before(&cleaned, MAX_PASTE_BYTES);
+            self.insert_str(&cleaned[..cut]);
             // Append a truncation notice so it's clear the paste was cut.
             self.insert_str(&format!(
-                "\n\n[paste truncated: {} chars → 1 MB limit]",
+                "\n\n[paste truncated: {} bytes → 1 MB limit]",
                 cleaned.len()
             ));
             return;
@@ -1972,6 +1976,39 @@ mod tests {
         // A following YankPop is now a no-op (nothing to pop).
         e.handle_key(ev(KeyCode::Char('y'), KeyModifiers::ALT));
         assert_eq!(e.buffer.as_str(), "");
+    }
+
+    /// dirge-n9c7: the 1 MB paste cap is a BYTE cap, but truncation used to
+    /// `chars().take(cap)` — so a multibyte paste kept up to ~4x the bytes
+    /// (and the notice mislabeled the byte count as chars). Cut at the last
+    /// char boundary at or below the byte cap instead.
+    #[test]
+    fn oversized_multibyte_paste_truncated_to_byte_cap() {
+        const CAP: usize = 1_048_576; // must match MAX_PASTE_BYTES
+        let mut e = InputEditor::new();
+        // 400k × 3-byte '中' = 1.2 MB of bytes but only 400k chars, so the old
+        // char-based take(CAP) kept the whole thing.
+        let big = "中".repeat(400_000);
+        assert!(big.len() > CAP);
+        e.handle_paste(&big);
+        let buf = e.buffer.as_str();
+        let notice_at = buf.find("\n\n[paste truncated").expect("truncation notice");
+        let content = &buf[..notice_at];
+        assert!(
+            content.len() <= CAP,
+            "kept {} bytes, over the {CAP}-byte cap",
+            content.len()
+        );
+        // Filled up to the cap (floored to a char boundary, so within 3 bytes).
+        assert!(
+            content.len() > CAP - 3,
+            "under-filled: {} bytes",
+            content.len()
+        );
+        assert!(
+            buf.contains("bytes → 1 MB limit"),
+            "notice should read bytes"
+        );
     }
 
     /// dirge-wncc: even if a stale yank_state survives, YankPop must never

@@ -1717,9 +1717,21 @@ impl Renderer {
         self.needs_paint = true;
     }
 
-    /// Number of rows reserved for chat history above the input area.
-    /// Subtracts the input box (`input_rows`) and the status line (1 row).
+    /// Number of chat-history rows painted above the input area — the window
+    /// the scroll clamps (`max_offset`, page up/down, scroll-to-top) work
+    /// against.
+    ///
+    /// dirge-g8x6: prefer the actual painted chat height from the cached rect.
+    /// With an alert/shell overlay up, the painted chat area is sized from
+    /// `effective_input_rows`, not `self.input_rows`, so the old input_rows
+    /// math reported a taller-than-painted window: scroll clamps overshot and
+    /// the oldest content became unreachable. Matches `buffer_line_at_row`,
+    /// whose selection mapping already reads the rect. Fall back to the legacy
+    /// estimate before the first paint (and in rect-less tests).
     pub fn visible_lines(&self) -> usize {
+        if let Some(rect) = self.cached_chat_rect {
+            return rect.height as usize;
+        }
         let (_, rows) = self.terminal_size();
         rows.saturating_sub(self.input_rows + 1 + ALERT_FRAME_ROWS + CHAT_FRAME_ROWS) as usize
     }

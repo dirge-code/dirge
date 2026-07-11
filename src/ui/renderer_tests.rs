@@ -261,6 +261,25 @@ fn remove_chat_adjusts_active() {
     assert_eq!(r2.active_chat(), 0);
 }
 
+/// dirge-g8x6: visible_lines() is the window the scroll clamps (max_offset,
+/// page up/down, scroll-to-top) work against, so it must equal the PAINTED
+/// chat height. With an alert/shell overlay up, the painted chat is sized from
+/// effective_input_rows, not self.input_rows — the cached rect is the source
+/// of truth. Before the fix visible_lines() read only input_rows and reported
+/// a taller-than-painted window, so the oldest content couldn't be reached.
+#[test]
+fn visible_lines_follows_cached_chat_rect() {
+    let mut r = Renderer::new().expect("renderer");
+    r.input_rows = 1;
+    // Painted chat rect is 10 rows (e.g. squeezed by an overlay) — the height
+    // visible_lines() must report regardless of input_rows.
+    r.set_chat_rect_for_test(ratatui::layout::Rect::new(0, 1, 80, 10));
+    assert_eq!(r.visible_lines(), 10);
+    // A different painted height (overlay dismissed / resized) tracks too.
+    r.set_chat_rect_for_test(ratatui::layout::Rect::new(0, 1, 80, 22));
+    assert_eq!(r.visible_lines(), 22);
+}
+
 /// Create a renderer with a synthetic buffer of `n` short lines so we
 /// can drive scroll/append behavior without touching a real terminal.
 /// If `n` is less than `visible + min_scroll_margin`, pads to that size
