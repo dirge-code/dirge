@@ -404,7 +404,10 @@ type OverlayRow = (String, crossterm::style::Color);
 /// is the last line (the sticky action-keys row). dirge-27md: the single
 /// source of truth for how many visual rows the body occupies, so the
 /// painter and both row-count helpers can't drift apart.
-fn wrap_overlay_lines(lines: &[OverlayRow], outer_width: u16) -> (Vec<OverlayRow>, Vec<OverlayRow>) {
+fn wrap_overlay_lines(
+    lines: &[OverlayRow],
+    outer_width: u16,
+) -> (Vec<OverlayRow>, Vec<OverlayRow>) {
     let inner_w = (outer_width as usize).saturating_sub(2);
     let wrap_w = inner_w.saturating_sub(2).max(1);
     use crate::ui::wrap::soft_wrap;
