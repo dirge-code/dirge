@@ -395,6 +395,34 @@ pub(crate) fn overlay_scroll_geom(head: usize, tail: usize, inner_h: usize) -> O
     }
 }
 
+/// One overlay body row: painted text plus its color.
+type OverlayRow = (String, crossterm::style::Color);
+
+/// Soft-wrap the overlay `lines` exactly as [`paint_overlay_box`] paints
+/// them — wrap width `inner_w - 2`, per-line hanging indent under a
+/// `label: ` prefix — split into `(head_rows, tail_rows)` where the tail
+/// is the last line (the sticky action-keys row). dirge-27md: the single
+/// source of truth for how many visual rows the body occupies, so the
+/// painter and both row-count helpers can't drift apart.
+fn wrap_overlay_lines(lines: &[OverlayRow], outer_width: u16) -> (Vec<OverlayRow>, Vec<OverlayRow>) {
+    let inner_w = (outer_width as usize).saturating_sub(2);
+    let wrap_w = inner_w.saturating_sub(2).max(1);
+    use crate::ui::wrap::soft_wrap;
+    let last_idx = lines.len().saturating_sub(1);
+    let (mut head, mut tail) = (Vec::new(), Vec::new());
+    for (i, (text, color)) in lines.iter().enumerate() {
+        let cont_indent = " ".repeat(label_prefix_width(text));
+        for chunk in soft_wrap(text, wrap_w, &cont_indent) {
+            if i == last_idx {
+                tail.push((chunk, *color));
+            } else {
+                head.push((chunk, *color));
+            }
+        }
+    }
+    (head, tail)
+}
+
 fn paint_overlay_box(
     buf: &mut Buffer,
     area: Rect,
@@ -411,38 +439,15 @@ fn paint_overlay_box(
     let inner_w = area.width as usize - 2;
     let inner_h = area.height as usize - 2;
 
-    // Soft-wrap each input line, but use a single SENTINEL value for
-    // the action-keys row (passed as the LAST line in `lines`) so
-    // we can guarantee it stays visible even if the body overflows.
-    // Lines shaped like `label: value` get a hanging continuation
-    // indent equal to the label width — wrapped rows align under
-    // the value column instead of bleeding back to col 0.
-    let wrap_w = inner_w.saturating_sub(2).max(1);
-    use crate::ui::wrap::soft_wrap;
-    let last_idx = lines.len().saturating_sub(1);
-    let mut head_visual: Vec<(String, crossterm::style::Color)> = Vec::new();
-    let mut sticky_last: Vec<(String, crossterm::style::Color)> = Vec::new();
-    for (i, (text, color)) in lines.iter().enumerate() {
-        // Detect `label: ` prefix to derive the hanging indent for
-        // continuation rows. e.g. `args: very long content` wraps to:
-        //   args: very long
-        //         content
-        // rather than:
-        //   args: very long
-        //   content
-        // We restrict this to ASCII alpha labels followed by ": " so
-        // arbitrary user content like "1:30 ratio" doesn't trigger.
-        let hang = label_prefix_width(text);
-        let cont_indent: String = " ".repeat(hang);
-        let chunks = soft_wrap(text, wrap_w, &cont_indent);
-        for chunk in chunks {
-            if i == last_idx {
-                sticky_last.push((chunk, *color));
-            } else {
-                head_visual.push((chunk, *color));
-            }
-        }
-    }
+    // Soft-wrap each input line, but keep the action-keys row (passed as
+    // the LAST line in `lines`) as a separate sticky tail so we can
+    // guarantee it stays visible even if the body overflows. Lines shaped
+    // like `label: value` get a hanging continuation indent equal to the
+    // label width — wrapped rows align under the value column instead of
+    // bleeding back to col 0. dirge-27md: the wrap (width + hanging indent)
+    // lives in `wrap_overlay_lines`, shared with the row-count helpers the
+    // renderer uses to size this box, so they can't disagree.
+    let (head_visual, sticky_last) = wrap_overlay_lines(lines, area.width);
 
     // Layout: head visual rows fill from the top; the sticky tail
     // (action keys) always anchors to the bottom. When the head
@@ -511,14 +516,12 @@ pub fn overlay_wrapped_row_count(
     lines: &[(String, crossterm::style::Color)],
     outer_width: u16,
 ) -> usize {
-    let inner_w = (outer_width as usize).saturating_sub(2);
-    let wrap_w = inner_w.saturating_sub(4).max(1);
-    use crate::ui::wrap::soft_wrap;
-    let mut total = 0;
-    for (text, _) in lines {
-        total += soft_wrap(text, wrap_w, "  ").len();
-    }
-    total
+    // dirge-27md: this used inner_w-4 + a fixed 2-space indent while the
+    // painter used inner_w-2 + a label-hanging indent, so it sized the box
+    // for a different row count than got painted. Delegate to the shared
+    // wrap so the size always matches.
+    let (head, tail) = wrap_overlay_lines(lines, outer_width);
+    head.len() + tail.len()
 }
 
 /// Wrapped-row counts for the overlay body, split as `(head, tail)`:
@@ -532,21 +535,9 @@ pub fn overlay_head_tail_wrapped(
     lines: &[(String, crossterm::style::Color)],
     outer_width: u16,
 ) -> (usize, usize) {
-    let inner_w = (outer_width as usize).saturating_sub(2);
-    let wrap_w = inner_w.saturating_sub(2).max(1);
-    use crate::ui::wrap::soft_wrap;
-    let last_idx = lines.len().saturating_sub(1);
-    let (mut head, mut tail) = (0usize, 0usize);
-    for (i, (text, _)) in lines.iter().enumerate() {
-        let cont_indent = " ".repeat(label_prefix_width(text));
-        let n = soft_wrap(text, wrap_w, &cont_indent).len();
-        if i == last_idx {
-            tail += n;
-        } else {
-            head += n;
-        }
-    }
-    (head, tail)
+    // dirge-27md: share the exact wrap the painter uses.
+    let (head, tail) = wrap_overlay_lines(lines, outer_width);
+    (head.len(), tail.len())
 }
 
 fn paint_status(buf: &mut Buffer, area: Rect, status: &str) {
@@ -723,6 +714,33 @@ mod tests {
             body0.contains("PERMISSION REQUIRED"),
             "got body0 {:?}",
             body0
+        );
+    }
+
+    /// dirge-27md: the row count that SIZES the box
+    /// (`overlay_wrapped_row_count`) used inner_w-4 + a fixed 2-space
+    /// indent, while the painter and `overlay_head_tail_wrapped` used
+    /// inner_w-2 + a label-hanging indent. A long `label: value` line then
+    /// counted a different number of rows than it painted, so the box was
+    /// sized wrong (too short → scroll despite room; too tall → phantom
+    /// blanks). All three now share one wrap helper, so the sizing count
+    /// must equal the painter's head+tail split, by construction.
+    #[test]
+    fn overlay_sizing_row_count_matches_head_tail_split() {
+        use crossterm::style::Color as CC;
+        let lines = vec![
+            (format!("command: {}", "x".repeat(200)), CC::White),
+            ("[y] allow  [n] deny".to_string(), CC::White),
+        ];
+        // A narrow box maximizes the divergence between inner_w-2 and
+        // inner_w-4 and between the 2-space and 9-space ("command: ") indents.
+        let outer_width = 30u16;
+        let total = overlay_wrapped_row_count(&lines, outer_width);
+        let (head, tail) = overlay_head_tail_wrapped(&lines, outer_width);
+        assert_eq!(
+            total,
+            head + tail,
+            "box-sizing row count must equal the painter's head+tail wrap"
         );
     }
 
