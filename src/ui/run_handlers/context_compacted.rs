@@ -100,16 +100,32 @@ pub(crate) async fn handle_context_compacted(
         // the turns and the parent link land in different rows and
         // `resolve_parent` can't walk the fold (dirge-g1ze).
         let new_sid = crate::text::db_session_id(new_session_id);
-        let _ = db.end_session(&old_sid, "compression");
         let now = chrono::Utc::now().to_rfc3339();
-        let _ = db.insert_session(
-            &new_sid,
-            "cli",
-            &ctx.session.model,
-            &ctx.session.provider,
-            &now,
-        );
-        let _ = db.set_parent_session(&new_sid, &old_sid);
+        // dirge-m7ja: persist the fold lineage atomically, with one retry on a
+        // transient busy/lock, and surface a residual failure. The old
+        // three-`let _ =` sequence could leave the rotated row unlinked on a
+        // busy DB — resolve_parent then reports it as its own root while the
+        // JSON side collapses the chain by origin, a silent permanent drift.
+        let link = || {
+            db.link_fold(
+                &old_sid,
+                &new_sid,
+                "cli",
+                &ctx.session.model,
+                &ctx.session.provider,
+                &now,
+            )
+        };
+        let link_result = link().or_else(|_| link());
+        if let Err(e) = link_result {
+            tracing::warn!(
+                target: "dirge::session",
+                error = %e,
+                old = %old_sid,
+                new = %new_sid,
+                "failed to persist compaction fold lineage; the pre-fold rotation may appear as a separate conversation in search/browse until repaired",
+            );
+        }
         // On a later fold the original ask is no longer in the live
         // messages; recover it from the write-once checkpoint slot.
         if let Some(cp) = db.get_checkpoint(&origin).ok().flatten()

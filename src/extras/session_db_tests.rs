@@ -1474,3 +1474,56 @@ fn anchored_view_foreign_anchor_does_not_overflow_before() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// dirge-m7ja: a fold persists its lineage atomically (old ended, rotated row
+/// inserted, child→parent linked) and returns a Result the caller can act on —
+/// replacing three silent best-effort writes that could leave a partial chain.
+#[test]
+fn link_fold_persists_atomic_resolvable_lineage() {
+    let (db, _dir) = temp_db();
+    db.insert_session("root", "cli", "m", "p", "2026-01-01T10:00:00Z")
+        .unwrap();
+
+    db.link_fold("root", "child", "cli", "m", "p", "2026-01-01T10:05:00Z")
+        .unwrap();
+
+    // The link exists → resolve_parent walks child → root.
+    assert_eq!(db.resolve_parent("child").unwrap(), "root");
+    // Old session ended with the compression reason.
+    let reason: Option<String> = db
+        .conn
+        .query_row(
+            "SELECT end_reason FROM sessions WHERE id = 'root'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(reason.as_deref(), Some("compression"));
+    // Rotated session row present.
+    let present: i64 = db
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM sessions WHERE id = 'child'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(present, 1);
+}
+
+/// dirge-m7ja: successive folds chain, so resolve_parent from any tip reaches
+/// the original root — the property search/browse rely on to show one
+/// conversation, not one per rotation.
+#[test]
+fn link_fold_chains_multiple_folds_to_original_root() {
+    let (db, _dir) = temp_db();
+    db.insert_session("s0", "cli", "m", "p", "2026-01-01T10:00:00Z")
+        .unwrap();
+    db.link_fold("s0", "s1", "cli", "m", "p", "2026-01-01T10:05:00Z")
+        .unwrap();
+    db.link_fold("s1", "s2", "cli", "m", "p", "2026-01-01T10:10:00Z")
+        .unwrap();
+
+    assert_eq!(db.resolve_parent("s2").unwrap(), "s0");
+    assert_eq!(db.resolve_parent("s1").unwrap(), "s0");
+}

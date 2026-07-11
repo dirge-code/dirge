@@ -1453,6 +1453,52 @@ impl SessionDb {
         Ok(())
     }
 
+    /// dirge-m7ja: persist a compaction fold's SQLite lineage as ONE atomic
+    /// unit — end the old session, insert the rotated session, and link
+    /// child→parent. The fold handler previously issued these as three
+    /// separate best-effort calls (`let _ = …`); a busy-DB / disk-pressure
+    /// failure on any of them left a PARTIAL chain — most damagingly the
+    /// rotated row present but unlinked, which `resolve_parent` then reports as
+    /// its own root while the JSON side collapses the two rotations by origin:
+    /// silent, unrepairable drift. Wrapping them in a transaction makes it
+    /// all-or-nothing, and returning `Result` lets the caller retry / log
+    /// instead of dropping the error.
+    pub fn link_fold(
+        &self,
+        old_sid: &str,
+        new_sid: &str,
+        source: &str,
+        model: &str,
+        provider: &str,
+        now: &str,
+    ) -> Result<(), String> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| format!("Failed to begin fold-link transaction: {e}"))?;
+        // Mirrors end_session's "first end_reason wins" guard.
+        tx.execute(
+            "UPDATE sessions SET ended_at = ?1, end_reason = 'compression' \
+             WHERE id = ?2 AND ended_at IS NULL",
+            params![now, old_sid],
+        )
+        .map_err(|e| format!("Failed to end old session: {e}"))?;
+        tx.execute(
+            "INSERT OR IGNORE INTO sessions (id, source, model, provider, started_at, last_active) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+            params![new_sid, source, model, provider, now],
+        )
+        .map_err(|e| format!("Failed to insert rotated session: {e}"))?;
+        tx.execute(
+            "UPDATE sessions SET parent_session_id = ?1 WHERE id = ?2",
+            params![old_sid, new_sid],
+        )
+        .map_err(|e| format!("Failed to link fold parent: {e}"))?;
+        tx.commit()
+            .map_err(|e| format!("Failed to commit fold link: {e}"))?;
+        Ok(())
+    }
+
     /// Mark a session as ended with the given reason.
     /// No-ops when the session is already ended — the first end_reason
     /// wins (compression splits keep their end_reason).
@@ -1461,6 +1507,9 @@ impl SessionDb {
     /// Mark a session as ended with the given reason.
     /// No-ops when the session is already ended — the first end_reason
     /// wins (compression splits keep their end_reason).
+    // dirge-m7ja: the fold path now ends the old session inside `link_fold`'s
+    // transaction, so this standalone helper is test-only.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn end_session(&self, session_id: &str, end_reason: &str) -> Result<(), String> {
         self.conn
             .execute(
