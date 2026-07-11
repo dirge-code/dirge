@@ -628,6 +628,54 @@ fn selected_text_joins_real_wrapped_markdown() {
     assert_eq!(r.selected_text(), Some(prose.to_string()));
 }
 
+/// dirge-p985: the `/btw` handler fed `markdown_to_styled` rows (one
+/// `LineEntry` per rendered row, no trailing newline) to `write`, which
+/// appends to a single partial line and commits only on newline/overflow
+/// — so headings, bullets, and paragraphs concatenated into one long line
+/// re-broken at arbitrary columns. `write_styled_lines` writes each row on
+/// its own line, so the structure survives.
+#[test]
+fn write_styled_lines_preserves_rows_that_write_collapses() {
+    let styled = vec![
+        LineEntry {
+            text: "alpha".into(),
+            color: Color::White,
+        },
+        LineEntry {
+            text: "beta".into(),
+            color: Color::White,
+        },
+        LineEntry {
+            text: "gamma".into(),
+            color: Color::White,
+        },
+    ];
+
+    // Buggy path: three newline-free `write`s fold into one partial line.
+    let mut buggy = Renderer::new().unwrap();
+    let base_b = buggy.buffer_len();
+    for e in &styled {
+        buggy.write(&e.text, e.color).unwrap();
+    }
+    buggy.commit_partial();
+    let buggy_rows = buggy.buffer_len() - base_b;
+
+    // Fixed path: one row per entry.
+    let mut fixed = Renderer::new().unwrap();
+    let base_f = fixed.buffer_len();
+    fixed.write_styled_lines(&styled).unwrap();
+    let fixed_rows = fixed.buffer_len() - base_f;
+
+    assert!(
+        fixed_rows >= 3,
+        "each of the 3 entries must be its own row, got {fixed_rows}"
+    );
+    assert!(
+        fixed_rows > buggy_rows,
+        "write collapses rows ({buggy_rows}); write_line preserves them ({fixed_rows})"
+    );
+}
+
 /// The join decision is made per-boundary: a partial first row still
 /// counts as ending in whitespace, and the head of the final row is
 /// appended without a leading newline when its predecessor wrapped.

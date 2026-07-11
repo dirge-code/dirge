@@ -4011,9 +4011,9 @@ pub async fn run_interactive(
                                     max_width,
                                     crate::ui::theme::agent(),
                                 );
-                                for span in styled {
-                                    renderer.write(&span.text, span.color)?;
-                                }
+                                // dirge-p985: write each rendered row as its own
+                                // line — `write` would collapse them into one.
+                                renderer.write_styled_lines(&styled)?;
                                 renderer.write_line("", crossterm::style::Color::White)?;
                             }
                             Some(Err(e)) => {

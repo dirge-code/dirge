@@ -2513,6 +2513,22 @@ impl Renderer {
         Ok(())
     }
 
+    /// Append pre-wrapped markdown rows (from
+    /// [`crate::ui::markdown::markdown_to_styled`]) one line each.
+    /// dirge-p985: each `LineEntry` is a rendered row with no trailing
+    /// newline, so feeding them to [`write`](Self::write) — which appends
+    /// to one partial and commits only on newline/overflow — concatenated
+    /// headings, bullets, and paragraphs into a single long line re-broken
+    /// at arbitrary columns. `write_line` writes each row as its own
+    /// reflowing block, preserving the structure (the session-reload path
+    /// already did this per entry).
+    pub fn write_styled_lines(&mut self, lines: &[LineEntry]) -> io::Result<()> {
+        for line in lines {
+            self.write_line(&line.text, line.color)?;
+        }
+        Ok(())
+    }
+
     pub fn write(&mut self, text: &str, color: Color) -> io::Result<()> {
         if text.is_empty() {
             return Ok(());
