@@ -1057,9 +1057,17 @@ impl SessionDb {
     /// Delete all of a session's messages, keeping both FTS indexes
     /// consistent (dirge-slj2). This is the ONLY safe way to delete
     /// message rows: `messages_fts` is an external-content FTS5 table
-    /// whose 'delete' command needs the exact indexed text, which is
-    /// the redacted projection `insert_message` wrote — recomputed
-    /// here from the raw row. Returns how many messages were deleted.
+    /// whose 'delete' command needs the EXACT text that was indexed —
+    /// the redacted projection `insert_message` wrote. Returns how many
+    /// messages were deleted.
+    ///
+    /// dirge-aceg: read that projection back from the standalone
+    /// `messages_fts_trigram.content` (insert_message writes the SAME redacted
+    /// value to both tables) instead of recomputing `redact_for_fts` from the
+    /// raw row. The redactor evolves over time (that's why the v6 rebuild
+    /// exists); a recomputed projection for a row indexed under an older
+    /// redactor differs from the indexed text, so the FTS5 'delete' silently
+    /// corrupts the index instead of cleaning it. The stored text can't drift.
     ///
     /// No production caller yet — this exists so the first feature
     /// that deletes messages (session pruning, /clear --purge, …)
@@ -1072,35 +1080,34 @@ impl SessionDb {
             .unchecked_transaction()
             .map_err(|e| format!("Failed to begin delete transaction: {e}"))?;
 
-        let rows: Vec<(i64, String, String, String)> = {
+        // (rowid, exact indexed projection) for every message of this session
+        // that has an FTS entry. A row absent from the trigram index was also
+        // skipped for messages_fts (they're written together), so joining here
+        // deletes exactly the entries that exist — no orphans, no over-delete.
+        let fts_targets: Vec<(i64, String)> = {
             let mut stmt = tx
                 .prepare(
-                    "SELECT id, content, COALESCE(tool_name, ''), COALESCE(tool_calls, '')
-                     FROM messages WHERE session_id = ?1",
+                    "SELECT m.id, t.content
+                     FROM messages m
+                     JOIN messages_fts_trigram t ON t.rowid = m.id
+                     WHERE m.session_id = ?1",
                 )
                 .map_err(|e| format!("Failed to prepare delete scan: {e}"))?;
-            stmt.query_map(params![session_id], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-            })
-            .map_err(|e| format!("Failed to scan session messages: {e}"))?
-            .filter_map(|r| r.ok())
-            .collect()
+            stmt.query_map(params![session_id], |row| Ok((row.get(0)?, row.get(1)?)))
+                .map_err(|e| format!("Failed to scan session messages: {e}"))?
+                .filter_map(|r| r.ok())
+                .collect()
         };
 
-        for (id, content, tool_name, tool_calls) in &rows {
-            // Mirror insert_message's projection EXACTLY — same
-            // format string, same redaction — or the FTS5 'delete'
-            // corrupts the index instead of cleaning it.
-            let combined = format!("{} {} {}", content, tool_name, tool_calls);
-            let redacted = redact_for_fts(&combined);
+        for (id, indexed_projection) in &fts_targets {
+            // 'delete' with the EXACT text that was indexed (read back above),
+            // never a recomputation that could differ from it.
             tx.execute(
                 "INSERT INTO messages_fts(messages_fts, rowid, content) VALUES ('delete', ?1, ?2)",
-                params![id, redacted],
+                params![id, indexed_projection],
             )
             .map_err(|e| format!("Failed to remove FTS entry: {e}"))?;
-            // Trigram is standalone — plain DML is safe (and the
-            // messages_fts_trigram_delete trigger would cover it on
-            // row delete anyway; explicit here for clarity).
+            // Trigram is standalone — plain DML is safe.
             tx.execute(
                 "DELETE FROM messages_fts_trigram WHERE rowid = ?1",
                 params![id],
@@ -1108,11 +1115,12 @@ impl SessionDb {
             .map_err(|e| format!("Failed to remove trigram entry: {e}"))?;
         }
 
-        tx.execute(
-            "DELETE FROM messages WHERE session_id = ?1",
-            params![session_id],
-        )
-        .map_err(|e| format!("Failed to delete messages: {e}"))?;
+        let deleted = tx
+            .execute(
+                "DELETE FROM messages WHERE session_id = ?1",
+                params![session_id],
+            )
+            .map_err(|e| format!("Failed to delete messages: {e}"))?;
         tx.execute(
             "UPDATE sessions SET message_count = 0 WHERE id = ?1",
             params![session_id],
@@ -1120,7 +1128,7 @@ impl SessionDb {
         .map_err(|e| format!("Failed to reset message count: {e}"))?;
         tx.commit()
             .map_err(|e| format!("Failed to commit delete: {e}"))?;
-        Ok(rows.len())
+        Ok(deleted)
     }
 
     pub fn insert_session(

@@ -165,11 +165,10 @@ fn schema_v9_drops_confidence_column() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// dirge-slj2: the safe delete path. delete_session_messages must
-/// recompute each row's exact indexed projection (redacted +
-/// concatenated, same as insert_message) for the FTS5 'delete'
-/// command, leaving zero ghosts in either index and other sessions
-/// untouched.
+/// dirge-slj2: the safe delete path. delete_session_messages must remove each
+/// row's exact indexed projection (the redacted + concatenated text
+/// insert_message wrote) from the FTS5 index, leaving zero ghosts in either
+/// index and other sessions untouched.
 #[test]
 fn delete_session_messages_cleans_both_fts_indexes() {
     let (db, _dir) = temp_db();
@@ -247,6 +246,60 @@ fn delete_session_messages_cleans_both_fts_indexes() {
         )
         .unwrap();
     assert_eq!(count, 0, "session message_count must reset");
+}
+
+/// dirge-aceg: the FTS5 'delete' must use the text that was INDEXED, not a
+/// fresh recomputation from the raw row — the redactor evolves, so recomputing
+/// a row indexed under an older redactor yields a different projection and the
+/// 'delete' corrupts the index instead of cleaning it.
+///
+/// Simulate that drift by mutating the raw `messages.content` AFTER indexing
+/// (no trigger updates the FTS — insert_message owns that path). A recompute
+/// would now 'delete' the wrong tokens and leave the real entry behind;
+/// reading the stored projection back deletes it cleanly.
+#[test]
+fn delete_uses_indexed_projection_not_recomputation() {
+    let (db, _dir) = temp_db();
+    db.insert_session("s1", "cli", "gpt-5", "openai", "2026-01-01T10:00:00Z")
+        .unwrap();
+    db.insert_message(
+        "s1",
+        "assistant",
+        "alphaindexed betaindexed",
+        None,
+        None,
+        None,
+        "2026-01-01T10:01:00Z",
+    )
+    .unwrap();
+
+    // Drift: the raw row now reads different text than what was indexed. The
+    // FTS tables still hold "alphaindexed betaindexed".
+    db.conn
+        .execute(
+            "UPDATE messages SET content = 'totallydifferent gammaword' WHERE session_id = 's1'",
+            [],
+        )
+        .unwrap();
+
+    let deleted = db.delete_session_messages("s1").unwrap();
+    assert_eq!(deleted, 1);
+
+    // The INDEXED token must be gone — proving 'delete' targeted the stored
+    // projection, not the drifted raw text (which a recompute would have used,
+    // missing this entry and corrupting the index).
+    let ghosts: i64 = db
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'alphaindexed'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        ghosts, 0,
+        "indexed token survived — recompute-based delete missed it"
+    );
 }
 
 #[test]
