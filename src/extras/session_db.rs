@@ -1651,6 +1651,61 @@ impl SessionDb {
             after,
         })
     }
+
+    /// dirge-ozxd: does `message_id` actually live in `session_id`? A real
+    /// membership check — `get_anchored_view` returns Ok even for a foreign
+    /// id (its COUNT-based anchor just clamps to the session's own rows), so
+    /// it can't be used as an existence probe.
+    pub fn message_in_session(&self, session_id: &str, message_id: i64) -> Result<bool, String> {
+        self.conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM messages WHERE session_id = ?1 AND id = ?2)",
+                params![session_id, message_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("Failed to probe message membership: {e}"))
+    }
+
+    /// dirge-ozxd: the first (`from_start`) or last `n` messages of a
+    /// session, cheaply and in chronological order. Replaces get_bookends'
+    /// abuse of `get_anchored_view` with a sentinel anchor of 1 (off by one)
+    /// and a 100_000 window (materialized the whole transcript per hit).
+    pub fn get_edge_messages(
+        &self,
+        session_id: &str,
+        from_start: bool,
+        n: usize,
+    ) -> Result<Vec<AnchorMessage>, String> {
+        let order = if from_start { "ASC" } else { "DESC" };
+        let sql = format!(
+            "SELECT id, role, content, timestamp
+             FROM messages
+             WHERE session_id = ?1
+             ORDER BY id {order}
+             LIMIT ?2"
+        );
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .map_err(|e| format!("Failed to prepare edge query: {e}"))?;
+        let mut messages: Vec<AnchorMessage> = stmt
+            .query_map(params![session_id, n as i64], |row| {
+                Ok(AnchorMessage {
+                    id: row.get(0)?,
+                    role: row.get(1)?,
+                    content: row.get(2)?,
+                    timestamp: row.get(3)?,
+                })
+            })
+            .map_err(|e| format!("Failed to query edge messages: {e}"))?
+            .filter_map(|r| r.ok())
+            .collect();
+        // DESC returns newest-first; restore chronological order for the tail.
+        if !from_start {
+            messages.reverse();
+        }
+        Ok(messages)
+    }
 }
 
 #[cfg(test)]

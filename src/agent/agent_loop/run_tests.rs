@@ -318,6 +318,106 @@ async fn sustained_transient_error_terminates_after_budget() {
     );
 }
 
+/// dirge-kjyz: `transient_recoveries` counts CONSECUTIVE recoveries so a
+/// dead network still terminates, but it was only ever incremented, never
+/// reset. Four transient blips SEPARATED by healthy turns (a dead network
+/// is not what's happening) must not accumulate past the budget into a
+/// false hard-fail: a clean assistant turn resets the counter. Here every
+/// blip is followed by a successful echo turn, so even though there are
+/// four blips (> MAX_TRANSIENT_RECOVERIES = 3) the run completes.
+#[tokio::test]
+async fn transient_blips_separated_by_healthy_turns_do_not_accumulate() {
+    use crate::agent::agent_loop::message::DeltaPhase;
+
+    let echo = std::sync::Arc::new(EchoTool::new());
+    let mut ctx = empty_context();
+    ctx.tools.push(echo.clone());
+
+    // Script by call index: blip, echo, blip, echo, blip, echo, blip, done.
+    // Without the reset, the third blip already exhausts the budget and the
+    // fourth blip (call 6) surfaces as terminal before "done" is reached.
+    let counter = std::sync::Arc::new(AtomicUsize::new(0));
+    let factory: StreamFn = std::sync::Arc::new(move |_ctx, _opts| {
+        let n = counter.fetch_add(1, Ordering::SeqCst);
+        let blip = n % 2 == 0 && n <= 6;
+        if blip {
+            let partial = AssistantMessage::new(
+                vec![ContentBlock::Text {
+                    text: "partial".to_string(),
+                }],
+                StopReason::Stop,
+            );
+            Box::pin(futures::stream::iter(vec![
+                StreamEvent::Start {
+                    partial: AssistantMessage::new(Vec::new(), StopReason::Stop),
+                },
+                StreamEvent::Delta {
+                    partial,
+                    phase: DeltaPhase::TextDelta,
+                },
+                StreamEvent::Error {
+                    error: "error decoding response body".to_string(),
+                },
+            ]))
+        } else {
+            let msg = if n >= 7 {
+                text_response("done")
+            } else {
+                tool_use_response("call", "echo", serde_json::json!({"n": n}))
+            };
+            let reason = msg.stop_reason;
+            Box::pin(futures::stream::iter(vec![StreamEvent::Done {
+                reason,
+                message: msg,
+                usage: None,
+            }]))
+        }
+    });
+
+    let (tx, mut rx) = mpsc::channel::<LoopEvent>(256);
+    let messages = run_agent_loop(
+        vec![user("start")],
+        ctx,
+        build_config(),
+        AbortSignal::new(),
+        &tx,
+        &factory,
+        None,
+        None,
+    )
+    .await;
+    drop(tx);
+
+    // The run reached the final clean turn instead of hard-failing on the
+    // fourth blip.
+    let last_text = messages.iter().rev().find_map(|m| match m {
+        LoopMessage::Assistant(a) => a.content.iter().find_map(|b| match b {
+            ContentBlock::Text { text } => Some(text.clone()),
+            _ => None,
+        }),
+        _ => None,
+    });
+    assert_eq!(
+        last_text.as_deref(),
+        Some("done"),
+        "blips spread across healthy turns must not accumulate into a hard-fail"
+    );
+
+    // All four blips surfaced a recovery banner — proof the counter never
+    // hit the budget despite exceeding it in raw count.
+    let mut retries = 0;
+    while let Ok(evt) = rx.try_recv() {
+        if matches!(evt, LoopEvent::RetryNotice { .. }) {
+            retries += 1;
+        }
+    }
+    assert_eq!(
+        retries,
+        (MAX_TRANSIENT_RECOVERIES as usize) + 1,
+        "each of the four separated blips must recover, not just the budgeted three"
+    );
+}
+
 /// LOOP-9 integration: `run_compaction_pass` end-to-end. Feed
 /// a long conversation, a mock summarizer, and assert that
 /// (a) the older messages were dropped, (b) a SUMMARY_PREFIX

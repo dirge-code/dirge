@@ -967,7 +967,12 @@ impl DapSessionManager {
             return Ok(summary);
         }
 
-        let args = PauseArgs { thread_id };
+        // dirge-8q3w: resolve the 0-sentinel to the last stopped thread,
+        // exactly as continue_/step/stack_trace do — strict adapters
+        // (debugpy) reject a literal threadId 0 with "thread not found".
+        let args = PauseArgs {
+            thread_id: session.resolve_thread_id(thread_id),
+        };
         session
             .client
             .request::<_, Value>("pause", &args, timeout)
@@ -1608,6 +1613,138 @@ mod tests {
             outcome.thread_id,
             Some(42),
             "continue(0) must target the last stopped thread, not 0"
+        );
+    }
+
+    /// dirge-8q3w: pause echo adapter. After the entry stop on thread 42
+    /// it answers a `pause` by echoing the received threadId into the
+    /// resulting stopped event, so the test can see which id pause sent.
+    async fn fake_echo_pause_adapter(
+        mut reader: impl AsyncBufRead + Unpin,
+        mut writer: impl AsyncWrite + Unpin,
+    ) {
+        // initialize
+        let frame = decode_frame(&mut reader).await.unwrap();
+        let msg: Value = serde_json::from_slice(&frame).unwrap();
+        let seq = msg["seq"].as_u64().unwrap();
+        encode_frame(
+            &mut writer,
+            &serde_json::to_vec(&serde_json::json!({
+                "type": "response", "seq": 1, "request_seq": seq, "success": true,
+                "command": "initialize",
+                "body": { "supportsConfigurationDoneRequest": true }
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        // launch → success → stopped on thread 42
+        let frame = decode_frame(&mut reader).await.unwrap();
+        let msg: Value = serde_json::from_slice(&frame).unwrap();
+        let seq = msg["seq"].as_u64().unwrap();
+        encode_frame(
+            &mut writer,
+            &serde_json::to_vec(&serde_json::json!({
+                "type": "response", "seq": 2, "request_seq": seq, "success": true,
+                "command": "launch",
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        encode_frame(
+            &mut writer,
+            &serde_json::to_vec(&serde_json::json!({
+                "type": "event", "seq": 3, "event": "stopped",
+                "body": { "reason": "entry", "threadId": 42 }
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        // configurationDone (notify — no response)
+        let frame = decode_frame(&mut reader).await.unwrap();
+        let msg: Value = serde_json::from_slice(&frame).unwrap();
+        assert_eq!(msg["command"], "configurationDone");
+
+        // pause → echo the received threadId into the stopped event.
+        let frame = decode_frame(&mut reader).await.unwrap();
+        let msg: Value = serde_json::from_slice(&frame).unwrap();
+        assert_eq!(msg["command"], "pause");
+        let seq = msg["seq"].as_u64().unwrap();
+        let received_tid = msg["arguments"]["threadId"].as_u64().unwrap();
+        encode_frame(
+            &mut writer,
+            &serde_json::to_vec(&serde_json::json!({
+                "type": "response", "seq": 4, "request_seq": seq, "success": true,
+                "command": "pause"
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        encode_frame(
+            &mut writer,
+            &serde_json::to_vec(&serde_json::json!({
+                "type": "event", "seq": 5, "event": "stopped",
+                "body": { "reason": "pause", "threadId": received_tid }
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    }
+
+    fn client_with_echo_pause_adapter() -> DapClient {
+        let (client_side, server_side) = tokio::io::duplex(4096);
+        let (client_read, client_write) = tokio::io::split(client_side);
+        let (server_read, server_write) = tokio::io::split(server_side);
+        let client_reader = tokio::io::BufReader::new(client_read);
+        let (rpc, _read_task) = DapRpc::new(client_reader, client_write);
+        tokio::spawn(async move {
+            fake_echo_pause_adapter(tokio::io::BufReader::new(server_read), server_write).await;
+        });
+        DapClient::from_rpc(rpc, "fake-adapter")
+    }
+
+    /// dirge-8q3w: pause built `PauseArgs { thread_id }` verbatim, skipping
+    /// the `resolve_thread_id` its sibling ops (continue/step/stackTrace)
+    /// apply. The debug tool defaults pause to thread 0, and strict
+    /// adapters reject threadId 0 with "thread not found". pause(0) must
+    /// target the last stopped thread (42), not 0.
+    #[tokio::test]
+    async fn pause_with_zero_thread_substitutes_last_stopped() {
+        let mgr = DapSessionManager::new();
+        let signal = AbortSignal::new();
+        let client = client_with_echo_pause_adapter();
+
+        let summary = mgr
+            .launch_with_client(
+                "fake-adapter",
+                "/tmp",
+                Some("p"),
+                None,
+                &[],
+                Some(true),
+                None,
+                &signal,
+                client,
+                Duration::from_secs(5),
+                vec![],
+            )
+            .await
+            .unwrap();
+        assert_eq!(summary.thread_id, Some(42));
+
+        // The debug tool / Janet bridge passes 0; pause must send the last
+        // stopped thread instead.
+        let outcome = mgr.pause(0, Duration::from_secs(5)).await.unwrap();
+        assert_eq!(
+            outcome.thread_id,
+            Some(42),
+            "pause(0) must target the last stopped thread, not 0"
         );
     }
 

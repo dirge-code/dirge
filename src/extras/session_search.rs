@@ -323,12 +323,14 @@ impl SessionSearch {
 
     // ── Internal helpers ──────────────────────────────
 
-    /// Get the first or last few messages of a session.
+    /// Get the first or last few messages of a session. dirge-ozxd: a
+    /// direct edge query — the old sentinel-anchor + 100_000-window abuse of
+    /// get_anchored_view returned BOOKEND_COUNT+1 messages and materialized
+    /// the whole transcript for the tail.
     fn get_bookends(&self, session_id: &str, start: bool) -> Result<Vec<MessagePreview>, String> {
-        let view = self.db.get_anchored_view(session_id, 1, BOOKEND_COUNT)?;
-
-        let messages: Vec<MessagePreview> = view
-            .messages
+        Ok(self
+            .db
+            .get_edge_messages(session_id, start, BOOKEND_COUNT)?
             .into_iter()
             .map(|m| MessagePreview {
                 id: m.id,
@@ -336,32 +338,7 @@ impl SessionSearch {
                 content_preview: truncate_content(&m.content, MAX_PREVIEW_LEN),
                 timestamp: m.timestamp,
             })
-            .collect();
-
-        if start {
-            Ok(messages)
-        } else {
-            // Get the last BOOKEND_COUNT messages.
-            let total_view = self.db.get_anchored_view(session_id, 1, 100_000)?;
-            let total = total_view.messages.len();
-            if total <= BOOKEND_COUNT {
-                return Ok(messages);
-            }
-            let last_id = total_view.messages.last().map(|m| m.id).unwrap_or(1);
-            let end_view = self
-                .db
-                .get_anchored_view(session_id, last_id, BOOKEND_COUNT)?;
-            Ok(end_view
-                .messages
-                .into_iter()
-                .map(|m| MessagePreview {
-                    id: m.id,
-                    role: m.role,
-                    content_preview: truncate_content(&m.content, MAX_PREVIEW_LEN),
-                    timestamp: m.timestamp,
-                })
-                .collect())
-        }
+            .collect())
     }
 
     /// Walk lineage from session_id to find which session
@@ -369,9 +346,11 @@ impl SessionSearch {
     /// created after a compression split, it lives in a child
     /// session.
     fn find_message_session(&self, session_id: &str, message_id: i64) -> Result<String, String> {
-        // First try the given session.
-        if self.db.get_anchored_view(session_id, message_id, 0).is_ok() {
-            // Message might exist — we trust the caller.
+        // First try the given session. dirge-ozxd: a real membership check —
+        // the old get_anchored_view(..).is_ok() probe was ALWAYS true, so the
+        // lineage walk below never ran and a child-session message anchored
+        // in the parent.
+        if self.db.message_in_session(session_id, message_id)? {
             return Ok(session_id.to_string());
         }
 
@@ -383,7 +362,7 @@ impl SessionSearch {
         // Find all sessions in this lineage.
         for s in &all {
             let s_root = self.db.resolve_parent(&s.id)?;
-            if s_root == root_id && self.db.get_anchored_view(&s.id, message_id, 0).is_ok() {
+            if s_root == root_id && self.db.message_in_session(&s.id, message_id)? {
                 return Ok(s.id.clone());
             }
         }
@@ -772,6 +751,108 @@ mod tests {
             anchored.content_preview.contains("basilisk"),
             "the anchored message must be the FTS match, got: {:?}",
             anchored.content_preview
+        );
+    }
+
+    // dirge-ozxd: find_message_session's probe was
+    // `get_anchored_view(session, id, 0).is_ok()`, which is ALWAYS true —
+    // the COUNT-based anchor just clamps a foreign id to the session's own
+    // rows and returns a window, never an error. So the lineage-walk below
+    // it was dead and a message living in a CHILD session (created by a
+    // compression split) resolved to the parent, mislabeling a window of
+    // parent messages as the anchored session.
+    #[test]
+    fn find_message_session_walks_to_the_child_that_holds_the_message() {
+        let (search, _dir) = temp_search();
+        // Parent with 5 messages (ids 1..=5).
+        seed_session(&search.db, "parent", "cli");
+        // A child session split off the parent, holding a later message.
+        search
+            .db
+            .insert_session("child", "cli", "gpt-5", "openai", "2025-01-15T11:00:00Z")
+            .unwrap();
+        search.db.set_parent_session("child", "parent").unwrap();
+        let child_msg = search
+            .db
+            .insert_message(
+                "child",
+                "user",
+                "this message lives in the child session",
+                None,
+                None,
+                None,
+                "2025-01-15T11:01:00Z",
+            )
+            .unwrap();
+
+        // Querying from the parent must walk lineage to the child, not
+        // anchor in the parent.
+        let found = search.find_message_session("parent", child_msg).unwrap();
+        assert_eq!(
+            found, "child",
+            "must resolve to the session that actually holds the message"
+        );
+
+        // A message that IS in the parent still resolves to the parent.
+        let in_parent = search.find_message_session("parent", 1).unwrap();
+        assert_eq!(in_parent, "parent");
+    }
+
+    // dirge-ozxd: get_bookends abused get_anchored_view with a sentinel
+    // anchor of 1 (off-by-one: returned BOOKEND_COUNT+1) and a window of
+    // 100_000 for the tail (materialized the whole transcript per hit).
+    #[test]
+    fn bookends_return_exactly_the_edge_messages() {
+        let (search, _dir) = temp_search();
+        search
+            .db
+            .insert_session("s", "cli", "gpt-5", "openai", "2025-01-15T10:00:00Z")
+            .unwrap();
+        for i in 0..10 {
+            search
+                .db
+                .insert_message(
+                    "s",
+                    "user",
+                    &format!("msg {i}"),
+                    None,
+                    None,
+                    None,
+                    &format!("2025-01-15T10:{:02}:00Z", i),
+                )
+                .unwrap();
+        }
+
+        let head = search.get_bookends("s", true).unwrap();
+        assert_eq!(
+            head.len(),
+            BOOKEND_COUNT,
+            "head must be exactly BOOKEND_COUNT, not BOOKEND_COUNT+1"
+        );
+        assert!(
+            head[0].content_preview.contains("msg 0"),
+            "head starts first"
+        );
+        assert!(
+            head[BOOKEND_COUNT - 1]
+                .content_preview
+                .contains(&format!("msg {}", BOOKEND_COUNT - 1)),
+            "head is contiguous from the start"
+        );
+
+        let tail = search.get_bookends("s", false).unwrap();
+        assert_eq!(
+            tail.len(),
+            BOOKEND_COUNT,
+            "tail must be exactly BOOKEND_COUNT"
+        );
+        assert!(
+            tail.last().unwrap().content_preview.contains("msg 9"),
+            "tail ends at the last message"
+        );
+        assert!(
+            tail[0].content_preview.contains("msg 7"),
+            "tail is the last BOOKEND_COUNT in chronological order"
         );
     }
 }

@@ -530,7 +530,15 @@ async fn run_prompt(
                 full_response = response.to_string();
                 break;
             }
-            AgentEvent::Error(_) => {
+            AgentEvent::Error(error) => {
+                // dirge-6po9: don't swallow the error and report a clean
+                // EndTurn — the editor client would see a truncated/empty
+                // turn with no diagnostic. Surface the text as a chunk
+                // before breaking, same shape as ContextOverflow below, so
+                // a provider auth failure / network error / tool crash is
+                // visible in the client.
+                let _ =
+                    cx.send_notification(diagnostic_chunk(&session_id, format!("error: {error}")));
                 break;
             }
             AgentEvent::ContextOverflow { error, .. } => {
@@ -540,15 +548,10 @@ async fn run_prompt(
                 // the stream, same shape as `Error`. Same warning:
                 // the original prompt isn't lost (ACP keeps its own
                 // history), but auto-recovery is interactive-only.
-                let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(format!(
-                    "context overflow: {}",
-                    error
-                ))));
-                let notif = SessionNotification::new(
-                    session_id.clone(),
-                    SessionUpdate::AgentMessageChunk(chunk),
-                );
-                let _ = cx.send_notification(notif);
+                let _ = cx.send_notification(diagnostic_chunk(
+                    &session_id,
+                    format!("context overflow: {error}"),
+                ));
                 break;
             }
             // Observability markers added for the interactive UI's
@@ -617,6 +620,20 @@ async fn run_prompt(
     };
     let _ = responder.respond(PromptResponse::new(reason));
     Ok(())
+}
+
+/// dirge-6po9: build the agent-message chunk that surfaces a run-ending
+/// diagnostic (a transient/auth/tool error, or a context overflow) to the
+/// ACP client. Without it the `Error` arm broke silently and the turn
+/// reported a clean `EndTurn` with truncated content and no reason. Shared
+/// by the `Error` and `ContextOverflow` arms so they stay the same shape.
+fn diagnostic_chunk(session_id: &SessionId, text: String) -> SessionNotification {
+    SessionNotification::new(
+        session_id.clone(),
+        SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(TextContent::new(
+            text,
+        )))),
+    )
 }
 
 fn create_acp_client(
@@ -914,6 +931,29 @@ mod tests {
         let mut c = ToolCallCorrelator::default();
         assert_eq!(c.resolve("missing"), None);
         assert_eq!(c.resolve(""), None);
+    }
+
+    /// dirge-6po9: an `AgentEvent::Error` must not be swallowed into a
+    /// clean EndTurn. The error arm now surfaces the text as an
+    /// agent-message chunk (same shape as ContextOverflow) so the editor
+    /// client sees why the turn ended. Pin the chunk shape here.
+    #[test]
+    fn diagnostic_chunk_carries_the_error_text() {
+        let sid = SessionId::new("sess-err".to_string());
+        let notif = diagnostic_chunk(&sid, "error: provider auth failed".to_string());
+        match notif.update {
+            SessionUpdate::AgentMessageChunk(chunk) => match chunk.content {
+                ContentBlock::Text(t) => {
+                    assert!(
+                        t.text.contains("provider auth failed"),
+                        "chunk must carry the diagnostic text, got {:?}",
+                        t.text
+                    );
+                }
+                other => panic!("expected a text content block, got {other:?}"),
+            },
+            other => panic!("expected an AgentMessageChunk, got {other:?}"),
+        }
     }
 
     /// dirge-5wqc: a fresh in-memory session map with one session already

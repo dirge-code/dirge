@@ -1739,6 +1739,14 @@ pub async fn run_loop(
                 return new_messages;
             }
 
+            // dirge-kjyz: MAX_TRANSIENT_RECOVERIES bounds CONSECUTIVE
+            // recoveries. Reaching here means the assistant turn completed
+            // with a non-error stop reason — the transient blip (if any)
+            // recovered — so reset the counter. Otherwise blips spread
+            // hours apart across a long autonomous run accumulate and the
+            // fourth one hard-fails a perfectly healthy network.
+            transient_recoveries = 0;
+
             // Pi lines 202-216: tool calls + results.
             let mut tool_calls = extract_tool_calls_from(&assistant_msg);
 
