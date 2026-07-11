@@ -1527,3 +1527,116 @@ fn link_fold_chains_multiple_folds_to_original_root() {
     assert_eq!(db.resolve_parent("s2").unwrap(), "s0");
     assert_eq!(db.resolve_parent("s1").unwrap(), "s0");
 }
+
+/// dirge-m7ja: the robustness win of the unified model — `resolve_parent` reads
+/// the authoritative `origin_id`, so a rotation whose intermediate
+/// `parent_session_id` link was lost (the exact drift the old chain walk
+/// couldn't survive — it would report the child as its own root) still groups
+/// under the conversation root.
+#[test]
+fn resolve_parent_uses_origin_not_broken_chain() {
+    let (db, _dir) = temp_db();
+    db.insert_session("root", "cli", "m", "p", "2026-01-01T10:00:00Z")
+        .unwrap();
+    db.insert_session("child", "cli", "m", "p", "2026-01-01T10:05:00Z")
+        .unwrap();
+    // Origin set; parent_session_id deliberately absent.
+    db.conn
+        .execute(
+            "UPDATE sessions SET origin_id = 'root' WHERE id = 'child'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(db.resolve_parent("child").unwrap(), "root");
+}
+
+/// dirge-m7ja: legacy DBs (parent chain, no origin) are backfilled from the
+/// existing chain on open, so every rotation gains the root as its origin and
+/// resolves through a single lookup afterward. Roots keep NULL.
+#[test]
+fn ensure_session_origin_backfills_legacy_chain() {
+    let (db, _dir) = temp_db();
+    for (id, t) in [
+        ("s0", "2026-01-01T10:00:00Z"),
+        ("s1", "2026-01-01T10:05:00Z"),
+        ("s2", "2026-01-01T10:10:00Z"),
+    ] {
+        db.insert_session(id, "cli", "m", "p", t).unwrap();
+    }
+    // Legacy shape: raw parent links, NO origin (bypass set_parent_session,
+    // which now also sets origin).
+    db.conn
+        .execute(
+            "UPDATE sessions SET parent_session_id='s0', origin_id=NULL WHERE id='s1'",
+            [],
+        )
+        .unwrap();
+    db.conn
+        .execute(
+            "UPDATE sessions SET parent_session_id='s1', origin_id=NULL WHERE id='s2'",
+            [],
+        )
+        .unwrap();
+
+    db.ensure_session_origin().unwrap();
+
+    let origin = |id: &str| -> Option<String> {
+        db.conn
+            .query_row(
+                "SELECT origin_id FROM sessions WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(origin("s2").as_deref(), Some("s0"));
+    assert_eq!(origin("s1").as_deref(), Some("s0"));
+    assert_eq!(origin("s0"), None, "root keeps a NULL origin");
+    assert_eq!(db.resolve_parent("s2").unwrap(), "s0");
+}
+
+/// dirge-m7ja: a fold writes the authoritative `origin_id` directly (single
+/// lookup, no chain walk), propagating the conversation root across rotations.
+#[test]
+fn link_fold_sets_authoritative_origin_id() {
+    let (db, _dir) = temp_db();
+    db.insert_session("s0", "cli", "m", "p", "2026-01-01T10:00:00Z")
+        .unwrap();
+    db.link_fold("s0", "s1", "cli", "m", "p", "2026-01-01T10:05:00Z")
+        .unwrap();
+    db.link_fold("s1", "s2", "cli", "m", "p", "2026-01-01T10:10:00Z")
+        .unwrap();
+    let o2: Option<String> = db
+        .conn
+        .query_row("SELECT origin_id FROM sessions WHERE id = 's2'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        o2.as_deref(),
+        Some("s0"),
+        "origin points straight at the root"
+    );
+    assert_eq!(db.resolve_parent("s2").unwrap(), "s0");
+}
+
+/// dirge-m7ja: the origin backfill is idempotent — re-running never re-touches
+/// an already-set origin and roots stay NULL.
+#[test]
+fn ensure_session_origin_is_idempotent() {
+    let (db, _dir) = temp_db();
+    db.insert_session("s0", "cli", "m", "p", "2026-01-01T10:00:00Z")
+        .unwrap();
+    db.link_fold("s0", "s1", "cli", "m", "p", "2026-01-01T10:05:00Z")
+        .unwrap();
+    db.ensure_session_origin().unwrap();
+    db.ensure_session_origin().unwrap();
+    assert_eq!(db.resolve_parent("s1").unwrap(), "s0");
+    let o0: Option<String> = db
+        .conn
+        .query_row("SELECT origin_id FROM sessions WHERE id = 's0'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(o0, None, "root origin stays NULL across re-runs");
+}

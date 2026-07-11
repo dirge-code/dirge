@@ -274,9 +274,12 @@ impl SessionDb {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .map_err(|e| format!("Failed to read schema version: {e}"))?;
 
-        if current >= SCHEMA_VERSION {
-            return Ok(());
-        }
+        // No early-return on an up-to-date DB: each migration below is guarded
+        // by `current < N`, so an already-migrated DB skips them all, but the
+        // feature-independent `ensure_*` steps must still run every open. Unlike
+        // `ensure_skills_tables` (which creates its own table before the
+        // ladder), `ensure_session_origin` ALTERs `sessions`, so it runs AFTER
+        // v1 has guaranteed that table exists (dirge-m7ja).
 
         if current < 1 {
             self.run_migration_v1()?;
@@ -340,9 +343,15 @@ impl SessionDb {
             self.run_migration_v15()?;
         }
 
-        self.conn
-            .pragma_update(None, "user_version", SCHEMA_VERSION)
-            .map_err(|e| format!("Failed to set schema version: {e}"))?;
+        if current < SCHEMA_VERSION {
+            self.conn
+                .pragma_update(None, "user_version", SCHEMA_VERSION)
+                .map_err(|e| format!("Failed to set schema version: {e}"))?;
+        }
+
+        // Feature-independent, idempotent, runs every open. Must follow v1
+        // (which creates `sessions`). dirge-m7ja.
+        self.ensure_session_origin()?;
 
         Ok(())
     }
@@ -1444,10 +1453,26 @@ impl SessionDb {
 
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn set_parent_session(&self, session_id: &str, parent_id: &str) -> Result<(), String> {
+        // dirge-m7ja: also propagate the origin (the parent's origin, or the
+        // parent id when the parent is itself the conversation's original), so
+        // lineage resolves through `origin_id` exactly as `link_fold`
+        // establishes it. Keeps this a faithful lineage-setup helper under the
+        // unified model.
+        let origin: String = self
+            .conn
+            .query_row(
+                "SELECT origin_id FROM sessions WHERE id = ?1",
+                params![parent_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten()
+            .filter(|o| !o.is_empty())
+            .unwrap_or_else(|| parent_id.to_string());
         self.conn
             .execute(
-                "UPDATE sessions SET parent_session_id = ?1 WHERE id = ?2",
-                params![parent_id, session_id],
+                "UPDATE sessions SET parent_session_id = ?1, origin_id = ?2 WHERE id = ?3",
+                params![parent_id, origin, session_id],
             )
             .map_err(|e| format!("Failed to set parent session: {e}"))?;
         Ok(())
@@ -1489,11 +1514,27 @@ impl SessionDb {
             params![new_sid, source, model, provider, now],
         )
         .map_err(|e| format!("Failed to insert rotated session: {e}"))?;
+        // dirge-m7ja: the rotation shares the OLD session's origin (or, when the
+        // old session is itself the conversation's original, the old id). This
+        // is the authoritative lineage key `resolve_parent` reads, so every
+        // rotation groups under one root via a single lookup — no dependence on
+        // the parent chain staying intact. parent_session_id is kept too, as
+        // non-load-bearing provenance (the immediate predecessor).
+        let origin: String = tx
+            .query_row(
+                "SELECT origin_id FROM sessions WHERE id = ?1",
+                params![old_sid],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten()
+            .filter(|o| !o.is_empty())
+            .unwrap_or_else(|| old_sid.to_string());
         tx.execute(
-            "UPDATE sessions SET parent_session_id = ?1 WHERE id = ?2",
-            params![old_sid, new_sid],
+            "UPDATE sessions SET parent_session_id = ?1, origin_id = ?2 WHERE id = ?3",
+            params![old_sid, origin, new_sid],
         )
-        .map_err(|e| format!("Failed to link fold parent: {e}"))?;
+        .map_err(|e| format!("Failed to link fold lineage: {e}"))?;
         tx.commit()
             .map_err(|e| format!("Failed to commit fold link: {e}"))?;
         Ok(())
@@ -1520,10 +1561,94 @@ impl SessionDb {
         Ok(())
     }
 
-    pub fn resolve_parent(&self, session_id: &str) -> Result<String, String> {
+    /// dirge-m7ja: bring the SQLite sessions table onto the same lineage key
+    /// the JSON side already uses (`Session::effective_origin`). `origin_id` is
+    /// the id of the conversation's ORIGINAL session, shared by every fold
+    /// rotation; NULL means the row IS its own origin (a fresh, unfolded
+    /// session). This is the single source of truth `resolve_parent` reads —
+    /// replacing the fragile `parent_session_id` chain walk, where one lost
+    /// intermediate link split a conversation into two roots.
+    ///
+    /// Feature-independent + idempotent (the `ensure_skills_tables` pattern),
+    /// so it applies in every build regardless of the feature-gated
+    /// `SCHEMA_VERSION`, and re-running only touches rows still missing origin.
+    fn ensure_session_origin(&self) -> Result<(), String> {
+        // A partial/legacy schema (some migration tests, a DB mid-build before
+        // v1) may not have the sessions table yet — nothing to do until it
+        // exists. A real fresh DB always has it by this point (v1 ran above).
+        let has_sessions: bool = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        if !has_sessions {
+            return Ok(());
+        }
+
+        // Add the column if it isn't there yet (guarded like the v4 ADD COLUMNs).
+        if let Err(e) = self
+            .conn
+            .execute("ALTER TABLE sessions ADD COLUMN origin_id TEXT", [])
+            && !e.to_string().contains("duplicate column name")
+        {
+            return Err(format!("Failed to add sessions.origin_id: {e}"));
+        }
+
+        // Backfill needs the parent chain; a schema predating parent_session_id
+        // has nothing to derive from (roots stay NULL, which is correct).
+        let has_parent: bool = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('sessions') WHERE name='parent_session_id'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        if !has_parent {
+            return Ok(());
+        }
+
+        // Backfill legacy rows from the existing parent chain, once. Roots
+        // (no parent) keep NULL — `resolve_parent` treats NULL as "own id is
+        // the root", matching the JSON side. Only NULL-origin children are
+        // touched, so this is safe to re-run and safe under the exclusive
+        // migration lock.
+        let pending: Vec<String> = {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT id FROM sessions \
+                     WHERE origin_id IS NULL AND parent_session_id IS NOT NULL",
+                )
+                .map_err(|e| format!("Failed to scan for origin backfill: {e}"))?;
+            stmt.query_map([], |row| row.get(0))
+                .map_err(|e| format!("Failed to read origin backfill rows: {e}"))?
+                .filter_map(|r| r.ok())
+                .collect()
+        };
+        for id in pending {
+            let root = self.chain_root(&id)?;
+            if root != id {
+                self.conn
+                    .execute(
+                        "UPDATE sessions SET origin_id = ?1 WHERE id = ?2 AND origin_id IS NULL",
+                        params![root, id],
+                    )
+                    .map_err(|e| format!("Failed to backfill origin for {id}: {e}"))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Root of `session_id`'s `parent_session_id` chain (the pre-origin walk).
+    /// Used ONLY to backfill legacy rows in [`ensure_session_origin`]; live
+    /// lineage resolution goes through `origin_id` via [`resolve_parent`].
+    fn chain_root(&self, session_id: &str) -> Result<String, String> {
         let mut current = session_id.to_string();
-        // Walk the parent chain up to root (max 100 hops to prevent
-        // infinite loops on corrupted data).
+        // Bounded walk (max 100 hops) so corrupted/cyclic legacy data can't spin.
         for _ in 0..100 {
             let parent: Option<String> = self
                 .conn
@@ -1540,6 +1665,30 @@ impl SessionDb {
             }
         }
         Ok(current)
+    }
+
+    /// The lineage ROOT of `session_id` — the id of the conversation's original
+    /// session, shared by every fold rotation. A single indexed lookup of the
+    /// authoritative `origin_id`: NULL/empty (or an unknown session) means the
+    /// session is its own root, matching `Session::effective_origin` on the
+    /// JSON side. dirge-m7ja replaced the `parent_session_id` chain walk with
+    /// this, so a rotation whose intermediate link was lost still groups
+    /// correctly as long as its origin is set — and there's no walk, hop cap,
+    /// or cycle risk.
+    pub fn resolve_parent(&self, session_id: &str) -> Result<String, String> {
+        let origin: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT origin_id FROM sessions WHERE id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .ok()
+            .and_then(|o: Option<String>| o);
+        Ok(match origin {
+            Some(o) if !o.is_empty() => o,
+            _ => session_id.to_string(),
+        })
     }
 }
 
