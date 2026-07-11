@@ -39,12 +39,9 @@ pub(crate) enum Verdict {
 /// per-site `.len() > MAX` gates truncated strings whose char count was
 /// already under the cap. Returns the input borrowed when within the cap.
 pub(crate) fn truncate_rules<'a>(rules: &'a str, max: usize, note: &str) -> Cow<'a, str> {
-    if rules.chars().count() > max {
-        let head: String = rules.chars().take(max).collect();
-        Cow::Owned(format!("{head}{note}"))
-    } else {
-        Cow::Borrowed(rules)
-    }
+    // dirge-kjzg: share the one char-based head truncator. `note` is a fixed
+    // suffix here (not parameterized by the dropped count), so ignore it.
+    crate::text::truncate_head(rules, max, |_| note.to_string())
 }
 
 /// Wall-clock bound on a single judge LLM call (critic / goal-gate /

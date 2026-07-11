@@ -56,6 +56,52 @@ pub(crate) fn ellipsize(s: &str, max_bytes: usize) -> String {
     format!("{}…", head(s, max_bytes.saturating_sub('…'.len_utf8())))
 }
 
+/// Truncate `s` to its first `budget` CHARACTERS (UTF-8 safe — never
+/// splits a codepoint), appending `note(dropped)` — where `dropped` is the
+/// number of characters cut — when it had to truncate. Returns `s`
+/// borrowed unchanged when already within budget.
+///
+/// dirge-kjzg: the one char-based head truncator. It replaces the
+/// byte-capped copies in `code_review::cap_diff`, `tools.rs` (two
+/// near-identical inline copies), and `critic::truncate_rules`, which each
+/// re-decided unit + note format — the byte ones needlessly shortened
+/// multibyte text and reported byte counts. The head+tail truncators
+/// (`compression::truncate_with_head_tail`, single-string with a
+/// budget-reserving marker; `run::build_critic_transcript`, block-level
+/// elision) are already char-based and structurally distinct, so they stay
+/// separate.
+pub(crate) fn truncate_head(
+    s: &str,
+    budget: usize,
+    note: impl Fn(usize) -> String,
+) -> std::borrow::Cow<'_, str> {
+    let total = s.chars().count();
+    if total <= budget {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let head: String = s.chars().take(budget).collect();
+    std::borrow::Cow::Owned(format!("{head}{}", note(total - budget)))
+}
+
+/// Byte-budget sibling of [`truncate_head`] for SIZE guards — log rings,
+/// memory caps — where the limit is a byte count (bounding storage /
+/// transport), not a display or token width. UTF-8-safe: floors the cut to
+/// a char boundary so a multibyte codepoint is never split. Appends
+/// `note(dropped_bytes)` when it truncates. dirge-kjzg: the two
+/// near-identical inline copies in `tools.rs` (adversarial-payload log
+/// caps) share this instead of re-deriving the `head + note` shape.
+pub(crate) fn truncate_head_bytes(
+    s: &str,
+    max_bytes: usize,
+    note: impl Fn(usize) -> String,
+) -> std::borrow::Cow<'_, str> {
+    if s.len() <= max_bytes {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let kept = head(s, max_bytes);
+    std::borrow::Cow::Owned(format!("{kept}{}", note(s.len() - kept.len())))
+}
+
 /// First line of `content`, capped at 80 chars (77 + `...`). The
 /// preview shape shared by memory breadcrumb indexes and curator
 /// audit reports (dirge-rwrg — was duplicated byte-for-byte in
@@ -191,6 +237,39 @@ mod tests {
         let cut = head(&s, 200); // byte 200 is mid-'世'
         assert!(s.starts_with(cut));
         assert_eq!(cut.len(), 199, "floored below the multibyte char");
+    }
+
+    #[test]
+    fn truncate_head_is_char_based_and_utf8_safe() {
+        // Within budget → borrowed, unchanged.
+        assert_eq!(truncate_head("hello", 10, |_| " …".into()), "hello");
+        // Over budget → first `budget` CHARS + note(dropped_chars).
+        assert_eq!(
+            truncate_head("hello world", 5, |d| format!(" (+{d})")),
+            "hello (+6)"
+        );
+        // dirge-kjzg: the budget counts CHARS, not bytes. 6 CJK chars (18
+        // bytes), budget 3 → three whole chars kept; a byte cap at 3 would
+        // have kept only "日".
+        let cjk = "日本語日本語";
+        assert_eq!(truncate_head(cjk, 3, |d| format!("[{d}]")), "日本語[3]");
+    }
+
+    #[test]
+    fn truncate_head_bytes_guards_byte_size_utf8_safe() {
+        // Within budget → borrowed, unchanged.
+        assert_eq!(truncate_head_bytes("hello", 10, |_| " …".into()), "hello");
+        // Over budget → head floored to a char boundary + note(dropped_bytes).
+        // "日本語" is 9 bytes; budget 4 floors to 3 (one char), drops 6.
+        assert_eq!(
+            truncate_head_bytes("日本語", 4, |d| format!(" ({d}b)")),
+            "日 (6b)"
+        );
+        // ASCII: byte budget == char budget.
+        assert_eq!(
+            truncate_head_bytes("abcdef", 3, |d| format!("[{d}]")),
+            "abc[3]"
+        );
     }
 
     #[test]

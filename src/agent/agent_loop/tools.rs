@@ -295,15 +295,10 @@ async fn prepare_tool_call(
             // the original to keep telemetry rows bounded —
             // multi-MB tool-call args are unusual but possible.
             let original_args = serde_json::to_string(&prepared_args).unwrap_or_default();
-            let original_truncated: String = if original_args.len() > 4096 {
-                format!(
-                    "{}... ({} bytes truncated)",
-                    crate::text::head(&original_args, 4096),
-                    original_args.len() - 4096
-                )
-            } else {
-                original_args
-            };
+            let original_truncated =
+                crate::text::truncate_head_bytes(&original_args, 4096, |dropped| {
+                    format!("... ({dropped} bytes truncated)")
+                });
             tracing::info!(
                 target: "tool_repair",
                 model = config.model_name.as_deref().unwrap_or("unknown"),
@@ -351,15 +346,10 @@ async fn prepare_tool_call(
             // generic `tool_repair = "failed"` log so structured-
             // log consumers can filter on it directly.
             let original_args = serde_json::to_string(&prepared_args).unwrap_or_default();
-            let original_truncated: String = if original_args.len() > 16384 {
-                format!(
-                    "{}... ({} bytes truncated)",
-                    crate::text::head(&original_args, 16384),
-                    original_args.len() - 16384
-                )
-            } else {
-                original_args
-            };
+            let original_truncated =
+                crate::text::truncate_head_bytes(&original_args, 16384, |dropped| {
+                    format!("... ({dropped} bytes truncated)")
+                });
             tracing::warn!(
                 target: "tool_input_invalid",
                 model = config.model_name.as_deref().unwrap_or("unknown"),

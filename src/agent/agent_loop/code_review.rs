@@ -750,23 +750,16 @@ fn should_exclude(path: &str) -> bool {
         || lower.starts_with("vendor/")
 }
 
-/// Truncate a diff to `max` bytes on a char boundary, appending a note so
-/// the reviewer knows the tail was elided. Returns the input untouched
-/// when it already fits.
+/// Truncate a diff to `max` characters, appending a note so the reviewer
+/// knows the tail was elided. Returns the input untouched when it fits.
+/// dirge-kjzg: shares the one char-based head truncator (was a byte cap —
+/// the reviewer sees a token-shaped budget now, and a multibyte diff isn't
+/// cut short).
 fn cap_diff(diff: &str, max: usize) -> String {
-    if diff.len() <= max {
-        return diff.to_string();
-    }
-    let mut end = max;
-    while end > 0 && !diff.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!(
-        "{}\n… (diff truncated — {} of {} bytes shown)",
-        &diff[..end],
-        end,
-        diff.len()
-    )
+    crate::text::truncate_head(diff, max, |dropped| {
+        format!("\n… (diff truncated — {dropped} chars elided)")
+    })
+    .into_owned()
 }
 
 // ── Prompt + orchestration (R3) ───────────────────────────────────────
@@ -1394,13 +1387,17 @@ diff --git a/Cargo.lock b/Cargo.lock\n\
 
     #[test]
     fn cap_diff_truncates_with_note_on_char_boundary() {
-        // Multibyte content to exercise the char-boundary walk-back.
-        let big = "é".repeat(1000); // 2 bytes each → 2000 bytes
+        // Multibyte content: char-based budget keeps whole codepoints.
+        let big = "é".repeat(1000); // 1000 chars, 2000 bytes
         let capped = cap_diff(&big, 101);
         assert!(capped.contains("diff truncated"));
-        assert!(capped.contains("of 2000 bytes"));
+        // dirge-kjzg: char-based — 1000 chars, 101 kept → 899 elided (a byte
+        // cap at 101 would have kept only ~50 é's and reported bytes).
+        assert!(capped.contains("899 chars"), "got: {capped}");
         // Must not have split a multibyte char (would panic on slice).
         assert!(capped.starts_with('é'));
+        // 101 chars of content kept before the note.
+        assert!(capped.chars().take_while(|&c| c == 'é').count() == 101);
     }
 
     #[test]
