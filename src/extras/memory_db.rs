@@ -841,6 +841,21 @@ impl SqliteMemoryStore {
         // form is canonical from here on (dedup/budget/insert all see it).
         let entry = redact_for_fts(trimmed);
 
+        // Char budget. Only an entry larger than the WHOLE hot budget is
+        // genuinely unsaveable (and that's a real error — split it).
+        // dirge-catw: checked BEFORE the overview branch, which returns
+        // early — an oversized overview-refresh lands in an eviction-exempt
+        // slot make_room_in_hot can never reclaim, so it must be gated here
+        // too, not only on the normal insert path below.
+        let char_limit = char_limit_for(target);
+        let entry_cost = entry.len();
+        if entry_cost > char_limit {
+            return Err(format!(
+                "Entry is {entry_cost} chars but the entire memory budget is {char_limit}; \
+                 split it into smaller entries.",
+            ));
+        }
+
         let mut conn = self.conn.lock_ignore_poison();
         let tx = conn
             .transaction()
@@ -855,6 +870,15 @@ impl SqliteMemoryStore {
             let rows = Self::active_rows(&tx, target)?;
             if let Some(existing) = rows.iter().find(|r| is_overview_row(r)) {
                 let id = existing.id;
+                // dirge-catw: don't let an overview-refresh become a verbatim
+                // copy of another active fact — the in-place branch skipped
+                // the dup gate the normal add path applies below.
+                if rows
+                    .iter()
+                    .any(|r| r.id != id && r.content.trim().eq_ignore_ascii_case(entry.trim()))
+                {
+                    return Err("Duplicate entry — already exists in memory".to_string());
+                }
                 let now = chrono::Utc::now().to_rfc3339();
                 tx.execute(
                     "UPDATE memories SET content = ?1, salience = ?2, tier = 'hot',
@@ -890,17 +914,6 @@ impl SqliteMemoryStore {
             .any(|r| r.content.trim().eq_ignore_ascii_case(entry.trim()))
         {
             return Err("Duplicate entry — already exists in memory".to_string());
-        }
-
-        // Char budget. Only an entry larger than the WHOLE hot budget
-        // is genuinely unsaveable (and that's a real error — split it).
-        let char_limit = char_limit_for(target);
-        let entry_cost = entry.len();
-        if entry_cost > char_limit {
-            return Err(format!(
-                "Entry is {entry_cost} chars but the entire memory budget is {char_limit}; \
-                 split it into smaller entries.",
-            ));
         }
 
         // Hot-tier insert with budget compaction (working-reserve rules
@@ -1016,6 +1029,18 @@ impl SqliteMemoryStore {
         // dirge-n3qf: redact secrets before storing (see add_entry).
         let new_entry = redact_for_fts(trimmed);
 
+        // dirge-catw: replace applies the same whole-budget gate as
+        // add_entry/supersede_entry — otherwise replacing a tiny entry with
+        // a huge body smuggled unbounded content straight into the hot tier.
+        let char_limit = char_limit_for(target);
+        if new_entry.len() > char_limit {
+            return Err(format!(
+                "Entry is {} chars but the entire memory budget is {char_limit}; \
+                 split it into smaller entries.",
+                new_entry.len()
+            ));
+        }
+
         let mut conn = self.conn.lock_ignore_poison();
         let tx = conn
             .transaction()
@@ -1023,6 +1048,17 @@ impl SqliteMemoryStore {
         let rows = Self::active_rows(&tx, target)?;
         let idx = find_unique_match(&rows, old_text)?;
         let id = rows[idx].id;
+
+        // dirge-catw: reject a replacement that duplicates a DIFFERENT active
+        // entry (case-insensitive), mirroring add/supersede — replacing A
+        // with a verbatim copy of B just collides two facts.
+        if rows
+            .iter()
+            .enumerate()
+            .any(|(i, r)| i != idx && r.content.trim().eq_ignore_ascii_case(new_entry.trim()))
+        {
+            return Err("Duplicate entry — already exists in memory".to_string());
+        }
 
         let now = chrono::Utc::now().to_rfc3339();
         match kind {
@@ -1059,6 +1095,25 @@ impl SqliteMemoryStore {
             params![id, redact_for_fts(&new_entry)],
         )
         .map_err(|e| format!("Failed to reindex entry: {e}"))?;
+
+        // dirge-catw: a replace that GROWS a hot entry can push the hot tier
+        // over budget just like an add. Compact the same way — demote
+        // least-salient hot rows to breadcrumb (never the overview) — so a
+        // grow can't silently overflow the inline budget. The grown row is
+        // already at its new size in the tx, so pass cost 0.
+        if rows[idx].tier == "hot" && new_entry.len() > rows[idx].content.len() {
+            let effective_kind =
+                kind.unwrap_or_else(|| parse_kind(&rows[idx].kind).unwrap_or_default());
+            let demoted = Self::make_room_in_hot(
+                &tx,
+                target,
+                0,
+                matches!(effective_kind, MemoryKind::Working),
+            )?;
+            if demoted > 0 {
+                Self::compact_breadcrumbs(&tx, target)?;
+            }
+        }
         tx.commit().map_err(|e| format!("Failed to commit: {e}"))?;
         Ok(())
     }
@@ -1346,9 +1401,18 @@ impl SqliteMemoryStore {
     pub fn bump_salience(&self, uid: &str, delta: f64, cap: f64) -> Result<(), String> {
         let conn = self.conn.lock_ignore_poison();
         let now = chrono::Utc::now().to_rfc3339();
+        // dirge-fxds: never REDUCE. A plain MIN(cap, salience+delta) writes
+        // an entry already above the cap DOWN to the cap — and since the
+        // graduation ledger then blocks a retry, a heavily-consulted entry
+        // reinforced past the cap by `expand_entry` would be permanently
+        // demoted. Only raise (toward the cap) entries currently below it.
         let changed = conn
             .execute(
-                "UPDATE memories SET salience = MIN(?1, salience + ?2), updated_at = ?3 WHERE uid = ?4",
+                "UPDATE memories
+                 SET salience = CASE WHEN salience >= ?1 THEN salience
+                                     ELSE MIN(?1, salience + ?2) END,
+                     updated_at = ?3
+                 WHERE uid = ?4",
                 params![cap, delta, now, uid],
             )
             .map_err(|e| format!("Failed to bump salience: {e}"))?;
@@ -2315,6 +2379,112 @@ mod tests {
             .add_entry("memory", "BUILD: CARGO BUILD", None)
             .unwrap_err();
         assert!(err.contains("Duplicate"), "got: {err}");
+    }
+
+    #[test]
+    fn replace_rejects_over_budget_body() {
+        // dirge-catw: add_entry/supersede_entry reject a body larger than
+        // the whole hot budget, but replace_entry stored it verbatim —
+        // replacing 'x' with a 50KB body smuggled unbounded content past
+        // the budget. Replace must apply the same whole-budget gate.
+        let (paths, _dir) = temp_project();
+        let store = SqliteMemoryStore::load(&paths).unwrap();
+        store.add_entry("memory", "small fact", None).unwrap();
+        let huge = "z".repeat(DEFAULT_MEMORY_CHAR_LIMIT + 500);
+        let err = store
+            .replace_entry("memory", "small fact", &huge, None)
+            .unwrap_err();
+        assert!(
+            err.contains("budget"),
+            "over-budget replace rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn replace_rejects_duplicate_of_another_entry() {
+        // dirge-catw: replacing entry A's text with an exact copy of entry
+        // B's content would create a duplicate fact. add/supersede reject
+        // this; replace must too.
+        let (paths, _dir) = temp_project();
+        let store = SqliteMemoryStore::load(&paths).unwrap();
+        store.add_entry("memory", "fact alpha", None).unwrap();
+        store.add_entry("memory", "fact beta", None).unwrap();
+        let err = store
+            .replace_entry("memory", "fact alpha", "FACT BETA", None)
+            .unwrap_err();
+        assert!(
+            err.contains("Duplicate"),
+            "duplicate replace rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn overview_refresh_rejects_over_budget_body() {
+        // dirge-catw: the overview in-place branch returned before the
+        // size check, so an oversized overview-refresh (run every session
+        // by the review pass) became permanent, eviction-exempt
+        // system-prompt bloat.
+        let (paths, _dir) = temp_project();
+        let store = SqliteMemoryStore::load(&paths).unwrap();
+        store
+            .add_entry("memory", "Project: a Rust CLI", Some(MemoryKind::Overview))
+            .unwrap();
+        let huge = format!("Project: {}", "o".repeat(DEFAULT_MEMORY_CHAR_LIMIT + 500));
+        let err = store
+            .add_entry("memory", &huge, Some(MemoryKind::Overview))
+            .unwrap_err();
+        assert!(
+            err.contains("budget"),
+            "over-budget overview rejected: {err}"
+        );
+        // The original overview must survive the rejected refresh.
+        let view = store.view("memory").to_string();
+        assert!(view.contains("a Rust CLI"), "original overview intact");
+    }
+
+    #[test]
+    fn replace_growing_a_hot_entry_compacts_to_stay_in_budget() {
+        // dirge-catw: a replace that GROWS a hot entry can push the hot
+        // tier over budget. Like an add, it must demote least-salient hot
+        // rows to breadcrumb rather than overflow silently.
+        let (paths, _dir) = temp_project();
+        let store = SqliteMemoryStore::load(&paths).unwrap();
+        // Fill the hot tier close to the 2200-char budget with five
+        // ~400-char facts.
+        for i in 0..5 {
+            let e = format!("fact {i}: {}", "x".repeat(390));
+            store
+                .add_entry("memory", &e, Some(MemoryKind::Semantic))
+                .unwrap();
+        }
+        // Grow one of them well past the remaining headroom.
+        let big = format!("fact 2: {}", "y".repeat(1800));
+        store
+            .replace_entry("memory", "fact 2:", &big, None)
+            .unwrap();
+        let conn = raw_conn(&paths);
+        let hot_total: i64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(LENGTH(content) + 3), 0) FROM memories \
+                 WHERE target = 'memory' AND status = 'active' AND tier = 'hot'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            hot_total <= DEFAULT_MEMORY_CHAR_LIMIT as i64,
+            "hot tier must stay within budget after a growing replace, got {hot_total}"
+        );
+        // The replaced fact must still be active (hot or breadcrumb).
+        let active_big: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories \
+                 WHERE status = 'active' AND content LIKE 'fact 2: yyy%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(active_big, 1, "the grown entry stays active");
     }
 
     #[test]
@@ -4533,6 +4703,45 @@ mod tests {
             )
             .unwrap();
         assert!((after - 0.9).abs() < 1e-9, "salience capped at 0.9");
+    }
+
+    #[test]
+    fn bump_salience_never_demotes_entry_above_cap() {
+        // dirge-fxds: MIN(cap, salience + delta) LOWERS an entry already
+        // above the cap. The cluster representative is chosen by highest
+        // use_count and reinforced up to 1.0, so a heavily-consulted entry
+        // at 0.95 that graduates would get written DOWN to 0.9 and the
+        // ledger would then block a retry. Bump must never reduce.
+        let (paths, _dir) = temp_project();
+        let store = SqliteMemoryStore::load(&paths).unwrap();
+        store
+            .add_entry("memory", "already hot entry", None)
+            .unwrap();
+        let conn = raw_conn(&paths);
+        let uid: String = conn
+            .query_row(
+                "SELECT uid FROM memories WHERE content = 'already hot entry'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "UPDATE memories SET salience = 0.95 WHERE uid = ?1",
+            rusqlite::params![uid],
+        )
+        .unwrap();
+        store.bump_salience(&uid, 0.05, 0.9).unwrap();
+        let after: f64 = conn
+            .query_row(
+                "SELECT salience FROM memories WHERE uid = ?1",
+                rusqlite::params![uid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            (after - 0.95).abs() < 1e-9,
+            "salience above the cap must be left untouched, got {after}"
+        );
     }
 
     #[test]
