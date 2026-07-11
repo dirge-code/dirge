@@ -484,9 +484,12 @@ async fn poll_finalization_follow_up(
                     // is gone by now (the review's judge call finishes after
                     // AgentEnd). Fall back to the (weak) per-turn sender for
                     // consumers without a sink — headless, tests — which stop
-                    // at Done and wouldn't render it anyway.
+                    // at Done and wouldn't render it anyway. try_send (not
+                    // send().await) so a stalled UI can't back-pressure this
+                    // detached task; an advisory dropped on a full queue is
+                    // acceptable, matching task::emit_chat's drop-on-overflow.
                     if let Some(sink) = super::code_review::review_notice_sink() {
-                        let _ = sink.send(notice).await;
+                        let _ = sink.try_send(notice);
                     } else if let Some(emit) = emit.upgrade() {
                         let _ = emit.send(LoopEvent::SystemNotice { content: notice }).await;
                     }
