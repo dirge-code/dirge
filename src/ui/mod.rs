@@ -2891,12 +2891,11 @@ pub async fn run_interactive(
                                         // the steering queue at turn boundaries and injects
                                         // it as mid-turn guidance within the same run.
                                         ui.interjection_queue.lock().unwrap().push_back(text.to_string());
-                                        // Signal the agent to stop at the next tool-result
-                                        // boundary so the queued message is injected as a new
-                                        // user turn rather than waiting for the run to complete.
-                                        if let Some(tx) = ui.agent_interject.as_ref() {
-                                            let _ = tx.try_send(());
-                                        }
+                                        // The queue itself is the turn-boundary handoff. Do
+                                        // not also send the runner's one-way interject signal:
+                                        // that signal races this queue drain (and Alt+X), and a
+                                        // late signal can stop the run after its message has
+                                        // already been consumed or dropped.
                                         // Seal the in-flight response + reset the render
                                         // buffer so the steering echo below doesn't cause the
                                         // partial to re-render (duplicating the <dirge> block).
