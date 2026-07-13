@@ -175,7 +175,7 @@ fn spawn_abort_watcher(
     abort: AbortSignal,
     handle: tokio::task::AbortHandle,
     cancel_tx: tokio::sync::mpsc::Sender<()>,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             if abort.is_cancelled() {
@@ -185,7 +185,7 @@ fn spawn_abort_watcher(
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
-    });
+    })
 }
 
 /// Read-only tool universe for a readonly tooled subagent. Verified against
@@ -296,15 +296,15 @@ pub fn resolve_subagent_allow(
         SubagentToolTier::Readonly => SUBAGENT_READONLY_BASE,
         SubagentToolTier::ReadWrite => SUBAGENT_READWRITE_BASE,
     };
-    let mut set: BTreeSet<String> = universe.iter().map(|s| s.to_ascii_lowercase()).collect();
-    // `allow` can only keep items already in the tier universe; additions
-    // outside it are silently dropped (can't escalate past the tier).
-    for a in &p.allow {
-        let a = a.to_ascii_lowercase();
-        if universe.iter().any(|u| u.eq_ignore_ascii_case(&a)) {
-            set.insert(a);
-        }
-    }
+    let mut set: BTreeSet<String> = if p.allow.is_empty() {
+        universe.iter().map(|s| s.to_ascii_lowercase()).collect()
+    } else {
+        p.allow
+            .iter()
+            .map(|s| s.to_ascii_lowercase())
+            .filter(|a| universe.iter().any(|u| u.eq_ignore_ascii_case(a)))
+            .collect()
+    };
     for d in &p.deny {
         set.remove(&d.to_ascii_lowercase());
     }
@@ -680,7 +680,7 @@ impl TaskTool {
                     max_turns,
                     model_for_task.as_ref(),
                 );
-                spawn_abort_watcher(
+                let abort_watcher = spawn_abort_watcher(
                     abort_for_task.clone(),
                     runner.task.abort_handle(),
                     runner.cancel_tx.clone(),
@@ -695,6 +695,7 @@ impl TaskTool {
                 };
                 let drained = drain_subagent_runner(runner, &tid_for_task, emit);
                 let outer = tokio::time::timeout(SUBAGENT_TIMEOUT, drained).await;
+                abort_watcher.abort();
                 let aborted = abort_for_task.is_cancelled();
                 let (state, chat_event) = match outer {
                     Ok(Ok(text)) => (
@@ -792,13 +793,14 @@ impl TaskTool {
                 max_turns,
                 route_model.as_ref(),
             );
-            spawn_abort_watcher(
+            let abort_watcher = spawn_abort_watcher(
                 abort.clone(),
                 runner.task.abort_handle(),
                 runner.cancel_tx.clone(),
             );
 
             let result = drain_subagent_runner(runner, &task_id, |ev| self.emit_chat(ev)).await;
+            abort_watcher.abort();
             unregister_subagent_abort(&task_id);
             let aborted = abort.is_cancelled();
             match result {
@@ -1240,6 +1242,21 @@ mod tests {
         )
     }
 
+    #[tokio::test]
+    async fn abort_watcher_can_be_stopped_after_runner_completion() {
+        let runner_task = tokio::spawn(std::future::pending::<()>());
+        let (cancel_tx, _cancel_rx) = tokio::sync::mpsc::channel(1);
+        let watcher =
+            spawn_abort_watcher(AbortSignal::new(), runner_task.abort_handle(), cancel_tx);
+
+        watcher.abort();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), watcher)
+            .await
+            .expect("aborted watcher must terminate");
+        assert!(result.unwrap_err().is_cancelled());
+        runner_task.abort();
+    }
+
     // Regression: the task tool description must tell the agent that
     // background=true delivers completion automatically and instruct it
     // NOT to poll task_status. The previous text told the agent to "use
@@ -1374,6 +1391,20 @@ mod tests {
     }
 
     #[test]
+    fn non_empty_allow_narrows_readonly_base() {
+        use crate::context::agent_defs::{SubagentToolPolicy, SubagentToolTier};
+        let p = SubagentToolPolicy {
+            tier: SubagentToolTier::Readonly,
+            allow: vec!["read".into(), "grep".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_subagent_allow(&p).unwrap(),
+            vec!["grep".to_string(), "read".to_string()]
+        );
+    }
+
+    #[test]
     fn resolve_toolless_returns_none() {
         use crate::context::agent_defs::{SubagentToolPolicy, SubagentToolTier};
         let p = SubagentToolPolicy {
@@ -1467,11 +1498,10 @@ mod tests {
             ..Default::default()
         };
         let got = resolve_subagent_allow(&p).unwrap();
-        assert!(!got.iter().any(|t| t == "bash"));
-        assert!(!got.iter().any(|t| t == "edit"));
-        assert!(!got.iter().any(|t| t == "write"));
-        // but the readonly base is still fully present
-        assert!(got.iter().any(|t| t == "read"));
+        assert!(
+            got.is_empty(),
+            "invalid-only allow must narrow to no tools: {got:?}"
+        );
     }
 
     #[test]

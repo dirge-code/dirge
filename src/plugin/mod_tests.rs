@@ -2343,6 +2343,73 @@ fn load_plugin_aliases_bare_hooks_to_stem_prefix() {
     assert_eq!(out, vec!["from-bare".to_string()]);
 }
 
+#[test]
+fn delegate_and_orchestrator_modes_are_isolated_and_do_not_follow_up() {
+    let plugins_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("plugins");
+    let mut mgr = PluginManager::try_new().unwrap();
+    super::load_plugin(&mut mgr, &plugins_dir.join("delegate.janet")).unwrap();
+    super::load_plugin(&mut mgr, &plugins_dir.join("orchestrator.janet")).unwrap();
+
+    let commands: std::collections::HashMap<_, _> = mgr.list_commands().into_iter().collect();
+    let delegate = commands.get("delegate").unwrap();
+    let delegate_off = commands.get("delegate-off").unwrap();
+    let orchestrate = commands.get("orchestrate").unwrap();
+    let orchestrate_off = commands.get("orchestrate-off").unwrap();
+
+    mgr.invoke_command(delegate, "").unwrap();
+    let prompt = mgr.dispatch("on-prompt", "@{:prompt \"task\"}").unwrap();
+    assert_eq!(
+        prompt.len(),
+        1,
+        "only delegation mode should be active: {prompt:?}"
+    );
+    assert!(prompt[0].contains("DELEGATION MODE"));
+
+    mgr.dispatch(
+        "on-tool-start",
+        r#"@{:tool "task" :args "{\"agent\":\"coder\",\"background\":true,\"prompt\":\"edit it\"}"}"#,
+    )
+    .unwrap();
+    assert!(
+        mgr.dispatch("on-response", "@{:response \"done\"}")
+            .unwrap()
+            .is_empty(),
+        "mode bookkeeping must not schedule an automatic follow-up"
+    );
+
+    let off = mgr.invoke_command(delegate_off, "").unwrap().unwrap();
+    assert!(
+        off.starts_with("delegation mode off"),
+        "wrong off handler: {off}"
+    );
+    assert!(
+        mgr.dispatch("on-prompt", "@{:prompt \"next\"}")
+            .unwrap()
+            .is_empty(),
+        "delegate-off must disable delegation without enabling orchestration"
+    );
+
+    mgr.invoke_command(orchestrate, "").unwrap();
+    let prompt = mgr.dispatch("on-prompt", "@{:prompt \"task\"}").unwrap();
+    assert_eq!(
+        prompt.len(),
+        1,
+        "only orchestration mode should be active: {prompt:?}"
+    );
+    assert!(prompt[0].contains("ORCHESTRATION MODE"));
+    let off = mgr.invoke_command(orchestrate_off, "").unwrap().unwrap();
+    assert!(
+        off.starts_with("orchestration mode off"),
+        "wrong off handler: {off}"
+    );
+    assert!(
+        mgr.dispatch("on-prompt", "@{:prompt \"next\"}")
+            .unwrap()
+            .is_empty(),
+        "orchestrate-off must disable orchestration without enabling delegation"
+    );
+}
+
 /// Two plugins both using *bare* hook names don't clobber each
 /// other — the alias step preserves each plugin's hook under its
 /// own `{stem}-on-prompt` namespace, so both fire on dispatch.
