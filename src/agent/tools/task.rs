@@ -1266,7 +1266,7 @@ mod tests {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
 
-        let _guard = registry_test_lock();
+        let _guard = registry_test_lock().await;
         clear_abort_registry_for_test();
         let id = "cancel-all-tooled";
         register_subagent_abort(id, AbortSignal::new());
@@ -1822,17 +1822,18 @@ mod tests {
     // dirge-781c: registry-backed kill resolution. These tests use a
     // serial mutex to ensure they don't trample each other's
     // registry state when run in parallel (cargo's default).
-    fn registry_test_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
-            .lock_ignore_poison()
+    async fn registry_test_lock() -> tokio::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await
     }
 
     /// `/kill` against an empty registry or a never-spawned prefix
     /// must be a NoOp — never panic, never cancel anything.
-    #[test]
-    fn kill_unknown_id_no_op() {
-        let _guard = registry_test_lock();
+    #[tokio::test]
+    async fn kill_unknown_id_no_op() {
+        let _guard = registry_test_lock().await;
         clear_abort_registry_for_test();
         // Empty registry, any prefix → NotFound.
         assert_eq!(kill_subagent("abc"), KillOutcome::NotFound);
@@ -1850,9 +1851,9 @@ mod tests {
 
     /// `/kill <prefix>` with exactly one matching id resolves to
     /// `Killed(full_id)` and fires the abort signal.
-    #[test]
-    fn kill_resolves_by_prefix_unique_match() {
-        let _guard = registry_test_lock();
+    #[tokio::test]
+    async fn kill_resolves_by_prefix_unique_match() {
+        let _guard = registry_test_lock().await;
         clear_abort_registry_for_test();
         let sig_a = AbortSignal::new();
         let sig_b = AbortSignal::new();
@@ -1912,13 +1913,9 @@ mod tests {
     /// The test exercises the racer directly because `btw_query`
     /// requires a real provider. The racer is the same code path
     /// the production `call()` runs.
-    // Serialization guard: intentionally held across the test's `.await`s
-    // so the global abort registry isn't shared with a concurrently-
-    // running test.
-    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn subagent_complete_after_kill_returns_aborted_result() {
-        let _guard = registry_test_lock();
+        let _guard = registry_test_lock().await;
         clear_abort_registry_for_test();
         let tid = "t-abort-1";
         let abort = AbortSignal::new();
