@@ -55,6 +55,31 @@ struct UndoSnapshot {
     pastes: Vec<Option<PasteSlot>>,
 }
 
+/// Reinterpret an AltGr-composed character as literal text input (gh-659).
+///
+/// Windows reports AltGr as left-Ctrl + right-Alt, so a character that
+/// needs AltGr on the active layout — `@ # [ ] { }` on the Italian,
+/// German, Spanish, … layouts — reaches the app as a `Char` event with
+/// BOTH `CONTROL` and `ALT` set, even though crossterm has already filled
+/// in the composed `char`. The editor's insertion arms gate on
+/// `!ctrl && !alt`, so without this those characters — and pastes
+/// containing them, which the Windows console backend delivers as
+/// synthesized keystrokes — are silently dropped. When both modifiers
+/// accompany a printable char, strip them so the keystroke is treated as
+/// text. Single-modifier chords (Ctrl+key / Alt+key keybindings) and
+/// non-printable chars are left untouched, so real keybindings still fire.
+/// Any Shift is preserved (some layouts compose via AltGr+Shift).
+fn normalize_altgr(mut key: KeyEvent) -> KeyEvent {
+    if let KeyCode::Char(c) = key.code
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && key.modifiers.contains(KeyModifiers::ALT)
+        && !c.is_control()
+    {
+        key.modifiers -= KeyModifiers::CONTROL | KeyModifiers::ALT;
+    }
+    key
+}
+
 fn prev_char_boundary(s: &str, idx: usize) -> usize {
     let mut i = idx.saturating_sub(1);
     while i > 0 && !s.is_char_boundary(i) {
@@ -885,6 +910,9 @@ impl InputEditor {
     }
 
     pub fn handle_picker_key(&mut self, key: KeyEvent) -> bool {
+        // Same AltGr fold as `handle_key` (gh-659): keep the file-picker
+        // query typable with `@`-layout special chars.
+        let key = normalize_altgr(key);
         let picker = match self.picker.as_mut() {
             Some(p) if p.active => p,
             _ => return false,
@@ -1401,6 +1429,10 @@ impl InputEditor {
     /// it can't record itself; reverse-i-search is excluded entirely
     /// (its buffer mirrors a transient history match, not an edit).
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<CompactString> {
+        // Fold AltGr-composed chars (Ctrl+Alt+printable on Windows) back to
+        // plain text before any dispatch, so `@ # [ ] { }` on non-US
+        // layouts type and paste instead of being dropped (gh-659).
+        let key = normalize_altgr(key);
         if self.search_mode {
             return self.handle_key_inner(key);
         }
@@ -2363,5 +2395,92 @@ mod tests {
         let (s, c) = e.display();
         assert_eq!(s, "[5 lines pasted] suffix");
         assert_eq!(c, s.len());
+    }
+
+    // ── gh-659: AltGr-composed characters on Windows ──────────────────
+    // Windows reports AltGr as Ctrl+Alt, so `@ # [ ] { }` on the Italian
+    // (and German/Spanish/…) layouts reach the editor as `Char` events
+    // with BOTH modifiers set. They must be inserted as text, not dropped
+    // as (unbound) keybindings — and `@` must still open the file picker.
+
+    #[test]
+    fn altgr_at_sign_inserts_and_opens_picker() {
+        let mut e = InputEditor::new();
+        e.handle_key(ev(
+            KeyCode::Char('@'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ));
+        assert_eq!(e.buffer.as_str(), "@");
+        assert_eq!(e.cursor, 1);
+        assert!(
+            e.picker.as_ref().is_some_and(|p| p.active),
+            "AltGr @ must open the @-file picker",
+        );
+    }
+
+    #[test]
+    fn altgr_special_chars_are_inserted() {
+        for c in ['#', '[', ']', '{', '}'] {
+            let mut e = InputEditor::new();
+            e.handle_key(ev(
+                KeyCode::Char(c),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ));
+            assert_eq!(
+                e.buffer.as_str(),
+                c.to_string(),
+                "AltGr {c:?} must be inserted as text",
+            );
+        }
+    }
+
+    #[test]
+    fn altgr_char_with_shift_is_inserted() {
+        // Some layouts compose via AltGr+Shift; the extra Shift must not
+        // suppress the insert.
+        let mut e = InputEditor::new();
+        e.handle_key(ev(
+            KeyCode::Char('{'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT,
+        ));
+        assert_eq!(e.buffer.as_str(), "{");
+    }
+
+    #[test]
+    fn altgr_char_typed_into_active_picker_query() {
+        // Once the picker is open, an AltGr char must extend the query
+        // rather than be dropped.
+        let mut e = InputEditor::new();
+        e.handle_key(ev(
+            KeyCode::Char('@'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ));
+        assert!(e.picker.as_ref().is_some_and(|p| p.active));
+        let consumed = e.handle_picker_key(ev(
+            KeyCode::Char('#'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ));
+        assert!(consumed, "picker must consume the AltGr char");
+        assert_eq!(e.buffer.as_str(), "@#");
+    }
+
+    #[test]
+    fn ctrl_only_binding_still_fires_not_inserted() {
+        // A single-modifier chord is a keybinding, NOT text: Ctrl+A moves
+        // to line start and inserts nothing.
+        let mut e = InputEditor::new();
+        e.insert_str("hello");
+        e.handle_key(ev(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        assert_eq!(e.buffer.as_str(), "hello", "Ctrl+A must not insert 'a'");
+        assert_eq!(e.cursor, 0, "Ctrl+A moves to line start");
+    }
+
+    #[test]
+    fn alt_only_char_is_not_inserted_as_text() {
+        // Alt+<char> is reserved for keybindings; an unbound Alt combo
+        // must never land in the buffer as literal text.
+        let mut e = InputEditor::new();
+        e.handle_key(ev(KeyCode::Char('z'), KeyModifiers::ALT));
+        assert_eq!(e.buffer.as_str(), "", "Alt+z must not insert 'z'");
     }
 }
