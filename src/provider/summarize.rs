@@ -100,14 +100,14 @@ pub(crate) async fn oneshot_with_model(
     // purpose, which model) is visible. No-op unless DIRGE_DUMP_REQUESTS is set.
     crate::provider::wire::dump_oneshot(
         label,
-        oneshot_provider_kind(&model),
+        model.provider_name(),
         &model.name(),
         preamble,
         &prompt,
     );
     // dirge-zt8p: disable extended reasoning for this one-shot (see
     // `reasoning_disable_for_kind`). Computed before the consuming match.
-    let disable = reasoning_disable_for_kind(oneshot_provider_kind(&model));
+    let disable = reasoning_disable_for_kind(model.provider_name());
     match model {
         super::AnyModel::OpenRouter(m) => run_oneshot(m, label, preamble, prompt, disable).await,
         super::AnyModel::OpenAI(m) => run_oneshot(m, label, preamble, prompt, disable).await,
@@ -123,24 +123,6 @@ pub(crate) async fn oneshot_with_model(
         super::AnyModel::OpenCode(m) => run_oneshot(m, label, preamble, prompt, disable).await,
         super::AnyModel::Ollama(m) => run_oneshot(m, label, preamble, prompt, disable).await,
         super::AnyModel::Custom(m) => run_oneshot(m, label, preamble, prompt, disable).await,
-    }
-}
-
-/// Canonical provider-kind string for an [`AnyModel`] variant — the three
-/// OpenAI client variants collapse to "openai", the two Anthropic ones to
-/// "anthropic". Used to pick the reasoning-disable shape for one-shots.
-fn oneshot_provider_kind(model: &super::AnyModel) -> &'static str {
-    use super::AnyModel as M;
-    match model {
-        M::OpenRouter(_) => "openrouter",
-        M::OpenAI(_) | M::ChatGptOpenAI(_) | M::OpenAICodex(_) => "openai",
-        M::Anthropic(_) | M::AnthropicOauth(_) => "anthropic",
-        M::Gemini(_) => "gemini",
-        M::DeepSeek(_) => "deepseek",
-        M::Glm(_) => "glm",
-        M::OpenCode(_) => "opencode",
-        M::Ollama(_) => "ollama",
-        M::Custom(_) => "custom",
     }
 }
 

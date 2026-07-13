@@ -512,11 +512,17 @@ impl AnyAgent {
         let names: Vec<&str> = allowed.iter().map(String::as_str).collect();
         let tools = filter_loop_tools(&self.loop_tools, &names);
         let tool_defs = Self::tool_defs_for(&tools);
-        let provider = self.provider_name().to_string();
+        let provider = model_override
+            .map(AnyModel::provider_name)
+            .unwrap_or_else(|| self.provider_name())
+            .to_string();
         let inner_stream_fn = match model_override {
-            Some(m) => {
-                m.build_stream_fn_with_filter(tool_defs, self.chunk_timeout, Some(provider), None)
-            }
+            Some(m) => m.build_stream_fn_with_filter(
+                tool_defs,
+                self.chunk_timeout,
+                Some(provider.clone()),
+                None,
+            ),
             None => self.build_stream_fn(tool_defs),
         };
         let stream_fn = retrying_stream_fn(inner_stream_fn, RecoveryPolicy::default());
@@ -524,7 +530,7 @@ impl AnyAgent {
         let mut cfg = LoopSpawnConfig::minimal(stream_fn, prompt);
         cfg.system_prompt = system_prompt;
         cfg.tools = tools;
-        cfg.provider_name = Some(self.provider_name().to_string());
+        cfg.provider_name = Some(provider);
         cfg.model_name = match model_override {
             Some(m) => Some(m.name()),
             None => Self::model_name_opt(&self.model_name),

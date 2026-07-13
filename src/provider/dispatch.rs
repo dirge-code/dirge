@@ -424,6 +424,20 @@ impl AnyModel {
         }
     }
 
+    pub fn provider_name(&self) -> &'static str {
+        match self {
+            AnyModel::OpenRouter(_) => "openrouter",
+            AnyModel::OpenAI(_) | AnyModel::ChatGptOpenAI(_) | AnyModel::OpenAICodex(_) => "openai",
+            AnyModel::Anthropic(_) | AnyModel::AnthropicOauth(_) => "anthropic",
+            AnyModel::Gemini(_) => "gemini",
+            AnyModel::DeepSeek(_) => "deepseek",
+            AnyModel::Glm(_) => "glm",
+            AnyModel::OpenCode(_) => "opencode",
+            AnyModel::Ollama(_) => "ollama",
+            AnyModel::Custom(_) => "custom",
+        }
+    }
+
     /// Return the model identifier string that was passed when
     /// the model was built (`client.completion_model("…")`).
     /// Forwarded to `LoopConfig.model_name` so the

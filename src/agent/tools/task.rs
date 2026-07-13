@@ -188,6 +188,29 @@ fn spawn_abort_watcher(
     })
 }
 
+struct SubagentCleanup {
+    id: String,
+    watcher: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl SubagentCleanup {
+    fn new(id: String, watcher: tokio::task::JoinHandle<()>) -> Self {
+        Self {
+            id,
+            watcher: Some(watcher),
+        }
+    }
+}
+
+impl Drop for SubagentCleanup {
+    fn drop(&mut self) {
+        if let Some(watcher) = self.watcher.take() {
+            watcher.abort();
+        }
+        unregister_subagent_abort(&self.id);
+    }
+}
+
 /// Read-only tool universe for a readonly tooled subagent. Verified against
 /// the registration list in `build_loop_tools`. A readonly subagent can read
 /// files, search, and browse the web — but never mutate, recurse, write
@@ -518,10 +541,6 @@ async fn drain_subagent_runner(
         match event {
             AgentEvent::Token(t) => {
                 text.push_str(&t);
-                emit(SubagentChatEvent::Token {
-                    id: id.to_string(),
-                    text: t.to_string(),
-                });
             }
             AgentEvent::Reasoning(t) => emit(SubagentChatEvent::Reasoning {
                 id: id.to_string(),
@@ -538,11 +557,20 @@ async fn drain_subagent_runner(
                 output_summary: one_line(&output, 120),
             }),
             AgentEvent::Done { response, .. } => {
-                return Ok(if response.is_empty() {
+                let response = if response.is_empty() {
                     text
                 } else {
                     response.to_string()
+                };
+                emit(SubagentChatEvent::Token {
+                    id: id.to_string(),
+                    text: response.clone(),
                 });
+                emit(SubagentChatEvent::Complete {
+                    id: id.to_string(),
+                    result: response.clone(),
+                });
+                return Ok(response);
             }
             AgentEvent::Error(msg) => return Err(msg.to_string()),
             AgentEvent::ContextOverflow { error, .. } => return Err(error.to_string()),
@@ -685,6 +713,7 @@ impl TaskTool {
                     runner.task.abort_handle(),
                     runner.cancel_tx.clone(),
                 );
+                let _cleanup = SubagentCleanup::new(tid_for_task.clone(), abort_watcher);
                 let chat_sink_drain = chat_sink.clone();
                 let emit = move |ev: SubagentChatEvent| {
                     if let Some(sink) = &chat_sink_drain {
@@ -695,32 +724,25 @@ impl TaskTool {
                 };
                 let drained = drain_subagent_runner(runner, &tid_for_task, emit);
                 let outer = tokio::time::timeout(SUBAGENT_TIMEOUT, drained).await;
-                abort_watcher.abort();
                 let aborted = abort_for_task.is_cancelled();
                 let (state, chat_event) = match outer {
-                    Ok(Ok(text)) => (
-                        TaskState::Completed(text.clone()),
-                        SubagentChatEvent::Token {
-                            id: tid_for_task.clone(),
-                            text: text.clone(),
-                        },
-                    ),
+                    Ok(Ok(text)) => (TaskState::Completed(text), None),
                     Ok(Err(e)) => {
                         let aborted_msg = "aborted by user".to_string();
                         if aborted {
                             (
                                 TaskState::Failed(aborted_msg.clone()),
-                                SubagentChatEvent::Aborted {
+                                Some(SubagentChatEvent::Aborted {
                                     id: tid_for_task.clone(),
-                                },
+                                }),
                             )
                         } else {
                             (
                                 TaskState::Failed(e.clone()),
-                                SubagentChatEvent::Failed {
+                                Some(SubagentChatEvent::Failed {
                                     id: tid_for_task.clone(),
                                     error: e,
-                                },
+                                }),
                             )
                         }
                     }
@@ -729,36 +751,20 @@ impl TaskTool {
                             format!("subagent timed out after {}s", SUBAGENT_TIMEOUT.as_secs());
                         (
                             TaskState::Failed(msg.clone()),
-                            SubagentChatEvent::Failed {
+                            Some(SubagentChatEvent::Failed {
                                 id: tid_for_task.clone(),
                                 error: msg,
-                            },
+                            }),
                         )
                     }
                 };
-                // Emit the streaming Token first (on success) then the
-                // terminal event, mirroring the btw background path so the UI
-                // renders the payload through the same code path.
-                let final_event = match &chat_event {
-                    SubagentChatEvent::Token { id, text } => {
-                        if let Some(sink) = &chat_sink {
-                            let _ = sink.try_send(chat_event.clone());
-                        } else if let Some(sink) = subagent_chat_sink() {
-                            let _ = sink.try_send(chat_event.clone());
-                        }
-                        SubagentChatEvent::Complete {
-                            id: id.clone(),
-                            result: text.clone(),
-                        }
+                if let Some(chat_event) = chat_event {
+                    if let Some(sink) = chat_sink {
+                        let _ = sink.try_send(chat_event);
+                    } else if let Some(sink) = subagent_chat_sink() {
+                        let _ = sink.try_send(chat_event);
                     }
-                    _ => chat_event.clone(),
-                };
-                if let Some(sink) = chat_sink {
-                    let _ = sink.try_send(final_event);
-                } else if let Some(sink) = subagent_chat_sink() {
-                    let _ = sink.try_send(final_event);
                 }
-                unregister_subagent_abort(&tid_for_task);
                 store_for_task.notify(&tid_for_task, state);
             });
             store.attach_handle(&task_id, handle);
@@ -799,16 +805,12 @@ impl TaskTool {
                 runner.cancel_tx.clone(),
             );
 
+            let _cleanup = SubagentCleanup::new(task_id.clone(), abort_watcher);
+
             let result = drain_subagent_runner(runner, &task_id, |ev| self.emit_chat(ev)).await;
-            abort_watcher.abort();
-            unregister_subagent_abort(&task_id);
             let aborted = abort.is_cancelled();
             match result {
                 Ok(text) => {
-                    self.emit_chat(SubagentChatEvent::Complete {
-                        id: task_id.clone(),
-                        result: text.clone(),
-                    });
                     let outcome =
                         crate::agent::tools::output_relay::relay_if_large("task", text, "");
                     Ok(outcome.text)
@@ -1242,6 +1244,73 @@ mod tests {
         )
     }
 
+    #[test]
+    fn model_provider_name_follows_model_variant() {
+        use rig::client::CompletionClient;
+
+        let openai = rig::providers::openai::Client::builder()
+            .api_key("test-key")
+            .base_url("http://localhost")
+            .build()
+            .unwrap()
+            .completion_model("gpt-test");
+        let anthropic = rig::providers::anthropic::Client::new("test-key")
+            .unwrap()
+            .completion_model("claude-test");
+
+        assert_eq!(AnyModel::OpenAI(openai).provider_name(), "openai");
+        assert_eq!(AnyModel::Anthropic(anthropic).provider_name(), "anthropic");
+    }
+
+    #[tokio::test]
+    async fn cancel_all_cleans_tooled_subagent_registry_and_watcher() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let _guard = registry_test_lock();
+        clear_abort_registry_for_test();
+        let id = "cancel-all-tooled";
+        register_subagent_abort(id, AbortSignal::new());
+
+        struct MarkDropped(Arc<AtomicBool>);
+        impl Drop for MarkDropped {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let watcher_dropped = Arc::new(AtomicBool::new(false));
+        let dropped = watcher_dropped.clone();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let outer = tokio::spawn(async move {
+            let watcher = tokio::spawn(async move {
+                let _mark = MarkDropped(dropped);
+                std::future::pending::<()>().await;
+            });
+            let _cleanup = SubagentCleanup::new(id.to_string(), watcher);
+            let _ = ready_tx.send(());
+            std::future::pending::<()>().await;
+        });
+
+        ready_rx.await.unwrap();
+        let store = BackgroundStore::new();
+        store.insert(id.to_string());
+        store.attach_handle(id, outer);
+        store.cancel_all();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while registered_subagent_ids()
+                .iter()
+                .any(|task_id| task_id == id)
+                || !watcher_dropped.load(Ordering::SeqCst)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancel_all must drop cleanup and abort watcher");
+    }
+
     #[tokio::test]
     async fn abort_watcher_can_be_stopped_after_runner_completion() {
         let runner_task = tokio::spawn(std::future::pending::<()>());
@@ -1544,7 +1613,7 @@ mod tests {
     /// in order, with the final Done text returned. Mirrors the
     /// `runner_replaying` pattern in `plan::runtime::tests`.
     #[tokio::test]
-    async fn drain_relays_events_to_chat_window() {
+    async fn drain_buffers_tokens_and_emits_response_once() {
         use crate::agent::runner::AgentRunner;
         use crate::event::{AgentEvent, ToolContent};
         use std::sync::{Arc, Mutex};
@@ -1601,32 +1670,30 @@ mod tests {
         use SubagentChatEvent::*;
         assert!(matches!(
             &events[0],
-            Token { id, text } if id == "sub-1" && text == "hello "
-        ));
-        assert!(matches!(
-            &events[1],
-            Token { id, text } if id == "sub-1" && text == "world"
-        ));
-        assert!(matches!(
-            &events[2],
             Reasoning { id, text } if id == "sub-1" && text == "thinking"
         ));
         assert!(matches!(
-            &events[3],
+            &events[1],
             ToolCall { id, tool_name, args_summary }
                 if id == "sub-1" && tool_name == "read" && args_summary.contains("path=/tmp/x")
         ));
         assert!(matches!(
-            &events[4],
+            &events[2],
             ToolResult { id, output_summary, .. }
                 if id == "sub-1" && output_summary.contains("file contents")
         ));
-        // The drain relays per-step events only — the caller emits the
-        // terminal Complete/Failed after, so exactly 5 events here.
+        assert!(matches!(
+            &events[3],
+            Token { id, text } if id == "sub-1" && text == "hello world"
+        ));
+        assert!(matches!(
+            &events[4],
+            Complete { id, result } if id == "sub-1" && result == "hello world"
+        ));
         assert_eq!(
             events.len(),
             5,
-            "drain relays 5 step events, no terminal: {events:?}"
+            "success must emit one buffered response then Complete: {events:?}"
         );
     }
 
