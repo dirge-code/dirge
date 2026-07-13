@@ -37,6 +37,7 @@ Example:
   "default_permission_mode": "standard",
   "show_tool_details": true,
   "show_edit_diff": true,
+  "animations_enabled": true,
   "show_reasoning": false,
   "display": "left|main|right",
   "tool_result_max_chars": 500,
@@ -107,6 +108,7 @@ Accepted top-level keys:
 | `default_permission_mode` | string  | Permission mode when no mode boolean/CLI flag is set. Use `standard`, `restrictive`, `accept`, or `yolo`.                                                                   |
 | `show_tool_details`       | boolean | Show tool-result output in the TUI. Default: `true`.                                                                                                                         |
 | `show_edit_diff`          | boolean | Show colorized diff output for `edit` tool results (`-` red, `+` green, `@@` cyan). Default: `true`.                                                                        |
+| `animations_enabled`      | boolean | Enable TUI animations (avatar face toggling, spinner repaint timer). Default: `true`. Set to `false` to reduce terminal flicker and CPU usage; the avatar freezes to a static face. |
 | `show_reasoning`          | boolean | Show the model's thinking/reasoning by default, instead of having to press `Ctrl+O` each turn. Default: `false`.                                                            |
 | `desktop_notifications`   | object  | Optional OS-level desktop notifications. Off when absent. Set `{ "enabled": true }` to notify on completed runs and prompts waiting for input. Backed by `notify-rust` on macOS, Linux, and Windows. |
 | `max_sessions`            | integer | How many of the most-recent prior sessions in the same project (same working dir) to mine for Up-arrow / Ctrl+F command history, seeded ahead of the current session's prompts. Default: `3`. Set `0` to keep recall to the current session only. See [Command history](#command-history-cross-session-recall). |

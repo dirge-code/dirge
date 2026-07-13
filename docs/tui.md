@@ -74,7 +74,9 @@ kill-subagent) are **rebindable** via the `keybindings` config — see
 
 A 5-cell face lives in the left margin of the input row and reflects what the
 agent is currently doing. Single-tick animation alternates between two poses
-where applicable.
+where applicable. Set `animations_enabled: false` in config to freeze the
+avatar to a static face and bypass the 200ms repaint timer (reduces terminal
+flicker and CPU usage).
 
 | State | Frames | Meaning |
 |-------|--------|---------|
