@@ -1248,9 +1248,8 @@ mod tests {
     fn model_provider_name_follows_model_variant() {
         use rig::client::CompletionClient;
 
-        let openai = rig::providers::openai::Client::builder()
+        let openai = rig::providers::openai::CompletionsClient::builder()
             .api_key("test-key")
-            .base_url("http://localhost")
             .build()
             .unwrap()
             .completion_model("gpt-test");
