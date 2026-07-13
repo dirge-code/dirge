@@ -1026,7 +1026,7 @@ impl InputEditor {
         use std::io::Write;
         let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
 
-        let path = std::env::temp_dir().join(format!("dirge-input-{}.txt", std::process::id()));
+        let path = std::env::temp_dir().join(format!("dirge-input-{}.md", std::process::id()));
         // Clear any leftover from an interrupted prior edit, then create the
         // file with O_EXCL (`create_new`): if an attacker pre-planted a symlink
         // at this predictable path, the open fails safely instead of writing
