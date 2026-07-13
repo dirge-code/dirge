@@ -689,6 +689,10 @@ pub struct Config {
     pub default_permission_mode: Option<String>,
     pub show_tool_details: Option<bool>,
     pub show_edit_diff: Option<bool>,
+    /// TUI animations (avatar face toggling, spinner repaint timer).
+    /// Default true. Set to false to reduce terminal flicker and CPU
+    /// usage; the avatar freezes to a static face.
+    pub animations_enabled: Option<bool>,
     /// Make the model's thinking/reasoning burst visible by default,
     /// without having to press Ctrl+O each turn (GH #461). Absent or
     /// `false` keeps today's behavior (reasoning hidden until toggled).

@@ -631,6 +631,8 @@ pub struct Renderer {
     /// Animation flip; toggled by `tick_avatar()` so the avatar's
     /// eyes / mouth alternate between two poses per state.
     avatar_tick: bool,
+    /// Whether TUI animations are enabled (set at construction from config).
+    animations_enabled: bool,
 
     // ── ratatui migration (Phase 6) ────────────────────────────────
     /// The ratatui Terminal driving the new paint pipeline. `Option`
@@ -747,6 +749,7 @@ impl Renderer {
             alert_title: String::new(),
             avatar_state: crate::ui::avatar::AvatarState::Idle,
             avatar_tick: false,
+            animations_enabled: true,
             // ratatui's backend writes to /dev/tty (a fresh fd
             // pointing at the controlling terminal) rather than the
             // process's stdout. With stdout/stderr redirected to
@@ -779,6 +782,16 @@ impl Renderer {
     /// tooltip appears on the next redraw.
     pub fn notify_copied(&mut self) {
         self.copied_at = Some(std::time::Instant::now());
+    }
+
+    /// Configure whether TUI animations are enabled (set from config at startup).
+    pub fn set_animations_enabled(&mut self, enabled: bool) {
+        self.animations_enabled = enabled;
+    }
+
+    /// Check whether TUI animations are enabled.
+    pub fn animations_enabled(&self) -> bool {
+        self.animations_enabled
     }
 
     /// If text was copied within the last 2 seconds, returns the
@@ -2732,7 +2745,7 @@ impl Renderer {
         };
         self.input_rows = (total_rows + completion_extra).clamp(1, MAX_INPUT_VISIBLE_LINES as u16);
 
-        if is_running {
+        if is_running && self.animations_enabled {
             self.spinner_tick = !self.spinner_tick;
             self.avatar_tick = !self.avatar_tick;
         }

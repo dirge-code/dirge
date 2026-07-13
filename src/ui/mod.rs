@@ -286,6 +286,7 @@ pub async fn run_interactive(
     let _guard = TerminalGuard::new()?;
 
     let mut renderer = Renderer::new()?;
+    renderer.set_animations_enabled(cfg.animations_enabled.unwrap_or(true));
     // Apply the preferred pane layout from config (`display`). An invalid
     // spec is surfaced as a warning and ignored (panels keep their
     // automatic width-based default); the `/display` command overrides
@@ -4880,7 +4881,7 @@ pub async fn run_interactive(
                         };
                         renderer.request_repaint();
                     }
-                    _ = tokio::time::sleep(tokio::time::Duration::from_millis(200)), if ui.is_running => {
+                    _ = tokio::time::sleep(tokio::time::Duration::from_millis(200)), if ui.is_running && renderer.animations_enabled() => {
                         // #387: drive the spinner/avatar animation. Force a repaint so
                         // the loop-top render effect advances the spinner (whose tick
                         // changes in cache_bottom but wouldn't trip dirty-on-change by
