@@ -72,10 +72,10 @@ mod todo_row_tests {
             rows[0],
             ("▶".to_string(), "wire retry backoff".to_string(), true)
         );
-        assert_eq!(rows[1].2, false);
+        assert!(!rows[1].2);
         assert_eq!(rows[1].0, "[ ]");
         assert_eq!(rows[2].0, "[!]");
-        assert_eq!(rows[2].2, false, "blocked is not the active/focus row");
+        assert!(!rows[2].2, "blocked is not the active/focus row");
     }
 
     #[test]

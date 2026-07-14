@@ -136,7 +136,10 @@ impl ProjectPaths {
         self.dirge_dir().join("config.json")
     }
 
-    /// `.dirge/plugins/` — project-local Janet plugins.
+    /// `.dirge/plugins/` — project-local Janet plugins. The only callers are
+    /// `#[cfg(feature = "plugin")]`, so this is dead code in the windows-default
+    /// / no-plugin build (which compiles with `-D warnings`).
+    #[cfg_attr(not(feature = "plugin"), allow(dead_code))]
     pub fn plugins_dir(&self) -> PathBuf {
         self.dirge_dir().join("plugins")
     }
