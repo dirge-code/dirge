@@ -939,7 +939,7 @@ async fn run_compaction_pass_with_focus(
             .filter(|cp| cp.generation == *generation);
         let mut reused = false;
         if let Some(cp) = reusable
-            && let Some((new_msgs, _first_kept)) = compression::apply_checkpoint_summary(
+            && let Some((new_msgs, cut)) = compression::apply_checkpoint_summary(
                 &current_context.messages,
                 &cp.summary,
                 cp.boundary,
@@ -947,14 +947,56 @@ async fn run_compaction_pass_with_focus(
         {
             let projected = compression::estimate_messages_tokens(&new_msgs);
             if projected <= fold_target {
-                current_context.messages = new_msgs;
-                after_summary = projected;
-                applied_summary = cp.summary;
+                // dirge-vpma.9: fire the compaction hooks over the slice this
+                // fold discards (`messages[..cut]`). The background checkpointer
+                // that produced `cp` never consulted them, so without this a
+                // memory provider never sees the discarded messages on the
+                // high-frequency fast path (the silent-insight-drop dirge-h5tv
+                // fixed for the inline path) and the on-compact plugin's
+                // first-refusal is bypassed. Fired ONLY here inside the
+                // committed reuse branch — the inline path below is
+                // `!reused`-guarded, so the hooks fire exactly once per pass.
+                let mut effective_summary = cp.summary;
+                let mut effective_msgs = new_msgs;
+                let mut effective_tokens = projected;
+                if memory_provider.is_some() || compaction_hooks.is_some() {
+                    let discarded: Vec<serde_json::Value> =
+                        current_context.messages[..cut].to_vec();
+                    // on_pre_compress (dirge-h5tv): let the memory provider
+                    // observe the discarded slice for insight capture. The
+                    // returned focus has no summary prompt to feed on the fast
+                    // path, so the call is purely for its side effect.
+                    let _ = build_augmented_focus(
+                        focus_topic.as_deref(),
+                        memory_provider.as_ref(),
+                        &discarded,
+                    );
+                    // on_compact (dirge-jia8): give the plugin first refusal. If
+                    // it returns a valid summary, fold with THAT instead of the
+                    // checkpoint's — the checkpoint summary was generated without
+                    // consulting the plugin.
+                    if let Some(hooks) = compaction_hooks
+                        && let Some(s) = (hooks.on_compact)(discarded).await
+                        && compression::validate_summary(&s)
+                        && let Some((m, _)) = compression::apply_checkpoint_summary(
+                            &current_context.messages,
+                            &s,
+                            cp.boundary,
+                        )
+                    {
+                        effective_tokens = compression::estimate_messages_tokens(&m);
+                        effective_msgs = m;
+                        effective_summary = s;
+                    }
+                }
+                current_context.messages = effective_msgs;
+                after_summary = effective_tokens;
+                applied_summary = effective_summary;
                 // dirge-vpma.3: apply_checkpoint_summary yields `[summary] +
                 // messages[cut..]`, so the summary marker sits at NEW-list index 0.
                 // `Succeeded(idx)` / `first_kept_index` are the NEW-list summary
                 // index (restore_working_files splices file snapshots at idx+1), so
-                // report 0 — the returned `_first_kept` is the OLD-list cut and
+                // report 0 — the returned `cut` is the OLD-list cut and
                 // feeding it splices snapshots at the wrong position (mid-tail →
                 // orphaned tool_use/result → provider 400, or past the end).
                 applied_first_kept = 0;
@@ -963,7 +1005,7 @@ async fn run_compaction_pass_with_focus(
                 tracing::info!(
                     target: "dirge::agent_loop",
                     boundary = cp.boundary,
-                    tokens_after = projected,
+                    tokens_after = after_summary,
                     "fast compaction: reused background checkpoint summary (no inline LLM call)",
                 );
             }

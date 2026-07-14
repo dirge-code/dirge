@@ -671,6 +671,169 @@ async fn run_compaction_pass_reuses_fresh_checkpoint_without_calling_summarizer(
     );
 }
 
+/// dirge-vpma.9: the fast (checkpoint-reuse) fold must still fire
+/// `on_pre_compress` over the slice it discards, exactly once. The
+/// background checkpointer that produced the summary never consulted the
+/// memory provider, so without this the provider never sees the discarded
+/// messages on the high-frequency fast path (the silent-insight-drop
+/// dirge-h5tv fixed for the inline path).
+#[tokio::test]
+async fn fast_reuse_fires_on_pre_compress_over_discarded_slice() {
+    use crate::extras::memory_provider::MemoryProvider;
+    use std::sync::atomic::Ordering;
+
+    struct RecordingProvider {
+        seen: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+    impl MemoryProvider for RecordingProvider {
+        fn name(&self) -> &str {
+            "recording"
+        }
+        fn view(&self, _t: &str) -> Value {
+            serde_json::json!({})
+        }
+        fn add(&self, _: &str, _: &str, _: Option<&str>) -> Result<Value, String> {
+            Ok(serde_json::json!({}))
+        }
+        fn replace(&self, _: &str, _: &str, _: &str, _: Option<&str>) -> Result<Value, String> {
+            Ok(serde_json::json!({}))
+        }
+        fn remove(&self, _: &str, _: &str) -> Result<Value, String> {
+            Ok(serde_json::json!({}))
+        }
+        fn on_pre_compress(&self, transcript: &str) -> String {
+            self.seen.lock().unwrap().push(transcript.to_string());
+            String::new()
+        }
+    }
+
+    let mut ctx = padded_ctx(20);
+    let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let summarize_fn = recording_summarizer(called.clone());
+    let slot = slot_with(
+        "## Active Task\nFROM CHECKPOINT\n## Remaining Work\nfinish",
+        10,
+        0,
+    );
+    let mut generation = 0u64;
+
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let provider: Option<std::sync::Arc<dyn MemoryProvider>> =
+        Some(std::sync::Arc::new(RecordingProvider {
+            seen: seen.clone(),
+        }));
+
+    let (tx, _rx) = mpsc::channel::<LoopEvent>(16);
+    let outcome = super::run_compaction_pass(
+        &mut ctx,
+        &summarize_fn,
+        5,
+        0,
+        &provider,
+        None,
+        &tx,
+        &slot,
+        &mut generation,
+        u64::MAX,
+    )
+    .await;
+    drop(tx);
+
+    assert!(
+        matches!(outcome, super::SummaryOutcome::Succeeded(_)),
+        "reuse should succeed"
+    );
+    assert!(
+        !called.load(Ordering::SeqCst),
+        "inline summarizer must NOT be called on the fast path"
+    );
+    let seen = seen.lock().unwrap();
+    assert_eq!(
+        seen.len(),
+        1,
+        "on_pre_compress must fire exactly once on the fast path (no drop, no double-fire)"
+    );
+    assert!(
+        seen[0].contains("turn"),
+        "the discarded messages should appear in the transcript the provider saw: {:?}",
+        seen[0]
+    );
+}
+
+/// dirge-vpma.9: on the fast reuse path, a plugin `on_compact` that returns
+/// a valid summary is honored — folded IN PLACE OF the background
+/// checkpoint's summary (first-refusal contract) — and it fires exactly
+/// once (no double-fire with the inline path, which is `!reused`-guarded).
+#[tokio::test]
+async fn fast_reuse_on_compact_overrides_checkpoint_summary() {
+    use crate::agent::agent_loop::types::CompactionHooks;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let mut ctx = padded_ctx(20);
+    let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let summarize_fn = recording_summarizer(called.clone());
+    let slot = slot_with(
+        "## Active Task\nFROM CHECKPOINT\n## Remaining Work\nfinish",
+        10,
+        0,
+    );
+    let mut generation = 0u64;
+
+    let compact_calls = std::sync::Arc::new(AtomicUsize::new(0));
+    let cc = compact_calls.clone();
+    let hooks = CompactionHooks {
+        on_before: std::sync::Arc::new(|_c, _t| Box::pin(async {})),
+        on_compact: std::sync::Arc::new(move |_middle| {
+            cc.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                Some("## Active Task\nPLUGIN-SUMMARY\n## Remaining Work\ngo".to_string())
+            })
+        }),
+    };
+
+    let (tx, _rx) = mpsc::channel::<LoopEvent>(16);
+    super::run_compaction_pass(
+        &mut ctx,
+        &summarize_fn,
+        5,
+        0,
+        &None,
+        Some(&hooks),
+        &tx,
+        &slot,
+        &mut generation,
+        u64::MAX,
+    )
+    .await;
+    drop(tx);
+
+    assert!(
+        !called.load(Ordering::SeqCst),
+        "inline summarizer must NOT be called on the fast path"
+    );
+    assert_eq!(
+        compact_calls.load(Ordering::SeqCst),
+        1,
+        "on_compact must fire exactly once on the fast path"
+    );
+    let has = |needle: &str| {
+        ctx.messages.iter().any(|m| {
+            m.get("content")
+                .and_then(|v| v.as_str())
+                .map(|s| s.contains(needle))
+                .unwrap_or(false)
+        })
+    };
+    assert!(
+        has("PLUGIN-SUMMARY"),
+        "the plugin summary must win over the checkpoint's on the fast path"
+    );
+    assert!(
+        !has("FROM CHECKPOINT"),
+        "the checkpoint summary must be replaced by the plugin's"
+    );
+}
+
 /// A checkpoint from a stale epoch (generation mismatch) is ignored — the
 /// fold falls back to the inline summarizer.
 #[tokio::test]
