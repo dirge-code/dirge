@@ -1219,9 +1219,10 @@ impl InputEditor {
                 None
             }
             InputAction::KillToLineEnd => {
-                if self.cursor < self.buffer.len() {
-                    let killed: CompactString = self.buffer[self.cursor..].into();
-                    self.buffer.truncate(self.cursor);
+                let line_end = cursor_line_end(&self.buffer, self.cursor);
+                if self.cursor < line_end {
+                    let killed: CompactString = self.buffer[self.cursor..line_end].into();
+                    self.buffer.replace_range(self.cursor..line_end, "");
                     self.push_kill(killed, KillDir::Append);
                 }
                 None
@@ -1985,6 +1986,19 @@ mod tests {
         // Ctrl+W kills the word before the cursor (cursor at end).
         e.handle_key(ev(KeyCode::Char('w'), KeyModifiers::CONTROL));
         assert_eq!(e.buffer.as_str(), "foo bar ");
+    }
+
+    /// dirge-vpma.16: Ctrl+K kills to end of the current LINE, not the
+    /// end of the whole buffer; the yanked text is available via Ctrl+Y.
+    #[test]
+    fn kill_to_line_end_stops_at_newline() {
+        let mut e = InputEditor::new();
+        e.insert_str("line1\nline2\nline3");
+        e.cursor = 3; // middle of line 1 ("lin|e1")
+        e.handle_key(ev(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        assert_eq!(e.buffer.as_str(), "lin\nline2\nline3");
+        e.handle_key(ev(KeyCode::Char('y'), KeyModifiers::CONTROL));
+        assert_eq!(e.buffer.as_str(), "line1\nline2\nline3");
     }
 
     /// dirge-wncc: a kill (Ctrl+W here) after a yank mutates the buffer
