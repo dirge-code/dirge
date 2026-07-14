@@ -177,32 +177,71 @@ where
             } else {
                 chunk_timeout
             };
+            // dirge-vpma.11: race the chunk-wait against the abort signal so
+            // a mid-stream cancel returns promptly instead of blocking up to
+            // the full chunk timeout (which can be ~300s). The pre-poll check
+            // above catches a signal already set before the wait; this catches
+            // a cancel that lands DURING the wait. `None` marks cancellation.
             let next = match effective_timeout {
-                Some(t) => match tokio::time::timeout(t, raw.next()).await {
-                    Ok(item) => item,
-                    Err(_) => {
-                        // Phrase using "timed out" so
-                        // recovery::classify_error matches on
-                        // it and routes to ErrorKind::Network for
-                        // retry. Matches runner.rs:301-304.
-                        let detail = if !open_tool_calls.is_empty() {
-                            format!(
-                                "stream chunk timed out after {}s while a tool call was mid-assembly (provider stalled emitting tool-call deltas — common DeepSeek symptom; the harness narrows to {}s while assembling tool calls). Retried automatically when no text has emitted yet; otherwise the partial response is kept to avoid duplicating it. If your model legitimately pauses longer than {}s between deltas, raise `timeouts.tool_call_gap_secs` in config.json.",
-                                t.as_secs(),
-                                tool_call_gap_timeout.as_secs(),
-                                tool_call_gap_timeout.as_secs(),
-                            )
-                        } else {
-                            format!(
-                                "stream chunk timed out after {}s (provider stalled or connection silently dropped) — bump `stream_chunk_timeout_secs` in config.json if your model has long reasoning gaps",
-                                t.as_secs(),
-                            )
-                        };
-                        yield StreamEvent::Error { error: detail };
-                        return;
+                Some(t) => {
+                    let waited = match signal.as_ref() {
+                        Some(sig) => tokio::select! {
+                            biased;
+                            _ = sig.cancelled() => None,
+                            r = tokio::time::timeout(t, raw.next()) => Some(r),
+                        },
+                        None => Some(tokio::time::timeout(t, raw.next()).await),
+                    };
+                    match waited {
+                        None => {
+                            yield StreamEvent::Error {
+                                error: "stream aborted by cancellation signal".to_string(),
+                            };
+                            return;
+                        }
+                        Some(Ok(item)) => item,
+                        Some(Err(_)) => {
+                            // Phrase using "timed out" so
+                            // recovery::classify_error matches on
+                            // it and routes to ErrorKind::Network for
+                            // retry. Matches runner.rs:301-304.
+                            let detail = if !open_tool_calls.is_empty() {
+                                format!(
+                                    "stream chunk timed out after {}s while a tool call was mid-assembly (provider stalled emitting tool-call deltas — common DeepSeek symptom; the harness narrows to {}s while assembling tool calls). Retried automatically when no text has emitted yet; otherwise the partial response is kept to avoid duplicating it. If your model legitimately pauses longer than {}s between deltas, raise `timeouts.tool_call_gap_secs` in config.json.",
+                                    t.as_secs(),
+                                    tool_call_gap_timeout.as_secs(),
+                                    tool_call_gap_timeout.as_secs(),
+                                )
+                            } else {
+                                format!(
+                                    "stream chunk timed out after {}s (provider stalled or connection silently dropped) — bump `stream_chunk_timeout_secs` in config.json if your model has long reasoning gaps",
+                                    t.as_secs(),
+                                )
+                            };
+                            yield StreamEvent::Error { error: detail };
+                            return;
+                        }
                     }
-                },
-                None => raw.next().await,
+                }
+                None => {
+                    let waited = match signal.as_ref() {
+                        Some(sig) => tokio::select! {
+                            biased;
+                            _ = sig.cancelled() => None,
+                            item = raw.next() => Some(item),
+                        },
+                        None => Some(raw.next().await),
+                    };
+                    match waited {
+                        None => {
+                            yield StreamEvent::Error {
+                                error: "stream aborted by cancellation signal".to_string(),
+                            };
+                            return;
+                        }
+                        Some(item) => item,
+                    }
+                }
             };
             let item = match next {
                 Some(item) => item,
