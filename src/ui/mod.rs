@@ -658,6 +658,7 @@ pub async fn run_interactive(
                 ui.last_user_prompt.clone_from(&combined);
                 let history = crate::agent::runner::convert_history(session);
                 session.add_message(MessageRole::User, &combined);
+                begin_snapshot_turn(session);
                 let runner = agent.clone().spawn_runner(
                     crate::provider::Prompt::text(
                         crate::agent::tools::background::prepend_pending_notifications(
