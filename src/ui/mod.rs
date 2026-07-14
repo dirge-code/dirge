@@ -2229,6 +2229,14 @@ pub async fn run_interactive(
                                     if ctrl_x {
                                         renderer.remove_chat(old_active);
                                         ui.chat_ui_states.remove(old_active);
+                                        // dirge-vpma.8: chat indices shifted
+                                        // down; keep the subagent id↔idx maps
+                                        // consistent with the new positions.
+                                        reindex_subagent_maps(
+                                            &mut ui.subagent_chat_map,
+                                            &mut ui.chat_idx_to_subagent,
+                                            old_active,
+                                        );
                                         load_chat_ui_state(
                                             &mut ui.chat_ui_states[renderer.active_chat()],
                                             &mut ui.response_buf,
@@ -5274,6 +5282,30 @@ fn rect_contains_xy(rect: Option<ratatui::layout::Rect>, row: u16, col: u16) -> 
 fn modified_visible_rows(rect: Option<ratatui::layout::Rect>) -> usize {
     rect.map(|r| (r.height as usize).saturating_sub(2).saturating_sub(1))
         .unwrap_or(0)
+}
+
+/// dirge-vpma.8: after a chat at index `removed` is closed, chat indices
+/// above it shift down by one. Keep the subagent id↔index maps consistent:
+/// drop the removed chat's entry (via the reverse lookup) and decrement
+/// every index greater than `removed`. Without this, a later Ctrl+K (and
+/// other index lookups) resolves a subagent id to the wrong chat.
+pub(crate) fn reindex_subagent_maps(
+    fwd: &mut std::collections::HashMap<String, usize>,
+    rev: &mut std::collections::HashMap<usize, String>,
+    removed: usize,
+) {
+    if let Some(dead_id) = rev.remove(&removed) {
+        fwd.remove(&dead_id);
+    }
+    *rev = rev
+        .drain()
+        .map(|(i, id)| (if i > removed { i - 1 } else { i }, id))
+        .collect();
+    for idx in fwd.values_mut() {
+        if *idx > removed {
+            *idx -= 1;
+        }
+    }
 }
 
 /// Open a file-snapshot turn keyed by the most recent user message,

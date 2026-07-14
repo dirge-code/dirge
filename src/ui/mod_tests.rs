@@ -9,6 +9,28 @@
 use super::*;
 use crate::ui::search_rewind::update_search;
 
+/// dirge-vpma.8: closing a chat shifts higher indices down; the subagent
+/// id↔index maps must be reindexed to match, dropping the removed entry.
+#[test]
+fn reindex_subagent_maps_after_remove() {
+    let mut fwd: std::collections::HashMap<String, usize> =
+        [("a".to_string(), 1), ("b".to_string(), 2)]
+            .into_iter()
+            .collect();
+    let mut rev: std::collections::HashMap<usize, String> =
+        [(1, "a".to_string()), (2, "b".to_string())]
+            .into_iter()
+            .collect();
+    reindex_subagent_maps(&mut fwd, &mut rev, 1);
+    assert!(
+        !fwd.contains_key("a"),
+        "removed id dropped from forward map"
+    );
+    assert_eq!(fwd.get("b"), Some(&1), "index above removed shifts down");
+    assert_eq!(rev.get(&1).map(String::as_str), Some("b"));
+    assert!(!rev.contains_key(&2), "old index vacated");
+}
+
 // ============================================================
 // apply_subagent_panel_event — left-panel cleanup
 // ============================================================
