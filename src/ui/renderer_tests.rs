@@ -1748,3 +1748,20 @@ fn remove_inactive_chat_preserves_active_hot_fields() {
         "removing an inactive chat must not disturb the active buffer"
     );
 }
+
+/// dirge-vpma.7: a line written to an INACTIVE chat must land in its
+/// width-independent source, so a rebuild() (e.g. on resize) re-derives
+/// the buffer instead of wiping the subagent transcript.
+#[test]
+fn inactive_chat_write_survives_rebuild() {
+    let mut r = Renderer::new().expect("renderer");
+    r.add_chat("sub"); // index 1; active stays 0
+    r.write_line_to_chat(1, "transcript line", Color::White)
+        .expect("write_line_to_chat");
+    r.switch_chat(1);
+    r.rebuild();
+    assert!(
+        r.buffer.iter().any(|l| l.text.contains("transcript line")),
+        "inactive-chat transcript must survive a rebuild"
+    );
+}

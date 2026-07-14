@@ -1313,13 +1313,25 @@ impl Renderer {
             return self.write_line(text, color);
         }
         if let Some(slot) = self.chats.get_mut(idx) {
+            let mut rows = 0usize;
             for line in text.split('\n') {
                 slot.buffer.push(LineEntry {
                     text: CompactString::from(line),
                     color,
                 });
                 slot.lines = slot.lines.saturating_add(1);
+                rows += 1;
             }
+            // dirge-vpma.7: also append to the width-independent source-of-
+            // truth so a later rebuild() (e.g. on resize) re-derives buffer
+            // instead of wiping this inactive chat's transcript.
+            slot.source.push(Block {
+                src: SourceBlock::Plain {
+                    text: text.to_string(),
+                    color,
+                },
+                rows,
+            });
         }
         Ok(())
     }
