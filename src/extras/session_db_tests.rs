@@ -1640,3 +1640,60 @@ fn ensure_session_origin_is_idempotent() {
         .unwrap();
     assert_eq!(o0, None, "root origin stays NULL across re-runs");
 }
+
+/// dirge-vpma.4: a plain `DELETE FROM` on an external-content FTS5 table
+/// un-indexes each row using the content table's CURRENT values. When the
+/// indexed text was a composite that differs from the content column — as the
+/// v2 message triggers wrote `content || tool_name || tool_calls` — the extra
+/// tokens survive as phantom postings, so a redacted secret stays matchable.
+/// The `'delete-all'` command resets the whole index regardless of the content
+/// table. This pins the semantics behind the v6 rebuild fix.
+#[test]
+fn fts5_external_content_delete_all_clears_phantom_postings() {
+    let (db, dir) = temp_db();
+    let c = &db.conn;
+    c.execute_batch(
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, body TEXT);
+         CREATE VIRTUAL TABLE t_fts USING fts5(body, content=t, content_rowid=id);
+         -- Content column has no secret, but we index a composite WITH one,
+         -- exactly like the pre-v6 message triggers did.
+         INSERT INTO t(id, body) VALUES (1, 'hello world');
+         INSERT INTO t_fts(rowid, body) VALUES (1, 'hello world AKIA_SECRET99');",
+    )
+    .unwrap();
+
+    let matches = |needle: &str| -> i64 {
+        c.query_row(
+            "SELECT COUNT(*) FROM t_fts WHERE t_fts MATCH ?1",
+            [needle],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(
+        matches("AKIA_SECRET99"),
+        1,
+        "secret indexed via the composite"
+    );
+
+    // The buggy clear: un-indexes only via the content column ('hello world'),
+    // leaving the composite-only token behind.
+    c.execute("DELETE FROM t_fts", []).unwrap();
+    assert_eq!(
+        matches("AKIA_SECRET99"),
+        1,
+        "DELETE FROM leaves the phantom posting — this is the bug"
+    );
+
+    // The fix: 'delete-all' resets the whole index.
+    c.execute("INSERT INTO t_fts(t_fts) VALUES('delete-all')", [])
+        .unwrap();
+    assert_eq!(
+        matches("AKIA_SECRET99"),
+        0,
+        "'delete-all' clears the phantom posting"
+    );
+    assert_eq!(matches("hello"), 0, "index is fully reset");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

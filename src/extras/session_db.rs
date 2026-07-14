@@ -600,9 +600,23 @@ impl SessionDb {
 
         // Backfill: clear both indexes then re-insert with redacted
         // content row-by-row so the redactor runs on each row.
+        //
+        // messages_fts is an EXTERNAL-CONTENT table (content=messages). A plain
+        // `DELETE FROM messages_fts` un-indexes each row using messages.content
+        // as it stands NOW, but the indexed text was the composite
+        // `content || ' ' || tool_name || ' ' || tool_calls` the v2 triggers
+        // wrote — so every tool_name/tool_calls token survives as a phantom
+        // posting and a secret in a folded tool_calls stays permanently
+        // matchable (dirge-vpma.4). Use the FTS5 'delete-all' command, which
+        // resets the whole index regardless of the content table.
         self.conn
-            .execute("DELETE FROM messages_fts", [])
+            .execute(
+                "INSERT INTO messages_fts(messages_fts) VALUES('delete-all')",
+                [],
+            )
             .map_err(|e| format!("Migration v6 clear fts failed: {e}"))?;
+        // messages_fts_trigram is a STANDALONE table (no content=), so it owns
+        // its indexed text — `DELETE FROM` correctly removes every posting.
         self.conn
             .execute("DELETE FROM messages_fts_trigram", [])
             .map_err(|e| format!("Migration v6 clear trigram failed: {e}"))?;
