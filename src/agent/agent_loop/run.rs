@@ -942,7 +942,7 @@ async fn run_compaction_pass_with_focus(
             .filter(|cp| cp.generation == *generation);
         let mut reused = false;
         if let Some(cp) = reusable
-            && let Some((new_msgs, first_kept)) = compression::apply_checkpoint_summary(
+            && let Some((new_msgs, _first_kept)) = compression::apply_checkpoint_summary(
                 &current_context.messages,
                 &cp.summary,
                 cp.boundary,
@@ -953,8 +953,15 @@ async fn run_compaction_pass_with_focus(
                 current_context.messages = new_msgs;
                 after_summary = projected;
                 applied_summary = cp.summary;
-                applied_first_kept = first_kept;
-                outcome = SummaryOutcome::Succeeded(first_kept);
+                // dirge-vpma.3: apply_checkpoint_summary yields `[summary] +
+                // messages[cut..]`, so the summary marker sits at NEW-list index 0.
+                // `Succeeded(idx)` / `first_kept_index` are the NEW-list summary
+                // index (restore_working_files splices file snapshots at idx+1), so
+                // report 0 — the returned `_first_kept` is the OLD-list cut and
+                // feeding it splices snapshots at the wrong position (mid-tail →
+                // orphaned tool_use/result → provider 400, or past the end).
+                applied_first_kept = 0;
+                outcome = SummaryOutcome::Succeeded(0);
                 reused = true;
                 tracing::info!(
                     target: "dirge::agent_loop",

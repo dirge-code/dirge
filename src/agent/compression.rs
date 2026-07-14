@@ -1628,6 +1628,31 @@ mod tests {
         assert_eq!(out[2]["content"].as_str().unwrap(), "a2");
     }
 
+    /// dirge-vpma.3: apply_checkpoint_summary returns the OLD-list cut (the
+    /// first kept message in the pre-fold list), NOT the new-list position of
+    /// the summary marker. The fold produces `[summary] + tail`, so the marker
+    /// is always at NEW-list index 0 — that 0, not the returned cut, is what
+    /// the checkpoint-reuse path must report as the summary index to
+    /// restore_working_files. Pins the distinction the reuse path got wrong.
+    #[test]
+    fn checkpoint_reuse_summary_marker_sits_at_new_index_zero() {
+        let msgs = vec![
+            serde_json::json!({"role": "user", "content": "u0"}),
+            serde_json::json!({"role": "assistant", "content": "a0"}),
+            serde_json::json!({"role": "user", "content": "u1"}),
+            serde_json::json!({"role": "assistant", "content": "a1"}),
+            serde_json::json!({"role": "user", "content": "u2"}),
+            serde_json::json!({"role": "assistant", "content": "a2"}),
+        ];
+        let (out, cut) = apply_checkpoint_summary(&msgs, "## Goal\nx", 4).unwrap();
+        // Returned index is an OLD-list index (the tail cut).
+        assert_eq!(cut, 4);
+        assert_ne!(cut, 0, "cut is old-list; must not be used as the new-list summary index");
+        // The summary marker — restore_working_files' anchor — is at new index 0.
+        assert_eq!(out[0]["role"].as_str().unwrap(), "system");
+        assert!(out[0]["content"].as_str().unwrap().starts_with(SUMMARY_PREFIX));
+    }
+
     #[test]
     fn checkpoint_reuse_snaps_cut_back_to_user_boundary() {
         // boundary lands mid-turn (on an assistant/tool message); the cut
