@@ -148,38 +148,58 @@ pub fn apply_tree_op(
                         id_prefix
                     )),
                     1 => {
-                        // dirge-dp24: fire on_session_end on the
-                        // outgoing session BEFORE we overwrite it,
-                        // then on_session_switch with the loaded id.
-                        // reset=false because switch-session restores
-                        // an existing logical conversation rather
-                        // than starting fresh.
-                        if let Some(a) = agent {
-                            crate::agent::review::maybe_fire_session_end(a, session);
+                        // dirge-vpma.14: load through load_session_tip so the
+                        // switched-to session gets migrate_session + the schema
+                        // version guard + mtime capture. The raw parse from
+                        // find_sessions_by_prefix skips all three (understated
+                        // context on old files, disabled concurrent-writer
+                        // detection, and a newer-version file truncated on the
+                        // next save). Load BEFORE firing on_session_end / saving
+                        // prev so a load failure leaves the current session
+                        // untouched.
+                        let matched_id =
+                            matches.into_iter().next().expect("len == 1").id.to_string();
+                        match crate::session::storage::load_session_tip(&matched_id) {
+                            Err(e) => TreeOpEffect::Failed(format!(
+                                "[plugin] switch-session: failed to load '{}': {}",
+                                id_prefix, e
+                            )),
+                            Ok(loaded) => {
+                                // dirge-dp24: fire on_session_end on the
+                                // outgoing session BEFORE we overwrite it,
+                                // then on_session_switch with the loaded id.
+                                // reset=false because switch-session restores
+                                // an existing logical conversation rather
+                                // than starting fresh.
+                                if let Some(a) = agent {
+                                    crate::agent::review::maybe_fire_session_end(a, session);
+                                }
+                                let prev_id = session.id.to_string();
+                                let save_err = crate::session::storage::save_session(session).err();
+                                let new_id = loaded.id.clone();
+                                *session = loaded;
+                                if let Some(a) = agent {
+                                    crate::agent::review::maybe_fire_session_switch(
+                                        a,
+                                        &session.id,
+                                        &prev_id,
+                                        /* reset = */ false,
+                                    );
+                                }
+                                input.set_text("");
+                                let mut msg = format!(
+                                    "[plugin] switched to session {}",
+                                    short(new_id.as_str()),
+                                );
+                                if let Some(e) = save_err {
+                                    msg.push_str(&format!(
+                                        "\n  warning: previous session save failed ({}); previous state may not be recoverable",
+                                        e,
+                                    ));
+                                }
+                                TreeOpEffect::SessionReplaced(msg)
+                            }
                         }
-                        let prev_id = session.id.to_string();
-                        let save_err = crate::session::storage::save_session(session).err();
-                        let loaded = matches.into_iter().next().expect("len == 1");
-                        let new_id = loaded.id.clone();
-                        *session = loaded;
-                        if let Some(a) = agent {
-                            crate::agent::review::maybe_fire_session_switch(
-                                a,
-                                &session.id,
-                                &prev_id,
-                                /* reset = */ false,
-                            );
-                        }
-                        input.set_text("");
-                        let mut msg =
-                            format!("[plugin] switched to session {}", short(new_id.as_str()),);
-                        if let Some(e) = save_err {
-                            msg.push_str(&format!(
-                                "\n  warning: previous session save failed ({}); previous state may not be recoverable",
-                                e,
-                            ));
-                        }
-                        TreeOpEffect::SessionReplaced(msg)
                     }
                     n => {
                         // Surface the first few matches so the plugin
@@ -410,6 +430,39 @@ mod tests {
         assert!(matches!(effect, TreeOpEffect::SessionReplaced(_)));
         assert!(s.messages.is_empty());
         assert_ne!(s.id, old_id);
+    }
+
+    /// dirge-vpma.14: switch-session must load through load_session_tip
+    /// (migrate + version guard + mtime capture), not adopt the raw-parsed
+    /// session from find_sessions_by_prefix. Proof: loaded_mtime is set only
+    /// by the real load path; the raw parse leaves it None.
+    #[test]
+    fn switch_session_routes_through_load_session_tip() {
+        let target_id = format!("switchtest-{}", uuid::Uuid::new_v4().simple());
+        let mut target = Session::new("p", "m", 100_000);
+        target.id = compact_str::CompactString::new(target_id.clone());
+        target.add_message(MessageRole::User, "restore me");
+        crate::session::storage::save_session(&mut target).expect("save target");
+
+        let mut s = Session::new("p", "m", 0);
+        let mut input = fresh_input();
+        let effect = apply_tree_op(
+            TreeOp::SwitchSession {
+                id_prefix: target_id.clone(),
+            },
+            &mut s,
+            &mut input,
+            None,
+        );
+        assert!(matches!(effect, TreeOpEffect::SessionReplaced(_)));
+        assert_eq!(s.id.as_str(), target_id);
+        assert!(
+            s.loaded_mtime.is_some(),
+            "switch must route through load_session_tip (sets loaded_mtime); \
+             a raw find_sessions_by_prefix parse leaves it None"
+        );
+
+        crate::session::storage::delete_session(&target_id).ok();
     }
 
     /// SwitchSession with a non-matching prefix returns Failed without
