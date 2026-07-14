@@ -170,10 +170,14 @@ async fn load_all(
     use std::collections::HashSet;
     use std::path::PathBuf;
 
-    // cwd (.dirge/plugins) loaded first so it takes precedence over
-    // ~/.config/dirge/plugins/ when two plugins share the same name.
+    // Project plugins (.dirge/plugins) loaded first so they take
+    // precedence over ~/.config/dirge/plugins/ when two plugins share
+    // the same name. The project dir is resolved via ProjectPaths
+    // (git-root walk-up / DIRGE_PROJECT_ROOT), matching the startup
+    // loader, so a subdirectory launch still finds it (dirge-vpma.17).
+    let project_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let candidate_dirs: Vec<PathBuf> = vec![
-        PathBuf::from(".dirge").join("plugins"),
+        crate::extras::dirge_paths::ProjectPaths::new(&project_cwd).plugins_dir(),
         crate::session::storage::config_path().join("plugins"),
     ];
     let search_dirs = crate::plugin::filter_existing_dirs(&candidate_dirs);

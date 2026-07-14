@@ -25,9 +25,12 @@ pub fn global_agents_dir() -> PathBuf {
     crate::session::storage::config_path().join("agents")
 }
 
-/// Per-project agent-profile directory: `<cwd>/.dirge/agents/` (mirrors skills).
+/// Per-project agent-profile directory: `<project-root>/.dirge/agents/`.
+/// Anchored at the project root (git-root walk-up, `DIRGE_PROJECT_ROOT`
+/// override) via `ProjectPaths` rather than the raw launch CWD, so a
+/// subdirectory launch still finds the repo's profiles (dirge-vpma.17).
 pub fn project_agents_dir(cwd: &Path) -> PathBuf {
-    cwd.join(".dirge").join("agents")
+    crate::extras::dirge_paths::ProjectPaths::new(cwd).agents_dir()
 }
 
 /// Resolve a profile's `model` field to a model string for the active client.

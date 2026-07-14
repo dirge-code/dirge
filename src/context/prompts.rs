@@ -236,11 +236,14 @@ pub fn global_prompts_dir() -> PathBuf {
     crate::session::storage::config_path().join("prompts")
 }
 
-/// Per-project prompts directory: `<cwd>/.dirge/prompts/`. Mirrors
-/// `.dirge/agents` / `.dirge/plugins`. A project prompt of the same
-/// name as a global or built-in prompt overrides it.
+/// Per-project prompts directory: `<project-root>/.dirge/prompts/`.
+/// Anchored at the project root (git-root walk-up, `DIRGE_PROJECT_ROOT`
+/// override) via `ProjectPaths`, mirroring `.dirge/agents` /
+/// `.dirge/plugins` (dirge-vpma.17). A project prompt of the same name
+/// as a global or built-in prompt overrides it.
 pub fn local_prompts_dir() -> PathBuf {
-    PathBuf::from(".dirge").join("prompts")
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    crate::extras::dirge_paths::ProjectPaths::new(&cwd).prompts_dir()
 }
 
 /// Read every `*.md` directly under `dir` and insert it (hard,

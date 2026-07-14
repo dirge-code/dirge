@@ -129,6 +129,27 @@ impl ProjectPaths {
     pub fn config_path(&self) -> PathBuf {
         self.dirge_dir().join("config.yaml")
     }
+
+    /// `.dirge/config.json` — project-local config layered over the
+    /// global `~/.config/dirge/config.json`.
+    pub fn project_config_file(&self) -> PathBuf {
+        self.dirge_dir().join("config.json")
+    }
+
+    /// `.dirge/plugins/` — project-local Janet plugins.
+    pub fn plugins_dir(&self) -> PathBuf {
+        self.dirge_dir().join("plugins")
+    }
+
+    /// `.dirge/prompts/` — project prompt overrides (`*.md`).
+    pub fn prompts_dir(&self) -> PathBuf {
+        self.dirge_dir().join("prompts")
+    }
+
+    /// `.dirge/agents/` — project agent-profile overrides (`*.md`).
+    pub fn agents_dir(&self) -> PathBuf {
+        self.dirge_dir().join("agents")
+    }
 }
 
 #[cfg(test)]
@@ -223,6 +244,52 @@ mod tests {
         assert!(paths.skills_dir().starts_with(&dirge));
         assert!(paths.sessions_dir().starts_with(&dirge));
         assert!(paths.config_path().starts_with(&dirge));
+        assert!(paths.project_config_file().starts_with(&dirge));
+        assert!(paths.plugins_dir().starts_with(&dirge));
+        assert!(paths.prompts_dir().starts_with(&dirge));
+        assert!(paths.agents_dir().starts_with(&dirge));
+    }
+
+    /// dirge-vpma.17: plugins/config/prompts/agents resolve at the
+    /// project root, not the launch CWD. Launching in `<repo>/sub/`
+    /// must anchor them at `<repo>/.dirge/`, matching where the
+    /// session DB and memory already live — no more split-brain.
+    #[test]
+    fn project_files_resolve_at_git_root_from_subdir() {
+        let base = std::env::temp_dir().join(format!("dirge-vpma17-walkup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let sub = base.join("crates").join("inner");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::create_dir_all(base.join(".git")).unwrap();
+
+        let root = base.canonicalize().unwrap_or_else(|_| base.clone());
+        let paths = ProjectPaths::new(&sub);
+        assert_eq!(paths.plugins_dir(), root.join(".dirge").join("plugins"));
+        assert_eq!(paths.prompts_dir(), root.join(".dirge").join("prompts"));
+        assert_eq!(paths.agents_dir(), root.join(".dirge").join("agents"));
+        assert_eq!(
+            paths.project_config_file(),
+            root.join(".dirge").join("config.json")
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// dirge-vpma.17: `DIRGE_PROJECT_ROOT` overrides the git-root walk
+    /// for the project-file accessors too, so a monorepo can point the
+    /// whole `.dirge/` tree at a chosen directory.
+    #[test]
+    fn project_files_honor_env_override() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = std::env::temp_dir();
+        let _guard = EnvGuard::set(tmp.to_str().unwrap());
+        let cwd = std::env::current_dir().unwrap();
+        let paths = ProjectPaths::new(&cwd);
+        assert_eq!(paths.plugins_dir(), tmp.join(".dirge").join("plugins"));
+        assert_eq!(
+            paths.project_config_file(),
+            tmp.join(".dirge").join("config.json")
+        );
     }
 
     /// `session_db_path` points into `sessions/` and ends with `state.db`.

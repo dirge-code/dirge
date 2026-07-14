@@ -1318,13 +1318,16 @@ pub fn config_file_path() -> PathBuf {
 }
 
 /// Project-local config, layered on top of the global
-/// `~/.config/dirge/config.json`. CWD-relative (matches `.dirge/agents`,
-/// `.dirge/plugins`, `.dirge/skills`). Fields present here override
-/// their global counterparts; absent keys fall through. Map-valued
-/// fields (`providers`, `mcp_servers`, `agents`, …) merge key-by-key
-/// rather than replacing the whole map.
+/// `~/.config/dirge/config.json`. Anchored at the project root
+/// (git-root walk-up, `DIRGE_PROJECT_ROOT` override) via `ProjectPaths`,
+/// so launching from a subdirectory loads the same `<repo>/.dirge/`
+/// config the session DB and memory already use (dirge-vpma.17). Fields
+/// present here override their global counterparts; absent keys fall
+/// through. Map-valued fields (`providers`, `mcp_servers`, `agents`, …)
+/// merge key-by-key rather than replacing the whole map.
 pub fn project_config_file_path() -> PathBuf {
-    PathBuf::from(".dirge").join("config.json")
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    crate::extras::dirge_paths::ProjectPaths::new(&cwd).project_config_file()
 }
 
 /// Read a config JSON file into a `serde_json::Value`. Returns `None`
