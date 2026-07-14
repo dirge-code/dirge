@@ -1909,9 +1909,9 @@ async fn run_headless_loop(
     use crate::extras::r#loop as loop_mod;
 
     loop {
-        state.iteration += 1;
-
-        if state.should_stop() {
+        // dirge-vpma.15: next_iteration checks the max BEFORE incrementing,
+        // so --loop-max N runs exactly N iterations (was N-1).
+        if !state.next_iteration() {
             eprintln!(
                 "[loop] max iterations ({}) reached, stopping",
                 state.iteration
