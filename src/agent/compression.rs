@@ -372,7 +372,7 @@ fn text_of_block(block: &Value) -> Option<&str> {
 /// (heal-on-load) shape and the production block-array shape
 /// (`[{type:"text", text:"..."}, ...]`). dirge-u5ka: production tool
 /// results are arrays, so a naive `.as_str()` saw nothing.
-fn content_text(content: Option<&Value>) -> String {
+pub(crate) fn content_text(content: Option<&Value>) -> String {
     match content {
         Some(Value::String(s)) => s.clone(),
         Some(Value::Array(blocks)) => blocks

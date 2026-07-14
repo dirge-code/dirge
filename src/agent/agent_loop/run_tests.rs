@@ -2254,6 +2254,17 @@ fn transcript_from_value_slice_renders_role_prefixes() {
     );
 }
 
+#[test]
+fn transcript_from_value_slice_extracts_block_array_content() {
+    let messages = vec![
+        serde_json::json!({"role":"assistant","content":[{"type":"text","text":"hello from assistant"}]}),
+        serde_json::json!({"role":"toolResult","content":[{"type":"text","text":"tool output here"}]}),
+    ];
+    let t = super::transcript_from_value_slice(&messages);
+    assert!(t.contains("assistant: hello from assistant"));
+    assert!(t.contains("toolResult: tool output here"));
+}
+
 /// The critic transcript feeds a LOAD-BEARING critic prompt (the F6 in-loop
 /// critic just had a stale-summary bug fixed). Pin its exact output byte-for-
 /// byte so a refactor can't silently shift the `USER:`/`ASSISTANT:` labels, the

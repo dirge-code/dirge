@@ -676,10 +676,7 @@ fn transcript_from_value_slice(messages: &[serde_json::Value]) -> String {
     let mut out = String::new();
     for m in messages {
         let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("?");
-        let content = m
-            .get("content")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default();
+        let content = crate::agent::compression::content_text(m.get("content"));
         if !content.is_empty() {
             let _ = writeln!(out, "{}: {}", role, content);
             out.push('\n');
