@@ -20,6 +20,71 @@ use crate::ui::sysload::SharedSysLoad;
 /// UI doesn't depend on the agent-loop internals.
 const FOLD_WARN_PCT: u16 = 75;
 
+/// Most TODOS rows to show. The board is already ordered in_progress-first,
+/// so the cap keeps the active work visible while stopping a long backlog
+/// from crowding out the MODIFIED panel below (use `/issues` for the full
+/// board).
+const MAX_TODO_ROWS: usize = 8;
+
+/// Map the live board mirror to TODOS panel rows: a status glyph, the title,
+/// and an `active` flag (the issue is in_progress) the painter renders in the
+/// focus color. The mirror is already in_progress-first, so `take` keeps the
+/// active item(s) pinned at the top. Pure so the glyph/active mapping is
+/// unit-testable without a Session or the global mirror.
+pub(crate) fn todo_rows(
+    list: &[crate::agent::tools::todo::TodoItem],
+) -> Vec<(String, String, bool)> {
+    list.iter()
+        .take(MAX_TODO_ROWS)
+        .map(|t| {
+            let active = t.status == "in_progress";
+            let glyph = match t.status.as_str() {
+                "in_progress" => "▶",
+                "blocked" => "[!]",
+                _ => "[ ]",
+            };
+            (glyph.to_string(), t.content.clone(), active)
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod todo_row_tests {
+    use super::todo_rows;
+    use crate::agent::tools::todo::TodoItem;
+
+    fn item(content: &str, status: &str) -> TodoItem {
+        TodoItem {
+            content: content.into(),
+            status: status.into(),
+            priority: "normal".into(),
+        }
+    }
+
+    #[test]
+    fn marks_in_progress_active_with_distinct_glyph() {
+        let rows = todo_rows(&[
+            item("wire retry backoff", "in_progress"),
+            item("add jitter", "open"),
+            item("audit timeouts", "blocked"),
+        ]);
+        assert_eq!(
+            rows[0],
+            ("▶".to_string(), "wire retry backoff".to_string(), true)
+        );
+        assert_eq!(rows[1].2, false);
+        assert_eq!(rows[1].0, "[ ]");
+        assert_eq!(rows[2].0, "[!]");
+        assert_eq!(rows[2].2, false, "blocked is not the active/focus row");
+    }
+
+    #[test]
+    fn caps_row_count() {
+        let many: Vec<TodoItem> = (0..20).map(|i| item(&format!("t{i}"), "open")).collect();
+        assert_eq!(todo_rows(&many).len(), super::MAX_TODO_ROWS);
+    }
+}
+
 /// Build the left-panel idle card: a live context gauge, the recent-tool
 /// activity ticker, and the git snapshot. Rebuilt each event-loop tick
 /// (cheap — a few field reads + the pre-polled git snapshot). `activity`
@@ -148,20 +213,7 @@ pub(crate) fn build_panel_data(
     // The TODOS panel mirrors this session's live issue board (open /
     // in_progress / blocked). Terminal items (done / cancelled) have already
     // dropped off the board, so no completed glyph is needed here.
-    let todos: Vec<(String, String)> = {
-        let list = crate::agent::tools::todo::TODO_LIST.lock_ignore_poison();
-        list.iter()
-            .take(8)
-            .map(|t| {
-                let status = match t.status.as_str() {
-                    "in_progress" => "[~]",
-                    "blocked" => "[!]",
-                    _ => "[ ]",
-                };
-                (status.to_string(), t.content.to_string())
-            })
-            .collect()
-    };
+    let todos = todo_rows(&crate::agent::tools::todo::TODO_LIST.lock_ignore_poison());
 
     let cwd_path = Path::new(session.working_dir.as_str()).to_path_buf();
     // Pull the full tracked set (capped at MAX_MODIFIED=256 inside the

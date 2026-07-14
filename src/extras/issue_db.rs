@@ -93,6 +93,27 @@ fn now() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
+/// Resolve a raw session id to its stable lineage origin via the shared
+/// `sessions` table in the same `state.db`. A compaction fold rotates
+/// `sessions.id` but keeps a constant `origin_id` (see `Session::effective_origin`
+/// / `session_db::resolve_parent`), so scoping the issue board by origin keeps
+/// the TODOS panel and the finish-your-work nudge populated across a fold or a
+/// resume instead of emptying when the id rotates.
+///
+/// Falls back to the id unchanged when the `sessions` table or row is absent —
+/// a bare issue DB (unit-test fixtures), a `--no-session` run, or a session
+/// predating the `origin_id` column — which degrades to the old exact-id
+/// scoping. `conn` is borrowed (via deref) from a lock the caller already
+/// holds, so this never re-locks.
+fn origin_of(conn: &Connection, session_id: &str) -> String {
+    conn.query_row(
+        "SELECT COALESCE(origin_id, id) FROM sessions WHERE id = ?1",
+        params![session_id],
+        |r| r.get::<_, String>(0),
+    )
+    .unwrap_or_else(|_| session_id.to_string())
+}
+
 fn row_to_issue(row: &rusqlite::Row<'_>) -> rusqlite::Result<Issue> {
     Ok(Issue {
         id: row.get(0)?,
@@ -190,10 +211,13 @@ impl IssueStore {
         let priority = priority.and_then(normalize_priority).unwrap_or("normal");
         let conn = self.conn.lock_ignore_poison();
         let now = now();
+        // Stamp the lineage origin, not the rotating id, so the row stays on
+        // this conversation's board across a later compaction fold.
+        let scoped = session_id.map(|s| origin_of(&conn, s));
         conn.execute(
             "INSERT INTO issues (title, body, status, priority, session_id, created_at, updated_at)
              VALUES (?1, ?2, 'open', ?3, ?4, ?5, ?5)",
-            params![title, body.trim(), priority, session_id, now],
+            params![title, body.trim(), priority, scoped, now],
         )
         .map_err(|e| format!("create issue: {e}"))?;
         Ok(conn.last_insert_rowid())
@@ -231,6 +255,26 @@ impl IssueStore {
             )
         }
         .map_err(|e| format!("set status: {e}"))?;
+        Ok(n > 0)
+    }
+
+    /// Re-assign an issue to `session_id`'s lineage (normalized to the stable
+    /// origin) so picking up an issue created in another conversation pulls it
+    /// onto the current session's board / TODOS panel. `session_id = None` is a
+    /// no-op — a runner without a session (e.g. `--no-session`) must not blank
+    /// an existing scope. Returns false if the issue doesn't exist.
+    pub fn assign_to_session(&self, id: i64, session_id: Option<&str>) -> Result<bool, String> {
+        let Some(session_id) = session_id else {
+            return Ok(false);
+        };
+        let conn = self.conn.lock_ignore_poison();
+        let scoped = origin_of(&conn, session_id);
+        let n = conn
+            .execute(
+                "UPDATE issues SET session_id = ?2, updated_at = ?3 WHERE id = ?1",
+                params![id, scoped, now()],
+            )
+            .map_err(|e| format!("assign session: {e}"))?;
         Ok(n > 0)
     }
 
@@ -300,7 +344,12 @@ impl IssueStore {
         limit: Option<usize>,
     ) -> Result<Vec<Issue>, String> {
         let conn = self.conn.lock_ignore_poison();
-        let where_session = if session.is_some() {
+        // Normalize the session filter to the lineage origin so the scoped board
+        // survives a compaction fold / resume (which rotates `session.id`). The
+        // inner `None` (an explicit NULL-session filter) is preserved as-is.
+        let scoped: Option<Option<String>> =
+            session.map(|inner| inner.map(|sid| origin_of(&conn, sid)));
+        let where_session = if scoped.is_some() {
             "session_id IS ?1 AND "
         } else {
             ""
@@ -319,7 +368,7 @@ impl IssueStore {
             }
         );
         let mut stmt = conn.prepare(&sql).map_err(|e| format!("board: {e}"))?;
-        let rows = match session {
+        let rows = match &scoped {
             Some(sid) => stmt.query_map(params![sid], row_to_issue),
             None => stmt.query_map([], row_to_issue),
         }
@@ -345,6 +394,10 @@ impl IssueStore {
         items: &[(&str, &str, &str)],
     ) -> Result<usize, String> {
         let mut conn = self.conn.lock_ignore_poison();
+        // Scope the whole batch to the lineage origin (see `origin_of`) so the
+        // upsert key and the stored rows match the board query across a fold.
+        let scoped_session: Option<String> = session_id.map(|s| origin_of(&conn, s));
+        let scoped_session = scoped_session.as_deref();
         let tx = conn
             .transaction()
             .map_err(|e| format!("sync todos (begin): {e}"))?;
@@ -361,7 +414,7 @@ impl IssueStore {
             let existing: Option<i64> = tx
                 .query_row(
                     "SELECT id FROM issues WHERE session_id IS ?1 AND title = ?2 ORDER BY id DESC LIMIT 1",
-                    params![session_id, title],
+                    params![scoped_session, title],
                     |r| r.get(0),
                 )
                 .optional()
@@ -378,7 +431,7 @@ impl IssueStore {
                     tx.execute(
                         "INSERT INTO issues (title, body, status, priority, session_id, created_at, updated_at, closed_at)
                          VALUES (?1, '', ?2, ?3, ?4, ?5, ?5, ?6)",
-                        params![title, status, priority, session_id, now, closed],
+                        params![title, status, priority, scoped_session, now, closed],
                     )
                     .map_err(|e| format!("sync todos (insert): {e}"))?;
                 }
@@ -470,6 +523,13 @@ mod tests {
     use super::*;
 
     fn store() -> IssueStore {
+        store_at().0
+    }
+
+    /// Like [`store`] but also returns the DB path, so a test can seed the
+    /// shared `sessions` table (see [`seed_lineage`]) to exercise origin
+    /// normalization.
+    fn store_at() -> (IssueStore, std::path::PathBuf) {
         // A process-wide counter guarantees a unique dir even when two tests
         // enter store() within the same clock nanosecond — the SystemTime
         // suffix alone let parallel tests collide on one DB and pollute each
@@ -485,7 +545,77 @@ mod tests {
             SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        IssueStore::open_at(&dir.join("state.db")).unwrap()
+        let path = dir.join("state.db");
+        let store = IssueStore::open_at(&path).unwrap();
+        (store, path)
+    }
+
+    /// Seed a minimal `sessions` table with a folded lineage: `tip` is a
+    /// post-fold id whose stable origin is `origin` (the origin row carries a
+    /// NULL `origin_id`, matching how `session_db` stamps a never-folded head).
+    fn seed_lineage(path: &Path, tip: &str, origin: &str) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, origin_id TEXT);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO sessions (id, origin_id) VALUES (?1, NULL)",
+            params![origin],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO sessions (id, origin_id) VALUES (?1, ?2)",
+            params![tip, origin],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn board_scopes_by_lineage_origin_across_fold() {
+        let (s, path) = store_at();
+        seed_lineage(&path, "tip", "orig");
+        // Created pre-fold under the original id, then started.
+        let id = s.create("keep me", "", Some("high"), Some("orig")).unwrap();
+        s.set_status(id, "in_progress").unwrap();
+        // A compaction fold rotates the session id to "tip"; the board queried
+        // under the new id still finds the issue because both normalize to the
+        // shared origin.
+        let board = s.board_for_session(Some("tip"), None).unwrap();
+        assert_eq!(board.len(), 1, "issue must survive the id rotation");
+        assert_eq!(board[0].title, "keep me");
+        // The stored scope was normalized to the origin, not the raw id.
+        assert_eq!(
+            s.get(id).unwrap().unwrap().session_id.as_deref(),
+            Some("orig")
+        );
+    }
+
+    #[test]
+    fn assign_to_session_claims_foreign_issue_onto_board() {
+        // No sessions table here → origin_of falls back to identity, exercising
+        // the graceful degradation path too.
+        let s = store();
+        let id = s
+            .create("from elsewhere", "", None, Some("other-sess"))
+            .unwrap();
+        s.set_status(id, "in_progress").unwrap();
+        // Not on our board yet — it belongs to another conversation.
+        assert!(
+            s.board_for_session(Some("mine"), None).unwrap().is_empty(),
+            "foreign issue must not appear before pickup"
+        );
+        // Picking it up claims it for us.
+        assert!(s.assign_to_session(id, Some("mine")).unwrap());
+        let board = s.board_for_session(Some("mine"), None).unwrap();
+        assert_eq!(board.len(), 1);
+        assert_eq!(board[0].title, "from elsewhere");
+        // A session-less runner must not blank the scope.
+        assert!(!s.assign_to_session(id, None).unwrap());
+        assert_eq!(
+            s.get(id).unwrap().unwrap().session_id.as_deref(),
+            Some("mine")
+        );
     }
 
     #[test]

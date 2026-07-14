@@ -6,7 +6,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- The TODOS panel went empty after a compaction fold or a resume and did not
+  come back when the agent picked an existing issue up. It was scoped to the
+  live `session.id`, which a fold rotates, so the board query stopped matching
+  the rows it had stamped under the old id; and starting an issue created in
+  another session never pulled it onto the current board. The board is now
+  scoped by the stable lineage origin (so it survives folds/resumes), and
+  starting an issue (`issue start` / an update to `in_progress`) claims it for
+  the current conversation so a picked-up issue appears (GH #663).
+
 ### Changed
+- The TODOS panel now marks the issue the agent is actively on: the
+  `in_progress` item is pinned at the top (it already sorted first) with a `▶`
+  marker and a distinct focus color, so the current task stands out from the
+  queued work. The panel still mirrors this session's live issue board; use
+  `/issues` for the full project board (GH #663).
 - Project-scoped `.dirge/plugins/`, `.dirge/config.json`, `.dirge/prompts/`,
   and `.dirge/agents/` are now resolved at the project root — the enclosing
   git repository, or `DIRGE_PROJECT_ROOT` when set — instead of the launch

@@ -168,6 +168,16 @@ impl Tool for IssueTool {
                     _ => "done",
                 };
                 if store.set_status(id, status).map_err(ToolError::Msg)? {
+                    // Starting an issue is the "I'm working on this now" signal:
+                    // claim it for THIS conversation so it lands on the session's
+                    // board / TODOS panel even if it was created elsewhere (or in
+                    // a pre-fold incarnation of this session). No-op when the
+                    // issue is already ours.
+                    if status == "in_progress" {
+                        store
+                            .assign_to_session(id, self.session_id.as_deref())
+                            .map_err(ToolError::Msg)?;
+                    }
                     refresh();
                     Ok(format!("Issue #{id} → {status}"))
                 } else {
@@ -209,6 +219,13 @@ impl Tool for IssueTool {
                 if let Some(status) = args.status.as_deref() {
                     store.set_status(id, status).map_err(ToolError::Msg)?;
                     changed.push("status");
+                    // An update that starts the issue claims it too (same as the
+                    // `start` verb), so a picked-up issue joins this board.
+                    if normalize_status(status) == Some("in_progress") {
+                        store
+                            .assign_to_session(id, self.session_id.as_deref())
+                            .map_err(ToolError::Msg)?;
+                    }
                 }
                 if let Some(priority) = args.priority.as_deref() {
                     store.set_priority(id, priority).map_err(ToolError::Msg)?;
@@ -329,6 +346,47 @@ mod tests {
         // closed issue drops off the default board.
         let after = t.call(args("list")).await.unwrap();
         assert!(after.contains("no matching issues"), "{after}");
+    }
+
+    #[tokio::test]
+    async fn start_claims_a_foreign_issue_for_this_session() {
+        // An issue created in another conversation, sitting in the same project
+        // DB the tool is bound to.
+        let dir = std::env::temp_dir().join(format!(
+            "dirge-issuetool-claim-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("state.db");
+        let store = IssueStore::open_at(&db).unwrap();
+        let foreign = store
+            .create("picked up", "", None, Some("other-sess"))
+            .unwrap();
+
+        let t = IssueTool::new(db.clone(), Some("sess-1".into()), None, None);
+        // Nothing on sess-1's board before pickup.
+        assert!(
+            store
+                .board_for_session(Some("sess-1"), None)
+                .unwrap()
+                .is_empty()
+        );
+
+        t.call(IssueArgs {
+            id: Some(serde_json::json!(foreign)),
+            ..args("start")
+        })
+        .await
+        .unwrap();
+
+        let board = store.board_for_session(Some("sess-1"), None).unwrap();
+        assert_eq!(board.len(), 1, "start must pull the issue onto our board");
+        assert_eq!(board[0].title, "picked up");
+        assert_eq!(board[0].status, "in_progress");
     }
 
     #[tokio::test]

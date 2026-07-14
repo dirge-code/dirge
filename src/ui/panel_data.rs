@@ -16,9 +16,11 @@ pub struct PanelData {
     pub mcp: Vec<(String, bool)>,
     /// (server_id, short root path, ok) — ok=false for broken servers.
     pub lsp: Vec<(String, String, bool)>,
-    /// (status glyph, todo text). Status is single-char shorthand
-    /// like "[ ]", "[~]", "[x]" depending on the todo state.
-    pub todos: Vec<(String, String)>,
+    /// (status glyph, todo text, active). `active` marks the in_progress
+    /// issue the agent is currently on — the painter pins it at the top (the
+    /// mirror is already in_progress-first) and renders it in a distinct
+    /// "focus" color so the current work stands out from the queue.
+    pub todos: Vec<(String, String, bool)>,
     /// Recent modified file paths, shortened relative to cwd when possible.
     pub modified: Vec<String>,
     /// ui-redesign: latest system load snapshot for the

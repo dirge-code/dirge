@@ -461,6 +461,10 @@ impl<'a> Widget for RightPanel<'a> {
         // Body text in the [SYSTEM] pane is amber per spec.
         let dim = RColor::DarkGray;
         let body = AMBER;
+        // The one issue the agent is actively on (in_progress) — a bright
+        // green that stands out from the amber queue so the current focus is
+        // obvious at a glance (issue #663).
+        let focus = RColor::Rgb(120, 220, 120);
 
         // [SYSTEM LOAD]
         let sysload_panel = match self.data.sysload.as_ref() {
@@ -501,8 +505,9 @@ impl<'a> Widget for RightPanel<'a> {
             if self.data.todos.is_empty() {
                 p = p.line("· (none)", dim);
             } else {
-                for (status, text) in &self.data.todos {
-                    p = p.line(format!("{} {}", status, text), body);
+                for (glyph, text, active) in &self.data.todos {
+                    let color = if *active { focus } else { body };
+                    p = p.line(format!("{} {}", glyph, text), color);
                 }
             }
             p
