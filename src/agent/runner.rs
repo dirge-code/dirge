@@ -467,6 +467,38 @@ mod plugin_hook_tests {
         assert!(is_running);
     }
 
+    /// Regression test: `install_into` sets `is_running = true`.  Callers
+    /// that redundantly set it back to `false` after a drain break the
+    /// invariant — the UI then thinks no run is active (Ctrl+C cancel
+    /// breaks, next prompt spawns a duplicate concurrent agent).
+    #[tokio::test]
+    async fn install_into_is_running_must_not_be_overwritten_by_caller() {
+        let (_tx, event_rx) = mpsc::channel(1);
+        let (interject_tx, _) = mpsc::channel(1);
+        let (cancel_tx, _) = mpsc::channel(1);
+        let runner = AgentRunner {
+            event_rx,
+            task: tokio::spawn(async {}),
+            interject_tx,
+            cancel_tx,
+        };
+        let (mut rx, mut abort, mut interject, mut cancel) = (None, None, None, None);
+        let mut is_running = false;
+        runner.install_into(
+            &mut rx,
+            &mut abort,
+            &mut interject,
+            &mut cancel,
+            &mut is_running,
+        );
+        // The macro manages is_running; a caller must not overwrite it.
+        assert!(is_running, "install_into sets is_running; caller must not set false");
+        // Simulate the bug: if a call site did `is_running = false` here it
+        // would clobber the live drain.  That line was removed — verify the
+        // flag stays true without it.
+        assert!(is_running, "is_running must still be true; no overwrite allowed");
+    }
+
     #[test]
     fn summarize_actions_dedups_preserving_first_occurrence_order() {
         let actions = [

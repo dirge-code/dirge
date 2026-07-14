@@ -3110,7 +3110,6 @@ pub async fn run_interactive(
                                     // output + "› interrupted" were logged above; `!!`
                                     // leaves no trace at all.
                                     drain_interjections!();
-                                    ui.is_running = false;
                                     renderer.set_avatar_state(avatar::AvatarState::Idle);
                                 }
                                 renderer.request_repaint();
