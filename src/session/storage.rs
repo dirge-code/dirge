@@ -287,15 +287,70 @@ fn migrate_session(session: &mut Session) {
 pub fn delete_session(id: &str) -> anyhow::Result<()> {
     validate_session_id(id)?;
     let dir = session_dir();
-    let path = dir.join(format!("{}.json", id));
-    if path.exists() {
-        std::fs::remove_file(path)?;
+
+    // dirge-vpma.13: a session and its compaction-fold rotations share one
+    // effective_origin. Deleting only <id>.json leaves the older rotations
+    // on disk, and find_recent_sessions resurfaces the pre-fold rotation as
+    // fully resumable — the "deleted" conversation comes back. Delete every
+    // member of the origin chain, not just the tip the caller named. Uses a
+    // cheap partial parse (id + origin_id only), like load_session_tip.
+    #[derive(serde::Deserialize)]
+    struct OriginMeta {
+        id: String,
+        #[serde(default)]
+        origin_id: Option<String>,
     }
-    // Drop the session's image assets (whole dir). Best-effort: a
-    // missing assets dir (pre-image sessions) is not an error.
-    let assets = assets_dir_for(id);
-    if assets.exists() {
-        std::fs::remove_dir_all(assets)?;
+    fn effective_origin(m: &OriginMeta) -> &str {
+        m.origin_id.as_deref().unwrap_or(&m.id)
+    }
+
+    // Resolve the target's origin. If it can't be resolved (file already
+    // gone or unparseable), fall back to deleting just the named id so the
+    // behaviour never regresses below the old single-file delete.
+    let target_origin = std::fs::read_to_string(dir.join(format!("{}.json", id)))
+        .ok()
+        .and_then(|json| serde_json::from_str::<OriginMeta>(&json).ok())
+        .map(|m| effective_origin(&m).to_string());
+
+    let members: Vec<String> = match target_origin {
+        Some(origin) => {
+            let mut ids = Vec::new();
+            if let Ok(rd) = std::fs::read_dir(&dir) {
+                for entry in rd.flatten() {
+                    let path = entry.path();
+                    if path.extension().is_some_and(|e| e == "json")
+                        && let Ok(json) = std::fs::read_to_string(&path)
+                        && let Ok(meta) = serde_json::from_str::<OriginMeta>(&json)
+                        && effective_origin(&meta) == origin
+                    {
+                        ids.push(meta.id);
+                    }
+                }
+            }
+            if ids.is_empty() {
+                vec![id.to_string()]
+            } else {
+                ids
+            }
+        }
+        None => vec![id.to_string()],
+    };
+
+    for member in members {
+        // Member ids come from on-disk files; re-validate before joining.
+        if validate_session_id(&member).is_err() {
+            continue;
+        }
+        let path = dir.join(format!("{}.json", member));
+        if path.exists() {
+            std::fs::remove_file(path)?;
+        }
+        // Drop the member's image assets (whole dir). Best-effort: a
+        // missing assets dir (pre-image sessions) is not an error.
+        let assets = assets_dir_for(&member);
+        if assets.exists() {
+            std::fs::remove_dir_all(assets)?;
+        }
     }
     Ok(())
 }
@@ -1567,6 +1622,49 @@ mod tests {
             msg.contains("o such file") || msg.contains("No such file"),
             "error must mention missing file: {msg}"
         );
+    }
+
+    /// dirge-vpma.13: deleting a session removes its whole fold chain
+    /// (origin + all rotations), not just the named tip — otherwise a
+    /// pre-fold rotation stays on disk and resurfaces as resumable. An
+    /// unrelated session must survive.
+    #[test]
+    fn delete_session_removes_whole_fold_chain() {
+        use crate::session::{MessageRole, Session};
+        let origin = format!("origin-{}", uuid::Uuid::new_v4().simple());
+
+        let mut old = Session::new("p", "m", 128_000);
+        old.id = compact_str::CompactString::new(origin.clone());
+        old.add_message(MessageRole::User, "the original ask");
+        save_session(&mut old).unwrap();
+
+        let tip_id = format!("compacted-{}", uuid::Uuid::new_v4().simple());
+        let mut tip = Session::new("p", "m", 128_000);
+        tip.id = compact_str::CompactString::new(tip_id.clone());
+        tip.origin_id = Some(compact_str::CompactString::new(origin.clone()));
+        tip.add_message(MessageRole::User, "newer state");
+        save_session(&mut tip).unwrap();
+
+        // Unrelated session (different origin) — must survive the delete.
+        let other_id = format!("other-{}", uuid::Uuid::new_v4().simple());
+        let mut other = Session::new("p", "m", 128_000);
+        other.id = compact_str::CompactString::new(other_id.clone());
+        save_session(&mut other).unwrap();
+
+        // The UI deletes by the tip id (find_sessions_by_prefix dedups to it).
+        delete_session(&tip_id).expect("delete");
+
+        assert!(
+            load_session(&origin).is_err(),
+            "origin file must be deleted"
+        );
+        assert!(load_session(&tip_id).is_err(), "tip file must be deleted");
+        assert!(
+            load_session(&other_id).is_ok(),
+            "unrelated session must survive"
+        );
+
+        cleanup_session(&other_id);
     }
 
     /// `write_asset` creates `<assets_dir>/<asset_id>.png` and the
