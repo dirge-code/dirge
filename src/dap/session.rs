@@ -296,6 +296,70 @@ impl DapSession {
             requested
         }
     }
+
+    /// Send the given breakpoint set for `file` to the adapter (DAP replace
+    /// semantics) and update the cache: store the set as the single record, or
+    /// drop the entry entirely when empty. Callers pass the already-merged set.
+    async fn set_source_breakpoints(
+        &mut self,
+        file: &str,
+        path: &Path,
+        breakpoints: Vec<SourceBreakpoint>,
+        timeout: Duration,
+    ) -> Result<Vec<Breakpoint>, ToolError> {
+        let source = Source {
+            path: Some(file.to_string()),
+            ..Default::default()
+        };
+        let args = SetBreakpointsArgs {
+            source,
+            breakpoints: Some(breakpoints.clone()),
+            breakpoints_deprecated: None,
+            source_modified: None,
+        };
+
+        let response: SetBreakpointsResponse = self
+            .client
+            .request("setBreakpoints", &args, timeout)
+            .await
+            .map_err(rpc_to_tool_error)?;
+
+        if breakpoints.is_empty() {
+            self.breakpoints.remove(path);
+        } else {
+            self.breakpoints.insert(
+                path.to_path_buf(),
+                vec![BreakpointRecord {
+                    file: file.to_string(),
+                    breakpoints,
+                    verified: Some(response.breakpoints.clone()),
+                }],
+            );
+        }
+
+        Ok(response.breakpoints)
+    }
+}
+
+/// Merge newly requested source breakpoints with those already set in the
+/// same file, de-duplicated by line (incoming wins, so re-setting a line
+/// updates its condition). DAP `setBreakpoints` replaces a source's whole
+/// set, so every add must resend the full list (dirge-vpma.12). Sorted by
+/// line for a stable request/cache order.
+fn merge_source_breakpoints(
+    cached: &[SourceBreakpoint],
+    incoming: Vec<SourceBreakpoint>,
+) -> Vec<SourceBreakpoint> {
+    let mut merged: Vec<SourceBreakpoint> = cached.to_vec();
+    for bp in incoming {
+        if let Some(existing) = merged.iter_mut().find(|c| c.line == bp.line) {
+            *existing = bp;
+        } else {
+            merged.push(bp);
+        }
+    }
+    merged.sort_by_key(|b| b.line);
+    merged
 }
 
 // ---------------------------------------------------------------------------
@@ -637,7 +701,11 @@ impl DapSessionManager {
         Ok(summary)
     }
 
-    /// Set file breakpoints for the active session.
+    /// Add file breakpoints for the active session, merging with any already
+    /// set in the same file. DAP `setBreakpoints` REPLACES a source's entire
+    /// breakpoint set, so sending just the new line silently drops every prior
+    /// breakpoint in that file (dirge-vpma.12). Re-send the merged set and
+    /// cache it. To clear a file, use [`clear_breakpoints`](Self::clear_breakpoints).
     pub async fn set_breakpoints(
         &self,
         file: &str,
@@ -649,35 +717,40 @@ impl DapSessionManager {
             .as_mut()
             .ok_or_else(|| ToolError::Msg("no active debug session".into()))?;
 
-        let source = Source {
-            path: Some(file.to_string()),
-            ..Default::default()
-        };
+        let path = PathBuf::from(file);
+        let cached: Vec<SourceBreakpoint> = session
+            .breakpoints
+            .get(&path)
+            .map(|records| {
+                records
+                    .iter()
+                    .flat_map(|r| r.breakpoints.iter().cloned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let merged = merge_source_breakpoints(&cached, breakpoints);
 
-        let args = SetBreakpointsArgs {
-            source,
-            breakpoints: Some(breakpoints.clone()),
-            breakpoints_deprecated: None,
-            source_modified: None,
-        };
-
-        let response: SetBreakpointsResponse = session
-            .client
-            .request("setBreakpoints", &args, timeout)
+        session
+            .set_source_breakpoints(file, &path, merged, timeout)
             .await
-            .map_err(rpc_to_tool_error)?;
+    }
+
+    /// Remove all breakpoints from a file: send an empty set (DAP replace
+    /// semantics clear the source) and drop the cache entry.
+    pub async fn clear_breakpoints(
+        &self,
+        file: &str,
+        timeout: Duration,
+    ) -> Result<Vec<Breakpoint>, ToolError> {
+        let mut active = self.active.lock().await;
+        let session = active
+            .as_mut()
+            .ok_or_else(|| ToolError::Msg("no active debug session".into()))?;
 
         let path = PathBuf::from(file);
-        session.breakpoints.insert(
-            path,
-            vec![BreakpointRecord {
-                file: file.to_string(),
-                breakpoints,
-                verified: Some(response.breakpoints.clone()),
-            }],
-        );
-
-        Ok(response.breakpoints)
+        session
+            .set_source_breakpoints(file, &path, Vec::new(), timeout)
+            .await
     }
 
     /// Set function breakpoints.
@@ -1278,6 +1351,41 @@ mod tests {
     use crate::jsonrpc_framing::{decode_frame, encode_frame};
     use serde_json::Value;
     use tokio::io::{AsyncBufRead, AsyncWrite};
+
+    fn sbp(line: i64, condition: Option<&str>) -> SourceBreakpoint {
+        SourceBreakpoint {
+            line,
+            column: None,
+            condition: condition.map(|c| c.to_string()),
+            hit_condition: None,
+            log_message: None,
+        }
+    }
+
+    // dirge-vpma.12: DAP setBreakpoints replaces a source's whole set, so an
+    // add must resend the merged list or the adapter drops the prior lines.
+    #[test]
+    fn merge_source_breakpoints_unions_by_line() {
+        let cached = vec![sbp(10, None)];
+        let merged = merge_source_breakpoints(&cached, vec![sbp(50, None)]);
+        let lines: Vec<i64> = merged.iter().map(|b| b.line).collect();
+        assert_eq!(lines, vec![10, 50], "second bp must not drop the first");
+    }
+
+    #[test]
+    fn merge_source_breakpoints_same_line_takes_incoming() {
+        let cached = vec![sbp(10, None)];
+        let merged = merge_source_breakpoints(&cached, vec![sbp(10, Some("x > 1"))]);
+        assert_eq!(merged.len(), 1, "same line must not duplicate");
+        assert_eq!(merged[0].condition.as_deref(), Some("x > 1"));
+    }
+
+    #[test]
+    fn merge_source_breakpoints_sorts_by_line() {
+        let merged = merge_source_breakpoints(&[sbp(30, None)], vec![sbp(5, None), sbp(20, None)]);
+        let lines: Vec<i64> = merged.iter().map(|b| b.line).collect();
+        assert_eq!(lines, vec![5, 20, 30]);
+    }
 
     /// A fake DAP adapter that handles:
     /// 1. initialize request → capabilities response

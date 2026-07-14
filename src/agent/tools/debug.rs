@@ -393,7 +393,7 @@ impl Tool for DebugTool {
             Action::RemoveBreakpoints => {
                 let file = required_nonblank(args.file.as_deref(), "file", "remove_breakpoints")?;
 
-                let results = mgr.set_breakpoints(file, vec![], timeout).await?;
+                let results = mgr.clear_breakpoints(file, timeout).await?;
 
                 Ok(format!(
                     "Removed all breakpoints from {} ({} remaining in adapter)",
