@@ -1647,10 +1647,18 @@ mod tests {
         let (out, cut) = apply_checkpoint_summary(&msgs, "## Goal\nx", 4).unwrap();
         // Returned index is an OLD-list index (the tail cut).
         assert_eq!(cut, 4);
-        assert_ne!(cut, 0, "cut is old-list; must not be used as the new-list summary index");
+        assert_ne!(
+            cut, 0,
+            "cut is old-list; must not be used as the new-list summary index"
+        );
         // The summary marker — restore_working_files' anchor — is at new index 0.
         assert_eq!(out[0]["role"].as_str().unwrap(), "system");
-        assert!(out[0]["content"].as_str().unwrap().starts_with(SUMMARY_PREFIX));
+        assert!(
+            out[0]["content"]
+                .as_str()
+                .unwrap()
+                .starts_with(SUMMARY_PREFIX)
+        );
     }
 
     #[test]

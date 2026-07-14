@@ -492,11 +492,17 @@ mod plugin_hook_tests {
             &mut is_running,
         );
         // The macro manages is_running; a caller must not overwrite it.
-        assert!(is_running, "install_into sets is_running; caller must not set false");
+        assert!(
+            is_running,
+            "install_into sets is_running; caller must not set false"
+        );
         // Simulate the bug: if a call site did `is_running = false` here it
         // would clobber the live drain.  That line was removed — verify the
         // flag stays true without it.
-        assert!(is_running, "is_running must still be true; no overwrite allowed");
+        assert!(
+            is_running,
+            "is_running must still be true; no overwrite allowed"
+        );
     }
 
     #[test]

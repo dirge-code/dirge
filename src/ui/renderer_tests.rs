@@ -1687,11 +1687,20 @@ fn remove_active_chat_does_not_clobber_survivor_history() {
     let mut r = Renderer::new().expect("renderer");
     r.add_chat("A"); // index 1
     r.add_chat("B"); // index 2
-    r.buffer.push(LineEntry { text: CompactString::new("main-content"), color: Color::White });
+    r.buffer.push(LineEntry {
+        text: CompactString::new("main-content"),
+        color: Color::White,
+    });
     r.switch_chat(1);
-    r.buffer.push(LineEntry { text: CompactString::new("A-content"), color: Color::White });
+    r.buffer.push(LineEntry {
+        text: CompactString::new("A-content"),
+        color: Color::White,
+    });
     r.switch_chat(2);
-    r.buffer.push(LineEntry { text: CompactString::new("B-content"), color: Color::White });
+    r.buffer.push(LineEntry {
+        text: CompactString::new("B-content"),
+        color: Color::White,
+    });
     // A active, hot = "A-content"; B's content safely in its slot.
     r.switch_chat(1);
     assert_eq!(r.buffer[0].text.as_str(), "A-content");
@@ -1724,7 +1733,10 @@ fn remove_inactive_chat_preserves_active_hot_fields() {
     r.add_chat("A"); // 1
     r.add_chat("B"); // 2
     r.switch_chat(2); // B active
-    r.buffer.push(LineEntry { text: CompactString::new("B-live"), color: Color::White });
+    r.buffer.push(LineEntry {
+        text: CompactString::new("B-live"),
+        color: Color::White,
+    });
     // Remove an EARLIER inactive chat; active shifts 2 -> 1 but B's
     // live buffer must be untouched.
     r.remove_chat(0);
