@@ -1201,11 +1201,22 @@ impl Renderer {
         if self.chats.len() <= 1 || idx >= self.chats.len() {
             return;
         }
+        let removing_active = idx == self.active_chat;
         self.chats.remove(idx);
         if idx < self.active_chat {
             self.active_chat -= 1;
         } else if idx == self.active_chat && self.active_chat >= self.chats.len() {
             self.active_chat = 0;
+        }
+        // dirge-vpma.2: the removed chat's content is still in the hot
+        // fields. When the ACTIVE chat was removed, active_chat now points
+        // at a survivor whose snapshot must be loaded — otherwise the next
+        // switch_chat's save_active() overwrites the survivor's history
+        // with the dead chat's content. Only on the active-removal path:
+        // otherwise the hot fields already hold the (unchanged) active chat
+        // and load_active() would clobber them from its emptied slot.
+        if removing_active {
+            self.load_active();
         }
         self.needs_paint = true;
     }

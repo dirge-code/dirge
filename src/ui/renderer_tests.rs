@@ -1677,3 +1677,62 @@ fn terminal_size_uses_cached_tty_size() {
         "test_cols override must take precedence over cache"
     );
 }
+
+/// dirge-vpma.2: closing the ACTIVE chat must load a survivor's
+/// snapshot into the hot fields, or the next switch_chat's
+/// save_active() overwrites the survivor's history with the dead
+/// chat's content.
+#[test]
+fn remove_active_chat_does_not_clobber_survivor_history() {
+    let mut r = Renderer::new().expect("renderer");
+    r.add_chat("A"); // index 1
+    r.add_chat("B"); // index 2
+    r.buffer.push(LineEntry { text: CompactString::new("main-content"), color: Color::White });
+    r.switch_chat(1);
+    r.buffer.push(LineEntry { text: CompactString::new("A-content"), color: Color::White });
+    r.switch_chat(2);
+    r.buffer.push(LineEntry { text: CompactString::new("B-content"), color: Color::White });
+    // A active, hot = "A-content"; B's content safely in its slot.
+    r.switch_chat(1);
+    assert_eq!(r.buffer[0].text.as_str(), "A-content");
+    // Close the ACTIVE chat A. active_chat (1) now points at B.
+    r.remove_chat(1);
+    assert_eq!(r.chat_count(), 2);
+    assert_ne!(
+        r.buffer.first().map(|l| l.text.as_str()),
+        Some("A-content"),
+        "closed chat's content must not linger in the hot fields"
+    );
+    // Round-trip: switching away and back must preserve B's history.
+    let survivor = r.active_chat();
+    r.switch_chat(0);
+    r.switch_chat(survivor);
+    assert_eq!(r.buffer.len(), 1);
+    assert_eq!(
+        r.buffer[0].text.as_str(),
+        "B-content",
+        "surviving chat's history must survive closing the active chat"
+    );
+}
+
+/// dirge-vpma.2 guard: removing a NON-active chat must NOT disturb the
+/// active chat's live hot fields (load_active() there would clobber
+/// them from the emptied slot).
+#[test]
+fn remove_inactive_chat_preserves_active_hot_fields() {
+    let mut r = Renderer::new().expect("renderer");
+    r.add_chat("A"); // 1
+    r.add_chat("B"); // 2
+    r.switch_chat(2); // B active
+    r.buffer.push(LineEntry { text: CompactString::new("B-live"), color: Color::White });
+    // Remove an EARLIER inactive chat; active shifts 2 -> 1 but B's
+    // live buffer must be untouched.
+    r.remove_chat(0);
+    assert_eq!(r.active_chat(), 1);
+    assert_eq!(r.buffer.len(), 1);
+    assert_eq!(
+        r.buffer[0].text.as_str(),
+        "B-live",
+        "removing an inactive chat must not disturb the active buffer"
+    );
+}
