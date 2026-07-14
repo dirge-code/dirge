@@ -1054,6 +1054,14 @@ impl InputEditor {
         use std::io::Write;
         let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
 
+        // Seed with the EXPANDED text (paste bodies inline, image markers
+        // dropped) rather than the raw buffer: the raw buffer carries
+        // invisible `\x01<idx>\x01` sentinel bytes that render as garbage in
+        // the editor and are trivially corrupted, and its text-paste bodies
+        // are collapsed to `[N lines pasted]` so they can't be edited at all
+        // (dirge-vpma.5).
+        let seed = self.editor_seed();
+
         let path = std::env::temp_dir().join(format!("dirge-input-{}.md", std::process::id()));
         // Clear any leftover from an interrupted prior edit, then create the
         // file with O_EXCL (`create_new`): if an attacker pre-planted a symlink
@@ -1064,7 +1072,7 @@ impl InputEditor {
             .write(true)
             .create_new(true)
             .open(&path)
-            .and_then(|mut f| f.write_all(self.buffer.as_bytes()));
+            .and_then(|mut f| f.write_all(seed.as_bytes()));
         if let Err(e) = write_result {
             crate::ui::notifications::notify_send(crate::ui::notifications::Notification::Error(
                 format!("External editor: failed to write temp file: {e}"),
@@ -1111,9 +1119,7 @@ impl InputEditor {
         }
 
         let content = match status {
-            Ok(s) if s.success() => {
-                std::fs::read_to_string(&path).unwrap_or_else(|_| self.buffer.to_string())
-            }
+            Ok(s) if s.success() => std::fs::read_to_string(&path).unwrap_or_else(|_| seed.clone()),
             Ok(s) => {
                 crate::ui::notifications::notify_send(
                     crate::ui::notifications::Notification::Error(format!(
@@ -1123,7 +1129,7 @@ impl InputEditor {
                             .unwrap_or_else(|| "signal".into())
                     )),
                 );
-                self.buffer.to_string()
+                seed.clone()
             }
             Err(e) => {
                 crate::ui::notifications::notify_send(
@@ -1131,17 +1137,59 @@ impl InputEditor {
                         "External editor: failed to spawn {editor}: {e}"
                     )),
                 );
-                self.buffer.to_string()
+                seed.clone()
             }
         };
 
         let _ = std::fs::remove_file(&path);
 
-        if content != self.buffer {
-            self.set_text(&content);
+        // Compare against the seed, not the raw buffer — the seed is what the
+        // editor was handed, so this correctly detects "no change" even though
+        // the raw buffer differs (markers expanded). On the error paths above
+        // `content == seed`, so nothing is applied.
+        if content != seed {
+            self.apply_editor_result(&content);
         }
 
         None
+    }
+
+    /// Text handed to the external editor: the buffer with paste markers
+    /// expanded to their bodies and image markers dropped. Same flattening
+    /// as [`expanded`](Self::expanded) — named as a seam so the round-trip is
+    /// testable and symmetric with [`apply_editor_result`](Self::apply_editor_result).
+    #[cfg(unix)]
+    fn editor_seed(&self) -> String {
+        self.expanded().to_string()
+    }
+
+    /// Fold an external-editor result back into the buffer. The editor works
+    /// on plain text (see [`editor_seed`](Self::editor_seed)), so text pastes
+    /// return inline and need no slots — but pending IMAGES have no textual
+    /// form and were dropped from the seed. Preserve them by re-attaching each
+    /// as a fresh image placeholder appended after the edited text, so they
+    /// still submit with the turn. Before dirge-vpma.5 this was a bare
+    /// `set_text`, which cleared every paste slot and silently destroyed
+    /// pasted images (and any un-expanded text bodies).
+    #[cfg(unix)]
+    fn apply_editor_result(&mut self, content: &str) {
+        let images: Vec<PendingImage> = self
+            .pastes
+            .iter()
+            .filter_map(|slot| match slot {
+                Some(PasteSlot::Image(img)) => Some(img.clone()),
+                _ => None,
+            })
+            .collect();
+        // set_text clears pastes / kill ring / history draft / undo — right
+        // here, since the editor rewrote the draft wholesale.
+        self.set_text(content);
+        for image in images {
+            let idx = self.pastes.len();
+            self.pastes.push(Some(PasteSlot::Image(image)));
+            let marker = format!("{}{}{}", PASTE_MARK, idx, PASTE_MARK);
+            self.insert_str(&marker);
+        }
     }
 
     /// Apply a resolved rebindable editing command (dirge-8fkp). The
@@ -2496,5 +2544,62 @@ mod tests {
         let mut e = InputEditor::new();
         e.handle_key(ev(KeyCode::Char('z'), KeyModifiers::ALT));
         assert_eq!(e.buffer.as_str(), "", "Alt+z must not insert 'z'");
+    }
+
+    // dirge-vpma.5: Ctrl+G (external editor) used to seed the temp file with
+    // the raw buffer — invisible `\x01` marker bytes and collapsed paste
+    // bodies — then fold the result back via a bare `set_text`, which cleared
+    // every paste slot and silently destroyed pasted images.
+    #[cfg(unix)]
+    #[test]
+    fn editor_seed_expands_text_and_drops_images() {
+        let mut e = InputEditor::new();
+        e.insert_str("before ");
+        e.handle_paste("line1\nline2\nline3\nline4\nline5"); // collapses to a placeholder
+        e.handle_paste_image(PendingImage {
+            bytes: vec![1, 2, 3],
+            media_type: "image/png".into(),
+        });
+        e.insert_str(" after");
+
+        // Raw buffer carries the sentinel markers.
+        assert!(e.buffer.as_str().contains(PASTE_MARK));
+
+        let seed = e.editor_seed();
+        // Text body is inline and editable; no sentinel bytes; image is gone
+        // from the text (it has no textual form).
+        assert!(seed.contains("line1\nline2\nline3\nline4\nline5"));
+        assert!(
+            !seed.contains(PASTE_MARK),
+            "seed must not carry marker bytes"
+        );
+        assert!(seed.starts_with("before "));
+        assert!(seed.ends_with(" after"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_editor_result_preserves_pending_images() {
+        let mut e = InputEditor::new();
+        e.insert_str("hi ");
+        e.handle_paste_image(PendingImage {
+            bytes: vec![9, 8, 7],
+            media_type: "image/png".into(),
+        });
+
+        // Simulate the editor returning rewritten text (no image markers —
+        // the seed dropped them).
+        e.apply_editor_result("totally new prompt");
+
+        assert!(e.buffer.as_str().starts_with("totally new prompt"));
+        // The image survived and re-submits with the turn.
+        let submitted = e.handle_key(ev(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(submitted.as_deref(), Some("totally new prompt"));
+        assert_eq!(
+            e.pending_images.len(),
+            1,
+            "pasted image must survive Ctrl+G"
+        );
+        assert_eq!(e.pending_images[0].bytes, vec![9, 8, 7]);
     }
 }
