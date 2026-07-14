@@ -1534,7 +1534,9 @@ mod sandbox_config_update_tests {
         std::fs::write(&config_json, "{ broken").unwrap();
 
         let prev = std::env::var_os("DIRGE_CONFIG_DIR");
-        unsafe { std::env::set_var("DIRGE_CONFIG_DIR", &dir); }
+        unsafe {
+            std::env::set_var("DIRGE_CONFIG_DIR", &dir);
+        }
 
         let result = update_config_file(&serde_json::json!({"sandbox": {"mode": "microvm"}}));
 
