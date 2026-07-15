@@ -254,8 +254,8 @@ mod tests {
 
     #[test]
     fn reasoning_disable_shapes_per_provider() {
-        // Hosted DeepSeek / GLM: thinking:{type:"disabled"} toggle.
-        for kind in ["deepseek", "glm"] {
+        // Hosted DeepSeek / GLM / OpenCode: thinking:{type:"disabled"} toggle.
+        for kind in ["deepseek", "glm", "opencode"] {
             assert_eq!(
                 reasoning_disable_for_kind(kind),
                 Some(serde_json::json!({ "thinking": { "type": "disabled" } })),
@@ -263,7 +263,7 @@ mod tests {
             );
         }
         // Self-hosted vLLM / SGLang backends: chat_template_kwargs convention.
-        for kind in ["opencode", "custom", "openrouter"] {
+        for kind in ["custom", "openrouter"] {
             assert_eq!(
                 reasoning_disable_for_kind(kind),
                 Some(serde_json::json!({ "chat_template_kwargs": { "thinking": false } })),
