@@ -517,22 +517,6 @@ impl IssueStore {
         Ok(applied)
     }
 
-    /// Count of live issues — used for the "N more" injection hint. Must match
-    /// [`Self::board`]'s membership (open / in_progress / blocked) so the
-    /// overflow hint is consistent: both terminal states (`done` and
-    /// `cancelled`) are excluded, otherwise cancelled issues would inflate the
-    /// "and N more" count for rows the model can never list.
-    pub fn open_count(&self) -> Result<usize, String> {
-        let conn = self.conn.lock_ignore_poison();
-        conn.query_row(
-            "SELECT COUNT(*) FROM issues WHERE status NOT IN ('done','cancelled')",
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .map(|n| n as usize)
-        .map_err(|e| format!("open_count: {e}"))
-    }
-
     /// The passive backlog: open / in_progress / blocked issues with
     /// `session_id IS NULL`, i.e. unassigned issues filed for later. Terminal
     /// issues are excluded. Ordered high-priority first, then most-recently
@@ -581,34 +565,6 @@ impl IssueStore {
             .map_err(|e| format!("children_of: {e}"))?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|e| format!("children_of: {e}"))
-    }
-
-    /// Build the harness's turn-start board reminder: the top `top_n` live
-    /// issues, wrapped in a `<system-reminder>` block. Kept for backward
-    /// compatibility; new code should prefer [`Self::board_reminder_split`].
-    #[allow(dead_code)]
-    pub fn board_reminder(&self, top_n: usize) -> Result<Option<String>, String> {
-        let issues = self.board(Some(top_n))?;
-        if issues.is_empty() {
-            return Ok(None);
-        }
-        let total = self.open_count()?;
-        let mut s = String::from(
-            "<system-reminder>\nIssue board (your persistent kanban — surfaced automatically; you did not ask for it). \
-             As you work: `issue` tool with action=start when you begin one, action=close when done, action=create for newly-discovered work.\n",
-        );
-        for i in &issues {
-            s.push_str(&format!("- {}\n", i.one_line()));
-        }
-        let shown = issues.len();
-        if total > shown {
-            s.push_str(&format!(
-                "… and {} more open issue(s) not shown. Use the `issue` tool (action=list) or /issues to see all.\n",
-                total - shown
-            ));
-        }
-        s.push_str("</system-reminder>");
-        Ok(Some(s))
     }
 
     /// Build the harness's turn-start board reminder as two labeled sections:
@@ -1126,7 +1082,7 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(s.board(Some(2)).unwrap().len(), 2);
-        assert_eq!(s.open_count().unwrap(), 5);
+        assert_eq!(s.board(None).unwrap().len(), 5);
     }
 
     // ── search ───────────────────────────────────────────────────────────
@@ -1162,21 +1118,21 @@ mod tests {
     // ── board reminder ───────────────────────────────────────────────────
 
     #[test]
-    fn board_reminder_none_when_empty_and_hints_overflow() {
+    fn board_reminder_split_hints_backlog_overflow() {
         let s = store();
-        assert!(
-            s.board_reminder(5).unwrap().is_none(),
-            "empty board → no reminder"
-        );
+        // 4 unassigned (passive) issues; cap the backlog section at 2.
         for i in 0..4 {
-            s.create(&format!("issue {i}"), "", None, None, None)
+            s.create(&format!("backlog {i}"), "", None, None, None)
                 .unwrap();
         }
-        let block = s.board_reminder(2).unwrap().expect("non-empty board");
+        let block = s
+            .board_reminder_split(Some("sess-1"), 3, 2)
+            .unwrap()
+            .expect("non-empty board");
         assert!(block.starts_with("<system-reminder>"));
         assert!(block.trim_end().ends_with("</system-reminder>"));
-        // Only 2 shown, 4 live → overflow hint mentions the remaining 2.
-        assert!(block.contains("2 more open issue"), "{block}");
+        // Only 2 of 4 shown → overflow hint mentions the remaining 2.
+        assert!(block.contains("2 more in the backlog"), "{block}");
     }
 
     // ── backlog ───────────────────────────────────────────────────────────
@@ -1292,7 +1248,7 @@ mod tests {
         );
     }
 
-    // ── cancelled / open_count ───────────────────────────────────────────
+    // ── cancelled / terminal states ──────────────────────────────────────
 
     #[test]
     fn cancelled_is_terminal_stamps_closed_at_and_leaves_board() {
@@ -1313,16 +1269,15 @@ mod tests {
     }
 
     #[test]
-    fn open_count_excludes_both_terminal_states() {
+    fn board_excludes_both_terminal_states() {
         let s = store();
         let _live = s.create("live", "", None, None, None).unwrap();
         let done = s.create("done", "", None, None, None).unwrap();
         s.set_status(&done, "done").unwrap();
         let cancelled = s.create("cancelled", "", None, None, None).unwrap();
         s.set_status(&cancelled, "cancelled").unwrap();
-        // Only the one live issue counts — cancelled must not inflate it (it's
-        // excluded from board(), so the "N more" hint would otherwise lie).
-        assert_eq!(s.open_count().unwrap(), 1);
+        // Only the one live issue is on the board — both terminal states
+        // (done and cancelled) drop off.
         assert_eq!(s.board(None).unwrap().len(), 1);
     }
 
