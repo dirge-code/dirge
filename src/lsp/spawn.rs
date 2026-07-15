@@ -174,6 +174,15 @@ impl ProcessSpawner {
                 init_options: Value::Null,
             },
         );
+        m.insert(
+            "cmake".to_string(),
+            ProcessCommand {
+                program: PathBuf::from("cmake-language-server"),
+                args: vec![],
+                env: vec![],
+                init_options: Value::Null,
+            },
+        );
         m
     }
 }

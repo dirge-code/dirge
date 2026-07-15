@@ -225,14 +225,25 @@ impl LspManager {
             .unwrap_or("")
             .to_lowercase();
 
+        let file_name = file
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+
         let mut out = Vec::new();
 
         for server in self.servers.iter() {
-            if !server
+            let ext_match = server
                 .extensions
                 .iter()
-                .any(|e| e.eq_ignore_ascii_case(&ext))
-            {
+                .any(|e| e.eq_ignore_ascii_case(&ext));
+            let name_match = server
+                .filenames
+                .iter()
+                .any(|f| f.eq_ignore_ascii_case(&file_name));
+
+            if !ext_match && !name_match {
                 continue;
             }
             let Some(root) = (server.root)(file, &self.worktree) else {

@@ -16,6 +16,10 @@ pub struct ServerInfo {
     /// override the builtin list — see
     /// `apply_extension_overrides`.
     pub extensions: Vec<String>,
+    /// Filenames (including extension) that this server claims. Used for
+    /// files like `CMakeLists.txt` whose extension (`.txt`) would otherwise
+    /// never trigger a match. Compared case-insensitively in `get_clients`.
+    pub filenames: Vec<String>,
     /// Walks up from `file` (bounded by `stop_at`) to locate the workspace
     /// root. Returns `None` when no plausible root exists (signals "don't
     /// attach this server to this file").
@@ -237,21 +241,25 @@ pub fn builtin_servers() -> Vec<ServerInfo> {
         ServerInfo {
             id: "rust",
             extensions: owned(&["rs"]),
+            filenames: owned(&[]),
             root: rust_workspace_root,
         },
         ServerInfo {
             id: "typescript",
             extensions: owned(&["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"]),
+            filenames: owned(&[]),
             root: typescript_root,
         },
         ServerInfo {
             id: "pyright",
             extensions: owned(&["py", "pyi"]),
+            filenames: owned(&[]),
             root: pyright_root,
         },
         ServerInfo {
             id: "clojure-lsp",
             extensions: owned(&["clj", "cljs", "cljc", "edn", "bb"]),
+            filenames: owned(&[]),
             root: clojure_root,
         },
         // Audit M5: semantic adapters cover 10 languages but only 4
@@ -264,26 +272,31 @@ pub fn builtin_servers() -> Vec<ServerInfo> {
         ServerInfo {
             id: "gopls",
             extensions: owned(&["go"]),
+            filenames: owned(&[]),
             root: go_root,
         },
         ServerInfo {
             id: "jdtls",
             extensions: owned(&["java"]),
+            filenames: owned(&[]),
             root: java_root,
         },
         ServerInfo {
             id: "clangd",
             extensions: owned(&["c", "cc", "cpp", "cxx", "h", "hh", "hpp", "hxx", "m", "mm"]),
+            filenames: owned(&[]),
             root: cfamily_root,
         },
         ServerInfo {
             id: "ruby-lsp",
             extensions: owned(&["rb", "rake", "gemspec"]),
+            filenames: owned(&[]),
             root: ruby_root,
         },
         ServerInfo {
             id: "bash-language-server",
             extensions: owned(&["sh", "bash"]),
+            filenames: owned(&[]),
             root: bash_root,
         },
         // Dafny: `dafny server` speaks LSP over stdio. Best-effort like
@@ -292,7 +305,20 @@ pub fn builtin_servers() -> Vec<ServerInfo> {
         ServerInfo {
             id: "dafny",
             extensions: owned(&["dfy"]),
+            filenames: owned(&[]),
             root: dafny_root,
+        },
+        // CMake: cmake-language-server speaks LSP over stdio.
+        // Best-effort like the others — if `cmake-language-server`
+        // isn't on PATH the spawn errors and broken-server backoff
+        // takes over. Uses cfamily_root because CMake projects
+        // share the same markers (compile_commands.json, Makefile,
+        // CMakeLists.txt).
+        ServerInfo {
+            id: "cmake",
+            extensions: owned(&["cmake"]),
+            filenames: owned(&["cmakelists.txt"]),
+            root: cfamily_root,
         },
     ]
 }

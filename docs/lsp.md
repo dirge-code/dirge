@@ -28,6 +28,7 @@ discovering it later via `cargo check`.
 | `clangd` | `clangd` | `.c`, `.cc`, `.cpp`, `.cxx`, `.h`, `.hh`, `.hpp`, `.hxx`, `.m`, `.mm` |
 | `ruby-lsp` | `ruby-lsp` | `.rb`, `.rake`, `.gemspec` |
 | `bash-language-server` | `bash-language-server start` | `.sh`, `.bash` |
+| `cmake` | `cmake-language-server` | `.cmake` (+ `CMakeLists.txt` by name) |
 
 Missing binaries trip the broken-server backoff (1s → 2s → … capped at 10 min)
 rather than failing dirge — the rest of the session keeps working. Override the
@@ -42,7 +43,9 @@ pyright looks for `pyproject.toml`/`setup.py`/etc.; clojure-lsp looks for
 `deps.edn`/`project.clj`/`shadow-cljs.edn`/`bb.edn`/`.clj-kondo`; gopls follows
 `go.mod`/`go.work`; jdtls looks for `pom.xml`/`build.gradle`; clangd uses
 `compile_commands.json`/`CMakeLists.txt`/`Makefile`/`meson.build`; ruby-lsp
-follows `Gemfile`/`Rakefile`; bash-language-server uses the file's parent.
+follows `Gemfile`/`Rakefile`; bash-language-server uses the file's parent. Cmake
+uses the same root markers as clangd (`compile_commands.json`, `CMakeLists.txt`,
+`Makefile`, `meson.build`).
 
 Disable: `--no-lsp` flag or `{ "lsp": false }` in the config. Per-server
 overrides (custom command, env, init options) live in the config — see

@@ -75,9 +75,14 @@ const LANGUAGES: &[(&str, &str)] = &[
     ("nix", "nix"),
     ("zig", "zig"),
     ("dfy", "dafny"),
+    ("cmake", "cmake"),
 ];
 
-const FILENAMES: &[(&str, &str)] = &[("makefile", "makefile"), ("dockerfile", "dockerfile")];
+const FILENAMES: &[(&str, &str)] = &[
+    ("makefile", "makefile"),
+    ("dockerfile", "dockerfile"),
+    ("cmakelists.txt", "cmake"),
+];
 
 #[cfg(test)]
 mod tests {
@@ -151,6 +156,10 @@ mod tests {
         // Case insensitive.
         assert_eq!(lang("makefile"), "makefile");
         assert_eq!(lang("path/to/Makefile"), "makefile");
+        // CMakeLists.txt has a generic .txt extension; it must match by filename.
+        assert_eq!(lang("CMakeLists.txt"), "cmake");
+        assert_eq!(lang("cmakelists.txt"), "cmake");
+        assert_eq!(lang("path/to/CMakeLists.txt"), "cmake");
     }
 
     #[test]
