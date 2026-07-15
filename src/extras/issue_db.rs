@@ -1,14 +1,20 @@
 //! Native issue tracker — a lightweight, agent-facing kanban stored in the
 //! per-project session DB (`.dirge/sessions/state.db`).
 //!
-//! Issues are a stateful extension of the memory model: open issues are the
-//! agent's working board (surfaced by the harness at turn start), and closed
-//! issues fade like ordinary procedural memory. The store deliberately owns
-//! its schema via idempotent `CREATE TABLE IF NOT EXISTS` on open rather than a
-//! versioned migration — the session DB's `user_version` chain is feature-gated
-//! (v14/v15 exist only under `experimental-graph-search`), so threading a new
-//! linear version would either collide with those or break the "enable the
-//! feature later" property. An additive, self-owned table sidesteps all of it.
+//! Issues are a stateful extension of the memory model and come in two buckets:
+//! **active** (session-scoped, shown in the right-pane panel and nudged to finish)
+//! and **passive backlog** (unassigned, `session_id IS NULL`, filed for later).
+//! `issue create` files an issue to the passive backlog (optionally under an
+//! epic parent via `epic_id`); `issue start` calls `assign_to_session` to claim
+//! one onto the active queue. Closed issues fade like ordinary procedural
+//! memory.
+//!
+//! The store deliberately owns its schema via idempotent `CREATE TABLE IF NOT
+//! EXISTS` on open rather than a versioned migration — the session DB's
+//! `user_version` chain is feature-gated (v14/v15 exist only under
+//! `experimental-graph-search`), so threading a new linear version would either
+//! collide with those or break the "enable the feature later" property. An
+//! additive, self-owned table sidesteps all of it.
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -553,6 +559,30 @@ impl IssueStore {
             .map_err(|e| format!("backlog: {e}"))
     }
 
+    /// All live children of an epic (the issue whose `epic_id` equals `epic_id`).
+    /// Terminal (`done` / `cancelled`) children are excluded. Ordered
+    /// in_progress first, then blocked, then open; high-priority first within
+    /// each status; then updated_at DESC, id DESC.
+    pub fn children_of(&self, epic_id: &str) -> Result<Vec<Issue>, String> {
+        let conn = self.conn.lock_ignore_poison();
+        let sql = format!(
+            "SELECT {COLS} FROM issues
+             WHERE epic_id = ?1 AND status IN ('open','in_progress','blocked')
+             ORDER BY
+               CASE status WHEN 'in_progress' THEN 0 WHEN 'blocked' THEN 1 ELSE 2 END,
+               CASE priority WHEN 'high' THEN 0 WHEN 'normal' THEN 1 ELSE 2 END,
+               updated_at DESC, id DESC"
+        );
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| format!("children_of: {e}"))?;
+        let rows = stmt
+            .query_map(params![epic_id], row_to_issue)
+            .map_err(|e| format!("children_of: {e}"))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| format!("children_of: {e}"))
+    }
+
     /// Build the harness's turn-start board reminder: the top `top_n` live
     /// issues, wrapped in a `<system-reminder>` block. Kept for backward
     /// compatibility; new code should prefer [`Self::board_reminder_split`].
@@ -986,6 +1016,35 @@ mod tests {
             .unwrap();
         let child = s.get(&child_id).unwrap().unwrap();
         assert_eq!(child.epic_id.as_deref(), Some(parent_id.as_str()));
+    }
+
+    #[test]
+    fn children_of_returns_live_children_excludes_terminal() {
+        let s = store();
+        let epic_id = s.create("epic", "", None, None, None).unwrap();
+        let c1 = s
+            .create("child 1", "", Some("high"), None, Some(&epic_id))
+            .unwrap();
+        let c2 = s.create("child 2", "", None, None, Some(&epic_id)).unwrap();
+        // Terminal child excluded.
+        let c_done = s
+            .create("child done", "", None, None, Some(&epic_id))
+            .unwrap();
+        s.set_status(&c_done, "done").unwrap();
+        // Non-child issue excluded.
+        s.create("unrelated", "", None, None, None).unwrap();
+
+        let kids = s.children_of(&epic_id).unwrap();
+        let ids: Vec<&str> = kids.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, vec![c1.as_str(), c2.as_str()]);
+        assert_eq!(kids[0].title, "child 1");
+        assert_eq!(kids[1].title, "child 2");
+    }
+
+    #[test]
+    fn children_of_empty_for_non_epic_id() {
+        let s = store();
+        assert!(s.children_of("drg-ffff").unwrap().is_empty());
     }
 
     #[test]

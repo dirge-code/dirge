@@ -113,11 +113,27 @@ fn show(ctx: &mut SlashCtx<'_>, store: &IssueStore, id: &str) -> anyhow::Result<
                 ctx.renderer
                     .write_line(&format!("  {}", i.body.replace('\n', "\n  ")), c_result())?;
             }
+            if let Some(ref epic) = i.epic_id {
+                ctx.renderer
+                    .write_line(&format!("  epic: {epic}"), c_result())?;
+            }
             let mut meta = format!("  created {} · updated {}", i.created_at, i.updated_at);
             if let Some(closed) = &i.closed_at {
                 meta.push_str(&format!(" · closed {closed}"));
             }
             ctx.renderer.write_line(&meta, c_agent())?;
+
+            // Show live children of an epic.
+            if let Ok(kids) = store.children_of(id)
+                && !kids.is_empty()
+            {
+                ctx.renderer
+                    .write_line(&format!("Children ({}):", kids.len()), c_agent())?;
+                for k in &kids {
+                    ctx.renderer
+                        .write_line(&format!("  {}", k.one_line()), c_result())?;
+                }
+            }
         }
         Ok(None) => {
             ctx.renderer

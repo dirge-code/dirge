@@ -4,9 +4,11 @@
 //! Historically this was a throwaway in-memory checklist separate from the
 //! `issue` tool. The two have been consolidated: a todo IS an issue. Each
 //! `write_todo_list` call upserts its items into the project's `issues` table
-//! (see [`crate::extras::issue_db`]), scoped to the current session, so bulk
-//! planning gains the full issue lifecycle (open / in_progress / blocked /
-//! done / cancelled) and the model can rely on which items are still open.
+//! (see [`crate::extras::issue_db`]), scoped to the current session. Items go
+//! onto the ACTIVE work queue (you get nudged to finish them); omitting an item
+//! does NOT auto-close it — restate it as completed/cancelled. `issue create`,
+//! by contrast, files to the passive backlog (unassigned, not nudged) for later
+//! pickup via `issue start`.
 //!
 //! [`TODO_LIST`] is no longer the source of truth — it's a fast in-memory
 //! mirror of this session's live board that the right-pane panel and the

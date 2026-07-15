@@ -1,11 +1,15 @@
 //! `issue` — the model's persistent issue/kanban board, stored in the
 //! per-project session DB via [`crate::extras::issue_db::IssueStore`].
 //!
-//! The incremental, single-item surface over the board; `write_todo_list`
-//! writes to the SAME store in bulk for laying out a plan. Issues persist
-//! across sessions and are surfaced by the harness at turn start, so the model
-//! doesn't have to remember to list them. This tool is the WRITE +
-//! on-demand-read surface; routine reads are injected automatically.
+//! Two buckets: ACTIVE (session-scoped, in the panel + nudged to finish)
+//! and BACKLOG (unassigned, filed for later). `create` files to the passive
+//! backlog (optionally under an epic via `epic=<id>`); `start` claims a
+//! backlog issue onto the active queue. `show` on an epic also lists its
+//! live children. The incremental, single-item surface over the board;
+//! `write_todo_list` writes to the SAME store in bulk for laying out a plan.
+//! Issues persist across sessions and are surfaced by the harness at turn
+//! start, so the model doesn't have to remember to list them. This tool is
+//! the WRITE + on-demand-read surface; routine reads are injected automatically.
 
 use std::path::PathBuf;
 
@@ -31,6 +35,9 @@ pub struct IssueArgs {
     pub status: Option<String>,
     #[serde(default)]
     pub priority: Option<String>,
+    /// Parent epic id (create only). Accepts a number or a string like "#drg-a1b2".
+    #[serde(default)]
+    pub epic: Option<serde_json::Value>,
     /// Filter for `list` (status) or term for `search`.
     #[serde(default)]
     pub query: Option<String>,
@@ -78,6 +85,9 @@ fn render_issue(i: &crate::extras::issue_db::Issue) -> String {
     if !i.body.trim().is_empty() {
         out.push_str(&format!("\n  {}", i.body.replace('\n', "\n  ")));
     }
+    if let Some(ref epic) = i.epic_id {
+        out.push_str(&format!("\n  epic: {epic}"));
+    }
     out.push_str(&format!(
         "\n  created {} · updated {}",
         i.created_at, i.updated_at
@@ -96,20 +106,21 @@ impl Tool for IssueTool {
         ToolDefinition {
             name: "issue".to_string(),
             description: "Persistent issue/kanban board for tracking work (stored in the project DB, persists ACROSS sessions). The harness shows your open board at the start of each turn, so you don't need to list it constantly. This is the incremental, single-item surface; `write_todo_list` writes to the SAME board in bulk for laying out a multi-step plan. Actions: \
-                create (title, optional body/priority high|normal|low) — files to the BACKLOG for later (NOT on your active work queue; use `start` to pick it up when you actually begin it); \
+                create (title, optional body/priority high|normal|low, optional epic=<id>) — files to the BACKLOG for later (NOT on your active work queue; use `start` to pick it up when you actually begin it); \
                 start (id → in_progress) — claims the issue onto your active work queue; block (id → blocked); close (id → done); \
                 update (id, optional status open|in_progress|blocked|done|cancelled / priority / body); \
-                show (id); list (optional status filter); search (query). \
-                Ids accept 7 or \"#7\". Create issues as you discover work; start one when you begin it; close it when done.".to_string(),
+                show (id) — shows detail, and for an epic also lists its live children; list (optional status filter); search (query). \
+                Ids look like \"drg-a1b2\" (legacy \"7\"/\"#7\" also accepted). Create issues as you discover work; start one when you begin it; close it when done.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "action": { "type": "string", "description": "create | list | show | start | block | close | update | search" },
                     "title": { "type": "string", "description": "Title (create)" },
                     "body": { "type": "string", "description": "Optional details (create/update)" },
-                    "id": { "type": ["integer", "string"], "description": "Issue id for show/update/start/block/close (e.g. 7 or \"#7\")" },
+                    "id": { "type": ["integer", "string"], "description": "Issue id for show/update/start/block/close (e.g. \"drg-a1b2\"; legacy 7/\"#7\" also accepted)" },
                     "status": { "type": "string", "description": "open | in_progress | blocked | done | cancelled (update)" },
                     "priority": { "type": "string", "description": "high | normal | low (create/update)" },
+                    "epic": { "type": ["integer", "string"], "description": "Parent epic id (create only; e.g. \"drg-a1b2\" or 7)" },
                     "query": { "type": "string", "description": "Status filter for list, or search term for search" }
                 },
                 "required": ["action"]
@@ -149,17 +160,22 @@ impl Tool for IssueTool {
                     .title
                     .as_deref()
                     .ok_or_else(|| ToolError::Msg("create needs a `title`".to_string()))?;
+                let epic_str = coerce_id(&args.epic);
                 let id = store
                     .create(
                         title,
                         args.body.as_deref().unwrap_or(""),
                         args.priority.as_deref(),
                         None,
-                        None,
+                        epic_str.as_deref(),
                     )
                     .map_err(ToolError::Msg)?;
                 refresh();
-                Ok(format!("Created issue {id}: {}", title.trim()))
+                let mut msg = format!("Created issue {id}: {}", title.trim());
+                if let Some(eid) = &epic_str {
+                    msg.push_str(&format!(" (under {eid})"));
+                }
+                Ok(msg)
             }
             "start" | "block" | "close" => {
                 let id = need_id(&args)?;
@@ -238,7 +254,19 @@ impl Tool for IssueTool {
             "show" => {
                 let id = need_id(&args)?;
                 match store.get(&id).map_err(ToolError::Msg)? {
-                    Some(issue) => Ok(render_issue(&issue)),
+                    Some(issue) => {
+                        let mut out = render_issue(&issue);
+                        // Show live children of an epic.
+                        if let Ok(kids) = store.children_of(&id)
+                            && !kids.is_empty()
+                        {
+                            out.push_str(&format!("\nChildren ({}):", kids.len()));
+                            for k in &kids {
+                                out.push_str(&format!("\n  {}", k.one_line()));
+                            }
+                        }
+                        Ok(out)
+                    }
                     None => Err(ToolError::Msg(format!("no issue {id}"))),
                 }
             }
@@ -283,17 +311,33 @@ impl Tool for IssueTool {
 mod tests {
     use super::*;
 
-    fn tool() -> IssueTool {
+    /// A process-wide counter guarantees a unique temp dir even when two tests
+    /// enter within the same clock nanosecond — `list`/`search` read the
+    /// project-wide board, so a shared DB would let parallel tests see each
+    /// other's issues (the source of a flaky `create_then_list_then_close_flow`).
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    fn unique_db(prefix: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "dirge-issuetool-{}-{}",
+            "{prefix}-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        IssueTool::new(dir.join("state.db"), Some("sess-1".into()), None, None)
+        dir.join("state.db")
+    }
+
+    fn tool() -> IssueTool {
+        IssueTool::new(
+            unique_db("dirge-issuetool"),
+            Some("sess-1".into()),
+            None,
+            None,
+        )
     }
 
     fn args(action: &str) -> IssueArgs {
@@ -304,6 +348,7 @@ mod tests {
             id: None,
             status: None,
             priority: None,
+            epic: None,
             query: None,
         }
     }
@@ -381,16 +426,7 @@ mod tests {
     async fn start_claims_a_foreign_issue_for_this_session() {
         // An issue created in another conversation, sitting in the same project
         // DB the tool is bound to.
-        let dir = std::env::temp_dir().join(format!(
-            "dirge-issuetool-claim-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let db = dir.join("state.db");
+        let db = unique_db("dirge-issuetool-claim");
         let store = IssueStore::open_at(&db).unwrap();
         let foreign = store
             .create("picked up", "", None, Some("other-sess"), None)
@@ -471,5 +507,154 @@ mod tests {
             shown.contains("[open]"),
             "status must not have been applied: {shown}"
         );
+    }
+
+    #[tokio::test]
+    async fn create_with_epic_stores_epic_id() {
+        let t = tool();
+        // Create an epic parent first.
+        let parent_created = t
+            .call(IssueArgs {
+                title: Some("Epic".into()),
+                ..args("create")
+            })
+            .await
+            .unwrap();
+        let parent_id = parent_created
+            .strip_prefix("Created issue ")
+            .unwrap()
+            .split_once(':')
+            .unwrap()
+            .0
+            .to_string();
+
+        // Create a child under the epic.
+        let child_created = t
+            .call(IssueArgs {
+                title: Some("Child task".into()),
+                epic: Some(serde_json::json!(&parent_id)),
+                ..args("create")
+            })
+            .await
+            .unwrap();
+        assert!(
+            child_created.starts_with("Created issue drg-"),
+            "{child_created}"
+        );
+        assert!(
+            child_created.contains(&format!("(under {parent_id})")),
+            "should mention epic parent: {child_created}"
+        );
+
+        let store = t.store().unwrap();
+        let child_id = child_created
+            .strip_prefix("Created issue ")
+            .unwrap()
+            .split_once(':')
+            .unwrap()
+            .0
+            .to_string();
+        let child = store.get(&child_id).unwrap().unwrap();
+        assert_eq!(child.epic_id.as_deref(), Some(parent_id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn show_on_epic_lists_children() {
+        let t = tool();
+        let parent_id = t
+            .call(IssueArgs {
+                title: Some("Parent epic".into()),
+                ..args("create")
+            })
+            .await
+            .unwrap();
+        let parent_id = parent_id
+            .strip_prefix("Created issue ")
+            .unwrap()
+            .split_once(':')
+            .unwrap()
+            .0
+            .to_string();
+
+        // Create two children.
+        let c1 = t
+            .call(IssueArgs {
+                title: Some("Child A".into()),
+                epic: Some(serde_json::json!(&parent_id)),
+                ..args("create")
+            })
+            .await
+            .unwrap();
+        let c1_id = c1
+            .strip_prefix("Created issue ")
+            .unwrap()
+            .split_once(':')
+            .unwrap()
+            .0
+            .to_string();
+        t.call(IssueArgs {
+            title: Some("Child B".into()),
+            epic: Some(serde_json::json!(&parent_id)),
+            ..args("create")
+        })
+        .await
+        .unwrap();
+
+        // show on the parent includes children.
+        let shown = t
+            .call(IssueArgs {
+                id: Some(serde_json::json!(&parent_id)),
+                ..args("show")
+            })
+            .await
+            .unwrap();
+        assert!(shown.contains("Children (2):"), "{shown}");
+        assert!(shown.contains("Child A"), "{shown}");
+        assert!(shown.contains("Child B"), "{shown}");
+        assert!(shown.contains(&c1_id), "{shown}");
+    }
+
+    #[tokio::test]
+    async fn show_on_child_contains_epic_line() {
+        let t = tool();
+        let parent_id = t
+            .call(IssueArgs {
+                title: Some("Epic".into()),
+                ..args("create")
+            })
+            .await
+            .unwrap();
+        let parent_id = parent_id
+            .strip_prefix("Created issue ")
+            .unwrap()
+            .split_once(':')
+            .unwrap()
+            .0
+            .to_string();
+
+        let child = t
+            .call(IssueArgs {
+                title: Some("Under epic".into()),
+                epic: Some(serde_json::json!(&parent_id)),
+                ..args("create")
+            })
+            .await
+            .unwrap();
+        let child_id = child
+            .strip_prefix("Created issue ")
+            .unwrap()
+            .split_once(':')
+            .unwrap()
+            .0
+            .to_string();
+
+        let shown = t
+            .call(IssueArgs {
+                id: Some(serde_json::json!(&child_id)),
+                ..args("show")
+            })
+            .await
+            .unwrap();
+        assert!(shown.contains(&format!("epic: {parent_id}")), "{shown}");
     }
 }

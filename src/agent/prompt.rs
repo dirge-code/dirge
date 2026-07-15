@@ -103,7 +103,8 @@ Available tools:
 - skill: Load a skill by name to get detailed instructions for a specific task or domain.";
 
 pub const TODO_TOOLS_PROMPT: &str = "\
-- write_todo_list: Lay out or update a multi-step plan; each item is a tracked issue on your persistent board (same board as the `issue` tool), matched by title. Use it for complex multi-step tasks. Items you omit aren't auto-closed — restate an item as completed/cancelled to close it.";
+- write_todo_list: Lay out or update a multi-step plan; each item is a tracked issue on your persistent board (same board as the `issue` tool), matched by title. Items go on your ACTIVE work queue — you are nudged to finish or close them before stopping. Use it for complex multi-step tasks. Items you omit aren't auto-closed — restate an item as completed/cancelled to close it.
+- issue board: Two buckets — ACTIVE (your session's picked-up issues, shown in the panel and nudged) and BACKLOG (unassigned issues filed for later, not worked automatically). `issue create` files an issue to the passive backlog (use epic=<id> to group under a parent epic, `issue show <id>` to see an epic's children). `issue start <id>` picks a backlog issue up onto your active queue. Closed issues drop off both.";
 
 /// Heading + lead-in injected into the agent preamble when the project
 /// has discoverable skills. The bullet list of skills is appended after
