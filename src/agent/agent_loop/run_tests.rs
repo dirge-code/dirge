@@ -4021,7 +4021,7 @@ async fn open_issues_gate_off_is_inert() {
     let store = crate::extras::issue_db::IssueStore::open_at(&db_path).unwrap();
     let sid = "open-issues-off-sess";
     store
-        .create("wire up telemetry", "", None, Some(sid))
+        .create("wire up telemetry", "", None, Some(sid), None)
         .unwrap();
 
     let (msgs, source) = poll_finalization_follow_up(
@@ -4069,10 +4069,10 @@ async fn open_issues_gate_blocking_with_session_open_issues_nudges() {
     let store = crate::extras::issue_db::IssueStore::open_at(&db_path).unwrap();
     let sid = "open-issues-blocking-sess";
     store
-        .create("wire up telemetry", "", None, Some(sid))
+        .create("wire up telemetry", "", None, Some(sid), None)
         .unwrap();
     store
-        .create("add metrics dashboard", "", None, Some(sid))
+        .create("add metrics dashboard", "", None, Some(sid), None)
         .unwrap();
 
     let (msgs, source) = poll_finalization_follow_up(
@@ -4129,7 +4129,7 @@ async fn open_issues_gate_blocking_has_bound() {
     let store = crate::extras::issue_db::IssueStore::open_at(&db_path).unwrap();
     let sid = "open-issues-bound-sess";
     store
-        .create("wire up telemetry", "", None, Some(sid))
+        .create("wire up telemetry", "", None, Some(sid), None)
         .unwrap();
 
     let (msgs, source) = poll_finalization_follow_up(
@@ -4256,7 +4256,7 @@ async fn open_issues_gate_advisory_emits_notice_but_does_not_reenter() {
     let store = crate::extras::issue_db::IssueStore::open_at(&db_path).unwrap();
     let sid = "open-issues-advisory-sess";
     store
-        .create("wire up telemetry", "", None, Some(sid))
+        .create("wire up telemetry", "", None, Some(sid), None)
         .unwrap();
 
     let (msgs, source) = poll_finalization_follow_up(
@@ -4448,7 +4448,9 @@ fn issue_board_reminder_block_reads_board_and_tolerates_missing_db() {
     let db_path = dir.join("state.db");
 
     let store = crate::extras::issue_db::IssueStore::open_at(&db_path).unwrap();
-    store.create("wire up telemetry", "", None, None).unwrap();
+    store
+        .create("wire up telemetry", "", None, None, None)
+        .unwrap();
 
     let block =
         super::issue_board_reminder_block(&db_path).expect("a non-empty board yields a reminder");

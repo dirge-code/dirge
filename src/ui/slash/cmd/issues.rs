@@ -40,7 +40,7 @@ pub(crate) async fn cmd_issues(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyhow
         }
         // Anything else is treated as an id (7 / #7 / iss-7).
         maybe_id => match parse_issue_id(maybe_id) {
-            Some(id) => show(ctx, &store, id),
+            Some(id) => show(ctx, &store, &id),
             None => {
                 ctx.renderer.write_line(
                     "usage: /issues [list [status]] | /issues search <query> | /issues <id>",
@@ -100,11 +100,11 @@ fn search(ctx: &mut SlashCtx<'_>, store: &IssueStore, query: &str) -> anyhow::Re
     Ok(())
 }
 
-fn show(ctx: &mut SlashCtx<'_>, store: &IssueStore, id: i64) -> anyhow::Result<()> {
+fn show(ctx: &mut SlashCtx<'_>, store: &IssueStore, id: &str) -> anyhow::Result<()> {
     match store.get(id) {
         Ok(Some(i)) => {
             ctx.renderer.write_line(
-                &format!("#{} [{}] ({})", i.id, i.status, i.priority),
+                &format!("{} [{}] ({})", i.id, i.status, i.priority),
                 c_agent(),
             )?;
             ctx.renderer
@@ -121,7 +121,7 @@ fn show(ctx: &mut SlashCtx<'_>, store: &IssueStore, id: i64) -> anyhow::Result<(
         }
         Ok(None) => {
             ctx.renderer
-                .write_line(&format!("no issue #{id}"), c_error())?;
+                .write_line(&format!("no issue {id}"), c_error())?;
         }
         Err(e) => {
             ctx.renderer.write_line(&e.to_string(), c_error())?;

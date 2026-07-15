@@ -37,10 +37,10 @@ pub struct IssueArgs {
 }
 
 /// Coerce the `id` field, which the model may send as a number or a string
-/// like "#7".
-fn coerce_id(v: &Option<serde_json::Value>) -> Option<i64> {
+/// like "drg-a1b2", "#7", or bare "a1b2".
+fn coerce_id(v: &Option<serde_json::Value>) -> Option<String> {
     match v.as_ref()? {
-        serde_json::Value::Number(n) => n.as_i64(),
+        serde_json::Value::Number(n) => n.as_i64().map(|i| i.to_string()),
         serde_json::Value::String(s) => parse_issue_id(s),
         _ => None,
     }
@@ -74,7 +74,7 @@ impl IssueTool {
 }
 
 fn render_issue(i: &crate::extras::issue_db::Issue) -> String {
-    let mut out = format!("#{} [{}] ({})\n  {}", i.id, i.status, i.priority, i.title);
+    let mut out = format!("{} [{}] ({})\n  {}", i.id, i.status, i.priority, i.title);
     if !i.body.trim().is_empty() {
         out.push_str(&format!("\n  {}", i.body.replace('\n', "\n  ")));
     }
@@ -135,7 +135,7 @@ impl Tool for IssueTool {
             crate::agent::tools::todo::refresh_board_from(&store, self.session_id.as_deref());
         };
 
-        let need_id = |args: &IssueArgs| -> Result<i64, ToolError> {
+        let need_id = |args: &IssueArgs| -> Result<String, ToolError> {
             coerce_id(&args.id).ok_or_else(|| {
                 ToolError::Msg(format!(
                     "action '{action}' needs an `id` (e.g. 7 or \"#7\")"
@@ -155,10 +155,11 @@ impl Tool for IssueTool {
                         args.body.as_deref().unwrap_or(""),
                         args.priority.as_deref(),
                         self.session_id.as_deref(),
+                        None,
                     )
                     .map_err(ToolError::Msg)?;
                 refresh();
-                Ok(format!("Created issue #{id}: {}", title.trim()))
+                Ok(format!("Created issue {id}: {}", title.trim()))
             }
             "start" | "block" | "close" => {
                 let id = need_id(&args)?;
@@ -167,7 +168,7 @@ impl Tool for IssueTool {
                     "block" => "blocked",
                     _ => "done",
                 };
-                if store.set_status(id, status).map_err(ToolError::Msg)? {
+                if store.set_status(&id, status).map_err(ToolError::Msg)? {
                     // Starting an issue is the "I'm working on this now" signal:
                     // claim it for THIS conversation so it lands on the session's
                     // board / TODOS panel even if it was created elsewhere (or in
@@ -175,13 +176,13 @@ impl Tool for IssueTool {
                     // issue is already ours.
                     if status == "in_progress" {
                         store
-                            .assign_to_session(id, self.session_id.as_deref())
+                            .assign_to_session(&id, self.session_id.as_deref())
                             .map_err(ToolError::Msg)?;
                     }
                     refresh();
-                    Ok(format!("Issue #{id} → {status}"))
+                    Ok(format!("Issue {id} → {status}"))
                 } else {
-                    Err(ToolError::Msg(format!("no issue #{id}")))
+                    Err(ToolError::Msg(format!("no issue {id}")))
                 }
             }
             "update" => {
@@ -212,33 +213,33 @@ impl Tool for IssueTool {
                     })?;
                 }
                 // Existence check up front so a missing id fails before any write.
-                if store.get(id).map_err(ToolError::Msg)?.is_none() {
-                    return Err(ToolError::Msg(format!("no issue #{id}")));
+                if store.get(&id).map_err(ToolError::Msg)?.is_none() {
+                    return Err(ToolError::Msg(format!("no issue {id}")));
                 }
                 let mut changed = Vec::new();
                 if let Some(status) = args.status.as_deref() {
-                    store.set_status(id, status).map_err(ToolError::Msg)?;
+                    store.set_status(&id, status).map_err(ToolError::Msg)?;
                     changed.push("status");
                     // An update that starts the issue claims it too (same as the
                     // `start` verb), so a picked-up issue joins this board.
                     if normalize_status(status) == Some("in_progress") {
                         store
-                            .assign_to_session(id, self.session_id.as_deref())
+                            .assign_to_session(&id, self.session_id.as_deref())
                             .map_err(ToolError::Msg)?;
                     }
                 }
                 if let Some(priority) = args.priority.as_deref() {
-                    store.set_priority(id, priority).map_err(ToolError::Msg)?;
+                    store.set_priority(&id, priority).map_err(ToolError::Msg)?;
                     changed.push("priority");
                 }
                 refresh();
-                Ok(format!("Updated issue #{id} ({})", changed.join(", ")))
+                Ok(format!("Updated issue {id} ({})", changed.join(", ")))
             }
             "show" => {
                 let id = need_id(&args)?;
-                match store.get(id).map_err(ToolError::Msg)? {
+                match store.get(&id).map_err(ToolError::Msg)? {
                     Some(issue) => Ok(render_issue(&issue)),
-                    None => Err(ToolError::Msg(format!("no issue #{id}"))),
+                    None => Err(ToolError::Msg(format!("no issue {id}"))),
                 }
             }
             "list" => {
@@ -318,16 +319,24 @@ mod tests {
             })
             .await
             .unwrap();
-        assert!(created.starts_with("Created issue #1"), "{created}");
+        assert!(created.starts_with("Created issue drg-"), "{created}");
+        // Extract the id from the created message.
+        let id = created
+            .strip_prefix("Created issue ")
+            .unwrap()
+            .split_once(':')
+            .unwrap()
+            .0
+            .to_string();
 
         let listed = t.call(args("list")).await.unwrap();
-        assert!(listed.contains("#1"));
+        assert!(listed.contains(&id));
         assert!(listed.contains("Build auth"));
 
-        // start then close via convenience verbs, with "#1" string id.
+        // start then close via convenience verbs, with the drg- string id.
         let started = t
             .call(IssueArgs {
-                id: Some(serde_json::json!("#1")),
+                id: Some(serde_json::json!(&id)),
                 ..args("start")
             })
             .await
@@ -336,7 +345,7 @@ mod tests {
 
         let closed = t
             .call(IssueArgs {
-                id: Some(serde_json::json!(1)),
+                id: Some(serde_json::json!(&id)),
                 ..args("close")
             })
             .await
@@ -364,7 +373,7 @@ mod tests {
         let db = dir.join("state.db");
         let store = IssueStore::open_at(&db).unwrap();
         let foreign = store
-            .create("picked up", "", None, Some("other-sess"))
+            .create("picked up", "", None, Some("other-sess"), None)
             .unwrap();
 
         let t = IssueTool::new(db.clone(), Some("sess-1".into()), None, None);
@@ -405,17 +414,25 @@ mod tests {
     #[tokio::test]
     async fn update_with_invalid_priority_does_not_half_apply_status() {
         let t = tool();
-        t.call(IssueArgs {
-            title: Some("x".into()),
-            ..args("create")
-        })
-        .await
-        .unwrap();
+        let created = t
+            .call(IssueArgs {
+                title: Some("x".into()),
+                ..args("create")
+            })
+            .await
+            .unwrap();
+        let id = created
+            .strip_prefix("Created issue ")
+            .unwrap()
+            .split_once(':')
+            .unwrap()
+            .0
+            .to_string();
         // status valid, priority invalid → must error WITHOUT committing the
         // status change (no transaction wraps the two writes).
         let res = t
             .call(IssueArgs {
-                id: Some(serde_json::json!(1)),
+                id: Some(serde_json::json!(&id)),
                 status: Some("done".into()),
                 priority: Some("bogus".into()),
                 ..args("update")
@@ -425,7 +442,7 @@ mod tests {
         // The issue must still be open (status not half-applied).
         let shown = t
             .call(IssueArgs {
-                id: Some(serde_json::json!(1)),
+                id: Some(serde_json::json!(&id)),
                 ..args("show")
             })
             .await
