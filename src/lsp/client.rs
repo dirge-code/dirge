@@ -291,6 +291,23 @@ impl LspClient {
         }
     }
 
+    /// LSP graceful teardown handshake: send the `shutdown` request, wait
+    /// (bounded) for its ack, then the `exit` notification, so the server
+    /// flushes/persists rather than dying to the process-group SIGKILL.
+    /// Best-effort — a dead or slow server just errors/times out and the
+    /// guard reaps it anyway (dirge-8m69). Only run on the NORMAL teardown
+    /// path; a signal exit skips this and SIGKILLs directly (no time to
+    /// handshake).
+    pub async fn shutdown_and_exit(&self, timeout: std::time::Duration) {
+        // `shutdown` takes null params and replies null; we only care that
+        // the server acknowledged before we tell it to exit.
+        let _: Result<serde_json::Value, _> = self
+            .rpc
+            .request("shutdown", serde_json::Value::Null, timeout)
+            .await;
+        let _ = self.rpc.notify("exit", serde_json::Value::Null).await;
+    }
+
     /// Merged + deduplicated diagnostics for a single file. Combines push
     /// (server-volunteered) and pull (server requested explicitly) state.
     pub fn diagnostics_for(&self, path: &Path) -> Vec<Diagnostic> {
@@ -537,6 +554,43 @@ mod tests {
         });
 
         (client, from_client, to_client_tx)
+    }
+
+    /// dirge-8m69: graceful teardown sends the `shutdown` REQUEST first,
+    /// waits for its ack, and only then the `exit` NOTIFICATION — the order
+    /// and message kinds the LSP spec requires so the server persists state.
+    #[tokio::test]
+    async fn shutdown_and_exit_sends_shutdown_request_then_exit_notification() {
+        let (client, mut from_client, to_client) = pair().await;
+
+        // The handshake blocks on the shutdown ack, so drive it concurrently.
+        let handle = tokio::spawn(async move {
+            client
+                .shutdown_and_exit(std::time::Duration::from_secs(5))
+                .await;
+        });
+
+        // 1) `shutdown` must arrive as a request (carries an id).
+        let req = from_client.recv().await.expect("shutdown request");
+        assert_eq!(req["method"], "shutdown");
+        let id = req["id"].clone();
+        assert!(!id.is_null(), "shutdown must be a request (has an id)");
+        assert!(
+            from_client.try_recv().is_err(),
+            "exit must NOT be sent before the shutdown ack"
+        );
+
+        // Ack it so the client proceeds.
+        to_client
+            .send(json!({"jsonrpc": "2.0", "id": id, "result": null}))
+            .unwrap();
+
+        // 2) `exit` must follow as a notification (no id).
+        let note = from_client.recv().await.expect("exit notification");
+        assert_eq!(note["method"], "exit");
+        assert!(note.get("id").is_none(), "exit must be a notification");
+
+        handle.await.unwrap();
     }
 
     /// Creates a tempfile named `dirge-lsp-client-test-<pid>-<nanos>-<suffix>.rs`

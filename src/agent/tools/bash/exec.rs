@@ -91,6 +91,10 @@ struct PgKillGuard {
 #[cfg(unix)]
 impl PgKillGuard {
     fn new(pid: u32) -> Self {
+        // Track the group so the signal reaper (src/signal.rs) can SIGKILL a
+        // still-running bash subtree if dirge is killed by a signal before
+        // this guard's Drop runs (dirge-6klk).
+        crate::child_guard::register_group(pid);
         Self { pid, armed: true }
     }
     fn disarm(&mut self) {
@@ -101,6 +105,7 @@ impl PgKillGuard {
 #[cfg(unix)]
 impl Drop for PgKillGuard {
     fn drop(&mut self) {
+        crate::child_guard::unregister_group(self.pid);
         if !self.armed {
             return;
         }

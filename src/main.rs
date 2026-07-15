@@ -31,6 +31,7 @@ mod sandbox;
 mod semantic;
 mod session;
 mod shell;
+mod signal;
 mod skill;
 mod sync_util;
 mod text;
@@ -440,6 +441,14 @@ async fn main() -> anyhow::Result<()> {
     // hit `sender() = None` and were silently dropped — exactly
     // the regression review #1 caught.
     ui::notifications::install();
+
+    // Reap detached child process groups (LSP/MCP/DAP/bash) if we're killed
+    // by a signal — SIGTERM (`kill`), SIGHUP (terminal closed), SIGINT.
+    // Those children are `setsid`-detached so terminal signals never reach
+    // them, and a signal exit skips the per-guard Drop that normally kills
+    // them, so without this rust-analyzer & friends are orphaned (dirge-6klk).
+    // Installed here, early and inside the runtime, before anything spawns.
+    signal::install_reaper();
 
     // Tracing filter precedence: RUST_LOG (always wins) > --verbose
     // (debug for dirge + warn for plugin hooks) > default
@@ -1867,6 +1876,10 @@ async fn main() -> anyhow::Result<()> {
         #[cfg(feature = "lsp")]
         if let Some(mgr) = lsp_manager_for_shutdown.as_ref() {
             mgr.close_all_files().await;
+            // Graceful `shutdown`+`exit` so servers flush/persist before the
+            // guards SIGKILL them as the manager drops (dirge-8m69). The
+            // signal-exit path skips this and reaps directly (src/signal.rs).
+            mgr.shutdown_all().await;
         }
         // dirge-ixcw: tear down any active DAP session — DAP_MANAGER is a
         // `static` whose Drop never runs at exit, so without this an

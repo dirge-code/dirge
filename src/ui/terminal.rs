@@ -161,6 +161,23 @@ pub fn install_panic_hook() {
     }));
 }
 
+/// Best-effort terminal restore for the signal reaper ([`crate::signal`]).
+/// Mirrors the panic hook's reset — write the reset/cursor-restore sequence
+/// to the controlling terminal and leave raw mode — so a SIGTERM / SIGHUP /
+/// SIGINT teardown doesn't strand the shell in raw mode with the alt screen
+/// still up. Harmless when there's no tty (headless `--print` / `--loop`).
+///
+/// Only the Unix signal reaper calls this today; off Unix there's no
+/// signal-driven teardown, so allow it to be unused there.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub fn emergency_restore() {
+    if let Some(mut tty) = open_tty_for_write() {
+        let _ = tty.write_all(PANIC_RESET_SEQ);
+        let _ = tty.flush();
+    }
+    let _ = terminal::disable_raw_mode();
+}
+
 /// Shared shutdown signal between the input-reader background thread
 /// in `ui::mod` and `TerminalGuard::drop`. The reader polls this with
 /// each `event::poll` tick; the guard sets it before tearing down so

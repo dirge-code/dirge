@@ -265,6 +265,13 @@ struct ProcessGroupGuard {
 
 #[cfg(unix)]
 impl ProcessGroupGuard {
+    /// Arm a guard for a freshly-spawned leader and register its group so
+    /// the signal reaper (src/signal.rs) can reap it if dirge is killed by a
+    /// signal before this guard's Drop runs (dirge-6klk).
+    fn new(pgid: u32) -> Self {
+        crate::child_guard::register_group(pgid);
+        Self { pgid, armed: true }
+    }
     fn disarm(&mut self) {
         self.armed = false;
     }
@@ -273,6 +280,7 @@ impl ProcessGroupGuard {
 #[cfg(unix)]
 impl Drop for ProcessGroupGuard {
     fn drop(&mut self) {
+        crate::child_guard::unregister_group(self.pgid);
         // Never signal group 0 (dirge's OWN group — suicide) or 1 (everything
         // signalable). setsid() makes the child a leader with pgid == pid
         // (> 1), but guard defensively against a 0/1 slipping in.
@@ -319,10 +327,7 @@ async fn run_child_killable(
     // the pgid; `child` then drops and `kill_on_drop` reaps the leader.
     let mut child = cmd.spawn()?;
     #[cfg(unix)]
-    let mut _pg_guard = child.id().map(|pid| ProcessGroupGuard {
-        pgid: pid,
-        armed: true,
-    });
+    let mut _pg_guard = child.id().map(ProcessGroupGuard::new);
 
     // Drain both pipes concurrently with the wait so a child that fills a pipe
     // buffer can't deadlock (mirrors what `wait_with_output` does internally).

@@ -532,6 +532,22 @@ impl LspManager {
         }
     }
 
+    /// Send the LSP `shutdown` + `exit` handshake to every live server on the
+    /// normal teardown path, each bounded by a short timeout, so servers get
+    /// to flush/persist before the `ProcessGroupGuard` SIGKILLs them as the
+    /// manager drops (dirge-8m69). Best-effort: a hung or already-dead server
+    /// just times out and the guard reaps it anyway. NOT used on the signal
+    /// path — that reaps directly (src/signal.rs), with no time to handshake.
+    pub async fn shutdown_all(&self) {
+        let entries: Vec<_> = {
+            let state = self.state.lock_ignore_poison();
+            state.clients.values().cloned().collect()
+        };
+        for entry in entries {
+            entry.client.shutdown_and_exit(Duration::from_secs(2)).await;
+        }
+    }
+
     /// Diagnostics for a single file, merged across attached clients.
     /// Returns `None` when no client tracks the file (so the caller can
     /// distinguish "no diagnostics" from "untracked" and fall back to a
