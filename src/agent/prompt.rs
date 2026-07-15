@@ -103,8 +103,9 @@ Available tools:
 - skill: Load a skill by name to get detailed instructions for a specific task or domain.";
 
 pub const TODO_TOOLS_PROMPT: &str = "\
-- write_todo_list: Lay out or update a multi-step plan; each item is a tracked issue on your persistent board (same board as the `issue` tool), matched by title. Items go on your ACTIVE work queue — you are nudged to finish or close them before stopping. Use it for complex multi-step tasks. Items you omit aren't auto-closed — restate an item as completed/cancelled to close it.
-- issue board: Two buckets — ACTIVE (your session's picked-up issues, shown in the panel and nudged) and BACKLOG (unassigned issues filed for later, not worked automatically). `issue create` files an issue to the passive backlog (use epic=<id> to group under a parent epic, `issue show <id>` to see an epic's children). `issue start <id>` picks a backlog issue up onto your active queue. Closed issues drop off both.";
+- write_todo_list: Lay out or update a multi-step plan; each item is a tracked issue on your persistent board (same board as the `issue` tool), matched by title (case/whitespace-insensitive). Items go on your ACTIVE work queue — you are nudged to finish or close them before stopping. Use it for complex multi-step tasks. Items you omit aren't auto-closed — restate an item as completed/cancelled to close it.
+- issue board: Two buckets — ACTIVE (your session's picked-up issues, shown in the panel and nudged) and BACKLOG (unassigned issues filed for later, not worked automatically). `issue create` files an issue to the passive backlog (use epic=<id> to group under a parent epic, `issue show <id>` to see an epic's children). `issue start <id>` picks a backlog issue up onto your active queue. Closed issues drop off both.
+- Work tracking: When you begin a non-trivial task, put it on your active list first — `write_todo_list` it (or `issue start` a backlog item) — and mark the item you're actively working on `in_progress`. Keep exactly ONE item in_progress at a time, and mark it completed the moment it's done, so your active list always reflects what you're doing now.";
 
 /// Heading + lead-in injected into the agent preamble when the project
 /// has discoverable skills. The bullet list of skills is appended after
@@ -471,6 +472,24 @@ mod tests {
                 .any(|a| text.contains(&format!("action='{}'", a))),
             "project-skills preamble must name a real skill action: {}",
             text
+        );
+    }
+
+    #[test]
+    fn todo_tools_prompt_contains_work_tracking_guidance() {
+        let p = TODO_TOOLS_PROMPT;
+        assert!(
+            p.contains("in_progress"),
+            "must mention in_progress status: {p}"
+        );
+        assert!(
+            p.contains("one item") || p.contains("ONE item"),
+            "must cap focused work: {p}"
+        );
+        assert!(p.contains("completed"), "must mention completed: {p}");
+        assert!(
+            p.contains("case/whitespace-insensitive"),
+            "must note case insensitivity: {p}"
         );
     }
 }

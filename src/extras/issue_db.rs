@@ -61,6 +61,27 @@ pub fn normalize_priority(raw: &str) -> Option<&'static str> {
     }
 }
 
+/// Normalize an issue title for matching: trim, lowercase, and collapse
+/// internal ASCII whitespace runs to a single space. So `"  Build   AUTH "`
+/// normalizes to `"build auth"`.
+pub fn normalize_title(s: &str) -> String {
+    let s = s.trim().to_ascii_lowercase();
+    let mut out = String::with_capacity(s.len());
+    let mut in_space = false;
+    for c in s.chars() {
+        if c.is_ascii_whitespace() {
+            if !in_space {
+                out.push(' ');
+                in_space = true;
+            }
+        } else {
+            out.push(c);
+            in_space = false;
+        }
+    }
+    out
+}
+
 /// Parse an issue id from intuitive forms:
 /// - `drg-a1b2` → `drg-a1b2`
 /// - `#drg-a1b2` → `drg-a1b2`
@@ -474,6 +495,27 @@ impl IssueStore {
         let tx = conn
             .transaction()
             .map_err(|e| format!("sync todos (begin): {e}"))?;
+
+        // Build a map of normalized-title → id from all existing rows in this
+        // session so a reworded restatement still hits the right row. Later ids
+        // overwrite earlier, matching today's `ORDER BY id DESC LIMIT 1`.
+        let mut id_by_norm: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        {
+            let mut stmt = tx
+                .prepare("SELECT id, title FROM issues WHERE session_id IS ?1 ORDER BY id ASC")
+                .map_err(|e| format!("sync todos (prefetch): {e}"))?;
+            let rows = stmt
+                .query_map(params![scoped_session], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })
+                .map_err(|e| format!("sync todos (prefetch): {e}"))?;
+            for row in rows {
+                let (rid, rtitle) = row.map_err(|e| format!("sync todos (prefetch): {e}"))?;
+                id_by_norm.insert(normalize_title(&rtitle), rid);
+            }
+        }
+
         let now = now();
         let mut applied = 0usize;
         for (title, status, priority) in items {
@@ -484,14 +526,8 @@ impl IssueStore {
             let status = normalize_status(status).unwrap_or("open");
             let priority = normalize_priority(priority).unwrap_or("normal");
             let closed: Option<&str> = is_terminal_status(status).then_some(now.as_str());
-            let existing: Option<String> = tx
-                .query_row(
-                    "SELECT id FROM issues WHERE session_id IS ?1 AND title = ?2 ORDER BY id DESC LIMIT 1",
-                    params![scoped_session, title],
-                    |r| r.get(0),
-                )
-                .optional()
-                .map_err(|e| format!("sync todos (lookup): {e}"))?;
+            let norm = normalize_title(title);
+            let existing = id_by_norm.get(&norm);
             match existing {
                 Some(id) => {
                     tx.execute(
@@ -508,6 +544,8 @@ impl IssueStore {
                         params![new_id, title, status, priority, scoped_session, now, closed],
                     )
                     .map_err(|e| format!("sync todos (insert): {e}"))?;
+                    // Insert into map so a within-batch duplicate matches too.
+                    id_by_norm.insert(norm, new_id);
                 }
             }
             applied += 1;
@@ -590,9 +628,13 @@ impl IssueStore {
         // Active work queue section.
         if !active.is_empty() {
             let active_total = self.board_for_session(session_id, None)?.len();
+            let in_progress = active.iter().find(|i| i.status == "in_progress");
             s.push_str(
-                "Active work queue (issues you've picked up this session — finish or update these before stopping):\n",
+                "Active work queue — your current tasks (keep one item in_progress; mark it completed the moment it's done):\n",
             );
+            if let Some(current) = in_progress {
+                s.push_str(&format!("Currently in progress: {}\n", current.title));
+            }
             for i in &active {
                 s.push_str(&format!("- {}\n", i.one_line()));
             }
@@ -819,6 +861,20 @@ mod tests {
         assert_eq!(parse_issue_id("drg-"), None);
         // Too short for bare hex (need >= 3 chars)
         assert_eq!(parse_issue_id("ab"), None);
+    }
+
+    // ── normalize_title ───────────────────────────────────────────────────
+
+    #[test]
+    fn normalize_title_trims_and_collapses_whitespace() {
+        assert_eq!(normalize_title("  Build   AUTH "), "build auth");
+        assert_eq!(normalize_title("simple"), "simple");
+        assert_eq!(normalize_title(""), "");
+        assert_eq!(normalize_title("  "), "");
+        assert_eq!(
+            normalize_title("camelCase\tTitle\nHere"),
+            "camelcase title here"
+        );
     }
 
     // ── migration ────────────────────────────────────────────────────────
@@ -1200,8 +1256,10 @@ mod tests {
             block.contains("Active work queue"),
             "must have Active section: {block}"
         );
+        assert!(block.contains("keep one item in_progress"), "{block}");
+        // The in_progress item gets a callout.
         assert!(
-            block.contains("finish or update these before stopping"),
+            block.contains("Currently in progress: active task"),
             "{block}"
         );
         assert!(block.contains("active task"), "{block}");
@@ -1234,6 +1292,42 @@ mod tests {
         assert!(
             !block.contains("Active work queue"),
             "no active work → no Active section: {block}"
+        );
+    }
+
+    #[test]
+    fn board_reminder_split_currently_in_progress_callout() {
+        let s = store();
+        let active_id = s
+            .create("solo task", "", Some("normal"), Some("sess-1"), None)
+            .unwrap();
+        s.set_status(&active_id, "in_progress").unwrap();
+
+        let block = s
+            .board_reminder_split(Some("sess-1"), 3, 3)
+            .unwrap()
+            .expect("non-empty board");
+        assert!(
+            block.contains("Currently in progress: solo task"),
+            "in_progress item must have callout: {block}"
+        );
+    }
+
+    #[test]
+    fn board_reminder_split_no_in_progress_no_callout() {
+        let s = store();
+        // Active but NOT in_progress — all open.
+        s.create("open item", "", None, Some("sess-1"), None)
+            .unwrap();
+
+        let block = s
+            .board_reminder_split(Some("sess-1"), 3, 3)
+            .unwrap()
+            .expect("non-empty board");
+        assert!(block.contains("Active work queue"), "{block}");
+        assert!(
+            !block.contains("Currently in progress:"),
+            "no in_progress → no callout: {block}"
         );
     }
 
@@ -1341,5 +1435,44 @@ mod tests {
         let issue = s.search("task", 10).unwrap().pop().unwrap();
         assert_eq!(issue.status, "in_progress");
         assert!(issue.closed_at.is_none(), "reopen must clear closed_at");
+    }
+
+    #[test]
+    fn sync_todos_matches_case_and_whitespace_insensitively() {
+        let s = store();
+        s.sync_todos(Some("sess-1"), &[("Build auth", "pending", "high")])
+            .unwrap();
+        // Restate with different case and extra spaces — must match the existing row.
+        s.sync_todos(Some("sess-1"), &[("  build  AUTH ", "completed", "high")])
+            .unwrap();
+        // Only one row exists, and it's now done.
+        let hits = s.search("build", 10).unwrap();
+        assert_eq!(hits.len(), 1, "must not create a duplicate row");
+        assert_eq!(hits[0].title, "Build auth");
+        assert_eq!(hits[0].status, "done");
+        assert!(hits[0].closed_at.is_some());
+    }
+
+    #[test]
+    fn sync_todos_exact_title_still_works() {
+        let s = store();
+        s.sync_todos(Some("sess-1"), &[("Build auth", "pending", "high")])
+            .unwrap();
+        s.sync_todos(Some("sess-1"), &[("Build auth", "completed", "high")])
+            .unwrap();
+        let hits = s.search("Build auth", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].status, "done");
+    }
+
+    #[test]
+    fn sync_todos_different_titles_still_create_two_rows() {
+        let s = store();
+        s.sync_todos(Some("sess-1"), &[("Build auth", "pending", "high")])
+            .unwrap();
+        s.sync_todos(Some("sess-1"), &[("Build dashboard", "pending", "normal")])
+            .unwrap();
+        let board = s.board_for_session(Some("sess-1"), None).unwrap();
+        assert_eq!(board.len(), 2);
     }
 }
