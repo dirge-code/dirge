@@ -4428,9 +4428,8 @@ async fn failure_then_success_injects_no_checkpoint() {
     );
 }
 
-// dirge-x6yi: the turn-start issue-board reminder does synchronous rusqlite
-// I/O (open + query). run_agent_loop now hands it to spawn_blocking so a
-// contended/locked state.db can't stall the loop task. The extracted reader
+// dirge-x6yi: the turn-start issue-board reminder now produces separate
+// Active / Backlog sections via `board_reminder_split`. The extracted reader
 // keeps the same behavior — a real board yields the reminder, a missing db
 // yields None without panicking.
 #[test]
@@ -4447,17 +4446,27 @@ fn issue_board_reminder_block_reads_board_and_tolerates_missing_db() {
     std::fs::create_dir_all(&dir).unwrap();
     let db_path = dir.join("state.db");
 
+    // Unassigned (passive) issue: appears under Backlog section.
     let store = crate::extras::issue_db::IssueStore::open_at(&db_path).unwrap();
     store
         .create("wire up telemetry", "", None, None, None)
         .unwrap();
 
-    let block =
-        super::issue_board_reminder_block(&db_path).expect("a non-empty board yields a reminder");
+    let block = super::issue_board_reminder_block(&db_path, Some("sess-1"))
+        .expect("a non-empty board yields a reminder");
+    // Passive issue → Backlog section, not Active.
+    assert!(
+        block.contains("Backlog"),
+        "passive issue must be in Backlog section: {block}"
+    );
+    assert!(
+        !block.contains("Active work queue"),
+        "no active issues → no Active section: {block}"
+    );
     assert!(block.contains("wire up telemetry"), "{block}");
 
     // Missing db → best-effort None, no panic.
-    assert!(super::issue_board_reminder_block(&dir.join("nope.db")).is_none());
+    assert!(super::issue_board_reminder_block(&dir.join("nope.db"), Some("sess-1")).is_none());
 
     let _ = std::fs::remove_dir_all(&dir);
 }

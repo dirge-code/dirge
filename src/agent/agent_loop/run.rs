@@ -698,20 +698,26 @@ const MAX_CONSECUTIVE_COMPACTION_FAILURES: u32 = 3;
 /// when the task matches fewer exemplars.
 const EXEMPLAR_TOP_K: usize = 3;
 
-/// Max live issues surfaced in the turn-start board reminder. The rest are
-/// summarized as a "+N more" hint so a large backlog can't flood context.
-const ISSUE_BOARD_TOP_N: usize = 7;
+/// Max live ACTIVE issues surfaced in the turn-start "Active work queue" section.
+/// The rest get a "+N more" hint so a large active board can't flood context.
+const ACTIVE_TOP_N: usize = 7;
 
-/// dirge-x6yi: open the issue DB and build the turn-start board reminder.
-/// This is synchronous rusqlite I/O (open + query), so `run_agent_loop`
-/// hands it to `spawn_blocking` — a contended/locked `state.db` must not
-/// stall the whole loop task (mirrors the pre-recall search path). Returns
-/// `None` on any failure (missing/locked db, empty board); the reminder is
-/// best-effort context, never fatal.
-fn issue_board_reminder_block(db_path: &std::path::Path) -> Option<String> {
+/// Max live BACKLOG issues surfaced in the turn-start "Backlog" section.
+const BACKLOG_TOP_N: usize = 5;
+
+/// dirge-x6yi: open the issue DB and build the turn-start board reminder with
+/// separate active / backlog sections. This is synchronous rusqlite I/O (open +
+/// query), so `run_agent_loop` hands it to `spawn_blocking` — a contended/locked
+/// `state.db` must not stall the whole loop task (mirrors the pre-recall search
+/// path). Returns `None` on any failure (missing/locked db, empty board); the
+/// reminder is best-effort context, never fatal.
+fn issue_board_reminder_block(
+    db_path: &std::path::Path,
+    session_id: Option<&str>,
+) -> Option<String> {
     crate::extras::issue_db::IssueStore::open_at(db_path)
         .ok()?
-        .board_reminder(ISSUE_BOARD_TOP_N)
+        .board_reminder_split(session_id, ACTIVE_TOP_N, BACKLOG_TOP_N)
         .ok()
         .flatten()
 }
@@ -1341,9 +1347,12 @@ pub async fn run_agent_loop(
         let db_path = std::env::current_dir()
             .map(|c| crate::extras::dirge_paths::ProjectPaths::new(&c).session_db_path())
             .unwrap_or_else(|_| std::path::PathBuf::from(".dirge/sessions/state.db"));
+        let sid = config.session_id.clone();
         // dirge-x6yi: run the blocking open+query off the loop task.
-        if let Ok(Some(block)) =
-            tokio::task::spawn_blocking(move || issue_board_reminder_block(&db_path)).await
+        if let Ok(Some(block)) = tokio::task::spawn_blocking(move || {
+            issue_board_reminder_block(&db_path, sid.as_deref())
+        })
+        .await
         {
             let msg = LoopMessage::User(super::message::UserMessage::text(block));
             context.messages.push(loop_message_to_value(&msg));

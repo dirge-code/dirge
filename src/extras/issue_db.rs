@@ -527,11 +527,36 @@ impl IssueStore {
         .map_err(|e| format!("open_count: {e}"))
     }
 
+    /// The passive backlog: open / in_progress / blocked issues with
+    /// `session_id IS NULL`, i.e. unassigned issues filed for later. Terminal
+    /// issues are excluded. Ordered high-priority first, then most-recently
+    /// touched, then id DESC for total ordering.
+    pub fn backlog(&self, limit: Option<usize>) -> Result<Vec<Issue>, String> {
+        let conn = self.conn.lock_ignore_poison();
+        let sql = format!(
+            "SELECT {COLS} FROM issues
+             WHERE session_id IS NULL AND status IN ('open','in_progress','blocked')
+             ORDER BY
+               CASE priority WHEN 'high' THEN 0 WHEN 'normal' THEN 1 ELSE 2 END,
+               updated_at DESC, id DESC
+             {}",
+            match limit {
+                Some(n) => format!("LIMIT {n}"),
+                None => String::new(),
+            }
+        );
+        let mut stmt = conn.prepare(&sql).map_err(|e| format!("backlog: {e}"))?;
+        let rows = stmt
+            .query_map([], row_to_issue)
+            .map_err(|e| format!("backlog: {e}"))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| format!("backlog: {e}"))
+    }
+
     /// Build the harness's turn-start board reminder: the top `top_n` live
-    /// issues, wrapped in a `<system-reminder>` block, with a hint to see the
-    /// rest when there are more. Returns `None` when the board is empty (so the
-    /// caller injects nothing). Token-bounded by `top_n` — the caller owns the
-    /// budget the same way the post-compaction snapshot cap does.
+    /// issues, wrapped in a `<system-reminder>` block. Kept for backward
+    /// compatibility; new code should prefer [`Self::board_reminder_split`].
+    #[allow(dead_code)]
     pub fn board_reminder(&self, top_n: usize) -> Result<Option<String>, String> {
         let issues = self.board(Some(top_n))?;
         if issues.is_empty() {
@@ -552,6 +577,63 @@ impl IssueStore {
                 total - shown
             ));
         }
+        s.push_str("</system-reminder>");
+        Ok(Some(s))
+    }
+
+    /// Build the harness's turn-start board reminder as two labeled sections:
+    /// "Active work queue" (session-scoped issues to finish) and "Backlog"
+    /// (unassigned issues filed for later). Each section is capped independently
+    /// (`active_top_n` / `backlog_top_n`) with an overflow hint. A section is
+    /// omitted entirely when empty. Returns `None` when BOTH are empty.
+    pub fn board_reminder_split(
+        &self,
+        session_id: Option<&str>,
+        active_top_n: usize,
+        backlog_top_n: usize,
+    ) -> Result<Option<String>, String> {
+        let active = self.board_for_session(session_id, Some(active_top_n))?;
+        let backlog = self.backlog(Some(backlog_top_n))?;
+
+        if active.is_empty() && backlog.is_empty() {
+            return Ok(None);
+        }
+
+        let mut s = String::from("<system-reminder>\n");
+
+        // Active work queue section.
+        if !active.is_empty() {
+            let active_total = self.board_for_session(session_id, None)?.len();
+            s.push_str(
+                "Active work queue (issues you've picked up this session — finish or update these before stopping):\n",
+            );
+            for i in &active {
+                s.push_str(&format!("- {}\n", i.one_line()));
+            }
+            let shown = active.len();
+            if active_total > shown {
+                s.push_str(&format!("… and {} more active.\n", active_total - shown));
+            }
+        }
+
+        // Backlog section.
+        if !backlog.is_empty() {
+            let backlog_total = self.backlog(None)?.len();
+            s.push_str(
+                "\nBacklog (issues filed for later — start one with the `issue` tool to pick it up; not worked automatically):\n",
+            );
+            for i in &backlog {
+                s.push_str(&format!("- {}\n", i.one_line()));
+            }
+            let shown = backlog.len();
+            if backlog_total > shown {
+                s.push_str(&format!(
+                    "… and {} more in the backlog. Use /issues to see all.\n",
+                    backlog_total - shown
+                ));
+            }
+        }
+
         s.push_str("</system-reminder>");
         Ok(Some(s))
     }
@@ -1036,6 +1118,119 @@ mod tests {
         assert!(block.trim_end().ends_with("</system-reminder>"));
         // Only 2 shown, 4 live → overflow hint mentions the remaining 2.
         assert!(block.contains("2 more open issue"), "{block}");
+    }
+
+    // ── backlog ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn backlog_returns_unassigned_issues_and_excludes_terminal() {
+        let s = store();
+        // Unassigned (passive) issues.
+        let passive_open = s.create("passive open", "", None, None, None).unwrap();
+        let passive_blocked = s.create("passive blocked", "", None, None, None).unwrap();
+        s.set_status(&passive_blocked, "blocked").unwrap();
+        let passive_done = s.create("passive done", "", None, None, None).unwrap();
+        s.set_status(&passive_done, "done").unwrap();
+        // Assigned (active) issue — must NOT appear in backlog.
+        s.create("active wip", "", None, Some("sess-1"), None)
+            .unwrap();
+
+        let backlog = s.backlog(None).unwrap();
+        let ids: Vec<&str> = backlog.iter().map(|i| i.id.as_str()).collect();
+        // blocked is NOT terminal, so both open and blocked appear.
+        assert_eq!(
+            ids,
+            vec![passive_blocked.as_str(), passive_open.as_str()],
+            "backlog must contain unassigned open+blocked only"
+        );
+        // done excluded
+        assert!(
+            !ids.contains(&passive_done.as_str()),
+            "terminal issues excluded from backlog"
+        );
+    }
+
+    #[test]
+    fn backlog_respects_limit() {
+        let s = store();
+        for i in 0..5 {
+            s.create(&format!("backlog {i}"), "", None, None, None)
+                .unwrap();
+        }
+        assert_eq!(s.backlog(Some(2)).unwrap().len(), 2);
+    }
+
+    // ── board reminder split ──────────────────────────────────────────────
+
+    #[test]
+    fn board_reminder_split_active_section_and_backlog_section() {
+        let s = store();
+        // Active: session-scoped in_progress issue.
+        let active_id = s
+            .create("active task", "", Some("high"), Some("sess-1"), None)
+            .unwrap();
+        s.set_status(&active_id, "in_progress").unwrap();
+        // Passive: unassigned open issue.
+        let _passive_id = s.create("backlog task", "", None, None, None).unwrap();
+
+        let block = s
+            .board_reminder_split(Some("sess-1"), 3, 3)
+            .unwrap()
+            .expect("non-empty board");
+        assert!(block.starts_with("<system-reminder>"));
+        assert!(block.trim_end().ends_with("</system-reminder>"));
+
+        // Active section present with correct framing.
+        assert!(
+            block.contains("Active work queue"),
+            "must have Active section: {block}"
+        );
+        assert!(
+            block.contains("finish or update these before stopping"),
+            "{block}"
+        );
+        assert!(block.contains("active task"), "{block}");
+
+        // Backlog section present with correct framing.
+        assert!(
+            block.contains("Backlog"),
+            "must have Backlog section: {block}"
+        );
+        assert!(block.contains("filed for later"), "{block}");
+        assert!(
+            block.contains("start one with the `issue` tool to pick it up"),
+            "{block}"
+        );
+        assert!(block.contains("backlog task"), "{block}");
+    }
+
+    #[test]
+    fn board_reminder_split_passive_only_no_active_section() {
+        let s = store();
+        s.create("only passive", "", None, None, None).unwrap();
+
+        let block = s
+            .board_reminder_split(Some("sess-1"), 3, 3)
+            .unwrap()
+            .expect("non-empty board");
+        // Backlog section present.
+        assert!(block.contains("Backlog"), "{block}");
+        // NO Active section.
+        assert!(
+            !block.contains("Active work queue"),
+            "no active work → no Active section: {block}"
+        );
+    }
+
+    #[test]
+    fn board_reminder_split_none_when_both_empty() {
+        let s = store();
+        assert!(
+            s.board_reminder_split(Some("sess-1"), 5, 5)
+                .unwrap()
+                .is_none(),
+            "both empty → None"
+        );
     }
 
     // ── cancelled / open_count ───────────────────────────────────────────

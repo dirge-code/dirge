@@ -96,8 +96,8 @@ impl Tool for IssueTool {
         ToolDefinition {
             name: "issue".to_string(),
             description: "Persistent issue/kanban board for tracking work (stored in the project DB, persists ACROSS sessions). The harness shows your open board at the start of each turn, so you don't need to list it constantly. This is the incremental, single-item surface; `write_todo_list` writes to the SAME board in bulk for laying out a multi-step plan. Actions: \
-                create (title, optional body/priority high|normal|low); \
-                start (id → in_progress); block (id → blocked); close (id → done); \
+                create (title, optional body/priority high|normal|low) — files to the BACKLOG for later (NOT on your active work queue; use `start` to pick it up when you actually begin it); \
+                start (id → in_progress) — claims the issue onto your active work queue; block (id → blocked); close (id → done); \
                 update (id, optional status open|in_progress|blocked|done|cancelled / priority / body); \
                 show (id); list (optional status filter); search (query). \
                 Ids accept 7 or \"#7\". Create issues as you discover work; start one when you begin it; close it when done.".to_string(),
@@ -154,7 +154,7 @@ impl Tool for IssueTool {
                         title,
                         args.body.as_deref().unwrap_or(""),
                         args.priority.as_deref(),
-                        self.session_id.as_deref(),
+                        None,
                         None,
                     )
                     .map_err(ToolError::Msg)?;
@@ -329,11 +329,24 @@ mod tests {
             .0
             .to_string();
 
+        // Create files to the PASSIVE backlog — issue is NOT on the active board.
+        let store = t.store().unwrap();
+        assert!(
+            store
+                .board_for_session(Some("sess-1"), None)
+                .unwrap()
+                .is_empty(),
+            "freshly created issue must not be on the active work queue"
+        );
+        // But it IS findable via get and search.
+        assert!(store.get(&id).unwrap().is_some());
+        assert_eq!(store.search("Build auth", 10).unwrap().len(), 1);
+
         let listed = t.call(args("list")).await.unwrap();
         assert!(listed.contains(&id));
         assert!(listed.contains("Build auth"));
 
-        // start then close via convenience verbs, with the drg- string id.
+        // start → claims the issue onto the active session board.
         let started = t
             .call(IssueArgs {
                 id: Some(serde_json::json!(&id)),
@@ -342,6 +355,13 @@ mod tests {
             .await
             .unwrap();
         assert!(started.contains("in_progress"), "{started}");
+        assert!(
+            !store
+                .board_for_session(Some("sess-1"), None)
+                .unwrap()
+                .is_empty(),
+            "started issue must appear on the active work queue"
+        );
 
         let closed = t
             .call(IssueArgs {
