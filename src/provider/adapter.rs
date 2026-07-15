@@ -82,8 +82,8 @@ pub fn reasoning_profile(provider: Option<&str>) -> ReasoningProfile {
             disable: DisableWire::ChatTemplateKwargs,
         },
         Some("opencode") => ReasoningProfile {
-            effort: EffortWire::GenericLevel,
-            disable: DisableWire::ChatTemplateKwargs,
+            effort: EffortWire::TopLevelEffort,
+            disable: DisableWire::ThinkingToggle,
         },
         Some("gemini") => ReasoningProfile {
             effort: EffortWire::GeminiBudget,
@@ -238,8 +238,8 @@ mod tests {
             ),
             (
                 "opencode",
-                EffortWire::GenericLevel,
-                DisableWire::ChatTemplateKwargs,
+                EffortWire::TopLevelEffort,
+                DisableWire::ThinkingToggle,
             ),
             (
                 "gemini",
