@@ -306,6 +306,12 @@ async fn poll_finalization_follow_up(
     // persistent Blocking path uses `code_review_reacts` instead.
     critic_done: &mut bool,
     code_review_reacts: &mut u8,
+    // dirge-<tag>: fingerprint of the diff the Blocking judge last reviewed, so
+    // an unchanged diff (the model declined/rebutted) isn't re-reviewed.
+    last_reviewed_fingerprint: &mut Option<u64>,
+    // dirge-9b2k R2: the last reaction's rendered findings, handed to the next
+    // judge prompt so it doesn't blindly re-raise one the model rebutted.
+    last_review_findings: &mut Option<String>,
     code_review_baseline: Option<&super::code_review::RunDiff>,
     goal_reacts: &mut u8,
     todo_nudges: &mut u8,
@@ -396,43 +402,81 @@ async fn poll_finalization_follow_up(
         if may_fire && let Some(judge) = &config.critic_fn {
             // Capture the run's diff only when diff-review is on AND the working
             // tree changed since run start; otherwise review completeness alone.
-            let diff_owned: Option<String> = if mode != CodeReviewMode::Off {
-                let repo =
-                    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-                // Diff capture shells out to git — do it off the async runtime.
-                let captured = tokio::task::spawn_blocking(move || {
-                    super::code_review::capture_run_diff(&repo)
-                })
-                .await
-                .ok()
-                .flatten();
-                run_delta_to_review(captured.as_ref(), code_review_baseline).map(str::to_string)
-            } else {
-                None
-            };
-            let transcript = build_critic_transcript(new_messages);
-            // dirge-6q3w: thread the run's compile/lint/test signal so the judge
-            // can be pickier about unverified changes. dirge-bedj: judge within
-            // the agent's own system prompt so it never demands a forbidden
-            // action.
-            let verification = config.verifier.as_ref().map(|v| v.status());
-            let msgs = super::critic::run_unified_review(
-                judge,
-                system_prompt,
-                &transcript,
-                diff_owned.as_deref(),
-                verification,
-            )
-            .await;
-            // One-shot modes fire at most once (flip regardless of verdict);
-            // blocking spends its budget only when it actually re-enters.
-            if one_shot {
-                *critic_done = true;
-            } else if !msgs.is_empty() {
-                *code_review_reacts += 1;
-            }
-            if !msgs.is_empty() {
-                return (msgs, FollowUpSource::Critic);
+            // dirge-9b2k: keep the UNcapped fingerprint too (dirge-8gdv) so the
+            // Blocking path can tell when the model changed nothing between two
+            // reviews of the same diff and skip a redundant stateless judge call.
+            let (diff_owned, current_fingerprint): (Option<String>, Option<u64>) =
+                if mode != CodeReviewMode::Off {
+                    let repo =
+                        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                    // Diff capture shells out to git — do it off the async runtime.
+                    let captured = tokio::task::spawn_blocking(move || {
+                        super::code_review::capture_run_diff(&repo)
+                    })
+                    .await
+                    .ok()
+                    .flatten();
+                    let fp = captured.as_ref().map(|d| d.fingerprint);
+                    let diff =
+                        run_delta_to_review(captured.as_ref(), code_review_baseline)
+                            .map(str::to_string);
+                    (diff, fp)
+                } else {
+                    (None, None)
+                };
+            // dirge-9b2k: Blocking dedupe. The judge is stateless, so when the
+            // model declined a finding and changed nothing on disk, the next
+            // reaction re-reviews the identical diff, re-raises the same finding,
+            // and elicits the same rebuttal — a duplicate message. When this exact
+            // diff (by uncapped fingerprint) was reviewed last reaction, skip the
+            // judge call; the model's rebuttal stands. Off/Advisory are one-shot
+            // via `critic_done`, so the guard is Blocking-only.
+            //
+            // Falling through (NOT early-returning) is load-bearing: a skip is
+            // semantically "the critic found nothing this reaction", and the
+            // existing empty-findings path falls through to the goal / todo /
+            // open-issues gates. An early `return` here would silently drop those
+            // nudges — so `skip` only gates the judge block below, leaving the
+            // downstream gates in play on a skipped reaction.
+            let skip = mode == CodeReviewMode::Blocking
+                && diff_owned.is_some()
+                && current_fingerprint == *last_reviewed_fingerprint;
+            if !skip {
+                let transcript = build_critic_transcript(new_messages);
+                // dirge-6q3w: thread the run's compile/lint/test signal so the
+                // judge can be pickier about unverified changes. dirge-bedj: judge
+                // within the agent's own system prompt so it never demands a
+                // forbidden action.
+                let verification = config.verifier.as_ref().map(|v| v.status());
+                let (msgs, raised_findings) = super::critic::run_unified_review(
+                    judge,
+                    system_prompt,
+                    &transcript,
+                    diff_owned.as_deref(),
+                    verification,
+                    last_review_findings.as_deref(),
+                )
+                .await;
+                // dirge-9b2k: remember the diff we just reviewed so the next
+                // Blocking reaction can skip it when the model changed nothing.
+                if mode == CodeReviewMode::Blocking && diff_owned.is_some() {
+                    *last_reviewed_fingerprint = current_fingerprint;
+                }
+                // dirge-9b2k R2: hand the last reaction's findings to the next
+                // judge so it re-raises one only if the model's decline was wrong.
+                if mode == CodeReviewMode::Blocking {
+                    *last_review_findings = raised_findings;
+                }
+                // One-shot modes fire at most once (flip regardless of verdict);
+                // blocking spends its budget only when it actually re-enters.
+                if one_shot {
+                    *critic_done = true;
+                } else if !msgs.is_empty() {
+                    *code_review_reacts += 1;
+                }
+                if !msgs.is_empty() {
+                    return (msgs, FollowUpSource::Critic);
+                }
             }
         }
     }
@@ -1425,6 +1469,12 @@ pub async fn run_loop(
     // (fix-then-re-review) bounded by MAX_REVIEW_REACT.
     let mut critic_done = false;
     let mut code_review_reacts: u8 = 0;
+    // dirge-<tag>: see poll_finalization_follow_up — the last-reviewed diff
+    // fingerprint drives the Blocking dedupe.
+    let mut last_reviewed_fingerprint: Option<u64> = None;
+    // dirge-9b2k R2: the last judge reaction's findings, threaded into the next
+    // judge prompt so a rebutted finding isn't blindly re-raised.
+    let mut last_review_findings: Option<String> = None;
 
     // dirge-1g3v: snapshot the working-tree diff at run start so the reviewer
     // can tell what THIS run changed. Without a baseline it diffed the whole
@@ -2379,6 +2429,8 @@ pub async fn run_loop(
             &new_messages,
             &mut critic_done,
             &mut code_review_reacts,
+            &mut last_reviewed_fingerprint,
+            &mut last_review_findings,
             code_review_baseline.as_ref(),
             &mut goal_reacts,
             &mut todo_nudges,

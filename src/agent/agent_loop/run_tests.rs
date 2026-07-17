@@ -3983,6 +3983,8 @@ async fn finalization_defers_critic_while_external_work_is_pending() {
         &new_messages,
         &mut critic_done,
         &mut 0u8,
+        &mut None::<u64>, // last_reviewed_fingerprint
+        &mut None::<String>, // last_review_findings
         None,
         &mut 0u8,
         &mut 0u8,
@@ -4030,6 +4032,8 @@ async fn finalization_hook_short_circuits_lower_gates() {
         &[],
         &mut critic_done,
         &mut code_review_reacts,
+        &mut None::<u64>, // last_reviewed_fingerprint
+        &mut None::<String>, // last_review_findings
         None, // code_review_baseline
         &mut goal_reacts,
         &mut todo_nudges,
@@ -4074,6 +4078,8 @@ async fn finalization_all_gates_silent_yields_none() {
         &[],
         &mut critic_done,
         &mut code_review_reacts,
+        &mut None::<u64>, // last_reviewed_fingerprint
+        &mut None::<String>, // last_review_findings
         None, // code_review_baseline
         &mut goal_reacts,
         &mut todo_nudges,
@@ -4115,6 +4121,8 @@ async fn finalization_goal_unmet_reenters_and_counts() {
         &[],
         &mut critic_done,
         &mut code_review_reacts,
+        &mut None::<u64>, // last_reviewed_fingerprint
+        &mut None::<String>, // last_review_findings
         None, // code_review_baseline
         &mut goal_reacts,
         &mut todo_nudges,
@@ -4177,6 +4185,8 @@ async fn finalization_unified_judge_reenters_on_finding() {
         &new_messages,
         &mut critic_done,
         &mut code_review_reacts,
+        &mut None::<u64>, // last_reviewed_fingerprint
+        &mut None::<String>, // last_review_findings
         None, // code_review_baseline
         &mut goal_reacts,
         &mut todo_nudges,
@@ -4227,6 +4237,8 @@ async fn finalization_goal_met_finalizes() {
         &[],
         &mut critic_done,
         &mut code_review_reacts,
+        &mut None::<u64>, // last_reviewed_fingerprint
+        &mut None::<String>, // last_review_findings
         None, // code_review_baseline
         &mut goal_reacts,
         &mut todo_nudges,
@@ -4267,6 +4279,8 @@ async fn finalization_goal_bound_stops_reentry() {
         &[],
         &mut critic_done,
         &mut code_review_reacts,
+        &mut None::<u64>, // last_reviewed_fingerprint
+        &mut None::<String>, // last_review_findings
         None, // code_review_baseline
         &mut goal_reacts,
         &mut todo_nudges,
@@ -4304,6 +4318,8 @@ async fn finalization_goal_without_judge_is_inert() {
         &[],
         &mut critic_done,
         &mut code_review_reacts,
+        &mut None::<u64>, // last_reviewed_fingerprint
+        &mut None::<String>, // last_review_findings
         None, // code_review_baseline
         &mut goal_reacts,
         &mut todo_nudges,
@@ -4349,6 +4365,8 @@ async fn open_issues_gate_off_is_inert() {
         &[],
         &mut critic_done,
         &mut code_review_reacts,
+        &mut None::<u64>, // last_reviewed_fingerprint
+        &mut None::<String>, // last_review_findings
         None,
         &mut goal_reacts,
         &mut todo_nudges,
@@ -4399,6 +4417,8 @@ async fn open_issues_gate_blocking_with_session_open_issues_nudges() {
         &[],
         &mut critic_done,
         &mut code_review_reacts,
+        &mut None::<u64>, // last_reviewed_fingerprint
+        &mut None::<String>, // last_review_findings
         None,
         &mut goal_reacts,
         &mut todo_nudges,
@@ -4455,6 +4475,8 @@ async fn open_issues_gate_blocking_has_bound() {
         &[],
         &mut critic_done,
         &mut code_review_reacts,
+        &mut None::<u64>, // last_reviewed_fingerprint
+        &mut None::<String>, // last_review_findings
         None,
         &mut goal_reacts,
         &mut todo_nudges,
@@ -4498,6 +4520,8 @@ async fn open_issues_gate_zero_open_session_issues_is_inert() {
         &[],
         &mut critic_done,
         &mut code_review_reacts,
+        &mut None::<u64>, // last_reviewed_fingerprint
+        &mut None::<String>, // last_review_findings
         None,
         &mut goal_reacts,
         &mut todo_nudges,
@@ -4535,6 +4559,8 @@ async fn open_issues_gate_missing_db_is_inert() {
         &[],
         &mut critic_done,
         &mut code_review_reacts,
+        &mut None::<u64>, // last_reviewed_fingerprint
+        &mut None::<String>, // last_review_findings
         None,
         &mut goal_reacts,
         &mut todo_nudges,
@@ -4579,6 +4605,8 @@ async fn open_issues_gate_advisory_emits_notice_but_does_not_reenter() {
         &[],
         &mut critic_done,
         &mut code_review_reacts,
+        &mut None::<u64>, // last_reviewed_fingerprint
+        &mut None::<String>, // last_review_findings
         None,
         &mut goal_reacts,
         &mut todo_nudges,
@@ -4609,6 +4637,302 @@ async fn open_issues_gate_advisory_emits_notice_but_does_not_reenter() {
     }
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── Blocking review dedupe (dirge-9b2k): skip re-reviewing an unchanged diff ─
+//
+// The unified finalization judge is stateless, so a Blocking run that persists
+// across finalizations can loop: when the model declines a finding and changes
+// nothing on disk, a naive re-review re-raises the identical finding and the
+// model re-emits the identical rebuttal — a duplicate. The fix skips the judge
+// when this exact diff (by uncapped fingerprint) was reviewed last reaction.
+
+/// Serialize tests that flip the process-global CWD, since git diff capture
+/// reads `current_dir()`. Without this, two such tests race under parallel
+/// execution and each captures the other's tree.
+static REVIEW_CWD_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Restore the CWD on drop — even if the test panics mid-assertion after
+/// `set_current_dir`, so a failed Blocking test can't strand the suite in a
+/// temp dir that gets removed.
+struct CwdGuard {
+    orig: std::path::PathBuf,
+}
+impl Drop for CwdGuard {
+    fn drop(&mut self) {
+        let _ = std::env::set_current_dir(&self.orig);
+    }
+}
+
+/// A temp git repo with one committed file and one uncommitted edit, so
+/// `capture_run_diff` yields a stable, non-empty diff. Caller must hold
+/// [`REVIEW_CWD_TEST_LOCK`] and have moved the CWD nowhere else.
+fn temp_review_repo(suffix: &str) -> std::path::PathBuf {
+    let dir = temp_dir(&format!("blocking-review-{suffix}"));
+    let git = |args: &[&str]| {
+        let _ = std::process::Command::new("git")
+            .current_dir(&dir)
+            .args(args)
+            .output();
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "test@test.test"]);
+    git(&["config", "user.name", "test"]);
+    std::fs::write(dir.join("a.rs"), "fn main() {}\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "base"]);
+    // dirty edit — the diff capture reviews this.
+    std::fs::write(dir.join("a.rs"), "fn main() { let x = 1; }\n").unwrap();
+    dir
+}
+
+/// A run that made a tool call, so `run_made_tool_calls` is true and the
+/// unified judge gate is eligible.
+fn run_with_tool_result() -> Vec<LoopMessage> {
+    vec![LoopMessage::ToolResult(
+        crate::agent::agent_loop::message::ToolResultMessage {
+            tool_call_id: "call_1".into(),
+            tool_name: "task".into(),
+            content: vec![crate::agent::agent_loop::message::ContentBlock::Text {
+                text: "done".into(),
+            }],
+            details: serde_json::Value::Null,
+            is_error: false,
+        },
+    )]
+}
+
+/// A stateless judge stub that always raises one high finding, recording how
+/// many times it was invoked.
+fn counting_judge(calls: &Arc<AtomicUsize>) -> crate::agent::agent_loop::critic::CriticFn {
+    let calls = calls.clone();
+    Arc::new(move |_p: String| {
+        calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Ok("VERDICT: INCOMPLETE\nFINDINGS:\n- High — bug".to_string()) })
+    })
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // current-thread runtime; lock only serializes CWD
+async fn blocking_review_skips_judge_when_diff_unchanged_across_reactions() {
+    use crate::agent::agent_loop::types::CodeReviewMode;
+
+    let _lock = REVIEW_CWD_TEST_LOCK.lock().unwrap();
+    let repo = temp_review_repo("skip");
+    let guard = CwdGuard {
+        orig: std::env::current_dir().unwrap(),
+    };
+    std::env::set_current_dir(&repo).unwrap();
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut config = build_config();
+    config.critic_fn = Some(counting_judge(&calls));
+    config.code_review_mode = CodeReviewMode::Blocking;
+
+    let msgs_run = run_with_tool_result();
+    let mut critic_done = false;
+    let mut reacts = 0u8;
+    let mut last_fp: Option<u64> = None;
+    let mut last_findings: Option<String> = None;
+    let (emit, _rx) = tokio::sync::mpsc::channel(8);
+
+    // Reaction 1: the judge reviews the diff and raises a finding.
+    let (msgs1, src1) = poll_finalization_follow_up(
+        &config, "sys", &msgs_run, &mut critic_done, &mut reacts, &mut last_fp, &mut last_findings, None, &mut 0u8,
+        &mut 0u8, &mut 0u8, GateMode::Off, None, None, &mut 0u8, &mut 0u8, &emit,
+    )
+    .await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "first reaction calls the judge");
+    assert!(!msgs1.is_empty(), "first reaction returns the finding");
+    assert_eq!(src1, FollowUpSource::Critic);
+    assert_eq!(reacts, 1, "first reaction spends a budget");
+    assert!(!critic_done, "Blocking never sets the one-shot flag");
+    assert!(last_fp.is_some(), "the reviewed diff fingerprint is recorded");
+
+    // Reaction 2: the diff on disk is UNCHANGED → the judge must be skipped.
+    let (msgs2, src2) = poll_finalization_follow_up(
+        &config, "sys", &msgs_run, &mut critic_done, &mut reacts, &mut last_fp, &mut last_findings, None, &mut 0u8,
+        &mut 0u8, &mut 0u8, GateMode::Off, None, None, &mut 0u8, &mut 0u8, &emit,
+    )
+    .await;
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "judge NOT called again on an unchanged diff"
+    );
+    assert!(msgs2.is_empty(), "no follow-up — the model's rebuttal stands");
+    assert_eq!(src2, FollowUpSource::None);
+    assert_eq!(reacts, 1, "budget not spent on the skipped reaction");
+
+    drop(guard);
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// dirge-9b2k regression: the Blocking dedupe skip must NOT early-return out of
+/// `poll_finalization_follow_up` — it must fall through to the downstream gates.
+/// Here reaction 2 skips the judge (unchanged diff), but an unfinished todo is
+/// present, so the TODO gate fires instead of finalizing with `None`. An earlier
+/// version of the guard `return`ed on skip, silently dropping the todo nudge.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // current-thread runtime; locks only serialize CWD + TODO_LIST
+async fn blocking_review_skip_falls_through_to_downstream_gate() {
+    use crate::agent::agent_loop::types::CodeReviewMode;
+    use crate::agent::tools::todo::{TODO_LIST, TodoItem};
+
+    let _cwd_lock = REVIEW_CWD_TEST_LOCK.lock().unwrap();
+    let repo = temp_review_repo("fallthrough");
+    let guard = CwdGuard {
+        orig: std::env::current_dir().unwrap(),
+    };
+    std::env::set_current_dir(&repo).unwrap();
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut config = build_config();
+    config.critic_fn = Some(counting_judge(&calls));
+    config.code_review_mode = CodeReviewMode::Blocking;
+
+    let msgs_run = run_with_tool_result();
+    let mut critic_done = false;
+    let mut reacts = 0u8;
+    let mut last_fp: Option<u64> = None;
+    let mut last_findings: Option<String> = None;
+    let (emit, _emit_rx) = tokio::sync::mpsc::channel(8);
+
+    // Reaction 1: the judge reviews the diff and raises a finding.
+    let (msgs1, src1) = poll_finalization_follow_up(
+        &config, "sys", &msgs_run, &mut critic_done, &mut reacts, &mut last_fp, &mut last_findings, None,
+        &mut 0u8, &mut 0u8, &mut 0u8, GateMode::Off, None, None, &mut 0u8, &mut 0u8, &emit,
+    )
+    .await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "first reaction calls the judge");
+    assert_eq!(src1, FollowUpSource::Critic);
+    assert!(!msgs1.is_empty());
+
+    // Plant an unfinished todo so the TODO gate is armed for reaction 2.
+    // Set it WITHOUT holding the lock across the poll — `unfinished_count()`
+    // inside the poll re-locks TODO_LIST, and std Mutex isn't reentrant.
+    *TODO_LIST.lock().unwrap() = vec![TodoItem {
+        content: "still open".into(),
+        status: "open".into(),
+        priority: "normal".into(),
+    }];
+
+    // Reaction 2: the diff on disk is UNCHANGED → the judge is skipped, BUT the
+    // fall-through must reach the TODO gate (unfinished todo present).
+    let mut todo_nudges = 0u8;
+    let (msgs2, src2) = poll_finalization_follow_up(
+        &config, "sys", &msgs_run, &mut critic_done, &mut reacts, &mut last_fp, &mut last_findings, None,
+        &mut todo_nudges, &mut 0u8, &mut 0u8, GateMode::Off, None, None, &mut 0u8, &mut 0u8, &emit,
+    )
+    .await;
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "judge NOT called again on an unchanged diff"
+    );
+    assert!(
+        !msgs2.is_empty(),
+        "the skipped reaction must fall through to the todo gate"
+    );
+    assert_eq!(
+        src2,
+        FollowUpSource::Todo,
+        "the TODO gate fires, not Critic and not None"
+    );
+    assert_eq!(reacts, 1, "budget not spent on the skipped reaction");
+
+    // Restore the global so no other test sees our planted todo.
+    TODO_LIST.lock().unwrap().clear();
+    drop(guard);
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // current-thread runtime; lock only serializes CWD
+async fn blocking_review_re_fires_judge_when_diff_changes_between_reactions() {
+    use crate::agent::agent_loop::types::CodeReviewMode;
+
+    let _lock = REVIEW_CWD_TEST_LOCK.lock().unwrap();
+    let repo = temp_review_repo("changed");
+    let guard = CwdGuard {
+        orig: std::env::current_dir().unwrap(),
+    };
+    std::env::set_current_dir(&repo).unwrap();
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut config = build_config();
+    config.critic_fn = Some(counting_judge(&calls));
+    config.code_review_mode = CodeReviewMode::Blocking;
+
+    let msgs_run = run_with_tool_result();
+    let mut critic_done = false;
+    let mut reacts = 0u8;
+    let mut last_fp: Option<u64> = None;
+    let mut last_findings: Option<String> = None;
+    let (emit, _rx) = tokio::sync::mpsc::channel(8);
+
+    // Reaction 1.
+    let (msgs1, _src1) = poll_finalization_follow_up(
+        &config, "sys", &msgs_run, &mut critic_done, &mut reacts, &mut last_fp, &mut last_findings, None, &mut 0u8,
+        &mut 0u8, &mut 0u8, GateMode::Off, None, None, &mut 0u8, &mut 0u8, &emit,
+    )
+    .await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(!msgs1.is_empty());
+
+    // The model changes the code on disk → the diff fingerprint changes.
+    std::fs::write(repo.join("a.rs"), "fn main() { let x = 2; let y = 3; }\n").unwrap();
+
+    // Reaction 2: the diff CHANGED → the judge fires again.
+    let (msgs2, src2) = poll_finalization_follow_up(
+        &config, "sys", &msgs_run, &mut critic_done, &mut reacts, &mut last_fp, &mut last_findings, None, &mut 0u8,
+        &mut 0u8, &mut 0u8, GateMode::Off, None, None, &mut 0u8, &mut 0u8, &emit,
+    )
+    .await;
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "judge re-fires when the diff changed"
+    );
+    assert!(!msgs2.is_empty());
+    assert_eq!(src2, FollowUpSource::Critic);
+
+    drop(guard);
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+#[tokio::test]
+async fn advisory_review_unaffected_by_last_reviewed_fingerprint() {
+    use crate::agent::agent_loop::types::CodeReviewMode;
+
+    // Advisory is one-shot via critic_done; the Blocking-only dedupe (last_fp)
+    // must never suppress it. A set fingerprint cannot block the Advisory judge.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut config = build_config();
+    config.critic_fn = Some(counting_judge(&calls));
+    // default code_review_mode is Advisory; assert it explicitly.
+    assert_eq!(config.code_review_mode, CodeReviewMode::Advisory);
+
+    let msgs_run = run_with_tool_result();
+    let mut critic_done = false;
+    let mut reacts = 0u8;
+    let mut last_fp: Option<u64> = Some(999); // must NOT suppress Advisory
+    let mut last_findings: Option<String> = None;
+    let (emit, _rx) = tokio::sync::mpsc::channel(8);
+
+    let (msgs1, src1) = poll_finalization_follow_up(
+        &config, "sys", &msgs_run, &mut critic_done, &mut reacts, &mut last_fp, &mut last_findings, None, &mut 0u8,
+        &mut 0u8, &mut 0u8, GateMode::Off, None, None, &mut 0u8, &mut 0u8, &emit,
+    )
+    .await;
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "Advisory judge fires despite a set last_fp"
+    );
+    assert!(!msgs1.is_empty());
+    assert_eq!(src1, FollowUpSource::Critic);
+    assert!(critic_done, "Advisory flips the one-shot flag");
 }
 
 // ── track-work advisory (R3): edited files but no active todo ──────────────
