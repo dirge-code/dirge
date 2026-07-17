@@ -306,7 +306,7 @@ async fn poll_finalization_follow_up(
     // persistent Blocking path uses `code_review_reacts` instead.
     critic_done: &mut bool,
     code_review_reacts: &mut u8,
-    // dirge-<tag>: fingerprint of the diff the Blocking judge last reviewed, so
+    // dirge-9b2k: fingerprint of the diff the Blocking judge last reviewed, so
     // an unchanged diff (the model declined/rebutted) isn't re-reviewed.
     last_reviewed_fingerprint: &mut Option<u64>,
     // dirge-9b2k R2: the last reaction's rendered findings, handed to the next
@@ -417,9 +417,8 @@ async fn poll_finalization_follow_up(
                     .ok()
                     .flatten();
                     let fp = captured.as_ref().map(|d| d.fingerprint);
-                    let diff =
-                        run_delta_to_review(captured.as_ref(), code_review_baseline)
-                            .map(str::to_string);
+                    let diff = run_delta_to_review(captured.as_ref(), code_review_baseline)
+                        .map(str::to_string);
                     (diff, fp)
                 } else {
                     (None, None)
@@ -457,14 +456,15 @@ async fn poll_finalization_follow_up(
                     last_review_findings.as_deref(),
                 )
                 .await;
-                // dirge-9b2k: remember the diff we just reviewed so the next
-                // Blocking reaction can skip it when the model changed nothing.
-                if mode == CodeReviewMode::Blocking && diff_owned.is_some() {
-                    *last_reviewed_fingerprint = current_fingerprint;
-                }
-                // dirge-9b2k R2: hand the last reaction's findings to the next
-                // judge so it re-raises one only if the model's decline was wrong.
+                // dirge-9b2k: carry per-reaction state forward for the next
+                // Blocking finalization. The fingerprint (only when a diff was
+                // actually reviewed) lets the next reaction skip an unchanged
+                // diff; the findings feed its judge prompt so it re-raises one
+                // only if still-present-and-unaddressed.
                 if mode == CodeReviewMode::Blocking {
+                    if diff_owned.is_some() {
+                        *last_reviewed_fingerprint = current_fingerprint;
+                    }
                     *last_review_findings = raised_findings;
                 }
                 // One-shot modes fire at most once (flip regardless of verdict);
@@ -1469,7 +1469,7 @@ pub async fn run_loop(
     // (fix-then-re-review) bounded by MAX_REVIEW_REACT.
     let mut critic_done = false;
     let mut code_review_reacts: u8 = 0;
-    // dirge-<tag>: see poll_finalization_follow_up — the last-reviewed diff
+    // dirge-9b2k: see poll_finalization_follow_up — the last-reviewed diff
     // fingerprint drives the Blocking dedupe.
     let mut last_reviewed_fingerprint: Option<u64> = None;
     // dirge-9b2k R2: the last judge reaction's findings, threaded into the next

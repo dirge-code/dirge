@@ -3983,7 +3983,7 @@ async fn finalization_defers_critic_while_external_work_is_pending() {
         &new_messages,
         &mut critic_done,
         &mut 0u8,
-        &mut None::<u64>, // last_reviewed_fingerprint
+        &mut None::<u64>,    // last_reviewed_fingerprint
         &mut None::<String>, // last_review_findings
         None,
         &mut 0u8,
@@ -4032,9 +4032,9 @@ async fn finalization_hook_short_circuits_lower_gates() {
         &[],
         &mut critic_done,
         &mut code_review_reacts,
-        &mut None::<u64>, // last_reviewed_fingerprint
+        &mut None::<u64>,    // last_reviewed_fingerprint
         &mut None::<String>, // last_review_findings
-        None, // code_review_baseline
+        None,                // code_review_baseline
         &mut goal_reacts,
         &mut todo_nudges,
         &mut resume_nudges,
@@ -4078,9 +4078,9 @@ async fn finalization_all_gates_silent_yields_none() {
         &[],
         &mut critic_done,
         &mut code_review_reacts,
-        &mut None::<u64>, // last_reviewed_fingerprint
+        &mut None::<u64>,    // last_reviewed_fingerprint
         &mut None::<String>, // last_review_findings
-        None, // code_review_baseline
+        None,                // code_review_baseline
         &mut goal_reacts,
         &mut todo_nudges,
         &mut resume_nudges,
@@ -4121,9 +4121,9 @@ async fn finalization_goal_unmet_reenters_and_counts() {
         &[],
         &mut critic_done,
         &mut code_review_reacts,
-        &mut None::<u64>, // last_reviewed_fingerprint
+        &mut None::<u64>,    // last_reviewed_fingerprint
         &mut None::<String>, // last_review_findings
-        None, // code_review_baseline
+        None,                // code_review_baseline
         &mut goal_reacts,
         &mut todo_nudges,
         &mut resume_nudges,
@@ -4185,9 +4185,9 @@ async fn finalization_unified_judge_reenters_on_finding() {
         &new_messages,
         &mut critic_done,
         &mut code_review_reacts,
-        &mut None::<u64>, // last_reviewed_fingerprint
+        &mut None::<u64>,    // last_reviewed_fingerprint
         &mut None::<String>, // last_review_findings
-        None, // code_review_baseline
+        None,                // code_review_baseline
         &mut goal_reacts,
         &mut todo_nudges,
         &mut resume_nudges,
@@ -4237,9 +4237,9 @@ async fn finalization_goal_met_finalizes() {
         &[],
         &mut critic_done,
         &mut code_review_reacts,
-        &mut None::<u64>, // last_reviewed_fingerprint
+        &mut None::<u64>,    // last_reviewed_fingerprint
         &mut None::<String>, // last_review_findings
-        None, // code_review_baseline
+        None,                // code_review_baseline
         &mut goal_reacts,
         &mut todo_nudges,
         &mut resume_nudges,
@@ -4279,9 +4279,9 @@ async fn finalization_goal_bound_stops_reentry() {
         &[],
         &mut critic_done,
         &mut code_review_reacts,
-        &mut None::<u64>, // last_reviewed_fingerprint
+        &mut None::<u64>,    // last_reviewed_fingerprint
         &mut None::<String>, // last_review_findings
-        None, // code_review_baseline
+        None,                // code_review_baseline
         &mut goal_reacts,
         &mut todo_nudges,
         &mut resume_nudges,
@@ -4318,9 +4318,9 @@ async fn finalization_goal_without_judge_is_inert() {
         &[],
         &mut critic_done,
         &mut code_review_reacts,
-        &mut None::<u64>, // last_reviewed_fingerprint
+        &mut None::<u64>,    // last_reviewed_fingerprint
         &mut None::<String>, // last_review_findings
-        None, // code_review_baseline
+        None,                // code_review_baseline
         &mut goal_reacts,
         &mut todo_nudges,
         &mut resume_nudges,
@@ -4365,7 +4365,7 @@ async fn open_issues_gate_off_is_inert() {
         &[],
         &mut critic_done,
         &mut code_review_reacts,
-        &mut None::<u64>, // last_reviewed_fingerprint
+        &mut None::<u64>,    // last_reviewed_fingerprint
         &mut None::<String>, // last_review_findings
         None,
         &mut goal_reacts,
@@ -4417,7 +4417,7 @@ async fn open_issues_gate_blocking_with_session_open_issues_nudges() {
         &[],
         &mut critic_done,
         &mut code_review_reacts,
-        &mut None::<u64>, // last_reviewed_fingerprint
+        &mut None::<u64>,    // last_reviewed_fingerprint
         &mut None::<String>, // last_review_findings
         None,
         &mut goal_reacts,
@@ -4475,7 +4475,7 @@ async fn open_issues_gate_blocking_has_bound() {
         &[],
         &mut critic_done,
         &mut code_review_reacts,
-        &mut None::<u64>, // last_reviewed_fingerprint
+        &mut None::<u64>,    // last_reviewed_fingerprint
         &mut None::<String>, // last_review_findings
         None,
         &mut goal_reacts,
@@ -4520,7 +4520,7 @@ async fn open_issues_gate_zero_open_session_issues_is_inert() {
         &[],
         &mut critic_done,
         &mut code_review_reacts,
-        &mut None::<u64>, // last_reviewed_fingerprint
+        &mut None::<u64>,    // last_reviewed_fingerprint
         &mut None::<String>, // last_review_findings
         None,
         &mut goal_reacts,
@@ -4559,7 +4559,7 @@ async fn open_issues_gate_missing_db_is_inert() {
         &[],
         &mut critic_done,
         &mut code_review_reacts,
-        &mut None::<u64>, // last_reviewed_fingerprint
+        &mut None::<u64>,    // last_reviewed_fingerprint
         &mut None::<String>, // last_review_findings
         None,
         &mut goal_reacts,
@@ -4605,7 +4605,7 @@ async fn open_issues_gate_advisory_emits_notice_but_does_not_reenter() {
         &[],
         &mut critic_done,
         &mut code_review_reacts,
-        &mut None::<u64>, // last_reviewed_fingerprint
+        &mut None::<u64>,    // last_reviewed_fingerprint
         &mut None::<String>, // last_review_findings
         None,
         &mut goal_reacts,
@@ -4738,21 +4738,58 @@ async fn blocking_review_skips_judge_when_diff_unchanged_across_reactions() {
 
     // Reaction 1: the judge reviews the diff and raises a finding.
     let (msgs1, src1) = poll_finalization_follow_up(
-        &config, "sys", &msgs_run, &mut critic_done, &mut reacts, &mut last_fp, &mut last_findings, None, &mut 0u8,
-        &mut 0u8, &mut 0u8, GateMode::Off, None, None, &mut 0u8, &mut 0u8, &emit,
+        &config,
+        "sys",
+        &msgs_run,
+        &mut critic_done,
+        &mut reacts,
+        &mut last_fp,
+        &mut last_findings,
+        None,
+        &mut 0u8,
+        &mut 0u8,
+        &mut 0u8,
+        GateMode::Off,
+        None,
+        None,
+        &mut 0u8,
+        &mut 0u8,
+        &emit,
     )
     .await;
-    assert_eq!(calls.load(Ordering::SeqCst), 1, "first reaction calls the judge");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "first reaction calls the judge"
+    );
     assert!(!msgs1.is_empty(), "first reaction returns the finding");
     assert_eq!(src1, FollowUpSource::Critic);
     assert_eq!(reacts, 1, "first reaction spends a budget");
     assert!(!critic_done, "Blocking never sets the one-shot flag");
-    assert!(last_fp.is_some(), "the reviewed diff fingerprint is recorded");
+    assert!(
+        last_fp.is_some(),
+        "the reviewed diff fingerprint is recorded"
+    );
 
     // Reaction 2: the diff on disk is UNCHANGED → the judge must be skipped.
     let (msgs2, src2) = poll_finalization_follow_up(
-        &config, "sys", &msgs_run, &mut critic_done, &mut reacts, &mut last_fp, &mut last_findings, None, &mut 0u8,
-        &mut 0u8, &mut 0u8, GateMode::Off, None, None, &mut 0u8, &mut 0u8, &emit,
+        &config,
+        "sys",
+        &msgs_run,
+        &mut critic_done,
+        &mut reacts,
+        &mut last_fp,
+        &mut last_findings,
+        None,
+        &mut 0u8,
+        &mut 0u8,
+        &mut 0u8,
+        GateMode::Off,
+        None,
+        None,
+        &mut 0u8,
+        &mut 0u8,
+        &emit,
     )
     .await;
     assert_eq!(
@@ -4760,7 +4797,10 @@ async fn blocking_review_skips_judge_when_diff_unchanged_across_reactions() {
         1,
         "judge NOT called again on an unchanged diff"
     );
-    assert!(msgs2.is_empty(), "no follow-up — the model's rebuttal stands");
+    assert!(
+        msgs2.is_empty(),
+        "no follow-up — the model's rebuttal stands"
+    );
     assert_eq!(src2, FollowUpSource::None);
     assert_eq!(reacts, 1, "budget not spent on the skipped reaction");
 
@@ -4800,11 +4840,30 @@ async fn blocking_review_skip_falls_through_to_downstream_gate() {
 
     // Reaction 1: the judge reviews the diff and raises a finding.
     let (msgs1, src1) = poll_finalization_follow_up(
-        &config, "sys", &msgs_run, &mut critic_done, &mut reacts, &mut last_fp, &mut last_findings, None,
-        &mut 0u8, &mut 0u8, &mut 0u8, GateMode::Off, None, None, &mut 0u8, &mut 0u8, &emit,
+        &config,
+        "sys",
+        &msgs_run,
+        &mut critic_done,
+        &mut reacts,
+        &mut last_fp,
+        &mut last_findings,
+        None,
+        &mut 0u8,
+        &mut 0u8,
+        &mut 0u8,
+        GateMode::Off,
+        None,
+        None,
+        &mut 0u8,
+        &mut 0u8,
+        &emit,
     )
     .await;
-    assert_eq!(calls.load(Ordering::SeqCst), 1, "first reaction calls the judge");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "first reaction calls the judge"
+    );
     assert_eq!(src1, FollowUpSource::Critic);
     assert!(!msgs1.is_empty());
 
@@ -4821,8 +4880,23 @@ async fn blocking_review_skip_falls_through_to_downstream_gate() {
     // fall-through must reach the TODO gate (unfinished todo present).
     let mut todo_nudges = 0u8;
     let (msgs2, src2) = poll_finalization_follow_up(
-        &config, "sys", &msgs_run, &mut critic_done, &mut reacts, &mut last_fp, &mut last_findings, None,
-        &mut todo_nudges, &mut 0u8, &mut 0u8, GateMode::Off, None, None, &mut 0u8, &mut 0u8, &emit,
+        &config,
+        "sys",
+        &msgs_run,
+        &mut critic_done,
+        &mut reacts,
+        &mut last_fp,
+        &mut last_findings,
+        None,
+        &mut todo_nudges,
+        &mut 0u8,
+        &mut 0u8,
+        GateMode::Off,
+        None,
+        None,
+        &mut 0u8,
+        &mut 0u8,
+        &emit,
     )
     .await;
     assert_eq!(
@@ -4873,8 +4947,23 @@ async fn blocking_review_re_fires_judge_when_diff_changes_between_reactions() {
 
     // Reaction 1.
     let (msgs1, _src1) = poll_finalization_follow_up(
-        &config, "sys", &msgs_run, &mut critic_done, &mut reacts, &mut last_fp, &mut last_findings, None, &mut 0u8,
-        &mut 0u8, &mut 0u8, GateMode::Off, None, None, &mut 0u8, &mut 0u8, &emit,
+        &config,
+        "sys",
+        &msgs_run,
+        &mut critic_done,
+        &mut reacts,
+        &mut last_fp,
+        &mut last_findings,
+        None,
+        &mut 0u8,
+        &mut 0u8,
+        &mut 0u8,
+        GateMode::Off,
+        None,
+        None,
+        &mut 0u8,
+        &mut 0u8,
+        &emit,
     )
     .await;
     assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -4885,8 +4974,23 @@ async fn blocking_review_re_fires_judge_when_diff_changes_between_reactions() {
 
     // Reaction 2: the diff CHANGED → the judge fires again.
     let (msgs2, src2) = poll_finalization_follow_up(
-        &config, "sys", &msgs_run, &mut critic_done, &mut reacts, &mut last_fp, &mut last_findings, None, &mut 0u8,
-        &mut 0u8, &mut 0u8, GateMode::Off, None, None, &mut 0u8, &mut 0u8, &emit,
+        &config,
+        "sys",
+        &msgs_run,
+        &mut critic_done,
+        &mut reacts,
+        &mut last_fp,
+        &mut last_findings,
+        None,
+        &mut 0u8,
+        &mut 0u8,
+        &mut 0u8,
+        GateMode::Off,
+        None,
+        None,
+        &mut 0u8,
+        &mut 0u8,
+        &emit,
     )
     .await;
     assert_eq!(
@@ -4921,8 +5025,23 @@ async fn advisory_review_unaffected_by_last_reviewed_fingerprint() {
     let (emit, _rx) = tokio::sync::mpsc::channel(8);
 
     let (msgs1, src1) = poll_finalization_follow_up(
-        &config, "sys", &msgs_run, &mut critic_done, &mut reacts, &mut last_fp, &mut last_findings, None, &mut 0u8,
-        &mut 0u8, &mut 0u8, GateMode::Off, None, None, &mut 0u8, &mut 0u8, &emit,
+        &config,
+        "sys",
+        &msgs_run,
+        &mut critic_done,
+        &mut reacts,
+        &mut last_fp,
+        &mut last_findings,
+        None,
+        &mut 0u8,
+        &mut 0u8,
+        &mut 0u8,
+        GateMode::Off,
+        None,
+        None,
+        &mut 0u8,
+        &mut 0u8,
+        &emit,
     )
     .await;
     assert_eq!(

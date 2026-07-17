@@ -273,9 +273,11 @@ pub fn build_unified_prompt(
     transcript: &str,
     diff: Option<&str>,
     verification: Option<VerificationStatus>,
-    // dirge-9b2k R2: findings a prior Blocking reaction raised that the model
-    // addressed or declined, so the judge re-raises one only if the decline was
-    // wrong rather than blindly re-emitting it. `None`/blank = no section.
+    // dirge-9b2k R2: findings a prior Blocking reaction raised. The judge is told
+    // to re-raise one only if it's still present AND the model neither fixed nor
+    // justified it (blindly re-emitting a declined finding is the duplicate bug;
+    // silently dropping an unaddressed one is the opposite failure). `None`/blank
+    // = no section.
     prior_findings: Option<&str>,
 ) -> String {
     let rules = strip_compaction_summary(rules).trim();
@@ -293,11 +295,12 @@ pub fn build_unified_prompt(
     };
     let prior_findings_block = match prior_findings {
         Some(p) if !p.trim().is_empty() => format!(
-            "\n\n--- findings raised on an earlier review (the assistant addressed or \
-             declined them; its reasoning is in the transcript above) ---\n{}\n--- end prior \
-             findings ---\n\
-             Do NOT re-raise any of these unless the assistant's reasoning for declining is \
-             factually wrong — in that case, explain why the reasoning fails.",
+            "\n\n--- findings raised on an earlier review (the assistant's response is in the \
+             transcript above) ---\n{}\n--- end prior findings ---\n\
+             For each: if the assistant fixed it, or gave a sound reason for leaving it, do NOT \
+             re-raise it. If it is still present and the assistant neither fixed nor justified \
+             it, DO re-raise it. Only re-raise a justified finding when the justification is \
+             factually wrong — then explain why it fails.",
             p.trim()
         ),
         _ => String::new(),
@@ -833,7 +836,13 @@ mod tests {
 
     #[test]
     fn unified_prompt_includes_diff_only_when_present() {
-        let with = build_unified_prompt("rules", "did stuff", Some("@@ -1 +1 @@\n-a\n+b"), None, None);
+        let with = build_unified_prompt(
+            "rules",
+            "did stuff",
+            Some("@@ -1 +1 @@\n-a\n+b"),
+            None,
+            None,
+        );
         assert!(with.contains("diff under review"));
         assert!(with.contains("+b"));
         let without = build_unified_prompt("rules", "did stuff", None, None, None);
@@ -847,7 +856,13 @@ mod tests {
     fn unified_prompt_omits_prior_findings_section_when_none() {
         // dirge-9b2k R2: no prior findings → no new section (identical to the
         // pre-R2 prompt).
-        let p = build_unified_prompt("rules", "did stuff", Some("@@ -1 +1 @@\n-a\n+b"), None, None);
+        let p = build_unified_prompt(
+            "rules",
+            "did stuff",
+            Some("@@ -1 +1 @@\n-a\n+b"),
+            None,
+            None,
+        );
         assert!(!p.contains("earlier review"));
         assert!(p.contains("diff under review"));
     }
@@ -868,14 +883,21 @@ mod tests {
             None,
             Some("- High — sql injection"),
         );
-        assert!(p.contains("earlier review"), "prior-findings section must appear");
+        assert!(
+            p.contains("earlier review"),
+            "prior-findings section must appear"
+        );
         assert!(
             p.contains("- High — sql injection"),
             "the prior findings must be inlined"
         );
         assert!(
-            p.contains("Do NOT re-raise"),
-            "the decline-rebuttal instruction must be present"
+            p.contains("do NOT re-raise"),
+            "the suppress-if-addressed instruction must be present"
+        );
+        assert!(
+            p.contains("neither fixed nor justified"),
+            "the re-raise-if-unaddressed instruction must be present"
         );
     }
 
