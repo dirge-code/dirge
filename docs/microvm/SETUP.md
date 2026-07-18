@@ -178,7 +178,7 @@ cp target/release/dirge-microvm-runner ~/.cargo/bin/
 libkrun couldn't boot the VM. Common causes:
 
 - **Linux**: `/dev/kvm` permission denied — add your user to the `kvm` group: `sudo usermod -aG kvm $USER` (log out and back in)
-- **macOS**: runner not codesigned — rebuild with `cargo build --features sandbox-microvm` which auto-codesigns via rustc wrapper; verify with `codesign -dv target/release/dirge-microvm-runner`
+- **macOS**: runner not codesigned — rebuild with `cargo build --features sandbox-microvm`; the sandbox automatically codesigns on first use via `ensure_runner_signed()`. To force sign at build time: `codesign --force --sign - --entitlements dirge.entitlements target/release/dirge-microvm-runner`. Verify with `codesign -d --entitlements - target/release/dirge-microvm-runner | grep hypervisor`
 - libkrun library not found — install from [libkrun releases](https://github.com/containers/libkrun/releases) (Linux) or `brew install libkrun libkrunfw` (macOS)
 - Missing CPU virtualization — enable VT-x/AMD-V in BIOS / Apple Silicon has it always on
 

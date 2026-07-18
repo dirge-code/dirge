@@ -58,7 +58,6 @@ const PANIC_RESET_SEQ: &[u8] = b"\x1b[<1u\x1b[0m\x1b[?2026l\x1b[?1000l\x1b[?1002
 // no-op; unsupported terminals ignore unknown CSI.
 const MODE_CLEAR: &[u8] = b"\x1b[<1u\x1b[?2026l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1006l\x1b[?1015l\x1b[?2004l";
 
-
 /// Set once `install_panic_hook` has chained onto the process hook, so
 /// repeated `TerminalGuard::new` calls (tests, embedded use) don't stack
 /// duplicate hooks.
@@ -772,7 +771,7 @@ pub(crate) fn sync_and_drain_via_sentinel(stdout: &mut dyn std::io::Write, budge
 pub(crate) fn suspend_tui_for_subprocess(
     user_tx: &tokio::sync::mpsc::UnboundedSender<crate::event::UserEvent>,
 ) -> Option<Vec<u8>> {
-EVENT_READER_SHUTDOWN.store(true, Ordering::Relaxed);
+    EVENT_READER_SHUTDOWN.store(true, Ordering::Relaxed);
     join_reader(Duration::from_millis(50));
     // If the reader hasn't exited yet, give it one more chance before
     // proceeding. The 1ms-poll reader should exit within ~2ms of the
@@ -893,12 +892,23 @@ mod tests {
     #[test]
     fn reset_seqs_include_kitty_pop_and_sync_off() {
         let panic_s = std::str::from_utf8(PANIC_RESET_SEQ).unwrap();
-        assert!(panic_s.contains("[<1u"), "PANIC_RESET_SEQ must pop kitty keyboard stack");
-        assert!(panic_s.contains("[?2026l"), "PANIC_RESET_SEQ must disable sync output");
+        assert!(
+            panic_s.contains("[<1u"),
+            "PANIC_RESET_SEQ must pop kitty keyboard stack"
+        );
+        assert!(
+            panic_s.contains("[?2026l"),
+            "PANIC_RESET_SEQ must disable sync output"
+        );
 
         let mode_s = std::str::from_utf8(MODE_CLEAR).unwrap();
-        assert!(mode_s.contains("[<1u"), "MODE_CLEAR must pop kitty keyboard stack");
-        assert!(mode_s.contains("[?2026l"), "MODE_CLEAR must disable sync output");
+        assert!(
+            mode_s.contains("[<1u"),
+            "MODE_CLEAR must pop kitty keyboard stack"
+        );
+        assert!(
+            mode_s.contains("[?2026l"),
+            "MODE_CLEAR must disable sync output"
+        );
     }
-
 }

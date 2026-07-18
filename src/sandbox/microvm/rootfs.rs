@@ -266,18 +266,16 @@ async fn install_alpine_packages(dest: &Path, packages: &[&str]) -> anyhow::Resu
     } else {
         anyhow::bail!("unsupported architecture for Alpine package installation");
     };
-    let repo_url =
-        format!("https://dl-cdn.alpinelinux.org/alpine/{alpine_version}/main/{arch}");
+    let repo_url = format!("https://dl-cdn.alpinelinux.org/alpine/{alpine_version}/main/{arch}");
 
     // Step 1: Download and parse APKINDEX.
     let index_url = format!("{repo_url}/APKINDEX.tar.gz");
     eprintln!("[alpine] downloading APKINDEX from {index_url} ...");
-    let index_bytes = reqwest::get(&index_url)
-        .await?
-        .bytes()
-        .await?
-        .to_vec();
-    eprintln!("[alpine] downloaded {} bytes from APKINDEX", index_bytes.len());
+    let index_bytes = reqwest::get(&index_url).await?.bytes().await?.to_vec();
+    eprintln!(
+        "[alpine] downloaded {} bytes from APKINDEX",
+        index_bytes.len()
+    );
 
     // Write APKINDEX to a temp file for tar extraction to avoid a
     // bidirectional pipe deadlock (tar blocks on stdout pipe while
@@ -297,7 +295,10 @@ async fn install_alpine_packages(dest: &Path, packages: &[&str]) -> anyhow::Resu
         anyhow::bail!("failed to extract Alpine APKINDEX: {stderr}");
     }
     let index_text = String::from_utf8_lossy(&index_output.stdout).to_string();
-    eprintln!("[alpine] APKINDEX extracted ({} bytes uncompressed)", index_text.len());
+    eprintln!(
+        "[alpine] APKINDEX extracted ({} bytes uncompressed)",
+        index_text.len()
+    );
     let entries = parse_apkindex(&index_text);
 
     // Step 2: BFS dependency resolution (collect package names + versions).
@@ -398,7 +399,9 @@ fn parse_apkindex(data: &str) -> Vec<ApkEntry> {
                                 token
                             };
                             // Strip version operators (pkgname=version, pkgname>=version, etc.)
-                            let clean = if let Some(pos) = token.find(|c: char| c == '=' || c == '>' || c == '<') {
+                            let clean = if let Some(pos) =
+                                token.find(|c: char| c == '=' || c == '>' || c == '<')
+                            {
                                 token[..pos].trim().to_string()
                             } else {
                                 token.to_string()
@@ -450,9 +453,7 @@ fn extract_apk_payload(data: &[u8], dest: &Path) -> anyhow::Result<()> {
         .filter(|(_, w)| *w == magic)
         .last()
         .map(|(i, _)| i)
-        .ok_or_else(|| {
-            anyhow::anyhow!("no gzip members found in .apk file")
-        })?;
+        .ok_or_else(|| anyhow::anyhow!("no gzip members found in .apk file"))?;
 
     // Write the payload to a temp file and use `tar -xzf` on it.
     // We avoid stdin piping because tar pre-checks the file before extracting
@@ -461,7 +462,12 @@ fn extract_apk_payload(data: &[u8], dest: &Path) -> anyhow::Result<()> {
     std::fs::write(&tmp, &data[payload_offset..])?;
 
     let output = std::process::Command::new("tar")
-        .args(["-xzf", &tmp.to_string_lossy(), "-C", &dest.to_string_lossy()])
+        .args([
+            "-xzf",
+            &tmp.to_string_lossy(),
+            "-C",
+            &dest.to_string_lossy(),
+        ])
         .output()?;
 
     let _ = std::fs::remove_file(&tmp);
@@ -494,11 +500,7 @@ fn extract_apk_payload(data: &[u8], dest: &Path) -> anyhow::Result<()> {
 ///    files directly from the Alpine mirror and extracting their payload
 ///    into the rootfs.
 /// 3. Creates `/var/empty` (required by sshd privilege separation).
-async fn prepare_local_via_oci(
-    variant: &str,
-    dest: &Path,
-    cache_dir: &Path,
-) -> anyhow::Result<()> {
+async fn prepare_local_via_oci(variant: &str, dest: &Path, cache_dir: &Path) -> anyhow::Result<()> {
     let base_image = match variant {
         "alpine" => "docker.io/library/alpine:3.21.3",
         "debian" => {
@@ -607,14 +609,12 @@ pub fn build_guest_image(name: &str) -> anyhow::Result<()> {
     }
 
     Ok(())
-
 }
 #[cfg(target_os = "macos")]
 pub fn build_guest_image(_name: &str) -> anyhow::Result<()> {
     eprintln!("  macOS: skipping buildah build (OCI pull will be used at runtime)");
     Ok(())
 }
-
 
 /// Canonicalize a user-supplied image reference for the microVM sandbox.
 ///
@@ -736,7 +736,7 @@ pub(crate) fn cp_r(src: &Path, dst: &Path) -> anyhow::Result<()> {
                     // the destination gets default permissions, breaking
                     // executables like /bin/sh inside the VM rootfs.
                     std::fs::set_permissions(&dst_path, metadata.permissions())?;
-    eprintln!("[alpine] /var/empty ready");
+                    eprintln!("[alpine] /var/empty ready");
                 }
                 Err(e) => {
                     let raw = e.raw_os_error().unwrap_or(0);

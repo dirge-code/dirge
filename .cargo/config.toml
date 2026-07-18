@@ -43,12 +43,3 @@ incremental = true
 # off so the final binary keeps its inline debuginfo for crash
 # reports. mold still kicks in on Linux release builds via the
 # target-specific rustflags above.
-# macOS microVM runner codesigning.
-#
-# Uses a rustc wrapper that runs codesign on the runner binary after the
-# final link step (when the -o output ends with dirge-microvm-runner).
-# This makes codesigning part of the build pipeline rather than a manual
-# post-build step or an on-first-use side effect in ensure_runner_signed.
-# On non-macOS or for non-runner artifacts the wrapper is a no-op.
-[build]
-rustc-wrapper = "scripts/build/rustc-wrapper.sh"

@@ -604,6 +604,9 @@ mod tests {
         });
         std::thread::sleep(std::time::Duration::from_millis(50));
         let result = wait_for_ssh("127.0.0.1", port, Duration::from_millis(1500));
-        assert!(result.is_err(), "expected timeout for non-SSH, got: {result:?}");
+        assert!(
+            result.is_err(),
+            "expected timeout for non-SSH, got: {result:?}"
+        );
     }
 }

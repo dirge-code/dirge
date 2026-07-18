@@ -181,7 +181,7 @@ impl PtyRelay {
                 unsafe { libc::tcsetattr(secondary_raw_fd, libc::TCSANOW, &termios) };
             }
         }
-// SSH reads termios from the process's controlling terminal
+        // SSH reads termios from the process's controlling terminal
         // (/dev/tty) — NOT from the PTY secondary — for its `-t` PTY
         // allocation request (RFC 4254 §8 → "pty-req" carries the
         // local terminal's termios to the server).  Crossterm's raw
@@ -253,7 +253,7 @@ impl PtyRelay {
     /// Uses `poll(2)` with retry buffers. When a non-blocking `write`
     /// returns `WouldBlock` (other side isn't draining fast enough),
     /// unsent bytes are queued and retried on the next poll iteration.
-pub(crate) fn relay(self) -> io::Result<std::process::ExitStatus> {
+    pub(crate) fn relay(self) -> io::Result<std::process::ExitStatus> {
         // ── relay priority: below input reader (-20), above KVM (19) ──
         unsafe {
             libc::setpriority(libc::PRIO_PROCESS, 0, -19);
@@ -270,8 +270,8 @@ pub(crate) fn relay(self) -> io::Result<std::process::ExitStatus> {
         if stdin_fd < 0 {
             return Err(io::Error::last_os_error());
         }
-let tty = unsafe { std::fs::File::from_raw_fd(stdin_fd) };
-// At this point /dev/tty's termios still has ECHO=1 from the
+        let tty = unsafe { std::fs::File::from_raw_fd(stdin_fd) };
+        // At this point /dev/tty's termios still has ECHO=1 from the
         // PtyRelay::spawn override (set so SSH's PTY request carries
         // ECHO=1 to the remote side). Restore ECHO=0 immediately so
         // the terminal driver doesn't locally echo typed characters

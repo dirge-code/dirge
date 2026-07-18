@@ -134,7 +134,9 @@ fn main() {
                 // Add runtime search path so the runner can find libkrun*.dylib/.so.
                 println!("cargo:rustc-link-arg-bin=dirge-microvm-runner=-Wl,-rpath,{krun_dir}");
                 if krunfw_dir != krun_dir {
-                    println!("cargo:rustc-link-arg-bin=dirge-microvm-runner=-Wl,-rpath,{krunfw_dir}");
+                    println!(
+                        "cargo:rustc-link-arg-bin=dirge-microvm-runner=-Wl,-rpath,{krunfw_dir}"
+                    );
                 }
             }
             _ => {
@@ -147,12 +149,10 @@ fn main() {
         }
     }
 
-    // codesign is handled by scripts/build/rustc-wrapper.sh (configured via
-    // build.rustc-wrapper in .cargo/config.toml). The wrapper runs after the
-    // final link step for dirge-microvm-runner, so no build.rs action needed.
+    // codesign is handled at runtime by ensure_runner_signed() in the sandbox
+    // microvm module — no build-time wrapper needed.
     #[cfg(all(feature = "sandbox-microvm", target_os = "macos"))]
     {
-        println!("cargo:rerun-if-changed=scripts/build/rustc-wrapper.sh");
         println!("cargo:rerun-if-changed=dirge.entitlements");
     }
 }

@@ -289,10 +289,7 @@ mod tests {
         let mut sandbox = MicrovmSandbox::new(cfg);
 
         eprintln!("[full_microvm_lifecycle] starting VM ...");
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(120),
-            sandbox.start(),
-        ).await {
+        match tokio::time::timeout(std::time::Duration::from_secs(120), sandbox.start()).await {
             Ok(Ok(())) => eprintln!("[full_microvm_lifecycle] VM started OK"),
             Ok(Err(e)) => {
                 let _ = std::fs::remove_dir_all(&cache);
@@ -343,9 +340,7 @@ mod tests {
                 "fd limit should be raised above 1024 by krun_set_rlimits, got {nofile}"
             );
         } else {
-            eprintln!(
-                "[ulimit] macOS: guest nofile={nofile} (krun_set_rlimits not supported)"
-            );
+            eprintln!("[ulimit] macOS: guest nofile={nofile} (krun_set_rlimits not supported)");
         }
 
         sandbox.stop().ok();
@@ -377,18 +372,12 @@ mod tests {
             ..MicrovmConfig::default()
         };
 
-        eprintln!(
-            "[alpine] image={} cache={:?}",
-            cfg.image, cfg.cache_dir
-        );
+        eprintln!("[alpine] image={} cache={:?}", cfg.image, cfg.cache_dir);
 
         let mut sandbox = MicrovmSandbox::new(cfg);
 
         eprintln!("[alpine] starting VM ...");
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(120),
-            sandbox.start(),
-        ).await {
+        match tokio::time::timeout(std::time::Duration::from_secs(120), sandbox.start()).await {
             Ok(Ok(())) => eprintln!("[alpine] VM started OK"),
             Ok(Err(e)) => {
                 let _ = std::fs::remove_dir_all(&cache);
@@ -404,9 +393,7 @@ mod tests {
         let result = sandbox.exec("uname -a && id", &[], "/");
         match result {
             Ok((stdout, stderr, code)) => {
-                eprintln!(
-                    "[alpine] exec OK: code={code} stdout={stdout:?} stderr={stderr:?}"
-                );
+                eprintln!("[alpine] exec OK: code={code} stdout={stdout:?} stderr={stderr:?}");
                 assert_eq!(code, 0, "expected exit 0, got {code} — stderr: {stderr}");
                 assert!(
                     stdout.contains("Linux"),
@@ -443,9 +430,7 @@ mod tests {
                 "fd limit should be raised above 1024 by krun_set_rlimits, got {nofile}"
             );
         } else {
-            eprintln!(
-                "[ulimit] macOS: guest nofile={nofile} (krun_set_rlimits not supported)"
-            );
+            eprintln!("[ulimit] macOS: guest nofile={nofile} (krun_set_rlimits not supported)");
         }
 
         sandbox.stop().ok();
@@ -689,9 +674,7 @@ mod tests {
             return;
         }
         if cfg!(target_os = "macos") {
-            eprintln!(
-                "skipping: virtio-fs workspace sharing unavailable on macOS libkrun 1.19.4"
-            );
+            eprintln!("skipping: virtio-fs workspace sharing unavailable on macOS libkrun 1.19.4");
             return;
         }
         let _guard = serial_vm_test();
@@ -1981,63 +1964,79 @@ mod tests {
         );
     }
 
-#[cfg(target_os = "macos")]
-#[test]
-fn dyld_fallback_library_path_valid_on_macos() {
-    // Regression guard: the DYLD_FALLBACK_LIBRARY_PATH the spawn code
-    // builds must contain a directory where libkrunfw.5.dylib lives.
-    // Uses the same logic as mod.rs: MicrovmSandbox::start().
-    use std::path::Path;
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn dyld_fallback_library_path_valid_on_macos() {
+        // Regression guard: the DYLD_FALLBACK_LIBRARY_PATH the spawn code
+        // builds must contain a directory where libkrunfw.5.dylib lives.
+        // Uses the same logic as mod.rs: MicrovmSandbox::start().
+        use std::path::Path;
 
-    // Resolve brew prefix (same as the spawn code).
-    let brew_prefixes: Vec<String> = [
-        std::process::Command::new("brew")
-            .args(["--prefix", "libkrunfw"])
-            .stderr(std::process::Stdio::null())
-            .output()
-            .ok()
-            .and_then(|o| {
-                if o.status.success() || !o.stdout.is_empty() {
-                    Some(std::str::from_utf8(&o.stdout).unwrap_or("").trim().to_string())
-                } else {
-                    None
-                }
-            }),
-        std::process::Command::new("brew")
-            .args(["--prefix"])
-            .output()
-            .ok()
-            .and_then(|o| {
-                let s = std::str::from_utf8(&o.stdout).unwrap_or("").trim().to_string();
-                if s.is_empty() { None } else { Some(s) }
-            }),
-    ]
-    .into_iter()
-    .flatten()
-    .filter(|p| !p.is_empty())
-    .collect::<Vec<_>>();
+        // Resolve brew prefix (same as the spawn code).
+        let brew_prefixes: Vec<String> = [
+            std::process::Command::new("brew")
+                .args(["--prefix", "libkrunfw"])
+                .stderr(std::process::Stdio::null())
+                .output()
+                .ok()
+                .and_then(|o| {
+                    if o.status.success() || !o.stdout.is_empty() {
+                        Some(
+                            std::str::from_utf8(&o.stdout)
+                                .unwrap_or("")
+                                .trim()
+                                .to_string(),
+                        )
+                    } else {
+                        None
+                    }
+                }),
+            std::process::Command::new("brew")
+                .args(["--prefix"])
+                .output()
+                .ok()
+                .and_then(|o| {
+                    let s = std::str::from_utf8(&o.stdout)
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    if s.is_empty() { None } else { Some(s) }
+                }),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|p| !p.is_empty())
+        .collect::<Vec<_>>();
 
-    eprintln!("brew prefixes resolved: {:?}", brew_prefixes);
+        eprintln!("brew prefixes resolved: {:?}", brew_prefixes);
 
-    // At least one brew prefix should be /opt/homebrew or /usr/local.
-    assert!(
-        !brew_prefixes.is_empty(),
-        "brew --prefix returned no prefixes — is Homebrew installed?"
-    );
+        // At least one brew prefix should be /opt/homebrew or /usr/local.
+        assert!(
+            !brew_prefixes.is_empty(),
+            "brew --prefix returned no prefixes — is Homebrew installed?"
+        );
 
-    // Each prefix should have a /lib subdirectory with libkrunfw.5.dylib.
-    let krunfw_name = "libkrunfw.5.dylib";
-    let found = brew_prefixes.iter().any(|p| {
-        let lib_path = Path::new(p).join("lib").join(krunfw_name);
-        let exists = lib_path.exists();
-        eprintln!("  {} -> {}", lib_path.display(), if exists { "OK" } else { "MISSING" });
-        exists
-    });
+        // Each prefix should have a /lib subdirectory with libkrunfw.5.dylib.
+        let krunfw_name = "libkrunfw.5.dylib";
+        let found = brew_prefixes.iter().any(|p| {
+            let lib_path = Path::new(p).join("lib").join(krunfw_name);
+            let exists = lib_path.exists();
+            eprintln!(
+                "  {} -> {}",
+                lib_path.display(),
+                if exists { "OK" } else { "MISSING" }
+            );
+            exists
+        });
 
-    assert!(
-        found,
-        "libkrunfw.5.dylib not found under any brew prefix -- {} --          install it: brew tap libkrun/krun && brew trust libkrun/krun &&          brew install libkrun libkrunfw",
-        brew_prefixes.iter().map(|p| format!("{p}/lib/{krunfw_name}")).collect::<Vec<_>>().join(", "),
-    );
-}
+        assert!(
+            found,
+            "libkrunfw.5.dylib not found under any brew prefix -- {} --          install it: brew tap libkrun/krun && brew trust libkrun/krun &&          brew install libkrun libkrunfw",
+            brew_prefixes
+                .iter()
+                .map(|p| format!("{p}/lib/{krunfw_name}"))
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+    }
 }

@@ -355,7 +355,11 @@ async fn extract_or_cache_layer(
         "[oci] extract layer {} ({} bytes, {})",
         digest,
         blob_bytes.len(),
-        if cache_path.exists() { "cached" } else { "downloaded" }
+        if cache_path.exists() {
+            "cached"
+        } else {
+            "downloaded"
+        }
     );
 
     let dest = dest.to_path_buf();
@@ -373,12 +377,16 @@ async fn extract_or_cache_layer(
         let tmp = std::env::temp_dir().join(format!("dirge-oci-blob-{}", uuid::Uuid::new_v4()));
         std::fs::write(&tmp, &blob_bytes)
             .map_err(|e| anyhow::anyhow!("writing blob temp file: {e}"))?;
-        eprintln!("[oci] wrote {} bytes to temp file {:?}", blob_bytes.len(), tmp);
+        eprintln!(
+            "[oci] wrote {} bytes to temp file {:?}",
+            blob_bytes.len(),
+            tmp
+        );
 
         let tmp_str = tmp.to_string_lossy();
-        let dest_str = dest.to_str().ok_or_else(|| {
-            anyhow::anyhow!("non-UTF-8 path: {}", dest.display())
-        })?;
+        let dest_str = dest
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("non-UTF-8 path: {}", dest.display()))?;
         let mut tar_args: Vec<&str> = vec![
             "-xf",
             &tmp_str,

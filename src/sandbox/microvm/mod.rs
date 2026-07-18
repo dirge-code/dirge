@@ -149,8 +149,10 @@ impl MicrovmSandbox {
             if !passwd.contains("sandbox:") {
                 std::fs::write(
                     &passwd_path,
-                    format!("{passwd}sandbox:x:1000:1000::/home/sandbox:/bin/sh
-"),
+                    format!(
+                        "{passwd}sandbox:x:1000:1000::/home/sandbox:/bin/sh
+"
+                    ),
                 )?;
             }
             let group_path = rootfs_path.join("etc").join("group");
@@ -229,7 +231,7 @@ impl MicrovmSandbox {
         };
 
         let binary = runner::find_runner_binary()?;
-#[cfg(target_os = "macos")]
+        #[cfg(target_os = "macos")]
         ensure_runner_signed(&binary)?;
         #[allow(unused_mut)]
         let mut config = serde_json::json!({
@@ -254,7 +256,7 @@ impl MicrovmSandbox {
                 pubkey_escaped,
             );
             config["exec_cmd"] = serde_json::json!(["/bin/sh", "-c", cmd]);
-}
+        }
         let mut cmd = std::process::Command::new(&binary);
         cmd.arg(serde_json::to_string(&config)?);
         // On macOS, libkrun.dylib dlopens libkrunfw.5.dylib by bare
@@ -280,7 +282,12 @@ impl MicrovmSandbox {
                     .ok()
                     .and_then(|o| {
                         if o.status.success() || !o.stdout.is_empty() {
-                            Some(std::str::from_utf8(&o.stdout).unwrap_or("").trim().to_string())
+                            Some(
+                                std::str::from_utf8(&o.stdout)
+                                    .unwrap_or("")
+                                    .trim()
+                                    .to_string(),
+                            )
                         } else {
                             None
                         }
@@ -290,7 +297,10 @@ impl MicrovmSandbox {
                     .output()
                     .ok()
                     .and_then(|o| {
-                        let s = std::str::from_utf8(&o.stdout).unwrap_or("").trim().to_string();
+                        let s = std::str::from_utf8(&o.stdout)
+                            .unwrap_or("")
+                            .trim()
+                            .to_string();
                         if s.is_empty() { None } else { Some(s) }
                     }),
             ]
@@ -325,11 +335,9 @@ impl MicrovmSandbox {
             // Preserve existing DYLD_FALLBACK_LIBRARY_PATH if set;
             // otherwise restore reasonable defaults so we don't
             // break other fallback lookups.
-            let existing = std::env::var(OsStr::new(
-                "DYLD_FALLBACK_LIBRARY_PATH",
-            ))
-            .ok()
-            .filter(|v| !v.is_empty());
+            let existing = std::env::var(OsStr::new("DYLD_FALLBACK_LIBRARY_PATH"))
+                .ok()
+                .filter(|v| !v.is_empty());
             let dyld_full = if let Some(ref existing) = existing {
                 format!("{dyld_val}:{existing}")
             } else {
@@ -390,7 +398,7 @@ impl MicrovmSandbox {
             wait_for_ssh("127.0.0.1", wait_port, Duration::from_secs(30))
         })
         .await
-{
+        {
             Ok(Ok(())) => {
                 // wait_for_ssh succeeded — but double-check the runner is
                 // still alive before declaring the VM ready. A VM that
@@ -406,7 +414,11 @@ impl MicrovmSandbox {
                         }
                         anyhow::bail!(
                             "VM exited immediately after boot: {status} — stderr: {}",
-                            if stderr.is_empty() { "(empty)" } else { &stderr }
+                            if stderr.is_empty() {
+                                "(empty)"
+                            } else {
+                                &stderr
+                            }
                         );
                     }
                 }

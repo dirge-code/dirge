@@ -137,7 +137,8 @@ fn main() {
         {
             let ws_cstr = CString::new(workspace_path).unwrap();
             let tag_cstr = CString::new("workspace").unwrap();
-            let rc = libkrun_sys::krun_add_virtiofs(ctx as u32, tag_cstr.as_ptr(), ws_cstr.as_ptr());
+            let rc =
+                libkrun_sys::krun_add_virtiofs(ctx as u32, tag_cstr.as_ptr(), ws_cstr.as_ptr());
             assert!(rc == 0, "krun_add_virtiofs failed: {rc}");
         }
         // Workspace: on Linux a virtio-fs device; on macOS libkrun@1.19.4 hits
