@@ -1,4 +1,5 @@
 use std::io::Write;
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
@@ -47,7 +48,16 @@ pub fn set_log_path(path: Option<std::path::PathBuf>) {
 // `\x1b[<1u` pops any enhanced-keyboard (kitty) flags we may have pushed; a
 // pop with an empty stack is a no-op and unsupported terminals ignore the
 // unknown CSI, so it's safe to emit unconditionally here on the panic path.
-const PANIC_RESET_SEQ: &[u8] = b"\x1b[<1u\x1b[0m\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1006l\x1b[?1015l\x1b[?2004l\x1b]0;\x1b\\\x1b[?1049l\x1b[?25h";
+const PANIC_RESET_SEQ: &[u8] = b"\x1b[<1u\x1b[0m\x1b[?2026l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1006l\x1b[?1015l\x1b[?2004l\x1b]0;\x1b\\\x1b[?1049l\x1b[?25h";
+
+/// Private-mode clear sequence shared across all teardown paths and the
+/// entry defensive burst.  Emitted unconditionally on startup (to normalize
+/// inherited state) and on every exit path (Drop, panic, signal-reaper,
+/// suspend-for-subprocess).
+// ponytail: emit unconditionally — pop/decrst on an empty/off mode is a
+// no-op; unsupported terminals ignore unknown CSI.
+const MODE_CLEAR: &[u8] = b"\x1b[<1u\x1b[?2026l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1006l\x1b[?1015l\x1b[?2004l";
+
 
 /// Set once `install_panic_hook` has chained onto the process hook, so
 /// repeated `TerminalGuard::new` calls (tests, embedded use) don't stack
@@ -249,6 +259,7 @@ impl TerminalGuard {
             Some(f) => Box::new(f),
             None => Box::new(std::io::stdout()),
         };
+        tty_writer.write_all(MODE_CLEAR)?;
         tty_writer.execute(EnterAlternateScreen)?;
         tty_writer.execute(Clear(ClearType::All))?;
         // Bracketed paste lets the terminal deliver a multi-line paste as a
@@ -491,6 +502,7 @@ impl Drop for TerminalGuard {
         let _ = stdout.write_all(
             b"\x1b[0m\
               \x1b[?25h\
+              \x1b[<1u\x1b[?2026l\
               \x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1006l\x1b[?1015l\
               \x1b[?2004l\
               \x1b]0;\x1b\\\
@@ -760,8 +772,17 @@ pub(crate) fn sync_and_drain_via_sentinel(stdout: &mut dyn std::io::Write, budge
 pub(crate) fn suspend_tui_for_subprocess(
     user_tx: &tokio::sync::mpsc::UnboundedSender<crate::event::UserEvent>,
 ) -> Option<Vec<u8>> {
-    EVENT_READER_SHUTDOWN.store(true, Ordering::Relaxed);
+EVENT_READER_SHUTDOWN.store(true, Ordering::Relaxed);
     join_reader(Duration::from_millis(50));
+    // If the reader hasn't exited yet, give it one more chance before
+    // proceeding. The 1ms-poll reader should exit within ~2ms of the
+    // shutdown flag, but crossterm internal buffers can delay it.
+    if !EVENT_READER_EXITED.load(Ordering::Relaxed) {
+        join_reader(Duration::from_millis(100));
+        if !EVENT_READER_EXITED.load(Ordering::Relaxed) {
+            eprintln!("[sandbox] input reader still running after 150ms — relay may race");
+        }
+    }
 
     let mut tty = match open_tty_for_write() {
         Some(t) => t,
@@ -776,7 +797,7 @@ pub(crate) fn suspend_tui_for_subprocess(
     // Reset terminal: default colors, disable mouse + bracketed paste, clear
     // title, leave the alternate screen.
     let _ = tty.write_all(
-        b"\x1b[0m\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1006l\x1b[?1015l\x1b[?2004l\x1b]0;\x1b\\\x1b[?1049l",
+        b"\x1b[0m\x1b[<1u\x1b[?2026l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1006l\x1b[?1015l\x1b[?2004l\x1b]0;\x1b\\\x1b[?1049l",
     );
     let _ = tty.flush();
 
@@ -869,4 +890,15 @@ mod tests {
         // stored — never touch the terminal in that case.
         assert!(!thread_owns_terminal(None, std::thread::current().id()));
     }
+    #[test]
+    fn reset_seqs_include_kitty_pop_and_sync_off() {
+        let panic_s = std::str::from_utf8(PANIC_RESET_SEQ).unwrap();
+        assert!(panic_s.contains("[<1u"), "PANIC_RESET_SEQ must pop kitty keyboard stack");
+        assert!(panic_s.contains("[?2026l"), "PANIC_RESET_SEQ must disable sync output");
+
+        let mode_s = std::str::from_utf8(MODE_CLEAR).unwrap();
+        assert!(mode_s.contains("[<1u"), "MODE_CLEAR must pop kitty keyboard stack");
+        assert!(mode_s.contains("[?2026l"), "MODE_CLEAR must disable sync output");
+    }
+
 }

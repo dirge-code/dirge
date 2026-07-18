@@ -68,7 +68,9 @@ pub(crate) async fn cmd_sandbox_attach(ctx: &mut SlashCtx<'_>) -> anyhow::Result
                 &format!(
                     "SSH pre-flight failed (exit {}): {}\n\
                      key: {}\n\
-                     Try manually: ssh -i {} -p {} sandbox@127.0.0.1",
+                     Try manually: ssh -i {} -p {} sandbox@127.0.0.1
+\
+                     No keystrokes reached the VM? If dirge is running under an agent harness, that harness may own the terminal. Run the ssh command above in a real terminal to interact.",
                     out.status.code().unwrap_or(-1),
                     stderr.trim_end(),
                     key_path.display(),

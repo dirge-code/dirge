@@ -5,7 +5,6 @@
 //! No buildah/podman/skopeo dependency — only reqwest (already in tree) and
 //! system tar/gunzip.
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -352,6 +351,13 @@ async fn extract_or_cache_layer(
         bytes
     };
 
+    eprintln!(
+        "[oci] extract layer {} ({} bytes, {})",
+        digest,
+        blob_bytes.len(),
+        if cache_path.exists() { "cached" } else { "downloaded" }
+    );
+
     let dest = dest.to_path_buf();
     let digest_owned = digest.to_string();
     tokio::task::spawn_blocking(move || {
@@ -360,34 +366,49 @@ async fn extract_or_cache_layer(
         // the extraction directory via path traversal.
         validate_tar_entries(&blob_bytes)?;
 
-        let mut child = std::process::Command::new("tar")
-            .args([
-                "-x",
-                "--no-same-owner",
-                "--no-same-permissions",
-                "--no-absolute-filenames",
-                "-C",
-            ])
-            .arg(&dest)
-            .stdin(Stdio::piped())
+        // Write the blob to a temp file and use tar on the file rather
+        // than piping via stdin. This avoids Broken pipe errors that can
+        // occur when tar exits early (e.g., on decompression errors)
+        // while stdout is still being written.
+        let tmp = std::env::temp_dir().join(format!("dirge-oci-blob-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&tmp, &blob_bytes)
+            .map_err(|e| anyhow::anyhow!("writing blob temp file: {e}"))?;
+        eprintln!("[oci] wrote {} bytes to temp file {:?}", blob_bytes.len(), tmp);
+
+        let tmp_str = tmp.to_string_lossy();
+        let dest_str = dest.to_str().ok_or_else(|| {
+            anyhow::anyhow!("non-UTF-8 path: {}", dest.display())
+        })?;
+        let mut tar_args: Vec<&str> = vec![
+            "-xf",
+            &tmp_str,
+            "--no-same-owner",
+            "--no-same-permissions",
+            "-C",
+        ];
+        // GNU tar preserves absolute paths by default; BSD tar (macOS)
+        // already warns/strips them. Only add the flag on Linux.
+        if cfg!(target_os = "linux") {
+            tar_args.push("--no-absolute-filenames");
+        }
+        tar_args.push(dest_str);
+
+        let output = std::process::Command::new("tar")
+            .args(&tar_args)
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
-            .spawn()
+            .output()
             .map_err(|e| anyhow::anyhow!("spawning tar: {e}"))?;
 
-        let mut stdin = child.stdin.take().unwrap();
-        stdin
-            .write_all(&blob_bytes)
-            .map_err(|e| anyhow::anyhow!("writing to tar stdin: {e}"))?;
-        drop(stdin);
-
-        let output = child
-            .wait_with_output()
-            .map_err(|e| anyhow::anyhow!("waiting for tar: {e}"))?;
+        let _ = std::fs::remove_file(&tmp);
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("tar extraction failed for {digest_owned}: {stderr}");
+            anyhow::bail!(
+                "tar extraction failed for {digest_owned}: {stderr} \
+                 (command: tar {:?})",
+                tar_args
+            );
         }
 
         // Process OCI whiteout files (.wh.<name> and .wh..wh..opq)
@@ -749,10 +770,16 @@ mod tests {
         let manifests = serde_json::json!([
             {"platform": {"os": "windows", "architecture": "amd64"}, "digest": "sha256:win"},
             {"platform": {"os": "linux", "architecture": "amd64"}, "digest": "sha256:linux"},
+            {"platform": {"os": "linux", "architecture": "arm64"}, "digest": "sha256:arm"},
         ]);
         let arr = manifests.as_array().unwrap();
         let digest = resolve_platform_manifest(arr).unwrap();
-        assert_eq!(digest, "sha256:linux");
+        let expected = if cfg!(target_arch = "aarch64") {
+            "sha256:arm"
+        } else {
+            "sha256:linux"
+        };
+        assert_eq!(digest, expected);
     }
 
     #[test]

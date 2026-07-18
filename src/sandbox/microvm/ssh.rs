@@ -1,5 +1,6 @@
 //! Ephemeral SSH key generation and command execution for the microVM sandbox.
 
+use std::io::Read;
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -192,24 +193,42 @@ impl Drop for EphemeralKeys {
     }
 }
 
-/// Wait for the SSH server to become reachable on the given port.
+/// Wait for the SSH server to become reachable and actually serving on the given
+/// port. Connects and reads the SSH protocol banner (`SSH-2.0-...`), which proves
+/// sshd (or an SSH-speaking server) is listening — not just that libkrun's
+/// host-side port forwarder accepted TCP.
 pub fn wait_for_ssh(host: &str, port: u16, timeout: Duration) -> anyhow::Result<()> {
     let start = std::time::Instant::now();
+    let addr: std::net::SocketAddr = format!("{host}:{port}")
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid address: {e}"))?;
     loop {
-        match TcpStream::connect_timeout(
-            &format!("{host}:{port}")
-                .parse()
-                .map_err(|e| anyhow::anyhow!("invalid address: {e}"))?,
-            Duration::from_millis(500),
-        ) {
-            Ok(_) => return Ok(()),
+        match TcpStream::connect_timeout(&addr, Duration::from_millis(500)) {
+            Ok(mut stream) => {
+                let _ = stream.set_read_timeout(Some(Duration::from_millis(1000)));
+                let mut buf = [0u8; 64];
+                match stream.read(&mut buf) {
+                    Ok(n) if n > 0 => {
+                        let banner = String::from_utf8_lossy(&buf[..n]);
+                        if banner.starts_with("SSH-") {
+                            return Ok(());
+                        }
+                    }
+                    _ => {}
+                }
+            }
             Err(_) => {
                 if start.elapsed() > timeout {
                     anyhow::bail!("timed out waiting for SSH on {host}:{port}");
                 }
                 std::thread::sleep(Duration::from_millis(100));
+                continue;
             }
         }
+        if start.elapsed() > timeout {
+            anyhow::bail!("timed out waiting for SSH on {host}:{port}");
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -254,17 +273,67 @@ pub fn ssh_exec(
     command: &str,
     host_key_bytes: Option<&[u8]>,
 ) -> anyhow::Result<(String, String, i32)> {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| anyhow::anyhow!("failed to build SSH runtime: {e}"))?;
-    rt.block_on(ssh_exec_async(
-        host,
-        port,
-        private_key_path,
-        command,
-        host_key_bytes,
-    ))
+    // Inside tokio runtime (single-thread)? Create a REAL OS thread with its
+    // own tokio runtime — avoids "Cannot start a runtime from within a runtime"
+    // while keeping ssh_exec synchronous for all callers.
+    let result = if let Ok(_handle) = tokio::runtime::Handle::try_current() {
+        let host = host.to_string();
+        let port = port;
+        let private_key_path = private_key_path.to_path_buf();
+        let command = command.to_string();
+        let host_key_bytes = host_key_bytes.map(|b| b.to_vec());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = (|| -> anyhow::Result<_> {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| anyhow::anyhow!("failed to build SSH runtime: {e}"))?;
+                // Retry up to 3 times on transient SSH disconnects (sshd
+                // may need a moment to clean up from a previous connection).
+                let mut last_err = None;
+                for attempt in 0..3 {
+                    if attempt > 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    match rt.block_on(ssh_exec_async(
+                        &host,
+                        port,
+                        &private_key_path,
+                        &command,
+                        host_key_bytes.as_deref(),
+                    )) {
+                        Ok(r) => return Ok(r),
+                        Err(e) => {
+                            let msg = e.to_string();
+                            if msg.contains("Disconnected") {
+                                last_err = Some(e);
+                                continue;
+                            }
+                            return Err(e);
+                        }
+                    }
+                }
+                Err(last_err.unwrap_or_else(|| anyhow::anyhow!("SSH exec failed after 3 retries")))
+            })();
+            let _ = tx.send(result);
+        });
+        rx.recv()
+            .map_err(|e| anyhow::anyhow!("SSH thread channel closed: {e}"))?
+    } else {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| anyhow::anyhow!("failed to build SSH runtime: {e}"))?;
+        rt.block_on(ssh_exec_async(
+            host,
+            port,
+            private_key_path,
+            command,
+            host_key_bytes,
+        ))
+    };
+    result
 }
 
 async fn ssh_exec_async(
@@ -311,7 +380,7 @@ async fn ssh_exec_async(
             )
         })?;
     if !authed.success() {
-        anyhow::bail!("SSH authentication rejected by the server (publickey)");
+        anyhow::bail!("SSH authentication rejected by the server (publickey): {authed:?}");
     }
 
     let mut channel = session
@@ -350,6 +419,7 @@ async fn ssh_exec_async(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
     fn ssh_exec_connection_refused() {
@@ -478,5 +548,62 @@ mod tests {
             hk.public_key.starts_with("ssh-ed25519 "),
             "generated host key should be ed25519"
         );
+    }
+
+    #[test]
+    fn wait_for_ssh_banner_success() {
+        // Listener that sends an SSH banner immediately on accept.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = stream.write_all(b"SSH-2.0-OpenSSH_9.8\r\n");
+            }
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let result = wait_for_ssh("127.0.0.1", port, Duration::from_secs(5));
+        assert!(
+            result.is_ok(),
+            "expected Ok for SSH banner, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn wait_for_ssh_close_after_accept_retries() {
+        // Listener that accepts then immediately closes — TCP connect
+        // succeeds but no banner is sent. wait_for_ssh should keep retrying
+        // and eventually time out.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                drop(stream);
+            }
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let start = std::time::Instant::now();
+        let result = wait_for_ssh("127.0.0.1", port, Duration::from_millis(1500));
+        let elapsed = start.elapsed();
+        assert!(result.is_err(), "expected timeout, got: {result:?}");
+        assert!(
+            elapsed >= Duration::from_millis(1400),
+            "expected ~1.5s timeout, got {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn wait_for_ssh_garbage_banner_retries() {
+        // Listener that sends non-SSH data on accept — wait_for_ssh
+        // should reject it and keep retrying.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\n");
+            }
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let result = wait_for_ssh("127.0.0.1", port, Duration::from_millis(1500));
+        assert!(result.is_err(), "expected timeout for non-SSH, got: {result:?}");
     }
 }

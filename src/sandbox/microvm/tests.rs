@@ -1,6 +1,8 @@
 //! Integration tests for the microVM sandbox module.
 //!
-//! These tests require `/dev/kvm` access and `libkrun.so`/`libkrunfw.so`.
+//! These tests require hardware virtualization support:
+//! - Linux: `/dev/kvm` access and `libkrun.so`/`libkrunfw.so`
+//! - macOS: Hypervisor.framework support and `libkrun.dylib`/`libkrunfw.dylib`
 //! They are gated behind the `sandbox-microvm` feature and skip gracefully
 //! when prerequisites are missing.
 
@@ -21,8 +23,21 @@ mod tests {
 
     /// Check whether we can actually boot a VM.
     fn vm_available() -> bool {
-        std::path::Path::new("/dev/kvm").exists()
-            && crate::sandbox::microvm::runner::find_runner_binary().is_ok()
+        let virtualization_ok = if cfg!(target_os = "macos") {
+            // Check Hypervisor.framework availability via sysctl.
+            std::process::Command::new("sysctl")
+                .args(["-n", "kern.hv_support"])
+                .output()
+                .ok()
+                .and_then(|o| {
+                    let s = String::from_utf8_lossy(&o.stdout);
+                    s.trim().parse::<u8>().ok()
+                })
+                == Some(1)
+        } else {
+            std::path::Path::new("/dev/kvm").exists()
+        };
+        virtualization_ok && crate::sandbox::microvm::runner::find_runner_binary().is_ok()
     }
 
     #[test]
@@ -30,7 +45,19 @@ mod tests {
         let cfg = MicrovmConfig::default();
         assert_eq!(cfg.cpus, 1);
         assert_eq!(cfg.memory_mib, 512);
-        assert!(cfg.image.contains("debian"));
+        if cfg!(target_os = "macos") {
+            assert!(
+                cfg.image.contains("alpine"),
+                "expected Alpine on macOS, got: {}",
+                cfg.image
+            );
+        } else {
+            assert!(
+                cfg.image.contains("debian"),
+                "expected Debian on Linux, got: {}",
+                cfg.image
+            );
+        }
     }
 
     #[test]
@@ -44,7 +71,19 @@ mod tests {
         // cached_base_path is under cache_dir/<safe_image>/base.
         assert!(base_path.ends_with("base"));
         assert!(base_path.starts_with(&cfg.cache_dir));
-        assert!(base_path.to_string_lossy().contains("dirge-microvm_debian"));
+        if cfg!(target_os = "macos") {
+            assert!(
+                base_path.to_string_lossy().contains("dirge-microvm_alpine"),
+                "expected alpine path on macOS, got: {:?}",
+                base_path
+            );
+        } else {
+            assert!(
+                base_path.to_string_lossy().contains("dirge-microvm_debian"),
+                "expected debian path on Linux, got: {:?}",
+                base_path
+            );
+        }
     }
 
     #[test]
@@ -216,7 +255,7 @@ mod tests {
     #[tokio::test]
     async fn full_microvm_lifecycle() {
         if !vm_available() {
-            eprintln!("skipping: /dev/kvm not available");
+            eprintln!("skipping: hardware virtualization not available");
             return;
         }
         let _guard = serial_vm_test();
@@ -242,19 +281,36 @@ mod tests {
             ..MicrovmConfig::default()
         };
 
+        eprintln!(
+            "[full_microvm_lifecycle] image={} cache={:?}",
+            cfg.image, cfg.cache_dir
+        );
+
         let mut sandbox = MicrovmSandbox::new(cfg);
 
-        match sandbox.start().await {
-            Ok(()) => {}
-            Err(e) => {
+        eprintln!("[full_microvm_lifecycle] starting VM ...");
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            sandbox.start(),
+        ).await {
+            Ok(Ok(())) => eprintln!("[full_microvm_lifecycle] VM started OK"),
+            Ok(Err(e)) => {
                 let _ = std::fs::remove_dir_all(&cache);
-                panic!("VM start failed: {e}");
+                panic!("VM start failed: {e:#}");
+            }
+            Err(_) => {
+                let _ = std::fs::remove_dir_all(&cache);
+                panic!("VM start timed out after 120s — see [alpine]/[oci] trace above");
             }
         }
 
+        eprintln!("[full_microvm_lifecycle] exec 'echo hello' ...");
         let result = sandbox.exec("echo hello", &[], "/");
         match result {
             Ok((stdout, stderr, code)) => {
+                eprintln!(
+                    "[full_microvm_lifecycle] exec OK: code={code} stdout={stdout:?} stderr={stderr:?}"
+                );
                 assert_eq!(code, 0, "expected exit 0, got {code} — stderr: {stderr}");
                 assert!(
                     stdout.contains("hello"),
@@ -262,7 +318,7 @@ mod tests {
                 );
             }
             Err(e) => {
-                panic!("exec failed: {e}");
+                panic!("exec failed: {e:#}");
             }
         }
 
@@ -278,10 +334,19 @@ mod tests {
             .trim()
             .parse()
             .expect("ulimit output should be a number");
-        assert!(
-            nofile > 1024,
-            "fd limit should be raised above 1024 by krun_set_rlimits, got {nofile}"
-        );
+        // On Linux, krun_set_rlimits raises the guest fd limit above 1024.
+        // On macOS, libkrun doesn't support krun_set_rlimits (RLIM_INFINITY
+        // overflows the kernel cmdline), so the guest stays at the kernel default.
+        if cfg!(target_os = "linux") {
+            assert!(
+                nofile > 1024,
+                "fd limit should be raised above 1024 by krun_set_rlimits, got {nofile}"
+            );
+        } else {
+            eprintln!(
+                "[ulimit] macOS: guest nofile={nofile} (krun_set_rlimits not supported)"
+            );
+        }
 
         sandbox.stop().ok();
         let _ = std::fs::remove_dir_all(&cache);
@@ -290,7 +355,7 @@ mod tests {
     #[tokio::test]
     async fn full_microvm_lifecycle_alpine() {
         if !vm_available() {
-            eprintln!("skipping: /dev/kvm not available");
+            eprintln!("skipping: hardware virtualization not available");
             return;
         }
         let _guard = serial_vm_test();
@@ -312,19 +377,36 @@ mod tests {
             ..MicrovmConfig::default()
         };
 
+        eprintln!(
+            "[alpine] image={} cache={:?}",
+            cfg.image, cfg.cache_dir
+        );
+
         let mut sandbox = MicrovmSandbox::new(cfg);
 
-        match sandbox.start().await {
-            Ok(()) => {}
-            Err(e) => {
+        eprintln!("[alpine] starting VM ...");
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            sandbox.start(),
+        ).await {
+            Ok(Ok(())) => eprintln!("[alpine] VM started OK"),
+            Ok(Err(e)) => {
                 let _ = std::fs::remove_dir_all(&cache);
-                panic!("VM start failed: {e}");
+                panic!("VM start failed: {e:#}");
+            }
+            Err(_) => {
+                let _ = std::fs::remove_dir_all(&cache);
+                panic!("VM start timed out after 120s — see [alpine]/[oci] trace above");
             }
         }
 
+        eprintln!("[alpine] exec 'uname -a && id' ...");
         let result = sandbox.exec("uname -a && id", &[], "/");
         match result {
             Ok((stdout, stderr, code)) => {
+                eprintln!(
+                    "[alpine] exec OK: code={code} stdout={stdout:?} stderr={stderr:?}"
+                );
                 assert_eq!(code, 0, "expected exit 0, got {code} — stderr: {stderr}");
                 assert!(
                     stdout.contains("Linux"),
@@ -336,7 +418,7 @@ mod tests {
                 );
             }
             Err(e) => {
-                panic!("exec failed: {e}");
+                panic!("exec failed: {e:#}");
             }
         }
 
@@ -352,10 +434,19 @@ mod tests {
             .trim()
             .parse()
             .expect("ulimit output should be a number");
-        assert!(
-            nofile > 1024,
-            "fd limit should be raised above 1024 by krun_set_rlimits, got {nofile}"
-        );
+        // On Linux, krun_set_rlimits raises the guest fd limit above 1024.
+        // On macOS, libkrun doesn't support krun_set_rlimits (RLIM_INFINITY
+        // overflows the kernel cmdline), so the guest stays at the kernel default.
+        if cfg!(target_os = "linux") {
+            assert!(
+                nofile > 1024,
+                "fd limit should be raised above 1024 by krun_set_rlimits, got {nofile}"
+            );
+        } else {
+            eprintln!(
+                "[ulimit] macOS: guest nofile={nofile} (krun_set_rlimits not supported)"
+            );
+        }
 
         sandbox.stop().ok();
         let _ = std::fs::remove_dir_all(&cache);
@@ -366,7 +457,7 @@ mod tests {
     #[tokio::test]
     async fn exec_edge_cases() {
         if !vm_available() {
-            eprintln!("skipping: /dev/kvm not available");
+            eprintln!("skipping: hardware virtualization not available");
             return;
         }
         let _guard = serial_vm_test();
@@ -475,7 +566,7 @@ mod tests {
     #[tokio::test]
     async fn exec_large_output() {
         if !vm_available() {
-            eprintln!("skipping: /dev/kvm not available");
+            eprintln!("skipping: hardware virtualization not available");
             return;
         }
         let _guard = serial_vm_test();
@@ -540,7 +631,7 @@ mod tests {
     #[tokio::test]
     async fn many_sequential_execs() {
         if !vm_available() {
-            eprintln!("skipping: /dev/kvm not available");
+            eprintln!("skipping: hardware virtualization not available");
             return;
         }
         let _guard = serial_vm_test();
@@ -594,7 +685,13 @@ mod tests {
     #[tokio::test]
     async fn workspace_file_round_trip() {
         if !vm_available() {
-            eprintln!("skipping: /dev/kvm not available");
+            eprintln!("skipping: hardware virtualization not available");
+            return;
+        }
+        if cfg!(target_os = "macos") {
+            eprintln!(
+                "skipping: virtio-fs workspace sharing unavailable on macOS libkrun 1.19.4"
+            );
             return;
         }
         let _guard = serial_vm_test();
@@ -722,7 +819,7 @@ mod tests {
     #[tokio::test]
     async fn snapshot_save_list_restore_delete() {
         if !vm_available() {
-            eprintln!("skipping: /dev/kvm not available");
+            eprintln!("skipping: hardware virtualization not available");
             return;
         }
         let _guard = serial_vm_test();
@@ -822,7 +919,7 @@ mod tests {
     #[tokio::test]
     async fn reboot_discards_state() {
         if !vm_available() {
-            eprintln!("skipping: /dev/kvm not available");
+            eprintln!("skipping: hardware virtualization not available");
             return;
         }
         let _guard = serial_vm_test();
@@ -1188,7 +1285,7 @@ mod tests {
     #[tokio::test]
     async fn snapshot_restore_requires_stopped_vm() {
         if !vm_available() {
-            eprintln!("skipping: /dev/kvm not available");
+            eprintln!("skipping: hardware virtualization not available");
             return;
         }
         let _guard = serial_vm_test();
@@ -1313,7 +1410,7 @@ mod tests {
     #[tokio::test]
     async fn keyboard_load_test() {
         if !vm_available() {
-            eprintln!("skipping: /dev/kvm not available");
+            eprintln!("skipping: hardware virtualization not available");
             return;
         }
         let _guard = serial_vm_test();
@@ -1427,7 +1524,7 @@ mod tests {
     #[ignore = "expensive: boots a real VM and pumps synthetic keystrokes"]
     async fn keyboard_input_reader_load_test() {
         if !vm_available() {
-            eprintln!("skipping: /dev/kvm not available");
+            eprintln!("skipping: hardware virtualization not available");
             return;
         }
         let _guard = serial_vm_test();
@@ -1560,7 +1657,7 @@ mod tests {
     #[ignore = "expensive: boots a real VM with 2 vCPUs, runs CPU burners, pumps keystrokes"]
     async fn keyboard_stress_test() {
         if !vm_available() {
-            eprintln!("skipping: /dev/kvm not available");
+            eprintln!("skipping: hardware virtualization not available");
             return;
         }
         let _guard = serial_vm_test();
@@ -1706,7 +1803,7 @@ mod tests {
     #[tokio::test]
     async fn timeout_kills_long_running_command() {
         if !vm_available() {
-            eprintln!("skipping: /dev/kvm not available");
+            eprintln!("skipping: hardware virtualization not available");
             return;
         }
         let _guard = serial_vm_test();
@@ -1749,4 +1846,198 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&cache);
     }
+
+    /// Boot a minimal Alpine microVM using the OCI puller (no buildah needed).
+    ///
+    /// This proves the VM actually boots on the current platform without
+    /// requiring a locally-built `dirge-microvm:*` image. It uses the pure
+    /// Rust OCI puller to fetch Alpine from Docker Hub, writes a simple
+    /// `.krun_config.json` (no SSH), spawns the runner, and verifies the
+    /// init command ran inside the guest.
+    #[tokio::test]
+    async fn microvm_boots_alpine_via_oci() {
+        if !vm_available() {
+            eprintln!("skipping: hardware virtualization not available");
+            return;
+        }
+        let _guard = serial_vm_test();
+
+        let cache = std::env::temp_dir().join(format!(
+            "dirge-test-alpine-boot-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&cache);
+        std::fs::create_dir_all(&cache).expect("create cache dir");
+
+        // Pull alpine via OCI puller (pure Rust, no buildah/Docker needed).
+        let rootfs = cache.join("rootfs");
+        crate::sandbox::microvm::oci::pull("docker.io/library/alpine:latest", &rootfs, &cache)
+            .await
+            .expect("OCI pull of alpine:latest failed");
+
+        // Verify the rootfs has /bin/sh
+        assert!(
+            rootfs.join("bin").join("sh").exists() || rootfs.join("bin").join("busybox").exists(),
+            "alpine rootfs missing /bin/sh or /bin/busybox"
+        );
+
+        // Find the runner binary and create workspace dir.
+        let binary = crate::sandbox::microvm::runner::find_runner_binary()
+            .expect("dirge-microvm-runner binary not found");
+        let workspace = cache.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("create workspace dir");
+
+        // Write runner config with exec_cmd so it works on both Linux
+        // (where libkrun's init reads .krun_config.json) and macOS
+        // (where we must pass exec_cmd via krun_set_exec).
+        let config = serde_json::json!({
+            "rootfs_path": rootfs,
+            "workspace_path": workspace,
+            "ssh_port": 0,
+            "cpus": 1,
+            "memory_mib": 256,
+            "exec_cmd": ["/bin/sh", "-c", "echo 'VM booted successfully' > /workspace/booted"],
+        });
+        // Spawn the runner process using tokio::process::Command so the
+        // async timeout below can actually fire (std::process::wait() is
+        // blocking and would stall the entire tokio runtime).
+        let mut child = tokio::process::Command::new(&binary)
+            .arg(serde_json::to_string(&config).expect("serialize runner config"))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn dirge-microvm-runner");
+
+        // Wait for the VM to boot, run the command, and exit.
+        // Use a 120s timeout in case something goes wrong so the test
+        // doesn't hang the suite indefinitely.
+        let output = tokio::time::timeout(std::time::Duration::from_secs(120), child.wait()).await;
+
+        let output = match output {
+            Ok(Ok(status)) => status,
+            Ok(Err(e)) => {
+                let _ = child.kill().await;
+                let _ = std::fs::remove_dir_all(&cache);
+                panic!("runner process error: {e}");
+            }
+            Err(_) => {
+                // Timeout — kill the runner.
+                let _ = child.kill().await;
+                let _ = std::fs::remove_dir_all(&cache);
+                panic!("runner timed out after 120s — VM may not have booted");
+            }
+        };
+
+        // Read stderr after process exits.
+        // NOTE: `child.stderr` is a field, not a method — `tokio::process::Child`
+        // exposes it as `Option<ChildStderr>`, unlike the std version.
+        // Also note: `tokio::process::ChildStderr` implements `tokio::io::AsyncRead`,
+        // not `std::io::Read`, so we must use the async trait to read it.
+        let stderr = if let Some(mut s) = child.stderr.take() {
+            let mut buf = String::new();
+            use tokio::io::AsyncReadExt;
+            let _ = s.read_to_string(&mut buf).await;
+            buf
+        } else {
+            String::new()
+        };
+
+        // Check booted marker file.
+        // On macOS the workspace is inside the rootfs (the runner creates
+        // {rootfs_path}/workspace for the guest). On Linux the workspace is
+        // a separate virtio-fs mount at the configured workspace_path.
+        let booted = if cfg!(target_os = "macos") {
+            rootfs.join("workspace").join("booted")
+        } else {
+            workspace.join("booted")
+        };
+        let booted_content = if booted.exists() {
+            std::fs::read_to_string(&booted).unwrap_or_default()
+        } else {
+            String::new()
+        };
+
+        let _ = std::fs::remove_dir_all(&cache);
+
+        assert!(
+            output.success(),
+            "runner failed (exit={:?}): {}",
+            output.code(),
+            stderr,
+        );
+        assert!(
+            booted.exists(),
+            "VM did not boot — /workspace/booted not found.\n\
+             Runner stderr: {stderr}\n\
+             Rootfs /bin/sh exists: {}",
+            rootfs.join("bin").join("sh").exists() || rootfs.join("bin").join("busybox").exists(),
+        );
+        assert!(
+            booted_content.contains("VM booted successfully"),
+            "unexpected boot marker content: {booted_content:?}"
+        );
+    }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn dyld_fallback_library_path_valid_on_macos() {
+    // Regression guard: the DYLD_FALLBACK_LIBRARY_PATH the spawn code
+    // builds must contain a directory where libkrunfw.5.dylib lives.
+    // Uses the same logic as mod.rs: MicrovmSandbox::start().
+    use std::path::Path;
+
+    // Resolve brew prefix (same as the spawn code).
+    let brew_prefixes: Vec<String> = [
+        std::process::Command::new("brew")
+            .args(["--prefix", "libkrunfw"])
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()
+            .and_then(|o| {
+                if o.status.success() || !o.stdout.is_empty() {
+                    Some(std::str::from_utf8(&o.stdout).unwrap_or("").trim().to_string())
+                } else {
+                    None
+                }
+            }),
+        std::process::Command::new("brew")
+            .args(["--prefix"])
+            .output()
+            .ok()
+            .and_then(|o| {
+                let s = std::str::from_utf8(&o.stdout).unwrap_or("").trim().to_string();
+                if s.is_empty() { None } else { Some(s) }
+            }),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|p| !p.is_empty())
+    .collect::<Vec<_>>();
+
+    eprintln!("brew prefixes resolved: {:?}", brew_prefixes);
+
+    // At least one brew prefix should be /opt/homebrew or /usr/local.
+    assert!(
+        !brew_prefixes.is_empty(),
+        "brew --prefix returned no prefixes — is Homebrew installed?"
+    );
+
+    // Each prefix should have a /lib subdirectory with libkrunfw.5.dylib.
+    let krunfw_name = "libkrunfw.5.dylib";
+    let found = brew_prefixes.iter().any(|p| {
+        let lib_path = Path::new(p).join("lib").join(krunfw_name);
+        let exists = lib_path.exists();
+        eprintln!("  {} -> {}", lib_path.display(), if exists { "OK" } else { "MISSING" });
+        exists
+    });
+
+    assert!(
+        found,
+        "libkrunfw.5.dylib not found under any brew prefix -- {} --          install it: brew tap libkrun/krun && brew trust libkrun/krun &&          brew install libkrun libkrunfw",
+        brew_prefixes.iter().map(|p| format!("{p}/lib/{krunfw_name}")).collect::<Vec<_>>().join(", "),
+    );
+}
 }

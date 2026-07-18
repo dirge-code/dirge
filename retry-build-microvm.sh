@@ -26,6 +26,11 @@ rm -f target/debug/dirge target/debug/dirge-microvm-runner 2>/dev/null || true
 echo "=== Building debug binary ==="
 cargo build --features sandbox-microvm
 
+echo "=== Codesigning runner binary (macOS: Hypervisor.framework entitlement) ==="
+if [ "$(uname)" = "Darwin" ] && [ -f target/debug/dirge-microvm-runner ]; then
+    codesign --force --sign - --entitlements dirge.entitlements target/debug/dirge-microvm-runner
+fi
+
 echo "=== Setting up sandbox (pulls/builds guest images) ==="
 ./target/debug/dirge sandbox setup
 

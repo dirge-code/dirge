@@ -265,8 +265,21 @@ mod tests {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
         // ── prerequisites ──────────────────────────────────────────
-        if !std::path::Path::new("/dev/kvm").exists() {
-            eprintln!("skipping: /dev/kvm not available");
+        let virtualization_ok = if cfg!(target_os = "macos") {
+            std::process::Command::new("sysctl")
+                .args(["-n", "kern.hv_support"])
+                .output()
+                .ok()
+                .and_then(|o| {
+                    let s = String::from_utf8_lossy(&o.stdout);
+                    s.trim().parse::<u8>().ok()
+                })
+                == Some(1)
+        } else {
+            std::path::Path::new("/dev/kvm").exists()
+        };
+        if !virtualization_ok {
+            eprintln!("skipping: hardware virtualization not available");
             return;
         }
         if crate::sandbox::microvm::runner::find_runner_binary().is_err() {

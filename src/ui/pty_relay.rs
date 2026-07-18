@@ -35,9 +35,8 @@ pub(crate) struct PtyRelay {
     capture: Option<Vec<u8>>,
 }
 
-// ── relay byte accounting (timing-diagnostics feature) ───────────
+// ── relay byte accounting ──────────────────────────────────────
 
-#[cfg(feature = "timing-diagnostics")]
 mod counters {
     /// Byte-accounting counters for the relay loop. Asserted on drop
     /// to catch lost bytes in either direction.
@@ -92,6 +91,15 @@ mod counters {
         fn drop(&mut self) {
             let tty_loss = self.tty_bytes_read.saturating_sub(self.pty_bytes_written);
             let pty_loss = self.pty_bytes_read.saturating_sub(self.tty_bytes_written);
+            // Always-printed summary for attach diagnostics.
+            eprintln!(
+                "[sandbox-attach] tty_read={} pty_written={} pty_read={} tty_written={}",
+                self.tty_bytes_read,
+                self.pty_bytes_written,
+                self.pty_bytes_read,
+                self.tty_bytes_written,
+            );
+            #[cfg(feature = "timing-diagnostics")]
             eprintln!(
                 "[timing-diagnostics] relay exit: \
                  tty_read={} pty_written={} tty_loss={} \
@@ -107,10 +115,6 @@ mod counters {
                 self.poll_count,
             );
             // Assert no loss beyond retry-buffer pending bytes.
-            // tty_loss > 0 means we read keystrokes from tty that never
-            // reached the PTY (either in flight or lost).> 0 is expected
-            // if retry buffers have pending bytes at exit; stress tests
-            // check exact equality after waiting for buffers to drain.
             assert!(
                 self.tty_bytes_read >= self.pty_bytes_written,
                 "RELAY LOSS tty→PTY: read {} bytes from tty, wrote {} to PTY (loss {})",
@@ -128,33 +132,6 @@ mod counters {
         }
     }
 }
-
-#[cfg(not(feature = "timing-diagnostics"))]
-mod counters {
-    /// Zero-cost stub: all methods compile to nothing.
-    pub(crate) struct RelayCounters;
-    impl RelayCounters {
-        #[inline(always)]
-        pub fn new() -> Self {
-            Self
-        }
-        #[inline(always)]
-        pub fn poll(&mut self) {}
-        #[inline(always)]
-        pub fn tty_read(&mut self, _n: usize) {}
-        #[inline(always)]
-        pub fn pty_read(&mut self, _n: usize) {}
-        #[inline(always)]
-        pub fn tty_write(&mut self, _n: usize) {}
-        #[inline(always)]
-        pub fn pty_write(&mut self, _n: usize) {}
-        #[inline(always)]
-        pub fn wouldblock(&mut self) {}
-        #[inline(always)]
-        pub fn drain_injected(&mut self, _n: usize) {}
-    }
-}
-
 use counters::RelayCounters;
 
 impl PtyRelay {
@@ -202,6 +179,23 @@ impl PtyRelay {
             if unsafe { libc::tcgetattr(secondary_raw_fd, &mut termios) } == 0 {
                 termios.c_lflag |= libc::ECHO;
                 unsafe { libc::tcsetattr(secondary_raw_fd, libc::TCSANOW, &termios) };
+            }
+        }
+// SSH reads termios from the process's controlling terminal
+        // (/dev/tty) — NOT from the PTY secondary — for its `-t` PTY
+        // allocation request (RFC 4254 §8 → "pty-req" carries the
+        // local terminal's termios to the server).  Crossterm's raw
+        // mode sets ECHO=0 on /dev/tty; if SSH reads that and
+        // forwards it, the remote shell starts with ECHO=0 and typed
+        // characters never echo.  Override ECHO=1 on /dev/tty so SSH
+        // reads the correct value.  It will be restored to ECHO=0 in
+        // the relay loop after the first data transfer (when SSH has
+        // completed its PTY allocation).
+        if let Ok(tty) = std::fs::OpenOptions::new().write(true).open("/dev/tty") {
+            let mut termios: libc::termios = unsafe { std::mem::zeroed() };
+            if unsafe { libc::tcgetattr(tty.as_raw_fd(), &mut termios) } == 0 {
+                termios.c_lflag |= libc::ECHO;
+                unsafe { libc::tcsetattr(tty.as_raw_fd(), libc::TCSANOW, &termios) };
             }
         }
 
@@ -259,16 +253,47 @@ impl PtyRelay {
     /// Uses `poll(2)` with retry buffers. When a non-blocking `write`
     /// returns `WouldBlock` (other side isn't draining fast enough),
     /// unsent bytes are queued and retried on the next poll iteration.
-    pub(crate) fn relay(self) -> io::Result<std::process::ExitStatus> {
+pub(crate) fn relay(self) -> io::Result<std::process::ExitStatus> {
         // ── relay priority: below input reader (-20), above KVM (19) ──
         unsafe {
             libc::setpriority(libc::PRIO_PROCESS, 0, -19);
         }
-        let tty = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open("/dev/tty")?;
-        self.relay_to_fd(tty)
+        // dup(0) shares the same file description as fd 0. When the relay
+        // sets O_NONBLOCK on the dup'd fd, it permanently affects fd 0.
+        // Save the original flags so we can restore them after the relay.
+        let saved_stdin_flags = unsafe { libc::fcntl(0, libc::F_GETFL) };
+        // Use stdin (fd 0) for reading keystrokes — it's the process's
+        // controlling terminal under normal interactive use.  dup(0) avoids
+        // opening /dev/tty which may have different fd flags / termios
+        // semantics on macOS after crossterm raw mode.
+        let stdin_fd = unsafe { libc::dup(0) };
+        if stdin_fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+let tty = unsafe { std::fs::File::from_raw_fd(stdin_fd) };
+// At this point /dev/tty's termios still has ECHO=1 from the
+        // PtyRelay::spawn override (set so SSH's PTY request carries
+        // ECHO=1 to the remote side). Restore ECHO=0 immediately so
+        // the terminal driver doesn't locally echo typed characters
+        // while the relay forwards them to the VM (remote echo from
+        // the shell handles display). Waiting until echo_disabled
+        // (first PTY→tty data transfer) is too late — keystrokes
+        // typed before SSH output appears get double-echoed.
+        if let Ok(tty_w) = std::fs::OpenOptions::new().write(true).open("/dev/tty") {
+            let mut termios: libc::termios = unsafe { std::mem::zeroed() };
+            if unsafe { libc::tcgetattr(tty_w.as_raw_fd(), &mut termios) } == 0 {
+                termios.c_lflag &= !libc::ECHO;
+                unsafe { libc::tcsetattr(tty_w.as_raw_fd(), libc::TCSANOW, &termios) };
+            }
+        }
+        let result = self.relay_to_fd(tty);
+        // Restore fd 0 flags after relay — dup(0) shares the same file
+        // description, so O_NONBLOCK set by the relay loop leaks to fd 0
+        // and makes the post-exit shell miss every other keystroke.
+        if saved_stdin_flags >= 0 {
+            unsafe { libc::fcntl(0, libc::F_SETFL, saved_stdin_flags) };
+        }
+        result
     }
 
     /// Same as [`relay`] but takes an explicit tty file descriptor instead
@@ -453,7 +478,7 @@ impl PtyRelay {
             // ── tty → PTY (user keystrokes → guest) ───────────────
             if fds[1].revents & libc::POLLIN != 0 {
                 match tty.read(&mut read_buf) {
-                    Ok(0) => break,
+                    Ok(0) => continue,
                     Ok(n) => {
                         counters.tty_read(n);
                         if !pty_write_buf.is_empty() {

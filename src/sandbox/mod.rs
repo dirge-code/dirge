@@ -24,7 +24,7 @@ pub enum SandboxMode {
     Off,
     /// Bubblewrap-based process isolation (default, fast, no KVM needed).
     Bwrap,
-    /// Hardware-isolated microVM via libkrun (needs /dev/kvm + libkrun.so).
+    /// Hardware-isolated microVM via libkrun (needs /dev/kvm + libkrun.so on Linux, Hypervisor.framework + libkrun.dylib on macOS).
     #[cfg(feature = "sandbox-microvm")]
     Microvm,
 }

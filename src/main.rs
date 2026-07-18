@@ -610,7 +610,7 @@ async fn main() -> anyhow::Result<()> {
                     {
                         use crate::sandbox::microvm::rootfs;
 
-                        let raw_default = "debian";
+                        let raw_default = if cfg!(target_os = "macos") { "alpine" } else { "debian" };
                         let raw = image.as_deref().unwrap_or(raw_default);
                         let image_ref = rootfs::canonicalize_image_ref(raw);
 

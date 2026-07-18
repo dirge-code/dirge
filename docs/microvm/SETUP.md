@@ -7,20 +7,21 @@ binary, and getting a microVM booted.
 
 ### Required (hard blockers)
 
-| Dependency | Purpose | Install |
-|-----------|---------|---------|
-| `/dev/kvm` | Hardware virtualization | Load `kvm` kernel module, user must be in `kvm` group |
-| `libkrun.so` + `libkrunfw.so` | KVM-based VM runtime | See [libkrun releases](https://github.com/containers/libkrun/releases) |
-| `gzip` + `tar` | OCI layer extraction | Already present on most Linux systems |
-| `ssh-keygen` | Ephemeral SSH key generation | `apt install openssh-client` |
-| `dirge-microvm-runner` | The binary that calls `krun_start_enter` | Built alongside dirge (see below) |
+| Dependency | Linux | macOS |
+|-----------|-------|-------|
+| Hardware virtualization | `/dev/kvm` (load `kvm` module, user in `kvm` group) | Hypervisor.framework (built-in on Apple Silicon) |
+| VM runtime | `libkrun.so` + `libkrunfw.so` (see [libkrun releases](https://github.com/containers/libkrun/releases)) | `libkrun.dylib` + `libkrunfw.5.dylib` (`brew install libkrun libkrunfw`) |
+| Image building (optional) | `buildah` (`apt install buildah`) | Not needed — uses built-in OCI puller |
+| OCI layer extraction | `gzip` + `tar` | `gzip` + `tar` (pre-installed) |
+| SSH key generation | `ssh-keygen` (`apt install openssh-client`) | `ssh-keygen` (pre-installed) |
+| Runner binary | `dirge-microvm-runner` (built alongside dirge) | Same binary, auto-codesigned at build |
 
 ### Optional
 
-| Dependency | When needed | Install |
-|-----------|-------------|---------|
-| `buildah` | Using `local://` images (the default) | `apt install buildah` |
-| `mold` linker | Faster rebuilds of the runner | `apt install mold` |
+| Dependency | When needed | Linux | macOS |
+|-----------|-------------|-------|-------|
+| `buildah` | Using `local://` images (the default) | `apt install buildah` | Not available — use `dirge sandbox setup --image docker.io/...` to pull remote images |
+| `mold` linker | Faster rebuilds of the runner | `apt install mold` | Not needed (Xcode linker is fast enough) |
 
 ## Check your system
 
@@ -33,15 +34,15 @@ before proceeding. `WARN` items (buildah, mold) are optional.
 
 ### What the check covers
 
-1. `/dev/kvm` — exists and accessible
-2. `libkrun.so` — found via `ldconfig -p` or common paths
-3. `libkrunfw.so` — same
+1. Hardware virtualization — `/dev/kvm` exists and accessible (Linux) or `sysctl kern.hv_support` → 1 (macOS)
+2. `libkrun` — found via platform-appropriate paths
+3. `libkrunfw` — same
 4. `gzip` — on PATH
 5. `tar` — on PATH
 6. `ssh-keygen` — on PATH
 7. `dirge-microvm-runner` — binary found adjacent to dirge or on PATH
 8. `buildah` — optional, warns if missing
-9. `mold` — optional, warns if missing
+9. `mold` — optional, warns if missing (Linux only)
 
 ## Building
 
@@ -55,7 +56,7 @@ This compiles both `dirge` and `dirge-microvm-runner`. The runner binary lands
 at `target/release/dirge-microvm-runner`. dirge finds it by looking next to its
 own binary or on `$PATH`.
 
-> **Caveat:** If `libkrun.so` / `libkrunfw.so` are not installed, the runner
+> **Caveat:** If libkrun (`libkrun.so` on Linux, `libkrun.dylib` on macOS) is not installed, the runner
 > binary will fail to *link* (unresolved symbols). The main `dirge` binary and
 > all non-VM tests still compile fine — `build.rs` emits a warning but doesn't
 > abort. Install libkrun before building if you need the runner.
@@ -132,7 +133,7 @@ dirge --sandbox microvm
 
 On first run, dirge will:
 
-1. **Prepare the rootfs** — exports the guest image from buildah, extracts
+1. **Prepare the rootfs** — exports the guest image (via buildah on Linux, via OCI puller on macOS), extracts
    layers into `~/.cache/dirge/microvm/<image>/base/`. This is cached — subsequent
    runs clone this base with `cp -r`.
 2. **Generate SSH keys** — ephemeral ed25519 key pair for host→guest auth.
@@ -152,11 +153,14 @@ exits (the runner process is killed on drop).
 
 ### "image not known" on first boot
 
-`buildah push dirge-microvm:debian` fails because the image was never built.
-Run `dirge sandbox setup` first, or build manually:
+The guest image hasn't been built or pulled yet. Run `dirge sandbox setup` first:
 
 ```bash
-buildah bud --storage-driver vfs --tag dirge-microvm:debian -f images/debian/Dockerfile .
+# Linux: builds locally via buildah
+dirge sandbox setup
+
+# macOS: pulls from the network via built-in OCI puller
+dirge sandbox setup --image docker.io/library/alpine:latest
 ```
 
 ### "failed to spawn dirge-microvm-runner"
@@ -173,9 +177,10 @@ cp target/release/dirge-microvm-runner ~/.cargo/bin/
 
 libkrun couldn't boot the VM. Common causes:
 
-- `/dev/kvm` permission denied — add your user to the `kvm` group: `sudo usermod -aG kvm $USER` (log out and back in)
-- `libkrun.so` not found — install from [libkrun releases](https://github.com/containers/libkrun/releases)
-- Missing CPU virtualization — enable VT-x/AMD-V in BIOS
+- **Linux**: `/dev/kvm` permission denied — add your user to the `kvm` group: `sudo usermod -aG kvm $USER` (log out and back in)
+- **macOS**: runner not codesigned — rebuild with `cargo build --features sandbox-microvm` which auto-codesigns via rustc wrapper; verify with `codesign -dv target/release/dirge-microvm-runner`
+- libkrun library not found — install from [libkrun releases](https://github.com/containers/libkrun/releases) (Linux) or `brew install libkrun libkrunfw` (macOS)
+- Missing CPU virtualization — enable VT-x/AMD-V in BIOS / Apple Silicon has it always on
 
 ### SSH timeout
 
@@ -184,7 +189,7 @@ The VM boots but sshd doesn't respond. Check:
 - Is the guest image built with `openssh-server`? The default Debian/Alpine
   images include it. Custom images must install and enable sshd.
 - Is port forwarding working? The runner maps `host:<port> → guest:22`.
-  Verify with `ss -tlnp | grep <port>` — you should see a LISTEN on localhost.
+  Verify with `ss -tlnp | grep <port>` (Linux) or `lsof -i -P | grep LISTEN` (macOS) — you should see a LISTEN on localhost.
 
 ### Slow first boot on btrfs/zfs
 

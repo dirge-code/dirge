@@ -55,7 +55,11 @@ pub struct MicrovmConfig {
 impl Default for MicrovmConfig {
     fn default() -> Self {
         Self {
-            image: "local://dirge-microvm:debian".to_string(),
+            image: if cfg!(target_os = "macos") {
+                "local://dirge-microvm:alpine".to_string()
+            } else {
+                "local://dirge-microvm:debian".to_string()
+            },
             workspace: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             cpus: 1,
             memory_mib: 512,
@@ -145,7 +149,8 @@ impl MicrovmSandbox {
             if !passwd.contains("sandbox:") {
                 std::fs::write(
                     &passwd_path,
-                    format!("{passwd}sandbox:x:1000:1000::/home/sandbox:/bin/sh\n"),
+                    format!("{passwd}sandbox:x:1000:1000::/home/sandbox:/bin/sh
+"),
                 )?;
             }
             let group_path = rootfs_path.join("etc").join("group");
@@ -224,17 +229,118 @@ impl MicrovmSandbox {
         };
 
         let binary = runner::find_runner_binary()?;
-        let config = serde_json::json!({
+#[cfg(target_os = "macos")]
+        ensure_runner_signed(&binary)?;
+        #[allow(unused_mut)]
+        let mut config = serde_json::json!({
             "rootfs_path": self.rootfs_path.as_ref().unwrap(),
             "workspace_path": self.config.workspace,
             "ssh_port": port,
             "cpus": self.config.cpus,
             "memory_mib": self.config.memory_mib,
         });
-        let child = std::process::Command::new(&binary)
-            .arg(serde_json::to_string(&config)?)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
+        // On macOS, libkrun's built-in init does not parse
+        // .krun_config.json, so we must pass the init command
+        // directly via exec_cmd (krun_set_exec). On Linux this
+        // is optional since libkrun's init handles it.
+        #[cfg(target_os = "macos")]
+        #[cfg(target_os = "macos")]
+        {
+            // Write authorized_keys inside the VM via the exec_cmd shell
+            // so the file is created by root (avoids host-uid ownership issues).
+            let pubkey_escaped = keys.public_key.replace("'", "'\\''");
+            let cmd = format!(
+                "mkdir -p /var/empty && mount -t tmpfs -o uid=0,gid=0,mode=0755 tmpfs /var/empty && mkdir -p /etc/ssh && echo '{0}' > /etc/ssh/authorized_keys && chown -R 1000:1000 /home/sandbox 2>/dev/null || true && exec /usr/sbin/sshd -D -e -o StrictModes=no -o AuthorizedKeysFile=/etc/ssh/authorized_keys",
+                pubkey_escaped,
+            );
+            config["exec_cmd"] = serde_json::json!(["/bin/sh", "-c", cmd]);
+}
+        let mut cmd = std::process::Command::new(&binary);
+        cmd.arg(serde_json::to_string(&config)?);
+        // On macOS, libkrun.dylib dlopens libkrunfw.5.dylib by bare
+        // leaf name during krun_start_enter, but libkrun.dylib has no
+        // LC_RPATH and /opt/homebrew/lib is not in dyld's default
+        // search path.  Set DYLD_FALLBACK_LIBRARY_PATH so the runner
+        // always finds it regardless of build-time rpath.
+        // ponytail: DYLD env var (not rpath) because libkrun.dylib has
+        // no LC_RPATH and dlopens libkrunfw by bare name; honored
+        // only while the runner stays non-hardened (no --options
+        // runtime in ensure_runner_signed).
+        #[cfg(target_os = "macos")]
+        {
+            use std::ffi::OsStr;
+            use std::path::Path;
+            // Resolve brew prefix for libkrunfw (formula-specific),
+            // fall back to generic brew --prefix.
+            let brew_prefixes: Vec<String> = [
+                std::process::Command::new("brew")
+                    .args(["--prefix", "libkrunfw"])
+                    .stderr(std::process::Stdio::null())
+                    .output()
+                    .ok()
+                    .and_then(|o| {
+                        if o.status.success() || !o.stdout.is_empty() {
+                            Some(std::str::from_utf8(&o.stdout).unwrap_or("").trim().to_string())
+                        } else {
+                            None
+                        }
+                    }),
+                std::process::Command::new("brew")
+                    .args(["--prefix"])
+                    .output()
+                    .ok()
+                    .and_then(|o| {
+                        let s = std::str::from_utf8(&o.stdout).unwrap_or("").trim().to_string();
+                        if s.is_empty() { None } else { Some(s) }
+                    }),
+            ]
+            .into_iter()
+            .flatten()
+            .filter(|p| !p.is_empty())
+            .map(|p| format!("{p}/lib"))
+            .collect::<Vec<_>>();
+
+            // De-duplicate (brew --prefix and brew --prefix libkrunfw
+            // may share the same prefix).
+            let mut seen = std::collections::HashSet::new();
+            let brew_lib_dirs: Vec<String> = brew_prefixes
+                .into_iter()
+                .filter(|d| seen.insert(d.clone()))
+                .collect();
+
+            // Derive the dlopen bare name libkrun uses.
+            let krunfw_name = "libkrunfw.5.dylib";
+            let krunfw_exists = brew_lib_dirs
+                .iter()
+                .any(|d| Path::new(d).join(krunfw_name).exists());
+            if !krunfw_exists {
+                anyhow::bail!(
+                    "{krunfw_name} not found — install it: \
+                     brew tap libkrun/krun && brew trust libkrun/krun && \
+                     brew install libkrun libkrunfw"
+                );
+            }
+
+            let dyld_val = brew_lib_dirs.join(":");
+            // Preserve existing DYLD_FALLBACK_LIBRARY_PATH if set;
+            // otherwise restore reasonable defaults so we don't
+            // break other fallback lookups.
+            let existing = std::env::var(OsStr::new(
+                "DYLD_FALLBACK_LIBRARY_PATH",
+            ))
+            .ok()
+            .filter(|v| !v.is_empty());
+            let dyld_full = if let Some(ref existing) = existing {
+                format!("{dyld_val}:{existing}")
+            } else {
+                format!("{dyld_val}:/usr/local/lib:/usr/lib")
+            };
+            cmd.env("DYLD_FALLBACK_LIBRARY_PATH", &dyld_full);
+        }
+
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::piped());
+        let child = cmd
             .spawn()
             .map_err(|e| anyhow::anyhow!("failed to spawn dirge-microvm-runner: {e}"))?;
 
@@ -284,8 +390,27 @@ impl MicrovmSandbox {
             wait_for_ssh("127.0.0.1", wait_port, Duration::from_secs(30))
         })
         .await
-        {
-            Ok(Ok(())) => {}
+{
+            Ok(Ok(())) => {
+                // wait_for_ssh succeeded — but double-check the runner is
+                // still alive before declaring the VM ready. A VM that
+                // booted-then-exited can leave a port forwarder accepting
+                // TCP long enough for wait_for_ssh to read an SSH banner
+                // before the forwarder closes.
+                if let Some(child) = self.child.as_mut() {
+                    if let Ok(Some(status)) = child.try_wait() {
+                        let mut stderr = String::new();
+                        if let Some(ref mut pipe) = child.stderr {
+                            use std::io::Read;
+                            let _ = pipe.read_to_string(&mut stderr);
+                        }
+                        anyhow::bail!(
+                            "VM exited immediately after boot: {status} — stderr: {}",
+                            if stderr.is_empty() { "(empty)" } else { &stderr }
+                        );
+                    }
+                }
+            }
             Ok(Err(e)) => {
                 // SSH never came up — check if the runner crashed.
                 if let Some(mut child) = self.child.take() {
@@ -525,4 +650,62 @@ impl Drop for MicrovmSandbox {
     fn drop(&mut self) {
         let _ = self.stop();
     }
+}
+#[cfg(target_os = "macos")]
+/// Ensure the microVM runner binary is codesigned with the
+/// `com.apple.security.hypervisor` entitlement.  The build script can't do
+/// this reliably because it runs before the binary is compiled (cargo
+/// ordering within the same package), so we sign at VM start instead.
+///
+/// Does NOT use `--options runtime` (hardened runtime) because that would
+/// enable library validation and require `disable-library-validation` —
+/// libkrun's dlopen of libkrunfw doesn't need either, and hardened runtime
+/// only creates unnecessary restrictions.  Must NOT switch to hardened
+/// runtime -- it would strip DYLD_FALLBACK_LIBRARY_PATH, breaking the
+/// libkrunfw lookup that the runner relies on (see start()).
+fn ensure_runner_signed(binary: &std::path::Path) -> anyhow::Result<()> {
+    use std::process::Command;
+
+    // Check whether the binary already has the hypervisor entitlement
+    // (already signed by a previous run or the build script).
+    let check = Command::new("codesign")
+        .args(["-d", "--entitlements", "-"])
+        .arg(binary)
+        .output();
+    if let Ok(ref out) = check {
+        let out_str = String::from_utf8_lossy(&out.stdout);
+        if out_str.contains("com.apple.security.hypervisor") {
+            return Ok(());
+        }
+    }
+
+    // Write entitlements to a temp file and sign.
+    let tmp = std::env::temp_dir().join(format!(
+        "dirge-runner-entitlements-{}.plist",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::write(
+        &tmp,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.hypervisor</key>
+    <true/>
+</dict>
+</plist>"#,
+    )?;
+    let status = Command::new("codesign")
+        .args(["--force", "--sign", "-", "--entitlements"])
+        .arg(&tmp)
+        .arg(binary)
+        .status()
+        .map_err(|e| anyhow::anyhow!("failed to run codesign: {e}"))?;
+    let _ = std::fs::remove_file(&tmp);
+    if !status.success() {
+        anyhow::bail!(
+            "failed to codesign dirge-microvm-runner — Hypervisor.framework won't be available"
+        );
+    }
+    Ok(())
 }

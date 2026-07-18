@@ -71,7 +71,17 @@ pub async fn prepare(image: &str, cache_dir: &Path) -> anyhow::Result<PreparedRo
             }
 
             if let Some(local_ref) = image.strip_prefix("local://") {
-                prepare_local(local_ref, &staging)?;
+                if cfg!(target_os = "macos") {
+                    if let Some(variant) = local_ref.strip_prefix("dirge-microvm:") {
+                        prepare_local_via_oci(variant, &staging, cache_dir).await?;
+                    } else {
+                        anyhow::bail!(
+                            "local:// images other than dirge-microvm:* are not supported on macOS"
+                        );
+                    }
+                } else {
+                    prepare_local(local_ref, &staging)?;
+                }
             } else {
                 super::oci::pull(image, &staging, cache_dir).await?;
             }
@@ -239,6 +249,303 @@ fn prepare_local(image_ref: &str, dest: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Install Alpine packages into a rootfs by downloading and extracting .apk files.
+///
+/// This implements a minimal subset of `apk add --root <dest> <packages>` by:
+/// 1. Fetching the Alpine APKINDEX from the appropriate mirror
+/// 2. Resolving package dependencies (recursively, skipping `so:` and `cmd:` deps
+///    which are assumed to be already present in the base Alpine image)
+/// 3. Downloading each `.apk` file
+/// 4. Extracting the payload (second gzip member) into the rootfs
+async fn install_alpine_packages(dest: &Path, packages: &[&str]) -> anyhow::Result<()> {
+    let alpine_version = "v3.21";
+    let arch = if cfg!(target_arch = "aarch64") {
+        "aarch64"
+    } else if cfg!(target_arch = "x86_64") {
+        "x86_64"
+    } else {
+        anyhow::bail!("unsupported architecture for Alpine package installation");
+    };
+    let repo_url =
+        format!("https://dl-cdn.alpinelinux.org/alpine/{alpine_version}/main/{arch}");
+
+    // Step 1: Download and parse APKINDEX.
+    let index_url = format!("{repo_url}/APKINDEX.tar.gz");
+    eprintln!("[alpine] downloading APKINDEX from {index_url} ...");
+    let index_bytes = reqwest::get(&index_url)
+        .await?
+        .bytes()
+        .await?
+        .to_vec();
+    eprintln!("[alpine] downloaded {} bytes from APKINDEX", index_bytes.len());
+
+    // Write APKINDEX to a temp file for tar extraction to avoid a
+    // bidirectional pipe deadlock (tar blocks on stdout pipe while
+    // parent blocks on stdin write). Mirrors the oci.rs blob fix.
+    let tmp = std::env::temp_dir().join(format!("dirge-apkindex-{}", uuid::Uuid::new_v4()));
+    std::fs::write(&tmp, &index_bytes)
+        .map_err(|e| anyhow::anyhow!("writing APKINDEX temp file: {e}"))?;
+    let index_output = std::process::Command::new("tar")
+        .args(["-xzf", &tmp.to_string_lossy(), "-O"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .map_err(|e| anyhow::anyhow!("extracting APKINDEX: {e}"))?;
+    let _ = std::fs::remove_file(&tmp);
+    if !index_output.status.success() {
+        let stderr = String::from_utf8_lossy(&index_output.stderr);
+        anyhow::bail!("failed to extract Alpine APKINDEX: {stderr}");
+    }
+    let index_text = String::from_utf8_lossy(&index_output.stdout).to_string();
+    eprintln!("[alpine] APKINDEX extracted ({} bytes uncompressed)", index_text.len());
+    let entries = parse_apkindex(&index_text);
+
+    // Step 2: BFS dependency resolution (collect package names + versions).
+    let mut needed: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut queue: Vec<String> = packages.iter().map(|s| s.to_string()).collect();
+
+    while let Some(pkg) = queue.pop() {
+        if !seen.insert(pkg.clone()) {
+            continue;
+        }
+        if let Some(entry) = entries.iter().find(|e| e.name == pkg) {
+            needed.push(format!("{}-{}", entry.name, entry.version));
+            for dep_name in &entry.dep_names {
+                if !seen.contains(dep_name) {
+                    queue.push(dep_name.clone());
+                }
+            }
+        } else {
+            anyhow::bail!("package not found in Alpine APKINDEX: {pkg}");
+        }
+    }
+
+    // Step 3: Download and extract each package.
+    eprintln!(
+        "[alpine] resolved {} dependencies: {:?}",
+        needed.len(),
+        packages,
+    );
+    for pkg_file in &needed {
+        let url = format!("{repo_url}/{pkg_file}.apk");
+        eprintln!("[alpine] downloading {url} ...");
+        let bytes = reqwest::get(&url).await?.bytes().await?.to_vec();
+        eprintln!("[alpine] downloaded {} bytes for {pkg_file}", bytes.len());
+        extract_apk_payload(&bytes, dest)?;
+        eprintln!("[alpine] extracted {pkg_file}");
+    }
+
+    eprintln!("[alpine] all {n} packages installed", n = needed.len());
+
+    Ok(())
+}
+
+/// A single entry parsed from the Alpine APKINDEX.
+struct ApkEntry {
+    name: String,
+    version: String,
+    /// Package-name dependencies (so:, cmd:, and version constraints excluded).
+    dep_names: Vec<String>,
+}
+
+/// Parse the Alpine APKINDEX text format.
+///
+/// Each entry is separated by a blank line. Fields use the format `KEY:VALUE`.
+///
+/// ```text
+/// P:openssh-server
+/// V:9.9_p1-r2
+/// D:openssh-server-common (= 9.9_p1-r2) so:libcrypto.so.3
+/// ```
+fn parse_apkindex(data: &str) -> Vec<ApkEntry> {
+    let mut entries = Vec::new();
+    for block in data.split("\n\n") {
+        let block = block.trim();
+        if block.is_empty() {
+            continue;
+        }
+        let mut entry = ApkEntry {
+            name: String::new(),
+            version: String::new(),
+            dep_names: Vec::new(),
+        };
+        for line in block.lines() {
+            if let Some((key, rest)) = line.split_once(':') {
+                let value = rest.trim_start();
+                match key {
+                    "P" => entry.name = value.to_string(),
+                    "V" => entry.version = value.to_string(),
+                    "D" => {
+                        for token in value.split_whitespace() {
+                            let token = token.trim();
+                            if token.is_empty()
+                                || token == "("
+                                || token == ")"
+                                || token.starts_with("so:")
+                                || token.starts_with("cmd:")
+                                || token.starts_with('/')
+                                || token.starts_with('=')
+                                || token.starts_with('<')
+                                || token.starts_with('>')
+                            {
+                                continue;
+                            }
+                            // Strip ! prefix (negative/conflicts dep).
+                            let token = if token.starts_with('!') {
+                                &token[1..]
+                            } else {
+                                token
+                            };
+                            // Strip version operators (pkgname=version, pkgname>=version, etc.)
+                            let clean = if let Some(pos) = token.find(|c: char| c == '=' || c == '>' || c == '<') {
+                                token[..pos].trim().to_string()
+                            } else {
+                                token.to_string()
+                            };
+                            // Also handle parenthesized "(= version)" format.
+                            let clean = if let Some(stripped) = clean.strip_suffix(')') {
+                                if let Some(paren) = stripped.rfind('(') {
+                                    let c = stripped[..paren].trim();
+                                    if c.is_empty() {
+                                        continue;
+                                    }
+                                    c.to_string()
+                                } else {
+                                    clean
+                                }
+                            } else {
+                                clean
+                            };
+                            if !clean.is_empty() {
+                                entry.dep_names.push(clean);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if !entry.name.is_empty() {
+            entries.push(entry);
+        }
+    }
+    entries
+}
+
+/// Extract the payload (last gzip member) from a `.apk` file into `dest`.
+///
+/// Alpine `.apk` files contain gzip members concatenated:
+/// - Optional: `.SIGN.*` (signature)
+/// - `control.tar.gz` — package metadata (.PKGINFO, install scripts)
+/// - `payload.tar.gz` — the actual files
+///
+/// We extract only the last gzip member (the payload).
+fn extract_apk_payload(data: &[u8], dest: &Path) -> anyhow::Result<()> {
+    let magic = [0x1f, 0x8b, 0x08];
+    // Find the LAST gzip member — the payload is always the last one in .apk files.
+    let payload_offset = data
+        .windows(3)
+        .enumerate()
+        .filter(|(_, w)| *w == magic)
+        .last()
+        .map(|(i, _)| i)
+        .ok_or_else(|| {
+            anyhow::anyhow!("no gzip members found in .apk file")
+        })?;
+
+    // Write the payload to a temp file and use `tar -xzf` on it.
+    // We avoid stdin piping because tar pre-checks the file before extracting
+    // and may close the pipe early if it detects an issue.
+    let tmp = std::env::temp_dir().join(format!("dirge-apk-payload-{}", uuid::Uuid::new_v4()));
+    std::fs::write(&tmp, &data[payload_offset..])?;
+
+    let output = std::process::Command::new("tar")
+        .args(["-xzf", &tmp.to_string_lossy(), "-C", &dest.to_string_lossy()])
+        .output()?;
+
+    let _ = std::fs::remove_file(&tmp);
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // Show a sample of the data for debugging.
+        let sample_hex: String = data[payload_offset..payload_offset + 32]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        anyhow::bail!(
+            "tar extraction of .apk payload failed: {stderr}\n\
+             payload_offset={payload_offset}, data_len={}, first_bytes={sample_hex}",
+            data.len()
+        );
+    }
+
+    Ok(())
+}
+
+/// Build an Alpine-based microVM image using OCI pull and package installation.
+///
+/// On platforms where buildah is unavailable (macOS), this function
+/// provides an alternative path for preparing `dirge-microvm:*` images:
+///
+/// 1. Pulls the base image via the pure-Rust OCI puller.
+/// 2. Installs `openssh-server` and dependencies by downloading `.apk`
+///    files directly from the Alpine mirror and extracting their payload
+///    into the rootfs.
+/// 3. Creates `/var/empty` (required by sshd privilege separation).
+async fn prepare_local_via_oci(
+    variant: &str,
+    dest: &Path,
+    cache_dir: &Path,
+) -> anyhow::Result<()> {
+    let base_image = match variant {
+        "alpine" => "docker.io/library/alpine:3.21.3",
+        "debian" => {
+            anyhow::bail!(
+                "Debian microVM images are not yet supported on this platform via OCI pull. \
+                 Use Alpine instead."
+            );
+        }
+        other => anyhow::bail!("unsupported dirge-microvm variant: {other}"),
+    };
+
+    // Pull the base image via pure Rust OCI puller.
+    eprintln!("[alpine] OCI pulling base image {base_image} ...");
+    super::oci::pull(base_image, dest, cache_dir).await?;
+    eprintln!("[alpine] OCI pull complete");
+
+    // Install openssh-server by downloading and extracting Alpine packages.
+    // `apk` (Alpine Package Keeper) is not available on macOS via Homebrew,
+    // so we download the .apk files directly and extract the payload tarballs
+    // into the rootfs. This avoids needing apk on the host system.
+    eprintln!("[alpine] installing packages via install_alpine_packages ...");
+    install_alpine_packages(dest, &["openssh-server"]).await?;
+    eprintln!("[alpine] package installation complete");
+
+    // Create /var/empty (required by sshd privilege separation).
+    eprintln!("[alpine] creating /var/empty ...");
+    let var_empty = dest.join("var").join("empty");
+    std::fs::create_dir_all(&var_empty)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&var_empty, std::fs::Permissions::from_mode(0o755))?;
+    }
+    // chown to root so the guest kernel sees root-owned /var/empty
+    // (virtio-fs presents host file uids/gids as-is in the guest).
+    let _ = std::process::Command::new("sudo")
+        .args(["chown", "0:0"])
+        .arg(&var_empty)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    // Also hardlink libcrypto to where musl-prngs expects it
+    eprintln!("[alpine] /var/empty ready");
+
+    Ok(())
+}
+
 /// Clean up an ephemeral rootfs clone.
 pub fn cleanup(path: &Path) -> anyhow::Result<()> {
     if path.exists() {
@@ -252,6 +559,7 @@ pub fn cleanup(path: &Path) -> anyhow::Result<()> {
 ///
 /// Uses `buildah bud` to produce a local image tagged `dirge-microvm:<name>`.
 /// Supported names: "debian", "alpine" (any directory under `images/` with a Dockerfile).
+#[cfg(target_os = "linux")]
 pub fn build_guest_image(name: &str) -> anyhow::Result<()> {
     let tag = format!("dirge-microvm:{name}");
 
@@ -299,7 +607,14 @@ pub fn build_guest_image(name: &str) -> anyhow::Result<()> {
     }
 
     Ok(())
+
 }
+#[cfg(target_os = "macos")]
+pub fn build_guest_image(_name: &str) -> anyhow::Result<()> {
+    eprintln!("  macOS: skipping buildah build (OCI pull will be used at runtime)");
+    Ok(())
+}
+
 
 /// Canonicalize a user-supplied image reference for the microVM sandbox.
 ///
@@ -421,6 +736,7 @@ pub(crate) fn cp_r(src: &Path, dst: &Path) -> anyhow::Result<()> {
                     // the destination gets default permissions, breaking
                     // executables like /bin/sh inside the VM rootfs.
                     std::fs::set_permissions(&dst_path, metadata.permissions())?;
+    eprintln!("[alpine] /var/empty ready");
                 }
                 Err(e) => {
                     let raw = e.raw_os_error().unwrap_or(0);
@@ -493,6 +809,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn build_guest_image_invalid_name() {
         let result = build_guest_image("nonexistent-variant-xyz");
         assert!(result.is_err());

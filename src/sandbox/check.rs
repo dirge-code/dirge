@@ -58,62 +58,113 @@ pub fn check_bwrap() -> Vec<CheckResult> {
 pub fn check_microvm() -> Vec<CheckResult> {
     let mut results = Vec::new();
 
-    // /dev/kvm
-    let kvm_ok = Path::new("/dev/kvm").exists();
-    results.push(CheckResult {
-        name: "/dev/kvm",
-        status: if kvm_ok { Status::Ok } else { Status::Error },
-        message: if kvm_ok {
-            "/dev/kvm is accessible".into()
-        } else {
-            "/dev/kvm not found".into()
-        },
-        fix: if kvm_ok {
-            None
-        } else {
-            Some("Enable KVM in BIOS/firmware, or load the kvm kernel module: modprobe kvm")
-        },
-    });
+    // /dev/kvm (Linux only — macOS uses Hypervisor.framework)
+    #[cfg(target_os = "linux")]
+    {
+        let kvm_ok = Path::new("/dev/kvm").exists();
+        results.push(CheckResult {
+            name: "/dev/kvm",
+            status: if kvm_ok { Status::Ok } else { Status::Error },
+            message: if kvm_ok {
+                "/dev/kvm is accessible".into()
+            } else {
+                "/dev/kvm not found".into()
+            },
+            fix: if kvm_ok {
+                None
+            } else {
+                Some("Enable KVM in BIOS/firmware, or load the kvm kernel module: modprobe kvm")
+            },
+        });
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // Check Hypervisor.framework availability via sysctl.
+        // kern.hv_support returns 1 when hardware virtualization is available.
+        let hv_ok = std::process::Command::new("sysctl")
+            .args(["-n", "kern.hv_support"])
+            .output()
+            .ok()
+            .and_then(|o| {
+                let s = String::from_utf8_lossy(&o.stdout);
+                s.trim().parse::<u8>().ok()
+            })
+            == Some(1);
+        results.push(CheckResult {
+            name: "Hypervisor.framework",
+            status: if hv_ok { Status::Ok } else { Status::Error },
+            message: if hv_ok {
+                "Hypervisor.framework is available".into()
+            } else {
+                "Hypervisor.framework not available (kern.hv_support=0)".into()
+            },
+            fix: if hv_ok {
+                None
+            } else {
+                Some("Hypervisor.framework requires Apple Silicon hardware")
+            },
+        });
+    }
 
-    // libkrun.so
-    let libkrun_ok = check_shared_library("libkrun.so");
+    // libkrun shared library (libkrun.so on Linux, libkrun.dylib on macOS)
+    let libkrun_name = if cfg!(target_os = "macos") {
+        "libkrun.dylib"
+    } else {
+        "libkrun.so"
+    };
+    let libkrun_ok = check_shared_library(libkrun_name);
     results.push(CheckResult {
-        name: "libkrun.so",
+        name: libkrun_name,
         status: if libkrun_ok {
             Status::Ok
         } else {
             Status::Error
         },
         message: if libkrun_ok {
-            "libkrun.so found".into()
+            format!("{libkrun_name} found")
         } else {
-            "libkrun.so not found".into()
+            format!("{libkrun_name} not found")
         },
         fix: if libkrun_ok {
             None
         } else {
-            Some("Install libkrun: see https://github.com/containers/libkrun")
+            Some(if cfg!(target_os = "macos") {
+                "Install libkrun: brew tap libkrun/krun && brew trust libkrun/krun && brew install libkrun libkrunfw"
+            } else {
+                "Install libkrun: see https://github.com/containers/libkrun"
+            })
         },
     });
 
-    // libkrunfw.so
-    let libkrunfw_ok = check_shared_library("libkrunfw.so");
+    // libkrunfw shared library
+    // On macOS, check the versioned leaf name that libkrun dlopens at
+    // runtime (libkrunfw.5.dylib), not just the unversioned symlink.
+    let libkrunfw_name = if cfg!(target_os = "macos") {
+        "libkrunfw.5.dylib"
+    } else {
+        "libkrunfw.so"
+    };
+    let libkrunfw_ok = check_shared_library(libkrunfw_name);
     results.push(CheckResult {
-        name: "libkrunfw.so",
+        name: libkrunfw_name,
         status: if libkrunfw_ok {
             Status::Ok
         } else {
             Status::Error
         },
         message: if libkrunfw_ok {
-            "libkrunfw.so found".into()
+            format!("{libkrunfw_name} found")
         } else {
-            "libkrunfw.so not found".into()
+            format!("{libkrunfw_name} not found")
         },
         fix: if libkrunfw_ok {
             None
         } else {
-            Some("Install libkrunfw: comes with libkrun")
+            Some(if cfg!(target_os = "macos") {
+                "Install libkrunfw: brew tap libkrun/krun && brew trust libkrun/krun && brew install libkrun libkrunfw"
+            } else {
+                "Install libkrunfw: comes with libkrun"
+            })
         },
     });
 
@@ -245,19 +296,56 @@ fn which_in_path(name: &str) -> bool {
 
 #[cfg(feature = "sandbox-microvm")]
 fn check_shared_library(name: &str) -> bool {
-    let output = std::process::Command::new("ldconfig").arg("-p").output();
-    if let Ok(out) = output {
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        if stdout.contains(name) {
-            return true;
+    // Try ldconfig -p (Linux only).
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(out) = std::process::Command::new("ldconfig").arg("-p").output() {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            if stdout.contains(name) {
+                return true;
+            }
         }
     }
-    for dir in &[
-        "/usr/lib",
-        "/usr/lib64",
-        "/usr/local/lib",
-        "/usr/local/lib64",
-    ] {
+
+    // On macOS, try pkg-config and common Homebrew paths.
+    #[cfg(target_os = "macos")]
+    {
+        let libname = name.trim_start_matches("lib").trim_end_matches(".dylib");
+        if let Ok(out) = std::process::Command::new("pkg-config")
+            .args(["--exists", libname])
+            .output()
+        {
+            if out.status.success() {
+                return true;
+            }
+        }
+        // Check brew --prefix
+        if let Ok(out) = std::process::Command::new("brew")
+            .args(["--prefix"])
+            .stderr(std::process::Stdio::null())
+            .output()
+        {
+            let prefix = std::str::from_utf8(&out.stdout).unwrap_or("").trim();
+            if !prefix.is_empty() && std::path::Path::new(prefix).join("lib").join(name).exists() {
+                return true;
+            }
+        }
+    }
+
+    let dirs: &[&str] = if cfg!(target_os = "macos") {
+        &["/opt/homebrew/lib", "/usr/local/lib", "/usr/lib"]
+    } else if cfg!(target_os = "linux") {
+        &[
+            "/usr/lib",
+            "/usr/lib64",
+            "/usr/local/lib",
+            "/usr/local/lib64",
+        ]
+    } else {
+        &["/usr/local/lib", "/usr/lib"]
+    };
+
+    for dir in dirs {
         if std::path::Path::new(dir).join(name).exists() {
             return true;
         }
@@ -380,21 +468,29 @@ mod tests {
             "check_microvm should return at least 6 results, got {}",
             results.len()
         );
-        // First entry should be /dev/kvm check
-        assert_eq!(results[0].name, "/dev/kvm");
-        // One of the last entries should be in the runner binary check
         let names: Vec<_> = results.iter().map(|r| r.name).collect();
         assert!(
             names.contains(&"dirge-microvm-runner"),
             "should include runner check, got: {names:?}"
         );
+        // Library check uses platform-appropriate extension (.so on Linux, .dylib on macOS)
+        let libkrun_name = if cfg!(target_os = "macos") {
+            "libkrun.dylib"
+        } else {
+            "libkrun.so"
+        };
         assert!(
-            names.contains(&"libkrun.so"),
-            "should include libkrun.so check, got: {names:?}"
+            names.contains(&libkrun_name),
+            "should include {libkrun_name} check, got: {names:?}"
         );
+        let libkrunfw_name = if cfg!(target_os = "macos") {
+            "libkrunfw.dylib"
+        } else {
+            "libkrunfw.so"
+        };
         assert!(
-            names.contains(&"libkrunfw.so"),
-            "should include libkrunfw.so check, got: {names:?}"
+            names.contains(&libkrunfw_name),
+            "should include {libkrunfw_name} check, got: {names:?}"
         );
     }
 }
