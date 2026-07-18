@@ -308,7 +308,19 @@ model override; keep the secret in `CEREBRAS_API_KEY`:
 ```
 
 Set `providers.cerebras.base_url` to an HTTPS proxy or custom Cerebras
-endpoint. Dirge does not read a separate `CEREBRAS_BASE_URL` variable.
+endpoint. Dirge does not read a separate `CEREBRAS_BASE_URL` variable:
+
+```json
+{
+  "provider": "cerebras",
+  "providers": {
+    "cerebras": {
+      "model": "gemma-4-31b",
+      "base_url": "https://cerebras-proxy.example.com/v1"
+    }
+  }
+}
+```
 
 Reasoning and image support depend on the model. For `gemma-4-31b`, Dirge
 sends top-level `reasoning_effort` values (`low`, `medium`, or `high`) and

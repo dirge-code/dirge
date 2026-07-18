@@ -4,6 +4,15 @@ All notable changes to dirge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.19.14] - 2026-07-18
+
+### Added
+- Cerebras as a first-class provider. Set `CEREBRAS_API_KEY` and select it with
+  `--provider cerebras` (or a `providers.cerebras` entry); defaults to
+  `gemma-4-31b` against `https://api.cerebras.ai/v1`. Reasoning effort is clamped
+  to `low`/`medium`/`high`, and image input is model-specific (`gemma-4-31b`
+  only). `CEREBRAS_API_KEY` is isolated from other providers (#683).
+
 ## [0.19.13] - 2026-07-17
 
 ### Fixed
