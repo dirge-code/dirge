@@ -605,6 +605,7 @@ pub fn spawn_loop_runner(cfg: LoopSpawnConfig) -> LoopRunner {
         critic_fn: cfg.critic_fn.clone(),
         code_review_fn: cfg.code_review_fn.clone(),
         code_review_mode: cfg.code_review_mode,
+        code_review_repo: None,
         open_issues_gate_mode: cfg.open_issues_gate_mode,
         session_id: cfg.session_id.clone(),
         goal_fn: cfg.goal_fn.clone(),

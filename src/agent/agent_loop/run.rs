@@ -407,8 +407,11 @@ async fn poll_finalization_follow_up(
             // reviews of the same diff and skip a redundant stateless judge call.
             let (diff_owned, current_fingerprint): (Option<String>, Option<u64>) =
                 if mode != CodeReviewMode::Off {
-                    let repo =
-                        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                    // dirge-9b2k: honor an explicit repo override (tests inject a
+                    // temp tree); production leaves it None → process CWD.
+                    let repo = config.code_review_repo.clone().unwrap_or_else(|| {
+                        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+                    });
                     // Diff capture shells out to git — do it off the async runtime.
                     let captured = tokio::task::spawn_blocking(move || {
                         super::code_review::capture_run_diff(&repo)
@@ -1482,7 +1485,10 @@ pub async fn run_loop(
     // and could block the loop. Only needed when the reviewer is armed.
     let code_review_baseline: Option<super::code_review::RunDiff> =
         if config.code_review_fn.is_some() {
-            let repo = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            // dirge-9b2k: same repo-override seam as the finalization poll.
+            let repo = config.code_review_repo.clone().unwrap_or_else(|| {
+                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+            });
             tokio::task::spawn_blocking(move || super::code_review::capture_run_diff(&repo))
                 .await
                 .ok()

@@ -510,6 +510,13 @@ pub struct LoopConfig {
     /// default is [`CodeReviewMode::Advisory`].
     pub code_review_mode: CodeReviewMode,
 
+    /// Repository root for the finalization reviewer's diff capture. `None`
+    /// (production default) falls back to the process working directory. Set
+    /// explicitly so a caller — or a test — can capture the diff of a specific
+    /// tree without depending on the process-global CWD (which parallel tests
+    /// race).
+    pub code_review_repo: Option<std::path::PathBuf>,
+
     /// How the open-issues finalization gate engages. Default `Off`
     /// (opt-in). Resolved at `build_agent` time from
     /// `Config::resolve_open_issues_gate_mode`.
@@ -740,6 +747,7 @@ impl Clone for LoopConfig {
             critic_fn: self.critic_fn.clone(),
             code_review_fn: self.code_review_fn.clone(),
             code_review_mode: self.code_review_mode,
+            code_review_repo: self.code_review_repo.clone(),
             open_issues_gate_mode: self.open_issues_gate_mode,
             session_id: self.session_id.clone(),
             goal_fn: self.goal_fn.clone(),
@@ -797,6 +805,7 @@ impl LoopConfig {
             critic_fn: None,
             code_review_fn: None,
             code_review_mode: CodeReviewMode::Advisory,
+            code_review_repo: None,
             open_issues_gate_mode: GateMode::Off,
             session_id: None,
             goal_fn: None,
