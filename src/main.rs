@@ -1180,6 +1180,7 @@ async fn main() -> anyhow::Result<()> {
                             // declare the env var name and the request
                             // builder reads options from cfg/CLI.
                             api_key: None,
+                            headers: None,
                             options: None,
                         },
                     )

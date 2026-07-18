@@ -57,6 +57,9 @@ pub struct ProviderEntry {
     /// `apiKey` in the JSON.
     #[serde(alias = "apiKey")]
     pub api_key: Option<String>,
+    /// Extra HTTP headers sent with requests to this provider. Accepts
+    /// literal strings OR `${ENV_VAR}` interpolation.
+    pub headers: Option<HashMap<String, String>>,
     /// Set to true to allow `http://` URLs (insecure). Default false —
     /// only `https://` is accepted. Non-https endpoints send every
     /// prompt, file content, and tool result in plaintext over the
@@ -100,10 +103,62 @@ impl ProviderEntry {
         }
     }
 
+    /// Resolve configured provider headers, rejecting invalid names or values
+    /// before a client is constructed.
+    pub fn resolved_headers(&self) -> anyhow::Result<rig::http_client::HeaderMap> {
+        let mut headers = rig::http_client::HeaderMap::new();
+        for (name, raw) in self.headers.iter().flat_map(|m| m.iter()) {
+            let header_name = http::HeaderName::try_from(name)
+                .map_err(|e| anyhow::anyhow!("invalid provider header name `{name}`: {e}"))?;
+            let value = raw
+                .strip_prefix("${")
+                .and_then(|s| s.strip_suffix('}'))
+                .map(|var| {
+                    std::env::var(var).map_err(|_| {
+                        anyhow::anyhow!(
+                            "provider header `{name}` references unset environment variable `{var}`"
+                        )
+                    })
+                })
+                .transpose()?
+                .map_or_else(
+                    || http::HeaderValue::try_from(raw),
+                    http::HeaderValue::try_from,
+                )
+                .map_err(|e| anyhow::anyhow!("invalid value for provider header `{name}`: {e}"))?;
+            headers.insert(header_name, value);
+        }
+        Ok(headers)
+    }
+
     /// `options.temperature` as an f64 when set. Other shapes (string,
     /// integer, missing) return `None`.
     pub fn options_temperature(&self) -> Option<f64> {
         self.options.as_ref()?.get("temperature")?.as_f64()
+    }
+}
+
+#[cfg(test)]
+mod provider_entry_tests {
+    use super::ProviderEntry;
+
+    #[test]
+    fn resolves_literal_headers() {
+        let entry: ProviderEntry = serde_json::from_value(serde_json::json!({
+            "headers": {"X-Title": "dirge"}
+        }))
+        .unwrap();
+        let headers = entry.resolved_headers().unwrap();
+        assert_eq!(headers.get("x-title").unwrap(), "dirge");
+    }
+
+    #[test]
+    fn rejects_invalid_header_values() {
+        let entry: ProviderEntry = serde_json::from_value(serde_json::json!({
+            "headers": {"X-Title": "bad\nvalue"}
+        }))
+        .unwrap();
+        assert!(entry.resolved_headers().is_err());
     }
 }
 

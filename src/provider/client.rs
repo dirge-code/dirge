@@ -270,6 +270,12 @@ where
             provider_name
         )
     })?;
+    let mut headers = providers
+        .get(provider_name)
+        .or_else(|| providers.get(&provider_name.to_ascii_lowercase()))
+        .map(ProviderEntry::resolved_headers)
+        .transpose()?
+        .unwrap_or_default();
 
     // dirge-ro8g: for the anthropic provider, a present OAuth login — a
     // stored `dirge auth anthropic` creds file OR an exported
@@ -378,7 +384,8 @@ where
                     account_id: openai_oauth_account_id,
                 })
                 .originator(CHATGPT_ORIGINATOR)
-                .base_url(CHATGPT_CODEX_BASE_URL);
+                .base_url(CHATGPT_CODEX_BASE_URL)
+                .http_headers(headers);
             Ok(AnyClient::OpenAICodex(b.build()?))
         }
         ProviderKind::OpenAI if is_chatgpt_auth => {
@@ -401,9 +408,10 @@ where
             if let Some(base_url) = &base_url {
                 b = b.base_url(base_url);
             }
-            if let Some(headers) = chatgpt_http_headers(auth_headers.as_ref()) {
-                b = b.http_headers(headers);
+            if let Some(chatgpt_headers) = chatgpt_http_headers(auth_headers.as_ref()) {
+                headers.extend(chatgpt_headers);
             }
+            b = b.http_headers(headers);
             Ok(AnyClient::ChatGptOpenAI(b.build()?))
         }
         ProviderKind::OpenAI => {
@@ -422,6 +430,7 @@ where
             if let Some(base_url) = &base_url {
                 b = b.base_url(base_url);
             }
+            b = b.http_headers(headers);
             Ok(AnyClient::OpenAI(b.build()?))
         }
         ProviderKind::Anthropic => {
@@ -466,6 +475,7 @@ where
                 if let Some(base_url) = &base_url {
                     b = b.base_url(base_url);
                 }
+                b = b.http_headers(headers);
                 Ok(AnyClient::AnthropicOauth(b.build()?))
             } else {
                 let mut b = anthropic::Client::builder().api_key(&key).http_client(
@@ -481,6 +491,7 @@ where
                 if let Some(base_url) = &base_url {
                     b = b.base_url(base_url);
                 }
+                b = b.http_headers(headers);
                 Ok(AnyClient::Anthropic(b.build()?))
             }
         }
@@ -498,6 +509,7 @@ where
             if let Some(base_url) = &base_url {
                 b = b.base_url(base_url);
             }
+            b = b.http_headers(headers);
             Ok(AnyClient::Gemini(b.build()?))
         }
         ProviderKind::DeepSeek => {
@@ -513,7 +525,8 @@ where
                     ),
                 )
                 .api_key(&key)
-                .base_url(base_url.as_deref().unwrap_or("https://api.deepseek.com/v1"));
+                .base_url(base_url.as_deref().unwrap_or("https://api.deepseek.com/v1"))
+                .http_headers(headers);
             Ok(AnyClient::DeepSeek(b.build()?))
         }
         ProviderKind::Glm => {
@@ -533,7 +546,8 @@ where
                     base_url
                         .as_deref()
                         .unwrap_or("https://open.bigmodel.cn/api/coding/paas/v4"),
-                );
+                )
+                .http_headers(headers);
             Ok(AnyClient::Glm(b.build()?))
         }
         ProviderKind::Cerebras => {
@@ -565,7 +579,8 @@ where
                     ),
                 )
                 .api_key(&key)
-                .base_url(base_url.as_deref().unwrap_or("https://opencode.ai/zen/v1"));
+                .base_url(base_url.as_deref().unwrap_or("https://opencode.ai/zen/v1"))
+                .http_headers(headers);
             Ok(AnyClient::OpenCode(b.build()?))
         }
         ProviderKind::Ollama => {
@@ -583,6 +598,7 @@ where
             if let Some(base_url) = &base_url {
                 b = b.base_url(base_url);
             }
+            b = b.http_headers(headers);
             Ok(AnyClient::Ollama(b.build()?))
         }
         ProviderKind::OpenRouter => {
@@ -599,6 +615,7 @@ where
             if let Some(base_url) = &base_url {
                 b = b.base_url(base_url);
             }
+            b = b.http_headers(headers);
             Ok(AnyClient::OpenRouter(b.build()?))
         }
         ProviderKind::Custom => {
@@ -619,7 +636,8 @@ where
                     ),
                 )
                 .api_key(&key)
-                .base_url(&base_url);
+                .base_url(&base_url)
+                .http_headers(headers);
             Ok(AnyClient::Custom(b.build()?))
         }
     }
