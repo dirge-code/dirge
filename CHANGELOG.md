@@ -4,6 +4,19 @@ All notable changes to dirge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.19.15] - 2026-07-18
+
+### Added
+- Custom per-provider HTTP headers via `providers.<name>.headers` (a
+  name → value map). A value that is exactly `${ENV_VAR}` is resolved from the
+  environment; header names and values are validated before the client is built
+  (#686).
+- `--verbose` now logs HTTP request method/URI/status and classifies stream and
+  retry errors (abort, timeout, network, auth, rate-limit), making API failures
+  easier to diagnose. The logged URI has its query string stripped so a
+  credential embedded there (e.g. Gemini's `?key=`) never reaches the logs
+  (#685).
+
 ## [0.19.14] - 2026-07-18
 
 ### Added

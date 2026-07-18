@@ -142,6 +142,19 @@ impl ProviderEntry {
 mod provider_entry_tests {
     use super::ProviderEntry;
 
+    /// Serializes the env-mutating test. `std::env::set_var` is `unsafe`
+    /// because environment mutation is process-global; concurrent tests racing
+    /// on env would flake.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Removes the test env var on drop so a panic mid-test can't leak it.
+    struct EnvGuard(&'static str);
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe { std::env::remove_var(self.0) };
+        }
+    }
+
     #[test]
     fn resolves_literal_headers() {
         let entry: ProviderEntry = serde_json::from_value(serde_json::json!({
@@ -156,6 +169,31 @@ mod provider_entry_tests {
     fn rejects_invalid_header_values() {
         let entry: ProviderEntry = serde_json::from_value(serde_json::json!({
             "headers": {"X-Title": "bad\nvalue"}
+        }))
+        .unwrap();
+        assert!(entry.resolved_headers().is_err());
+    }
+
+    #[test]
+    fn resolves_env_var_headers() {
+        const VAR: &str = "DIRGE_TEST_HEADER_TOKEN";
+        let _lock = ENV_LOCK.lock().unwrap();
+        unsafe { std::env::set_var(VAR, "s3cr3t") };
+        let _guard = EnvGuard(VAR);
+        let entry: ProviderEntry = serde_json::from_value(serde_json::json!({
+            "headers": {"Authorization": format!("${{{VAR}}}")}
+        }))
+        .unwrap();
+        let headers = entry.resolved_headers().unwrap();
+        assert_eq!(headers.get("authorization").unwrap(), "s3cr3t");
+    }
+
+    #[test]
+    fn rejects_unset_env_var_headers() {
+        // A whole-value `${VAR}` that points at an unset variable is a hard
+        // error, not a silent empty header.
+        let entry: ProviderEntry = serde_json::from_value(serde_json::json!({
+            "headers": {"Authorization": "${DIRGE_DEFINITELY_UNSET_HEADER_VAR}"}
         }))
         .unwrap();
         assert!(entry.resolved_headers().is_err());

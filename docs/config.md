@@ -278,7 +278,7 @@ Each `providers` entry accepts:
 | `allow_insecure` | Allow `http://` URLs (plaintext). Default `false`; only enable for local-only proxies. |
 | `stream_chunk_timeout_secs` | Per-provider streaming chunk timeout override. |
 | `multimodal` | Override for whether this provider/model accepts image input (gates the Ctrl+V image-paste UX). `true`/`false` forces it either way; omit to auto-detect from the model name and provider type. Set `true` to enable pasting into a local vision model (e.g. Ollama `llama3.2-vision`) behind a generic provider type. |
-| `headers` | Extra HTTP request headers. Values may be literal strings or `${ENV_VAR}` references. |
+| `headers` | Extra HTTP request headers. A value that is exactly `${ENV_VAR}` is replaced by that environment variable (an unset variable is a hard error); any other value, including one with `${…}` embedded in surrounding text, is sent literally. |
 | `options` | Free-form per-provider model options; currently honors `temperature`. |
 
 The aliases on the left of the map become the values you write in
