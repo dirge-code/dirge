@@ -41,7 +41,7 @@ jobs:
             cargo_flags: "--no-default-features --features windows-default"
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -88,14 +88,14 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: main
           # Full history so the post-build commit can rebase+push to main.
           fetch-depth: 0
 
       - name: Install Nix
-        uses: DeterminateSystems/nix-installer-action@v16
+        uses: DeterminateSystems/nix-installer-action@v22
 
       - name: Prefetch release assets and update nix/bin.nix
         env:
@@ -193,7 +193,7 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Check out the tap
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: dirge-code/homebrew-dirge
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}

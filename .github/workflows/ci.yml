@@ -17,7 +17,7 @@ jobs:
   rustfmt:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -39,7 +39,7 @@ jobs:
   clippy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -52,6 +52,14 @@ jobs:
 
       - name: Clippy (windows-default)
         run: cargo clippy --no-default-features --features windows-default --all-targets -- -D warnings
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Audit dependencies
+        uses: pirafrank/audit-check-action@v1
 
   # The `validate_all_plugins_compile` Rust test (mod_tests.rs) loads every
   # plugin against the full dirge harness surface.  It runs in the
@@ -103,7 +111,7 @@ jobs:
           - name: all-features
             features: "--all-features"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -138,7 +146,7 @@ jobs:
     name: build (windows-default)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
