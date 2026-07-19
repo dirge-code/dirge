@@ -81,6 +81,7 @@ pub(crate) fn spawn(
     kind: ShellKind,
     cols: u16,
     rows: u16,
+    shell_path: Option<&str>,
 ) -> io::Result<ShellSession> {
     let (primary, secondary) = open_pty_pair()?;
     let secondary_fd = secondary.as_raw_fd();
@@ -91,7 +92,14 @@ pub(crate) fn spawn(
     set_winsize(secondary_fd, cols, rows);
 
     // Build the command with the PTY slave as stdin/stdout/stderr.
-    let mut cmd = sandbox.command_for_interactive(command);
+    let effective_cmd = match shell_path {
+        Some(shell) => {
+            let escaped = command.replace('\'', "'\\''");
+            format!("{shell} -c '{escaped}'")
+        }
+        None => command.to_string(),
+    };
+    let mut cmd = sandbox.command_for_interactive(&effective_cmd);
     let din = secondary.try_clone()?;
     let dout = secondary.try_clone()?;
     let derr = secondary.try_clone()?;
@@ -291,6 +299,7 @@ pub(crate) fn spawn(
     kind: ShellKind,
     _cols: u16,
     _rows: u16,
+    _shell_path: Option<&str>,
 ) -> io::Result<ShellSession> {
     use std::process::Stdio;
 
@@ -472,6 +481,7 @@ mod tests {
             ShellKind::Visible,
             80,
             24,
+            None,
         )
         .unwrap();
         let ShellSession {
@@ -495,6 +505,7 @@ mod tests {
             ShellKind::Visible,
             80,
             24,
+            None,
         )
         .unwrap();
         let ShellSession {
@@ -513,7 +524,7 @@ mod tests {
 
     #[tokio::test]
     async fn forwards_stdin_to_child() {
-        let s = spawn("cat", &sb(), ShellKind::Visible, 80, 24).unwrap();
+        let s = spawn("cat", &sb(), ShellKind::Visible, 80, 24, None).unwrap();
         let ShellSession {
             input_tx,
             mut events_rx,
@@ -540,6 +551,7 @@ mod tests {
             ShellKind::Visible,
             80,
             24,
+            None,
         )
         .unwrap();
         let ShellSession {
@@ -561,7 +573,7 @@ mod tests {
 
     #[tokio::test]
     async fn propagates_nonzero_exit_code() {
-        let s = spawn("exit 7", &sb(), ShellKind::Visible, 80, 24).unwrap();
+        let s = spawn("exit 7", &sb(), ShellKind::Visible, 80, 24, None).unwrap();
         let ShellSession {
             input_tx,
             mut events_rx,
@@ -580,6 +592,7 @@ mod tests {
             ShellKind::Visible,
             80,
             24,
+            None,
         )
         .unwrap();
         let ShellSession {
@@ -601,6 +614,7 @@ mod tests {
             ShellKind::Visible,
             80,
             24,
+            None,
         )
         .unwrap();
         let ShellSession {
@@ -626,7 +640,7 @@ mod tests {
 
     #[tokio::test]
     async fn interrupt_kills_long_running_process() {
-        let s = spawn("sleep 30", &sb(), ShellKind::Visible, 80, 24).unwrap();
+        let s = spawn("sleep 30", &sb(), ShellKind::Visible, 80, 24, None).unwrap();
         let mut session = s;
         tokio::time::sleep(Duration::from_millis(200)).await;
         if let Some(tx) = session.interrupt.take() {

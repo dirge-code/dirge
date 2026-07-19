@@ -607,7 +607,8 @@ pub async fn build_loop_tools(
                 sandbox.clone(),
                 cache.clone(),
             )
-            .with_shell_store(Some(tools::bg_shell::global())),
+            .with_shell_store(Some(tools::bg_shell::global()))
+            .with_shell_path_option(cfg.shell.clone()),
             Some(ToolExecutionMode::Sequential),
         )
         .await,

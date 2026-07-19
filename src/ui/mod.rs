@@ -2565,6 +2565,7 @@ pub async fn run_interactive(
                                             kind,
                                             cols,
                                             rows,
+                                            cfg.shell.as_deref(),
                                         ) {
                                             Ok(session) => {
                                                 // `$ cmd` marks the start in the chat log;

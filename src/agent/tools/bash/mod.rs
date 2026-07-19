@@ -27,6 +27,9 @@ pub struct BashTool {
     /// (`kill_shell`). When absent (e.g. some headless paths) `background`
     /// degrades gracefully to synchronous execution.
     shell_store: Option<crate::agent::tools::bg_shell::BackgroundShellStore>,
+    /// Custom shell binary path. When set, commands are wrapped as `{shell} -c '{cmd}'`
+    /// before reaching the sandbox wrapper. Default: unset (sandbox's hardcoded "bash").
+    shell_path: Option<String>,
 }
 
 impl BashTool {
@@ -39,7 +42,15 @@ impl BashTool {
             execution_root: None,
             cache: None,
             shell_store: None,
+            shell_path: None,
         }
+    }
+
+    /// Set a custom shell binary path. Commands are wrapped as `{shell} -c '{cmd}'`.
+    /// Accepts `Option<String>` — no-op when None.
+    pub fn with_shell_path_option(mut self, path: Option<String>) -> Self {
+        self.shell_path = path;
+        self
     }
 
     pub fn with_cache(
@@ -55,6 +66,7 @@ impl BashTool {
             execution_root: None,
             cache: Some(cache),
             shell_store: None,
+            shell_path: None,
         }
     }
 
@@ -113,6 +125,15 @@ impl Tool for BashTool {
         let command =
             crate::ui::ansi::strip_escapes(&args.command, crate::ui::ansi::StripPolicy::KEEP_BOTH);
         check::check_bash_segments(&self.permission, &self.ask_tx, &command).await?;
+
+        // Wrap with the configured shell if set, so the command runs under the
+        // user's chosen shell binary instead of the default PATH-resolved "bash".
+        let command = if let Some(shell) = &self.shell_path {
+            let escaped = command.replace('\'', "'\\''");
+            format!("{shell} -c '{escaped}'")
+        } else {
+            command
+        };
 
         // F6: spawn into its own process group so a timeout can
         // SIGKILL the entire subprocess tree, not just the
