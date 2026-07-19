@@ -113,6 +113,17 @@ jobs:
       - name: Build
         run: cargo build --bin dirge ${{ matrix.features }}
 
+      # nextest runs the suite in parallel per-test-process; faster and
+      # clearer failures than `cargo test` on our ~4400-test suite. dirge
+      # is a bin-only crate (no lib), so `cargo test --bin` never ran
+      # doctests and nextest drops no coverage. Installed via prebuilt
+      # binary only on the variants that actually test.
+      - name: Install nextest
+        if: matrix.name == 'default' || matrix.name == 'plugin' || matrix.name == 'dap' || matrix.name == 'all-features'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+
       - name: Test
         # Skip tests for matrix variants where `cargo build` alone
         # is the canary — they share most code with the default
@@ -121,7 +132,7 @@ jobs:
         # default, plugin (covers plugin-only hook tests), and
         # all-features (worst-case interaction).
         if: matrix.name == 'default' || matrix.name == 'plugin' || matrix.name == 'dap' || matrix.name == 'all-features'
-        run: cargo test --bin dirge ${{ matrix.features }}
+        run: cargo nextest run --bin dirge ${{ matrix.features }}
 
   # Windows is only built at release time (release.yml, tag-triggered),
   # so platform-specific breakage used to slip through until a release.
