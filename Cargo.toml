@@ -55,6 +55,10 @@ required-features = ["sandbox-microvm"]
 # deps, so it falsely reports rig-core as unused.
 ignored = ["rig-core"]
 
+[package.metadata.cargo-shear]
+ignored = ["rig-core"]
+ignored-paths = ["src/tests/dap/fixtures/test_program.rs"]
+
 [features]
 # Batteries-included by default: `cargo install dirge-agent` and the
 # release binaries get the whole tool (MCP, LSP, ACP, plugins, and every
@@ -210,9 +214,7 @@ notify-rust = { version = "4", default-features = false, features = ["z"] }
 # Dirge only uses rig's MCP transport (`rmcp` feature) and the core
 # provider/agent/completion APIs. By disabling default features we
 # drop ~370 transitive crates (881→508 deps) and eliminate all 6
-# cargo-audit findings. The `rustls` feature on rig-core ensures the
-# reqwest TLS backend stays on the modern rustls 0.23 → webpki 0.103
-# stack rather than the legacy 0.21 pathway.
+# cargo-audit findings.
 # Pinned to an exact version, not a caret. rig ships breaking API
 # changes in patch/minor releases (0.37.0 -> 0.37.1 added a required
 # `Text.additional_params` field), and `cargo install dirge-agent`
@@ -226,7 +228,7 @@ rig = { version = "=0.39.0", default-features = false, features = ["rmcp"] }
 # future readers understand the TLS backend choice is deliberate.
 # cargo-machete reports this as unused — the package.metadata
 # block at the top of this file suppresses that false positive.
-rig-core = { version = "=0.39.0", default-features = false, features = ["reqwest", "derive", "rustls"] }
+rig-core = { version = "=0.39.0", default-features = false, features = ["reqwest", "derive"] }
 # Macros for emitting `Stream<Item = …>` from async generator-style
 # code blocks. Used by `agent_loop::rig_stream` to wrap rig's
 # `StreamingCompletionResponse` into our pi-style `StreamEvent`
@@ -271,7 +273,16 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 thiserror = "2"
 futures = "0.3"
-reqwest = "0.13"
+# ring-based rustls TLS for reqwest. Faster cold build vs aws-lc-rs
+# (~15s vs 76s native C compile). See plans/compile-time-improvements.md
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "charset", "http2", "system-proxy"] }
+# Explicit deps to pin rustls to ring backend instead of aws-lc-rs.
+# Required because reqwest/rustls-no-provider enables the deps but
+# doesn't specify a crypto backend; cargo would fall back to their
+# default features (aws-lc-rs). These override that.
+hyper-rustls = { version = "0.27", default-features = false, features = ["ring"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 # UI-redesign branch: system CPU / MEM gauges for the [SYSTEM LOAD]
 # sub-panel. `default-features = false` + only the modules we use
 # keeps the dep small (no disks / networks / processes — just CPU
@@ -298,7 +309,7 @@ tree-sitter-java = { version = "0.23", optional = true }
 tree-sitter-c = { version = "0.24", optional = true }
 tree-sitter-cpp = { version = "0.23", optional = true }
 streaming-iterator = { version = "0.1", optional = true }
-jsonschema = "0.46"
+jsonschema = { version = "0.46", default-features = false, features = ["resolve-http", "resolve-file", "tls-ring"] }
 janetrs = { version = "0.8", optional = true }
 html2text = "0.17"
 indexmap = "2"
@@ -364,6 +375,7 @@ whatlang = { version = "0.18.0" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
+ctor = "1"
 
 # Profiles tuned with cargo-wizard, then adjusted for dirge's constraints.
 #
@@ -396,3 +408,4 @@ debug = false
 # in a dev backtrace, set `debug = "line-tables-only"`.
 [profile.dev]
 debug = 0
+

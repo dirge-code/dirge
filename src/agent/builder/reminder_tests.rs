@@ -14,6 +14,9 @@ use crate::cli::Cli;
 use crate::config::Config;
 use crate::sandbox::{Sandbox, SandboxMode};
 use clap::Parser;
+// Ensure ring crypto provider is installed for rustls-based reqwest clients.
+// Tests bypass main(), so the provider install in main() doesn't cover them.
+static RING_INIT: std::sync::Once = std::sync::Once::new();
 
 #[test]
 fn plan_mode_injects_plan_reminder() {
@@ -480,6 +483,9 @@ fn memory_preamble_injection_uses_trait_dispatch() {
 /// the wiring (rather than from the helper) is caught.
 #[tokio::test]
 async fn build_agent_inner_emits_assembled_preamble() {
+    RING_INIT.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
     use crate::context::ContextFiles;
     use rig::client::CompletionClient;
     use rig::providers::openai;

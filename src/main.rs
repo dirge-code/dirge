@@ -433,6 +433,9 @@ fn should_adopt_session_provider(
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
+    // Install ring crypto provider for rustls (reqwest uses rustls-no-provider).
+    // Must happen before any reqwest::Client::new() call.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let mut cli = cli::Cli::parse();
 
     // Install the off-stream notification channel EARLY so MCP
