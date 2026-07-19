@@ -788,6 +788,9 @@ pub struct Config {
     /// Default authentication source for providers that do not set
     /// `providers.<name>.auth`. `ApiKey` remains the implicit default.
     pub auth: Option<ProviderAuth>,
+    /// Shell binary path for non-sandboxed bash execution.
+    /// Default: `"bash"` (looked up via $PATH by the OS spawn mechanism).
+    pub shell: Option<String>,
     pub max_tokens: Option<u64>,
     pub temperature: Option<f64>,
     pub no_tools: Option<bool>,
