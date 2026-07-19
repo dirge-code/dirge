@@ -45,10 +45,26 @@ static STATUS_5XX_RE: LazyLock<Regex> = LazyLock::new(|| {
 pub enum ErrorKind {
     ContextLength,
     RateLimit,
+    /// A rate-limit-shaped 429 whose quota won't reset within a window
+    /// we're willing to wait out — a provider usage cap (e.g. Zhipu/GLM's
+    /// "5-hour usage limit", error code 1308), or any 429 whose
+    /// `Retry-After` exceeds [`MAX_IN_RUN_RETRY_WAIT`]. Split from
+    /// [`RateLimit`] because retrying with the capped backoff just
+    /// re-hits the cap (burning the retry budget and stalling the run for
+    /// minutes before dying mid-task); the run should stop cleanly and
+    /// resume after the quota resets instead. Non-retryable, like Auth.
+    UsageCap,
     Network,
     Auth,
     Other,
 }
+
+/// A rate-limit whose server-requested wait is longer than this is
+/// treated as an [`ErrorKind::UsageCap`] rather than a retryable
+/// [`ErrorKind::RateLimit`]: our backoff caps at the same 5 minutes
+/// (`backoff_duration_for_msg`), so retrying sooner than the server asked
+/// just earns another 429. Matches that ceiling.
+pub(crate) const MAX_IN_RUN_RETRY_WAIT: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone)]
 pub struct RecoveryPolicy {
@@ -264,6 +280,30 @@ pub(crate) fn retry_after_from_error_msg(msg: &str) -> Option<Duration> {
     None
 }
 
+/// Best-effort human-readable reset time for a usage-cap error, for
+/// surfacing "resets at …" to the user. Recognizes an ISO-ish
+/// `YYYY-MM-DD HH:MM[:SS]` timestamp anywhere in the message — the form
+/// Zhipu/GLM emits ("您的限额将在 2026-07-18 07:41:55 重置" / "resets at …");
+/// failing that, derives a relative hint from a `Retry-After` header.
+/// `None` when neither is present.
+pub fn usage_cap_reset_hint(msg: &str) -> Option<String> {
+    static RESET_TS_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\d{2})?").expect("static regex compiles")
+    });
+    if let Some(m) = RESET_TS_RE.find(msg) {
+        return Some(m.as_str().to_string());
+    }
+    let wait = retry_after_from_error_msg(msg)?;
+    let secs = wait.as_secs();
+    Some(if secs >= 3600 {
+        format!("~{}h from now", secs / 3600)
+    } else if secs >= 60 {
+        format!("~{}m from now", secs / 60)
+    } else {
+        format!("~{secs}s from now")
+    })
+}
+
 /// Scan `msg` for a `Retry-After:` header whose value parses as an
 /// RFC 7231 HTTP-date (IMF-fixdate, RFC 850, or asctime form). Returns
 /// the time from now until that date, clamped to 0 if in the past.
@@ -383,29 +423,49 @@ pub fn classify_error(msg: &str) -> ErrorKind {
         return ErrorKind::Auth;
     }
 
-    if lower.contains("rate limit") || lower.contains("too many requests") {
-        return ErrorKind::RateLimit;
+    // Usage caps: rate-limit-shaped responses whose quota won't reset
+    // within a retryable window. Zhipu/GLM returns HTTP 429 code 1308 with
+    // a multi-hour reset ("已达到 5 小时的使用上限" — reached the 5-hour usage
+    // limit); it contains "too many requests", so it MUST be caught before
+    // the generic rate-limit arm below or it'd be retried futilely (the
+    // reset is hours out; our backoff caps at 5 min — the run stalls
+    // through its budget, then dies mid-task). Match the unambiguous cap
+    // wording, not the 429 shell, so a momentary throttle stays retryable.
+    if lower.contains("使用上限")            // Zhipu: "usage limit / ceiling"
+        || lower.contains("usage limit")
+        || lower.contains("usage cap")
+        || lower.contains("daily limit")
+        || lower.contains("quota exceeded")
+        || lower.contains("code\":\"1308")   // Zhipu usage-cap error code
+        || lower.contains("code\": \"1308")
+    {
+        return ErrorKind::UsageCap;
     }
 
-    if lower.contains(" 429 ") || lower.contains("error 429") || lower.starts_with("429 ") {
-        return ErrorKind::RateLimit;
-    }
-
-    // PROV-7: Gemini emits 429s with body
-    // `{"error":{"status":"RESOURCE_EXHAUSTED",…}}` that often
-    // arrive stringified without the literal " 429 " or "rate
-    // limit" wording. Treat as transient so the backoff loop runs.
-    if lower.contains("resource_exhausted") || lower.contains("resource has been exhausted") {
-        return ErrorKind::RateLimit;
-    }
-
-    // Anthropic's `overloaded_error` is a transient capacity signal —
-    // structurally a rate-limit response without the "rate limit" /
-    // "too many" wording. Classify as RateLimit so the retry-with-
-    // backoff policy applies; previously it fell through to `Other`
-    // and the user saw a one-shot failure on transient backend
-    // pressure.
-    if lower.contains("overloaded") {
+    // Rate-limit-shaped 429s. PROV-7: Gemini emits `RESOURCE_EXHAUSTED`
+    // bodies without the literal " 429 " / "rate limit" wording;
+    // Anthropic's `overloaded_error` is a transient capacity signal
+    // shaped like a rate-limit without that wording. All are transient —
+    // retry with backoff — UNLESS the server's `Retry-After` is longer
+    // than we'll wait (a usage cap in disguise; see below).
+    let rate_limited = lower.contains("rate limit")
+        || lower.contains("too many requests")
+        || lower.contains(" 429 ")
+        || lower.contains("error 429")
+        || lower.starts_with("429 ")
+        || lower.contains("resource_exhausted")
+        || lower.contains("resource has been exhausted")
+        || lower.contains("overloaded");
+    if rate_limited {
+        // A rate-limit whose requested wait exceeds our backoff ceiling
+        // is effectively a usage cap: retrying at the capped delay just
+        // re-hits it. Stop cleanly (UsageCap) rather than burning the
+        // budget on retries that can't succeed.
+        if let Some(wait) = retry_after_from_error_msg(msg)
+            && wait > MAX_IN_RUN_RETRY_WAIT
+        {
+            return ErrorKind::UsageCap;
+        }
         return ErrorKind::RateLimit;
     }
 
@@ -527,6 +587,10 @@ pub fn user_facing_error(msg: &str, attempts: usize) -> String {
         ErrorKind::RateLimit => (
             "provider rate-limited the request",
             "wait a moment and retry, or switch to a different model via /model",
+        ),
+        ErrorKind::UsageCap => (
+            "provider usage cap reached — the quota won't reset within a retryable window",
+            "wait for the quota to reset (see the reset time in the cause), then re-run to resume; or switch providers via /model",
         ),
         ErrorKind::ContextLength => (
             "conversation exceeds the model's context window",
@@ -826,6 +890,84 @@ mod tests {
             classify_error("received http 502 from upstream"),
             ErrorKind::Network
         );
+    }
+
+    /// dirge-u6zc: Zhipu/GLM's 5-hour usage cap (HTTP 429, code 1308) is
+    /// a UsageCap, not a retryable RateLimit — retrying just re-hits it.
+    #[test]
+    fn zhipu_usage_cap_1308_is_usage_cap_not_ratelimit() {
+        let msg = r#"ProviderError: Invalid status code 429 Too Many Requests with message: {"error":{"code":"1308","message":"已达到 5 小时的使用上限。您的限额将在 2026-07-18 07:41:55 重置。"}}"#;
+        assert_eq!(classify_error(msg), ErrorKind::UsageCap);
+    }
+
+    /// A rate-limit whose Retry-After exceeds our backoff ceiling is a
+    /// usage cap in disguise — retrying at the capped delay can't succeed.
+    #[test]
+    fn long_retry_after_promotes_ratelimit_to_usage_cap() {
+        assert_eq!(
+            classify_error("429 Too Many Requests; Retry-After: 18000"),
+            ErrorKind::UsageCap
+        );
+    }
+
+    /// A short Retry-After stays a retryable RateLimit — a momentary
+    /// throttle, not a cap.
+    #[test]
+    fn short_retry_after_stays_ratelimit() {
+        assert_eq!(
+            classify_error("429 Too Many Requests; Retry-After: 30"),
+            ErrorKind::RateLimit
+        );
+    }
+
+    /// A plain 429 with no cap signal and no long Retry-After stays a
+    /// retryable RateLimit (regression guard for the common case).
+    #[test]
+    fn plain_429_without_cap_signal_stays_ratelimit() {
+        assert_eq!(
+            classify_error("HTTP 429 Too Many Requests"),
+            ErrorKind::RateLimit
+        );
+        assert_eq!(classify_error("rate limit exceeded"), ErrorKind::RateLimit);
+        assert_eq!(classify_error("overloaded_error"), ErrorKind::RateLimit);
+    }
+
+    /// UsageCap is non-retryable — the retry policy must not burn the
+    /// budget on it.
+    #[test]
+    fn usage_cap_is_not_retryable() {
+        let p = RecoveryPolicy::default();
+        assert!(!p.should_retry(0, ErrorKind::UsageCap));
+    }
+
+    /// The reset hint pulls the Zhipu timestamp so the user knows when
+    /// to resume; a Retry-After yields a relative hint.
+    #[test]
+    fn usage_cap_reset_hint_extracts_reset_time() {
+        let zhipu = r#"{"code":"1308","message":"已达到 5 小时的使用上限。您的限额将在 2026-07-18 07:41:55 重置。"}"#;
+        assert_eq!(
+            usage_cap_reset_hint(zhipu).as_deref(),
+            Some("2026-07-18 07:41:55")
+        );
+        assert_eq!(
+            usage_cap_reset_hint("429; Retry-After: 18000").as_deref(),
+            Some("~5h from now")
+        );
+        assert_eq!(
+            usage_cap_reset_hint("plain error, no reset").as_deref(),
+            None
+        );
+    }
+
+    /// UsageCap gets its own user-facing headline distinct from RateLimit.
+    #[test]
+    fn user_facing_error_classifies_usage_cap() {
+        let pretty = user_facing_error(
+            r#"429 Too Many Requests {"code":"1308","message":"使用上限"}"#,
+            2,
+        );
+        assert!(pretty.to_lowercase().contains("usage cap"));
+        assert!(pretty.contains("cause:"));
     }
 
     /// `user_facing_error` produces a multi-line message with headline,

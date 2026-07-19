@@ -24,6 +24,11 @@ pub(crate) enum RunEnd {
     /// The event channel closed without a `Done` — the runner died
     /// (panic/abort) and `full_response` is whatever streamed first.
     Incomplete,
+    /// A provider usage cap (dirge-u6zc) stopped the run: the quota won't
+    /// reset within a retryable window (e.g. Zhipu/GLM's 5-hour limit).
+    /// Distinct from `Incomplete` so a consumer can tell "pause and resume
+    /// after the quota resets" from a genuine runner failure.
+    UsageCapped,
 }
 
 /// Build the machine-readable result envelope for the headless modes.
@@ -41,6 +46,9 @@ pub(crate) fn headless_result_json(
         // Matches the Claude Code stream-json convention dirge mimics.
         RunEnd::Truncated => ("error_max_turns", true),
         RunEnd::Incomplete => ("error", true),
+        // dirge-u6zc: a quota pause, not a task failure — a resuming
+        // wrapper keys on this subtype to re-run after the reset.
+        RunEnd::UsageCapped => ("error_usage_cap", true),
     };
     serde_json::json!({
         "type": "result",
@@ -191,6 +199,10 @@ impl AnyAgent {
         // can't claim success for a truncated or runner-died run.
         let mut completed = false;
         let mut truncated = false;
+        // dirge-u6zc: a provider usage cap stopped the run (quota reset is
+        // hours out — not retryable). Flagged from the Error arm so the
+        // envelope reports a distinct, resumable outcome.
+        let mut usage_capped = false;
         // Accumulate the turn's tool calls so the headless save is
         // full-fidelity (matching the interactive path). Without this the
         // saved assistant message carried only its final text, so a resumed
@@ -276,6 +288,30 @@ impl AnyAgent {
                 AgentEvent::Error(err) => {
                     if had_output {
                         println!();
+                    }
+                    // dirge-u6zc: a provider usage cap isn't a failure to
+                    // retry — the quota resets hours out, so retrying just
+                    // re-hits it. Stop cleanly with a distinct, resumable
+                    // outcome (the session is saved below) and tell the user
+                    // when the quota resets, rather than dumping a raw
+                    // ProviderError and exiting like a hard failure.
+                    if matches!(
+                        crate::agent::recovery::classify_error(&err),
+                        crate::agent::recovery::ErrorKind::UsageCap
+                    ) {
+                        usage_capped = true;
+                        let resume = format!(
+                            "Session {session_id} saved; re-run (e.g. `dirge --continue`) once the quota resets to resume."
+                        );
+                        match crate::agent::recovery::usage_cap_reset_hint(&err) {
+                            Some(reset) => eprintln!(
+                                "Provider usage cap reached — quota resets at {reset}. {resume}\n  ↳ cause: {err}"
+                            ),
+                            None => eprintln!(
+                                "Provider usage cap reached — quota won't reset within a retryable window. {resume}\n  ↳ cause: {err}"
+                            ),
+                        }
+                        break;
                     }
                     eprintln!("Error: {}", err);
                     let _ = task.await;
@@ -365,7 +401,9 @@ impl AnyAgent {
         // dirge-18v2: classify how the stream ended. A truncated run
         // or one whose runner died without a Done must not produce a
         // success envelope.
-        let end = if !completed {
+        let end = if usage_capped {
+            RunEnd::UsageCapped
+        } else if !completed {
             RunEnd::Incomplete
         } else if truncated {
             RunEnd::Truncated
@@ -437,6 +475,14 @@ impl AnyAgent {
                 "run ended without completing — the agent runner stopped before producing a result"
             ));
         }
+        // dirge-u6zc: exit non-zero on a usage cap so a non-JSON script
+        // consumer notices the run paused; the envelope's `error_usage_cap`
+        // subtype and the stderr reset hint distinguish it from a failure.
+        if end == RunEnd::UsageCapped {
+            return Err(anyhow::anyhow!(
+                "provider usage cap reached — run paused before completion; resume after the quota resets"
+            ));
+        }
         Ok((full_response, tool_calls))
     }
 }
@@ -462,6 +508,14 @@ mod tests {
         let died = headless_result_json(RunEnd::Incomplete, 10, 1, "fragment", "sid");
         assert_eq!(died["subtype"], "error");
         assert_eq!(died["is_error"], true);
+
+        // dirge-u6zc: a usage-cap pause is a distinct, resumable outcome —
+        // its own subtype so a wrapper can re-run after the reset, not the
+        // generic "error" it'd share with a runner death.
+        let capped = headless_result_json(RunEnd::UsageCapped, 10, 5, "partial", "sid");
+        assert_eq!(capped["subtype"], "error_usage_cap");
+        assert_eq!(capped["is_error"], true);
+        assert_eq!(capped["result"], "partial", "partial work still delivered");
     }
 
     /// dirge-kuqp: a turn's assistant event carries its streamed text
