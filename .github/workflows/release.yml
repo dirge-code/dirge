@@ -5,9 +5,32 @@ on:
     tags:
       - "v*"
 
-permissions: write-all
+permissions:
+  id-token: write
+  attestations: write
+  contents: write
 
 jobs:
+  sbom:
+    name: Generate SBOM
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: psastras/sbom-rs/actions/install-cargo-sbom@cargo-sbom-latest
+      - name: Generate SPDX SBOM
+        run: cargo sbom --output-format spdx_2_3 -o sbom.spdx.json
+      - name: Upload SBOM as release asset
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file: sbom.spdx.json
+          tag: ${{ github.ref }}
+          overwrite: true
+      - name: Upload SBOM as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom.spdx.json
   build:
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
@@ -73,6 +96,23 @@ jobs:
           $archive = "dirge-${{ matrix.target }}.zip"
           Compress-Archive -Path "target/${{ matrix.target }}/release/dirge.exe" -DestinationPath $archive
           (Get-FileHash $archive -Algorithm SHA256).Hash | Out-File -Encoding ascii "$archive.sha256"
+
+      - name: Download SBOM
+        uses: actions/download-artifact@v4
+        with:
+          name: sbom
+      - name: Attest binary (Unix)
+        if: matrix.os != 'windows-latest'
+        uses: actions/attest@v4
+        with:
+          subject-path: dirge-${{ matrix.target }}.tar.gz
+          sbom-path: sbom.spdx.json
+      - name: Attest binary (Windows)
+        if: matrix.os == 'windows-latest'
+        uses: actions/attest@v4
+        with:
+          subject-path: dirge-${{ matrix.target }}.zip
+          sbom-path: sbom.spdx.json
 
       - name: Upload release assets
         uses: svenstaro/upload-release-action@v2
@@ -147,7 +187,7 @@ jobs:
       # PR route (peter-evans/create-pull-request) failed on every release
       # with "GitHub Actions is not permitted to create or approve pull
       # requests" — a repo Actions toggle that's off. `main` is unprotected
-      # and this job has `contents: write` (permissions: write-all), so a
+      # and this job has contents: write (explicit permissions), so a
       # direct push works and needs no extra setting or PAT. A GITHUB_TOKEN
       # push doesn't re-trigger workflows, so this can't loop.
       - name: Commit nix/bin.nix bump

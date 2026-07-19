@@ -61,6 +61,11 @@ jobs:
       - name: Audit dependencies
         uses: pirafrank/audit-check-action@v1
 
+      - name: OSV vulnerability scan
+        uses: google/osv-scanner-action/osv-scanner-action@v2.3.8
+        with:
+          scan-args: "--lockfile=Cargo.lock --config=.osv-scanner.toml"
+
   # The `validate_all_plugins_compile` Rust test (mod_tests.rs) loads every
   # plugin against the full dirge harness surface.  It runs in the
   # --all-features test variant below.  That's the canonical gate; there is
