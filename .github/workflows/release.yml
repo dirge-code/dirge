@@ -16,9 +16,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: psastras/sbom-rs/actions/install-cargo-sbom@cargo-sbom-latest
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+      # Install from crates.io rather than psastras/sbom-rs/actions/…@cargo-sbom-latest:
+      # that tag is stale (2023, no actions/ dir) so the action ref fails to resolve.
+      - name: Install cargo-sbom
+        run: cargo install cargo-sbom --locked
+      # cargo-sbom writes to stdout (no -o flag) and the SPDX value is
+      # spdx_json_2_3 (not spdx_2_3).
       - name: Generate SPDX SBOM
-        run: cargo sbom --output-format spdx_2_3 -o sbom.spdx.json
+        run: cargo sbom --output-format spdx_json_2_3 > sbom.spdx.json
       - name: Upload SBOM as release asset
         uses: svenstaro/upload-release-action@v2
         with:
@@ -33,6 +42,11 @@ jobs:
           path: sbom.spdx.json
   build:
     name: ${{ matrix.target }}
+    # Wait for the SBOM: the "Download SBOM" step below pulls the `sbom`
+    # artifact, and attestation needs it. Without this the jobs race and
+    # build can hit Download SBOM before sbom uploads (or after it fails),
+    # dying before it uploads the binaries.
+    needs: sbom
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
