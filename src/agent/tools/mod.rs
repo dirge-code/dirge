@@ -252,6 +252,82 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "plugin_tool",
 ];
 
+/// Whether the built-in named `name` is actually compiled into THIS build.
+/// Most built-ins are unconditional; a handful are registered only behind a
+/// cargo feature (see the `#[cfg(...)]` gates in
+/// `agent/builder/loop_tools.rs`) and are absent when it's off. Names that
+/// aren't feature-gated — including anything not a built-in at all — return
+/// `true`; callers gate on `BUILTIN_TOOL_NAMES` membership separately (see
+/// [`reserves_builtin_name`]).
+///
+/// Keep this mapping in sync with those registration gates.
+// Only reached via `reserves_builtin_name`, whose sole non-test caller is
+// the mcp/plugin collision gate; unused in a build with neither feature.
+#[cfg_attr(not(any(feature = "mcp", feature = "plugin")), allow(dead_code))]
+fn builtin_compiled_in(name: &str) -> bool {
+    match name {
+        // src/agent/builder/loop_tools.rs: build_graph_tool, cfg experimental-graph-search
+        "search_graph" => cfg!(feature = "experimental-graph-search"),
+        // semantic_manager.tools(), cfg semantic
+        "list_symbols" | "get_symbol_body" | "find_definition" | "find_callers"
+        | "find_callees" => cfg!(feature = "semantic"),
+        // LspTool, cfg lsp
+        "lsp" => cfg!(feature = "lsp"),
+        // DebugTool, cfg dap
+        "debug" => cfg!(feature = "dap"),
+        _ => true,
+    }
+}
+
+/// Whether `name` is reserved by a built-in tool that is ACTUALLY present in
+/// this build. A feature-gated built-in that isn't compiled in does NOT
+/// reserve its name — so an MCP server or plugin may export a tool by that
+/// name and have it registered instead of silently skipped (issue #702:
+/// `search_graph` was reserved even in default builds, where it lives behind
+/// `experimental-graph-search` and isn't registered, leaving no such tool
+/// available at all).
+///
+/// This is the collision gate for externally-sourced tools. It stays
+/// narrower than [`BUILTIN_TOOL_NAMES`], which remains the full known set
+/// for deny/allow-list validation — a config may legitimately name a tool
+/// that some build ships even if the current one doesn't.
+#[cfg_attr(not(any(feature = "mcp", feature = "plugin")), allow(dead_code))]
+pub fn reserves_builtin_name(name: &str) -> bool {
+    BUILTIN_TOOL_NAMES.contains(&name) && builtin_compiled_in(name)
+}
+
+#[cfg(test)]
+mod builtin_reservation_tests {
+    use super::*;
+
+    /// issue #702: a feature-gated built-in reserves its name only when its
+    /// feature is compiled in. Asserted against the build's own cfg so the
+    /// invariant holds under any feature set (default or `--no-default-features`).
+    #[test]
+    fn feature_gated_builtins_reserve_only_when_compiled_in() {
+        assert_eq!(
+            reserves_builtin_name("search_graph"),
+            cfg!(feature = "experimental-graph-search"),
+        );
+        assert_eq!(reserves_builtin_name("debug"), cfg!(feature = "dap"));
+        assert_eq!(reserves_builtin_name("lsp"), cfg!(feature = "lsp"));
+        assert_eq!(
+            reserves_builtin_name("list_symbols"),
+            cfg!(feature = "semantic"),
+        );
+    }
+
+    /// Unconditional built-ins always reserve; non-built-ins never do.
+    #[test]
+    fn unconditional_builtins_reserve_and_customs_do_not() {
+        assert!(reserves_builtin_name("read"));
+        assert!(reserves_builtin_name("bash"));
+        assert!(reserves_builtin_name("write"));
+        assert!(!reserves_builtin_name("acme_search"));
+        assert!(!reserves_builtin_name("totally_custom_tool"));
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ToolError {
     #[error("{0}")]
