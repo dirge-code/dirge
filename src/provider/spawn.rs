@@ -536,11 +536,16 @@ impl AnyAgent {
     /// each one still carries the parent's `PermCheck` — cwd reads are
     /// auto-allowed, novel paths surface a prompt through the parent UI. No
     /// subagent-scoped checker is constructed in v1.
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn_subagent_runner(
         &self,
         prompt: String,
         system_prompt: String,
         allowed: &[String],
+        // MCP tools to grant on top of the tier's built-in allow-list (#701).
+        // Resolved HERE (not at route-build time) against the live agent's
+        // MCP-tool set, so servers that connect after startup are covered.
+        mcp: &crate::context::agent_defs::SubagentMcpAccess,
         child_session_id: &str,
         max_turns: usize,
         // Profile-pinned model. `Some` builds the stream_fn from this model
@@ -549,7 +554,22 @@ impl AnyAgent {
         // from the live agent (the parent's filtered registry).
         model_override: Option<&AnyModel>,
     ) -> crate::agent::runner::AgentRunner {
-        let names: Vec<&str> = allowed.iter().map(String::as_str).collect();
+        // Union the tier-capped built-in allow-list with the profile's MCP
+        // selection. `resolve_mcp_selection` intersects the request with the
+        // live MCP-tool set, so only genuine MCP tools can be added — a built-in
+        // like `bash` can never sneak past the tier cap this way.
+        let mut names: Vec<String> = allowed.to_vec();
+        let mcp_extra = crate::agent::tools::task::resolve_mcp_selection(mcp, &self.mcp_tool_names);
+        if !mcp_extra.is_empty() {
+            tracing::debug!(
+                target: "dirge::agents",
+                count = mcp_extra.len(),
+                "granting MCP tools to subagent: {}",
+                mcp_extra.join(", ")
+            );
+            names.extend(mcp_extra);
+        }
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
         let tools = filter_loop_tools(&self.loop_tools, &names);
         self.spawn_subagent_runner_with_tools(
             prompt,

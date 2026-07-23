@@ -192,6 +192,13 @@ pub struct AnyAgent {
     /// interactive agent never sees them. The review runner swaps this in
     /// place of the main memory tool. `None` when no store loaded.
     review_memory_tool: Option<std::sync::Arc<dyn crate::agent::agent_loop::LoopTool>>,
+    /// Names of the MCP tools present in `loop_tools` (#701). Populated at
+    /// `build_agent` time from `build_loop_tools` and extended by
+    /// `extend_loop_tools` when servers connect in the background. A tooled
+    /// subagent's `subagent_mcp` selection is resolved against this set at
+    /// fork time (`spawn_subagent_runner`), so it can only grant genuine MCP
+    /// tools — never a built-in past the tier cap. Empty on non-mcp builds.
+    mcp_tool_names: std::collections::HashSet<String>,
 }
 
 #[derive(Clone)]
@@ -318,7 +325,17 @@ impl AnyAgent {
             openai_api_key_fallback_model: None,
             api_billing_ask_tx: None,
             review_memory_tool: None,
+            mcp_tool_names: std::collections::HashSet::new(),
         }
+    }
+
+    /// Record the MCP tool names present in `loop_tools` (#701). Called by
+    /// `build_agent` with the names `build_loop_tools` collected, so a tooled
+    /// subagent's `subagent_mcp` selection can be validated against real MCP
+    /// tools at fork time.
+    pub fn with_mcp_tool_names(mut self, names: impl IntoIterator<Item = String>) -> Self {
+        self.mcp_tool_names = names.into_iter().collect();
+        self
     }
 
     /// dirge-ygm3: attach the review-enabled memory tool (see the field doc).
@@ -360,6 +377,12 @@ impl AnyAgent {
                     t.as_ref(),
                 ));
             }
+        }
+        // #701: this path only ever carries MCP tools (background MCP load),
+        // so their names join the MCP-tool set a subagent's `subagent_mcp`
+        // selection resolves against.
+        for t in &more {
+            self.mcp_tool_names.insert(t.name().to_string());
         }
         self.loop_tools.extend(more);
     }
