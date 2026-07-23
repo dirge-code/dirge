@@ -133,9 +133,17 @@ impl AnyAgent {
         // session's history (via `convert_history`) so a headless run
         // continues where it left off instead of starting cold each time.
         history: Vec<rig::completion::Message>,
-        // Returns the final response text plus the turn's tool calls (so the
-        // caller can persist a full-fidelity assistant message).
-    ) -> anyhow::Result<(String, Vec<crate::session::ToolCallEntry>)> {
+        // Returns the final response text, the turn's tool calls (so the
+        // caller can persist a full-fidelity assistant message), and the
+        // run's cumulative provider token usage (so the caller can fold it
+        // into the session — headless previously dropped `AgentEvent::Usage`
+        // on the floor, leaving `cumulative_input_tokens` at 0 for every
+        // --print / --loop session and breaking `/cache` + A/B measurement).
+    ) -> anyhow::Result<(
+        String,
+        Vec<crate::session::ToolCallEntry>,
+        crate::agent::agent_loop::message::TokenUsage,
+    )> {
         // dirge-nqr: honor the cap explicitly even if the agent was
         // built with a different one. `run_print` is the headless
         // entry point — callers explicitly pass the cap they want.
@@ -212,6 +220,12 @@ impl AnyAgent {
         // (run_handlers/tool_call.rs + tool_result.rs).
         use crate::session::{ToolCallEntry, ToolCallState};
         let mut tool_calls: Vec<ToolCallEntry> = Vec::new();
+
+        // Accumulate provider-reported token usage across every turn so the
+        // caller can persist it into the session (mirrors the interactive
+        // UI's `AgentEvent::Usage` handler at ui/mod.rs). The `Usage` event
+        // carries only the input-side counters.
+        let mut usage = crate::agent::agent_loop::message::TokenUsage::default();
 
         // dirge-kuqp: per-turn buffers for incremental stream-json. The
         // bridge collapses `TurnEnd` to a bare index, so we rebuild each
@@ -357,6 +371,20 @@ impl AnyAgent {
                     }
                     eprintln!("{}", content);
                 }
+                AgentEvent::Usage {
+                    input_tokens,
+                    cached_input_tokens,
+                    cache_creation_input_tokens,
+                    ..
+                } => {
+                    usage.input_tokens = usage.input_tokens.saturating_add(input_tokens);
+                    usage.cached_input_tokens = usage
+                        .cached_input_tokens
+                        .saturating_add(cached_input_tokens);
+                    usage.cache_creation_input_tokens = usage
+                        .cache_creation_input_tokens
+                        .saturating_add(cache_creation_input_tokens);
+                }
                 // Plugin-driven model swap after last run puts the
                 // request in the mgr; caller drains via
                 // take_pending_next_model().
@@ -483,7 +511,7 @@ impl AnyAgent {
                 "provider usage cap reached — run paused before completion; resume after the quota resets"
             ));
         }
-        Ok((full_response, tool_calls))
+        Ok((full_response, tool_calls, usage))
     }
 }
 

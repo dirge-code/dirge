@@ -18,8 +18,8 @@ use crate::config::Config;
 use crate::context::ContextFiles;
 
 use super::{
-    append_memory_to_preamble, append_mode_reminder, assemble_base_preamble,
-    model_steering_fragment,
+    append_code_mode_guidance, append_memory_to_preamble, append_mode_reminder,
+    assemble_base_preamble, model_steering_fragment,
 };
 
 // Post phase 4.5h-6 the rig `Agent` this builds is retained ONLY for its
@@ -56,6 +56,7 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
     // edit/write/apply_patch/bash entirely, so the file-name gate
     // is unnecessary.
     let mut preamble = assemble_base_preamble();
+    append_code_mode_guidance(&mut preamble, cfg.resolve_code_mode_rubric());
     if let Some(agents) = &context.agents {
         preamble.push_str("\n\n");
         preamble.push_str(agents);

@@ -191,6 +191,27 @@ pub const SESSION_SEARCH_GUIDANCE: &str = "\n\n## Past-session recall\n\n\
 pub const DYNAMIC_TOOL_SEARCH_PROMPT: &str = "\
 Many tools are not loaded by default. Call `tool_search` with a query to discover and load relevant tools — they'll be available on the next turn. Always-on tools (write_todo_list, task_status) are shipped every turn and need no discovery.";
 
+/// "Code mode" rubric, appended to the preamble only when
+/// `config.code_mode_rubric` is on (default off). Nudges the model to
+/// collapse a bulk/fan-out of similar tool calls into ONE `bash` script
+/// whose raw per-item output stays in the subprocess — only the script's
+/// stdout enters context. Mirrors the swarm's `context_mode` rubric; the
+/// measured payoff is documented in `docs/code-mode-rubric.md`.
+pub const CODE_MODE_GUIDANCE: &str = "\n\n## Code mode — one script over N tool calls\n\n\
+     For a bulk or fan-out operation — the same kind of call repeated across many items \
+     (roughly 10+ files, records, matches, or endpoints), or any scan whose raw per-item \
+     output you don't actually need to read — write ONE `bash` script that does the whole \
+     sweep and prints only the distilled result, instead of issuing the calls one at a time.\n\
+     Only the script's stdout returns to your context; the raw intermediate data stays in \
+     the subprocess. To learn which of 40 files import a symbol, run a single `grep -l` and \
+     get back the list — not 40 file bodies. To size a tree, one `wc -l` over the glob, not \
+     40 reads.\n\
+     Keep the script's output small and structured — counts, paths, a short summary. This \
+     refines the single-file rule above: keep using read/grep/edit for one file at a time; \
+     reach for a script only when the aggregate across many items is what you're after. It \
+     does not apply to a handful of calls (issue those in parallel) or to edits you must \
+     review individually.";
+
 /// DeepSeek-specific steering, appended to the preamble only for DeepSeek
 /// **chat** models (see `crate::agent::model_family`). Sourced from an
 /// editable markdown file embedded at compile time via `include_str!` so
@@ -472,6 +493,35 @@ mod tests {
                 .any(|a| text.contains(&format!("action='{}'", a))),
             "project-skills preamble must name a real skill action: {}",
             text
+        );
+    }
+
+    /// The code-mode rubric must name the core idea (one `bash` script
+    /// instead of N per-item calls), the mechanism (only stdout reaches
+    /// context), and a rough threshold so the model knows when it kicks
+    /// in. If any drift out, the guidance stops steering the behavior the
+    /// A/B harness measures.
+    #[test]
+    fn code_mode_guidance_names_script_over_calls() {
+        let g = CODE_MODE_GUIDANCE;
+        assert!(g.contains("bash"), "must name the bash tool: {g}");
+        assert!(
+            g.contains("script"),
+            "must frame the pattern as one script: {g}"
+        );
+        assert!(
+            g.contains("stdout") || g.contains("context"),
+            "must explain that only stdout reaches context: {g}"
+        );
+        assert!(
+            g.contains("10+") || g.contains("bulk") || g.contains("fan-out"),
+            "must give a bulk/fan-out threshold: {g}"
+        );
+        // Respect the base prompt's no-tables rule — the guidance must not
+        // sneak a markdown table into its own output advice.
+        assert!(
+            !g.contains(" | "),
+            "guidance must not contain a markdown table: {g}"
         );
     }
 
