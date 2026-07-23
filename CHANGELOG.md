@@ -4,6 +4,29 @@ All notable changes to dirge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- `code_mode_rubric` config flag (default off): appends a "code mode" rubric to the
+  system prompt telling the model to collapse a bulk/fan-out of similar tool calls
+  (roughly 10+ items) into ONE `bash` script that returns only the distilled result,
+  keeping raw per-item output out of context. A/B measured on deepseek-flash with
+  the reproducible harness `scripts/code-mode-ab.sh` (three scenarios). The payoff
+  scales with how much naive fan-out the model would do without it: on an
+  already-greppable aggregate it is ~flat (nothing to capture); on an obvious
+  count task ~19% fewer input tokens; on a task that forces genuine per-file
+  fan-out (two markers on different lines, no single-line grep possible) −45%
+  input tokens, tool calls 8.0 → 4.5, and correctness up from 5/8 to 8/8 (scripting
+  the intersection beats eyeballing 40 files). Methodology in
+  `docs/code-mode-rubric.md`.
+
+### Fixed
+- Headless `-p` / `--loop` sessions now persist provider token usage. `run_print`
+  dropped `AgentEvent::Usage` on the floor, so every headless session saved
+  `cumulative_input_tokens = 0`, breaking `/cache` on resumed sessions and any
+  token accounting off the session file. It now folds per-turn usage into the
+  session like the interactive UI does.
+
 ## [0.19.17] - 2026-07-18
 
 ### Fixed

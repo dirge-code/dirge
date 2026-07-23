@@ -1007,6 +1007,15 @@ pub struct Config {
     /// with MCP-heavy toolsets (≈30% token savings).
     pub dynamic_tool_search: Option<bool>,
 
+    /// Opt-in "code mode" rubric: when true, append guidance nudging the
+    /// model to collapse a bulk/fan-out of similar tool calls into ONE
+    /// `bash` script that returns only the distilled result — keeping the
+    /// raw per-item output out of context. `None`/`false` (default) omits
+    /// the guidance. Off by default so it can be A/B'd against the baseline
+    /// (see the harness in `scripts/`). Sibling of `dynamic_tool_search`;
+    /// both trade a little prompt text for context-token savings.
+    pub code_mode_rubric: Option<bool>,
+
     /// Phase 4 part 2 (`docs/AGENTIC_LOOP_PLAN.md`): consecutive-turn
     /// threshold for the context-depth reminder system. `None`
     /// (default) keeps the feature OFF — long sessions get no
@@ -1298,6 +1307,13 @@ impl Config {
     /// Phase-3: dynamic-tool-search opt-in. Default off.
     pub fn resolve_dynamic_tool_search(&self) -> bool {
         self.dynamic_tool_search.unwrap_or(false)
+    }
+
+    /// Code-mode rubric opt-in. Default off — the guidance is only
+    /// appended to the preamble when this is explicitly enabled, so the
+    /// A/B harness can flip it per run.
+    pub fn resolve_code_mode_rubric(&self) -> bool {
+        self.code_mode_rubric.unwrap_or(false)
     }
 
     /// Phased plan workflow opt-in (vix port). Default off — `/plan` is gated

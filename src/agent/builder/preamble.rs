@@ -5,8 +5,8 @@
 
 use crate::agent::model_family::ModelFamily;
 use crate::agent::prompt::{
-    DEEPSEEK_GUIDANCE, MEMORY_GUIDANCE, SESSION_SEARCH_GUIDANCE, SKILLS_GUIDANCE, SYSTEM_PROMPT,
-    TODO_TOOLS_PROMPT,
+    CODE_MODE_GUIDANCE, DEEPSEEK_GUIDANCE, MEMORY_GUIDANCE, SESSION_SEARCH_GUIDANCE,
+    SKILLS_GUIDANCE, SYSTEM_PROMPT, TODO_TOOLS_PROMPT,
 };
 
 /// Append a memory provider's prompt block to the assembled preamble.
@@ -79,6 +79,17 @@ pub(crate) fn model_steering_fragment(family: ModelFamily) -> Option<&'static st
         Some(DEEPSEEK_GUIDANCE)
     } else {
         None
+    }
+}
+
+/// Append the "code mode" rubric to `preamble` when `enabled`. Gated on
+/// `config.code_mode_rubric` (default off) so the guidance ships only when
+/// the operator opts in — the A/B harness flips this per run to isolate
+/// the rubric's token effect. No-op when disabled, so the baseline
+/// preamble is byte-for-byte unchanged.
+pub(crate) fn append_code_mode_guidance(preamble: &mut String, enabled: bool) {
+    if enabled {
+        preamble.push_str(CODE_MODE_GUIDANCE);
     }
 }
 

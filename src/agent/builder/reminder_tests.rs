@@ -89,6 +89,32 @@ fn regression_code_mode_reminder_requires_plan_md() {
     assert_eq!(p_without, "base", "no reminder must be added");
 }
 
+// The code-mode rubric is appended verbatim when enabled, and the
+// preamble is left byte-for-byte untouched when disabled (default). This
+// is what lets the A/B harness attribute any token delta to the rubric
+// alone.
+#[test]
+fn code_mode_guidance_appended_when_enabled() {
+    let mut p = String::from("base");
+    append_code_mode_guidance(&mut p, true);
+    assert!(
+        p.starts_with("base"),
+        "must append, not replace the preamble"
+    );
+    assert!(
+        p.contains(crate::agent::prompt::CODE_MODE_GUIDANCE),
+        "enabled must append the full guidance"
+    );
+    assert!(p.len() > "base".len(), "enabled must grow the preamble");
+}
+
+#[test]
+fn code_mode_guidance_omitted_when_disabled() {
+    let mut p = String::from("base");
+    append_code_mode_guidance(&mut p, false);
+    assert_eq!(p, "base", "disabled must leave the preamble unchanged");
+}
+
 // Unknown prompts (custom user prompts) must produce no reminder so the
 // plan/review semantics don't bleed into other modes.
 #[test]
