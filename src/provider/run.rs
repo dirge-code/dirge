@@ -40,6 +40,7 @@ pub(crate) fn headless_result_json(
     num_turns: u32,
     result: &str,
     session_id: &str,
+    files_changed: &[String],
 ) -> serde_json::Value {
     let (subtype, is_error) = match end {
         RunEnd::Completed => ("success", false),
@@ -58,8 +59,42 @@ pub(crate) fn headless_result_json(
         "num_turns": num_turns,
         "result": result,
         "session_id": session_id,
+        // Files the run's edit/write/patch/bash tools touched, from the
+        // modified-files tracker. Reported here (not inferred from git by
+        // the consumer) so `files_changed` is accurate even when the
+        // project isn't a git repo, git isn't on PATH, or the edits were
+        // committed mid-run — see dirge MCP `delegate` (issue #704).
+        "files_changed": files_changed,
         "total_cost_usd": 0.0,
     })
+}
+
+/// Files the run modified — snapshot the process-global modified-files
+/// tracker (write/edit/edit_lines/edit_minified/apply_patch/bash all mark
+/// it) and project each to a `cwd`-relative string when it lives under the
+/// working dir, else its absolute path. Sorted + deduped. Empty when
+/// nothing was touched. The tracker is authoritative and git-independent,
+/// which is the point: a git-status diff silently reports nothing when the
+/// project isn't a repo (issue #704).
+fn headless_files_changed() -> Vec<String> {
+    // Canonicalize cwd to match the tracker, which stores canonical paths;
+    // a raw cwd wouldn't strip on symlinked dirs (e.g. macOS /tmp).
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|c| crate::permission::path::canonical_or_self(&c));
+    let mut v: Vec<String> = crate::agent::tools::modified::recent(usize::MAX)
+        .into_iter()
+        .map(|p| {
+            cwd.as_ref()
+                .and_then(|c| p.strip_prefix(c).ok())
+                .unwrap_or(p.as_path())
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    v.sort();
+    v.dedup();
+    v
 }
 
 /// Build a stream-json `assistant` event for one turn (dirge-kuqp).
@@ -444,6 +479,7 @@ impl AnyAgent {
             num_turns,
             &full_response,
             &session_id,
+            &headless_files_changed(),
         );
 
         match output_format {
@@ -523,27 +559,44 @@ mod tests {
     /// — `--print` consumers parse this JSON, not stderr.
     #[test]
     fn result_envelope_reflects_run_end() {
-        let ok = headless_result_json(RunEnd::Completed, 10, 2, "answer", "sid");
+        let ok = headless_result_json(RunEnd::Completed, 10, 2, "answer", "sid", &[]);
         assert_eq!(ok["subtype"], "success");
         assert_eq!(ok["is_error"], false);
         assert_eq!(ok["result"], "answer");
 
-        let capped = headless_result_json(RunEnd::Truncated, 10, 100, "partial", "sid");
+        let capped = headless_result_json(RunEnd::Truncated, 10, 100, "partial", "sid", &[]);
         assert_eq!(capped["subtype"], "error_max_turns");
         assert_eq!(capped["is_error"], true);
         assert_eq!(capped["result"], "partial", "partial text still delivered");
 
-        let died = headless_result_json(RunEnd::Incomplete, 10, 1, "fragment", "sid");
+        let died = headless_result_json(RunEnd::Incomplete, 10, 1, "fragment", "sid", &[]);
         assert_eq!(died["subtype"], "error");
         assert_eq!(died["is_error"], true);
 
         // dirge-u6zc: a usage-cap pause is a distinct, resumable outcome —
         // its own subtype so a wrapper can re-run after the reset, not the
         // generic "error" it'd share with a runner death.
-        let capped = headless_result_json(RunEnd::UsageCapped, 10, 5, "partial", "sid");
+        let capped = headless_result_json(RunEnd::UsageCapped, 10, 5, "partial", "sid", &[]);
         assert_eq!(capped["subtype"], "error_usage_cap");
         assert_eq!(capped["is_error"], true);
         assert_eq!(capped["result"], "partial", "partial work still delivered");
+    }
+
+    /// issue #704: the envelope carries `files_changed` verbatim (a JSON
+    /// array) so the MCP `delegate` consumer reads dirge's own record of
+    /// edited files instead of guessing from `git status`. Empty when the
+    /// run touched nothing; never absent.
+    #[test]
+    fn result_envelope_carries_files_changed() {
+        let none = headless_result_json(RunEnd::Completed, 1, 1, "ok", "sid", &[]);
+        assert_eq!(none["files_changed"], serde_json::json!([]));
+
+        let files = ["src/a.rs".to_string(), "tests/b.rs".to_string()];
+        let env = headless_result_json(RunEnd::Completed, 1, 1, "ok", "sid", &files);
+        assert_eq!(
+            env["files_changed"],
+            serde_json::json!(["src/a.rs", "tests/b.rs"])
+        );
     }
 
     /// dirge-kuqp: a turn's assistant event carries its streamed text

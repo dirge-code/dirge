@@ -160,10 +160,11 @@ impl DirgeMcp {
         )
         .await;
         let after = git_status_set(&project_dir);
-        let files_changed = changed_paths(&before, &after);
+        let git_changed = changed_paths(&before, &after);
 
         match run {
             Ok(env) => {
+                let files_changed = merge_changed(git_changed, &env.files_changed);
                 let result = json!({
                     "session_id": session_id,
                     "status": env.status,
@@ -248,6 +249,11 @@ struct Envelope {
     summary: String,
     turns: u64,
     duration_ms: u64,
+    /// Files dirge's own edit/write/patch/bash tools recorded touching this
+    /// run — read straight from the child's result JSON. Authoritative and
+    /// git-independent (issue #704); the git-status diff is only a
+    /// supplement for anything the tools didn't record.
+    files_changed: Vec<String>,
 }
 
 /// SIGKILL a whole process group on drop. Mirrors
@@ -433,7 +439,30 @@ async fn run_delegation(
             .get("duration_ms")
             .and_then(|v| v.as_u64())
             .unwrap_or(0),
+        files_changed: env_val
+            .get("files_changed")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|s| s.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default(),
     })
+}
+
+/// Union of the git-status diff and dirge's own modified-files record,
+/// sorted and deduped. dirge's record (from the result envelope) is
+/// authoritative and works even when the project isn't a git repo, git is
+/// off PATH, or the edits were committed mid-run — the exact cases where
+/// the git diff alone came back empty (issue #704). git still contributes
+/// as a supplement, catching anything the tools didn't record.
+fn merge_changed(git: Vec<String>, reported: &[String]) -> Vec<String> {
+    let mut v = git;
+    v.extend(reported.iter().cloned());
+    v.sort();
+    v.dedup();
+    v
 }
 
 /// `git status --porcelain` as a set of `"XY path"` lines. Empty (not an
@@ -602,6 +631,34 @@ mod tests {
         .into();
         let changed = changed_paths(&before, &after);
         assert_eq!(changed, vec!["c.rs".to_string(), "src/b.rs".to_string()]);
+    }
+
+    /// issue #704: `files_changed` unions the git diff with dirge's own
+    /// record so it's never empty just because git saw nothing (non-repo,
+    /// git off PATH, committed edits). Result is sorted + deduped across
+    /// both sources.
+    #[test]
+    fn merge_changed_unions_git_and_reported() {
+        // git blind (not a repo) but dirge recorded its edits → reported wins.
+        assert_eq!(
+            merge_changed(vec![], &["src/a.rs".into(), "src/b.rs".into()]),
+            vec!["src/a.rs".to_string(), "src/b.rs".to_string()]
+        );
+        // Overlap dedupes; a git-only path (e.g. a bash edit the tools
+        // didn't record) is still carried.
+        assert_eq!(
+            merge_changed(
+                vec!["src/a.rs".into(), "gen/x.rs".into()],
+                &["src/a.rs".into(), "src/b.rs".into()]
+            ),
+            vec![
+                "gen/x.rs".to_string(),
+                "src/a.rs".to_string(),
+                "src/b.rs".to_string()
+            ]
+        );
+        // Both empty → empty (a genuine no-op run).
+        assert!(merge_changed(vec![], &[]).is_empty());
     }
 
     #[test]
