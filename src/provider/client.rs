@@ -414,6 +414,33 @@ where
             b = b.http_headers(headers);
             Ok(AnyClient::ChatGptOpenAI(b.build()?))
         }
+        ProviderKind::OpenAI if info.openai_responses => {
+            // #703: a custom/self-hosted OpenAI provider that speaks the
+            // Responses API (`/v1/responses`) rather than chat/completions
+            // (e.g. an OAuth proxy that only exposes /responses). Reuse the
+            // ChatGptOpenAI client (`openai::Client` → Responses adapter) but
+            // with a NON-token `CodexHttpClient`: no OAuth refresh — just the
+            // plain api-key bearer rig sets, against the configured base_url.
+            // The codex http layer still normalizes the outgoing Responses
+            // body (rig 0.37 emits `instructions: null` + a system item in
+            // `input`), which is the correct shape for ANY /v1/responses
+            // endpoint, not just chatgpt.com's.
+            let mut b = openai::Client::builder().api_key(&key).http_client(
+                crate::provider::compressing_http::CompressingHttpClient::new(
+                    CodexHttpClient::default(),
+                    crate::llmtrim::ir::ProviderKind::OpenAi,
+                    std::sync::Arc::new(crate::compression::config_for_preset(
+                        &resolve_compression_preset(),
+                    )),
+                    resolve_compression_enabled(),
+                ),
+            );
+            if let Some(base_url) = &base_url {
+                b = b.base_url(base_url);
+            }
+            b = b.http_headers(headers);
+            Ok(AnyClient::ChatGptOpenAI(b.build()?))
+        }
         ProviderKind::OpenAI => {
             let mut b = openai::CompletionsClient::builder()
                 .http_client(
@@ -1322,6 +1349,52 @@ mod tests {
         assert!(
             !loaded.get(),
             "configured OpenAI base_url must not read the Dirge OAuth store"
+        );
+    }
+
+    #[test]
+    fn openai_responses_provider_type_builds_responses_client() {
+        // #703: `provider_type: "openai-responses"` with a plain api-key +
+        // custom base_url builds the Responses client (ChatGptOpenAI), not the
+        // chat/completions client — and never touches the OAuth store.
+        let providers = HashMap::from([(
+            "gpt5-proxy".to_string(),
+            ProviderEntry {
+                provider_type: Some("openai-responses".to_string()),
+                base_url: Some("https://proxy.invalid/v1".to_string()),
+                api_key: Some("sk-test".to_string()),
+                ..Default::default()
+            },
+        )]);
+        let loaded = Cell::new(false);
+        let client = create_client_with("gpt5-proxy", None, &providers, no_env, || {
+            loaded.set(true);
+            Ok(None)
+        })
+        .unwrap();
+        assert!(
+            matches!(client, AnyClient::ChatGptOpenAI(_)),
+            "openai-responses must build the Responses (ChatGptOpenAI) client"
+        );
+        assert!(
+            !loaded.get(),
+            "a custom api-key Responses provider must not read the OAuth store"
+        );
+
+        // Control: plain `openai` with the same shape stays chat/completions.
+        let providers = HashMap::from([(
+            "vanilla".to_string(),
+            ProviderEntry {
+                provider_type: Some("openai".to_string()),
+                base_url: Some("https://proxy.invalid/v1".to_string()),
+                api_key: Some("sk-test".to_string()),
+                ..Default::default()
+            },
+        )]);
+        let client = create_client_with("vanilla", None, &providers, no_env, || Ok(None)).unwrap();
+        assert!(
+            matches!(client, AnyClient::OpenAI(_)),
+            "plain openai must build the chat/completions client"
         );
     }
 

@@ -1677,8 +1677,9 @@ pub fn load() -> Config {
                 eprintln!(
                     "error: provider {:?} has invalid provider_type {:?}.\n\
                      Either the alias must match a built-in (openrouter, openai,\n\
-                     anthropic, gemini, deepseek, glm, cerebras, opencode, ollama,\n\
-                     custom) or set `provider_type` explicitly to one of those.",
+                     openai-responses, anthropic, gemini, deepseek, glm, cerebras,\n\
+                     opencode, ollama, custom) or set `provider_type` explicitly\n\
+                     to one of those.",
                     name, ptype,
                 );
                 std::process::exit(1);
