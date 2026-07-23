@@ -1034,6 +1034,11 @@ pub struct Config {
     /// up with `Exhausted`. `None` defaults to 2 (vix's default). Only
     /// consulted when `phased_workflow_enabled` is on.
     pub phased_workflow_max_review_cycles: Option<usize>,
+    /// #622: pause the phased `/plan` workflow after the plan phase and ask the
+    /// user to approve / edit / cancel before the implement run starts. `None`/
+    /// `false` (default) keeps the yolo behavior — implement launches straight
+    /// away. Only consulted when `phased_workflow_enabled` is on.
+    pub phased_workflow_plan_approval: Option<bool>,
     /// dirge-onlr / dirge-4xgd: per-operation timeout overrides. Unset
     /// fields fall back to `crate::timeout::Timeouts::DEFAULT`. Merged in
     /// `resolve_timeouts()` and installed process-wide at startup.
@@ -1326,6 +1331,12 @@ impl Config {
     /// Default 2 (vix's default).
     pub fn resolve_phased_workflow_max_review_cycles(&self) -> usize {
         self.phased_workflow_max_review_cycles.unwrap_or(2)
+    }
+
+    /// #622: whether the phased `/plan` workflow pauses for user approval of
+    /// the plan before implementing. Default `false` (implement immediately).
+    pub fn resolve_phased_workflow_plan_approval(&self) -> bool {
+        self.phased_workflow_plan_approval.unwrap_or(false)
     }
 
     pub fn resolve_tool_result_max_chars(&self) -> usize {
@@ -1826,6 +1837,16 @@ mod tests {
         .unwrap();
         assert!(cfg.resolve_phased_workflow_enabled());
         assert_eq!(cfg.resolve_phased_workflow_max_review_cycles(), 4);
+    }
+
+    /// #622: the plan-approval gate is off by default (yolo) and honored when set.
+    #[test]
+    fn phased_workflow_plan_approval_defaults_off() {
+        let cfg: Config = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(!cfg.resolve_phased_workflow_plan_approval());
+        let cfg: Config =
+            serde_json::from_str(r#"{ "phased_workflow_plan_approval": true }"#).unwrap();
+        assert!(cfg.resolve_phased_workflow_plan_approval());
     }
 
     /// dirge-4hld: the `memory` block is absent by default and parses its

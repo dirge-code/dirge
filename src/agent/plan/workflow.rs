@@ -134,6 +134,36 @@ Write the plan in full. Then, before finalising, review it against these questio
 If any answer reveals a problem, silently fix the plan, then output the final, \
 corrected plan.";
 
+/// #622: re-plan template. Used when the user picks "edit" at the plan-approval
+/// gate: the prior plan plus their feedback go in, a revised plan comes out.
+const REVISE_TEMPLATE: &str = "\
+You are dirge in the **Plan** phase, revising a plan the user reviewed. Fold the \
+user's feedback into the plan and output the updated plan. Do NOT write or modify \
+any code. Keep the same plan format (Name / Context / Architecture / Files / \
+Steps). Preserve the parts of the previous plan the feedback does not touch; \
+change only what the feedback asks for (plus anything that must change to stay \
+consistent).
+
+## User request
+
+{{REQUEST}}
+
+## Exploration findings
+
+{{FINDINGS}}
+
+## Previous plan
+
+{{PLAN}}
+
+## User feedback on the plan
+
+{{FEEDBACK}}
+
+## Output
+
+Output the full revised plan (not a diff or a changelog), same format as before.";
+
 const REVIEWER_TEMPLATE: &str = "\
 You are dirge running as the **reviewer**. You are reviewing another agent's \
 attempt at the task below — you are NOT the implementer. **Your write, edit, and \
@@ -252,6 +282,21 @@ pub fn plan_prompt(request: &str, findings: &str) -> String {
     render_template(
         PLAN_TEMPLATE,
         &[("REQUEST", request), ("FINDINGS", findings)],
+    )
+}
+
+/// #622: system prompt for a **re-plan** fork — the plan phase re-run when the
+/// user edits the plan at the approval gate. Carries the prior plan and the
+/// user's feedback so the revision is targeted, not a from-scratch redo.
+pub fn revise_plan_prompt(request: &str, findings: &str, plan: &str, feedback: &str) -> String {
+    render_template(
+        REVISE_TEMPLATE,
+        &[
+            ("REQUEST", request),
+            ("FINDINGS", findings),
+            ("PLAN", plan),
+            ("FEEDBACK", feedback),
+        ],
     )
 }
 
@@ -464,6 +509,27 @@ mod tests {
             p.contains("core.rs:42 is the map"),
             "real findings still substituted at the template's placeholder",
         );
+    }
+
+    #[test]
+    fn revise_plan_prompt_carries_prior_plan_and_feedback() {
+        // #622: the re-plan fork must see the request, findings, the prior
+        // plan, and the user's feedback, so the revision is targeted.
+        let p = revise_plan_prompt(
+            "add caching",
+            "core.rs:42 is the hot path",
+            "### Steps\n1. add an LRU to core.rs",
+            "also invalidate on write",
+        );
+        assert!(p.contains("add caching"), "request present");
+        assert!(p.contains("core.rs:42 is the hot path"), "findings present");
+        assert!(p.contains("1. add an LRU to core.rs"), "prior plan present");
+        assert!(p.contains("also invalidate on write"), "feedback present");
+        // Guard the four placeholders were actually substituted.
+        assert!(!p.contains("{{REQUEST}}"));
+        assert!(!p.contains("{{FINDINGS}}"));
+        assert!(!p.contains("{{PLAN}}"));
+        assert!(!p.contains("{{FEEDBACK}}"));
     }
 
     #[test]

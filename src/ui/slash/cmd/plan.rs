@@ -8,12 +8,15 @@
 //! (driven in `run_handlers/done.rs`). The phases are separate forks → genuine
 //! context resets, per the chosen "separate-agent phases" model.
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::agent::plan::runtime::{
-    ActivePlan, PlanKickoff, PlanPhaseEvent, PlanPhaseHandle, collect_runner_text,
+    ActivePlan, PlanApprovalDecision, PlanKickoff, PlanPhaseEvent, PlanPhaseHandle,
+    collect_runner_text,
 };
-use crate::agent::plan::workflow::{READONLY_PHASE_TOOLS, explore_prompt, plan_prompt};
+use crate::agent::plan::workflow::{
+    READONLY_PHASE_TOOLS, explore_prompt, plan_prompt, revise_plan_prompt,
+};
 use crate::provider::AnyAgent;
 use crate::ui::avatar::AvatarState;
 use crate::ui::colors::c_error;
@@ -75,12 +78,14 @@ pub(crate) async fn cmd_plan(
     // session/renderer/config stay on the UI thread.
     let transcript = crate::agent::review::build_transcript(ctx.session);
     let cycles = ctx.cfg.resolve_phased_workflow_max_review_cycles();
+    // #622: opt-in pause for plan approval before the implement run.
+    let approval = ctx.cfg.resolve_phased_workflow_plan_approval();
     let agent = ctx.agent.clone();
 
     // Channel capacity is small — the task emits a handful of progress lines
     // plus one terminal event; the UI loop drains it promptly.
     let core = crate::ui::phase::PhaseHandle::spawn(8, move |tx| {
-        run_phases_task(agent, request, transcript, cycles, tx)
+        run_phases_task(agent, request, transcript, cycles, approval, tx)
     });
 
     // Show busy immediately (the typed line is already cleared), then hand the
@@ -114,6 +119,7 @@ async fn run_phases_task(
     request: String,
     transcript: String,
     cycles: usize,
+    approval: bool,
     tx: mpsc::Sender<PlanPhaseEvent>,
 ) {
     // Phase 1: Explore (read-only fork, fresh context).
@@ -168,7 +174,7 @@ async fn run_phases_task(
         String::new(),
         READONLY_PHASE_TOOLS,
     );
-    let plan = match collect_runner_text(plan_runner).await {
+    let mut plan = match collect_runner_text(plan_runner).await {
         Ok(t) if !t.trim().is_empty() => t,
         Ok(_) => {
             progress(&tx, "Phase: Plan — produced no plan; aborting", true).await;
@@ -181,6 +187,69 @@ async fn run_phases_task(
             return;
         }
     };
+
+    // #622: optional approval gate. Pause, show the plan, and let the user
+    // approve / edit (re-plan) / cancel before any code is touched. Off by
+    // default (yolo) — the loop below runs once and breaks straight to
+    // implement. On `Edit` we re-run the plan fork with the feedback (carrying
+    // the prior plan + findings) and ask again; on `Cancel`/closed channel we
+    // abort without implementing.
+    if approval {
+        loop {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            if tx
+                .send(PlanPhaseEvent::AwaitApproval {
+                    plan: plan.clone(),
+                    reply: reply_tx,
+                })
+                .await
+                .is_err()
+            {
+                return; // UI dropped the receiver (Ctrl+C) — nothing to do.
+            }
+            match reply_rx.await {
+                Ok(PlanApprovalDecision::Approve) => break,
+                Ok(PlanApprovalDecision::Edit(feedback)) => {
+                    if !progress(&tx, "Phase: Plan — revising with your feedback…", false).await
+                    {
+                        return;
+                    }
+                    let revise_runner = agent.spawn_phase_runner(
+                        revise_plan_prompt(&request, &findings, &plan, &feedback),
+                        String::new(),
+                        READONLY_PHASE_TOOLS,
+                    );
+                    match collect_runner_text(revise_runner).await {
+                        Ok(t) if !t.trim().is_empty() => plan = t,
+                        Ok(_) => {
+                            progress(
+                                &tx,
+                                "Phase: Plan — revision produced no plan; keeping the previous one",
+                                true,
+                            )
+                            .await;
+                        }
+                        Err(e) => {
+                            progress(
+                                &tx,
+                                format!(
+                                    "Phase: Plan — revision error: {e}; keeping the previous plan"
+                                ),
+                                true,
+                            )
+                            .await;
+                        }
+                    }
+                    // Loop back and present the (revised) plan again.
+                }
+                Ok(PlanApprovalDecision::Cancel) | Err(_) => {
+                    progress(&tx, "Phase: Plan — cancelled before implementation", false).await;
+                    let _ = tx.send(PlanPhaseEvent::Aborted).await;
+                    return;
+                }
+            }
+        }
+    }
 
     // Hand off to the UI loop: it launches the streamed implement run and arms
     // the reviewer loop.
