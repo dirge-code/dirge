@@ -4491,6 +4491,14 @@ pub async fn run_interactive(
                             // loop + the request's tool defs — and adopt the
                             // connected manager so the panel + `/mcp` see it.
                             agent.extend_loop_tools(tools);
+                            // #701: re-publish the live agent so `current_agent()`
+                            // (what a tooled `task(agent=…)` subagent forks off)
+                            // reflects the just-injected MCP tools + their names.
+                            // Without this the background-loaded MCP tools reach
+                            // the main loop (via `agent.clone()` per prompt) but
+                            // NOT subagents, whose snapshot would stay pre-MCP
+                            // until the next rebuild (/model, /agent, /cd, …).
+                            crate::provider::set_current_agent(std::sync::Arc::new(agent.clone()));
                             mcp_manager = Some(mgr);
                             mcp_ready_rx = None;
                             tracing::info!("MCP ready: injected {n} tool(s) into the live agent");

@@ -1283,6 +1283,17 @@ async fn main() -> anyhow::Result<()> {
                 // allow-list for a tooled fork. `None` (tool-less profile) →
                 // the unchanged btw path; `Some` selects the tooled fork.
                 let tool_allow = agent::tools::task::resolve_subagent_allow(&def.subagent);
+                // #701: MCP access needs a real tooled loop to attach tools to.
+                // A tool-less profile has none, so warn that the grant is inert.
+                if tool_allow.is_none()
+                    && def.subagent.mcp != context::agent_defs::SubagentMcpAccess::None
+                {
+                    tracing::warn!(
+                        target: "dirge::agents",
+                        agent = %def.name,
+                        "subagent_mcp is set but subagent_tools is tool-less; MCP tools are ignored. Set subagent_tools: readonly (or readwrite) to grant them."
+                    );
+                }
                 let max_turns = agent::tools::task::resolve_subagent_max_turns(&def.subagent);
                 let timeout = agent::tools::task::resolve_subagent_timeout(&def.subagent);
                 (
@@ -1294,6 +1305,7 @@ async fn main() -> anyhow::Result<()> {
                         max_turns,
                         timeout,
                         tier: def.subagent.tier.clone(),
+                        mcp: def.subagent.mcp.clone(),
                     },
                 )
             })

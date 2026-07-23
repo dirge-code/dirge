@@ -111,6 +111,28 @@ pub enum SubagentToolTier {
     ReadWrite,
 }
 
+/// Which MCP tools a `task(agent=…)` subagent may call, on top of its tier's
+/// built-in universe (issue #701). MCP tools are otherwise unreachable to a
+/// subagent — the tier universe is built-in-only, so `allow` can't name one.
+///
+/// This is a SEPARATE opt-in channel from the tier: it can only add tools that
+/// are genuinely MCP-sourced (validated against the live agent's MCP-tool set
+/// at fork time), so it can never smuggle a built-in like `bash` past the
+/// tier cap. Honored only on the tooled tiers (`Readonly`/`ReadWrite`); a
+/// `Toolless` profile has no loop to attach tools to, so it's ignored there
+/// (with a warning at route-build time).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum SubagentMcpAccess {
+    /// No MCP tools (the default — unchanged behavior).
+    #[default]
+    None,
+    /// Every connected MCP tool.
+    All,
+    /// Only these MCP tool names (lowercased). Names that don't match a live
+    /// MCP tool at fork time are silently dropped.
+    Only(Vec<String>),
+}
+
 /// Per-profile policy for what tools a `task(agent=…)` subagent may use.
 /// Layered over [`SubagentToolTier`]: the tier fixes the tool universe,
 /// `allow`/`deny` are raw overrides (for readonly, `allow` cannot escalate
@@ -123,6 +145,8 @@ pub struct SubagentToolPolicy {
     pub deny: Vec<String>,
     pub max_turns: Option<usize>,
     pub timeout_secs: Option<u64>,
+    /// MCP tools to grant on top of the tier's built-in universe (#701).
+    pub mcp: SubagentMcpAccess,
 }
 
 /// `config.json` `agents.<name>.subagent` block (serde). Mirrors the `.md`
@@ -136,6 +160,55 @@ pub struct SubagentConfig {
     pub deny: Option<Vec<String>>,
     pub max_turns: Option<usize>,
     pub timeout_secs: Option<u64>,
+    /// MCP access (#701). Accepts either a string (`"all"` / `"none"` / a
+    /// single tool name) or a list of tool names.
+    pub mcp: Option<McpAccessConfig>,
+}
+
+/// `config.json` `subagent.mcp` value: either a scalar (`"all"` / `"none"` /
+/// one tool name) or a list of tool names. Mirrors the `.md` `subagent_mcp`
+/// key, which accepts `all`, a bare name, or `[a, b]`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum McpAccessConfig {
+    Flag(String),
+    List(Vec<String>),
+}
+
+/// Convert a `config.json` `subagent.mcp` value into [`SubagentMcpAccess`].
+fn mcp_access_from_config(raw: Option<McpAccessConfig>) -> SubagentMcpAccess {
+    match raw {
+        None => SubagentMcpAccess::None,
+        Some(McpAccessConfig::Flag(s)) => parse_mcp_access(&s),
+        Some(McpAccessConfig::List(v)) => {
+            let names = normalize_names(v);
+            if names.is_empty() {
+                SubagentMcpAccess::None
+            } else {
+                SubagentMcpAccess::Only(names)
+            }
+        }
+    }
+}
+
+/// Parse an `.md` `subagent_mcp` frontmatter value (or a config scalar).
+/// `all`/`*`/`true` → every MCP tool; empty/`none`/`off`/`false` → none;
+/// `[a, b]` or a bare `a, b` / single name → those specific tool names.
+fn parse_mcp_access(value: &str) -> SubagentMcpAccess {
+    let trimmed = value.trim();
+    if !trimmed.starts_with('[') {
+        match trimmed.to_ascii_lowercase().as_str() {
+            "" | "none" | "off" | "false" => return SubagentMcpAccess::None,
+            "all" | "*" | "true" => return SubagentMcpAccess::All,
+            _ => {}
+        }
+    }
+    let names = parse_inline_list(trimmed);
+    if names.is_empty() {
+        SubagentMcpAccess::None
+    } else {
+        SubagentMcpAccess::Only(names)
+    }
 }
 
 /// Map a tier name to its enum. Tolerant: known names map to variants,
@@ -251,6 +324,7 @@ impl AgentConfig {
                 deny: s.deny.unwrap_or_default(),
                 max_turns: s.max_turns,
                 timeout_secs: s.timeout_secs,
+                mcp: mcp_access_from_config(s.mcp),
             },
             source,
         }
@@ -390,6 +464,7 @@ pub(crate) fn parse_agent_md(name: &str, raw: &str, source: AgentSource) -> Agen
     let mut sub_deny: Option<Vec<String>> = None;
     let mut sub_max_turns: Option<usize> = None;
     let mut sub_timeout_secs: Option<u64> = None;
+    let mut sub_mcp: Option<SubagentMcpAccess> = None;
     for line in front.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -411,6 +486,7 @@ pub(crate) fn parse_agent_md(name: &str, raw: &str, source: AgentSource) -> Agen
             "subagent_timeout_secs" => sub_timeout_secs = value.parse::<u64>().ok(),
             "subagent_allow" => sub_allow = Some(parse_inline_list(value)),
             "subagent_deny" => sub_deny = Some(parse_inline_list(value)),
+            "subagent_mcp" => sub_mcp = Some(parse_mcp_access(value)),
             _ => {}
         }
     }
@@ -424,6 +500,7 @@ pub(crate) fn parse_agent_md(name: &str, raw: &str, source: AgentSource) -> Agen
         deny: sub_deny.unwrap_or_default(),
         max_turns: sub_max_turns,
         timeout_secs: sub_timeout_secs,
+        mcp: sub_mcp.unwrap_or_default(),
     };
     def
 }
@@ -487,6 +564,81 @@ mod tests {
         assert_eq!(def.subagent.tier, SubagentToolTier::Readonly);
         assert_eq!(def.subagent.max_turns, Some(12));
         assert_eq!(def.subagent.deny, vec!["webfetch"]);
+    }
+
+    #[test]
+    fn subagent_mcp_frontmatter_forms() {
+        // list form
+        let def = parse_agent_md(
+            "r",
+            "---\nsubagent_tools: readonly\nsubagent_mcp: [search_graph, find_refs]\n---\nb",
+            AgentSource::ProjectFile,
+        );
+        assert_eq!(
+            def.subagent.mcp,
+            SubagentMcpAccess::Only(vec!["search_graph".into(), "find_refs".into()])
+        );
+        // `all` wildcard
+        let def = parse_agent_md(
+            "r",
+            "---\nsubagent_tools: readonly\nsubagent_mcp: all\n---\nb",
+            AgentSource::ProjectFile,
+        );
+        assert_eq!(def.subagent.mcp, SubagentMcpAccess::All);
+        // bare single name
+        let def = parse_agent_md(
+            "r",
+            "---\nsubagent_tools: readonly\nsubagent_mcp: search_graph\n---\nb",
+            AgentSource::ProjectFile,
+        );
+        assert_eq!(
+            def.subagent.mcp,
+            SubagentMcpAccess::Only(vec!["search_graph".into()])
+        );
+        // omitted → None (default, unchanged behavior)
+        let def = parse_agent_md(
+            "r",
+            "---\nsubagent_tools: readonly\n---\nb",
+            AgentSource::Config,
+        );
+        assert_eq!(def.subagent.mcp, SubagentMcpAccess::None);
+        // explicit none
+        let def = parse_agent_md(
+            "r",
+            "---\nsubagent_tools: readonly\nsubagent_mcp: none\n---\nb",
+            AgentSource::Config,
+        );
+        assert_eq!(def.subagent.mcp, SubagentMcpAccess::None);
+    }
+
+    #[test]
+    fn subagent_mcp_config_json_forms() {
+        // list
+        let def = AgentConfig {
+            subagent: Some(SubagentConfig {
+                tools: Some("readonly".into()),
+                mcp: Some(McpAccessConfig::List(vec!["Search_Graph".into()])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .into_definition("r", AgentSource::Config);
+        // normalized (lowercased)
+        assert_eq!(
+            def.subagent.mcp,
+            SubagentMcpAccess::Only(vec!["search_graph".into()])
+        );
+        // scalar "all"
+        let def = AgentConfig {
+            subagent: Some(SubagentConfig {
+                tools: Some("readonly".into()),
+                mcp: Some(McpAccessConfig::Flag("all".into())),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .into_definition("r", AgentSource::Config);
+        assert_eq!(def.subagent.mcp, SubagentMcpAccess::All);
     }
 
     #[test]

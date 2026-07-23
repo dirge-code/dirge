@@ -422,12 +422,16 @@ pub async fn build_loop_tools(
     // dirge-ygm3: the review-enabled memory tool (mark/supersede), kept OUT of
     // the main tool set above and handed to the review runner separately.
     Option<std::sync::Arc<dyn crate::agent::agent_loop::LoopTool>>,
+    // #701: names of the MCP tools registered below, so a tooled subagent's
+    // `subagent_mcp` selection can be validated against real MCP tools.
+    // Always empty on non-mcp builds.
+    Vec<String>,
 ) {
     use crate::agent::agent_loop::types::ToolExecutionMode;
     use crate::agent::agent_loop::{LoopTool, RigToolAdapter};
 
     if cli.resolve_no_tools(cfg) {
-        return (Vec::new(), None, None);
+        return (Vec::new(), None, None, Vec::new());
     }
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
@@ -899,7 +903,10 @@ pub async fn build_loop_tools(
     // Parallel; future work can let an MCP server declare
     // execution_mode in its definition. Same name-collision
     // filtering as build_agent_inner (skip names that shadow
-    // built-ins).
+    // built-ins). #701: collect the names actually registered so a
+    // tooled subagent can opt into them via `subagent_mcp`.
+    #[cfg_attr(not(feature = "mcp"), allow(unused_mut))]
+    let mut mcp_tool_names: Vec<String> = Vec::new();
     #[cfg(feature = "mcp")]
     if let Some(manager) = &mcp_manager {
         let mcp_tools = manager
@@ -911,6 +918,7 @@ pub async fn build_loop_tools(
                 continue;
             }
             tools.push(wrap(mcp_tool.with_injection_scan(injection_scan), None).await);
+            mcp_tool_names.push(name);
         }
     }
 
@@ -984,7 +992,7 @@ pub async fn build_loop_tools(
         None
     };
 
-    (tools, tool_def_filter, review_memory_tool)
+    (tools, tool_def_filter, review_memory_tool, mcp_tool_names)
 }
 
 #[cfg(all(test, any(feature = "mcp", feature = "plugin")))]

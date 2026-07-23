@@ -57,6 +57,7 @@ All frontmatter keys are optional:
 | `subagent_tools` | Opt this profile's `task(agent=…)` subagent into tools: `readonly` (read-only tool universe), `readwrite` (readonly + write/edit/bash — can edit the repo), or `toolless` (the default one-shot). See *Tooled subagents* below. |
 | `subagent_max_turns` | Cap the tooled subagent's loop (default `25`). |
 | `subagent_deny` | Narrow the tool set further within the tier (e.g. `[webfetch]`). |
+| `subagent_mcp` | Grant the tooled subagent MCP tools on top of its tier: `all` for every connected MCP tool, or a list of names (e.g. `[search_graph, find_refs]`). Requires a `readonly`/`readwrite` tier — ignored on `toolless`. See *Tooled subagents* below. |
 
 A frontmatter-less file is treated as a body-only profile (just a system
 prompt).
@@ -78,9 +79,10 @@ The same shape as a JSON object, for profiles you'd rather keep in config:
       "subagent": {
         "tools": "readonly",
         "max_turns": 15,
-        "deny": ["webfetch"]
+        "deny": ["webfetch"],
+        "mcp": ["search_graph", "find_refs"]
       },
-      "description": "tooled subagent that reads the repo directly"
+      "description": "tooled subagent that reads the repo + a code-graph MCP server"
     },
     "architect": {
       "model": "opus",
@@ -191,6 +193,32 @@ Permissions inherit the parent agent: in-cwd reads/edits are auto-allowed,
 and a path outside the cwd surfaces a permission prompt through the parent
 UI. If a profile pinned a model, the tooled subagent runs on that model;
 otherwise it uses the live agent's.
+
+#### MCP tools for subagents
+
+By default a subagent can't reach the [MCP tools](mcp.md) configured for the
+main agent — the tier universe above is built-in-only. Grant them explicitly
+with `subagent_mcp` (frontmatter) or `subagent.mcp` (config):
+
+```
+---
+subagent_tools: readonly
+subagent_mcp: [search_graph, find_refs]   # or: subagent_mcp: all
+---
+You are a research subagent. Use the code-graph MCP tools to trace calls.
+```
+
+- `all` grants every connected MCP tool; a list grants only those tool names.
+- The grant is validated against the live set of MCP tools **at spawn time**,
+  so servers that connect after startup (dirge loads MCP in the background)
+  are covered, and a name that matches no MCP tool is silently ignored.
+- This is a **separate channel from the tier** and can only ever add genuine
+  MCP tools — it can never grant a built-in like `bash`, so the tier cap
+  stays honest. A named entry that collides with a built-in is a no-op.
+- MCP access needs a real loop to attach to, so it requires a
+  `readonly`/`readwrite` tier; on `toolless` it's ignored (with a warning at
+  startup). Isolated worktree writers (coordinator read-write dispatch) don't
+  get MCP tools yet.
 
 To coordinate several background subagents as a batch, require read-only and
 read-write profile tiers, retry failed tasks, or isolate writers in Git

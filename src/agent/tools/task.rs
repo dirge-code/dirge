@@ -460,6 +460,42 @@ pub fn resolve_subagent_allow(
     Some(set.into_iter().collect())
 }
 
+/// Resolve a profile's [`SubagentMcpAccess`] against the live agent's set of
+/// MCP tool names (issue #701). Returns the MCP tool names to ADD to the
+/// subagent's allow-list on top of its tier universe.
+///
+/// The result is always a subset of `available`, so a profile can never use
+/// `subagent_mcp` to name a non-MCP tool (a built-in like `bash`): the tier
+/// cap on built-in tools stays honest. `Only` names not present in
+/// `available` (typo / disconnected server) are dropped with a warning so a
+/// misspelled name isn't a silent no-op. Case-insensitive against `available`.
+pub fn resolve_mcp_selection(
+    access: &crate::context::agent_defs::SubagentMcpAccess,
+    available: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    use crate::context::agent_defs::SubagentMcpAccess;
+    match access {
+        SubagentMcpAccess::None => Vec::new(),
+        SubagentMcpAccess::All => available.iter().cloned().collect(),
+        SubagentMcpAccess::Only(names) => names
+            .iter()
+            .filter_map(
+                |n| match available.iter().find(|a| a.eq_ignore_ascii_case(n)) {
+                    Some(a) => Some(a.clone()),
+                    None => {
+                        tracing::warn!(
+                            target: "dirge::agents",
+                            tool = %n,
+                            "subagent_mcp names '{n}' but no such MCP tool is connected; ignoring"
+                        );
+                        None
+                    }
+                },
+            )
+            .collect(),
+    }
+}
+
 /// Per-subagent turn cap, honoring a profile override or the default.
 pub fn resolve_subagent_max_turns(p: &crate::context::agent_defs::SubagentToolPolicy) -> usize {
     p.max_turns.unwrap_or(SUBAGENT_DEFAULT_MAX_TURNS)
@@ -506,6 +542,11 @@ pub struct SubagentRoute {
     pub max_turns: usize,
     pub timeout: std::time::Duration,
     pub tier: crate::context::agent_defs::SubagentToolTier,
+    /// MCP tools this profile grants its subagent on top of the tier universe
+    /// (#701). Resolved against the live agent's MCP-tool set at fork time
+    /// (not here) because MCP servers connect after routes are built. Ignored
+    /// on the tool-less path (no loop to attach tools to).
+    pub mcp: crate::context::agent_defs::SubagentMcpAccess,
 }
 
 #[derive(Debug, Clone)]
@@ -836,6 +877,7 @@ impl TaskTool {
         route_model: Option<AnyModel>,
         route_preamble: Option<String>,
         allowed: Vec<String>,
+        mcp: crate::context::agent_defs::SubagentMcpAccess,
         max_turns: usize,
         timeout: std::time::Duration,
         background: bool,
@@ -1009,6 +1051,7 @@ impl TaskTool {
             let tid_for_task = task_id.clone();
             let preamble_for_task = route_preamble.clone();
             let allowed_for_task = allowed.clone();
+            let mcp_for_task = mcp.clone();
             let model_for_task = route_model.clone();
             let abort_for_task = abort.clone();
             let permission_for_task = self.permission.clone();
@@ -1066,6 +1109,10 @@ impl TaskTool {
                             return;
                         }
                     };
+                    // Isolated worktree writers build a fresh tool registry
+                    // rooted at the worktree; MCP tools aren't rooted there,
+                    // so `subagent_mcp` (#701) is not wired into this path in
+                    // v1 — it applies to the shared-checkout fork below.
                     let tools = crate::agent::builder::build_rooted_writer_tools(
                         root,
                         permission_for_task,
@@ -1090,6 +1137,7 @@ impl TaskTool {
                         prompt.clone(),
                         system_prompt,
                         &allowed_for_task,
+                        &mcp_for_task,
                         &child_sid,
                         max_turns,
                         model_for_task.as_ref(),
@@ -1204,6 +1252,7 @@ impl TaskTool {
                 prompt.clone(),
                 system_prompt,
                 &allowed,
+                &mcp,
                 &child_sid,
                 max_turns,
                 route_model.as_ref(),
@@ -1372,7 +1421,7 @@ impl Tool for TaskTool {
         // the model asked for a specific persona). `tool_allow` is `Some`
         // when the profile opted its subagent into tools (v1: readonly tier);
         // that selects the tooled fork below instead of the tool-less one-shot.
-        let (route_model, route_preamble, tool_allow, max_turns, timeout, tier) = match args
+        let (route_model, route_preamble, tool_allow, max_turns, timeout, tier, mcp) = match args
             .agent
             .as_deref()
         {
@@ -1383,6 +1432,7 @@ impl Tool for TaskTool {
                 SUBAGENT_DEFAULT_MAX_TURNS,
                 std::time::Duration::from_secs(600),
                 crate::context::agent_defs::SubagentToolTier::Toolless,
+                crate::context::agent_defs::SubagentMcpAccess::None,
             ),
             Some(name) => {
                 if !subagent_routes_available() {
@@ -1399,6 +1449,7 @@ impl Tool for TaskTool {
                         r.max_turns,
                         r.timeout,
                         r.tier,
+                        r.mcp,
                     ),
                     None => {
                         return Err(ToolError::Msg(format!(
@@ -1446,6 +1497,7 @@ impl Tool for TaskTool {
                     route_model,
                     route_preamble,
                     allowed,
+                    mcp,
                     max_turns,
                     timeout,
                     background,
@@ -1987,6 +2039,7 @@ mod tests {
                 deny: Vec::new(),
                 max_turns: None,
                 timeout_secs: None,
+                mcp: crate::context::agent_defs::SubagentMcpAccess::None,
             };
             let resolved = resolve_subagent_allow(&policy)
                 .unwrap_or_else(|| panic!("{tier:?} should yield a tool set"));
@@ -2133,6 +2186,45 @@ mod tests {
     }
 
     #[test]
+    fn resolve_mcp_selection_matches_issue_701() {
+        use crate::context::agent_defs::SubagentMcpAccess;
+        use std::collections::HashSet;
+        let available: HashSet<String> = ["search_graph", "find_refs", "web_lookup"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+
+        // None → nothing.
+        assert!(resolve_mcp_selection(&SubagentMcpAccess::None, &available).is_empty());
+
+        // All → every available MCP tool.
+        let mut all = resolve_mcp_selection(&SubagentMcpAccess::All, &available);
+        all.sort();
+        assert_eq!(all, vec!["find_refs", "search_graph", "web_lookup"]);
+
+        // Only → just the named tools, case-insensitively; unknown names dropped.
+        let only = resolve_mcp_selection(
+            &SubagentMcpAccess::Only(vec!["Search_Graph".into(), "nonexistent".into()]),
+            &available,
+        );
+        assert_eq!(only, vec!["search_graph".to_string()]);
+
+        // A built-in name in the Only list can NEVER be granted — it isn't in
+        // the available MCP set, so the tier cap on built-ins stays honest.
+        let escalate = resolve_mcp_selection(
+            &SubagentMcpAccess::Only(vec!["bash".into(), "edit".into()]),
+            &available,
+        );
+        assert!(
+            escalate.is_empty(),
+            "subagent_mcp must never grant a non-MCP (built-in) tool: {escalate:?}"
+        );
+
+        // All against an empty set (no MCP servers connected) → nothing.
+        assert!(resolve_mcp_selection(&SubagentMcpAccess::All, &HashSet::new()).is_empty());
+    }
+
+    #[test]
     fn resolve_max_turns_honors_override_and_default() {
         use crate::context::agent_defs::{SubagentToolPolicy, SubagentToolTier};
         let none = SubagentToolPolicy {
@@ -2273,6 +2365,7 @@ mod tests {
                 max_turns: SUBAGENT_DEFAULT_MAX_TURNS,
                 timeout: std::time::Duration::from_secs(600),
                 tier: crate::context::agent_defs::SubagentToolTier::Toolless,
+                mcp: crate::context::agent_defs::SubagentMcpAccess::None,
             },
         );
         set_subagent_routes(routes);

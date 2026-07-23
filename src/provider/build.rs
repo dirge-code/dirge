@@ -175,26 +175,27 @@ pub async fn build_agent(
             // is on, `tool_def_filter` is `Some` and a
             // `ToolSearchTool` has been registered inside `tools`
             // with the same Arc.
-            let (loop_tools, dyn_search, review_memory_tool) = builder::build_loop_tools(
-                cache.clone(),
-                permission_for_loop,
-                ask_tx_for_loop,
-                question_tx_for_loop,
-                plan_tx_for_loop,
-                bg_store_for_loop,
-                #[cfg(feature = "lsp")]
-                lsp_for_loop,
-                sandbox_for_loop,
-                parent_model_for_loop,
-                #[cfg(feature = "mcp")]
-                mcp_manager,
-                #[cfg(feature = "semantic")]
-                semantic_manager,
-                cli,
-                cfg,
-                session_id.clone(),
-            )
-            .await;
+            let (loop_tools, dyn_search, review_memory_tool, mcp_tool_names) =
+                builder::build_loop_tools(
+                    cache.clone(),
+                    permission_for_loop,
+                    ask_tx_for_loop,
+                    question_tx_for_loop,
+                    plan_tx_for_loop,
+                    bg_store_for_loop,
+                    #[cfg(feature = "lsp")]
+                    lsp_for_loop,
+                    sandbox_for_loop,
+                    parent_model_for_loop,
+                    #[cfg(feature = "mcp")]
+                    mcp_manager,
+                    #[cfg(feature = "semantic")]
+                    semantic_manager,
+                    cli,
+                    cfg,
+                    session_id.clone(),
+                )
+                .await;
 
             // Phase 4.5h-6: extract the rig Agent's preamble so
             // the new path can pass it as Context.system_prompt.
@@ -224,6 +225,9 @@ pub async fn build_agent(
                 preamble,
                 model_name.clone(),
             );
+            // #701: record MCP tool names so a tooled subagent's
+            // `subagent_mcp` selection resolves against real MCP tools.
+            agent = agent.with_mcp_tool_names(mcp_tool_names);
             // dirge-7tvq: attach the memory provider so session-end
             // and pre-compress hooks can dispatch through the trait.
             if let Some(provider) = memory_provider {
