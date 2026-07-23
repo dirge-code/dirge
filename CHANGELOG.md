@@ -4,9 +4,24 @@ All notable changes to dirge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.19.18] - 2026-07-23
 
 ### Added
+- Subagent MCP tools (#701): an agent profile can grant its `task(agent=…)`
+  subagent selected MCP tools with `subagent_mcp` — `all` for every connected
+  MCP tool, or a list of names. Resolved against the live MCP-tool set at fork
+  time (so background-loaded servers are covered) and validated against it, so
+  it can only ever add real MCP tools, never a built-in past the tier cap.
+  Honored on the `readonly`/`readwrite` tiers.
+- `openai-responses` provider type (#703): a custom OpenAI-compatible provider
+  can target the Responses API (`/v1/responses`) instead of chat/completions by
+  setting `provider_type: "openai-responses"`. Uses a plain api-key bearer
+  against the configured `base_url` — no OAuth/Codex login — so it works against
+  any `/v1/responses` server; `allow_insecure` is honored.
+- Optional `/plan` approval gate (#622): with `phased_workflow_plan_approval`
+  on, the phased workflow pauses after the plan phase to approve / edit / cancel
+  before any code is written. Edit takes free-form feedback and re-plans, so you
+  can steer the plan before implementation. Default off (implement immediately).
 - `code_mode_rubric` config flag (default off): appends a "code mode" rubric to the
   system prompt telling the model to collapse a bulk/fan-out of similar tool calls
   (roughly 10+ items) into ONE `bash` script that returns only the distilled result,
