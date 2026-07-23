@@ -74,10 +74,25 @@ pub fn default_model_for_alias(
     }
 }
 
+/// True when a `provider_type` string selects the OpenAI **Responses** API
+/// (`/v1/responses`) rather than chat/completions (#703). Both separators are
+/// accepted so a config typo (`openai_responses`) still works. The kind stays
+/// `ProviderKind::OpenAI`; only the client dialect differs (see
+/// [`ProviderInfo::openai_responses`]).
+pub fn is_openai_responses_type(provider_type: &str) -> bool {
+    matches!(
+        provider_type.trim().to_ascii_lowercase().as_str(),
+        "openai-responses" | "openai_responses"
+    )
+}
+
 pub fn parse_provider(name: &str) -> Option<ProviderKind> {
     match name.to_lowercase().as_str() {
         "openrouter" => Some(ProviderKind::OpenRouter),
         "openai" => Some(ProviderKind::OpenAI),
+        // #703: the Responses-API dialect resolves to the OpenAI kind — it
+        // differs only in which endpoint/client is built (ChatGptOpenAI).
+        "openai-responses" | "openai_responses" => Some(ProviderKind::OpenAI),
         "anthropic" => Some(ProviderKind::Anthropic),
         "gemini" | "google" => Some(ProviderKind::Gemini),
         "deepseek" => Some(ProviderKind::DeepSeek),
@@ -263,6 +278,12 @@ pub struct ProviderInfo {
     /// already expanded). When present, takes precedence over both
     /// `api_key_env` and the standard env-var fallback chain.
     pub api_key_literal: Option<String>,
+    /// #703: the provider_type selected the OpenAI **Responses** API
+    /// (`provider_type: "openai-responses"`). `kind` is still `OpenAI`; this
+    /// flag forks the client build to `ChatGptOpenAI` (the `/v1/responses`
+    /// client) with the configured `base_url` + api key. Never set for OAuth /
+    /// ChatGPT-auth paths, which already force the Responses endpoint.
+    pub openai_responses: bool,
 }
 
 pub fn resolve_provider_info(
@@ -325,6 +346,7 @@ pub fn resolve_provider_info(
             api_key_env: entry.api_key_env.clone(),
             auth: entry.auth,
             api_key_literal,
+            openai_responses: is_openai_responses_type(&ptype),
         });
     }
     // Then plugin-registered providers from `harness/register-provider`.
@@ -371,6 +393,7 @@ pub fn resolve_provider_info(
             api_key_env: entry.api_key_env,
             auth: entry.auth,
             api_key_literal,
+            openai_responses: is_openai_responses_type(&ptype),
         });
     }
     let kind = parse_provider(name)?;
@@ -380,6 +403,7 @@ pub fn resolve_provider_info(
         api_key_env: None,
         auth: None,
         api_key_literal: None,
+        openai_responses: is_openai_responses_type(name),
     })
 }
 
@@ -826,6 +850,54 @@ mod resolve_model_switch_tests {
             model: model.map(str::to_string),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn openai_responses_type_parses_as_openai_kind() {
+        // #703: the Responses dialect resolves to the OpenAI kind, both
+        // separators, case-insensitively.
+        assert_eq!(
+            parse_provider("openai-responses"),
+            Some(ProviderKind::OpenAI)
+        );
+        assert_eq!(
+            parse_provider("openai_responses"),
+            Some(ProviderKind::OpenAI)
+        );
+        assert!(is_openai_responses_type("openai-responses"));
+        assert!(is_openai_responses_type("  OpenAI-Responses "));
+        assert!(!is_openai_responses_type("openai"));
+        assert!(!is_openai_responses_type("anthropic"));
+    }
+
+    #[test]
+    fn resolve_provider_info_flags_openai_responses() {
+        let providers = HashMap::from([
+            (
+                "gpt5".to_string(),
+                ProviderEntry {
+                    provider_type: Some("openai-responses".to_string()),
+                    base_url: Some("https://proxy.invalid/v1".to_string()),
+                    api_key: Some("sk-test".to_string()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "vanilla".to_string(),
+                ProviderEntry {
+                    provider_type: Some("openai".to_string()),
+                    base_url: Some("https://proxy.invalid/v1".to_string()),
+                    api_key: Some("sk-test".to_string()),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let r = resolve_provider_info("gpt5", &providers).unwrap();
+        assert_eq!(r.kind, ProviderKind::OpenAI);
+        assert!(r.openai_responses, "openai-responses must set the flag");
+        let v = resolve_provider_info("vanilla", &providers).unwrap();
+        assert_eq!(v.kind, ProviderKind::OpenAI);
+        assert!(!v.openai_responses, "plain openai must not set the flag");
     }
 
     /// The user's real shape: deepseek default + a pinned glm + local ollama.

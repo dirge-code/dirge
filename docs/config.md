@@ -270,7 +270,7 @@ Each `providers` entry accepts:
 
 | Field | Description |
 |-------|-------------|
-| `provider_type` | Built-in backend to use: `openrouter`, `openai`, `anthropic`, `gemini`, `deepseek`, `glm`, `cerebras`, `opencode`, `ollama`, or `custom`. Optional — defaults to the entry's alias when that alias matches a built-in name. |
+| `provider_type` | Built-in backend to use: `openrouter`, `openai`, `openai-responses`, `anthropic`, `gemini`, `deepseek`, `glm`, `cerebras`, `opencode`, `ollama`, or `custom`. Optional — defaults to the entry's alias when that alias matches a built-in name. `openai` speaks the Chat Completions API (`/v1/chat/completions`); `openai-responses` speaks the Responses API (`/v1/responses`) — see below. |
 | `base_url` | Endpoint base URL (for custom / self-hosted endpoints). |
 | `model` | Model name for this provider. |
 | `api_key` | Literal key or `${ENV_VAR}` interpolation. Takes precedence over `api_key_env`. |
@@ -284,6 +284,34 @@ Each `providers` entry accepts:
 
 The aliases on the left of the map become the values you write in
 role-assignment keys.
+
+### OpenAI Chat Completions vs Responses API
+
+`provider_type: "openai"` sends requests to the Chat Completions endpoint
+(`/v1/chat/completions`). Some OpenAI-compatible endpoints only expose the
+newer Responses API (`/v1/responses`) — e.g. an OAuth proxy that mirrors what
+OpenAI itself serves for GPT-5+. Set `provider_type: "openai-responses"` to
+target that endpoint instead:
+
+```json
+{
+  "providers": {
+    "gpt5-proxy": {
+      "provider_type": "openai-responses",
+      "model": "gpt-5.6",
+      "base_url": "http://127.0.0.1:8639/v1",
+      "api_key": "${MY_PROXY_KEY}",
+      "allow_insecure": true
+    }
+  }
+}
+```
+
+It behaves like `openai` in every other respect (default model, API-key auth,
+`base_url` handling) — only the request shape and endpoint differ. The api key
+is sent as a bearer token; unlike `auth: chatgpt` this uses no OAuth/Codex
+login, so it works against any plain `/v1/responses` server. (`allow_insecure`
+is honored here since no OAuth bearer is involved.)
 
 ### Cerebras
 
