@@ -45,10 +45,30 @@ pub(crate) struct PlanKickoff {
 pub(crate) enum PlanPhaseEvent {
     /// A status line to render. `error` selects the color.
     Progress { text: String, error: bool },
+    /// #622: the plan is ready and plan-approval is on — pause for the user.
+    /// The UI renders `plan`, opens the approve/edit/cancel modal, and sends
+    /// the decision back over `reply`. On `Edit` the task re-plans with the
+    /// feedback and emits another `AwaitApproval`; on `Approve` it emits
+    /// `Ready`; on `Cancel` (or a dropped reply) it emits `Aborted`.
+    AwaitApproval {
+        plan: String,
+        reply: tokio::sync::oneshot::Sender<PlanApprovalDecision>,
+    },
     /// Both forks succeeded — launch the streamed implement run from this.
     Ready(Box<PlanKickoff>),
     /// A phase produced nothing or errored (a `Progress` line already said why).
     Aborted,
+}
+
+/// #622: the user's verdict at the plan-approval gate.
+#[derive(Debug)]
+pub(crate) enum PlanApprovalDecision {
+    /// Run the plan as-is.
+    Approve,
+    /// Revise the plan with this feedback, then ask again.
+    Edit(String),
+    /// Abandon the workflow without implementing.
+    Cancel,
 }
 
 /// Handle to the spawned explore→plan task: the event stream the UI loop drains

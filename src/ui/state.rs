@@ -285,6 +285,13 @@ pub(crate) enum InputMode {
         /// Human label for the confirmation/result lines.
         label: &'static str,
     },
+    /// #622: phased `/plan` approval gate. `a` approves, `e` starts free-form
+    /// feedback entry (Enter submits → re-plan), `c`/Esc cancels. `entry` is
+    /// `Some` while the user is typing feedback (mirrors [`QuestionState::entry`]).
+    PlanApproval {
+        reply: tokio::sync::oneshot::Sender<crate::agent::plan::runtime::PlanApprovalDecision>,
+        entry: Option<CustomEntry>,
+    },
     /// `question` tool: walk the questionnaire one option-picker at a time.
     Question(QuestionState),
     /// Plugin `harness/confirm` dialog: y/n (Esc / Ctrl+C = no).
@@ -375,6 +382,7 @@ impl CustomEntry {
 pub(crate) enum ModalKind {
     Compose,
     PlanSwitch,
+    PlanApproval,
     Question,
     DialogConfirm,
     DialogSelect,
@@ -392,6 +400,7 @@ impl InputMode {
         match self {
             InputMode::Compose => ModalKind::Compose,
             InputMode::PlanSwitch { .. } => ModalKind::PlanSwitch,
+            InputMode::PlanApproval { .. } => ModalKind::PlanApproval,
             InputMode::Question(_) => ModalKind::Question,
             InputMode::DialogConfirm { .. } => ModalKind::DialogConfirm,
             InputMode::DialogSelect { .. } => ModalKind::DialogSelect,

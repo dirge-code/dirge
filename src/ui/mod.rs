@@ -741,6 +741,15 @@ pub async fn run_interactive(
                     entry.paste(text);
                     render_custom_entry(&mut renderer, &entry.buf, entry.input_anchor);
                     renderer.request_repaint();
+                } else if let state::InputMode::PlanApproval {
+                    entry: Some(entry), ..
+                } = &mut ui.input_mode
+                {
+                    // #622: a paste while typing plan-edit feedback lands here,
+                    // not in the compose editor.
+                    entry.paste(text);
+                    render_custom_entry(&mut renderer, &entry.buf, entry.input_anchor);
+                    renderer.request_repaint();
                 }
                 continue;
             }
@@ -815,6 +824,120 @@ pub async fn run_interactive(
                         }
                         _ => {}
                     },
+                    state::ModalKind::PlanApproval => {
+                        // #622: two-phase like Question — mutate the entry behind
+                        // `&mut` (typing / start-entry / esc-out), recording a
+                        // terminal `decision`; then take the reply via
+                        // `mem::replace` once the borrow ends and send it.
+                        use crate::agent::plan::runtime::PlanApprovalDecision;
+                        let is_ctrl_c = key.code == KeyCode::Char('c')
+                            && key.modifiers.contains(KeyModifiers::CONTROL);
+                        let mut decision: Option<PlanApprovalDecision> = None;
+                        {
+                            let state::InputMode::PlanApproval { entry, .. } =
+                                &mut ui.input_mode
+                            else {
+                                unreachable!()
+                            };
+                            if let Some(e) = entry {
+                                // Typing feedback for the "edit" path.
+                                match key.code {
+                                    KeyCode::Enter => {
+                                        let fb = e.buf.trim().to_string();
+                                        if !fb.is_empty() {
+                                            decision = Some(PlanApprovalDecision::Edit(fb));
+                                        }
+                                        // Empty feedback → ignore Enter, keep typing.
+                                    }
+                                    KeyCode::Esc => {
+                                        // Discard the draft, return to a/e/c.
+                                        *entry = None;
+                                        renderer.write_line(
+                                            "  (edit cancelled) [a] approve   [e] edit   [c] cancel",
+                                            c_perm(),
+                                        )?;
+                                        renderer.request_repaint();
+                                    }
+                                    KeyCode::Backspace => {
+                                        e.buf.pop();
+                                        render_custom_entry(
+                                            &mut renderer,
+                                            &e.buf,
+                                            e.input_anchor,
+                                        );
+                                        renderer.request_repaint();
+                                    }
+                                    KeyCode::Char(c)
+                                        if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                    {
+                                        e.buf.push(c);
+                                        render_custom_entry(
+                                            &mut renderer,
+                                            &e.buf,
+                                            e.input_anchor,
+                                        );
+                                        renderer.request_repaint();
+                                    }
+                                    // Ctrl+C bails from feedback entry too (not just
+                                    // the a/e/c screen), matching the rest of the UI.
+                                    _ if is_ctrl_c => {
+                                        decision = Some(PlanApprovalDecision::Cancel)
+                                    }
+                                    _ => {}
+                                }
+                            } else {
+                                // Choosing approve / edit / cancel.
+                                match key.code {
+                                    KeyCode::Char('a') => {
+                                        decision = Some(PlanApprovalDecision::Approve)
+                                    }
+                                    KeyCode::Char('e') => {
+                                        renderer.write_line(
+                                            "  feedback (Enter submits, Esc goes back):",
+                                            c_perm(),
+                                        )?;
+                                        let input_anchor = renderer.buffer_len();
+                                        *entry = Some(state::CustomEntry {
+                                            buf: String::new(),
+                                            input_anchor,
+                                        });
+                                        render_custom_entry(&mut renderer, "", input_anchor);
+                                        renderer.request_repaint();
+                                    }
+                                    KeyCode::Char('c') | KeyCode::Esc => {
+                                        decision = Some(PlanApprovalDecision::Cancel)
+                                    }
+                                    _ if is_ctrl_c => {
+                                        decision = Some(PlanApprovalDecision::Cancel)
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        if let Some(d) = decision {
+                            let state::InputMode::PlanApproval { reply, .. } =
+                                std::mem::replace(&mut ui.input_mode, state::InputMode::Compose)
+                            else {
+                                unreachable!()
+                            };
+                            match &d {
+                                PlanApprovalDecision::Approve => renderer.write_line(
+                                    "  → approved; implementing…",
+                                    Color::Green,
+                                )?,
+                                PlanApprovalDecision::Edit(_) => renderer.write_line(
+                                    "  → revising the plan with your feedback…",
+                                    c_perm(),
+                                )?,
+                                PlanApprovalDecision::Cancel => {
+                                    renderer.write_line("  → cancelled", theme::dim())?
+                                }
+                            }
+                            renderer.request_repaint();
+                            // If the receiver is gone the task already unwound; ignore.
+                            let _ = reply.send(d);
+                        }
+                    }
                     state::ModalKind::Question => {
                         // Phase 1: mutate the QuestionState behind `&mut`,
                         // recording what to do next. The reply channel can
@@ -3566,6 +3689,23 @@ pub async fn run_interactive(
                             Some(PlanPhaseEvent::Progress { text, error }) => {
                                 renderer.write_line(&text, if error { c_error() } else { c_agent() })?;
                                 renderer.request_repaint();
+                            }
+                            Some(PlanPhaseEvent::AwaitApproval { plan, reply }) => {
+                                // #622: render the plan for review and open the
+                                // approve/edit/cancel modal. Keep `ui.plan_phase`
+                                // set — the task is blocked awaiting our reply.
+                                renderer.write_line("", c_agent())?;
+                                renderer.write_line("── Plan ready for review ──", c_agent())?;
+                                for line in plan.lines() {
+                                    renderer.write_line(line, c_agent())?;
+                                }
+                                renderer.write_line("", c_agent())?;
+                                renderer.write_line(
+                                    "  [a] approve & implement   [e] edit (give feedback)   [c] cancel",
+                                    c_perm(),
+                                )?;
+                                renderer.request_repaint();
+                                ui.input_mode = state::InputMode::PlanApproval { reply, entry: None };
                             }
                             Some(PlanPhaseEvent::Ready(kickoff)) => {
                                 // explore→plan finished: launch the streamed implement run
