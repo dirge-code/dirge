@@ -33,14 +33,20 @@ use super::build_session_search_tool;
 /// server or plugin may not shadow `read`/`bash`/etc. — rig's builder and the
 /// LoopTool registry would otherwise prefer the last-added tool, letting an
 /// arbitrary external tool replace a core dirge tool. Returns `true` when
-/// `name` collides with a built-in (emitting a warning that names `source`,
-/// e.g. `"MCP server 'foo'"` or `"plugin"`) so the caller can skip it.
+/// `name` collides with a built-in that is actually present in this build
+/// (emitting a warning that names `source`, e.g. `"MCP server 'foo'"` or
+/// `"plugin"`) so the caller can skip it.
+///
+/// Only reserves built-ins compiled into the current build: a feature-gated
+/// tool that isn't registered (e.g. `search_graph` without
+/// `experimental-graph-search`) leaves its name free for an external tool,
+/// so it isn't skipped into nonexistence (issue #702).
 ///
 /// Single source of truth for the collision policy, previously inlined
 /// verbatim at three sites (MCP eager + MCP background + plugin) [dirge-p99h].
 #[cfg(any(feature = "mcp", feature = "plugin"))]
 fn shadows_builtin(name: &str, source: &str) -> bool {
-    if tools::BUILTIN_TOOL_NAMES.contains(&name) {
+    if tools::reserves_builtin_name(name) {
         eprintln!(
             "warning: {source} exports tool '{name}' which collides with a dirge built-in; skipping it",
         );
@@ -996,5 +1002,31 @@ mod tests {
         // A name no built-in uses → accepted.
         assert!(!shadows_builtin("totally_custom_tool", "plugin"));
         assert!(!shadows_builtin("acme_search", "MCP server 'acme'"));
+    }
+
+    /// issue #702: `search_graph` is a built-in only behind
+    /// `experimental-graph-search`. When that feature is off (default
+    /// builds) the built-in isn't registered, so an MCP server exporting
+    /// `search_graph` must NOT be shadowed — otherwise the name resolves to
+    /// no tool at all. Guarded by cfg so it only asserts when the feature is
+    /// actually off.
+    #[cfg(not(feature = "experimental-graph-search"))]
+    #[test]
+    fn disabled_feature_builtin_does_not_shadow_mcp_tool() {
+        assert!(!shadows_builtin(
+            "search_graph",
+            "MCP server 'codebase-memory-mcp'"
+        ));
+    }
+
+    /// The mirror: when the feature IS on, the built-in exists and the name
+    /// stays reserved.
+    #[cfg(feature = "experimental-graph-search")]
+    #[test]
+    fn enabled_feature_builtin_still_shadows_mcp_tool() {
+        assert!(shadows_builtin(
+            "search_graph",
+            "MCP server 'codebase-memory-mcp'"
+        ));
     }
 }
