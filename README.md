@@ -91,6 +91,15 @@ longer session rides alongside it in memory. See
 cargo install dirge-agent
 ```
 
+> **Source builds need a C/LLVM toolchain.** The default `plugin` (Janet)
+> feature builds `evil_janet` from C and runs `bindgen`, so a source install
+> needs a C compiler and libclang. On Debian/Ubuntu:
+> `sudo apt install build-essential clang libclang-dev`. Without them the
+> build fails inside `janetrs`/`evil_janet` (e.g. `struct evil_janet::JanetArray
+> has no field named data`). The prebuilt binaries and Homebrew bottle below
+> carry no such requirement. To skip Janet entirely, build the `no-plugin`
+> set (see below).
+
 Or install a prebuilt binary with [Homebrew](https://brew.sh) (macOS + Linux):
 
 ```bash
@@ -102,9 +111,15 @@ Homebrew also makes upgrades a one-liner (`brew upgrade dirge`), and on macOS
 it installs without the Gatekeeper quarantine prompt you'd get from
 double-clicking a downloaded tarball.
 
-Want a leaner binary? Opt out of the defaults and pick only what you need:
+Want a leaner binary, or a build that doesn't need a C/LLVM toolchain? Opt out
+of the defaults and pick only what you need:
 
 ```bash
+# Everything except the Janet plugin runtime — the whole default feature set
+# minus `plugin`, so no C compiler / libclang needed. Best when the default
+# build fails in janetrs/evil_janet or you don't use plugins.
+cargo install dirge-agent --no-default-features --features no-plugin
+
 # Minimal: just the core agent + MCP, no semantic tools / plugins / ACP
 cargo install dirge-agent --no-default-features --features "loop,git-worktree,mcp,lsp"
 
@@ -113,8 +128,9 @@ cargo install dirge-agent --no-default-features \
   --features "loop,git-worktree,mcp,lsp,semantic-rust,semantic-python"
 ```
 
-If a source build fails while using a newer system LLVM than the project
-expects, point bindgen at LLVM 18's libclang explicitly:
+If you do want the Janet `plugin` feature but the source build fails while
+using a newer system LLVM than the project expects, point bindgen at LLVM 18's
+libclang explicitly:
 
 ```bash
 LIBCLANG_PATH=/usr/lib64/llvm18/lib cargo install dirge-agent

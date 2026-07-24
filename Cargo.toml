@@ -87,14 +87,14 @@ default = [
     'slash-completion',
     'mcp-server',
 ]
-# Default feature set minus `plugin` (dirge-4xgd / Windows release).
-# The Janet bindings don't build on Windows MSVC: `evil_janet` references
-# `_setjmp` (absent on MSVC) and `janetrs` 0.8 passes an i64 to the Windows
-# `fseek`, whose `offset` is `c_long` (i32). The release workflow builds the
-# Windows target with this set; Windows users can `cargo install
-# --no-default-features --features windows-default` for the same result
-# (everything except Janet-backed plugins).
-windows-default = [
+# The default feature set minus `plugin` — everything except the Janet
+# plugin runtime. Use this for a source build that doesn't need a C/LLVM
+# toolchain: the `plugin` feature pulls in `janetrs`/`evil_janet`, which
+# compile Janet from C and run `bindgen` (needs a C compiler + libclang).
+# On a host missing or mismatching those, `evil_janet` emits opaque FFI
+# structs and the build fails (dirge-4xgd, #712). Toolchain-free install:
+# `cargo install dirge-agent --no-default-features --features no-plugin`.
+no-plugin = [
     'loop',
     'git-worktree',
     'mcp',
@@ -116,6 +116,11 @@ windows-default = [
     'slash-completion',
     'mcp-server',
 ]
+# Windows ships the `no-plugin` set: the Janet bindings can't build on MSVC
+# at all (`evil_janet` references `_setjmp`, absent on MSVC, and `janetrs`
+# 0.8 passes an i64 to the Windows `fseek`, whose `offset` is `c_long`/i32).
+# The release workflow builds the Windows target with this set.
+windows-default = ['no-plugin']
 loop = []
 # Run dirge itself as an MCP server (`dirge mcp`) so another agent (e.g.
 # Claude Code) can delegate implementation tasks to dirge and review them.
