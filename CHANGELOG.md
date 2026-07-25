@@ -4,6 +4,29 @@ All notable changes to dirge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.19.19] - 2026-07-24
+
+### Added
+- ACP slash commands (#714): the ACP bridge now advertises a curated set of
+  slash commands to editor clients via `available_commands_update` after a
+  session is created, and handles them locally instead of forwarding them to
+  the model: `/help`, `/clear`, `/cd`, `/model`, and `/mode`. Command names are
+  advertised without the leading `/` (the client adds that affordance).
+  `/model` and `/mode` switches are session-scoped and persist across turns.
+  TUI-only commands (`/panel`, `/tree`, `/fork`, …) aren't advertised because
+  they have no meaning without the interactive UI; any unrecognized `/…` input
+  still flows through to the model unchanged.
+- `no-plugin` build feature (#712, #713): the default feature set minus
+  `plugin`, for a source build that needs no C/LLVM toolchain (the `plugin`
+  feature compiles Janet from C via bindgen, which needs a C compiler +
+  libclang). Install with `cargo install dirge-agent --no-default-features
+  --features no-plugin`. `windows-default` now aliases to it.
+
+### Security
+- Bumped russh 0.61 → 0.62.4, clearing three advisories (GHSA-5xvq-cp9x-6p6r,
+  GHSA-cqjc-rmpq-xprq, GHSA-g9hv-x236-4qp3) against the SSH client used by the
+  optional `sandbox-microvm` feature. The API is unchanged across the bump.
+
 ## [0.19.18] - 2026-07-23
 
 ### Added
