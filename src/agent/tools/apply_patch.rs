@@ -101,7 +101,8 @@ async fn apply_create(path: &str, content: &str) -> Result<String, String> {
     // syntactically-broken files. dirge-p5fu: a purely unclosed-delimiter
     // imbalance is mechanically closed (parity with the JSON truncation
     // repair) and reported, rather than rejected. See AGENTIC_LOOP_PLAN §2.
-    let (content, syntax_note) = crate::agent::tools::syntax_gate(p, content)?;
+    // A create has no pre-edit baseline — the full gate applies.
+    let (content, syntax_note) = crate::agent::tools::syntax_gate(p, content, || None)?;
     // Snapshot pre-state (absent) for /rewind so restore deletes it.
     crate::agent::tools::snapshots::capture(p);
     crate::fs_atomic::atomic_write(p, content.as_bytes())
@@ -158,7 +159,9 @@ async fn apply_update(path: &str, old_text: &str, new_text: &str) -> Result<Stri
     // closed (parity with the JSON truncation repair) and reported, rather
     // than rejected. See docs/AGENTIC_LOOP_PLAN.md §2.
     let (to_write, syntax_note) =
-        crate::agent::tools::syntax_gate(std::path::Path::new(path), &candidate)?;
+        crate::agent::tools::syntax_gate(std::path::Path::new(path), &candidate, || {
+            Some(normalized.to_string())
+        })?;
     // Snapshot pre-update content for /rewind, reusing the bytes we already
     // read rather than re-reading from disk.
     crate::agent::tools::snapshots::capture_bytes(std::path::Path::new(path), &original_bytes);

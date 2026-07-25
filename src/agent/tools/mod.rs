@@ -463,30 +463,89 @@ pub fn require_absolute_path(path: &str, subject: &str) -> Result<(), String> {
 pub(crate) fn syntax_gate<'a>(
     path: &std::path::Path,
     content: &'a str,
-) -> Result<(std::borrow::Cow<'a, str>, Option<String>), String> {
+    baseline: impl FnOnce() -> Option<String>,
+) -> Result<(std::borrow::Cow<'a, str>, Option<GateNote>), String> {
     #[cfg(feature = "semantic")]
     {
-        use crate::semantic::syntax_validator::{SyntaxOutcome, validate_or_repair};
-        match validate_or_repair(path, content) {
-            SyntaxOutcome::Clean => Ok((std::borrow::Cow::Borrowed(content), None)),
-            SyntaxOutcome::Repaired { content, note } => {
-                Ok((std::borrow::Cow::Owned(content), Some(note)))
-            }
+        use crate::semantic::syntax_validator::{SyntaxOutcome, check_syntax, validate_or_repair};
+        let outcome = validate_or_repair(path, content);
+        if matches!(outcome, SyntaxOutcome::Clean) {
+            return Ok((std::borrow::Cow::Borrowed(content), None));
+        }
+        // dirge-ytu1: the gate can only fairly blame an edit for breakage the
+        // edit introduced. When the file ALREADY failed the check, blocking
+        // strands the agent — every edit, including one meant to fix the file
+        // incrementally, is rejected with a location it never touched, and
+        // there is no opt-out (`write` goes through the same gate). Files that
+        // legitimately carry a lisp extension but never parse — templates with
+        // `<% %>` markers, linter fixtures — become permanently uneditable.
+        // So: step aside entirely (no reject, and no mechanical repair on top
+        // of structure we can't trust) and tell the model why.
+        if let Some(before) = baseline()
+            && check_syntax(path, &before).is_err()
+        {
+            return Ok((
+                std::borrow::Cow::Borrowed(content),
+                Some(GateNote::PreExisting(
+                    "this file already failed the syntax check BEFORE your edit, so the pre-write \
+                     gate stood down and your text was written verbatim. The pre-existing errors \
+                     are still there — fix them deliberately rather than by guessing."
+                        .to_string(),
+                )),
+            ));
+        }
+        match outcome {
+            SyntaxOutcome::Repaired { content, note } => Ok((
+                std::borrow::Cow::Owned(content),
+                Some(GateNote::Repaired(note)),
+            )),
             SyntaxOutcome::Rejected { message } => Err(message),
+            SyntaxOutcome::Clean => Ok((std::borrow::Cow::Borrowed(content), None)),
         }
     }
     #[cfg(not(feature = "semantic"))]
     {
-        let _ = path;
+        let _ = (path, baseline);
         Ok((std::borrow::Cow::Borrowed(content), None))
     }
 }
 
-/// Append the auto-repair note (if any) to a tool's success message, in one
+/// What the syntax gate did, when it did something the model needs to know
+/// about. The distinction is load-bearing: only a REPAIR means the bytes on
+/// disk differ from the model's text, which is what the LSP-backed rollback
+/// (dirge-p1ws) verifies.
+pub(crate) enum GateNote {
+    /// Delimiters were mechanically closed / trimmed.
+    Repaired(String),
+    /// The file was already broken before this edit; the gate stood down.
+    PreExisting(String),
+}
+
+impl GateNote {
+    /// True when the written bytes differ from what the tool was given.
+    pub(crate) fn is_repair(&self) -> bool {
+        matches!(self, GateNote::Repaired(_))
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            GateNote::Repaired(_) => "auto-repair",
+            GateNote::PreExisting(_) => "syntax",
+        }
+    }
+
+    fn text(&self) -> &str {
+        match self {
+            GateNote::Repaired(t) | GateNote::PreExisting(t) => t,
+        }
+    }
+}
+
+/// Append the syntax-gate note (if any) to a tool's success message, in one
 /// uniform format across every edit tool.
-pub(crate) fn append_repair_note(msg: &mut String, note: Option<String>) {
+pub(crate) fn append_repair_note(msg: &mut String, note: Option<GateNote>) {
     if let Some(note) = note {
-        msg.push_str(&format!("\n[auto-repair] {note}"));
+        msg.push_str(&format!("\n[{}] {}", note.label(), note.text()));
     }
 }
 
@@ -938,6 +997,84 @@ mod tests {
         Action, OpSpec, PermissionConfig, RuleConfig, SecurityMode, checker::PermissionChecker,
     };
     use std::sync::{Arc, Mutex};
+
+    // ---- Pre-edit baseline for the syntax gate (dirge-ytu1) ----
+    // `.janet` has no tree-sitter grammar, so these exercise the
+    // comment/string-aware scanner and need no `semantic-<lang>` feature.
+
+    #[cfg(feature = "semantic")]
+    #[test]
+    fn gate_blocks_an_edit_that_breaks_a_clean_file() {
+        let path = std::path::Path::new("/tmp/gate.janet");
+        let before = "(def a 1)\n(def b 2)\n";
+        // Mid-file stray closer: unrepairable, and the edit introduced it.
+        let candidate = "(def a 1))\n(def b 2)\n";
+        assert!(
+            syntax_gate(path, candidate, || Some(before.to_string())).is_err(),
+            "breaking a previously-clean file must still be blocked"
+        );
+    }
+
+    #[cfg(feature = "semantic")]
+    #[test]
+    fn gate_steps_aside_when_the_file_was_already_broken() {
+        let path = std::path::Path::new("/tmp/gate.janet");
+        let before = "(def a 1))\n(def b 2)\n"; // already broken before the edit
+        let candidate = "(def a 1))\n(def b 3)\n"; // unrelated change, still broken
+        let (out, note) = syntax_gate(path, candidate, || Some(before.to_string()))
+            .expect("a pre-existing error must not block an unrelated edit");
+        assert_eq!(out, candidate, "the model's text is written verbatim");
+        let note = note.expect("the model must be told why the gate stood down");
+        assert!(!note.is_repair(), "this is a warning, not a repair");
+        let mut msg = String::from("Applied edit");
+        append_repair_note(&mut msg, Some(note));
+        assert!(msg.contains("already"), "{msg}");
+        assert!(!msg.contains("[auto-repair]"), "wrong label: {msg}");
+    }
+
+    #[cfg(feature = "semantic")]
+    #[test]
+    fn gate_does_not_mechanically_repair_on_top_of_a_broken_baseline() {
+        let path = std::path::Path::new("/tmp/gate.janet");
+        let before = "(def a 1))\n"; // broken
+        // Repairable on its own (trailing truncation), but the baseline is
+        // broken, so the gate must not rewrite the model's bytes.
+        let candidate = "(def a 1)\n(defn g []\n  (+ 1 2\n";
+        let (out, note) =
+            syntax_gate(path, candidate, || Some(before.to_string())).expect("must not block");
+        assert_eq!(out, candidate, "no mechanical close on a broken baseline");
+        assert!(!note.expect("note").is_repair());
+    }
+
+    #[cfg(feature = "semantic")]
+    #[test]
+    fn gate_without_a_baseline_applies_in_full() {
+        // `write`/`apply_patch` creating a NEW file has no baseline.
+        let path = std::path::Path::new("/tmp/gate.janet");
+        assert!(syntax_gate(path, "(def a 1))\n(def b 2)\n", || None).is_err());
+        let (out, note) =
+            syntax_gate(path, "(defn g []\n  (+ 1 2\n", || None).expect("truncation repairs");
+        assert_eq!(out, "(defn g []\n  (+ 1 2\n))");
+        assert!(note.expect("note").is_repair());
+    }
+
+    #[cfg(feature = "semantic")]
+    #[test]
+    fn gate_does_not_consult_the_baseline_for_a_clean_edit() {
+        let path = std::path::Path::new("/tmp/gate.janet");
+        let mut consulted = false;
+        let (out, note) = syntax_gate(path, "(def a 1)\n", || {
+            consulted = true;
+            None
+        })
+        .expect("clean");
+        assert_eq!(out, "(def a 1)\n");
+        assert!(note.is_none());
+        assert!(
+            !consulted,
+            "the clean path must not pay for reading the file"
+        );
+    }
 
     #[test]
     fn is_permission_denial_recognizes_every_enforce_denial_form() {
