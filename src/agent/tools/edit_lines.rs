@@ -254,9 +254,12 @@ impl Tool for EditLinesTool {
         // dirge-p5fu: a purely unclosed-delimiter imbalance is
         // mechanically closed (parity with the JSON truncation repair)
         // and reported, rather than bounced back to the model.
-        let (output, syntax_note) =
-            crate::agent::tools::syntax_gate(std::path::Path::new(&resolved_path), &candidate)
-                .map_err(ToolError::Msg)?;
+        let (output, syntax_note) = crate::agent::tools::syntax_gate(
+            std::path::Path::new(&resolved_path),
+            &candidate,
+            || Some(content.to_string()),
+        )
+        .map_err(ToolError::Msg)?;
 
         // Snapshot pre-edit content for /rewind before mutating, reusing
         // the bytes already read above instead of re-reading from disk.

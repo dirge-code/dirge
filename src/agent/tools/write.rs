@@ -122,8 +122,13 @@ impl Tool for WriteTool {
         // the fix is reported on the result so it's never silent. No-op
         // for unknown file types or when no `semantic-<lang>` feature is
         // built. See docs/AGENTIC_LOOP_PLAN.md §2.
-        let (content, syntax_note) =
-            crate::agent::tools::syntax_gate(path, &args.content).map_err(ToolError::Msg)?;
+        // dirge-ytu1: the baseline is read lazily — only when the gate is
+        // about to reject or repair — so a clean overwrite never pays for an
+        // extra read of the file it's about to replace.
+        let (content, syntax_note) = crate::agent::tools::syntax_gate(path, &args.content, || {
+            std::fs::read_to_string(path).ok()
+        })
+        .map_err(ToolError::Msg)?;
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
@@ -135,11 +140,16 @@ impl Tool for WriteTool {
         // counting convention.
         let line_count = content.lines().count();
         let was_creation = !path.exists();
+        // Only a REPAIR rewrites the model's bytes; a pre-existing-error note
+        // means the text went out verbatim, so there is nothing to verify.
+        let was_repaired = syntax_note
+            .as_ref()
+            .is_some_and(crate::agent::tools::GateNote::is_repair);
         // Repair-path rollback (dirge-p1ws): when syntax_gate had to auto-close
         // a truncation, snapshot the pre-write bytes so an LSP-rejected repair
         // can be reverted. Clean writes skip this entirely.
         #[cfg(feature = "lsp")]
-        let repair_before: Option<Vec<u8>> = if syntax_note.is_some() && !was_creation {
+        let repair_before: Option<Vec<u8>> = if was_repaired && !was_creation {
             tokio::fs::read(path).await.ok()
         } else {
             None
@@ -180,7 +190,7 @@ impl Tool for WriteTool {
             // close produced errors, the file is rolled back and the model
             // gets the diagnostics. A clean write keeps today's behavior:
             // surface diagnostics, never block (dirge-p1ws).
-            let lsp_block = if syntax_note.is_some() {
+            let lsp_block = if was_repaired {
                 match verify_repaired_write_or_rollback(
                     self.lsp_manager.as_ref(),
                     path,

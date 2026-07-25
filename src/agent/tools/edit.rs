@@ -345,13 +345,18 @@ impl Tool for EditTool {
         // imbalance is mechanically closed (parity with the JSON
         // truncation repair) and reported, rather than bounced back.
         // See docs/AGENTIC_LOOP_PLAN.md §2.
-        let (output, syntax_note) =
-            crate::agent::tools::syntax_gate(std::path::Path::new(&resolved_path), &candidate)
-                .map_err(ToolError::Msg)?;
+        let (output, syntax_note) = crate::agent::tools::syntax_gate(
+            std::path::Path::new(&resolved_path),
+            &candidate,
+            || Some(content.clone()),
+        )
+        .map_err(ToolError::Msg)?;
         // Captured before `append_repair_note` consumes `syntax_note` below;
         // gates the repair-path LSP rollback (dirge-p1ws).
         #[cfg(feature = "lsp")]
-        let was_repaired = syntax_note.is_some();
+        let was_repaired = syntax_note
+            .as_ref()
+            .is_some_and(crate::agent::tools::GateNote::is_repair);
         #[cfg(feature = "lsp")]
         let write_at = std::time::Instant::now();
         // Snapshot pre-edit content for /rewind before mutating. Reuse

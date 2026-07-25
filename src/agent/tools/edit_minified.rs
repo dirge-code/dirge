@@ -130,8 +130,10 @@ impl Tool for EditMinifiedTool {
         // syntactically-broken edit, or mechanically close a purely-unclosed
         // delimiter imbalance and report it (dirge-p5fu).
         let (new_source, syntax_note) =
-            crate::agent::tools::syntax_gate(std::path::Path::new(&resolved), &candidate)
-                .map_err(ToolError::Msg)?;
+            crate::agent::tools::syntax_gate(std::path::Path::new(&resolved), &candidate, || {
+                Some(source.clone())
+            })
+            .map_err(ToolError::Msg)?;
 
         // dirge-weyc: record the pre-mutation bytes so /rewind can restore
         // this file, same as every other mutator. `source` is the exact

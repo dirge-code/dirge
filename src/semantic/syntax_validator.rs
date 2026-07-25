@@ -129,6 +129,25 @@ fn language_for_path(path: &Path) -> Option<tree_sitter::Language> {
     }
 }
 
+/// The grammar to actually use for `content`, or `None` when the content
+/// itself defeats tree-sitter.
+///
+/// dirge-c0il: tree-sitter's lexer cannot distinguish a NUL byte from
+/// end-of-input, so a file containing one parses as truncated and every form
+/// after it is reported as an error at a line/col that has nothing to do with
+/// the edit. That is a phantom — the language's own reader accepts it (a raw
+/// NUL inside a string or regex literal is valid Clojure, which has no `\0`
+/// escape, and two files in the wild do exactly that). Left unhandled it makes
+/// the file permanently uneditable, since every write goes through this gate.
+/// Fall through to the delimiter scanner instead: it counts bytes and handles
+/// NUL correctly.
+fn grammar_for(path: &Path, content: &str) -> Option<tree_sitter::Language> {
+    if content.as_bytes().contains(&0) {
+        return None;
+    }
+    language_for_path(path)
+}
+
 /// Walk the syntax tree and collect ERROR / MISSING nodes. Capped
 /// at `MAX_ERRORS`. Each error includes line:col plus a short
 /// source snippet so the model can localize without re-reading.
@@ -215,8 +234,9 @@ fn snippet_for(node: tree_sitter::Node, source: &str) -> String {
 /// site decides whether to surface the errors as a tool failure
 /// (the safest default for `write` / `edit` / `apply_patch`).
 pub fn check_syntax(path: &Path, content: &str) -> Result<(), Vec<SyntaxError>> {
-    let Some(lang) = language_for_path(path) else {
-        // No tree-sitter grammar for this extension. For languages we have
+    let Some(lang) = grammar_for(path, content) else {
+        // No tree-sitter grammar for this extension (or content the grammar
+        // can't lex — see `grammar_for`). For languages we have
         // delimiter-lexing rules for (lisps without a grammar — .janet,
         // .fnl, .lisp, .scm, .rkt, .el, .cljd, .jdn), fall back to the
         // delimiter-balance scanner so the model still gets the actionable
@@ -461,15 +481,32 @@ enum DelimiterBalance {
     Stray(char, usize, usize),
 }
 
+/// Everything one comment/string-aware pass over the source yields. Both the
+/// human summary and the mechanical repair read from this, so they share one
+/// understanding of what is and isn't a delimiter (dirge-p5fu).
+struct DelimiterScan {
+    balance: DelimiterBalance,
+    /// 1-based lines of openers that begin at COLUMN 1 while already nested
+    /// inside another form. A lisp top-level form starts at column 1 by
+    /// universal convention, so such an opener is a form that something
+    /// earlier swallowed — the signal `repair_delimiters` needs (dirge-u05r).
+    nested_top_level_lines: Vec<usize>,
+}
+
 /// Scan source for a delimiter imbalance under `rules`. Comment/string/
 /// char-literal aware so the real `()[]{}` are counted correctly. All
 /// comment/string/delimiter syntax is ASCII, so a byte scan is safe.
 fn delimiter_balance(content: &str, rules: &LexRules) -> DelimiterBalance {
+    scan_delimiters(content, rules).balance
+}
+
+fn scan_delimiters(content: &str, rules: &LexRules) -> DelimiterScan {
     let b = content.as_bytes();
     let n = b.len();
     let mut i = 0usize;
     let (mut line, mut col) = (1usize, 1usize);
     let mut stack: Vec<(u8, usize, usize)> = Vec::new(); // (open, line, col)
+    let mut nested_top_level_lines: Vec<usize> = Vec::new();
 
     'outer: while i < n {
         for lc in rules.line_comments {
@@ -581,7 +618,12 @@ fn delimiter_balance(content: &str, rules: &LexRules) -> DelimiterBalance {
             continue 'outer;
         }
         match b[i] {
-            b'(' | b'[' | b'{' => stack.push((b[i], line, col)),
+            b'(' | b'[' | b'{' => {
+                if col == 1 && !stack.is_empty() {
+                    nested_top_level_lines.push(line);
+                }
+                stack.push((b[i], line, col));
+            }
             b')' | b']' | b'}' => {
                 let want = match b[i] {
                     b')' => b'(',
@@ -593,7 +635,10 @@ fn delimiter_balance(content: &str, rules: &LexRules) -> DelimiterBalance {
                         stack.pop();
                     }
                     _ => {
-                        return DelimiterBalance::Stray(b[i] as char, line, col);
+                        return DelimiterScan {
+                            balance: DelimiterBalance::Stray(b[i] as char, line, col),
+                            nested_top_level_lines,
+                        };
                     }
                 }
             }
@@ -602,10 +647,14 @@ fn delimiter_balance(content: &str, rules: &LexRules) -> DelimiterBalance {
         adv(b, &mut i, &mut line, &mut col, 1);
     }
 
-    if stack.is_empty() {
+    let balance = if stack.is_empty() {
         DelimiterBalance::Balanced
     } else {
         DelimiterBalance::Unclosed(stack)
+    };
+    DelimiterScan {
+        balance,
+        nested_top_level_lines,
     }
 }
 
@@ -630,14 +679,30 @@ fn delimiter_summary(content: &str, rules: &LexRules) -> Option<String> {
              opener before it."
         )),
         DelimiterBalance::Unclosed(stack) => {
-            let (open, l, c) = stack[0];
+            // dirge-l8ou: lead with the INNERMOST unclosed opener. The
+            // outermost is almost always the enclosing top-level form (column
+            // 1 of a `defn`), which is nowhere near the dropped closer — it
+            // sends the model to the top of the form to count by hand, the
+            // exact thing the message tells it not to do. The innermost
+            // opener is at or next to the mistake.
+            let n = stack.len();
+            let (open, l, c) = *stack.last().expect("Unclosed implies a non-empty stack");
             let openc = open as char;
             let close = closer_for(open);
-            Some(format!(
-                "Delimiter imbalance: {n} unclosed — the `{openc}` opened at line {l}, col {c} is \
-                 never closed; add {n} matching `{close}` (do not count by hand — fix this delimiter).",
-                n = stack.len()
-            ))
+            let mut msg = format!(
+                "Delimiter imbalance: {n} unclosed — the innermost is the `{openc}` opened at \
+                 line {l}, col {c}; close it with `{close}` (do not count by hand — fix this \
+                 delimiter)."
+            );
+            if n > 1 {
+                let (oopen, ol, oc) = stack[0];
+                msg.push_str(&format!(
+                    " {rest} still open, outermost the `{oopenc}` at line {ol}, col {oc}.",
+                    rest = n - 1,
+                    oopenc = oopen as char,
+                ));
+            }
+            Some(msg)
         }
     }
 }
@@ -693,10 +758,27 @@ fn is_trailing_truncation(content: &str, stack: &[(u8, usize, usize)]) -> bool {
 /// - The result is RE-VALIDATED with [`check_syntax`]; returned only if clean.
 pub fn repair_delimiters(path: &Path, content: &str) -> Option<(String, String)> {
     let rules = lex_rules_for_path(path)?;
-    let DelimiterBalance::Unclosed(stack) = delimiter_balance(content, rules) else {
+    let scan = scan_delimiters(content, rules);
+    let DelimiterBalance::Unclosed(stack) = scan.balance else {
         return None;
     };
     if !is_trailing_truncation(content, &stack) {
+        return None;
+    }
+    // dirge-u05r: closing at EOF extends the outermost unclosed opener over
+    // everything that follows it. If a top-level form starts inside that
+    // region, the close RE-PARENTS it — for a lisp that is the whole story,
+    // since any balanced paren arrangement parses and the re-validation below
+    // (and even a language server) sees nothing wrong. The Rust analogue is
+    // the nested-`fn` corruption `is_trailing_truncation` guards against; this
+    // catches the case where the swallowed code is short enough to slip under
+    // that line budget.
+    let outermost_line = stack[0].1;
+    if scan
+        .nested_top_level_lines
+        .iter()
+        .any(|&l| l >= outermost_line)
+    {
         return None;
     }
     // Append closers top-of-stack first (innermost closes first) — correct
@@ -838,7 +920,7 @@ pub fn format_errors(path: &Path, content: &str, errors: &[SyntaxError]) -> Stri
     // errors are sentinels from the delimiter-balance fallback — the summary
     // below IS the message, so don't claim tree-sitter and don't render the
     // empty sentinels. (dirge-gwpi)
-    let has_grammar = language_for_path(path).is_some();
+    let has_grammar = grammar_for(path, content).is_some();
     let mut out = if has_grammar {
         format!(
             "Syntax check failed for {}: {} error(s) detected by tree-sitter. \
@@ -1264,11 +1346,13 @@ int main(void) {
     }
 
     #[test]
-    fn lisp_summary_points_at_first_unclosed_open() {
-        // `(defn f [x` — one unclosed `(` and one unclosed `[`.
+    fn lisp_summary_points_at_the_innermost_unclosed_open() {
+        // `(defn f [x` — one unclosed `(` and one unclosed `[`. The `[` is
+        // the innermost and the one to close first.
         let s = delimiter_summary("(defn f [x\n  (+ x 1)", &RULES_LISP).expect("imbalanced");
         assert!(s.contains("unclosed"), "{s}");
-        assert!(s.contains("line 1"), "should point at the first open: {s}");
+        assert!(s.contains("`[` opened at line 1, col 9"), "{s}");
+        assert!(s.contains("close it with `]`"), "{s}");
     }
 
     #[test]
@@ -1412,5 +1496,111 @@ int main(void) {
     fn elisp_unbalanced_flags() {
         let path = PathBuf::from("/tmp/x.el");
         assert!(check_syntax(&path, "(defun f ()\n  (+ 1 2)\n").is_err());
+    }
+
+    // ---- NUL bytes defeat every tree-sitter lexer (dirge-c0il) ----
+
+    #[cfg(feature = "semantic-clojure")]
+    #[test]
+    fn nul_byte_does_not_fake_a_syntax_error() {
+        // A raw NUL inside a regex literal is valid Clojure (there is no `\0`
+        // string escape, so people embed the byte). tree-sitter reads 0 as
+        // end-of-input and reports the rest of the file as an error, which
+        // used to make the file permanently uneditable.
+        let path = PathBuf::from("/tmp/x.clj");
+        let content = "(ns app.core)\n\n(defn clean [s]\n  (clojure.string/replace s #\"[\\r\\n\\t\u{0}]\" \"\"))\n";
+        assert!(
+            check_syntax(&path, content).is_ok(),
+            "a NUL byte must not be reported as a syntax error"
+        );
+    }
+
+    #[cfg(feature = "semantic-clojure")]
+    #[test]
+    fn nul_byte_file_still_gets_delimiter_feedback() {
+        // Skipping the grammar must not skip the gate: the scanner still
+        // catches a real imbalance, and the message must not claim
+        // tree-sitter found it.
+        let path = PathBuf::from("/tmp/x.clj");
+        let content = "(ns app.core)\n\n(defn clean [s]\n  (str s \"\u{0}\"\n";
+        let errors = check_syntax(&path, content).expect_err("imbalance must still be flagged");
+        let msg = format_errors(&path, content, &errors);
+        assert!(msg.contains("do not count by hand"), "{msg}");
+        assert!(
+            !msg.contains("tree-sitter"),
+            "NUL path must not claim tree-sitter: {msg}"
+        );
+    }
+
+    // ---- Innermost-opener hint (dirge-l8ou) ----
+
+    #[test]
+    fn lisp_summary_leads_with_the_innermost_unclosed_open() {
+        // The top-level `(defn` stays open only because `(println` lost its
+        // closer. Pointing at the defn sends the model to the top of the form
+        // to count by hand; the innermost opener IS the mistake.
+        let src = "(defn f [x]\n  (let [y 1]\n    (println y\n";
+        let s = delimiter_summary(src, &RULES_LISP).expect("imbalanced");
+        assert!(s.contains("3 unclosed"), "keeps the count: {s}");
+        assert!(
+            s.contains("line 3, col 5"),
+            "must lead with the innermost unclosed opener: {s}"
+        );
+        assert!(
+            s.contains("line 1, col 1"),
+            "outermost is still named as context: {s}"
+        );
+    }
+
+    #[test]
+    fn single_unclosed_summary_names_it_once() {
+        // With one unclosed opener the innermost IS the outermost — the
+        // message must not repeat it as "context".
+        let s = delimiter_summary("(+ 1 2\n", &RULES_LISP).expect("imbalanced");
+        assert_eq!(s.matches("line 1").count(), 1, "no duplicate location: {s}");
+    }
+
+    // ---- Structure-preserving repair for lisps (dirge-u05r) ----
+
+    #[test]
+    fn repair_refuses_to_swallow_a_later_top_level_form() {
+        // The model dropped the `)` on `(print y)`. Appending at EOF balances
+        // the file and parses — but re-parents `(defn g ...)` INSIDE
+        // `(defn f ...)`. For a lisp the re-validation can't see that (any
+        // balanced paren arrangement parses), so the structural guard must.
+        let path = PathBuf::from("/tmp/x.janet");
+        let src = "(defn f [x]\n  (let [y 1]\n    (print y\n    y))\n\n(defn g []\n  (f 1))\n";
+        assert!(
+            check_syntax(&path, &format!("{src})")).is_ok(),
+            "precondition: the naive close does parse"
+        );
+        assert!(
+            repair_delimiters(&path, src).is_none(),
+            "closing must not re-parent a following top-level form"
+        );
+    }
+
+    #[test]
+    fn repair_still_closes_a_truncated_last_form() {
+        // The complement: nothing follows the truncated form, so appending at
+        // EOF is the correct placement and must still fire.
+        let path = PathBuf::from("/tmp/x.janet");
+        let src = "(def a 1)\n\n(defn g []\n  (+ 1 2\n";
+        let (repaired, _) =
+            repair_delimiters(&path, src).expect("a genuine trailing truncation still repairs");
+        assert_eq!(repaired, "(def a 1)\n\n(defn g []\n  (+ 1 2\n))");
+    }
+
+    #[test]
+    fn repair_ignores_nested_openers_before_the_truncation() {
+        // A column-1 opener nested inside an earlier, COMPLETE form (a rich
+        // comment block) is not affected by closers appended at EOF, so it
+        // must not veto the repair.
+        let path = PathBuf::from("/tmp/x.janet");
+        let src = "(comment\n(def a 1)\n)\n\n(defn g []\n  (+ 1 2\n";
+        assert!(
+            repair_delimiters(&path, src).is_some(),
+            "an earlier nested column-1 opener is irrelevant to an EOF close"
+        );
     }
 }
