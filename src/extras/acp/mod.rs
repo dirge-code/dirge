@@ -7,14 +7,16 @@ use agent_client_protocol::{Agent, Client, ConnectionTo, Dispatch, Responder, St
 use agent_client_protocol::{on_receive_notification, on_receive_request};
 
 use crate::cli::Cli;
-use crate::config::Config;
+use crate::config::{Config, ProviderEntry};
 use crate::context::ContextFiles;
 use crate::event::AgentEvent;
 use crate::permission::ask::AskSender;
 use crate::permission::checker::{PermCheck, PermissionChecker};
 use crate::permission::{PermissionConfig, SecurityMode};
+use crate::provider::{ModelSwitch, resolve_model_switch};
 use crate::sandbox::Sandbox;
 use crate::session::{MessageRole, Session, ToolCallEntry, ToolCallState};
+use compact_str::CompactString;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,8 +29,19 @@ struct AcpSession {
     /// Accumulated conversation. `convert_history` turns it into the rig
     /// history fed to `spawn_runner` on the next prompt.
     session: Session,
-    /// The client-declared working directory for this session.
+    /// The client-declared working directory for this session. `/cd` updates
+    /// it; `run_prompt` chdirs here before each turn.
     cwd: PathBuf,
+    /// Session-scoped `/model` override (ACP slash command). `run_prompt`
+    /// prefers these over the CLI/config default so a switch persists across
+    /// turns in this session. Both stay `None` until the client runs
+    /// `/model <id>`; `provider_override` is set only on a cross-provider
+    /// switch (a same-provider swap keeps the current provider).
+    model_override: Option<CompactString>,
+    provider_override: Option<CompactString>,
+    /// Session-scoped `/mode` override (ACP slash command). `None` falls back
+    /// to the CLI/config-resolved security mode.
+    mode_override: Option<SecurityMode>,
     /// Abort/cancel handles for the currently-running prompt, if any.
     run: Option<AcpRun>,
 }
@@ -90,6 +103,9 @@ async fn register_run(
     let entry = map.entry(id.to_string()).or_insert_with(|| AcpSession {
         session: Session::new(provider, model, 0),
         cwd: std::env::current_dir().unwrap_or_default(),
+        model_override: None,
+        provider_override: None,
+        mode_override: None,
         run: None,
     });
     if let Some(prev) = entry.run.replace(run) {
@@ -249,7 +265,7 @@ async fn handle_initialize(
 async fn handle_new_session(
     req: NewSessionRequest,
     responder: Responder<NewSessionResponse>,
-    _cx: ConnectionTo<Client>,
+    cx: ConnectionTo<Client>,
     state: &AcpState,
 ) -> Result<(), agent_client_protocol::Error> {
     let session_id = SessionId::new(uuid::Uuid::new_v4().to_string());
@@ -269,12 +285,29 @@ async fn handle_new_session(
         AcpSession {
             session: Session::new(&provider, &model, 0),
             cwd: req.cwd.clone(),
+            model_override: None,
+            provider_override: None,
+            mode_override: None,
             run: None,
         },
     );
 
-    let resp = NewSessionResponse::new(session_id);
-    responder.respond(resp)
+    let resp = NewSessionResponse::new(session_id.clone());
+    responder.respond(resp)?;
+
+    // dirge-32k9 (gh#714): announce the slash commands so ACP clients (Zed, etc.) can
+    // offer them in their command palette. The spec expects this after
+    // session creation; each invoked command comes back as ordinary prompt
+    // text, which `run_prompt` intercepts. Fire-and-forget: a failed
+    // notification just means no palette entries, not a broken session.
+    let notif = SessionNotification::new(
+        session_id,
+        SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(
+            acp_available_commands(),
+        )),
+    );
+    let _ = cx.send_notification(notif);
+    Ok(())
 }
 
 async fn handle_prompt(
@@ -310,22 +343,65 @@ async fn run_prompt(
     responder: Responder<PromptResponse>,
     cx: ConnectionTo<Client>,
 ) -> Result<(), agent_client_protocol::Error> {
-    let provider_str = state.cli.resolve_provider(&state.cfg);
-    let config_model = state
-        .cfg
-        .resolve_role(crate::config::ConfigRole::Default)
-        .and_then(|(_, e)| e.model);
-    let model_explicit = state.cli.model.is_some() || config_model.is_some();
-    let model_str = if !model_explicit {
-        // dirge-j3jd: resolve the alias's provider TYPE so a custom alias
-        // doesn't fall back to the OpenRouter default model id.
-        compact_str::CompactString::new(crate::provider::default_model_for_alias(
-            &provider_str,
-            &state.cfg.providers_map(),
-        ))
+    let id_key = session_id.to_string();
+
+    // dirge-32k9 (gh#714): session-scoped `/model` and `/mode` overrides take precedence
+    // over the CLI/config resolution so a slash-command switch persists across
+    // turns in this ACP session.
+    let (model_override, provider_override, mode_override) =
+        session_overrides(&state.sessions, &id_key).await;
+
+    let provider_str = provider_override
+        .clone()
+        .unwrap_or_else(|| state.cli.resolve_provider(&state.cfg));
+    let (model_str, model_explicit) = if let Some(m) = model_override.clone() {
+        // A `/model` switch is an explicit choice — skip the alias-default and
+        // Codex-default substitutions the default path applies below.
+        (m, true)
     } else {
-        state.cli.resolve_model(&state.cfg)
+        let config_model = state
+            .cfg
+            .resolve_role(crate::config::ConfigRole::Default)
+            .and_then(|(_, e)| e.model);
+        let model_explicit = state.cli.model.is_some() || config_model.is_some();
+        let model_str = if !model_explicit {
+            // dirge-j3jd: resolve the alias's provider TYPE so a custom alias
+            // doesn't fall back to the OpenRouter default model id.
+            CompactString::new(crate::provider::default_model_for_alias(
+                &provider_str,
+                &state.cfg.providers_map(),
+            ))
+        } else {
+            state.cli.resolve_model(&state.cfg)
+        };
+        (model_str, model_explicit)
     };
+
+    let current_mode = resolve_acp_mode(&state.cli, &state.cfg, mode_override);
+
+    // dirge-32k9 (gh#714): intercept the curated ACP slash commands. They run locally and
+    // never reach the LLM — mirroring the interactive UI, where slash commands
+    // don't enter the conversation. Unrecognized `/...` prompts fall through to
+    // the model unchanged.
+    if let Some((cmd, args)) = parse_acp_slash(prompt_text)
+        && let Some(reply) = handle_acp_slash(
+            &state.sessions,
+            &state.cfg,
+            &id_key,
+            cmd,
+            args,
+            AcpCurrent {
+                provider: &provider_str,
+                model: &model_str,
+                mode: current_mode,
+            },
+        )
+        .await
+    {
+        let _ = cx.send_notification(agent_text_chunk(&session_id, reply));
+        let _ = responder.respond(PromptResponse::new(StopReason::EndTurn));
+        return Ok(());
+    }
 
     let client = create_acp_client(&provider_str, &state.cfg)
         .map_err(|e| agent_client_protocol::Error::new(-32603, e.to_string()))?;
@@ -335,7 +411,7 @@ async fn run_prompt(
     let model_str = crate::provider::resolve_model_name(&client, &model_str, model_explicit);
     let model = client.completion_model(model_str.clone());
 
-    let (permission, ask_tx) = build_acp_permission(state);
+    let (permission, ask_tx) = build_acp_permission(state, current_mode);
     // Adversarial-review finding #2: ACP used to build its checker
     // and never install the active prompt's `deny_tools` list. Plan
     // mode (or any frontmatter deny) was a no-op for editor-side
@@ -385,7 +461,6 @@ async fn run_prompt(
     // best-effort: the process working directory is global, so two sessions in
     // different directories would race it — but editors drive one turn at a
     // time, so in practice a session always runs in its own directory.
-    let id_key = session_id.to_string();
     let (history, cwd) = history_and_cwd(&state.sessions, &id_key).await;
     if let Some(cwd) = cwd
         && cwd.is_dir()
@@ -622,18 +697,302 @@ async fn run_prompt(
     Ok(())
 }
 
-/// dirge-6po9: build the agent-message chunk that surfaces a run-ending
-/// diagnostic (a transient/auth/tool error, or a context overflow) to the
-/// ACP client. Without it the `Error` arm broke silently and the turn
-/// reported a clean `EndTurn` with truncated content and no reason. Shared
-/// by the `Error` and `ContextOverflow` arms so they stay the same shape.
-fn diagnostic_chunk(session_id: &SessionId, text: String) -> SessionNotification {
+/// Wrap plain text as an `AgentMessageChunk` session notification. The base
+/// for surfacing any agent-authored text over ACP — diagnostics and the
+/// locally-handled slash-command replies both use it.
+fn agent_text_chunk(session_id: &SessionId, text: String) -> SessionNotification {
     SessionNotification::new(
         session_id.clone(),
         SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(TextContent::new(
             text,
         )))),
     )
+}
+
+/// dirge-6po9: build the agent-message chunk that surfaces a run-ending
+/// diagnostic (a transient/auth/tool error, or a context overflow) to the
+/// ACP client. Without it the `Error` arm broke silently and the turn
+/// reported a clean `EndTurn` with truncated content and no reason. Shared
+/// by the `Error` and `ContextOverflow` arms so they stay the same shape.
+fn diagnostic_chunk(session_id: &SessionId, text: String) -> SessionNotification {
+    agent_text_chunk(session_id, text)
+}
+
+/// dirge-32k9 (gh#714): the curated slash commands dirge exposes over ACP. Unlike the
+/// full interactive set, these are the ones with a meaningful non-interactive
+/// behavior an editor client can drive; TUI-only commands (`/panel`, `/tree`,
+/// `/fork`, …) are deliberately omitted. Tuple is `(name, description, input
+/// hint)`; names carry NO leading `/` — the ACP client adds that affordance.
+/// The single source for both the advertisement and the dispatcher below, so
+/// they can't drift.
+const ACP_COMMANDS: &[(&str, &str, Option<&str>)] = &[
+    ("help", "list dirge's ACP slash commands", None),
+    ("clear", "clear this session's conversation history", None),
+    (
+        "cd",
+        "change the session working directory",
+        Some("directory path"),
+    ),
+    (
+        "model",
+        "show the current model, or switch to one",
+        Some("model id (optional)"),
+    ),
+    (
+        "mode",
+        "view or set the permission mode",
+        Some("standard | restrictive | accept | yolo"),
+    ),
+];
+
+/// Build the ACP `AvailableCommand` list from [`ACP_COMMANDS`].
+fn acp_available_commands() -> Vec<AvailableCommand> {
+    ACP_COMMANDS
+        .iter()
+        .map(|(name, desc, hint)| {
+            let cmd = AvailableCommand::new(*name, *desc);
+            match hint {
+                Some(h) => cmd.input(AvailableCommandInput::Unstructured(
+                    UnstructuredCommandInput::new(*h),
+                )),
+                None => cmd,
+            }
+        })
+        .collect()
+}
+
+/// Render the `/help` reply — the same curated list, as plain text.
+fn acp_help_text() -> String {
+    let mut out = String::from("dirge slash commands:\n");
+    for (name, desc, _) in ACP_COMMANDS {
+        out.push_str(&format!("  /{name}  —  {desc}\n"));
+    }
+    out.push_str("\nother `/...` input is sent to the model as-is.");
+    out
+}
+
+/// Split a leading-slash prompt into `(command, args)` with the `/` stripped
+/// from the command. Returns `None` when the prompt isn't a slash command (no
+/// leading `/`, a bare `/`, or whitespace right after the slash). The command
+/// is the first whitespace-delimited token; args is the trimmed remainder.
+/// WHICH commands are actually handled is decided by [`handle_acp_slash`].
+fn parse_acp_slash(prompt: &str) -> Option<(&str, &str)> {
+    let rest = prompt.trim().strip_prefix('/')?;
+    if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    Some(match rest.split_once(char::is_whitespace) {
+        Some((cmd, args)) => (cmd, args.trim()),
+        None => (rest, ""),
+    })
+}
+
+/// The provider/model/mode a slash command should treat as "current" — the
+/// values `run_prompt` resolved for this turn (session overrides already
+/// applied). Bundled so [`handle_acp_slash`] stays under the arg-count limit.
+struct AcpCurrent<'a> {
+    provider: &'a str,
+    model: &'a str,
+    mode: SecurityMode,
+}
+
+/// Dispatch a parsed slash command against the ACP session state. Returns
+/// `Some(reply)` for a handled command (the caller streams `reply` back as an
+/// agent message and ends the turn), or `None` for a command outside the
+/// curated set (the caller forwards the original prompt to the model).
+async fn handle_acp_slash(
+    sessions: &SessionMap,
+    cfg: &Config,
+    id: &str,
+    cmd: &str,
+    args: &str,
+    current: AcpCurrent<'_>,
+) -> Option<String> {
+    match cmd {
+        "help" => Some(acp_help_text()),
+        "clear" => {
+            let mut map = sessions.lock().await;
+            if let Some(s) = map.get_mut(id) {
+                // Mirror the interactive `/clear`, minus the TUI/board bits:
+                // wipe the conversation state so the next prompt starts fresh.
+                s.session.messages.clear();
+                s.session.total_estimated_tokens = 0;
+                s.session.compactions.clear();
+                s.session.message_store.clear();
+                s.session.tree.entries.clear();
+                s.session.tree.leaf_id = None;
+            }
+            Some("conversation history cleared".to_string())
+        }
+        "cd" => Some(acp_cd(sessions, id, args).await),
+        "model" => Some(acp_model(sessions, cfg, id, args, current.provider, current.model).await),
+        "mode" => Some(acp_mode(sessions, id, args, current.mode).await),
+        _ => None,
+    }
+}
+
+/// `/cd` over ACP: resolve `args` against the session's stored cwd (so it
+/// doesn't depend on the process-global working directory that other sessions
+/// may have moved), verify it's a directory, and update the session cwd. An
+/// empty arg goes home; a leading `~` expands to the home directory.
+async fn acp_cd(sessions: &SessionMap, id: &str, args: &str) -> String {
+    let mut map = sessions.lock().await;
+    let Some(s) = map.get_mut(id) else {
+        return "cd: unknown session".to_string();
+    };
+    let target = args.trim();
+    let path = if target.is_empty() {
+        dirs::home_dir().unwrap_or_default()
+    } else if let Some(rest) = target.strip_prefix('~') {
+        let mut home = dirs::home_dir().unwrap_or_default();
+        home.push(rest.trim_start_matches('/'));
+        home
+    } else {
+        let p = PathBuf::from(target);
+        if p.is_absolute() { p } else { s.cwd.join(p) }
+    };
+    match dunce::canonicalize(&path) {
+        Ok(canonical) if canonical.is_dir() => {
+            s.cwd = canonical.clone();
+            format!("changed directory to {}", canonical.display())
+        }
+        Ok(_) => format!("cd: not a directory: {}", path.display()),
+        Err(e) => format!("cd: {}: {e}", path.display()),
+    }
+}
+
+/// `(model, alias, is_active)` rows for the configured providers that pin a
+/// model — the `/model` listing. Mirrors the interactive handler's helper.
+fn acp_configured_models(
+    providers: &HashMap<String, ProviderEntry>,
+    current: &str,
+) -> Vec<(String, String, bool)> {
+    let mut rows: Vec<(String, String, bool)> = providers
+        .iter()
+        .filter_map(|(alias, entry)| {
+            entry
+                .model
+                .as_ref()
+                .map(|m| (m.clone(), alias.clone(), m == current))
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
+/// `/model` over ACP: with no arg, list the current + configured models; with
+/// an arg, record a session-scoped switch. Routing mirrors the interactive
+/// `/model` via [`resolve_model_switch`], but the switch is applied lazily —
+/// the override is stored and the next prompt's `run_prompt` builds the client
+/// (surfacing any auth error then), so this stays side-effect-free.
+async fn acp_model(
+    sessions: &SessionMap,
+    cfg: &Config,
+    id: &str,
+    args: &str,
+    current_provider: &str,
+    current_model: &str,
+) -> String {
+    let providers = cfg.providers_map();
+    let new_model = args.trim();
+    if new_model.is_empty() {
+        let mut out = format!("current model: {current_model}\n");
+        let rows = acp_configured_models(&providers, current_model);
+        if rows.is_empty() {
+            out.push_str(
+                "no models pinned in `providers` config — /model <id> switches to any model your provider supports",
+            );
+        } else {
+            out.push_str("configured models:\n");
+            for (model, alias, is_active) in &rows {
+                let marker = if *is_active { "* " } else { "  " };
+                out.push_str(&format!("{marker}{model}  ·  {alias}\n"));
+            }
+            out.push_str("usage: /model <id> to switch");
+        }
+        return out;
+    }
+
+    let (provider_override, note) = match resolve_model_switch(
+        &providers,
+        current_provider,
+        new_model,
+    ) {
+        ModelSwitch::Switch(alias) => {
+            let note = format!("  ·  {alias}");
+            (Some(alias), note)
+        }
+        ModelSwitch::NoProviderForFamily(family) => {
+            return format!(
+                "'{new_model}' matches the {family} model family, but no {family} provider is configured — keeping model '{current_model}' on '{current_provider}'. Add a provider of type {family} to config to switch to it.",
+            );
+        }
+        ModelSwitch::Keep => (None, String::new()),
+    };
+
+    let mut map = sessions.lock().await;
+    if let Some(s) = map.get_mut(id) {
+        s.model_override = Some(CompactString::new(new_model));
+        s.session.model = CompactString::new(new_model);
+        if let Some(alias) = &provider_override {
+            s.provider_override = Some(CompactString::new(alias));
+            s.session.provider = CompactString::new(alias);
+        }
+    }
+    format!("switched to model: {new_model}{note}")
+}
+
+/// `/mode` over ACP: with no arg, show the current mode and options; with an
+/// arg, record a session-scoped override that `resolve_acp_mode` honors on the
+/// next prompt.
+async fn acp_mode(
+    sessions: &SessionMap,
+    id: &str,
+    args: &str,
+    current_mode: SecurityMode,
+) -> String {
+    let arg = args.trim();
+    if arg.is_empty() {
+        return format!(
+            "security mode: {current_mode}\n\n  /mode standard      use configured permission rules\n  /mode restrictive   default all tools to ask\n  /mode accept        auto-accept within working directory\n  /mode yolo          auto-accept ALL operations",
+        );
+    }
+    let new_mode = match arg {
+        "standard" => SecurityMode::Standard,
+        "restrictive" => SecurityMode::Restrictive,
+        "accept" => SecurityMode::Accept,
+        "yolo" => SecurityMode::Yolo,
+        other => return format!("unknown mode: {other}"),
+    };
+    if let Some(s) = sessions.lock().await.get_mut(id) {
+        s.mode_override = Some(new_mode);
+    }
+    match new_mode {
+        SecurityMode::Yolo => "security mode: yolo (all operations allowed)".to_string(),
+        SecurityMode::Accept => "security mode: accept (auto-allow within CWD)".to_string(),
+        other => format!("security mode: {other}"),
+    }
+}
+
+/// Snapshot a session's `/model` and `/mode` overrides — `(model, provider,
+/// mode)`. Unknown session (a prompt without `new_session`) yields all `None`.
+async fn session_overrides(
+    sessions: &SessionMap,
+    id: &str,
+) -> (
+    Option<CompactString>,
+    Option<CompactString>,
+    Option<SecurityMode>,
+) {
+    let map = sessions.lock().await;
+    match map.get(id) {
+        Some(s) => (
+            s.model_override.clone(),
+            s.provider_override.clone(),
+            s.mode_override,
+        ),
+        None => (None, None, None),
+    }
 }
 
 fn create_acp_client(
@@ -643,7 +1002,10 @@ fn create_acp_client(
     crate::provider::create_client_with_auth(provider_str, None, &cfg.providers_map(), cfg.auth)
 }
 
-fn build_acp_permission(state: &AcpState) -> (Option<PermCheck>, Option<AskSender>) {
+fn build_acp_permission(
+    state: &AcpState,
+    mode: SecurityMode,
+) -> (Option<PermCheck>, Option<AskSender>) {
     use std::sync::Mutex;
 
     let no_tools = state.cli.resolve_no_tools(&state.cfg);
@@ -658,7 +1020,6 @@ fn build_acp_permission(state: &AcpState) -> (Option<PermCheck>, Option<AskSende
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .unwrap_or_default();
 
-    let mode = resolve_acp_mode(&state.cli, &state.cfg);
     let checker = PermissionChecker::new(&perm_config, mode, None);
     let perm: PermCheck = Arc::new(Mutex::new(checker));
 
@@ -733,7 +1094,11 @@ fn spawn_acp_ask_drain(
     });
 }
 
-fn resolve_acp_mode(cli: &Cli, cfg: &Config) -> SecurityMode {
+fn resolve_acp_mode(cli: &Cli, cfg: &Config, override_mode: Option<SecurityMode>) -> SecurityMode {
+    // dirge-32k9 (gh#714): a session-scoped `/mode` override wins over CLI/config.
+    if let Some(mode) = override_mode {
+        return mode;
+    }
     if cli.yolo || cfg.yolo.unwrap_or(false) {
         SecurityMode::Yolo
     } else if cli.accept_all || cfg.accept_all.unwrap_or(false) {
@@ -965,6 +1330,9 @@ mod tests {
             AcpSession {
                 session: crate::session::Session::new("p", "m", 0),
                 cwd: std::env::temp_dir(),
+                model_override: None,
+                provider_override: None,
+                mode_override: None,
                 run: None,
             },
         );
@@ -1166,6 +1534,196 @@ mod tests {
     async fn cancel_run_unknown_session_is_false() {
         let sessions: SessionMap = tokio::sync::Mutex::new(std::collections::HashMap::new());
         assert!(!cancel_run(&sessions, "ghost").await);
+    }
+
+    // dirge-32k9 (gh#714): ACP slash-command exposure + handling.
+
+    /// The advertised set is exactly the curated commands, names carry no
+    /// leading `/`, and only the arg-taking ones declare an input hint.
+    #[test]
+    fn available_commands_are_the_curated_set() {
+        let cmds = acp_available_commands();
+        let names: Vec<&str> = cmds.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["help", "clear", "cd", "model", "mode"]);
+        assert!(
+            names.iter().all(|n| !n.starts_with('/')),
+            "ACP command names must not carry the leading slash",
+        );
+        for c in &cmds {
+            assert!(!c.description.is_empty(), "{} needs a description", c.name);
+            let wants_input = matches!(c.name.as_str(), "cd" | "model" | "mode");
+            assert_eq!(
+                c.input.is_some(),
+                wants_input,
+                "input hint presence wrong for {}",
+                c.name,
+            );
+        }
+    }
+
+    /// `/help` text lists every advertised command so the two can't drift.
+    #[test]
+    fn help_text_lists_every_command() {
+        let text = acp_help_text();
+        for (name, _, _) in ACP_COMMANDS {
+            assert!(text.contains(&format!("/{name}")), "help missing /{name}");
+        }
+    }
+
+    #[test]
+    fn parse_slash_splits_command_and_args() {
+        assert_eq!(parse_acp_slash("/help"), Some(("help", "")));
+        assert_eq!(
+            parse_acp_slash("  /cd /tmp/foo  "),
+            Some(("cd", "/tmp/foo"))
+        );
+        assert_eq!(
+            parse_acp_slash("/model gpt-4o mini"),
+            Some(("model", "gpt-4o mini")),
+        );
+        // Not slash commands.
+        assert_eq!(parse_acp_slash("hello /help"), None);
+        assert_eq!(parse_acp_slash("/"), None);
+        assert_eq!(parse_acp_slash("/ spaced"), None);
+        assert_eq!(parse_acp_slash(""), None);
+    }
+
+    /// An un-curated slash command is not intercepted — the caller forwards it
+    /// to the model.
+    #[tokio::test]
+    async fn unknown_slash_command_is_not_handled() {
+        let sessions = session_map_with("s");
+        let cfg = Config::default();
+        let out = handle_acp_slash(
+            &sessions,
+            &cfg,
+            "s",
+            "panel",
+            "",
+            AcpCurrent {
+                provider: "openrouter",
+                model: "some-model",
+                mode: SecurityMode::Standard,
+            },
+        )
+        .await;
+        assert!(
+            out.is_none(),
+            "TUI-only /panel must fall through to the LLM"
+        );
+    }
+
+    /// `/clear` wipes the accumulated conversation so the next prompt's
+    /// converted history is empty.
+    #[tokio::test]
+    async fn clear_empties_session_history() {
+        let id = "s";
+        let sessions = session_map_with(id);
+        finish_turn(&sessions, id, 0, "hi", "hello", Vec::new()).await;
+        let (before, _) = history_and_cwd(&sessions, id).await;
+        assert!(!before.is_empty(), "precondition: a turn is recorded");
+
+        let reply = handle_acp_slash(
+            &sessions,
+            &Config::default(),
+            id,
+            "clear",
+            "",
+            AcpCurrent {
+                provider: "p",
+                model: "m",
+                mode: SecurityMode::Standard,
+            },
+        )
+        .await;
+        assert!(reply.unwrap().contains("cleared"));
+
+        let (after, _) = history_and_cwd(&sessions, id).await;
+        assert!(after.is_empty(), "history must be empty after /clear");
+    }
+
+    /// `/cd` into a real directory updates the session cwd; a bad path reports
+    /// an error and leaves the cwd untouched.
+    #[tokio::test]
+    async fn cd_updates_cwd_and_rejects_bad_paths() {
+        let id = "s";
+        let sessions = session_map_with(id);
+        let dir = TestDir::new("cd");
+        let canonical = dunce::canonicalize(dir.path()).unwrap();
+
+        let reply = acp_cd(&sessions, id, &dir.path().to_string_lossy()).await;
+        assert!(reply.contains("changed directory"), "got {reply}");
+        assert_eq!(
+            sessions.lock().await.get(id).unwrap().cwd,
+            canonical,
+            "cwd updated to the canonical target",
+        );
+
+        let bad = acp_cd(&sessions, id, "/no/such/dir/exists/here").await;
+        assert!(bad.starts_with("cd:"), "bad path reports an error: {bad}");
+        assert_eq!(
+            sessions.lock().await.get(id).unwrap().cwd,
+            canonical,
+            "a failed /cd leaves the cwd unchanged",
+        );
+    }
+
+    /// `/model` with no arg lists the current model; with an unclassifiable id
+    /// it records a same-provider switch as a session override.
+    #[tokio::test]
+    async fn model_lists_then_switches() {
+        let id = "s";
+        let sessions = session_map_with(id);
+        let cfg = Config::default();
+
+        let list = acp_model(&sessions, &cfg, id, "", "openrouter", "current-x").await;
+        assert!(list.contains("current model: current-x"), "got {list}");
+
+        // `llama-3.1` has no recognized family → ModelSwitch::Keep → override
+        // set, provider left alone.
+        let set = acp_model(&sessions, &cfg, id, "llama-3.1", "openrouter", "current-x").await;
+        assert!(set.contains("switched to model: llama-3.1"), "got {set}");
+        let (model_ovr, provider_ovr, _) = session_overrides(&sessions, id).await;
+        assert_eq!(model_ovr.as_deref(), Some("llama-3.1"));
+        assert!(
+            provider_ovr.is_none(),
+            "a same-provider swap keeps the provider",
+        );
+    }
+
+    /// `/mode` shows the current mode with no arg, records a valid mode as an
+    /// override, and rejects an unknown one without touching state.
+    #[tokio::test]
+    async fn mode_views_sets_and_rejects() {
+        let id = "s";
+        let sessions = session_map_with(id);
+
+        let view = acp_mode(&sessions, id, "", SecurityMode::Standard).await;
+        assert!(view.contains("security mode: standard"), "got {view}");
+
+        let set = acp_mode(&sessions, id, "yolo", SecurityMode::Standard).await;
+        assert!(set.contains("yolo"), "got {set}");
+        let (_, _, mode_ovr) = session_overrides(&sessions, id).await;
+        assert_eq!(mode_ovr, Some(SecurityMode::Yolo));
+
+        let bad = acp_mode(&sessions, id, "bogus", SecurityMode::Standard).await;
+        assert!(bad.contains("unknown mode"), "got {bad}");
+        let (_, _, still_yolo) = session_overrides(&sessions, id).await;
+        assert_eq!(still_yolo, Some(SecurityMode::Yolo), "bad arg is a no-op");
+    }
+
+    /// A session `/mode` override wins over CLI/config resolution.
+    #[test]
+    fn resolve_mode_prefers_session_override() {
+        use clap::Parser as _;
+        let cli = Cli::parse_from(["dirge"]);
+        let cfg = Config::default();
+        assert_eq!(
+            resolve_acp_mode(&cli, &cfg, Some(SecurityMode::Accept)),
+            SecurityMode::Accept,
+        );
+        // No override → the CLI/config default (Standard here).
+        assert_eq!(resolve_acp_mode(&cli, &cfg, None), SecurityMode::Standard,);
     }
 
     /// Multiple concurrent asks all get responded to.
