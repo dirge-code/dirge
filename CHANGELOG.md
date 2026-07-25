@@ -4,6 +4,32 @@ All notable changes to dirge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.19.20] - 2026-07-25
+
+### Fixed
+- Pre-write syntax gate (#716), four defects that between them made Lisp files
+  hard or impossible to edit:
+  - A raw NUL byte anywhere in a file blocked every edit to it, permanently.
+    tree-sitter can't distinguish NUL from end-of-input, so the file parsed as
+    truncated and the first form was flagged at a line/col unrelated to the
+    edit. A NUL inside a string or regex is valid Clojure (there is no `\0`
+    escape) and occurs in real code. Such content now skips the grammar and
+    falls through to the delimiter scanner, which handles it correctly.
+  - The mechanical delimiter repair could silently re-nest code. It appends
+    the missing closers at EOF and re-validates with tree-sitter, which proves
+    nothing for a Lisp — any balanced arrangement parses. A closer dropped
+    mid-form was "repaired" into a file where a following top-level form had
+    been swallowed by the one above it. The repair now refuses when closing at
+    EOF would pull a column-1 opener inside the form being closed.
+  - The delimiter hint named the outermost unclosed opener, which in a Lisp is
+    almost always the enclosing top-level `defn` rather than the mistake. It
+    now leads with the innermost opener and keeps the outermost as context.
+  - The gate had no pre-edit baseline, so a file that already failed the check
+    could not be edited at all — including files that legitimately never parse,
+    such as templates with `<% %>` markers or linter fixtures. When the file
+    was already broken before the edit, the gate now stands down with a warning
+    instead of blocking, and does not auto-repair on top of it.
+
 ## [0.19.19] - 2026-07-24
 
 ### Added
