@@ -4142,6 +4142,347 @@ async fn finalization_goal_unmet_reenters_and_counts() {
     assert_eq!(msgs.len(), 1);
 }
 
+// ── dirge-g2ex: awaiting-user gate (step 0) ────────────────────────────────
+//
+// A final assistant turn that ends in a question must finalize and hand
+// control back to the user, outranking the hook (step 1) and every lower
+// "are we done?" gate. The goal gate is the one exception (autonomous stop).
+
+/// dirge-g2ex: a trailing `ToolResult` so `run_made_tool_calls` is true (the
+/// critic's precondition passes), making the step-0 short-circuit the ONLY
+/// reason the critic never runs.
+fn g2ex_tool_result() -> LoopMessage {
+    LoopMessage::ToolResult(crate::agent::agent_loop::message::ToolResultMessage {
+        tool_call_id: "call_1".into(),
+        tool_name: "edit".into(),
+        content: vec![crate::agent::agent_loop::message::ContentBlock::Text { text: "ok".into() }],
+        details: serde_json::Value::Null,
+        is_error: false,
+    })
+}
+
+/// (a) Question pending outranks the hook: the hook is NEVER polled, the critic
+/// judge is NEVER paid for (even though its `run_made_tool_calls` precondition
+/// holds), `critic_done` stays false, and `todo_nudges` stays 0. Finalizes with
+/// empty messages + `AwaitingUser`.
+#[tokio::test]
+async fn awaiting_user_gate_short_circuits_hook_critic_and_todos() {
+    use crate::agent::agent_loop::critic::CriticFn;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let hook_calls = Arc::new(AtomicUsize::new(0));
+    let critic_calls = Arc::new(AtomicUsize::new(0));
+
+    let mut config = build_config();
+    // Wire a hook that would otherwise win (step 1).
+    let hc = Arc::clone(&hook_calls);
+    config.get_followup_messages = Some(std::sync::Arc::new(move || {
+        hc.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async {
+            vec![LoopMessage::User(
+                crate::agent::agent_loop::message::UserMessage::text("hook follow-up"),
+            )]
+        })
+    }));
+    // Wire a critic that WOULD fire (critic_done=false, run_made_tool_calls=true).
+    let cc = Arc::clone(&critic_calls);
+    let judge: CriticFn = Arc::new(move |_p| {
+        cc.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Ok("VERDICT: INCOMPLETE".to_string()) })
+    });
+    config.critic_fn = Some(judge);
+
+    // Turn did real work, then ended by asking the user.
+    let new_messages = vec![
+        g2ex_tool_result(),
+        assistant_text("Which approach would you prefer?"),
+    ];
+
+    let mut critic_done = false;
+    let mut code_review_reacts = 0u8;
+    let mut goal_reacts = 0u8;
+    let mut todo_nudges = 0u8; // would otherwise fire (unfinished_count is process-global)
+    let mut resume_nudges: u8 = 0;
+    let (emit, _emit_rx) = tokio::sync::mpsc::channel(64);
+
+    let (msgs, source) = poll_finalization_follow_up(
+        &config,
+        "sys",
+        &new_messages,
+        &mut critic_done,
+        &mut code_review_reacts,
+        &mut None::<u64>,
+        &mut None::<String>,
+        None,
+        &mut goal_reacts,
+        &mut todo_nudges,
+        &mut resume_nudges,
+        GateMode::Off,
+        None,
+        None,
+        &mut 0u8,
+        &mut 0u8,
+        &emit,
+    )
+    .await;
+
+    assert_eq!(source, FollowUpSource::AwaitingUser);
+    assert!(msgs.is_empty(), "finalizes with no injected follow-up");
+    assert_eq!(
+        hook_calls.load(Ordering::SeqCst),
+        0,
+        "step-0 outranks the hook"
+    );
+    assert_eq!(
+        critic_calls.load(Ordering::SeqCst),
+        0,
+        "no judge LLM call is paid for"
+    );
+    assert!(!critic_done, "critic one-shot never consumed");
+    assert_eq!(todo_nudges, 0, "todo gate never reached");
+}
+
+/// (b) Even with a question pending, an unmet `--goal` still pushes the run.
+#[tokio::test]
+async fn awaiting_user_gate_still_honors_unmet_goal() {
+    use crate::agent::agent_loop::critic::CriticFn;
+
+    let mut config = build_config();
+    config.goal = Some("all tests pass and committed".into());
+    let judge: CriticFn =
+        Arc::new(|_p| Box::pin(async { Ok("GOAL: UNMET\n- tests still failing".to_string()) }));
+    config.goal_fn = Some(judge);
+
+    let new_messages = vec![assistant_text("Which approach would you prefer?")];
+
+    let mut critic_done = true; // isolate the goal gate from the one-shot critic
+    let mut goal_reacts = 0u8;
+    let mut todo_nudges = MAX_TODO_NUDGES;
+    let mut resume_nudges: u8 = 0;
+    let mut code_review_reacts = 0u8;
+    let (emit, _emit_rx) = tokio::sync::mpsc::channel(64);
+
+    let (msgs, source) = poll_finalization_follow_up(
+        &config,
+        "sys",
+        &new_messages,
+        &mut critic_done,
+        &mut code_review_reacts,
+        &mut None::<u64>,
+        &mut None::<String>,
+        None,
+        &mut goal_reacts,
+        &mut todo_nudges,
+        &mut resume_nudges,
+        GateMode::Off,
+        None,
+        None,
+        &mut 0u8,
+        &mut 0u8,
+        &emit,
+    )
+    .await;
+
+    assert_eq!(source, FollowUpSource::Goal);
+    assert_eq!(goal_reacts, 1, "an unmet goal counts one re-entry");
+    assert_eq!(msgs.len(), 1);
+}
+
+/// (c) A question pending + `should_defer_finalization` true → source `None`,
+/// and the goal judge is NEVER called (defer takes precedence over the goal).
+#[tokio::test]
+async fn awaiting_user_gate_defers_when_coordinator_running() {
+    use crate::agent::agent_loop::critic::CriticFn;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let goal_calls = Arc::new(AtomicUsize::new(0));
+    let mut config = build_config();
+    config.should_defer_finalization = Some(Arc::new(|| true));
+    config.goal = Some("all tests pass".into());
+    let gc = Arc::clone(&goal_calls);
+    let judge: CriticFn = Arc::new(move |_p| {
+        gc.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Ok("GOAL: UNMET".to_string()) })
+    });
+    config.goal_fn = Some(judge);
+
+    let new_messages = vec![assistant_text("Which approach would you prefer?")];
+
+    let mut critic_done = true;
+    let mut goal_reacts = 0u8;
+    let mut todo_nudges = MAX_TODO_NUDGES;
+    let mut resume_nudges: u8 = 0;
+    let mut code_review_reacts = 0u8;
+    let (emit, _emit_rx) = tokio::sync::mpsc::channel(64);
+
+    let (msgs, source) = poll_finalization_follow_up(
+        &config,
+        "sys",
+        &new_messages,
+        &mut critic_done,
+        &mut code_review_reacts,
+        &mut None::<u64>,
+        &mut None::<String>,
+        None,
+        &mut goal_reacts,
+        &mut todo_nudges,
+        &mut resume_nudges,
+        GateMode::Off,
+        None,
+        None,
+        &mut 0u8,
+        &mut 0u8,
+        &emit,
+    )
+    .await;
+
+    assert_eq!(source, FollowUpSource::None);
+    assert!(msgs.is_empty());
+    assert_eq!(
+        goal_calls.load(Ordering::SeqCst),
+        0,
+        "defer short-circuits before the goal judge"
+    );
+    assert_eq!(goal_reacts, 0);
+}
+
+// ── dirge-g2ex R3: todo gate now requires the turn to have made file edits ──
+
+/// Helper: seed the process-global TODO_LIST mirror with `n` open items and
+/// return a guard that clears it on drop, so a test can't leak state.
+///
+/// The guard also HOLDS `TODO_TEST_LOCK` for the caller's whole seed-act-assert
+/// span. The mirror is process-global and cargo runs tests in parallel threads
+/// within one process, so without this another test's seed lands between our
+/// seed and our assert and the gate sees the wrong count (dirge-g2ex). Field
+/// order matters: `Drop::drop` clears the mirror, then the guard field releases
+/// the lock.
+struct TodoGuard(
+    // Held for RAII only — never read. Dropping it is the entire point.
+    #[allow(dead_code)] std::sync::MutexGuard<'static, ()>,
+);
+impl Drop for TodoGuard {
+    fn drop(&mut self) {
+        crate::agent::tools::todo::TODO_LIST
+            .lock_ignore_poison()
+            .clear();
+    }
+}
+fn seed_open_todos(n: usize) -> TodoGuard {
+    let lock = crate::agent::tools::todo::TODO_TEST_LOCK.lock_ignore_poison();
+    let items: Vec<_> = (0..n)
+        .map(|_| crate::agent::tools::todo::TodoItem {
+            content: "pending work".into(),
+            status: "open".into(),
+            priority: "normal".into(),
+        })
+        .collect();
+    *crate::agent::tools::todo::TODO_LIST.lock_ignore_poison() = items;
+    TodoGuard(lock)
+}
+
+/// A read-only turn (no file edits) with unfinished todos must NOT trip the
+/// todo nudge — `unfinished_count()` is a cross-turn global, so without the
+/// `turn_made_file_edits` precondition an interrupting Q&A gets nagged.
+#[tokio::test]
+async fn todo_gate_skips_readonly_turn_even_with_unfinished_todos() {
+    let _g = seed_open_todos(2);
+    let config = build_config();
+
+    // Read-only turn: grepped and read, then stopped. No file edits.
+    let new_messages = vec![assistant_calling("read"), assistant_text("Done reading.")];
+    assert!(
+        !turn_made_file_edits(&new_messages),
+        "fixture: turn really is read-only"
+    );
+
+    let mut critic_done = true;
+    let mut code_review_reacts = 0u8;
+    let mut goal_reacts = 0u8;
+    let mut todo_nudges = 0u8;
+    let mut resume_nudges: u8 = 0;
+    let (emit, _emit_rx) = tokio::sync::mpsc::channel(64);
+
+    let (msgs, source) = poll_finalization_follow_up(
+        &config,
+        "sys",
+        &new_messages,
+        &mut critic_done,
+        &mut code_review_reacts,
+        &mut None::<u64>,
+        &mut None::<String>,
+        None,
+        &mut goal_reacts,
+        &mut todo_nudges,
+        &mut resume_nudges,
+        GateMode::Off,
+        None,
+        None,
+        &mut 0u8,
+        &mut 0u8,
+        &emit,
+    )
+    .await;
+
+    assert_eq!(source, FollowUpSource::None);
+    assert!(msgs.is_empty(), "no todo nudge on a read-only turn");
+    assert_eq!(todo_nudges, 0, "todo budget untouched");
+}
+
+/// A turn that made a file edit with unfinished todos still fires the nudge —
+/// the precondition only narrows the gate, it doesn't disable it.
+#[tokio::test]
+async fn todo_gate_fires_on_file_edit_turn_with_unfinished_todos() {
+    let _g = seed_open_todos(1);
+    let config = build_config();
+
+    let new_messages = vec![assistant_calling("edit")];
+    assert!(
+        turn_made_file_edits(&new_messages),
+        "fixture: turn made a file edit"
+    );
+
+    let mut critic_done = true; // skip the one-shot critic
+    let mut code_review_reacts = 0u8;
+    let mut goal_reacts = 0u8;
+    let mut todo_nudges = 0u8;
+    let mut resume_nudges: u8 = 0;
+    let (emit, _emit_rx) = tokio::sync::mpsc::channel(64);
+
+    let (msgs, source) = poll_finalization_follow_up(
+        &config,
+        "sys",
+        &new_messages,
+        &mut critic_done,
+        &mut code_review_reacts,
+        &mut None::<u64>,
+        &mut None::<String>,
+        None,
+        &mut goal_reacts,
+        &mut todo_nudges,
+        &mut resume_nudges,
+        GateMode::Off,
+        None,
+        None,
+        &mut 0u8,
+        &mut 0u8,
+        &emit,
+    )
+    .await;
+
+    assert_eq!(source, FollowUpSource::Todo);
+    assert_eq!(todo_nudges, 1, "nudge fires as before on an editing turn");
+    assert_eq!(msgs.len(), 1);
+    let content = match &msgs[0] {
+        LoopMessage::User(u) => u.text_joined(),
+        _ => panic!("expected User message"),
+    };
+    assert!(
+        content.starts_with(crate::agent::agent_loop::run::TODO_NUDGE_TAG),
+        "expected [todo] tag, got: {content}"
+    );
+}
+
 /// dirge-8v98: the unified judge re-enters the loop on a review finding even
 /// when the completeness verdict is COMPLETE — the exact case the old
 /// display-only advisory swallowed. One-shot in Advisory/Off, so `critic_done`
@@ -4412,10 +4753,12 @@ async fn open_issues_gate_blocking_with_session_open_issues_nudges() {
         .create("add metrics dashboard", "", None, Some(sid), None)
         .unwrap();
 
+    // dirge-g2ex: open-issues gate now requires the turn to have made file
+    // edits, so seed a real edit (not the empty `&[]` it used before).
     let (msgs, source) = poll_finalization_follow_up(
         &config,
         "sys",
-        &[],
+        &[assistant_calling("edit")],
         &mut critic_done,
         &mut code_review_reacts,
         &mut None::<u64>,    // last_reviewed_fingerprint
@@ -4600,10 +4943,11 @@ async fn open_issues_gate_advisory_emits_notice_but_does_not_reenter() {
         .create("wire up telemetry", "", None, Some(sid), None)
         .unwrap();
 
+    // dirge-g2ex: open-issues gate now requires the turn to have made file edits.
     let (msgs, source) = poll_finalization_follow_up(
         &config,
         "sys",
-        &[],
+        &[assistant_calling("edit")],
         &mut critic_done,
         &mut code_review_reacts,
         &mut None::<u64>,    // last_reviewed_fingerprint
@@ -5036,6 +5380,16 @@ fn assistant_calling(tool: &str) -> LoopMessage {
     ))
 }
 
+/// An assistant turn whose content is the given blocks (dirge-g2ex detector tests).
+fn assistant_blocks(blocks: Vec<ContentBlock>) -> LoopMessage {
+    LoopMessage::Assistant(AssistantMessage::new(blocks, StopReason::Stop))
+}
+
+/// An assistant turn whose only content is one text block.
+fn assistant_text(text: &str) -> LoopMessage {
+    assistant_blocks(vec![ContentBlock::Text { text: text.into() }])
+}
+
 #[test]
 fn turn_made_file_edits_detects_edit_tools_only() {
     assert!(turn_made_file_edits(&[assistant_calling("edit")]));
@@ -5045,6 +5399,134 @@ fn turn_made_file_edits_detects_edit_tools_only() {
     assert!(!turn_made_file_edits(&[assistant_calling("read")]));
     assert!(!turn_made_file_edits(&[assistant_calling("bash")]));
     assert!(!turn_made_file_edits(&[]));
+}
+
+// ── dirge-g2ex: did the run end waiting on the user? ───────────────────────
+//
+// `awaiting_user_response` is the pure predicate that lets the finalization
+// gates finalize a turn that ended in a question instead of re-entering until
+// the model guesses. Covers the prose-question shapes the prompts ask for
+// (plain, bolded, question-then-options) and the must-not-match cases (tool
+// calls, statements, non-assistant tails, unterminated code).
+
+#[test]
+fn awaiting_user_response_plain_trailing_question() {
+    assert!(awaiting_user_response(&[assistant_text(
+        "Which approach do you prefer?"
+    )]));
+}
+
+#[test]
+fn awaiting_user_response_bolded_question() {
+    assert!(awaiting_user_response(&[assistant_text(
+        "**Which approach?**"
+    )]));
+}
+
+#[test]
+fn awaiting_user_response_question_then_numbered_options() {
+    assert!(awaiting_user_response(&[assistant_text(
+        "Which database should I use?\n1. PostgreSQL\n2. MySQL\n3. SQLite"
+    )]));
+}
+
+#[test]
+fn awaiting_user_response_question_then_bulleted_options() {
+    assert!(awaiting_user_response(&[assistant_text(
+        "Which database should I use?\n\n- PostgreSQL\n- MySQL\n- SQLite"
+    )]));
+}
+
+#[test]
+fn awaiting_user_response_question_then_marker_variants() {
+    // Every option-list marker the detector recognizes is dropped, so the
+    // question one line up still wins.
+    assert!(awaiting_user_response(&[assistant_text(
+        "Pick one?\n* red\n+ green\n• blue\n1) alpha\n(2) beta\na) gamma\nb. delta"
+    )]));
+}
+
+#[test]
+fn awaiting_user_response_fullwidth_question_mark() {
+    assert!(awaiting_user_response(&[assistant_text("進めますか？")]));
+}
+
+#[test]
+fn awaiting_user_response_statement_is_false() {
+    assert!(!awaiting_user_response(&[assistant_text(
+        "I've updated the file."
+    )]));
+}
+
+#[test]
+fn awaiting_user_response_question_but_made_tool_calls_is_false() {
+    // Still working — the run didn't actually stop to wait.
+    let msg = assistant_blocks(vec![
+        ContentBlock::ToolCall {
+            id: "tc1".into(),
+            name: "edit".into(),
+            arguments: serde_json::json!({}),
+        },
+        ContentBlock::Text {
+            text: "Which file should I edit next?".into(),
+        },
+    ]);
+    assert!(!awaiting_user_response(&[msg]));
+}
+
+#[test]
+fn awaiting_user_response_non_assistant_tail_is_false() {
+    // The last message is a user/tool message, not the assistant's turn.
+    assert!(!awaiting_user_response(&[LoopMessage::User(
+        UserMessage::text("which?")
+    )]));
+}
+
+#[test]
+fn awaiting_user_response_empty_content_is_false() {
+    assert!(!awaiting_user_response(&[assistant_text("")]));
+    assert!(!awaiting_user_response(&[assistant_blocks(vec![])]));
+}
+
+#[test]
+fn awaiting_user_response_question_in_middle_statement_last_is_false() {
+    assert!(!awaiting_user_response(&[assistant_text(
+        "Which database?\nActually, never mind — I'll go with Postgres."
+    )]));
+}
+
+#[test]
+fn awaiting_user_response_question_inside_unterminated_fence_is_false() {
+    // Odd number of ``` fences → don't parse prose out of code.
+    assert!(!awaiting_user_response(&[assistant_text(
+        "Here's my attempt:\n```\nfn lookup() -> Option<i32>?"
+    )]));
+}
+
+#[test]
+fn awaiting_user_response_terminated_fence_with_question_after_is_true() {
+    // Even fences: the ``` block is closed, and the trailing prose asks a question.
+    assert!(awaiting_user_response(&[assistant_text(
+        "Here's the code:\n```\nfn main() {}\n```\nIs this what you wanted?"
+    )]));
+}
+
+#[test]
+fn awaiting_user_response_multiple_text_blocks_last_is_question() {
+    let msg = assistant_blocks(vec![
+        ContentBlock::Text {
+            text: "Let me think through the options.".into(),
+        },
+        ContentBlock::Text {
+            text: "Which one do you want?".into(),
+        },
+    ]);
+    assert!(awaiting_user_response(&[msg]));
+}
+
+#[test]
+fn awaiting_user_response_no_last_message_is_false() {
+    assert!(!awaiting_user_response(&[]));
 }
 
 /// The advisory fires only when a real session made file edits with an empty

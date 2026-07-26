@@ -127,6 +127,9 @@ other way. Judge the rest of the work as if that action were correctly deferred 
 - A block marked `[CONTEXT COMPACTION — REFERENCE ONLY]` (or a `## Active Task` lifted from one) \
 describes ALREADY-COMPLETED prior work — never treat it as an outstanding requirement. Judge only \
 the latest request and the transcript.\n\
+- If the assistant ended by asking the user a question or presenting options and is waiting on their \
+decision, that is a CORRECT stopping point, not incompleteness — never tell it to proceed anyway, \
+pick a default, or guess. Judge only the work done up to the question.\n\
 - Do NOT invent new requirements, scope, or \"nice to haves\". If you cannot determine correctness from \
 the spec and evidence available, ABSTAIN — say what's missing (e.g. no test covering this change, \
 unclear acceptance criteria). An abstention is safer than a false pass. If you are unsure whether \
@@ -621,6 +624,30 @@ mod tests {
             "must forbid demanding disallowed actions",
         );
         assert!(lower.contains("unsure"), "must keep the fail-open guidance");
+    }
+
+    // dirge-g2ex: an assistant that stopped to ask the user a question is at a
+    // CORRECT stopping point — the preamble must tell the judge never to treat
+    // that as incompleteness or push it to guess/proceed.
+
+    /// The preamble carries the awaiting-question carve-out: it names the
+    /// scenario (asking the user / awaiting a decision), marks it a correct
+    /// stop, and forbids proceeding/guessing/picking a default.
+    #[test]
+    fn preamble_treats_awaiting_user_question_as_correct_stop() {
+        let lower = CRITIC_PREAMBLE.to_ascii_lowercase();
+        assert!(
+            lower.contains("asking the user a question") || lower.contains("presenting options"),
+            "must name the awaiting-question / options scenario"
+        );
+        assert!(
+            lower.contains("correct stopping point"),
+            "must mark a pending question a correct stop"
+        );
+        assert!(
+            lower.contains("guess"),
+            "must forbid pushing the assistant to guess"
+        );
     }
 
     // dirge-6q3w: verification-status block.

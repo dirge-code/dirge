@@ -155,8 +155,13 @@ const FAILURE_REFLECTION_THRESHOLD: usize = 3;
 /// [dirge-vcsn].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FollowUpSource {
+    /// The model ended its turn blocked on the user — it asked a clarifying
+    /// question and is awaiting their decision. Finalize and hand control
+    /// back; do NOT run the lower "are we done?" gates (they'd re-enter until
+    /// the model gives up waiting and guesses). [dirge-g2ex]
+    AwaitingUser,
     /// Caller-supplied `get_followup_messages` hook (e.g. the `/plan`
-    /// reviewer loop). Highest priority.
+    /// reviewer loop). Highest priority among the work-gates.
     Hook,
     /// Deterministic resume: the model's last action was a failed tool call
     /// and it stopped without retrying. Cheap, no LLM call, always-on.
@@ -287,6 +292,41 @@ fn is_retryable_failure(tr: &super::message::ToolResultMessage) -> bool {
     true
 }
 
+/// Goal gate (dirge-g2ex): the user-defined stop-condition judge, extracted
+/// verbatim from its old inline position in [`poll_finalization_follow_up`] so
+/// the step-0 awaiting-user gate can reuse it without duplicating the
+/// [`super::goal::MAX_GOAL_REACT`] bound or the `*goal_reacts` accounting.
+///
+/// Returns `Some((msgs, FollowUpSource::Goal))` when the goal is unmet (the
+/// judge surfaced a reason to re-enter), `None` otherwise (no goal armed, goal
+/// met, budget exhausted, or judge error). Pure refactor of the step-3.5 block:
+/// same conditions, same react-counting, same source.
+async fn poll_goal_gate(
+    config: &LoopConfig,
+    system_prompt: &str,
+    new_messages: &[LoopMessage],
+    goal_reacts: &mut u8,
+) -> Option<(Vec<LoopMessage>, FollowUpSource)> {
+    if *goal_reacts < super::goal::MAX_GOAL_REACT
+        && let Some(goal) = &config.goal
+        && let Some(judge) = &config.goal_fn
+    {
+        let transcript = build_critic_transcript(new_messages);
+        // dirge-6q3w: same read-only verification signal as the critic, but
+        // the goal judge treats it as a SOFT advisory (see
+        // `goal_verification_note`) so a non-testable task can't trap the
+        // bounded goal loop.
+        let verification = config.verifier.as_ref().map(|v| v.status());
+        let msgs =
+            super::goal::run_goal_gate(judge, goal, system_prompt, &transcript, verification).await;
+        if !msgs.is_empty() {
+            *goal_reacts += 1;
+            return Some((msgs, FollowUpSource::Goal));
+        }
+    }
+    None
+}
+
 /// Poll the finalization gates in strict priority order and return the first
 /// non-empty source's messages (plus which source fired, for tracing/tests).
 ///
@@ -325,6 +365,46 @@ async fn poll_finalization_follow_up(
     track_nudges: &mut u8,
     emit: &mpsc::Sender<LoopEvent>,
 ) -> (Vec<LoopMessage>, FollowUpSource) {
+    // 0. Awaiting-user gate (dirge-g2ex). The model ended its final assistant
+    //    turn by asking the user a question — it is blocked on the USER, not
+    //    "done". Finalize and hand control back instead of letting the lower
+    //    "are we done?" gates (critic, todo, open-issues) re-enter until the
+    //    model gives up waiting and guesses.
+    //
+    //    This sits ABOVE the caller hook deliberately: a pending question
+    //    outranks even the hook. Skipping the hook loses nothing —
+    //    `followup_from_background_store` (src/agent/tools/background.rs:898)
+    //    and `get_followup_messages_from_plugin_manager`
+    //    (src/agent/agent_loop/plugin_hooks.rs:409) leave their queues intact
+    //    when not polled, and background completions still surface on the next
+    //    user prompt via `prepend_pending_notifications` (integration.rs:474-481).
+    //
+    //    The ONE exception is the goal gate: `--goal` is an explicit autonomous
+    //    stop condition, so it must keep pushing the run forward even with a
+    //    question pending. A still-running coordinator generation keeps its
+    //    existing meaning too — `should_defer_finalization` defers as before.
+    if awaiting_user_response(new_messages) {
+        // (a) A coordinator generation still running defers the whole decision.
+        if config
+            .should_defer_finalization
+            .as_ref()
+            .is_some_and(|should_defer| should_defer())
+        {
+            return (Vec::new(), FollowUpSource::None);
+        }
+        // (b) The goal gate stays authoritative for autonomous runs.
+        if let Some(hit) = poll_goal_gate(config, system_prompt, new_messages, goal_reacts).await {
+            return hit;
+        }
+        // (c) Finalize and hand control back to the user.
+        tracing::debug!(
+            target: "dirge::loop",
+            "final assistant turn ended with a question to the user; \
+             finalizing without running the critic/todo/open-issues gates"
+        );
+        return (Vec::new(), FollowUpSource::AwaitingUser);
+    }
+
     // 1. Caller hook (pi lines 256-262) — highest priority.
     if let Some(get) = &config.get_followup_messages {
         let msgs = get().await;
@@ -490,26 +570,23 @@ async fn poll_finalization_follow_up(
     //     re-enters the loop. Bounded by MAX_GOAL_REACT so a mis-stated or
     //     unsatisfiable goal can't loop forever. Active only when a goal is
     //     set AND a judge is configured — off for default/interactive runs.
-    if *goal_reacts < super::goal::MAX_GOAL_REACT
-        && let Some(goal) = &config.goal
-        && let Some(judge) = &config.goal_fn
-    {
-        let transcript = build_critic_transcript(new_messages);
-        // dirge-6q3w: same read-only verification signal as the critic, but
-        // the goal judge treats it as a SOFT advisory (see
-        // `goal_verification_note`) so a non-testable task can't trap the
-        // bounded goal loop.
-        let verification = config.verifier.as_ref().map(|v| v.status());
-        let msgs =
-            super::goal::run_goal_gate(judge, goal, system_prompt, &transcript, verification).await;
-        if !msgs.is_empty() {
-            *goal_reacts += 1;
-            return (msgs, FollowUpSource::Goal);
-        }
+    //     dirge-g2ex: extracted into `poll_goal_gate` so the step-0 awaiting-
+    //     user gate reuses it; conditions and `*goal_reacts` accounting are
+    //     byte-for-byte unchanged.
+    if let Some(hit) = poll_goal_gate(config, system_prompt, new_messages, goal_reacts).await {
+        return hit;
     }
     // 4. vix-port — final gate: nudge the model to finish or clear unfinished
     //    todos before stopping. Bounded by MAX_TODO_NUDGES.
-    if *todo_nudges < MAX_TODO_NUDGES {
+    //    dirge-g2ex: gated on `turn_made_file_edits` (NOT `run_made_tool_calls`).
+    //    This nudge means "you were working and stopped with it unfinished"; a
+    //    read-only Q&A or investigation turn has nothing of its own to finish,
+    //    and `todo::unfinished_count()` is a cross-turn process-global — so
+    //    without this gate the model gets dragged back into stale coding todos
+    //    every time the user interrupts to ask something. (A Q&A turn that
+    //    greps and reads still trips `run_made_tool_calls`, so that's the wrong
+    //    predicate here.)
+    if *todo_nudges < MAX_TODO_NUDGES && turn_made_file_edits(new_messages) {
         let unfinished = crate::agent::tools::todo::unfinished_count();
         if unfinished > 0 {
             *todo_nudges += 1;
@@ -520,7 +597,10 @@ async fn poll_finalization_follow_up(
     //    open. Session-scoped (not the global board), lowest priority.
     //    Advisory emits a one-shot SystemNotice; blocking re-enters the loop
     //    bounded by MAX_OPEN_ISSUES_NUDGES.
+    //    dirge-g2ex: same `turn_made_file_edits` precondition as the todo gate
+    //    (above) — a read-only turn has nothing of its own to finish.
     if open_issues_gate_mode != GateMode::Off
+        && turn_made_file_edits(new_messages)
         && let Some(db_path) = issue_db_path
     {
         // Clone to PathBuf for 'static spawn_blocking captures.
@@ -2551,6 +2631,139 @@ fn run_made_tool_calls(new_messages: &[LoopMessage]) -> bool {
     new_messages
         .iter()
         .any(|m| matches!(m, LoopMessage::ToolResult(_)))
+}
+
+/// True when the run's final assistant turn ended by asking the user a
+/// question. [dirge-g2ex]
+///
+/// Every prompt instructs the model to clarify in prose ("ask one question at a
+/// time, prefer multiple-choice"), and the `question` tool blocks and resolves
+/// in-turn so it never reaches finalization — so a trailing prose question is
+/// the only reliable signal that a turn ended waiting on the user. The
+/// finalization gates (`poll_finalization_follow_up`) key off this so they
+/// finalize and hand control back instead of re-entering until the model gives
+/// up waiting and guesses.
+///
+/// Rules, in order:
+/// 1. The last message must be `LoopMessage::Assistant`.
+/// 2. It must contain NO `ContentBlock::ToolCall` (still working).
+/// 3. Join its `Text` bodies with `\n`; `Thinking` blocks are ignored.
+/// 4. An ODD number of ``` fences means an unterminated code block — don't
+///    parse prose out of code.
+/// 5. Drop trailing blank or option/list-item lines, so a question followed by
+///    a multiple-choice block still counts.
+/// 6. Nothing remaining → false.
+/// 7. Trim the last remaining line, then strip trailing decoration chars and
+///    whitespace.
+/// 8. True iff it now ends with `?` or `？`.
+fn awaiting_user_response(new_messages: &[LoopMessage]) -> bool {
+    // 1. The last message must be an assistant turn.
+    let Some(LoopMessage::Assistant(last)) = new_messages.last() else {
+        return false;
+    };
+    // 2. A trailing tool call means it's still working, not waiting.
+    if !extract_tool_calls_from(last).is_empty() {
+        return false;
+    }
+    // 3. Join the Text bodies with '\n'; ignore Thinking blocks.
+    let mut joined = String::new();
+    for block in &last.content {
+        if let ContentBlock::Text { text } = block {
+            if !joined.is_empty() {
+                joined.push('\n');
+            }
+            joined.push_str(text);
+        }
+    }
+    // 4. An odd number of ``` fences is an unterminated code block — don't
+    //    parse prose (and a trailing '?') out of code.
+    if joined.matches("```").count() % 2 == 1 {
+        return false;
+    }
+    // 5-6. Walk back over trailing blank / option-list lines and keep the last
+    //      meaningful line, so a question followed by a multiple-choice block
+    //      still counts.
+    let mut candidate: Option<&str> = None;
+    for line in joined.lines().rev() {
+        if line.trim().is_empty() || is_option_list_line(line) {
+            continue;
+        }
+        candidate = Some(line);
+        break;
+    }
+    let Some(candidate) = candidate else {
+        return false;
+    };
+    // 7. Trim, then strip trailing decoration chars and whitespace so e.g.
+    //    `**Which approach?**` resolves to a trailing '?'.
+    let mut s: String = candidate.trim().to_string();
+    while let Some(ch) = s.chars().last() {
+        if ch.is_whitespace()
+            || matches!(
+                ch,
+                '*' | '_' | '`' | ')' | ']' | '"' | '\'' | '\u{201d}' | '\u{2019}' | '>'
+            )
+        {
+            s.pop();
+        } else {
+            break;
+        }
+    }
+    // 8. True iff it now ends with '?' or fullwidth '？'.
+    s.ends_with('?') || s.ends_with('\u{ff1f}')
+}
+
+/// True for a trailing option/list-item line: leading whitespace, then a marker
+/// (one of `-`, `*`, `+`, `•`, `N.`, `N)`, `(N)`, `a.`, `a)`), then whitespace
+/// or end of line. Plain string matching only — no regex dependency.
+/// [dirge-g2ex]
+fn is_option_list_line(line: &str) -> bool {
+    let s = line.trim_start();
+    let Some(marker_len) = option_marker_len(s) else {
+        return false;
+    };
+    let after = &s[marker_len..];
+    after.is_empty() || after.starts_with(char::is_whitespace)
+}
+
+/// Byte length of an option-list marker at the start of `s`, if any.
+fn option_marker_len(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    // Single-char markers: -, *, +, •
+    if let Some(ch) = s.chars().next() {
+        match ch {
+            '-' | '*' | '+' | '\u{2022}' => return Some(ch.len_utf8()),
+            _ => {}
+        }
+    }
+    // <digits>.  or  <digits>)
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i > 0 && i < bytes.len() && (bytes[i] == b'.' || bytes[i] == b')') {
+        return Some(i + 1);
+    }
+    // ( <digits> )
+    if bytes.first() == Some(&b'(') {
+        let mut j = 1;
+        while j < bytes.len() && bytes[j].is_ascii_digit() {
+            j += 1;
+        }
+        if j > 1 && j < bytes.len() && bytes[j] == b')' {
+            return Some(j + 1);
+        }
+    }
+    // <single letter>.  or  <single letter>)
+    let mut chars = s.chars();
+    if let Some(first) = chars.next()
+        && first.is_ascii_alphabetic()
+        && let Some(second) = chars.next()
+        && (second == '.' || second == ')')
+    {
+        return Some(first.len_utf8() + second.len_utf8());
+    }
+    None
 }
 
 /// dirge-1g3v / dirge-8gdv: the diff-aware reviewer engages only on what THIS
