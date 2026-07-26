@@ -4,6 +4,31 @@ All notable changes to dirge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.19.21] - 2026-07-26
+
+### Fixed
+- A pending question to the user now outranks the finalization gates (#717).
+  Ask the agent something mid-task, let it reach a point where it needs your
+  decision, and the critic would keep reminding it about unfinished work until
+  it gave up waiting and guessed. Nothing downstream could tell a turn that
+  stopped to ask from a turn that stopped because it was done — every prompt
+  tells the model to clarify in prose, and the `question` tool blocks and
+  resolves in-turn, so it never reaches finalization. Each gate then re-entered
+  on its own budget: critic 1-3x, todo 3x, open-issues 2x.
+
+  A turn that ends by asking now finalizes and hands control back. Detection is
+  a trailing question mark on the last meaningful line, after dropping trailing
+  option-list lines (so a question followed by a multiple-choice block still
+  counts) and markdown decoration; an unterminated code fence is left alone.
+  The goal gate is the one exception and still runs, since `--goal` is an
+  explicit autonomous stop condition and there may be no user present to
+  answer.
+
+  The unfinished-todo and open-issues nudges now also require the turn to have
+  edited a file. The todo count comes from a cross-turn process-global mirror,
+  so a read-only Q&A turn was being nagged about stale coding todos left over
+  from before the interruption.
+
 ## [0.19.20] - 2026-07-25
 
 ### Fixed

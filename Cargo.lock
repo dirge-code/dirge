@@ -1302,7 +1302,7 @@ dependencies = [
 
 [[package]]
 name = "dirge-agent"
-version = "0.19.20"
+version = "0.19.21"
 dependencies = [
  "agent-client-protocol",
  "ansi-to-tui",
