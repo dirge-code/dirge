@@ -8,6 +8,7 @@ pub mod client;
 pub(crate) mod codex_http;
 pub(crate) mod compressing_http;
 mod dispatch;
+pub(crate) mod rate_limit_gate;
 mod resolve;
 mod run;
 mod spawn;

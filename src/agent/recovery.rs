@@ -169,11 +169,24 @@ where
                 let msg = err.to_string();
                 let kind = classify_error(&msg);
                 if !policy.should_retry(attempts, kind) {
+                    // Distinguish the two reasons `should_retry` says no.
+                    // Reporting "non-retryable" for an exhausted budget
+                    // reads as a classification bug when it isn't — the
+                    // #718 log shows `error_kind=RateLimit` next to
+                    // "non-retryable error", which is exactly backwards.
+                    let exhausted = attempts >= policy.max_retries();
                     tracing::error!(
                         op = label,
                         error_kind = %format!("{:?}", kind),
+                        attempts = attempts,
+                        max = policy.max_retries(),
                         error = %msg,
-                        "non-retryable error, bailing"
+                        "{}",
+                        if exhausted {
+                            "retry budget exhausted, bailing"
+                        } else {
+                            "non-retryable error, bailing"
+                        }
                     );
                     return Err(err);
                 }
@@ -194,49 +207,256 @@ where
     }
 }
 
+/// Case-insensitive search for an ASCII `label`, returning its byte
+/// offset in `msg`.
+///
+/// Deliberately NOT implemented as "lowercase the message, then index
+/// back into the original": `to_lowercase` can change byte length for
+/// some unicode (Turkish `İ` → `i̇` is 2 → 3 bytes), so the offsets
+/// disagree and slicing the original could land mid-UTF-8 and panic.
+/// Scanning the original bytes window-by-window with case-insensitive
+/// ASCII comparison is sound because the label is fixed ASCII — and an
+/// ASCII byte can never occur inside a multi-byte UTF-8 sequence, so a
+/// match is always on a char boundary.
+fn find_label_ci(msg: &str, label: &str) -> Option<usize> {
+    let label_bytes = label.as_bytes();
+    let msg_bytes = msg.as_bytes();
+    if msg_bytes.len() < label_bytes.len() {
+        return None;
+    }
+    (0..=msg_bytes.len() - label_bytes.len()).find(|&i| {
+        msg_bytes[i..i + label_bytes.len()]
+            .iter()
+            .zip(label_bytes.iter())
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
+    })
+}
+
+/// Rate-limit facts recovered from a provider's 429 body.
+///
+/// GH #718: rig discards HTTP response headers (`non_success_status_error`
+/// keeps only status + body text), so this parses the *body*. That covers
+/// providers which echo their headers into the payload — OpenRouter nests
+/// them under `error.metadata.headers`, Zhipu writes the reset into the
+/// message prose. Providers that only ever send real headers (Anthropic,
+/// OpenAI, Groq) are still parsed correctly here if the text ever reaches
+/// us; making those headers visible at all is tracked separately.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RateLimitSignal {
+    /// How long until the exhausted window resets, when the provider said.
+    pub reset_in: Option<Duration>,
+    /// The provider reported zero remaining quota. This is the definitive
+    /// bit: retrying before `reset_in` elapses *cannot* succeed, so the
+    /// request is worth suppressing outright rather than spending.
+    pub exhausted: bool,
+    /// The window the provider named, e.g. `free-models-per-day`.
+    pub scope: Option<String>,
+}
+
+/// Read the value following `label`. `reject_hyphen_suffix` keeps a lookup
+/// for the generic `x-ratelimit-reset` from being satisfied by the longer
+/// `x-ratelimit-reset-requests`; when set, a match followed by `-` is
+/// skipped and the scan continues.
+fn label_value(msg: &str, label: &str, reject_hyphen_suffix: bool) -> Option<String> {
+    let mut from = 0usize;
+    loop {
+        if from >= msg.len() || !msg.is_char_boundary(from) {
+            return None;
+        }
+        let idx = find_label_ci(&msg[from..], label)? + from;
+        let after = idx + label.len();
+        if !msg.is_char_boundary(after) {
+            return None;
+        }
+        let rest = &msg[after..];
+        if reject_hyphen_suffix && rest.starts_with('-') {
+            // Advances by at least one byte every iteration (labels are
+            // non-empty), so this terminates.
+            from = after;
+            continue;
+        }
+        let value: String = rest
+            .trim_start_matches([':', '=', ' ', '\t', '"'])
+            .chars()
+            .take_while(|&c| !matches!(c, ',' | '"' | '}' | '\n' | '\r' | ';'))
+            .collect();
+        let value = value.trim();
+        return (!value.is_empty()).then(|| value.to_string());
+    }
+}
+
+/// Parse a Go-style duration — `1s`, `6m0s`, `2m59.56s`, `500ms`, `1h2m3s`.
+/// OpenAI and Groq both report `x-ratelimit-reset-*` in this form. The
+/// matches must tile the whole input so stray prose can't parse as a
+/// duration.
+fn parse_go_duration(raw: &str) -> Option<Duration> {
+    static UNIT_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)(\d+(?:\.\d+)?)(ms|h|m|s)").expect("static regex compiles")
+    });
+    let mut total_secs = 0f64;
+    let mut consumed = 0usize;
+    for caps in UNIT_RE.captures_iter(raw) {
+        let whole = caps.get(0)?;
+        // Any gap means the input isn't purely a duration.
+        if whole.start() != consumed {
+            return None;
+        }
+        consumed = whole.end();
+        let value: f64 = caps[1].parse().ok()?;
+        total_secs += match caps[2].to_ascii_lowercase().as_str() {
+            "ms" => value / 1000.0,
+            "s" => value,
+            "m" => value * 60.0,
+            "h" => value * 3600.0,
+            _ => return None,
+        };
+    }
+    if consumed == 0 || consumed != raw.len() {
+        return None;
+    }
+    // Round to whole milliseconds — `from_secs_f64(7.66)` lands a few ns
+    // short, which makes exact-value assertions (and log output) noisy.
+    Some(Duration::from_millis(
+        (total_secs * 1000.0).round().clamp(0.0, u64::MAX as f64) as u64,
+    ))
+}
+
+/// Interpret a rate-limit reset value as a wait from now.
+///
+/// Providers disagree on the encoding, so discriminate by shape:
+///   - Go duration (`6m0s`)            — OpenAI, Groq
+///   - epoch milliseconds              — OpenRouter
+///   - epoch seconds                   — common elsewhere
+///   - a small integer                 — a relative second count
+///   - RFC 3339 / RFC 2822 instant     — Anthropic
+///
+/// Absolute forms already in the past clamp to zero rather than wrapping,
+/// so a stale or misconfigured value can't suppress a retry.
+fn parse_reset_value(raw: &str) -> Option<Duration> {
+    let raw = raw.trim().trim_matches('"').trim();
+    if raw.is_empty() {
+        return None;
+    }
+
+    // Checked before the numeric branch: a bare `500` is a count, but
+    // `500ms` is a duration.
+    if let Some(d) = parse_go_duration(raw) {
+        return Some(d);
+    }
+
+    if raw.len() <= 20 && raw.chars().all(|c| c.is_ascii_digit()) {
+        let n: u128 = raw.parse().ok()?;
+        // Boundaries: 1e9 seconds ≈ 2001-09-09, and a *relative* wait of
+        // 1e9 seconds would be 31 years — so anything at or above the
+        // floor is an absolute timestamp, not a countdown.
+        const EPOCH_SECS_FLOOR: u128 = 1_000_000_000;
+        const EPOCH_MILLIS_FLOOR: u128 = 1_000_000_000_000;
+        let target_ms = if n >= EPOCH_MILLIS_FLOOR {
+            n
+        } else if n >= EPOCH_SECS_FLOOR {
+            n.saturating_mul(1_000)
+        } else {
+            return Some(Duration::from_secs(n.min(u64::MAX as u128) as u64));
+        };
+        let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u128;
+        return Some(Duration::from_millis(
+            target_ms.saturating_sub(now_ms).min(u64::MAX as u128) as u64,
+        ));
+    }
+
+    let parsed = chrono::DateTime::parse_from_rfc3339(raw)
+        .ok()
+        .or_else(|| chrono::DateTime::parse_from_rfc2822(raw).ok())?;
+    let delta = parsed - chrono::Utc::now().fixed_offset();
+    Some(Duration::from_secs(delta.num_seconds().max(0) as u64))
+}
+
+/// Extract whatever the provider told us about the rate limit it just
+/// enforced. Never errors — an absent or unrecognized field simply stays
+/// `None`/`false`, preserving the pre-#718 exponential-backoff behaviour.
+pub fn rate_limit_signal(msg: &str) -> RateLimitSignal {
+    // (remaining label, reset label, generic-form disambiguation needed)
+    let mut dimensions: Vec<(String, String, bool)> = Vec::new();
+    // OpenAI / Groq / OpenRouter family. The bare form is probed last and
+    // must not be satisfied by one of the suffixed labels.
+    for suffix in ["-requests", "-tokens", ""] {
+        dimensions.push((
+            format!("x-ratelimit-remaining{suffix}"),
+            format!("x-ratelimit-reset{suffix}"),
+            suffix.is_empty(),
+        ));
+    }
+    // Anthropic puts the dimension in the middle of the label.
+    for dim in ["requests", "tokens", "input-tokens", "output-tokens"] {
+        dimensions.push((
+            format!("anthropic-ratelimit-{dim}-remaining"),
+            format!("anthropic-ratelimit-{dim}-reset"),
+            false,
+        ));
+    }
+
+    let mut exhausted = false;
+    let mut exhausted_resets: Vec<Duration> = Vec::new();
+    let mut any_resets: Vec<Duration> = Vec::new();
+
+    for (remaining_label, reset_label, exact) in &dimensions {
+        let remaining = label_value(msg, remaining_label, *exact)
+            .and_then(|v| v.trim().trim_matches('"').parse::<u64>().ok());
+        let reset = label_value(msg, reset_label, *exact).and_then(|v| parse_reset_value(&v));
+        if let Some(r) = reset {
+            any_resets.push(r);
+        }
+        if remaining == Some(0) {
+            exhausted = true;
+            if let Some(r) = reset {
+                exhausted_resets.push(r);
+            }
+        }
+    }
+
+    // Prefer the dimension the provider actually ran out of: waiting on an
+    // unrelated (possibly far longer) window would stall needlessly. When
+    // several are empty, the latest reset is the one that unblocks us.
+    let reset_in = if !exhausted_resets.is_empty() {
+        exhausted_resets.into_iter().max()
+    } else {
+        any_resets.into_iter().max()
+    };
+
+    static SCOPE_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)rate limit exceeded:\s*([A-Za-z0-9_-]+)").expect("static regex compiles")
+    });
+    let scope = SCOPE_RE
+        .captures(msg)
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str().trim_end_matches('.').to_string());
+
+    RateLimitSignal {
+        reset_in,
+        exhausted,
+        scope,
+    }
+}
+
 /// Parse a `Retry-After` value out of an error message. Looks for
 /// (in order):
 /// 1. Anthropic-style `retry-after-ms: <N>` — milliseconds.
 /// 2. Standard `Retry-After: <N>` — seconds.
 /// 3. JSON body `"retry_after": <N>` — seconds.
+/// 4. RFC 7231 HTTP-date form.
+/// 5. `X-RateLimit-Reset` and friends (GH #718).
+///
+/// An explicit `Retry-After` outranks a reset header: it is the provider's
+/// direct instruction, whereas a reset is a window boundary we infer from.
 ///
 /// Returns `None` if no recognized form is present. Robust to the
 /// `:` being absent (some providers emit `retry-after 30`).
 pub(crate) fn retry_after_from_error_msg(msg: &str) -> Option<Duration> {
     fn parse_after_label(msg: &str, label: &str) -> Option<u64> {
-        // Case-insensitive search WITHOUT lowercasing the whole
-        // message: previously we lowercased `msg` and then indexed
-        // into the ORIGINAL `msg` at the lowered string's byte
-        // offset. For ASCII that's identical, but `to_lowercase`
-        // can change byte length for some unicode (e.g. Turkish
-        // `İ` → `i̇` is 2 → 3 bytes). The mismatched offset could
-        // land mid-UTF-8 and panic on `&msg[...]`. Now we scan the
-        // original bytes window-by-window with case-insensitive
-        // ASCII comparison. The label itself is fixed-ASCII so this
-        // is sound — we just need to be case-insensitive against
-        // the message's casing.
-        let label_bytes = label.as_bytes();
-        let msg_bytes = msg.as_bytes();
-        if msg_bytes.len() < label_bytes.len() {
-            return None;
-        }
-        let mut idx = None;
-        for i in 0..=msg_bytes.len() - label_bytes.len() {
-            let window = &msg_bytes[i..i + label_bytes.len()];
-            if window
-                .iter()
-                .zip(label_bytes.iter())
-                .all(|(a, b)| a.eq_ignore_ascii_case(b))
-            {
-                idx = Some(i);
-                break;
-            }
-        }
-        let idx = idx?;
-        // `idx` is now a byte offset into the original `msg`.
-        // Land at a char boundary (the ASCII label match guarantees
-        // we're on a boundary, but `idx + label.len()` could still
-        // hit one — for ASCII labels it can't, but defend anyway).
+        let idx = find_label_ci(msg, label)?;
+        // `idx` is a byte offset into the original `msg`, guaranteed to be
+        // a char boundary by `find_label_ci`. Defend on the end offset
+        // anyway — for ASCII labels it cannot land mid-sequence.
         let after = idx + label.len();
         if !msg.is_char_boundary(after) {
             return None;
@@ -277,7 +497,12 @@ pub(crate) fn retry_after_from_error_msg(msg: &str) -> Option<Duration> {
     if let Some(d) = parse_http_date_retry_after(msg) {
         return Some(d);
     }
-    None
+    // GH #718: no `Retry-After` at all, but the provider told us when the
+    // window resets. OpenRouter is the motivating case — it nests
+    // `X-RateLimit-Reset` (epoch millis) inside the 429 body and sends no
+    // `Retry-After`, so before this the backoff was a blind exponential
+    // guess that expired before the window rolled.
+    rate_limit_signal(msg).reset_in
 }
 
 /// Best-effort human-readable reset time for a usage-cap error, for
@@ -461,9 +686,28 @@ pub fn classify_error(msg: &str) -> ErrorKind {
         // is effectively a usage cap: retrying at the capped delay just
         // re-hits it. Stop cleanly (UsageCap) rather than burning the
         // budget on retries that can't succeed.
-        if let Some(wait) = retry_after_from_error_msg(msg)
-            && wait > MAX_IN_RUN_RETRY_WAIT
-        {
+        //
+        // This is checked BEFORE the wording heuristic below: when the
+        // provider gave us a hard number we trust it. A per-minute 429
+        // whose body happens to mention a daily allowance stays a
+        // retryable throttle, as it should.
+        // A zero wait is NOT hard data — it means the reset we parsed has
+        // already elapsed (a stale value, or the user's clock running
+        // ahead of the provider's). Fall through to the wording heuristic
+        // rather than declaring the window open on the strength of it.
+        if let Some(wait) = retry_after_from_error_msg(msg).filter(|w| !w.is_zero()) {
+            return if wait > MAX_IN_RUN_RETRY_WAIT {
+                ErrorKind::UsageCap
+            } else {
+                ErrorKind::RateLimit
+            };
+        }
+        // GH #718: no parseable reset, but the window the provider named
+        // is a daily one — those reset hours out, well past anything we
+        // would wait through. The list above ("daily limit", "usage
+        // limit", "quota exceeded") missed OpenRouter's phrasing, so its
+        // free-models-per-day 429 was retried like a transient blip.
+        if lower.contains("per-day") || lower.contains("requests per day") {
             return ErrorKind::UsageCap;
         }
         return ErrorKind::RateLimit;
@@ -1233,5 +1477,290 @@ mod tests {
         let policy = RecoveryPolicy::default();
         let d = policy.backoff_duration_for_msg(0, "Retry-After: 9999");
         assert!(d <= Duration::from_secs(300));
+    }
+
+    // ---------------------------------------------------------------
+    // GH #718 — rate-limit reset headers.
+    //
+    // rig discards response headers (`non_success_status_error` keeps
+    // only status + body), so everything below is parsed out of the
+    // error BODY text. Formats are drawn from each provider's docs:
+    //   OpenRouter  X-RateLimit-Reset        epoch millis
+    //   OpenAI      x-ratelimit-reset-*      Go duration ("6m0s")
+    //   Groq        x-ratelimit-reset-*      Go duration ("2m59.56s")
+    //   Anthropic   anthropic-ratelimit-*-reset  RFC 3339
+    // ---------------------------------------------------------------
+
+    /// Go/OpenAI/Groq duration strings.
+    #[test]
+    fn reset_value_parses_go_duration_strings() {
+        for (raw, want_ms) in [
+            ("1s", 1_000u64),
+            ("6m0s", 360_000),
+            ("7.66s", 7_660),
+            ("2m59.56s", 179_560),
+            ("1h2m3s", 3_723_000),
+            ("500ms", 500),
+        ] {
+            assert_eq!(
+                parse_reset_value(raw),
+                Some(Duration::from_millis(want_ms)),
+                "duration string {raw}",
+            );
+        }
+    }
+
+    /// Bare text that isn't a duration must not parse as one.
+    #[test]
+    fn reset_value_rejects_non_duration_text() {
+        assert_eq!(parse_reset_value("soon"), None);
+        assert_eq!(parse_reset_value(""), None);
+        assert_eq!(parse_reset_value("12x"), None);
+    }
+
+    /// Epoch millis (OpenRouter) vs epoch seconds vs a relative count are
+    /// told apart by magnitude.
+    #[test]
+    fn reset_value_discriminates_epoch_millis_seconds_and_relative() {
+        let now = chrono::Utc::now();
+        let in_90s = now + chrono::Duration::seconds(90);
+
+        // Epoch millis — the OpenRouter form.
+        let ms = in_90s.timestamp_millis().to_string();
+        let d = parse_reset_value(&ms).expect("epoch millis parses");
+        assert!(
+            (85..=95).contains(&d.as_secs()),
+            "epoch millis should yield ~90s, got {d:?}",
+        );
+
+        // Epoch seconds.
+        let secs = in_90s.timestamp().to_string();
+        let d = parse_reset_value(&secs).expect("epoch seconds parses");
+        assert!(
+            (85..=95).contains(&d.as_secs()),
+            "epoch seconds should yield ~90s, got {d:?}",
+        );
+
+        // Small integer — a relative wait, not an epoch.
+        assert_eq!(parse_reset_value("42"), Some(Duration::from_secs(42)));
+    }
+
+    /// A reset already in the past clamps to zero rather than wrapping.
+    #[test]
+    fn reset_value_in_the_past_clamps_to_zero() {
+        let past = (chrono::Utc::now() - chrono::Duration::hours(1))
+            .timestamp_millis()
+            .to_string();
+        assert_eq!(parse_reset_value(&past), Some(Duration::ZERO));
+    }
+
+    /// The reporter's verbatim OpenRouter per-minute 429 (GH #718).
+    /// Reset 1785056700000 = 2026-07-26T09:05:00Z, ~42s after the log
+    /// timestamp. Before the fix this parsed to `None` and the retry
+    /// layer fell back to bare exponential backoff.
+    #[test]
+    fn openrouter_per_minute_429_yields_reset_and_exhaustion() {
+        let msg = r#"Invalid status code 429 Too Many Requests with message: {"error":{"message":"Rate limit exceeded: free-models-per-min. ","code":429,"metadata":{"headers":{"X-RateLimit-Limit":"20","X-RateLimit-Remaining":"0","X-RateLimit-Reset":"1785056700000"},"provider_name":null}},"user_id":"<redacted>"}"#;
+        let sig = rate_limit_signal(msg);
+        assert!(
+            sig.exhausted,
+            "X-RateLimit-Remaining: 0 is a definitive exhaustion signal",
+        );
+        assert_eq!(sig.scope.as_deref(), Some("free-models-per-min"));
+        assert!(sig.reset_in.is_some(), "X-RateLimit-Reset must parse");
+        // The log is from 2026 so the absolute reset is long past now;
+        // what matters is that it parsed and clamped rather than
+        // returning None.
+        assert!(retry_after_from_error_msg(msg).is_some());
+    }
+
+    /// The reporter's verbatim OpenRouter per-DAY 429. The reset is
+    /// ~14.9h out, so this must classify as a non-retryable UsageCap —
+    /// retrying at the 5-minute backoff ceiling can never succeed.
+    #[test]
+    fn openrouter_per_day_429_is_a_usage_cap_not_a_retryable_ratelimit() {
+        // Reset far in the future so the assertion holds regardless of
+        // when the suite runs.
+        let reset = (chrono::Utc::now() + chrono::Duration::hours(14)).timestamp_millis();
+        let msg = format!(
+            r#"Invalid status code 429 Too Many Requests with message: {{"error":{{"message":"Rate limit exceeded: free-models-per-day. Add 10 credits to unlock 1000 free model requests per day","code":429,"metadata":{{"headers":{{"X-RateLimit-Limit":"50","X-RateLimit-Remaining":"0","X-RateLimit-Reset":"{reset}"}},"provider_name":null}}}},"user_id":"<redacted>"}}"#
+        );
+        assert_eq!(
+            classify_error(&msg),
+            ErrorKind::UsageCap,
+            "a 14h reset must not be retried like a transient throttle",
+        );
+        let p = RecoveryPolicy::default();
+        assert!(!p.should_retry(0, classify_error(&msg)));
+    }
+
+    /// Even with the reset stripped out, the "per day" wording alone is
+    /// enough to recognise a cap — the old substring list only knew
+    /// "daily limit" and missed OpenRouter's phrasing entirely.
+    #[test]
+    fn per_day_wording_alone_is_a_usage_cap() {
+        assert_eq!(
+            classify_error("429 Too Many Requests: Rate limit exceeded: free-models-per-day."),
+            ErrorKind::UsageCap,
+        );
+        assert_eq!(
+            classify_error("HTTP 429 Too Many Requests: you have exceeded your requests per day"),
+            ErrorKind::UsageCap,
+        );
+    }
+
+    /// A per-MINUTE window stays a retryable RateLimit, and the backoff
+    /// becomes the server's actual reset instead of the exponential
+    /// guess. This is the fix for the reporter's first symptom: one
+    /// 42s wait instead of five doomed attempts over ~31s.
+    #[test]
+    fn per_minute_reset_drives_the_backoff_and_stays_retryable() {
+        let reset = (chrono::Utc::now() + chrono::Duration::seconds(42)).timestamp_millis();
+        let msg = format!(
+            r#"429 Too Many Requests {{"message":"Rate limit exceeded: free-models-per-min. ","metadata":{{"headers":{{"X-RateLimit-Limit":"20","X-RateLimit-Remaining":"0","X-RateLimit-Reset":"{reset}"}}}}}}"#
+        );
+        assert_eq!(classify_error(&msg), ErrorKind::RateLimit);
+        let p = RecoveryPolicy::default();
+        // attempts=0 would otherwise give ~1s; the reset must win.
+        let d = p.backoff_duration_for_msg(0, &msg);
+        assert!(
+            d >= Duration::from_secs(38) && d <= Duration::from_secs(45),
+            "backoff should track the ~42s reset, got {d:?}",
+        );
+    }
+
+    /// OpenAI / Groq split the reset per dimension. When only ONE
+    /// dimension is exhausted, wait for that dimension — not the other,
+    /// unrelated (possibly much longer) window.
+    #[test]
+    fn per_dimension_reset_pairs_with_the_exhausted_dimension() {
+        // Requests exhausted (reset 3s), tokens fine (reset 6m0s).
+        let msg = "429 Too Many Requests\n\
+             x-ratelimit-remaining-requests: 0\n\
+             x-ratelimit-reset-requests: 3s\n\
+             x-ratelimit-remaining-tokens: 149984\n\
+             x-ratelimit-reset-tokens: 6m0s";
+        let sig = rate_limit_signal(msg);
+        assert!(sig.exhausted);
+        assert_eq!(
+            sig.reset_in,
+            Some(Duration::from_secs(3)),
+            "must wait on the exhausted dimension, not the healthy one",
+        );
+    }
+
+    /// Both dimensions exhausted → wait for the later of the two, since
+    /// retrying while either is still empty just earns another 429.
+    #[test]
+    fn both_dimensions_exhausted_waits_for_the_later_reset() {
+        let msg = "429\n\
+             x-ratelimit-remaining-requests: 0\n\
+             x-ratelimit-reset-requests: 3s\n\
+             x-ratelimit-remaining-tokens: 0\n\
+             x-ratelimit-reset-tokens: 45s";
+        assert_eq!(
+            rate_limit_signal(msg).reset_in,
+            Some(Duration::from_secs(45))
+        );
+    }
+
+    /// The generic `x-ratelimit-reset` lookup must not be satisfied by
+    /// the longer `x-ratelimit-reset-requests` label.
+    #[test]
+    fn generic_reset_label_does_not_swallow_the_suffixed_one() {
+        let msg = "429 x-ratelimit-reset-tokens: 90s";
+        let sig = rate_limit_signal(msg);
+        assert_eq!(sig.reset_in, Some(Duration::from_secs(90)));
+        // No bare `x-ratelimit-reset:` present, so nothing should have
+        // matched a truncated prefix and produced a different value.
+        assert!(!sig.exhausted, "no remaining:0 was reported");
+    }
+
+    /// Anthropic publishes resets as RFC 3339 instants.
+    #[test]
+    fn anthropic_rfc3339_reset_headers_parse() {
+        let reset = (chrono::Utc::now() + chrono::Duration::seconds(25)).to_rfc3339();
+        let msg = format!(
+            "429 Too Many Requests\n\
+             anthropic-ratelimit-requests-remaining: 0\n\
+             anthropic-ratelimit-requests-reset: {reset}"
+        );
+        let sig = rate_limit_signal(&msg);
+        assert!(sig.exhausted);
+        let d = sig.reset_in.expect("RFC 3339 reset parses");
+        assert!((20..=30).contains(&d.as_secs()), "expected ~25s, got {d:?}",);
+    }
+
+    /// An explicit `Retry-After` still outranks the reset headers — it is
+    /// the provider's direct instruction, whereas a reset is the window
+    /// boundary we infer from.
+    #[test]
+    fn retry_after_takes_priority_over_ratelimit_reset() {
+        let msg = "429; Retry-After: 7; x-ratelimit-reset: 300s";
+        assert_eq!(
+            retry_after_from_error_msg(msg),
+            Some(Duration::from_secs(7)),
+        );
+    }
+
+    /// A reset that has already elapsed (stale value, or the local clock
+    /// running ahead of the provider's) must not be read as "the window is
+    /// open" — that would let a daily cap through as a retryable throttle.
+    /// The wording heuristic still catches it.
+    #[test]
+    fn an_already_elapsed_reset_falls_through_to_the_wording_heuristic() {
+        let past = (chrono::Utc::now() - chrono::Duration::hours(1)).timestamp_millis();
+        let msg = format!(
+            r#"429 Too Many Requests {{"message":"Rate limit exceeded: free-models-per-day.","metadata":{{"headers":{{"X-RateLimit-Remaining":"0","X-RateLimit-Reset":"{past}"}}}}}}"#
+        );
+        assert_eq!(classify_error(&msg), ErrorKind::UsageCap);
+    }
+
+    /// ...but an elapsed reset on a per-MINUTE window still stays
+    /// retryable — the window really has rolled, so retrying is right.
+    #[test]
+    fn an_elapsed_reset_on_a_short_window_stays_retryable() {
+        let past = (chrono::Utc::now() - chrono::Duration::minutes(5)).timestamp_millis();
+        let msg = format!(
+            r#"429 Too Many Requests {{"message":"Rate limit exceeded: free-models-per-min.","metadata":{{"headers":{{"X-RateLimit-Remaining":"0","X-RateLimit-Reset":"{past}"}}}}}}"#
+        );
+        assert_eq!(classify_error(&msg), ErrorKind::RateLimit);
+        // And the backoff falls back to the exponential schedule rather
+        // than retrying instantly on a zero wait.
+        let d = RecoveryPolicy::default().backoff_duration_for_msg(0, &msg);
+        assert!(d >= Duration::from_secs(1), "got {d:?}");
+    }
+
+    /// A 429 with no reset information at all keeps the old behaviour:
+    /// retryable, exponential backoff, nothing invented.
+    #[test]
+    fn bare_429_without_reset_info_is_unchanged() {
+        let sig = rate_limit_signal("HTTP 429 Too Many Requests");
+        assert!(!sig.exhausted);
+        assert_eq!(sig.reset_in, None);
+        assert_eq!(
+            classify_error("HTTP 429 Too Many Requests"),
+            ErrorKind::RateLimit
+        );
+    }
+
+    /// A non-rate-limit message must not yield a signal — the extractor
+    /// is only consulted for 429-shaped errors, but keep it honest.
+    #[test]
+    fn unrelated_error_yields_no_rate_limit_signal() {
+        let sig = rate_limit_signal("connection reset by peer");
+        assert!(!sig.exhausted);
+        assert_eq!(sig.reset_in, None);
+        assert_eq!(sig.scope, None);
+    }
+
+    /// `remaining: 0` with no parseable reset is still a definitive
+    /// "this attempt cannot succeed" — the gate needs to know that even
+    /// when it can't compute a deadline.
+    #[test]
+    fn exhaustion_is_reported_even_without_a_parseable_reset() {
+        let sig = rate_limit_signal(r#"429 {"X-RateLimit-Remaining":"0"}"#);
+        assert!(sig.exhausted);
+        assert_eq!(sig.reset_in, None);
     }
 }
