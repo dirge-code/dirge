@@ -4,6 +4,46 @@ All notable changes to dirge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.19.22] - 2026-07-26
+
+### Fixed
+- Retry logic now honours rate-limit reset headers instead of backing off blind
+  (#718). OpenRouter's 429 carries no `Retry-After` — the reset is epoch millis
+  in the body, under `error.metadata.headers.X-RateLimit-Reset` — and dirge
+  never parsed it, so every 429 fell through to plain exponential backoff. That
+  hurt twice. The per-minute budget (~31s over five retries) expired before a
+  42s window rolled, and the rate-limit-to-usage-cap promotion never fired for a
+  `free-models-per-day` 429 whose reset was 15h out, so a daily cap got retried
+  like a transient blip. In the reported log 118 of 154 requests were 429s, and
+  the retries alone burned the account's 50/day free quota in under three
+  minutes.
+
+  `Retry-After` parsing now also reads `x-ratelimit-reset` and the
+  `anthropic-ratelimit-*-reset` family, telling epoch millis, epoch seconds,
+  relative seconds, Go durations (`2m59.56s`, `6m0s`) and RFC 3339 apart by
+  shape. A reset pairs with the dimension whose `remaining` hit 0, so an
+  exhausted request window no longer makes dirge wait out an unrelated token
+  window. An explicit `Retry-After` still wins, and an already-elapsed reset is
+  not treated as hard data — it falls through to the wording heuristic, which
+  now recognises `per-day` phrasing.
+
+  When a provider definitively reports a window exhausted, further requests to
+  that host are answered locally instead of sent. The wasted requests came from
+  independent retry budgets — agent turn, run-level recovery, summarizer,
+  post-session — that could not see each other being throttled.
+
+### Changed
+- Provider rate-limit headers now survive the streaming path. rig flattens any
+  non-2xx into status plus body text and drops the header map before dirge sees
+  it, and streaming carries every provider request — so providers that report
+  their limits only in real headers (OpenAI's `x-ratelimit-reset-*`, Groq's
+  `retry-after`, Anthropic's `anthropic-ratelimit-*-reset`) were invisible.
+  Only OpenRouter, which nests its headers in the 429 body, and Zhipu, which
+  writes the reset into the message, were covered. For a plain reqwest client
+  dirge now drives the streaming request itself: the success path mirrors rig
+  exactly, and only the non-2xx branch differs, keeping the headers and
+  reproducing rig's error verbatim.
+
 ## [0.19.21] - 2026-07-26
 
 ### Fixed
