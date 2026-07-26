@@ -228,6 +228,34 @@ impl HttpClientExt for AnthropicHttpClient {
     }
 }
 
+/// Anthropic is one of the providers that reports rate-limit state ONLY in
+/// real headers (`retry-after`, `anthropic-ratelimit-*-reset`), so it has the
+/// most to gain from the header-preserving path. The inner client is a plain
+/// `reqwest::Client`, so this delegates there rather than through rig — same
+/// normalization as [`HttpClientExt::send_streaming`] above, just without
+/// rig's status check discarding the `HeaderMap`.
+impl super::compressing_http::StreamingWithHeaders for AnthropicHttpClient {
+    fn send_streaming_with_headers(
+        &self,
+        req: http::Request<Bytes>,
+    ) -> impl Future<Output = super::compressing_http::StreamingSend> + Send {
+        use super::compressing_http::StreamingSend;
+        let inner = self.inner.clone();
+        let req = self.normalized_request(req);
+        async move {
+            match req {
+                Ok(req) => inner.send_streaming_with_headers(req).await,
+                // A normalization failure never reached the network, so there
+                // is no response and no headers to keep.
+                Err(e) => StreamingSend {
+                    result: Err(e),
+                    headers: None,
+                },
+            }
+        }
+    }
+}
+
 fn is_messages_path(path: &str) -> bool {
     path.ends_with("/messages")
 }
@@ -840,5 +868,56 @@ mod tests {
 
         let normalized = client.normalized_request(req).unwrap();
         assert_eq!(normalized.into_body(), body);
+    }
+
+    /// dirge-hydd: Anthropic reports rate-limit state only in real headers, so
+    /// the wrapper must hand them through rather than letting rig's status
+    /// check flatten the 429 into status+body and drop the `HeaderMap`. A
+    /// `None` here would silently reduce the streaming path back to
+    /// body-only parsing, which for Anthropic means no signal at all.
+    #[tokio::test]
+    async fn streaming_429_surfaces_response_headers() {
+        use super::super::compressing_http::StreamingWithHeaders;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let _ = sock.read(&mut buf).await;
+            let _ = sock
+                .write_all(
+                    b"HTTP/1.1 429 Too Many Requests\r\n\
+                      retry-after: 42\r\n\
+                      anthropic-ratelimit-requests-remaining: 0\r\n\
+                      content-length: 9\r\n\r\nrate limit",
+                )
+                .await;
+            let _ = sock.flush().await;
+        });
+
+        let client = AnthropicHttpClient::new("sk-ant-api03-test".to_string());
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("http://{addr}/v1/messages"))
+            .body(Bytes::from_static(b"{}"))
+            .unwrap();
+
+        let sent = client.send_streaming_with_headers(req).await;
+        assert!(sent.result.is_err(), "429 must surface as an error");
+        let headers = sent
+            .headers
+            .expect("the 429's headers must survive for the rate-limit gate");
+        assert_eq!(
+            headers.get("retry-after").and_then(|v| v.to_str().ok()),
+            Some("42"),
+        );
+        assert_eq!(
+            headers
+                .get("anthropic-ratelimit-requests-remaining")
+                .and_then(|v| v.to_str().ok()),
+            Some("0"),
+        );
     }
 }
