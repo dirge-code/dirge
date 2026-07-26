@@ -1640,15 +1640,21 @@ where
     F: FnOnce(mpsc::Sender<DialogReply>) -> DialogRequest,
 {
     let (reply_tx, reply_rx) = mpsc::channel();
-    let req = build(reply_tx);
-    tx.send(req).ok()?;
 
     // Mark a dialog in flight so the host's eval loop keeps waiting for the
     // human answer instead of timing out at the tight per-hook budget and
     // running the gated tool while the confirm is still on screen
     // (dirge-hwzs). Cleared when this scope exits (answer, timeout, or
     // shutdown), so a hook stuck for a NON-dialog reason still times out.
+    //
+    // Entered BEFORE the request is published: once the responder can see
+    // the request it can also answer it, and anything observing "is a
+    // dialog in flight?" in that window must not see zero. Sending first
+    // left a gap where the dialog was visible but not yet counted.
     let _pending = DialogPendingGuard::enter();
+
+    let req = build(reply_tx);
+    tx.send(req).ok()?;
 
     // Poll for the reply. Wake every `DIALOG_POLL` to check the
     // worker-shutdown flag so a UI exit or `Worker::Drop` doesn't pin
@@ -2641,31 +2647,56 @@ mod tests {
     /// (`dispatch_tool_hook`) sees no block and runs the gated tool while
     /// the confirm is still on screen. Here the answer arrives well after
     /// the 100 ms base timeout; the in-flight dialog must extend the wait.
+    /// The base budget must comfortably exceed the time the worker needs to
+    /// go from `Cmd::Eval` to entering `harness/confirm`, because the
+    /// extension only engages if `dialog_pending` is already set when the
+    /// budget expires. The original 100 ms raced a cold Janet VM and failed
+    /// on loaded CI with "did not reply within 0s"; the warm-up eval below
+    /// removes VM init from that path, and this leaves generous headroom for
+    /// scheduling jitter on top.
+    const CONFIRM_BASE_BUDGET: Duration = Duration::from_millis(750);
+    /// Must exceed [`CONFIRM_BASE_BUDGET`] — that gap is the whole point of
+    /// the test, so the answer cannot arrive before the base budget lapses.
+    const CONFIRM_ANSWER_DELAY: Duration = Duration::from_millis(1500);
+
     #[test]
     fn eval_waits_for_an_in_flight_confirm_past_the_base_timeout() {
         let (mut worker, mut dialog_rx, _lsp_rx) = Worker::try_spawn().unwrap();
 
-        // Answer only after a delay far longer than the base timeout below.
+        // Warm up so the timed eval below doesn't pay Janet VM init. Without
+        // this the worker could still be starting when the base budget
+        // expires, `dialog_pending` would read 0, and the eval would time
+        // out — the extension never getting a chance to engage.
+        worker.eval("(+ 1 1)").expect("warm-up eval");
+
+        // Answer only after a delay longer than the base budget.
         let helper = std::thread::spawn(move || match dialog_rx.blocking_recv() {
             Some(DialogRequest::Confirm { reply, .. }) => {
-                std::thread::sleep(Duration::from_millis(400));
+                std::thread::sleep(CONFIRM_ANSWER_DELAY);
                 let _ = reply.send(DialogReply::Confirm(true));
             }
             other => panic!("unexpected dialog request: {other:?}"),
         });
 
-        // Base timeout (100 ms) ≪ the 400 ms answer delay. Pre-fix this
-        // returned a timeout Err; the in-flight-dialog extension makes it
-        // wait for the real answer.
-        let r = worker.eval_with_timeout(
-            r#"(harness/confirm "warn" "really?")"#,
-            Duration::from_millis(100),
-        );
+        // Pre-fix this returned a timeout Err; the in-flight-dialog
+        // extension makes it wait for the real answer.
+        let started = std::time::Instant::now();
+        let r =
+            worker.eval_with_timeout(r#"(harness/confirm "warn" "really?")"#, CONFIRM_BASE_BUDGET);
+        let waited = started.elapsed();
         helper.join().unwrap();
         assert_eq!(
             r.as_deref(),
             Ok("true"),
             "eval must wait for the confirm answer instead of timing out, got {r:?}"
+        );
+        // Guards against the assertion above passing for the wrong reason: if
+        // the answer somehow arrived before the base budget lapsed, the
+        // extension was never exercised and this test proves nothing.
+        assert!(
+            waited >= CONFIRM_BASE_BUDGET,
+            "the answer must arrive AFTER the base budget lapses, else the \
+             extension path is untested (waited {waited:?})",
         );
     }
 
