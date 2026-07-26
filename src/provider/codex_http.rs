@@ -201,6 +201,30 @@ impl HttpClientExt for CodexHttpClient {
     }
 }
 
+/// Same reasoning as the Anthropic client: the inner is a plain
+/// `reqwest::Client`, so delegate to the header-preserving path instead of
+/// letting rig's status check drop the `HeaderMap`. OpenAI reports its
+/// `x-ratelimit-reset-*` windows in headers only.
+impl super::compressing_http::StreamingWithHeaders for CodexHttpClient {
+    fn send_streaming_with_headers(
+        &self,
+        req: http::Request<Bytes>,
+    ) -> impl Future<Output = super::compressing_http::StreamingSend> + Send {
+        use super::compressing_http::StreamingSend;
+        let inner = self.inner.clone();
+        let req = self.normalized_request(req);
+        async move {
+            match req {
+                Ok(req) => inner.send_streaming_with_headers(req).await,
+                Err(e) => StreamingSend {
+                    result: Err(e),
+                    headers: None,
+                },
+            }
+        }
+    }
+}
+
 fn is_responses_path(path: &str) -> bool {
     path.ends_with("/responses")
 }
