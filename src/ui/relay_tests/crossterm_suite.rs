@@ -139,6 +139,8 @@ mod tests {
             let injector_bytes2 = Arc::clone(&injector_bytes);
             let shutdown_active = Arc::new(AtomicBool::new(false));
             let shutdown_active2 = Arc::clone(&shutdown_active);
+            let injector_paused = Arc::new(AtomicBool::new(false));
+            let injector_paused2 = Arc::clone(&injector_paused);
             let charset: Vec<u8> = (b'a'..=b'z')
                 .chain(b'A'..=b'Z')
                 .chain(b'0'..=b'9')
@@ -148,6 +150,10 @@ mod tests {
                 for i in 0u64.. {
                     if !injector_running2.load(Ordering::Relaxed) {
                         break;
+                    }
+                    if injector_paused2.load(Ordering::Relaxed) {
+                        std::thread::sleep(Duration::from_millis(1));
+                        continue;
                     }
                     let b = charset[i as usize % charset.len()];
                     let _ = pri.write_all(&[b]);
@@ -160,20 +166,58 @@ mod tests {
             });
 
             std::thread::sleep(Duration::from_millis(100));
+
+            // Pause the flood and let the bridge catch up before sampling the
+            // baseline. `event_count` is incremented by the BRIDGE thread,
+            // which trails the reader under load — sampling while it lags
+            // credits pre-shutdown events to the post-shutdown window and
+            // inflates `new_events`. That is a measurement artifact, not a
+            // reader that ignored the flag: on a loaded machine this reported
+            // 8 "new" events from a 2-byte shutdown window. With the flood
+            // paused the bridge drains to a fixed point, so the baseline is
+            // exact.
+            injector_paused.store(true, Ordering::Relaxed);
+            let settle_deadline = Instant::now() + Duration::from_secs(2);
+            let mut last_seen = event_count.load(Ordering::Relaxed);
+            loop {
+                std::thread::sleep(Duration::from_millis(10));
+                let current = event_count.load(Ordering::Relaxed);
+                if current == last_seen || Instant::now() >= settle_deadline {
+                    break;
+                }
+                last_seen = current;
+            }
             let events_before = event_count.load(Ordering::Relaxed);
 
+            // Resume so bytes are genuinely in flight as shutdown lands —
+            // that in-flight byte is the race this section exists to check.
+            injector_paused.store(false, Ordering::Relaxed);
             shutdown_active.store(true, Ordering::Relaxed);
             crate::ui::terminal::EVENT_READER_SHUTDOWN.store(true, Ordering::Relaxed);
             crate::ui::terminal::join_reader(Duration::from_millis(50));
 
-            // The reader is now joined (consuming nothing). The earlier
-            // version drained whatever the free-running injector happened
-            // to have buffered at this instant — racy, so the drain came
-            // back empty intermittently. Instead write a DETERMINISTIC
-            // sentinel (a byte outside the injector's alnum charset) now
-            // that nothing will consume it, and drain until it appears.
-            // This still exercises the drain-capture path (the real
-            // invariant) without depending on injector timing.
+            // Quiesce the injector BEFORE the sentinel. The shutdown-race
+            // window this section measures is already closed — the flood ran
+            // continuously through `EVENT_READER_SHUTDOWN` and the join above,
+            // which is what puts bytes in flight at the moment of shutdown —
+            // so stopping here costs the test nothing.
+            //
+            // Leaving it running made the drain below chase a live producer:
+            // the sentinel lands behind whatever the injector has already
+            // queued, and at ~1 byte/ms the drain consumes at roughly the
+            // production rate without ever clearing that backlog. On loaded
+            // CI the deadline expired with the sentinel still buffered
+            // (observed: drained=187, shutdown_window_bytes=191, no sentinel).
+            // With the producer stopped the backlog is finite, so the drain
+            // reaches the sentinel in bounded time.
+            injector_running.store(false, Ordering::Relaxed);
+            let _ = injector.join();
+
+            // The reader is joined and the flood is stopped, so nothing will
+            // consume this. Write a DETERMINISTIC sentinel (a byte outside
+            // the injector's alnum charset) and drain until it appears — the
+            // earlier version drained whatever happened to be buffered at
+            // this instant, which came back empty intermittently.
             const SENTINEL: u8 = b'~';
             {
                 let mut sentinel_pri = primary.try_clone().expect("clone primary for sentinel");
@@ -181,7 +225,11 @@ mod tests {
                 let _ = sentinel_pri.flush();
             }
             let mut drained: Vec<u8> = Vec::new();
-            let drain_deadline = Instant::now() + Duration::from_millis(200);
+            // Generous, but the loop exits the moment the sentinel appears —
+            // this only bounds the pathological case. With the producer
+            // stopped the backlog is finite, so a slow runner needs headroom
+            // to chew through it, not a tighter deadline.
+            let drain_deadline = Instant::now() + Duration::from_secs(2);
             while Instant::now() < drain_deadline {
                 drained.extend_from_slice(&crate::ui::terminal::drain_stdin_nonblocking());
                 if drained.contains(&SENTINEL) {
@@ -205,8 +253,6 @@ mod tests {
             }
             let events_after = event_count.load(Ordering::Relaxed);
 
-            injector_running.store(false, Ordering::Relaxed);
-            let _ = injector.join();
             bridge_done.store(true, Ordering::Relaxed);
             let _ = bridge.join();
 
