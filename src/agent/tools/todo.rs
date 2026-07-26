@@ -51,6 +51,17 @@ pub struct TodoWriteArgs {
 /// hit SQLite on every redraw. The DB is authoritative; this is a cache.
 pub static TODO_LIST: std::sync::Mutex<Vec<TodoItem>> = std::sync::Mutex::new(Vec::new());
 
+/// Test-only serialization lock for the [`TODO_LIST`] mirror. dirge-g2ex.
+///
+/// The mirror is process-global but cargo runs tests in parallel threads within
+/// ONE process, so any two tests that seed it clobber each other's fixture and
+/// fail nondeterministically. Locking `TODO_LIST` itself isn't enough — a test
+/// seeds, then drops the lock to call the code under test, which is where the
+/// other test's write lands. Every test that WRITES the mirror must hold this
+/// for the whole seed-act-assert span instead.
+#[cfg(test)]
+pub(crate) static TODO_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Re-query the session's live board from the issue DB and replace the
 /// [`TODO_LIST`] mirror. Best-effort: a DB open/read failure leaves the mirror
 /// as-is (transient lock) rather than blanking the panel. `session_id = None`
@@ -249,6 +260,9 @@ mod tool_tests {
     /// upserting by title across calls (no duplicate rows, omitted items kept).
     #[tokio::test]
     async fn write_todo_list_persists_to_the_issue_board() {
+        // dirge-g2ex: the tool refreshes the process-global TODO_LIST mirror,
+        // so serialize against every other test that seeds it.
+        let _lock = TODO_TEST_LOCK.lock_ignore_poison();
         let db = tmp_db();
         let tool = WriteTodoList::new(db.clone(), Some("sess-1".into()), None, None);
 
@@ -303,6 +317,9 @@ mod nudge_tests {
     /// blocked/done/cancelled. (Mutates the global TODO_LIST mirror directly.)
     #[test]
     fn unfinished_count_counts_open_and_in_progress() {
+        // dirge-g2ex: hold the shared lock — the agent-loop todo-gate tests
+        // seed this same mirror in parallel.
+        let _lock = TODO_TEST_LOCK.lock_ignore_poison();
         let item = |status: &str| TodoItem {
             content: "x".into(),
             status: status.into(),

@@ -9,6 +9,7 @@ critic_preamble: |
   - Do NOT block because no code was written, edited, or run — that is expected in this mode. Do not demand implementation or file changes.
   - A tool result tagged `[DENIED]` (or whose text begins `Permission denied` / `Auto-approval denied`) is a PERMISSION block, not a failure. Treat that capability as out of scope: never demand the agent retry it or route around it.
   - A block marked `[CONTEXT COMPACTION — REFERENCE ONLY]` describes ALREADY-COMPLETED prior work — never treat it as an outstanding requirement.
+  - If the agent ended by asking the user a question or presenting options and is waiting on their decision, that is a CORRECT stopping point — never tell it to proceed anyway, pick a default, or guess. Judge only the answer given up to the question.
   - If the agent stated it could not find or verify something, treat that as an honest answer, not a gap — unless the evidence was clearly within reach and ignored.
   - Do NOT invent new requirements, scope, or "nice to haves". If you are unsure, PASS — a false block wastes a whole turn.
 ---
