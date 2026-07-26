@@ -4357,7 +4357,10 @@ async fn awaiting_user_gate_defers_when_coordinator_running() {
 /// seed and our assert and the gate sees the wrong count (dirge-g2ex). Field
 /// order matters: `Drop::drop` clears the mirror, then the guard field releases
 /// the lock.
-struct TodoGuard(std::sync::MutexGuard<'static, ()>);
+struct TodoGuard(
+    // Held for RAII only — never read. Dropping it is the entire point.
+    #[allow(dead_code)] std::sync::MutexGuard<'static, ()>,
+);
 impl Drop for TodoGuard {
     fn drop(&mut self) {
         crate::agent::tools::todo::TODO_LIST

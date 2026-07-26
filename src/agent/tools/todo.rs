@@ -259,9 +259,14 @@ mod tool_tests {
     /// `write_todo_list` writes its plan through to the session's issue board,
     /// upserting by title across calls (no duplicate rows, omitted items kept).
     #[tokio::test]
+    // dirge-g2ex: the guard is held across `tool.call(...).await`. Safe here —
+    // `#[tokio::test]` is a single-task current-thread runtime, so there is no
+    // second task to deadlock against, and a std guard blocking a sibling test
+    // thread is exactly the serialization we want.
+    #[allow(clippy::await_holding_lock)]
     async fn write_todo_list_persists_to_the_issue_board() {
-        // dirge-g2ex: the tool refreshes the process-global TODO_LIST mirror,
-        // so serialize against every other test that seeds it.
+        // The tool refreshes the process-global TODO_LIST mirror, so serialize
+        // against every other test that seeds it.
         let _lock = TODO_TEST_LOCK.lock_ignore_poison();
         let db = tmp_db();
         let tool = WriteTodoList::new(db.clone(), Some("sess-1".into()), None, None);
