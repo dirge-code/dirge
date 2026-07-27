@@ -509,9 +509,17 @@ where
                     let error_msg = err.to_string();
                     use crate::agent::recovery::classify_error;
                     let kind = classify_error(&error_msg);
-                    tracing::debug!(
+                    // #711: log the provider's own message, not just the kind
+                    // it classified to. The message is the only place the
+                    // actionable detail lives (which model, which account,
+                    // which limit); downstream it is reduced to a capped
+                    // `failed: …` line, so dropping it here left mis-routed
+                    // requests with no diagnostics anywhere.
+                    tracing::warn!(
+                        target: "dirge::provider",
                         error_kind = %format!("{:?}", kind),
-                        "stream event: error"
+                        error = %error_msg,
+                        "llm stream error"
                     );
                     yield StreamEvent::Error {
                         error: error_msg,

@@ -310,6 +310,20 @@ where
                 }
             }
             Ok(Err(e)) => {
+                // #711: this is where a provider REJECTION lands — the request
+                // fails at the response headers, before any event streams. The
+                // body carries the actionable reason ("model X is not supported
+                // when using Codex with a ChatGPT account"), and downstream it
+                // is only ever surfaced as a capped `[task <id>] failed: …`
+                // string. Log it verbatim with the provider + model that
+                // produced it so the cause is recoverable from the log alone.
+                tracing::warn!(
+                    target: "dirge::provider",
+                    provider = %provider.unwrap_or("default"),
+                    model = %model_name.as_ref().as_deref().unwrap_or("default"),
+                    error = %e,
+                    "llm request rejected before the stream started",
+                );
                 yield StreamEvent::Error {
                     error: format!("rig stream call failed: {e}"),
                 };

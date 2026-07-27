@@ -159,6 +159,20 @@ pub fn retrying_stream_fn_with_non_retryable(
                             // below.
                             let retryable =
                                 policy.should_retry(attempts, kind) && !committed;
+                            // #711: the retry layer used to make this decision
+                            // silently, so a request that failed on every
+                            // attempt left no record of how many attempts ran or
+                            // why they stopped. Log the decision with the
+                            // classified kind and the provider's message.
+                            tracing::info!(
+                                target: "dirge::provider",
+                                attempt = attempts + 1,
+                                error_kind = %format!("{kind:?}"),
+                                retrying = retryable,
+                                committed,
+                                error = %error,
+                                "llm stream error: retry decision",
+                            );
                             if retryable {
                                 retry_msg = Some(error.clone());
                                 // Don't yield this Error — we're
