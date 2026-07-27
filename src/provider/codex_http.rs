@@ -212,15 +212,35 @@ impl super::compressing_http::StreamingWithHeaders for CodexHttpClient {
     ) -> impl Future<Output = super::compressing_http::StreamingSend> + Send {
         use super::compressing_http::StreamingSend;
         let inner = self.inner.clone();
+        let is_responses_stream = is_responses_path(req.uri().path());
         let req = self.normalized_request(req);
         async move {
-            match req {
+            let mut send = match req {
                 Ok(req) => inner.send_streaming_with_headers(req).await,
                 Err(e) => StreamingSend {
                     result: Err(e),
                     headers: None,
                 },
+            };
+            // rig's `openai` (Responses) provider does not set
+            // `.allow_missing_content_type()` (only the `chatgpt` provider
+            // does), so the Codex/ChatGPT `/responses` endpoint — which omits
+            // a Content-Type rig's strict SSE decoder accepts — is rejected as
+            // `Invalid content type was returned`. This seam is the only
+            // streaming path `CompressingHttpClient` routes through, so the
+            // injection that used to live in `send_streaming` must live here.
+            if is_responses_stream
+                && let Ok(response) = send.result.as_mut()
+                && !response
+                    .headers()
+                    .contains_key(reqwest::header::CONTENT_TYPE)
+            {
+                response.headers_mut().insert(
+                    reqwest::header::CONTENT_TYPE,
+                    http::HeaderValue::from_static("text/event-stream"),
+                );
             }
+            send
         }
     }
 }
@@ -471,5 +491,51 @@ mod tests {
             serde_json::from_slice(&normalize_codex_responses_body(body)).unwrap();
 
         assert_eq!(value["store"], false);
+    }
+
+    /// #718 regression: when streaming was re-routed through the
+    /// `send_streaming_with_headers` seam, the `Content-Type: text/event-stream`
+    /// fixup the old `send_streaming` did for the Codex/ChatGPT `/responses`
+    /// endpoint was dropped. That endpoint omits a content-type rig's strict
+    /// SSE decoder accepts, and rig's `openai` (Responses) provider does not
+    /// call `.allow_missing_content_type()` (only the `chatgpt` provider does),
+    /// so the stream was rejected as `Invalid content type was returned`. The
+    /// seam must restore the injection on the happy-path `/responses` response.
+    #[tokio::test]
+    async fn responses_stream_injects_text_event_stream_when_absent() {
+        use crate::provider::compressing_http::StreamingWithHeaders;
+
+        // Loopback server: 200 OK with NO Content-Type, mirroring the Codex
+        // /responses streaming endpoint. No mock crate needed.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let _ = sock.read(&mut buf).await;
+            let body = b"data: {\"type\":\"response.completed\"}\n\n";
+            let head = format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n", body.len());
+            let _ = sock.write_all(head.as_bytes()).await;
+            let _ = sock.write_all(body).await;
+            let _ = sock.flush().await;
+        });
+
+        let client = CodexHttpClient::default();
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("http://{addr}/responses"))
+            .body(Bytes::from_static(b"{}"))
+            .unwrap();
+
+        let sent = client.send_streaming_with_headers(req).await;
+        let response = sent
+            .result
+            .expect("happy-path /responses stream must succeed");
+        let ct = response
+            .headers()
+            .get(http::header::CONTENT_TYPE)
+            .expect("Content-Type must be injected on a /responses stream lacking one");
+        assert_eq!(ct, "text/event-stream");
     }
 }
