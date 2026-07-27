@@ -421,6 +421,20 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    // `HostKeys::generate` shells out to `ssh-keygen`; when that binary isn't
+    // installed (e.g. a minimal CI runner) the host-key tests would panic on
+    // process spawn instead of exercising anything. Skip loudly in that case —
+    // the assertions below still run in full wherever ssh-keygen exists.
+    fn ssh_keygen_on_path() -> bool {
+        // `is_file`, not `exists`: a *directory* named `ssh-keygen` on PATH
+        // would satisfy the guard and then panic on spawn — the very failure
+        // this check exists to prevent. Fails safe in the other direction too
+        // (an unreadable PATH entry skips rather than panics).
+        std::env::var_os("PATH")
+            .map(|p| std::env::split_paths(&p).any(|dir| dir.join("ssh-keygen").is_file()))
+            .unwrap_or(false)
+    }
+
     #[test]
     fn ssh_exec_connection_refused() {
         // Pick a port where nothing is listening.
@@ -534,6 +548,12 @@ mod tests {
 
     #[test]
     fn host_keys_public_key_bytes_roundtrip() {
+        if !ssh_keygen_on_path() {
+            eprintln!(
+                "skipping: ssh-keygen not on PATH; install it to exercise host-key generation"
+            );
+            return;
+        }
         let hk = HostKeys::generate().expect("generate host keys");
         let raw = hk.public_key_bytes().expect("decode public key");
         assert_eq!(raw.len(), 32, "ed25519 raw key must be 32 bytes");
@@ -543,6 +563,12 @@ mod tests {
 
     #[test]
     fn host_keys_generated_key_is_ed25519() {
+        if !ssh_keygen_on_path() {
+            eprintln!(
+                "skipping: ssh-keygen not on PATH; install it to exercise host-key generation"
+            );
+            return;
+        }
         let hk = HostKeys::generate().unwrap();
         assert!(
             hk.public_key.starts_with("ssh-ed25519 "),
