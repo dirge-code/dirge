@@ -4,6 +4,48 @@ All notable changes to dirge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.19.23] - 2026-07-27
+
+### Fixed
+- A model change now rebuilds the client that serves it (#711). A
+  `task(agent=…)` profile pinning a model from another family was built against
+  the ACTIVE client, so `model: glm-5.2` under a Codex/ChatGPT client was POSTed
+  to the ChatGPT endpoint and rejected on the subagent's first turn — the common
+  "main session on a subscription, cheap subagents on a separate provider" setup
+  failed 100%. `/agent <name>` had the same defect on the main session, and
+  `/agent off` restored the pre-agent model without restoring the client it came
+  from. `/model` and the plugin model swap already cross-routed, each with its
+  own copy of the logic.
+
+  Changing the model and changing the client are one operation, so all five
+  paths now share one seam that keeps them together. `/agent off` restores the
+  captured (provider, model) pair rather than re-deriving it from the id, which
+  can pick a different alias of the same family or refuse outright when the
+  pre-agent provider was a built-in with no `providers` entry.
+
+- A `vendor/model` id no longer reroutes away from the gateway that serves it.
+  The family inference behind `/model` read `anthropic/claude-opus-4` as an
+  Anthropic id, so on an OpenRouter session with an Anthropic provider also
+  configured it switched to the direct Anthropic client, which rejects the
+  prefixed id. A prefixed id now stays on an active provider whose own pinned or
+  default model is prefixed too.
+
+- Cross-provider switching picks its target deterministically. When two aliases
+  pinned the same model id the choice came from `HashMap` iteration order, so
+  the same `/model` command could land on a different provider between runs.
+
+- The Codex `/responses` streaming path sends `Content-Type` again (#722), which
+  #718 dropped when it re-routed streaming through a header-preserving seam.
+
+### Changed
+- Failed LLM requests now say what the provider said. A rejection fails before
+  any event streams and its body carries the only actionable detail — which
+  model, which account, which limit — but only the classified error kind was
+  logged, at debug, and the message surfaced downstream as a capped
+  `[task <id>] failed: …`. The body is now logged at warn with the provider and
+  model that produced it, stream errors carry their message alongside the kind,
+  and each retry attempt's decision is recorded at info.
+
 ## [0.19.22] - 2026-07-26
 
 ### Fixed
