@@ -388,7 +388,9 @@ where
     })
 }
 
-fn encode_form(params: &[(String, String)]) -> String {
+/// Shared with the Kimi device flow (`kimi_device.rs`), which speaks the
+/// same `application/x-www-form-urlencoded` POST shape on every endpoint.
+pub(crate) fn encode_form(params: &[(String, String)]) -> String {
     params
         .iter()
         .map(|(key, value)| format!("{}={}", form_escape(key), form_escape(value)))

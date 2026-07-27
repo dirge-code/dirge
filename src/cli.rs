@@ -298,6 +298,13 @@ pub enum AuthAction {
     },
     /// Start Anthropic Claude Code OAuth login and persist credentials
     Anthropic,
+    /// Log in to Kimi Code (Moonshot) using device-code OAuth
+    #[command(
+        name = "kimi",
+        visible_alias = "kimi-code",
+        long_about = "Log in to Kimi Code (Moonshot) using device-code OAuth.\n\nPrints a verification URL and user code; authorize in the browser and Dirge polls until the login completes. Requires a Kimi membership with coding-plan access."
+    )]
+    Kimi,
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -710,6 +717,23 @@ mod tests {
                 action: AuthAction::Openai { device_code: true },
             }) => {}
             other => panic!("expected auth openai --device-code command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_auth_kimi_subcommand_and_kimi_code_alias() {
+        for args in [
+            ["dirge", "auth", "kimi"],
+            ["dirge", "auth", "kimi-code"],
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+
+            match cli.command {
+                Some(Command::Auth {
+                    action: AuthAction::Kimi,
+                }) => {}
+                other => panic!("expected auth kimi command from {args:?}, got {other:?}"),
+            }
         }
     }
 }

@@ -1,10 +1,14 @@
+use super::kimi_device::{
+    DeviceAuthorization, KimiDeviceAuthFlow, KimiDeviceAuthHttp, KimiDeviceAuthRuntime,
+    Result as KimiAuthResult, TokenInfo,
+};
 use super::oauth_pkce;
 use super::openai_device::{
     DEFAULT_CLIENT_ID, DEFAULT_ISSUER, DeviceAuthHttp, DeviceAuthRuntime, DeviceCode,
     OpenAiDeviceAuthFlow, Result as DeviceAuthResult,
 };
 use super::openai_oauth::{self, OAuthTokens};
-use super::store::{OpenAiAuthStore, OpenAiOAuthCredential};
+use super::store::{KimiAuthStore, KimiOAuthCredential, OpenAiAuthStore, OpenAiOAuthCredential};
 use anyhow::Context;
 use std::future::Future;
 use std::io::Write;
@@ -22,6 +26,9 @@ const OPENAI_OAUTH_SCOPE: &str = "openid profile email offline_access";
 const OPENAI_OAUTH_ORIGINATOR: &str = "dirge";
 type DeviceCodeFuture<'a> = Pin<Box<dyn Future<Output = DeviceAuthResult<DeviceCode>> + Send + 'a>>;
 type TokenFuture<'a> = Pin<Box<dyn Future<Output = DeviceAuthResult<OAuthTokens>> + Send + 'a>>;
+type KimiAuthorizationFuture<'a> =
+    Pin<Box<dyn Future<Output = KimiAuthResult<DeviceAuthorization>> + Send + 'a>>;
+type KimiTokenFuture<'a> = Pin<Box<dyn Future<Output = KimiAuthResult<TokenInfo>> + Send + 'a>>;
 
 pub(crate) trait OpenAiLoginFlow {
     fn request_device_code(&self) -> DeviceCodeFuture<'_>;
@@ -62,6 +69,45 @@ impl OpenAiCredentialStore for OpenAiAuthStore {
     }
 }
 
+pub(crate) trait KimiLoginFlow {
+    fn request_device_authorization(&self) -> KimiAuthorizationFuture<'_>;
+
+    fn complete_device_login(&self, authorization: DeviceAuthorization) -> KimiTokenFuture<'_>;
+}
+
+impl<H, R> KimiLoginFlow for KimiDeviceAuthFlow<H, R>
+where
+    H: KimiDeviceAuthHttp,
+    R: KimiDeviceAuthRuntime,
+{
+    fn request_device_authorization(&self) -> KimiAuthorizationFuture<'_> {
+        Box::pin(async move { KimiDeviceAuthFlow::request_device_authorization(self).await })
+    }
+
+    fn complete_device_login(&self, authorization: DeviceAuthorization) -> KimiTokenFuture<'_> {
+        Box::pin(async move {
+            KimiDeviceAuthFlow::complete_device_login(self, &authorization).await
+        })
+    }
+}
+
+pub(crate) trait KimiCredentialStore {
+    fn path(&self) -> &Path;
+
+    fn save_kimi(&self, credential: &KimiOAuthCredential) -> anyhow::Result<()>;
+}
+
+impl KimiCredentialStore for KimiAuthStore {
+    fn path(&self) -> &Path {
+        KimiAuthStore::path(self)
+    }
+
+    fn save_kimi(&self, credential: &KimiOAuthCredential) -> anyhow::Result<()> {
+        KimiAuthStore::save_kimi(self, credential)?;
+        Ok(())
+    }
+}
+
 pub(crate) async fn run_auth_action(action: &crate::cli::AuthAction) -> anyhow::Result<()> {
     run_auth_action_with(action, login_openai).await
 }
@@ -87,6 +133,7 @@ where
             println!("Anthropic OAuth credentials saved to {}", path.display());
             Ok(())
         }
+        crate::cli::AuthAction::Kimi => login_kimi().await,
     }
 }
 
@@ -101,6 +148,62 @@ pub(crate) async fn login_openai_device() -> anyhow::Result<()> {
     let store = OpenAiAuthStore::default();
     let mut stdout = std::io::stdout().lock();
     login_openai_with_clock(flow, store, current_epoch_ms, &mut stdout).await
+}
+
+pub(crate) async fn login_kimi() -> anyhow::Result<()> {
+    let flow = KimiDeviceAuthFlow::default();
+    let store = KimiAuthStore::default();
+    let mut stdout = std::io::stdout().lock();
+    login_kimi_with(flow, store, &mut stdout).await
+}
+
+/// Kimi device-code login. Unlike the OpenAI flow there is no clock
+/// injection: the Kimi token bundle already carries its resolved
+/// `expires_at_epoch_ms` (see `kimi_device::TokenInfo`).
+pub(crate) async fn login_kimi_with<F, S, W>(
+    flow: F,
+    store: S,
+    stdout: &mut W,
+) -> anyhow::Result<()>
+where
+    F: KimiLoginFlow,
+    S: KimiCredentialStore,
+    W: Write,
+{
+    let authorization = flow.request_device_authorization().await?;
+
+    writeln!(stdout, "Kimi Code device-code login")?;
+    writeln!(stdout, "1. Open: {}", authorization.verification_uri_complete)?;
+    writeln!(stdout, "2. Confirm the code shown is: {}", authorization.user_code)?;
+    writeln!(
+        stdout,
+        "Do not share this code. Anyone with it may be able to authorize Dirge as you."
+    )?;
+    writeln!(stdout, "Waiting for Kimi authorization...")?;
+
+    let tokens = flow.complete_device_login(authorization).await?;
+    let credential = kimi_tokens_to_credential(tokens);
+    store.save_kimi(&credential)?;
+
+    writeln!(
+        stdout,
+        "Kimi authorization saved to {}",
+        store.path().display()
+    )?;
+    writeln!(
+        stdout,
+        "This login persists across Dirge sessions until you delete that file or Kimi revokes it."
+    )?;
+
+    Ok(())
+}
+
+pub(crate) fn kimi_tokens_to_credential(tokens: TokenInfo) -> KimiOAuthCredential {
+    KimiOAuthCredential::new(
+        tokens.access_token,
+        tokens.refresh_token,
+        tokens.expires_at_epoch_ms,
+    )
 }
 
 async fn login_openai_browser_with_clock<S, W, N>(

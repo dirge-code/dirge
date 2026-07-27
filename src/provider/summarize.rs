@@ -120,6 +120,7 @@ pub(crate) async fn oneshot_with_model(
         super::AnyModel::Glm(m) => run_oneshot(m, label, preamble, prompt, disable).await,
         super::AnyModel::Cerebras(m) => run_oneshot(m, label, preamble, prompt, disable).await,
         super::AnyModel::OpenCode(m) => run_oneshot(m, label, preamble, prompt, disable).await,
+        super::AnyModel::Kimi(m) => run_oneshot(m, label, preamble, prompt, disable).await,
         super::AnyModel::Ollama(m) => run_oneshot(m, label, preamble, prompt, disable).await,
         super::AnyModel::Custom(m) => run_oneshot(m, label, preamble, prompt, disable).await,
     }

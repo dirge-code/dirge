@@ -108,6 +108,9 @@ macro_rules! dispatch_stream_fn {
             $enum::OpenCode($bind) => {
                 __stream_fn($model, $tools, $timeout, $provider, $model_name, $filter)
             }
+            $enum::Kimi($bind) => {
+                __stream_fn($model, $tools, $timeout, $provider, $model_name, $filter)
+            }
             $enum::Ollama($bind) => {
                 __stream_fn($model, $tools, $timeout, $provider, $model_name, $filter)
             }

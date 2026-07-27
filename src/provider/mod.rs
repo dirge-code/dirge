@@ -8,6 +8,7 @@ pub mod client;
 pub(crate) mod codex_http;
 pub(crate) mod compressing_http;
 mod dispatch;
+pub(crate) mod kimi_http;
 pub(crate) mod rate_limit_gate;
 mod resolve;
 mod route;
@@ -274,6 +275,13 @@ pub(crate) enum AnyAgentInner {
         Agent<
             openai::completion::CompletionModel<
                 compressing_http::CompressingHttpClient<reqwest::Client>,
+            >,
+        >,
+    ),
+    Kimi(
+        Agent<
+            openai::completion::CompletionModel<
+                compressing_http::CompressingHttpClient<kimi_http::KimiHttpClient>,
             >,
         >,
     ),
@@ -610,6 +618,7 @@ impl AnyAgent {
             AnyAgentInner::Glm(_) => "glm",
             AnyAgentInner::Cerebras(_) => "cerebras",
             AnyAgentInner::OpenCode(_) => "opencode",
+            AnyAgentInner::Kimi(_) => "kimi",
             AnyAgentInner::Ollama(_) => "ollama",
             AnyAgentInner::Custom(_) => "custom",
         }

@@ -3,6 +3,8 @@ pub(crate) mod command;
 pub(crate) mod file_lock;
 // Shared 0600 file-store + expiry + account-id helpers used by both OAuth stores.
 pub(crate) mod file_store;
+// Kimi Code (Moonshot) device-code OAuth flow + device identity headers.
+pub(crate) mod kimi_device;
 // Staged for downstream CLI/provider beads; this child owns the tested protocol flow.
 pub(crate) mod oauth_pkce;
 #[allow(dead_code)]
@@ -14,7 +16,6 @@ pub(crate) mod store;
 
 #[cfg(test)]
 pub(crate) static DIRGE_DATA_DIR_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 #[cfg(test)]
 mod command_tests {
     use super::command::{
@@ -492,5 +493,286 @@ mod command_tests {
                 "{script} must print the non-secret config dir in validation evidence"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod kimi_command_tests {
+    use super::command::{KimiCredentialStore, KimiLoginFlow, login_kimi_with};
+    use super::kimi_device::{
+        DeviceAuthorization, KimiAuthError, Result as KimiAuthResult, TokenInfo,
+    };
+    use super::store::{KimiAuthStore, KimiOAuthCredential};
+    use std::future::Future;
+    use std::path::{Path, PathBuf};
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new(tag: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "dirge_kimi_command_{tag}_{}_{}",
+                std::process::id(),
+                uuid::Uuid::new_v4().simple()
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn auth_path(&self) -> PathBuf {
+            self.0.join("auth.json")
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[derive(Clone)]
+    struct FakeLoginFlow {
+        state: Arc<Mutex<FakeLoginFlowState>>,
+    }
+
+    struct FakeLoginFlowState {
+        authorization: Option<KimiAuthResult<DeviceAuthorization>>,
+        tokens: Option<KimiAuthResult<TokenInfo>>,
+        completed_with: Option<DeviceAuthorization>,
+    }
+
+    impl FakeLoginFlow {
+        fn new(authorization: DeviceAuthorization, tokens: TokenInfo) -> Self {
+            Self {
+                state: Arc::new(Mutex::new(FakeLoginFlowState {
+                    authorization: Some(Ok(authorization)),
+                    tokens: Some(Ok(tokens)),
+                    completed_with: None,
+                })),
+            }
+        }
+
+        fn completed_with(&self) -> Option<DeviceAuthorization> {
+            self.state.lock().unwrap().completed_with.clone()
+        }
+    }
+
+    impl KimiLoginFlow for FakeLoginFlow {
+        fn request_device_authorization(
+            &self,
+        ) -> Pin<Box<dyn Future<Output = KimiAuthResult<DeviceAuthorization>> + Send + '_>> {
+            Box::pin(async move { self.state.lock().unwrap().authorization.take().unwrap() })
+        }
+
+        fn complete_device_login(
+            &self,
+            authorization: DeviceAuthorization,
+        ) -> Pin<Box<dyn Future<Output = KimiAuthResult<TokenInfo>> + Send + '_>> {
+            Box::pin(async move {
+                let mut state = self.state.lock().unwrap();
+                state.completed_with = Some(authorization);
+                state.tokens.take().unwrap()
+            })
+        }
+    }
+
+    #[derive(Clone)]
+    struct FakeStore {
+        path: PathBuf,
+        state: Arc<Mutex<FakeStoreState>>,
+    }
+
+    struct FakeStoreState {
+        saved: Vec<KimiOAuthCredential>,
+        save_error: Option<&'static str>,
+    }
+
+    impl FakeStore {
+        fn new(path: PathBuf) -> Self {
+            Self {
+                path,
+                state: Arc::new(Mutex::new(FakeStoreState {
+                    saved: Vec::new(),
+                    save_error: None,
+                })),
+            }
+        }
+
+        fn with_save_error(path: PathBuf, save_error: &'static str) -> Self {
+            Self {
+                path,
+                state: Arc::new(Mutex::new(FakeStoreState {
+                    saved: Vec::new(),
+                    save_error: Some(save_error),
+                })),
+            }
+        }
+
+        fn saved(&self) -> Vec<KimiOAuthCredential> {
+            self.state.lock().unwrap().saved.clone()
+        }
+    }
+
+    impl KimiCredentialStore for FakeStore {
+        fn path(&self) -> &Path {
+            &self.path
+        }
+
+        fn save_kimi(&self, credential: &KimiOAuthCredential) -> anyhow::Result<()> {
+            let mut state = self.state.lock().unwrap();
+            if let Some(save_error) = state.save_error.take() {
+                anyhow::bail!(save_error);
+            }
+            state.saved.push(credential.clone());
+            Ok(())
+        }
+    }
+
+    fn authorization() -> DeviceAuthorization {
+        DeviceAuthorization {
+            user_code: "USER-CODE".to_string(),
+            device_code: "DEVICE-CODE".to_string(),
+            verification_uri: "https://kimi.com/device".to_string(),
+            verification_uri_complete: "https://kimi.com/device?code=USER-CODE".to_string(),
+            interval: Duration::from_secs(5),
+        }
+    }
+
+    fn tokens() -> TokenInfo {
+        TokenInfo {
+            access_token: "ACCESS-TOKEN".to_string(),
+            refresh_token: "REFRESH-TOKEN".to_string(),
+            expires_at_epoch_ms: 1_700_000_900_000,
+            scope: String::new(),
+            token_type: "Bearer".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn kimi_login_with_fake_flow_and_store_saves_credential_and_redacts_stdout() {
+        let flow = FakeLoginFlow::new(authorization(), tokens());
+        let store = FakeStore::new(PathBuf::from("/tmp/fake-kimi-auth.json"));
+        let mut stdout = Vec::new();
+
+        login_kimi_with(flow.clone(), store.clone(), &mut stdout)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            flow.completed_with().unwrap().device_code,
+            "DEVICE-CODE"
+        );
+        let saved = store.saved();
+        assert_eq!(saved.len(), 1);
+        let credential = &saved[0];
+        assert_eq!(credential.access_token(), "ACCESS-TOKEN");
+        assert_eq!(credential.refresh_token(), "REFRESH-TOKEN");
+        assert_eq!(credential.expires_at_epoch_ms(), 1_700_000_900_000);
+
+        let stdout = String::from_utf8(stdout).unwrap();
+        assert!(stdout.contains("https://kimi.com/device?code=USER-CODE"));
+        assert!(stdout.contains("USER-CODE"));
+        assert!(stdout.contains("/tmp/fake-kimi-auth.json"));
+        assert!(!stdout.contains("ACCESS-TOKEN"));
+        assert!(!stdout.contains("REFRESH-TOKEN"));
+        assert!(!stdout.contains("DEVICE-CODE"));
+    }
+
+    #[tokio::test]
+    async fn kimi_login_propagates_store_error_without_leaking_tokens_to_stdout() {
+        let flow = FakeLoginFlow::new(authorization(), tokens());
+        let store = FakeStore::with_save_error(PathBuf::from("/tmp/fake-kimi-auth.json"), "disk full");
+        let mut stdout = Vec::new();
+
+        let err = login_kimi_with(flow, store.clone(), &mut stdout)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("disk full"));
+        assert!(store.saved().is_empty());
+        let stdout = String::from_utf8(stdout).unwrap();
+        assert!(stdout.contains("USER-CODE"));
+        assert!(!stdout.contains("Kimi authorization saved"));
+        assert!(!stdout.contains("ACCESS-TOKEN"));
+        assert!(!stdout.contains("REFRESH-TOKEN"));
+    }
+
+    #[tokio::test]
+    async fn kimi_login_flow_error_does_not_create_auth_file() {
+        let dir = TestDir::new("flow_error");
+        let store = FakeStore::new(dir.auth_path());
+        let flow = FakeLoginFlow {
+            state: Arc::new(Mutex::new(FakeLoginFlowState {
+                authorization: Some(Err(KimiAuthError::DeviceAuthorizationStatus {
+                    status: 500,
+                })),
+                tokens: None,
+                completed_with: None,
+            })),
+        };
+        let mut stdout = Vec::new();
+
+        let err = login_kimi_with(flow, store.clone(), &mut stdout)
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.downcast_ref::<KimiAuthError>()
+                .is_some_and(|err| matches!(
+                    err,
+                    KimiAuthError::DeviceAuthorizationStatus { status: 500 }
+                ))
+        );
+        assert!(!err.to_string().contains("ACCESS-TOKEN"));
+        assert!(stdout.is_empty());
+    }
+
+    #[tokio::test]
+    async fn kimi_login_with_real_store_writes_tokens_under_data_dir() {
+        let dir = TestDir::new("success");
+        let flow = FakeLoginFlow::new(authorization(), tokens());
+        let store = KimiAuthStore::at(dir.auth_path());
+        let mut stdout = Vec::new();
+
+        login_kimi_with(flow, store.clone(), &mut stdout)
+            .await
+            .unwrap();
+
+        let stdout = String::from_utf8(stdout).unwrap();
+        assert!(stdout.contains(store.path().to_string_lossy().as_ref()));
+        assert!(!stdout.contains("ACCESS-TOKEN"));
+        assert!(!stdout.contains("REFRESH-TOKEN"));
+
+        let saved = std::fs::read_to_string(store.path()).unwrap();
+        assert!(saved.contains("\"kimi\""));
+        assert!(saved.contains("ACCESS-TOKEN"));
+        assert!(saved.contains("REFRESH-TOKEN"));
+        assert!(saved.contains("1700000900000"));
+    }
+
+    #[test]
+    fn kimi_oauth_validation_script_isolates_config_dir() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let body = std::fs::read_to_string(root.join("scripts/validate-kimi-oauth.sh")).unwrap();
+
+        assert!(
+            body.contains("DIRGE_OAUTH_VALIDATION_CONFIG_DIR"),
+            "script must document its isolated config dir override"
+        );
+        assert!(
+            body.contains("export DIRGE_CONFIG_DIR=\"$config_dir\""),
+            "script must export an isolated DIRGE_CONFIG_DIR"
+        );
+        assert!(
+            body.contains("rm -rf -- \"$config_dir\""),
+            "script must clear stale validation config before each run"
+        );
+        assert!(
+            body.contains("Using DIRGE_CONFIG_DIR"),
+            "script must print the non-secret config dir in validation evidence"
+        );
     }
 }

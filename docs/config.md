@@ -73,8 +73,8 @@ Accepted top-level keys:
 
 | Key                       | Type    | Description                                                                                                                                                                 |
 | ------------------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `provider`                | string  | Active provider alias. Built-ins are `openrouter`, `openai`, `anthropic`, `gemini`/`google`, `deepseek`, `glm`/`zhipu`, `cerebras`, `opencode`, and `ollama`; any alias declared in `providers` is also accepted. Default: `openrouter`. See [Providers and roles](#providers-and-roles). |
-| `auth`                    | string  | Default authentication source for providers that don't set their own `providers.<name>.auth`: `api-key` (the implicit default), `chatgpt` (Codex/OpenAI login tokens), or `anthropic` / `claude-code` (Anthropic Claude Code OAuth). See [Providers and roles](#providers-and-roles). |
+| `provider`                | string  | Active provider alias. Built-ins are `openrouter`, `openai`, `anthropic`, `gemini`/`google`, `deepseek`, `glm`/`zhipu`, `cerebras`, `opencode`, `kimi`/`kimi-code`/`moonshot`, and `ollama`; any alias declared in `providers` is also accepted. Default: `openrouter`. See [Providers and roles](#providers-and-roles). |
+| `auth`                    | string  | Default authentication source for providers that don't set their own `providers.<name>.auth`: `api-key` (the implicit default), `chatgpt` (Codex/OpenAI login tokens), `anthropic` / `claude-code` (Anthropic Claude Code OAuth), or `kimi` (Kimi Code device OAuth). See [Providers and roles](#providers-and-roles). |
 | `providers`               | object  | Map of provider alias → entry. The active model lives in `providers.<active-provider>.model`. Each role key below points at one of these aliases. See [Providers and roles](#providers-and-roles). |
 | `review_provider`         | string  | Provider alias for the background session-review pass. Falls back to `provider`. |
 | `escalation_provider`     | string  | Provider alias for the one-shot retry after repair-exhaustion / pre-write syntax failure. Falls back to `provider` (no-op when equal). |
@@ -271,12 +271,12 @@ Each `providers` entry accepts:
 
 | Field | Description |
 |-------|-------------|
-| `provider_type` | Built-in backend to use: `openrouter`, `openai`, `openai-responses`, `anthropic`, `gemini`, `deepseek`, `glm`, `cerebras`, `opencode`, `ollama`, or `custom`. Optional — defaults to the entry's alias when that alias matches a built-in name. `openai` speaks the Chat Completions API (`/v1/chat/completions`); `openai-responses` speaks the Responses API (`/v1/responses`) — see below. |
+| `provider_type` | Built-in backend to use: `openrouter`, `openai`, `openai-responses`, `anthropic`, `gemini`, `deepseek`, `glm`, `cerebras`, `opencode`, `kimi`, `ollama`, or `custom`. Optional — defaults to the entry's alias when that alias matches a built-in name. `openai` speaks the Chat Completions API (`/v1/chat/completions`); `openai-responses` speaks the Responses API (`/v1/responses`) — see below. |
 | `base_url` | Endpoint base URL (for custom / self-hosted endpoints). |
 | `model` | Model name for this provider. |
 | `api_key` | Literal key or `${ENV_VAR}` interpolation. Takes precedence over `api_key_env`. |
 | `api_key_env` | Name of the env var holding the API key. |
-| `auth` | Authentication mode: `api-key` (default), `chatgpt` for Codex/OpenAI login tokens, or `anthropic` / `claude-code` for Anthropic Claude Code OAuth. |
+| `auth` | Authentication mode: `api-key` (default), `chatgpt` for Codex/OpenAI login tokens, `anthropic` / `claude-code` for Anthropic Claude Code OAuth, or `kimi` for Kimi Code (Moonshot) device OAuth. |
 | `allow_insecure` | Allow `http://` URLs (plaintext). Default `false`; only enable for local-only proxies. |
 | `stream_chunk_timeout_secs` | Per-provider streaming chunk timeout override. |
 | `multimodal` | Override for whether this provider/model accepts image input (gates the Ctrl+V image-paste UX). `true`/`false` forces it either way; omit to auto-detect from the model name and provider type. Set `true` to enable pasting into a local vision model (e.g. Ollama `llama3.2-vision`) behind a generic provider type. |
@@ -435,6 +435,55 @@ Aliases `claude-code`, `claude_code`, and `claude` are accepted for the same
 auth mode. `ANTHROPIC_OAUTH_TOKEN` can also provide a raw access token for
 smoke tests, but persisted credentials are preferred because dirge can refresh
 expired tokens before rebuilding the Anthropic client.
+
+### Kimi Code (Moonshot) OAuth
+
+To use a Kimi membership's managed coding API instead of a raw API key, run:
+
+```bash
+dirge auth kimi   # alias: dirge auth kimi-code
+```
+
+This is a device-code flow (there is no browser/localhost variant): Dirge
+prints a verification URL and user code, you authorize in the browser, and
+Dirge polls until the login completes. The credential is stored under the
+`kimi` key in the same `$DIRGE_DATA_DIR/auth.json` used by the other OAuth
+logins.
+
+Then select the provider (a stored login is also auto-detected when no
+provider/env key is configured):
+
+```json
+{
+  "provider": "kimi",
+  "providers": {
+    "kimi": {
+      "model": "k3"
+    }
+  }
+}
+```
+
+Models: `k3` (default), `kimi-for-coding`, and `kimi-for-coding-highspeed`,
+all OpenAI-compatible chat completions against
+`https://api.kimi.com/coding/v1` with a 262144-token context window. Lower
+membership tiers without K3 access should use `--model kimi-for-coding`.
+
+Kimi access tokens live only 15 minutes; Dirge refreshes them automatically
+(before client construction and mid-session) and persists the rotated token
+bundle, so a long session does not die on token expiry.
+
+Environment overrides:
+
+- `KIMI_CODE_API_KEY` — static bearer used instead of the OAuth login (not
+  refreshable).
+- `KIMI_CODE_BASE_URL` — API base URL override (https only).
+- `KIMI_CODE_OAUTH_HOST` / `KIMI_OAUTH_HOST` — OAuth host override (default
+  `https://auth.kimi.com`).
+
+Aliases `kimi-code` and `moonshot` are accepted for the provider name and
+the `auth` mode. The separate Kimi Platform API (`api.moonshot.ai`) is not
+this provider — use a `custom` provider with an API key for that.
 
 ### Role assignments
 
