@@ -53,10 +53,13 @@ pub struct ContextFiles {
     /// The active `/agent` profile, or `None`. Contributes an optional
     /// body override, a model, and extra denies.
     pub agent_layer: Option<agent_defs::AgentDefinition>,
-    /// The `session.model` value captured when an agent was activated from
-    /// the no-agent state, so `/agent off` can restore it (dirge-anhw).
-    /// `None` when no agent is active.
-    pub model_before_agent: Option<String>,
+    /// The `(provider, model)` pair the session was on when an agent was
+    /// activated from the no-agent state, so `/agent off` can restore it
+    /// (dirge-anhw). Stored as a route rather than a bare model id because a
+    /// profile can move the live CLIENT too — restoring the id alone would
+    /// leave the pre-agent model pointed at the profile's provider
+    /// (dirge-fhr5). `None` when no agent is active.
+    pub route_before_agent: Option<crate::provider::ModelRoute>,
 }
 
 /// The `/prompt`-selected layer: a named mode with a body and its own
@@ -92,7 +95,7 @@ impl ContextFiles {
     }
 
     /// Install / replace the `/agent` layer and refold. The caller owns
-    /// the model swap + `model_before_agent` capture (model lives in
+    /// the model swap + `route_before_agent` capture (model lives in
     /// `session`, not here).
     pub fn set_agent_layer(&mut self, def: agent_defs::AgentDefinition) {
         self.agent_layer = Some(def);
@@ -187,7 +190,7 @@ pub fn load(no_context_files: bool) -> ContextFiles {
         current_prompt_deny_tools: Vec::new(),
         prompt_layer: None,
         agent_layer: None,
-        model_before_agent: None,
+        route_before_agent: None,
     }
 }
 
@@ -302,7 +305,7 @@ mod composition_tests {
             current_prompt_deny_tools: Vec::new(),
             prompt_layer: None,
             agent_layer: None,
-            model_before_agent: None,
+            route_before_agent: None,
         }
     }
 

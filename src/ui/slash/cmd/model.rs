@@ -7,7 +7,7 @@ use crate::sync_util::LockExt;
 use compact_str::CompactString;
 
 use crate::config::ProviderEntry;
-use crate::provider::{ModelSwitch, resolve_model_switch};
+use crate::provider::{apply_model_route, resolve_model_route};
 use crate::ui::slash::cmd::agent;
 use crate::ui::slash::{SlashCtx, c_agent, c_error, c_result};
 
@@ -60,74 +60,31 @@ pub(crate) async fn cmd_model(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyhow:
     } else {
         let new_model = CompactString::new(parts[1].trim());
 
-        // Decide whether the chosen id routes to a *different* provider. An
-        // exact pin on another provider, or a free-form id whose family maps to
-        // a configured provider (e.g. `glm-4.6` while on deepseek), swaps the
-        // live client — otherwise we'd POST that id to the active endpoint and
-        // 404/401. Same-provider and unclassifiable ids keep the current client
-        // (dirge-cfaw).
-        let providers = ctx.cfg.providers_map();
-        let switch = resolve_model_switch(
-            &providers,
-            ctx.session.provider.as_str(),
-            new_model.as_str(),
-        );
-
-        let mut switched_to: Option<String> = None;
-        match switch {
-            ModelSwitch::Switch(alias) => {
-                match crate::provider::create_client_with_auth(
-                    &alias,
-                    None,
-                    &providers,
-                    ctx.cfg.auth,
-                ) {
-                    Ok(new_client) => {
-                        *ctx.client = new_client;
-                        switched_to = Some(alias);
-                    }
-                    Err(e) => {
-                        ctx.renderer.write_line(
-                            &format!("could not switch to provider '{alias}': {e}"),
-                            c_error(),
-                        )?;
-                        return Ok(());
-                    }
-                }
-            }
-            ModelSwitch::NoProviderForFamily(family) => {
-                // The id looks like a `{family}` model but no provider of that
-                // kind is configured. Renaming it onto the active client would
-                // just point the session at a model that can't work, so refuse
-                // the switch and keep the session functional — telling the user
-                // how to make it routable (mirrors the plugin-swap skip).
+        // Decide whether the chosen id routes to a *different* provider, then
+        // apply the model AND any client swap as one operation — otherwise we'd
+        // POST that id to whatever endpoint happened to be live and 400/404.
+        // Same-provider and unclassifiable ids keep the current client.
+        let old_ctx = ctx.session.context_window;
+        let route = resolve_model_route(ctx.cfg, ctx.session.provider.as_str(), new_model.as_str());
+        // A refusal leaves the session untouched: renaming onto a client that
+        // can't serve the id would just point the session at a model that can't
+        // work. Keep it functional and say how to make the id routable.
+        let switched_to = match apply_model_route(ctx.cfg, ctx.client, ctx.session, route) {
+            Ok(switched_to) => switched_to,
+            Err(refusal) => {
                 ctx.renderer.write_line(
                     &format!(
-                        "'{new_model}' matches the {family} model family, but no {family} provider is configured — keeping model '{}' on '{}'. Add a provider of type {family} to config.json to switch to it.",
+                        "{refusal} Keeping model '{}' on '{}'.",
                         ctx.session.model, ctx.session.provider,
                     ),
                     c_error(),
                 )?;
                 return Ok(());
             }
-            ModelSwitch::Keep => {}
-        }
+        };
 
-        ctx.session.model = new_model.clone();
         agent::rebuild_agent(ctx).await;
-        // On a cross-provider switch the active provider becomes the target
-        // alias. On a same-provider model swap it is left UNCHANGED — the live
-        // client is still on the previously active provider, and resetting to
-        // the CLI/config default here would make the next cross-provider
-        // target call reason from the wrong active provider.
-        if let Some(alias) = &switched_to {
-            ctx.session.provider = CompactString::new(alias);
-        }
-        let new_ctx = ctx.cfg.resolve_context_window(new_model.as_str());
-        let old_ctx = ctx.session.context_window;
-        if new_ctx != old_ctx {
-            ctx.session.context_window = new_ctx;
-        }
+        let new_ctx = ctx.session.context_window;
         let provider_note = switched_to
             .as_deref()
             .map(|a| format!("  ·  {a}"))

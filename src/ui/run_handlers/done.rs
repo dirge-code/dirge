@@ -80,38 +80,16 @@ pub(crate) fn prepare_next_model_client(
     if trimmed.is_empty() || trimmed == session.model.as_str() {
         return Ok(NextModelAction::Skip);
     }
-    let providers = cfg.providers_map();
-    match crate::provider::resolve_model_switch(&providers, session.provider.as_str(), trimmed) {
-        // Same provider (or unclassifiable id) → rename on the current client.
-        crate::provider::ModelSwitch::Keep => Ok(NextModelAction::Apply {
-            swapped_provider: None,
-        }),
-        // A different provider → build its client and install it in place so the
-        // rebuilt agent (and every later turn) runs there.
-        crate::provider::ModelSwitch::Switch(alias) => {
-            match crate::provider::create_client_with_auth(&alias, None, &providers, cfg.auth) {
-                Ok(new_client) => {
-                    *client = new_client;
-                    Ok(NextModelAction::Apply {
-                        swapped_provider: Some(alias),
-                    })
-                }
-                Err(e) => {
-                    renderer.write_line(
-                        &format!(
-                            "[plugin] can't swap to '{trimmed}': failed to build provider '{alias}' ({e}) — staying on '{}'.",
-                            session.provider,
-                        ),
-                        c_error(),
-                    )?;
-                    Ok(NextModelAction::Skip)
-                }
-            }
-        }
-        crate::provider::ModelSwitch::NoProviderForFamily(family) => {
+    // Shared routing decision (the one `/model` and `/agent` make), but only
+    // the CLIENT half is applied here: the session's model/provider move later
+    // in `apply_next_model`, after the hook chain resolves.
+    let route = crate::provider::resolve_model_route(cfg, session.provider.as_str(), trimmed);
+    match crate::provider::swap_client_for_route(cfg, client, session.provider.as_str(), &route) {
+        Ok(swapped_provider) => Ok(NextModelAction::Apply { swapped_provider }),
+        Err(refusal) => {
             renderer.write_line(
                 &format!(
-                    "[plugin] ignoring model swap to '{trimmed}': it matches the {family} model family with no {family} provider configured — staying on '{}'.",
+                    "[plugin] ignoring model swap: {refusal} Staying on '{}'.",
                     session.provider,
                 ),
                 c_error(),
@@ -733,7 +711,7 @@ pub(crate) fn finalize_idle_turn(
 
 // dirge-m6ut: the plugin prepare-next-run swap now hops providers. These
 // exercise the client-swapping half (`prepare_next_model_client`) directly —
-// the pure routing decision is covered by `resolve_model_switch` tests. Gated
+// the pure routing decision is covered by `provider::route` tests. Gated
 // on `plugin` because that's what compiles the function.
 #[cfg(all(test, feature = "plugin"))]
 mod next_model_tests {

@@ -840,6 +840,74 @@ fn resolve_subagent_model(cfg: &Config) -> Option<AnyModel> {
     }
 }
 
+/// Build the [`AnyModel`] a `task(agent="<profile>")` subagent runs on, from
+/// the profile's pinned `model` (#711).
+///
+/// The DETACHED applier of [`super::ModelRoute`]: unlike the interactive
+/// commands it has no live session to move, it just needs a model object bound
+/// to the right client. Routing itself is the shared decision — a model whose
+/// family differs from the active client's is built by that family's configured
+/// provider. Building every pin on the active client, what this path used to
+/// do, sent e.g. `glm-5.2` to a ChatGPT/Codex endpoint, which rejects it with a
+/// 400 on the subagent's very first turn.
+///
+/// `clients` caches cross-routed clients across profiles so N profiles pinning
+/// the same foreign model build one client, not N.
+///
+/// Unlike the interactive commands, a refusal here degrades to the active client
+/// with a warning instead of refusing: this runs at startup with no user to
+/// answer, and the pre-#711 behavior was to use the active client anyway.
+pub fn resolve_profile_model(
+    cfg: &Config,
+    active_client: &AnyClient,
+    active_provider: &str,
+    profile: &str,
+    model: Option<&str>,
+    clients: &mut HashMap<String, AnyClient>,
+) -> Option<AnyModel> {
+    use super::{ModelRoute, RouteRefusal, build_route_client, resolve_model_route};
+
+    // A profile's `model` may name a `providers` alias rather than a model id;
+    // resolve that to the id first, then route the id.
+    let model = crate::context::agent_defs::resolve_model_alias(cfg, model)?;
+    let fall_back = |refusal: RouteRefusal, model: String| {
+        eprintln!(
+            "warning: agent '{profile}': {refusal} Running it on '{active_provider}' instead, \
+             where it may be rejected."
+        );
+        Some(active_client.completion_model(model))
+    };
+
+    match resolve_model_route(cfg, active_provider, &model) {
+        ModelRoute::Active(model) => Some(active_client.completion_model(model)),
+        ModelRoute::Provider { alias, model } => {
+            if !clients.contains_key(&alias) {
+                match build_route_client(cfg, &alias, &model) {
+                    Ok(client) => {
+                        clients.insert(alias.clone(), client);
+                    }
+                    Err(refusal) => return fall_back(refusal, model),
+                }
+            }
+            tracing::info!(
+                target: "dirge::agents",
+                agent = %profile,
+                alias = %alias,
+                model = %model,
+                "agent profile model routed to its family's provider",
+            );
+            Some(clients[&alias].completion_model(model))
+        }
+        ModelRoute::Unroutable { model, family } => fall_back(
+            RouteRefusal::NoProviderForFamily {
+                model: model.clone(),
+                family,
+            },
+            model,
+        ),
+    }
+}
+
 /// dirge-0g6i: build the LLM auto-approval evaluator from a resolved
 /// `approval_provider`. Mirrors [`build_judge_fn`] — same client + model
 /// resolution and the SAME shared one-shot helper
@@ -996,6 +1064,167 @@ mod nw25_tests {
         cli.resolved_api_key = Some("resolved-key".to_string());
 
         assert_eq!(openai_api_billing_fallback_key(&cli), Some("resolved-key"));
+    }
+
+    /// GH #711: the active client is OpenAI but the profile pins `glm-5.2`.
+    /// Pre-fix this built `AnyModel::OpenAI("glm-5.2")` and every dispatch
+    /// 400'd; the model must be built by the glm provider's own client.
+    #[test]
+    fn profile_model_builds_against_its_family_provider() {
+        let cfg = issue_711_config();
+        let providers = cfg.providers_map();
+        let active = create_role_client("gpt-sol", &providers, None).unwrap();
+        let mut clients = HashMap::new();
+
+        let model = resolve_profile_model(
+            &cfg,
+            &active,
+            "gpt-sol",
+            "researcher",
+            Some("glm-5.2"),
+            &mut clients,
+        )
+        .expect("a pinned model must yield a route model");
+
+        assert_eq!(model.provider_name(), "glm");
+        assert_eq!(model.name(), "glm-5.2");
+    }
+
+    /// A profile may name the provider ALIAS instead of a model id. The alias
+    /// resolves to its pinned model, which then routes the same way.
+    #[test]
+    fn profile_model_naming_an_alias_resolves_then_cross_routes() {
+        let cfg = issue_711_config();
+        let providers = cfg.providers_map();
+        let active = create_role_client("gpt-sol", &providers, None).unwrap();
+        let mut clients = HashMap::new();
+
+        let model = resolve_profile_model(
+            &cfg,
+            &active,
+            "gpt-sol",
+            "researcher",
+            Some("glm"),
+            &mut clients,
+        )
+        .unwrap();
+
+        assert_eq!(model.provider_name(), "glm");
+        assert_eq!(model.name(), "glm-5.2");
+    }
+
+    /// The control: a model in the ACTIVE provider's family still builds on the
+    /// active client, and no extra client is constructed.
+    #[test]
+    fn profile_model_in_the_active_family_uses_the_active_client() {
+        let cfg = issue_711_config();
+        let providers = cfg.providers_map();
+        let active = create_role_client("gpt-sol", &providers, None).unwrap();
+        let mut clients = HashMap::new();
+
+        let model = resolve_profile_model(
+            &cfg,
+            &active,
+            "gpt-sol",
+            "researcher",
+            Some("gpt-5.5-mini"),
+            &mut clients,
+        )
+        .unwrap();
+
+        assert_eq!(model.provider_name(), "openai");
+        assert_eq!(model.name(), "gpt-5.5-mini");
+        assert!(clients.is_empty(), "no cross-provider client was needed");
+    }
+
+    /// Several profiles pinning the same foreign model share ONE built client.
+    #[test]
+    fn cross_routed_clients_are_built_once_per_alias() {
+        let cfg = issue_711_config();
+        let providers = cfg.providers_map();
+        let active = create_role_client("gpt-sol", &providers, None).unwrap();
+        let mut clients = HashMap::new();
+
+        for profile in ["researcher", "implementer", "reviewer"] {
+            let model = resolve_profile_model(
+                &cfg,
+                &active,
+                "gpt-sol",
+                profile,
+                Some("glm-5.2"),
+                &mut clients,
+            )
+            .unwrap();
+            assert_eq!(model.provider_name(), "glm");
+        }
+        assert_eq!(clients.len(), 1, "one client per target alias");
+    }
+
+    /// A profile with no `model` keeps the route's `None` (the task tool then
+    /// falls back to the default subagent model) — unchanged behavior.
+    #[test]
+    fn profile_without_a_model_yields_no_route_model() {
+        let cfg = issue_711_config();
+        let providers = cfg.providers_map();
+        let active = create_role_client("gpt-sol", &providers, None).unwrap();
+        let mut clients = HashMap::new();
+
+        assert!(
+            resolve_profile_model(&cfg, &active, "gpt-sol", "researcher", None, &mut clients)
+                .is_none()
+        );
+    }
+
+    /// An id whose family has no configured provider can't be routed anywhere
+    /// better — it stays on the active client (the caller warns).
+    #[test]
+    fn unroutable_family_falls_back_to_the_active_client() {
+        let cfg = issue_711_config();
+        let providers = cfg.providers_map();
+        let active = create_role_client("gpt-sol", &providers, None).unwrap();
+        let mut clients = HashMap::new();
+
+        let model = resolve_profile_model(
+            &cfg,
+            &active,
+            "gpt-sol",
+            "reviewer",
+            Some("claude-opus-4"),
+            &mut clients,
+        )
+        .unwrap();
+
+        assert_eq!(model.provider_name(), "openai");
+        assert_eq!(model.name(), "claude-opus-4");
+    }
+
+    /// The GH #711 config: an openai alias on a subscription plus a glm
+    /// provider. API keys are literal so no env/network is involved.
+    fn issue_711_config() -> Config {
+        use crate::config::ProviderEntry;
+        let mut providers = HashMap::new();
+        providers.insert(
+            "gpt-sol".to_string(),
+            ProviderEntry {
+                provider_type: Some("openai".to_string()),
+                model: Some("gpt-5.5".to_string()),
+                api_key: Some("sk-test-openai".to_string()),
+                ..Default::default()
+            },
+        );
+        providers.insert(
+            "glm".to_string(),
+            ProviderEntry {
+                provider_type: Some("glm".to_string()),
+                model: Some("glm-5.2".to_string()),
+                api_key: Some("sk-test-glm".to_string()),
+                ..Default::default()
+            },
+        );
+        Config {
+            providers: Some(providers),
+            ..Default::default()
+        }
     }
 
     #[test]
