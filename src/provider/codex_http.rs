@@ -229,17 +229,16 @@ impl super::compressing_http::StreamingWithHeaders for CodexHttpClient {
             // `Invalid content type was returned`. This seam is the only
             // streaming path `CompressingHttpClient` routes through, so the
             // injection that used to live in `send_streaming` must live here.
-            if is_responses_stream {
-                if let Ok(response) = send.result.as_mut()
-                    && !response
-                        .headers()
-                        .contains_key(reqwest::header::CONTENT_TYPE)
-                {
-                    response.headers_mut().insert(
-                        reqwest::header::CONTENT_TYPE,
-                        http::HeaderValue::from_static("text/event-stream"),
-                    );
-                }
+            if is_responses_stream
+                && let Ok(response) = send.result.as_mut()
+                && !response
+                    .headers()
+                    .contains_key(reqwest::header::CONTENT_TYPE)
+            {
+                response.headers_mut().insert(
+                    reqwest::header::CONTENT_TYPE,
+                    http::HeaderValue::from_static("text/event-stream"),
+                );
             }
             send
         }
