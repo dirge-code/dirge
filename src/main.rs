@@ -1273,12 +1273,25 @@ async fn main() -> anyhow::Result<()> {
     // registry coexist. Empty registry → no routes installed (the `agent`
     // param simply isn't advertised). No effect on the built-in critic/roles.
     if !context.agent_defs.is_empty() {
+        // #711: a profile's pinned model is routed the way `/model` routes an
+        // id — one whose family differs from the active client's is built by
+        // that family's configured provider. Building every pin on the active
+        // client sent e.g. `glm-5.2` to a ChatGPT/Codex endpoint, which 400s on
+        // the subagent's first turn. Clients for cross-routed providers are
+        // cached here so profiles sharing a model share one client.
+        let mut route_clients = std::collections::HashMap::new();
         let routes = context
             .agent_defs
             .iter()
             .map(|def| {
-                let model = context::agent_defs::resolve_model_alias(&cfg, def.model.as_deref())
-                    .map(|m| client.completion_model(m));
+                let model = provider::resolve_profile_model(
+                    &cfg,
+                    &client,
+                    &provider,
+                    &def.name,
+                    def.model.as_deref(),
+                    &mut route_clients,
+                );
                 // Resolve the profile's subagent tool policy into the exact
                 // allow-list for a tooled fork. `None` (tool-less profile) →
                 // the unchanged btw path; `Some` selects the tooled fork.

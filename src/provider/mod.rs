@@ -10,6 +10,7 @@ pub(crate) mod compressing_http;
 mod dispatch;
 pub(crate) mod rate_limit_gate;
 mod resolve;
+mod route;
 mod run;
 mod spawn;
 mod stream_dispatch;
@@ -20,6 +21,7 @@ pub use self::spawn::Prompt;
 pub use build::*;
 pub use dispatch::*;
 pub use resolve::*;
+pub use route::*;
 
 /// Process-global handle to the most recently built interactive agent.
 /// Tooled subagents (`TaskTool` tooled branch) fork a filtered runner off

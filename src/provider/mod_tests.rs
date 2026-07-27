@@ -1479,7 +1479,7 @@ async fn cerebras_identity_survives_client_model_and_agent_construction() {
         current_prompt_deny_tools: Vec::new(),
         prompt_layer: None,
         agent_layer: None,
-        model_before_agent: None,
+        route_before_agent: None,
     };
     let agent = build_agent(
         model,

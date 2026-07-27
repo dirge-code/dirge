@@ -13,7 +13,7 @@ use crate::event::AgentEvent;
 use crate::permission::ask::AskSender;
 use crate::permission::checker::{PermCheck, PermissionChecker};
 use crate::permission::{PermissionConfig, SecurityMode};
-use crate::provider::{ModelSwitch, resolve_model_switch};
+use crate::provider::{ModelRoute, RouteRefusal, resolve_model_route};
 use crate::sandbox::Sandbox;
 use crate::session::{MessageRole, Session, ToolCallEntry, ToolCallState};
 use compact_str::CompactString;
@@ -882,7 +882,7 @@ fn acp_configured_models(
 
 /// `/model` over ACP: with no arg, list the current + configured models; with
 /// an arg, record a session-scoped switch. Routing mirrors the interactive
-/// `/model` via [`resolve_model_switch`], but the switch is applied lazily —
+/// `/model` via [`resolve_model_route`], but the switch is applied lazily —
 /// the override is stored and the next prompt's `run_prompt` builds the client
 /// (surfacing any auth error then), so this stays side-effect-free.
 async fn acp_model(
@@ -913,21 +913,19 @@ async fn acp_model(
         return out;
     }
 
-    let (provider_override, note) = match resolve_model_switch(
-        &providers,
-        current_provider,
-        new_model,
-    ) {
-        ModelSwitch::Switch(alias) => {
+    // Shared routing decision; only the DECISION is used here — the client is
+    // built lazily by the next `run_prompt` (see the doc comment above), so
+    // there is nothing live to apply it to.
+    let (provider_override, note) = match resolve_model_route(cfg, current_provider, new_model) {
+        ModelRoute::Provider { alias, .. } => {
             let note = format!("  ·  {alias}");
             (Some(alias), note)
         }
-        ModelSwitch::NoProviderForFamily(family) => {
-            return format!(
-                "'{new_model}' matches the {family} model family, but no {family} provider is configured — keeping model '{current_model}' on '{current_provider}'. Add a provider of type {family} to config to switch to it.",
-            );
+        ModelRoute::Unroutable { model, family } => {
+            let refusal = RouteRefusal::NoProviderForFamily { model, family };
+            return format!("{refusal} Keeping model '{current_model}' on '{current_provider}'.",);
         }
-        ModelSwitch::Keep => (None, String::new()),
+        ModelRoute::Active(_) => (None, String::new()),
     };
 
     let mut map = sessions.lock().await;
@@ -1679,7 +1677,7 @@ mod tests {
         let list = acp_model(&sessions, &cfg, id, "", "openrouter", "current-x").await;
         assert!(list.contains("current model: current-x"), "got {list}");
 
-        // `llama-3.1` has no recognized family → ModelSwitch::Keep → override
+        // `llama-3.1` has no recognized family → ModelRoute::Active → override
         // set, provider left alone.
         let set = acp_model(&sessions, &cfg, id, "llama-3.1", "openrouter", "current-x").await;
         assert!(set.contains("switched to model: llama-3.1"), "got {set}");

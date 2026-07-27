@@ -154,10 +154,15 @@ fn is_openai_o_series(bare: &str) -> bool {
 }
 
 /// What switching to a given model id should do to the live client, given the
-/// active provider and the configured providers (dirge-cfaw). Consumed by
-/// `/model` and by the plugin `prepare-next-run` swap.
+/// active provider and the configured providers (dirge-cfaw).
+///
+/// Deliberately NOT public beyond `provider`: this is the raw decision, and a
+/// caller that acts on it directly has to remember that a model change implies
+/// a CLIENT change — the thing every site that forgot it got wrong (#711,
+/// dirge-fhr5). Consumers go through [`super::ModelRoute`], which carries the
+/// decision and the appliers together.
 #[derive(Debug, PartialEq, Eq)]
-pub enum ModelSwitch {
+pub(super) enum ModelSwitch {
     /// Keep the current client — the id belongs to the active provider (or
     /// carries no cross-provider signal). Just rename the model.
     Keep,
@@ -184,7 +189,7 @@ pub enum ModelSwitch {
 ///        to the `glm` provider instead of 404'ing against deepseek).
 ///      - a different kind with NO configured provider → `NoProviderForFamily`
 ///        so the caller can warn instead of silently mis-routing.
-pub fn resolve_model_switch(
+pub(super) fn resolve_model_switch(
     providers: &HashMap<String, ProviderEntry>,
     active: &str,
     model: &str,
@@ -201,11 +206,29 @@ pub fn resolve_model_switch(
         return ModelSwitch::Keep;
     }
 
-    if let Some(alias) = providers.iter().find_map(|(alias, entry)| {
-        (entry.model.as_deref() == Some(model) && !alias.eq_ignore_ascii_case(active))
-            .then(|| alias.clone())
-    }) {
-        return ModelSwitch::Switch(alias);
+    // Sorted, not `find_map` over the raw HashMap: when several aliases pin the
+    // SAME model id the pick must be stable across runs, the same guarantee
+    // `configured_alias_for_kind` gives the family path below.
+    let mut exact_pins: Vec<&String> = providers
+        .iter()
+        .filter(|(alias, entry)| {
+            entry.model.as_deref() == Some(model) && !alias.eq_ignore_ascii_case(active)
+        })
+        .map(|(alias, _)| alias)
+        .collect();
+    exact_pins.sort();
+    if let Some(alias) = exact_pins.first() {
+        return ModelSwitch::Switch(alias.to_string());
+    }
+
+    // #711: a `vendor/model` id is the multi-vendor gateway dialect. When the
+    // ACTIVE provider already speaks it (its pinned — or built-in default —
+    // model is also vendor-prefixed), the id is one FOR that gateway: routing
+    // it to the vendor's direct API would POST a prefixed id the direct API
+    // rejects. The exact-pin rules above still win, since an exact pin is the
+    // user declaring that alias serves this precise id.
+    if model.contains('/') && speaks_vendor_prefixed_ids(providers, active) {
+        return ModelSwitch::Keep;
     }
 
     let Some(family) = model_family(model) else {
@@ -233,6 +256,22 @@ fn active_provider_kind(
         .map(|entry| Config::provider_type_of(active, entry))
         .unwrap_or_else(|| active.to_ascii_lowercase());
     parse_provider(&type_name)
+}
+
+/// Whether the active provider speaks the multi-vendor `vendor/model` dialect
+/// (#711). Evidence-based rather than kind-based: the endpoint's own pinned
+/// model — or, unpinned, its kind's built-in default — carries a `vendor/`
+/// prefix. That covers OpenRouter and equally a LiteLLM-style proxy declared
+/// under any alias, without hard-coding a gateway list.
+fn speaks_vendor_prefixed_ids(providers: &HashMap<String, ProviderEntry>, active: &str) -> bool {
+    let entry = providers
+        .get(active)
+        .or_else(|| providers.get(&active.to_ascii_lowercase()));
+    if let Some(pinned) = entry.and_then(|entry| entry.model.as_deref()) {
+        return pinned.contains('/');
+    }
+    active_provider_kind(providers, active)
+        .is_some_and(|kind| default_model_for(kind_label(kind)).contains('/'))
 }
 
 /// The lowest (sorted) configured alias whose backend kind is `kind`, or
@@ -987,6 +1026,27 @@ mod resolve_model_switch_tests {
     }
 
     #[test]
+    fn exact_pin_target_is_deterministic_across_duplicate_pins() {
+        // Two aliases pinning the SAME id: the pick must be stable, not
+        // whichever the HashMap iterator happened to reach first.
+        let providers = HashMap::from([
+            ("glm".to_string(), typed_entry("glm", Some("glm-5.2"))),
+            (
+                "gpt-sol".to_string(),
+                typed_entry("openai", Some("gpt-5.5")),
+            ),
+            (
+                "azure-gpt".to_string(),
+                typed_entry("openai", Some("gpt-5.5")),
+            ),
+        ]);
+        assert_eq!(
+            resolve_model_switch(&providers, "glm", "gpt-5.5"),
+            ModelSwitch::Switch("azure-gpt".to_string()),
+        );
+    }
+
+    #[test]
     fn switch_target_is_deterministic_across_duplicate_kinds() {
         // Two glm aliases → the sorted-first one is chosen, stably.
         let providers = HashMap::from([
@@ -999,6 +1059,96 @@ mod resolve_model_switch_tests {
         assert_eq!(
             resolve_model_switch(&providers, "deepseek", "glm-4.6"),
             ModelSwitch::Switch("glm-a".to_string())
+        );
+    }
+
+    /// #711: a `vendor/model` id is the multi-vendor gateway dialect. When the
+    /// active provider already speaks it, the id is meant FOR that gateway —
+    /// routing it to the vendor's direct API would send a prefixed id the
+    /// direct API rejects.
+    #[test]
+    fn vendor_prefixed_id_stays_on_a_gateway_active_client() {
+        let providers = HashMap::from([
+            (
+                "openrouter".to_string(),
+                entry(Some("deepseek/deepseek-v4")),
+            ),
+            (
+                "anthropic".to_string(),
+                typed_entry("anthropic", Some("claude-opus-4")),
+            ),
+        ]);
+        assert_eq!(
+            resolve_model_switch(&providers, "openrouter", "anthropic/claude-opus-4"),
+            ModelSwitch::Keep,
+        );
+    }
+
+    #[test]
+    fn vendor_prefixed_id_stays_on_an_unpinned_gateway() {
+        // No pinned model — the openrouter DEFAULT is vendor-prefixed, which is
+        // the same evidence that this endpoint speaks the gateway dialect.
+        let providers = HashMap::from([
+            ("openrouter".to_string(), entry(None)),
+            (
+                "anthropic".to_string(),
+                typed_entry("anthropic", Some("claude-opus-4")),
+            ),
+        ]);
+        assert_eq!(
+            resolve_model_switch(&providers, "openrouter", "anthropic/claude-opus-4"),
+            ModelSwitch::Keep,
+        );
+    }
+
+    #[test]
+    fn exact_pin_still_switches_for_a_vendor_prefixed_id() {
+        // An exact pin is the user explicitly declaring that alias serves this
+        // exact id — it outranks the gateway-dialect guard.
+        let providers = HashMap::from([
+            (
+                "openrouter".to_string(),
+                entry(Some("deepseek/deepseek-v4")),
+            ),
+            (
+                "bedrock".to_string(),
+                typed_entry("anthropic", Some("anthropic/claude-opus-4")),
+            ),
+        ]);
+        assert_eq!(
+            resolve_model_switch(&providers, "openrouter", "anthropic/claude-opus-4"),
+            ModelSwitch::Switch("bedrock".to_string()),
+        );
+    }
+
+    #[test]
+    fn bare_id_from_a_gateway_still_cross_routes() {
+        // The guard is scoped to prefixed ids: a bare `glm-5.2` from openrouter
+        // still routes to the configured glm provider.
+        let providers = HashMap::from([
+            (
+                "openrouter".to_string(),
+                entry(Some("deepseek/deepseek-v4")),
+            ),
+            ("glm".to_string(), typed_entry("glm", Some("glm-5.2"))),
+        ]);
+        assert_eq!(
+            resolve_model_switch(&providers, "openrouter", "glm-4.6"),
+            ModelSwitch::Switch("glm".to_string()),
+        );
+    }
+
+    #[test]
+    fn vendor_prefixed_id_still_cross_routes_from_a_non_gateway_client() {
+        // deepseek pins a bare id — it does not speak the gateway dialect, so a
+        // prefixed glm id is not "an id for this endpoint" and routes normally.
+        let providers = HashMap::from([
+            ("deepseek".to_string(), entry(Some("deepseek-v4-pro"))),
+            ("glm".to_string(), typed_entry("glm", Some("glm-5.2"))),
+        ]);
+        assert_eq!(
+            resolve_model_switch(&providers, "deepseek", "zhipu/glm-4.6"),
+            ModelSwitch::Switch("glm".to_string()),
         );
     }
 
