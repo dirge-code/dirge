@@ -82,8 +82,15 @@ impl std::fmt::Debug for AnthropicHttpClient {
 /// authenticating with a Claude Code OAuth token.
 const CLAUDE_CODE_SYSTEM_PROMPT: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
 
-/// Beta flags Anthropic's API requires for the Claude Code OAuth wire path.
-const ANTHROPIC_OAUTH_BETA: &str = "claude-code-20250219,oauth-2025-04-20";
+/// Beta flags always sent for the Claude Code OAuth wire path.
+const ANTHROPIC_BETA_CLAUDE_CODE: &str = "claude-code-20250219";
+const ANTHROPIC_BETA_OAUTH: &str = "oauth-2025-04-20";
+/// Required for extended (non-adaptive) thinking requests.
+const ANTHROPIC_BETA_INTERLEAVED_THINKING: &str = "interleaved-thinking-2025-05-14";
+/// Context management — part of the OAuth baseline set.
+const ANTHROPIC_BETA_CONTEXT_MANAGEMENT: &str = "context-management-2025-06-27";
+/// Per-session cache scope (dirge-607).
+const ANTHROPIC_BETA_PROMPT_CACHING_SCOPE: &str = "prompt-caching-scope-2026-01-05";
 
 /// `User-Agent` that identifies the request as first-party Claude Code.
 /// Without it the subscription path returns a third-party "extra usage" 400.
@@ -135,16 +142,21 @@ impl AnthropicHttpClient {
         // fires if the token has expired (dirge-956a).
         let bearer = self.token.as_ref().map(|t| t.bearer());
         let (mut parts, body) = req.into_parts();
+        let body: Bytes = body.into();
         parts.headers.remove("x-api-key");
         if let Some(token) = bearer.as_deref()
             && let Ok(value) = http::HeaderValue::from_str(&format!("Bearer {token}"))
         {
             parts.headers.insert(http::header::AUTHORIZATION, value);
         }
-        parts.headers.insert(
-            http::HeaderName::from_static("anthropic-beta"),
-            http::HeaderValue::from_static(ANTHROPIC_OAUTH_BETA),
-        );
+        if let Some(beta) = build_anthropic_beta_header(bearer.as_deref(), &body)
+            && let Ok(value) = http::HeaderValue::from_str(&beta)
+        {
+            parts.headers.insert(
+                http::HeaderName::from_static("anthropic-beta"),
+                value,
+            );
+        }
         parts.headers.insert(
             http::HeaderName::from_static("anthropic-dangerous-direct-browser-access"),
             http::HeaderValue::from_static("true"),
@@ -158,7 +170,6 @@ impl AnthropicHttpClient {
             http::HeaderValue::from_static(CLAUDE_CODE_USER_AGENT),
         );
 
-        let body = body.into();
         let body = if is_messages_path(parts.uri.path()) && is_oauth_bearer(bearer.as_deref()) {
             shape_oauth_messages_payload(body)
         } else {
@@ -260,6 +271,43 @@ fn is_messages_path(path: &str) -> bool {
     path.ends_with("/messages")
 }
 
+/// Builds the `anthropic-beta` header value for OAuth requests.
+/// Returns `None` for non-OAuth (API-key) paths — no beta header needed there.
+/// Adds `interleaved-thinking` only for extended thinking (`type == "enabled"`),
+/// not for adaptive thinking (`type == "adaptive"`).
+fn build_anthropic_beta_header(bearer: Option<&str>, body: &Bytes) -> Option<String> {
+    if !is_oauth_bearer(bearer) {
+        return None;
+    }
+    let mut betas = vec![
+        ANTHROPIC_BETA_CLAUDE_CODE,
+        ANTHROPIC_BETA_OAUTH,
+        ANTHROPIC_BETA_CONTEXT_MANAGEMENT,
+        ANTHROPIC_BETA_PROMPT_CACHING_SCOPE,
+    ];
+    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) {
+        if value
+            .get("thinking")
+            .and_then(|t| t.get("type"))
+            .and_then(serde_json::Value::as_str)
+            == Some("enabled")
+        {
+            betas.push(ANTHROPIC_BETA_INTERLEAVED_THINKING);
+        }
+    }
+    Some(betas.join(","))
+}
+
+/// Removes `temperature` from the payload when thinking is active.
+/// Anthropic returns a 400 if both `thinking` and `temperature` are present.
+fn strip_temperature_if_thinking(value: &mut serde_json::Value) {
+    if value.get("thinking").is_some_and(|t| !t.is_null()) {
+        if let Some(obj) = value.as_object_mut() {
+            obj.remove("temperature");
+        }
+    }
+}
+
 const CLAUDE_CODE_VERSION: &str = "2.1.169";
 const BILLING_HEADER_SALT: &str = "59cf53e54c78";
 const BILLING_HEADER_POSITIONS: [usize; 3] = [4, 7, 20];
@@ -298,6 +346,7 @@ fn shape_oauth_messages_payload(body: Bytes) -> Bytes {
     // identity first, then the billing header, so billing lands at index 0.
     prepend_claude_code_system_value(&mut value);
     prepend_billing_header(&mut value);
+    strip_temperature_if_thinking(&mut value);
 
     serde_json::to_vec(&value).map(Bytes::from).unwrap_or(body)
 }
@@ -918,6 +967,115 @@ mod tests {
                 .get("anthropic-ratelimit-requests-remaining")
                 .and_then(|v| v.to_str().ok()),
             Some("0"),
+        );
+    }
+
+    fn oauth_client() -> AnthropicHttpClient {
+        AnthropicHttpClient::new("sk-ant-oat-test".to_string())
+    }
+
+    fn messages_req(body: Bytes) -> Request<Bytes> {
+        Request::builder()
+            .method("POST")
+            .uri("https://api.anthropic.com/v1/messages")
+            .body(body)
+            .unwrap()
+    }
+
+    fn beta_header(req: &Request<Bytes>) -> String {
+        req.headers()
+            .get("anthropic-beta")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn dynamic_beta_includes_interleaved_thinking_when_extended() {
+        let client = oauth_client();
+        let body = Bytes::from(
+            r#"{"model":"claude-opus-4-5","messages":[],"thinking":{"type":"enabled","budget_tokens":10000}}"#,
+        );
+        let normalized = client.normalized_request(messages_req(body)).unwrap();
+        let header = beta_header(&normalized);
+        assert!(
+            header.contains("interleaved-thinking-2025-05-14"),
+            "expected interleaved-thinking beta, got: {header}"
+        );
+    }
+
+    #[test]
+    fn dynamic_beta_excludes_interleaved_thinking_when_adaptive() {
+        let client = oauth_client();
+        let body = Bytes::from(
+            r#"{"model":"claude-opus-4-7","messages":[],"thinking":{"type":"adaptive","display":"summarized"}}"#,
+        );
+        let normalized = client.normalized_request(messages_req(body)).unwrap();
+        let header = beta_header(&normalized);
+        assert!(
+            !header.contains("interleaved-thinking-2025-05-14"),
+            "adaptive thinking must NOT include interleaved-thinking, got: {header}"
+        );
+    }
+
+    #[test]
+    fn dynamic_beta_baseline_oauth_set_unchanged() {
+        let client = oauth_client();
+        let body = Bytes::from(
+            r#"{"model":"claude-sonnet-4-5","messages":[]}"#,
+        );
+        let normalized = client.normalized_request(messages_req(body)).unwrap();
+        let header = beta_header(&normalized);
+        assert!(header.contains("claude-code-20250219"), "missing claude-code beta: {header}");
+        assert!(header.contains("oauth-2025-04-20"), "missing oauth beta: {header}");
+        assert!(
+            header.contains("context-management-2025-06-27"),
+            "missing context-management beta: {header}"
+        );
+        assert!(
+            header.contains("prompt-caching-scope-2026-01-05"),
+            "missing prompt-caching-scope beta: {header}"
+        );
+    }
+
+    #[test]
+    fn temperature_stripped_when_extended_thinking_present() {
+        let body = Bytes::from(
+            r#"{"model":"claude-opus-4-5","stream":true,"messages":[],"temperature":1.0,"thinking":{"type":"enabled","budget_tokens":10000}}"#,
+        );
+        let shaped: serde_json::Value =
+            serde_json::from_slice(&shape_oauth_messages_payload(body)).unwrap();
+        assert!(
+            shaped.get("temperature").is_none(),
+            "temperature must be stripped when extended thinking is present"
+        );
+    }
+
+    #[test]
+    fn temperature_stripped_when_adaptive_thinking_present() {
+        let body = Bytes::from(
+            r#"{"model":"claude-opus-4-7","stream":true,"messages":[],"temperature":1.0,"thinking":{"type":"adaptive","display":"summarized"}}"#,
+        );
+        let shaped: serde_json::Value =
+            serde_json::from_slice(&shape_oauth_messages_payload(body)).unwrap();
+        assert!(
+            shaped.get("temperature").is_none(),
+            "temperature must be stripped when adaptive thinking is present"
+        );
+    }
+
+    #[test]
+    fn temperature_preserved_when_no_thinking() {
+        let body = Bytes::from(
+            r#"{"model":"claude-sonnet-4-5","messages":[],"temperature":0.7}"#,
+        );
+        let shaped: serde_json::Value =
+            serde_json::from_slice(&shape_oauth_messages_payload(body)).unwrap();
+        assert_eq!(
+            shaped["temperature"],
+            serde_json::json!(0.7),
+            "temperature must be preserved when thinking is absent"
         );
     }
 }
