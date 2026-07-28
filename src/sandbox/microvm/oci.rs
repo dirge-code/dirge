@@ -129,10 +129,9 @@ fn resolve_platform_manifest(manifests: &[serde_json::Value]) -> anyhow::Result<
         let plat = &entry["platform"];
         if plat["os"].as_str() == Some("linux")
             && plat["architecture"].as_str() == Some(target_arch)
+            && let Some(d) = entry["digest"].as_str()
         {
-            if let Some(d) = entry["digest"].as_str() {
-                return Ok(d.to_string());
-            }
+            return Ok(d.to_string());
         }
     }
     // No exact match — return the first entry as a fallback.
@@ -450,10 +449,10 @@ async fn download_blob(ref_: &ImageRef, digest: &str, token: &str) -> anyhow::Re
     // Reject blobs larger than 2 GiB — a compromised or misconfigured
     // registry returning an unbounded response would exhaust host memory.
     const MAX_BLOB_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-    if let Some(len) = resp.content_length() {
-        if len > MAX_BLOB_BYTES {
-            anyhow::bail!("blob {digest} Content-Length {len} exceeds {MAX_BLOB_BYTES} byte cap");
-        }
+    if let Some(len) = resp.content_length()
+        && len > MAX_BLOB_BYTES
+    {
+        anyhow::bail!("blob {digest} Content-Length {len} exceeds {MAX_BLOB_BYTES} byte cap");
     }
 
     // Stream the response with a running byte counter so chunked
@@ -523,7 +522,7 @@ fn validate_tar_entries(bytes: &[u8]) -> anyhow::Result<()> {
         let size_str = std::str::from_utf8(&header[124..136]).unwrap_or("");
         let size_str = size_str.trim_end_matches('\0').trim();
         let size = u64::from_str_radix(size_str, 8).unwrap_or(0);
-        let data_blocks = ((size + 511) / 512) as usize;
+        let data_blocks = size.div_ceil(512) as usize;
         offset += 512 + data_blocks * 512;
         if offset > bytes.len() {
             break;
@@ -539,6 +538,7 @@ fn contains_dotdot(path: &str) -> bool {
 /// Walk `dest` and process OCI whiteout files:
 /// - `.wh..wh..opq` removes all siblings in the directory.
 /// - `.wh.<name>` removes the file/dir `<name>` in the same directory.
+///
 /// After processing, the whiteout marker file itself is deleted.
 fn process_whiteouts(dest: &Path) -> std::io::Result<()> {
     let mut to_remove: Vec<PathBuf> = Vec::new();
@@ -952,15 +952,15 @@ mod tests {
             cksum += *b as u32;
         }
         // Add 8 * b' ' for the checksum field itself
-        for i in 148..156 {
-            cksum -= header[i] as u32;
+        for b in &header[148..156] {
+            cksum -= *b as u32;
             cksum += b' ' as u32;
         }
         let cksum_str = format!("{cksum:06o}\0 ");
         header[148..156].copy_from_slice(cksum_str.as_bytes());
         let mut tar = header.to_vec();
         // pad data to 512-byte boundary
-        let data_blocks = ((size + 511) / 512) as usize;
+        let data_blocks = size.div_ceil(512) as usize;
         tar.resize(512 + data_blocks * 512, 0);
         tar
     }
@@ -1130,10 +1130,7 @@ mod tests {
     async fn stream_blob_with_cap_propagates_error() {
         let chunks: Vec<Result<Vec<u8>, std::io::Error>> = vec![
             Ok(b"first ".to_vec()),
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "connection lost",
-            )),
+            Err(std::io::Error::other("connection lost")),
         ];
         let stream = futures::stream::iter(chunks);
         let err = stream_blob_with_cap(stream, "sha256:test", 100)

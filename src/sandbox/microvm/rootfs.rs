@@ -393,15 +393,9 @@ fn parse_apkindex(data: &str) -> Vec<ApkEntry> {
                                 continue;
                             }
                             // Strip ! prefix (negative/conflicts dep).
-                            let token = if token.starts_with('!') {
-                                &token[1..]
-                            } else {
-                                token
-                            };
+                            let token = token.strip_prefix('!').unwrap_or(token);
                             // Strip version operators (pkgname=version, pkgname>=version, etc.)
-                            let clean = if let Some(pos) =
-                                token.find(|c: char| c == '=' || c == '>' || c == '<')
-                            {
+                            let clean = if let Some(pos) = token.find(['=', '>', '<']) {
                                 token[..pos].trim().to_string()
                             } else {
                                 token.to_string()
@@ -450,8 +444,7 @@ fn extract_apk_payload(data: &[u8], dest: &Path) -> anyhow::Result<()> {
     let payload_offset = data
         .windows(3)
         .enumerate()
-        .filter(|(_, w)| *w == magic)
-        .last()
+        .rfind(|(_, w)| *w == magic)
         .map(|(i, _)| i)
         .ok_or_else(|| anyhow::anyhow!("no gzip members found in .apk file"))?;
 

@@ -3,12 +3,19 @@
 //! These tests require hardware virtualization support:
 //! - Linux: `/dev/kvm` access and `libkrun.so`/`libkrunfw.so`
 //! - macOS: Hypervisor.framework support and `libkrun.dylib`/`libkrunfw.dylib`
+//!
 //! They are gated behind the `sandbox-microvm` feature and skip gracefully
 //! when prerequisites are missing.
 
 #[cfg(test)]
 #[cfg(feature = "sandbox-microvm")]
-mod tests {
+// `VM_SERIAL`'s guard is deliberately held across the `.await`s that boot and
+// drive a VM — that is the whole point of the lock (see below). It is sound
+// here: `#[tokio::test]` runs on a current-thread runtime, so awaiting never
+// hands the guard to another thread, and libtest gives each test its own OS
+// thread, so a peer blocking in `lock()` cannot stall the holder.
+#[allow(clippy::await_holding_lock)]
+mod integration {
     use super::super::*;
     use crate::sandbox::{Sandbox, SandboxMode};
 

@@ -405,22 +405,22 @@ impl MicrovmSandbox {
                 // booted-then-exited can leave a port forwarder accepting
                 // TCP long enough for wait_for_ssh to read an SSH banner
                 // before the forwarder closes.
-                if let Some(child) = self.child.as_mut() {
-                    if let Ok(Some(status)) = child.try_wait() {
-                        let mut stderr = String::new();
-                        if let Some(ref mut pipe) = child.stderr {
-                            use std::io::Read;
-                            let _ = pipe.read_to_string(&mut stderr);
-                        }
-                        anyhow::bail!(
-                            "VM exited immediately after boot: {status} — stderr: {}",
-                            if stderr.is_empty() {
-                                "(empty)"
-                            } else {
-                                &stderr
-                            }
-                        );
+                if let Some(child) = self.child.as_mut()
+                    && let Ok(Some(status)) = child.try_wait()
+                {
+                    let mut stderr = String::new();
+                    if let Some(ref mut pipe) = child.stderr {
+                        use std::io::Read;
+                        let _ = pipe.read_to_string(&mut stderr);
                     }
+                    anyhow::bail!(
+                        "VM exited immediately after boot: {status} — stderr: {}",
+                        if stderr.is_empty() {
+                            "(empty)"
+                        } else {
+                            &stderr
+                        }
+                    );
                 }
             }
             Ok(Err(e)) => {
@@ -512,22 +512,22 @@ impl MicrovmSandbox {
             .and_then(|hk| hk.public_key_bytes().ok());
         if let Some(mut child) = self.child.take() {
             // 1. Fire-and-forget graceful SSH shutdown.
-            if let (Some(keys), ssh_port) = (self.keys.as_ref(), self.ssh_port) {
-                if ssh_port != 0 {
-                    let private_key = keys.private_key_path.clone();
-                    let hkb = host_key_bytes;
-                    std::thread::spawn(move || {
-                        let _ = ssh_exec(
-                            "127.0.0.1",
-                            ssh_port,
-                            &private_key,
-                            "poweroff",
-                            hkb.as_deref(),
-                        );
-                    });
-                    // Give the VM a moment to process the poweroff.
-                    std::thread::sleep(std::time::Duration::from_secs(1));
-                }
+            if let (Some(keys), ssh_port) = (self.keys.as_ref(), self.ssh_port)
+                && ssh_port != 0
+            {
+                let private_key = keys.private_key_path.clone();
+                let hkb = host_key_bytes;
+                std::thread::spawn(move || {
+                    let _ = ssh_exec(
+                        "127.0.0.1",
+                        ssh_port,
+                        &private_key,
+                        "poweroff",
+                        hkb.as_deref(),
+                    );
+                });
+                // Give the VM a moment to process the poweroff.
+                std::thread::sleep(std::time::Duration::from_secs(1));
             }
 
             // 2. If still running, try SIGTERM via kill(1).

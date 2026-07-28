@@ -314,10 +314,9 @@ fn check_shared_library(name: &str) -> bool {
         if let Ok(out) = std::process::Command::new("pkg-config")
             .args(["--exists", libname])
             .output()
+            && out.status.success()
         {
-            if out.status.success() {
-                return true;
-            }
+            return true;
         }
         // Check brew --prefix
         if let Ok(out) = std::process::Command::new("brew")

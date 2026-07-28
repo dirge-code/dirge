@@ -41,14 +41,13 @@ mod tests {
         // The runner should exist adjacent to or near the test binary
         // (e.g. target/debug/dirge-microvm-runner). Skip if not built.
         let result = find_runner_binary();
-        if result.is_err() {
-            eprintln!(
-                "skipping: runner binary not found in build tree: {}",
-                result.unwrap_err()
-            );
-            return;
-        }
-        let path = result.unwrap();
+        let path = match result {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("skipping: runner binary not found in build tree: {e}");
+                return;
+            }
+        };
         assert!(
             path.ends_with("dirge-microvm-runner"),
             "path should end with dirge-microvm-runner, got: {}",
