@@ -33,7 +33,6 @@ pub(crate) fn spawn_input_reader(user_tx: tokio::sync::mpsc::UnboundedSender<Use
         // enters poll() it may never come back.
         #[cfg(unix)]
         let probe_fd: Option<(std::os::unix::io::RawFd, Option<std::fs::File>)> = {
-            use std::os::unix::io::AsRawFd;
             if unsafe { libc::isatty(0) } == 1 {
                 Some((0, None))
             } else {
@@ -43,6 +42,7 @@ pub(crate) fn spawn_input_reader(user_tx: tokio::sync::mpsc::UnboundedSender<Use
                     .open("/dev/tty")
                 {
                     Ok(f) => {
+                        use std::os::unix::io::AsRawFd;
                         let raw = f.as_raw_fd();
                         Some((raw, Some(f)))
                     }
@@ -81,9 +81,10 @@ pub(crate) fn spawn_input_reader(user_tx: tokio::sync::mpsc::UnboundedSender<Use
                             // `tty` must be MOVED into the thread and kept
                             // alive here. Binding it outside and passing only
                             // the RawFd would drop the File when this scope
-                            // ends, closing the descriptor; poll would then
-                            // report POLLNVAL on a dead fd and the watchdog
-                            // would exit the process moments after startup.
+                            // ends, closing the descriptor; the ioctl probe in
+                            // tty_is_dead would then fail EBADF and the
+                            // watchdog would exit the process moments after
+                            // startup.
                             let fd = tty.as_raw_fd();
                             loop {
                                 std::thread::sleep(std::time::Duration::from_millis(250));
@@ -251,6 +252,17 @@ pub(crate) fn spawn_input_reader(user_tx: tokio::sync::mpsc::UnboundedSender<Use
     }
 }
 
+/// Death probe for a tty fd. Two independent checks:
+///
+/// 1. `poll(2)` for POLLHUP/POLLERR — catches a dead pty slave (the
+///    primary side closed). POLLNVAL is deliberately NOT treated as
+///    death: on macOS `/dev/tty` is the controlling-terminal redirect
+///    device and ALWAYS reports POLLNVAL to poll(2), even on a healthy
+///    terminal — treating it as fatal made the dead-tty watchdog kill
+///    the process ~250ms after every startup (exit 128+SIGHUP).
+/// 2. `ioctl(TIOCGWINSZ)` — on a hung-up terminal the line discipline
+///    is gone and the ioctl fails with EIO. This covers the /dev/tty
+///    case where poll can't see the hangup, and costs one syscall.
 #[cfg(unix)]
 pub(crate) fn tty_is_dead(fd: std::os::unix::io::RawFd) -> std::io::Result<bool> {
     let mut pfd = libc::pollfd {
@@ -262,7 +274,12 @@ pub(crate) fn tty_is_dead(fd: std::os::unix::io::RawFd) -> std::io::Result<bool>
     if ret < 0 {
         return Err(std::io::Error::last_os_error());
     }
-    Ok((pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)) != 0)
+    if (pfd.revents & (libc::POLLHUP | libc::POLLERR)) != 0 {
+        return Ok(true);
+    }
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) };
+    Ok(rc < 0)
 }
 
 #[cfg(all(test, unix))]
@@ -306,5 +323,26 @@ mod tests {
             "secondary should be dead after primary closes"
         );
         drop(secondary);
+    }
+
+    /// Regression: on macOS, poll(2) on /dev/tty (the controlling-
+    /// terminal redirect device) ALWAYS reports POLLNVAL, even on a
+    /// healthy tty — the watchdog read that as death and killed the
+    /// process ~250ms after startup (exit 128+SIGHUP). A live /dev/tty
+    /// must report NOT dead. Skipped when there is no controlling
+    /// terminal (CI).
+    #[test]
+    fn live_controlling_tty_is_not_dead() {
+        let Ok(f) = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/tty")
+        else {
+            return;
+        };
+        assert!(
+            !tty_is_dead(f.as_raw_fd()).expect("poll failed"),
+            "a live /dev/tty must not report dead (macOS POLLNVAL false positive)"
+        );
     }
 }
