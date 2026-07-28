@@ -4,6 +4,29 @@ All notable changes to dirge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.19.25] - 2026-07-28
+
+### Fixed
+- dirge no longer aborts when its terminal goes away (#730). `tty_size()`
+  reports 0x0 once the tty is gone, so ratatui allocated a 0x0 buffer while the
+  layout — built from the cached size — still handed widgets a full-size rect.
+  The first `buf[(x, y)]` write was out of bounds and killed the process with
+  `index outside of buffer: the area is Rect { 0, 0, 0, 0 }`, exit 101, before
+  `signal.rs` could run its teardown and reap the detached child groups (LSP,
+  MCP, DAP, bash subtrees) that a hangup otherwise strands.
+
+  `paint_frame` had a `width < 2 || height < 2` guard already, but it tested the
+  widget's rect rather than the buffer's, so it never fired. Every painter now
+  clamps to `buf.area`, and `tui_redraw` skips the frame outright when the
+  terminal reports a zero dimension — that second guard keeps the whole widget
+  tree out of the degenerate case instead of trusting each painter. dirge exits
+  through the normal error path now, so `Drop` cleanup runs.
+
+- A narrow terminal could panic the permission/questionnaire overlay.
+  `paint_overlay_box` computed `area.width as usize - 2` with no lower bound, so
+  any overlay rect under two cells wide underflowed. Found while fixing the
+  above; it needs only a very narrow terminal, no hangup.
+
 ## [0.19.24] - 2026-07-28
 
 ### Fixed
