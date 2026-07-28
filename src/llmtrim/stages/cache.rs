@@ -12,7 +12,7 @@
 //! templated/structural reuse). Runs last so it fingerprints the final prefix.
 
 use anyhow::Result;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::llmtrim::gate::{GateKind, PlanEntry, Transform};
 use crate::llmtrim::ir::Request;
@@ -51,9 +51,44 @@ impl Transform for CacheStage {
             sort_tools(req);
             let key = format!("{:016x}", cache_prefix_hash(req));
             provider.set_prompt_cache_key(req, &key);
+            set_router_automatic_caching(req);
         }
         provider.set_cache_breakpoints(req, self.max_breakpoints);
         Ok(())
+    }
+}
+
+/// Ask a router to cache an Anthropic-family route.
+///
+/// A router (OpenRouter, and the gateways that copy its `vendor/model` ids) speaks the
+/// OpenAI wire shape but forwards to whatever provider owns the model, so caching
+/// behaviour is the upstream's. OpenAI, DeepSeek, GLM and Cerebras cache the longest
+/// matching prefix by themselves; Anthropic caches nothing without a breakpoint. So a
+/// Claude model reached through a router re-bills the whole system prompt and tool block
+/// every turn — the same hole dirge-607 closed on the direct Anthropic path, still open
+/// here because the OpenAI shape has nowhere to put a per-block marker.
+///
+/// A top-level `cache_control` is the router's automatic-caching shape: it picks the
+/// breakpoint and advances it as the conversation grows, exactly like the direct path,
+/// and 1h is the TTL that shape accepts for Claude routes.
+///
+/// Gated on the vendor segment because a top-level `cache_control` is an unrecognized
+/// argument to a genuine OpenAI-shaped endpoint, which is a 400 rather than something
+/// ignored, and only a router serves models named `anthropic/…`. The cache-zone freeze
+/// shares that predicate ([`crate::llmtrim::cache_zone::routes_to_anthropic`]) so the two
+/// agree about which requests carry a cached prefix.
+///
+/// Runs after `set_prompt_cache_key`, and only when the client set no breakpoints of its
+/// own: the routing pin has to survive (a router falls back to `prompt_cache_key` to keep a
+/// conversation on the endpoint holding its cache), and a 1h marker must never land beside
+/// someone else's 5m block marker, which is the ttl-ordering violation the API rejects.
+fn set_router_automatic_caching(req: &mut Request) {
+    if !crate::llmtrim::cache_zone::routes_to_anthropic(req.raw()) {
+        return;
+    }
+    if let Some(obj) = req.raw_mut().as_object_mut() {
+        obj.entry("cache_control")
+            .or_insert_with(|| json!({"type": "ephemeral", "ttl": "1h"}));
     }
 }
 
@@ -80,8 +115,27 @@ fn sort_tools(req: &mut Request) {
     };
     for tool in tools.iter_mut() {
         sort_keys(tool);
+        sort_function_declarations(tool);
     }
     tools.sort_by(|a, b| tool_name(a).cmp(tool_name(b)));
+}
+
+/// Order Gemini's nested declarations by name.
+///
+/// Gemini wraps the tools one level deeper than everyone else —
+/// `tools: [{ functionDeclarations: [...] }]` — so the outer sort above sees a single
+/// element with no name to sort on, and `sort_keys` only orders object keys, never array
+/// elements. Without this the declaration order is whatever the SDK emitted, and Gemini's
+/// implicit cache is pure prefix matching: a tool block that reshuffles between runs never
+/// matches the earlier prefix, which is the one thing we can do for that provider.
+fn sort_function_declarations(tool: &mut Value) {
+    // rig serializes camelCase; accept the snake_case spelling too so a hand-built or
+    // proxied body gets the same treatment.
+    for key in ["functionDeclarations", "function_declarations"] {
+        if let Some(Value::Array(decls)) = tool.get_mut(key) {
+            decls.sort_by(|a, b| tool_name(a).cmp(tool_name(b)));
+        }
+    }
 }
 
 /// Tool name across wire shapes: Anthropic top-level `name`, OpenAI `function.name`.
@@ -149,7 +203,7 @@ pub fn cache_prefix_hash(req: &Request) -> u64 {
 mod tests {
     use super::*;
     use crate::llmtrim::ir::ProviderKind;
-    use crate::llmtrim::provider::{AnthropicProvider, OpenAiProvider};
+    use crate::llmtrim::provider::{AnthropicProvider, GoogleProvider, OpenAiProvider};
     use serde_json::json;
 
     fn anthropic(body: Value) -> Request {
@@ -246,6 +300,127 @@ mod tests {
         assert_eq!(tools[1].pointer("/function/name").unwrap(), "zebra");
         let keys: Vec<&str> = tools[1]
             .pointer("/function/parameters")
+            .and_then(Value::as_object)
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, ["a", "b"], "schema keys canonicalized");
+    }
+
+    /// An OpenAI-shaped body as a router receives it.
+    fn routed(model: &str) -> Request {
+        Request::from_value(
+            ProviderKind::OpenAi,
+            json!({
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": "a long stable system prompt"},
+                    {"role": "user", "content": "hi"},
+                ],
+                "tools": [{"type": "function", "function": {"name": "read", "parameters": {}}}]
+            }),
+        )
+    }
+
+    #[test]
+    fn routed_anthropic_model_gets_automatic_caching() {
+        let mut req = routed("anthropic/claude-sonnet-4.5");
+        run_cache_stage(&mut req, &OpenAiProvider);
+        assert_eq!(
+            req.raw().pointer("/cache_control/ttl").unwrap(),
+            "1h",
+            "router asked to cache the Anthropic route"
+        );
+        // The routing pin has to survive: it is what keeps the conversation on the
+        // endpoint holding the cache we just paid to write.
+        assert!(
+            req.raw().get("prompt_cache_key").is_some(),
+            "prompt_cache_key still set"
+        );
+    }
+
+    #[test]
+    fn routed_variants_and_price_prefixes_are_recognized() {
+        for model in [
+            "~anthropic/claude-sonnet-latest",
+            "anthropic/claude-opus-4.5:nitro",
+            "Anthropic/claude-haiku-4.5",
+        ] {
+            let mut req = routed(model);
+            run_cache_stage(&mut req, &OpenAiProvider);
+            assert!(
+                req.raw().get("cache_control").is_some(),
+                "{model} is an Anthropic route"
+            );
+        }
+    }
+
+    #[test]
+    fn implicitly_cached_routes_get_no_marker() {
+        // A top-level `cache_control` is an unrecognized argument on a real OpenAI-shaped
+        // endpoint (a 400, not an ignore), and these providers cache the prefix themselves.
+        for model in [
+            "openai/gpt-5.2",
+            "deepseek/deepseek-chat",
+            "google/gemini-3-pro",
+            "qwen/qwen3-coder-plus",
+            "openrouter/auto",
+            "gpt-5.2",
+            "claude-sonnet-4-5",
+        ] {
+            let mut req = routed(model);
+            run_cache_stage(&mut req, &OpenAiProvider);
+            assert!(
+                req.raw().get("cache_control").is_none(),
+                "{model} must not get a top-level marker"
+            );
+        }
+    }
+
+    #[test]
+    fn routed_marker_defers_to_a_client_breakpoint() {
+        // A caller that placed its own breakpoint owns the policy; adding a 1h marker
+        // beside a 5m block marker is the ttl-ordering violation the API rejects.
+        let mut req = Request::from_value(
+            ProviderKind::OpenAi,
+            json!({
+                "model": "anthropic/claude-sonnet-4.5",
+                "messages": [{"role": "system", "content": [
+                    {"type": "text", "text": "s", "cache_control": {"type": "ephemeral"}}
+                ]}]
+            }),
+        );
+        run_cache_stage(&mut req, &OpenAiProvider);
+        assert!(req.raw().get("cache_control").is_none());
+    }
+
+    #[test]
+    fn stabilize_sorts_gemini_function_declarations() {
+        // Gemini's tools sit one level down, so the outer sort can't see them. Its
+        // implicit cache is pure prefix matching, so a declaration block that reshuffles
+        // between runs never matches — canonicalizing it is the only lever we have there.
+        let mut req = Request::from_value(
+            ProviderKind::Google,
+            json!({
+                "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+                "tools": [{"functionDeclarations": [
+                    {"name": "zebra", "parameters": {"b": 1, "a": 2}},
+                    {"name": "apple", "parameters": {}},
+                ]}]
+            }),
+        );
+        run_cache_stage(&mut req, &GoogleProvider);
+        assert_eq!(
+            req.raw()
+                .pointer("/tools/0/functionDeclarations/0/name")
+                .unwrap(),
+            "apple",
+            "declarations sorted by name"
+        );
+        let keys: Vec<&str> = req
+            .raw()
+            .pointer("/tools/0/functionDeclarations/1/parameters")
             .and_then(Value::as_object)
             .unwrap()
             .keys()

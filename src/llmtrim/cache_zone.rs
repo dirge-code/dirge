@@ -8,6 +8,14 @@
 //! the segments after the last `cache_control` marker. Each new tool result is therefore
 //! compressed exactly once — when it first arrives in the live zone — then frozen.
 //!
+//! Anthropic's *automatic* caching (dirge-607) puts a single `cache_control` at the TOP
+//! LEVEL of the body instead of on a block: the API picks the breakpoint itself, placing it
+//! on the last cacheable block and advancing it as the conversation grows. There is no
+//! marker to read the position off, but the position is implied — everything sent on an
+//! earlier turn is inside the cached prefix. So a top-level marker freezes the system
+//! prompt and every message except the newest, which is the one that hasn't been cached
+//! yet and therefore is still ours to compress (exactly once, as above).
+//!
 //! No markers ⇒ no known cache ⇒ everything is compressible (behavior unchanged):
 //! determinism keeps an identical prefix cache-stable across calls, and Stage A's OpenAI
 //! `prompt_cache_key` pins auto-cached prefixes.
@@ -58,17 +66,25 @@ fn is_instruction(req: &Request, provider: &dyn Provider, pointer: &str) -> bool
 /// request carries no `cache_control` markers (nothing known-cached to protect).
 pub fn frozen_pointers(req: &Request, provider: &dyn Provider) -> HashSet<String> {
     let raw = req.raw();
-    let system_frozen = raw.get("system").is_some_and(has_cache_control);
-    let frozen_until = raw
-        .get("messages")
-        .and_then(Value::as_array)
-        .and_then(|msgs| {
-            msgs.iter()
-                .enumerate()
-                .filter(|(_, m)| has_cache_control(m))
-                .map(|(i, _)| i)
-                .max()
-        });
+    let automatic = has_automatic_cache_marker(raw);
+    let system_frozen = automatic || raw.get("system").is_some_and(has_cache_control);
+    let messages = raw.get("messages").and_then(Value::as_array);
+    let marked_until = messages.and_then(|msgs| {
+        msgs.iter()
+            .enumerate()
+            .filter(|(_, m)| has_cache_control(m))
+            .map(|(i, _)| i)
+            .max()
+    });
+    // Under automatic caching the breakpoint sits at the end of the request the provider
+    // last saw, so treat every message but the newest as cached. `len - 2` is the index of
+    // the second-to-last message; a 1-message request has no earlier turn to protect.
+    let automatic_until = automatic
+        .then(|| messages.map(Vec::len).filter(|len| *len >= 2))
+        .flatten()
+        .map(|len| len - 2);
+    // `None` sorts below `Some`, so this takes whichever boundary reaches further.
+    let frozen_until = marked_until.max(automatic_until);
 
     if frozen_until.is_none() && !system_frozen {
         return HashSet::new();
@@ -78,6 +94,35 @@ pub fn frozen_pointers(req: &Request, provider: &dyn Provider) -> HashSet<String
         .into_iter()
         .filter(|p| is_frozen(p, frozen_until, system_frozen))
         .collect()
+}
+
+/// Whether an automatic cache breakpoint is in play for this request.
+///
+/// Either the marker is already there — a `cache_control` at the top level of the body
+/// rather than on a content block, as distinct from a client-placed breakpoint, which
+/// always sits inside `system` / `messages` / `tools` — or Stage A is about to add one for
+/// a routed Anthropic model. Stage A runs LAST (it fingerprints the final prefix), so on
+/// that path the content stages consulting this would otherwise decide before the marker
+/// exists and re-window a prefix the provider has cached.
+///
+/// The routed case reads the model id rather than the config, so it also freezes under a
+/// preset that leaves Stage A off. That errs toward not rewriting cached bytes, which is
+/// the direction those presets want anyway.
+fn has_automatic_cache_marker(raw: &Value) -> bool {
+    raw.get("cache_control").is_some_and(|c| !c.is_null()) || routes_to_anthropic(raw)
+}
+
+/// Whether `model` names an Anthropic route through a router: a `vendor/model` id whose
+/// vendor is `anthropic`. Ids may carry a `~` price-preference prefix and a `:variant`
+/// suffix, so only the vendor segment is matched. Direct Anthropic traffic never matches
+/// (its wire shape has no vendor prefix on the model id), and Gemini carries no `model`
+/// field in the body at all.
+pub(crate) fn routes_to_anthropic(raw: &Value) -> bool {
+    raw.get("model")
+        .and_then(Value::as_str)
+        .map(|m| m.trim_start_matches(['~', '@']))
+        .and_then(|m| m.split_once('/'))
+        .is_some_and(|(vendor, _)| vendor.eq_ignore_ascii_case("anthropic"))
 }
 
 /// `cache_control` present anywhere within `v` (a block, a message, or nested content).
@@ -215,5 +260,145 @@ mod tests {
                 .iter()
                 .any(|x| x.starts_with("/messages/0"))
         );
+    }
+
+    #[test]
+    fn top_level_automatic_marker_freezes_everything_but_the_newest_turn() {
+        // dirge-607: automatic caching marks nothing, so before this the frozen set was
+        // empty and the content stages re-windowed tool results the provider had already
+        // cached. Re-compressing message 0 or 1 here truncates the cache hit at the first
+        // changed block and re-bills the rest at the 1h write rate (2× base input).
+        let r = req(json!({
+            "cache_control": {"type": "ephemeral", "ttl": "1h"},
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "turn one"}]},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "a 10k-line build log from an earlier turn"}
+                ]},
+                {"role": "user", "content": [{"type": "text", "text": "the new tool result"}]},
+            ]
+        }));
+        let p = for_kind(ProviderKind::Anthropic);
+        let frozen = frozen_pointers(&r, p.as_ref());
+        assert!(frozen.contains("/messages/0/content/0/text"));
+        assert!(frozen.contains("/messages/1/content/0/text"));
+        let comp = compressible_pointers(&r, p.as_ref());
+        assert!(
+            comp.iter().all(|x| x.starts_with("/messages/2")),
+            "only the turn that hasn't been cached yet: {comp:?}"
+        );
+    }
+
+    #[test]
+    fn automatic_marker_leaves_the_opening_request_compressible() {
+        // One message means no earlier turn is in the cache, so there is nothing to
+        // protect and the usual compression applies. Freezing here would forfeit the
+        // saving on the very request that is largest and cheapest to cut.
+        let r = req(json!({
+            "cache_control": {"type": "ephemeral"},
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "opening ask"}]}],
+        }));
+        let p = for_kind(ProviderKind::Anthropic);
+        assert!(
+            compressible_pointers(&r, p.as_ref())
+                .iter()
+                .any(|x| x.starts_with("/messages/0")),
+            "single-message request stays compressible"
+        );
+    }
+
+    #[test]
+    fn automatic_marker_freezes_the_system_prompt() {
+        // The automatic breakpoint always sits at or after the system prompt, so it is
+        // cached from the first turn on even though it carries no marker of its own.
+        let r = req(json!({
+            "cache_control": {"type": "ephemeral", "ttl": "1h"},
+            "system": [{"type": "text", "text": "stable instructions"}],
+            "messages": [
+                {"role": "user", "content": "one"},
+                {"role": "user", "content": "two"},
+            ],
+        }));
+        let p = for_kind(ProviderKind::Anthropic);
+        assert!(
+            frozen_pointers(&r, p.as_ref()).contains("/system/0/text"),
+            "system is inside the automatic prefix"
+        );
+    }
+
+    #[test]
+    fn explicit_marker_past_the_automatic_boundary_still_wins() {
+        // Both kinds present: the marker on the last message reaches further than
+        // "all but the newest", so it sets the boundary.
+        let r = req(json!({
+            "cache_control": {"type": "ephemeral", "ttl": "1h"},
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "one"}]},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "two", "cache_control": {"type": "ephemeral"}}
+                ]},
+            ]
+        }));
+        let p = for_kind(ProviderKind::Anthropic);
+        let frozen = frozen_pointers(&r, p.as_ref());
+        assert!(frozen.contains("/messages/1/content/0/text"));
+        assert!(
+            compressible_pointers(&r, p.as_ref()).is_empty(),
+            "the explicit marker covers the whole request"
+        );
+    }
+
+    #[test]
+    fn routed_anthropic_model_freezes_before_the_marker_exists() {
+        // Stage A adds the marker last, so on a routed Anthropic model the content stages
+        // reach this first and would see a bare body. The model id is the signal.
+        let r = Request::from_value(
+            ProviderKind::OpenAi,
+            json!({
+                "model": "anthropic/claude-sonnet-4.5",
+                "messages": [
+                    {"role": "user", "content": "an earlier turn"},
+                    {"role": "assistant", "content": "ok"},
+                    {"role": "user", "content": "the new tool result"},
+                ]
+            }),
+        );
+        let p = for_kind(ProviderKind::OpenAi);
+        let comp = compressible_pointers(&r, p.as_ref());
+        assert!(
+            comp.iter().all(|x| x.starts_with("/messages/2")),
+            "only the newest turn: {comp:?}"
+        );
+    }
+
+    #[test]
+    fn implicitly_cached_route_keeps_everything_compressible() {
+        let r = Request::from_value(
+            ProviderKind::OpenAi,
+            json!({
+                "model": "openai/gpt-5.2",
+                "messages": [
+                    {"role": "user", "content": "one"},
+                    {"role": "user", "content": "two"},
+                ]
+            }),
+        );
+        let p = for_kind(ProviderKind::OpenAi);
+        assert!(frozen_pointers(&r, p.as_ref()).is_empty());
+    }
+
+    #[test]
+    fn null_cache_control_is_not_an_automatic_marker() {
+        // rig serializes an unset top-level cache_control as `null` in some shapes;
+        // that is the absence of a marker, not a breakpoint.
+        let r = req(json!({
+            "cache_control": null,
+            "messages": [
+                {"role": "user", "content": "one"},
+                {"role": "user", "content": "two"},
+            ]
+        }));
+        let p = for_kind(ProviderKind::Anthropic);
+        assert!(frozen_pointers(&r, p.as_ref()).is_empty());
     }
 }

@@ -4,6 +4,47 @@ All notable changes to dirge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- Prompt caching now holds the prefix it pays to cache (dirge-mv8k). Enabling
+  Anthropic automatic caching put a single `cache_control` at the top level of the
+  request body, but the cache-zone guard only recognised breakpoints placed on a
+  block, so it concluded nothing was cached and let the content stages rewrite the
+  whole history on every turn. Tool-output windowing is scored against the short
+  segments of the request, and that set grows with each turn, so an old tool result
+  came back windowed differently, the cached prefix changed mid-history, and the
+  cache hit truncated at the first altered block while everything after it was
+  re-billed at the 1h write rate (2x base input). A top-level marker now freezes the
+  system prompt and every message except the newest, which is the one the provider
+  has not seen yet and so is still ours to compress, exactly once.
+
+- Anthropic models reached through OpenRouter are cached (dirge-mv8k). OpenRouter
+  forwards to whichever provider owns the model, and Anthropic caches nothing without
+  an explicit breakpoint, so a Claude route was re-billing the full system prompt and
+  tool block every turn. Those requests now carry the top-level `cache_control`
+  OpenRouter documents for automatic caching. Gated on the `anthropic/` vendor segment,
+  since the field is an unrecognised argument to a genuine OpenAI-shaped endpoint and
+  the other providers cache the longest matching prefix by themselves.
+
+- Gemini's tool block is canonicalised (dirge-mv8k). Gemini nests its tools one level
+  down as `tools[].functionDeclarations[]`, so the sort that makes the prefix
+  byte-identical across restarts saw a single unnamed element and left the declaration
+  order as the SDK emitted it. Gemini's implicit cache is pure prefix matching, so a
+  tool block that reshuffles between runs never matched the earlier prefix. Ordering
+  the declarations is the one caching lever that provider has.
+
+- The `prompt-caching-scope-2026-01-05` beta is no longer sent (dirge-mv8k). It only
+  permits a `scope` field inside a `cache_control` block, which dirge never sends, so
+  it bought nothing while making every request unsendable through an
+  Anthropic-compatible relay that does not recognise the value: those reject the whole
+  request rather than ignoring the flag.
+
+### Changed
+- The Anthropic OAuth transport parses each request body once instead of twice. The
+  beta-header decision reads `thinking.type` and the payload shaping needs the same
+  JSON, and an agent turn's body is the largest allocation on that path.
+
 ## [0.19.26] - 2026-07-28
 
 ### Fixed
