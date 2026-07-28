@@ -25,6 +25,32 @@ pub(crate) fn spawn_input_reader(user_tx: tokio::sync::mpsc::UnboundedSender<Use
             libc::setpriority(libc::PRIO_PROCESS, 0, -20);
         }
 
+        // ── Dead-tty guard (dirge-jiiv) ─────────────────────────
+        // Mirror crossterm's internal fd selection: if stdin is a
+        // tty use fd 0; otherwise open /dev/tty. Probe this fd
+        // before each call to event::poll because crossterm's
+        // internal read loop never returns on EOF/EIO — once control
+        // enters poll() it may never come back.
+        #[cfg(unix)]
+        let probe_fd: Option<(std::os::unix::io::RawFd, Option<std::fs::File>)> = {
+            use std::os::unix::io::AsRawFd;
+            if unsafe { libc::isatty(0) } == 1 {
+                Some((0, None))
+            } else {
+                match std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open("/dev/tty")
+                {
+                    Ok(f) => {
+                        let raw = f.as_raw_fd();
+                        Some((raw, Some(f)))
+                    }
+                    Err(_) => None,
+                }
+            }
+        };
+
         // Poll-based loop so `TerminalGuard::drop` can signal a
         // cooperative shutdown via `EVENT_READER_SHUTDOWN`. Previously
         // this thread blocked in `event::read()` indefinitely; on
@@ -35,6 +61,16 @@ pub(crate) fn spawn_input_reader(user_tx: tokio::sync::mpsc::UnboundedSender<Use
         // signalling, the mutex is released, and the drain runs
         // uncontended.
         loop {
+            // Probe for a dead tty before calling event::poll.
+            // crossterm's internal read loop never returns on
+            // EOF/EIO, so once we enter poll() we may never come
+            // back. A dead fd reports POLLHUP|POLLERR|POLLNVAL.
+            #[cfg(unix)]
+            if let Some((fd, _guard)) = &probe_fd
+                && tty_is_dead(*fd).unwrap_or(false)
+            {
+                break;
+            }
             if crate::ui::terminal::EVENT_READER_SHUTDOWN.load(std::sync::atomic::Ordering::Relaxed)
             {
                 break;
@@ -156,5 +192,63 @@ pub(crate) fn spawn_input_reader(user_tx: tokio::sync::mpsc::UnboundedSender<Use
     // need to guarantee the reader is gone before draining stdin.
     if let Ok(mut guard) = crate::ui::terminal::READER_HANDLE.lock() {
         *guard = Some(handle);
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn tty_is_dead(fd: std::os::unix::io::RawFd) -> std::io::Result<bool> {
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ret = unsafe { libc::poll(&mut pfd, 1, 0) };
+    if ret < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok((pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)) != 0)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+
+    fn open_pty_pair() -> (std::fs::File, std::fs::File) {
+        let primary_fd = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) };
+        assert!(primary_fd >= 0, "posix_openpt failed");
+        assert_eq!(unsafe { libc::grantpt(primary_fd) }, 0, "grantpt failed");
+        assert_eq!(unsafe { libc::unlockpt(primary_fd) }, 0, "unlockpt failed");
+        let secondary_name = unsafe { libc::ptsname(primary_fd) };
+        assert!(!secondary_name.is_null(), "ptsname returned null");
+        let secondary_fd = unsafe { libc::open(secondary_name, libc::O_RDWR | libc::O_NOCTTY) };
+        assert!(secondary_fd >= 0, "open secondary failed");
+        let primary = unsafe { std::fs::File::from_raw_fd(primary_fd) };
+        let secondary = unsafe { std::fs::File::from_raw_fd(secondary_fd) };
+        (primary, secondary)
+    }
+
+    #[test]
+    fn tty_is_dead_false_for_live_pty() {
+        let (primary, secondary) = open_pty_pair();
+        let secondary_fd = secondary.as_raw_fd();
+        assert!(
+            !tty_is_dead(secondary_fd).expect("poll failed"),
+            "secondary should be alive while primary is open"
+        );
+        drop(primary);
+        drop(secondary);
+    }
+
+    #[test]
+    fn tty_is_dead_true_after_peer_close() {
+        let (primary, secondary) = open_pty_pair();
+        let secondary_fd = secondary.as_raw_fd();
+        drop(primary);
+        assert!(
+            tty_is_dead(secondary_fd).expect("poll failed"),
+            "secondary should be dead after primary closes"
+        );
+        drop(secondary);
     }
 }
