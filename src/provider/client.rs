@@ -13,7 +13,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rig::http_client::HeaderMap;
 use rig::providers::{anthropic, chatgpt, gemini, ollama, openai, openrouter};
 
-use crate::auth::store::{KimiAuthStore, KimiOAuthCredential, OpenAiAuthStore, OpenAiOAuthCredential};
+use crate::auth::store::{
+    KimiAuthStore, KimiOAuthCredential, OpenAiAuthStore, OpenAiOAuthCredential,
+};
 use crate::config::{ProviderAuth, ProviderEntry};
 
 use super::auth::{ProviderAuthHeaders, resolve_auth_headers};
@@ -1134,7 +1136,12 @@ mod tests {
         );
         // An EXPLICIT api_key choice is honored even with OAuth present.
         assert_eq!(
-            effective_auth(Some(ProviderAuth::ApiKey), ProviderKind::Anthropic, true, false),
+            effective_auth(
+                Some(ProviderAuth::ApiKey),
+                ProviderKind::Anthropic,
+                true,
+                false
+            ),
             ProviderAuth::ApiKey
         );
         // A non-anthropic provider never gets Anthropic auth implied.
@@ -1874,7 +1881,10 @@ mod tests {
             "{:?}",
             ProviderCredential::ChatGptAuth("CHATGPT-TOKEN".to_string())
         );
-        let kimi_debug = format!("{:?}", ProviderCredential::KimiAuth("KIMI-TOKEN".to_string()));
+        let kimi_debug = format!(
+            "{:?}",
+            ProviderCredential::KimiAuth("KIMI-TOKEN".to_string())
+        );
         let api_key_debug = format!("{:?}", ProviderCredential::ApiKey("API-KEY".to_string()));
 
         assert!(!oauth_debug.contains("ACCESS-TOKEN"));
@@ -2265,7 +2275,10 @@ mod tests {
             msg.contains("only supported for the `kimi` provider"),
             "unexpected error: {msg}"
         );
-        assert!(msg.contains("deepseek"), "error should name the provider: {msg}");
+        assert!(
+            msg.contains("deepseek"),
+            "error should name the provider: {msg}"
+        );
     }
 
     #[test]

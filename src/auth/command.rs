@@ -85,9 +85,9 @@ where
     }
 
     fn complete_device_login(&self, authorization: DeviceAuthorization) -> KimiTokenFuture<'_> {
-        Box::pin(async move {
-            KimiDeviceAuthFlow::complete_device_login(self, &authorization).await
-        })
+        Box::pin(
+            async move { KimiDeviceAuthFlow::complete_device_login(self, &authorization).await },
+        )
     }
 }
 
@@ -173,8 +173,16 @@ where
     let authorization = flow.request_device_authorization().await?;
 
     writeln!(stdout, "Kimi Code device-code login")?;
-    writeln!(stdout, "1. Open: {}", authorization.verification_uri_complete)?;
-    writeln!(stdout, "2. Confirm the code shown is: {}", authorization.user_code)?;
+    writeln!(
+        stdout,
+        "1. Open: {}",
+        authorization.verification_uri_complete
+    )?;
+    writeln!(
+        stdout,
+        "2. Confirm the code shown is: {}",
+        authorization.user_code
+    )?;
     writeln!(
         stdout,
         "Do not share this code. Anyone with it may be able to authorize Dirge as you."

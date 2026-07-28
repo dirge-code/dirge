@@ -201,7 +201,9 @@ impl KimiHttpClient {
         if let Some(headers) = builder.headers_mut() {
             *headers = parts.headers;
         }
-        builder.body(body.into()).map_err(http_client::Error::Protocol)
+        builder
+            .body(body.into())
+            .map_err(http_client::Error::Protocol)
     }
 }
 
@@ -396,10 +398,7 @@ mod tests {
         let client = client("TOKEN", Some(i64::MAX), never_refresh());
         let headers = request(&client, None);
 
-        assert_eq!(
-            headers.get("x-msh-platform").unwrap(),
-            "kimi_code_cli"
-        );
+        assert_eq!(headers.get("x-msh-platform").unwrap(), "kimi_code_cli");
         assert_eq!(headers.get("x-msh-device-id").unwrap(), "device-1");
         assert_eq!(
             headers.get(http::header::USER_AGENT).unwrap(),

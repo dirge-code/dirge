@@ -722,10 +722,7 @@ mod tests {
 
     #[test]
     fn parses_auth_kimi_subcommand_and_kimi_code_alias() {
-        for args in [
-            ["dirge", "auth", "kimi"],
-            ["dirge", "auth", "kimi-code"],
-        ] {
+        for args in [["dirge", "auth", "kimi"], ["dirge", "auth", "kimi-code"]] {
             let cli = Cli::try_parse_from(args).unwrap();
 
             match cli.command {

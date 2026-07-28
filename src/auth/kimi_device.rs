@@ -233,7 +233,8 @@ impl KimiDeviceAuthRuntime for TokioKimiDeviceAuthRuntime {
 }
 
 #[derive(Clone)]
-pub(crate) struct KimiDeviceAuthFlow<H = ReqwestKimiDeviceAuthHttp, R = TokioKimiDeviceAuthRuntime> {
+pub(crate) struct KimiDeviceAuthFlow<H = ReqwestKimiDeviceAuthHttp, R = TokioKimiDeviceAuthRuntime>
+{
     oauth_host: String,
     client_id: String,
     http: H,
@@ -301,10 +302,7 @@ where
                 vec![
                     ("client_id".to_string(), self.client_id.clone()),
                     ("device_code".to_string(), device_code.to_string()),
-                    (
-                        "grant_type".to_string(),
-                        DEVICE_CODE_GRANT_TYPE.to_string(),
-                    ),
+                    ("grant_type".to_string(), DEVICE_CODE_GRANT_TYPE.to_string()),
                 ],
             )
             .await?;
@@ -457,9 +455,7 @@ fn parse_token_info(body: &str, now_epoch_ms: i64) -> Result<TokenInfo> {
         _ => None,
     }
     .filter(|expires_in| *expires_in > 0)
-    .ok_or_else(|| {
-        KimiAuthError::InvalidResponse("missing or invalid expires_in".to_string())
-    })?;
+    .ok_or_else(|| KimiAuthError::InvalidResponse("missing or invalid expires_in".to_string()))?;
     let expires_in_ms = i64::try_from(expires_in_seconds.saturating_mul(1000)).unwrap_or(i64::MAX);
     Ok(TokenInfo {
         access_token,
@@ -529,7 +525,9 @@ fn kimi_device_id_at(path: &Path) -> String {
 }
 
 fn persist_device_id(path: &Path, id: &str) {
-    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty())
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
         && std::fs::create_dir_all(parent).is_ok()
     {
         #[cfg(unix)]
@@ -560,7 +558,10 @@ fn kimi_device_headers_at(device_id_path: &Path) -> Vec<(String, String)> {
         ("X-Msh-Platform".to_string(), KIMI_PLATFORM.to_string()),
         ("X-Msh-Version".to_string(), version.to_string()),
         ("X-Msh-Device-Name".to_string(), ascii_header(&host_name())),
-        ("X-Msh-Device-Model".to_string(), ascii_header(&device_model())),
+        (
+            "X-Msh-Device-Model".to_string(),
+            ascii_header(&device_model()),
+        ),
         (
             "X-Msh-Os-Version".to_string(),
             ascii_header(std::env::consts::OS),
@@ -738,8 +739,9 @@ mod tests {
             "https://staging.kimi.com"
         );
         assert_eq!(
-            oauth_host_from(|name| (name == "KIMI_OAUTH_HOST")
-                .then(|| "https://legacy.kimi.com".to_string())),
+            oauth_host_from(
+                |name| (name == "KIMI_OAUTH_HOST").then(|| "https://legacy.kimi.com".to_string())
+            ),
             "https://legacy.kimi.com"
         );
         // Empty values are ignored.
@@ -867,7 +869,10 @@ mod tests {
 
     #[tokio::test]
     async fn device_authorization_error_status_does_not_echo_body() {
-        let http = FakeHttp::new([response(403, json!({"error": "ACCESS-TOKEN REFRESH-TOKEN"}))]);
+        let http = FakeHttp::new([response(
+            403,
+            json!({"error": "ACCESS-TOKEN REFRESH-TOKEN"}),
+        )]);
 
         let err = flow(http, FakeRuntime::new(0))
             .request_device_authorization()
@@ -891,7 +896,11 @@ mod tests {
             (json!({"error": "expired_token"}), 400, "expired"),
             (json!({"error": "access_denied"}), 403, "denied"),
             (json!({"error": "something_else"}), 400, "poll-status"),
-            (json!({"error": "authorization_pending"}), 500, "poll-status"),
+            (
+                json!({"error": "authorization_pending"}),
+                500,
+                "poll-status",
+            ),
         ];
         for (body, status, expected) in cases {
             let http = FakeHttp::new([response(status, body)]);
@@ -944,10 +953,7 @@ mod tests {
                 form: vec![
                     ("client_id".to_string(), "client-test".to_string()),
                     ("device_code".to_string(), "DEVICE-CODE".to_string()),
-                    (
-                        "grant_type".to_string(),
-                        DEVICE_CODE_GRANT_TYPE.to_string()
-                    ),
+                    ("grant_type".to_string(), DEVICE_CODE_GRANT_TYPE.to_string()),
                 ],
             }]
         );
@@ -992,7 +998,10 @@ mod tests {
                 json!({"error": "expired_token"}),
                 KimiAuthError::DeviceCodeExpired,
             ),
-            (json!({"error": "access_denied"}), KimiAuthError::AccessDenied),
+            (
+                json!({"error": "access_denied"}),
+                KimiAuthError::AccessDenied,
+            ),
         ] {
             let http = FakeHttp::new([response(400, body)]);
             let authorization = DeviceAuthorization {
@@ -1061,15 +1070,21 @@ mod tests {
         assert_eq!(token.expires_at_epoch_ms, 1_700_000_900_000);
         let requests = http.requests();
         assert_eq!(requests.len(), 1);
-        assert!(requests[0]
-            .form
-            .contains(&("grant_type".to_string(), "refresh_token".to_string())));
-        assert!(requests[0]
-            .form
-            .contains(&("refresh_token".to_string(), "OLD-REFRESH".to_string())));
-        assert!(requests[0]
-            .form
-            .contains(&("client_id".to_string(), "client-test".to_string())));
+        assert!(
+            requests[0]
+                .form
+                .contains(&("grant_type".to_string(), "refresh_token".to_string()))
+        );
+        assert!(
+            requests[0]
+                .form
+                .contains(&("refresh_token".to_string(), "OLD-REFRESH".to_string()))
+        );
+        assert!(
+            requests[0]
+                .form
+                .contains(&("client_id".to_string(), "client-test".to_string()))
+        );
     }
 
     #[tokio::test]
@@ -1136,10 +1151,7 @@ mod tests {
             .unwrap_err();
         let message = err.to_string();
 
-        assert!(matches!(
-            err,
-            KimiAuthError::RefreshStatus { status: 502 }
-        ));
+        assert!(matches!(err, KimiAuthError::RefreshStatus { status: 502 }));
         assert!(!message.contains("OLD-REFRESH"));
     }
 
@@ -1246,10 +1258,7 @@ mod tests {
             map.get("X-Msh-Platform").map(String::as_str),
             Some(KIMI_PLATFORM)
         );
-        assert_eq!(
-            map.get("X-Msh-Version").map(String::as_str),
-            Some(version)
-        );
+        assert_eq!(map.get("X-Msh-Version").map(String::as_str), Some(version));
         for name in [
             "X-Msh-Device-Name",
             "X-Msh-Device-Model",

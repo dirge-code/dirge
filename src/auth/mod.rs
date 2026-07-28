@@ -563,7 +563,8 @@ mod kimi_command_tests {
     impl KimiLoginFlow for FakeLoginFlow {
         fn request_device_authorization(
             &self,
-        ) -> Pin<Box<dyn Future<Output = KimiAuthResult<DeviceAuthorization>> + Send + '_>> {
+        ) -> Pin<Box<dyn Future<Output = KimiAuthResult<DeviceAuthorization>> + Send + '_>>
+        {
             Box::pin(async move { self.state.lock().unwrap().authorization.take().unwrap() })
         }
 
@@ -661,10 +662,7 @@ mod kimi_command_tests {
             .await
             .unwrap();
 
-        assert_eq!(
-            flow.completed_with().unwrap().device_code,
-            "DEVICE-CODE"
-        );
+        assert_eq!(flow.completed_with().unwrap().device_code, "DEVICE-CODE");
         let saved = store.saved();
         assert_eq!(saved.len(), 1);
         let credential = &saved[0];
@@ -684,7 +682,8 @@ mod kimi_command_tests {
     #[tokio::test]
     async fn kimi_login_propagates_store_error_without_leaking_tokens_to_stdout() {
         let flow = FakeLoginFlow::new(authorization(), tokens());
-        let store = FakeStore::with_save_error(PathBuf::from("/tmp/fake-kimi-auth.json"), "disk full");
+        let store =
+            FakeStore::with_save_error(PathBuf::from("/tmp/fake-kimi-auth.json"), "disk full");
         let mut stdout = Vec::new();
 
         let err = login_kimi_with(flow, store.clone(), &mut stdout)
