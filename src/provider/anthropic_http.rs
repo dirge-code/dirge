@@ -152,10 +152,9 @@ impl AnthropicHttpClient {
         if let Some(beta) = build_anthropic_beta_header(bearer.as_deref(), &body)
             && let Ok(value) = http::HeaderValue::from_str(&beta)
         {
-            parts.headers.insert(
-                http::HeaderName::from_static("anthropic-beta"),
-                value,
-            );
+            parts
+                .headers
+                .insert(http::HeaderName::from_static("anthropic-beta"), value);
         }
         parts.headers.insert(
             http::HeaderName::from_static("anthropic-dangerous-direct-browser-access"),
@@ -285,15 +284,14 @@ fn build_anthropic_beta_header(bearer: Option<&str>, body: &Bytes) -> Option<Str
         ANTHROPIC_BETA_CONTEXT_MANAGEMENT,
         ANTHROPIC_BETA_PROMPT_CACHING_SCOPE,
     ];
-    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) {
-        if value
+    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(body)
+        && value
             .get("thinking")
             .and_then(|t| t.get("type"))
             .and_then(serde_json::Value::as_str)
             == Some("enabled")
-        {
-            betas.push(ANTHROPIC_BETA_INTERLEAVED_THINKING);
-        }
+    {
+        betas.push(ANTHROPIC_BETA_INTERLEAVED_THINKING);
     }
     Some(betas.join(","))
 }
@@ -301,10 +299,10 @@ fn build_anthropic_beta_header(bearer: Option<&str>, body: &Bytes) -> Option<Str
 /// Removes `temperature` from the payload when thinking is active.
 /// Anthropic returns a 400 if both `thinking` and `temperature` are present.
 fn strip_temperature_if_thinking(value: &mut serde_json::Value) {
-    if value.get("thinking").is_some_and(|t| !t.is_null()) {
-        if let Some(obj) = value.as_object_mut() {
-            obj.remove("temperature");
-        }
+    if value.get("thinking").is_some_and(|t| !t.is_null())
+        && let Some(obj) = value.as_object_mut()
+    {
+        obj.remove("temperature");
     }
 }
 
@@ -1022,13 +1020,17 @@ mod tests {
     #[test]
     fn dynamic_beta_baseline_oauth_set_unchanged() {
         let client = oauth_client();
-        let body = Bytes::from(
-            r#"{"model":"claude-sonnet-4-5","messages":[]}"#,
-        );
+        let body = Bytes::from(r#"{"model":"claude-sonnet-4-5","messages":[]}"#);
         let normalized = client.normalized_request(messages_req(body)).unwrap();
         let header = beta_header(&normalized);
-        assert!(header.contains("claude-code-20250219"), "missing claude-code beta: {header}");
-        assert!(header.contains("oauth-2025-04-20"), "missing oauth beta: {header}");
+        assert!(
+            header.contains("claude-code-20250219"),
+            "missing claude-code beta: {header}"
+        );
+        assert!(
+            header.contains("oauth-2025-04-20"),
+            "missing oauth beta: {header}"
+        );
         assert!(
             header.contains("context-management-2025-06-27"),
             "missing context-management beta: {header}"
@@ -1067,9 +1069,7 @@ mod tests {
 
     #[test]
     fn temperature_preserved_when_no_thinking() {
-        let body = Bytes::from(
-            r#"{"model":"claude-sonnet-4-5","messages":[],"temperature":0.7}"#,
-        );
+        let body = Bytes::from(r#"{"model":"claude-sonnet-4-5","messages":[],"temperature":0.7}"#);
         let shaped: serde_json::Value =
             serde_json::from_slice(&shape_oauth_messages_payload(body)).unwrap();
         assert_eq!(

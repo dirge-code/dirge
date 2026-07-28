@@ -66,13 +66,27 @@ macro_rules! dispatch_stream_fn {
                 // stable system-prompt + tool-definition prefix is cached
                 // server-side across turns. Without this every turn bills full
                 // input tokens even though the prefix never changes.
-                __stream_fn($model.with_automatic_caching_1h(), $tools, $timeout, $provider, $model_name, $filter)
+                __stream_fn(
+                    $model.with_automatic_caching_1h(),
+                    $tools,
+                    $timeout,
+                    $provider,
+                    $model_name,
+                    $filter,
+                )
             }
             $enum::AnthropicOauth($bind) => {
                 // dirge-607: same as Anthropic arm above; the OAuth/Claude-Code
                 // path is the primary user-facing path and the biggest source of
                 // token burn on the Pro 5x plan.
-                __stream_fn($model.with_automatic_caching_1h(), $tools, $timeout, $provider, $model_name, $filter)
+                __stream_fn(
+                    $model.with_automatic_caching_1h(),
+                    $tools,
+                    $timeout,
+                    $provider,
+                    $model_name,
+                    $filter,
+                )
             }
             $enum::Gemini($bind) => {
                 __stream_fn($model, $tools, $timeout, $provider, $model_name, $filter)
