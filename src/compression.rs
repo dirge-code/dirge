@@ -73,6 +73,51 @@ pub fn config_for_preset(name: &str) -> crate::llmtrim::config::DenseConfig {
     crate::llmtrim::config::DenseConfig::preset(name).unwrap_or_else(dirge_default_config)
 }
 
+/// [`config_for_preset`] plus the caching policy that depends on which backend the request
+/// is bound for. Preset choice is the user's; these two are not.
+pub fn config_for_provider(
+    kind: crate::provider::ProviderKind,
+    preset: &str,
+) -> crate::llmtrim::config::DenseConfig {
+    let mut c = config_for_preset(preset);
+    c.cache_prompt_key = accepts_prompt_cache_key(kind);
+    c.cache_auto_ttl = crate::prompt_cache::ttl()
+        .wire_ttl()
+        .unwrap_or_default()
+        .to_string();
+    c
+}
+
+/// Whether a backend accepts OpenAI's `prompt_cache_key` (dirge-07ew).
+///
+/// This has to be an allowlist rather than "send it and let them ignore it". An
+/// OpenAI-compatible server that validates its request body strictly rejects the whole
+/// request over an unknown field — Cerebras answered `body.prompt_cache_key: property
+/// 'body.prompt_cache_key' is unsupported` with a 422 before it shipped caching, Groq and
+/// Volcano Engine's DeepSeek answer the same way today — so a field sent hopefully is a
+/// session that cannot make a single request.
+///
+/// The parameter also has to be worth the risk, and mostly it isn't. It is a routing hint
+/// for OpenAI's prefix cache (and required for reliable matching on GPT-5.6 and later), and
+/// a router uses it to keep a conversation on the endpoint holding its cache. Everywhere
+/// else the caching is automatic with no key to pin: DeepSeek, GLM and Cerebras match the
+/// prefix themselves and gain nothing from it, so they are left out even where they might
+/// tolerate it. Ollama, OpenCode and Custom point at arbitrary endpoints whose strictness we
+/// cannot know, which decides it for them.
+fn accepts_prompt_cache_key(kind: crate::provider::ProviderKind) -> bool {
+    use crate::provider::ProviderKind as K;
+    match kind {
+        // First-party OpenAI, including the ChatGPT/Codex backends.
+        K::OpenAI => true,
+        // Documented, and the fallback OpenRouter uses for sticky routing when no
+        // `session_id` is set.
+        K::OpenRouter => true,
+        K::Anthropic | K::Gemini => false,
+        K::DeepSeek | K::Glm | K::Cerebras | K::Kimi => false,
+        K::Ollama | K::OpenCode | K::Custom => false,
+    }
+}
+
 /// Rewrite a request body with an explicit config (the low-level entry point,
 /// called from the HTTP interceptor).
 pub fn rewrite_with(
@@ -88,6 +133,44 @@ pub fn rewrite_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::ProviderKind;
+
+    #[test]
+    fn prompt_cache_key_goes_only_where_it_is_documented() {
+        // dirge-07ew: an allowlist, not a denylist. A strict OpenAI-compatible endpoint
+        // rejects the whole request over an unknown field, so a backend we are unsure
+        // about must not receive it — and outside the OpenAI family there is nothing to
+        // gain, since those providers match the prefix without a key.
+        assert!(accepts_prompt_cache_key(ProviderKind::OpenAI));
+        assert!(accepts_prompt_cache_key(ProviderKind::OpenRouter));
+        for kind in [
+            ProviderKind::Cerebras,
+            ProviderKind::DeepSeek,
+            ProviderKind::Glm,
+            ProviderKind::Kimi,
+            ProviderKind::Ollama,
+            ProviderKind::OpenCode,
+            ProviderKind::Custom,
+        ] {
+            assert!(
+                !accepts_prompt_cache_key(kind),
+                "{kind:?} must not be sent prompt_cache_key"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_config_carries_the_caching_policy() {
+        let c = config_for_provider(ProviderKind::Cerebras, "dirge");
+        assert!(c.cache, "the dirge preset still runs the cache stage");
+        assert!(!c.cache_prompt_key, "but sends no key to Cerebras");
+        let c = config_for_provider(ProviderKind::OpenAI, "dirge");
+        assert!(c.cache_prompt_key);
+        assert_eq!(
+            c.cache_auto_ttl, "1h",
+            "the shipped default TTL, absent config"
+        );
+    }
 
     #[test]
     fn init_from_config_disables_compression() {

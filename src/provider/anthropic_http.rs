@@ -89,8 +89,6 @@ const ANTHROPIC_BETA_OAUTH: &str = "oauth-2025-04-20";
 const ANTHROPIC_BETA_INTERLEAVED_THINKING: &str = "interleaved-thinking-2025-05-14";
 /// Context management — part of the OAuth baseline set.
 const ANTHROPIC_BETA_CONTEXT_MANAGEMENT: &str = "context-management-2025-06-27";
-/// Per-session cache scope (dirge-607).
-const ANTHROPIC_BETA_PROMPT_CACHING_SCOPE: &str = "prompt-caching-scope-2026-01-05";
 
 /// `User-Agent` that identifies the request as first-party Claude Code.
 /// Without it the subscription path returns a third-party "extra usage" 400.
@@ -149,7 +147,12 @@ impl AnthropicHttpClient {
         {
             parts.headers.insert(http::header::AUTHORIZATION, value);
         }
-        if let Some(beta) = build_anthropic_beta_header(bearer.as_deref(), &body)
+        // Parse the body once. Both the beta-header decision (it reads
+        // `thinking.type`) and the OAuth payload shaping below need the body as
+        // JSON, and an agent turn's body is the largest allocation on this path —
+        // parsing it twice per request is pure waste.
+        let mut parsed = serde_json::from_slice::<serde_json::Value>(&body).ok();
+        if let Some(beta) = build_anthropic_beta_header(bearer.as_deref(), parsed.as_ref())
             && let Ok(value) = http::HeaderValue::from_str(&beta)
         {
             parts
@@ -169,10 +172,13 @@ impl AnthropicHttpClient {
             http::HeaderValue::from_static(CLAUDE_CODE_USER_AGENT),
         );
 
-        let body = if is_messages_path(parts.uri.path()) && is_oauth_bearer(bearer.as_deref()) {
-            shape_oauth_messages_payload(body)
-        } else {
-            body
+        let body = match parsed.take() {
+            Some(value)
+                if is_messages_path(parts.uri.path()) && is_oauth_bearer(bearer.as_deref()) =>
+            {
+                shape_oauth_messages_value(value, body)
+            }
+            _ => body,
         };
 
         let mut builder = Request::builder()
@@ -274,7 +280,17 @@ fn is_messages_path(path: &str) -> bool {
 /// Returns `None` for non-OAuth (API-key) paths — no beta header needed there.
 /// Adds `interleaved-thinking` only for extended thinking (`type == "enabled"`),
 /// not for adaptive thinking (`type == "adaptive"`).
-fn build_anthropic_beta_header(bearer: Option<&str>, body: &Bytes) -> Option<String> {
+///
+/// Every flag here is one first-party Claude Code actually sends, which is what
+/// keeps the OAuth classifier happy. Nothing speculative belongs in this list:
+/// an `anthropic-beta` value the endpoint doesn't recognize is a hard 400
+/// ("Unexpected value(s) … for the `anthropic-beta` header"), not a silent
+/// ignore, so a flag we don't need is a request we can't send. `body` is the
+/// pre-parsed request (`None` when it isn't JSON, e.g. a non-messages path).
+fn build_anthropic_beta_header(
+    bearer: Option<&str>,
+    body: Option<&serde_json::Value>,
+) -> Option<String> {
     if !is_oauth_bearer(bearer) {
         return None;
     }
@@ -282,14 +298,12 @@ fn build_anthropic_beta_header(bearer: Option<&str>, body: &Bytes) -> Option<Str
         ANTHROPIC_BETA_CLAUDE_CODE,
         ANTHROPIC_BETA_OAUTH,
         ANTHROPIC_BETA_CONTEXT_MANAGEMENT,
-        ANTHROPIC_BETA_PROMPT_CACHING_SCOPE,
     ];
-    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(body)
-        && value
-            .get("thinking")
-            .and_then(|t| t.get("type"))
-            .and_then(serde_json::Value::as_str)
-            == Some("enabled")
+    if body
+        .and_then(|v| v.get("thinking"))
+        .and_then(|t| t.get("type"))
+        .and_then(serde_json::Value::as_str)
+        == Some("enabled")
     {
         betas.push(ANTHROPIC_BETA_INTERLEAVED_THINKING);
     }
@@ -314,10 +328,22 @@ const TEXT_REPLACEMENTS: [(&str, &str); 1] = [(
     "Environment context you are running in:",
 )];
 
+/// Parse-and-shape entry point. [`normalized_request`] uses
+/// [`shape_oauth_messages_value`] directly with the body it already parsed.
+///
+/// [`normalized_request`]: AnthropicHttpClient::normalized_request
+#[cfg(test)]
 fn shape_oauth_messages_payload(body: Bytes) -> Bytes {
-    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&body) else {
-        return body;
-    };
+    match serde_json::from_slice::<serde_json::Value>(&body) {
+        Ok(value) => shape_oauth_messages_value(value, body),
+        Err(_) => body,
+    }
+}
+
+/// Shape an already-parsed OAuth messages payload. `body` is the original bytes,
+/// returned unchanged when the payload isn't a messages request or re-serializing
+/// fails, so a shaping miss can never break a request.
+fn shape_oauth_messages_value(mut value: serde_json::Value, body: Bytes) -> Bytes {
     if !is_anthropic_messages_payload(&value) {
         return body;
     }
@@ -1035,9 +1061,24 @@ mod tests {
             header.contains("context-management-2025-06-27"),
             "missing context-management beta: {header}"
         );
+    }
+
+    #[test]
+    fn dynamic_beta_omits_prompt_caching_scope() {
+        // `prompt-caching-scope-2026-01-05` only permits a `scope` field inside a
+        // `cache_control` block, and dirge never sends `scope` — automatic caching
+        // puts a bare marker at the top level. So the flag bought nothing while
+        // making every request unsendable through an Anthropic-compatible relay
+        // that doesn't know the value: those reject the whole request with
+        // "Unexpected value(s) `prompt-caching-scope-2026-01-05` for the
+        // `anthropic-beta` header" rather than ignoring it.
+        let client = oauth_client();
+        let body = Bytes::from(r#"{"model":"claude-sonnet-4-5","messages":[]}"#);
+        let normalized = client.normalized_request(messages_req(body)).unwrap();
+        let header = beta_header(&normalized);
         assert!(
-            header.contains("prompt-caching-scope-2026-01-05"),
-            "missing prompt-caching-scope beta: {header}"
+            !header.contains("prompt-caching-scope"),
+            "prompt-caching-scope must not be sent: {header}"
         );
     }
 

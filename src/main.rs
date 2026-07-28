@@ -26,6 +26,7 @@ mod llmtrim;
 mod lsp;
 mod permission;
 mod plugin;
+mod prompt_cache;
 mod provider;
 mod sandbox;
 #[cfg(feature = "semantic")]
@@ -545,6 +546,7 @@ async fn main() -> anyhow::Result<()> {
         cfg.compression.as_ref().and_then(|c| c.enabled),
         cfg.compression.as_ref().and_then(|c| c.preset.clone()),
     );
+    crate::prompt_cache::init_from_config(cfg.prompt_cache.as_ref().and_then(|c| c.ttl.as_deref()));
 
     // Handle subcommands that exit before the TUI starts.
     if let Some(ref command) = cli.command {

@@ -62,12 +62,14 @@ macro_rules! dispatch_stream_fn {
                 $filter,
             ),
             $enum::Anthropic($bind) => {
-                // dirge-607: enable automatic prompt caching (1h TTL) so the
-                // stable system-prompt + tool-definition prefix is cached
-                // server-side across turns. Without this every turn bills full
-                // input tokens even though the prefix never changes.
+                // dirge-607: enable automatic prompt caching so the stable
+                // system-prompt + tool-definition prefix is cached server-side
+                // across turns. Without this every turn bills full input tokens
+                // even though the prefix never changes. TTL is config (dirge-cbgz);
+                // the two lifetimes bill writes differently, so it is a cost
+                // decision rather than a constant.
                 __stream_fn(
-                    $model.with_automatic_caching_1h(),
+                    $crate::provider::stream_dispatch::automatic_caching!($model),
                     $tools,
                     $timeout,
                     $provider,
@@ -80,7 +82,7 @@ macro_rules! dispatch_stream_fn {
                 // path is the primary user-facing path and the biggest source of
                 // token burn on the Pro 5x plan.
                 __stream_fn(
-                    $model.with_automatic_caching_1h(),
+                    $crate::provider::stream_dispatch::automatic_caching!($model),
                     $tools,
                     $timeout,
                     $provider,
@@ -122,3 +124,24 @@ macro_rules! dispatch_stream_fn {
 }
 
 pub(crate) use dispatch_stream_fn;
+
+/// Turn on Anthropic's automatic prompt caching at the configured TTL (dirge-cbgz).
+///
+/// A macro rather than a function because rig spells the two lifetimes as two different
+/// builder methods on a concrete model type, and the dispatch arms hold two different
+/// concrete types (the plain and the OAuth transports). Both branches return `Self`, so the
+/// arm's type is unchanged either way.
+///
+/// See [`crate::prompt_cache`] for why the TTL is a knob: 1h writes cost 2x base input
+/// against 1.25x for 5m, while a read refreshes a 5m entry, so which one is cheaper depends
+/// on how long the gaps between turns are.
+macro_rules! automatic_caching {
+    ($model:expr) => {
+        match $crate::prompt_cache::ttl() {
+            $crate::prompt_cache::CacheTtl::OneHour => $model.with_automatic_caching_1h(),
+            $crate::prompt_cache::CacheTtl::FiveMinutes => $model.with_automatic_caching(),
+        }
+    };
+}
+
+pub(crate) use automatic_caching;

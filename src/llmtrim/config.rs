@@ -108,6 +108,17 @@ pub struct DenseConfig {
     pub cache: bool,
     /// Stage A — maximum cache breakpoints to place (Anthropic allows up to 4).
     pub cache_max_breakpoints: usize,
+    /// Stage A — inject a `prompt_cache_key` to pin the provider's automatic prefix cache
+    /// to a stable identity. On by default, but the caller must turn it OFF for backends
+    /// that validate the request body strictly: an OpenAI-compatible endpoint that does
+    /// not know the field rejects the whole request (`property 'body.prompt_cache_key' is
+    /// unsupported`) rather than ignoring it, so this is only safe where the parameter is
+    /// documented. No-op on wire shapes that have no such key (Anthropic, Google).
+    pub cache_prompt_key: bool,
+    /// Stage A — TTL for an *automatic* (top-level `cache_control`) breakpoint: `"1h"`, or
+    /// empty for the API default of 5 minutes. Does not touch the explicit per-block
+    /// breakpoints `cache_max_breakpoints` governs, which stay at the default lifetime.
+    pub cache_auto_ttl: String,
     /// Stage E — collapse exact-duplicate lines in content (with `[×N]` counts).
     pub dedup: bool,
     /// Stage E — also collapse near-duplicate lines (SimHash).
@@ -240,6 +251,8 @@ impl DenseConfig {
             retrieve_sentence: false,
             cache: false,
             cache_max_breakpoints: 4,
+            cache_prompt_key: true,
+            cache_auto_ttl: "1h".to_string(),
             dedup: true,
             dedup_near: false,
             dedup_near_max_distance: 3,

@@ -204,6 +204,8 @@ fn stages_for(_provider: ProviderKind, config: &config::DenseConfig) -> Vec<Box<
     if config.cache {
         stages.push(Box::new(stages::CacheStage {
             max_breakpoints: config.cache_max_breakpoints,
+            prompt_key: config.cache_prompt_key,
+            auto_ttl: config.cache_auto_ttl.clone(),
         }));
     }
     stages
