@@ -815,6 +815,17 @@ impl Renderer {
         // Refresh cached terminal size once per paint (dirge-jisr).
         self.cached_tty_size = crate::ui::terminal::tty_size();
 
+        // A terminal that has gone away reports 0x0. ratatui then allocates a
+        // 0x0 buffer while the layout still hands widgets full-size rects, and
+        // the first `buf[(x, y)]` write panics with "index outside of buffer" —
+        // dirge died that way on hangup instead of tearing down cleanly.
+        // Nothing can be painted at that size, so skip the frame entirely. The
+        // painters clamp individually too; this keeps the whole widget tree
+        // (chat, scene, bottom) out of the degenerate case in one place.
+        if self.cached_tty_size.0 == 0 || self.cached_tty_size.1 == 0 {
+            return Ok(());
+        }
+
         use crate::ui::avatar;
         use crate::ui::tui::bottom::{AvatarSpec, BottomBody};
         use crate::ui::tui::scene::{Scene, render_frame};

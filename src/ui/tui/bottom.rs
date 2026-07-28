@@ -143,7 +143,22 @@ impl<'a> Widget for BottomStrip<'a> {
     }
 }
 
+/// Clamp `area` to what `buf` can actually hold.
+///
+/// The layout rects come from the cached terminal size, not from the
+/// buffer, and the two disagree exactly when the terminal goes away: a
+/// hangup makes `tty_size()` report 0x0, so ratatui allocates a 0x0
+/// buffer while the layout still hands widgets a full-size rect. Every
+/// painter here writes through `buf[(x, y)]`, which panics on an
+/// out-of-bounds index, so dirge died with "index outside of buffer"
+/// instead of tearing down cleanly. Clamping first makes a too-small
+/// buffer paint nothing rather than abort the process.
+fn clamp_to_buffer(buf: &Buffer, area: Rect) -> Rect {
+    area.intersection(buf.area)
+}
+
 fn paint_avatar_box(buf: &mut Buffer, area: Rect, spec: Option<&AvatarSpec>, style: Style) {
+    let area = clamp_to_buffer(buf, area);
     if area.width < 4 || area.height < 2 {
         return;
     }
@@ -208,6 +223,7 @@ fn paint_avatar_box(buf: &mut Buffer, area: Rect, spec: Option<&AvatarSpec>, sty
 }
 
 fn paint_frame(buf: &mut Buffer, area: Rect, title: Option<&str>, style: Style) {
+    let area = clamp_to_buffer(buf, area);
     if area.width < 2 || area.height < 2 {
         return;
     }
@@ -291,6 +307,7 @@ fn paint_editor_box(
     ghost: &str,
     style: Style,
 ) {
+    let area = clamp_to_buffer(buf, area);
     paint_frame(buf, area, None, style);
     if area.width < 6 || area.height < 3 {
         return;
@@ -438,7 +455,14 @@ fn paint_overlay_box(
     // style — the user must see at a glance that this is a
     // cautionary modal, not a casual chrome border.
     let yellow = Style::default().fg(RColor::Yellow);
+    let area = clamp_to_buffer(buf, area);
     paint_frame(buf, area, Some(title), yellow);
+    // Below this point `area.width - 2` / `area.height - 2` would underflow
+    // on a degenerate rect, which panics in debug just as surely as an
+    // out-of-bounds buffer write does.
+    if area.width < 2 || area.height < 2 {
+        return;
+    }
     let inner_w = area.width as usize - 2;
     let inner_h = area.height as usize - 2;
 
@@ -544,6 +568,7 @@ pub fn overlay_head_tail_wrapped(
 }
 
 fn paint_status(buf: &mut Buffer, area: Rect, status: &str) {
+    let area = clamp_to_buffer(buf, area);
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -581,6 +606,35 @@ mod tests {
             .unwrap();
         backend = terminal.backend().clone();
         backend
+    }
+
+    /// A terminal hangup makes `tty_size()` report 0x0, so ratatui
+    /// allocates a 0x0 buffer while the cached layout still hands widgets
+    /// a full-size rect. Every painter writes through `buf[(x, y)]`, which
+    /// panics on an out-of-bounds index — dirge died with
+    /// "index outside of buffer: the area is Rect { 0, 0, 0, 0 }" instead
+    /// of tearing down cleanly. Painters must clamp to the buffer.
+    #[test]
+    fn painters_tolerate_a_buffer_smaller_than_their_area() {
+        let area = Rect::new(0, 0, 40, 3);
+        let style = Style::default();
+
+        let rows = [String::from("hello")];
+        let overlay = [(String::from("body"), crossterm::style::Color::White)];
+
+        for buf in [
+            &mut Buffer::empty(Rect::new(0, 0, 0, 0)),
+            // A buffer merely narrower/shorter than the area must be safe too.
+            &mut Buffer::empty(Rect::new(0, 0, 4, 1)),
+        ] {
+            paint_frame(buf, area, Some("title"), style);
+            paint_frame(buf, area, None, style);
+            paint_empty_box(buf, area, style);
+            paint_avatar_box(buf, area, None, style);
+            paint_editor_box(buf, area, &rows, false, "", "", style);
+            paint_overlay_box(buf, area, "title", &overlay, 0, style);
+            paint_status(buf, Rect::new(0, 0, 40, 1), "status");
+        }
     }
 
     fn row_chars(backend: &TestBackend, y: u16, x0: u16, w: u16) -> Vec<char> {
