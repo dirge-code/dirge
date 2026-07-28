@@ -34,8 +34,12 @@ jobs:
   # gate and accumulated. We lint the two configs CI actually ships:
   # the batteries-included default set, and the Janet-free `windows-default`
   # set (the only non-`plugin` / `loop` code path). `-D warnings` fails the
-  # build on any clippy lint. Extending coverage to `dap` / `sandbox-microvm`
-  # / `--all-features` is a follow-up (those need extra native deps in CI).
+  # build on any clippy lint. `sandbox-microvm` is linted too: it was skipped
+  # as needing native deps, but clippy only checks and never links, so libkrun
+  # / libkrunfw are not required — build.rs just warns and carries on, exactly
+  # as the existing `build (sandbox-microvm)` job already does. Without this
+  # gate the feature accumulated 50 findings unnoticed (dirge-xw43). Extending
+  # coverage to `dap` / `--all-features` is still a follow-up.
   clippy:
     runs-on: ubuntu-latest
     steps:
@@ -52,6 +56,9 @@ jobs:
 
       - name: Clippy (windows-default)
         run: cargo clippy --no-default-features --features windows-default --all-targets -- -D warnings
+
+      - name: Clippy (sandbox-microvm)
+        run: cargo clippy --features sandbox-microvm --all-targets -- -D warnings
 
   audit:
     runs-on: ubuntu-latest
