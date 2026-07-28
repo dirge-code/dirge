@@ -45,9 +45,9 @@ impl Transform for CacheStage {
         _plan: &mut Vec<PlanEntry>,
     ) -> Result<()> {
         // Stabilize the prefix so it's byte-identical across SDK restarts (raises the
-        // provider's cache-hit rate). Skip when the client manages its own caching —
+        // provider's cache-hit rate). Skip when the client placed its own breakpoints —
         // reordering tools or injecting a key would bust the cache it set up.
-        if !crate::llmtrim::cache_zone::has_cache_control(req.raw()) {
+        if !has_client_breakpoint(req.raw()) {
             sort_tools(req);
             let key = format!("{:016x}", cache_prefix_hash(req));
             provider.set_prompt_cache_key(req, &key);
@@ -55,6 +55,19 @@ impl Transform for CacheStage {
         provider.set_cache_breakpoints(req, self.max_breakpoints);
         Ok(())
     }
+}
+
+/// Whether the client placed its own cache breakpoint, i.e. a `cache_control` on a block
+/// inside `system`, `messages`, or `tools`. A `cache_control` at the top level of the body
+/// is Anthropic's automatic-caching marker (dirge-607): the API chooses the breakpoint
+/// itself, so it pins no block we could reorder. Canonicalizing the prefix still matters
+/// there — more so, since a 1h entry that a churning tool order never matches is pure
+/// cache-write cost.
+fn has_client_breakpoint(raw: &Value) -> bool {
+    ["system", "messages", "tools"]
+        .iter()
+        .filter_map(|key| raw.get(*key))
+        .any(crate::llmtrim::cache_zone::has_cache_control)
 }
 
 /// Canonicalize `tools[]`: recursively sort every JSON-object key (schemas included), then
@@ -273,6 +286,34 @@ mod tests {
             req.raw().pointer("/tools/0/name").unwrap(),
             "zebra",
             "tool order preserved when the client manages caching"
+        );
+    }
+
+    #[test]
+    fn top_level_automatic_caching_still_stabilizes_tools() {
+        // dirge-607: rig's `with_automatic_caching_1h()` puts a `cache_control` at the
+        // top level of the body. That is not a client-placed breakpoint on any block, so
+        // it must not switch off tool canonicalization — the 1h prefix cache depends on
+        // the tool block being byte-identical across restarts.
+        let mut req = anthropic(json!({
+            "max_tokens": 1, "messages": [],
+            "cache_control": {"type": "ephemeral", "ttl": "1h"},
+            "tools": [
+                {"name": "zebra", "input_schema": {}},
+                {"name": "apple", "input_schema": {}},
+            ]
+        }));
+        run_cache_stage(&mut req, &AnthropicProvider);
+        assert_eq!(
+            req.raw().pointer("/tools/0/name").unwrap(),
+            "apple",
+            "tools canonicalized despite the top-level automatic-caching marker"
+        );
+        // The breakpoints themselves stay off: mixing our default-ttl markers with the
+        // top-level 1h marker is exactly the ttl-ordering violation the API rejects.
+        assert!(
+            req.raw().pointer("/tools/1/cache_control").is_none(),
+            "no 5m breakpoints added alongside the top-level 1h marker"
         );
     }
 
