@@ -8,14 +8,16 @@ type Result<T> = std::result::Result<T, AuthStoreError>;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum AuthStoreError {
-    #[error("OpenAI auth store I/O failed for {path:?}: {source}")]
+    // The Io/CorruptJson/Serialize messages are provider-neutral: one
+    // auth.json serves every provider key (`openai`, `kimi`, …).
+    #[error("auth store I/O failed for {path:?}: {source}")]
     Io {
         path: PathBuf,
         #[source]
         source: std::io::Error,
     },
     #[error(
-        "OpenAI auth store JSON is corrupt at {path:?}; fix or remove the file and run `dirge auth openai` again: {source}"
+        "auth store JSON is corrupt at {path:?}; fix or remove the file and log in again: {source}"
     )]
     CorruptJson {
         path: PathBuf,
@@ -24,7 +26,9 @@ pub(crate) enum AuthStoreError {
     },
     #[error("OpenAI auth entry is invalid at {path:?}; run `dirge auth openai` again: {reason}")]
     InvalidOpenAiCredential { path: PathBuf, reason: String },
-    #[error("OpenAI auth store serialization failed for {path:?}: {source}")]
+    #[error("Kimi auth entry is invalid at {path:?}; run `dirge auth kimi` again: {reason}")]
+    InvalidKimiCredential { path: PathBuf, reason: String },
+    #[error("auth store serialization failed for {path:?}: {source}")]
     Serialize {
         path: PathBuf,
         #[source]
@@ -279,6 +283,163 @@ fn canonicalize_account_id_aliases(openai: &mut Map<String, Value>) {
     }
     if let Some(account_id) = account_id {
         openai.insert("account_id".to_string(), json!(account_id));
+    }
+}
+
+// ── Kimi Code (Moonshot) OAuth — key "kimi" in the same auth.json ──────
+
+/// Dirge-managed Kimi OAuth credential. Same access/refresh/expires shape
+/// as the OpenAI credential, minus the OpenAI-only id_token/account_id —
+/// the Kimi token bundle carries neither.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct KimiOAuthCredential {
+    access_token: String,
+    refresh_token: String,
+    expires_at_epoch_ms: i64,
+}
+
+impl KimiOAuthCredential {
+    pub(crate) fn new(
+        access_token: impl Into<String>,
+        refresh_token: impl Into<String>,
+        expires_at_epoch_ms: i64,
+    ) -> Self {
+        Self {
+            access_token: access_token.into(),
+            refresh_token: refresh_token.into(),
+            expires_at_epoch_ms,
+        }
+    }
+
+    pub(crate) fn access_token(&self) -> &str {
+        &self.access_token
+    }
+
+    pub(crate) fn refresh_token(&self) -> &str {
+        &self.refresh_token
+    }
+
+    pub(crate) fn expires_at_epoch_ms(&self) -> i64 {
+        self.expires_at_epoch_ms
+    }
+
+    pub(crate) fn is_expired_at(&self, epoch_ms: i64) -> bool {
+        super::file_store::epoch_ms_is_expired(self.expires_at_epoch_ms, epoch_ms)
+    }
+
+    pub(crate) fn is_fresh_at(&self, epoch_ms: i64) -> bool {
+        !self.is_expired_at(epoch_ms)
+    }
+}
+
+impl fmt::Debug for KimiOAuthCredential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("KimiOAuthCredential")
+            .field("access_token", &"[REDACTED]")
+            .field("refresh_token", &"[REDACTED]")
+            .field("expires_at_epoch_ms", &self.expires_at_epoch_ms)
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct KimiAuthStore {
+    path: PathBuf,
+}
+
+impl Default for KimiAuthStore {
+    fn default() -> Self {
+        Self::at(crate::session::storage::dirs_path().join("auth.json"))
+    }
+}
+
+impl KimiAuthStore {
+    pub(crate) fn at(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn load_kimi(&self) -> Result<Option<KimiOAuthCredential>> {
+        let Some(document) = self.load_document()? else {
+            return Ok(None);
+        };
+        let Some(kimi) = document.get("kimi") else {
+            return Ok(None);
+        };
+        let kimi = match kimi {
+            Value::Object(kimi) => kimi,
+            _ => return Ok(None),
+        };
+        if kimi.get("type").and_then(Value::as_str) != Some("oauth") {
+            return Ok(None);
+        }
+        let entry: StoredKimiCredential = serde_json::from_value(Value::Object(kimi.clone()))
+            .map_err(|_source| AuthStoreError::InvalidKimiCredential {
+                path: self.path.clone(),
+                reason: "stored Kimi OAuth credential fields are malformed".to_string(),
+            })?;
+        Ok(Some(entry.into_credential()))
+    }
+
+    pub(crate) fn save_kimi(&self, credential: &KimiOAuthCredential) -> Result<()> {
+        let mut document = self.load_document()?.unwrap_or_default();
+        document.insert(
+            "kimi".to_string(),
+            json!({
+                "type": "oauth",
+                "access": credential.access_token,
+                "refresh": credential.refresh_token,
+                "expires": credential.expires_at_epoch_ms,
+            }),
+        );
+
+        super::file_store::save_json_0600(&self.path, &Value::Object(document)).map_err(|source| {
+            AuthStoreError::Io {
+                path: self.path.clone(),
+                source: std::io::Error::other(source.to_string()),
+            }
+        })
+    }
+
+    fn load_document(&self) -> Result<Option<Map<String, Value>>> {
+        let contents = match std::fs::read_to_string(&self.path) {
+            Ok(contents) => contents,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => {
+                return Err(AuthStoreError::Io {
+                    path: self.path.clone(),
+                    source,
+                });
+            }
+        };
+        let value: Value =
+            serde_json::from_str(&contents).map_err(|source| AuthStoreError::CorruptJson {
+                path: self.path.clone(),
+                source,
+            })?;
+        match value {
+            Value::Object(document) => Ok(Some(document)),
+            _ => Err(AuthStoreError::InvalidKimiCredential {
+                path: self.path.clone(),
+                reason: "top-level auth document must be a JSON object".to_string(),
+            }),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct StoredKimiCredential {
+    access: String,
+    refresh: String,
+    expires: i64,
+}
+
+impl StoredKimiCredential {
+    fn into_credential(self) -> KimiOAuthCredential {
+        KimiOAuthCredential::new(self.access, self.refresh, self.expires)
     }
 }
 
@@ -729,5 +890,132 @@ mod tests {
         assert!(!error_debug.contains("REFRESH-TOKEN"));
         assert!(!error_debug.contains("ID-TOKEN"));
         assert!(!error_debug.contains("USER-CODE"));
+    }
+
+    // ── Kimi store (key "kimi" in the same auth.json) ──────────────────
+
+    fn kimi_credential() -> KimiOAuthCredential {
+        KimiOAuthCredential::new("KIMI-ACCESS", "KIMI-REFRESH", 1_900_000_000_000)
+    }
+
+    #[test]
+    fn missing_auth_file_loads_kimi_as_none() {
+        let dir = TestDir::new("kimi_missing");
+        let store = KimiAuthStore::at(dir.auth_path());
+
+        assert!(store.load_kimi().unwrap().is_none());
+    }
+
+    #[test]
+    fn kimi_credential_roundtrips_through_auth_json() {
+        let dir = TestDir::new("kimi_roundtrip");
+        let store = KimiAuthStore::at(dir.auth_path());
+
+        store.save_kimi(&kimi_credential()).unwrap();
+        let loaded = store.load_kimi().unwrap().unwrap();
+
+        assert_eq!(loaded.access_token(), "KIMI-ACCESS");
+        assert_eq!(loaded.refresh_token(), "KIMI-REFRESH");
+        assert_eq!(loaded.expires_at_epoch_ms(), 1_900_000_000_000);
+    }
+
+    #[test]
+    fn save_kimi_preserves_other_provider_keys() {
+        let dir = TestDir::new("kimi_preserve");
+        let store = OpenAiAuthStore::at(dir.auth_path());
+        store.save_openai(&credential()).unwrap();
+        std::fs::write(
+            dir.auth_path(),
+            std::fs::read_to_string(dir.auth_path())
+                .unwrap()
+                .replace('}', ",\"custom\": \"keep-me\"}"),
+        )
+        .unwrap();
+
+        let kimi_store = KimiAuthStore::at(dir.auth_path());
+        kimi_store.save_kimi(&kimi_credential()).unwrap();
+
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.auth_path()).unwrap()).unwrap();
+        assert_eq!(saved["openai"]["access"], "ACCESS-TOKEN");
+        assert_eq!(saved["custom"], "keep-me");
+        assert_eq!(saved["kimi"]["type"], "oauth");
+        assert_eq!(saved["kimi"]["access"], "KIMI-ACCESS");
+        assert_eq!(saved["kimi"]["refresh"], "KIMI-REFRESH");
+        assert_eq!(saved["kimi"]["expires"], 1_900_000_000_000_i64);
+        // The OpenAI credential still loads after the kimi write.
+        assert!(store.load_openai().unwrap().is_some());
+    }
+
+    #[test]
+    fn non_oauth_kimi_entry_loads_as_none() {
+        let dir = TestDir::new("kimi_non_oauth");
+        std::fs::write(
+            dir.auth_path(),
+            json!({"kimi": {"type": "api_key", "key": "KIMI-KEY"}}).to_string(),
+        )
+        .unwrap();
+        let store = KimiAuthStore::at(dir.auth_path());
+
+        assert!(store.load_kimi().unwrap().is_none());
+    }
+
+    #[test]
+    fn malformed_kimi_entry_errors_without_echoing_secrets() {
+        let dir = TestDir::new("kimi_malformed");
+        std::fs::write(
+            dir.auth_path(),
+            json!({"kimi": {"type": "oauth", "access": "KIMI-ACCESS", "expires": "KIMI-REFRESH"}})
+                .to_string(),
+        )
+        .unwrap();
+        let store = KimiAuthStore::at(dir.auth_path());
+
+        let err = store.load_kimi().unwrap_err();
+        let message = err.to_string();
+        let debug = format!("{err:?}");
+
+        assert!(matches!(err, AuthStoreError::InvalidKimiCredential { .. }));
+        for secret in ["KIMI-ACCESS", "KIMI-REFRESH"] {
+            assert!(!message.contains(secret), "Display leaked {secret}");
+            assert!(!debug.contains(secret), "Debug leaked {secret}");
+        }
+    }
+
+    #[test]
+    fn save_kimi_creates_private_auth_file_on_unix() {
+        let dir = TestDir::new("kimi_permissions");
+        let store = KimiAuthStore::at(dir.auth_path());
+
+        store.save_kimi(&kimi_credential()).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.auth_path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+    }
+
+    #[test]
+    fn kimi_expiry_helpers_distinguish_fresh_and_expired_tokens() {
+        let token = KimiOAuthCredential::new("KIMI-ACCESS", "KIMI-REFRESH", 1_000);
+
+        assert!(token.is_fresh_at(999));
+        assert!(token.is_expired_at(1_000));
+        assert!(!token.is_fresh_at(1_000));
+    }
+
+    #[test]
+    fn kimi_credential_debug_redacts_tokens() {
+        let debug = format!("{:?}", kimi_credential());
+
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("KIMI-ACCESS"));
+        assert!(!debug.contains("KIMI-REFRESH"));
     }
 }

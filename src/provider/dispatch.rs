@@ -43,6 +43,11 @@ pub enum AnyClient {
     OpenCode(
         openai::CompletionsClient<super::compressing_http::CompressingHttpClient<reqwest::Client>>,
     ),
+    Kimi(
+        openai::CompletionsClient<
+            super::compressing_http::CompressingHttpClient<super::kimi_http::KimiHttpClient>,
+        >,
+    ),
     Ollama(ollama::Client<super::compressing_http::CompressingHttpClient<reqwest::Client>>),
     Custom(
         openai::CompletionsClient<super::compressing_http::CompressingHttpClient<reqwest::Client>>,
@@ -77,6 +82,7 @@ impl AnyClient {
             AnyClient::Glm(c) => AnyModel::Glm(c.completion_model(name)),
             AnyClient::Cerebras(c) => AnyModel::Cerebras(c.completion_model(name)),
             AnyClient::OpenCode(c) => AnyModel::OpenCode(c.completion_model(name)),
+            AnyClient::Kimi(c) => AnyModel::Kimi(c.completion_model(name)),
             AnyClient::Ollama(c) => AnyModel::Ollama(c.completion_model(name)),
             AnyClient::Custom(c) => AnyModel::Custom(c.completion_model(name)),
         }
@@ -376,6 +382,11 @@ pub enum AnyModel {
             super::compressing_http::CompressingHttpClient<reqwest::Client>,
         >,
     ),
+    Kimi(
+        openai::completion::CompletionModel<
+            super::compressing_http::CompressingHttpClient<super::kimi_http::KimiHttpClient>,
+        >,
+    ),
     Ollama(
         ollama::CompletionModel<super::compressing_http::CompressingHttpClient<reqwest::Client>>,
     ),
@@ -439,6 +450,7 @@ impl AnyModel {
             AnyModel::Glm(m) => one_shot!(m),
             AnyModel::Cerebras(m) => one_shot!(m),
             AnyModel::OpenCode(m) => one_shot!(m),
+            AnyModel::Kimi(m) => one_shot!(m),
             AnyModel::Ollama(m) => one_shot!(m),
             AnyModel::Custom(m) => one_shot!(m),
         }
@@ -496,6 +508,7 @@ impl AnyModel {
             AnyModel::Glm(_) => "glm",
             AnyModel::Cerebras(_) => "cerebras",
             AnyModel::OpenCode(_) => "opencode",
+            AnyModel::Kimi(_) => "kimi",
             AnyModel::Ollama(_) => "ollama",
             AnyModel::Custom(_) => "custom",
         }
@@ -519,6 +532,7 @@ impl AnyModel {
             AnyModel::Glm(m) => m.model.clone(),
             AnyModel::Cerebras(m) => m.model.clone(),
             AnyModel::OpenCode(m) => m.model.clone(),
+            AnyModel::Kimi(m) => m.model.clone(),
             AnyModel::Ollama(m) => m.model.clone(),
             AnyModel::Custom(m) => m.model.clone(),
         }

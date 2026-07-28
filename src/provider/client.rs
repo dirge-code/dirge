@@ -13,7 +13,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rig::http_client::HeaderMap;
 use rig::providers::{anthropic, chatgpt, gemini, ollama, openai, openrouter};
 
-use crate::auth::store::{OpenAiAuthStore, OpenAiOAuthCredential};
+use crate::auth::store::{
+    KimiAuthStore, KimiOAuthCredential, OpenAiAuthStore, OpenAiOAuthCredential,
+};
 use crate::config::{ProviderAuth, ProviderEntry};
 
 use super::auth::{ProviderAuthHeaders, resolve_auth_headers};
@@ -27,6 +29,7 @@ const CHATGPT_ORIGINATOR: &str = "dirge";
 enum ProviderCredential {
     ApiKey(String),
     ChatGptAuth(String),
+    KimiAuth(String),
     OpenAiOAuth {
         access_token: String,
         account_id: Option<String>,
@@ -38,6 +41,7 @@ impl fmt::Debug for ProviderCredential {
         match self {
             Self::ApiKey(_) => f.debug_tuple("ApiKey").field(&"[REDACTED]").finish(),
             Self::ChatGptAuth(_) => f.debug_tuple("ChatGptAuth").field(&"[REDACTED]").finish(),
+            Self::KimiAuth(_) => f.debug_tuple("KimiAuth").field(&"[REDACTED]").finish(),
             Self::OpenAiOAuth { account_id, .. } => f
                 .debug_struct("OpenAiOAuth")
                 .field("access_token", &"[REDACTED]")
@@ -50,7 +54,7 @@ impl fmt::Debug for ProviderCredential {
 impl ProviderCredential {
     fn into_secret(self) -> String {
         match self {
-            Self::ApiKey(secret) | Self::ChatGptAuth(secret) => secret,
+            Self::ApiKey(secret) | Self::ChatGptAuth(secret) | Self::KimiAuth(secret) => secret,
             Self::OpenAiOAuth { access_token, .. } => access_token,
         }
     }
@@ -160,17 +164,20 @@ where
 /// present (`anthropic_oauth_present`) — then it's `Anthropic`, so the
 /// stored `dirge auth anthropic` login / `ANTHROPIC_OAUTH_TOKEN` is used
 /// via `resolve_anthropic_auth` instead of being ignored or mis-sent as an
-/// x-api-key.
+/// x-api-key. The kimi provider gets the same treatment: a stored
+/// `dirge auth kimi` login (`kimi_oauth_present`) implies `Kimi` auth.
 fn effective_auth(
     explicit: Option<ProviderAuth>,
     kind: ProviderKind,
     anthropic_oauth_present: bool,
+    kimi_oauth_present: bool,
 ) -> ProviderAuth {
     match explicit {
         Some(auth) => auth,
         None if kind == ProviderKind::Anthropic && anthropic_oauth_present => {
             ProviderAuth::Anthropic
         }
+        None if kind == ProviderKind::Kimi && kimi_oauth_present => ProviderAuth::Kimi,
         None => ProviderAuth::ApiKey,
     }
 }
@@ -209,6 +216,10 @@ fn resolve_provider_base_url(
             Some("https://open.bigmodel.cn/api/coding/paas/v4"),
         ),
         ProviderKind::Cerebras => (None, Some("https://api.cerebras.ai/v1")),
+        ProviderKind::Kimi => (
+            Some("KIMI_CODE_BASE_URL"),
+            Some(crate::auth::kimi_device::KIMI_CODE_BASE_URL),
+        ),
         ProviderKind::Custom => (Some("CUSTOM_BASE_URL"), None),
         _ => (None, None),
     };
@@ -266,7 +277,7 @@ where
 {
     let info = resolve_provider_info(provider_name, providers).ok_or_else(|| {
         anyhow::anyhow!(
-            "Unknown provider: {}. Supported providers: openrouter, openai, anthropic, gemini, deepseek, glm, cerebras, opencode, ollama, custom",
+            "Unknown provider: {}. Supported providers: openrouter, openai, anthropic, gemini, deepseek, glm, cerebras, opencode, kimi, ollama, custom",
             provider_name
         )
     })?;
@@ -286,10 +297,22 @@ where
     let anthropic_oauth_present = info.kind == ProviderKind::Anthropic
         && (env("ANTHROPIC_OAUTH_TOKEN").is_some_and(|v| !v.trim().is_empty())
             || super::anthropic_oauth::credentials_file_path().exists());
+    // Same implication for the kimi provider: a stored `dirge auth kimi`
+    // login means OAuth auth even when the user chose none explicitly, so
+    // the session uses the login instead of bailing "No API key found".
+    // Only the stored credential counts — KIMI_CODE_API_KEY is an API key
+    // and resolves through the ordinary ApiKey path.
+    let kimi_oauth_present = info.kind == ProviderKind::Kimi
+        && KimiAuthStore::default()
+            .load_kimi()
+            .ok()
+            .flatten()
+            .is_some();
     let auth = effective_auth(
         info.auth.or(default_auth),
         info.kind,
         anthropic_oauth_present,
+        kimi_oauth_present,
     );
     // A top-level `auth: chatgpt` applies to every provider. Refuse non-OpenAI
     // early so a Codex bearer token is never sent to another provider.
@@ -305,13 +328,28 @@ where
              Set `auth: anthropic` only on your anthropic provider (or use an API key for `{provider_name}`)."
         );
     }
+    if auth == ProviderAuth::Kimi && info.kind != ProviderKind::Kimi {
+        anyhow::bail!(
+            "Kimi OAuth is only supported for the `kimi` provider, not `{provider_name}`. \
+             Set `auth: kimi` only on your kimi provider (or use an API key for `{provider_name}`)."
+        );
+    }
     let auth_headers = match (auth, resolved_auth_headers) {
         (ProviderAuth::ChatGpt | ProviderAuth::Anthropic, Some(headers)) => Some(headers),
         _ => resolve_auth_headers(auth)?,
     };
+    // Kimi resolves separately: its bearer carries an expiry the
+    // ProviderAuthHeaders shape can't express (mirrors the Anthropic
+    // expiry path). None for every other auth mode.
+    let kimi_auth = match auth {
+        ProviderAuth::Kimi => Some(super::auth::resolve_kimi_auth()?),
+        _ => None,
+    };
     let is_chatgpt_auth = auth == ProviderAuth::ChatGpt;
 
-    let credential = if let Some(headers) = auth_headers.as_ref() {
+    let credential = if let Some(kimi) = kimi_auth.as_ref() {
+        ProviderCredential::KimiAuth(kimi.bearer_token.clone())
+    } else if let Some(headers) = auth_headers.as_ref() {
         ProviderCredential::ChatGptAuth(headers.bearer_token.clone())
     } else {
         // Canonical OpenAI prefers stored Dirge OAuth/Codex subscription auth
@@ -361,12 +399,14 @@ where
         _ => resolve_provider_base_url(info.kind, info.base_url.clone(), &env)?,
     };
 
-    // An OAuth login token — Codex/ChatGPT bearer, native Dirge OAuth, or an
-    // Anthropic `sk-ant-oat` bearer — is higher-value than a per-provider API
-    // key, so it must never leave over plaintext. `allow_insecure` is
-    // intentionally not honored for any of them.
+    // An OAuth login token — Codex/ChatGPT bearer, native Dirge OAuth, an
+    // Anthropic `sk-ant-oat` bearer, or a Kimi Code OAuth bearer — is
+    // higher-value than a per-provider API key, so it must never leave over
+    // plaintext. `allow_insecure` is intentionally not honored for any of
+    // them.
     let uses_anthropic_oauth = auth == ProviderAuth::Anthropic;
-    if (is_chatgpt_auth || uses_openai_oauth || uses_anthropic_oauth)
+    let uses_kimi_oauth = auth == ProviderAuth::Kimi;
+    if (is_chatgpt_auth || uses_openai_oauth || uses_anthropic_oauth || uses_kimi_oauth)
         && let Some(url) = base_url.as_deref()
         && !url.starts_with("https://")
     {
@@ -610,6 +650,50 @@ where
                 .http_headers(headers);
             Ok(AnyClient::OpenCode(b.build()?))
         }
+        ProviderKind::Kimi => {
+            // The Kimi transport always injects the X-Msh-*/User-Agent device
+            // identity headers. When the bearer is Dirge's own OAuth token it
+            // is also refreshable mid-session — Kimi access tokens live only
+            // 15 minutes, so a long run must renew or die on a 401.
+            let http = match kimi_auth.as_ref() {
+                Some(resolved) if resolved.kimi_bearer_is_dirge_oauth => {
+                    let refresher: super::kimi_http::KimiRefreshFn = std::sync::Arc::new(|| {
+                        let credential = load_fresh_kimi_oauth()?.ok_or_else(|| {
+                            anyhow::anyhow!("stored Kimi OAuth credential is no longer available")
+                        })?;
+                        Ok(super::auth::RefreshedAuth {
+                            bearer_token: credential.access_token().to_string(),
+                            expires_at_ms: Some(credential.expires_at_epoch_ms()),
+                        })
+                    });
+                    super::kimi_http::KimiHttpClient::new_refreshable(
+                        resolved.bearer_token.clone(),
+                        resolved.expires_at_ms,
+                        refresher,
+                    )
+                }
+                _ => super::kimi_http::KimiHttpClient::new(key.clone()),
+            };
+            let mut b = openai::CompletionsClient::builder()
+                .http_client(
+                    crate::provider::compressing_http::CompressingHttpClient::new(
+                        http,
+                        crate::llmtrim::ir::ProviderKind::OpenAi,
+                        std::sync::Arc::new(crate::compression::config_for_preset(
+                            &resolve_compression_preset(),
+                        )),
+                        resolve_compression_enabled(),
+                    ),
+                )
+                .api_key(&key)
+                .base_url(
+                    base_url
+                        .as_deref()
+                        .unwrap_or(crate::auth::kimi_device::KIMI_CODE_BASE_URL),
+                );
+            b = b.http_headers(headers);
+            Ok(AnyClient::Kimi(b.build()?))
+        }
         ProviderKind::Ollama => {
             let key: ollama::OllamaApiKey = key.as_str().into();
             let mut b = ollama::Client::builder().api_key(key).http_client(
@@ -759,6 +843,10 @@ where
             if kind == ProviderKind::OpenAI && allow_openai_oauth {
                 anyhow::anyhow!(
                     "{err} You can also run `dirge auth openai` to use a stored OpenAI OAuth login."
+                )
+            } else if kind == ProviderKind::Kimi {
+                anyhow::anyhow!(
+                    "{err} You can also run `dirge auth kimi` to use a stored Kimi OAuth login."
                 )
             } else {
                 err
@@ -924,6 +1012,79 @@ fn current_epoch_ms() -> i64 {
     }
 }
 
+pub(crate) fn load_fresh_kimi_oauth() -> anyhow::Result<Option<KimiOAuthCredential>> {
+    let store = KimiAuthStore::default();
+    load_fresh_kimi_oauth_locked(&store, current_epoch_ms, |credential| {
+        let refreshed = refresh_kimi_credential(credential)?;
+        store.save_kimi(&refreshed)?;
+        Ok(refreshed)
+    })
+}
+
+/// Kimi twin of [`load_fresh_openai_oauth_locked`] — same cross-process
+/// lock and re-check discipline (Kimi rotates the refresh token on every
+/// use too), so two Dirge processes can't both spend the same refresh
+/// token. See that function's comment and dirge-m1o5.
+fn load_fresh_kimi_oauth_locked(
+    store: &KimiAuthStore,
+    now: impl Fn() -> i64,
+    refresh_and_save: impl FnOnce(&KimiOAuthCredential) -> anyhow::Result<KimiOAuthCredential>,
+) -> anyhow::Result<Option<KimiOAuthCredential>> {
+    match store.load_kimi()? {
+        Some(credential) if credential.is_fresh_at(now()) => return Ok(Some(credential)),
+        None => return Ok(None),
+        _ => {}
+    }
+    let _lock = crate::auth::file_lock::FileLock::acquire_for(store.path());
+    fresh_kimi_oauth_at(store.load_kimi()?, now(), refresh_and_save)
+}
+
+fn fresh_kimi_oauth_at(
+    credential: Option<KimiOAuthCredential>,
+    epoch_ms: i64,
+    refresh: impl FnOnce(&KimiOAuthCredential) -> anyhow::Result<KimiOAuthCredential>,
+) -> anyhow::Result<Option<KimiOAuthCredential>> {
+    let Some(credential) = credential else {
+        return Ok(None);
+    };
+    if credential.is_fresh_at(epoch_ms) {
+        return Ok(Some(credential));
+    }
+    if credential.refresh_token().trim().is_empty() {
+        anyhow::bail!(
+            "Stored Kimi OAuth credential is expired and has no refresh token; run `dirge auth kimi` again or set KIMI_CODE_API_KEY."
+        );
+    }
+    let refreshed = refresh(&credential).map_err(|_err| {
+        anyhow::anyhow!(
+            "Stored Kimi OAuth credential is expired and could not be refreshed; run `dirge auth kimi` again or set KIMI_CODE_API_KEY."
+        )
+    })?;
+    Ok(Some(refreshed))
+}
+
+/// Exchange the credential's refresh token for a rotated token bundle.
+///
+/// Runs the async refresh on a dedicated thread+runtime so it works whether
+/// or not the caller is already inside a Tokio runtime (mirrors
+/// [`refresh_openai_credential`]).
+fn refresh_kimi_credential(
+    credential: &KimiOAuthCredential,
+) -> anyhow::Result<KimiOAuthCredential> {
+    let refresh_token = credential.refresh_token().to_string();
+    let tokens = std::thread::spawn(
+        move || -> anyhow::Result<crate::auth::kimi_device::TokenInfo> {
+            let runtime = tokio::runtime::Runtime::new()?;
+            let flow = crate::auth::kimi_device::KimiDeviceAuthFlow::default();
+            Ok(runtime.block_on(flow.refresh_access_token(&refresh_token))?)
+        },
+    )
+    .join()
+    .map_err(|panic| anyhow::anyhow!("Kimi OAuth refresh thread panicked: {panic:?}"))??;
+
+    Ok(crate::auth::command::kimi_tokens_to_credential(tokens))
+}
+
 /// Resolve `enabled` for the compression interceptor. Config defaults to
 /// on; `DIRGE_COMPRESSION=0` or `DIRGE_COMPRESSION=off` disables at runtime.
 fn resolve_compression_enabled() -> bool {
@@ -965,22 +1126,52 @@ mod tests {
         use crate::config::ProviderAuth;
         // No explicit auth + anthropic + OAuth present → Anthropic.
         assert_eq!(
-            effective_auth(None, ProviderKind::Anthropic, true),
+            effective_auth(None, ProviderKind::Anthropic, true, false),
             ProviderAuth::Anthropic
         );
         // No OAuth present → the ApiKey default.
         assert_eq!(
-            effective_auth(None, ProviderKind::Anthropic, false),
+            effective_auth(None, ProviderKind::Anthropic, false, false),
             ProviderAuth::ApiKey
         );
         // An EXPLICIT api_key choice is honored even with OAuth present.
         assert_eq!(
-            effective_auth(Some(ProviderAuth::ApiKey), ProviderKind::Anthropic, true),
+            effective_auth(
+                Some(ProviderAuth::ApiKey),
+                ProviderKind::Anthropic,
+                true,
+                false
+            ),
             ProviderAuth::ApiKey
         );
         // A non-anthropic provider never gets Anthropic auth implied.
         assert_eq!(
-            effective_auth(None, ProviderKind::DeepSeek, true),
+            effective_auth(None, ProviderKind::DeepSeek, true, false),
+            ProviderAuth::ApiKey
+        );
+    }
+
+    #[test]
+    fn kimi_oauth_presence_implies_kimi_auth() {
+        use crate::config::ProviderAuth;
+        // No explicit auth + kimi + stored OAuth login → Kimi.
+        assert_eq!(
+            effective_auth(None, ProviderKind::Kimi, false, true),
+            ProviderAuth::Kimi
+        );
+        // No login present → the ApiKey default.
+        assert_eq!(
+            effective_auth(None, ProviderKind::Kimi, false, false),
+            ProviderAuth::ApiKey
+        );
+        // An EXPLICIT api_key choice is honored even with a login present.
+        assert_eq!(
+            effective_auth(Some(ProviderAuth::ApiKey), ProviderKind::Kimi, false, true),
+            ProviderAuth::ApiKey
+        );
+        // A non-kimi provider never gets Kimi auth implied.
+        assert_eq!(
+            effective_auth(None, ProviderKind::DeepSeek, false, true),
             ProviderAuth::ApiKey
         );
     }
@@ -1690,13 +1881,19 @@ mod tests {
             "{:?}",
             ProviderCredential::ChatGptAuth("CHATGPT-TOKEN".to_string())
         );
+        let kimi_debug = format!(
+            "{:?}",
+            ProviderCredential::KimiAuth("KIMI-TOKEN".to_string())
+        );
         let api_key_debug = format!("{:?}", ProviderCredential::ApiKey("API-KEY".to_string()));
 
         assert!(!oauth_debug.contains("ACCESS-TOKEN"));
         assert!(!chatgpt_debug.contains("CHATGPT-TOKEN"));
+        assert!(!kimi_debug.contains("KIMI-TOKEN"));
         assert!(!api_key_debug.contains("API-KEY"));
         assert!(oauth_debug.contains("[REDACTED]"));
         assert!(chatgpt_debug.contains("[REDACTED]"));
+        assert!(kimi_debug.contains("[REDACTED]"));
         assert!(api_key_debug.contains("[REDACTED]"));
     }
 
@@ -1947,5 +2144,281 @@ mod tests {
             "unexpected error: {message}"
         );
         assert!(!message.contains("test-openai-key-must-not-leak"));
+    }
+
+    // ── Kimi provider ───────────────────────────────────────────────────
+
+    /// Run `body` with DIRGE_DATA_DIR pointed at an isolated (empty or
+    /// pre-seeded) store so the kimi OAuth-presence probe and
+    /// `resolve_kimi_auth` never touch the developer's real auth.json.
+    fn with_isolated_kimi_store<R>(dir: &TestDir, body: impl FnOnce() -> R) -> R {
+        let _guard = crate::auth::DIRGE_DATA_DIR_ENV_LOCK.lock().unwrap();
+        let previous = std::env::var_os("DIRGE_DATA_DIR");
+        // SAFETY: DIRGE_DATA_DIR changes are serialized by DIRGE_DATA_DIR_ENV_LOCK.
+        unsafe {
+            std::env::set_var("DIRGE_DATA_DIR", &dir.0);
+        }
+        let result = body();
+        // SAFETY: the lock is still held until after restoration.
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("DIRGE_DATA_DIR", value),
+                None => std::env::remove_var("DIRGE_DATA_DIR"),
+            }
+        }
+        result
+    }
+
+    fn kimi_oauth(access_token: &str) -> KimiOAuthCredential {
+        KimiOAuthCredential::new(access_token, "KIMI-REFRESH", i64::MAX)
+    }
+
+    #[test]
+    fn kimi_base_url_defaults_to_coding_api_and_honors_env_and_config() {
+        assert_eq!(
+            resolve_provider_base_url(ProviderKind::Kimi, None, no_env)
+                .unwrap()
+                .as_deref(),
+            Some(crate::auth::kimi_device::KIMI_CODE_BASE_URL)
+        );
+        let env_url = resolve_provider_base_url(ProviderKind::Kimi, None, |name| {
+            (name == "KIMI_CODE_BASE_URL").then(|| "https://kimi.proxy/v1".to_string())
+        })
+        .unwrap();
+        assert_eq!(env_url.as_deref(), Some("https://kimi.proxy/v1"));
+        let config_url = resolve_provider_base_url(
+            ProviderKind::Kimi,
+            Some("https://kimi.config/v1".to_string()),
+            |name| (name == "KIMI_CODE_BASE_URL").then(|| "https://kimi.proxy/v1".to_string()),
+        )
+        .unwrap();
+        assert_eq!(config_url.as_deref(), Some("https://kimi.config/v1"));
+        // An http:// env URL is rejected like every other provider.
+        assert!(
+            resolve_provider_base_url(ProviderKind::Kimi, None, |name| {
+                (name == "KIMI_CODE_BASE_URL").then(|| "http://kimi.proxy/v1".to_string())
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn kimi_api_key_builds_kimi_client() {
+        let dir = TestDir::new("kimi_api_key");
+        with_isolated_kimi_store(&dir, || {
+            let client = create_client_with(
+                "kimi",
+                Some("test-kimi-key"),
+                &HashMap::new(),
+                no_env,
+                || Ok(None),
+            )
+            .expect("kimi client should build from an explicit API key");
+            let model = client.completion_model("k3");
+
+            assert!(matches!(client, AnyClient::Kimi(_)));
+            assert_eq!(
+                (model.provider_name(), model.name()),
+                ("kimi", "k3".to_string())
+            );
+        });
+    }
+
+    #[test]
+    fn kimi_env_key_builds_kimi_client() {
+        let dir = TestDir::new("kimi_env_key");
+        with_isolated_kimi_store(&dir, || {
+            let client = create_client_with(
+                "kimi",
+                None,
+                &HashMap::new(),
+                |name| (name == "KIMI_CODE_API_KEY").then(|| "test-kimi-key".to_string()),
+                || Ok(None),
+            )
+            .expect("kimi client should build from KIMI_CODE_API_KEY");
+
+            assert!(matches!(client, AnyClient::Kimi(_)));
+        });
+    }
+
+    #[test]
+    fn kimi_missing_key_points_to_login_command() {
+        let dir = TestDir::new("kimi_missing_key");
+        with_isolated_kimi_store(&dir, || {
+            let result = create_client_with("kimi", None, &HashMap::new(), no_env, || Ok(None));
+            let message = match result {
+                Ok(_) => panic!("kimi without a key or login must fail"),
+                Err(err) => err.to_string(),
+            };
+
+            assert!(message.contains("KIMI_CODE_API_KEY"), "{message}");
+            assert!(message.contains("dirge auth kimi"), "{message}");
+        });
+    }
+
+    #[test]
+    fn kimi_auth_rejected_for_non_kimi_provider() {
+        let providers = HashMap::new();
+        let msg = match create_client_with_resolved_auth(
+            "deepseek",
+            None,
+            &providers,
+            Some(ProviderAuth::Kimi),
+            None,
+            no_env,
+            || Ok(None),
+        ) {
+            Ok(_) => panic!("kimi auth on a non-kimi provider must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("only supported for the `kimi` provider"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains("deepseek"),
+            "error should name the provider: {msg}"
+        );
+    }
+
+    #[test]
+    fn kimi_oauth_refuses_insecure_base_url_even_with_allow_insecure() {
+        let dir = TestDir::new("kimi_https");
+        // A fresh stored credential makes `resolve_kimi_auth` succeed without
+        // network, so the build reaches the base-URL guard.
+        KimiAuthStore::at(dir.auth_path())
+            .save_kimi(&kimi_oauth("KIMI-ACCESS"))
+            .unwrap();
+        with_isolated_kimi_store(&dir, || {
+            let providers = HashMap::from([(
+                "kimi".to_string(),
+                ProviderEntry {
+                    base_url: Some("http://proxy.local/kimi".to_string()),
+                    allow_insecure: true,
+                    ..Default::default()
+                },
+            )]);
+            let msg = match create_client_with_resolved_auth(
+                "kimi",
+                None,
+                &providers,
+                Some(ProviderAuth::Kimi),
+                None,
+                no_env,
+                || Ok(None),
+            ) {
+                Ok(_) => panic!("http base url must be refused under kimi oauth"),
+                Err(e) => e.to_string(),
+            };
+            assert!(msg.contains("https base URL"), "unexpected error: {msg}");
+        });
+    }
+
+    #[test]
+    fn expired_kimi_oauth_error_is_actionable_and_redacted() {
+        let err = fresh_kimi_oauth_at(Some(kimi_oauth("KIMI-ACCESS")), i64::MAX, |_| {
+            anyhow::bail!("refresh unavailable in test")
+        })
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("dirge auth kimi"));
+        for secret in ["KIMI-ACCESS", "KIMI-REFRESH"] {
+            assert!(!err.contains(secret), "expired-token error leaked {secret}");
+        }
+    }
+
+    #[test]
+    fn expired_kimi_oauth_is_refreshed_when_refresh_succeeds() {
+        let refreshed = KimiOAuthCredential::new("NEW-ACCESS", "NEW-REFRESH", i64::MAX);
+        let result = fresh_kimi_oauth_at(Some(kimi_oauth("OLD-ACCESS")), i64::MAX, |cred| {
+            assert_eq!(cred.refresh_token(), "KIMI-REFRESH");
+            Ok(refreshed.clone())
+        })
+        .unwrap()
+        .expect("refreshed credential returned");
+
+        assert_eq!(result.access_token(), "NEW-ACCESS");
+    }
+
+    #[test]
+    fn fresh_kimi_oauth_does_not_refresh() {
+        let result = fresh_kimi_oauth_at(Some(kimi_oauth("KIMI-ACCESS")), 0, |_| {
+            panic!("must not refresh a fresh credential")
+        })
+        .unwrap()
+        .expect("fresh credential returned");
+
+        assert_eq!(result.access_token(), "KIMI-ACCESS");
+    }
+
+    #[test]
+    fn locked_kimi_load_takes_fast_path_for_fresh_credential() {
+        let dir = TestDir::new("kimi_fast");
+        let store = KimiAuthStore::at(dir.auth_path());
+        store
+            .save_kimi(&KimiOAuthCredential::new("KIMI-ACCESS", "R0", i64::MAX))
+            .unwrap();
+
+        let result = load_fresh_kimi_oauth_locked(
+            &store,
+            || 0,
+            |_| panic!("a fresh credential must not be refreshed"),
+        )
+        .unwrap()
+        .expect("fresh credential returned");
+
+        assert_eq!(result.access_token(), "KIMI-ACCESS");
+    }
+
+    #[test]
+    fn concurrent_locked_kimi_refresh_rotates_token_exactly_once() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = TestDir::new("kimi_m1o5");
+        let path = dir.auth_path();
+        // Seed an expired credential whose single-use refresh token is "R0".
+        KimiAuthStore::at(path.clone())
+            .save_kimi(&KimiOAuthCredential::new("OLD-ACCESS", "R0", 0))
+            .unwrap();
+
+        let refreshes = Arc::new(AtomicUsize::new(0));
+        let now = || 1_900_000_000_000_i64;
+
+        let handles: Vec<_> = (0..6)
+            .map(|_| {
+                let path = path.clone();
+                let refreshes = refreshes.clone();
+                std::thread::spawn(move || {
+                    let store = KimiAuthStore::at(path);
+                    load_fresh_kimi_oauth_locked(&store, now, |cred| {
+                        // Single-use: the token being rotated is still the
+                        // original — no one clobbered it back to "R0".
+                        assert_eq!(cred.refresh_token(), "R0");
+                        refreshes.fetch_add(1, Ordering::SeqCst);
+                        let refreshed = KimiOAuthCredential::new("NEW-ACCESS", "R1", i64::MAX);
+                        store.save_kimi(&refreshed)?;
+                        Ok(refreshed)
+                    })
+                    .unwrap()
+                })
+            })
+            .collect();
+
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        assert_eq!(
+            refreshes.load(Ordering::SeqCst),
+            1,
+            "the stale credential must be refreshed exactly once across processes"
+        );
+        for result in &results {
+            let cred = result.as_ref().expect("a fresh credential");
+            assert_eq!(cred.access_token(), "NEW-ACCESS");
+        }
+        // The winner's rotated refresh token survives; it isn't overwritten.
+        let stored = KimiAuthStore::at(path).load_kimi().unwrap().unwrap();
+        assert_eq!(stored.refresh_token(), "R1");
     }
 }

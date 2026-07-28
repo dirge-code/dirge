@@ -101,6 +101,7 @@ fn build_stream_fn() -> Option<crate::agent::agent_loop::StreamFn> {
         AnyModel::Glm(m) => rig_stream_fn_from_model(m, vec![], chunk_timeout),
         AnyModel::Cerebras(m) => rig_stream_fn_from_model(m, vec![], chunk_timeout),
         AnyModel::OpenCode(m) => rig_stream_fn_from_model(m, vec![], chunk_timeout),
+        AnyModel::Kimi(m) => rig_stream_fn_from_model(m, vec![], chunk_timeout),
         AnyModel::Ollama(m) => rig_stream_fn_from_model(m, vec![], chunk_timeout),
         AnyModel::Custom(m) => rig_stream_fn_from_model(m, vec![], chunk_timeout),
     };

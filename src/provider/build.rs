@@ -258,6 +258,7 @@ pub async fn build_agent(
         AnyModel::Glm(m) => build_inner!(m, Glm),
         AnyModel::Cerebras(m) => build_inner!(m, Cerebras),
         AnyModel::OpenCode(m) => build_inner!(m, OpenCode),
+        AnyModel::Kimi(m) => build_inner!(m, Kimi),
         AnyModel::Ollama(m) => build_inner!(m, Ollama),
         AnyModel::Custom(m) => build_inner!(m, Custom),
     };

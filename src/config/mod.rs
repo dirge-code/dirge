@@ -16,7 +16,7 @@ use crate::extras::acp::config::AcpServerConfig;
 /// config (and `provider`, `review_provider`, etc.) refers to.
 ///
 /// `provider_type` is optional: when the alias matches a built-in
-/// (anthropic, cerebras, deepseek, gemini, glm, ollama, openai, opencode,
+/// (anthropic, cerebras, deepseek, gemini, glm, kimi, ollama, openai, opencode,
 /// openrouter, or custom), it is inferred from the key. Set it only when aliasing
 /// a built-in backend under a different name — e.g.
 /// `"ollama": { "provider_type": "openai", "base_url": "..." }`
@@ -35,6 +35,8 @@ pub enum ProviderAuth {
     ChatGpt,
     #[serde(alias = "claude-code", alias = "claude_code", alias = "claude")]
     Anthropic,
+    #[serde(alias = "kimi-code", alias = "kimi_code", alias = "moonshot")]
+    Kimi,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]

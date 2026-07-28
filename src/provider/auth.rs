@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use crate::auth::openai_oauth::normalize_optional_string;
-use crate::auth::store::OpenAiOAuthCredential;
+use crate::auth::store::{KimiOAuthCredential, OpenAiOAuthCredential};
 use crate::config::ProviderAuth;
 
 #[derive(Clone, PartialEq, Eq)]
@@ -45,6 +45,87 @@ pub fn resolve_auth_headers(auth: ProviderAuth) -> anyhow::Result<Option<Provide
         ProviderAuth::ApiKey => Ok(None),
         ProviderAuth::ChatGpt => Ok(Some(resolve_chatgpt_auth()?)),
         ProviderAuth::Anthropic => Ok(Some(resolve_anthropic_auth()?)),
+        // Kimi carries an expiry the ProviderAuthHeaders shape can't
+        // express; it resolves separately via `resolve_kimi_auth` in
+        // client.rs, exactly like the Anthropic expiry path.
+        ProviderAuth::Kimi => Ok(None),
+    }
+}
+
+/// A Kimi Code bearer resolved together with its expiry. The expiry lets
+/// the transport know WHEN to refresh mid-session — Kimi access tokens live
+/// only 15 minutes, so this is mandatory, not optional. It is `None` for
+/// the `KIMI_CODE_API_KEY` env path, which has no refresh token and so can
+/// never be renewed.
+#[derive(Clone)]
+pub(crate) struct KimiAuthHeaders {
+    pub bearer_token: String,
+    pub expires_at_ms: Option<i64>,
+    /// true only when `bearer_token` is Dirge's own refreshable Kimi OAuth
+    /// access token (mirrors `chatgpt_bearer_is_dirge_oauth`, dirge-8gdv.4).
+    /// A `KIMI_CODE_API_KEY` env token sets this false — Dirge can't
+    /// refresh it.
+    pub kimi_bearer_is_dirge_oauth: bool,
+}
+
+// Hand-written so the live Kimi bearer token can never land in a log or
+// panic message via `{:?}` — same reasoning as ProviderAuthHeaders.
+impl std::fmt::Debug for KimiAuthHeaders {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KimiAuthHeaders")
+            .field(
+                "bearer_token",
+                &if self.bearer_token.is_empty() {
+                    "<unset>"
+                } else {
+                    "<redacted>"
+                },
+            )
+            .field("expires_at_ms", &self.expires_at_ms)
+            .field(
+                "kimi_bearer_is_dirge_oauth",
+                &self.kimi_bearer_is_dirge_oauth,
+            )
+            .finish()
+    }
+}
+
+/// Resolve the Kimi bearer: a `KIMI_CODE_API_KEY` env token wins (static,
+/// non-refreshable); otherwise the stored `dirge auth kimi` OAuth
+/// credential, refreshed if expired. Unlike the ChatGPT path there is no
+/// legacy third-party file to fall back to, so a present-but-unusable
+/// Dirge credential propagates its (actionable) error.
+pub(crate) fn resolve_kimi_auth() -> anyhow::Result<KimiAuthHeaders> {
+    resolve_kimi_auth_with(
+        std::env::var("KIMI_CODE_API_KEY").ok(),
+        crate::provider::client::load_fresh_kimi_oauth,
+    )
+}
+
+fn resolve_kimi_auth_with(
+    api_key: Option<String>,
+    load_kimi_oauth: impl FnOnce() -> anyhow::Result<Option<KimiOAuthCredential>>,
+) -> anyhow::Result<KimiAuthHeaders> {
+    if let Some(key) = api_key
+        && !key.trim().is_empty()
+    {
+        return Ok(KimiAuthHeaders {
+            bearer_token: key.trim().to_string(),
+            expires_at_ms: None,
+            // Env override — not Dirge-refreshable.
+            kimi_bearer_is_dirge_oauth: false,
+        });
+    }
+    match load_kimi_oauth()? {
+        Some(credential) => Ok(KimiAuthHeaders {
+            bearer_token: credential.access_token().to_string(),
+            expires_at_ms: Some(credential.expires_at_epoch_ms()),
+            // Dirge's own OAuth token — refreshable mid-session.
+            kimi_bearer_is_dirge_oauth: true,
+        }),
+        None => anyhow::bail!(
+            "Kimi auth requested, but KIMI_CODE_API_KEY is unset and no stored Kimi OAuth login was found. Run `dirge auth kimi` or set KIMI_CODE_API_KEY."
+        ),
     }
 }
 
@@ -577,5 +658,71 @@ mod tests {
         assert_eq!(headers.bearer_token, "sk-ant-oat-file");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── Kimi auth resolution ────────────────────────────────────────────
+
+    #[test]
+    fn kimi_debug_redacts_bearer_token() {
+        let headers = KimiAuthHeaders {
+            bearer_token: "kimi-secret-token".to_string(),
+            expires_at_ms: Some(1_700_000_900_000),
+            kimi_bearer_is_dirge_oauth: true,
+        };
+        let rendered = format!("{headers:?}");
+        assert!(
+            !rendered.contains("kimi-secret-token"),
+            "bearer token must not appear in Debug output: {rendered}"
+        );
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+    }
+
+    #[test]
+    fn kimi_code_api_key_env_wins_and_is_not_refreshable() {
+        let headers = resolve_kimi_auth_with(Some(" env-kimi-key ".to_string()), || {
+            panic!("env key must short-circuit the OAuth store")
+        })
+        .unwrap();
+
+        assert_eq!(headers.bearer_token, "env-kimi-key");
+        assert_eq!(headers.expires_at_ms, None);
+        assert!(!headers.kimi_bearer_is_dirge_oauth);
+    }
+
+    #[test]
+    fn stored_kimi_oauth_is_used_when_no_env_key() {
+        let headers = resolve_kimi_auth_with(None, || {
+            Ok(Some(KimiOAuthCredential::new(
+                "kimi-access",
+                "kimi-refresh",
+                1_700_000_900_000,
+            )))
+        })
+        .unwrap();
+
+        assert_eq!(headers.bearer_token, "kimi-access");
+        assert_eq!(headers.expires_at_ms, Some(1_700_000_900_000));
+        assert!(headers.kimi_bearer_is_dirge_oauth);
+    }
+
+    #[test]
+    fn kimi_auth_without_env_or_login_is_actionable() {
+        let err = resolve_kimi_auth_with(None, || Ok(None)).unwrap_err();
+        let message = err.to_string();
+
+        assert!(message.contains("dirge auth kimi"), "{message}");
+        assert!(message.contains("KIMI_CODE_API_KEY"), "{message}");
+    }
+
+    #[test]
+    fn unusable_stored_kimi_credential_propagates() {
+        // No legacy fallback file exists for Kimi (unlike ChatGPT/codex), so
+        // the refresh/load failure must surface rather than being swallowed.
+        let err = resolve_kimi_auth_with(None, || {
+            anyhow::bail!("stored Kimi OAuth credential is expired and could not be refreshed")
+        })
+        .unwrap_err();
+
+        assert!(err.to_string().contains("could not be refreshed"));
     }
 }

@@ -23,6 +23,7 @@ pub enum ProviderKind {
     Cerebras,
     Ollama,
     OpenCode,
+    Kimi,
     Custom,
 }
 
@@ -41,6 +42,7 @@ pub fn default_model_for(provider_name: &str) -> &'static str {
         Some(ProviderKind::Glm) => "glm-5.2",
         Some(ProviderKind::Cerebras) => "gemma-4-31b",
         Some(ProviderKind::OpenCode) => "deepseek-v4-flash",
+        Some(ProviderKind::Kimi) => "k3",
         Some(ProviderKind::Ollama) => "llama3",
         // OpenRouter + Custom + unknown — keep the historical default
         // since OpenRouter wants the `vendor/model` form.
@@ -99,6 +101,9 @@ pub fn parse_provider(name: &str) -> Option<ProviderKind> {
         "glm" | "zhipu" => Some(ProviderKind::Glm),
         "cerebras" => Some(ProviderKind::Cerebras),
         "opencode" => Some(ProviderKind::OpenCode),
+        // Kimi Code (Moonshot) managed coding API — `moonshot` accepted as
+        // the vendor name users reach for.
+        "kimi" | "kimi-code" | "moonshot" => Some(ProviderKind::Kimi),
         "ollama" => Some(ProviderKind::Ollama),
         "custom" => Some(ProviderKind::Custom),
         _ => None,
@@ -126,7 +131,9 @@ pub fn model_family(model: &str) -> Option<ProviderKind> {
     // Strip an OpenRouter-style `vendor/` prefix to classify by the model
     // itself, not the routing vendor.
     let bare = id.rsplit('/').next().unwrap_or(id.as_str());
-    if bare.starts_with("glm-") {
+    if bare == "k3" || bare.starts_with("kimi-") {
+        Some(ProviderKind::Kimi)
+    } else if bare.starts_with("glm-") {
         Some(ProviderKind::Glm)
     } else if bare.starts_with("deepseek") {
         Some(ProviderKind::DeepSeek)
@@ -304,6 +311,7 @@ fn kind_label(kind: ProviderKind) -> &'static str {
         ProviderKind::Cerebras => "cerebras",
         ProviderKind::Ollama => "ollama",
         ProviderKind::OpenCode => "opencode",
+        ProviderKind::Kimi => "kimi",
         ProviderKind::Custom => "custom",
     }
 }
@@ -459,6 +467,9 @@ const BUILTIN_PROVIDER_NAMES: &[&str] = &[
     "zhipu",
     "cerebras",
     "opencode",
+    "kimi",
+    "kimi-code",
+    "moonshot",
     "ollama",
     "openrouter",
     "custom",
@@ -605,6 +616,7 @@ fn provider_env_var(kind: ProviderKind) -> &'static str {
         ProviderKind::Glm => "GLM_API_KEY",
         ProviderKind::Cerebras => "CEREBRAS_API_KEY",
         ProviderKind::OpenCode => "OPENCODE_API_KEY",
+        ProviderKind::Kimi => "KIMI_CODE_API_KEY",
         ProviderKind::Ollama => "OLLAMA_API_KEY",
         ProviderKind::OpenRouter => "OPENROUTER_API_KEY",
         ProviderKind::Custom => "CUSTOM_API_KEY",
@@ -639,6 +651,7 @@ pub(crate) const PROVIDER_AUTODETECT_ORDER: &[(&str, &str)] = &[
     // primary one; users with only ZHIPU_API_KEY still get glm.
     ("ZHIPU_API_KEY", "glm"),
     ("OPENCODE_API_KEY", "opencode"),
+    ("KIMI_CODE_API_KEY", "kimi"),
     ("CEREBRAS_API_KEY", "cerebras"),
     ("OLLAMA_API_KEY", "ollama"),
     ("OPENROUTER_API_KEY", "openrouter"),
@@ -664,10 +677,11 @@ pub(crate) fn auto_detect_provider_from<F: Fn(&str) -> Option<String>>(
 
 /// Provider implied by a stored `dirge auth` OAuth login. Consulted
 /// after env-var autodetect and before the hard `openrouter` default so
-/// that a user who ran `dirge auth openai` (or `dirge auth anthropic`) but
-/// set no API-key env var and no `provider` in config launches against the
-/// account they logged in to, instead of being asked for an OpenRouter key
-/// (GH #617). Reads the local credential stores only — no network.
+/// that a user who ran `dirge auth openai` (or `dirge auth anthropic`, or
+/// `dirge auth kimi`) but set no API-key env var and no `provider` in config
+/// launches against the account they logged in to, instead of being asked
+/// for an OpenRouter key (GH #617). Reads the local credential stores only —
+/// no network.
 pub fn auth_detect_provider() -> Option<&'static str> {
     let openai = crate::auth::store::OpenAiAuthStore::default()
         .load_openai()
@@ -676,18 +690,29 @@ pub fn auth_detect_provider() -> Option<&'static str> {
         .is_some();
     let anthropic = std::env::var("ANTHROPIC_OAUTH_TOKEN").is_ok_and(|v| !v.is_empty())
         || crate::provider::anthropic_oauth::credentials_file_path().exists();
-    auth_detect_provider_from(openai, anthropic)
+    let kimi = crate::auth::store::KimiAuthStore::default()
+        .load_kimi()
+        .ok()
+        .flatten()
+        .is_some();
+    auth_detect_provider_from(openai, anthropic, kimi)
 }
 
 /// Pure core of [`auth_detect_provider`]: pick a provider from which
-/// OAuth logins are present. OpenAI wins over Anthropic when both exist —
-/// arbitrary but stable, matching the env-autodetect order where openai
-/// precedes anthropic.
-pub(crate) fn auth_detect_provider_from(openai: bool, anthropic: bool) -> Option<&'static str> {
+/// OAuth logins are present. OpenAI wins over Anthropic wins over Kimi when
+/// several exist — arbitrary but stable, matching the env-autodetect order
+/// where openai precedes anthropic.
+pub(crate) fn auth_detect_provider_from(
+    openai: bool,
+    anthropic: bool,
+    kimi: bool,
+) -> Option<&'static str> {
     if openai {
         Some("openai")
     } else if anthropic {
         Some("anthropic")
+    } else if kimi {
+        Some("kimi")
     } else {
         None
     }
@@ -867,6 +892,53 @@ mod cerebras_identity_tests {
             );
         }
         assert_eq!(default_model_for("cerebras"), "gemma-4-31b");
+    }
+}
+
+#[cfg(test)]
+mod kimi_identity_tests {
+    use super::*;
+
+    #[test]
+    fn kimi_parses_aliases_and_defaults_to_k3() {
+        for name in ["kimi", "kimi-code", "moonshot", "KIMI", "Kimi-Code"] {
+            assert_eq!(
+                parse_provider(name).map(kind_label),
+                Some("kimi"),
+                "provider name {name:?} should resolve canonically",
+            );
+        }
+        assert_eq!(default_model_for("kimi"), "k3");
+        assert_eq!(default_model_for("kimi-code"), "k3");
+    }
+
+    #[test]
+    fn kimi_models_classify_to_the_kimi_family() {
+        assert_eq!(model_family("k3"), Some(ProviderKind::Kimi));
+        assert_eq!(model_family("kimi-for-coding"), Some(ProviderKind::Kimi));
+        assert_eq!(
+            model_family("kimi-for-coding-highspeed"),
+            Some(ProviderKind::Kimi)
+        );
+        // OpenRouter-vendored kimi ids classify by the model, not the vendor.
+        assert_eq!(
+            model_family("moonshotai/kimi-k2.6"),
+            Some(ProviderKind::Kimi)
+        );
+        // Lookalikes that are not kimi ids stay unclassified.
+        assert_eq!(model_family("k30"), None);
+        assert_eq!(model_family("kimi"), None);
+    }
+
+    #[test]
+    fn kimi_api_key_env_is_kimi_code_api_key() {
+        assert_eq!(provider_env_var(ProviderKind::Kimi), "KIMI_CODE_API_KEY");
+        assert!(
+            PROVIDER_AUTODETECT_ORDER
+                .iter()
+                .any(|(var, name)| *var == "KIMI_CODE_API_KEY" && *name == "kimi"),
+            "KIMI_CODE_API_KEY must participate in env autodetect"
+        );
     }
 }
 

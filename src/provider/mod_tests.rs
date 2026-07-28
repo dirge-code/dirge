@@ -117,6 +117,7 @@ fn cerebras_autodetect_preserves_existing_precedence() {
             ("GLM_API_KEY", "glm"),
             ("ZHIPU_API_KEY", "glm"),
             ("OPENCODE_API_KEY", "opencode"),
+            ("KIMI_CODE_API_KEY", "kimi"),
             ("OLLAMA_API_KEY", "ollama"),
             ("OPENROUTER_API_KEY", "openrouter"),
         ],
@@ -182,28 +183,46 @@ fn cerebras_builtin_name_is_protected_from_plugin_shadowing() {
 /// caller falls through to the openrouter default.
 #[test]
 fn auth_detect_returns_none_when_no_login_present() {
-    assert_eq!(auth_detect_provider_from(false, false), None);
+    assert_eq!(auth_detect_provider_from(false, false, false), None);
 }
 
 /// A stored `dirge auth openai` login makes openai the provider
 /// even with no API-key env var set (GH #617).
 #[test]
 fn auth_detect_picks_openai_when_openai_login_present() {
-    assert_eq!(auth_detect_provider_from(true, false), Some("openai"));
+    assert_eq!(
+        auth_detect_provider_from(true, false, false),
+        Some("openai")
+    );
 }
 
 /// A stored `dirge auth anthropic` login makes anthropic the
 /// provider, mirroring the openai case.
 #[test]
 fn auth_detect_picks_anthropic_when_anthropic_login_present() {
-    assert_eq!(auth_detect_provider_from(false, true), Some("anthropic"));
+    assert_eq!(
+        auth_detect_provider_from(false, true, false),
+        Some("anthropic")
+    );
 }
 
 /// With both logins present, openai wins — a stable order matching
 /// the env-autodetect list where openai precedes anthropic.
 #[test]
 fn auth_detect_prefers_openai_when_both_logins_present() {
-    assert_eq!(auth_detect_provider_from(true, true), Some("openai"));
+    assert_eq!(auth_detect_provider_from(true, true, true), Some("openai"));
+}
+
+/// A stored `dirge auth kimi` login makes kimi the provider,
+/// mirroring the openai/anthropic cases.
+#[test]
+fn auth_detect_picks_kimi_when_only_kimi_login_present() {
+    assert_eq!(auth_detect_provider_from(false, false, true), Some("kimi"));
+    // Anthropic still outranks kimi, matching the documented order.
+    assert_eq!(
+        auth_detect_provider_from(false, true, true),
+        Some("anthropic")
+    );
 }
 
 /// `provider_env_var_fallbacks` lists canonical API-KEY alternatives for
