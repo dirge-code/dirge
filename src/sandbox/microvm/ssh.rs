@@ -276,9 +276,9 @@ pub fn ssh_exec(
     // Inside tokio runtime (single-thread)? Create a REAL OS thread with its
     // own tokio runtime — avoids "Cannot start a runtime from within a runtime"
     // while keeping ssh_exec synchronous for all callers.
-    let result = if let Ok(_handle) = tokio::runtime::Handle::try_current() {
+
+    if let Ok(_handle) = tokio::runtime::Handle::try_current() {
         let host = host.to_string();
-        let port = port;
         let private_key_path = private_key_path.to_path_buf();
         let command = command.to_string();
         let host_key_bytes = host_key_bytes.map(|b| b.to_vec());
@@ -332,8 +332,7 @@ pub fn ssh_exec(
             command,
             host_key_bytes,
         ))
-    };
-    result
+    }
 }
 
 async fn ssh_exec_async(
@@ -401,9 +400,7 @@ async fn ssh_exec_async(
         match msg {
             ChannelMsg::Data { ref data } => stdout.extend_from_slice(data),
             // ext == 1 is SSH_EXTENDED_DATA_STDERR.
-            ChannelMsg::ExtendedData { ref data, ext } if ext == 1 => {
-                stderr.extend_from_slice(data)
-            }
+            ChannelMsg::ExtendedData { ref data, ext: 1 } => stderr.extend_from_slice(data),
             ChannelMsg::ExitStatus { exit_status } => exit_code = exit_status as i32,
             _ => {}
         }
