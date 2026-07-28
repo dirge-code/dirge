@@ -4,6 +4,22 @@ All notable changes to dirge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.19.26] - 2026-07-28
+
+### Fixed
+- The dead-tty watchdog no longer kills every macOS TUI session shortly after
+  startup (#731; thanks @nikolap). The watchdog added in 0.19.24 polls
+  `/dev/tty` every 250ms and treated `POLLNVAL` as terminal death — but on macOS
+  `/dev/tty` is the controlling-terminal redirect device and *always* reports
+  `POLLNVAL` to `poll(2)`, healthy terminal or not. So dirge ran its SIGHUP
+  teardown and exited 129 on a perfectly live tty. 0.19.24 and 0.19.25 are
+  effectively unusable on macOS; upgrade past them.
+
+  `tty_is_dead` now ignores `POLLNVAL` and adds an `ioctl(TIOCGWINSZ)` probe: a
+  hung-up line discipline fails that ioctl with `EIO`, which covers the
+  `/dev/tty` hangup that poll can't see there. pty secondaries still report
+  `POLLHUP` as before, so the hangup teardown 0.19.24 added is unchanged.
+
 ## [0.19.25] - 2026-07-28
 
 ### Fixed
