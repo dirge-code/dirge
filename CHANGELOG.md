@@ -4,6 +4,55 @@ All notable changes to dirge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.19.24] - 2026-07-28
+
+### Fixed
+- The PTY relay no longer spins at 100% CPU when the tty hangs up (#728).
+  0.19.16 changed the tty read's `Ok(0)` arm from `break` to `continue`, and a
+  hung-up tty polls `POLLIN|POLLHUP` and reads 0 forever — so the loop made no
+  progress while pinning a core, and the `continue` skipped the `POLLHUP` branch
+  that kills the child. Two relay threads in that state burned 17h of CPU on an
+  orphaned process. EOF is now terminal and kills the child; a bare `break` is
+  not enough, because the relay holds the PTY secondary open so the child never
+  sees EOF and `wait()` would block forever.
+
+- `POLLNVAL` is treated as fatal on both relay fds. `relay()` switched from
+  opening `/dev/tty` to `dup(0)` in the same release, so a backgrounded dirge
+  gets `/dev/null` as its tty, where poll reports `POLLNVAL` — matching neither
+  the `POLLIN` arm nor the hangup branch, and spinning with nothing to do. Both
+  relay defects shipped in 0.19.16.
+
+- The input reader no longer pins a core when the terminal goes away.
+  crossterm 0.29 never returns from `event::poll()` once the tty is gone — its
+  internal read loop retries on EOF/EIO with no timeout check
+  (crossterm-rs/crossterm#793) — so the reader thread spun and never got back
+  to re-check its shutdown flag, which also wedged `join_reader` and the TUI
+  suspend path.
+
+  Three changes. The reader probes the tty (`POLLHUP`/`POLLERR`/`POLLNVAL`)
+  before each poll. It now polls with a zero timeout and owns the 1ms wait
+  itself, so crossterm holds the thread for microseconds rather than a
+  millisecond, shrinking the window in which a dying tty can trap it by roughly
+  three orders of magnitude; idle CPU is unchanged. And a watchdog thread
+  checks every 250ms, running the same teardown `signal.rs` does for SIGHUP
+  when the tty is gone — dirge already means to exit on hangup, but an orphaned
+  background process never receives the signal. Headless modes have no probe fd
+  and never self-exit.
+
+  This does not fix the upstream bug; crossterm-rs/crossterm#1067 is the real
+  fix. Until it lands, the window is narrow and the watchdog guarantees dirge
+  cannot spin indefinitely.
+
+### Changed
+- Relay byte counters are gated behind `timing-diagnostics` again. They were
+  un-gated in 0.19.16, so release builds wrote to stderr on every relay exit and
+  ran two `assert!`s inside a `Drop` impl.
+
+- `clippy -D warnings` is clean under `sandbox-microvm` (50 findings across 7
+  files that default CI never saw). Mechanical only, but `tests.rs`'s inner
+  module is renamed `tests` -> `integration`, moving test filters to
+  `sandbox::microvm::tests::integration::*`.
+
 ## [0.19.23] - 2026-07-27
 
 ### Fixed
