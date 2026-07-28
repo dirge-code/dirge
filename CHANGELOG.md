@@ -7,6 +7,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Fixed
+- dirge no longer sends `prompt_cache_key` to backends that reject it (dirge-07ew).
+  The field was injected into every OpenAI-shaped request body, which covers the
+  openai-compatible backends as well as OpenAI itself. A server that validates its
+  request body strictly answers an unknown field by rejecting the whole request:
+  Cerebras returned `body.prompt_cache_key: property 'body.prompt_cache_key' is
+  unsupported` before it shipped caching, and Groq and Volcano Engine's DeepSeek
+  still answer that way. It is now an allowlist covering OpenAI (where it is a
+  documented routing hint, and required for reliable matching on GPT-5.6 and later)
+  and OpenRouter (which falls back to it for sticky routing). Everywhere else the
+  caching is automatic with no key to pin, so nothing is lost by leaving it out.
+
 - Prompt caching now holds the prefix it pays to cache (dirge-mv8k). Enabling
   Anthropic automatic caching put a single `cache_control` at the top level of the
   request body, but the cache-zone guard only recognised breakpoints placed on a
@@ -40,10 +51,32 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Anthropic-compatible relay that does not recognise the value: those reject the whole
   request rather than ignoring the flag.
 
+### Added
+- Qwen and Gemini routes through OpenRouter are cached (dirge-gcxb). Both upstreams
+  need an explicit breakpoint like Anthropic does, but neither accepts the top-level
+  form, so they get a `cache_control` on the end of the system message instead. A
+  string `content` is lifted to a block array to carry it. No TTL, since the 1h
+  option is Anthropic-only. Gemma and the other families that cache the longest
+  matching prefix on their own are left untouched.
+
+- The Anthropic prompt-cache TTL is configurable (dirge-cbgz), via
+  `[prompt_cache] ttl` or `DIRGE_PROMPT_CACHE_TTL`, as `"5m"` or `"1h"`. The default
+  is unchanged at 1h. A 1h cache write costs 2x the base input rate against 1.25x
+  for 5m, while reads are a tenth either way, and a read refreshes a 5m entry. So a
+  continuously active session stays warm on 5m and never pays the premium, while 1h
+  earns it across idle gaps longer than five minutes, when a lapsed entry means
+  re-writing the whole prefix instead of the turn's delta. See
+  [config.md](docs/config.md#prompt-caching).
+
 ### Changed
 - The Anthropic OAuth transport parses each request body once instead of twice. The
   beta-header decision reads `thinking.type` and the payload shaping needs the same
   JSON, and an agent turn's body is the largest allocation on that path.
+
+- Provider clients build their compression interceptor through one helper rather than
+  repeating the same four arguments at each of fourteen arms. The wire shape a body is
+  parsed as is now derived from the provider kind in one place, which is also where
+  the per-backend caching policy above is applied.
 
 ## [0.19.26] - 2026-07-28
 

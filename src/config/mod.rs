@@ -566,6 +566,17 @@ pub struct Compression {
     pub preset: Option<String>,
 }
 
+/// Prompt-cache policy (dirge-cbgz). `ttl` is `"5m"` or `"1h"` and sets the lifetime of
+/// the automatic cache breakpoint on providers that take one. 1h cache writes cost 2x
+/// base input against 1.25x for 5m, while a read refreshes a 5m entry, so 5m is cheaper
+/// on a continuously active session and 1h wins across idle gaps. Absent → 1h, the
+/// shipped default. Runtime env: `DIRGE_PROMPT_CACHE_TTL` overrides this setting.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct PromptCache {
+    pub ttl: Option<String>,
+}
+
 /// Optional desktop notification settings. The block is absent/off by default;
 /// when enabled, individual event classes default to on so a minimal
 /// `{ "enabled": true }` does the useful thing.
@@ -829,6 +840,9 @@ pub struct Config {
     /// `DIRGE_COMPRESSION=0` disables compression at runtime even when the
     /// feature is compiled in; the `preset` key picks the compression profile.
     pub compression: Option<Compression>,
+    /// Prompt-cache policy. Only `ttl` today (`"5m"` or `"1h"`), picking the lifetime
+    /// of the automatic cache breakpoint. Absent → 1h.
+    pub prompt_cache: Option<PromptCache>,
     pub permission: Option<serde_json::Value>,
     pub restrictive: Option<bool>,
     pub accept_all: Option<bool>,
@@ -1823,6 +1837,24 @@ mod tests {
             r#"{ "mode": "microvm", "microvm": { "memory_mib": 5000000000 } }"#,
         );
         assert!(err.is_err(), "out-of-range memory_mib must error");
+    }
+
+    /// dirge-cbgz: `[prompt_cache] ttl` reaches the deserializer, and its absence
+    /// leaves the shipped default in place rather than erroring.
+    #[test]
+    fn prompt_cache_ttl_parses_and_is_optional() {
+        let cfg: Config = serde_json::from_str(r#"{"prompt_cache": {"ttl": "5m"}}"#).unwrap();
+        assert_eq!(
+            cfg.prompt_cache.as_ref().and_then(|c| c.ttl.as_deref()),
+            Some("5m")
+        );
+
+        let cfg: Config = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(cfg.prompt_cache.is_none(), "absent section is fine");
+
+        // An empty section is also fine; the resolver supplies the default.
+        let cfg: Config = serde_json::from_str(r#"{"prompt_cache": {}}"#).unwrap();
+        assert!(cfg.prompt_cache.is_some_and(|c| c.ttl.is_none()));
     }
 
     /// Phased workflow is opt-in and off by default; the review-cycle

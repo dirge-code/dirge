@@ -143,16 +143,7 @@ where
         }
     };
     let client = openai::CompletionsClient::builder()
-        .http_client(
-            crate::provider::compressing_http::CompressingHttpClient::new(
-                reqwest::Client::new(),
-                crate::llmtrim::ir::ProviderKind::OpenAi,
-                std::sync::Arc::new(crate::compression::config_for_preset(
-                    &resolve_compression_preset(),
-                )),
-                resolve_compression_enabled(),
-            ),
-        )
+        .http_client(compressing(reqwest::Client::new(), ProviderKind::OpenAI))
         .api_key(&key)
         .build()?;
     Ok(Some(AnyClient::OpenAI(client)))
@@ -435,16 +426,12 @@ where
             let bearer_is_dirge_oauth = auth_headers
                 .as_ref()
                 .is_some_and(|h| h.chatgpt_bearer_is_dirge_oauth);
-            let mut b = openai::Client::builder().api_key(&key).http_client(
-                crate::provider::compressing_http::CompressingHttpClient::new(
+            let mut b = openai::Client::builder()
+                .api_key(&key)
+                .http_client(compressing(
                     codex_http_client_for(&key, bearer_is_dirge_oauth),
-                    crate::llmtrim::ir::ProviderKind::OpenAi,
-                    std::sync::Arc::new(crate::compression::config_for_preset(
-                        &resolve_compression_preset(),
-                    )),
-                    resolve_compression_enabled(),
-                ),
-            );
+                    ProviderKind::OpenAI,
+                ));
             if let Some(base_url) = &base_url {
                 b = b.base_url(base_url);
             }
@@ -465,16 +452,12 @@ where
             // body (rig 0.37 emits `instructions: null` + a system item in
             // `input`), which is the correct shape for ANY /v1/responses
             // endpoint, not just chatgpt.com's.
-            let mut b = openai::Client::builder().api_key(&key).http_client(
-                crate::provider::compressing_http::CompressingHttpClient::new(
+            let mut b = openai::Client::builder()
+                .api_key(&key)
+                .http_client(compressing(
                     CodexHttpClient::default(),
-                    crate::llmtrim::ir::ProviderKind::OpenAi,
-                    std::sync::Arc::new(crate::compression::config_for_preset(
-                        &resolve_compression_preset(),
-                    )),
-                    resolve_compression_enabled(),
-                ),
-            );
+                    ProviderKind::OpenAI,
+                ));
             if let Some(base_url) = &base_url {
                 b = b.base_url(base_url);
             }
@@ -483,16 +466,7 @@ where
         }
         ProviderKind::OpenAI => {
             let mut b = openai::CompletionsClient::builder()
-                .http_client(
-                    crate::provider::compressing_http::CompressingHttpClient::new(
-                        reqwest::Client::new(),
-                        crate::llmtrim::ir::ProviderKind::OpenAi,
-                        std::sync::Arc::new(crate::compression::config_for_preset(
-                            &resolve_compression_preset(),
-                        )),
-                        resolve_compression_enabled(),
-                    ),
-                )
+                .http_client(compressing(reqwest::Client::new(), ProviderKind::OpenAI))
                 .api_key(&key);
             if let Some(base_url) = &base_url {
                 b = b.base_url(base_url);
@@ -530,14 +504,7 @@ where
                         super::anthropic_http::AnthropicHttpClient::new(bearer)
                     }
                 };
-                let http = crate::provider::compressing_http::CompressingHttpClient::new(
-                    http,
-                    crate::llmtrim::ir::ProviderKind::Anthropic,
-                    std::sync::Arc::new(crate::compression::config_for_preset(
-                        &resolve_compression_preset(),
-                    )),
-                    resolve_compression_enabled(),
-                );
+                let http = compressing(http, ProviderKind::Anthropic);
                 let mut b = anthropic::Client::builder().api_key(&key).http_client(http);
                 if let Some(base_url) = &base_url {
                     b = b.base_url(base_url);
@@ -545,16 +512,9 @@ where
                 b = b.http_headers(headers);
                 Ok(AnyClient::AnthropicOauth(b.build()?))
             } else {
-                let mut b = anthropic::Client::builder().api_key(&key).http_client(
-                    crate::provider::compressing_http::CompressingHttpClient::new(
-                        reqwest::Client::new(),
-                        crate::llmtrim::ir::ProviderKind::Anthropic,
-                        std::sync::Arc::new(crate::compression::config_for_preset(
-                            &resolve_compression_preset(),
-                        )),
-                        resolve_compression_enabled(),
-                    ),
-                );
+                let mut b = anthropic::Client::builder()
+                    .api_key(&key)
+                    .http_client(compressing(reqwest::Client::new(), ProviderKind::Anthropic));
                 if let Some(base_url) = &base_url {
                     b = b.base_url(base_url);
                 }
@@ -563,16 +523,9 @@ where
             }
         }
         ProviderKind::Gemini => {
-            let mut b = gemini::Client::builder().api_key(&key).http_client(
-                crate::provider::compressing_http::CompressingHttpClient::new(
-                    reqwest::Client::new(),
-                    crate::llmtrim::ir::ProviderKind::Google,
-                    std::sync::Arc::new(crate::compression::config_for_preset(
-                        &resolve_compression_preset(),
-                    )),
-                    resolve_compression_enabled(),
-                ),
-            );
+            let mut b = gemini::Client::builder()
+                .api_key(&key)
+                .http_client(compressing(reqwest::Client::new(), ProviderKind::Gemini));
             if let Some(base_url) = &base_url {
                 b = b.base_url(base_url);
             }
@@ -581,16 +534,7 @@ where
         }
         ProviderKind::DeepSeek => {
             let b = openai::CompletionsClient::builder()
-                .http_client(
-                    crate::provider::compressing_http::CompressingHttpClient::new(
-                        reqwest::Client::new(),
-                        crate::llmtrim::ir::ProviderKind::OpenAi,
-                        std::sync::Arc::new(crate::compression::config_for_preset(
-                            &resolve_compression_preset(),
-                        )),
-                        resolve_compression_enabled(),
-                    ),
-                )
+                .http_client(compressing(reqwest::Client::new(), ProviderKind::DeepSeek))
                 .api_key(&key)
                 .base_url(base_url.as_deref().unwrap_or("https://api.deepseek.com/v1"))
                 .http_headers(headers);
@@ -598,16 +542,7 @@ where
         }
         ProviderKind::Glm => {
             let b = openai::CompletionsClient::builder()
-                .http_client(
-                    crate::provider::compressing_http::CompressingHttpClient::new(
-                        reqwest::Client::new(),
-                        crate::llmtrim::ir::ProviderKind::OpenAi,
-                        std::sync::Arc::new(crate::compression::config_for_preset(
-                            &resolve_compression_preset(),
-                        )),
-                        resolve_compression_enabled(),
-                    ),
-                )
+                .http_client(compressing(reqwest::Client::new(), ProviderKind::Glm))
                 .api_key(&key)
                 .base_url(
                     base_url
@@ -619,32 +554,14 @@ where
         }
         ProviderKind::Cerebras => {
             let b = openai::CompletionsClient::builder()
-                .http_client(
-                    crate::provider::compressing_http::CompressingHttpClient::new(
-                        reqwest::Client::new(),
-                        crate::llmtrim::ir::ProviderKind::OpenAi,
-                        std::sync::Arc::new(crate::compression::config_for_preset(
-                            &resolve_compression_preset(),
-                        )),
-                        resolve_compression_enabled(),
-                    ),
-                )
+                .http_client(compressing(reqwest::Client::new(), ProviderKind::Cerebras))
                 .api_key(&key)
                 .base_url(base_url.as_deref().unwrap_or("https://api.cerebras.ai/v1"));
             Ok(AnyClient::Cerebras(b.build()?))
         }
         ProviderKind::OpenCode => {
             let b = openai::CompletionsClient::builder()
-                .http_client(
-                    crate::provider::compressing_http::CompressingHttpClient::new(
-                        reqwest::Client::new(),
-                        crate::llmtrim::ir::ProviderKind::OpenAi,
-                        std::sync::Arc::new(crate::compression::config_for_preset(
-                            &resolve_compression_preset(),
-                        )),
-                        resolve_compression_enabled(),
-                    ),
-                )
+                .http_client(compressing(reqwest::Client::new(), ProviderKind::OpenCode))
                 .api_key(&key)
                 .base_url(base_url.as_deref().unwrap_or("https://opencode.ai/zen/v1"))
                 .http_headers(headers);
@@ -675,16 +592,7 @@ where
                 _ => super::kimi_http::KimiHttpClient::new(key.clone()),
             };
             let mut b = openai::CompletionsClient::builder()
-                .http_client(
-                    crate::provider::compressing_http::CompressingHttpClient::new(
-                        http,
-                        crate::llmtrim::ir::ProviderKind::OpenAi,
-                        std::sync::Arc::new(crate::compression::config_for_preset(
-                            &resolve_compression_preset(),
-                        )),
-                        resolve_compression_enabled(),
-                    ),
-                )
+                .http_client(compressing(http, ProviderKind::Kimi))
                 .api_key(&key)
                 .base_url(
                     base_url
@@ -696,16 +604,9 @@ where
         }
         ProviderKind::Ollama => {
             let key: ollama::OllamaApiKey = key.as_str().into();
-            let mut b = ollama::Client::builder().api_key(key).http_client(
-                crate::provider::compressing_http::CompressingHttpClient::new(
-                    reqwest::Client::new(),
-                    crate::llmtrim::ir::ProviderKind::OpenAi,
-                    std::sync::Arc::new(crate::compression::config_for_preset(
-                        &resolve_compression_preset(),
-                    )),
-                    resolve_compression_enabled(),
-                ),
-            );
+            let mut b = ollama::Client::builder()
+                .api_key(key)
+                .http_client(compressing(reqwest::Client::new(), ProviderKind::Ollama));
             if let Some(base_url) = &base_url {
                 b = b.base_url(base_url);
             }
@@ -713,16 +614,12 @@ where
             Ok(AnyClient::Ollama(b.build()?))
         }
         ProviderKind::OpenRouter => {
-            let mut b = openrouter::Client::builder().api_key(&key).http_client(
-                crate::provider::compressing_http::CompressingHttpClient::new(
+            let mut b = openrouter::Client::builder()
+                .api_key(&key)
+                .http_client(compressing(
                     reqwest::Client::new(),
-                    crate::llmtrim::ir::ProviderKind::OpenAi,
-                    std::sync::Arc::new(crate::compression::config_for_preset(
-                        &resolve_compression_preset(),
-                    )),
-                    resolve_compression_enabled(),
-                ),
-            );
+                    ProviderKind::OpenRouter,
+                ));
             if let Some(base_url) = &base_url {
                 b = b.base_url(base_url);
             }
@@ -736,16 +633,7 @@ where
                 )
             })?;
             let b = openai::CompletionsClient::builder()
-                .http_client(
-                    crate::provider::compressing_http::CompressingHttpClient::new(
-                        reqwest::Client::new(),
-                        crate::llmtrim::ir::ProviderKind::OpenAi,
-                        std::sync::Arc::new(crate::compression::config_for_preset(
-                            &resolve_compression_preset(),
-                        )),
-                        resolve_compression_enabled(),
-                    ),
-                )
+                .http_client(compressing(reqwest::Client::new(), ProviderKind::Custom))
                 .api_key(&key)
                 .base_url(&base_url)
                 .http_headers(headers);
@@ -1105,6 +993,47 @@ fn resolve_compression_enabled() -> bool {
 fn resolve_compression_preset() -> String {
     std::env::var("DIRGE_COMPRESSION_PRESET")
         .unwrap_or_else(|_| crate::compression::configured_preset())
+}
+
+/// Wrap a transport in the request-compression interceptor for `kind`.
+///
+/// Every provider arm below needs this, and each used to spell out the same four arguments.
+/// One place now decides all of them: the wire shape the body will be parsed as, the
+/// compression profile including the per-backend caching policy (dirge-07ew), and whether
+/// compression runs at all.
+fn compressing<Inner>(
+    inner: Inner,
+    kind: ProviderKind,
+) -> super::compressing_http::CompressingHttpClient<Inner> {
+    super::compressing_http::CompressingHttpClient::new(
+        inner,
+        wire_kind(kind),
+        std::sync::Arc::new(crate::compression::config_for_provider(
+            kind,
+            &resolve_compression_preset(),
+        )),
+        resolve_compression_enabled(),
+    )
+}
+
+/// Which of the three request shapes a provider's bodies take. Everything that isn't
+/// Anthropic's Messages API or Gemini's `generateContent` is OpenAI-shaped, including every
+/// openai-compatible backend and the routers.
+fn wire_kind(kind: ProviderKind) -> crate::llmtrim::ir::ProviderKind {
+    use crate::llmtrim::ir::ProviderKind as Wire;
+    match kind {
+        ProviderKind::Anthropic => Wire::Anthropic,
+        ProviderKind::Gemini => Wire::Google,
+        ProviderKind::OpenAI
+        | ProviderKind::OpenRouter
+        | ProviderKind::DeepSeek
+        | ProviderKind::Glm
+        | ProviderKind::Cerebras
+        | ProviderKind::Ollama
+        | ProviderKind::OpenCode
+        | ProviderKind::Kimi
+        | ProviderKind::Custom => Wire::OpenAi,
+    }
 }
 
 #[cfg(test)]

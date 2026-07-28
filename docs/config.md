@@ -485,6 +485,38 @@ Aliases `kimi-code` and `moonshot` are accepted for the provider name and
 the `auth` mode. The separate Kimi Platform API (`api.moonshot.ai`) is not
 this provider — use a `custom` provider with an API key for that.
 
+### Prompt caching
+
+dirge asks each provider to cache the stable part of every request (the system
+prompt and tool definitions, plus the conversation history where the provider
+supports it) so it is billed once instead of on every turn. Cached input reads
+at roughly a tenth of the normal rate, which makes the cache hit ratio the main
+cost lever on a long session. `/cache` reports that ratio along with the
+cumulative read and write totals.
+
+Nothing needs configuring for this to work. Most providers cache the longest
+matching prefix by themselves; where an explicit breakpoint is required
+(Anthropic directly, and the Anthropic, Qwen and Gemini routes through
+OpenRouter) dirge places one.
+
+The one knob is how long an Anthropic cache entry lives:
+
+```json
+{
+  "prompt_cache": { "ttl": "1h" }
+}
+```
+
+`"1h"` (the default) or `"5m"`. The tradeoff is in the write price: a 1h write
+costs 2x the base input rate against 1.25x for 5m, while reads are a tenth
+either way. A read refreshes a 5m entry, so a session that keeps working stays
+warm on 5m and never pays the premium. What 1h buys is the idle gap: if more
+than five minutes pass between turns, a lapsed 5m entry means re-writing the
+whole prefix on the next turn rather than just that turn's delta. Pick `"5m"`
+if your sessions run continuously, keep `"1h"` if you leave dirge sitting while
+you read or work elsewhere. `DIRGE_PROMPT_CACHE_TTL` overrides the setting at
+runtime.
+
 ### Role assignments
 
 | Key | Used for | Falls back to |
@@ -954,6 +986,7 @@ behavior (e.g. an alias for `/quit` works while the agent is running).
 | `EXA_API_KEY` | API key for the built-in `websearch` tool and the default Exa MCP server. Without this the `websearch` tool emits a startup warning and is not registered. |
 | `DIRGE_WEBFETCH_ALLOW_PRIVATE` | Set to `1` (or any non-empty value) to allow `webfetch` to call private / loopback IPs. By default `webfetch` enforces SSRF protection — it refuses `localhost`, `127.x`, `10.x`, `172.16-31.x`, `192.168.x`, and link-local addresses. Override only in trusted local-dev contexts; never set this in production environments that touch attacker-influenced URLs. |
 | `WEBSEARCH_ENABLED` / `WEBFETCH_ENABLED` | Force-enable the corresponding tool when not enabled via `tools.*` config. Useful in container builds where you set the toggle once via env rather than per-config-file. |
+| `DIRGE_PROMPT_CACHE_TTL` | `5m` or `1h`, overriding `[prompt_cache] ttl`. See [Prompt caching](#prompt-caching) for the cost tradeoff. |
 
 ## LSP configuration
 

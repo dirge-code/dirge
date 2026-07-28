@@ -112,17 +112,25 @@ fn has_automatic_cache_marker(raw: &Value) -> bool {
     raw.get("cache_control").is_some_and(|c| !c.is_null()) || routes_to_anthropic(raw)
 }
 
-/// Whether `model` names an Anthropic route through a router: a `vendor/model` id whose
-/// vendor is `anthropic`. Ids may carry a `~` price-preference prefix and a `:variant`
-/// suffix, so only the vendor segment is matched. Direct Anthropic traffic never matches
-/// (its wire shape has no vendor prefix on the model id), and Gemini carries no `model`
-/// field in the body at all.
-pub(crate) fn routes_to_anthropic(raw: &Value) -> bool {
+/// Split a router-style `vendor/model` id into its two halves, e.g.
+/// `("anthropic", "claude-sonnet-4.5")`. `None` when the model is not vendor-prefixed,
+/// which is how a router (OpenRouter and the gateways that copy its ids) is told apart
+/// from a provider addressed directly. Ids may carry a `~` price-preference prefix, which
+/// is stripped, and a `:variant` suffix, which stays with the model half.
+///
+/// Direct Anthropic and OpenAI traffic never matches (no vendor prefix), and Gemini
+/// carries no `model` field in the body at all.
+pub(crate) fn router_model(raw: &Value) -> Option<(&str, &str)> {
     raw.get("model")
         .and_then(Value::as_str)
         .map(|m| m.trim_start_matches(['~', '@']))
         .and_then(|m| m.split_once('/'))
-        .is_some_and(|(vendor, _)| vendor.eq_ignore_ascii_case("anthropic"))
+}
+
+/// Whether the request routes to Anthropic through a router, which is the case where the
+/// upstream holds a cached prefix we must not rewrite.
+pub(crate) fn routes_to_anthropic(raw: &Value) -> bool {
+    router_model(raw).is_some_and(|(vendor, _)| vendor.eq_ignore_ascii_case("anthropic"))
 }
 
 /// `cache_control` present anywhere within `v` (a block, a message, or nested content).
