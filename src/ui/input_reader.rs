@@ -51,6 +51,55 @@ pub(crate) fn spawn_input_reader(user_tx: tokio::sync::mpsc::UnboundedSender<Use
             }
         };
 
+        // ── Dead-tty watchdog (dirge-jiiv) ─────────────────────
+        // crossterm 0.29's event::poll may never return once the
+        // terminal dies (upstream bug crossterm-rs/crossterm#793).
+        // The reader loop probes tty_is_dead before each poll call,
+        // but if the terminal dies DURING poll, the thread is trapped
+        // forever — the probe never runs again. This watchdog supplies
+        // the SIGHUP that an orphaned background process never receives:
+        // when the tty goes away, it performs the same emergency
+        // teardown as src/signal.rs. Skipped in headless modes
+        // (--print, MCP server) where there is no controlling terminal
+        // to lose and we must never self-exit.
+        #[cfg(unix)]
+        {
+            use std::sync::Once;
+            static WATCHDOG_STARTED: Once = Once::new();
+            if probe_fd.is_some() {
+                WATCHDOG_STARTED.call_once(|| {
+                    // Open an independent handle — the watchdog must not
+                    // share or close the reader's descriptor.
+                    let watchdog_tty = std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open("/dev/tty")
+                        .ok();
+                    if let Some(tty) = watchdog_tty {
+                        std::thread::spawn(move || {
+                            use std::os::unix::io::AsRawFd;
+                            // `tty` must be MOVED into the thread and kept
+                            // alive here. Binding it outside and passing only
+                            // the RawFd would drop the File when this scope
+                            // ends, closing the descriptor; poll would then
+                            // report POLLNVAL on a dead fd and the watchdog
+                            // would exit the process moments after startup.
+                            let fd = tty.as_raw_fd();
+                            loop {
+                                std::thread::sleep(std::time::Duration::from_millis(250));
+                                if tty_is_dead(fd).unwrap_or(false) {
+                                    // Mirror signal.rs SIGHUP teardown exactly.
+                                    crate::child_guard::reap_all_groups();
+                                    crate::ui::terminal::emergency_restore();
+                                    std::process::exit(128 + libc::SIGHUP);
+                                }
+                            }
+                        });
+                    }
+                });
+            }
+        }
+
         // Poll-based loop so `TerminalGuard::drop` can signal a
         // cooperative shutdown via `EVENT_READER_SHUTDOWN`. Previously
         // this thread blocked in `event::read()` indefinitely; on
@@ -75,9 +124,16 @@ pub(crate) fn spawn_input_reader(user_tx: tokio::sync::mpsc::UnboundedSender<Use
             {
                 break;
             }
-            match event::poll(std::time::Duration::from_millis(1)) {
+            // Poll with zero timeout — we own the 1ms wait ourselves
+            // so crossterm only holds the thread for a few microseconds.
+            // This shrinks the window where a dying tty can trap us
+            // inside crossterm's internal read loop by ~1000×.
+            match event::poll(std::time::Duration::ZERO) {
                 Ok(true) => {}
-                Ok(false) => continue,
+                Ok(false) => {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    continue;
+                }
                 Err(_) => break,
             }
             // Re-check the shutdown flag between poll and read.
