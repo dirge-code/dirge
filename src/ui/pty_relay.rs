@@ -89,46 +89,47 @@ mod counters {
 
     impl Drop for RelayCounters {
         fn drop(&mut self) {
-            let tty_loss = self.tty_bytes_read.saturating_sub(self.pty_bytes_written);
-            let pty_loss = self.pty_bytes_read.saturating_sub(self.tty_bytes_written);
-            // Always-printed summary for attach diagnostics.
-            eprintln!(
-                "[sandbox-attach] tty_read={} pty_written={} pty_read={} tty_written={}",
-                self.tty_bytes_read,
-                self.pty_bytes_written,
-                self.pty_bytes_read,
-                self.tty_bytes_written,
-            );
             #[cfg(feature = "timing-diagnostics")]
-            eprintln!(
-                "[timing-diagnostics] relay exit: \
-                 tty_read={} pty_written={} tty_loss={} \
-                 pty_read={} tty_written={} pty_loss={} \
-                 wouldblock={} poll={}",
-                self.tty_bytes_read,
-                self.pty_bytes_written,
-                tty_loss,
-                self.pty_bytes_read,
-                self.tty_bytes_written,
-                pty_loss,
-                self.wouldblock_count,
-                self.poll_count,
-            );
-            // Assert no loss beyond retry-buffer pending bytes.
-            assert!(
-                self.tty_bytes_read >= self.pty_bytes_written,
-                "RELAY LOSS tty→PTY: read {} bytes from tty, wrote {} to PTY (loss {})",
-                self.tty_bytes_read,
-                self.pty_bytes_written,
-                tty_loss,
-            );
-            assert!(
-                self.pty_bytes_read >= self.tty_bytes_written,
-                "RELAY LOSS PTY→tty: read {} bytes from PTY, wrote {} to tty (loss {})",
-                self.pty_bytes_read,
-                self.tty_bytes_written,
-                pty_loss,
-            );
+            {
+                let tty_loss = self.tty_bytes_read.saturating_sub(self.pty_bytes_written);
+                let pty_loss = self.pty_bytes_read.saturating_sub(self.tty_bytes_written);
+                eprintln!(
+                    "[sandbox-attach] tty_read={} pty_written={} pty_read={} tty_written={}",
+                    self.tty_bytes_read,
+                    self.pty_bytes_written,
+                    self.pty_bytes_read,
+                    self.tty_bytes_written,
+                );
+                eprintln!(
+                    "[timing-diagnostics] relay exit: \
+                     tty_read={} pty_written={} tty_loss={} \
+                     pty_read={} tty_written={} pty_loss={} \
+                     wouldblock={} poll={}",
+                    self.tty_bytes_read,
+                    self.pty_bytes_written,
+                    tty_loss,
+                    self.pty_bytes_read,
+                    self.tty_bytes_written,
+                    pty_loss,
+                    self.wouldblock_count,
+                    self.poll_count,
+                );
+                // Assert no loss beyond retry-buffer pending bytes.
+                assert!(
+                    self.tty_bytes_read >= self.pty_bytes_written,
+                    "RELAY LOSS tty→PTY: read {} bytes from tty, wrote {} to PTY (loss {})",
+                    self.tty_bytes_read,
+                    self.pty_bytes_written,
+                    tty_loss,
+                );
+                assert!(
+                    self.pty_bytes_read >= self.tty_bytes_written,
+                    "RELAY LOSS PTY→tty: read {} bytes from PTY, wrote {} to tty (loss {})",
+                    self.pty_bytes_read,
+                    self.tty_bytes_written,
+                    pty_loss,
+                );
+            }
         }
     }
 }
@@ -310,6 +311,8 @@ impl PtyRelay {
     /// `Some`, record every byte the child writes to the PTY so callers can
     /// feed it back. Shared core of [`PtyRelay::relay`] / [`relay_to_fd`].
     fn run_loop(&mut self, tty: &mut std::fs::File) -> io::Result<std::process::ExitStatus> {
+        const FATAL_REVENTS: libc::c_short = libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
+
         #[cfg(feature = "timing-diagnostics")]
         let t_relay_enter = std::time::Instant::now();
 
@@ -471,14 +474,18 @@ impl PtyRelay {
                     Err(_) => break,
                 }
             }
-            if fds[0].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+            if fds[0].revents & FATAL_REVENTS != 0 {
                 return self.child.wait();
             }
 
             // ── tty → PTY (user keystrokes → guest) ───────────────
             if fds[1].revents & libc::POLLIN != 0 {
                 match tty.read(&mut read_buf) {
-                    Ok(0) => continue,
+                    Ok(0) => {
+                        // Tty EOF — kill the child so we don't block in wait().
+                        let _ = self.child.kill();
+                        break;
+                    }
                     Ok(n) => {
                         counters.tty_read(n);
                         if !pty_write_buf.is_empty() {
@@ -513,7 +520,7 @@ impl PtyRelay {
                     Err(_) => break,
                 }
             }
-            if fds[1].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+            if fds[1].revents & FATAL_REVENTS != 0 {
                 // Tty is gone — kill the child so we don't block in wait().
                 let _ = self.child.kill();
                 break;

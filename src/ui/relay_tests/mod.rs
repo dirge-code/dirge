@@ -56,3 +56,7 @@ mod sentinel_restore;
 #[cfg(test)]
 #[cfg(all(unix, feature = "sandbox-microvm"))]
 mod poll_latency;
+
+#[cfg(test)]
+#[cfg(all(unix, feature = "sandbox-microvm"))]
+mod tty_hangup;

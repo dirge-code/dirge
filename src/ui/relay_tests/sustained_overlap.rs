@@ -62,9 +62,18 @@ mod tests {
             }
         }
 
-        // Final drain.
-        std::thread::sleep(Duration::from_millis(500));
-        echoed.append(&mut drain_fd_nonblock(&mut tty_secondary));
+        // Final drain: the relay may have buffered trailing bytes in its
+        // internal retry buffer while the PTY buffer was full. A single
+        // fixed sleep + one-shot drain races it. Loop until every
+        // injected byte echoes or a generous timeout elapses.
+        let total = injected.len();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while echoed.len() < total && std::time::Instant::now() < deadline {
+            echoed.append(&mut drain_fd_nonblock(&mut tty_secondary));
+            if echoed.len() < total {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
         drop(tty_secondary);
 
         match relay_handle.join() {
@@ -164,12 +173,20 @@ mod tests {
             set_nonblocking(&final_tty).expect("set nonblocking for drain");
         }
 
-        // Give the relay time to process all bytes.
-        std::thread::sleep(Duration::from_millis(500));
-
-        let mut final_tty = tty_shared.lock().unwrap();
-        let echoed = drain_fd_nonblock(&mut final_tty);
-        drop(final_tty);
+        // Poll-drain: the relay may still be flushing its internal retry
+        // buffer. A single fixed sleep + one-shot drain races it. Loop
+        // until every injected byte echoes or a generous timeout elapses.
+        let mut echoed = Vec::with_capacity(TOTAL);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while echoed.len() < TOTAL && std::time::Instant::now() < deadline {
+            {
+                let mut final_tty = tty_shared.lock().unwrap();
+                echoed.append(&mut drain_fd_nonblock(&mut final_tty));
+            }
+            if echoed.len() < TOTAL {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
         drop(tty_shared);
 
         match relay_handle.join() {
