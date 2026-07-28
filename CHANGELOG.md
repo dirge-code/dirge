@@ -4,7 +4,7 @@ All notable changes to dirge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.19.27] - 2026-07-28
 
 ### Fixed
 - dirge no longer sends `prompt_cache_key` to backends that reject it (dirge-07ew).
@@ -52,6 +52,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   request rather than ignoring the flag.
 
 ### Added
+- Kimi Code (Moonshot) is a supported provider, with a device OAuth login: `dirge auth
+  kimi` (alias `dirge auth kimi-code`) prints a verification URL and code, then stores
+  the credential under the `kimi` key in the same `auth.json` the other OAuth providers
+  use. Set `provider = "kimi"` (aliases `kimi-code`, `moonshot`) to use a Kimi
+  membership's managed coding API instead of a raw API key. Models are `k3` (default),
+  `kimi-for-coding`, and `kimi-for-coding-highspeed` against
+  `https://api.kimi.com/coding/v1`, with a 262144-token context; tiers without K3 access
+  want `--model kimi-for-coding`. Access tokens last 15 minutes and are refreshed
+  automatically mid-session. `KIMI_CODE_API_KEY` takes a static bearer instead of the
+  OAuth login, and `KIMI_CODE_BASE_URL` / `KIMI_CODE_OAUTH_HOST` override the endpoints.
+  The separate Kimi Platform API (`api.moonshot.ai`) is not covered. See
+  [config.md](docs/config.md#kimi-code-moonshot-oauth).
+
 - Qwen and Gemini routes through OpenRouter are cached (dirge-gcxb). Both upstreams
   need an explicit breakpoint like Anthropic does, but neither accepts the top-level
   form, so they get a `cache_control` on the end of the system message instead. A
