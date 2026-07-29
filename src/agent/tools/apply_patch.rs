@@ -450,7 +450,12 @@ mod tests {
 
     impl TestFile {
         fn new(name: &str) -> Self {
-            let path = format!("/tmp/dirge-test-{}", name);
+            // Process-scoped, like the ad-hoc paths some of these tests already
+            // build for their rename/delete targets. A bare `/tmp/dirge-test-{name}`
+            // is global, so two concurrent nextest invocations — two checkouts of
+            // the repo, a worktree beside the main tree — fight over the same file
+            // and one of them fails a test that has nothing wrong with it.
+            let path = format!("/tmp/dirge-test-{}-{}", std::process::id(), name);
             // Clean up any leftover
             let _ = std::fs::remove_file(&path);
             Self { path }
@@ -568,7 +573,9 @@ mod tests {
     #[tokio::test]
     async fn test_rename_file() {
         let src = TestFile::new("rename-src.txt");
-        let dst = "/tmp/dirge-test-rename-dst.txt";
+        // Process-scoped for the same reason as `TestFile::new`.
+        let dst = format!("/tmp/dirge-test-{}-rename-dst.txt", std::process::id());
+        let dst = dst.as_str();
         let _ = std::fs::remove_file(dst);
         std::fs::write(&src.path, "rename me").unwrap();
 
