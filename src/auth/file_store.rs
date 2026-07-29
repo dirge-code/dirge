@@ -20,7 +20,25 @@ pub(crate) const OPENAI_ACCOUNT_ID_ALIASES: &[&str] = &[
 
 /// `now >= expires_at` — a token at exactly its expiry instant is expired.
 pub(crate) fn epoch_ms_is_expired(expires_at_ms: i64, now_ms: i64) -> bool {
-    now_ms >= expires_at_ms
+    epoch_ms_is_expired_within(expires_at_ms, now_ms, 0)
+}
+
+/// As [`epoch_ms_is_expired`], but treats the token as expired `margin_ms`
+/// before it actually is, so a refresh happens while the current token is
+/// still usable.
+///
+/// dirge-iki5: without a margin a request can pass the freshness check with
+/// microseconds to spare and still reach the provider after the token has
+/// died — network latency plus clock skew between us and them. The resulting
+/// 401 is classified `ErrorKind::Auth`, which `should_retry` refuses to retry,
+/// so the whole turn fails rather than refreshing. Long-lived tokens cross
+/// that boundary rarely; a 15-minute Kimi token crosses it every 15 minutes of
+/// an active session.
+///
+/// Saturating, so an absurd margin reports expired rather than wrapping into
+/// "fresh".
+pub(crate) fn epoch_ms_is_expired_within(expires_at_ms: i64, now_ms: i64, margin_ms: i64) -> bool {
+    now_ms.saturating_add(margin_ms) >= expires_at_ms
 }
 
 /// Pull the first present account-id value (canonical key first, then
@@ -145,6 +163,27 @@ mod tests {
         assert!(!epoch_ms_is_expired(1_000, 999));
         assert!(epoch_ms_is_expired(1_000, 1_000));
         assert!(epoch_ms_is_expired(1_000, 1_001));
+    }
+
+    /// dirge-iki5: a margin treats a token as expired that many ms early, so a
+    /// request issued just under the wire doesn't land after the token has
+    /// actually died. A zero margin is exactly the bare comparison.
+    #[test]
+    fn epoch_ms_is_expired_within_refreshes_early_by_the_margin() {
+        // 60s margin: expiry at t=100_000 is "expired" from t=40_000 on.
+        assert!(!epoch_ms_is_expired_within(100_000, 39_999, 60_000));
+        assert!(epoch_ms_is_expired_within(100_000, 40_000, 60_000));
+        assert!(epoch_ms_is_expired_within(100_000, 99_999, 60_000));
+        // Zero margin collapses to the inclusive bare comparison.
+        assert!(!epoch_ms_is_expired_within(1_000, 999, 0));
+        assert!(epoch_ms_is_expired_within(1_000, 1_000, 0));
+    }
+
+    /// A margin wider than the remaining life must not underflow into "fresh".
+    #[test]
+    fn epoch_ms_is_expired_within_saturates_on_absurd_margin() {
+        assert!(epoch_ms_is_expired_within(1_000, 0, i64::MAX));
+        assert!(epoch_ms_is_expired_within(i64::MAX, i64::MAX - 1, i64::MAX));
     }
 
     #[test]

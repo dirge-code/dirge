@@ -288,6 +288,21 @@ fn canonicalize_account_id_aliases(openai: &mut Map<String, Value>) {
 
 // ── Kimi Code (Moonshot) OAuth — key "kimi" in the same auth.json ──────
 
+/// Refresh a Kimi token this long before it actually expires (dirge-iki5).
+///
+/// Kimi access tokens live 15 minutes, so the expiry boundary is crossed
+/// every 15 minutes of an active session — orders of magnitude more often
+/// than on the OpenAI/Anthropic paths, whose tokens are long-lived and which
+/// therefore keep the bare `now >= expires_at` comparison. Without slack a
+/// request can pass the freshness check and still arrive after the token has
+/// died; the 401 that comes back is non-retryable (`ErrorKind::Auth`), so the
+/// turn dies outright.
+///
+/// 60s is ~7% of the token's life — comfortably longer than any plausible
+/// request latency plus clock skew, and far short of thrashing (it costs at
+/// most one extra refresh per token).
+pub(crate) const KIMI_REFRESH_MARGIN_MS: i64 = 60_000;
+
 /// Dirge-managed Kimi OAuth credential. Same access/refresh/expires shape
 /// as the OpenAI credential, minus the OpenAI-only id_token/account_id —
 /// the Kimi token bundle carries neither.
@@ -324,7 +339,11 @@ impl KimiOAuthCredential {
     }
 
     pub(crate) fn is_expired_at(&self, epoch_ms: i64) -> bool {
-        super::file_store::epoch_ms_is_expired(self.expires_at_epoch_ms, epoch_ms)
+        super::file_store::epoch_ms_is_expired_within(
+            self.expires_at_epoch_ms,
+            epoch_ms,
+            KIMI_REFRESH_MARGIN_MS,
+        )
     }
 
     pub(crate) fn is_fresh_at(&self, epoch_ms: i64) -> bool {
@@ -1003,11 +1022,30 @@ mod tests {
 
     #[test]
     fn kimi_expiry_helpers_distinguish_fresh_and_expired_tokens() {
-        let token = KimiOAuthCredential::new("KIMI-ACCESS", "KIMI-REFRESH", 1_000);
+        // Expiry far enough out that the refresh margin doesn't reach it.
+        let expires_at = 10 * KIMI_REFRESH_MARGIN_MS;
+        let token = KimiOAuthCredential::new("KIMI-ACCESS", "KIMI-REFRESH", expires_at);
 
-        assert!(token.is_fresh_at(999));
-        assert!(token.is_expired_at(1_000));
-        assert!(!token.is_fresh_at(1_000));
+        assert!(token.is_fresh_at(0));
+        assert!(token.is_expired_at(expires_at));
+        assert!(!token.is_fresh_at(expires_at));
+    }
+
+    /// dirge-iki5: a Kimi token inside the refresh margin counts as expired, so
+    /// it gets renewed while the current one still works. Without this a
+    /// request could pass the check with milliseconds left and still land after
+    /// expiry — and the resulting 401 is classified `ErrorKind::Auth`, which is
+    /// never retried, so the whole turn dies.
+    #[test]
+    fn kimi_token_inside_the_refresh_margin_is_treated_as_expired() {
+        let expires_at = 10 * KIMI_REFRESH_MARGIN_MS;
+        let token = KimiOAuthCredential::new("KIMI-ACCESS", "KIMI-REFRESH", expires_at);
+
+        // One ms before the margin opens: still fresh.
+        assert!(token.is_fresh_at(expires_at - KIMI_REFRESH_MARGIN_MS - 1));
+        // Exactly at the margin boundary, and inside it: refresh now.
+        assert!(token.is_expired_at(expires_at - KIMI_REFRESH_MARGIN_MS));
+        assert!(token.is_expired_at(expires_at - 1));
     }
 
     #[test]

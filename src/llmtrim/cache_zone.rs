@@ -66,7 +66,7 @@ fn is_instruction(req: &Request, provider: &dyn Provider, pointer: &str) -> bool
 /// request carries no `cache_control` markers (nothing known-cached to protect).
 pub fn frozen_pointers(req: &Request, provider: &dyn Provider) -> HashSet<String> {
     let raw = req.raw();
-    let automatic = has_automatic_cache_marker(raw);
+    let automatic = has_automatic_cache_marker(req);
     let system_frozen = automatic || raw.get("system").is_some_and(has_cache_control);
     let messages = raw.get("messages").and_then(Value::as_array);
     let marked_until = messages.and_then(|msgs| {
@@ -105,11 +105,24 @@ pub fn frozen_pointers(req: &Request, provider: &dyn Provider) -> HashSet<String
 /// that path the content stages consulting this would otherwise decide before the marker
 /// exists and re-window a prefix the provider has cached.
 ///
-/// The routed case reads the model id rather than the config, so it also freezes under a
-/// preset that leaves Stage A off. That errs toward not rewriting cached bytes, which is
-/// the direction those presets want anyway.
-fn has_automatic_cache_marker(raw: &Value) -> bool {
-    raw.get("cache_control").is_some_and(|c| !c.is_null()) || routes_to_anthropic(raw)
+/// The two arms differ in kind. A top-level `cache_control` is EVIDENCE — it is on the
+/// body, so a cached prefix exists. The routed-model arm is a PREDICTION that Stage A will
+/// add one, which only holds when Stage A is enabled; it is gated on `cache_stage_enabled`
+/// accordingly (dirge-01tu). Freezing on the model id alone under a preset that leaves
+/// Stage A off protected a prefix that never got cached, so the history was neither
+/// compressed nor cached — strictly worse than not freezing.
+fn has_automatic_cache_marker(req: &Request) -> bool {
+    let raw = req.raw();
+    // An explicit top-level marker is self-evidencing: it is already on the body, so the
+    // upstream really does hold a cached prefix, whatever the config says.
+    if raw.get("cache_control").is_some_and(|c| !c.is_null()) {
+        return true;
+    }
+    // The routed case is a PREDICTION that Stage A will add the marker later, so it only
+    // holds when Stage A is actually going to run (dirge-01tu). Anthropic caches nothing
+    // without an explicit breakpoint, so freezing with the stage off would protect a
+    // prefix that never gets cached — leaving the content neither compressed nor cached.
+    req.cache_stage_enabled() && routes_to_anthropic(raw)
 }
 
 /// Split a router-style `vendor/model` id into its two halves, e.g.
@@ -356,11 +369,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn routed_anthropic_model_freezes_before_the_marker_exists() {
-        // Stage A adds the marker last, so on a routed Anthropic model the content stages
-        // reach this first and would see a bare body. The model id is the signal.
-        let r = Request::from_value(
+    fn routed_anthropic_request(cache_stage_enabled: bool) -> Request {
+        let mut r = Request::from_value(
             ProviderKind::OpenAi,
             json!({
                 "model": "anthropic/claude-sonnet-4.5",
@@ -371,11 +381,65 @@ mod tests {
                 ]
             }),
         );
+        r.set_cache_stage_enabled(cache_stage_enabled);
+        r
+    }
+
+    #[test]
+    fn routed_anthropic_model_freezes_before_the_marker_exists() {
+        // Stage A adds the marker last, so on a routed Anthropic model the content stages
+        // reach this first and would see a bare body. The model id is the signal.
+        let r = routed_anthropic_request(true);
         let p = for_kind(ProviderKind::OpenAi);
         let comp = compressible_pointers(&r, p.as_ref());
         assert!(
             comp.iter().all(|x| x.starts_with("/messages/2")),
             "only the newest turn: {comp:?}"
+        );
+    }
+
+    /// dirge-01tu: the routed-Anthropic freeze must not fire when Stage A is
+    /// switched off.
+    ///
+    /// The freeze exists to protect a prefix the upstream has cached, and on a
+    /// routed Anthropic model nothing is cached unless Stage A writes the
+    /// breakpoint — Anthropic caches nothing without one. Stage A is gated on
+    /// `config.cache`, which is true only in the `agent` / `aggressive` /
+    /// `cache` presets and false in the lossless baseline that `safe` / `rag` /
+    /// `code` / `reasoning` inherit. Under those presets the pre-fix code froze
+    /// the history anyway, so the content was neither compressed (frozen) nor
+    /// cached (no marker) — strictly worse than before the freeze existed.
+    #[test]
+    fn routed_anthropic_does_not_freeze_when_the_cache_stage_is_off() {
+        let r = routed_anthropic_request(false);
+        let p = for_kind(ProviderKind::OpenAi);
+        assert!(
+            frozen_pointers(&r, p.as_ref()).is_empty(),
+            "no marker will be written, so there is no cached prefix to protect",
+        );
+        let comp = compressible_pointers(&r, p.as_ref());
+        assert!(
+            comp.iter().any(|x| x.starts_with("/messages/0")),
+            "the earlier turns stay compressible: {comp:?}"
+        );
+    }
+
+    /// An explicit top-level marker is self-evidencing — its presence proves a
+    /// breakpoint exists — so it freezes regardless of the stage flag.
+    #[test]
+    fn explicit_top_level_marker_freezes_even_with_the_cache_stage_off() {
+        let mut r = req(json!({
+            "cache_control": {"type": "ephemeral", "ttl": "1h"},
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "earlier"}]},
+                {"role": "user", "content": [{"type": "text", "text": "newest"}]},
+            ]
+        }));
+        r.set_cache_stage_enabled(false);
+        let p = for_kind(ProviderKind::Anthropic);
+        assert!(
+            frozen_pointers(&r, p.as_ref()).contains("/messages/0/content/0/text"),
+            "an already-present marker means the upstream really has cached this",
         );
     }
 

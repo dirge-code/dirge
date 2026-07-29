@@ -52,6 +52,18 @@ pub struct Request {
     /// Out-of-band model id for providers that don't carry it in the body (Gemini puts the
     /// model in the URL path). Never serialized — `to_json_string` emits only `raw`.
     model_hint: Option<String>,
+    /// Whether the cache stage (Stage A) will run for this request, i.e. `config.cache`
+    /// after `auto` preset routing has resolved. Never serialized.
+    ///
+    /// The cache zone needs this to decide whether a routed-Anthropic request is *going*
+    /// to get a breakpoint: Stage A runs last (it fingerprints the final prefix), so the
+    /// content stages ask before the marker exists and have to predict it. Predicting from
+    /// the model id alone is wrong when the stage is switched off — the freeze would then
+    /// protect a cached prefix that never gets created (dirge-01tu).
+    ///
+    /// Defaults to `false`, which errs toward compressing: a caller that forgets to set it
+    /// keeps the pre-freeze behavior rather than silently disabling compression.
+    cache_stage_enabled: bool,
 }
 
 impl Request {
@@ -62,6 +74,7 @@ impl Request {
             kind,
             raw,
             model_hint: None,
+            cache_stage_enabled: false,
         })
     }
 
@@ -71,6 +84,7 @@ impl Request {
             kind,
             raw,
             model_hint: None,
+            cache_stage_enabled: false,
         }
     }
 
@@ -82,6 +96,18 @@ impl Request {
     /// body). Never affects serialization; only [`Request::model_id`] reads it.
     pub fn set_model_hint(&mut self, model: Option<&str>) {
         self.model_hint = model.map(str::to_string);
+    }
+
+    /// Record whether the cache stage will run for this request (`config.cache`, after
+    /// `auto` routing resolves). Never affects serialization; only the cache zone reads it.
+    pub fn set_cache_stage_enabled(&mut self, enabled: bool) {
+        self.cache_stage_enabled = enabled;
+    }
+
+    /// Whether the cache stage will run — i.e. whether a routed-Anthropic request is going
+    /// to receive a breakpoint the content stages must not rewrite around.
+    pub fn cache_stage_enabled(&self) -> bool {
+        self.cache_stage_enabled
     }
 
     /// The request's model id: the body's `model` field if present, else the out-of-band hint.

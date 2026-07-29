@@ -1504,7 +1504,33 @@ pub fn webfetch_enabled(cfg: &Config) -> bool {
     cfg.tools.as_ref().and_then(|t| t.webfetch).unwrap_or(true) || web_env_true("WEBFETCH_ENABLED")
 }
 
+/// Context window (tokens) for a model id, or `None` when neither source knows
+/// it (the caller then keeps its own 128k default).
+///
+/// Two sources, consulted in order:
+///
+///   1. the hand-maintained `TABLE` below — substring matches, so a family key
+///      like `claude` covers every dated variant;
+///   2. the embedded models.dev snapshot (`llmtrim::context_window`), refreshed
+///      by `tools/refresh_context.py`.
+///
+/// The table wins on a conflict, which keeps the snapshot a strictly additive
+/// backstop: adding it can only turn a `None` into a value, never change an
+/// answer the table already gave. That matters because this feeds every
+/// compaction tier — a window that silently shifted under an existing user
+/// would change when their sessions fold.
+///
+/// dirge-9jy7: the snapshot arm exists because substring matching cannot match
+/// a short id. `k3` (Kimi's flagship, a real 262144 window) contains none of the
+/// table keys, so it fell to the 128k default and every budget tier ran at
+/// roughly twice the intended pressure — folding on turns that were nowhere
+/// near the real limit. The snapshot already carried the correct figure; only
+/// the breakdown view was reading it.
 pub fn context_window_for_model(model: &str) -> Option<u64> {
+    table_context_window(model).or_else(|| crate::llmtrim::context_window(model).map(u64::from))
+}
+
+fn table_context_window(model: &str) -> Option<u64> {
     let m = model.to_lowercase();
     // Ordered: most-specific first.
     const TABLE: &[(&str, u64)] = &[
@@ -2356,6 +2382,50 @@ mod model_context_tests {
     fn unknown_model_returns_none() {
         assert!(context_window_for_model("totally-fictional-model").is_none());
         assert!(context_window_for_model("").is_none());
+    }
+
+    /// dirge-9jy7: a model absent from the hand-maintained table falls through
+    /// to the embedded models.dev snapshot instead of the 128k default.
+    ///
+    /// `k3` is the regression that motivated this: the substring table matches
+    /// with `model.contains(key)`, and a two-character id can never contain any
+    /// key, so Kimi's flagship silently resolved to the 128k fallback against a
+    /// real 262144 window. Every budget tier then ran at ~2x the intended
+    /// pressure and folded on turns that were nowhere near the limit.
+    #[test]
+    fn model_absent_from_table_falls_back_to_models_dev_snapshot() {
+        for (model, want) in &[
+            ("k3", 262_144),
+            ("kimi-for-coding", 262_144),
+            ("kimi-for-coding-highspeed", 262_144),
+        ] {
+            let got = context_window_for_model(model);
+            assert_eq!(
+                got,
+                Some(*want),
+                "model {model} expected {want} from the snapshot, got {got:?}",
+            );
+        }
+    }
+
+    /// The snapshot is a FALLBACK, not an override: a model the table knows
+    /// keeps the table's value even when the snapshot also lists it. Keeps this
+    /// change strictly additive — no existing window silently shifts.
+    #[test]
+    fn table_wins_over_snapshot_when_both_know_the_model() {
+        // `claude-opus-4-5` is in both and they disagree: table 1M, snapshot 200k.
+        assert_eq!(
+            crate::llmtrim::context_window("claude-opus-4-5"),
+            Some(200_000),
+            "precondition: the snapshot must disagree with the table here",
+        );
+        assert_eq!(context_window_for_model("claude-opus-4-5"), Some(1_000_000));
+    }
+
+    /// A genuine miss in BOTH sources still returns `None`.
+    #[test]
+    fn unknown_in_table_and_snapshot_returns_none() {
+        assert!(context_window_for_model("totally-fictional-model-xyz").is_none());
     }
 
     /// Match is case-insensitive — provider ids that uppercase
