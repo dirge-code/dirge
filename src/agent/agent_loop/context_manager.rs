@@ -22,9 +22,24 @@
 //! | 0.80 | Exit-with-summary | [`FORCE_SUMMARY_THRESHOLD`] | defense in depth: force a final summary and end the turn |
 //! | 0.90 | Turn-start fold | [`TURN_START_FOLD_THRESHOLD`] | before the first API call — catches a terminal prior turn, session restore, or a huge user paste |
 //!
-//! Plus a guard (not a pressure tier): the **min-savings check** (0.30,
-//! `HISTORY_FOLD_MIN_SAVINGS_FRACTION`) skips a fold whose head wouldn't
-//! shrink the log by at least that fraction.
+//! Plus a guard (not a pressure tier): a pass that frees **nothing** does not
+//! rotate the session or emit `ContextCompacted` (see the tail of
+//! `run::run_compaction_pass_with_focus`). This matters because the tiers above
+//! and the fold itself do not measure the same thing — the ratios are computed
+//! from the API's `prompt_tokens`, which includes the system prompt and every
+//! tool schema, while a fold only rewrites `current_context.messages`. When the
+//! unfoldable fixed overhead alone clears a threshold, no fold can bring the
+//! ratio back under it, and without this guard the loop re-folds every turn
+//! forever (dirge-kq3a).
+//!
+//! Note this is a *no-progress* guard, not the minimum-savings guard this doc
+//! previously described: there was a `HISTORY_FOLD_MIN_SAVINGS_FRACTION = 0.30`
+//! constant, but it was `#[cfg(test)]` and referenced only by a compile-time
+//! assert, so no release build ever consulted it and no fold was ever skipped
+//! for saving too little. Skipping a *partially* useful fold is a real
+//! behavior change with its own overflow risk (a 29% saving is still worth
+//! having when the alternative is a 400), so it is deliberately not
+//! reintroduced here — dirge-kq3a tracks it separately.
 //!
 //! # One estimator, two measurement points
 //!
@@ -86,11 +101,6 @@ pub const HISTORY_FOLD_AGGRESSIVE_THRESHOLD: f64 = 0.78;
 /// Tail budget after an aggressive fold — half the normal one,
 /// sacrifices recent context for headroom.
 pub const HISTORY_FOLD_AGGRESSIVE_TAIL_FRACTION: f64 = 0.1;
-
-/// Skip the fold if the head wouldn't shrink the log by at
-/// least this fraction.
-#[cfg(test)]
-pub const HISTORY_FOLD_MIN_SAVINGS_FRACTION: f64 = 0.3;
 
 /// Above this fraction we exit the turn with a summary instead
 /// of folding (defense in depth).
@@ -932,6 +942,5 @@ mod tests {
     // former runtime `assert!`s because both operands are consts.)
     const _: () = assert!(FORCE_SUMMARY_THRESHOLD > HISTORY_FOLD_AGGRESSIVE_THRESHOLD);
     const _: () = assert!(HISTORY_FOLD_AGGRESSIVE_THRESHOLD > HISTORY_FOLD_THRESHOLD);
-    const _: () = assert!(HISTORY_FOLD_THRESHOLD > HISTORY_FOLD_MIN_SAVINGS_FRACTION);
     const _: () = assert!(HISTORY_FOLD_AGGRESSIVE_TAIL_FRACTION < HISTORY_FOLD_TAIL_FRACTION);
 }

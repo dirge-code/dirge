@@ -46,7 +46,14 @@ impl RefreshableToken {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(expires_at) = state.expires_at_ms {
             let now = chrono::Utc::now().timestamp_millis();
-            if crate::auth::file_store::epoch_ms_is_expired(expires_at, now) {
+            // dirge-iki5: refresh a little BEFORE the token dies. A request
+            // that passes this check with milliseconds to spare can still
+            // reach Kimi after expiry, and that 401 is non-retryable.
+            if crate::auth::file_store::epoch_ms_is_expired_within(
+                expires_at,
+                now,
+                crate::auth::store::KIMI_REFRESH_MARGIN_MS,
+            ) {
                 match (self.refresher)() {
                     Ok(fresh) => {
                         state.bearer = fresh.bearer_token;

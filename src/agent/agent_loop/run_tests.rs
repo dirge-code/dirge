@@ -420,6 +420,76 @@ async fn transient_blips_separated_by_healthy_turns_do_not_accumulate() {
     );
 }
 
+/// dirge-kq3a: a pass that frees nothing must NOT rotate the session or
+/// emit `ContextCompacted`.
+///
+/// The fold trigger reads the API's `prompt_tokens`, which counts the system
+/// prompt and every tool schema; the fold itself only rewrites
+/// `current_context.messages`. When the unfoldable fixed overhead alone sits
+/// above the threshold — a big MCP tool surface, say — the ratio stays high no
+/// matter how often we fold, and nothing here can bring it down. Pre-fix the
+/// pass still rotated the session id, rebuilt the agent and printed
+/// "context compacted: N → N tokens" on EVERY turn, forever; sessions were
+/// observed rotating every ~6 seconds with identical before/after counts.
+///
+/// Six messages is below `PROTECT_HEAD_DEFAULT + PROTECT_TAIL_DEFAULT + 1`, so
+/// `compute_compress_window` returns an empty window and there is nothing to
+/// summarize or prune — the same shape as the real runaway.
+#[tokio::test]
+async fn run_compaction_pass_that_frees_nothing_does_not_rotate_or_announce() {
+    let mut ctx = empty_context();
+    ctx.system_prompt = "you are an agent".into();
+    for i in 0..6 {
+        let role = if i % 2 == 0 { "user" } else { "assistant" };
+        ctx.messages.push(serde_json::json!({
+            "role": role,
+            "content": format!("turn {i}"),
+        }));
+    }
+    let before = ctx.messages.clone();
+
+    // A summarizer that must never be called: with an empty compress window
+    // there is nothing to summarize, and calling it would burn an LLM request
+    // per turn for no benefit.
+    let summarize_fn: Option<crate::agent::compression::SummarizeFn> =
+        Some(std::sync::Arc::new(move |_prompt: String| {
+            Box::pin(async move { panic!("summarizer must not run when nothing can be folded") })
+        }));
+
+    let (tx, mut rx) = mpsc::channel::<LoopEvent>(8);
+    super::run_compaction_pass(
+        &mut ctx,
+        &summarize_fn,
+        5,
+        0,
+        &None,
+        None,
+        &tx,
+        &empty_checkpoint_slot(),
+        &mut 0,
+        u64::MAX,
+    )
+    .await;
+    drop(tx);
+
+    assert_eq!(
+        ctx.messages, before,
+        "a no-op pass must leave the context byte-identical",
+    );
+
+    let mut events = Vec::new();
+    while let Some(ev) = rx.recv().await {
+        events.push(ev);
+    }
+    assert!(
+        !events
+            .iter()
+            .any(|ev| matches!(ev, LoopEvent::ContextCompacted { .. })),
+        "a pass that freed nothing must not announce a compaction or rotate \
+         the session; got {events:?}",
+    );
+}
+
 /// LOOP-9 integration: `run_compaction_pass` end-to-end. Feed
 /// a long conversation, a mock summarizer, and assert that
 /// (a) the older messages were dropped, (b) a SUMMARY_PREFIX
@@ -3782,6 +3852,16 @@ async fn context_compacted_reports_compaction_kind() {
             .push(serde_json::json!({"role":"system","content":"agent"}));
         ctx.messages
             .push(serde_json::json!({"role":"user","content":"task"}));
+        // An oversized tool result outside the protected tail, so the pruner
+        // frees real tokens. Without it the no-summarizer case is a pure no-op,
+        // which since dirge-kq3a no longer emits at all — and this test is
+        // about which KIND is reported, not about no-op behavior (that is
+        // `run_compaction_pass_that_frees_nothing_does_not_rotate_or_announce`).
+        ctx.messages.push(serde_json::json!({
+            "role": "tool",
+            "tool_name": "bash",
+            "content": "x".repeat(4000),
+        }));
         for i in 0..20 {
             let role = if i % 2 == 0 { "assistant" } else { "user" };
             ctx.messages.push(serde_json::json!({

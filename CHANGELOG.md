@@ -4,6 +4,50 @@ All notable changes to dirge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- Compaction no longer runs away on models missing from the context-window table
+  (dirge-9jy7). `context_window_for_model` matches with `model.contains(key)`, so a
+  short id can never match any key: `k3` fell through to the 128k default against a
+  real 262144-token window. Every budget tier then ran at roughly twice the intended
+  pressure. The lookup now falls back to the embedded models.dev snapshot — which
+  already carried the right figure, but was only being read by the breakdown view.
+  The hand-maintained table still wins on a conflict, so no existing window shifts;
+  the snapshot can only turn a miss into a hit.
+
+- A compaction pass that frees nothing no longer rotates the session or reports
+  itself (dirge-kq3a). The fold trigger reads the API's `prompt_tokens`, which counts
+  the system prompt and every tool schema, while the fold only rewrites the message
+  history. Once the unfoldable fixed overhead alone cleared the threshold — a large
+  MCP tool surface will do it — no fold could bring the ratio back down, so the loop
+  re-fired every turn: rotate the session id, rebuild the agent, fire
+  `on_session_switch`, print `context compacted: N → N tokens`, repeat. Sessions were
+  observed rotating every ~6 seconds with identical before/after counts. Combined with
+  the window fix above, a k3 session at ~100k tokens now sits well under the fold
+  threshold instead of permanently over it.
+
+  Relatedly, `HISTORY_FOLD_MIN_SAVINGS_FRACTION` is gone. The module doc described it
+  as a live guard that skips a fold saving too little, but it was `#[cfg(test)]` and
+  referenced only by a compile-time assert, so no release build ever consulted it. The
+  doc now describes the guard that actually exists.
+
+- Kimi OAuth tokens refresh 60s before they expire (dirge-iki5). Access tokens live 15
+  minutes and the freshness check was a bare `now >= expires_at`, so a request could
+  pass it with milliseconds to spare and still reach Kimi after the token died. The
+  resulting 401 classifies as an auth error, which is never retried, so the turn failed
+  outright. The OpenAI and Anthropic paths keep the exact comparison — their tokens are
+  long-lived enough that the boundary is rarely crossed.
+
+- The routed-Anthropic cache freeze no longer fires when the cache stage is off
+  (dirge-01tu). Freezing predicted that Stage A would add a breakpoint, but Stage A is
+  gated on `config.cache` — true in the `agent` / `aggressive` / `cache` presets, false
+  in the lossless baseline `safe` / `rag` / `code` / `reasoning` inherit. Under those
+  presets the history was frozen (so never compressed) while no marker was written (so
+  never cached), which is strictly worse than not freezing. An explicit top-level
+  `cache_control` still freezes unconditionally — its presence is evidence the upstream
+  really holds a cached prefix.
+
 ## [0.19.27] - 2026-07-28
 
 ### Fixed

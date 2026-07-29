@@ -331,6 +331,11 @@ pub fn compress_with_config_model(
         config
     };
 
+    // dirge-01tu: tell the cache zone whether Stage A will run, so the routed-Anthropic
+    // freeze only fires when a breakpoint is actually going to be written. Set AFTER the
+    // `auto` routing above, since that is what decides the effective preset.
+    req.set_cache_stage_enabled(config.cache);
+
     let stages = stages_for(kind, config);
     let outcome = pipeline::run_gated(
         &mut req,

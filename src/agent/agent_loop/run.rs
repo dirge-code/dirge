@@ -1217,6 +1217,34 @@ async fn run_compaction_pass_with_focus(
         }
     };
 
+    // dirge-kq3a: a pass that changed nothing must not present itself as a
+    // compaction. `Skipped` means the summarizer never replaced a slice, and
+    // no token reduction means the pruner freed nothing either — so the
+    // context is byte-identical and there is nothing to report.
+    //
+    // Rotating anyway is not merely noisy, it is unbounded. The fold trigger
+    // reads the API's `prompt_tokens`, which counts the system prompt and
+    // every tool schema, while the fold only rewrites
+    // `current_context.messages`. Once the unfoldable fixed overhead alone
+    // sits above the threshold (a large MCP tool surface will do it), the
+    // ratio stays high however often we fold, so the loop re-fires every
+    // turn: rotate the session id, rebuild the agent, save, fire
+    // `on_session_switch`, print "context compacted: N → N tokens", repeat.
+    // Observed in the wild at ~6 second intervals with identical counts.
+    //
+    // Failed/breaker-open passes still report, even when the pruner freed
+    // nothing: that event carries the summarizer-failure signal, and its own
+    // runaway is already bounded by MAX_CONSECUTIVE_COMPACTION_FAILURES.
+    if matches!(outcome, SummaryOutcome::Skipped) && after_summary >= before {
+        tracing::debug!(
+            target: "dirge::agent_loop",
+            tokens = before,
+            messages = current_context.messages.len(),
+            "compaction pass freed nothing — not rotating the session",
+        );
+        return outcome;
+    }
+
     let new_id = compression::rotate_session_id();
     let _ = emit
         .send(LoopEvent::ContextCompacted {
