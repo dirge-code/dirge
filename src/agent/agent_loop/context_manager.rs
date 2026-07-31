@@ -545,7 +545,7 @@ mod pre_recall_tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(".git")).unwrap();
-        let paths = ProjectPaths::new(&dir);
+        let paths = ProjectPaths::at(&dir);
 
         // Seed an entry, then reload so it's captured in the frozen snapshot.
         {

@@ -27,7 +27,7 @@ fn temp_project() -> (ProjectPaths, PathBuf) {
         std::env::temp_dir().join(format!("dirge-learning-test-{}-{}", std::process::id(), n));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join(".git")).unwrap();
-    let paths = ProjectPaths::new(&dir);
+    let paths = ProjectPaths::at(&dir);
     // Ensure skills dir exists for curator tests.
     let _ = std::fs::create_dir_all(paths.skills_dir());
     (paths, dir)

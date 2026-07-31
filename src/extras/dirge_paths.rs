@@ -94,6 +94,23 @@ impl ProjectPaths {
         }
     }
 
+    /// Anchor at `root` verbatim — no git walk-up, no `DIRGE_PROJECT_ROOT`.
+    ///
+    /// For callers that already know the root and must not have it
+    /// reinterpreted. `new()` resolves through process-global state (the env
+    /// override), so a caller handed a scratch directory can silently end up
+    /// writing somewhere else entirely if anything in the process has that
+    /// variable set.
+    ///
+    /// Only tests need this today — every production caller starts from a
+    /// cwd and wants the resolution `new()` does.
+    #[allow(dead_code)]
+    pub fn at(root: &Path) -> Self {
+        ProjectPaths {
+            root: root.to_path_buf(),
+        }
+    }
+
     /// Top-level `.dirge/` directory under the project root.
     pub fn dirge_dir(&self) -> PathBuf {
         self.root.join(".dirge")
@@ -181,6 +198,33 @@ mod tests {
         fn drop(&mut self) {
             unsafe { std::env::remove_var("DIRGE_PROJECT_ROOT") };
         }
+    }
+
+    /// `ProjectPaths::at` takes the root literally — no git walk-up, no
+    /// `DIRGE_PROJECT_ROOT`. Tests that own a scratch directory need this:
+    /// `new()` consults a process-global env var, so a sibling test setting
+    /// the override (this module has several) silently redirects an
+    /// unrelated test's paths at whatever that override points to. That is
+    /// not hypothetical — it left a shared `$TMPDIR/.dirge/sessions/state.db`
+    /// on disk, and once it held 10+ rows the curator-clock session gate
+    /// failed intermittently for every later run.
+    #[test]
+    fn at_takes_the_root_literally_ignoring_the_env_override() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = std::env::temp_dir();
+        let _guard = EnvGuard::set(tmp.to_str().unwrap());
+
+        let scratch = tmp.join(format!("dirge-at-test-{}", std::process::id()));
+        let paths = ProjectPaths::at(&scratch);
+        assert_eq!(paths.root, scratch, "at() must not consult the override");
+        assert!(
+            paths.session_db_path().starts_with(&scratch),
+            "derived paths stay under the given root: {:?}",
+            paths.session_db_path()
+        );
+
+        // `new()` is the resolving constructor and still honours the override.
+        assert_eq!(ProjectPaths::new(&scratch).root, tmp);
     }
 
     /// In the dirge repo itself, `find_git_root` from the current

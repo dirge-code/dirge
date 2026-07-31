@@ -342,7 +342,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(".git")).unwrap();
-        let paths = ProjectPaths::new(&dir);
+        let paths = ProjectPaths::at(&dir);
         let mgr = SkillManager::new(&paths);
         (mgr, dir)
     }
@@ -537,7 +537,7 @@ mod tests {
         assert!(result.is_ok(), "patch failed: {:?}", result);
 
         // Read the file directly to verify patch was applied.
-        let paths = ProjectPaths::new(&_dir);
+        let paths = ProjectPaths::at(&_dir);
         let skill_path = paths.skills_dir().join("patchable").join("SKILL.md");
         let disk_content = std::fs::read_to_string(&skill_path).unwrap();
         assert!(disk_content.contains("Replaced line"));
@@ -618,7 +618,7 @@ mod tests {
 
     fn store_backed_tool() -> (SkillTool, std::path::PathBuf, Arc<SkillStore>) {
         let (mgr, dir) = temp_skills_dir();
-        let paths = ProjectPaths::new(&dir);
+        let paths = ProjectPaths::at(&dir);
         let store = Arc::new(SkillStore::load(&paths).unwrap());
         let tool = SkillTool::new(make_skills(), mgr, Some(store.clone()), None, None);
         (tool, dir, store)
@@ -671,7 +671,7 @@ mod tests {
         assert!(!out.contains("recoverable"));
 
         // … but preserved under .archive/ (recoverable), not removed.
-        let archived = ProjectPaths::new(&dir)
+        let archived = ProjectPaths::at(&dir)
             .skills_dir()
             .join(".archive")
             .join("recoverable")
