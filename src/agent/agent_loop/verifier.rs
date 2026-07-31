@@ -255,6 +255,18 @@ impl VerifierGate {
         self.inner.lock_ignore_poison().edits_since_verify
     }
 
+    /// True when the working tree is currently at a verified-green point: a
+    /// build/test command ran AND passed AND no code edit has landed since
+    /// (dirge-uw2l.4). This is the safe-state abort's "last green" signal —
+    /// mode-independent (unlike [`status`], it does NOT latch green in off
+    /// mode), because what matters for a restore target is the actual
+    /// verified point, not the reported vocabulary. Read-only; never mutates
+    /// the gate.
+    pub fn is_fresh_green(&self) -> bool {
+        let inner = self.inner.lock_ignore_poison();
+        inner.ran_verification && !inner.verification_failed && inner.edits_since_verify == 0
+    }
+
     /// Finalization seam. Two independent gates, in order:
     ///
     /// 1. the legacy one-shot — a build/test failed, or none ran at all;
@@ -1479,6 +1491,39 @@ mod tests {
         g.record_outcome("edit", &json!({"path": "src/a.rs"}), &ok_result(), false);
         g.record_outcome("bash", &json!({"command": "ls -la"}), &ok_result(), false);
         assert_eq!(g.edits_since_verify(), 2);
+    }
+
+    // dirge-uw2l.4: the safe-state abort's "last green" marker keys off a
+    // verified point that no later edit has invalidated. Mode-independent —
+    // it must not latch in off mode the way `status(Off)` does.
+    #[test]
+    fn is_fresh_green_only_when_verified_and_unedited_since() {
+        let g = VerifierGate::new();
+        // An edit alone is not green — no verification has run.
+        g.record_outcome("edit", &json!({"path": "src/a.rs"}), &ok_result(), false);
+        assert!(!g.is_fresh_green(), "edit alone is not green");
+        // A passing test reaches fresh green (edits_since_verify reset to 0).
+        g.record_outcome(
+            "bash",
+            &json!({"command": "cargo test"}),
+            &ok_result(),
+            false,
+        );
+        assert!(
+            g.is_fresh_green(),
+            "passing test with no edits since is fresh green"
+        );
+        // An edit after green makes it stale — NOT fresh green.
+        g.record_outcome("edit", &json!({"path": "src/a.rs"}), &ok_result(), false);
+        assert!(!g.is_fresh_green(), "edit after green makes it stale");
+        // A failing verification is not green either.
+        g.record_outcome(
+            "bash",
+            &json!({"command": "cargo test"}),
+            &failed_result(),
+            false,
+        );
+        assert!(!g.is_fresh_green(), "failing verification is not green");
     }
 
     /// Tiered variant of `nudge()` — passes the gate mode explicitly.

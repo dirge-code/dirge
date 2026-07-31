@@ -72,6 +72,7 @@ use crate::sync_util::LockExt;
 async fn poll_steering_and_reminder(
     config: &LoopConfig,
     guards: &super::activity::LoopGuards,
+    safe_state_msg: Option<String>,
 ) -> (Vec<LoopMessage>, bool) {
     let mut out = match &config.get_steering_messages {
         Some(get) => get().await,
@@ -81,10 +82,20 @@ async fn poll_steering_and_reminder(
     if let Some(tracker) = &config.file_touch_tracker {
         out.extend(tracker.poll_reminder());
     }
-    // Cross-turn recovery checkpoint: fired when consecutive *distinct*
-    // tool errors pile up (storm only catches identical repeats). Follows
-    // any user steering so the human's guidance is read first.
-    out.extend(guards.poll_reflection());
+    // dirge-uw2l.4: the safe-state rung REPLACES (does not add to) the rung-2
+    // recovery checkpoint on a boundary it fires — emitting both would tell
+    // the model to both "diagnose and retry" (rung 2) and "abort and re-plan"
+    // (rung 3), which are contradictory. When safe-state declines, or when it
+    // is off (the default), the regular checkpoint runs exactly as before, so
+    // off-mode is byte-identical.
+    if let Some(msg) = safe_state_msg {
+        out.push(LoopMessage::User(super::message::UserMessage::text(msg)));
+    } else {
+        // Cross-turn recovery checkpoint: fired when consecutive *distinct*
+        // tool errors pile up (storm only catches identical repeats). Follows
+        // any user steering so the human's guidance is read first.
+        out.extend(guards.poll_reflection());
+    }
     (out, had_user_steering)
 }
 
@@ -1618,7 +1629,10 @@ pub async fn run_loop(
     // Phase 4 part 2: composes with the file-touch tracker's
     // reminder poll when configured.
     let (mut pending_messages, _initial_user_steering): (Vec<LoopMessage>, bool) =
-        poll_steering_and_reminder(&config, &guards).await;
+        // The initial poll runs before any results, so there is nothing for
+        // the safe-state rung to decide yet — None falls through to
+        // poll_reflection unchanged.
+        poll_steering_and_reminder(&config, &guards, None).await;
 
     // dirge-nqr: count assistant turns so a hard cap can stop a
     // runaway run. `max_turns = None` means unlimited (legacy).
@@ -1629,6 +1643,13 @@ pub async fn run_loop(
     // can remind it of every dead end (not just the latest repeat).
     // Lives outside the outer loop so it persists across turns.
     let mut reflections = super::reflexion::ReflectionLog::new();
+
+    // dirge-uw2l.4: safe-state abort rung. Off (the default) is byte-identical
+    // — decide() short-circuits on Off before any work, so the default loop is
+    // untouched. Advisory adds a third failure-ladder rung that re-plans from
+    // the last verified-green tree when the failure streak reaches 2× the
+    // checkpoint threshold.
+    let mut safe_state = super::safe_state::SafeStateEngine::new();
 
     // dirge-8v98: the unified finalization judge fires at most once per run in
     // Off/Advisory mode (one-shot); Blocking mode persists across finalizations
@@ -2569,8 +2590,29 @@ pub async fn run_loop(
 
             // Pi line 253: refresh steering for next iteration.
             // Phase 4 part 2: also polls the file-touch tracker.
+            // dirge-uw2l.4: ask the safe-state engine whether this boundary
+            // should replace the rung-2 checkpoint with a re-plan. Off (the
+            // default) computes None and the checkpoint runs as before.
+            let safe_state_msg = if config.safe_state_abort_mode != super::types::SafeStateMode::Off
+            {
+                let excerpts = guards.recent_excerpts();
+                safe_state.decide(
+                    config.safe_state_abort_mode,
+                    config.verifier.as_ref().is_some_and(|v| v.is_fresh_green()),
+                    guards.safe_state_due(),
+                    config
+                        .verifier
+                        .as_ref()
+                        .map_or(0, |v| v.edits_since_verify()),
+                    crate::agent::tools::snapshots::current_turn_id().as_deref(),
+                    &reflections,
+                    &excerpts,
+                )
+            } else {
+                None
+            };
             let (next_pending, had_user_steering) =
-                poll_steering_and_reminder(&config, &guards).await;
+                poll_steering_and_reminder(&config, &guards, safe_state_msg).await;
             pending_messages = next_pending;
 
             // dirge-st8r: a fresh USER steering message means the human is

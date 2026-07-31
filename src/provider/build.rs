@@ -529,6 +529,10 @@ pub async fn build_agent(
     // config. Default is Off (opt-in; nagging is intrusive).
     agent = agent.with_open_issues_gate_mode(cfg.resolve_open_issues_gate_mode());
     agent = agent.with_verification_tiers_mode(cfg.resolve_verification_tiers_mode());
+    // dirge-uw2l.4: safe-state abort rung (off by default; advisory adds a
+    // third failure-ladder rung that re-plans from the last verified-green
+    // tree). See resolve_safe_state_abort_mode.
+    agent = agent.with_safe_state_abort_mode(cfg.resolve_safe_state_abort_mode());
     agent = agent.with_session_id(session_id);
 
     // dirge-9tfq — install the BackgroundStore on the agent so

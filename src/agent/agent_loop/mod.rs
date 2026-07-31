@@ -50,6 +50,7 @@ pub mod rig_stream;
 pub mod rig_stream_factory;
 pub mod rig_tool;
 pub mod run;
+pub mod safe_state;
 pub mod scavenge;
 pub mod schema_flatten;
 pub mod steering;

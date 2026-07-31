@@ -119,6 +119,20 @@ impl LoopGuards {
     pub fn poll_reflection(&self) -> Vec<LoopMessage> {
         self.failures.poll_reflection()
     }
+
+    /// Whether the failure streak has reached 2× the recovery-checkpoint
+    /// threshold (dirge-uw2l.4). Read-only signal for the safe-state abort
+    /// rung's decision. Delegated so run.rs talks to one facade, not the raw
+    /// tracker.
+    pub fn safe_state_due(&self) -> bool {
+        self.failures.safe_state_due()
+    }
+
+    /// The `(tool, excerpt)` pairs for the current failure streak, for the
+    /// safe-state replan message to quote (dirge-uw2l.4).
+    pub fn recent_excerpts(&self) -> Vec<(String, String)> {
+        self.failures.recent_excerpts()
+    }
 }
 
 #[cfg(test)]

@@ -258,6 +258,7 @@ impl AnyAgent {
         cfg.code_review_mode = self.code_review_mode;
         cfg.open_issues_gate_mode = self.open_issues_gate_mode;
         cfg.verification_tiers_mode = self.verification_tiers_mode;
+        cfg.safe_state_abort_mode = self.safe_state_abort_mode;
         cfg.session_id = self.session_id.clone();
         cfg.goal_fn = self.goal_fn.clone();
         // Goal gate stop condition (`--goal`). Engages only when

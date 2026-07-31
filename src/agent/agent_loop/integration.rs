@@ -459,6 +459,9 @@ pub struct LoopSpawnConfig {
     /// Forwarded to `LoopConfig.verification_tiers_mode`. Default `Off`
     /// (opt-in; `Off` is byte-identical to the untiered gate).
     pub verification_tiers_mode: crate::agent::agent_loop::types::GateMode,
+    /// Forwarded to `LoopConfig.safe_state_abort_mode`. Default `Off`
+    /// (opt-in; off is byte-identical to the loop without the rung).
+    pub safe_state_abort_mode: crate::agent::agent_loop::types::SafeStateMode,
 
     /// Active session id forwarded to `LoopConfig.session_id` for
     /// session-scoped gate queries. `None` in sub-runners.
@@ -532,6 +535,7 @@ impl LoopSpawnConfig {
             code_review_mode: crate::agent::agent_loop::types::CodeReviewMode::default(),
             open_issues_gate_mode: crate::agent::agent_loop::types::GateMode::Off,
             verification_tiers_mode: crate::agent::agent_loop::types::GateMode::Off,
+            safe_state_abort_mode: crate::agent::agent_loop::types::SafeStateMode::Off,
             session_id: None,
             goal_fn: None,
             goal: None,
@@ -618,6 +622,7 @@ pub fn spawn_loop_runner(cfg: LoopSpawnConfig) -> LoopRunner {
         code_review_repo: None,
         open_issues_gate_mode: cfg.open_issues_gate_mode,
         verification_tiers_mode: cfg.verification_tiers_mode,
+        safe_state_abort_mode: cfg.safe_state_abort_mode,
         session_id: cfg.session_id.clone(),
         goal_fn: cfg.goal_fn.clone(),
         goal: cfg.goal.clone(),

@@ -184,6 +184,38 @@ impl GateMode {
 /// reference resolves to `GateMode::…`.
 pub type CodeReviewMode = GateMode;
 
+/// Two-mode engagement for the safe-state abort rung (dirge-uw2l.4).
+///
+/// Unlike [`GateMode`], the default is `Off`: this rung rewrites a failing
+/// plan, which is intrusive, so it stays dark until asked for. There is
+/// deliberately no `Blocking`/`Auto` variant — an automatic file restore is
+/// destructive behind the model's back and is blocked on snapshot coverage
+/// for `bash`-mutated files (dirge-uw2l.6), so a config value of `auto` (or
+/// `blocking`, or anything else unrecognized) fails to parse and falls back
+/// to `Off` with a warning rather than silently doing something other than
+/// what its name says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SafeStateMode {
+    #[default]
+    Off,
+    Advisory,
+}
+
+impl SafeStateMode {
+    /// Parse a wire value (case-insensitive, trimmed). Empty string and
+    /// `"off"` resolve to `Off` (the opt-in default — unlike [`GateMode`],
+    /// absence means "do nothing"). `"advisory"` resolves to `Advisory`.
+    /// Anything else (including `"auto"`, which is deferred behind
+    /// dirge-uw2l.6) returns `None` so the resolver can warn + fall back.
+    pub fn from_wire(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "" | "off" => Some(SafeStateMode::Off),
+            "advisory" => Some(SafeStateMode::Advisory),
+            _ => None,
+        }
+    }
+}
+
 /// How the ingestion-time injection scanner handles untrusted tool results.
 /// Resolved from `config.injection_scan` — see
 /// [`crate::config::Config::resolve_injection_scan_mode`].
@@ -528,6 +560,14 @@ pub struct LoopConfig {
     /// byte-identical to the untiered gate. Set by `build_agent` from
     /// `Config::resolve_verification_tiers_mode`.
     pub verification_tiers_mode: GateMode,
+    /// How the safe-state abort rung engages (dirge-uw2l.4). `Off` *(default)*
+    /// is byte-identical to the loop without the rung. `Advisory` adds a third
+    /// failure-ladder rung that replaces a boundary's recovery checkpoint with
+    /// a single "abort this approach, re-plan" message when the failure streak
+    /// reaches 2× the checkpoint threshold AND unverified edits sit on the tree
+    /// AND a verified-green point exists behind the run; it performs NO file
+    /// writes. Set by `build_agent` from `Config::resolve_safe_state_abort_mode`.
+    pub safe_state_abort_mode: SafeStateMode,
 
     /// Active session id for the open-issues gate and tools that need
     /// session-scoping. `None` in review/curator sub-runners and most
@@ -707,6 +747,7 @@ impl std::fmt::Debug for LoopConfig {
             .field("code_review_mode", &self.code_review_mode)
             .field("open_issues_gate_mode", &self.open_issues_gate_mode)
             .field("verification_tiers_mode", &self.verification_tiers_mode)
+            .field("safe_state_abort_mode", &self.safe_state_abort_mode)
             .field("progress", &self.progress.is_some())
             .field("session_id", &self.session_id)
             .field("goal_fn", &self.goal_fn.as_ref().map(|_| "<judge>"))
@@ -759,6 +800,7 @@ impl Clone for LoopConfig {
             code_review_repo: self.code_review_repo.clone(),
             open_issues_gate_mode: self.open_issues_gate_mode,
             verification_tiers_mode: self.verification_tiers_mode,
+            safe_state_abort_mode: self.safe_state_abort_mode,
             progress: self.progress.clone(),
             session_id: self.session_id.clone(),
             goal_fn: self.goal_fn.clone(),
@@ -819,6 +861,7 @@ impl LoopConfig {
             code_review_repo: None,
             open_issues_gate_mode: GateMode::Off,
             verification_tiers_mode: GateMode::Off,
+            safe_state_abort_mode: SafeStateMode::Off,
             progress: None,
             session_id: None,
             goal_fn: None,
