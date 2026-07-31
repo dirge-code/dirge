@@ -16,9 +16,10 @@ NO FIXES WITHOUT ROOT CAUSE INVESTIGATION FIRST
 
 1. **Read error messages** carefully — note line numbers, file paths, error codes.
 2. **Reproduce consistently** — exact steps. If not reproducible, gather data — do not guess.
-3. **Check recent changes** — run `git diff`, check recent commits.
-4. **Gather evidence** — in multi-component systems, add diagnostic logging at each boundary. Run once to identify the failing layer.
-5. **Trace data flow** — trace backward from the error through the call stack to find where the bad value originates.
+3. **Confirm the inputs** — when behavior diverges from expected but the setup looks identical, diff the actual inputs, config, environment, and versions against your assumptions. The system may be correctly solving a different problem.
+4. **Check recent changes** — run `git diff`, check recent commits.
+5. **Gather evidence** — in multi-component systems, add diagnostic logging at each boundary. Run once to identify the failing layer.
+6. **Trace data flow** — trace backward from the error through the call stack to find where the bad value originates.
 
 ### Phase 2: Pattern Analysis
 
