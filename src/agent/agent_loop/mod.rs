@@ -42,6 +42,7 @@ pub mod message;
 pub mod plugin_hooks;
 #[cfg(all(test, feature = "plugin"))]
 mod plugin_hooks_tests;
+pub mod progress;
 pub mod reflexion;
 pub mod result;
 pub mod retry;

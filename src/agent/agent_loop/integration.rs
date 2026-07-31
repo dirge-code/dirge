@@ -428,6 +428,10 @@ pub struct LoopSpawnConfig {
     /// Phase 4 part 2: optional file-touch tracker for the
     /// context-depth reminder system. `None` keeps the feature
     /// off (legacy behavior, byte-identical to today).
+    /// Progress monitor (dirge-uw2l.3) — stall + turn-budget signals.
+    /// Built per session by `spawn_runner` from the agent's configured
+    /// threshold. `None` disables it.
+    pub progress: Option<std::sync::Arc<super::progress::ProgressTracker>>,
     pub file_touch_tracker:
         Option<std::sync::Arc<crate::agent::agent_loop::context_depth::FileTouchTracker>>,
 
@@ -520,6 +524,7 @@ impl LoopSpawnConfig {
             escalation_stream_fn: None,
             escalation_provider_name: None,
             escalation_max_per_session: None,
+            progress: None,
             file_touch_tracker: None,
             verifier: None,
             critic_fn: None,
@@ -605,6 +610,7 @@ pub fn spawn_loop_runner(cfg: LoopSpawnConfig) -> LoopRunner {
             cfg.escalation_max_per_session.unwrap_or(3),
         )),
         file_touch_tracker: cfg.file_touch_tracker.clone(),
+        progress: cfg.progress.clone(),
         verifier: cfg.verifier.clone(),
         critic_fn: cfg.critic_fn.clone(),
         code_review_fn: cfg.code_review_fn.clone(),

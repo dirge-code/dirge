@@ -19,6 +19,14 @@ pub fn version() -> u64 {
     VERSION.load(Ordering::Acquire)
 }
 
+/// How many DISTINCT files have been mutated. The progress monitor
+/// (dirge-uw2l.3) reads this at turn boundaries: an increase means new
+/// ground was broken, while a flat count across turns means the run is
+/// re-editing what it already touched. Cheap — a length, not a clone.
+pub fn count() -> usize {
+    MODIFIED_FILES.lock().map(|s| s.len()).unwrap_or(0)
+}
+
 /// Files the agent has written, edited, or patched in this session, in
 /// insertion order (most-recently-modified appears last). The info panel
 /// reads this to show a short tail of touched paths so the user has a

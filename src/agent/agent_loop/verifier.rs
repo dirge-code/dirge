@@ -233,8 +233,15 @@ impl VerifierGate {
         if !inner.ran_verification {
             return VerificationStatus::Unverified;
         }
-        // Green. Tiered modes distinguish "the suite passed" from "only the
-        // cheap checks passed"; off mode cannot tell them apart.
+        // Green — but possibly STALE (dirge-uw2l.3). Code edited after the
+        // last green check isn't covered by it, so the green says nothing
+        // about the current tree. Tiered modes only: off mode has always
+        // reported a latched green and must stay byte-identical.
+        if mode != GateMode::Off && inner.edits_since_verify > 0 {
+            return VerificationStatus::Unverified;
+        }
+        // Tiered modes distinguish "the suite passed" from "only the cheap
+        // checks passed"; off mode cannot tell them apart.
         if mode != GateMode::Off && inner.is_fast_green_only() {
             return VerificationStatus::FastGreenOnly;
         }
@@ -1362,6 +1369,69 @@ mod tests {
             g.record_outcome("edit", &json!({"path": "src/a.rs"}), &ok_result(), false);
             assert_eq!(g.status(mode), VerificationStatus::Unverified);
         }
+    }
+
+    /// dirge-uw2l.3: a green check says nothing about code edited AFTER
+    /// it. In tiered modes that reads as unverified again; off mode keeps
+    /// its latched green (byte-identical).
+    #[test]
+    fn green_goes_stale_when_edits_follow_it() {
+        let g = VerifierGate::new();
+        g.record_outcome("edit", &json!({"path": "src/a.rs"}), &ok_result(), false);
+        g.record_outcome(
+            "bash",
+            &json!({"command": "cargo test"}),
+            &ok_result(),
+            false,
+        );
+        assert_eq!(
+            g.status(GateMode::Advisory),
+            VerificationStatus::VerifiedGreen
+        );
+
+        // One more code edit — the green no longer covers the tree.
+        g.record_outcome("edit", &json!({"path": "src/b.rs"}), &ok_result(), false);
+        assert_eq!(
+            g.status(GateMode::Advisory),
+            VerificationStatus::Unverified,
+            "a post-green edit is uncovered"
+        );
+        assert_eq!(
+            g.status(GateMode::Off),
+            VerificationStatus::VerifiedGreen,
+            "off mode keeps the legacy latched green"
+        );
+
+        // Re-running the suite clears it again.
+        g.record_outcome(
+            "bash",
+            &json!({"command": "cargo test"}),
+            &ok_result(),
+            false,
+        );
+        assert_eq!(
+            g.status(GateMode::Advisory),
+            VerificationStatus::VerifiedGreen
+        );
+    }
+
+    /// A doc-only edit after a green check must NOT invalidate it — only
+    /// code counts, same rule as the `edited_code` precondition.
+    #[test]
+    fn doc_edit_after_green_does_not_go_stale() {
+        let g = VerifierGate::new();
+        g.record_outcome("edit", &json!({"path": "src/a.rs"}), &ok_result(), false);
+        g.record_outcome(
+            "bash",
+            &json!({"command": "cargo test"}),
+            &ok_result(),
+            false,
+        );
+        g.record_outcome("write", &json!({"path": "README.md"}), &ok_result(), false);
+        assert_eq!(
+            g.status(GateMode::Advisory),
+            VerificationStatus::VerifiedGreen
+        );
     }
 
     #[test]

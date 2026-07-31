@@ -483,6 +483,9 @@ pub struct LoopConfig {
     /// Phase 4 part 2: per-session file-touch tracker for context-depth
     /// reminders. None when the feature isn't configured.
     pub file_touch_tracker: Option<std::sync::Arc<super::context_depth::FileTouchTracker>>,
+    /// Progress monitor (dirge-uw2l.3) — stall + turn-budget signals.
+    /// `None` disables it and the loop behaves exactly as before.
+    pub progress: Option<std::sync::Arc<super::progress::ProgressTracker>>,
 
     /// F6: per-run verifier gate. Watches for code edits vs. shell runs
     /// and, at the finalization boundary, injects a one-time "verify
@@ -704,6 +707,7 @@ impl std::fmt::Debug for LoopConfig {
             .field("code_review_mode", &self.code_review_mode)
             .field("open_issues_gate_mode", &self.open_issues_gate_mode)
             .field("verification_tiers_mode", &self.verification_tiers_mode)
+            .field("progress", &self.progress.is_some())
             .field("session_id", &self.session_id)
             .field("goal_fn", &self.goal_fn.as_ref().map(|_| "<judge>"))
             .field("goal", &self.goal)
@@ -755,6 +759,7 @@ impl Clone for LoopConfig {
             code_review_repo: self.code_review_repo.clone(),
             open_issues_gate_mode: self.open_issues_gate_mode,
             verification_tiers_mode: self.verification_tiers_mode,
+            progress: self.progress.clone(),
             session_id: self.session_id.clone(),
             goal_fn: self.goal_fn.clone(),
             goal: self.goal.clone(),
@@ -814,6 +819,7 @@ impl LoopConfig {
             code_review_repo: None,
             open_issues_gate_mode: GateMode::Off,
             verification_tiers_mode: GateMode::Off,
+            progress: None,
             session_id: None,
             goal_fn: None,
             goal: None,

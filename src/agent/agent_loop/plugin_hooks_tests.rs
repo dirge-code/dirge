@@ -98,6 +98,7 @@ fn build_config() -> LoopConfig {
         escalation_max_per_session: 3,
         escalation_remaining: Arc::new(std::sync::atomic::AtomicUsize::new(3)),
         file_touch_tracker: None,
+        progress: None,
         verifier: None,
         critic_fn: None,
         code_review_fn: None,

@@ -1051,6 +1051,12 @@ pub struct Config {
     /// re-focusing; higher to silence the reminder for routine
     /// multi-step refactors.
     pub context_depth_reminder_threshold: Option<usize>,
+    /// Barren turn boundaries before the progress monitor asks the model
+    /// to name what's blocking and change approach or cut scope
+    /// (dirge-uw2l.3). Absent *(default)* disables the monitor entirely —
+    /// no stall checkpoints and no turn-budget notices, byte-identical to
+    /// a loop without it. Clamped to a minimum of 2.
+    pub progress_stall_threshold: Option<usize>,
     /// Phase 3 (`dirge-phyi`, vix port): opt-in phased plan workflow —
     /// explore → plan → reviewer-runs-code loop, each phase a fresh
     /// context-reset fork. `None`/`false` (default) keeps the normal
@@ -2047,6 +2053,16 @@ mod tests {
         );
         assert_eq!(resolve(Some("")), SubagentWriteIsolation::Auto);
         assert_eq!(resolve(Some("unknown")), SubagentWriteIsolation::Auto);
+    }
+
+    /// The progress monitor is off unless a threshold is configured, and
+    /// the value passes through verbatim (the clamp lives in the tracker).
+    #[test]
+    fn progress_stall_threshold_defaults_to_absent() {
+        let cfg: Config = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(cfg.progress_stall_threshold, None);
+        let cfg: Config = serde_json::from_str(r#"{ "progress_stall_threshold": 4 }"#).unwrap();
+        assert_eq!(cfg.progress_stall_threshold, Some(4));
     }
 
     #[test]

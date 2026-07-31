@@ -520,6 +520,11 @@ pub async fn build_agent(
         agent = agent.with_context_depth_reminder(threshold);
     }
 
+    // dirge-uw2l.3 — progress monitor. Off unless a threshold is set.
+    if let Some(threshold) = cfg.progress_stall_threshold {
+        agent = agent.with_progress_stall_threshold(threshold);
+    }
+
     // dirge-ksjl — open-issues finalization gate mode, resolved from
     // config. Default is Off (opt-in; nagging is intrusive).
     agent = agent.with_open_issues_gate_mode(cfg.resolve_open_issues_gate_mode());

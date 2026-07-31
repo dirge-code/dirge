@@ -2299,6 +2299,42 @@ pub async fn run_loop(
                 new_messages.push(reminder);
             }
 
+            // dirge-uw2l.3: progress monitor. Runs LAST of the boundary
+            // nudges so the cheaper, more specific ones (track work, fast
+            // verify) get first say — a stall checkpoint is the broadest
+            // message of the three and shouldn't pre-empt them. At most one
+            // of stall/budget is injected per boundary, stall first: a run
+            // that is both stalled and near its cap needs the diagnosis
+            // before the countdown.
+            if let Some(progress) = config.progress.as_ref() {
+                let snapshot = super::progress::ProgressSnapshot {
+                    todos_unfinished: crate::agent::tools::todo::unfinished_count(),
+                    files_touched: crate::agent::tools::modified::count(),
+                    // Deliberately the LATCHED green (`GateMode::Off`), not
+                    // the tier-aware one. Staleness (dirge-uw2l.3) flips a
+                    // tiered status back to Unverified on every post-green
+                    // edit, so reading it here would manufacture a fresh
+                    // false→true edge on each edit→test cycle and reset the
+                    // stall counter forever — silently disabling the monitor
+                    // for green-but-not-converging runs, the exact case it
+                    // exists to catch. Staleness answers "verify again?";
+                    // progress answers "did this run reach a new state?".
+                    // Off-mode status still flips red→green, so fixing a red
+                    // build correctly counts as progress.
+                    verified_green: matches!(
+                        config.verifier.as_ref().map(|v| v.status(GateMode::Off)),
+                        Some(super::verifier::VerificationStatus::VerifiedGreen)
+                    ),
+                };
+                let signal = progress
+                    .record_turn(snapshot)
+                    .or_else(|| progress.poll_budget(turns_taken, config.max_turns.unwrap_or(0)));
+                if let Some(msg) = signal {
+                    current_context.messages.push(loop_message_to_value(&msg));
+                    new_messages.push(msg);
+                }
+            }
+
             // Pi line 218: turn_end.
             let _ = emit
                 .send(LoopEvent::TurnEnd {
