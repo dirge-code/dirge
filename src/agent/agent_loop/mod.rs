@@ -44,6 +44,7 @@ pub mod plugin_hooks;
 mod plugin_hooks_tests;
 pub mod progress;
 pub mod reflexion;
+pub mod residual;
 pub mod result;
 pub mod retry;
 pub mod rig_stream;

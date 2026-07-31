@@ -157,11 +157,14 @@ impl SessionDigest {
                 out.push_str(&format!("- `{c}`\n"));
             }
         }
-        if !self.todos.is_empty() {
-            out.push_str("\n**Todos at session end:**\n");
-            for t in &self.todos {
-                out.push_str(&format!("- [{}] {}\n", t.status, t.content));
-            }
+        // dirge-uw2l.5: reuse the residual-objectives block so a resume / review
+        // sees what's outstanding rather than re-deriving scope. The mirror is
+        // non-terminal-only, so every todo is outstanding; empty board → None →
+        // no section (byte-identical to before when there were no todos).
+        if let Some(block) = crate::agent::agent_loop::residual::residual_block(&self.todos) {
+            out.push('\n');
+            out.push_str(&block);
+            out.push('\n');
         }
         if !self.last_state.is_empty() {
             out.push_str(&format!("\n**Where we stopped:** {}\n", self.last_state));
@@ -394,6 +397,25 @@ mod tests {
 
         d = SessionDigest::default();
         assert_eq!(d.render_for_review(), "");
+    }
+
+    /// dirge-uw2l.5: the digest reuses `residual_block` so a resume / review
+    /// sees what's outstanding rather than re-deriving scope from the
+    /// transcript. The mirror is non-terminal-only, so every todo is
+    /// outstanding.
+    #[test]
+    fn render_surfaces_outstanding_objectives_block() {
+        let d = SessionDigest {
+            todos: vec![TodoItem {
+                content: "wire the digest reuse".into(),
+                status: "open".into(),
+                priority: "normal".into(),
+            }],
+            ..Default::default()
+        };
+        let r = d.render_for_review();
+        assert!(r.contains("Objectives still outstanding (1):"), "{r}");
+        assert!(r.contains("- wire the digest reuse"), "{r}");
     }
 
     #[test]

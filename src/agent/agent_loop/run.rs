@@ -250,15 +250,46 @@ const MAX_TRANSIENT_RECOVERIES: u8 = 3;
 /// constant keeps emitter and detector from drifting.
 pub(crate) const MAX_TURNS_NOTICE_PREFIX: &str = "[dirge] Max agent turns";
 
+/// Build the max-turns truncation notice, appending the residual-objectives
+/// block (dirge-uw2l.5) when the live board has outstanding work. Pure: takes
+/// the board so the prefix-survival property — the headless detector in
+/// `provider::run` matches `content.starts_with(MAX_TURNS_NOTICE_PREFIX)` — is
+/// unit-testable (see `max_turns_notice_keeps_truncation_prefix`). Empty board
+/// → no block → byte-identical to the old notice.
+fn max_turns_notice(cap: usize, board: &[crate::agent::tools::todo::TodoItem]) -> String {
+    let mut notice = format!(
+        "{MAX_TURNS_NOTICE_PREFIX} ({cap}) reached. Stopping the run. Increase --max-agent-turns or `max_agent_turns` in config.json to allow more."
+    );
+    if let Some(block) = super::residual::residual_block(board) {
+        notice.push_str("\n\n");
+        notice.push_str(&block);
+    }
+    notice
+}
+
 /// The unfinished-todo nudge message. Pure (no globals) so the singular/plural
 /// wording is unit-testable independent of the todo store.
-fn todo_nudge_message(unfinished: usize) -> LoopMessage {
-    LoopMessage::User(super::message::UserMessage::text(format!(
+///
+/// dirge-uw2l.5: when at least one outstanding item is low-priority the nudge
+/// names them as the explicit cancel candidates. RAX's planner treated
+/// rejecting a low-priority unachievable goal as a validation objective, not a
+/// failure (paper §3.1b), and the todo store already carries priority that
+/// nothing surfaced back. When `low == 0` the message is byte-identical to the
+/// pre-uw2l.5 wording, so the common case changes nothing.
+fn todo_nudge_message(unfinished: usize, low: usize) -> LoopMessage {
+    let mut body = format!(
         "{TODO_NUDGE_TAG} You still have {unfinished} unfinished todo{} (pending or in progress). \
          Finish the remaining work, or if it's genuinely done or no longer needed, \
          update the todo list (mark items completed/cancelled) before stopping.",
         if unfinished == 1 { "" } else { "s" }
-    )))
+    );
+    if low > 0 {
+        body.push_str(&format!(
+            " You have {low} low-priority item{} left — if one won't fit, cancel it with a one-line reason rather than leaving it open.",
+            if low == 1 { "" } else { "s" }
+        ));
+    }
+    LoopMessage::User(super::message::UserMessage::text(body))
 }
 
 /// The plan-only variant of the nudge (dirge-u1ay): the turn wrote a todo
@@ -647,11 +678,12 @@ async fn poll_finalization_follow_up(
     if *todo_nudges < MAX_TODO_NUDGES {
         let edited = turn_made_file_edits(new_messages);
         if edited || (*todo_nudges == 0 && turn_wrote_todos(new_messages)) {
-            let unfinished = crate::agent::tools::todo::unfinished_count();
+            let (high, normal, low) = crate::agent::tools::todo::unfinished_by_priority();
+            let unfinished = high + normal + low;
             if unfinished > 0 {
                 *todo_nudges += 1;
                 let msg = if edited {
-                    todo_nudge_message(unfinished)
+                    todo_nudge_message(unfinished, low)
                 } else {
                     plan_only_nudge_message(unfinished)
                 };
@@ -2640,9 +2672,7 @@ pub async fn run_loop(
                     cap = cap,
                     "max_turns reached — terminating run"
                 );
-                let notice = format!(
-                    "{MAX_TURNS_NOTICE_PREFIX} ({cap}) reached. Stopping the run. Increase --max-agent-turns or `max_agent_turns` in config.json to allow more."
-                );
+                let notice = max_turns_notice(cap, &crate::agent::tools::todo::snapshot());
                 // Surface to the user as a `<system>` log line (warning
                 // color) rather than a `MessageStart { User }` — the
                 // latter rendered with the `<you>` prefix as if the user

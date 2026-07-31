@@ -115,6 +115,33 @@ pub fn unfinished_count() -> usize {
         .unwrap_or(0)
 }
 
+/// Unfinished items on the mirrored board, split by priority — (high, normal,
+/// low). A sibling of [`unfinished_count`] used by the todo nudge
+/// (dirge-uw2l.5) to name low-priority items as cancel candidates. Same lock
+/// discipline; counts only `open` / `in_progress` (blocked is parked, terminal
+/// items are off the board).
+pub fn unfinished_by_priority() -> (usize, usize, usize) {
+    TODO_LIST
+        .lock()
+        .map(|list| {
+            let mut high = 0;
+            let mut normal = 0;
+            let mut low = 0;
+            for t in list.iter() {
+                if !matches!(t.status.as_str(), "open" | "in_progress") {
+                    continue;
+                }
+                match t.priority.as_str() {
+                    "high" => high += 1,
+                    "low" => low += 1,
+                    _ => normal += 1,
+                }
+            }
+            (high, normal, low)
+        })
+        .unwrap_or((0, 0, 0))
+}
+
 pub struct WriteTodoList {
     db_path: PathBuf,
     session_id: Option<String>,
@@ -384,6 +411,32 @@ mod nudge_tests {
         }
         assert_eq!(unfinished_count(), 0);
         // Leave the global clean for any other consumer.
+        TODO_LIST.lock_ignore_poison().clear();
+    }
+
+    #[test]
+    fn unfinished_by_priority_counts_open_or_in_progress_by_bucket() {
+        // Same shared-lock discipline as the unfinished_count test above.
+        let _lock = TODO_TEST_LOCK.lock_ignore_poison();
+        let item = |status: &str, priority: &str| TodoItem {
+            content: "x".into(),
+            status: status.into(),
+            priority: priority.into(),
+        };
+        {
+            let mut list = TODO_LIST.lock_ignore_poison();
+            *list = vec![
+                item("open", "high"),
+                item("in_progress", "low"),
+                item("open", "low"),
+                item("open", "normal"),
+                // Excluded: blocked is parked; done/cancelled are terminal.
+                item("blocked", "high"),
+                item("done", "high"),
+                item("cancelled", "low"),
+            ];
+        }
+        assert_eq!(unfinished_by_priority(), (1, 1, 2));
         TODO_LIST.lock_ignore_poison().clear();
     }
 }

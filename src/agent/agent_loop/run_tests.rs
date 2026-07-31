@@ -3948,16 +3948,77 @@ async fn context_compacted_reports_compaction_kind() {
 /// The unfinished-todo nudge wording agrees in number with the count.
 #[test]
 fn todo_nudge_message_pluralizes() {
-    let one = match todo_nudge_message(1) {
+    let one = match todo_nudge_message(1, 0) {
         LoopMessage::User(u) => u.text_joined(),
         _ => panic!("expected a user message"),
     };
     assert!(one.contains("1 unfinished todo "), "singular: {one}");
-    let many = match todo_nudge_message(3) {
+    let many = match todo_nudge_message(3, 0) {
         LoopMessage::User(u) => u.text_joined(),
         _ => panic!("expected a user message"),
     };
     assert!(many.contains("3 unfinished todos "), "plural: {many}");
+}
+
+/// dirge-uw2l.5: `low == 0` must reproduce the pre-uw2l.5 wording exactly, so
+/// the common case (no low-priority items) changes nothing.
+#[test]
+fn todo_nudge_message_byte_identical_when_no_low_priority() {
+    let want = format!(
+        "{TODO_NUDGE_TAG} You still have 2 unfinished todos (pending or in progress). \
+         Finish the remaining work, or if it's genuinely done or no longer needed, \
+         update the todo list (mark items completed/cancelled) before stopping."
+    );
+    let got = match todo_nudge_message(2, 0) {
+        LoopMessage::User(u) => u.text_joined(),
+        _ => panic!("expected a user message"),
+    };
+    assert_eq!(got, want);
+}
+
+/// dirge-uw2l.5: when a low-priority item is outstanding the nudge names it as
+/// the cancel candidate (RAX treated rejecting a low-priority unachievable
+/// goal as a validation objective, not a failure — paper §3.1b).
+#[test]
+fn todo_nudge_message_names_low_priority_as_cancel_candidate() {
+    let got = match todo_nudge_message(3, 1) {
+        LoopMessage::User(u) => u.text_joined(),
+        _ => panic!("expected a user message"),
+    };
+    assert!(
+        got.contains("1 low-priority item "),
+        "names the low count: {got}"
+    );
+    assert!(got.contains("cancel"), "invites cancellation: {got}");
+}
+
+/// dirge-uw2l.5: the residual-objectives block is appended AFTER the `[dirge]`
+/// prefix, so the headless truncation detector in `provider::run` — which
+/// matches `content.starts_with(MAX_TURNS_NOTICE_PREFIX)` (provider/run.rs) —
+/// still fires. This test is what keeps the emitter and the detector from
+/// drifting: if a future change reorders or drops the prefix, it fails here
+/// rather than silently breaking truncation detection.
+#[test]
+fn max_turns_notice_keeps_truncation_prefix_with_residual_block() {
+    use crate::agent::tools::todo::TodoItem;
+    let board = vec![TodoItem {
+        content: "ship the residual handoff".into(),
+        status: "open".into(),
+        priority: "normal".into(),
+    }];
+    let notice = max_turns_notice(50, &board);
+    assert!(
+        notice.starts_with(MAX_TURNS_NOTICE_PREFIX),
+        "truncation prefix dropped: {notice}"
+    );
+    assert!(
+        notice.contains("Objectives still outstanding"),
+        "residual block missing: {notice}"
+    );
+    // Empty board → no block, still prefixed, byte-identical to the old notice.
+    let bare = max_turns_notice(50, &[]);
+    assert!(bare.starts_with(MAX_TURNS_NOTICE_PREFIX));
+    assert!(!bare.contains("Objectives still outstanding"));
 }
 
 /// dirge-1g3v: the reviewer engages only on what THIS run changed. Given the
