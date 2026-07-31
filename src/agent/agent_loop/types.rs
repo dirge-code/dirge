@@ -521,6 +521,10 @@ pub struct LoopConfig {
     /// (opt-in). Resolved at `build_agent` time from
     /// `Config::resolve_open_issues_gate_mode`.
     pub open_issues_gate_mode: GateMode,
+    /// How tiered verification engages (dirge-uw2l.2). `Off` is
+    /// byte-identical to the untiered gate. Set by `build_agent` from
+    /// `Config::resolve_verification_tiers_mode`.
+    pub verification_tiers_mode: GateMode,
 
     /// Active session id for the open-issues gate and tools that need
     /// session-scoping. `None` in review/curator sub-runners and most
@@ -699,6 +703,7 @@ impl std::fmt::Debug for LoopConfig {
             )
             .field("code_review_mode", &self.code_review_mode)
             .field("open_issues_gate_mode", &self.open_issues_gate_mode)
+            .field("verification_tiers_mode", &self.verification_tiers_mode)
             .field("session_id", &self.session_id)
             .field("goal_fn", &self.goal_fn.as_ref().map(|_| "<judge>"))
             .field("goal", &self.goal)
@@ -749,6 +754,7 @@ impl Clone for LoopConfig {
             code_review_mode: self.code_review_mode,
             code_review_repo: self.code_review_repo.clone(),
             open_issues_gate_mode: self.open_issues_gate_mode,
+            verification_tiers_mode: self.verification_tiers_mode,
             session_id: self.session_id.clone(),
             goal_fn: self.goal_fn.clone(),
             goal: self.goal.clone(),
@@ -807,6 +813,7 @@ impl LoopConfig {
             code_review_mode: CodeReviewMode::Advisory,
             code_review_repo: None,
             open_issues_gate_mode: GateMode::Off,
+            verification_tiers_mode: GateMode::Off,
             session_id: None,
             goal_fn: None,
             goal: None,

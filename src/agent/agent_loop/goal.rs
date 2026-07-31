@@ -81,6 +81,15 @@ fn goal_verification_note(verification: Option<VerificationStatus>) -> &'static 
              working code, it is probably not met yet — unless the failure is pre-existing, \
              expected, or unrelated to the change."
         }
+        // dirge-uw2l.2: fast-tier green only. Weaker than `Unverified` —
+        // something DID pass — so the note stays advisory and, like its
+        // sibling, must never on its own flip a goal to UNMET.
+        Some(VerificationStatus::FastGreenOnly) => {
+            "\n\n=== VERIFICATION (advisory) ===\n\
+             The agent edited code and fast checks passed, but the full test suite never ran this \
+             run. Consider this ONLY if the stop condition implies the code is working/verified. \
+             Never answer UNMET solely because the full suite didn't run."
+        }
         Some(VerificationStatus::VerifiedGreen) | Some(VerificationStatus::NoCodeEdited) | None => {
             ""
         }
@@ -173,6 +182,29 @@ pub async fn run_goal_gate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// dirge-uw2l.2: the fast-green-only note is advisory only. It must
+    /// never on its own flip a goal to UNMET — same invariant as the
+    /// `Unverified` note (dirge-6q3w), or a bounded loop would trap on a
+    /// project that has no full suite to run.
+    #[test]
+    fn goal_verification_note_fast_green_only() {
+        let note = goal_verification_note(Some(VerificationStatus::FastGreenOnly));
+        assert!(!note.is_empty());
+        assert!(note.contains("advisory"), "{note}");
+        assert!(note.contains("full test suite"), "{note}");
+        assert!(
+            note.contains("Never answer UNMET solely"),
+            "must not flip the goal on its own: {note}"
+        );
+
+        // Unchanged: green / no-edit / no-gate add nothing.
+        assert_eq!(
+            goal_verification_note(Some(VerificationStatus::VerifiedGreen)),
+            ""
+        );
+        assert_eq!(goal_verification_note(None), "");
+    }
     use std::sync::Arc;
 
     #[test]

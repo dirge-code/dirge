@@ -54,6 +54,7 @@ use super::storm::StormBreaker;
 use super::stream::{StreamFn, stream_assistant_response};
 use super::tool::AbortSignal;
 use super::types::{CodeReviewMode, Context, GateMode, LoopConfig};
+use super::verifier::VERIFY_TAG;
 use crate::sync_util::LockExt;
 
 /// Phase 4 part 2: poll the configured `get_steering_messages`
@@ -140,6 +141,17 @@ const MAX_OPEN_ISSUES_NUDGES: u8 = 2;
 /// One-shot: fire at most once per run when the model edits files but has
 /// no active todo — a gap the normal unfinished-todo nudge can't cover.
 const MAX_TRACK_NUDGES: u8 = 1;
+
+/// One-shot: fire at most once per run when code edits pile up with no
+/// verification since (dirge-uw2l.2). Bounded to a single message so the
+/// mid-run reminder can never become nagging.
+const MAX_VERIFY_NUDGES: u8 = 1;
+
+/// Code edits since the last verification before the mid-run fast-check
+/// reminder fires. One or two edits may be mid-sequence; three-plus with
+/// nothing run is integrating without testing — the pattern RAX's
+/// front-line-tester finding says to interrupt early.
+const FAST_VERIFY_EDIT_THRESHOLD: u32 = 3;
 
 /// Consecutive errored tool results before the failure tracker injects a
 /// recovery checkpoint. Tuned low — the tool-repair literature finds the
@@ -331,7 +343,10 @@ async fn poll_goal_gate(
         // the goal judge treats it as a SOFT advisory (see
         // `goal_verification_note`) so a non-testable task can't trap the
         // bounded goal loop.
-        let verification = config.verifier.as_ref().map(|v| v.status());
+        let verification = config
+            .verifier
+            .as_ref()
+            .map(|v| v.status(config.verification_tiers_mode));
         let msgs =
             super::goal::run_goal_gate(judge, goal, system_prompt, &transcript, verification).await;
         if !msgs.is_empty() {
@@ -462,7 +477,7 @@ async fn poll_finalization_follow_up(
     // 2. F6 verifier gate — one-time "verify before done" when code was edited
     //    but nothing was run to check it.
     if let Some(verifier) = &config.verifier {
-        let msgs = verifier.check_before_finalize();
+        let msgs = verifier.check_before_finalize(config.verification_tiers_mode);
         if !msgs.is_empty() {
             return (msgs, FollowUpSource::Verifier);
         }
@@ -544,7 +559,10 @@ async fn poll_finalization_follow_up(
                 // judge can be pickier about unverified changes. dirge-bedj: judge
                 // within the agent's own system prompt so it never demands a
                 // forbidden action.
-                let verification = config.verifier.as_ref().map(|v| v.status());
+                let verification = config
+                    .verifier
+                    .as_ref()
+                    .map(|v| v.status(config.verification_tiers_mode));
                 let (msgs, raised_findings) = super::critic::run_unified_review(
                     judge,
                     system_prompt,
@@ -1676,6 +1694,7 @@ pub async fn run_loop(
 
     // dirge-track: file-edits-without-tracked-todos advisory (one-shot).
     let mut track_nudges: u8 = 0;
+    let mut verify_nudges: u8 = 0;
 
     // Compute the issue db path once for both the issue-board reminder and
     // the open-issues gate. Fail-open: absent db → None, gate is inert.
@@ -2262,6 +2281,24 @@ pub async fn run_loop(
                 new_messages.push(reminder);
             }
 
+            // dirge-uw2l.2: mid-run fast-check reminder — edits piling up
+            // with nothing run since. One-shot per run; follows the track
+            // nudge so work-tracking guidance lands first.
+            if let Some(reminder) = build_fast_verify_reminder(
+                config.verification_tiers_mode,
+                verify_nudges,
+                config
+                    .verifier
+                    .as_ref()
+                    .map_or(0, |v| v.edits_since_verify()),
+            ) {
+                verify_nudges += 1;
+                current_context
+                    .messages
+                    .push(loop_message_to_value(&reminder));
+                new_messages.push(reminder);
+            }
+
             // Pi line 218: turn_end.
             let _ = emit
                 .send(LoopEvent::TurnEnd {
@@ -2652,6 +2689,39 @@ fn track_work_reminder_message() -> LoopMessage {
         "{TRACK_WORK_TAG} You're editing files without an active todo. Before continuing, \
          add this task to your active work list with write_todo_list and mark the item \
          you're working on in_progress, so your progress is tracked."
+    )))
+}
+
+/// Whether to remind the model to run a FAST check mid-run (dirge-uw2l.2).
+/// True only when tiers are engaged, the one-shot budget is unspent, and
+/// enough code edits have piled up since the last verification of any tier.
+fn should_nudge_fast_verify(mode: GateMode, verify_nudges: u8, edits_since_verify: u32) -> bool {
+    mode != GateMode::Off
+        && verify_nudges < MAX_VERIFY_NUDGES
+        && edits_since_verify >= FAST_VERIFY_EDIT_THRESHOLD
+}
+
+/// Pure decision + message builder for the mid-run fast-check reminder
+/// (dirge-uw2l.2). The RAX finding this implements: most bugs were caught by
+/// developers front-line testing DURING integration, not by the expensive
+/// end-stage campaign — so ask for the cheap tier now and keep the slow tier
+/// for the boundary. Split out from the inner loop so it's unit-testable
+/// without the run loop.
+fn build_fast_verify_reminder(
+    mode: GateMode,
+    verify_nudges: u8,
+    edits_since_verify: u32,
+) -> Option<LoopMessage> {
+    if !should_nudge_fast_verify(mode, verify_nudges, edits_since_verify) {
+        return None;
+    }
+    Some(LoopMessage::User(super::message::UserMessage::text(
+        format!(
+            "{VERIFY_TAG} You've made {edits_since_verify} code edits without running any check. \
+             Run a FAST one now — a typecheck, a linter, or just the test covering what you're \
+             touching — so a mistake surfaces here instead of several edits from now. Save the \
+             full suite for when the work is done."
+        ),
     )))
 }
 

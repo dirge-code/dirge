@@ -190,6 +190,18 @@ fn verification_block(verification: Option<VerificationStatus>) -> &'static str 
              RELEVANT to the change (e.g. tests covering the edited area, not just an unrelated \
              build); don't manufacture extra requirements.\n--- end verification status ---"
         }
+        // dirge-uw2l.2: cheap tier green, slow tier never seen green. Same
+        // calibrated escape hatch as `Unverified` — the point is to ask for
+        // the suite once, not to invent a requirement where none can run.
+        Some(VerificationStatus::FastGreenOnly) => {
+            "\n\n--- verification status ---\n\
+             Code was edited and the fast checks (typecheck/lint/a targeted test) passed, but the \
+             full test suite never ran this run. If a broader suite is runnable here and not \
+             forbidden, flag that as a concrete gap and name the command. This is a NUDGE, not a \
+             hard rule: if there is no broader suite, it can't run here, or the assistant verified \
+             end-to-end another way and said so, treat it as COMPLETE.\n\
+             --- end verification status ---"
+        }
         // No code edited (precondition not met) or no gate configured →
         // add nothing, so the critic behaves exactly as before.
         Some(VerificationStatus::NoCodeEdited) | None => "",
@@ -428,6 +440,29 @@ pub async fn run_unified_review(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// dirge-uw2l.2: the fast-green-only block must name the gap (the full
+    /// suite never ran) while keeping the same calibrated escape hatch as
+    /// the `Unverified` block — it is a nudge, not a hard rule, so a project
+    /// with no broader suite is never blocked on running one.
+    #[test]
+    fn critic_verification_block_fast_green_only() {
+        let block = verification_block(Some(VerificationStatus::FastGreenOnly));
+        assert!(!block.is_empty());
+        assert!(block.contains("full test suite"), "{block}");
+        assert!(block.contains("NUDGE, not a hard rule"), "{block}");
+        assert!(
+            block.contains("COMPLETE"),
+            "escape hatch preserved: {block}"
+        );
+
+        // Unchanged: no code edited / no gate configured stay silent.
+        assert_eq!(
+            verification_block(Some(VerificationStatus::NoCodeEdited)),
+            ""
+        );
+        assert_eq!(verification_block(None), "");
+    }
 
     /// Test shim (dirge-8v98): the old `build_prompt` was folded into
     /// `build_unified_prompt` with a `None` diff (completeness-only). The prompt

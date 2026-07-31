@@ -523,6 +523,7 @@ pub async fn build_agent(
     // dirge-ksjl — open-issues finalization gate mode, resolved from
     // config. Default is Off (opt-in; nagging is intrusive).
     agent = agent.with_open_issues_gate_mode(cfg.resolve_open_issues_gate_mode());
+    agent = agent.with_verification_tiers_mode(cfg.resolve_verification_tiers_mode());
     agent = agent.with_session_id(session_id);
 
     // dirge-9tfq — install the BackgroundStore on the agent so

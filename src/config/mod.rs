@@ -956,6 +956,18 @@ pub struct Config {
     /// closes or defers its session-scoped issues. See
     /// [`resolve_open_issues_gate_mode`](Self::resolve_open_issues_gate_mode).
     pub open_issues_gate: Option<String>,
+    /// How tiered verification engages (dirge-uw2l.2). One of `off` /
+    /// `advisory` / `blocking` (case-insensitive, trimmed). `off`
+    /// *(default)* is byte-identical to the untiered gate: build/test
+    /// commands are recognized but never classified, and the run gets at
+    /// most the one legacy nudge. `advisory` splits commands into a fast
+    /// tier (typecheck/lint/targeted test) and a slow tier (full
+    /// suite/build), reminds the agent once mid-run to run a fast check
+    /// when edits pile up unverified, and escalates once at finalization
+    /// when only the fast tier ever passed. `blocking` repeats that
+    /// escalation, bounded. See
+    /// [`resolve_verification_tiers_mode`](Self::resolve_verification_tiers_mode).
+    pub verification_tiers: Option<String>,
     /// How the ingestion-time injection scanner handles untrusted tool
     /// results (read, MCP, websearch). One of `off` / `advisory` / `block`
     /// (case-insensitive, trimmed). `advisory` *(default)* fences positive
@@ -1260,6 +1272,32 @@ impl Config {
                 target: "dirge::config",
                 value = trimmed,
                 "unrecognized `open_issues_gate` value; falling back to `off` \
+                 (valid: off | advisory | blocking)"
+            );
+            GateMode::Off
+        })
+    }
+
+    /// [`verification_tiers`](Self::verification_tiers): `off`/`advisory`/
+    /// `blocking`, parsed case-insensitively and trimmed. `None` and an
+    /// empty value resolve to `Off` (opt-in, like the open-issues gate —
+    /// tiering can only ever ADD messages, so it stays dark by default).
+    /// An unrecognized non-empty value also resolves to `Off` but logs a
+    /// warning, so a typo never silently arms the gate.
+    pub fn resolve_verification_tiers_mode(&self) -> crate::agent::agent_loop::types::GateMode {
+        use crate::agent::agent_loop::types::GateMode;
+        let Some(raw) = self.verification_tiers.as_deref() else {
+            return GateMode::Off;
+        };
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return GateMode::Off;
+        }
+        GateMode::from_wire(trimmed).unwrap_or_else(|| {
+            tracing::warn!(
+                target: "dirge::config",
+                value = trimmed,
+                "unrecognized `verification_tiers` value; falling back to `off` \
                  (valid: off | advisory | blocking)"
             );
             GateMode::Off
@@ -2009,6 +2047,36 @@ mod tests {
         );
         assert_eq!(resolve(Some("")), SubagentWriteIsolation::Auto);
         assert_eq!(resolve(Some("unknown")), SubagentWriteIsolation::Auto);
+    }
+
+    #[test]
+    fn resolve_verification_tiers_mode_each_string_and_default() {
+        use crate::agent::agent_loop::types::GateMode;
+
+        let mk = |raw: &str| {
+            Config::deserialize(serde_json::json!({ "verification_tiers": raw }))
+                .unwrap()
+                .resolve_verification_tiers_mode()
+        };
+        assert_eq!(mk("off"), GateMode::Off);
+        assert_eq!(mk("OFF"), GateMode::Off);
+        assert_eq!(mk("  Blocking  "), GateMode::Blocking);
+        assert_eq!(mk("advisory"), GateMode::Advisory);
+
+        // Absent / empty → default Off. Tiering can only ADD messages, so it
+        // stays dark until asked for.
+        let cfg: Config = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(cfg.resolve_verification_tiers_mode(), GateMode::Off);
+        let cfg: Config = serde_json::from_str(r#"{ "verification_tiers": "   " }"#).unwrap();
+        assert_eq!(cfg.resolve_verification_tiers_mode(), GateMode::Off);
+    }
+
+    /// A typo must never silently arm the gate.
+    #[test]
+    fn resolve_verification_tiers_mode_unknown_warns_and_defaults() {
+        use crate::agent::agent_loop::types::GateMode;
+        let cfg: Config = serde_json::from_str(r#"{ "verification_tiers": "nuclear" }"#).unwrap();
+        assert_eq!(cfg.resolve_verification_tiers_mode(), GateMode::Off);
     }
 
     #[test]

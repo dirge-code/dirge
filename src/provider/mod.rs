@@ -133,6 +133,10 @@ pub struct AnyAgent {
     /// forwarded to `LoopConfig.open_issues_gate_mode`. Defaults to `Off`
     /// (opt-in — nagging is intrusive).
     open_issues_gate_mode: crate::agent::agent_loop::types::GateMode,
+    /// Set by `build_agent` from `Config::resolve_verification_tiers_mode`;
+    /// forwarded to `LoopConfig.verification_tiers_mode`. Defaults to `Off`
+    /// (dirge-uw2l.2).
+    verification_tiers_mode: crate::agent::agent_loop::types::GateMode,
     /// Active session id forwarded to `LoopConfig.session_id` for the
     /// open-issues gate and session-scoped tools. `None` in sub-runners.
     session_id: Option<String>,
@@ -322,6 +326,7 @@ impl AnyAgent {
             code_review_fn: None,
             code_review_mode: crate::agent::agent_loop::types::CodeReviewMode::default(),
             open_issues_gate_mode: crate::agent::agent_loop::types::GateMode::Off,
+            verification_tiers_mode: crate::agent::agent_loop::types::GateMode::Off,
             session_id: None,
             goal_fn: None,
             goal: None,
@@ -529,6 +534,14 @@ impl AnyAgent {
         mode: crate::agent::agent_loop::types::GateMode,
     ) -> Self {
         self.open_issues_gate_mode = mode;
+        self
+    }
+
+    pub fn with_verification_tiers_mode(
+        mut self,
+        mode: crate::agent::agent_loop::types::GateMode,
+    ) -> Self {
+        self.verification_tiers_mode = mode;
         self
     }
 

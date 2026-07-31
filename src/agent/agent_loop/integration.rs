@@ -452,6 +452,9 @@ pub struct LoopSpawnConfig {
     /// Engagement mode for the open-issues finalization gate. Forwarded to
     /// `LoopConfig.open_issues_gate_mode`. Default `Off` (opt-in).
     pub open_issues_gate_mode: crate::agent::agent_loop::types::GateMode,
+    /// Forwarded to `LoopConfig.verification_tiers_mode`. Default `Off`
+    /// (opt-in; `Off` is byte-identical to the untiered gate).
+    pub verification_tiers_mode: crate::agent::agent_loop::types::GateMode,
 
     /// Active session id forwarded to `LoopConfig.session_id` for
     /// session-scoped gate queries. `None` in sub-runners.
@@ -523,6 +526,7 @@ impl LoopSpawnConfig {
             code_review_fn: None,
             code_review_mode: crate::agent::agent_loop::types::CodeReviewMode::default(),
             open_issues_gate_mode: crate::agent::agent_loop::types::GateMode::Off,
+            verification_tiers_mode: crate::agent::agent_loop::types::GateMode::Off,
             session_id: None,
             goal_fn: None,
             goal: None,
@@ -607,6 +611,7 @@ pub fn spawn_loop_runner(cfg: LoopSpawnConfig) -> LoopRunner {
         code_review_mode: cfg.code_review_mode,
         code_review_repo: None,
         open_issues_gate_mode: cfg.open_issues_gate_mode,
+        verification_tiers_mode: cfg.verification_tiers_mode,
         session_id: cfg.session_id.clone(),
         goal_fn: cfg.goal_fn.clone(),
         goal: cfg.goal.clone(),

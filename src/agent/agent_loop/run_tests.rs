@@ -140,6 +140,7 @@ fn build_config() -> LoopConfig {
         code_review_mode: crate::agent::agent_loop::types::CodeReviewMode::default(),
         code_review_repo: None,
         open_issues_gate_mode: crate::agent::agent_loop::types::GateMode::Off,
+        verification_tiers_mode: crate::agent::agent_loop::types::GateMode::Off,
         session_id: None,
         goal_fn: None,
         goal: None,
@@ -6220,4 +6221,64 @@ fn last_action_failed_and_stopped_bounded() {
     ];
     let resume_nudges = MAX_RESUME_NUDGE;
     assert!(!(resume_nudges < MAX_RESUME_NUDGE && last_action_failed_and_stopped(&msgs)));
+}
+
+// ── mid-run fast-check reminder (dirge-uw2l.2, RAX R1) ──────────────────
+
+/// The mid-run reminder fires only with tiers engaged, budget unspent, and
+/// enough unverified edits piled up. Pure — no gate, no LLM.
+#[test]
+fn should_nudge_fast_verify_gate() {
+    // Fires: tiered mode + budget available + threshold reached.
+    assert!(should_nudge_fast_verify(
+        GateMode::Advisory,
+        0,
+        FAST_VERIFY_EDIT_THRESHOLD
+    ));
+    assert!(should_nudge_fast_verify(
+        GateMode::Blocking,
+        0,
+        FAST_VERIFY_EDIT_THRESHOLD
+    ));
+    // Off is byte-identical to the untiered loop — never nudges, however
+    // many edits pile up.
+    assert!(!should_nudge_fast_verify(GateMode::Off, 0, 99));
+    // Below threshold: one or two edits may be mid-sequence.
+    assert!(!should_nudge_fast_verify(
+        GateMode::Advisory,
+        0,
+        FAST_VERIFY_EDIT_THRESHOLD - 1
+    ));
+    // One-shot: budget spent.
+    assert!(!should_nudge_fast_verify(
+        GateMode::Advisory,
+        MAX_VERIFY_NUDGES,
+        99
+    ));
+}
+
+/// The built message carries the verifier tag (so the UI attributes it to
+/// the system, dirge-i75f) and asks for the CHEAP tier now, explicitly
+/// deferring the full suite — that split is the whole point of the round.
+#[test]
+fn build_fast_verify_reminder_message() {
+    let msg = build_fast_verify_reminder(GateMode::Advisory, 0, FAST_VERIFY_EDIT_THRESHOLD)
+        .expect("threshold reached in a tiered mode");
+    let text = match msg {
+        LoopMessage::User(u) => u.text_joined(),
+        _ => panic!("expected a user message"),
+    };
+    assert!(text.contains(VERIFY_TAG), "carries the tag: {text}");
+    assert!(text.contains("FAST"), "asks for the fast tier: {text}");
+    assert!(text.contains("full suite"), "defers the slow tier: {text}");
+    assert!(build_fast_verify_reminder(GateMode::Off, 0, 99).is_none());
+    assert!(build_fast_verify_reminder(GateMode::Advisory, 0, 1).is_none());
+}
+
+/// Bounded: once the budget is spent the reminder can never fire again,
+/// however far the edit count runs. Guarantees it can't loop.
+#[test]
+fn fast_verify_nudge_bounded_once() {
+    assert!(build_fast_verify_reminder(GateMode::Advisory, MAX_VERIFY_NUDGES, 10).is_none());
+    assert!(build_fast_verify_reminder(GateMode::Blocking, MAX_VERIFY_NUDGES, 10).is_none());
 }
