@@ -58,11 +58,31 @@ pub const DEFAULT_TOP_K: usize = 8;
 
 /// The always-on set: tools the agent must be able to call without
 /// going through `tool_search` first. UI / control tools the model
-/// needs unconditionally + `tool_search` itself.
+/// needs unconditionally + `tool_search` itself + the core loop tools
+/// the system prompt names as the model's primary interface.
 ///
-/// Keep this list short — every name here is a tool whose
+/// dirge-w72q (GH #734): this used to be just `tool_search`,
+/// `task_status` and `write_todo_list`. Making `read`/`write`/`edit`/
+/// `bash` discoverable-only cost a round-trip on the most common
+/// action in every session, and left `write_todo_list` as the only
+/// write-shaped tool in the request — models asked to put code on disk
+/// called it instead of `write`. Discovery is for the long tail (MCP,
+/// semantic, debug, spec), not for reading and editing files.
+///
+/// Keep the rest of this list short — every name here is a tool whose
 /// definition ships every turn regardless of the filter.
-pub const ALWAYS_ON_TOOLS: &[&str] = &[TOOL_SEARCH_NAME, "task_status", "write_todo_list"];
+pub const ALWAYS_ON_TOOLS: &[&str] = &[
+    TOOL_SEARCH_NAME,
+    "task_status",
+    "write_todo_list",
+    "read",
+    "write",
+    "edit",
+    "bash",
+    "grep",
+    "glob",
+    "list_dir",
+];
 
 /// `tool_search` meta-tool. Registers as a LoopTool so it can
 /// mutate the per-session loaded set during execution.
@@ -150,7 +170,7 @@ impl LoopTool for ToolSearchTool {
     }
 
     fn description(&self) -> &str {
-        "Discover tools available in this session that aren't loaded yet. Pass a natural-language query describing what you need to do (e.g. \"read a file\", \"search the web\", \"run a shell command\") and tool_search returns the top matching tools by name + description. Once tool_search names a tool, its full schema becomes available on your NEXT turn — call it then with the right arguments. Use this when you need a capability and aren't sure which tool to call; the regular always-on tools (write_todo_list, task_status) are listed up-front and don't need discovery."
+        "Discover tools available in this session that aren't loaded yet. Pass a natural-language query describing what you need to do (e.g. \"read a file\", \"search the web\", \"run a shell command\") and tool_search returns the top matching tools by name + description. Once tool_search names a tool, its full schema becomes available on your NEXT turn — call it then with the right arguments. Use this when you need a capability and aren't sure which tool to call; the core tools (read, write, edit, bash, grep, glob, list_dir, write_todo_list, task_status) are listed up-front and don't need discovery."
     }
 
     fn label(&self) -> &str {
@@ -530,6 +550,21 @@ mod tests {
     #[test]
     fn always_on_includes_tool_search() {
         assert!(ALWAYS_ON_TOOLS.contains(&TOOL_SEARCH_NAME));
+    }
+
+    /// dirge-w72q (GH #734): the core loop tools must ship every turn. With
+    /// only `tool_search` / `task_status` / `write_todo_list` always on, a
+    /// model asked to put code on disk saw exactly one write-shaped tool —
+    /// `write_todo_list` — and called it instead of `write`. Discovery is for
+    /// the long tail (MCP, semantic, debug), never for reading and editing.
+    #[test]
+    fn always_on_covers_the_core_file_tools() {
+        for name in ["read", "write", "edit", "bash", "grep", "glob", "list_dir"] {
+            assert!(
+                ALWAYS_ON_TOOLS.contains(&name),
+                "{name} must ship every turn — it cannot require a tool_search round-trip"
+            );
+        }
     }
 
     /// dirge-tpx6: the registry is shared (Arc<Mutex>) and read live, so

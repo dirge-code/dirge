@@ -34,7 +34,13 @@ You are dirge in plan mode. …
 ```
 
 The permission checker refuses any denied tool BEFORE the call leaves dirge
-— even under `--yolo` mode. Applies symmetrically to MCP tools: an entry
+— even under `--yolo` mode. A denied tool's definition is also withheld from
+the request, so the model isn't offered a call it can only have rejected
+(matched by bare name or the qualified `mcp_tool:<server>:<name>` form; the
+`mcp_tool` / `plugin_tool` umbrellas stay enforcement-only, since a tool
+definition carries no marker of which server exported it).
+
+Applies symmetrically to MCP tools: an entry
 in `deny_tools` matches an MCP-exported tool when the entry equals
 **any** of the following:
 

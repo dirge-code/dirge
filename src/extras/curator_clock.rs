@@ -139,7 +139,7 @@ mod tests {
             std::env::temp_dir().join(format!("dirge-clock-test-{}-{}", std::process::id(), n));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let paths = ProjectPaths::new(&dir);
+        let paths = ProjectPaths::at(&dir);
         (paths, dir)
     }
 

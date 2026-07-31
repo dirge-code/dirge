@@ -400,8 +400,42 @@ pub fn filter_tool_defs(
     tools: &[ToolDefinition],
     filter: Option<&std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>>,
 ) -> Vec<ToolDefinition> {
+    let denied = crate::permission::PROMPT_DENIED_TOOLS
+        .lock_ignore_poison()
+        .clone();
+    retain_tool_defs(tools, filter, &denied)
+}
+
+/// The pure core of [`filter_tool_defs`], with the active prompt's
+/// `deny_tools` passed in rather than read off the global.
+///
+/// Two independent reasons to withhold a definition:
+///   - the prompt denies it (dirge-41al) — a hard refusal that holds even
+///     under `--yolo`, so its schema can only ever buy a rejected call. This
+///     wins over the always-on set: `plan` mode denies `write`, and `write`
+///     being always-on must not smuggle it back in.
+///   - `dynamic_tool_search` hasn't loaded it yet — the Phase-3 filter.
+pub fn retain_tool_defs(
+    tools: &[ToolDefinition],
+    filter: Option<&std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>>,
+    denied: &[String],
+) -> Vec<ToolDefinition> {
+    let is_denied = |name: &str| {
+        denied.iter().any(|entry| {
+            let entry = entry.trim();
+            entry == name
+                || entry
+                    .strip_prefix("mcp_tool:")
+                    .and_then(|rest| rest.rsplit(':').next())
+                    .is_some_and(|bare| bare == name)
+        })
+    };
     match filter {
-        None => tools.to_vec(),
+        None => tools
+            .iter()
+            .filter(|td| !is_denied(&td.name))
+            .cloned()
+            .collect(),
         Some(arc) => {
             let loaded = arc.lock_ignore_poison();
             let always_on: std::collections::HashSet<&str> =
@@ -411,7 +445,10 @@ pub fn filter_tool_defs(
                     .collect();
             tools
                 .iter()
-                .filter(|td| always_on.contains(td.name.as_str()) || loaded.contains(&td.name))
+                .filter(|td| {
+                    !is_denied(&td.name)
+                        && (always_on.contains(td.name.as_str()) || loaded.contains(&td.name))
+                })
                 .cloned()
                 .collect()
         }
@@ -1732,6 +1769,7 @@ mod tests {
             mk_def("tool_search"),
             mk_def("write_todo_list"),
             mk_def("task_status"),
+            mk_def("session_search"),
             mk_def("custom_mcp"),
         ];
         let filter = std::sync::Arc::new(std::sync::Mutex::new(
@@ -1739,12 +1777,15 @@ mod tests {
         ));
         let out = filter_tool_defs(&defs, Some(&filter));
         let names: std::collections::HashSet<String> = out.iter().map(|d| d.name.clone()).collect();
-        // Always-on tools survive; others don't.
+        // Always-on tools survive; the long tail doesn't.
         assert!(names.contains("tool_search"));
         assert!(names.contains("write_todo_list"));
         assert!(names.contains("task_status"));
-        assert!(!names.contains("read"), "read must be filtered out");
-        assert!(!names.contains("write"));
+        // dirge-w72q: the core loop tools are always-on too — the model can
+        // read and write without a discovery round-trip.
+        assert!(names.contains("read"), "read must ship unfiltered");
+        assert!(names.contains("write"), "write must ship unfiltered");
+        assert!(!names.contains("session_search"));
         assert!(!names.contains("custom_mcp"));
     }
 
@@ -1755,8 +1796,8 @@ mod tests {
     #[test]
     fn tool_search_filter_only_tool_search_suppresses_others() {
         let defs = vec![
-            mk_def("read"),
-            mk_def("write"),
+            mk_def("session_search"),
+            mk_def("spec"),
             mk_def("tool_search"),
             mk_def("custom_mcp"),
         ];
@@ -1768,29 +1809,106 @@ mod tests {
         assert_eq!(names, vec!["tool_search"]);
     }
 
-    /// After `tool_search` returns "read", the shared set
-    /// contains "read"; the NEXT filter call surfaces it.
+    /// After `tool_search` returns "custom_mcp", the shared set
+    /// contains "custom_mcp"; the NEXT filter call surfaces it.
     /// Mirrors the spec's "model calls tool_search, NEXT turn's
-    /// defs include `read`" check.
+    /// defs include the discovered tool" check.
     #[test]
     fn tool_search_filter_loaded_tool_surfaces_on_next_turn() {
         let defs = vec![
-            mk_def("read"),
-            mk_def("write"),
+            mk_def("session_search"),
             mk_def("tool_search"),
             mk_def("custom_mcp"),
         ];
         let filter = std::sync::Arc::new(std::sync::Mutex::new(
             std::collections::HashSet::<String>::new(),
         ));
-        // Turn 1: no "read" in set.
+        // Turn 1: no "custom_mcp" in set.
         let out1 = filter_tool_defs(&defs, Some(&filter));
-        assert!(!out1.iter().any(|d| d.name == "read"));
-        // Tool execution inserts "read" into the shared set.
-        filter.lock().unwrap().insert("read".to_string());
-        // Turn 2: "read" must now ship.
+        assert!(!out1.iter().any(|d| d.name == "custom_mcp"));
+        // Tool execution inserts "custom_mcp" into the shared set.
+        filter.lock().unwrap().insert("custom_mcp".to_string());
+        // Turn 2: "custom_mcp" must now ship.
         let out2 = filter_tool_defs(&defs, Some(&filter));
-        assert!(out2.iter().any(|d| d.name == "read"));
+        assert!(out2.iter().any(|d| d.name == "custom_mcp"));
+    }
+
+    // ============================================================
+    // dirge-41al: prompt deny_tools withhold the definition
+    // ============================================================
+
+    /// A prompt's `deny_tools` refuses the call before it leaves dirge, so
+    /// shipping the schema only buys a rejected tool call. `--prompt ask`
+    /// used to send all 34 defs including `write`/`edit`/`bash`.
+    #[test]
+    fn denied_tools_are_withheld_from_the_request() {
+        let defs = vec![
+            mk_def("read"),
+            mk_def("write"),
+            mk_def("edit"),
+            mk_def("bash"),
+            mk_def("grep"),
+        ];
+        let denied = vec!["write".to_string(), "edit".to_string(), "bash".to_string()];
+        let out = retain_tool_defs(&defs, None, &denied);
+        let names: Vec<&str> = out.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, vec!["read", "grep"]);
+    }
+
+    /// Empty deny list is the common case and must be byte-for-byte the old
+    /// behavior.
+    #[test]
+    fn empty_deny_list_passes_every_tool() {
+        let defs = vec![mk_def("read"), mk_def("write")];
+        let out = retain_tool_defs(&defs, None, &[]);
+        assert_eq!(out.len(), 2);
+    }
+
+    /// A qualified `mcp_tool:<server>:<name>` entry withholds that server's
+    /// tool by its registered bare name. The `mcp_tool` umbrella does not
+    /// expand here — a ToolDefinition can't be identified as MCP-exported,
+    /// and hiding built-ins on a guess would be worse than shipping them.
+    #[test]
+    fn qualified_mcp_deny_matches_bare_name_umbrella_does_not() {
+        let defs = vec![mk_def("read"), mk_def("search_docs")];
+        let out = retain_tool_defs(
+            &defs,
+            None,
+            &["mcp_tool:docs-server:search_docs".to_string()],
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "read");
+
+        let out = retain_tool_defs(&defs, None, &["mcp_tool".to_string()]);
+        assert_eq!(out.len(), 2, "umbrella must not hide built-ins by guess");
+    }
+
+    /// Deny wins over always-on: a denied tool stays out even when
+    /// dynamic_tool_search would otherwise force it into every request.
+    #[test]
+    fn deny_beats_the_always_on_set() {
+        let defs = vec![mk_def("write"), mk_def("read"), mk_def("tool_search")];
+        let filter = std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::HashSet::<String>::new(),
+        ));
+        let out = retain_tool_defs(&defs, Some(&filter), &["write".to_string()]);
+        let names: Vec<&str> = out.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, vec!["read", "tool_search"]);
+    }
+
+    /// `filter_tool_defs` reads the live deny list that `/prompt` writes, so
+    /// a mid-session prompt switch changes the next request's tool list.
+    #[test]
+    fn filter_tool_defs_reads_the_live_prompt_deny_list() {
+        // The deny list is process-global; use a name no sibling test ships
+        // so a concurrent `filter_tool_defs` call can't observe this.
+        let defs = vec![mk_def("read"), mk_def("deny_probe_tool")];
+        crate::permission::apply_prompt_deny(&None, &["deny_probe_tool".to_string()]);
+        let out = filter_tool_defs(&defs, None);
+        crate::permission::apply_prompt_deny(&None, &[]);
+
+        let names: Vec<&str> = out.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, vec!["read"]);
     }
 
     /// Names in the loaded set that aren't in the registry are

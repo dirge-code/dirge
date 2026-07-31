@@ -4,6 +4,50 @@ All notable changes to dirge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- The agent no longer reaches for `write_todo_list` when it should be writing a file
+  (GH #734, dirge-w72q / dirge-5xvn / dirge-u1ay). Reported against a local Qwen over
+  LocalAI, where the same prompt worked in opencode. Capturing both requests off the
+  wire found four causes, all ours.
+
+  With `dynamic_tool_search` on, the request shipped exactly three tools —
+  `tool_search`, `task_status`, `write_todo_list` — because the always-on set omitted
+  every core file tool. Asked to put code on disk, the model saw one write-shaped tool
+  and called it. `read`, `write`, `edit`, `bash`, `grep`, `glob` and `list_dir` are
+  always-on now; discovery is for the long tail.
+
+  The system prompt separately told the model to put a non-trivial task on its active
+  list *first*, and the tool description buried its one "skip this" clause after 700
+  characters of board mechanics. The ordering mandate is gone and the when-not-to-use
+  rules now lead the description, with `write`/`edit` named as what to call instead.
+
+  The unfinished-todo nudge could not fire on a plan-only turn: it was gated on
+  `turn_made_file_edits`, and `write_todo_list` is not an Edit operation, so "planned,
+  did nothing, stopped" was the one failure with no backstop. It fires there now,
+  worded toward the edit rather than the list, and one-shot — `new_messages`
+  accumulates across finalization re-entries, so an unbounded branch would repeat the
+  same nudge until the budget drained.
+
+- A prompt's `deny_tools` now withholds the tool definition, not just the call
+  (dirge-41al). `--prompt ask` shipped all 34 tools including `write`, `edit`, `bash`
+  and `apply_patch` — schemas for calls the permission layer would refuse even under
+  `--yolo`. Matching is by bare name and the qualified `mcp_tool:<server>:<name>` form;
+  the `mcp_tool` / `plugin_tool` umbrellas stay enforcement-only, since a tool
+  definition carries no marker of which server exported it. An agent profile's
+  `allow_tools` becomes a real way to shrink the toolset as a result.
+
+- Curator, skill and memory tests no longer leak into a shared `$TMPDIR/.dirge`
+  (dirge-9cg2). They built `ProjectPaths::new` over a scratch directory, which resolves
+  through the process-global `DIRGE_PROJECT_ROOT` — a variable the `dirge_paths` tests
+  set concurrently. Their writes landed in the temp root instead, and once the leaked
+  `sessions/state.db` held 10+ rows the curator first-run gate failed intermittently on
+  every later run. Added `ProjectPaths::at` for a literal root.
+
+### Security
+- `event-listener` 5.4.1 → 5.4.2 (RUSTSEC-2026-0221). Transitive; lockfile-only.
+
 ## [0.19.28] - 2026-07-28
 
 ### Fixed

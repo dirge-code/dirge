@@ -148,7 +148,7 @@ impl Tool for WriteTodoList {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: "write_todo_list".to_string(),
-            description: "Lay out or update a structured plan for a COMPLEX, MULTI-STEP task. Each item is a tracked issue on your persistent board (the same board the `issue` tool and /issues use), scoped to this session. Listing an item creates it or updates a matching one by title (matched case/whitespace-insensitively); statuses follow the issue lifecycle (pending|in_progress|completed|cancelled, plus blocked). Items you omit are NOT auto-closed — to finish one, restate it with status completed (or cancelled), or close it by id with the `issue` tool (action=close). The loop nudges you to finish or close open items before ending a turn. Use the `issue` tool for incremental single-item edits or cross-session work. Skip this for trivial single-step work; use `task` to delegate independent work to a background subagent.".to_string(),
+            description: "Lay out or update a structured plan for a COMPLEX, MULTI-STEP task — work that takes several distinct steps, not several tool calls for one step.\n\nDo NOT use this for single-step work, for questions, or as a step toward changing a file. Writing a plan is not doing the work: to create or change a file, call `write` or `edit`. \"Add a hello-world script\" is one edit — just make it.\n\nEach item is a tracked issue on this session's board (shared with the `issue` tool). Listing an item creates it or updates a matching one by title (case/whitespace-insensitive); statuses are pending|in_progress|completed|cancelled|blocked. Keep exactly ONE item in_progress. Omitted items are NOT auto-closed — restate one as completed/cancelled to close it. Use `issue` for single-item or cross-session edits, `task` to delegate independent work to a background subagent.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -236,6 +236,44 @@ impl Tool for WriteTodoList {
         Ok(format!(
             "Synced {applied} item(s) to the board; {live} live item(s) now on this session's board."
         ))
+    }
+}
+
+#[cfg(test)]
+mod description_tests {
+    use super::*;
+    use rig::tool::Tool;
+
+    /// dirge-5xvn (GH #734): the description has to carry its own
+    /// when-NOT-to-use guidance. The board semantics used to fill the first
+    /// 700 characters and the single "skip this" clause landed last, so a
+    /// small model weighing 34 tools read it as "planning tool, always
+    /// applicable" and called it in place of `write`. Negative guidance goes
+    /// up front, with a concrete counter-example.
+    #[tokio::test]
+    async fn description_says_when_not_to_use_and_names_the_write_tool() {
+        let tool = WriteTodoList::new(PathBuf::from("/tmp/none.db"), None, None, None);
+        let desc = tool.definition(String::new()).await.description;
+        let lower = desc.to_lowercase();
+
+        assert!(
+            lower.contains("do not use") || lower.contains("don't use"),
+            "must carry an explicit when-NOT-to-use rule: {desc}"
+        );
+        assert!(
+            lower.contains("write") && lower.contains("edit"),
+            "must point at the tools that do the actual work: {desc}"
+        );
+        // The negative guidance has to be early enough to survive a small
+        // model's attention, not buried after the board mechanics.
+        let skip_at = lower
+            .find("do not use")
+            .or_else(|| lower.find("don't use"))
+            .expect("checked above");
+        assert!(
+            skip_at < 400,
+            "when-NOT-to-use must come early (found at {skip_at}): {desc}"
+        );
     }
 }
 

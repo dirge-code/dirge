@@ -4563,6 +4563,165 @@ async fn todo_gate_fires_on_file_edit_turn_with_unfinished_todos() {
     );
 }
 
+/// dirge-u1ay (GH #734): a turn that wrote a todo list and did nothing else
+/// must be nudged back to the work. `write_todo_list` is not an Edit
+/// operation, so the `turn_made_file_edits` precondition left exactly the
+/// reported failure — model plans, model stops, nothing on disk — as the one
+/// case with no backstop. The wording has to push toward the edit, not toward
+/// another round of list maintenance.
+#[tokio::test]
+async fn todo_gate_fires_on_a_plan_only_turn() {
+    let _g = seed_open_todos(2);
+    let config = build_config();
+
+    let new_messages = vec![
+        assistant_calling("write_todo_list"),
+        assistant_text("I have laid out the plan."),
+    ];
+    assert!(
+        !turn_made_file_edits(&new_messages),
+        "fixture: planning is not a file edit"
+    );
+
+    let mut critic_done = true;
+    let mut code_review_reacts = 0u8;
+    let mut goal_reacts = 0u8;
+    let mut todo_nudges = 0u8;
+    let mut resume_nudges: u8 = 0;
+    let (emit, _emit_rx) = tokio::sync::mpsc::channel(64);
+
+    let (msgs, source) = poll_finalization_follow_up(
+        &config,
+        "sys",
+        &new_messages,
+        &mut critic_done,
+        &mut code_review_reacts,
+        &mut None::<u64>,
+        &mut None::<String>,
+        None,
+        &mut goal_reacts,
+        &mut todo_nudges,
+        &mut resume_nudges,
+        GateMode::Off,
+        None,
+        None,
+        &mut 0u8,
+        &mut 0u8,
+        &emit,
+    )
+    .await;
+
+    assert_eq!(source, FollowUpSource::Todo);
+    assert_eq!(todo_nudges, 1, "plan-only turn spends a nudge");
+    let content = match &msgs[0] {
+        LoopMessage::User(u) => u.text_joined(),
+        _ => panic!("expected User message"),
+    };
+    assert!(
+        content.starts_with(crate::agent::agent_loop::run::TODO_NUDGE_TAG),
+        "expected [todo] tag, got: {content}"
+    );
+    assert!(
+        content.contains("write") || content.contains("edit"),
+        "must point at the tools that do the work, got: {content}"
+    );
+}
+
+/// The plan-only branch is one-shot. `new_messages` accumulates across
+/// finalization re-entries, so the `write_todo_list` call that triggered the
+/// first nudge is still in the list on the next pass — without a one-shot
+/// gate the same text re-enters until the budget drains, spending API
+/// round-trips on a model that already stopped planning. A behavioral nudge
+/// that didn't land once won't land on the third identical repeat.
+#[tokio::test]
+async fn plan_only_nudge_is_one_shot() {
+    let _g = seed_open_todos(2);
+    let config = build_config();
+
+    // The turn that already spent a nudge: planning is still in the history,
+    // and the model answered with prose instead of doing the work.
+    let new_messages = vec![
+        assistant_calling("write_todo_list"),
+        assistant_text("I have laid out the plan."),
+        assistant_text("Still just planning."),
+    ];
+
+    let mut critic_done = true;
+    let mut code_review_reacts = 0u8;
+    let mut goal_reacts = 0u8;
+    let mut todo_nudges = 1u8; // one already spent
+    let mut resume_nudges: u8 = 0;
+    let (emit, _emit_rx) = tokio::sync::mpsc::channel(64);
+
+    let (msgs, source) = poll_finalization_follow_up(
+        &config,
+        "sys",
+        &new_messages,
+        &mut critic_done,
+        &mut code_review_reacts,
+        &mut None::<u64>,
+        &mut None::<String>,
+        None,
+        &mut goal_reacts,
+        &mut todo_nudges,
+        &mut resume_nudges,
+        GateMode::Off,
+        None,
+        None,
+        &mut 0u8,
+        &mut 0u8,
+        &emit,
+    )
+    .await;
+
+    assert_eq!(source, FollowUpSource::None, "must not nudge twice");
+    assert!(msgs.is_empty());
+    assert_eq!(todo_nudges, 1, "budget untouched by the repeat");
+}
+
+/// The plan-only branch must not resurrect the nagging that the
+/// `turn_made_file_edits` precondition was introduced to stop: a read-only
+/// Q&A turn with stale cross-turn todos still gets nothing.
+#[tokio::test]
+async fn todo_gate_still_skips_readonly_turn_that_wrote_no_todos() {
+    let _g = seed_open_todos(2);
+    let config = build_config();
+
+    let new_messages = vec![assistant_calling("grep"), assistant_text("Here's why.")];
+
+    let mut critic_done = true;
+    let mut code_review_reacts = 0u8;
+    let mut goal_reacts = 0u8;
+    let mut todo_nudges = 0u8;
+    let mut resume_nudges: u8 = 0;
+    let (emit, _emit_rx) = tokio::sync::mpsc::channel(64);
+
+    let (msgs, source) = poll_finalization_follow_up(
+        &config,
+        "sys",
+        &new_messages,
+        &mut critic_done,
+        &mut code_review_reacts,
+        &mut None::<u64>,
+        &mut None::<String>,
+        None,
+        &mut goal_reacts,
+        &mut todo_nudges,
+        &mut resume_nudges,
+        GateMode::Off,
+        None,
+        None,
+        &mut 0u8,
+        &mut 0u8,
+        &emit,
+    )
+    .await;
+
+    assert_eq!(source, FollowUpSource::None);
+    assert!(msgs.is_empty(), "no nudge without todo writes or edits");
+    assert_eq!(todo_nudges, 0, "todo budget untouched");
+}
+
 /// dirge-8v98: the unified judge re-enters the loop on a review finding even
 /// when the completeness verdict is COMPLETE — the exact case the old
 /// display-only advisory swallowed. One-shot in Advisory/Off, so `critic_done`

@@ -105,7 +105,7 @@ Available tools:
 pub const TODO_TOOLS_PROMPT: &str = "\
 - write_todo_list: Lay out or update a multi-step plan; each item is a tracked issue on your persistent board (same board as the `issue` tool), matched by title (case/whitespace-insensitive). Items go on your ACTIVE work queue — you are nudged to finish or close them before stopping. Use it for complex multi-step tasks. Items you omit aren't auto-closed — restate an item as completed/cancelled to close it.
 - issue board: Two buckets — ACTIVE (your session's picked-up issues, shown in the panel and nudged) and BACKLOG (unassigned issues filed for later, not worked automatically). `issue create` files an issue to the passive backlog (use epic=<id> to group under a parent epic, `issue show <id>` to see an epic's children). `issue start <id>` picks a backlog issue up onto your active queue. Closed issues drop off both.
-- Work tracking: When you begin a non-trivial task, put it on your active list first — `write_todo_list` it (or `issue start` a backlog item) — and mark the item you're actively working on `in_progress`. Keep exactly ONE item in_progress at a time, and mark it completed the moment it's done, so your active list always reflects what you're doing now.";
+- Work tracking: Track work that genuinely spans several distinct steps — `write_todo_list` it (or `issue start` a backlog item), keep exactly ONE item in_progress at a time, and mark it completed the moment it's done, so your active list always reflects what you're doing now. Skip tracking for single-step work and for questions: a task you can finish in one edit does not need a list. Tracking never substitutes for doing the work — when the next step is to change a file, call `write` or `edit`, not `write_todo_list`.";
 
 /// Heading + lead-in injected into the agent preamble when the project
 /// has discoverable skills. The bullet list of skills is appended after
@@ -189,7 +189,7 @@ pub const SESSION_SEARCH_GUIDANCE: &str = "\n\n## Past-session recall\n\n\
 /// always-on set of tools ships every turn and the rest must be
 /// discovered via `tool_search`.
 pub const DYNAMIC_TOOL_SEARCH_PROMPT: &str = "\
-Many tools are not loaded by default. Call `tool_search` with a query to discover and load relevant tools — they'll be available on the next turn. Always-on tools (write_todo_list, task_status) are shipped every turn and need no discovery.";
+Many tools are not loaded by default. Call `tool_search` with a query to discover and load relevant tools — they'll be available on the next turn. The core tools (read, write, edit, bash, grep, glob, list_dir, write_todo_list, task_status) ship every turn and need no discovery.";
 
 /// "Code mode" rubric, appended to the preamble only when
 /// `config.code_mode_rubric` is on (default off). Nudges the model to
@@ -540,6 +540,29 @@ mod tests {
         assert!(
             p.contains("case/whitespace-insensitive"),
             "must note case insensitivity: {p}"
+        );
+    }
+
+    /// dirge-5xvn (GH #734): the work-tracking guidance must not order the
+    /// model to file a todo BEFORE doing the work. Read literally by a small
+    /// local model, "put it on your list first" makes writing the list the
+    /// compliant first action, and the actual edit never happens. Tracking is
+    /// worth doing on genuinely multi-step work and worth skipping otherwise —
+    /// say that instead of imposing an ordering.
+    #[test]
+    fn todo_tools_prompt_does_not_order_tracking_before_the_work() {
+        let p = TODO_TOOLS_PROMPT.to_lowercase();
+        assert!(
+            !p.contains("first"),
+            "must not make tracking the mandated first action: {TODO_TOOLS_PROMPT}"
+        );
+        assert!(
+            p.contains("skip") || p.contains("don't"),
+            "must tell the model when NOT to track: {TODO_TOOLS_PROMPT}"
+        );
+        assert!(
+            p.contains("do the work") || p.contains("doing the work"),
+            "must say tracking never substitutes for the work: {TODO_TOOLS_PROMPT}"
         );
     }
 }

@@ -20,6 +20,7 @@ pub fn apply_prompt_deny(perm: &Option<checker::PermCheck>, deny: &[String]) {
         let mut guard = p.lock_ignore_poison();
         guard.set_prompt_deny_tools(deny.to_vec());
     }
+    *PROMPT_DENIED_TOOLS.lock_ignore_poison() = deny.to_vec();
     #[cfg(feature = "experimental-ui-computer-use")]
     {
         if let Some(pm) = crate::plugin::hook::global() {
@@ -29,6 +30,26 @@ pub fn apply_prompt_deny(perm: &Option<checker::PermCheck>, deny: &[String]) {
         // Without the `plugin` feature, the global is never set — no-op.
     }
 }
+
+/// The active prompt's `deny_tools`, mirrored out of the permission checker
+/// so the request builder can drop those tool definitions before they ship
+/// (dirge-41al). Process-global for the same reason the todo mirror is: the
+/// stream factory is built once and has no handle on the checker, while
+/// `/prompt` can swap the deny list at any point mid-session.
+///
+/// A prompt deny is a hard refusal — it holds even under `--yolo` — so a
+/// denied tool's schema is pure cost: tokens spent advertising a call the
+/// model will only ever have rejected.
+///
+/// Matching is by bare name and by the qualified `mcp_tool:<server>:<name>`
+/// form's trailing segment; see
+/// [`crate::agent::agent_loop::rig_stream_factory::retain_tool_defs`]. The
+/// `mcp_tool` / `plugin_tool` umbrellas are deliberately not expanded there —
+/// a `ToolDefinition` carries only a name, so nothing distinguishes an
+/// MCP-exported tool from a built-in, and guessing would hide the wrong ones.
+/// They stay enforced at the permission layer: withholding a definition is an
+/// optimization on top of enforcement, never a substitute for it.
+pub static PROMPT_DENIED_TOOLS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
 #[allow(unused_imports)]
 use crate::sync_util::LockExt;

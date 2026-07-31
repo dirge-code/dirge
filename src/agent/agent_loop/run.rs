@@ -238,6 +238,21 @@ fn todo_nudge_message(unfinished: usize) -> LoopMessage {
     )))
 }
 
+/// The plan-only variant of the nudge (dirge-u1ay): the turn wrote a todo
+/// list and touched no files. Deliberately worded away from list maintenance
+/// — the failure it catches is a model that answers "do the work" with
+/// another `write_todo_list` call, so re-reading this must not read as an
+/// invitation to restate the plan.
+fn plan_only_nudge_message(unfinished: usize) -> LoopMessage {
+    LoopMessage::User(super::message::UserMessage::text(format!(
+        "{TODO_NUDGE_TAG} You planned {unfinished} item{} this turn but changed no files. \
+         The plan is not the work — start the first item now with `write` / `edit` \
+         (or `bash` if it's a command). Do not call write_todo_list again until \
+         something is actually done.",
+        if unfinished == 1 { "" } else { "s" }
+    )))
+}
+
 /// True when the model's most recent action was a FAILED tool call and it
 /// then stopped: the tail of the run is a contiguous group of ToolResult
 /// messages containing at least one `is_error == true`, immediately
@@ -586,11 +601,33 @@ async fn poll_finalization_follow_up(
     //    every time the user interrupts to ask something. (A Q&A turn that
     //    greps and reads still trips `run_made_tool_calls`, so that's the wrong
     //    predicate here.)
-    if *todo_nudges < MAX_TODO_NUDGES && turn_made_file_edits(new_messages) {
-        let unfinished = crate::agent::tools::todo::unfinished_count();
-        if unfinished > 0 {
-            *todo_nudges += 1;
-            return (vec![todo_nudge_message(unfinished)], FollowUpSource::Todo);
+    //    dirge-u1ay (GH #734): the edit precondition also excluded the one
+    //    case with no other backstop — a turn that wrote a todo list and did
+    //    nothing else. `write_todo_list` isn't an Edit operation, so "model
+    //    plans, model stops, nothing on disk" finalized silently. Planning
+    //    THIS turn is as good a signal of unfinished own-work as editing is,
+    //    and it can't drag an interrupting Q&A into stale todos (a Q&A turn
+    //    writes no list), so it gets its own branch with wording that points
+    //    at the edit rather than at the list.
+    //    The plan-only branch is ONE-SHOT (`*todo_nudges == 0`), unlike the
+    //    edit branch's budget of MAX_TODO_NUDGES: `new_messages` accumulates
+    //    across re-entries, so the triggering `write_todo_list` call stays in
+    //    the list and the condition would hold on every later pass. A
+    //    behavioral nudge that didn't land the first time doesn't land on the
+    //    third identical repeat — it just spends round-trips.
+    if *todo_nudges < MAX_TODO_NUDGES {
+        let edited = turn_made_file_edits(new_messages);
+        if edited || (*todo_nudges == 0 && turn_wrote_todos(new_messages)) {
+            let unfinished = crate::agent::tools::todo::unfinished_count();
+            if unfinished > 0 {
+                *todo_nudges += 1;
+                let msg = if edited {
+                    todo_nudge_message(unfinished)
+                } else {
+                    plan_only_nudge_message(unfinished)
+                };
+                return (vec![msg], FollowUpSource::Todo);
+            }
         }
     }
     // 5. dirge-ksjl — open-issues gate: nudge when this session left issues
@@ -2651,6 +2688,20 @@ fn turn_made_file_edits(new_messages: &[LoopMessage]) -> bool {
         }
     }
     false
+}
+
+/// Did any assistant turn this finalization cycle call `write_todo_list`?
+/// Distinguishes "planned this turn" from the cross-turn
+/// `todo::unfinished_count()` global, so the plan-only nudge fires on a turn
+/// that produced a list and nothing else, and never on a turn that merely
+/// inherited someone else's open items.
+fn turn_wrote_todos(new_messages: &[LoopMessage]) -> bool {
+    new_messages.iter().any(|msg| {
+        matches!(msg, LoopMessage::Assistant(a)
+            if extract_tool_calls_from(a)
+                .iter()
+                .any(|tc| tc.name == "write_todo_list"))
+    })
 }
 
 /// Did this run actually use tools? Gates the F6 critic so pure Q&A turns
