@@ -93,6 +93,124 @@ pub type CriticFn = Arc<
     dyn Fn(String) -> Pin<Box<dyn Future<Output = anyhow::Result<String>> + Send>> + Send + Sync,
 >;
 
+/// Judge callback that returns the INDEX of a chosen option, never prose
+/// (dirge-5mtx.3). The caller supplies a closed answer set as a `&'static`
+/// slice; the judge is constrained to emit exactly one member, and the result
+/// comes back as an index — so there is no free-text verdict to misread. This
+/// is the §7 split (classify and respond as separate calls) applied to a
+/// genuinely binary question: the next consumer is dirge-5mtx.4's
+/// blocked-vs-next-step gate.
+pub type ClassifyFn = Arc<
+    dyn Fn(
+            String,
+            &'static [&'static str],
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<usize>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Classify a judge response against a fixed answer set. Matches each option
+/// as a WHOLE WORD, case-insensitively — the same regex/word-boundary
+/// discipline the verdict tokens use (dirge-5mtx), so an option named `MET`
+/// does NOT match inside `UNMET`. Bare `contains` is exactly the trap that
+/// produced dirge-5mtx.3 and is deliberately not used.
+///
+/// Returns the index of the single option that matched, or:
+/// - `None` when NO option matched (no answer), and
+/// - `None` when MORE THAN ONE distinct option matched (ambiguous).
+///
+/// Ambiguity is a non-answer on purpose: a confused judge must be visible to
+/// the caller as a non-answer so it can fall back, never silently resolved by
+/// position or first-match. Repetition of the SAME option is not ambiguity.
+///
+/// # Precondition
+/// No option may be a (case-insensitive) substring of another — overlapping
+/// answer sets are the hazard this function exists to remove. Checked by a
+/// `debug_assert` so a competing set fails loudly in tests rather than
+/// silently misclassifying. Pick non-nesting members (e.g. `MET / SHORT`, not
+/// `MET / UNMET`).
+pub fn parse_choice(response: &str, options: &[&str]) -> Option<usize> {
+    debug_assert!(
+        !options_overlap(options),
+        "parse_choice: answer-set members must not be substrings of one another (dirge-5mtx.3)"
+    );
+    let mut found: Option<usize> = None;
+    for (i, opt) in options.iter().enumerate() {
+        if whole_word_present(response, opt) {
+            if found.is_some() {
+                return None; // a second DISTINCT option matched → ambiguous, not first-wins
+            }
+            found = Some(i);
+        }
+    }
+    found
+}
+
+/// Whether `needle` appears in `haystack` as a whole word, case-insensitively.
+/// `\b` stops `MET` from matching inside `UNMET`; `(?i)` matches any casing
+/// without upper-casing both sides. Escaped so option text (e.g. `next-step`)
+/// is matched literally, not as a regex.
+fn whole_word_present(haystack: &str, needle: &str) -> bool {
+    let pattern = format!(r"(?i)\b{}\b", regex::escape(needle));
+    // `regex::escape` guarantees a valid pattern; the only fixed wrapper is
+    // `\b`, so this cannot fail.
+    Regex::new(&pattern)
+        .expect("escaped word-boundary pattern is always valid")
+        .is_match(haystack)
+}
+
+/// `true` when some option is a (case-insensitive) substring of another — i.e.
+/// the answer set nests, which is a caller bug (dirge-5mtx.3). Substring
+/// subsumes whole-word match, so this single check covers both failure modes.
+fn options_overlap(options: &[&str]) -> bool {
+    for (i, a) in options.iter().enumerate() {
+        for (j, b) in options.iter().enumerate() {
+            if i != j && a.to_lowercase().contains(&b.to_lowercase()) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// System preamble for the classify judge (dirge-5mtx.3). Minimal on purpose:
+/// the constraint that actually matters — answer with exactly one option word
+/// — lives in the user prompt ([`classify_prompt`]), right next to the
+/// question. A heavy system role would invite the very prose this exists to
+/// suppress. Passed as the LLM system prompt by `build_classify_fn`.
+pub const CLASSIFY_PREAMBLE: &str = "\
+You answer a single question by choosing exactly one option from a fixed set. Reply with that one \
+option word and nothing else — no reasoning, no punctuation, no extra text.";
+
+/// Build the constrained classify user prompt: states the question, names every
+/// option, and demands the answer be EXACTLY one of them, nothing else. Kept
+/// short — a long preamble invites prose, and prose is what [`parse_choice`]
+/// then has to dig an option word out of (dirge-5mtx.3).
+pub fn classify_prompt(question: &str, options: &[&str]) -> String {
+    let list = options
+        .iter()
+        .map(|o| format!("`{o}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "{question}\n\nAnswer with EXACTLY ONE of these words and nothing else: {list}.\n\
+         Do not add explanation, punctuation, or any other text."
+    )
+}
+
+/// The retry prompt: a terser restatement used when [`parse_choice`] already
+/// failed once (the model hedged in prose or emitted no option word). The
+/// question context already reached the model on the first call, so the retry
+/// only needs to re-deny prose and re-state the options.
+pub(crate) fn classify_retry_prompt(options: &[&str]) -> String {
+    let list = options
+        .iter()
+        .map(|o| format!("`{o}`"))
+        .collect::<Vec<_>>()
+        .join(" / ");
+    format!("Reply with a single word — one of: {list}. Nothing else.")
+}
+
 /// Tag prefixed onto the critic's injected follow-up message. The agent
 /// loop re-enters it as a user-role message (so the model acts on it); the
 /// UI keys on this tag to render it under a distinct `<critic>` handle and
@@ -1183,5 +1301,83 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── dirge-5mtx.3: ClassifyFn answer-set matching ──────────────────────
+
+    /// Exactly one option present → its index, for EACH position in the set.
+    #[test]
+    fn parse_choice_single_match_each_index() {
+        let opts = ["BLOCKED", "NEXT", "DONE"];
+        assert_eq!(parse_choice("BLOCKED", &opts), Some(0));
+        assert_eq!(parse_choice("the run is BLOCKED on the user", &opts), Some(0));
+        assert_eq!(parse_choice("NEXT", &opts), Some(1));
+        assert_eq!(parse_choice("offering a NEXT step", &opts), Some(1));
+        assert_eq!(parse_choice("DONE", &opts), Some(2));
+    }
+
+    /// Case-insensitive and whole-word: `MET` must NOT match inside `UNMET`.
+    /// This is the exact hazard that produced dirge-5mtx.3 — the overlap is
+    /// why a non-nesting answer set (`MET / SHORT`) is required in practice.
+    #[test]
+    fn parse_choice_case_insensitive_and_whole_word() {
+        let opts = ["MET", "SHORT"];
+        assert_eq!(parse_choice("met", &opts), Some(0));
+        assert_eq!(parse_choice("Met.", &opts), Some(0));
+        assert_eq!(parse_choice("goal is met", &opts), Some(0));
+        assert_eq!(parse_choice("SHORT", &opts), Some(1));
+        assert_eq!(parse_choice("short by a lot", &opts), Some(1));
+        assert_eq!(parse_choice("the goal is not satisfied", &opts), None);
+        // Demonstrate the trap the precondition guards against: with an
+        // overlapping set, `MET` would match inside `UNMET`. We assert the
+        // debug-check catches it rather than asserting parse_choice behaviour
+        // on an invalid set, so the test documents the precondition.
+        let bad = ["MET", "UNMET"];
+        assert!(options_overlap(&bad));
+    }
+
+    /// Two DIFFERENT options present → `None` (ambiguous, not first-wins).
+    #[test]
+    fn parse_choice_two_distinct_options_is_ambiguous() {
+        let opts = ["BLOCKED", "NEXT", "DONE"];
+        assert_eq!(parse_choice("BLOCKED and then DONE", &opts), None);
+        assert_eq!(parse_choice("NEXT not DONE", &opts), None);
+    }
+
+    /// No option present → `None`.
+    #[test]
+    fn parse_choice_no_match() {
+        let opts = ["BLOCKED", "NEXT"];
+        assert_eq!(parse_choice("", &opts), None);
+        assert_eq!(parse_choice("the assistant is waiting", &opts), None);
+        assert_eq!(parse_choice("COMPLETELY unrelated prose", &opts), None);
+    }
+
+    /// An option appearing twice → still that index (repetition is not
+    /// ambiguity).
+    #[test]
+    fn parse_choice_repeated_option_not_ambiguous() {
+        let opts = ["BLOCKED", "NEXT"];
+        assert_eq!(parse_choice("BLOCKED, yes BLOCKED", &opts), Some(0));
+        assert_eq!(parse_choice("NEXT NEXT NEXT", &opts), Some(1));
+    }
+
+    /// The prompt builder names EVERY option, so the judge sees the full set.
+    #[test]
+    fn classify_prompt_names_every_option() {
+        let prompt = classify_prompt("Is the agent blocked?", &["BLOCKED", "NEXT"]);
+        assert!(prompt.contains("BLOCKED"));
+        assert!(prompt.contains("NEXT"));
+        assert!(prompt.contains("Is the agent blocked?"));
+        assert!(prompt.contains("EXACTLY ONE"));
+    }
+
+    /// The retry prompt also names every option (the last chance to steer the
+    /// model back to the set before the callback errors).
+    #[test]
+    fn classify_retry_prompt_names_every_option() {
+        let prompt = classify_retry_prompt(&["BLOCKED", "NEXT"]);
+        assert!(prompt.contains("BLOCKED"));
+        assert!(prompt.contains("NEXT"));
     }
 }

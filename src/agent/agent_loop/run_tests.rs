@@ -137,6 +137,7 @@ fn build_config() -> LoopConfig {
         progress: None,
         verifier: None,
         critic_fn: None,
+        classify_fn: None,
         code_review_fn: None,
         code_review_mode: crate::agent::agent_loop::types::CodeReviewMode::default(),
         code_review_repo: None,

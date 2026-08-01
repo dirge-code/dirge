@@ -466,6 +466,15 @@ pub async fn build_agent(
                                 "critic",
                                 judge_preamble,
                             ));
+                            // dirge-5mtx.3b: closed-answer-set judge, same
+                            // client and model. Armed whenever the critic is,
+                            // since it is the same provider being asked an
+                            // easier question. dirge-5mtx.4 is its first
+                            // consumer.
+                            agent = agent.with_classify_fn(build_classify_fn(
+                                client.clone(),
+                                model_name.clone(),
+                            ));
                             // The standalone code-review judge stays armed only
                             // for the manual `/review` command (which runs the
                             // dedicated two-pass reviewer). `critic: false`
@@ -703,6 +712,56 @@ fn build_escalation_stream_fn(
 /// and the goal gate (its own `GOAL_PREAMBLE`) — the two share one
 /// connection while judging under independent preambles. No tools — the
 /// judge only reads a transcript and returns a verdict.
+/// dirge-5mtx.3b: build a [`ClassifyFn`] over a shared client + model.
+///
+/// Mirrors [`build_judge_fn`] — one connection, no tools — but asks a closed
+/// question and returns the INDEX of the chosen option rather than prose. The
+/// caller never parses free text, which is the whole point: the verdict bugs
+/// this epic started from were all prose-parsing bugs.
+///
+/// `parse_choice` returns `None` for an ambiguous answer (two different
+/// options present) as well as for no match, and both get ONE terser retry
+/// before erroring. Retrying an ambiguous answer is worth it — a judge that
+/// wrote a sentence usually names one option when told again to answer with
+/// the bare word — but retrying forever is not, and an error lets the caller
+/// fall back to whatever it did before.
+fn build_classify_fn(
+    client: std::sync::Arc<AnyClient>,
+    model_name: String,
+) -> crate::agent::agent_loop::critic::ClassifyFn {
+    std::sync::Arc::new(move |question: String, options: &'static [&'static str]| {
+        let client = client.clone();
+        let model_name = model_name.clone();
+        Box::pin(async move {
+            use crate::agent::agent_loop::critic::{
+                CLASSIFY_PREAMBLE, classify_prompt, classify_retry_prompt, parse_choice,
+            };
+            let preamble: std::sync::Arc<str> = std::sync::Arc::from(CLASSIFY_PREAMBLE);
+            let model = client.completion_model(model_name);
+            let prompt = classify_prompt(&question, options);
+            let raw = summarize::oneshot_with_model(
+                model.clone(),
+                "classify",
+                &preamble,
+                prompt,
+            )
+            .await?;
+            if let Some(idx) = parse_choice(&raw, options) {
+                return Ok(idx);
+            }
+            let retry = classify_retry_prompt(options);
+            let raw2 =
+                summarize::oneshot_with_model(model, "classify-retry", &preamble, retry).await?;
+            parse_choice(&raw2, options).ok_or_else(|| {
+                anyhow::anyhow!("classifier did not choose one of {options:?}")
+            })
+        })
+            as std::pin::Pin<
+                Box<dyn std::future::Future<Output = anyhow::Result<usize>> + Send>,
+            >
+    })
+}
+
 fn build_judge_fn(
     client: std::sync::Arc<AnyClient>,
     model_name: String,

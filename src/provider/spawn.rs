@@ -273,6 +273,9 @@ impl AnyAgent {
         cfg.safe_state_abort_mode = self.safe_state_abort_mode;
         cfg.session_id = self.session_id.clone();
         cfg.goal_fn = self.goal_fn.clone();
+        // dirge-5mtx.3: classify judge. No consumer in run.rs yet —
+        // dirge-5mtx.4 is the first caller.
+        cfg.classify_fn = self.classify_fn.clone();
         // Goal gate stop condition (`--goal`). Engages only when
         // `goal_fn` above is also present (it's the judge).
         cfg.goal = self.goal.clone();

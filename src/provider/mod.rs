@@ -153,6 +153,13 @@ pub struct AnyAgent {
     /// same critic provider as `critic_fn` but baking its own
     /// `GOAL_PREAMBLE`; forwarded to `LoopConfig.goal_fn`. `None` = off.
     goal_fn: Option<crate::agent::agent_loop::critic::CriticFn>,
+    /// dirge-5mtx.3: classify judge. Built at `build_agent` time from the
+    /// same critic provider/client as `critic_fn`/`goal_fn`, but under
+    /// `CLASSIFY_PREAMBLE` and a constrained prompt; forwarded to
+    /// `LoopConfig.classify_fn`. `None` = off (default; no consumer yet —
+    /// dirge-5mtx.4 is the first caller).
+    #[allow(dead_code)]
+    classify_fn: Option<crate::agent::agent_loop::critic::ClassifyFn>,
     /// Goal gate: optional natural-language stop condition for autonomous
     /// runs (`--goal`). Forwarded to `LoopConfig.goal`; active only when a
     /// `goal_fn` (the judge) is also present. `None` = off (default).
@@ -347,6 +354,7 @@ impl AnyAgent {
             session_id: None,
             goal_fn: None,
             goal: None,
+            classify_fn: None,
             summarize_fn: None,
             context_depth_reminder_threshold: None,
             progress_stall_threshold: None,
@@ -591,6 +599,19 @@ impl AnyAgent {
     /// independent of any critic preamble override or `critic: false` prompt.
     pub fn with_goal_fn(mut self, goal_fn: crate::agent::agent_loop::critic::CriticFn) -> Self {
         self.goal_fn = Some(goal_fn);
+        self
+    }
+
+    /// dirge-5mtx.3: attach the classify judge. Built from the same critic
+    /// provider/client as `critic_fn`/`goal_fn` but under
+    /// `CLASSIFY_PREAMBLE` and a constrained prompt, so it returns an option
+    /// INDEX instead of prose. First consumer is dirge-5mtx.4.
+    #[allow(dead_code)]
+    pub fn with_classify_fn(
+        mut self,
+        classify_fn: crate::agent::agent_loop::critic::ClassifyFn,
+    ) -> Self {
+        self.classify_fn = Some(classify_fn);
         self
     }
 
