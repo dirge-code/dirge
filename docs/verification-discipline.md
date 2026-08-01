@@ -5,8 +5,8 @@ check *ran*, reported success, and could not have failed for the reason that
 mattered.
 
 Every one came out of building the loop-control work in `dirge-5mtx`, and not
-from looking for them. Five distinct failures surfaced during that work; all
-five were verification failures, none was a steering failure. That ratio is the
+from looking for them. Six distinct failures surfaced during that work; all six
+were verification failures, none was a steering failure. That ratio is the
 reason this page exists as its own document rather than a paragraph in
 [agent-loop.md](agent-loop.md).
 
@@ -22,7 +22,7 @@ reason this page exists as its own document rather than a paragraph in
 
 ## The pattern
 
-Five failures, one shape:
+Six failures, one shape:
 
 | | What happened |
 |---|---|
@@ -31,8 +31,17 @@ Five failures, one shape:
 | Status masked | `cargo clippy \| tail -2` reported zero, because that zero was `tail`'s |
 | Can't discriminate | An A/B with no arm overrides "passed" while shipping a broken multi-value parser — neither path was exercised |
 | Mechanism unconfirmed | Arms compared on outcomes without checking whether the code under test ever ran. It hadn't |
+| Partial gate set | clippy and the suite were green for the whole epic on a branch that failed `cargo fmt --all --check` in 31 places |
 
 A gate that cannot fail is worse than no gate, because it is trusted.
+
+The last row is the one to take seriously, because it happened on the branch
+that added this page, after everything above it had already shipped. The
+tooling was not at fault: this repo's CI advisory already names `cargo fmt
+--all --check`, so a model verifying here is told about it. A human ran clippy
+and the tests instead, every time, and both were honestly green. Which is the
+point — **a single-command gate is a habit, not a design**, and no amount of
+knowing better substitutes for running the whole set.
 
 ## Project gate (`verification_command`)
 

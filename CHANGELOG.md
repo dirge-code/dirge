@@ -9,8 +9,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 - **Verification discipline** — a set of loop and tooling changes with one thing
   in common: a check *ran*, reported success, and could not have failed for the
-  reason that mattered. All five failures found while building this came from
-  doing the work, not from looking for them; all five were verification
+  reason that mattered. All six failures found while building this came from
+  doing the work, not from looking for them; all six were verification
   failures, none was a steering failure. See
   [docs/verification-discipline.md](docs/verification-discipline.md).
 
@@ -47,7 +47,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   delta inside that is reported `~noise`), and an explicit warning that a
   single-model result is not evidence.
 
+### Changed
+- **Gate lifecycle state collapsed into `GateStates`** (dirge-5mtx.5).
+  `poll_finalization_follow_up` took seventeen positional arguments, nine of
+  them `&mut` counters, behind an `allow(clippy::too_many_arguments)`; it now
+  takes one state struct plus a borrow of the read-only inputs, and the allow
+  is gone. Behaviour-preserving — both structs are destructured at the top, so
+  the gate bodies are unchanged. The value is that every gate's re-fire state
+  now sits in one place, each labelled cost-ceiling (bounds LLM spend, stays)
+  or re-fire-guard (compensates for a predicate that can't tell "happened"
+  from "happened and I already reacted"). Relaxing any budget remains
+  descoped: at a ~2x noise floor that claim is not measurable.
+
 ### Fixed
+- **The branch failed `cargo fmt --all --check`** in 31 places across the eight
+  files this work touched, while `clippy -D warnings` and the test suite were
+  green throughout. CI runs rustfmt as its own job. Recorded as the sixth row
+  of the pattern table, since it is the only one observed *after* the
+  mitigation for its own family shipped.
 - **Masked commands latched a false green** (dirge-w2de). `cargo test || true`,
   `cargo clippy | tail -2` and `cargo test; echo done` all recorded
   `VerifiedGreen` — the exit status belonged to `true`, to `tail`, to the
