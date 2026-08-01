@@ -1056,6 +1056,50 @@ impl Drop for DialogPendingGuard {
     }
 }
 
+/// What `eval_with_timeout` does when a wait slice expires without a reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimeoutAction {
+    /// A dialog is genuinely in flight and the ceiling is not reached — keep
+    /// waiting in small slices.
+    KeepWaiting,
+    /// No dialog pending, or the ceiling reached: report the timeout.
+    GiveUp,
+}
+
+/// Decide whether an expired wait slice should extend or give up [dirge-hwzs].
+///
+/// The base eval timeout is deliberately tight so a hook stuck in a loop
+/// recovers fast, but a hook that opened `harness/confirm` is blocked on a
+/// *human*, who routinely takes longer. Giving up there let the gated tool run
+/// while the confirm was still on screen — a security gate failing OPEN. So an
+/// in-flight dialog extends the wait, bounded by `ceiling` so a genuinely
+/// wedged worker still cannot pin the caller forever.
+///
+/// # Why this is a free function
+///
+/// It used to be an inline `if` inside the recv loop, which meant the only way
+/// to test it was to race a real Janet VM against a wall clock: spawn a
+/// worker, give it a budget short enough that the timeout fires, and hope the
+/// worker reached `harness/confirm` first. That test (dirge-h3dw) flaked twice
+/// on loaded CI, because "time for the worker to reach the dialog" is
+/// scheduler-dependent and has no upper bound. Raising the budget lowers the
+/// failure rate and cannot reach zero — the first fix moved it 100ms → 750ms
+/// and it flaked again.
+///
+/// Pulled out, the decision is a total function of three values and needs no
+/// worker, no VM, and no clock, so the truth table below is exhaustive and
+/// deterministic. What remains genuinely end-to-end — that `dialog_pending` is
+/// actually set while a dialog is in flight — is covered by observing the flag
+/// at the moment the request is received, which is also clock-free because
+/// `DialogPendingGuard::enter` happens-before the request is published.
+fn timeout_action(dialog_active: bool, elapsed: Duration, ceiling: Duration) -> TimeoutAction {
+    if dialog_active && elapsed < ceiling {
+        TimeoutAction::KeepWaiting
+    } else {
+        TimeoutAction::GiveUp
+    }
+}
+
 #[cfg_attr(not(feature = "plugin"), allow(dead_code))]
 pub enum Cmd {
     /// Evaluate Janet code and return its stringified result.
@@ -1208,6 +1252,10 @@ impl Worker {
     /// Variant of `eval` with a caller-provided timeout. Capped at
     /// the global `EVAL_TIMEOUT` so callers can't accidentally
     /// extend the wait.
+    ///
+    /// The decision taken when a wait slice expires lives in
+    /// [`timeout_action`], which is pure and unit-tested — see there for why
+    /// it is not tested through this function.
     pub fn eval_with_timeout(&mut self, code: &str, timeout: Duration) -> Result<String, String> {
         let effective = timeout.min(EVAL_TIMEOUT);
         let (reply, rx) = mpsc::channel();
@@ -1240,17 +1288,21 @@ impl Worker {
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     let dialog_active = self.dialog_pending.load(Ordering::SeqCst) > 0;
-                    if dialog_active && start.elapsed() < dialog_ceiling {
-                        // A confirm/select is awaiting a human — keep
-                        // waiting, polling in small slices so we notice
-                        // promptly when it resolves (or the dialog aborts).
-                        slice = DIALOG_POLL;
-                        continue;
+                    match timeout_action(dialog_active, start.elapsed(), dialog_ceiling) {
+                        TimeoutAction::KeepWaiting => {
+                            // A confirm/select is awaiting a human — keep
+                            // waiting, polling in small slices so we notice
+                            // promptly when it resolves (or the dialog aborts).
+                            slice = DIALOG_POLL;
+                            continue;
+                        }
+                        TimeoutAction::GiveUp => {
+                            return Err(format!(
+                                "janet worker did not reply within {}s — plugin may be stuck in an infinite loop",
+                                start.elapsed().as_secs(),
+                            ));
+                        }
                     }
-                    return Err(format!(
-                        "janet worker did not reply within {}s — plugin may be stuck in an infinite loop",
-                        start.elapsed().as_secs(),
-                    ));
                 }
             }
         }
@@ -2640,63 +2692,109 @@ mod tests {
         helper.join().unwrap();
     }
 
-    /// dirge-hwzs: a hook that opens `harness/confirm` blocks on a human,
-    /// who takes longer than the tight per-hook eval budget. The eval must
-    /// keep waiting while the dialog is in flight (up to the dialog budget)
-    /// instead of giving up at the base timeout — otherwise the caller
-    /// (`dispatch_tool_hook`) sees no block and runs the gated tool while
-    /// the confirm is still on screen. Here the answer arrives well after
-    /// the 100 ms base timeout; the in-flight dialog must extend the wait.
-    /// The base budget must comfortably exceed the time the worker needs to
-    /// go from `Cmd::Eval` to entering `harness/confirm`, because the
-    /// extension only engages if `dialog_pending` is already set when the
-    /// budget expires. The original 100 ms raced a cold Janet VM and failed
-    /// on loaded CI with "did not reply within 0s"; the warm-up eval below
-    /// removes VM init from that path, and this leaves generous headroom for
-    /// scheduling jitter on top.
-    const CONFIRM_BASE_BUDGET: Duration = Duration::from_millis(750);
-    /// Must exceed [`CONFIRM_BASE_BUDGET`] — that gap is the whole point of
-    /// the test, so the answer cannot arrive before the base budget lapses.
-    const CONFIRM_ANSWER_DELAY: Duration = Duration::from_millis(1500);
-
+    /// dirge-hwzs: a hook that opens `harness/confirm` blocks on a human, who
+    /// takes longer than the tight per-hook eval budget. The eval must keep
+    /// waiting while the dialog is in flight instead of giving up at the base
+    /// timeout — otherwise the caller (`dispatch_tool_hook`) sees no block and
+    /// runs the gated tool while the confirm is still on screen.
+    ///
+    /// This is the DECISION half of that behaviour, and it is a total function
+    /// of three values: is a dialog in flight, how long have we waited, and
+    /// what is the ceiling. No worker, no Janet VM, no clock, so the table is
+    /// exhaustive and cannot flake.
+    ///
+    /// It replaces a test that raced a real VM against a wall clock and flaked
+    /// twice on loaded CI (dirge-h3dw) — see [`timeout_action`] for why no
+    /// choice of budget fixes that shape of test.
     #[test]
-    fn eval_waits_for_an_in_flight_confirm_past_the_base_timeout() {
+    fn timeout_action_extends_only_for_an_in_flight_dialog() {
+        let under = Duration::from_secs(1);
+        let ceiling = Duration::from_secs(10);
+
+        // The one case that extends: a dialog is up and there is budget left.
+        assert_eq!(
+            timeout_action(true, under, ceiling),
+            TimeoutAction::KeepWaiting
+        );
+
+        // No dialog: a wedged plugin must recover at the base budget rather
+        // than inherit the human-scale grace period.
+        assert_eq!(timeout_action(false, under, ceiling), TimeoutAction::GiveUp);
+
+        // Past the ceiling, a pending dialog no longer buys time — otherwise a
+        // worker wedged *inside* a dialog could pin the caller forever.
+        assert_eq!(
+            timeout_action(true, ceiling + under, ceiling),
+            TimeoutAction::GiveUp
+        );
+        assert_eq!(
+            timeout_action(false, ceiling + under, ceiling),
+            TimeoutAction::GiveUp
+        );
+
+        // Boundary: the comparison is strict, so landing exactly on the
+        // ceiling gives up. Pinned because `<` vs `<=` here is the difference
+        // between a bounded and an unbounded wait.
+        assert_eq!(
+            timeout_action(true, ceiling, ceiling),
+            TimeoutAction::GiveUp
+        );
+
+        // Degenerate ceiling: extension is off entirely, never negative time.
+        assert_eq!(
+            timeout_action(true, Duration::ZERO, Duration::ZERO),
+            TimeoutAction::GiveUp
+        );
+    }
+
+    /// The WIRING half: `dialog_pending` must actually be set while a dialog
+    /// is in flight. If it were not, [`timeout_action`] would still be correct
+    /// and the gate would still fail open — so this is the part that has to be
+    /// observed against a real worker.
+    ///
+    /// Deterministic despite that. `DialogPendingGuard::enter` happens-before
+    /// the request is published to `dialog_rx`, so by the time this helper has
+    /// a `DialogRequest` in hand the counter is already incremented. The
+    /// assertion is on that ordering, not on a duration, so no amount of CI
+    /// load can change the outcome. The eval budget is generous and the reply
+    /// is immediate, so the timeout path is never entered here.
+    #[test]
+    fn dialog_pending_is_set_while_a_confirm_is_in_flight() {
         let (mut worker, mut dialog_rx, _lsp_rx) = Worker::try_spawn().unwrap();
+        let pending = worker.dialog_pending.clone();
 
-        // Warm up so the timed eval below doesn't pay Janet VM init. Without
-        // this the worker could still be starting when the base budget
-        // expires, `dialog_pending` would read 0, and the eval would time
-        // out — the extension never getting a chance to engage.
-        worker.eval("(+ 1 1)").expect("warm-up eval");
-
-        // Answer only after a delay longer than the base budget.
         let helper = std::thread::spawn(move || match dialog_rx.blocking_recv() {
             Some(DialogRequest::Confirm { reply, .. }) => {
-                std::thread::sleep(CONFIRM_ANSWER_DELAY);
+                // Sampled BEFORE answering: the dialog is provably in flight
+                // at this instant, because the worker is blocked waiting for
+                // the reply we are holding.
+                let seen = pending.load(Ordering::SeqCst);
                 let _ = reply.send(DialogReply::Confirm(true));
+                seen
             }
             other => panic!("unexpected dialog request: {other:?}"),
         });
 
-        // Pre-fix this returned a timeout Err; the in-flight-dialog
-        // extension makes it wait for the real answer.
-        let started = std::time::Instant::now();
-        let r =
-            worker.eval_with_timeout(r#"(harness/confirm "warn" "really?")"#, CONFIRM_BASE_BUDGET);
-        let waited = started.elapsed();
-        helper.join().unwrap();
-        assert_eq!(
-            r.as_deref(),
-            Ok("true"),
-            "eval must wait for the confirm answer instead of timing out, got {r:?}"
+        let r = worker.eval_with_timeout(
+            r#"(harness/confirm "warn" "really?")"#,
+            Duration::from_secs(60),
         );
-        // Guards against the assertion above passing for the wrong reason: if
-        // the answer somehow arrived before the base budget lapsed, the
-        // extension was never exercised and this test proves nothing.
+        let seen = helper.join().unwrap();
+
         assert!(
-            waited >= CONFIRM_BASE_BUDGET,
-            "the answer must arrive AFTER the base budget lapses, else the \
-             extension path is untested (waited {waited:?})",
+            seen > 0,
+            "dialog_pending must be set while a confirm is in flight, else the \
+             eval timeout cannot tell a human-blocked hook from a wedged one \
+             and the gate fails open"
+        );
+        assert_eq!(r.as_deref(), Ok("true"));
+
+        // And it must be released afterwards, or the next eval would inherit
+        // the human-scale grace period it has not earned.
+        assert_eq!(
+            worker.dialog_pending.load(Ordering::SeqCst),
+            0,
+            "the guard must drop once the dialog is answered"
         );
     }
 
