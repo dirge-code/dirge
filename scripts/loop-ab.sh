@@ -168,15 +168,32 @@ It must return RETRY_LIMIT from src/settings.py when attempts is 0 or less, and 
     local out="$1" f="$FIXTURE/src/limits.py"
     [ -f "$f" ] || { echo 0; return; }
     grep -q "def effective_retry_limit" "$f" || { echo 0; return; }
-    grep -qE "from settings import RETRY_LIMIT|from src.settings import RETRY_LIMIT|import settings" "$f" || { echo 0; return; }
     # Behavioural check: exercise the function for real.
-    ( cd "$FIXTURE/src" && python3 -c "
+    #
+    # Import style must NOT decide the verdict. An earlier version grepped for
+    # an accepted import line and then executed with cwd=src, so a model that
+    # wrote `from src.settings import RETRY_LIMIT` passed the grep and failed
+    # the exec — scored wrong for a stylistic choice while the behaviour was
+    # right. That made success_rate swing between 3/3 and 0/3 across runs for
+    # reasons unrelated to anything under test, which is worse than useless as
+    # an A/B metric. Both layouts are now tried; only real behaviour counts.
+    local probe
+    probe="
+import sys
+sys.path.insert(0, 'src')
 import limits, settings
 assert limits.effective_retry_limit(0) == settings.RETRY_LIMIT
 assert limits.effective_retry_limit(-5) == settings.RETRY_LIMIT
 assert limits.effective_retry_limit(1) == settings.RETRY_LIMIT - 1
 assert limits.effective_retry_limit(999) == 0
-" ) >/dev/null 2>&1 && echo 1 || echo 0
+"
+    if ( cd "$FIXTURE" && python3 -c "$probe" ) >/dev/null 2>&1; then
+      echo 1; return
+    fi
+    if ( cd "$FIXTURE/src" && python3 -c "$probe" ) >/dev/null 2>&1; then
+      echo 1; return
+    fi
+    echo 0
   }
 fi
 
@@ -322,24 +339,41 @@ run_arm() { # $1 = overrides, $2 = tag, $3 = model
       rep_invalid="$(get_field repair_invalid "$gates_line")"
       rep_total="$(get_field repair_total_successful "$gates_line")"
       verification="$(get_field final_verification "$gates_line")"
+      # MECHANISM CHECK. Without this an A/B cannot distinguish "the change
+      # helped" from "the change never fired" — the arms differ in config but
+      # nothing confirms the code path under test was reached. Sum of every
+      # harness nudge, plus the prologue one broken out since it is what
+      # dirge-t5dh tunes.
+      nudge_prologue="$(get_field nudge_progress_prologue "$gates_line")"
+      nudges_total=0
+      for nk in nudge_track_work nudge_fast_verify nudge_progress_stall \
+                nudge_progress_budget nudge_file_touch \
+                nudge_reflection_checkpoint nudge_safe_state \
+                nudge_progress_prologue; do
+        nv="$(get_field "$nk" "$gates_line")"
+        nudges_total=$(( nudges_total + ${nv:-0} ))
+      done
     else
       tally_found=0
       turns=0; tool_calls_f=0; errored=0; scavenged=0; storm=0
       maxstreak=0; rep_invalid=0; rep_total=0; verification="-"
+      nudge_prologue=0; nudges_total=0
     fi
 
     fw="$(first_write "$out")"
     ok="$(check_correct "$out")"
 
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
       "$2" "$3" "$i" "$turns" "$tool_calls_f" "$errored" "$scavenged" "$storm" \
       "$maxstreak" "$rep_invalid" "$rep_total" "$verification" "$fw" "$ok" "$tally_found" \
+      "$nudge_prologue" "$nudges_total" \
       >> "$WORK/results.tsv"
 
     if [ "$tally_found" = 1 ]; then tally_str=found; else tally_str=missing; fi
-    printf '  [%s %s %s/%s] turns=%s tools=%s err=%s scav=%s storm=%s streak=%s rep_inv=%s rep_ok=%s verify=%s first_write=%s correct=%s tally=%s\n' \
+    printf '  [%s %s %s/%s] turns=%s tools=%s err=%s scav=%s storm=%s streak=%s rep_inv=%s rep_ok=%s verify=%s first_write=%s correct=%s nudges=%s prologue=%s tally=%s\n' \
       "$2" "$3" "$i" "$REPEATS" "$turns" "$tool_calls_f" "$errored" "$scavenged" "$storm" \
-      "$maxstreak" "$rep_invalid" "$rep_total" "$verification" "$fw" "$ok" "$tally_str"
+      "$maxstreak" "$rep_invalid" "$rep_total" "$verification" "$fw" "$ok" \
+      "$nudges_total" "$nudge_prologue" "$tally_str"
     if [ "$tally_found" = 0 ]; then
       printf '    ^ no dirge::gates line in %s (harness bug, not a zero tally)\n' "$logfile"
     fi
@@ -388,7 +422,15 @@ awk -F'\t' '
     if (!(("m" $2) in mseen)) { mseen["m" $2] = 1; mlist[++nm] = $2 }
   }
   n[key]++
+  # 4..11 are the numeric run metrics; 16 (prologue nudges) and 17 (all
+  # harness nudges) are the mechanism check. 12..15 are string/flag fields
+  # handled separately below.
   for (c = 4; c <= 11; c++) {
+    sum[key,c] += $c
+    if (n[key] == 1 || $c < mn[key,c]) mn[key,c] = $c
+    if (n[key] == 1 || $c > mx[key,c]) mx[key,c] = $c
+  }
+  for (c = 16; c <= 17; c++) {
     sum[key,c] += $c
     if (n[key] == 1 || $c < mn[key,c]) mn[key,c] = $c
     if (n[key] == 1 || $c > mx[key,c]) mx[key,c] = $c
@@ -448,6 +490,12 @@ END {
     dval = (fwn[ck] && fwn[tk]) ? dir3(fws[ck] / fwn[ck], fws[tk] / fwn[tk], 1, 0.5) : "n/a"
     row("first_write", cval, tval, dval)
 
+    # MECHANISM: did the code path under test actually run? A treatment arm
+    # whose nudge count is zero did not fire, so any delta above is noise and
+    # must not be read as an effect. Reported before the outcome rates so it
+    # is seen first.
+    row("nudges_fired", spread(ck, 17), spread(tk, 17), "mechanism")
+    row("  of which prologue", spread(ck, 16), spread(tk, 16), "mechanism")
     row("success_rate", rate(ck), rate(tk), dir3(ok[ck] / n[ck], ok[tk] / n[tk], 0, 0.05))
     row("green_rate", sprintf("%d/%d (%.0f%%)", green[ck], n[ck], 100 * green[ck] / n[ck]),
         sprintf("%d/%d (%.0f%%)", green[tk], n[tk], 100 * green[tk] / n[tk]),
