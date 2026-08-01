@@ -23,6 +23,7 @@
 
 pub mod activity;
 pub mod bridge;
+pub mod capability;
 pub mod code_review;
 pub mod context_depth;
 pub mod context_manager;
