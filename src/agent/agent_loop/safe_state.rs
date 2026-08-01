@@ -55,6 +55,11 @@ use super::types::SafeStateMode;
 /// happening at most twice before a human-level stop is warranted.
 pub const MAX_SAFE_STATE_ABORTS: u8 = 2;
 
+/// Display tag prefixing the safe-state replan message. The UI keys on this
+/// to attribute it to the system rather than the user, and the headless
+/// harness-notice mirror (dirge-uw2l.7) uses it to surface the injection.
+pub const SAFE_STATE_TAG: &str = "[safe-state]";
+
 /// Per-run state for the safe-state abort rung. Owned as a local in
 /// `run_loop`, persists across the outer (turn) loop so a green point from an
 /// earlier turn is still a valid re-plan target later.
@@ -161,13 +166,13 @@ impl SafeStateEngine {
 /// not a menu (a menu invites cycling back through the very dead ends the
 /// reflexion log just enumerated).
 fn format_safe_state(reflections_block: Option<&str>, excerpts: &[(String, String)]) -> String {
-    let mut s = String::from(
-        "[safe-state] Repeated tool failures have left the working tree in an \
+    let mut s = format!(
+        "{SAFE_STATE_TAG} Repeated tool failures have left the working tree in an \
          unverified state on top of the last check that passed. The current \
          approach has failed. The failure ladder has run its course — an \
          alternate method was tried (rung 1) and a recovery was requested \
          (rung 2) — so this rung aborts the approach and asks for a fresh plan \
-         from the last known-good state.\n",
+         from the last known-good state.\n"
     );
     if let Some(block) = reflections_block {
         s.push_str(block);

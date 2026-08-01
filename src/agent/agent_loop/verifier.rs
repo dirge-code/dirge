@@ -186,7 +186,16 @@ impl VerifierGate {
             // silent on unverified changes.
             "write" | "edit" | "apply_patch" | "edit_minified" if touches_code_file(args) => {
                 inner.edited_code = true;
-                inner.edits_since_verify = inner.edits_since_verify.saturating_add(1);
+                // Count code FILES, not tool calls (dirge-uw2l.7). A single
+                // `apply_patch` routinely carries several operations, and a
+                // model that batches four files into one call has left four
+                // files unverified, not one. Counting calls undercounted the
+                // unverified surface badly enough that the mid-run threshold
+                // was near-unreachable for exactly the models that batch — as
+                // an end-to-end run against a real model showed.
+                inner.edits_since_verify = inner
+                    .edits_since_verify
+                    .saturating_add(code_paths_touched(args).max(1));
             }
             "bash" => {
                 let command = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
@@ -635,8 +644,17 @@ fn script_name_is_verification(token: &str) -> bool {
 /// Looks at top-level `path` / `file_path` / `file` and `apply_patch`'s
 /// `operations[].path`.
 fn touches_code_file(args: &serde_json::Value) -> bool {
+    code_paths_touched(args) > 0
+}
+
+/// How many DISTINCT code paths this mutating call touches (dirge-uw2l.7).
+/// `apply_patch` carries an `operations` array, so one call can edit many
+/// files; the mid-run verify counter needs the file count, not the call
+/// count. Deduplicated — patching the same file twice in one call is one
+/// unverified file.
+fn code_paths_touched(args: &serde_json::Value) -> u32 {
     let Some(obj) = args.as_object() else {
-        return false;
+        return 0;
     };
     let mut paths: Vec<&str> = Vec::new();
     for key in ["path", "file_path", "file"] {
@@ -646,12 +664,16 @@ fn touches_code_file(args: &serde_json::Value) -> bool {
     }
     if let Some(ops) = obj.get("operations").and_then(|v| v.as_array()) {
         for op in ops {
-            if let Some(s) = op.get("path").and_then(|v| v.as_str()) {
-                paths.push(s);
+            for key in ["path", "new_path"] {
+                if let Some(s) = op.get(key).and_then(|v| v.as_str()) {
+                    paths.push(s);
+                }
             }
         }
     }
-    paths.iter().any(|p| is_code_path(p))
+    paths.sort_unstable();
+    paths.dedup();
+    paths.iter().filter(|p| is_code_path(p)).count() as u32
 }
 
 /// Source-code file extensions. A change to one of these is "editing
@@ -1466,6 +1488,56 @@ mod tests {
         g.record_outcome("write", &json!({"path": "README.md"}), &ok_result(), false);
         g.record_outcome("read", &json!({"path": "src/e.rs"}), &ok_result(), false);
         assert_eq!(g.edits_since_verify(), 4);
+    }
+
+    /// dirge-uw2l.7: a batched multi-file `apply_patch` counts once PER CODE
+    /// FILE, not once per call. Found by an end-to-end run against a real
+    /// model: asked to change four files, it emitted a single `apply_patch`
+    /// with four operations, which registered as one edit — so the mid-run
+    /// threshold of three was effectively unreachable for any model that
+    /// batches, which is most of the good ones.
+    #[test]
+    fn batched_apply_patch_counts_each_code_file() {
+        let g = VerifierGate::new();
+        g.record_outcome(
+            "apply_patch",
+            &json!({"operations": [
+                {"type": "update", "path": "src/alpha.rs"},
+                {"type": "update", "path": "src/beta.rs"},
+                {"type": "update", "path": "src/gamma.rs"},
+                {"type": "update", "path": "src/delta.rs"},
+            ]}),
+            &ok_result(),
+            false,
+        );
+        assert_eq!(g.edits_since_verify(), 4, "four files, not one call");
+    }
+
+    /// Non-code operations in the same batch don't inflate the count, and a
+    /// file patched twice in one call is one unverified file.
+    #[test]
+    fn batched_patch_ignores_docs_and_dedupes() {
+        let g = VerifierGate::new();
+        g.record_outcome(
+            "apply_patch",
+            &json!({"operations": [
+                {"type": "update", "path": "src/alpha.rs"},
+                {"type": "update", "path": "src/alpha.rs"},
+                {"type": "update", "path": "README.md"},
+                {"type": "update", "path": "Cargo.toml"},
+            ]}),
+            &ok_result(),
+            false,
+        );
+        assert_eq!(g.edits_since_verify(), 1, "one distinct code file");
+    }
+
+    /// A single-path tool still counts as exactly one.
+    #[test]
+    fn single_file_edit_counts_once() {
+        let g = VerifierGate::new();
+        g.record_outcome("edit", &json!({"path": "src/a.rs"}), &ok_result(), false);
+        assert_eq!(g.edits_since_verify(), 1);
     }
 
     #[test]

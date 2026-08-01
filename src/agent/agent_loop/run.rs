@@ -99,6 +99,56 @@ async fn poll_steering_and_reminder(
     (out, had_user_steering)
 }
 
+/// Every tag the harness prefixes onto a message it injects on the model's
+/// behalf (dirge-uw2l.7). The TUI keys on these to attribute the message to
+/// the system rather than the user; [`emit_harness_notices`] uses the same
+/// list so headless consumers can see the injection too.
+const HARNESS_TAGS: &[&str] = &[
+    TODO_NUDGE_TAG,
+    OPEN_ISSUES_NUDGE_TAG,
+    RESUME_NUDGE_TAG,
+    TRACK_WORK_TAG,
+    VERIFY_TAG,
+    super::critic::CRITIC_TAG,
+    super::goal::GOAL_TAG,
+    super::progress::STALL_TAG,
+    super::progress::BUDGET_TAG,
+    super::safe_state::SAFE_STATE_TAG,
+];
+
+/// The harness tag `text` carries, if any.
+fn harness_tag_of(text: &str) -> Option<&'static str> {
+    let t = text.trim_start();
+    HARNESS_TAGS.iter().copied().find(|tag| t.starts_with(tag))
+}
+
+/// Mirror harness-injected messages to a `SystemNotice` (dirge-uw2l.7).
+///
+/// These are injected as USER-role messages so the model acts on them, and
+/// the TUI renders them under a system handle by matching their tag. Headless
+/// consumers had no equivalent: `--print` shows only the final answer, and
+/// the stream-json `user` event carries tool results only. So a `--print` or
+/// `--loop` user saw the model abruptly change course — run a check, re-plan,
+/// abandon an approach — with nothing explaining why, and no way to tell an
+/// injected steer from the model's own judgement.
+///
+/// Emitting a notice costs nothing when no tag matches (an ordinary user
+/// message or steering text mirrors nothing), so this is additive.
+async fn emit_harness_notices(emit: &mpsc::Sender<LoopEvent>, msgs: &[LoopMessage]) {
+    for m in msgs {
+        let LoopMessage::User(u) = m else { continue };
+        let text = u.text_joined();
+        if harness_tag_of(&text).is_none() {
+            continue;
+        }
+        let _ = emit
+            .send(LoopEvent::SystemNotice {
+                content: text.clone(),
+            })
+            .await;
+    }
+}
+
 /// Joined text of a tool result's content blocks — fed to the failure
 /// tracker as the error excerpt quoted back in a recovery checkpoint.
 fn tool_result_excerpt(content: &[super::message::ContentBlock]) -> String {
@@ -2328,6 +2378,7 @@ pub async fn run_loop(
                 turn_made_file_edits(&new_messages),
             ) {
                 track_nudges += 1;
+                emit_harness_notices(emit, std::slice::from_ref(&reminder)).await;
                 current_context
                     .messages
                     .push(loop_message_to_value(&reminder));
@@ -2346,6 +2397,7 @@ pub async fn run_loop(
                     .map_or(0, |v| v.edits_since_verify()),
             ) {
                 verify_nudges += 1;
+                emit_harness_notices(emit, std::slice::from_ref(&reminder)).await;
                 current_context
                     .messages
                     .push(loop_message_to_value(&reminder));
@@ -2383,6 +2435,7 @@ pub async fn run_loop(
                     .record_turn(snapshot)
                     .or_else(|| progress.poll_budget(turns_taken, config.max_turns.unwrap_or(0)));
                 if let Some(msg) = signal {
+                    emit_harness_notices(emit, std::slice::from_ref(&msg)).await;
                     current_context.messages.push(loop_message_to_value(&msg));
                     new_messages.push(msg);
                 }
@@ -2646,6 +2699,8 @@ pub async fn run_loop(
             let (next_pending, had_user_steering) =
                 poll_steering_and_reminder(&config, &guards, safe_state_msg).await;
             pending_messages = next_pending;
+            // dirge-uw2l.7: surface harness steers to headless consumers.
+            emit_harness_notices(emit, &pending_messages).await;
 
             // dirge-st8r: a fresh USER steering message means the human is
             // actively driving the run — give them a fresh turn budget
@@ -2741,6 +2796,7 @@ pub async fn run_loop(
         .await;
         if !follow_up.is_empty() {
             tracing::trace!(target: "dirge::loop", ?source, "finalization follow-up interjected");
+            emit_harness_notices(emit, &follow_up).await;
             pending_messages = follow_up;
             continue 'outer;
         }

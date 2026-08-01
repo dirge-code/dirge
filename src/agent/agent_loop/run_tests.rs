@@ -6345,3 +6345,34 @@ fn fast_verify_nudge_bounded_once() {
     assert!(build_fast_verify_reminder(GateMode::Advisory, MAX_VERIFY_NUDGES, 10).is_none());
     assert!(build_fast_verify_reminder(GateMode::Blocking, MAX_VERIFY_NUDGES, 10).is_none());
 }
+
+// ── harness-notice mirror (dirge-uw2l.7) ────────────────────────────────
+
+/// Every tag the harness injects under must be recognized, or that steer
+/// stays invisible to headless consumers. Pins the list against a tag being
+/// added to a nudge but forgotten here.
+#[test]
+fn harness_tag_of_recognizes_every_injection_tag() {
+    for tag in HARNESS_TAGS {
+        let text = format!("{tag} some guidance text");
+        assert_eq!(
+            harness_tag_of(&text),
+            Some(*tag),
+            "tag {tag} not recognized"
+        );
+    }
+    // Leading whitespace is tolerated (messages are built with formatters).
+    assert_eq!(harness_tag_of("  [stall] x"), Some("[stall]"));
+}
+
+/// An ordinary user message — or user steering — mirrors nothing. The notice
+/// is for harness-authored injections only, so a human's own words are never
+/// echoed back at them as a system line.
+#[test]
+fn harness_tag_of_ignores_ordinary_user_text() {
+    assert!(harness_tag_of("fix the failing test").is_none());
+    assert!(harness_tag_of("[not-a-real-tag] hello").is_none());
+    assert!(harness_tag_of("").is_none());
+    // A tag mentioned mid-sentence isn't an injection.
+    assert!(harness_tag_of("I saw a [stall] in the log").is_none());
+}
