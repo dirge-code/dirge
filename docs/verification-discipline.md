@@ -18,7 +18,7 @@ reason this page exists as its own document rather than a paragraph in
 | CI command advisory | — | always on, advisory only |
 | Masked-command guard | — | always on |
 | Exploration-prologue bound | `progress_prologue_cap` | `24` |
-| Capability tier | — | observed always; drives one threshold |
+| Capability tier | — | observed always; only `Struggling` changes behaviour |
 
 ## The pattern
 
