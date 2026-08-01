@@ -75,14 +75,33 @@
 //!   [`CapabilityTier::Struggling`].
 //! - otherwise → [`CapabilityTier::Nominal`].
 //!
-//! [`CapabilityTier::scale`] maps a base threshold to the tier's working value:
+//! [`CapabilityTier::scale_threshold`] and [`CapabilityTier::scale_budget`]
+//! map a base value to the tier's working value. Adaptation is
+//! **one-directional** — the tier may add support, never remove it:
 //!
 //! ```text
-//! scale(base) = base * num / den
-//!   Nominal    -> (1, 1)   // bit-identical to base
-//!   Strong     -> (3, 2)   // coping: more latitude before intervening
-//!   Struggling -> (1, 2)   // failing: tighten limits, intervene sooner
+//!               threshold ("intervene after N")   budget ("at most N")
+//!   Nominal     base                              base
+//!   Strong      base                              base       <- drives NOTHING
+//!   Struggling  base / SUPPORT_SCALE  (sooner)    base * SUPPORT_SCALE (more)
 //! ```
+//!
+//! `Strong` scaling identically to `Nominal` is deliberate and is the single
+//! most important thing to understand here. The counters above observe
+//! **tool-call mechanics only** — nothing in [`CapabilityCounters`] moves
+//! based on whether the model verifies its work, checks the right gate, or
+//! makes progress on the task. So a `Strong` reading is evidence about
+//! argument hygiene and about nothing else, and it cannot license relaxing a
+//! guard that fires on progress or verification. See [`CapabilityTier::Strong`]
+//! for the two concrete failures that make the point.
+//!
+//! Two consequences worth knowing before wiring a new threshold here:
+//!
+//! - Deriving a guard whose trigger is unrelated to tool-call mechanics buys
+//!   nothing, because only `Struggling` moves and `Struggling` is rare.
+//! - A budget of exactly 1 cannot move at all, because `1 * 3 / 2` truncates
+//!   straight back to 1. Routing a one-shot budget through the estimator
+//!   looks like adaptation and changes nothing.
 //!
 //! Every weight, floor, threshold and ratio is a named constant below — there
 //! are no magic numbers in the body. Tuning happens in one place.
@@ -130,15 +149,19 @@ const STRUGGLING_MIN_PER_MILLE: u64 = 333;
 /// published tier flips. 2 means a single differing observation is absorbed.
 const HYSTERESIS_FLIP_RUNS: u32 = 2;
 
-// --- scale ratios (num, den) per tier; Nominal is (1,1) so it is bit-identical ---
+// --- scale ratio (num, den); applied to `Struggling` ONLY ---
 
-/// `Strong` scales a base threshold UP: a coping model gets more latitude.
-const STRONG_SCALE_NUM: u64 = 3;
-const STRONG_SCALE_DEN: u64 = 2;
-/// `Struggling` scales a base threshold DOWN: a failing model is tightened and
-/// intervened on sooner.
-const STRUGGLING_SCALE_NUM: u64 = 1;
-const STRUGGLING_SCALE_DEN: u64 = 2;
+/// The single adaptation ratio. Applied as `1/2` to a threshold (intervene at
+/// half the base count) and as `3/2` to a budget (half again as many nudges
+/// allowed) — see [`CapabilityTier::scale_threshold`] and
+/// [`CapabilityTier::scale_budget`].
+///
+/// `Nominal` and `Strong` are BOTH `(1,1)`, i.e. bit-identical to the
+/// pre-estimator constants. Adaptation is deliberately **one-directional**:
+/// the tier may add support, never remove it. See
+/// [`CapabilityTier::Strong`] for why.
+const SUPPORT_SCALE_NUM: u64 = 3;
+const SUPPORT_SCALE_DEN: u64 = 2;
 
 /// A model's observed capability tier for the current run.
 ///
@@ -150,8 +173,43 @@ const STRUGGLING_SCALE_DEN: u64 = 2;
 pub enum CapabilityTier {
     /// Default. Every threshold behaves exactly as it did before this module.
     Nominal,
-    /// The model is coping well: thresholds are relaxed to give it more
-    /// latitude before the loop intervenes.
+    /// The model is coping well on tool-call mechanics: no malformed
+    /// arguments, no invented tool names, few or no errored calls.
+    ///
+    /// # This tier deliberately drives NOTHING
+    ///
+    /// It scales identically to [`Self::Nominal`], and that is not an
+    /// oversight. Adaptation here is one-directional — the tier may add
+    /// support, never remove it — for a reason that is structural rather than
+    /// statistical.
+    ///
+    /// [`CapabilityCounters`] observes tool-call mechanics *only*: errored
+    /// calls, repaired arguments, invented names, scavenged text, storms,
+    /// failure streaks. Not one of those fields changes based on whether the
+    /// model verifies its work, makes progress on the task, or checks the
+    /// right gate. So a `Strong` reading is evidence about **argument
+    /// hygiene** and about nothing else, and cannot support relaxing a guard
+    /// that fires on progress or verification.
+    ///
+    /// The epic's own record makes the point concretely. Both failures worth
+    /// having a guard for came from models this estimator reads as `Strong`:
+    ///
+    /// - the 60-turn reconnaissance thrash (dirge-t5dh) was deepseek-flash
+    ///   with a 0% tool-call error rate — flawless mechanics, zero files
+    ///   written
+    /// - the wrong-gate verification failure (dirge-w2de) came from the same
+    ///   tier, which is what `docs/verification-discipline.md` is about
+    ///
+    /// An earlier cut of this work scaled `FAST_VERIFY_EDIT_THRESHOLD` up for
+    /// `Strong`, on the argument that extra latitude for a model with no
+    /// observed failures could not cause a nudge storm. True, but it inverts
+    /// the risk: it relaxes verification pressure on precisely the class of
+    /// model that produced the only verification failures on record. Removed.
+    ///
+    /// Keep observing it — it is the distinction the estimator discriminates
+    /// most cleanly (deepseek 6/6 `Strong`, glm 3/6 `Nominal`, tracking
+    /// failure exactly), which makes it useful telemetry and useful to the A/B
+    /// harness. Just do not let it take a guard away.
     Strong,
     /// The model is visibly failing: thresholds are tightened so the loop
     /// intervenes and offers help sooner.
@@ -200,11 +258,12 @@ impl CapabilityTier {
 
     /// Scale a THRESHOLD — "intervene after N". Lower means sooner.
     ///
-    /// `Nominal` returns `base` bit-identically (the no-op path). `Strong`
-    /// multiplies by `3/2` (more latitude before the loop steps in);
-    /// `Struggling` by `1/2` (help arrives sooner). Integer arithmetic.
+    /// `Nominal` and `Strong` both return `base` bit-identically; only
+    /// `Struggling` moves it, dividing by `SUPPORT_SCALE` so help arrives
+    /// sooner. Integer arithmetic. See [`CapabilityTier::Strong`] for why
+    /// `Strong` does not relax anything.
     ///
-    /// FLOORED AT 1 for any non-zero base. `base * 1 / 2` truncates to 0 at
+    /// FLOORED AT 1 for any non-zero base. `base / 2` truncates to 0 at
     /// `base == 1`, and a threshold of 0 fires unconditionally — every
     /// boundary, forever. Several real thresholds are exactly 1, so without
     /// the floor the Struggling tier would turn them into a nudge storm
@@ -214,12 +273,12 @@ impl CapabilityTier {
         if base == 0 {
             return 0;
         }
-        let (num, den) = match self {
-            CapabilityTier::Nominal => (1u64, 1u64),
-            CapabilityTier::Strong => (STRONG_SCALE_NUM, STRONG_SCALE_DEN),
-            CapabilityTier::Struggling => (STRUGGLING_SCALE_NUM, STRUGGLING_SCALE_DEN),
-        };
-        ((base as u64 * num / den) as u32).max(1)
+        match self {
+            CapabilityTier::Nominal | CapabilityTier::Strong => base,
+            CapabilityTier::Struggling => {
+                ((base as u64 * SUPPORT_SCALE_DEN / SUPPORT_SCALE_NUM) as u32).max(1)
+            }
+        }
     }
 
     /// Scale a BUDGET — "at most N of these per run". Higher means more help.
@@ -232,19 +291,25 @@ impl CapabilityTier {
     /// `MAX_PROLOGUE_NUDGES`, all of which are exactly 1, into 0 and
     /// disabling those nudges entirely for a failing run.
     ///
-    /// `Nominal` is bit-identical; `Struggling` gets `3/2`; `Strong` gets
-    /// `1/2` (a coping model needs fewer interruptions). Floored at 1 for a
+    /// `Nominal` and `Strong` are both bit-identical; only `Struggling` moves,
+    /// multiplying by `SUPPORT_SCALE` for more nudges. Floored at 1 for a
     /// non-zero base for the same reason as above.
+    ///
+    /// Note the floor makes this a **no-op for any budget of exactly 1**:
+    /// `1 * 3 / 2` truncates back to 1. `MAX_TRACK_NUDGES`,
+    /// `MAX_VERIFY_NUDGES` and `MAX_PROLOGUE_NUDGES` are all 1, so routing
+    /// them through here would look like adaptation and change nothing. Give
+    /// a one-shot budget a larger base before deriving it, or leave it alone.
     pub fn scale_budget(self, base: u32) -> u32 {
         if base == 0 {
             return 0;
         }
-        let (num, den) = match self {
-            CapabilityTier::Nominal => (1u64, 1u64),
-            CapabilityTier::Struggling => (STRONG_SCALE_NUM, STRONG_SCALE_DEN),
-            CapabilityTier::Strong => (STRUGGLING_SCALE_NUM, STRUGGLING_SCALE_DEN),
-        };
-        ((base as u64 * num / den) as u32).max(1)
+        match self {
+            CapabilityTier::Nominal | CapabilityTier::Strong => base,
+            CapabilityTier::Struggling => {
+                ((base as u64 * SUPPORT_SCALE_NUM / SUPPORT_SCALE_DEN) as u32).max(1)
+            }
+        }
     }
 }
 
@@ -478,20 +543,27 @@ mod tests {
         assert_eq!(est.tier(), CapabilityTier::Struggling);
     }
 
+    /// Adaptation is ONE-DIRECTIONAL: the tier may add support, never remove
+    /// it. `Nominal` and `Strong` are both the bit-identical no-op; only
+    /// `Struggling` moves a threshold. See `CapabilityTier::Strong` for why —
+    /// the counters observe tool-call mechanics only, so a `Strong` reading
+    /// cannot justify relaxing a progress or verification guard.
     #[test]
-    fn scale_is_identity_for_nominal_and_directional_otherwise() {
-        // Nominal is bit-identical: the no-op path.
+    fn scale_is_identity_for_nominal_and_strong() {
         for base in [0u32, 1, 7, 42, 1_000, u32::MAX] {
             assert_eq!(
                 CapabilityTier::Nominal.scale_threshold(base),
                 base,
                 "Nominal must return base bit-identically"
             );
+            assert_eq!(
+                CapabilityTier::Strong.scale_threshold(base),
+                base,
+                "Strong must NOT relax a threshold — it drives nothing"
+            );
         }
-        // Strong scales up, Struggling scales down.
-        assert_eq!(CapabilityTier::Strong.scale_threshold(10), 15);
-        assert_eq!(CapabilityTier::Struggling.scale_threshold(10), 5);
-        assert!(CapabilityTier::Strong.scale_threshold(10) > 10);
+        // Only Struggling moves, and only toward earlier intervention.
+        assert_eq!(CapabilityTier::Struggling.scale_threshold(10), 6);
         assert!(CapabilityTier::Struggling.scale_threshold(10) < 10);
     }
 
@@ -555,15 +627,37 @@ mod tests {
             "a failing run gets MORE help, not less"
         );
         assert!(
-            CapabilityTier::Strong.scale_budget(base) < base,
-            "a coping run gets fewer interruptions"
+            CapabilityTier::Struggling.scale_threshold(base) < base,
+            "...and gets it sooner — the two axes move opposite ways"
         );
-        // Nominal is the bit-identical no-op on both axes.
-        assert_eq!(CapabilityTier::Nominal.scale_budget(base), base);
-        assert_eq!(CapabilityTier::Nominal.scale_threshold(base), base);
+        // Nominal and Strong are the bit-identical no-op on both axes.
+        for tier in [CapabilityTier::Nominal, CapabilityTier::Strong] {
+            assert_eq!(tier.scale_budget(base), base);
+            assert_eq!(tier.scale_threshold(base), base);
+        }
         // And budgets floor at 1 too.
         for b in 1..=4u32 {
-            assert!(CapabilityTier::Strong.scale_budget(b) >= 1);
+            assert!(CapabilityTier::Struggling.scale_budget(b) >= 1);
+        }
+    }
+
+    /// A budget of exactly 1 cannot be adapted, because `1 * 3 / 2` truncates
+    /// straight back to 1. Several real budgets are 1 (`MAX_TRACK_NUDGES`,
+    /// `MAX_VERIFY_NUDGES`, `MAX_PROLOGUE_NUDGES`), so wiring them through
+    /// the estimator would look like adaptation and do nothing. Pinned so the
+    /// no-op is a documented property rather than a surprise.
+    #[test]
+    fn a_budget_of_one_is_a_structural_no_op() {
+        for tier in [
+            CapabilityTier::Struggling,
+            CapabilityTier::Nominal,
+            CapabilityTier::Strong,
+        ] {
+            assert_eq!(
+                tier.scale_budget(1),
+                1,
+                "{tier:?} must leave a one-shot budget alone"
+            );
         }
     }
 

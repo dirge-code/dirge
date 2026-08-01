@@ -6837,30 +6837,45 @@ fn fast_verify_threshold_is_unchanged_at_nominal() {
     ));
 }
 
-/// A run with zero observed failures gets more rope before the harness
-/// interrupts it. The direction is the point: extra latitude for a model
-/// demonstrably coping cannot cause a nudge storm, whereas the opposite
-/// direction could.
+/// Strong must NOT relax the verify nudge — it behaves exactly as Nominal.
+///
+/// An earlier cut scaled this threshold up for Strong, reasoning that extra
+/// latitude for a demonstrably-coping model could not cause a nudge storm.
+/// The reasoning holds but the risk is inverted: the counters observe
+/// tool-call mechanics only, so a Strong reading says nothing about whether
+/// the model verifies its work — and both failures on record (the 60-turn
+/// thrash, the wrong-gate green) came from models this estimator reads as
+/// Strong. Relaxing verification pressure on that exact class is backwards.
 #[test]
-fn strong_runs_get_more_latitude_before_the_verify_nudge() {
-    // At the Nominal threshold, Strong is not yet nudged.
+fn strong_does_not_relax_the_verify_nudge() {
+    for edits in [3u32, 4, 10] {
+        assert_eq!(
+            should_nudge_fast_verify(GateMode::Advisory, 0, edits, CapabilityTier::Strong),
+            should_nudge_fast_verify(GateMode::Advisory, 0, edits, CapabilityTier::Nominal),
+            "Strong must be bit-identical to Nominal at {edits} edits"
+        );
+    }
+    // Nominal still fires at the base threshold, so this is not "gate off".
     assert!(should_nudge_fast_verify(
         GateMode::Advisory,
         0,
         3,
         CapabilityTier::Nominal
     ));
+}
+
+/// Struggling is the only tier that moves a threshold, and only toward
+/// earlier help: it is nudged to verify before the base count is reached.
+#[test]
+fn struggling_runs_are_asked_to_verify_sooner() {
     assert!(
-        !should_nudge_fast_verify(GateMode::Advisory, 0, 3, CapabilityTier::Strong),
-        "a run with no observed failures should not be interrupted at the default threshold"
+        !should_nudge_fast_verify(GateMode::Advisory, 0, 1, CapabilityTier::Nominal),
+        "one edit is below the base threshold"
     );
-    // It still fires eventually — latitude, not exemption.
-    assert!(should_nudge_fast_verify(
-        GateMode::Advisory,
-        0,
-        4,
-        CapabilityTier::Strong
-    ));
+    assert!(
+        should_nudge_fast_verify(GateMode::Advisory, 0, 2, CapabilityTier::Struggling),
+        "a failing run should be asked to verify before the base count"
+    );
 }
 
 /// Off mode stays off at every tier. The tier scales WHEN a gate fires, never

@@ -178,12 +178,31 @@ contributed more than both errors combined, and that weight is exactly what
 selected the failing run. Retuning would have removed the discrimination that
 worked.
 
-Currently the tier derives one threshold (`FAST_VERIFY_EDIT_THRESHOLD`). Only
-`Strong` moves it, and only toward *less* intervention: extra latitude for a
-model with zero observed failures cannot cause a nudge storm, whereas tightening
-on a misjudged tier could. `Nominal` is bit-identical, so a default install is
-untouched. `Struggling` drives nothing — wiring a threshold to a state rarely
-observed is the mistake this page is about.
+Adaptation is **one-directional**: the tier may add support, never remove it.
+`Nominal` and `Strong` are both bit-identical to the pre-estimator constants,
+so a default install is untouched; only `Struggling` moves anything, and only
+toward earlier and more frequent help.
+
+`Strong` driving nothing is the part that took a correction to get right. The
+counters observe **tool-call mechanics only** — errored calls, repaired
+arguments, invented tool names, scavenged text, storms, streaks. Nothing in
+that set moves based on whether the model verifies its work or makes progress.
+So a `Strong` reading is evidence about argument hygiene and nothing else.
+
+An earlier cut used it to relax `FAST_VERIFY_EDIT_THRESHOLD`, reasoning that
+extra latitude for a model with no observed failures could not cause a nudge
+storm. That much is true, but it inverts the risk, and this page's own table is
+the counter-example: both failures worth having a guard for came from models
+the estimator reads as `Strong`. The 60-turn reconnaissance thrash was
+deepseek-flash at a 0% tool-call error rate — flawless mechanics, nothing
+written. The wrong-gate green came from the same tier. Relaxing verification
+pressure on exactly that class is backwards, so the derivation was removed.
+
+The general rule, worth applying before wiring any new threshold to the tier:
+**a signal may only tune a guard that fires on the same thing the signal
+measures.** And note that a budget of exactly 1 cannot be scaled at all —
+`1 × 3/2` truncates back to 1 — so routing a one-shot budget through the
+estimator looks like adaptation and does nothing.
 
 ## Measuring a loop-control change
 
