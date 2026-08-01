@@ -121,31 +121,34 @@ pub fn build_goal_prompt(
 }
 
 /// Parse the judge's verdict. `Some(remaining)` means the goal is NOT yet
-/// met (with the outstanding work); `None` means met. An empty or
-/// unparseable verdict resolves to `None` (met) — failing toward
-/// finalization so a flaky judge can't trap the loop; the re-entry bound is
-/// the backstop for the opposite mistake.
+/// met (with the outstanding work); `None` means met. An empty response, or
+/// one carrying NO verdict token anywhere, resolves to `None` (met) — failing
+/// toward finalization so a flaky judge can't trap the loop; the re-entry bound
+/// is the backstop for the opposite mistake.
+///
+/// Classification is the shared whole-word classifier
+/// ([`super::critic::classify_verdict_head`]) — so `GOAL: UNMET`, bare `UNMET`,
+/// `GOAL: NOT MET`, and rephrasings like "the stop condition is not satisfied"
+/// all read as unmet, instead of the old first-line literal match letting `MET`
+/// win as a substring of `UNMET`. A negative verdict carries the remaining-work
+/// detail (everything after the verdict line), or `(no detail given)` when the
+/// judge emitted the verdict alone.
 pub fn parse_goal_verdict(raw: &str) -> Option<String> {
+    use super::critic::{VerdictSignal, classify_verdict_head, detail_after_verdict};
+
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return None;
     }
-    let first_line = trimmed.lines().next().unwrap_or("").to_ascii_uppercase();
-    if first_line.contains("GOAL: UNMET") || first_line.contains("GOAL:UNMET") {
-        // Everything after the first line is the remaining-work detail.
-        let detail = trimmed
-            .split_once('\n')
-            .map(|(_, rest)| rest.trim())
-            .unwrap_or("");
-        let detail = if detail.is_empty() {
-            "(no detail given)".to_string()
-        } else {
-            detail.to_string()
-        };
-        Some(detail)
-    } else {
-        // MET, or ambiguous → fail toward done.
-        None
+    match classify_verdict_head(trimmed) {
+        VerdictSignal::Negative => Some(
+            detail_after_verdict(trimmed)
+                .map(str::to_string)
+                .unwrap_or_else(|| "(no detail given)".to_string()),
+        ),
+        // Positive, Abstain (the goal gate has no abstain variant), or no
+        // verdict token anywhere → fail toward met.
+        _ => None,
     }
 }
 
@@ -232,6 +235,55 @@ mod tests {
         assert!(parse_goal_verdict("").is_none());
         assert!(parse_goal_verdict("   \n ").is_none());
         assert!(parse_goal_verdict("probably done?").is_none());
+    }
+
+    #[test]
+    fn parse_goal_verdict_corpus() {
+        // dirge-5mtx: a goal judge that rephrases the verdict must not be read
+        // as MET. `MET` is a substring of `UNMET`; `NOT MET` embeds MET.
+        // Whole-word classification + explicit-negation handling, and scanning
+        // past a preamble, stop the answer sets competing. Genuine ambiguity
+        // (no verdict token anywhere) still fails toward MET on purpose.
+        // (input, expected: "met" = None, "unmet" = Some(detail))
+        let rows: &[(&str, &str)] = &[
+            // GOAL: prefix
+            ("GOAL: MET", "met"),
+            ("GOAL: UNMET", "unmet"),
+            ("GOAL: SHORT", "unmet"),
+            // bare tokens — MET/UNMET substring trap, both orders
+            ("MET", "met"),
+            ("UNMET", "unmet"),
+            // negated forms — MET/DONE appear as substrings but mean not met
+            ("GOAL: NOT MET", "unmet"),
+            ("NOT MET", "unmet"),
+            ("NOT SATISFIED", "unmet"),
+            ("NOT DONE", "unmet"),
+            // a rephrasing that must not silently finalize the run
+            ("the stop condition is not satisfied", "unmet"),
+            // preamble line before the verdict
+            ("Let me check the transcript.\nGOAL: UNMET\n- commit the work", "unmet"),
+            ("Thinking it over.\nUNMET", "unmet"),
+            // mixed case
+            ("goal: unmet", "unmet"),
+            ("Goal: Not Met", "unmet"),
+            // no verdict token → fail toward MET (deliberate)
+            ("", "met"),
+            ("I'm not sure what to make of it", "met"),
+        ];
+        for &(input, want) in rows {
+            let got = match parse_goal_verdict(input) {
+                None => "met",
+                Some(_) => "unmet",
+            };
+            assert_eq!(got, want, "parse_goal_verdict({input:?})");
+        }
+
+        // The preamble row must carry the remaining-work detail through.
+        let r = parse_goal_verdict("Let me check the transcript.\nGOAL: UNMET\n- commit the work");
+        assert!(
+            r.as_ref().is_some_and(|d| d.contains("commit the work")),
+            "detail lost: {r:?}"
+        );
     }
 
     #[test]

@@ -18,6 +18,9 @@ use std::borrow::Cow;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::LazyLock;
+
+use regex::Regex;
 
 use super::code_review::{Finding, parse_findings, partition_findings};
 use super::message::{LoopMessage, UserMessage};
@@ -208,43 +211,122 @@ fn verification_block(verification: Option<VerificationStatus>) -> &'static str 
     }
 }
 
+/// Classified verdict signal, strongest (most action-forcing) first. Shared by
+/// the critic and goal parsers so both judge the same surface form the same way
+/// (dirge-5mtx).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VerdictSignal {
+    /// Not done / gaps remain / goal unmet.
+    Negative,
+    /// Cannot verify from the spec/evidence available.
+    Abstain,
+    /// Done / goal met.
+    Positive,
+    /// No verdict token anywhere in the head — fail open.
+    None,
+}
+
+// dirge-5mtx: whole-word verdict classification. `COMPLETE` is a proper
+// substring of `INCOMPLETE` and `MET` of `UNMET`, so a naive `contains` lets
+// the answer sets compete — whichever branch the code tests first wins,
+// independent of what the judge meant. Word boundaries stop that; an explicit
+// `NOT` before a positive word (`NOT COMPLETE`, `NOT MET`) flips it negative
+// rather than letting the embedded positive token win. `FINISHED` is only
+// meaningful negated (`NOT FINISHED`), so it appears in the negation set but
+// NOT in the positive set. All four run against upper-cased text.
+static NEGATED_POSITIVE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\bNOT\s+(?:COMPLETE|DONE|MET|SATISFIED|FINISHED)\b").unwrap()
+});
+static NEGATIVE_TOKEN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b(?:INCOMPLETE|GAPS|SHORT|UNMET)\b").unwrap());
+static ABSTAIN_TOKEN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b(?:ABSTAIN|INSUFFICIENT|UNSURE)\b").unwrap());
+static POSITIVE_TOKEN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b(?:COMPLETE|DONE|MET|SATISFIED)\b").unwrap());
+
+/// Whether a single (upper-cased) line bears any verdict token — used to find
+/// where the verdict line ends and the remaining-work detail begins.
+fn line_bears_verdict(line_upper: &str) -> bool {
+    NEGATED_POSITIVE.is_match(line_upper)
+        || NEGATIVE_TOKEN.is_match(line_upper)
+        || ABSTAIN_TOKEN.is_match(line_upper)
+        || POSITIVE_TOKEN.is_match(line_upper)
+}
+
+/// Classify the verdict in a judge response. Finds the first line that bears a
+/// whole-word verdict token (the verdict line — scanning past any prose
+/// preamble) and classifies THAT line alone, honouring an explicit `NOT`
+/// negation of a positive word. Precedence is Negative > Abstain > Positive:
+/// when the verdict line mixes tokens the safer, action-forcing signal wins.
+/// `None` (no verdict token on any line) is the deliberate fail-open input —
+/// the caller maps it to its own pass variant.
+///
+/// Only the verdict line is classified — not the whole response — so common
+/// English in the remaining-work detail (e.g. "a few short comments, no gaps in
+/// logic") can't compete with the verdict above it.
+pub(crate) fn classify_verdict_head(trimmed: &str) -> VerdictSignal {
+    for line in trimmed.split('\n') {
+        let upper = line.to_ascii_uppercase();
+        if !line_bears_verdict(&upper) {
+            continue;
+        }
+        if NEGATED_POSITIVE.is_match(&upper) || NEGATIVE_TOKEN.is_match(&upper) {
+            return VerdictSignal::Negative;
+        }
+        if ABSTAIN_TOKEN.is_match(&upper) {
+            return VerdictSignal::Abstain;
+        }
+        return VerdictSignal::Positive;
+    }
+    VerdictSignal::None
+}
+
+/// Non-empty remaining-work detail AFTER the first line that bears a verdict
+/// token, or `None` when the verdict is its own last line (no separate detail).
+/// Splitting on `\n` (not `.lines()`) keeps the byte offsets exact under both
+/// `\n` and `\r\n` endings. The caller picks the fallback for the no-detail
+/// case — the critic reuses the whole response, the goal substitutes a note.
+pub(crate) fn detail_after_verdict(trimmed: &str) -> Option<&str> {
+    let mut after_verdict_byte = None;
+    let mut cursor = 0usize;
+    for line in trimmed.split('\n') {
+        if after_verdict_byte.is_none() && line_bears_verdict(&line.to_ascii_uppercase()) {
+            // Detail begins right after this line's content (before its `\n`).
+            after_verdict_byte = Some(cursor + line.len());
+            break;
+        }
+        cursor += line.len() + 1; // +1 for the '\n' separator.
+    }
+    let off = after_verdict_byte?;
+    let rest = trimmed[off..].trim();
+    (!rest.is_empty()).then_some(rest)
+}
+
 /// Parse the critic's raw response into a verdict. `Verdict::Complete` means
-/// the work is done — or the response was empty/ambiguous, in which case we
-/// fail OPEN (don't block finalization on a confused critic).
+/// the work is done — or the response carried NO verdict token anywhere, in
+/// which case we fail OPEN (don't block finalization on a confused critic).
 /// `Verdict::Incomplete(issues)` means concrete gaps to fix.
 /// `Verdict::Abstain(missing)` means the critic cannot verify from available
 /// spec/evidence — the model should write a held-out test or clarify the spec.
 ///
-/// ORDER of precedence on the first non-empty line: INCOMPLETE > ABSTAIN >
-/// Complete (fail-open). A line containing both INCOMPLETE and ABSTAIN
-/// resolves to Incomplete (the safer, action-forcing state).
+/// Classification is whole-word with explicit-negation handling
+/// ([`classify_verdict_head`]); precedence is Negative > Abstain > Positive, so
+/// a line mixing INCOMPLETE and ABSTAIN resolves to Incomplete. The detail is
+/// [`detail_after_verdict`], falling back to the whole response when the bare
+/// verdict has nothing after it.
 pub fn parse_verdict(response: &str) -> Verdict {
     let trimmed = response.trim();
     if trimmed.is_empty() {
         return Verdict::Complete;
     }
-    // Look at the first non-empty line for the verdict token.
-    let first = trimmed.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
-    let upper = first.to_ascii_uppercase();
-    if upper.contains("INCOMPLETE") {
-        let rest = trimmed
-            .split_once('\n')
-            .map(|(_, x)| x)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or(trimmed);
-        Verdict::Incomplete(rest.to_string())
-    } else if upper.contains("ABSTAIN") || upper.contains("INSUFFICIENT") {
-        let rest = trimmed
-            .split_once('\n')
-            .map(|(_, x)| x)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or(trimmed);
-        Verdict::Abstain(rest.to_string())
-    } else {
-        // "COMPLETE", or anything that isn't a clear INCOMPLETE/ABSTAIN → pass.
-        Verdict::Complete
+    match classify_verdict_head(trimmed) {
+        VerdictSignal::Negative => {
+            Verdict::Incomplete(detail_after_verdict(trimmed).unwrap_or(trimmed).to_string())
+        }
+        VerdictSignal::Abstain => {
+            Verdict::Abstain(detail_after_verdict(trimmed).unwrap_or(trimmed).to_string())
+        }
+        VerdictSignal::Positive | VerdictSignal::None => Verdict::Complete,
     }
 }
 
@@ -559,6 +641,76 @@ mod tests {
                 assert!(issues.contains("missing tests"));
             }
             other => panic!("expected Incomplete (priority over ABSTAIN), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_verdict_corpus() {
+        // dirge-5mtx: a judge's verdict surface form competes with itself.
+        // `COMPLETE` is a substring of `INCOMPLETE`; a bare positive word is
+        // embedded in its own negation (`NOT COMPLETE`). The parser must
+        // classify whole words, honour an explicit `NOT`, scan past a prose
+        // preamble to the verdict line, and only fail open when NO verdict
+        // token is present anywhere in the head. Most rows reproduced a bug on
+        // the old first-line / substring parser.
+        // (input, expected verdict class)
+        let rows: &[(&str, &str)] = &[
+            // bare tokens
+            ("COMPLETE", "complete"),
+            ("DONE", "complete"),
+            ("INCOMPLETE", "incomplete"),
+            ("GAPS", "incomplete"),
+            ("SHORT", "incomplete"),
+            // VERDICT: prefix
+            ("VERDICT: COMPLETE", "complete"),
+            ("VERDICT: INCOMPLETE", "incomplete"),
+            ("VERDICT: DONE", "complete"),
+            ("VERDICT: GAPS", "incomplete"),
+            ("VERDICT: UNSURE", "abstain"),
+            ("VERDICT: ABSTAIN", "abstain"),
+            // negated forms — `COMPLETE`/`DONE` appear as substrings but mean
+            // NOT done. The INCOMPLETE/COMPLETE trap, negated order.
+            ("NOT COMPLETE", "incomplete"),
+            ("NOT DONE", "incomplete"),
+            ("NOT FINISHED", "incomplete"),
+            ("NOT SATISFIED", "incomplete"),
+            // preamble line before the verdict token
+            ("I reviewed the work.\nINCOMPLETE\n- tests still failing", "incomplete"),
+            ("After checking, VERDICT: DONE", "complete"),
+            // mixed case
+            ("verdict: incomplete\n- x", "incomplete"),
+            ("Verdict: UNSURE", "abstain"),
+            // tokens mid-sentence (first-line substring handling, both ways)
+            ("The task is NOT COMPLETE yet", "incomplete"),
+            ("Overall the work is COMPLETE", "complete"),
+            // the INCOMPLETE/COMPLETE substring trap in both orders — negative
+            // wins whenever both tokens are present on the verdict line.
+            ("COMPLETE, not INCOMPLETE", "incomplete"),
+            ("INCOMPLETE then COMPLETE", "incomplete"),
+            // common English in the DETAIL must NOT compete with the verdict
+            // line above it — only the verdict line is classified.
+            ("DONE\nThe diff is clean; a few short comments, no gaps in logic.", "complete"),
+            ("COMPLETE\naddressing the remaining gaps next sprint is out of scope.", "complete"),
+            // no verdict token anywhere in the head → fail open (deliberate)
+            ("", "complete"),
+            ("probably looks fine", "complete"),
+        ];
+        for &(input, want) in rows {
+            let got = match parse_verdict(input) {
+                Verdict::Complete => "complete",
+                Verdict::Incomplete(_) => "incomplete",
+                Verdict::Abstain(_) => "abstain",
+            };
+            assert_eq!(got, want, "parse_verdict({input:?})");
+        }
+
+        // The preamble row must carry the remaining-work detail through.
+        match parse_verdict("I reviewed the work.\nINCOMPLETE\n- tests still failing") {
+            Verdict::Incomplete(issues) => assert!(
+                issues.contains("tests still failing"),
+                "detail lost: {issues:?}"
+            ),
+            other => panic!("expected Incomplete with detail, got {other:?}"),
         }
     }
 
@@ -973,5 +1125,63 @@ mod tests {
                 .is_empty(),
             "a judge error must not block finalization"
         );
+    }
+
+    /// Mechanical guard on the hazard itself, rather than on a fixed list of
+    /// phrasings: for EVERY positive token and EVERY negative token that
+    /// embeds it, a line bearing the negative must classify negative.
+    ///
+    /// The emitted answer set is deliberately left as COMPLETE/INCOMPLETE/
+    /// ABSTAIN rather than switched to non-overlapping words. Changing what
+    /// the prompt asks the judge for is a behavioural change, and run-to-run
+    /// variance makes behavioural changes to the judge unverifiable at any
+    /// sample size we can afford (dirge-5mtx.6, FM-5). The parser handling
+    /// both vocabularies is the structural fix, and it is checkable at n=1 —
+    /// which is what this test does. If someone later does change the
+    /// prompt, this still holds.
+    #[test]
+    fn negative_always_beats_the_positive_it_embeds() {
+        // (negative form, embedded positive token, is that token also a
+        // standalone positive?). FINISHED is deliberately negation-only: it
+        // is recognised in `NOT FINISHED` but bare `FINISHED` is not a
+        // verdict token, so it falls through to fail-open. Harmless, because
+        // fail-open and Positive both resolve to the same verdict — but the
+        // asymmetry is real and is pinned here rather than left to surprise
+        // someone.
+        let traps: &[(&str, &str, bool)] = &[
+            ("INCOMPLETE", "COMPLETE", true),
+            ("NOT COMPLETE", "COMPLETE", true),
+            ("NOT DONE", "DONE", true),
+            ("NOT MET", "MET", true),
+            ("NOT SATISFIED", "SATISFIED", true),
+            ("NOT FINISHED", "FINISHED", false),
+        ];
+        for &(negative, positive, positive_is_standalone) in traps {
+            assert!(
+                negative.contains(positive),
+                "test data error: {negative} should embed {positive}"
+            );
+            assert_eq!(
+                classify_verdict_head(negative),
+                VerdictSignal::Negative,
+                "{negative} embeds {positive} and must still classify negative"
+            );
+            // The fix must not have been achieved by simply never returning
+            // Positive — bare positives still read positive where they are
+            // part of the vocabulary at all.
+            if positive_is_standalone {
+                assert_eq!(
+                    classify_verdict_head(positive),
+                    VerdictSignal::Positive,
+                    "bare {positive} must still classify positive"
+                );
+            } else {
+                assert_eq!(
+                    classify_verdict_head(positive),
+                    VerdictSignal::None,
+                    "{positive} is negation-only; bare use falls through to fail-open"
+                );
+            }
+        }
     }
 }
