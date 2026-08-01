@@ -251,9 +251,7 @@ impl GateTally {
         let repairs = &self.repairs;
         // Stable placeholder when unset, so the log line keeps one shape and
         // a scraper never has to cope with a missing field.
-        let capability_tier = self
-            .capability_tier
-            .map_or("none", |t| t.as_str());
+        let capability_tier = self.capability_tier.map_or("none", |t| t.as_str());
         tracing::info!(
             target: "dirge::gates",
             capability_tier = %capability_tier,
@@ -396,7 +394,10 @@ mod tests {
         assert!(tally.final_verification.is_none());
 
         tally.set_verification(Some(VerificationStatus::VerifiedGreen));
-        assert_eq!(tally.final_verification, Some(VerificationStatus::VerifiedGreen));
+        assert_eq!(
+            tally.final_verification,
+            Some(VerificationStatus::VerifiedGreen)
+        );
 
         tally.set_verification(None);
         assert!(tally.final_verification.is_none());

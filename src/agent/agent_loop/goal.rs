@@ -261,7 +261,10 @@ mod tests {
             // a rephrasing that must not silently finalize the run
             ("the stop condition is not satisfied", "unmet"),
             // preamble line before the verdict
-            ("Let me check the transcript.\nGOAL: UNMET\n- commit the work", "unmet"),
+            (
+                "Let me check the transcript.\nGOAL: UNMET\n- commit the work",
+                "unmet",
+            ),
             ("Thinking it over.\nUNMET", "unmet"),
             // mixed case
             ("goal: unmet", "unmet"),

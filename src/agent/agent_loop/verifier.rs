@@ -406,7 +406,6 @@ impl VerifierGate {
     }
 }
 
-
 /// The build/test commands this project's CI actually runs (dirge-w2de part 2).
 ///
 /// # Why this is a LIST and not a gate
@@ -522,9 +521,10 @@ pub fn ci_hint(commands: &[String]) -> String {
         .map(|c| format!("`{c}`"))
         .collect::<Vec<_>>()
         .join(", ");
-    format!(" This project's CI runs: {list} — a green check that isn't one of those may not be what gets enforced.")
+    format!(
+        " This project's CI runs: {list} — a green check that isn't one of those may not be what gets enforced."
+    )
 }
-
 
 /// Does this command's shell shape MASK a non-zero exit from the verification
 /// step, so a reported success proves nothing?
@@ -2221,7 +2221,12 @@ mod tests {
     fn configured_gate_not_run_downgrades_green_to_fast_only() {
         let g = VerifierGate::with_project_gate(Some("cargo clippy --all-targets".into()));
         g.record_outcome("edit", &json!({"path": "src/auth.rs"}), &ok_result(), false);
-        g.record_outcome("bash", &json!({"command": "cargo test"}), &ok_result(), false);
+        g.record_outcome(
+            "bash",
+            &json!({"command": "cargo test"}),
+            &ok_result(),
+            false,
+        );
         assert_eq!(g.status(GateMode::Off), VerificationStatus::FastGreenOnly);
     }
 
@@ -2238,7 +2243,12 @@ mod tests {
             false,
         );
         assert_eq!(g.status(GateMode::Off), VerificationStatus::VerifiedRed);
-        g.record_outcome("bash", &json!({"command": "cargo test"}), &ok_result(), true);
+        g.record_outcome(
+            "bash",
+            &json!({"command": "cargo test"}),
+            &ok_result(),
+            true,
+        );
         assert_eq!(g.status(GateMode::Off), VerificationStatus::VerifiedRed);
     }
 
@@ -2248,7 +2258,12 @@ mod tests {
     fn unconfigured_gate_keeps_off_mode_byte_identical() {
         let g = VerifierGate::new();
         g.record_outcome("edit", &json!({"path": "src/auth.rs"}), &ok_result(), false);
-        g.record_outcome("bash", &json!({"command": "cargo test"}), &ok_result(), false);
+        g.record_outcome(
+            "bash",
+            &json!({"command": "cargo test"}),
+            &ok_result(),
+            false,
+        );
         assert_eq!(g.status(GateMode::Off), VerificationStatus::VerifiedGreen);
     }
 
@@ -2374,7 +2389,6 @@ mod tests {
         assert!(n.starts_with(VERIFY_NUDGE), "original text is preserved");
         assert!(n.contains("cargo clippy"), "and CI is named: {n}");
     }
-
 
     // ── A gate that cannot fail for the reason that matters ────────────────
     //

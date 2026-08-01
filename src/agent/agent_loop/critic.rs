@@ -352,9 +352,8 @@ pub(crate) enum VerdictSignal {
 // rather than letting the embedded positive token win. `FINISHED` is only
 // meaningful negated (`NOT FINISHED`), so it appears in the negation set but
 // NOT in the positive set. All four run against upper-cased text.
-static NEGATED_POSITIVE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\bNOT\s+(?:COMPLETE|DONE|MET|SATISFIED|FINISHED)\b").unwrap()
-});
+static NEGATED_POSITIVE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\bNOT\s+(?:COMPLETE|DONE|MET|SATISFIED|FINISHED)\b").unwrap());
 static NEGATIVE_TOKEN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\b(?:INCOMPLETE|GAPS|SHORT|UNMET)\b").unwrap());
 static ABSTAIN_TOKEN: LazyLock<Regex> =
@@ -816,7 +815,10 @@ mod tests {
             ("NOT FINISHED", "incomplete"),
             ("NOT SATISFIED", "incomplete"),
             // preamble line before the verdict token
-            ("I reviewed the work.\nINCOMPLETE\n- tests still failing", "incomplete"),
+            (
+                "I reviewed the work.\nINCOMPLETE\n- tests still failing",
+                "incomplete",
+            ),
             ("After checking, VERDICT: DONE", "complete"),
             // mixed case
             ("verdict: incomplete\n- x", "incomplete"),
@@ -830,8 +832,14 @@ mod tests {
             ("INCOMPLETE then COMPLETE", "incomplete"),
             // common English in the DETAIL must NOT compete with the verdict
             // line above it — only the verdict line is classified.
-            ("DONE\nThe diff is clean; a few short comments, no gaps in logic.", "complete"),
-            ("COMPLETE\naddressing the remaining gaps next sprint is out of scope.", "complete"),
+            (
+                "DONE\nThe diff is clean; a few short comments, no gaps in logic.",
+                "complete",
+            ),
+            (
+                "COMPLETE\naddressing the remaining gaps next sprint is out of scope.",
+                "complete",
+            ),
             // no verdict token anywhere in the head → fail open (deliberate)
             ("", "complete"),
             ("probably looks fine", "complete"),
@@ -1333,7 +1341,10 @@ mod tests {
     fn parse_choice_single_match_each_index() {
         let opts = ["BLOCKED", "NEXT", "DONE"];
         assert_eq!(parse_choice("BLOCKED", &opts), Some(0));
-        assert_eq!(parse_choice("the run is BLOCKED on the user", &opts), Some(0));
+        assert_eq!(
+            parse_choice("the run is BLOCKED on the user", &opts),
+            Some(0)
+        );
         assert_eq!(parse_choice("NEXT", &opts), Some(1));
         assert_eq!(parse_choice("offering a NEXT step", &opts), Some(1));
         assert_eq!(parse_choice("DONE", &opts), Some(2));
@@ -1415,13 +1426,17 @@ mod tests {
         let judge: CriticFn = Arc::new(|_p| Box::pin(async { anyhow::bail!("provider down") }));
         let out = run_unified_review(&judge, "", "did stuff", Some("diff"), None, None).await;
         assert!(!out.judged, "a failed call must not claim to have judged");
-        assert!(out.messages.is_empty(), "fail-open still yields no follow-up");
+        assert!(
+            out.messages.is_empty(),
+            "fail-open still yields no follow-up"
+        );
         assert!(out.raised_findings.is_none());
     }
 
     #[tokio::test]
     async fn clean_review_is_reported_as_judged() {
-        let judge: CriticFn = Arc::new(|_p| Box::pin(async { Ok("VERDICT: COMPLETE".to_string()) }));
+        let judge: CriticFn =
+            Arc::new(|_p| Box::pin(async { Ok("VERDICT: COMPLETE".to_string()) }));
         let out = run_unified_review(&judge, "", "did stuff", Some("diff"), None, None).await;
         assert!(out.judged, "a real response must count as judged");
         assert!(

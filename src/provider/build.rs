@@ -739,26 +739,18 @@ fn build_classify_fn(
             let preamble: std::sync::Arc<str> = std::sync::Arc::from(CLASSIFY_PREAMBLE);
             let model = client.completion_model(model_name);
             let prompt = classify_prompt(&question, options);
-            let raw = summarize::oneshot_with_model(
-                model.clone(),
-                "classify",
-                &preamble,
-                prompt,
-            )
-            .await?;
+            let raw =
+                summarize::oneshot_with_model(model.clone(), "classify", &preamble, prompt).await?;
             if let Some(idx) = parse_choice(&raw, options) {
                 return Ok(idx);
             }
             let retry = classify_retry_prompt(options);
             let raw2 =
                 summarize::oneshot_with_model(model, "classify-retry", &preamble, retry).await?;
-            parse_choice(&raw2, options).ok_or_else(|| {
-                anyhow::anyhow!("classifier did not choose one of {options:?}")
-            })
+            parse_choice(&raw2, options)
+                .ok_or_else(|| anyhow::anyhow!("classifier did not choose one of {options:?}"))
         })
-            as std::pin::Pin<
-                Box<dyn std::future::Future<Output = anyhow::Result<usize>> + Send>,
-            >
+            as std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<usize>> + Send>>
     })
 }
 
