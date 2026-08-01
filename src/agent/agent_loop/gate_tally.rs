@@ -18,15 +18,17 @@
 //! Both read the same observation-only counters — the tally still has no
 //! control-flow effect.
 //!
+//! The tally AGGREGATES signals, one source of truth per signal: repair
+//! counts come from the existing per-run `RepairStats` on `LoopConfig`
+//! (latched at run end), not a second counter. Among those,
+//! `repair_invalid` is the strongest capability tell — arguments so
+//! malformed the repair pass gave up means the model could not produce a
+//! dispatchable call even after repair.
+//!
 //! It deliberately contains no rig/LLM types, so it stays unit-testable
 //! without a model.
 
-// STOPGAP: nothing in this module is reachable from production code yet —
-// the run.rs wiring lands as part of bd dirge-5mtx.1. Remove this allow
-// the moment that wiring ships; it must not silence anything else.
-#![allow(dead_code)]
-
-use crate::agent::agent_loop::tool_input_repair::RepairKind;
+use crate::agent::agent_loop::tool_input_repair::RepairStatsSnapshot;
 
 /// Which finalization gate produced a run's follow-up. Mirrors the
 /// existing `FollowUpSource` in `run.rs`.
@@ -88,19 +90,6 @@ impl BoundaryNudge {
     }
 }
 
-/// Index into the per-kind repair array. `RepairKind` is defined in
-/// `tool_input_repair`, so the match lives here.
-fn repair_index(kind: RepairKind) -> usize {
-    match kind {
-        RepairKind::NullStripped => 0,
-        RepairKind::JsonStringToArray => 1,
-        RepairKind::ObjectToArray => 2,
-        RepairKind::BareStringToArray => 3,
-        RepairKind::MdLinkUnwrapped => 4,
-        RepairKind::TruncationFixed => 5,
-    }
-}
-
 /// Aggregated per-run counts of which gates and boundary nudges fired,
 /// plus the capability signals the loop computes and would otherwise
 /// discard.
@@ -112,8 +101,8 @@ pub struct GateTally {
     tool_calls: u32,
     errored_tool_calls: u32,
     final_verification: Option<crate::agent::agent_loop::verifier::VerificationStatus>,
+    repairs: Option<RepairStatsSnapshot>,
     scavenged_calls: u32,
-    repairs: [u32; 6],
     hallucinated_tool_names: u32,
     storm_suppressions: u32,
     max_failure_streak: u32,
@@ -158,17 +147,24 @@ impl GateTally {
         self.final_verification = status;
     }
 
+    /// Latch the per-run repair snapshot. Sourced from the existing
+    /// `LoopConfig::repair_stats` — one source of truth per signal, no
+    /// second counter.
+    pub fn set_repairs(&mut self, snapshot: Option<RepairStatsSnapshot>) {
+        self.repairs = snapshot;
+    }
+
     /// The model emitted tool-call-shaped TEXT instead of a native tool
     /// call, and it was scavenged into a real call.
     pub fn record_scavenged_call(&mut self) {
         self.scavenged_calls += 1;
     }
 
-    pub fn record_repair(&mut self, kind: RepairKind) {
-        self.repairs[repair_index(kind)] += 1;
-    }
-
     /// A tool name had to be resolved by nearest-name match (suggest.rs).
+    /// Not wired yet: suggest.rs is called from several sites, so its
+    /// recording is scoped separately (dirge-5mtx.7). Remove this allow
+    /// when that wiring lands.
+    #[allow(dead_code)]
     pub fn record_hallucinated_tool_name(&mut self) {
         self.hallucinated_tool_names += 1;
     }
@@ -183,7 +179,13 @@ impl GateTally {
     pub fn record_failure_streak(&mut self, current: u32) {
         self.max_failure_streak = self.max_failure_streak.max(current);
     }
+}
 
+// Read-side accessors. No consumer yet: the A/B harness (bd dirge-5mtx.1)
+// and the capability estimator (dirge-5mtx.7) land in later issues.
+// Remove this allow when either lands.
+#[allow(dead_code)]
+impl GateTally {
     pub fn gate_count(&self, gate: GateSource) -> u32 {
         self.gates[gate.index()]
     }
@@ -208,14 +210,6 @@ impl GateTally {
         self.scavenged_calls
     }
 
-    pub fn repair_count(&self, kind: RepairKind) -> u32 {
-        self.repairs[repair_index(kind)]
-    }
-
-    pub fn total_repairs(&self) -> u32 {
-        self.repairs.iter().sum()
-    }
-
     pub fn hallucinated_tool_names(&self) -> u32 {
         self.hallucinated_tool_names
     }
@@ -237,6 +231,10 @@ impl GateTally {
             Some(status) => format!("{status:?}"),
             None => "none".to_string(),
         };
+        // Repair counts come from the latched RepairStats snapshot; when it
+        // is absent (never set) emit zeros so the log line keeps a stable
+        // shape a script can parse.
+        let repairs = &self.repairs;
         tracing::info!(
             target: "dirge::gates",
             turns = self.turns,
@@ -262,13 +260,14 @@ impl GateTally {
             hallucinated_tool_names = self.hallucinated_tool_names,
             storm_suppressions = self.storm_suppressions,
             max_failure_streak = self.max_failure_streak,
-            total_repairs = self.total_repairs(),
-            repair_null_stripped = self.repairs[repair_index(RepairKind::NullStripped)],
-            repair_json_string_to_array = self.repairs[repair_index(RepairKind::JsonStringToArray)],
-            repair_object_to_array = self.repairs[repair_index(RepairKind::ObjectToArray)],
-            repair_bare_string_to_array = self.repairs[repair_index(RepairKind::BareStringToArray)],
-            repair_md_link_unwrapped = self.repairs[repair_index(RepairKind::MdLinkUnwrapped)],
-            repair_truncation_fixed = self.repairs[repair_index(RepairKind::TruncationFixed)],
+            repair_null_stripped = repairs.as_ref().map_or(0, |s| s.null_stripped),
+            repair_json_string_to_array = repairs.as_ref().map_or(0, |s| s.json_string_to_array),
+            repair_object_to_array = repairs.as_ref().map_or(0, |s| s.object_to_array),
+            repair_bare_string_to_array = repairs.as_ref().map_or(0, |s| s.bare_string_to_array),
+            repair_md_link_unwrapped = repairs.as_ref().map_or(0, |s| s.md_link_unwrapped),
+            repair_truncation_fixed = repairs.as_ref().map_or(0, |s| s.truncation_fixed),
+            repair_invalid = repairs.as_ref().map_or(0, |s| s.invalid),
+            repair_total_successful = repairs.as_ref().map_or(0, |s| s.total_successful()),
         );
     }
 }
@@ -391,36 +390,20 @@ mod tests {
     }
 
     #[test]
-    fn repair_counts_are_tracked_per_kind() {
+    fn repair_snapshot_round_trips() {
         let mut tally = GateTally::new();
-        for kind in [
-            RepairKind::NullStripped,
-            RepairKind::JsonStringToArray,
-            RepairKind::ObjectToArray,
-            RepairKind::BareStringToArray,
-            RepairKind::MdLinkUnwrapped,
-            RepairKind::TruncationFixed,
-        ] {
-            tally.record_repair(kind);
-        }
-        tally.record_repair(RepairKind::ObjectToArray);
+        assert!(tally.repairs.is_none());
 
-        assert_eq!(tally.repair_count(RepairKind::NullStripped), 1);
-        assert_eq!(tally.repair_count(RepairKind::JsonStringToArray), 1);
-        assert_eq!(tally.repair_count(RepairKind::ObjectToArray), 2);
-        assert_eq!(tally.repair_count(RepairKind::BareStringToArray), 1);
-        assert_eq!(tally.repair_count(RepairKind::MdLinkUnwrapped), 1);
-        assert_eq!(tally.repair_count(RepairKind::TruncationFixed), 1);
-    }
+        let snapshot = RepairStatsSnapshot {
+            truncation_fixed: 2,
+            invalid: 1,
+            ..Default::default()
+        };
+        tally.set_repairs(Some(snapshot.clone()));
+        assert_eq!(tally.repairs, Some(snapshot));
 
-    #[test]
-    fn total_repairs_sums_across_kinds() {
-        let mut tally = GateTally::new();
-        tally.record_repair(RepairKind::NullStripped);
-        tally.record_repair(RepairKind::NullStripped);
-        tally.record_repair(RepairKind::JsonStringToArray);
-        tally.record_repair(RepairKind::TruncationFixed);
-        assert_eq!(tally.total_repairs(), 4);
+        tally.set_repairs(None);
+        assert!(tally.repairs.is_none());
     }
 
     #[test]

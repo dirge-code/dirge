@@ -231,6 +231,13 @@ impl FailureTracker {
     pub fn recent_excerpts(&self) -> Vec<(String, String)> {
         self.inner.lock_ignore_poison().recent.clone()
     }
+
+    /// Current consecutive errored-tool-result streak — the mechanical,
+    /// unweighted call count, not the escalation score. Feeds the
+    /// capability tally's high-water mark (dirge-5mtx.1).
+    pub fn consecutive(&self) -> usize {
+        self.inner.lock_ignore_poison().consecutive
+    }
 }
 
 /// Collapse an excerpt to a single bounded line for the checkpoint.

@@ -54,6 +54,7 @@ use super::storm::StormBreaker;
 use super::stream::{StreamFn, stream_assistant_response};
 use super::tool::AbortSignal;
 use super::types::{CodeReviewMode, Context, GateMode, LoopConfig};
+use super::gate_tally::{BoundaryNudge, GateSource, GateTally};
 use super::verifier::VERIFY_TAG;
 use crate::sync_util::LockExt;
 
@@ -73,6 +74,7 @@ async fn poll_steering_and_reminder(
     config: &LoopConfig,
     guards: &super::activity::LoopGuards,
     safe_state_msg: Option<String>,
+    tally: &mut GateTally,
 ) -> (Vec<LoopMessage>, bool) {
     let mut out = match &config.get_steering_messages {
         Some(get) => get().await,
@@ -80,7 +82,11 @@ async fn poll_steering_and_reminder(
     };
     let had_user_steering = !out.is_empty();
     if let Some(tracker) = &config.file_touch_tracker {
-        out.extend(tracker.poll_reminder());
+        let reminder = tracker.poll_reminder();
+        if !reminder.is_empty() {
+            tally.record_nudge(BoundaryNudge::FileTouch);
+        }
+        out.extend(reminder);
     }
     // dirge-uw2l.4: the safe-state rung REPLACES (does not add to) the rung-2
     // recovery checkpoint on a boundary it fires — emitting both would tell
@@ -89,12 +95,17 @@ async fn poll_steering_and_reminder(
     // is off (the default), the regular checkpoint runs exactly as before, so
     // off-mode is byte-identical.
     if let Some(msg) = safe_state_msg {
+        tally.record_nudge(BoundaryNudge::SafeState);
         out.push(LoopMessage::User(super::message::UserMessage::text(msg)));
     } else {
         // Cross-turn recovery checkpoint: fired when consecutive *distinct*
         // tool errors pile up (storm only catches identical repeats). Follows
         // any user steering so the human's guidance is read first.
-        out.extend(guards.poll_reflection());
+        let checkpoint = guards.poll_reflection();
+        if !checkpoint.is_empty() {
+            tally.record_nudge(BoundaryNudge::ReflectionCheckpoint);
+        }
+        out.extend(checkpoint);
     }
     (out, had_user_steering)
 }
@@ -328,6 +339,22 @@ enum FollowUpSource {
     OpenIssues,
     /// No gate fired — the run may finalize.
     None,
+}
+
+impl From<FollowUpSource> for GateSource {
+    fn from(source: FollowUpSource) -> Self {
+        match source {
+            FollowUpSource::AwaitingUser => GateSource::AwaitingUser,
+            FollowUpSource::Hook => GateSource::Hook,
+            FollowUpSource::ResumeAfterFailure => GateSource::ResumeAfterFailure,
+            FollowUpSource::Verifier => GateSource::Verifier,
+            FollowUpSource::Critic => GateSource::Critic,
+            FollowUpSource::Goal => GateSource::Goal,
+            FollowUpSource::Todo => GateSource::Todo,
+            FollowUpSource::OpenIssues => GateSource::OpenIssues,
+            FollowUpSource::None => GateSource::None,
+        }
+    }
 }
 
 /// Display tag prefixing the unfinished-todo nudge. The UI keys on this to
@@ -1716,6 +1743,20 @@ pub async fn run_agent_loop(
     .await
 }
 
+/// One-shot run-finish instrumentation: latch the verifier status and
+/// emit the aggregated gate/nudge/capability tally as one `dirge::gates`
+/// event. Observation only — no control-flow effect.
+fn finish_tally(tally: &mut GateTally, config: &LoopConfig) {
+    tally.set_verification(
+        config
+            .verifier
+            .as_ref()
+            .map(|v| v.status(config.verification_tiers_mode)),
+    );
+    tally.set_repairs(Some(config.repair_stats.snapshot()));
+    tally.emit();
+}
+
 /// The actual loop. Faithful port of pi `runLoop` (agent-loop.ts:155-269)
 /// plus the LOOP-9 `summarize_fn` callback for context-compaction's
 /// structured-summary pass. Pass `None` to disable LLM compaction.
@@ -1780,6 +1821,10 @@ pub async fn run_loop(
     // (IMPROVEMENTS_PLAN #4). Reset after each post-usage decision.
     let mut snip_tokens_freed: u64 = 0;
 
+    // dirge-5mtx.1: per-run gate/capability tally. Declared before the
+    // initial steering poll so both steering-poll sites can record into it.
+    let mut tally = GateTally::new();
+
     // Pi line 167: initial steering poll.
     // Phase 4 part 2: composes with the file-touch tracker's
     // reminder poll when configured.
@@ -1787,7 +1832,7 @@ pub async fn run_loop(
         // The initial poll runs before any results, so there is nothing for
         // the safe-state rung to decide yet — None falls through to
         // poll_reflection unchanged.
-        poll_steering_and_reminder(&config, &guards, None).await;
+        poll_steering_and_reminder(&config, &guards, None, &mut tally).await;
 
     // dirge-nqr: count assistant turns so a hard cap can stop a
     // runaway run. `max_turns = None` means unlimited (legacy).
@@ -2149,6 +2194,7 @@ pub async fn run_loop(
                         tool_results: Vec::new(),
                     })
                     .await;
+                finish_tally(&mut tally, &config);
                 let _ = emit
                     .send(LoopEvent::AgentEnd {
                         messages: new_messages.clone(),
@@ -2223,10 +2269,15 @@ pub async fn run_loop(
                                 ) {
                                     Ok(None) => {
                                         // Valid — push as-is.
+                                        tally.record_scavenged_call();
                                         tool_calls.push(sc.clone());
                                     }
                                     Ok(Some(rr)) => {
                                         // Repaired — push with repaired args.
+                                        // Kinds are already counted in
+                                        // `config.repair_stats`; the tally
+                                        // latches that snapshot at run end.
+                                        tally.record_scavenged_call();
                                         let mut repaired_call = sc.clone();
                                         repaired_call.arguments = rr.repaired;
                                         tool_calls.push(repaired_call);
@@ -2242,6 +2293,7 @@ pub async fn run_loop(
                                 // allowed_names is built from this same tool set.
                                 // Preserve prior behavior and push the call as-is.
                                 tool_calls.push(sc.clone());
+                                tally.record_scavenged_call();
                             }
                         }
                     }
@@ -2283,6 +2335,9 @@ pub async fn run_loop(
             if !tool_calls.is_empty() {
                 let original_count = tool_calls.len();
                 let (surviving_calls, storm_report) = guards.inspect_calls(&tool_calls);
+                for _ in 0..storm_report.storms_broken {
+                    tally.record_storm_suppression();
+                }
                 let all_suppressed = storm_report.all_suppressed(original_count);
 
                 // Port of Reasonix loop.ts:935-956 — first-time
@@ -2387,6 +2442,8 @@ pub async fn run_loop(
                                 arguments: serde_json::Value::Null,
                             });
                         guards.record_result(&originating, result.is_error, &excerpt);
+                        tally.record_tool_call(result.is_error);
+                        tally.record_failure_streak(guards.failure_streak() as u32);
                         current_context.messages.push(tool_result_to_value(result));
                         new_messages.push(LoopMessage::ToolResult(result.clone()));
                     }
@@ -2450,6 +2507,7 @@ pub async fn run_loop(
                 crate::agent::tools::todo::unfinished_count(),
                 turn_made_file_edits(&new_messages),
             ) {
+                tally.record_nudge(BoundaryNudge::TrackWork);
                 track_nudges += 1;
                 emit_harness_notices(emit, std::slice::from_ref(&reminder)).await;
                 current_context
@@ -2469,6 +2527,7 @@ pub async fn run_loop(
                     .as_ref()
                     .map_or(0, |v| v.edits_since_verify()),
             ) {
+                tally.record_nudge(BoundaryNudge::FastVerify);
                 verify_nudges += 1;
                 emit_harness_notices(emit, std::slice::from_ref(&reminder)).await;
                 current_context
@@ -2504,9 +2563,17 @@ pub async fn run_loop(
                         Some(super::verifier::VerificationStatus::VerifiedGreen)
                     ),
                 };
-                let signal = progress
-                    .record_turn(snapshot)
-                    .or_else(|| progress.poll_budget(turns_taken, config.max_turns.unwrap_or(0)));
+                let signal = if let Some(m) = progress.record_turn(snapshot) {
+                    tally.record_nudge(BoundaryNudge::ProgressStall);
+                    Some(m)
+                } else if let Some(m) =
+                    progress.poll_budget(turns_taken, config.max_turns.unwrap_or(0))
+                {
+                    tally.record_nudge(BoundaryNudge::ProgressBudget);
+                    Some(m)
+                } else {
+                    None
+                };
                 if let Some(msg) = signal {
                     emit_harness_notices(emit, std::slice::from_ref(&msg)).await;
                     current_context.messages.push(loop_message_to_value(&msg));
@@ -2737,6 +2804,7 @@ pub async fn run_loop(
                     new_messages: new_messages.clone(),
                 };
                 if hook(hook_ctx).await {
+                    finish_tally(&mut tally, &config);
                     let _ = emit
                         .send(LoopEvent::AgentEnd {
                             messages: new_messages.clone(),
@@ -2785,7 +2853,7 @@ pub async fn run_loop(
                 None
             };
             let (next_pending, had_user_steering) =
-                poll_steering_and_reminder(&config, &guards, safe_state_msg).await;
+                poll_steering_and_reminder(&config, &guards, safe_state_msg, &mut tally).await;
             pending_messages = next_pending;
             // dirge-uw2l.7: surface harness steers to headless consumers.
             emit_harness_notices(emit, &pending_messages).await;
@@ -2806,6 +2874,7 @@ pub async fn run_loop(
             // append a user-facing message into the transcript so the
             // model's history reflects the truncation, and bail.
             turns_taken += 1;
+            tally.record_turn();
             if let Some(cap) = config.max_turns
                 && turns_taken >= cap
             {
@@ -2882,6 +2951,7 @@ pub async fn run_loop(
             emit,
         )
         .await;
+        tally.record_gate(source.into());
         if !follow_up.is_empty() {
             tracing::trace!(target: "dirge::loop", ?source, "finalization follow-up interjected");
             emit_harness_notices(emit, &follow_up).await;
@@ -2904,6 +2974,7 @@ pub async fn run_loop(
     }
 
     // Pi line 268: final agent_end.
+    finish_tally(&mut tally, &config);
     let _ = emit
         .send(LoopEvent::AgentEnd {
             messages: new_messages.clone(),
