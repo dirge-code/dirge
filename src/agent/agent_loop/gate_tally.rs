@@ -53,6 +53,9 @@ pub enum BoundaryNudge {
     FastVerify,
     ProgressStall,
     ProgressBudget,
+    /// dirge-t5dh: a run that has produced NOTHING yet crossed the prologue
+    /// bound. Distinct from `ProgressStall` (produced, then stopped).
+    ProgressPrologue,
     FileTouch,
     ReflectionCheckpoint,
     SafeState,
@@ -82,10 +85,11 @@ impl BoundaryNudge {
             BoundaryNudge::FastVerify => 1,
             BoundaryNudge::ProgressStall => 2,
             BoundaryNudge::ProgressBudget => 3,
-            BoundaryNudge::FileTouch => 4,
-            BoundaryNudge::ReflectionCheckpoint => 5,
-            BoundaryNudge::SafeState => 6,
-            BoundaryNudge::None => 7,
+            BoundaryNudge::ProgressPrologue => 4,
+            BoundaryNudge::FileTouch => 5,
+            BoundaryNudge::ReflectionCheckpoint => 6,
+            BoundaryNudge::SafeState => 7,
+            BoundaryNudge::None => 8,
         }
     }
 }
@@ -96,7 +100,7 @@ impl BoundaryNudge {
 #[derive(Clone, Debug, Default)]
 pub struct GateTally {
     gates: [u32; 9],
-    nudges: [u32; 8],
+    nudges: [u32; 9],
     turns: u32,
     tool_calls: u32,
     errored_tool_calls: u32,
@@ -253,6 +257,7 @@ impl GateTally {
             nudge_fast_verify = self.nudges[BoundaryNudge::FastVerify.index()],
             nudge_progress_stall = self.nudges[BoundaryNudge::ProgressStall.index()],
             nudge_progress_budget = self.nudges[BoundaryNudge::ProgressBudget.index()],
+            nudge_progress_prologue = self.nudges[BoundaryNudge::ProgressPrologue.index()],
             nudge_file_touch = self.nudges[BoundaryNudge::FileTouch.index()],
             nudge_reflection_checkpoint = self.nudges[BoundaryNudge::ReflectionCheckpoint.index()],
             nudge_safe_state = self.nudges[BoundaryNudge::SafeState.index()],
@@ -313,6 +318,7 @@ mod tests {
             BoundaryNudge::FastVerify,
             BoundaryNudge::ProgressStall,
             BoundaryNudge::ProgressBudget,
+            BoundaryNudge::ProgressPrologue,
             BoundaryNudge::FileTouch,
             BoundaryNudge::ReflectionCheckpoint,
             BoundaryNudge::SafeState,

@@ -240,9 +240,14 @@ impl AnyAgent {
         // dirge-uw2l.3: progress monitor — stall + turn-budget signals,
         // built fresh per session. `None` keeps it off, byte-identical to
         // a loop without it.
+        // dirge-t5dh: the prologue cap bounds the "never produced anything"
+        // case the stall counter structurally cannot see.
+        let prologue_cap = self
+            .progress_prologue_cap
+            .unwrap_or(crate::agent::agent_loop::progress::DEFAULT_PROLOGUE_CAP);
         cfg.progress = self
             .progress_stall_threshold
-            .map(crate::agent::agent_loop::progress::ProgressTracker::new);
+            .map(|t| crate::agent::agent_loop::progress::ProgressTracker::new(t, prologue_cap));
         // F6: pre-finalization verifier gate, always on (baked-in). Nudges
         // to verify before finishing when code was edited but not run.
         // dirge-w2de: a configured `verification_command` makes the gate

@@ -524,6 +524,9 @@ pub async fn build_agent(
     if let Some(threshold) = cfg.progress_stall_threshold {
         agent = agent.with_progress_stall_threshold(threshold);
     }
+    if let Some(cap) = cfg.progress_prologue_cap {
+        agent = agent.with_progress_prologue_cap(cap);
+    }
 
     // dirge-ksjl — open-issues finalization gate mode, resolved from
     // config. Default is Off (opt-in; nagging is intrusive).

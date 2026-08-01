@@ -1074,6 +1074,17 @@ pub struct Config {
     /// no stall checkpoints and no turn-budget notices, byte-identical to
     /// a loop without it. Clamped to a minimum of 2.
     pub progress_stall_threshold: Option<usize>,
+    /// Upper bound on the "exploration prologue" (dirge-t5dh) — how many
+    /// barren turn boundaries (or, times `PROLOGUE_TOOL_MULTIPLE`, barren tool
+    /// calls) a run may make BEFORE its first progress event before the monitor
+    /// nudges it to write something. Only meaningful when
+    /// `progress_stall_threshold` is also set (the monitor is otherwise off).
+    /// Absent *(default)* uses a generous provisional cap (see
+    /// [`crate::agent::agent_loop::progress::DEFAULT_PROLOGUE_CAP`]); the stall
+    /// counter still arms normally on the first progress event. dirge-5mtx.7
+    /// will replace that provisional default by deriving the cap from observed
+    /// capability signals, so this key is the intended override point.
+    pub progress_prologue_cap: Option<usize>,
     /// dirge-w2de: the project's real gate command — the build/test
     /// command CI actually runs (e.g. `RUSTFLAGS="-D warnings" cargo
     /// clippy --all-targets`). When set, `VerifierGate` only reports a
@@ -2118,6 +2129,16 @@ mod tests {
         assert_eq!(cfg.progress_stall_threshold, None);
         let cfg: Config = serde_json::from_str(r#"{ "progress_stall_threshold": 4 }"#).unwrap();
         assert_eq!(cfg.progress_stall_threshold, Some(4));
+    }
+
+    /// dirge-t5dh: the prologue cap is opt-in. Absent (default) leaves it to the
+    /// provisional in-tracker default; present, it passes through verbatim.
+    #[test]
+    fn progress_prologue_cap_defaults_to_absent() {
+        let cfg: Config = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(cfg.progress_prologue_cap, None);
+        let cfg: Config = serde_json::from_str(r#"{ "progress_prologue_cap": 8 }"#).unwrap();
+        assert_eq!(cfg.progress_prologue_cap, Some(8));
     }
 
     /// dirge-w2de: the project gate command is opt-in. Absent (default)

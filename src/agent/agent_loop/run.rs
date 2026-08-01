@@ -2562,9 +2562,19 @@ pub async fn run_loop(
                         config.verifier.as_ref().map(|v| v.status(GateMode::Off)),
                         Some(super::verifier::VerificationStatus::VerifiedGreen)
                     ),
+                    // dirge-t5dh: the prologue bound also watches tool calls,
+                    // since a turn batching forty reads is one boundary but
+                    // forty calls. The tally already counts them for the run.
+                    tool_calls: tally.tool_calls() as usize,
                 };
                 let signal = if let Some(m) = progress.record_turn(snapshot) {
-                    tally.record_nudge(BoundaryNudge::ProgressStall);
+                    // record_turn returns either a stall checkpoint or a
+                    // prologue one; the tag is the only difference.
+                    if super::progress::is_prologue_checkpoint(&m) {
+                        tally.record_nudge(BoundaryNudge::ProgressPrologue);
+                    } else {
+                        tally.record_nudge(BoundaryNudge::ProgressStall);
+                    }
                     Some(m)
                 } else if let Some(m) =
                     progress.poll_budget(turns_taken, config.max_turns.unwrap_or(0))

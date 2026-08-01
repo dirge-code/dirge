@@ -172,6 +172,9 @@ pub struct AnyAgent {
     /// Set by `build_agent` from `Config::progress_stall_threshold`;
     /// forwarded to the loop's progress monitor. `None` = off.
     progress_stall_threshold: Option<usize>,
+    /// dirge-t5dh: barren boundaries before the exploration-prologue
+    /// checkpoint. `None` uses [`crate::agent::agent_loop::progress::DEFAULT_PROLOGUE_CAP`].
+    progress_prologue_cap: Option<usize>,
     /// dirge-nqr: hard cap on assistant turns per run. Set via
     /// `with_max_turns`. Forwarded to `LoopSpawnConfig.max_turns`
     /// at spawn time. `None` = unlimited (legacy).
@@ -347,6 +350,7 @@ impl AnyAgent {
             summarize_fn: None,
             context_depth_reminder_threshold: None,
             progress_stall_threshold: None,
+            progress_prologue_cap: None,
             max_turns: None,
             review_stream_fn: None,
             review_provider_name: None,
@@ -624,6 +628,14 @@ impl AnyAgent {
     /// session.
     pub fn with_progress_stall_threshold(mut self, threshold: usize) -> Self {
         self.progress_stall_threshold = Some(threshold);
+        self
+    }
+
+    /// dirge-t5dh: override the exploration-prologue cap. Only meaningful
+    /// alongside `with_progress_stall_threshold`; unset uses the provisional
+    /// default.
+    pub fn with_progress_prologue_cap(mut self, cap: usize) -> Self {
+        self.progress_prologue_cap = Some(cap);
         self
     }
 
