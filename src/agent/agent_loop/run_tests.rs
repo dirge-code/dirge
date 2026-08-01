@@ -6756,3 +6756,118 @@ fn awaiting_user_corpus_known_misclassifications() {
          improvement rather than the defect."
     );
 }
+
+/// dirge-5mtx.4: with a classifier armed, the offers the heuristic misreads
+/// are classified correctly — and the genuinely-blocked cases still finalize.
+///
+/// This is the counterpart to `awaiting_user_corpus_known_misclassifications`
+/// above, which pins the heuristic's 5-of-5 failure on the same phrasings. The
+/// stub judge answers the way a real one would; what is under test is the
+/// wiring and the fallback behaviour, not the model.
+#[tokio::test]
+async fn awaiting_user_classifier_fixes_the_offer_cases() {
+    // Stub: OFFERING (index 1) for anything mentioning finished work, BLOCKED
+    // (index 0) otherwise. Deliberately keyed on the message, not on a counter,
+    // so the test fails if the wrong text reaches the judge.
+    let classify: crate::agent::agent_loop::critic::ClassifyFn =
+        std::sync::Arc::new(|question: String, _opts: &'static [&'static str]| {
+            Box::pin(async move {
+                let q = question.to_lowercase();
+                let offering = q.contains("i've added")
+                    || q.contains("is fixed")
+                    || q.contains("that's the refactor")
+                    || q.contains("implemented and committed")
+                    || q.contains("is written");
+                Ok(if offering { 1usize } else { 0usize })
+            })
+                as std::pin::Pin<
+                    Box<dyn std::future::Future<Output = anyhow::Result<usize>> + Send>,
+                >
+        });
+    let mut cfg = build_config();
+    cfg.classify_fn = Some(classify);
+
+    // The five the heuristic gets wrong — all offers, none blocking.
+    for t in [
+        "I've added the parser and its tests. Want me to wire it into the loop as well?",
+        "The bug is fixed and the suite is green. Shall I also update the changelog?",
+        "That's the refactor done. Should I run the full test suite now?",
+        "Implemented and committed. Anything else you'd like me to pick up?",
+        "The migration script is written. Would you like me to run it against staging?",
+    ] {
+        assert!(
+            !crate::agent::agent_loop::run::is_awaiting_user(&cfg, &[assistant_text(t)]).await,
+            "offer must no longer read as blocked: {t}"
+        );
+    }
+    // Genuinely blocked still finalizes — the fix must not simply always
+    // return false, which would disable the gate rather than correct it.
+    for t in [
+        "Which database should I use?",
+        "Do you want me to use the async or the blocking client?",
+    ] {
+        assert!(
+            crate::agent::agent_loop::run::is_awaiting_user(&cfg, &[assistant_text(t)]).await,
+            "genuinely blocked must still finalize: {t}"
+        );
+    }
+}
+
+/// A turn with no question mark never reaches the judge. This is the common
+/// case, so paying for a classifier call on it would be a real cost.
+#[tokio::test]
+async fn awaiting_user_no_question_mark_never_calls_the_judge() {
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = calls.clone();
+    let classify: crate::agent::agent_loop::critic::ClassifyFn =
+        std::sync::Arc::new(move |_q: String, _o: &'static [&'static str]| {
+            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move { Ok(0usize) })
+                as std::pin::Pin<
+                    Box<dyn std::future::Future<Output = anyhow::Result<usize>> + Send>,
+                >
+        });
+    let mut cfg = build_config();
+    cfg.classify_fn = Some(classify);
+    assert!(
+        !crate::agent::agent_loop::run::is_awaiting_user(&cfg, &[assistant_text("I've updated the file.")]).await
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+/// A classifier error falls back to the heuristic rather than failing the
+/// turn — the gate must answer something, and the pre-fix answer is the right
+/// one when the better signal is unavailable.
+#[tokio::test]
+async fn awaiting_user_classifier_error_falls_back_to_heuristic() {
+    let classify: crate::agent::agent_loop::critic::ClassifyFn =
+        std::sync::Arc::new(|_q: String, _o: &'static [&'static str]| {
+            Box::pin(async move { anyhow::bail!("judge unavailable") })
+                as std::pin::Pin<
+                    Box<dyn std::future::Future<Output = anyhow::Result<usize>> + Send>,
+                >
+        });
+    let mut cfg = build_config();
+    cfg.classify_fn = Some(classify);
+    // Heuristic says blocked (trailing '?'), so the fallback does too.
+    assert!(
+        crate::agent::agent_loop::run::is_awaiting_user(&cfg, &[assistant_text("Which database should I use?")]).await
+    );
+}
+
+/// No classifier configured → byte-identical to the old behaviour.
+#[tokio::test]
+async fn awaiting_user_without_a_classifier_is_the_old_heuristic() {
+    let cfg = build_config();
+    assert!(cfg.classify_fn.is_none());
+    for t in [
+        "Which database should I use?",
+        "I've added the parser and its tests. Want me to wire it into the loop as well?",
+    ] {
+        assert_eq!(
+            crate::agent::agent_loop::run::is_awaiting_user(&cfg, &[assistant_text(t)]).await,
+            awaiting_user_response(&[assistant_text(t)]),
+            "unconfigured path must match the heuristic exactly: {t}"
+        );
+    }
+}

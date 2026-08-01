@@ -518,6 +518,70 @@ async fn poll_goal_gate(
     None
 }
 
+/// dirge-5mtx.4: is the run BLOCKED on the user, or merely OFFERING more work?
+///
+/// Gate 0 of [`poll_finalization_follow_up`] finalizes immediately when this is
+/// true, skipping the verifier, critic, todo and open-issues gates. So a false
+/// positive silently disables the whole finalization stack — and skipping a gate
+/// produces no output, so nothing in the transcript shows it happened.
+///
+/// [`awaiting_user_response`] answers it by testing whether the last meaningful
+/// line ends in `?`. That cannot separate "which database should I use?" (the
+/// run genuinely cannot proceed) from "I've added the parser — want me to wire
+/// it in too?" (the work is done and is exactly what the gates exist to check).
+/// Measured, it reads five out of five completed-work offers as blocked; see
+/// `awaiting_user_corpus_known_misclassifications`.
+///
+/// Three tiers, cheapest first:
+///   1. No `?` anywhere in the final text → not blocked. Costs nothing and is
+///      the overwhelmingly common case, so the judge is never called for it.
+///   2. No classifier configured → the heuristic, exactly as before.
+///   3. Otherwise ask the judge to choose between two non-overlapping words.
+///      A classifier error falls back to the heuristic rather than failing the
+///      turn: the gate has to answer something, and the pre-fix behaviour is
+///      the right thing to answer when the better signal is unavailable.
+pub(crate) async fn is_awaiting_user(config: &LoopConfig, new_messages: &[LoopMessage]) -> bool {
+    let Some(LoopMessage::Assistant(last)) = new_messages.last() else {
+        return false;
+    };
+    let joined: String = last
+        .content
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    // 1. Cheap structural pre-filter. A turn with no question mark at all is
+    //    not waiting on anyone, and this is most turns.
+    if !joined.contains('?') && !joined.contains('\u{ff1f}') {
+        return false;
+    }
+    // 2. No judge armed — heuristic, unchanged.
+    let Some(classify) = config.classify_fn.as_ref() else {
+        return awaiting_user_response(new_messages);
+    };
+    // 3. Ask. Options are deliberately non-overlapping words: neither is a
+    //    substring or whole-word match of the other (dirge-5mtx.3).
+    const OPTIONS: &[&str] = &["BLOCKED", "OFFERING"];
+    let question = format!(
+        "Here is the final message a coding agent sent at the end of its turn:\n\n         ---\n{joined}\n---\n\n         Did it STOP because it needs a decision from the user before it can          continue (BLOCKED), or had it finished the work and was offering to do          more / asking a rhetorical or courtesy question (OFFERING)?"
+    );
+    match classify(question, OPTIONS).await {
+        Ok(0) => true,
+        Ok(_) => false,
+        Err(e) => {
+            tracing::debug!(
+                target: "dirge::loop",
+                error = %e,
+                "awaiting-user classifier failed; falling back to the heuristic"
+            );
+            awaiting_user_response(new_messages)
+        }
+    }
+}
+
 /// Poll the finalization gates in strict priority order and return the first
 /// non-empty source's messages (plus which source fired, for tracing/tests).
 ///
@@ -574,7 +638,7 @@ async fn poll_finalization_follow_up(
     //    stop condition, so it must keep pushing the run forward even with a
     //    question pending. A still-running coordinator generation keeps its
     //    existing meaning too — `should_defer_finalization` defers as before.
-    if awaiting_user_response(new_messages) {
+    if is_awaiting_user(config, new_messages).await {
         // (a) A coordinator generation still running defers the whole decision.
         if config
             .should_defer_finalization
