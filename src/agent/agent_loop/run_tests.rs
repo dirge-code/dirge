@@ -6894,3 +6894,61 @@ fn tier_does_not_bypass_the_nudge_budget() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// dirge-5mtx.7: hallucinated tool names must reach the capability estimator.
+//
+// `record_hallucinated_tool_name` had a unit test that called it directly and
+// ZERO production callers, so the counter was structurally always 0 and its
+// weight could never contribute. These drive the function the loop actually
+// calls, which is the part that was missing.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn unknown_tool_name_is_counted_as_hallucinated() {
+    let known = ["read", "write", "bash"];
+    let mut tally = crate::agent::agent_loop::gate_tally::GateTally::new();
+    record_tool_result_signals(&mut tally, "search_files", true, &known);
+    assert_eq!(tally.hallucinated_tool_names(), 1);
+    // It is ALSO an errored call — the stacking is deliberate, matching how
+    // repair_invalid already stacks with errored.
+    assert_eq!(tally.errored_tool_calls(), 1);
+    assert_eq!(tally.tool_calls(), 1);
+}
+
+#[test]
+fn known_tool_that_errors_is_not_hallucinated() {
+    let known = ["read", "write", "bash"];
+    let mut tally = crate::agent::agent_loop::gate_tally::GateTally::new();
+    record_tool_result_signals(&mut tally, "bash", true, &known);
+    assert_eq!(
+        tally.hallucinated_tool_names(),
+        0,
+        "a real tool misused is a different signal from an invented name"
+    );
+    assert_eq!(tally.errored_tool_calls(), 1);
+}
+
+#[test]
+fn successful_call_is_never_hallucinated() {
+    let known = ["read"];
+    let mut tally = crate::agent::agent_loop::gate_tally::GateTally::new();
+    // A name that isn't in the list can't actually succeed, but the guard is
+    // on is_error so the classification can never fire on a working call.
+    record_tool_result_signals(&mut tally, "mystery", false, &known);
+    assert_eq!(tally.hallucinated_tool_names(), 0);
+    assert_eq!(tally.errored_tool_calls(), 0);
+    assert_eq!(tally.tool_calls(), 1);
+}
+
+#[test]
+fn hallucinated_names_accumulate_across_calls() {
+    let known = ["read"];
+    let mut tally = crate::agent::agent_loop::gate_tally::GateTally::new();
+    record_tool_result_signals(&mut tally, "view", true, &known);
+    record_tool_result_signals(&mut tally, "open_file", true, &known);
+    record_tool_result_signals(&mut tally, "read", true, &known);
+    assert_eq!(tally.hallucinated_tool_names(), 2);
+    assert_eq!(tally.errored_tool_calls(), 3);
+    assert_eq!(tally.tool_calls(), 3);
+}
