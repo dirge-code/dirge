@@ -607,6 +607,21 @@ pub fn build_unified_followup(verdict: Verdict, findings: Vec<Finding>) -> Optio
 /// consolidated [`CRITIC_TAG`] follow-up. Replaces the separate critic +
 /// code-review calls (dirge-8v98). Fail-open: a judge error/timeout finalizes
 /// without blocking.
+/// Outcome of one unified review.
+///
+/// `judged` distinguishes "the judge ran and found nothing" from "the judge
+/// call failed and we failed open" — which the old `(Vec, Option<String>)`
+/// return could not (dirge-q7vw). Both produced an empty vec and a `None`, so
+/// the Blocking caller recorded the reviewed-diff fingerprint after a
+/// transient judge error and then skipped re-review of that same diff forever:
+/// the diff never got code-reviewed at all, silently.
+pub struct ReviewOutcome {
+    pub messages: Vec<LoopMessage>,
+    pub raised_findings: Option<String>,
+    /// True only when a judge response was actually parsed.
+    pub judged: bool,
+}
+
 pub async fn run_unified_review(
     judge: &CriticFn,
     rules: &str,
@@ -614,14 +629,18 @@ pub async fn run_unified_review(
     diff: Option<&str>,
     verification: Option<VerificationStatus>,
     prior_findings: Option<&str>,
-) -> (Vec<LoopMessage>, Option<String>) {
+) -> ReviewOutcome {
     let prompt = build_unified_prompt(rules, transcript, diff, verification, prior_findings);
     let response = run_judge!(
         judge,
         prompt,
         "dirge::critic",
         "unified review call failed; finalizing without it",
-        (Vec::new(), None)
+        ReviewOutcome {
+            messages: Vec::new(),
+            raised_findings: None,
+            judged: false,
+        }
     );
     let (verdict, findings) = parse_unified(&response);
     // dirge-9b2k R2: surface the rendered findings so the caller can hand them
@@ -631,10 +650,14 @@ pub async fn run_unified_review(
     } else {
         Some(render_findings(&findings))
     };
-    let msgs = build_unified_followup(verdict, findings)
+    let messages = build_unified_followup(verdict, findings)
         .into_iter()
         .collect();
-    (msgs, raised)
+    ReviewOutcome {
+        messages,
+        raised_findings: raised,
+        judged: true,
+    }
 }
 
 #[cfg(test)]
@@ -1069,7 +1092,7 @@ mod tests {
         assert!(
             run_unified_review(&judge, "rules", "did stuff", None, None, None)
                 .await
-                .0
+                .messages
                 .is_empty()
         );
     }
@@ -1239,7 +1262,7 @@ mod tests {
         assert!(
             run_unified_review(&judge, "rules", "did stuff", Some("diff"), None, None)
                 .await
-                .0
+                .messages
                 .is_empty(),
             "a judge error must not block finalization"
         );
@@ -1379,5 +1402,44 @@ mod tests {
         let prompt = classify_retry_prompt(&["BLOCKED", "NEXT"]);
         assert!(prompt.contains("BLOCKED"));
         assert!(prompt.contains("NEXT"));
+    }
+
+    // ── dirge-q7vw: a failed judge call must be distinguishable from a
+    // clean review. Both produce no messages and no findings, and the
+    // Blocking caller used that to decide whether to record the
+    // reviewed-diff fingerprint. Recording it after an ERROR made the next
+    // reaction skip the same unchanged diff, so it never got reviewed.
+
+    #[tokio::test]
+    async fn judge_error_is_not_reported_as_judged() {
+        let judge: CriticFn = Arc::new(|_p| Box::pin(async { anyhow::bail!("provider down") }));
+        let out = run_unified_review(&judge, "", "did stuff", Some("diff"), None, None).await;
+        assert!(!out.judged, "a failed call must not claim to have judged");
+        assert!(out.messages.is_empty(), "fail-open still yields no follow-up");
+        assert!(out.raised_findings.is_none());
+    }
+
+    #[tokio::test]
+    async fn clean_review_is_reported_as_judged() {
+        let judge: CriticFn = Arc::new(|_p| Box::pin(async { Ok("VERDICT: COMPLETE".to_string()) }));
+        let out = run_unified_review(&judge, "", "did stuff", Some("diff"), None, None).await;
+        assert!(out.judged, "a real response must count as judged");
+        assert!(
+            out.messages.is_empty(),
+            "COMPLETE with no findings still yields no follow-up"
+        );
+    }
+
+    /// The pair is the actual invariant: the two cases are indistinguishable
+    /// by messages/findings alone, which is exactly why `judged` exists.
+    #[tokio::test]
+    async fn error_and_clean_review_differ_only_in_judged() {
+        let err: CriticFn = Arc::new(|_p| Box::pin(async { anyhow::bail!("down") }));
+        let ok: CriticFn = Arc::new(|_p| Box::pin(async { Ok("VERDICT: COMPLETE".to_string()) }));
+        let a = run_unified_review(&err, "", "t", Some("d"), None, None).await;
+        let b = run_unified_review(&ok, "", "t", Some("d"), None, None).await;
+        assert_eq!(a.messages.len(), b.messages.len());
+        assert_eq!(a.raised_findings, b.raised_findings);
+        assert_ne!(a.judged, b.judged, "only `judged` separates them");
     }
 }

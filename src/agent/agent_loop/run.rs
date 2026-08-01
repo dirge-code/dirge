@@ -775,9 +775,32 @@ async fn poll_finalization_follow_up(
             // open-issues gates. An early `return` here would silently drop those
             // nudges — so `skip` only gates the judge block below, leaving the
             // downstream gates in play on a skipped reaction.
+            // dirge-9b2k: Blocking dedupe. The judge is stateless, so when the
+            // model declined a finding and changed nothing on disk, the next
+            // reaction re-reviews the identical diff, re-raises the same
+            // finding, and elicits the same rebuttal — a duplicate message.
+            //
+            // dirge-mu46: but `run_unified_review` judges TWO things — the diff
+            // for defects and the transcript for completeness — and skipping
+            // wholesale skipped completeness too, letting an objectively
+            // incomplete task finalize on the model's say-so because the
+            // reaction that would have re-judged it never ran.
+            //
+            // The extra condition is `last_review_findings.is_some()`: only skip
+            // when the previous reaction actually raised DIFF FINDINGS, which is
+            // the duplicate-message scenario the dedupe exists for. When the
+            // previous message was completeness-only there is no finding to
+            // duplicate, and the transcript has grown since, so re-judging is
+            // exactly the right thing to do.
+            //
+            // Falling through (NOT early-returning) is load-bearing: a skip is
+            // semantically "the critic found nothing this reaction", and the
+            // existing empty-findings path falls through to the goal / todo /
+            // open-issues gates. An early `return` would silently drop those.
             let skip = mode == CodeReviewMode::Blocking
                 && diff_owned.is_some()
-                && current_fingerprint == *last_reviewed_fingerprint;
+                && current_fingerprint == *last_reviewed_fingerprint
+                && last_review_findings.is_some();
             if !skip {
                 let transcript = build_critic_transcript(new_messages);
                 // dirge-6q3w: thread the run's compile/lint/test signal so the
@@ -788,7 +811,7 @@ async fn poll_finalization_follow_up(
                     .verifier
                     .as_ref()
                     .map(|v| v.status(config.verification_tiers_mode));
-                let (msgs, raised_findings) = super::critic::run_unified_review(
+                let outcome = super::critic::run_unified_review(
                     judge,
                     system_prompt,
                     &transcript,
@@ -797,16 +820,24 @@ async fn poll_finalization_follow_up(
                     last_review_findings.as_deref(),
                 )
                 .await;
+                let msgs = outcome.messages;
                 // dirge-9b2k: carry per-reaction state forward for the next
                 // Blocking finalization. The fingerprint (only when a diff was
                 // actually reviewed) lets the next reaction skip an unchanged
                 // diff; the findings feed its judge prompt so it re-raises one
                 // only if still-present-and-unaddressed.
-                if mode == CodeReviewMode::Blocking {
+                //
+                // dirge-q7vw: record the fingerprint ONLY when the judge
+                // actually ran. A failed call fails open with no messages and
+                // no findings — indistinguishable from a clean review until
+                // `judged` existed — and recording the fingerprint for it made
+                // the next reaction skip the same unchanged diff, so the diff
+                // never got reviewed at all.
+                if mode == CodeReviewMode::Blocking && outcome.judged {
                     if diff_owned.is_some() {
                         *last_reviewed_fingerprint = current_fingerprint;
                     }
-                    *last_review_findings = raised_findings;
+                    *last_review_findings = outcome.raised_findings;
                 }
                 // One-shot modes fire at most once (flip regardless of verdict);
                 // blocking spends its budget only when it actually re-enters.

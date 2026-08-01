@@ -6871,3 +6871,57 @@ async fn awaiting_user_without_a_classifier_is_the_old_heuristic() {
         );
     }
 }
+
+/// dirge-mu46: a completeness-only verdict must NOT be deduped away.
+///
+/// The Blocking dedupe skips the judge when the diff is unchanged, so a
+/// declined finding isn't re-raised verbatim. But the judge also rules on
+/// COMPLETENESS from the transcript, which keeps growing between reactions
+/// even when nothing lands on disk. Skipping wholesale meant an objectively
+/// incomplete task could finalize on the model's say-so — the reaction that
+/// would have re-judged it never ran.
+///
+/// The dedupe now additionally requires that the previous reaction actually
+/// raised diff findings. Here it didn't (INCOMPLETE with no FINDINGS block),
+/// so reaction 2 must re-judge even though the diff is byte-identical.
+#[tokio::test]
+async fn blocking_completeness_only_verdict_is_re_judged_on_unchanged_diff() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = calls.clone();
+    // Completeness gap, NO findings block — nothing to duplicate.
+    let judge: crate::agent::agent_loop::critic::CriticFn = Arc::new(move |_p: String| {
+        seen.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Ok("VERDICT: INCOMPLETE\n- the error path is still untested".to_string()) })
+    });
+    let mut config = build_config();
+    config.critic_fn = Some(judge);
+    config.code_review_mode = CodeReviewMode::Blocking;
+    let (emit, _rx) = tokio::sync::mpsc::channel(64);
+    let msgs_run = run_with_tool_result();
+
+    let mut critic_done = false;
+    let mut reacts = 0u8;
+    let mut last_fp: Option<u64> = None;
+    let mut last_findings: Option<String> = None;
+
+    for reaction in 1..=2 {
+        let _ = poll_finalization_follow_up(
+            &config, "sys", &msgs_run,
+            &mut critic_done, &mut reacts, &mut last_fp, &mut last_findings,
+            None, &mut 0u8, &mut 0u8, &mut 0u8,
+            GateMode::Off, None, None, &mut 0u8, &mut 0u8, &emit,
+        )
+        .await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            reaction,
+            "reaction {reaction}: a completeness-only verdict must be re-judged, \
+             not deduped away with the diff"
+        );
+    }
+    assert!(
+        last_findings.is_none(),
+        "no diff findings were ever raised, so nothing was there to duplicate"
+    );
+}
