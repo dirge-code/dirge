@@ -552,6 +552,19 @@ function dir3(c, t, lower_is_better, eps, noise,    d) {
 # The control arm observed spread for a column: the smallest effect this
 # sample size could honestly distinguish from chance.
 function noisefloor(ck, c) { return mx[ck,c] - mn[ck,c] }
+
+# Noise floor for a PROPORTION (success rate, green rate). These are binary
+# per run, so the control arm spread is usually 0 or 1 and tells you nothing —
+# a different floor is needed. The smallest movement the sample can express is
+# one run flipping, i.e. 1/n, so any difference at or below that is a coin
+# flip. An A/A on recon-real at n=2 reported success_rate 2/2 vs 1/2 as
+# "worse" with IDENTICAL arms; 50 points is exactly one run of two, and this
+# is what gates it.
+function ratefloor(ck, tk,    a, b) {
+  a = n[ck] ? 1 / n[ck] : 1
+  b = n[tk] ? 1 / n[tk] : 1
+  return (a > b) ? a : b
+}
 # dirge-5mtx.7 is observation-only, so the tier is REPORTED, never scored.
 # Collecting how it distributes across models and scenarios is the whole
 # point of wiring it before deriving any threshold from it.
@@ -591,7 +604,9 @@ END {
 
     cval = (fwn[ck] ? sprintf("%.1f (%.0f..%.0f) [never=%d]", fws[ck] / fwn[ck], fwmin[ck], fwmax[ck], never[ck]) : "- [never=" never[ck] "]")
     tval = (fwn[tk] ? sprintf("%.1f (%.0f..%.0f) [never=%d]", fws[tk] / fwn[tk], fwmin[tk], fwmax[tk], never[tk]) : "- [never=" never[tk] "]")
-    dval = (fwn[ck] && fwn[tk]) ? dir3(fws[ck] / fwn[ck], fws[tk] / fwn[tk], 1, 0.5, 0) : "n/a"
+    dval = (fwn[ck] && fwn[tk]) \
+        ? dir3(fws[ck] / fwn[ck], fws[tk] / fwn[tk], 1, 0.5, fwmax[ck] - fwmin[ck]) \
+        : "n/a"
     row("first_write", cval, tval, dval)
 
     # MECHANISM: did the code path under test actually run? A treatment arm
@@ -600,10 +615,10 @@ END {
     # is seen first.
     row("nudges_fired", spread(ck, 17), spread(tk, 17), "mechanism")
     row("  of which prologue", spread(ck, 16), spread(tk, 16), "mechanism")
-    row("success_rate", rate(ck), rate(tk), dir3(ok[ck] / n[ck], ok[tk] / n[tk], 0, 0.05, 0))
+    row("success_rate", rate(ck), rate(tk), dir3(ok[ck] / n[ck], ok[tk] / n[tk], 0, 0.05, ratefloor(ck, tk)))
     row("green_rate", sprintf("%d/%d (%.0f%%)", green[ck], n[ck], 100 * green[ck] / n[ck]),
         sprintf("%d/%d (%.0f%%)", green[tk], n[tk], 100 * green[tk] / n[tk]),
-        dir3(green[ck] / n[ck], green[tk] / n[tk], 0, 0.05, 0))
+        dir3(green[ck] / n[ck], green[tk] / n[tk], 0, 0.05, ratefloor(ck, tk)))
     row("capability_tier", tierdist(ck), tierdist(tk), "observed")
     row("tally_found", sprintf("%d/%d", tallyfound[ck], n[ck]), sprintf("%d/%d", tallyfound[tk], n[tk]), "must be full")
     printf "\n"
