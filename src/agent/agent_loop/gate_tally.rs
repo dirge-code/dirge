@@ -12,6 +12,12 @@
 //! pushes with no enum at all. This gives both a home, and makes the
 //! per-variant counts scrapeable from the `dirge::gates` log target.
 //!
+//! The tally now serves TWO consumers: an A/B harness that reads it after
+//! a run completes, and a capability estimator that reads it during a run
+//! to adapt steering thresholds to how the model is actually performing.
+//! Both read the same observation-only counters — the tally still has no
+//! control-flow effect.
+//!
 //! It deliberately contains no rig/LLM types, so it stays unit-testable
 //! without a model.
 
@@ -19,6 +25,8 @@
 // the run.rs wiring lands as part of bd dirge-5mtx.1. Remove this allow
 // the moment that wiring ships; it must not silence anything else.
 #![allow(dead_code)]
+
+use crate::agent::agent_loop::tool_input_repair::RepairKind;
 
 /// Which finalization gate produced a run's follow-up. Mirrors the
 /// existing `FollowUpSource` in `run.rs`.
@@ -80,7 +88,22 @@ impl BoundaryNudge {
     }
 }
 
-/// Aggregated per-run counts of which gates and boundary nudges fired.
+/// Index into the per-kind repair array. `RepairKind` is defined in
+/// `tool_input_repair`, so the match lives here.
+fn repair_index(kind: RepairKind) -> usize {
+    match kind {
+        RepairKind::NullStripped => 0,
+        RepairKind::JsonStringToArray => 1,
+        RepairKind::ObjectToArray => 2,
+        RepairKind::BareStringToArray => 3,
+        RepairKind::MdLinkUnwrapped => 4,
+        RepairKind::TruncationFixed => 5,
+    }
+}
+
+/// Aggregated per-run counts of which gates and boundary nudges fired,
+/// plus the capability signals the loop computes and would otherwise
+/// discard.
 #[derive(Clone, Debug, Default)]
 pub struct GateTally {
     gates: [u32; 9],
@@ -89,6 +112,11 @@ pub struct GateTally {
     tool_calls: u32,
     errored_tool_calls: u32,
     final_verification: Option<crate::agent::agent_loop::verifier::VerificationStatus>,
+    scavenged_calls: u32,
+    repairs: [u32; 6],
+    hallucinated_tool_names: u32,
+    storm_suppressions: u32,
+    max_failure_streak: u32,
 }
 
 impl GateTally {
@@ -130,6 +158,32 @@ impl GateTally {
         self.final_verification = status;
     }
 
+    /// The model emitted tool-call-shaped TEXT instead of a native tool
+    /// call, and it was scavenged into a real call.
+    pub fn record_scavenged_call(&mut self) {
+        self.scavenged_calls += 1;
+    }
+
+    pub fn record_repair(&mut self, kind: RepairKind) {
+        self.repairs[repair_index(kind)] += 1;
+    }
+
+    /// A tool name had to be resolved by nearest-name match (suggest.rs).
+    pub fn record_hallucinated_tool_name(&mut self) {
+        self.hallucinated_tool_names += 1;
+    }
+
+    /// A call was suppressed by the storm breaker as a repeat.
+    pub fn record_storm_suppression(&mut self) {
+        self.storm_suppressions += 1;
+    }
+
+    /// High-water mark: keeps the PEAK consecutive-errored-tool-result
+    /// streak seen this run, so it never decreases.
+    pub fn record_failure_streak(&mut self, current: u32) {
+        self.max_failure_streak = self.max_failure_streak.max(current);
+    }
+
     pub fn gate_count(&self, gate: GateSource) -> u32 {
         self.gates[gate.index()]
     }
@@ -150,14 +204,39 @@ impl GateTally {
         self.errored_tool_calls
     }
 
+    pub fn scavenged_calls(&self) -> u32 {
+        self.scavenged_calls
+    }
+
+    pub fn repair_count(&self, kind: RepairKind) -> u32 {
+        self.repairs[repair_index(kind)]
+    }
+
+    pub fn total_repairs(&self) -> u32 {
+        self.repairs.iter().sum()
+    }
+
+    pub fn hallucinated_tool_names(&self) -> u32 {
+        self.hallucinated_tool_names
+    }
+
+    pub fn storm_suppressions(&self) -> u32 {
+        self.storm_suppressions
+    }
+
+    pub fn max_failure_streak(&self) -> u32 {
+        self.max_failure_streak
+    }
+
     /// Emit the tally as one structured event on the `dirge::gates` target,
     /// with each count as its own named field so a script can scrape it.
     pub fn emit(&self) {
         // VerificationStatus is not a tracing primitive, so render it via
         // its Debug form; use a stable placeholder when none was recorded.
-        let final_verification = self
-            .final_verification
-            .map_or_else(|| "none".to_string(), |status| format!("{status:?}"));
+        let final_verification = match self.final_verification {
+            Some(status) => format!("{status:?}"),
+            None => "none".to_string(),
+        };
         tracing::info!(
             target: "dirge::gates",
             turns = self.turns,
@@ -179,6 +258,17 @@ impl GateTally {
             nudge_file_touch = self.nudges[BoundaryNudge::FileTouch.index()],
             nudge_reflection_checkpoint = self.nudges[BoundaryNudge::ReflectionCheckpoint.index()],
             nudge_safe_state = self.nudges[BoundaryNudge::SafeState.index()],
+            scavenged_calls = self.scavenged_calls,
+            hallucinated_tool_names = self.hallucinated_tool_names,
+            storm_suppressions = self.storm_suppressions,
+            max_failure_streak = self.max_failure_streak,
+            total_repairs = self.total_repairs(),
+            repair_null_stripped = self.repairs[repair_index(RepairKind::NullStripped)],
+            repair_json_string_to_array = self.repairs[repair_index(RepairKind::JsonStringToArray)],
+            repair_object_to_array = self.repairs[repair_index(RepairKind::ObjectToArray)],
+            repair_bare_string_to_array = self.repairs[repair_index(RepairKind::BareStringToArray)],
+            repair_md_link_unwrapped = self.repairs[repair_index(RepairKind::MdLinkUnwrapped)],
+            repair_truncation_fixed = self.repairs[repair_index(RepairKind::TruncationFixed)],
         );
     }
 }
@@ -289,5 +379,71 @@ mod tests {
 
         tally.set_verification(None);
         assert!(tally.final_verification.is_none());
+    }
+
+    #[test]
+    fn scavenged_calls_are_counted() {
+        let mut tally = GateTally::new();
+        tally.record_scavenged_call();
+        tally.record_scavenged_call();
+        tally.record_scavenged_call();
+        assert_eq!(tally.scavenged_calls(), 3);
+    }
+
+    #[test]
+    fn repair_counts_are_tracked_per_kind() {
+        let mut tally = GateTally::new();
+        for kind in [
+            RepairKind::NullStripped,
+            RepairKind::JsonStringToArray,
+            RepairKind::ObjectToArray,
+            RepairKind::BareStringToArray,
+            RepairKind::MdLinkUnwrapped,
+            RepairKind::TruncationFixed,
+        ] {
+            tally.record_repair(kind);
+        }
+        tally.record_repair(RepairKind::ObjectToArray);
+
+        assert_eq!(tally.repair_count(RepairKind::NullStripped), 1);
+        assert_eq!(tally.repair_count(RepairKind::JsonStringToArray), 1);
+        assert_eq!(tally.repair_count(RepairKind::ObjectToArray), 2);
+        assert_eq!(tally.repair_count(RepairKind::BareStringToArray), 1);
+        assert_eq!(tally.repair_count(RepairKind::MdLinkUnwrapped), 1);
+        assert_eq!(tally.repair_count(RepairKind::TruncationFixed), 1);
+    }
+
+    #[test]
+    fn total_repairs_sums_across_kinds() {
+        let mut tally = GateTally::new();
+        tally.record_repair(RepairKind::NullStripped);
+        tally.record_repair(RepairKind::NullStripped);
+        tally.record_repair(RepairKind::JsonStringToArray);
+        tally.record_repair(RepairKind::TruncationFixed);
+        assert_eq!(tally.total_repairs(), 4);
+    }
+
+    #[test]
+    fn hallucinated_tool_names_are_counted() {
+        let mut tally = GateTally::new();
+        tally.record_hallucinated_tool_name();
+        assert_eq!(tally.hallucinated_tool_names(), 1);
+    }
+
+    #[test]
+    fn storm_suppressions_are_counted() {
+        let mut tally = GateTally::new();
+        tally.record_storm_suppression();
+        tally.record_storm_suppression();
+        assert_eq!(tally.storm_suppressions(), 2);
+    }
+
+    #[test]
+    fn max_failure_streak_keeps_peak() {
+        let mut tally = GateTally::new();
+        tally.record_failure_streak(3);
+        tally.record_failure_streak(5);
+        tally.record_failure_streak(2);
+        assert_eq!(tally.max_failure_streak(), 5);
     }
 }
