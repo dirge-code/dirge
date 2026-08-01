@@ -63,6 +63,7 @@ pub mod tool_input_repair;
 pub mod tools;
 pub mod types;
 pub mod verifier;
+pub mod worktree_probe;
 
 pub use bridge::EventBridge;
 pub use hooks::{

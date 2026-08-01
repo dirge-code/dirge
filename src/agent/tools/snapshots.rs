@@ -298,8 +298,32 @@ pub fn current_turn_id() -> Option<String> {
 /// contract is what keeps a future `auto` mode from performing a coarse,
 /// lossy restore. Pure wrapper over [`restore_from`] — no new restore or
 /// atomic-write logic.
-#[allow(dead_code)] // prod-unused while only `advisory` ships; the deferred
-// `auto` mode (dirge-uw2l.6) and its tests are the caller.
+/// The paths [`restore_after_green_turn`] WOULD restore, without touching
+/// anything (dirge-uw2l.6).
+///
+/// This is the store's half of the auto-mode coverage check: auto may only
+/// fire when everything that actually changed since green is something the
+/// store can put back. Returns empty under exactly the conditions
+/// [`restore_after_green_turn`] declines, so the two agree by construction.
+pub fn restorable_paths_after(green_turn_id: &str) -> Vec<PathBuf> {
+    let s = STORE.lock_ignore_poison();
+    let Some(idx) = s.turns.iter().position(|t| t.turn_id == green_turn_id) else {
+        return Vec::new();
+    };
+    if idx + 1 >= s.turns.len() {
+        return Vec::new();
+    }
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for bucket in &s.turns[idx + 1..] {
+        for path in bucket.captures.keys() {
+            if !paths.contains(path) {
+                paths.push(path.clone());
+            }
+        }
+    }
+    paths
+}
+
 pub fn restore_after_green_turn(green_turn_id: &str) -> Vec<PathBuf> {
     // Resolve the next bucket id under the lock, then drop the lock before
     // restore_from re-acquires it (restoring while holding the store lock

@@ -1327,12 +1327,15 @@ impl Config {
         })
     }
 
-    /// [`safe_state_abort`](Self::safe_state_abort): `off`/`advisory`, parsed
-    /// case-insensitively and trimmed. `None` and an empty value resolve to
-    /// `Off` (opt-in — the rung rewrites a failing plan, which is intrusive).
-    /// An unrecognized non-empty value (including `auto`, which is deferred
-    /// behind dirge-uw2l.6) also resolves to `Off` but logs a warning, so a
-    /// typo or a premature `auto` never silently arms a destructive path.
+    /// [`safe_state_abort`](Self::safe_state_abort): `off`/`advisory`/`auto`,
+    /// parsed case-insensitively and trimmed. `None` and an empty value
+    /// resolve to `Off` (opt-in — the rung rewrites a failing plan, which is
+    /// intrusive). An unrecognized non-empty value also resolves to `Off` but
+    /// logs a warning, so a typo never silently arms a destructive path.
+    ///
+    /// `auto` restores the tree itself, and only after proving against git
+    /// that the snapshot store covers every file changed since the green
+    /// point (dirge-uw2l.6); short of that it behaves as `advisory`.
     pub fn resolve_safe_state_abort_mode(&self) -> crate::agent::agent_loop::types::SafeStateMode {
         use crate::agent::agent_loop::types::SafeStateMode;
         let Some(raw) = self.safe_state_abort.as_deref() else {
@@ -1347,7 +1350,7 @@ impl Config {
                 target: "dirge::config",
                 value = trimmed,
                 "unrecognized `safe_state_abort` value; falling back to `off` \
-                 (valid: off | advisory; `auto` is deferred behind dirge-uw2l.6)"
+                 (valid: off | advisory | auto)"
             );
             SafeStateMode::Off
         })
@@ -2159,17 +2162,27 @@ mod tests {
         assert_eq!(cfg.resolve_safe_state_abort_mode(), SafeStateMode::Off);
     }
 
-    /// A typo, AND a premature `auto`, must never silently arm the rung.
-    /// `auto` is destructive behind the model's back and is deferred behind
-    /// snapshot coverage for `bash`-mutated files (dirge-uw2l.6); a config
-    /// value that does something other than what it says is worse than a
-    /// rejected one, so it falls back to `off` (with a warning).
+    /// A typo must never silently arm the rung — least of all now that
+    /// `auto` writes to the user's files.
     #[test]
-    fn resolve_safe_state_abort_mode_unknown_and_auto_default_off() {
+    fn resolve_safe_state_abort_mode_unknown_defaults_off() {
         use crate::agent::agent_loop::types::SafeStateMode;
         let cfg: Config = serde_json::from_str(r#"{ "safe_state_abort": "nuclear" }"#).unwrap();
         assert_eq!(cfg.resolve_safe_state_abort_mode(), SafeStateMode::Off);
+    }
+
+    /// `auto` resolves to `Auto` now that the coverage gate (dirge-uw2l.6)
+    /// makes it safe. It stays strictly opt-in — absence is still `Off` —
+    /// and the gate, not the config, is what prevents a partial restore.
+    #[test]
+    fn resolve_safe_state_abort_mode_accepts_auto() {
+        use crate::agent::agent_loop::types::SafeStateMode;
         let cfg: Config = serde_json::from_str(r#"{ "safe_state_abort": "auto" }"#).unwrap();
+        assert_eq!(cfg.resolve_safe_state_abort_mode(), SafeStateMode::Auto);
+        let cfg: Config = serde_json::from_str(r#"{ "safe_state_abort": "  AUTO " }"#).unwrap();
+        assert_eq!(cfg.resolve_safe_state_abort_mode(), SafeStateMode::Auto);
+        // Absent is still Off — enabling a destructive path is never implicit.
+        let cfg: Config = serde_json::from_str(r#"{}"#).unwrap();
         assert_eq!(cfg.resolve_safe_state_abort_mode(), SafeStateMode::Off);
     }
 

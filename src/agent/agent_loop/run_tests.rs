@@ -6376,3 +6376,135 @@ fn harness_tag_of_ignores_ordinary_user_text() {
     // A tag mentioned mid-sentence isn't an injection.
     assert!(harness_tag_of("I saw a [stall] in the log").is_none());
 }
+
+// ── safe-state auto restore, end to end (dirge-uw2l.6) ──────────────────
+// `coverage_verified_restore` is the ONLY function in the safe-state rung
+// that writes to the user's files, so it gets a real git repo, a real
+// snapshot store, and real files on disk rather than a mocked seam.
+
+#[cfg(test)]
+mod auto_restore_tests {
+    use super::*;
+    use crate::agent::tools::snapshots;
+    use std::path::{Path, PathBuf};
+
+    fn git(dir: &Path, args: &[&str]) -> bool {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// A git repo with one committed source file, plus an isolated snapshot
+    /// store. Returns None when git is unavailable so the test skips.
+    fn repo(tag: &str) -> Option<PathBuf> {
+        let dir = std::env::temp_dir().join(format!("dirge-auto-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).ok()?;
+        if !git(&dir, &["init", "-q"]) {
+            return None;
+        }
+        let _ = git(&dir, &["config", "user.email", "t@t"]);
+        let _ = git(&dir, &["config", "user.name", "t"]);
+        std::fs::write(dir.join("src/a.rs"), "fn a() { /* green */ }\n").ok()?;
+        git(&dir, &["add", "-A"]).then_some(())?;
+        git(&dir, &["commit", "-qm", "green"]).then_some(())?;
+        Some(dir)
+    }
+
+    /// The happy path: every file that changed since green went through an
+    /// edit tool, so the store covers it and the tree is put back.
+    #[test]
+    fn restores_when_every_change_is_covered() {
+        let _g = snapshots::TEST_GATE.lock_ignore_poison();
+        snapshots::clear();
+        let Some(dir) = repo("covered") else { return };
+        let file = dir.join("src/a.rs");
+
+        // Green: clean tree, fingerprint it.
+        snapshots::begin_turn("green-turn");
+        let green_fp = crate::agent::agent_loop::worktree_probe::fingerprint(&dir).expect("git");
+
+        // Post-green turn: edit THROUGH the capture path, as an edit tool does.
+        snapshots::begin_turn("after-green");
+        snapshots::capture(&file);
+        std::fs::write(&file, "fn a() { BROKEN }\n").unwrap();
+
+        let n = coverage_verified_restore(Some(&dir), Some(&green_fp), "green-turn");
+        assert_eq!(n, Some(1), "one covered file restored");
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "fn a() { /* green */ }\n",
+            "file is back at its green content"
+        );
+        snapshots::clear();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The case the whole gate exists for: a file mutated OUT OF BAND (as
+    /// `sed -i` or a formatter would) is invisible to the snapshot store, so
+    /// coverage is incomplete and nothing is touched. A partial restore here
+    /// would leave a tree that never existed.
+    #[test]
+    fn declines_and_touches_nothing_when_a_bash_style_mutation_is_present() {
+        let _g = snapshots::TEST_GATE.lock_ignore_poison();
+        snapshots::clear();
+        let Some(dir) = repo("uncovered") else { return };
+        let covered = dir.join("src/a.rs");
+        let sedded = dir.join("src/sedded.rs");
+
+        snapshots::begin_turn("green-turn");
+        let green_fp = crate::agent::agent_loop::worktree_probe::fingerprint(&dir).expect("git");
+
+        snapshots::begin_turn("after-green");
+        snapshots::capture(&covered);
+        std::fs::write(&covered, "fn a() { BROKEN }\n").unwrap();
+        // No capture() — exactly what a `bash` write looks like to the store.
+        std::fs::write(&sedded, "fn sed() {}\n").unwrap();
+
+        let n = coverage_verified_restore(Some(&dir), Some(&green_fp), "green-turn");
+        assert_eq!(n, None, "incomplete coverage must decline");
+        assert_eq!(
+            std::fs::read_to_string(&covered).unwrap(),
+            "fn a() { BROKEN }\n",
+            "declining must leave the tree exactly as it was — no partial restore"
+        );
+        assert!(sedded.exists(), "the uncaptured file is untouched too");
+        snapshots::clear();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// No repo, no green fingerprint, and nothing-changed all decline.
+    /// These are the "proceed blind" cases; every one must be a no-op.
+    #[test]
+    fn declines_without_ground_truth_or_changes() {
+        let _g = snapshots::TEST_GATE.lock_ignore_poison();
+        snapshots::clear();
+        let Some(dir) = repo("blind") else { return };
+
+        snapshots::begin_turn("green-turn");
+        let green_fp = crate::agent::agent_loop::worktree_probe::fingerprint(&dir).expect("git");
+        snapshots::begin_turn("after-green");
+
+        assert_eq!(
+            coverage_verified_restore(None, Some(&green_fp), "green-turn"),
+            None,
+            "no repo path → decline"
+        );
+        assert_eq!(
+            coverage_verified_restore(Some(&dir), None, "green-turn"),
+            None,
+            "no green fingerprint → decline"
+        );
+        assert_eq!(
+            coverage_verified_restore(Some(&dir), Some(&green_fp), "green-turn"),
+            None,
+            "nothing changed since green → nothing to restore, and no false claim"
+        );
+        snapshots::clear();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

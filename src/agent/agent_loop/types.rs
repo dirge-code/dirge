@@ -199,18 +199,27 @@ pub enum SafeStateMode {
     #[default]
     Off,
     Advisory,
+    /// The harness restores the tree itself before asking for a re-plan
+    /// (dirge-uw2l.6). It does so ONLY after proving, against git, that the
+    /// snapshot store can put back every file that changed since the green
+    /// point; if anything changed that the store never captured — a `sed
+    /// -i`, a formatter, any `bash` write — it declines and behaves exactly
+    /// like [`SafeStateMode::Advisory`]. Never restores a partially-covered
+    /// tree, because a half-reverted tree is worse than the broken one.
+    Auto,
 }
 
 impl SafeStateMode {
     /// Parse a wire value (case-insensitive, trimmed). Empty string and
     /// `"off"` resolve to `Off` (the opt-in default — unlike [`GateMode`],
-    /// absence means "do nothing"). `"advisory"` resolves to `Advisory`.
-    /// Anything else (including `"auto"`, which is deferred behind
-    /// dirge-uw2l.6) returns `None` so the resolver can warn + fall back.
+    /// absence means "do nothing"). `"advisory"` and `"auto"` resolve to
+    /// themselves; anything else returns `None` so the resolver can warn +
+    /// fall back.
     pub fn from_wire(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "" | "off" => Some(SafeStateMode::Off),
             "advisory" => Some(SafeStateMode::Advisory),
+            "auto" => Some(SafeStateMode::Auto),
             _ => None,
         }
     }

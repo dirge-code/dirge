@@ -99,6 +99,64 @@ async fn poll_steering_and_reminder(
     (out, had_user_steering)
 }
 
+/// Restore the tree to its last verified-green state — but ONLY after
+/// proving the snapshot store can put back everything that changed
+/// (dirge-uw2l.6). Returns the number of files restored, or `None` when it
+/// declined and the caller should fall back to the advisory wording.
+///
+/// This is the one function in the safe-state rung that writes to the user's
+/// files, so every precondition is a hard decline rather than a best effort:
+///
+/// - no repo, or not a git work tree → decline (no ground truth to check)
+/// - no green fingerprint → decline (nothing to diff against)
+/// - a file changed since green that the store never captured → decline
+///
+/// That last case is the whole reason auto was deferred in R3.
+/// `snapshots::capture` is wired into the edit tools and not into `bash`, so
+/// a `sed -i`, a `>` redirect or an in-place formatter mutates a file with
+/// no pre-state recorded. Restoring the captured edits while leaving those
+/// alone yields a tree in a state that never existed — likely not
+/// compiling — which is strictly worse than the broken tree we started
+/// from, and arrived at behind the model's back. Detecting it via git and
+/// declining is what makes auto safe to ship at all.
+fn coverage_verified_restore(
+    repo: Option<&std::path::Path>,
+    green_fp: Option<&super::worktree_probe::TreeFingerprint>,
+    green_turn: &str,
+) -> Option<usize> {
+    let repo = repo?;
+    let green_fp = green_fp?;
+    let now = super::worktree_probe::fingerprint(repo)?;
+    let mutated = super::worktree_probe::changed_between(green_fp, &now);
+    if mutated.is_empty() {
+        // Nothing changed since green — there is nothing to restore, and
+        // claiming a restore would be a lie.
+        return None;
+    }
+    let restorable = crate::agent::tools::snapshots::restorable_paths_after(green_turn);
+    if !super::worktree_probe::coverage_is_complete(&mutated, &restorable) {
+        tracing::info!(
+            target: "dirge::loop",
+            mutated = mutated.len(),
+            restorable = restorable.len(),
+            "safe-state auto declined: snapshot coverage incomplete \
+             (a file changed that the store never captured — likely a bash \
+             write); falling back to advisory"
+        );
+        return None;
+    }
+    let restored = crate::agent::tools::snapshots::restore_after_green_turn(green_turn);
+    if restored.is_empty() {
+        return None;
+    }
+    tracing::info!(
+        target: "dirge::loop",
+        files = restored.len(),
+        "safe-state auto restored the tree to its last verified-green state"
+    );
+    Some(restored.len())
+}
+
 /// Every tag the harness prefixes onto a message it injects on the model's
 /// behalf (dirge-uw2l.7). The TUI keys on these to attribute the message to
 /// the system rather than the user; [`emit_harness_notices`] uses the same
@@ -2681,9 +2739,24 @@ pub async fn run_loop(
             let safe_state_msg = if config.safe_state_abort_mode != super::types::SafeStateMode::Off
             {
                 let excerpts = guards.recent_excerpts();
+                let fresh_green = config.verifier.as_ref().is_some_and(|v| v.is_fresh_green());
+                // dirge-uw2l.6: stamp the working-tree fingerprint at the same
+                // instant as the green marker, so the two always describe one
+                // moment. Auto only — Advisory never restores, so it must not
+                // pay a `git status` on every green turn.
+                if fresh_green && config.safe_state_abort_mode == super::types::SafeStateMode::Auto
+                {
+                    let fp = config
+                        .code_review_repo
+                        .as_deref()
+                        .and_then(super::worktree_probe::fingerprint);
+                    safe_state.set_green_fingerprint(fp);
+                }
+                let green_fp = safe_state.green_fingerprint().cloned();
+                let repo = config.code_review_repo.clone();
                 safe_state.decide(
                     config.safe_state_abort_mode,
-                    config.verifier.as_ref().is_some_and(|v| v.is_fresh_green()),
+                    fresh_green,
                     guards.safe_state_due(),
                     config
                         .verifier
@@ -2692,6 +2765,7 @@ pub async fn run_loop(
                     crate::agent::tools::snapshots::current_turn_id().as_deref(),
                     &reflections,
                     &excerpts,
+                    |green| coverage_verified_restore(repo.as_deref(), green_fp.as_ref(), green),
                 )
             } else {
                 None
