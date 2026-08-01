@@ -32,6 +32,19 @@
 //! at any instant, so the run hears each as it crosses into it. With
 //! `off` every tiered path is unreachable: behavior is byte-identical to
 //! the untiered gate.
+//! Project gate (dirge-w2de): `LoopConfig.verifier` may be built with a
+//! `verification_command` — the build/test command CI actually runs
+//! (e.g. `RUSTFLAGS="-D warnings" cargo clippy --all-targets`). A green
+//! weaker command is a FALSE green: it says nothing about the tree CI
+//! builds. So when a project gate is configured, `status()` only reports
+//! [`VerificationStatus::VerifiedGreen`] after a command with the same
+//! (program, subcommand) signature passed — matching is signature-based,
+//! not string-identical, so env prefixes and flag placement don't matter.
+//! Until then an otherwise-green result reports FastGreenOnly and the
+//! existing full-suite escalation carries it at finalization. Configuring
+//! the gate is an explicit opt-in: it may change off-mode behaviour for
+//! that user, while users who never set the key keep byte-identical
+//! behaviour (off mode never returns FastGreenOnly).
 //!
 //! Cheap and signal-based: no extra LLM call. Outcome is read from the
 //! tool result post-execution (bash appends `Exit code: N` on non-zero
@@ -67,9 +80,12 @@ pub enum VerificationStatus {
     /// Code was edited, fast-tier checks (typecheck/lint/targeted test)
     /// passed, but the slow tier (full suite/full build) never ran.
     /// Only reachable when verification tiers are engaged
-    /// (`verification_tiers` ≠ off): off-mode `status()` never returns
-    /// it — fast-only coverage collapses to [`VerificationStatus::VerifiedGreen`]
-    /// (dirge-uw2l.2).
+    /// (`verification_tiers` ≠ off) or when a project gate is configured
+    /// (`verification_command`, dirge-w2de): off-mode `status()` never
+    /// returns it for users who did not opt in — fast-only coverage
+    /// collapses to [`VerificationStatus::VerifiedGreen`] (dirge-uw2l.2).
+    /// The project gate is an explicit opt-in, so it may return here in
+    /// off mode for that user — intended.
     FastGreenOnly,
 }
 
@@ -140,6 +156,13 @@ struct Inner {
     /// Full-suite escalations already spent. Separate budget from
     /// [`Inner::fired`] — see the module docs.
     escalations: u8,
+    /// dirge-w2de: the configured project gate's signature. `None` when
+    /// the user did not opt in (no `verification_command` config key) —
+    /// behaviour is byte-identical to before.
+    project_gate: Option<GateSignature>,
+    /// The project gate has been seen PASS this run. A failing gate run
+    /// must not set this — the red dominates downstream.
+    ran_project_gate: bool,
 }
 
 impl Inner {
@@ -164,6 +187,21 @@ impl VerifierGate {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(Inner::default()),
+        })
+    }
+
+    /// dirge-w2de: opt-in project gate (`verification_command` config).
+    /// `Some` sets the command whose PASS is the only honest green — a
+    /// green weaker command downgrades to
+    /// [`VerificationStatus::FastGreenOnly`] until the gate itself
+    /// passes. `None` (default) keeps behaviour byte-identical to
+    /// [`VerifierGate::new`].
+    pub fn with_project_gate(project_gate: Option<String>) -> Arc<Self> {
+        Arc::new(Self {
+            inner: Mutex::new(Inner {
+                project_gate: project_gate.as_deref().and_then(gate_signature),
+                ..Inner::default()
+            }),
         })
     }
 
@@ -209,6 +247,15 @@ impl VerifierGate {
                     inner.edits_since_verify = 0;
                     // Tier coverage only counts when the command PASSED.
                     if !failed {
+                        // dirge-w2de: a PASSED command whose signature
+                        // matches the configured project gate satisfies
+                        // it. A FAILING gate run must not set this — the
+                        // red dominates downstream.
+                        if let Some(gate) = &inner.project_gate
+                            && gate_signatures(command).iter().any(|s| s == gate)
+                        {
+                            inner.ran_project_gate = true;
+                        }
                         match verification_tier(command) {
                             Some(VerificationTier::Fast) => inner.ran_fast = true,
                             Some(VerificationTier::Slow) => inner.ran_slow = true,
@@ -248,6 +295,15 @@ impl VerifierGate {
         // reported a latched green and must stay byte-identical.
         if mode != GateMode::Off && inner.edits_since_verify > 0 {
             return VerificationStatus::Unverified;
+        }
+        // dirge-w2de: a project gate was configured but never ran green.
+        // A green weaker command is a FALSE green — it says nothing about
+        // the tree CI actually builds. Explicit opt-in
+        // (`verification_command` set), so it applies in ALL modes,
+        // including off, for that user; users who never set the key keep
+        // byte-identical behaviour (off mode never returns FastGreenOnly).
+        if inner.project_gate.is_some() && !inner.ran_project_gate {
+            return VerificationStatus::FastGreenOnly;
         }
         // Tiered modes distinguish "the suite passed" from "only the cheap
         // checks passed"; off mode cannot tell them apart.
@@ -496,6 +552,92 @@ fn cargo_tier(args: &[&str]) -> VerificationTier {
         "test" | "bench" if cargo_has_filter(args) => VerificationTier::Fast,
         _ => VerificationTier::Slow,
     }
+}
+
+/// dirge-w2de: the project's real gate command, normalized to
+/// (program, subcommand). Two textual forms of the same gate
+/// (`RUSTFLAGS="-D warnings" cargo clippy --all-targets` vs
+/// `cargo clippy --all-targets -- -D warnings`) normalize to the same
+/// signature, so matching is robust to env prefixes and flag placement
+/// without being string-identical.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GateSignature {
+    program: String,
+    subcommand: Option<String>,
+}
+
+/// Tokenize a shell command keeping quoted values as ONE word
+/// (`RUSTFLAGS="-D warnings"` is a single env assignment, not three
+/// words). Quote characters are dropped; `None` when the segment has no
+/// words at all.
+fn shell_words(segment: &str) -> Option<Vec<String>> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut in_word = false;
+    for c in segment.chars() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => current.push(c),
+            None => match c {
+                '"' | '\'' => {
+                    quote = Some(c);
+                    in_word = true;
+                }
+                c if c.is_whitespace() => {
+                    if in_word {
+                        words.push(std::mem::take(&mut current));
+                        in_word = false;
+                    }
+                }
+                c => {
+                    current.push(c);
+                    in_word = true;
+                }
+            },
+        }
+    }
+    if in_word {
+        words.push(current);
+    }
+    (!words.is_empty()).then_some(words)
+}
+
+/// Extract the (program, subcommand) signature of ONE shell command
+/// segment: skip leading `VAR=value` env assignments, take the first bare
+/// word as the program and the next non-flag word as the subcommand.
+fn segment_signature(segment: &str) -> Option<GateSignature> {
+    let words = shell_words(segment)?;
+    let mut rest = words.iter().skip_while(|w| w.contains('='));
+    let program = rest.next()?.clone();
+    let subcommand = rest.find(|w| !w.starts_with('-')).cloned();
+    Some(GateSignature {
+        program,
+        subcommand,
+    })
+}
+
+/// Every (program, subcommand) signature in a command, splitting chains on
+/// `& | ; \n` — the same separators [`is_verification_command`] uses.
+///
+/// ALL segments, not just the last. This matters for satisfying the gate:
+/// the caller only consults this for a command that PASSED, and under `&&`
+/// a passing chain means every segment passed. So `cargo clippy && cargo
+/// test` genuinely satisfies a `cargo clippy` gate — taking only the last
+/// segment would miss it and leave the run reporting fast-green-only after
+/// the real gate had in fact run clean.
+fn gate_signatures(command: &str) -> Vec<GateSignature> {
+    command
+        .split(['&', '|', ';', '\n'])
+        .filter_map(segment_signature)
+        .collect()
+}
+
+/// The single signature of a command treated as a gate SPECIFICATION (the
+/// `verification_command` config value). A spec naming a chain is taken by
+/// its last segment: `cargo fmt && cargo clippy` specifies the clippy gate.
+fn gate_signature(command: &str) -> Option<GateSignature> {
+    gate_signatures(command).pop()
 }
 
 /// True when a positional test-name filter survives after the subcommand,
@@ -1717,5 +1859,178 @@ mod tests {
             .expect("fast-green escalation still fires after the legacy nudge");
         assert!(n.contains("full test suite"), "{n}");
         assert!(tiered_nudge(&g, GateMode::Advisory).is_none());
+    }
+
+    // ---- dirge-w2de: project gate (config-driven real CI command) ----
+
+    /// The same gate written two ways — env-prefixed with a quoted value
+    /// vs flag placement after the subcommand — must normalize to the
+    /// same ("cargo", "clippy") signature.
+    #[test]
+    fn gate_signature_handles_env_prefix_and_flag_placement() {
+        assert_eq!(
+            gate_signature(r#"RUSTFLAGS="-D warnings" cargo clippy --all-targets"#),
+            Some(GateSignature {
+                program: "cargo".into(),
+                subcommand: Some("clippy".into()),
+            })
+        );
+        assert_eq!(
+            gate_signature("cargo clippy --all-targets -- -D warnings"),
+            Some(GateSignature {
+                program: "cargo".into(),
+                subcommand: Some("clippy".into()),
+            })
+        );
+    }
+
+    /// Quoted env values stay ONE token (`CC="ccache gcc"` is an env
+    /// assignment, not three words), and flags before the subcommand are
+    /// skipped.
+    #[test]
+    fn gate_signature_quoted_env_values_and_flags_before_subcommand() {
+        assert_eq!(
+            gate_signature(r#"CC="ccache gcc" RUSTFLAGS="-D warnings" cargo clippy"#),
+            Some(GateSignature {
+                program: "cargo".into(),
+                subcommand: Some("clippy".into()),
+            })
+        );
+        assert_eq!(
+            gate_signature("cargo --locked --offline clippy --all-targets"),
+            Some(GateSignature {
+                program: "cargo".into(),
+                subcommand: Some("clippy".into()),
+            })
+        );
+    }
+
+    /// A bare program has no subcommand; empty input has no signature.
+    #[test]
+    fn gate_signature_bare_program_and_empty() {
+        assert_eq!(
+            gate_signature("make"),
+            Some(GateSignature {
+                program: "make".into(),
+                subcommand: None,
+            })
+        );
+        assert_eq!(gate_signature(""), None);
+        assert_eq!(gate_signature("   "), None);
+    }
+
+    /// A gate SPECIFICATION naming a chain takes its last segment:
+    /// `cargo check && cargo clippy` specifies the clippy gate.
+    #[test]
+    fn gate_signature_spec_chain_takes_last_segment() {
+        assert_eq!(
+            gate_signature("cargo check && cargo clippy --all-targets"),
+            Some(GateSignature {
+                program: "cargo".into(),
+                subcommand: Some("clippy".into()),
+            })
+        );
+        assert_eq!(
+            gate_signature("cargo fmt\ncargo clippy --all-targets"),
+            Some(GateSignature {
+                program: "cargo".into(),
+                subcommand: Some("clippy".into()),
+            })
+        );
+    }
+
+    /// An OBSERVED command yields every segment's signature, not just the
+    /// last. The caller only consults this for a command that passed, and
+    /// under `&&` that means every segment passed — so a gate satisfied by
+    /// an early segment must still count. Taking only the last segment
+    /// left a run reporting fast-green-only after the real gate had run
+    /// clean.
+    #[test]
+    fn observed_chain_yields_every_segment_signature() {
+        let sigs = gate_signatures("cargo clippy --all-targets && cargo test");
+        assert_eq!(
+            sigs,
+            vec![
+                GateSignature {
+                    program: "cargo".into(),
+                    subcommand: Some("clippy".into()),
+                },
+                GateSignature {
+                    program: "cargo".into(),
+                    subcommand: Some("test".into()),
+                },
+            ]
+        );
+    }
+
+    /// End to end: the gate ran green as the FIRST link of a chain. The
+    /// last-segment reading would have downgraded this to FastGreenOnly.
+    #[test]
+    fn gate_green_in_first_chain_segment_is_verified_green() {
+        let g = VerifierGate::with_project_gate(Some("cargo clippy".into()));
+        g.record_outcome("edit", &json!({"path": "src/auth.rs"}), &ok_result(), false);
+        g.record_outcome(
+            "bash",
+            &json!({"command": "cargo clippy --all-targets && cargo test"}),
+            &ok_result(),
+            false,
+        );
+        assert_eq!(g.status(GateMode::Off), VerificationStatus::VerifiedGreen);
+    }
+
+    /// The happy path: the configured gate command ran and PASSED →
+    /// VerifiedGreen.
+    #[test]
+    fn configured_gate_run_green_is_verified_green() {
+        let g = VerifierGate::with_project_gate(Some(
+            r#"RUSTFLAGS="-D warnings" cargo clippy --all-targets"#.into(),
+        ));
+        g.record_outcome("edit", &json!({"path": "src/auth.rs"}), &ok_result(), false);
+        g.record_outcome(
+            "bash",
+            &json!({"command": r#"RUSTFLAGS="-D warnings" cargo clippy --all-targets"#}),
+            &ok_result(),
+            false,
+        );
+        assert_eq!(g.status(GateMode::Off), VerificationStatus::VerifiedGreen);
+    }
+
+    /// The bug this fixes: only a weaker command (`cargo test`) ran green,
+    /// never the gate. The green is a FALSE green — it says nothing about
+    /// the tree CI actually builds. Opt-in (`verification_command` set),
+    /// so this applies even in off mode; unconfigured users are untouched.
+    #[test]
+    fn configured_gate_not_run_downgrades_green_to_fast_only() {
+        let g = VerifierGate::with_project_gate(Some("cargo clippy --all-targets".into()));
+        g.record_outcome("edit", &json!({"path": "src/auth.rs"}), &ok_result(), false);
+        g.record_outcome("bash", &json!({"command": "cargo test"}), &ok_result(), false);
+        assert_eq!(g.status(GateMode::Off), VerificationStatus::FastGreenOnly);
+    }
+
+    /// A FAILING gate run must not set `ran_project_gate`; the red
+    /// dominates, and a later lesser green cannot resurrect a fake green.
+    #[test]
+    fn failing_gate_run_never_sets_ran_project_gate() {
+        let g = VerifierGate::with_project_gate(Some("cargo clippy --all-targets".into()));
+        g.record_outcome("edit", &json!({"path": "src/auth.rs"}), &ok_result(), false);
+        g.record_outcome(
+            "bash",
+            &json!({"command": "cargo clippy --all-targets"}),
+            &failed_result(),
+            false,
+        );
+        assert_eq!(g.status(GateMode::Off), VerificationStatus::VerifiedRed);
+        g.record_outcome("bash", &json!({"command": "cargo test"}), &ok_result(), true);
+        assert_eq!(g.status(GateMode::Off), VerificationStatus::VerifiedRed);
+    }
+
+    /// No `verification_command` configured: off-mode status is
+    /// byte-identical to before — a passed `cargo test` is VerifiedGreen.
+    #[test]
+    fn unconfigured_gate_keeps_off_mode_byte_identical() {
+        let g = VerifierGate::new();
+        g.record_outcome("edit", &json!({"path": "src/auth.rs"}), &ok_result(), false);
+        g.record_outcome("bash", &json!({"command": "cargo test"}), &ok_result(), false);
+        assert_eq!(g.status(GateMode::Off), VerificationStatus::VerifiedGreen);
     }
 }

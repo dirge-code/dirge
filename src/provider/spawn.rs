@@ -245,7 +245,14 @@ impl AnyAgent {
             .map(crate::agent::agent_loop::progress::ProgressTracker::new);
         // F6: pre-finalization verifier gate, always on (baked-in). Nudges
         // to verify before finishing when code was edited but not run.
-        cfg.verifier = Some(crate::agent::agent_loop::verifier::VerifierGate::new());
+        // dirge-w2de: a configured `verification_command` makes the gate
+        // require the REAL CI command to pass before reporting green.
+        cfg.verifier = Some(match self.verification_command.clone() {
+            Some(cmd) => {
+                crate::agent::agent_loop::verifier::VerifierGate::with_project_gate(Some(cmd))
+            }
+            None => crate::agent::agent_loop::verifier::VerifierGate::new(),
+        });
         // F6 tier 3: thread the bounded critic (only Some when
         // critic_provider is configured). `None` → no critic.
         cfg.critic_fn = self.critic_fn.clone();

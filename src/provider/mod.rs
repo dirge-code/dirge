@@ -137,6 +137,11 @@ pub struct AnyAgent {
     /// forwarded to `LoopConfig.verification_tiers_mode`. Defaults to `Off`
     /// (dirge-uw2l.2).
     verification_tiers_mode: crate::agent::agent_loop::types::GateMode,
+    /// dirge-w2de: the project's real gate command (`verification_command`
+    /// config). Forwarded to `LoopConfig.verifier` at spawn so the gate
+    /// only reports a full green after THIS command passed. `None` keeps
+    /// the verifier byte-identical to before.
+    verification_command: Option<String>,
     /// Set by `build_agent` from `Config::resolve_safe_state_abort_mode`;
     /// forwarded to `LoopConfig.safe_state_abort_mode`. Defaults to `Off`
     /// (dirge-uw2l.4; the rung is opt-in and off is byte-identical).
@@ -334,6 +339,7 @@ impl AnyAgent {
             code_review_mode: crate::agent::agent_loop::types::CodeReviewMode::default(),
             open_issues_gate_mode: crate::agent::agent_loop::types::GateMode::Off,
             verification_tiers_mode: crate::agent::agent_loop::types::GateMode::Off,
+            verification_command: None,
             safe_state_abort_mode: crate::agent::agent_loop::types::SafeStateMode::Off,
             session_id: None,
             goal_fn: None,
@@ -551,6 +557,13 @@ impl AnyAgent {
         mode: crate::agent::agent_loop::types::GateMode,
     ) -> Self {
         self.verification_tiers_mode = mode;
+        self
+    }
+
+    /// dirge-w2de: set the project gate command (config
+    /// `verification_command`).
+    pub fn with_verification_command(mut self, command: Option<String>) -> Self {
+        self.verification_command = command;
         self
     }
 

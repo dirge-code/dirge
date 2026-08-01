@@ -1074,6 +1074,15 @@ pub struct Config {
     /// no stall checkpoints and no turn-budget notices, byte-identical to
     /// a loop without it. Clamped to a minimum of 2.
     pub progress_stall_threshold: Option<usize>,
+    /// dirge-w2de: the project's real gate command — the build/test
+    /// command CI actually runs (e.g. `RUSTFLAGS="-D warnings" cargo
+    /// clippy --all-targets`). When set, `VerifierGate` only reports a
+    /// full `VerifiedGreen` when a command with the same
+    /// (program, subcommand) signature passed; a green weaker command
+    /// downgrades to `FastGreenOnly` and the existing full-suite
+    /// escalation carries it at finalization. `None` (default) keeps the
+    /// verifier byte-identical to before.
+    pub verification_command: Option<String>,
     /// Phase 3 (`dirge-phyi`, vix port): opt-in phased plan workflow —
     /// explore → plan → reviewer-runs-code loop, each phase a fresh
     /// context-reset fork. `None`/`false` (default) keeps the normal
@@ -2109,6 +2118,23 @@ mod tests {
         assert_eq!(cfg.progress_stall_threshold, None);
         let cfg: Config = serde_json::from_str(r#"{ "progress_stall_threshold": 4 }"#).unwrap();
         assert_eq!(cfg.progress_stall_threshold, Some(4));
+    }
+
+    /// dirge-w2de: the project gate command is opt-in. Absent (default)
+    /// keeps the verifier byte-identical to before; present, it passes
+    /// through verbatim for signature extraction in `VerifierGate`.
+    #[test]
+    fn verification_command_defaults_to_absent() {
+        let cfg: Config = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(cfg.verification_command, None);
+        let cfg: Config = serde_json::from_str(
+            r#"{ "verification_command": "RUSTFLAGS=\"-D warnings\" cargo clippy --all-targets" }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.verification_command.as_deref(),
+            Some(r#"RUSTFLAGS="-D warnings" cargo clippy --all-targets"#)
+        );
     }
 
     #[test]
