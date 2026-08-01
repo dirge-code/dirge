@@ -183,6 +183,29 @@ Adaptation is **one-directional**: the tier may add support, never remove it.
 so a default install is untouched; only `Struggling` moves anything, and only
 toward earlier and more frequent help.
 
+Two thresholds are derived, both scaled down by `Struggling` alone:
+
+| Constant | Base | `Struggling` | Guard |
+|---|---|---|---|
+| `FAST_VERIFY_EDIT_THRESHOLD` | 3 | 2 | verify after N edits with nothing run |
+| `FAILURE_REFLECTION_THRESHOLD` | 3 | 2 | recovery checkpoint after N consecutive failures |
+
+The second is the best-matched derivation in the loop and the only one where the
+signal and the trigger are the same observation: the estimator is *built* from
+failure counts and streaks, and this guard fires on consecutive errored results.
+It is read at every poll rather than at tracker construction — the tracker is
+built at run start, where the estimator is always `Nominal` by warm-up, so a
+threshold fixed there would read the neutral tier every time and be inert by
+construction. That is the shape to check for before wiring anything else here.
+
+Two things the tier deliberately does **not** move, both inside that same
+tracker: the permission checkpoint (a denial streak is a policy wall, and
+nothing the estimator counts measures how often the user's rules block a call)
+and the safe-state abort's 2× signal (that rung spends one of two hard-capped
+aborts and, in `auto` mode, writes to the tree — pulling it forward is not
+"support"). And the derived value is floored at 2: at 1 the checkpoint fires on
+the first errored call, which is not what a *repeated*-failure guard is for.
+
 `Strong` driving nothing is the part that took a correction to get right. The
 counters observe **tool-call mechanics only** — errored calls, repaired
 arguments, invented tool names, scavenged text, storms, streaks. Nothing in

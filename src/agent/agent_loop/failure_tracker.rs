@@ -19,6 +19,14 @@
 //! and re-arms every further `threshold` failures rather than spamming
 //! once per errored call. Any successful tool result clears the streak.
 //!
+//! The threshold is read at every poll, not fixed at construction
+//! (dirge-z85a): [`super::capability::CapabilityTier::Struggling`] scales it
+//! down so a visibly failing run gets the checkpoint sooner (3 → 2).
+//! `Nominal` and `Strong` are bit-identical to the base. This is the one
+//! guard whose input and trigger are the same observation — the estimator is
+//! built from failure counts and streaks, and this fires on consecutive
+//! errored results — which is what licenses the derivation at all.
+//!
 //! Self-contained — no rig/LLM state. Lives as a local in
 //! [`super::run`]; when the loop never wires it, behaviour is
 //! unchanged.
@@ -27,12 +35,18 @@ use std::sync::{Arc, Mutex};
 
 use crate::sync_util::LockExt;
 
+use super::capability::CapabilityTier;
 use super::message::{LoopMessage, UserMessage};
 
 /// How many recent failures to quote back in the checkpoint body.
 const MAX_QUOTED: usize = 5;
 /// Per-error excerpt cap (single line) so the nudge stays compact.
 const EXCERPT_CAP: usize = 160;
+/// Floor on the effective threshold, tier or no tier (dirge-z85a). Mirrors the
+/// `>= 2` construction invariant: at 1 the checkpoint fires on the FIRST
+/// errored call, which contradicts this module's premise — *repeated*, distinct
+/// failures — and would nudge on every isolated transient.
+const MIN_EFFECTIVE_THRESHOLD: usize = 2;
 
 /// Per-session consecutive-failure tracker. `Mutex<Inner>` so the
 /// record hook (tool dispatch) and the poll hook (turn boundary) can
@@ -173,10 +187,38 @@ impl FailureTracker {
         self.record(outcome, tool_name, excerpt);
     }
 
+    /// The threshold this poll evaluates at (dirge-z85a).
+    ///
+    /// Read per evaluation rather than baked in at construction. The tracker is
+    /// built at run start, where the estimator is always `Nominal` by warm-up
+    /// (`MIN_CALLS_FOR_ESTIMATE` tool calls), so deriving it at the
+    /// construction site would read the neutral tier every time and be inert.
+    ///
+    /// Of the loop's movable constants this is the one whose *signal* and
+    /// *trigger* are the same thing: the estimator is built from failure counts
+    /// and streaks, and this guard fires on consecutive errored results. That
+    /// match is the whole justification — see `docs/verification-discipline.md`
+    /// ("a signal may only tune a guard that fires on the same thing the signal
+    /// measures").
+    ///
+    /// `Nominal` and `Strong` return the base bit-identically; only
+    /// `Struggling` moves it, and only earlier (base 3 → 2), floored at
+    /// [`MIN_EFFECTIVE_THRESHOLD`].
+    fn effective_threshold(&self, tier: CapabilityTier) -> usize {
+        let base = u32::try_from(self.threshold).unwrap_or(u32::MAX);
+        (tier.scale_threshold(base) as usize).max(MIN_EFFECTIVE_THRESHOLD)
+    }
+
     /// Poll hook: returns one recovery-checkpoint message when the
-    /// streak has reached `threshold` and we haven't nudged since the
-    /// last `threshold`-failure interval; otherwise empty.
-    pub fn poll_reflection(&self) -> Vec<LoopMessage> {
+    /// streak has reached the tier's effective threshold and we haven't
+    /// nudged since the last such interval; otherwise empty.
+    ///
+    /// `tier` scales the MECHANICAL streak only. The permission checkpoint
+    /// below keeps the base threshold: a denial streak is a policy wall, and
+    /// nothing [`super::capability::CapabilityCounters`] measures says anything
+    /// about how often the user's rules block a call.
+    pub fn poll_reflection(&self, tier: CapabilityTier) -> Vec<LoopMessage> {
+        let threshold = self.effective_threshold(tier);
         let mut inner = self.inner.lock_ignore_poison();
         let mut out = Vec::new();
 
@@ -194,12 +236,12 @@ impl FailureTracker {
             }
         }
 
-        if inner.escalation >= self.threshold {
+        if inner.escalation >= threshold {
             // First crossing, or another full `threshold` of escalation since
             // the last nudge. Keyed on the weighted score so timeouts pull
             // the nudge forward.
             let due = inner.last_emitted_at == 0
-                || inner.escalation.saturating_sub(inner.last_emitted_at) >= self.threshold;
+                || inner.escalation.saturating_sub(inner.last_emitted_at) >= threshold;
             if due {
                 inner.last_emitted_at = inner.escalation;
                 let body = format_checkpoint(inner.consecutive, inner.timeouts, &inner.recent);
@@ -209,7 +251,7 @@ impl FailureTracker {
         out
     }
 
-    /// Whether the failure streak has reached 2× the recovery-checkpoint
+    /// Whether the failure streak has reached 2× the BASE recovery-checkpoint
     /// threshold (dirge-uw2l.4). This is the safe-state abort rung's
     /// escalation signal — it fires only when the model is deep in a failing
     /// streak that the rung-2 checkpoint has already nudged and failed to
@@ -219,6 +261,14 @@ impl FailureTracker {
     /// consult it cheaply every iteration. Knowledge of `threshold` stays
     /// here (the tracker owns it; the safe-state engine never sees the raw
     /// number).
+    ///
+    /// Deliberately NOT tier-scaled (dirge-z85a), unlike
+    /// [`Self::poll_reflection`]. The tier's one-directional rule is that it
+    /// may add support, never take latitude away, and this rung is not
+    /// support: it spends one of two hard-capped aborts per run and, in
+    /// `auto` mode, restores files on the tree. Pulling that forward for a
+    /// struggling model is a different decision from nudging it sooner, and
+    /// there is no evidence for it.
     pub fn safe_state_due(&self) -> bool {
         let inner = self.inner.lock_ignore_poison();
         inner.escalation >= self.threshold.saturating_mul(2)
@@ -331,6 +381,13 @@ fn dominant_tool(recent: &[(String, String)]) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// Poll at the neutral tier — what every test predating dirge-z85a
+    /// asserts, and the property `Nominal` must keep: bit-identical to the
+    /// base threshold.
+    fn poll(t: &FailureTracker) -> Vec<LoopMessage> {
+        t.poll_reflection(CapabilityTier::Nominal)
+    }
+
     fn content_of(msgs: &[LoopMessage]) -> String {
         match msgs.first() {
             Some(LoopMessage::User(u)) => u.text_joined(),
@@ -343,7 +400,7 @@ mod tests {
         let t = FailureTracker::new(3);
         t.record_result(true, "edit", "no match");
         t.record_result(true, "edit", "no match either");
-        assert!(t.poll_reflection().is_empty(), "2 < threshold 3");
+        assert!(poll(&t).is_empty(), "2 < threshold 3");
     }
 
     #[test]
@@ -352,7 +409,7 @@ mod tests {
         t.record_result(true, "edit", "old_string not found");
         t.record_result(true, "read", "file not found");
         t.record_result(true, "bash", "command failed");
-        let msgs = t.poll_reflection();
+        let msgs = poll(&t);
         assert_eq!(msgs.len(), 1, "streak of 3 distinct errors nudges");
         let body = content_of(&msgs);
         assert!(body.contains("Recovery checkpoint"));
@@ -372,7 +429,7 @@ mod tests {
         for _ in 0..3 {
             t.record_result(true, "edit", "old_string not found");
         }
-        let body = content_of(&t.poll_reflection());
+        let body = content_of(&poll(&t));
         assert!(
             body.contains("Every one of these was `edit`"),
             "single-tool streak should name the tool: {body}"
@@ -387,13 +444,13 @@ mod tests {
         t.record(Outcome::Timeout, "bash", "Command timed out after 120s");
         // One timeout (escalation 2) is below threshold 3 — still silent.
         assert!(
-            t.poll_reflection().is_empty(),
+            poll(&t).is_empty(),
             "single timeout (weight 2) < threshold 3"
         );
         t.record(Outcome::Timeout, "bash", "Command timed out after 120s");
         // Two timeouts (escalation 4) cross threshold 3 after only 2 calls,
         // where two plain errors (weight 2) would not have.
-        let msgs = t.poll_reflection();
+        let msgs = poll(&t);
         assert_eq!(msgs.len(), 1, "two timeouts escalate past threshold");
         let body = content_of(&msgs);
         // Truthful call count, not the weighted score.
@@ -405,7 +462,7 @@ mod tests {
         use super::super::activity::Outcome;
         let t = FailureTracker::new(2);
         t.record(Outcome::Timeout, "bash", "Command timed out after 120s");
-        let body = content_of(&t.poll_reflection());
+        let body = content_of(&poll(&t));
         assert!(
             body.contains("timed out") && body.contains("time budget"),
             "checkpoint should name the timeout failure mode: {body}"
@@ -417,10 +474,10 @@ mod tests {
         use super::super::activity::Outcome;
         let t = FailureTracker::new(3);
         t.record(Outcome::Error, "edit", "no match");
-        assert!(t.poll_reflection().is_empty(), "escalation 1 < 3");
+        assert!(poll(&t).is_empty(), "escalation 1 < 3");
         t.record(Outcome::Timeout, "bash", "Command timed out after 5s");
         // 1 (error) + 2 (timeout) = 3 → trips.
-        assert_eq!(t.poll_reflection().len(), 1, "error+timeout escalate to 3");
+        assert_eq!(poll(&t).len(), 1, "error+timeout escalate to 3");
     }
 
     #[test]
@@ -431,7 +488,7 @@ mod tests {
         t.record_result(false, "read", "ok"); // success resets
         t.record_result(true, "edit", "miss");
         assert!(
-            t.poll_reflection().is_empty(),
+            poll(&t).is_empty(),
             "one success reset the counter; only 1 error since"
         );
     }
@@ -442,11 +499,11 @@ mod tests {
         for _ in 0..3 {
             t.record_result(true, "edit", "miss");
         }
-        assert_eq!(t.poll_reflection().len(), 1, "first crossing nudges");
+        assert_eq!(poll(&t).len(), 1, "first crossing nudges");
         // A 4th failure shouldn't re-nudge — not yet another full threshold.
         t.record_result(true, "edit", "miss");
         assert!(
-            t.poll_reflection().is_empty(),
+            poll(&t).is_empty(),
             "streak 4, last emitted at 3 — not due again"
         );
     }
@@ -457,12 +514,12 @@ mod tests {
         for _ in 0..3 {
             t.record_result(true, "edit", "miss");
         }
-        assert_eq!(t.poll_reflection().len(), 1);
+        assert_eq!(poll(&t).len(), 1);
         // Three more failures (streak now 6) re-arms the nudge.
         for _ in 0..3 {
             t.record_result(true, "edit", "miss");
         }
-        let msgs = t.poll_reflection();
+        let msgs = poll(&t);
         assert_eq!(msgs.len(), 1, "streak of 6 re-arms");
         assert!(content_of(&msgs).contains("6 tool calls in a row"));
     }
@@ -472,9 +529,9 @@ mod tests {
         let t = FailureTracker::new(2);
         t.record_result(true, "edit", "miss");
         t.record_result(true, "edit", "miss");
-        assert_eq!(t.poll_reflection().len(), 1);
+        assert_eq!(poll(&t).len(), 1);
         assert!(
-            t.poll_reflection().is_empty(),
+            poll(&t).is_empty(),
             "second poll with no new failures stays silent"
         );
     }
@@ -485,7 +542,7 @@ mod tests {
         let noisy = format!("line one\n  line two\t{}", "x".repeat(400));
         t.record_result(true, "bash", &noisy);
         t.record_result(true, "bash", "second");
-        let body = content_of(&t.poll_reflection());
+        let body = content_of(&poll(&t));
         assert!(!body.contains('\t'), "tabs collapsed");
         // The 400-x run must be truncated with an ellipsis.
         assert!(body.contains('…'));
@@ -501,7 +558,7 @@ mod tests {
         for i in 0..7 {
             t.record_result(true, "edit", &format!("err{i}"));
         }
-        let body = content_of(&t.poll_reflection());
+        let body = content_of(&poll(&t));
         assert!(!body.contains("err0"), "oldest dropped beyond MAX_QUOTED");
         assert!(!body.contains("err1"));
         assert!(body.contains("err2"));
@@ -524,7 +581,7 @@ mod tests {
                 "Permission denied: writes outside project",
             );
         }
-        let msgs = t.poll_reflection();
+        let msgs = poll(&t);
         assert_eq!(msgs.len(), 1, "denial streak nudges once");
         let body = content_of(&msgs);
         // NOT the mechanical checkpoint — none of its tells.
@@ -559,7 +616,7 @@ mod tests {
             "Permission denied: outside project",
         );
         assert!(
-            t.poll_reflection().is_empty(),
+            poll(&t).is_empty(),
             "2 mechanical errors + 1 denial: neither streak at threshold"
         );
     }
@@ -574,7 +631,7 @@ mod tests {
         // mechanical failure (no increment) — the error streak survives it.
         t.record(Outcome::Denied, "write", "Permission denied: x");
         t.record(Outcome::Error, "edit", "no match");
-        let msgs = t.poll_reflection();
+        let msgs = poll(&t);
         assert_eq!(msgs.len(), 1, "3 mechanical errors across a denial trip");
         assert!(content_of(&msgs).contains("3 tool calls in a row have failed"));
     }
@@ -588,7 +645,7 @@ mod tests {
         t.record(Outcome::Ok, "read", "ok");
         t.record(Outcome::Denied, "write", "Permission denied: x");
         assert!(
-            t.poll_reflection().is_empty(),
+            poll(&t).is_empty(),
             "success reset the denial streak; 1 denial < threshold"
         );
     }
@@ -672,6 +729,127 @@ mod tests {
             t.record(Outcome::Denied, "write", "Permission denied: x");
         }
         assert!(!t.safe_state_due(), "denials never feed escalation");
+    }
+
+    // dirge-z85a: the recovery-checkpoint threshold is read at every poll, not
+    // baked in at construction. The tracker is built at run start, when the
+    // estimator is always `Nominal` by warm-up (MIN_CALLS_FOR_ESTIMATE), so a
+    // threshold derived at the construction site would read the neutral tier
+    // every time and be inert by construction.
+
+    #[test]
+    fn struggling_reflects_sooner_than_nominal() {
+        let t = FailureTracker::new(3);
+        t.record_result(true, "edit", "old_string not found");
+        t.record_result(true, "read", "file not found");
+        assert!(
+            t.poll_reflection(CapabilityTier::Nominal).is_empty(),
+            "2 < base threshold 3"
+        );
+        let msgs = t.poll_reflection(CapabilityTier::Struggling);
+        assert_eq!(msgs.len(), 1, "struggling reflects at the scaled 2");
+        assert!(content_of(&msgs).contains("2 tool calls in a row have failed"));
+    }
+
+    #[test]
+    fn tier_flip_mid_streak_moves_the_guard_both_ways() {
+        let t = FailureTracker::new(3);
+        t.record_result(true, "edit", "a");
+        t.record_result(true, "edit", "b");
+        // Struggling: fires at 2.
+        assert_eq!(t.poll_reflection(CapabilityTier::Struggling).len(), 1);
+        // Flipped back to Nominal, the re-arm interval is the BASE threshold
+        // again — escalation 4 is only 2 past the last emit, so it stays quiet
+        // until 5.
+        t.record_result(true, "edit", "c");
+        t.record_result(true, "edit", "d");
+        assert!(
+            t.poll_reflection(CapabilityTier::Nominal).is_empty(),
+            "4 - 2 = 2 < base 3"
+        );
+        t.record_result(true, "edit", "e");
+        assert_eq!(
+            t.poll_reflection(CapabilityTier::Nominal).len(),
+            1,
+            "5 - 2 = 3 re-arms at the base interval"
+        );
+    }
+
+    #[test]
+    fn nominal_and_strong_are_bit_identical() {
+        for tier in [CapabilityTier::Nominal, CapabilityTier::Strong] {
+            let t = FailureTracker::new(3);
+            t.record_result(true, "edit", "a");
+            t.record_result(true, "edit", "b");
+            assert!(t.poll_reflection(tier).is_empty(), "{tier:?}: 2 < 3");
+            t.record_result(true, "edit", "c");
+            assert_eq!(t.poll_reflection(tier).len(), 1, "{tier:?}: 3 == 3");
+        }
+    }
+
+    #[test]
+    fn struggling_re_arms_at_the_scaled_interval() {
+        let t = FailureTracker::new(3);
+        for _ in 0..2 {
+            t.record_result(true, "edit", "miss");
+        }
+        assert_eq!(
+            t.poll_reflection(CapabilityTier::Struggling).len(),
+            1,
+            "fires at 2"
+        );
+        t.record_result(true, "edit", "miss");
+        assert!(
+            t.poll_reflection(CapabilityTier::Struggling).is_empty(),
+            "3 - 2 = 1 < 2"
+        );
+        t.record_result(true, "edit", "miss");
+        assert_eq!(
+            t.poll_reflection(CapabilityTier::Struggling).len(),
+            1,
+            "4 - 2 = 2 re-arms"
+        );
+    }
+
+    #[test]
+    fn scaled_threshold_respects_the_two_failure_floor() {
+        let t = FailureTracker::new(2);
+        t.record_result(true, "edit", "one");
+        assert!(
+            t.poll_reflection(CapabilityTier::Struggling).is_empty(),
+            "base 2 scales to 1, clamped back to 2 — never nudge on a single error"
+        );
+        t.record_result(true, "edit", "two");
+        assert_eq!(t.poll_reflection(CapabilityTier::Struggling).len(), 1);
+    }
+
+    #[test]
+    fn permission_checkpoint_stays_on_the_base_threshold() {
+        use super::super::activity::Outcome;
+        let t = FailureTracker::new(3);
+        t.record(Outcome::Denied, "write", "Permission denied: x");
+        t.record(Outcome::Denied, "write", "Permission denied: x");
+        // A denial streak is a policy wall, and nothing the estimator counts
+        // measures it — the tier has no standing to pull this one forward.
+        assert!(
+            t.poll_reflection(CapabilityTier::Struggling).is_empty(),
+            "2 denials < base threshold 3, tier notwithstanding"
+        );
+        t.record(Outcome::Denied, "write", "Permission denied: x");
+        assert_eq!(t.poll_reflection(CapabilityTier::Struggling).len(), 1);
+    }
+
+    #[test]
+    fn safe_state_signal_stays_on_the_base_threshold() {
+        use super::super::activity::Outcome;
+        let t = FailureTracker::new(3);
+        for _ in 0..4 {
+            t.record(Outcome::Error, "edit", "no match");
+        }
+        // Struggling pulls the rung-2 checkpoint forward (2, not 3). It must
+        // NOT drag the rung-3 abort with it: that rung spends a hard-capped
+        // budget and, in auto mode, writes to the tree.
+        assert!(!t.safe_state_due(), "2x stays 6 regardless of tier");
     }
 
     #[test]

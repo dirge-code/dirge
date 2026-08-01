@@ -122,8 +122,10 @@ impl LoopGuards {
     }
 
     /// Turn-boundary poll for the failure tracker's recovery checkpoint.
-    pub fn poll_reflection(&self) -> Vec<LoopMessage> {
-        self.failures.poll_reflection()
+    /// `tier` sets the threshold for THIS poll (dirge-z85a) — the tracker
+    /// holds the base, the caller supplies the currently observed tier.
+    pub fn poll_reflection(&self, tier: super::capability::CapabilityTier) -> Vec<LoopMessage> {
+        self.failures.poll_reflection(tier)
     }
 
     /// Whether the failure streak has reached 2× the recovery-checkpoint

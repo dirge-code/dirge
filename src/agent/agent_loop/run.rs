@@ -1933,7 +1933,7 @@ pub(crate) fn poll_boundary_nudge(
     }
     // 2. Cross-turn recovery checkpoint (rung 2) — distinct tool errors piling
     //    up, which storm's identical-repeat rule never sees.
-    if let Some(msg) = guards.poll_reflection().into_iter().next() {
+    if let Some(msg) = guards.poll_reflection(tier).into_iter().next() {
         tally.record_nudge(BoundaryNudge::ReflectionCheckpoint);
         return Some((msg, BoundaryNudge::ReflectionCheckpoint));
     }
