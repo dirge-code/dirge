@@ -50,7 +50,7 @@ set -euo pipefail
 #   -B  treatment arm overrides    (default: none)
 #   -b  dirge binary               (default target/debug/dirge)
 #   -t  max_agent_turns cap        (default 20)
-#   -s  scenario small             (default small; the only one so far)
+#   -s  scenario small|recon       (default small)
 #
 # With -A and -B both empty the two arms are identical — a useful check
 # that the harness itself adds no bias.
@@ -81,7 +81,7 @@ while getopts "n:m:A:B:b:t:s:" opt; do
   esac
 done
 
-[ "$SCENARIO" = "small" ] || { echo "error: -s must be small (only scenario so far)" >&2; exit 2; }
+case "$SCENARIO" in small|recon) ;; *) echo "error: -s must be small or recon" >&2; exit 2 ;; esac
 [ "$REPEATS" -ge 1 ] 2>/dev/null || { echo "error: -n must be a positive integer" >&2; exit 2; }
 command -v jq >/dev/null || { echo "error: jq required" >&2; exit 1; }
 [ -x "$BINARY" ] || { echo "error: dirge binary not found/executable: $BINARY (cargo build first)" >&2; exit 1; }
@@ -92,30 +92,113 @@ FIXTURE="$WORK/fixture"
 mkdir -p "$FIXTURE"
 trap 'rm -rf "$WORK"' EXIT
 
-# ---- Scenario: small — 30 .log files; those whose index divides by 5 or 7
-# get a FATAL line. Ground truth is computed from the fixture itself, never
+# ---- Scenarios. Ground truth is computed from the fixture itself, never
 # hardcoded, so the correctness gate always matches what was planted.
-for i in $(seq 1 30); do
-  f="$FIXTURE/service-${i}.log"
-  {
-    echo "INFO: service ${i} started"
-    echo "status=ok"
-    if (( i % 5 == 0 || i % 7 == 0 )); then
-      echo "FATAL: service ${i} crashed, unrecoverable"
-    fi
-  } > "$f"
-done
-EXPECTED_COUNT="$(grep -lE 'FATAL' "$FIXTURE"/*.log | wc -l | tr -d ' ')"
-FIXTURE_DESC="30 .log files, $EXPECTED_COUNT contain FATAL"
-TASK='This directory has many .log files. Report exactly how many of them contain the string FATAL, and list those filenames sorted. End your answer with a line: COUNT=<n>'
+if [ "$SCENARIO" = "small" ]; then
+  # 30 .log files; those whose index divides by 5 or 7 get a FATAL line.
+  # Read-only: exercises the machinery, writes nothing.
+  for i in $(seq 1 30); do
+    f="$FIXTURE/service-${i}.log"
+    {
+      echo "INFO: service ${i} started"
+      echo "status=ok"
+      if (( i % 5 == 0 || i % 7 == 0 )); then
+        echo "FATAL: service ${i} crashed, unrecoverable"
+      fi
+    } > "$f"
+  done
+  EXPECTED_COUNT="$(grep -lE 'FATAL' "$FIXTURE"/*.log | wc -l | tr -d ' ')"
+  FIXTURE_DESC="30 .log files, $EXPECTED_COUNT contain FATAL"
+  TASK='This directory has many .log files. Report exactly how many of them contain the string FATAL, and list those filenames sorted. End your answer with a line: COUNT=<n>'
+else
+  # recon — the reconnaissance-thrash scenario (dirge-t5dh).
+  #
+  # A wide, shallow, interlinked module tree where the change itself is
+  # tiny and fully specified, but there is a great deal one COULD read
+  # first. This is the shape that produced the motivating incident: 60
+  # turns of successful, varied grep/read calls and nothing written.
+  # The dependent variable is turns-to-first-write.
+  #
+  # Every module looks alike and none of them matters to the task, so
+  # reading more of them buys nothing — a model that reads its way through
+  # the tree is thrashing by construction, not being careful.
+  mkdir -p "$FIXTURE/src"
+  for i in $(seq 1 40); do
+    cat > "$FIXTURE/src/module_${i}.py" <<PYEOF
+"""Module ${i} — part of the widget pipeline."""
+
+from typing import Any
+
+
+def transform_${i}(payload: dict[str, Any]) -> dict[str, Any]:
+    """Apply stage ${i} of the pipeline to payload."""
+    out = dict(payload)
+    out["stage_${i}"] = True
+    return out
+
+
+def validate_${i}(payload: dict[str, Any]) -> bool:
+    """True when payload is well formed for stage ${i}."""
+    return isinstance(payload, dict) and "id" in payload
+PYEOF
+  done
+  cat > "$FIXTURE/src/settings.py" <<'PYEOF'
+"""Pipeline settings."""
+
+RETRY_LIMIT = 3
+TIMEOUT_SECONDS = 30
+BATCH_SIZE = 100
+PYEOF
+  cat > "$FIXTURE/README.md" <<'MDEOF'
+# widget pipeline
+
+Stages live in `src/module_N.py`. Shared configuration lives in
+`src/settings.py`.
+MDEOF
+  FIXTURE_DESC="40 near-identical pipeline modules + settings.py; the task touches ONE new file"
+  TASK='In this project, create a new file `src/limits.py` containing exactly one function:
+
+def effective_retry_limit(attempts: int) -> int
+
+It must return RETRY_LIMIT from src/settings.py when attempts is 0 or less, and otherwise return RETRY_LIMIT minus attempts, floored at 0. Import RETRY_LIMIT from settings. Do not modify any existing file. When you are done, end your answer with a line: DONE=limits'
+
+  # Correctness is checked against the WRITTEN FILE, not the model's prose —
+  # a run that claims DONE without writing must not score as correct.
+  check_correct() {
+    local out="$1" f="$FIXTURE/src/limits.py"
+    [ -f "$f" ] || { echo 0; return; }
+    grep -q "def effective_retry_limit" "$f" || { echo 0; return; }
+    grep -qE "from settings import RETRY_LIMIT|from src.settings import RETRY_LIMIT|import settings" "$f" || { echo 0; return; }
+    # Behavioural check: exercise the function for real.
+    ( cd "$FIXTURE/src" && python3 -c "
+import limits, settings
+assert limits.effective_retry_limit(0) == settings.RETRY_LIMIT
+assert limits.effective_retry_limit(-5) == settings.RETRY_LIMIT
+assert limits.effective_retry_limit(1) == settings.RETRY_LIMIT - 1
+assert limits.effective_retry_limit(999) == 0
+" ) >/dev/null 2>&1 && echo 1 || echo 0
+  }
+fi
+
+# ---- Undo whatever a run wrote, so each repeat starts from the same tree.
+# Read-only scenarios need nothing; recon must drop the file under test.
+reset_fixture() {
+  if [ "$SCENARIO" = "recon" ]; then
+    rm -f "$FIXTURE/src/limits.py"
+    rm -rf "$FIXTURE/src/__pycache__"
+  fi
+}
 
 # ---- Correctness check for one run's stream-json output; echoes 1 or 0.
-check_correct() {
-  local out="$1" result got
-  result="$(jq -r 'select(.type=="result") | .result' "$out" 2>/dev/null || true)"
-  got="$(printf '%s' "$result" | grep -oE 'COUNT=[0-9]+' | tail -1 || true)"
-  [ "$got" = "COUNT=$EXPECTED_COUNT" ] && echo 1 || echo 0
-}
+# The recon scenario overrides this above (it checks the file on disk).
+if ! declare -F check_correct >/dev/null; then
+  check_correct() {
+    local out="$1" result got
+    result="$(jq -r 'select(.type=="result") | .result' "$out" 2>/dev/null || true)"
+    got="$(printf '%s' "$result" | grep -oE 'COUNT=[0-9]+' | tail -1 || true)"
+    [ "$got" = "COUNT=$EXPECTED_COUNT" ] && echo 1 || echo 0
+  }
+fi
 
 # ---- Pull one key=value field out of a tracing line. Handles quoted
 # string values (tracing fmt quotes Display fields) and bare numbers.
@@ -212,6 +295,10 @@ run_arm() { # $1 = overrides, $2 = tag, $3 = model
     cfgdir="$(mktemp -d "$WORK/cfg.XXXXXX")"
     datadir="$(mktemp -d "$WORK/data.XXXXXX")"
     build_config "$cfgdir" "$1" "$3"
+    # Reset any artefact a previous run wrote. The fixture is shared across
+    # runs and arms, so without this the first run to succeed would make
+    # every later run score correct without doing anything.
+    reset_fixture
 
     out="$WORK/${2}-${3}-${i}.jsonl"
     err="$WORK/${2}-${3}-${i}.err"
