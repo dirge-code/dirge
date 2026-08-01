@@ -50,7 +50,7 @@ set -euo pipefail
 #   -B  treatment arm overrides    (default: none)
 #   -b  dirge binary               (default target/debug/dirge)
 #   -t  max_agent_turns cap        (default 20)
-#   -s  scenario small|recon       (default small)
+#   -s  scenario small|recon|recon-real  (default small)
 #
 # With -A and -B both empty the two arms are identical — a useful check
 # that the harness itself adds no bias.
@@ -77,11 +77,11 @@ while getopts "n:m:A:B:b:t:s:" opt; do
     b) BINARY="$OPTARG" ;;
     t) MAXTURNS="$OPTARG" ;;
     s) SCENARIO="$OPTARG" ;;
-    *) echo "usage: $0 [-n REPEATS] [-m MODELS] [-A OVERRIDES] [-B OVERRIDES] [-b BINARY] [-t MAXTURNS] [-s small]" >&2; exit 2 ;;
+    *) echo "usage: $0 [-n REPEATS] [-m MODELS] [-A OVERRIDES] [-B OVERRIDES] [-b BINARY] [-t MAXTURNS] [-s small|recon|recon-real]" >&2; exit 2 ;;
   esac
 done
 
-case "$SCENARIO" in small|recon) ;; *) echo "error: -s must be small or recon" >&2; exit 2 ;; esac
+case "$SCENARIO" in small|recon|recon-real) ;; *) echo "error: -s must be small, recon, or recon-real" >&2; exit 2 ;; esac
 [ "$REPEATS" -ge 1 ] 2>/dev/null || { echo "error: -n must be a positive integer" >&2; exit 2; }
 command -v jq >/dev/null || { echo "error: jq required" >&2; exit 1; }
 [ -x "$BINARY" ] || { echo "error: dirge binary not found/executable: $BINARY (cargo build first)" >&2; exit 1; }
@@ -110,7 +110,7 @@ if [ "$SCENARIO" = "small" ]; then
   EXPECTED_COUNT="$(grep -lE 'FATAL' "$FIXTURE"/*.log | wc -l | tr -d ' ')"
   FIXTURE_DESC="30 .log files, $EXPECTED_COUNT contain FATAL"
   TASK='This directory has many .log files. Report exactly how many of them contain the string FATAL, and list those filenames sorted. End your answer with a line: COUNT=<n>'
-else
+elif [ "$SCENARIO" = "recon" ]; then
   # recon — the reconnaissance-thrash scenario (dirge-t5dh).
   #
   # A wide, shallow, interlinked module tree where the change itself is
@@ -195,19 +195,88 @@ assert limits.effective_retry_limit(999) == 0
     fi
     echo 0
   }
+elif [ "$SCENARIO" = "recon-real" ]; then
+  # recon-real — reconnaissance thrash against a REAL codebase.
+  #
+  # The synthetic `recon` scenario (40 near-identical toy Python modules)
+  # does not reproduce the failure it was built to measure: both models
+  # write within a few turns and the prologue bound never fires. The real
+  # incident was an agent burning ~60 turns and 8 minutes on ~40 successful
+  # grep/read calls against a genuinely large, genuinely interconnected
+  # Rust codebase, writing nothing. The bound under test is an UPPER BOUND —
+  # a safety net against runaway reconnaissance, not an eager nudge — so it
+  # can only be validated by a scenario that actually runs away.
+  #
+  # The fixture is an EXTRACT of this repo's own agent loop: the
+  # ~3,500-line run.rs keystone plus ~40 siblings, plus the two files that
+  # keep their module references from dangling. It deliberately does not
+  # compile — the task is a single self-contained file and making it
+  # buildable would add a whole confound. Everything needed is in the
+  # prompt; the surrounding files exist purely to invite unbounded reading.
+  REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+  mkdir -p "$FIXTURE/src/agent/agent_loop"
+  cp "$REPO_ROOT"/src/agent/agent_loop/*.rs "$FIXTURE/src/agent/agent_loop/"
+  if [ -f "$REPO_ROOT/src/agent/mod.rs" ]; then
+    cp "$REPO_ROOT/src/agent/mod.rs" "$FIXTURE/src/agent/mod.rs"
+  fi
+  if [ -f "$REPO_ROOT/src/sync_util.rs" ]; then
+    cp "$REPO_ROOT/src/sync_util.rs" "$FIXTURE/src/sync_util.rs"
+  fi
+  cat > "$FIXTURE/README.md" <<'MDEOF'
+# agent loop (extract)
+
+This is an extract of one piece of a larger codebase: the agent-loop
+module from a Rust coding agent. The keystone is
+`src/agent/agent_loop/run.rs` (the main loop); the other files are its
+collaborators. Not every referenced module is present and nothing here
+compiles — it is a reading target, not a build target.
+MDEOF
+  # Keep a pristine mod.rs so reset_fixture can revert a run's edits. Without
+  # this, a successful run's `pub mod capability;` survives into the next
+  # repeat and the gate goes green having done nothing.
+  cp "$FIXTURE/src/agent/agent_loop/mod.rs" "$FIXTURE/src/agent/agent_loop/mod.rs.pristine"
+  FIXTURE_DESC="real agent_loop extract (~43 .rs files incl. ~3500-line run.rs); the task adds ONE self-contained file"
+  TASK='In src/agent/agent_loop/, create a new file `capability.rs` containing a `CapabilitySignal` enum with exactly these variants: Scavenged, ArgRepaired, Truncated, HallucinatedTool, StormRepeat, and a `CapabilityCount` struct holding one u32 per variant plus `fn record(&mut self, signal: CapabilitySignal)` and `fn total(&self) -> u32`. Mirror the style of the existing enums in this directory. Register the module in mod.rs in alphabetical order. Do not modify any other file. End your answer with a line: DONE=capability'
+
+  # Correctness is structural — the tree does not compile by design. The file
+  # must exist, name the enum and all five variants, name the struct and its
+  # two methods, AND mod.rs must declare the capability module. A run that
+  # announces DONE without writing the file scores 0 — that IS the failure.
+  check_correct() {
+    local out="$1" f="$FIXTURE/src/agent/agent_loop/capability.rs" m="$FIXTURE/src/agent/agent_loop/mod.rs"
+    [ -f "$f" ] || { echo 0; return; }
+    grep -q 'enum CapabilitySignal' "$f" || { echo 0; return; }
+    grep -wq Scavenged "$f" || { echo 0; return; }
+    grep -wq ArgRepaired "$f" || { echo 0; return; }
+    grep -wq Truncated "$f" || { echo 0; return; }
+    grep -wq HallucinatedTool "$f" || { echo 0; return; }
+    grep -wq StormRepeat "$f" || { echo 0; return; }
+    grep -q 'struct CapabilityCount' "$f" || { echo 0; return; }
+    grep -q 'fn record' "$f" || { echo 0; return; }
+    grep -q 'fn total' "$f" || { echo 0; return; }
+    grep -wq capability "$m" || { echo 0; return; }
+    echo 1
+  }
 fi
 
 # ---- Undo whatever a run wrote, so each repeat starts from the same tree.
-# Read-only scenarios need nothing; recon must drop the file under test.
+# Read-only scenarios need nothing; recon and recon-real must drop the file
+# under test (recon-real also reverts mod.rs from its pristine copy).
 reset_fixture() {
   if [ "$SCENARIO" = "recon" ]; then
     rm -f "$FIXTURE/src/limits.py"
     rm -rf "$FIXTURE/src/__pycache__"
+  elif [ "$SCENARIO" = "recon-real" ]; then
+    rm -f "$FIXTURE/src/agent/agent_loop/capability.rs"
+    if [ -f "$FIXTURE/src/agent/agent_loop/mod.rs.pristine" ]; then
+      cp -f "$FIXTURE/src/agent/agent_loop/mod.rs.pristine" "$FIXTURE/src/agent/agent_loop/mod.rs"
+    fi
   fi
 }
 
 # ---- Correctness check for one run's stream-json output; echoes 1 or 0.
-# The recon scenario overrides this above (it checks the file on disk).
+# The recon and recon-real scenarios override this above (they check files
+# on disk, not the model's prose).
 if ! declare -F check_correct >/dev/null; then
   check_correct() {
     local out="$1" result got
