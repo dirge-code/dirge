@@ -45,6 +45,8 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 
 use super::context_manager::{self, PostUsageDecisionKind};
+use super::gate_state::{GateInputs, GateStates};
+use super::gate_tally::{BoundaryNudge, GateSource, GateTally};
 use super::inflight::InflightSet;
 use super::message::{
     AssistantMessage, ContentBlock, LoopEvent, LoopMessage, StopReason, ToolResultMessage,
@@ -54,7 +56,6 @@ use super::storm::StormBreaker;
 use super::stream::{StreamFn, stream_assistant_response};
 use super::tool::AbortSignal;
 use super::types::{CodeReviewMode, Context, GateMode, LoopConfig};
-use super::gate_tally::{BoundaryNudge, GateSource, GateTally};
 use super::verifier::VERIFY_TAG;
 use crate::sync_util::LockExt;
 
@@ -592,34 +593,41 @@ pub(crate) async fn is_awaiting_user(config: &LoopConfig, new_messages: &[LoopMe
 /// verifier won't fire twice). This is the single authority for finalization
 /// precedence — previously four separate `if follow_up.is_empty()` blocks
 /// inline in the outer loop [dirge-vcsn].
-#[allow(clippy::too_many_arguments)]
+///
+/// Every gate's re-fire state lives in [`GateStates`], and every field there is
+/// labelled cost-ceiling or re-fire-guard — see that type for why the
+/// distinction decides what is safe to change [dirge-5mtx.5].
 async fn poll_finalization_follow_up(
     config: &LoopConfig,
     system_prompt: &str,
     new_messages: &[LoopMessage],
-    // dirge-8v98: one-shot flag for the Off/Advisory unified judge; the
-    // persistent Blocking path uses `code_review_reacts` instead.
-    critic_done: &mut bool,
-    code_review_reacts: &mut u8,
-    // dirge-9b2k: fingerprint of the diff the Blocking judge last reviewed, so
-    // an unchanged diff (the model declined/rebutted) isn't re-reviewed.
-    last_reviewed_fingerprint: &mut Option<u64>,
-    // dirge-9b2k R2: the last reaction's rendered findings, handed to the next
-    // judge prompt so it doesn't blindly re-raise one the model rebutted.
-    last_review_findings: &mut Option<String>,
-    code_review_baseline: Option<&super::code_review::RunDiff>,
-    goal_reacts: &mut u8,
-    todo_nudges: &mut u8,
-    resume_nudges: &mut u8,
-    // dirge-ksjl: open-issues gate — session-scoped issue count nudge.
-    open_issues_gate_mode: GateMode,
-    issue_db_path: Option<&std::path::Path>,
-    session_id: Option<&str>,
-    open_issues_nudges: &mut u8,
-    // dirge-track: file-edits-without-todos advisory — one-shot per run.
-    track_nudges: &mut u8,
+    gates: &mut GateStates,
+    inputs: GateInputs<'_>,
     emit: &mpsc::Sender<LoopEvent>,
 ) -> (Vec<LoopMessage>, FollowUpSource) {
+    // Destructured rather than accessed through `gates.` / `inputs.` so the
+    // gate bodies below read exactly as they did when these were seventeen
+    // positional parameters. Default binding modes give each name the same
+    // `&mut T` / `T` it had before, so this collapse is a signature change
+    // only — no gate logic moved.
+    let GateStates {
+        critic_done,
+        code_review_reacts,
+        last_reviewed_fingerprint,
+        last_review_findings,
+        goal_reacts,
+        todo_nudges,
+        resume_nudges,
+        open_issues_nudges,
+        track_nudges,
+    } = gates;
+    let GateInputs {
+        code_review_baseline,
+        open_issues_gate_mode,
+        issue_db_path,
+        session_id,
+    } = inputs;
+
     // 0. Awaiting-user gate (dirge-g2ex). The model ended its final assistant
     //    turn by asking the user a question — it is blocked on the USER, not
     //    "done". Finalize and hand control back instead of letting the lower
@@ -2062,17 +2070,10 @@ pub async fn run_loop(
     // checkpoint threshold.
     let mut safe_state = super::safe_state::SafeStateEngine::new();
 
-    // dirge-8v98: the unified finalization judge fires at most once per run in
-    // Off/Advisory mode (one-shot); Blocking mode persists across finalizations
-    // (fix-then-re-review) bounded by MAX_REVIEW_REACT.
-    let mut critic_done = false;
-    let mut code_review_reacts: u8 = 0;
-    // dirge-9b2k: see poll_finalization_follow_up — the last-reviewed diff
-    // fingerprint drives the Blocking dedupe.
-    let mut last_reviewed_fingerprint: Option<u64> = None;
-    // dirge-9b2k R2: the last judge reaction's findings, threaded into the next
-    // judge prompt so a rebutted finding isn't blindly re-raised.
-    let mut last_review_findings: Option<String> = None;
+    // dirge-5mtx.5: every finalization gate's re-fire state, in one place. Each
+    // field is labelled cost-ceiling or re-fire-guard on `GateStates` itself —
+    // that distinction is what decides which are safe to relax.
+    let mut gates = GateStates::default();
 
     // dirge-1g3v: snapshot the working-tree diff at run start so the reviewer
     // can tell what THIS run changed. Without a baseline it diffed the whole
@@ -2092,10 +2093,6 @@ pub async fn run_loop(
             None
         };
 
-    // Goal gate: counts re-entries so a user-defined stop condition that
-    // never resolves can't loop past MAX_GOAL_REACT.
-    let mut goal_reacts: u8 = 0;
-
     // Incremental background checkpoint schedule (MiMo 20% cadence).
     // Lazily built on first post-usage check with the live ctx_max; reset
     // after a destructive fold rebuilds the context.
@@ -2109,23 +2106,11 @@ pub async fn run_loop(
     let checkpoint_slot: CheckpointSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
     let mut checkpoint_generation: u64 = 0;
 
-    // vix-port: don't let the model end a turn while it still has unfinished
-    // todos (bounded by MAX_TODO_NUDGES; vix caps at 3, session.go:1551).
-    let mut todo_nudges: u8 = 0;
-
-    // Deterministic resume-after-failure (bounded by MAX_RESUME_NUDGE).
-    let mut resume_nudges: u8 = 0;
-
     // Run-level recovery from a transient mid-stream error (bounded by
     // MAX_TRANSIENT_RECOVERIES). Counts consecutive recoveries so a
     // truly dead network still terminates.
     let mut transient_recoveries: u8 = 0;
 
-    // dirge-ksjl: open-issues gate counter (bounded by MAX_OPEN_ISSUES_NUDGES).
-    let mut open_issues_nudges: u8 = 0;
-
-    // dirge-track: file-edits-without-tracked-todos advisory (one-shot).
-    let mut track_nudges: u8 = 0;
     let mut verify_nudges: u8 = 0;
 
     // Compute the issue db path once for both the issue-board reminder and
@@ -2770,7 +2755,7 @@ pub async fn run_loop(
                 safe_state_msg,
                 &new_messages,
                 turns_taken,
-                &mut track_nudges,
+                &mut gates.track_nudges,
                 &mut verify_nudges,
                 &mut tally,
                 capability.tier(),
@@ -3098,19 +3083,13 @@ pub async fn run_loop(
             &config,
             &current_context.system_prompt,
             &new_messages,
-            &mut critic_done,
-            &mut code_review_reacts,
-            &mut last_reviewed_fingerprint,
-            &mut last_review_findings,
-            code_review_baseline.as_ref(),
-            &mut goal_reacts,
-            &mut todo_nudges,
-            &mut resume_nudges,
-            config.open_issues_gate_mode,
-            issue_db_path.as_deref(),
-            config.session_id.as_deref(),
-            &mut open_issues_nudges,
-            &mut track_nudges,
+            &mut gates,
+            GateInputs {
+                code_review_baseline: code_review_baseline.as_ref(),
+                open_issues_gate_mode: config.open_issues_gate_mode,
+                issue_db_path: issue_db_path.as_deref(),
+                session_id: config.session_id.as_deref(),
+            },
             emit,
         )
         .await;
