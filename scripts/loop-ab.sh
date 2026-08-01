@@ -52,8 +52,13 @@ set -euo pipefail
 #   -t  max_agent_turns cap        (default 20)
 #   -s  scenario small|recon|recon-real  (default small)
 #
-# With -A and -B both empty the two arms are identical — a useful check
-# that the harness itself adds no bias.
+# With -A and -B both empty (or set the same) the two arms are identical —
+# an A/A calibration. RUN ONE BEFORE TRUSTING ANY A/B. On the recon-real
+# scenario an A/A produced 18 vs 36 turns on one model and 15 vs 33 on
+# another: identical config, roughly double. That spread is the smallest
+# effect the sample size can distinguish from chance, and every metric whose
+# delta falls inside the control arm own spread is reported as "~noise"
+# rather than given a direction.
 #
 # Requires: a built dirge binary, jq, and a working provider (with
 # credentials) in ~/.config/dirge/config.json.
@@ -521,12 +526,23 @@ function spread(key, c,    k) {
   k = key SUBSEP c
   return sprintf("%.1f (%s..%s)", mean(key, c), n[key] ? mn[k] : 0, n[key] ? mx[k] : 0)
 }
-function dir3(c, t, lower_is_better, eps,    d) {
+# Direction of effect, but ONLY when the effect clears the control arms
+# own run-to-run spread. An A/A calibration on the recon-real scenario — both arms
+# configured identically — produced 18 vs 36 turns on one model and 15 vs 33 on
+# another. Identical config, roughly double. Every effect measured at n<=3 up to
+# that point was at or under that spread, which means none of them was
+# detectable and several were reported as real. A delta smaller than the noise
+# it sits in is not a direction, it is a coin flip, and must be labelled so.
+function dir3(c, t, lower_is_better, eps, noise,    d) {
   d = t - c
+  if (noise > 0 && (d < 0 ? -d : d) <= noise) return "~noise"
   if (d < -eps) return (lower_is_better ? "better" : "worse")
   if (d > eps)  return (lower_is_better ? "worse"  : "better")
   return "flat"
 }
+# The control arm observed spread for a column: the smallest effect this
+# sample size could honestly distinguish from chance.
+function noisefloor(ck, c) { return mx[ck,c] - mn[ck,c] }
 function rate(key,    k) {
   k = key SUBSEP "ok"
   return n[key] ? sprintf("%d/%d (%.0f%%)", ok[key], n[key], 100 * ok[key] / n[key]) : "-"
@@ -545,18 +561,18 @@ END {
     printf "== model: %s ==\n", m
     printf "%-26s %-26s %-26s %s\n", "metric", "control", "treatment", "delta"
 
-    row("turns", spread(ck, 4), spread(tk, 4), dir3(mean(ck, 4), mean(tk, 4), 1, 0.5))
-    row("tool_calls", spread(ck, 5), spread(tk, 5), dir3(mean(ck, 5), mean(tk, 5), 1, 0.5))
-    row("errored_tool_calls", spread(ck, 6), spread(tk, 6), dir3(mean(ck, 6), mean(tk, 6), 1, 0.5))
-    row("scavenged_calls", spread(ck, 7), spread(tk, 7), dir3(mean(ck, 7), mean(tk, 7), 1, 0.5))
-    row("storm_suppressions", spread(ck, 8), spread(tk, 8), dir3(mean(ck, 8), mean(tk, 8), 1, 0.5))
-    row("max_failure_streak", spread(ck, 9), spread(tk, 9), dir3(mean(ck, 9), mean(tk, 9), 1, 0.5))
-    row("repair_invalid", spread(ck, 10), spread(tk, 10), dir3(mean(ck, 10), mean(tk, 10), 1, 0.5))
+    row("turns", spread(ck, 4), spread(tk, 4), dir3(mean(ck, 4), mean(tk, 4), 1, 0.5, noisefloor(ck, 4)))
+    row("tool_calls", spread(ck, 5), spread(tk, 5), dir3(mean(ck, 5), mean(tk, 5), 1, 0.5, noisefloor(ck, 5)))
+    row("errored_tool_calls", spread(ck, 6), spread(tk, 6), dir3(mean(ck, 6), mean(tk, 6), 1, 0.5, noisefloor(ck, 6)))
+    row("scavenged_calls", spread(ck, 7), spread(tk, 7), dir3(mean(ck, 7), mean(tk, 7), 1, 0.5, noisefloor(ck, 7)))
+    row("storm_suppressions", spread(ck, 8), spread(tk, 8), dir3(mean(ck, 8), mean(tk, 8), 1, 0.5, noisefloor(ck, 8)))
+    row("max_failure_streak", spread(ck, 9), spread(tk, 9), dir3(mean(ck, 9), mean(tk, 9), 1, 0.5, noisefloor(ck, 9)))
+    row("repair_invalid", spread(ck, 10), spread(tk, 10), dir3(mean(ck, 10), mean(tk, 10), 1, 0.5, noisefloor(ck, 10)))
     row("repair_total_successful", spread(ck, 11), spread(tk, 11), sprintf("%+.1f", mean(tk, 11) - mean(ck, 11)))
 
     cval = (fwn[ck] ? sprintf("%.1f (%.0f..%.0f) [never=%d]", fws[ck] / fwn[ck], fwmin[ck], fwmax[ck], never[ck]) : "- [never=" never[ck] "]")
     tval = (fwn[tk] ? sprintf("%.1f (%.0f..%.0f) [never=%d]", fws[tk] / fwn[tk], fwmin[tk], fwmax[tk], never[tk]) : "- [never=" never[tk] "]")
-    dval = (fwn[ck] && fwn[tk]) ? dir3(fws[ck] / fwn[ck], fws[tk] / fwn[tk], 1, 0.5) : "n/a"
+    dval = (fwn[ck] && fwn[tk]) ? dir3(fws[ck] / fwn[ck], fws[tk] / fwn[tk], 1, 0.5, 0) : "n/a"
     row("first_write", cval, tval, dval)
 
     # MECHANISM: did the code path under test actually run? A treatment arm
@@ -565,10 +581,10 @@ END {
     # is seen first.
     row("nudges_fired", spread(ck, 17), spread(tk, 17), "mechanism")
     row("  of which prologue", spread(ck, 16), spread(tk, 16), "mechanism")
-    row("success_rate", rate(ck), rate(tk), dir3(ok[ck] / n[ck], ok[tk] / n[tk], 0, 0.05))
+    row("success_rate", rate(ck), rate(tk), dir3(ok[ck] / n[ck], ok[tk] / n[tk], 0, 0.05, 0))
     row("green_rate", sprintf("%d/%d (%.0f%%)", green[ck], n[ck], 100 * green[ck] / n[ck]),
         sprintf("%d/%d (%.0f%%)", green[tk], n[tk], 100 * green[tk] / n[tk]),
-        dir3(green[ck] / n[ck], green[tk] / n[tk], 0, 0.05))
+        dir3(green[ck] / n[ck], green[tk] / n[tk], 0, 0.05, 0))
     row("tally_found", sprintf("%d/%d", tallyfound[ck], n[ck]), sprintf("%d/%d", tallyfound[tk], n[tk]), "must be full")
     printf "\n"
   }
