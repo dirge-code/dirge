@@ -442,6 +442,9 @@ pub struct LoopSpawnConfig {
     /// F6 tier 3: optional bounded LLM critic, threaded into
     /// `LoopConfig.critic_fn`. `None` = off (default).
     pub critic_fn: Option<crate::agent::agent_loop::critic::CriticFn>,
+    /// `LoopConfig.classify_fn` — the closed-answer-set judge (dirge-5mtx.3
+    /// part B). `None` = off; dirge-5mtx.4 is the first consumer.
+    pub classify_fn: Option<crate::agent::agent_loop::critic::ClassifyFn>,
 
     /// Diff-aware code reviewer judge (dirge-iyf5), threaded into
     /// `LoopConfig.code_review_fn`. Built from the same critic provider as
@@ -531,6 +534,7 @@ impl LoopSpawnConfig {
             file_touch_tracker: None,
             verifier: None,
             critic_fn: None,
+            classify_fn: None,
             code_review_fn: None,
             code_review_mode: crate::agent::agent_loop::types::CodeReviewMode::default(),
             open_issues_gate_mode: crate::agent::agent_loop::types::GateMode::Off,
@@ -617,6 +621,7 @@ pub fn spawn_loop_runner(cfg: LoopSpawnConfig) -> LoopRunner {
         progress: cfg.progress.clone(),
         verifier: cfg.verifier.clone(),
         critic_fn: cfg.critic_fn.clone(),
+        classify_fn: cfg.classify_fn.clone(),
         code_review_fn: cfg.code_review_fn.clone(),
         code_review_mode: cfg.code_review_mode,
         code_review_repo: None,

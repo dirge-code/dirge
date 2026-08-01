@@ -240,12 +240,30 @@ impl AnyAgent {
         // dirge-uw2l.3: progress monitor — stall + turn-budget signals,
         // built fresh per session. `None` keeps it off, byte-identical to
         // a loop without it.
+        // dirge-t5dh: the prologue cap bounds the "never produced anything"
+        // case the stall counter structurally cannot see.
+        let prologue_cap = self
+            .progress_prologue_cap
+            .unwrap_or(crate::agent::agent_loop::progress::DEFAULT_PROLOGUE_CAP);
         cfg.progress = self
             .progress_stall_threshold
-            .map(crate::agent::agent_loop::progress::ProgressTracker::new);
+            .map(|t| crate::agent::agent_loop::progress::ProgressTracker::new(t, prologue_cap));
         // F6: pre-finalization verifier gate, always on (baked-in). Nudges
         // to verify before finishing when code was edited but not run.
-        cfg.verifier = Some(crate::agent::agent_loop::verifier::VerifierGate::new());
+        // dirge-w2de: a configured `verification_command` makes the gate
+        // require the REAL CI command to pass before reporting green.
+        // dirge-w2de part 2: what this project's CI actually runs, resolved
+        // once. Advisory only — it is named in the verify nudge so the model
+        // knows which check is enforced, and never consulted for a verdict.
+        let ci_commands = crate::agent::agent_loop::verifier::ci_verification_commands(
+            &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+        );
+        cfg.verifier = Some(
+            crate::agent::agent_loop::verifier::VerifierGate::with_project_gate_and_ci(
+                self.verification_command.clone(),
+                ci_commands,
+            ),
+        );
         // F6 tier 3: thread the bounded critic (only Some when
         // critic_provider is configured). `None` → no critic.
         cfg.critic_fn = self.critic_fn.clone();
@@ -261,6 +279,9 @@ impl AnyAgent {
         cfg.safe_state_abort_mode = self.safe_state_abort_mode;
         cfg.session_id = self.session_id.clone();
         cfg.goal_fn = self.goal_fn.clone();
+        // dirge-5mtx.3: classify judge. No consumer in run.rs yet —
+        // dirge-5mtx.4 is the first caller.
+        cfg.classify_fn = self.classify_fn.clone();
         // Goal gate stop condition (`--goal`). Engages only when
         // `goal_fn` above is also present (it's the judge).
         cfg.goal = self.goal.clone();

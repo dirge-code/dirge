@@ -589,6 +589,15 @@ pub struct LoopConfig {
     /// prompt does not steer goal judgements. `None` = no judge (default).
     pub goal_fn: Option<super::critic::CriticFn>,
 
+    /// dirge-5mtx.3: classify judge — returns the INDEX of a chosen option
+    /// from a closed answer set, never prose. Built at `build_agent` time from
+    /// the same critic provider/client as `critic_fn`/`goal_fn`, but under
+    /// [`super::critic::CLASSIFY_PREAMBLE`] and a constrained prompt. The first
+    /// consumer is dirge-5mtx.4's blocked-vs-next-step gate; until then nothing
+    /// reads it, so it defaults to `None`.
+    #[allow(dead_code)] // dirge-5mtx.4: first consumer not yet wired
+    pub classify_fn: Option<super::critic::ClassifyFn>,
+
     /// Goal gate: an opt-in natural-language stop condition for
     /// autonomous runs. When `Some` AND `goal_fn` is configured (the
     /// judge), each finalization is held until the judge rules the
@@ -814,6 +823,7 @@ impl Clone for LoopConfig {
             session_id: self.session_id.clone(),
             goal_fn: self.goal_fn.clone(),
             goal: self.goal.clone(),
+            classify_fn: self.classify_fn.clone(),
             max_turns: self.max_turns,
         }
     }
@@ -875,6 +885,7 @@ impl LoopConfig {
             session_id: None,
             goal_fn: None,
             goal: None,
+            classify_fn: None,
             max_turns: None,
         }
     }

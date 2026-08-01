@@ -18,6 +18,9 @@ use std::borrow::Cow;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::LazyLock;
+
+use regex::Regex;
 
 use super::code_review::{Finding, parse_findings, partition_findings};
 use super::message::{LoopMessage, UserMessage};
@@ -89,6 +92,124 @@ pub(crate) use run_judge;
 pub type CriticFn = Arc<
     dyn Fn(String) -> Pin<Box<dyn Future<Output = anyhow::Result<String>> + Send>> + Send + Sync,
 >;
+
+/// Judge callback that returns the INDEX of a chosen option, never prose
+/// (dirge-5mtx.3). The caller supplies a closed answer set as a `&'static`
+/// slice; the judge is constrained to emit exactly one member, and the result
+/// comes back as an index — so there is no free-text verdict to misread. This
+/// is the §7 split (classify and respond as separate calls) applied to a
+/// genuinely binary question: the next consumer is dirge-5mtx.4's
+/// blocked-vs-next-step gate.
+pub type ClassifyFn = Arc<
+    dyn Fn(
+            String,
+            &'static [&'static str],
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<usize>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Classify a judge response against a fixed answer set. Matches each option
+/// as a WHOLE WORD, case-insensitively — the same regex/word-boundary
+/// discipline the verdict tokens use (dirge-5mtx), so an option named `MET`
+/// does NOT match inside `UNMET`. Bare `contains` is exactly the trap that
+/// produced dirge-5mtx.3 and is deliberately not used.
+///
+/// Returns the index of the single option that matched, or:
+/// - `None` when NO option matched (no answer), and
+/// - `None` when MORE THAN ONE distinct option matched (ambiguous).
+///
+/// Ambiguity is a non-answer on purpose: a confused judge must be visible to
+/// the caller as a non-answer so it can fall back, never silently resolved by
+/// position or first-match. Repetition of the SAME option is not ambiguity.
+///
+/// # Precondition
+/// No option may be a (case-insensitive) substring of another — overlapping
+/// answer sets are the hazard this function exists to remove. Checked by a
+/// `debug_assert` so a competing set fails loudly in tests rather than
+/// silently misclassifying. Pick non-nesting members (e.g. `MET / SHORT`, not
+/// `MET / UNMET`).
+pub fn parse_choice(response: &str, options: &[&str]) -> Option<usize> {
+    debug_assert!(
+        !options_overlap(options),
+        "parse_choice: answer-set members must not be substrings of one another (dirge-5mtx.3)"
+    );
+    let mut found: Option<usize> = None;
+    for (i, opt) in options.iter().enumerate() {
+        if whole_word_present(response, opt) {
+            if found.is_some() {
+                return None; // a second DISTINCT option matched → ambiguous, not first-wins
+            }
+            found = Some(i);
+        }
+    }
+    found
+}
+
+/// Whether `needle` appears in `haystack` as a whole word, case-insensitively.
+/// `\b` stops `MET` from matching inside `UNMET`; `(?i)` matches any casing
+/// without upper-casing both sides. Escaped so option text (e.g. `next-step`)
+/// is matched literally, not as a regex.
+fn whole_word_present(haystack: &str, needle: &str) -> bool {
+    let pattern = format!(r"(?i)\b{}\b", regex::escape(needle));
+    // `regex::escape` guarantees a valid pattern; the only fixed wrapper is
+    // `\b`, so this cannot fail.
+    Regex::new(&pattern)
+        .expect("escaped word-boundary pattern is always valid")
+        .is_match(haystack)
+}
+
+/// `true` when some option is a (case-insensitive) substring of another — i.e.
+/// the answer set nests, which is a caller bug (dirge-5mtx.3). Substring
+/// subsumes whole-word match, so this single check covers both failure modes.
+fn options_overlap(options: &[&str]) -> bool {
+    for (i, a) in options.iter().enumerate() {
+        for (j, b) in options.iter().enumerate() {
+            if i != j && a.to_lowercase().contains(&b.to_lowercase()) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// System preamble for the classify judge (dirge-5mtx.3). Minimal on purpose:
+/// the constraint that actually matters — answer with exactly one option word
+/// — lives in the user prompt ([`classify_prompt`]), right next to the
+/// question. A heavy system role would invite the very prose this exists to
+/// suppress. Passed as the LLM system prompt by `build_classify_fn`.
+pub const CLASSIFY_PREAMBLE: &str = "\
+You answer a single question by choosing exactly one option from a fixed set. Reply with that one \
+option word and nothing else — no reasoning, no punctuation, no extra text.";
+
+/// Build the constrained classify user prompt: states the question, names every
+/// option, and demands the answer be EXACTLY one of them, nothing else. Kept
+/// short — a long preamble invites prose, and prose is what [`parse_choice`]
+/// then has to dig an option word out of (dirge-5mtx.3).
+pub fn classify_prompt(question: &str, options: &[&str]) -> String {
+    let list = options
+        .iter()
+        .map(|o| format!("`{o}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "{question}\n\nAnswer with EXACTLY ONE of these words and nothing else: {list}.\n\
+         Do not add explanation, punctuation, or any other text."
+    )
+}
+
+/// The retry prompt: a terser restatement used when [`parse_choice`] already
+/// failed once (the model hedged in prose or emitted no option word). The
+/// question context already reached the model on the first call, so the retry
+/// only needs to re-deny prose and re-state the options.
+pub(crate) fn classify_retry_prompt(options: &[&str]) -> String {
+    let list = options
+        .iter()
+        .map(|o| format!("`{o}`"))
+        .collect::<Vec<_>>()
+        .join(" / ");
+    format!("Reply with a single word — one of: {list}. Nothing else.")
+}
 
 /// Tag prefixed onto the critic's injected follow-up message. The agent
 /// loop re-enters it as a user-role message (so the model acts on it); the
@@ -208,43 +329,121 @@ fn verification_block(verification: Option<VerificationStatus>) -> &'static str 
     }
 }
 
+/// Classified verdict signal, strongest (most action-forcing) first. Shared by
+/// the critic and goal parsers so both judge the same surface form the same way
+/// (dirge-5mtx).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VerdictSignal {
+    /// Not done / gaps remain / goal unmet.
+    Negative,
+    /// Cannot verify from the spec/evidence available.
+    Abstain,
+    /// Done / goal met.
+    Positive,
+    /// No verdict token anywhere in the head — fail open.
+    None,
+}
+
+// dirge-5mtx: whole-word verdict classification. `COMPLETE` is a proper
+// substring of `INCOMPLETE` and `MET` of `UNMET`, so a naive `contains` lets
+// the answer sets compete — whichever branch the code tests first wins,
+// independent of what the judge meant. Word boundaries stop that; an explicit
+// `NOT` before a positive word (`NOT COMPLETE`, `NOT MET`) flips it negative
+// rather than letting the embedded positive token win. `FINISHED` is only
+// meaningful negated (`NOT FINISHED`), so it appears in the negation set but
+// NOT in the positive set. All four run against upper-cased text.
+static NEGATED_POSITIVE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\bNOT\s+(?:COMPLETE|DONE|MET|SATISFIED|FINISHED)\b").unwrap());
+static NEGATIVE_TOKEN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b(?:INCOMPLETE|GAPS|SHORT|UNMET)\b").unwrap());
+static ABSTAIN_TOKEN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b(?:ABSTAIN|INSUFFICIENT|UNSURE)\b").unwrap());
+static POSITIVE_TOKEN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b(?:COMPLETE|DONE|MET|SATISFIED)\b").unwrap());
+
+/// Whether a single (upper-cased) line bears any verdict token — used to find
+/// where the verdict line ends and the remaining-work detail begins.
+fn line_bears_verdict(line_upper: &str) -> bool {
+    NEGATED_POSITIVE.is_match(line_upper)
+        || NEGATIVE_TOKEN.is_match(line_upper)
+        || ABSTAIN_TOKEN.is_match(line_upper)
+        || POSITIVE_TOKEN.is_match(line_upper)
+}
+
+/// Classify the verdict in a judge response. Finds the first line that bears a
+/// whole-word verdict token (the verdict line — scanning past any prose
+/// preamble) and classifies THAT line alone, honouring an explicit `NOT`
+/// negation of a positive word. Precedence is Negative > Abstain > Positive:
+/// when the verdict line mixes tokens the safer, action-forcing signal wins.
+/// `None` (no verdict token on any line) is the deliberate fail-open input —
+/// the caller maps it to its own pass variant.
+///
+/// Only the verdict line is classified — not the whole response — so common
+/// English in the remaining-work detail (e.g. "a few short comments, no gaps in
+/// logic") can't compete with the verdict above it.
+pub(crate) fn classify_verdict_head(trimmed: &str) -> VerdictSignal {
+    for line in trimmed.split('\n') {
+        let upper = line.to_ascii_uppercase();
+        if !line_bears_verdict(&upper) {
+            continue;
+        }
+        if NEGATED_POSITIVE.is_match(&upper) || NEGATIVE_TOKEN.is_match(&upper) {
+            return VerdictSignal::Negative;
+        }
+        if ABSTAIN_TOKEN.is_match(&upper) {
+            return VerdictSignal::Abstain;
+        }
+        return VerdictSignal::Positive;
+    }
+    VerdictSignal::None
+}
+
+/// Non-empty remaining-work detail AFTER the first line that bears a verdict
+/// token, or `None` when the verdict is its own last line (no separate detail).
+/// Splitting on `\n` (not `.lines()`) keeps the byte offsets exact under both
+/// `\n` and `\r\n` endings. The caller picks the fallback for the no-detail
+/// case — the critic reuses the whole response, the goal substitutes a note.
+pub(crate) fn detail_after_verdict(trimmed: &str) -> Option<&str> {
+    let mut after_verdict_byte = None;
+    let mut cursor = 0usize;
+    for line in trimmed.split('\n') {
+        if after_verdict_byte.is_none() && line_bears_verdict(&line.to_ascii_uppercase()) {
+            // Detail begins right after this line's content (before its `\n`).
+            after_verdict_byte = Some(cursor + line.len());
+            break;
+        }
+        cursor += line.len() + 1; // +1 for the '\n' separator.
+    }
+    let off = after_verdict_byte?;
+    let rest = trimmed[off..].trim();
+    (!rest.is_empty()).then_some(rest)
+}
+
 /// Parse the critic's raw response into a verdict. `Verdict::Complete` means
-/// the work is done — or the response was empty/ambiguous, in which case we
-/// fail OPEN (don't block finalization on a confused critic).
+/// the work is done — or the response carried NO verdict token anywhere, in
+/// which case we fail OPEN (don't block finalization on a confused critic).
 /// `Verdict::Incomplete(issues)` means concrete gaps to fix.
 /// `Verdict::Abstain(missing)` means the critic cannot verify from available
 /// spec/evidence — the model should write a held-out test or clarify the spec.
 ///
-/// ORDER of precedence on the first non-empty line: INCOMPLETE > ABSTAIN >
-/// Complete (fail-open). A line containing both INCOMPLETE and ABSTAIN
-/// resolves to Incomplete (the safer, action-forcing state).
+/// Classification is whole-word with explicit-negation handling
+/// ([`classify_verdict_head`]); precedence is Negative > Abstain > Positive, so
+/// a line mixing INCOMPLETE and ABSTAIN resolves to Incomplete. The detail is
+/// [`detail_after_verdict`], falling back to the whole response when the bare
+/// verdict has nothing after it.
 pub fn parse_verdict(response: &str) -> Verdict {
     let trimmed = response.trim();
     if trimmed.is_empty() {
         return Verdict::Complete;
     }
-    // Look at the first non-empty line for the verdict token.
-    let first = trimmed.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
-    let upper = first.to_ascii_uppercase();
-    if upper.contains("INCOMPLETE") {
-        let rest = trimmed
-            .split_once('\n')
-            .map(|(_, x)| x)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or(trimmed);
-        Verdict::Incomplete(rest.to_string())
-    } else if upper.contains("ABSTAIN") || upper.contains("INSUFFICIENT") {
-        let rest = trimmed
-            .split_once('\n')
-            .map(|(_, x)| x)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or(trimmed);
-        Verdict::Abstain(rest.to_string())
-    } else {
-        // "COMPLETE", or anything that isn't a clear INCOMPLETE/ABSTAIN → pass.
-        Verdict::Complete
+    match classify_verdict_head(trimmed) {
+        VerdictSignal::Negative => {
+            Verdict::Incomplete(detail_after_verdict(trimmed).unwrap_or(trimmed).to_string())
+        }
+        VerdictSignal::Abstain => {
+            Verdict::Abstain(detail_after_verdict(trimmed).unwrap_or(trimmed).to_string())
+        }
+        VerdictSignal::Positive | VerdictSignal::None => Verdict::Complete,
     }
 }
 
@@ -407,6 +606,21 @@ pub fn build_unified_followup(verdict: Verdict, findings: Vec<Finding>) -> Optio
 /// consolidated [`CRITIC_TAG`] follow-up. Replaces the separate critic +
 /// code-review calls (dirge-8v98). Fail-open: a judge error/timeout finalizes
 /// without blocking.
+/// Outcome of one unified review.
+///
+/// `judged` distinguishes "the judge ran and found nothing" from "the judge
+/// call failed and we failed open" — which the old `(Vec, Option<String>)`
+/// return could not (dirge-q7vw). Both produced an empty vec and a `None`, so
+/// the Blocking caller recorded the reviewed-diff fingerprint after a
+/// transient judge error and then skipped re-review of that same diff forever:
+/// the diff never got code-reviewed at all, silently.
+pub struct ReviewOutcome {
+    pub messages: Vec<LoopMessage>,
+    pub raised_findings: Option<String>,
+    /// True only when a judge response was actually parsed.
+    pub judged: bool,
+}
+
 pub async fn run_unified_review(
     judge: &CriticFn,
     rules: &str,
@@ -414,14 +628,18 @@ pub async fn run_unified_review(
     diff: Option<&str>,
     verification: Option<VerificationStatus>,
     prior_findings: Option<&str>,
-) -> (Vec<LoopMessage>, Option<String>) {
+) -> ReviewOutcome {
     let prompt = build_unified_prompt(rules, transcript, diff, verification, prior_findings);
     let response = run_judge!(
         judge,
         prompt,
         "dirge::critic",
         "unified review call failed; finalizing without it",
-        (Vec::new(), None)
+        ReviewOutcome {
+            messages: Vec::new(),
+            raised_findings: None,
+            judged: false,
+        }
     );
     let (verdict, findings) = parse_unified(&response);
     // dirge-9b2k R2: surface the rendered findings so the caller can hand them
@@ -431,10 +649,14 @@ pub async fn run_unified_review(
     } else {
         Some(render_findings(&findings))
     };
-    let msgs = build_unified_followup(verdict, findings)
+    let messages = build_unified_followup(verdict, findings)
         .into_iter()
         .collect();
-    (msgs, raised)
+    ReviewOutcome {
+        messages,
+        raised_findings: raised,
+        judged: true,
+    }
 }
 
 #[cfg(test)]
@@ -559,6 +781,85 @@ mod tests {
                 assert!(issues.contains("missing tests"));
             }
             other => panic!("expected Incomplete (priority over ABSTAIN), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_verdict_corpus() {
+        // dirge-5mtx: a judge's verdict surface form competes with itself.
+        // `COMPLETE` is a substring of `INCOMPLETE`; a bare positive word is
+        // embedded in its own negation (`NOT COMPLETE`). The parser must
+        // classify whole words, honour an explicit `NOT`, scan past a prose
+        // preamble to the verdict line, and only fail open when NO verdict
+        // token is present anywhere in the head. Most rows reproduced a bug on
+        // the old first-line / substring parser.
+        // (input, expected verdict class)
+        let rows: &[(&str, &str)] = &[
+            // bare tokens
+            ("COMPLETE", "complete"),
+            ("DONE", "complete"),
+            ("INCOMPLETE", "incomplete"),
+            ("GAPS", "incomplete"),
+            ("SHORT", "incomplete"),
+            // VERDICT: prefix
+            ("VERDICT: COMPLETE", "complete"),
+            ("VERDICT: INCOMPLETE", "incomplete"),
+            ("VERDICT: DONE", "complete"),
+            ("VERDICT: GAPS", "incomplete"),
+            ("VERDICT: UNSURE", "abstain"),
+            ("VERDICT: ABSTAIN", "abstain"),
+            // negated forms — `COMPLETE`/`DONE` appear as substrings but mean
+            // NOT done. The INCOMPLETE/COMPLETE trap, negated order.
+            ("NOT COMPLETE", "incomplete"),
+            ("NOT DONE", "incomplete"),
+            ("NOT FINISHED", "incomplete"),
+            ("NOT SATISFIED", "incomplete"),
+            // preamble line before the verdict token
+            (
+                "I reviewed the work.\nINCOMPLETE\n- tests still failing",
+                "incomplete",
+            ),
+            ("After checking, VERDICT: DONE", "complete"),
+            // mixed case
+            ("verdict: incomplete\n- x", "incomplete"),
+            ("Verdict: UNSURE", "abstain"),
+            // tokens mid-sentence (first-line substring handling, both ways)
+            ("The task is NOT COMPLETE yet", "incomplete"),
+            ("Overall the work is COMPLETE", "complete"),
+            // the INCOMPLETE/COMPLETE substring trap in both orders — negative
+            // wins whenever both tokens are present on the verdict line.
+            ("COMPLETE, not INCOMPLETE", "incomplete"),
+            ("INCOMPLETE then COMPLETE", "incomplete"),
+            // common English in the DETAIL must NOT compete with the verdict
+            // line above it — only the verdict line is classified.
+            (
+                "DONE\nThe diff is clean; a few short comments, no gaps in logic.",
+                "complete",
+            ),
+            (
+                "COMPLETE\naddressing the remaining gaps next sprint is out of scope.",
+                "complete",
+            ),
+            // no verdict token anywhere in the head → fail open (deliberate)
+            ("", "complete"),
+            ("probably looks fine", "complete"),
+        ];
+        for &(input, want) in rows {
+            let got = match parse_verdict(input) {
+                Verdict::Complete => "complete",
+                Verdict::Incomplete(_) => "incomplete",
+                Verdict::Abstain(_) => "abstain",
+            };
+            assert_eq!(got, want, "parse_verdict({input:?})");
+        }
+
+        // The preamble row must carry the remaining-work detail through.
+        match parse_verdict("I reviewed the work.\nINCOMPLETE\n- tests still failing") {
+            Verdict::Incomplete(issues) => assert!(
+                issues.contains("tests still failing"),
+                "detail lost: {issues:?}"
+            ),
+            other => panic!("expected Incomplete with detail, got {other:?}"),
         }
     }
 
@@ -799,7 +1100,7 @@ mod tests {
         assert!(
             run_unified_review(&judge, "rules", "did stuff", None, None, None)
                 .await
-                .0
+                .messages
                 .is_empty()
         );
     }
@@ -969,9 +1270,191 @@ mod tests {
         assert!(
             run_unified_review(&judge, "rules", "did stuff", Some("diff"), None, None)
                 .await
-                .0
+                .messages
                 .is_empty(),
             "a judge error must not block finalization"
         );
+    }
+
+    /// Mechanical guard on the hazard itself, rather than on a fixed list of
+    /// phrasings: for EVERY positive token and EVERY negative token that
+    /// embeds it, a line bearing the negative must classify negative.
+    ///
+    /// The emitted answer set is deliberately left as COMPLETE/INCOMPLETE/
+    /// ABSTAIN rather than switched to non-overlapping words. Changing what
+    /// the prompt asks the judge for is a behavioural change, and run-to-run
+    /// variance makes behavioural changes to the judge unverifiable at any
+    /// sample size we can afford (dirge-5mtx.6, FM-5). The parser handling
+    /// both vocabularies is the structural fix, and it is checkable at n=1 —
+    /// which is what this test does. If someone later does change the
+    /// prompt, this still holds.
+    #[test]
+    fn negative_always_beats_the_positive_it_embeds() {
+        // (negative form, embedded positive token, is that token also a
+        // standalone positive?). FINISHED is deliberately negation-only: it
+        // is recognised in `NOT FINISHED` but bare `FINISHED` is not a
+        // verdict token, so it falls through to fail-open. Harmless, because
+        // fail-open and Positive both resolve to the same verdict — but the
+        // asymmetry is real and is pinned here rather than left to surprise
+        // someone.
+        let traps: &[(&str, &str, bool)] = &[
+            ("INCOMPLETE", "COMPLETE", true),
+            ("NOT COMPLETE", "COMPLETE", true),
+            ("NOT DONE", "DONE", true),
+            ("NOT MET", "MET", true),
+            ("NOT SATISFIED", "SATISFIED", true),
+            ("NOT FINISHED", "FINISHED", false),
+        ];
+        for &(negative, positive, positive_is_standalone) in traps {
+            assert!(
+                negative.contains(positive),
+                "test data error: {negative} should embed {positive}"
+            );
+            assert_eq!(
+                classify_verdict_head(negative),
+                VerdictSignal::Negative,
+                "{negative} embeds {positive} and must still classify negative"
+            );
+            // The fix must not have been achieved by simply never returning
+            // Positive — bare positives still read positive where they are
+            // part of the vocabulary at all.
+            if positive_is_standalone {
+                assert_eq!(
+                    classify_verdict_head(positive),
+                    VerdictSignal::Positive,
+                    "bare {positive} must still classify positive"
+                );
+            } else {
+                assert_eq!(
+                    classify_verdict_head(positive),
+                    VerdictSignal::None,
+                    "{positive} is negation-only; bare use falls through to fail-open"
+                );
+            }
+        }
+    }
+
+    // ── dirge-5mtx.3: ClassifyFn answer-set matching ──────────────────────
+
+    /// Exactly one option present → its index, for EACH position in the set.
+    #[test]
+    fn parse_choice_single_match_each_index() {
+        let opts = ["BLOCKED", "NEXT", "DONE"];
+        assert_eq!(parse_choice("BLOCKED", &opts), Some(0));
+        assert_eq!(
+            parse_choice("the run is BLOCKED on the user", &opts),
+            Some(0)
+        );
+        assert_eq!(parse_choice("NEXT", &opts), Some(1));
+        assert_eq!(parse_choice("offering a NEXT step", &opts), Some(1));
+        assert_eq!(parse_choice("DONE", &opts), Some(2));
+    }
+
+    /// Case-insensitive and whole-word: `MET` must NOT match inside `UNMET`.
+    /// This is the exact hazard that produced dirge-5mtx.3 — the overlap is
+    /// why a non-nesting answer set (`MET / SHORT`) is required in practice.
+    #[test]
+    fn parse_choice_case_insensitive_and_whole_word() {
+        let opts = ["MET", "SHORT"];
+        assert_eq!(parse_choice("met", &opts), Some(0));
+        assert_eq!(parse_choice("Met.", &opts), Some(0));
+        assert_eq!(parse_choice("goal is met", &opts), Some(0));
+        assert_eq!(parse_choice("SHORT", &opts), Some(1));
+        assert_eq!(parse_choice("short by a lot", &opts), Some(1));
+        assert_eq!(parse_choice("the goal is not satisfied", &opts), None);
+        // Demonstrate the trap the precondition guards against: with an
+        // overlapping set, `MET` would match inside `UNMET`. We assert the
+        // debug-check catches it rather than asserting parse_choice behaviour
+        // on an invalid set, so the test documents the precondition.
+        let bad = ["MET", "UNMET"];
+        assert!(options_overlap(&bad));
+    }
+
+    /// Two DIFFERENT options present → `None` (ambiguous, not first-wins).
+    #[test]
+    fn parse_choice_two_distinct_options_is_ambiguous() {
+        let opts = ["BLOCKED", "NEXT", "DONE"];
+        assert_eq!(parse_choice("BLOCKED and then DONE", &opts), None);
+        assert_eq!(parse_choice("NEXT not DONE", &opts), None);
+    }
+
+    /// No option present → `None`.
+    #[test]
+    fn parse_choice_no_match() {
+        let opts = ["BLOCKED", "NEXT"];
+        assert_eq!(parse_choice("", &opts), None);
+        assert_eq!(parse_choice("the assistant is waiting", &opts), None);
+        assert_eq!(parse_choice("COMPLETELY unrelated prose", &opts), None);
+    }
+
+    /// An option appearing twice → still that index (repetition is not
+    /// ambiguity).
+    #[test]
+    fn parse_choice_repeated_option_not_ambiguous() {
+        let opts = ["BLOCKED", "NEXT"];
+        assert_eq!(parse_choice("BLOCKED, yes BLOCKED", &opts), Some(0));
+        assert_eq!(parse_choice("NEXT NEXT NEXT", &opts), Some(1));
+    }
+
+    /// The prompt builder names EVERY option, so the judge sees the full set.
+    #[test]
+    fn classify_prompt_names_every_option() {
+        let prompt = classify_prompt("Is the agent blocked?", &["BLOCKED", "NEXT"]);
+        assert!(prompt.contains("BLOCKED"));
+        assert!(prompt.contains("NEXT"));
+        assert!(prompt.contains("Is the agent blocked?"));
+        assert!(prompt.contains("EXACTLY ONE"));
+    }
+
+    /// The retry prompt also names every option (the last chance to steer the
+    /// model back to the set before the callback errors).
+    #[test]
+    fn classify_retry_prompt_names_every_option() {
+        let prompt = classify_retry_prompt(&["BLOCKED", "NEXT"]);
+        assert!(prompt.contains("BLOCKED"));
+        assert!(prompt.contains("NEXT"));
+    }
+
+    // ── dirge-q7vw: a failed judge call must be distinguishable from a
+    // clean review. Both produce no messages and no findings, and the
+    // Blocking caller used that to decide whether to record the
+    // reviewed-diff fingerprint. Recording it after an ERROR made the next
+    // reaction skip the same unchanged diff, so it never got reviewed.
+
+    #[tokio::test]
+    async fn judge_error_is_not_reported_as_judged() {
+        let judge: CriticFn = Arc::new(|_p| Box::pin(async { anyhow::bail!("provider down") }));
+        let out = run_unified_review(&judge, "", "did stuff", Some("diff"), None, None).await;
+        assert!(!out.judged, "a failed call must not claim to have judged");
+        assert!(
+            out.messages.is_empty(),
+            "fail-open still yields no follow-up"
+        );
+        assert!(out.raised_findings.is_none());
+    }
+
+    #[tokio::test]
+    async fn clean_review_is_reported_as_judged() {
+        let judge: CriticFn =
+            Arc::new(|_p| Box::pin(async { Ok("VERDICT: COMPLETE".to_string()) }));
+        let out = run_unified_review(&judge, "", "did stuff", Some("diff"), None, None).await;
+        assert!(out.judged, "a real response must count as judged");
+        assert!(
+            out.messages.is_empty(),
+            "COMPLETE with no findings still yields no follow-up"
+        );
+    }
+
+    /// The pair is the actual invariant: the two cases are indistinguishable
+    /// by messages/findings alone, which is exactly why `judged` exists.
+    #[tokio::test]
+    async fn error_and_clean_review_differ_only_in_judged() {
+        let err: CriticFn = Arc::new(|_p| Box::pin(async { anyhow::bail!("down") }));
+        let ok: CriticFn = Arc::new(|_p| Box::pin(async { Ok("VERDICT: COMPLETE".to_string()) }));
+        let a = run_unified_review(&err, "", "t", Some("d"), None, None).await;
+        let b = run_unified_review(&ok, "", "t", Some("d"), None, None).await;
+        assert_eq!(a.messages.len(), b.messages.len());
+        assert_eq!(a.raised_findings, b.raised_findings);
+        assert_ne!(a.judged, b.judged, "only `judged` separates them");
     }
 }

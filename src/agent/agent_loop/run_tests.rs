@@ -137,6 +137,7 @@ fn build_config() -> LoopConfig {
         progress: None,
         verifier: None,
         critic_fn: None,
+        classify_fn: None,
         code_review_fn: None,
         code_review_mode: crate::agent::agent_loop::types::CodeReviewMode::default(),
         code_review_repo: None,
@@ -4120,25 +4121,17 @@ async fn finalization_defers_critic_while_external_work_is_pending() {
             is_error: false,
         },
     )];
-    let mut critic_done = false;
+    let mut gates = GateStates {
+        critic_done: false,
+        ..Default::default()
+    };
     let (emit, _emit_rx) = tokio::sync::mpsc::channel(8);
     let (msgs, source) = poll_finalization_follow_up(
         &config,
         "sys",
         &new_messages,
-        &mut critic_done,
-        &mut 0u8,
-        &mut None::<u64>,    // last_reviewed_fingerprint
-        &mut None::<String>, // last_review_findings
-        None,
-        &mut 0u8,
-        &mut 0u8,
-        &mut 0u8,
-        GateMode::Off,
-        None,
-        None,
-        &mut 0u8,
-        &mut 0u8,
+        &mut gates,
+        GateInputs::default(),
         &emit,
     )
     .await;
@@ -4146,7 +4139,7 @@ async fn finalization_defers_critic_while_external_work_is_pending() {
     assert!(msgs.is_empty());
     assert_eq!(source, FollowUpSource::None);
     assert_eq!(calls.load(Ordering::SeqCst), 0);
-    assert!(!critic_done);
+    assert!(!gates.critic_done);
 }
 
 /// Highest-priority gate (the caller hook) short-circuits the lower gates:
@@ -4165,29 +4158,21 @@ async fn finalization_hook_short_circuits_lower_gates() {
     // A batch can become terminal at this exact boundary. Delivery must win
     // over a stale/overlapping deferral signal.
     config.should_defer_finalization = Some(Arc::new(|| true));
-    let mut critic_done = false;
-    let mut goal_reacts = 0u8;
-    let mut todo_nudges = 0u8;
-    let mut resume_nudges: u8 = 0;
-    let mut code_review_reacts = 0u8;
+    let mut gates = GateStates {
+        critic_done: false,
+        code_review_reacts: 0u8,
+        goal_reacts: 0u8,
+        todo_nudges: 0u8,
+        resume_nudges: 0,
+        ..Default::default()
+    };
     let (review_emit, _review_emit_rx) = tokio::sync::mpsc::channel(64);
     let (msgs, source) = poll_finalization_follow_up(
         &config,
         "sys",
         &[],
-        &mut critic_done,
-        &mut code_review_reacts,
-        &mut None::<u64>,    // last_reviewed_fingerprint
-        &mut None::<String>, // last_review_findings
-        None,                // code_review_baseline
-        &mut goal_reacts,
-        &mut todo_nudges,
-        &mut resume_nudges,
-        GateMode::Off,
-        None,
-        None,
-        &mut 0u8,
-        &mut 0u8, // track_nudges
+        &mut gates,
+        GateInputs::default(),
         &review_emit,
     )
     .await;
@@ -4195,10 +4180,10 @@ async fn finalization_hook_short_circuits_lower_gates() {
     assert_eq!(source, FollowUpSource::Hook);
     assert_eq!(msgs.len(), 1);
     assert!(
-        !critic_done,
+        !gates.critic_done,
         "hook must short-circuit before the critic runs"
     );
-    assert_eq!(todo_nudges, 0, "todo gate must not be reached");
+    assert_eq!(gates.todo_nudges, 0, "todo gate must not be reached");
 }
 
 // dirge-8v98: the `decide_review_reaction` react-counting/advisory-dedup tests
@@ -4211,29 +4196,21 @@ async fn finalization_hook_short_circuits_lower_gates() {
 #[tokio::test]
 async fn finalization_all_gates_silent_yields_none() {
     let config = build_config(); // hook/verifier/critic all None
-    let mut critic_done = false;
-    let mut goal_reacts = 0u8;
-    let mut todo_nudges = MAX_TODO_NUDGES; // todo gate bounded out
-    let mut resume_nudges: u8 = 0;
-    let mut code_review_reacts = 0u8;
+    let mut gates = GateStates {
+        critic_done: false,
+        code_review_reacts: 0u8,
+        goal_reacts: 0u8,
+        todo_nudges: MAX_TODO_NUDGES, // todo gate bounded out
+        resume_nudges: 0,
+        ..Default::default()
+    };
     let (review_emit, _review_emit_rx) = tokio::sync::mpsc::channel(64);
     let (msgs, source) = poll_finalization_follow_up(
         &config,
         "sys",
         &[],
-        &mut critic_done,
-        &mut code_review_reacts,
-        &mut None::<u64>,    // last_reviewed_fingerprint
-        &mut None::<String>, // last_review_findings
-        None,                // code_review_baseline
-        &mut goal_reacts,
-        &mut todo_nudges,
-        &mut resume_nudges,
-        GateMode::Off,
-        None,
-        None,
-        &mut 0u8,
-        &mut 0u8, // track_nudges
+        &mut gates,
+        GateInputs::default(),
         &review_emit,
     )
     .await;
@@ -4254,35 +4231,27 @@ async fn finalization_goal_unmet_reenters_and_counts() {
         Arc::new(|_p| Box::pin(async { Ok("GOAL: UNMET\n- tests still failing".to_string()) }));
     config.goal_fn = Some(judge);
 
-    let mut critic_done = true; // skip the one-shot critic
-    let mut goal_reacts = 0u8;
-    let mut todo_nudges = MAX_TODO_NUDGES;
-    let mut resume_nudges: u8 = 0;
-    let mut code_review_reacts = 0u8;
+    let mut gates = GateStates {
+        critic_done: true, // skip the one-shot critic
+        code_review_reacts: 0u8,
+        goal_reacts: 0u8,
+        todo_nudges: MAX_TODO_NUDGES,
+        resume_nudges: 0,
+        ..Default::default()
+    };
     let (review_emit, _review_emit_rx) = tokio::sync::mpsc::channel(64);
     let (msgs, source) = poll_finalization_follow_up(
         &config,
         "sys",
         &[],
-        &mut critic_done,
-        &mut code_review_reacts,
-        &mut None::<u64>,    // last_reviewed_fingerprint
-        &mut None::<String>, // last_review_findings
-        None,                // code_review_baseline
-        &mut goal_reacts,
-        &mut todo_nudges,
-        &mut resume_nudges,
-        GateMode::Off,
-        None,
-        None,
-        &mut 0u8,
-        &mut 0u8, // track_nudges
+        &mut gates,
+        GateInputs::default(),
         &review_emit,
     )
     .await;
 
     assert_eq!(source, FollowUpSource::Goal);
-    assert_eq!(goal_reacts, 1, "an unmet goal counts one re-entry");
+    assert_eq!(gates.goal_reacts, 1, "an unmet goal counts one re-entry");
     assert_eq!(msgs.len(), 1);
 }
 
@@ -4342,30 +4311,22 @@ async fn awaiting_user_gate_short_circuits_hook_critic_and_todos() {
         assistant_text("Which approach would you prefer?"),
     ];
 
-    let mut critic_done = false;
-    let mut code_review_reacts = 0u8;
-    let mut goal_reacts = 0u8;
-    let mut todo_nudges = 0u8; // would otherwise fire (unfinished_count is process-global)
-    let mut resume_nudges: u8 = 0;
+    let mut gates = GateStates {
+        critic_done: false,
+        code_review_reacts: 0u8,
+        goal_reacts: 0u8,
+        todo_nudges: 0u8, // would otherwise fire (unfinished_count is process-global)
+        resume_nudges: 0,
+        ..Default::default()
+    };
     let (emit, _emit_rx) = tokio::sync::mpsc::channel(64);
 
     let (msgs, source) = poll_finalization_follow_up(
         &config,
         "sys",
         &new_messages,
-        &mut critic_done,
-        &mut code_review_reacts,
-        &mut None::<u64>,
-        &mut None::<String>,
-        None,
-        &mut goal_reacts,
-        &mut todo_nudges,
-        &mut resume_nudges,
-        GateMode::Off,
-        None,
-        None,
-        &mut 0u8,
-        &mut 0u8,
+        &mut gates,
+        GateInputs::default(),
         &emit,
     )
     .await;
@@ -4382,8 +4343,8 @@ async fn awaiting_user_gate_short_circuits_hook_critic_and_todos() {
         0,
         "no judge LLM call is paid for"
     );
-    assert!(!critic_done, "critic one-shot never consumed");
-    assert_eq!(todo_nudges, 0, "todo gate never reached");
+    assert!(!gates.critic_done, "critic one-shot never consumed");
+    assert_eq!(gates.todo_nudges, 0, "todo gate never reached");
 }
 
 /// (b) Even with a question pending, an unmet `--goal` still pushes the run.
@@ -4399,36 +4360,28 @@ async fn awaiting_user_gate_still_honors_unmet_goal() {
 
     let new_messages = vec![assistant_text("Which approach would you prefer?")];
 
-    let mut critic_done = true; // isolate the goal gate from the one-shot critic
-    let mut goal_reacts = 0u8;
-    let mut todo_nudges = MAX_TODO_NUDGES;
-    let mut resume_nudges: u8 = 0;
-    let mut code_review_reacts = 0u8;
+    let mut gates = GateStates {
+        critic_done: true, // isolate the goal gate from the one-shot critic
+        code_review_reacts: 0u8,
+        goal_reacts: 0u8,
+        todo_nudges: MAX_TODO_NUDGES,
+        resume_nudges: 0,
+        ..Default::default()
+    };
     let (emit, _emit_rx) = tokio::sync::mpsc::channel(64);
 
     let (msgs, source) = poll_finalization_follow_up(
         &config,
         "sys",
         &new_messages,
-        &mut critic_done,
-        &mut code_review_reacts,
-        &mut None::<u64>,
-        &mut None::<String>,
-        None,
-        &mut goal_reacts,
-        &mut todo_nudges,
-        &mut resume_nudges,
-        GateMode::Off,
-        None,
-        None,
-        &mut 0u8,
-        &mut 0u8,
+        &mut gates,
+        GateInputs::default(),
         &emit,
     )
     .await;
 
     assert_eq!(source, FollowUpSource::Goal);
-    assert_eq!(goal_reacts, 1, "an unmet goal counts one re-entry");
+    assert_eq!(gates.goal_reacts, 1, "an unmet goal counts one re-entry");
     assert_eq!(msgs.len(), 1);
 }
 
@@ -4452,30 +4405,22 @@ async fn awaiting_user_gate_defers_when_coordinator_running() {
 
     let new_messages = vec![assistant_text("Which approach would you prefer?")];
 
-    let mut critic_done = true;
-    let mut goal_reacts = 0u8;
-    let mut todo_nudges = MAX_TODO_NUDGES;
-    let mut resume_nudges: u8 = 0;
-    let mut code_review_reacts = 0u8;
+    let mut gates = GateStates {
+        critic_done: true,
+        code_review_reacts: 0u8,
+        goal_reacts: 0u8,
+        todo_nudges: MAX_TODO_NUDGES,
+        resume_nudges: 0,
+        ..Default::default()
+    };
     let (emit, _emit_rx) = tokio::sync::mpsc::channel(64);
 
     let (msgs, source) = poll_finalization_follow_up(
         &config,
         "sys",
         &new_messages,
-        &mut critic_done,
-        &mut code_review_reacts,
-        &mut None::<u64>,
-        &mut None::<String>,
-        None,
-        &mut goal_reacts,
-        &mut todo_nudges,
-        &mut resume_nudges,
-        GateMode::Off,
-        None,
-        None,
-        &mut 0u8,
-        &mut 0u8,
+        &mut gates,
+        GateInputs::default(),
         &emit,
     )
     .await;
@@ -4487,7 +4432,7 @@ async fn awaiting_user_gate_defers_when_coordinator_running() {
         0,
         "defer short-circuits before the goal judge"
     );
-    assert_eq!(goal_reacts, 0);
+    assert_eq!(gates.goal_reacts, 0);
 }
 
 // ── dirge-g2ex R3: todo gate now requires the turn to have made file edits ──
@@ -4540,37 +4485,29 @@ async fn todo_gate_skips_readonly_turn_even_with_unfinished_todos() {
         "fixture: turn really is read-only"
     );
 
-    let mut critic_done = true;
-    let mut code_review_reacts = 0u8;
-    let mut goal_reacts = 0u8;
-    let mut todo_nudges = 0u8;
-    let mut resume_nudges: u8 = 0;
+    let mut gates = GateStates {
+        critic_done: true,
+        code_review_reacts: 0u8,
+        goal_reacts: 0u8,
+        todo_nudges: 0u8,
+        resume_nudges: 0,
+        ..Default::default()
+    };
     let (emit, _emit_rx) = tokio::sync::mpsc::channel(64);
 
     let (msgs, source) = poll_finalization_follow_up(
         &config,
         "sys",
         &new_messages,
-        &mut critic_done,
-        &mut code_review_reacts,
-        &mut None::<u64>,
-        &mut None::<String>,
-        None,
-        &mut goal_reacts,
-        &mut todo_nudges,
-        &mut resume_nudges,
-        GateMode::Off,
-        None,
-        None,
-        &mut 0u8,
-        &mut 0u8,
+        &mut gates,
+        GateInputs::default(),
         &emit,
     )
     .await;
 
     assert_eq!(source, FollowUpSource::None);
     assert!(msgs.is_empty(), "no todo nudge on a read-only turn");
-    assert_eq!(todo_nudges, 0, "todo budget untouched");
+    assert_eq!(gates.todo_nudges, 0, "todo budget untouched");
 }
 
 /// A turn that made a file edit with unfinished todos still fires the nudge —
@@ -4586,36 +4523,31 @@ async fn todo_gate_fires_on_file_edit_turn_with_unfinished_todos() {
         "fixture: turn made a file edit"
     );
 
-    let mut critic_done = true; // skip the one-shot critic
-    let mut code_review_reacts = 0u8;
-    let mut goal_reacts = 0u8;
-    let mut todo_nudges = 0u8;
-    let mut resume_nudges: u8 = 0;
+    let mut gates = GateStates {
+        critic_done: true, // skip the one-shot critic
+        code_review_reacts: 0u8,
+        goal_reacts: 0u8,
+        todo_nudges: 0u8,
+        resume_nudges: 0,
+        ..Default::default()
+    };
     let (emit, _emit_rx) = tokio::sync::mpsc::channel(64);
 
     let (msgs, source) = poll_finalization_follow_up(
         &config,
         "sys",
         &new_messages,
-        &mut critic_done,
-        &mut code_review_reacts,
-        &mut None::<u64>,
-        &mut None::<String>,
-        None,
-        &mut goal_reacts,
-        &mut todo_nudges,
-        &mut resume_nudges,
-        GateMode::Off,
-        None,
-        None,
-        &mut 0u8,
-        &mut 0u8,
+        &mut gates,
+        GateInputs::default(),
         &emit,
     )
     .await;
 
     assert_eq!(source, FollowUpSource::Todo);
-    assert_eq!(todo_nudges, 1, "nudge fires as before on an editing turn");
+    assert_eq!(
+        gates.todo_nudges, 1,
+        "nudge fires as before on an editing turn"
+    );
     assert_eq!(msgs.len(), 1);
     let content = match &msgs[0] {
         LoopMessage::User(u) => u.text_joined(),
@@ -4647,36 +4579,28 @@ async fn todo_gate_fires_on_a_plan_only_turn() {
         "fixture: planning is not a file edit"
     );
 
-    let mut critic_done = true;
-    let mut code_review_reacts = 0u8;
-    let mut goal_reacts = 0u8;
-    let mut todo_nudges = 0u8;
-    let mut resume_nudges: u8 = 0;
+    let mut gates = GateStates {
+        critic_done: true,
+        code_review_reacts: 0u8,
+        goal_reacts: 0u8,
+        todo_nudges: 0u8,
+        resume_nudges: 0,
+        ..Default::default()
+    };
     let (emit, _emit_rx) = tokio::sync::mpsc::channel(64);
 
     let (msgs, source) = poll_finalization_follow_up(
         &config,
         "sys",
         &new_messages,
-        &mut critic_done,
-        &mut code_review_reacts,
-        &mut None::<u64>,
-        &mut None::<String>,
-        None,
-        &mut goal_reacts,
-        &mut todo_nudges,
-        &mut resume_nudges,
-        GateMode::Off,
-        None,
-        None,
-        &mut 0u8,
-        &mut 0u8,
+        &mut gates,
+        GateInputs::default(),
         &emit,
     )
     .await;
 
     assert_eq!(source, FollowUpSource::Todo);
-    assert_eq!(todo_nudges, 1, "plan-only turn spends a nudge");
+    assert_eq!(gates.todo_nudges, 1, "plan-only turn spends a nudge");
     let content = match &msgs[0] {
         LoopMessage::User(u) => u.text_joined(),
         _ => panic!("expected User message"),
@@ -4710,37 +4634,29 @@ async fn plan_only_nudge_is_one_shot() {
         assistant_text("Still just planning."),
     ];
 
-    let mut critic_done = true;
-    let mut code_review_reacts = 0u8;
-    let mut goal_reacts = 0u8;
-    let mut todo_nudges = 1u8; // one already spent
-    let mut resume_nudges: u8 = 0;
+    let mut gates = GateStates {
+        critic_done: true,
+        code_review_reacts: 0u8,
+        goal_reacts: 0u8,
+        todo_nudges: 1u8, // one already spent
+        resume_nudges: 0,
+        ..Default::default()
+    };
     let (emit, _emit_rx) = tokio::sync::mpsc::channel(64);
 
     let (msgs, source) = poll_finalization_follow_up(
         &config,
         "sys",
         &new_messages,
-        &mut critic_done,
-        &mut code_review_reacts,
-        &mut None::<u64>,
-        &mut None::<String>,
-        None,
-        &mut goal_reacts,
-        &mut todo_nudges,
-        &mut resume_nudges,
-        GateMode::Off,
-        None,
-        None,
-        &mut 0u8,
-        &mut 0u8,
+        &mut gates,
+        GateInputs::default(),
         &emit,
     )
     .await;
 
     assert_eq!(source, FollowUpSource::None, "must not nudge twice");
     assert!(msgs.is_empty());
-    assert_eq!(todo_nudges, 1, "budget untouched by the repeat");
+    assert_eq!(gates.todo_nudges, 1, "budget untouched by the repeat");
 }
 
 /// The plan-only branch must not resurrect the nagging that the
@@ -4753,37 +4669,29 @@ async fn todo_gate_still_skips_readonly_turn_that_wrote_no_todos() {
 
     let new_messages = vec![assistant_calling("grep"), assistant_text("Here's why.")];
 
-    let mut critic_done = true;
-    let mut code_review_reacts = 0u8;
-    let mut goal_reacts = 0u8;
-    let mut todo_nudges = 0u8;
-    let mut resume_nudges: u8 = 0;
+    let mut gates = GateStates {
+        critic_done: true,
+        code_review_reacts: 0u8,
+        goal_reacts: 0u8,
+        todo_nudges: 0u8,
+        resume_nudges: 0,
+        ..Default::default()
+    };
     let (emit, _emit_rx) = tokio::sync::mpsc::channel(64);
 
     let (msgs, source) = poll_finalization_follow_up(
         &config,
         "sys",
         &new_messages,
-        &mut critic_done,
-        &mut code_review_reacts,
-        &mut None::<u64>,
-        &mut None::<String>,
-        None,
-        &mut goal_reacts,
-        &mut todo_nudges,
-        &mut resume_nudges,
-        GateMode::Off,
-        None,
-        None,
-        &mut 0u8,
-        &mut 0u8,
+        &mut gates,
+        GateInputs::default(),
         &emit,
     )
     .await;
 
     assert_eq!(source, FollowUpSource::None);
     assert!(msgs.is_empty(), "no nudge without todo writes or edits");
-    assert_eq!(todo_nudges, 0, "todo budget untouched");
+    assert_eq!(gates.todo_nudges, 0, "todo budget untouched");
 }
 
 /// dirge-8v98: the unified judge re-enters the loop on a review finding even
@@ -4818,29 +4726,21 @@ async fn finalization_unified_judge_reenters_on_finding() {
         },
     )];
 
-    let mut critic_done = false;
-    let mut goal_reacts = 0u8;
-    let mut todo_nudges = MAX_TODO_NUDGES;
-    let mut resume_nudges: u8 = 0;
-    let mut code_review_reacts = 0u8;
+    let mut gates = GateStates {
+        critic_done: false,
+        code_review_reacts: 0u8,
+        goal_reacts: 0u8,
+        todo_nudges: MAX_TODO_NUDGES,
+        resume_nudges: 0,
+        ..Default::default()
+    };
     let (review_emit, _review_emit_rx) = tokio::sync::mpsc::channel(64);
     let (msgs, source) = poll_finalization_follow_up(
         &config,
         "sys",
         &new_messages,
-        &mut critic_done,
-        &mut code_review_reacts,
-        &mut None::<u64>,    // last_reviewed_fingerprint
-        &mut None::<String>, // last_review_findings
-        None,                // code_review_baseline
-        &mut goal_reacts,
-        &mut todo_nudges,
-        &mut resume_nudges,
-        GateMode::Off,
-        None,
-        None,
-        &mut 0u8,
-        &mut 0u8, // track_nudges
+        &mut gates,
+        GateInputs::default(),
         &review_emit,
     )
     .await;
@@ -4856,8 +4756,8 @@ async fn finalization_unified_judge_reenters_on_finding() {
         "finding must reach the model: {text}"
     );
     assert!(
-        critic_done,
-        "Off/Advisory unified judge is one-shot — critic_done must flip"
+        gates.critic_done,
+        "Off/Advisory unified judge is one-shot — gates.critic_done must flip"
     );
 }
 
@@ -4870,36 +4770,28 @@ async fn finalization_goal_met_finalizes() {
     let judge: CriticFn = Arc::new(|_p| Box::pin(async { Ok("GOAL: MET".to_string()) }));
     config.goal_fn = Some(judge);
 
-    let mut critic_done = true;
-    let mut goal_reacts = 0u8;
-    let mut todo_nudges = MAX_TODO_NUDGES;
-    let mut resume_nudges: u8 = 0;
-    let mut code_review_reacts = 0u8;
+    let mut gates = GateStates {
+        critic_done: true,
+        code_review_reacts: 0u8,
+        goal_reacts: 0u8,
+        todo_nudges: MAX_TODO_NUDGES,
+        resume_nudges: 0,
+        ..Default::default()
+    };
     let (review_emit, _review_emit_rx) = tokio::sync::mpsc::channel(64);
     let (msgs, source) = poll_finalization_follow_up(
         &config,
         "sys",
         &[],
-        &mut critic_done,
-        &mut code_review_reacts,
-        &mut None::<u64>,    // last_reviewed_fingerprint
-        &mut None::<String>, // last_review_findings
-        None,                // code_review_baseline
-        &mut goal_reacts,
-        &mut todo_nudges,
-        &mut resume_nudges,
-        GateMode::Off,
-        None,
-        None,
-        &mut 0u8,
-        &mut 0u8, // track_nudges
+        &mut gates,
+        GateInputs::default(),
         &review_emit,
     )
     .await;
 
     assert!(msgs.is_empty());
     assert_eq!(source, FollowUpSource::None);
-    assert_eq!(goal_reacts, 0);
+    assert_eq!(gates.goal_reacts, 0);
 }
 
 /// Once the re-entry bound is reached, an unmet goal no longer blocks —
@@ -4912,29 +4804,21 @@ async fn finalization_goal_bound_stops_reentry() {
     let judge: CriticFn = Arc::new(|_p| Box::pin(async { Ok("GOAL: UNMET".to_string()) }));
     config.goal_fn = Some(judge);
 
-    let mut critic_done = true;
-    let mut goal_reacts = crate::agent::agent_loop::goal::MAX_GOAL_REACT;
-    let mut todo_nudges = MAX_TODO_NUDGES;
-    let mut resume_nudges: u8 = 0;
-    let mut code_review_reacts = 0u8;
+    let mut gates = GateStates {
+        critic_done: true,
+        code_review_reacts: 0u8,
+        goal_reacts: crate::agent::agent_loop::goal::MAX_GOAL_REACT,
+        todo_nudges: MAX_TODO_NUDGES,
+        resume_nudges: 0,
+        ..Default::default()
+    };
     let (review_emit, _review_emit_rx) = tokio::sync::mpsc::channel(64);
     let (msgs, source) = poll_finalization_follow_up(
         &config,
         "sys",
         &[],
-        &mut critic_done,
-        &mut code_review_reacts,
-        &mut None::<u64>,    // last_reviewed_fingerprint
-        &mut None::<String>, // last_review_findings
-        None,                // code_review_baseline
-        &mut goal_reacts,
-        &mut todo_nudges,
-        &mut resume_nudges,
-        GateMode::Off,
-        None,
-        None,
-        &mut 0u8,
-        &mut 0u8, // track_nudges
+        &mut gates,
+        GateInputs::default(),
         &review_emit,
     )
     .await;
@@ -4951,48 +4835,43 @@ async fn finalization_goal_without_judge_is_inert() {
     config.goal = Some("all tests pass".into());
     config.goal_fn = None; // no judge
 
-    let mut critic_done = true;
-    let mut goal_reacts = 0u8;
-    let mut todo_nudges = MAX_TODO_NUDGES;
-    let mut resume_nudges: u8 = 0;
-    let mut code_review_reacts = 0u8;
+    let mut gates = GateStates {
+        critic_done: true,
+        code_review_reacts: 0u8,
+        goal_reacts: 0u8,
+        todo_nudges: MAX_TODO_NUDGES,
+        resume_nudges: 0,
+        ..Default::default()
+    };
     let (review_emit, _review_emit_rx) = tokio::sync::mpsc::channel(64);
     let (msgs, source) = poll_finalization_follow_up(
         &config,
         "sys",
         &[],
-        &mut critic_done,
-        &mut code_review_reacts,
-        &mut None::<u64>,    // last_reviewed_fingerprint
-        &mut None::<String>, // last_review_findings
-        None,                // code_review_baseline
-        &mut goal_reacts,
-        &mut todo_nudges,
-        &mut resume_nudges,
-        GateMode::Off,
-        None,
-        None,
-        &mut 0u8,
-        &mut 0u8, // track_nudges
+        &mut gates,
+        GateInputs::default(),
         &review_emit,
     )
     .await;
 
     assert!(msgs.is_empty());
     assert_eq!(source, FollowUpSource::None);
-    assert_eq!(goal_reacts, 0);
+    assert_eq!(gates.goal_reacts, 0);
 }
 
 /// Open-issues gate Off → inert (FollowUpSource::None).
 #[tokio::test]
 async fn open_issues_gate_off_is_inert() {
     let config = build_config();
-    let mut critic_done = true;
-    let mut goal_reacts = 0u8;
-    let mut todo_nudges = MAX_TODO_NUDGES;
-    let mut resume_nudges: u8 = 0;
-    let mut open_issues_nudges: u8 = 0;
-    let mut code_review_reacts = 0u8;
+    let mut gates = GateStates {
+        critic_done: true,
+        code_review_reacts: 0u8,
+        goal_reacts: 0u8,
+        todo_nudges: MAX_TODO_NUDGES,
+        resume_nudges: 0,
+        open_issues_nudges: 0,
+        ..Default::default()
+    };
     let (review_emit, _review_emit_rx) = tokio::sync::mpsc::channel(64);
 
     // Create a temp DB with open issues for this session.
@@ -5008,19 +4887,13 @@ async fn open_issues_gate_off_is_inert() {
         &config,
         "sys",
         &[],
-        &mut critic_done,
-        &mut code_review_reacts,
-        &mut None::<u64>,    // last_reviewed_fingerprint
-        &mut None::<String>, // last_review_findings
-        None,
-        &mut goal_reacts,
-        &mut todo_nudges,
-        &mut resume_nudges,
-        GateMode::Off, // opt-out
-        Some(db_path.as_path()),
-        Some(sid),
-        &mut open_issues_nudges,
-        &mut 0u8,
+        &mut gates,
+        GateInputs {
+            code_review_baseline: None,
+            open_issues_gate_mode: GateMode::Off,
+            issue_db_path: Some(db_path.as_path()),
+            session_id: Some(sid),
+        },
         &review_emit,
     )
     .await;
@@ -5037,12 +4910,15 @@ async fn open_issues_gate_off_is_inert() {
 async fn open_issues_gate_blocking_with_session_open_issues_nudges() {
     use crate::agent::agent_loop::run::OPEN_ISSUES_NUDGE_TAG;
     let config = build_config();
-    let mut critic_done = true;
-    let mut goal_reacts = 0u8;
-    let mut todo_nudges = MAX_TODO_NUDGES;
-    let mut resume_nudges: u8 = 0;
-    let mut open_issues_nudges: u8 = 0;
-    let mut code_review_reacts = 0u8;
+    let mut gates = GateStates {
+        critic_done: true,
+        code_review_reacts: 0u8,
+        goal_reacts: 0u8,
+        todo_nudges: MAX_TODO_NUDGES,
+        resume_nudges: 0,
+        open_issues_nudges: 0,
+        ..Default::default()
+    };
     let (review_emit, _review_emit_rx) = tokio::sync::mpsc::channel(64);
 
     let dir = temp_dir("open-issues-blocking");
@@ -5062,25 +4938,19 @@ async fn open_issues_gate_blocking_with_session_open_issues_nudges() {
         &config,
         "sys",
         &[assistant_calling("edit")],
-        &mut critic_done,
-        &mut code_review_reacts,
-        &mut None::<u64>,    // last_reviewed_fingerprint
-        &mut None::<String>, // last_review_findings
-        None,
-        &mut goal_reacts,
-        &mut todo_nudges,
-        &mut resume_nudges,
-        GateMode::Blocking,
-        Some(db_path.as_path()),
-        Some(sid),
-        &mut open_issues_nudges,
-        &mut 0u8,
+        &mut gates,
+        GateInputs {
+            code_review_baseline: None,
+            open_issues_gate_mode: GateMode::Blocking,
+            issue_db_path: Some(db_path.as_path()),
+            session_id: Some(sid),
+        },
         &review_emit,
     )
     .await;
 
     assert_eq!(source, FollowUpSource::OpenIssues);
-    assert_eq!(open_issues_nudges, 1);
+    assert_eq!(gates.open_issues_nudges, 1);
     assert_eq!(msgs.len(), 1);
     let content = match &msgs[0] {
         LoopMessage::User(u) => u.text_joined(),
@@ -5100,12 +4970,15 @@ async fn open_issues_gate_blocking_with_session_open_issues_nudges() {
 #[tokio::test]
 async fn open_issues_gate_blocking_has_bound() {
     let config = build_config();
-    let mut critic_done = true;
-    let mut goal_reacts = 0u8;
-    let mut todo_nudges = MAX_TODO_NUDGES;
-    let mut resume_nudges: u8 = 0;
-    let mut open_issues_nudges: u8 = MAX_OPEN_ISSUES_NUDGES; // already at bound
-    let mut code_review_reacts = 0u8;
+    let mut gates = GateStates {
+        critic_done: true,
+        code_review_reacts: 0u8,
+        goal_reacts: 0u8,
+        todo_nudges: MAX_TODO_NUDGES,
+        resume_nudges: 0,
+        open_issues_nudges: MAX_OPEN_ISSUES_NUDGES, // already at bound
+        ..Default::default()
+    };
     let (review_emit, _review_emit_rx) = tokio::sync::mpsc::channel(64);
 
     let dir = temp_dir("open-issues-bound");
@@ -5120,19 +4993,13 @@ async fn open_issues_gate_blocking_has_bound() {
         &config,
         "sys",
         &[],
-        &mut critic_done,
-        &mut code_review_reacts,
-        &mut None::<u64>,    // last_reviewed_fingerprint
-        &mut None::<String>, // last_review_findings
-        None,
-        &mut goal_reacts,
-        &mut todo_nudges,
-        &mut resume_nudges,
-        GateMode::Blocking,
-        Some(db_path.as_path()),
-        Some(sid),
-        &mut open_issues_nudges,
-        &mut 0u8,
+        &mut gates,
+        GateInputs {
+            code_review_baseline: None,
+            open_issues_gate_mode: GateMode::Blocking,
+            issue_db_path: Some(db_path.as_path()),
+            session_id: Some(sid),
+        },
         &review_emit,
     )
     .await;
@@ -5147,12 +5014,15 @@ async fn open_issues_gate_blocking_has_bound() {
 #[tokio::test]
 async fn open_issues_gate_zero_open_session_issues_is_inert() {
     let config = build_config();
-    let mut critic_done = true;
-    let mut goal_reacts = 0u8;
-    let mut todo_nudges = MAX_TODO_NUDGES;
-    let mut resume_nudges: u8 = 0;
-    let mut open_issues_nudges: u8 = 0;
-    let mut code_review_reacts = 0u8;
+    let mut gates = GateStates {
+        critic_done: true,
+        code_review_reacts: 0u8,
+        goal_reacts: 0u8,
+        todo_nudges: MAX_TODO_NUDGES,
+        resume_nudges: 0,
+        open_issues_nudges: 0,
+        ..Default::default()
+    };
     let (review_emit, _review_emit_rx) = tokio::sync::mpsc::channel(64);
 
     let dir = temp_dir("open-issues-zero");
@@ -5165,19 +5035,13 @@ async fn open_issues_gate_zero_open_session_issues_is_inert() {
         &config,
         "sys",
         &[],
-        &mut critic_done,
-        &mut code_review_reacts,
-        &mut None::<u64>,    // last_reviewed_fingerprint
-        &mut None::<String>, // last_review_findings
-        None,
-        &mut goal_reacts,
-        &mut todo_nudges,
-        &mut resume_nudges,
-        GateMode::Blocking,
-        Some(db_path.as_path()),
-        Some(sid),
-        &mut open_issues_nudges,
-        &mut 0u8,
+        &mut gates,
+        GateInputs {
+            code_review_baseline: None,
+            open_issues_gate_mode: GateMode::Blocking,
+            issue_db_path: Some(db_path.as_path()),
+            session_id: Some(sid),
+        },
         &review_emit,
     )
     .await;
@@ -5192,31 +5056,28 @@ async fn open_issues_gate_zero_open_session_issues_is_inert() {
 #[tokio::test]
 async fn open_issues_gate_missing_db_is_inert() {
     let config = build_config();
-    let mut critic_done = true;
-    let mut goal_reacts = 0u8;
-    let mut todo_nudges = MAX_TODO_NUDGES;
-    let mut resume_nudges: u8 = 0;
-    let mut open_issues_nudges: u8 = 0;
-    let mut code_review_reacts = 0u8;
+    let mut gates = GateStates {
+        critic_done: true,
+        code_review_reacts: 0u8,
+        goal_reacts: 0u8,
+        todo_nudges: MAX_TODO_NUDGES,
+        resume_nudges: 0,
+        open_issues_nudges: 0,
+        ..Default::default()
+    };
     let (review_emit, _review_emit_rx) = tokio::sync::mpsc::channel(64);
 
     let (msgs, source) = poll_finalization_follow_up(
         &config,
         "sys",
         &[],
-        &mut critic_done,
-        &mut code_review_reacts,
-        &mut None::<u64>,    // last_reviewed_fingerprint
-        &mut None::<String>, // last_review_findings
-        None,
-        &mut goal_reacts,
-        &mut todo_nudges,
-        &mut resume_nudges,
-        GateMode::Blocking,
-        None, // no db
-        Some("some-sess"),
-        &mut open_issues_nudges,
-        &mut 0u8,
+        &mut gates,
+        GateInputs {
+            code_review_baseline: None,
+            open_issues_gate_mode: GateMode::Blocking,
+            issue_db_path: None,
+            session_id: Some("some-sess"),
+        },
         &review_emit,
     )
     .await;
@@ -5230,12 +5091,15 @@ async fn open_issues_gate_missing_db_is_inert() {
 #[tokio::test]
 async fn open_issues_gate_advisory_emits_notice_but_does_not_reenter() {
     let config = build_config();
-    let mut critic_done = true;
-    let mut goal_reacts = 0u8;
-    let mut todo_nudges = MAX_TODO_NUDGES;
-    let mut resume_nudges: u8 = 0;
-    let mut open_issues_nudges: u8 = 0;
-    let mut code_review_reacts = 0u8;
+    let mut gates = GateStates {
+        critic_done: true,
+        code_review_reacts: 0u8,
+        goal_reacts: 0u8,
+        todo_nudges: MAX_TODO_NUDGES,
+        resume_nudges: 0,
+        open_issues_nudges: 0,
+        ..Default::default()
+    };
     let (review_emit, mut review_emit_rx) = tokio::sync::mpsc::channel(64);
 
     let dir = temp_dir("open-issues-advisory");
@@ -5251,19 +5115,13 @@ async fn open_issues_gate_advisory_emits_notice_but_does_not_reenter() {
         &config,
         "sys",
         &[assistant_calling("edit")],
-        &mut critic_done,
-        &mut code_review_reacts,
-        &mut None::<u64>,    // last_reviewed_fingerprint
-        &mut None::<String>, // last_review_findings
-        None,
-        &mut goal_reacts,
-        &mut todo_nudges,
-        &mut resume_nudges,
-        GateMode::Advisory,
-        Some(db_path.as_path()),
-        Some(sid),
-        &mut open_issues_nudges,
-        &mut 0u8,
+        &mut gates,
+        GateInputs {
+            code_review_baseline: None,
+            open_issues_gate_mode: GateMode::Advisory,
+            issue_db_path: Some(db_path.as_path()),
+            session_id: Some(sid),
+        },
         &review_emit,
     )
     .await;
@@ -5271,7 +5129,7 @@ async fn open_issues_gate_advisory_emits_notice_but_does_not_reenter() {
     // Advisory does NOT re-enter (returns empty messages).
     assert!(msgs.is_empty(), "advisory should not re-enter");
     assert_eq!(source, FollowUpSource::None);
-    assert_eq!(open_issues_nudges, 1, "counts the advisory");
+    assert_eq!(gates.open_issues_nudges, 1, "counts the advisory");
 
     // Check that a SystemNotice was emitted.
     match review_emit_rx.try_recv() {
@@ -5357,10 +5215,13 @@ async fn blocking_review_skips_judge_when_diff_unchanged_across_reactions() {
     config.code_review_repo = Some(repo.clone());
 
     let msgs_run = run_with_tool_result();
-    let mut critic_done = false;
-    let mut reacts = 0u8;
-    let mut last_fp: Option<u64> = None;
-    let mut last_findings: Option<String> = None;
+    let mut gates = GateStates {
+        critic_done: false,
+        code_review_reacts: 0u8,
+        last_reviewed_fingerprint: None,
+        last_review_findings: None,
+        ..Default::default()
+    };
     let (emit, _rx) = tokio::sync::mpsc::channel(8);
 
     // Reaction 1: the judge reviews the diff and raises a finding.
@@ -5368,19 +5229,8 @@ async fn blocking_review_skips_judge_when_diff_unchanged_across_reactions() {
         &config,
         "sys",
         &msgs_run,
-        &mut critic_done,
-        &mut reacts,
-        &mut last_fp,
-        &mut last_findings,
-        None,
-        &mut 0u8,
-        &mut 0u8,
-        &mut 0u8,
-        GateMode::Off,
-        None,
-        None,
-        &mut 0u8,
-        &mut 0u8,
+        &mut gates,
+        GateInputs::default(),
         &emit,
     )
     .await;
@@ -5391,10 +5241,13 @@ async fn blocking_review_skips_judge_when_diff_unchanged_across_reactions() {
     );
     assert!(!msgs1.is_empty(), "first reaction returns the finding");
     assert_eq!(src1, FollowUpSource::Critic);
-    assert_eq!(reacts, 1, "first reaction spends a budget");
-    assert!(!critic_done, "Blocking never sets the one-shot flag");
+    assert_eq!(
+        gates.code_review_reacts, 1,
+        "first reaction spends a budget"
+    );
+    assert!(!gates.critic_done, "Blocking never sets the one-shot flag");
     assert!(
-        last_fp.is_some(),
+        gates.last_reviewed_fingerprint.is_some(),
         "the reviewed diff fingerprint is recorded"
     );
 
@@ -5403,19 +5256,8 @@ async fn blocking_review_skips_judge_when_diff_unchanged_across_reactions() {
         &config,
         "sys",
         &msgs_run,
-        &mut critic_done,
-        &mut reacts,
-        &mut last_fp,
-        &mut last_findings,
-        None,
-        &mut 0u8,
-        &mut 0u8,
-        &mut 0u8,
-        GateMode::Off,
-        None,
-        None,
-        &mut 0u8,
-        &mut 0u8,
+        &mut gates,
+        GateInputs::default(),
         &emit,
     )
     .await;
@@ -5429,7 +5271,10 @@ async fn blocking_review_skips_judge_when_diff_unchanged_across_reactions() {
         "no follow-up — the model's rebuttal stands"
     );
     assert_eq!(src2, FollowUpSource::None);
-    assert_eq!(reacts, 1, "budget not spent on the skipped reaction");
+    assert_eq!(
+        gates.code_review_reacts, 1,
+        "budget not spent on the skipped reaction"
+    );
 
     let _ = std::fs::remove_dir_all(&repo);
 }
@@ -5459,11 +5304,14 @@ async fn blocking_review_skip_falls_through_to_downstream_gate() {
     }));
 
     let msgs_run = run_with_tool_result();
-    let mut critic_done = false;
-    let mut reacts = 0u8;
-    let mut last_fp: Option<u64> = None;
-    let mut last_findings: Option<String> = None;
-    let mut goal_reacts = 0u8;
+    let mut gates = GateStates {
+        critic_done: false,
+        code_review_reacts: 0u8,
+        last_reviewed_fingerprint: None,
+        last_review_findings: None,
+        goal_reacts: 0u8,
+        ..Default::default()
+    };
     let (emit, _emit_rx) = tokio::sync::mpsc::channel(8);
 
     // Reaction 1: the critic reviews the diff and raises a finding, returning
@@ -5472,19 +5320,8 @@ async fn blocking_review_skip_falls_through_to_downstream_gate() {
         &config,
         "sys",
         &msgs_run,
-        &mut critic_done,
-        &mut reacts,
-        &mut last_fp,
-        &mut last_findings,
-        None,
-        &mut goal_reacts,
-        &mut 0u8,
-        &mut 0u8,
-        GateMode::Off,
-        None,
-        None,
-        &mut 0u8,
-        &mut 0u8,
+        &mut gates,
+        GateInputs::default(),
         &emit,
     )
     .await;
@@ -5496,7 +5333,7 @@ async fn blocking_review_skip_falls_through_to_downstream_gate() {
     assert_eq!(src1, FollowUpSource::Critic);
     assert!(!msgs1.is_empty());
     assert_eq!(
-        goal_reacts, 0,
+        gates.goal_reacts, 0,
         "goal gate not reached while the critic fires"
     );
 
@@ -5506,19 +5343,8 @@ async fn blocking_review_skip_falls_through_to_downstream_gate() {
         &config,
         "sys",
         &msgs_run,
-        &mut critic_done,
-        &mut reacts,
-        &mut last_fp,
-        &mut last_findings,
-        None,
-        &mut goal_reacts,
-        &mut 0u8,
-        &mut 0u8,
-        GateMode::Off,
-        None,
-        None,
-        &mut 0u8,
-        &mut 0u8,
+        &mut gates,
+        GateInputs::default(),
         &emit,
     )
     .await;
@@ -5536,8 +5362,14 @@ async fn blocking_review_skip_falls_through_to_downstream_gate() {
         FollowUpSource::Goal,
         "the goal gate fires, not Critic and not None"
     );
-    assert_eq!(reacts, 1, "critic budget not spent on the skipped reaction");
-    assert_eq!(goal_reacts, 1, "the goal gate fired on the fall-through");
+    assert_eq!(
+        gates.code_review_reacts, 1,
+        "critic budget not spent on the skipped reaction"
+    );
+    assert_eq!(
+        gates.goal_reacts, 1,
+        "the goal gate fired on the fall-through"
+    );
 
     let _ = std::fs::remove_dir_all(&repo);
 }
@@ -5555,10 +5387,13 @@ async fn blocking_review_re_fires_judge_when_diff_changes_between_reactions() {
     config.code_review_repo = Some(repo.clone());
 
     let msgs_run = run_with_tool_result();
-    let mut critic_done = false;
-    let mut reacts = 0u8;
-    let mut last_fp: Option<u64> = None;
-    let mut last_findings: Option<String> = None;
+    let mut gates = GateStates {
+        critic_done: false,
+        code_review_reacts: 0u8,
+        last_reviewed_fingerprint: None,
+        last_review_findings: None,
+        ..Default::default()
+    };
     let (emit, _rx) = tokio::sync::mpsc::channel(8);
 
     // Reaction 1.
@@ -5566,19 +5401,8 @@ async fn blocking_review_re_fires_judge_when_diff_changes_between_reactions() {
         &config,
         "sys",
         &msgs_run,
-        &mut critic_done,
-        &mut reacts,
-        &mut last_fp,
-        &mut last_findings,
-        None,
-        &mut 0u8,
-        &mut 0u8,
-        &mut 0u8,
-        GateMode::Off,
-        None,
-        None,
-        &mut 0u8,
-        &mut 0u8,
+        &mut gates,
+        GateInputs::default(),
         &emit,
     )
     .await;
@@ -5593,19 +5417,8 @@ async fn blocking_review_re_fires_judge_when_diff_changes_between_reactions() {
         &config,
         "sys",
         &msgs_run,
-        &mut critic_done,
-        &mut reacts,
-        &mut last_fp,
-        &mut last_findings,
-        None,
-        &mut 0u8,
-        &mut 0u8,
-        &mut 0u8,
-        GateMode::Off,
-        None,
-        None,
-        &mut 0u8,
-        &mut 0u8,
+        &mut gates,
+        GateInputs::default(),
         &emit,
     )
     .await;
@@ -5633,40 +5446,32 @@ async fn advisory_review_unaffected_by_last_reviewed_fingerprint() {
     assert_eq!(config.code_review_mode, CodeReviewMode::Advisory);
 
     let msgs_run = run_with_tool_result();
-    let mut critic_done = false;
-    let mut reacts = 0u8;
-    let mut last_fp: Option<u64> = Some(999); // must NOT suppress Advisory
-    let mut last_findings: Option<String> = None;
+    let mut gates = GateStates {
+        critic_done: false,
+        code_review_reacts: 0u8,
+        last_reviewed_fingerprint: Some(999), // must NOT suppress Advisory
+        last_review_findings: None,
+        ..Default::default()
+    };
     let (emit, _rx) = tokio::sync::mpsc::channel(8);
 
     let (msgs1, src1) = poll_finalization_follow_up(
         &config,
         "sys",
         &msgs_run,
-        &mut critic_done,
-        &mut reacts,
-        &mut last_fp,
-        &mut last_findings,
-        None,
-        &mut 0u8,
-        &mut 0u8,
-        &mut 0u8,
-        GateMode::Off,
-        None,
-        None,
-        &mut 0u8,
-        &mut 0u8,
+        &mut gates,
+        GateInputs::default(),
         &emit,
     )
     .await;
     assert_eq!(
         calls.load(Ordering::SeqCst),
         1,
-        "Advisory judge fires despite a set last_fp"
+        "Advisory judge fires despite a set gates.last_reviewed_fingerprint"
     );
     assert!(!msgs1.is_empty());
     assert_eq!(src1, FollowUpSource::Critic);
-    assert!(critic_done, "Advisory flips the one-shot flag");
+    assert!(gates.critic_done, "Advisory flips the one-shot flag");
 }
 
 // ── track-work advisory (R3): edited files but no active todo ──────────────
@@ -6296,27 +6101,36 @@ fn should_nudge_fast_verify_gate() {
     assert!(should_nudge_fast_verify(
         GateMode::Advisory,
         0,
-        FAST_VERIFY_EDIT_THRESHOLD
+        FAST_VERIFY_EDIT_THRESHOLD,
+        crate::agent::agent_loop::capability::CapabilityTier::Nominal
     ));
     assert!(should_nudge_fast_verify(
         GateMode::Blocking,
         0,
-        FAST_VERIFY_EDIT_THRESHOLD
+        FAST_VERIFY_EDIT_THRESHOLD,
+        crate::agent::agent_loop::capability::CapabilityTier::Nominal
     ));
     // Off is byte-identical to the untiered loop — never nudges, however
     // many edits pile up.
-    assert!(!should_nudge_fast_verify(GateMode::Off, 0, 99));
+    assert!(!should_nudge_fast_verify(
+        GateMode::Off,
+        0,
+        99,
+        crate::agent::agent_loop::capability::CapabilityTier::Nominal
+    ));
     // Below threshold: one or two edits may be mid-sequence.
     assert!(!should_nudge_fast_verify(
         GateMode::Advisory,
         0,
-        FAST_VERIFY_EDIT_THRESHOLD - 1
+        FAST_VERIFY_EDIT_THRESHOLD - 1,
+        crate::agent::agent_loop::capability::CapabilityTier::Nominal
     ));
     // One-shot: budget spent.
     assert!(!should_nudge_fast_verify(
         GateMode::Advisory,
         MAX_VERIFY_NUDGES,
-        99
+        99,
+        crate::agent::agent_loop::capability::CapabilityTier::Nominal
     ));
 }
 
@@ -6325,8 +6139,13 @@ fn should_nudge_fast_verify_gate() {
 /// deferring the full suite — that split is the whole point of the round.
 #[test]
 fn build_fast_verify_reminder_message() {
-    let msg = build_fast_verify_reminder(GateMode::Advisory, 0, FAST_VERIFY_EDIT_THRESHOLD)
-        .expect("threshold reached in a tiered mode");
+    let msg = build_fast_verify_reminder(
+        GateMode::Advisory,
+        0,
+        crate::agent::agent_loop::capability::CapabilityTier::Nominal,
+        FAST_VERIFY_EDIT_THRESHOLD,
+    )
+    .expect("threshold reached in a tiered mode");
     let text = match msg {
         LoopMessage::User(u) => u.text_joined(),
         _ => panic!("expected a user message"),
@@ -6334,16 +6153,48 @@ fn build_fast_verify_reminder_message() {
     assert!(text.contains(VERIFY_TAG), "carries the tag: {text}");
     assert!(text.contains("FAST"), "asks for the fast tier: {text}");
     assert!(text.contains("full suite"), "defers the slow tier: {text}");
-    assert!(build_fast_verify_reminder(GateMode::Off, 0, 99).is_none());
-    assert!(build_fast_verify_reminder(GateMode::Advisory, 0, 1).is_none());
+    assert!(
+        build_fast_verify_reminder(
+            GateMode::Off,
+            0,
+            crate::agent::agent_loop::capability::CapabilityTier::Nominal,
+            99
+        )
+        .is_none()
+    );
+    assert!(
+        build_fast_verify_reminder(
+            GateMode::Advisory,
+            0,
+            crate::agent::agent_loop::capability::CapabilityTier::Nominal,
+            1
+        )
+        .is_none()
+    );
 }
 
 /// Bounded: once the budget is spent the reminder can never fire again,
 /// however far the edit count runs. Guarantees it can't loop.
 #[test]
 fn fast_verify_nudge_bounded_once() {
-    assert!(build_fast_verify_reminder(GateMode::Advisory, MAX_VERIFY_NUDGES, 10).is_none());
-    assert!(build_fast_verify_reminder(GateMode::Blocking, MAX_VERIFY_NUDGES, 10).is_none());
+    assert!(
+        build_fast_verify_reminder(
+            GateMode::Advisory,
+            MAX_VERIFY_NUDGES,
+            crate::agent::agent_loop::capability::CapabilityTier::Nominal,
+            10
+        )
+        .is_none()
+    );
+    assert!(
+        build_fast_verify_reminder(
+            GateMode::Blocking,
+            MAX_VERIFY_NUDGES,
+            crate::agent::agent_loop::capability::CapabilityTier::Nominal,
+            10
+        )
+        .is_none()
+    );
 }
 
 // ── harness-notice mirror (dirge-uw2l.7) ────────────────────────────────
@@ -6531,4 +6382,515 @@ fn safe_state_repo_falls_back_to_cwd_in_production() {
         Some(explicit),
         "an explicit override still wins"
     );
+}
+
+// ---------------------------------------------------------------------------
+// dirge-5mtx.2 — the mid-turn boundary arbiter.
+//
+// The finalization boundary has emitted at most one gate per pass since
+// dirge-vcsn. The mid-turn boundary did not: track-work, fast-verify, the
+// progress signal, the file-touch reminder and the safe-state/reflection
+// rungs each pushed independently, so up to five harness messages could land
+// before a single assistant turn.
+// ---------------------------------------------------------------------------
+
+/// Guards with both engines effectively disarmed, so a test can trip exactly
+/// the nudges it means to.
+fn quiet_guards() -> crate::agent::agent_loop::activity::LoopGuards {
+    crate::agent::agent_loop::activity::LoopGuards::new(
+        crate::agent::agent_loop::storm::StormBreaker::new(99, 99, None, None),
+        crate::agent::agent_loop::failure_tracker::FailureTracker::new(99),
+    )
+}
+
+/// Several nudges eligible at once → exactly ONE message, and it is the
+/// highest-priority one. Before the arbiter these stacked.
+#[test]
+fn boundary_emits_at_most_one_nudge() {
+    let mut cfg = build_config();
+    cfg.session_id = Some("s1".into());
+    cfg.verification_tiers_mode = GateMode::Advisory;
+    // Verifier with edits and nothing run → fast-verify is eligible.
+    let verifier = crate::agent::agent_loop::verifier::VerifierGate::new();
+    for i in 0..5 {
+        verifier.record_outcome(
+            "edit",
+            &serde_json::json!({ "path": format!("src/f{i}.rs") }),
+            &crate::agent::agent_loop::result::LoopToolResult {
+                content: vec![serde_json::json!({"type":"text","text":"ok"})],
+                details: serde_json::json!(null),
+                terminate: None,
+            },
+            false,
+        );
+    }
+    cfg.verifier = Some(verifier);
+    // Progress monitor primed to be barren.
+    cfg.progress = Some(crate::agent::agent_loop::progress::ProgressTracker::new(
+        2, 2,
+    ));
+
+    let guards = quiet_guards();
+    let mut tally = crate::agent::agent_loop::gate_tally::GateTally::new();
+    let mut track = 0u8;
+    let mut verify = 0u8;
+    // An edit this turn makes the track-work nudge eligible too.
+    let msgs = vec![LoopMessage::Assistant(AssistantMessage::new(
+        vec![ContentBlock::ToolCall {
+            id: "c1".into(),
+            name: "edit".into(),
+            arguments: serde_json::json!({"path": "src/f0.rs"}),
+        }],
+        StopReason::Stop,
+    ))];
+
+    let hit = crate::agent::agent_loop::run::poll_boundary_nudge(
+        &cfg,
+        &guards,
+        None,
+        &msgs,
+        1,
+        &mut track,
+        &mut verify,
+        &mut tally,
+        crate::agent::agent_loop::capability::CapabilityTier::Nominal,
+    );
+    let (_msg, which) = hit.expect("something should fire");
+    // Track-work outranks fast-verify and progress.
+    assert_eq!(
+        which,
+        crate::agent::agent_loop::gate_tally::BoundaryNudge::TrackWork
+    );
+    // Exactly one nudge recorded across every variant.
+    let total: u32 = [
+        crate::agent::agent_loop::gate_tally::BoundaryNudge::TrackWork,
+        crate::agent::agent_loop::gate_tally::BoundaryNudge::FastVerify,
+        crate::agent::agent_loop::gate_tally::BoundaryNudge::FileTouch,
+        crate::agent::agent_loop::gate_tally::BoundaryNudge::ProgressStall,
+        crate::agent::agent_loop::gate_tally::BoundaryNudge::ProgressPrologue,
+        crate::agent::agent_loop::gate_tally::BoundaryNudge::ProgressBudget,
+        crate::agent::agent_loop::gate_tally::BoundaryNudge::SafeState,
+        crate::agent::agent_loop::gate_tally::BoundaryNudge::ReflectionCheckpoint,
+    ]
+    .iter()
+    .map(|n| tally.nudge_count(*n))
+    .sum();
+    assert_eq!(total, 1, "exactly one nudge per boundary");
+}
+
+/// Safe-state (EXEC rung 3) supersedes the recovery checkpoint it replaces.
+/// This used to be a hand-written special case; it is now just precedence.
+#[test]
+fn safe_state_outranks_everything_else() {
+    let mut cfg = build_config();
+    cfg.session_id = Some("s1".into());
+    let guards = quiet_guards();
+    let mut tally = crate::agent::agent_loop::gate_tally::GateTally::new();
+    let mut track = 0u8;
+    let mut verify = 0u8;
+
+    let hit = crate::agent::agent_loop::run::poll_boundary_nudge(
+        &cfg,
+        &guards,
+        Some("abort and re-plan".into()),
+        &[],
+        1,
+        &mut track,
+        &mut verify,
+        &mut tally,
+        crate::agent::agent_loop::capability::CapabilityTier::Nominal,
+    );
+    let (_m, which) = hit.expect("safe-state fires");
+    assert_eq!(
+        which,
+        crate::agent::agent_loop::gate_tally::BoundaryNudge::SafeState
+    );
+    assert_eq!(
+        tally
+            .nudge_count(crate::agent::agent_loop::gate_tally::BoundaryNudge::ReflectionCheckpoint),
+        0,
+        "rung 3 replaces rung 2, never adds to it"
+    );
+}
+
+/// Nothing eligible → no message, and no budget spent.
+#[test]
+fn quiet_boundary_emits_nothing() {
+    let cfg = build_config();
+    let guards = quiet_guards();
+    let mut tally = crate::agent::agent_loop::gate_tally::GateTally::new();
+    let mut track = 0u8;
+    let mut verify = 0u8;
+    let hit = crate::agent::agent_loop::run::poll_boundary_nudge(
+        &cfg,
+        &guards,
+        None,
+        &[],
+        1,
+        &mut track,
+        &mut verify,
+        &mut tally,
+        crate::agent::agent_loop::capability::CapabilityTier::Nominal,
+    );
+    assert!(hit.is_none());
+    assert_eq!(track, 0);
+    assert_eq!(verify, 0);
+}
+
+// ── dirge-5mtx.4: is the model BLOCKED on the user, or OFFERING a next step? ──
+//
+// `awaiting_user_response` is gate 0 of `poll_finalization_follow_up`: when it
+// returns true the run finalizes immediately and the verifier, critic, todo and
+// open-issues gates are all SKIPPED for that boundary. A false positive
+// therefore disables the entire finalization stack, silently — skipping a gate
+// produces no output, so nothing in the transcript shows it happened.
+//
+// The existing tests above cover the SYNTACTIC shapes (bolded, followed by an
+// option list, inside a code fence). They do not cover the semantic split that
+// actually decides whether skipping the gates is right:
+//
+//   BLOCKED  — the model cannot proceed without a decision. Finalizing is
+//              correct; re-entering would make it guess.
+//   OFFERING — the model finished the work and proposed more. Finalizing is
+//              WRONG: the work is exactly what the gates exist to check.
+//
+// Both end in '?', so the trailing-'?' heuristic cannot tell them apart. These
+// two tests fix the current error rate in place so any change to this gate has
+// to confront it.
+
+/// Cases the trailing-'?' heuristic classifies correctly.
+#[test]
+fn awaiting_user_corpus_heuristic_is_right_here() {
+    // Genuinely blocked — a decision is required to continue.
+    for t in [
+        "Which database should I use?",
+        "Do you want me to use the async or the blocking client?",
+        "I can't tell which config is authoritative — which one should I edit?",
+        "Before I touch the migration, should I back up the table first?",
+    ] {
+        assert!(
+            awaiting_user_response(&[assistant_text(t)]),
+            "should read as blocked: {t}"
+        );
+    }
+    // Plain statements — not questions at all.
+    for t in [
+        "I've updated the file and the tests pass.",
+        "Done — the parser now handles the negated forms.",
+        "That change is already covered by the existing test.",
+    ] {
+        assert!(
+            !awaiting_user_response(&[assistant_text(t)]),
+            "should not read as blocked: {t}"
+        );
+    }
+}
+
+/// Cases it gets WRONG. Every one of these is the model finishing work and
+/// offering to do more — an offer, not a block — so finalizing without running
+/// the gates skips exactly the work the gates were built to check.
+///
+/// These assert the CURRENT (incorrect) behaviour deliberately, so the error
+/// rate is visible and versioned rather than discovered later. When a
+/// classifier lands (dirge-5mtx.4) these assertions must flip, and the diff
+/// that flips them IS the measured improvement.
+#[test]
+fn awaiting_user_corpus_known_misclassifications() {
+    let offers_misread_as_blocked = [
+        "I've added the parser and its tests. Want me to wire it into the loop as well?",
+        "The bug is fixed and the suite is green. Shall I also update the changelog?",
+        "That's the refactor done. Should I run the full test suite now?",
+        "Implemented and committed. Anything else you'd like me to pick up?",
+        "The migration script is written. Would you like me to run it against staging?",
+    ];
+    let mut misread = 0;
+    for t in offers_misread_as_blocked {
+        if awaiting_user_response(&[assistant_text(t)]) {
+            misread += 1;
+        }
+    }
+    assert_eq!(
+        misread,
+        offers_misread_as_blocked.len(),
+        "documented state: the heuristic reads EVERY completed-work offer as \
+         'blocked on the user' and skips the finalization gates. If this count \
+         dropped, a classifier landed — update this test to assert the \
+         improvement rather than the defect."
+    );
+}
+
+/// dirge-5mtx.4: with a classifier armed, the offers the heuristic misreads
+/// are classified correctly — and the genuinely-blocked cases still finalize.
+///
+/// This is the counterpart to `awaiting_user_corpus_known_misclassifications`
+/// above, which pins the heuristic's 5-of-5 failure on the same phrasings. The
+/// stub judge answers the way a real one would; what is under test is the
+/// wiring and the fallback behaviour, not the model.
+#[tokio::test]
+async fn awaiting_user_classifier_fixes_the_offer_cases() {
+    // Stub: OFFERING (index 1) for anything mentioning finished work, BLOCKED
+    // (index 0) otherwise. Deliberately keyed on the message, not on a counter,
+    // so the test fails if the wrong text reaches the judge.
+    let classify: crate::agent::agent_loop::critic::ClassifyFn =
+        std::sync::Arc::new(|question: String, _opts: &'static [&'static str]| {
+            Box::pin(async move {
+                let q = question.to_lowercase();
+                let offering = q.contains("i've added")
+                    || q.contains("is fixed")
+                    || q.contains("that's the refactor")
+                    || q.contains("implemented and committed")
+                    || q.contains("is written");
+                Ok(if offering { 1usize } else { 0usize })
+            })
+                as std::pin::Pin<
+                    Box<dyn std::future::Future<Output = anyhow::Result<usize>> + Send>,
+                >
+        });
+    let mut cfg = build_config();
+    cfg.classify_fn = Some(classify);
+
+    // The five the heuristic gets wrong — all offers, none blocking.
+    for t in [
+        "I've added the parser and its tests. Want me to wire it into the loop as well?",
+        "The bug is fixed and the suite is green. Shall I also update the changelog?",
+        "That's the refactor done. Should I run the full test suite now?",
+        "Implemented and committed. Anything else you'd like me to pick up?",
+        "The migration script is written. Would you like me to run it against staging?",
+    ] {
+        assert!(
+            !crate::agent::agent_loop::run::is_awaiting_user(&cfg, &[assistant_text(t)]).await,
+            "offer must no longer read as blocked: {t}"
+        );
+    }
+    // Genuinely blocked still finalizes — the fix must not simply always
+    // return false, which would disable the gate rather than correct it.
+    for t in [
+        "Which database should I use?",
+        "Do you want me to use the async or the blocking client?",
+    ] {
+        assert!(
+            crate::agent::agent_loop::run::is_awaiting_user(&cfg, &[assistant_text(t)]).await,
+            "genuinely blocked must still finalize: {t}"
+        );
+    }
+}
+
+/// A turn with no question mark never reaches the judge. This is the common
+/// case, so paying for a classifier call on it would be a real cost.
+#[tokio::test]
+async fn awaiting_user_no_question_mark_never_calls_the_judge() {
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = calls.clone();
+    let classify: crate::agent::agent_loop::critic::ClassifyFn =
+        std::sync::Arc::new(move |_q: String, _o: &'static [&'static str]| {
+            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move { Ok(0usize) })
+                as std::pin::Pin<
+                    Box<dyn std::future::Future<Output = anyhow::Result<usize>> + Send>,
+                >
+        });
+    let mut cfg = build_config();
+    cfg.classify_fn = Some(classify);
+    assert!(
+        !crate::agent::agent_loop::run::is_awaiting_user(
+            &cfg,
+            &[assistant_text("I've updated the file.")]
+        )
+        .await
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+/// A classifier error falls back to the heuristic rather than failing the
+/// turn — the gate must answer something, and the pre-fix answer is the right
+/// one when the better signal is unavailable.
+#[tokio::test]
+async fn awaiting_user_classifier_error_falls_back_to_heuristic() {
+    let classify: crate::agent::agent_loop::critic::ClassifyFn =
+        std::sync::Arc::new(|_q: String, _o: &'static [&'static str]| {
+            Box::pin(async move { anyhow::bail!("judge unavailable") })
+                as std::pin::Pin<
+                    Box<dyn std::future::Future<Output = anyhow::Result<usize>> + Send>,
+                >
+        });
+    let mut cfg = build_config();
+    cfg.classify_fn = Some(classify);
+    // Heuristic says blocked (trailing '?'), so the fallback does too.
+    assert!(
+        crate::agent::agent_loop::run::is_awaiting_user(
+            &cfg,
+            &[assistant_text("Which database should I use?")]
+        )
+        .await
+    );
+}
+
+/// No classifier configured → byte-identical to the old behaviour.
+#[tokio::test]
+async fn awaiting_user_without_a_classifier_is_the_old_heuristic() {
+    let cfg = build_config();
+    assert!(cfg.classify_fn.is_none());
+    for t in [
+        "Which database should I use?",
+        "I've added the parser and its tests. Want me to wire it into the loop as well?",
+    ] {
+        assert_eq!(
+            crate::agent::agent_loop::run::is_awaiting_user(&cfg, &[assistant_text(t)]).await,
+            awaiting_user_response(&[assistant_text(t)]),
+            "unconfigured path must match the heuristic exactly: {t}"
+        );
+    }
+}
+
+/// dirge-mu46: a completeness-only verdict must NOT be deduped away.
+///
+/// The Blocking dedupe skips the judge when the diff is unchanged, so a
+/// declined finding isn't re-raised verbatim. But the judge also rules on
+/// COMPLETENESS from the transcript, which keeps growing between reactions
+/// even when nothing lands on disk. Skipping wholesale meant an objectively
+/// incomplete task could finalize on the model's say-so — the reaction that
+/// would have re-judged it never ran.
+///
+/// The dedupe now additionally requires that the previous reaction actually
+/// raised diff findings. Here it didn't (INCOMPLETE with no FINDINGS block),
+/// so reaction 2 must re-judge even though the diff is byte-identical.
+#[tokio::test]
+async fn blocking_completeness_only_verdict_is_re_judged_on_unchanged_diff() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = calls.clone();
+    // Completeness gap, NO findings block — nothing to duplicate.
+    let judge: crate::agent::agent_loop::critic::CriticFn = Arc::new(move |_p: String| {
+        seen.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async {
+            Ok("VERDICT: INCOMPLETE\n- the error path is still untested".to_string())
+        })
+    });
+    let mut config = build_config();
+    config.critic_fn = Some(judge);
+    config.code_review_mode = CodeReviewMode::Blocking;
+    let (emit, _rx) = tokio::sync::mpsc::channel(64);
+    let msgs_run = run_with_tool_result();
+
+    let mut gates = GateStates {
+        critic_done: false,
+        code_review_reacts: 0u8,
+        last_reviewed_fingerprint: None,
+        last_review_findings: None,
+        ..Default::default()
+    };
+
+    for reaction in 1..=2 {
+        let _ = poll_finalization_follow_up(
+            &config,
+            "sys",
+            &msgs_run,
+            &mut gates,
+            GateInputs::default(),
+            &emit,
+        )
+        .await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            reaction,
+            "reaction {reaction}: a completeness-only verdict must be re-judged, \
+             not deduped away with the diff"
+        );
+    }
+    assert!(
+        gates.last_review_findings.is_none(),
+        "no diff findings were ever raised, so nothing was there to duplicate"
+    );
+}
+
+// ── dirge-5mtx.7: the derivation. Thresholds keyed on the OBSERVED tier. ─────
+//
+// Only Strong changes anything, and only in the direction of LESS
+// intervention. Nominal is the bit-identical default, so an unmeasured or
+// in-range run behaves exactly as before — which matters because a behavioural
+// change cannot be validated against the measured ~2x run-to-run noise floor
+// (dirge-5mtx.6, FM-5). What CAN be asserted is the structural claim these
+// tests make: which way each tier moves, and that the default path is untouched.
+//
+// Struggling is deliberately NOT keyed on here. It sits below the supported
+// capability range and has never been observed firing; wiring a threshold to a
+// state we have never seen is the mistake FM-4 names.
+
+use crate::agent::agent_loop::capability::CapabilityTier;
+
+/// Nominal reproduces today's constant exactly. This is the no-op guarantee
+/// the whole design rests on: a default install is unaffected.
+#[test]
+fn fast_verify_threshold_is_unchanged_at_nominal() {
+    // Three edits is the shipped threshold — fires at 3, not at 2.
+    assert!(!should_nudge_fast_verify(
+        GateMode::Advisory,
+        0,
+        2,
+        CapabilityTier::Nominal
+    ));
+    assert!(should_nudge_fast_verify(
+        GateMode::Advisory,
+        0,
+        3,
+        CapabilityTier::Nominal
+    ));
+}
+
+/// A run with zero observed failures gets more rope before the harness
+/// interrupts it. The direction is the point: extra latitude for a model
+/// demonstrably coping cannot cause a nudge storm, whereas the opposite
+/// direction could.
+#[test]
+fn strong_runs_get_more_latitude_before_the_verify_nudge() {
+    // At the Nominal threshold, Strong is not yet nudged.
+    assert!(should_nudge_fast_verify(
+        GateMode::Advisory,
+        0,
+        3,
+        CapabilityTier::Nominal
+    ));
+    assert!(
+        !should_nudge_fast_verify(GateMode::Advisory, 0, 3, CapabilityTier::Strong),
+        "a run with no observed failures should not be interrupted at the default threshold"
+    );
+    // It still fires eventually — latitude, not exemption.
+    assert!(should_nudge_fast_verify(
+        GateMode::Advisory,
+        0,
+        4,
+        CapabilityTier::Strong
+    ));
+}
+
+/// Off mode stays off at every tier. The tier scales WHEN a gate fires, never
+/// WHETHER an operator disabled it.
+#[test]
+fn tier_never_re_enables_a_disabled_gate() {
+    for tier in [
+        CapabilityTier::Strong,
+        CapabilityTier::Nominal,
+        CapabilityTier::Struggling,
+    ] {
+        assert!(
+            !should_nudge_fast_verify(GateMode::Off, 0, 99, tier),
+            "off must stay off at {tier:?}"
+        );
+    }
+}
+
+/// The budget is still respected at every tier — scaling the threshold must
+/// not become a way around the per-run ceiling.
+#[test]
+fn tier_does_not_bypass_the_nudge_budget() {
+    for tier in [
+        CapabilityTier::Strong,
+        CapabilityTier::Nominal,
+        CapabilityTier::Struggling,
+    ] {
+        assert!(
+            !should_nudge_fast_verify(GateMode::Advisory, MAX_VERIFY_NUDGES, 99, tier),
+            "spent budget must hold at {tier:?}"
+        );
+    }
 }

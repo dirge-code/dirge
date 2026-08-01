@@ -4,6 +4,96 @@ All notable changes to dirge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Verification discipline** — a set of loop and tooling changes with one thing
+  in common: a check *ran*, reported success, and could not have failed for the
+  reason that mattered. All six failures found while building this came from
+  doing the work, not from looking for them; all six were verification
+  failures, none was a steering failure. See
+  [docs/verification-discipline.md](docs/verification-discipline.md).
+
+  **Project gate** (`verification_command`, dirge-w2de). Names the command whose
+  pass is the only honest green. When set and unmet, a `VerifiedGreen` becomes
+  `FastGreenOnly` so the existing escalation carries it — no new status.
+  Matching is by (program, subcommand) signature, since `RUSTFLAGS="-D warnings"
+  cargo clippy --all-targets` and `cargo clippy --all-targets -- -D warnings`
+  are the same gate. Unset by default and unchanged when unset.
+
+  **CI command advisory.** Auto-detecting *the* gate from CI does not work:
+  this repo's own `ci.yml` yields four recognized signatures, two equally
+  strongest, so any rule picking one is guessing — and a wrong auto-gate nags
+  forever. Real CI has several gates, all required. The recognized set is now
+  surfaced as information in the verify nudge, touching no verdict.
+
+  **Exploration-prologue bound** (`progress_prologue_cap`, dirge-t5dh). The
+  progress monitor's stall counter armed only on a progress event, so a run that
+  produced nothing never armed and the monitor could not report the case it most
+  needed to. Observed: 60 turns of successful reads with nothing written, the
+  threshold configured and on, and no other guard able to see it. An upper bound,
+  not an eager nudge — it also counts tool calls, since the observed thrash
+  batched 40+ into one turn.
+
+  **Capability tier.** Estimated from observed failure rates, never from model
+  identity — on the same task the stronger model was the one in trouble.
+  Currently derives one threshold, and only for `Strong`, only toward less
+  intervention. `Nominal` is bit-identical, so a default install is untouched.
+
+  **A/B harness** (`scripts/loop-ab.sh`). Arbitrary config overrides per arm,
+  per-model reporting, and three guards each earned by a failure: a mechanism
+  check (a treatment arm whose nudge count is zero did not exercise the change),
+  a noise floor (an A/A produced 18 vs 36 turns from identical config — any
+  delta inside that is reported `~noise`), and an explicit warning that a
+  single-model result is not evidence.
+
+### Changed
+- **Gate lifecycle state collapsed into `GateStates`** (dirge-5mtx.5).
+  `poll_finalization_follow_up` took seventeen positional arguments, nine of
+  them `&mut` counters, behind an `allow(clippy::too_many_arguments)`; it now
+  takes one state struct plus a borrow of the read-only inputs, and the allow
+  is gone. Behaviour-preserving — both structs are destructured at the top, so
+  the gate bodies are unchanged. The value is that every gate's re-fire state
+  now sits in one place, each labelled cost-ceiling (bounds LLM spend, stays)
+  or re-fire-guard (compensates for a predicate that can't tell "happened"
+  from "happened and I already reacted"). Relaxing any budget remains
+  descoped: at a ~2x noise floor that claim is not measurable.
+
+### Fixed
+- **The branch failed `cargo fmt --all --check`** in 31 places across the eight
+  files this work touched, while `clippy -D warnings` and the test suite were
+  green throughout. CI runs rustfmt as its own job. Recorded as the sixth row
+  of the pattern table, since it is the only one observed *after* the
+  mitigation for its own family shipped.
+- **Masked commands latched a false green** (dirge-w2de). `cargo test || true`,
+  `cargo clippy | tail -2` and `cargo test; echo done` all recorded
+  `VerifiedGreen` — the exit status belonged to `true`, to `tail`, to the
+  `echo`. A masked *success* is no longer recorded at all (status stays
+  `Unverified` and the gate asks again); a masked *failure* is still recorded
+  red, since that direction is trustworthy. `&&` is not masking.
+- **Verdict answer sets competed** (dirge-5mtx.3). `COMPLETE` is a substring of
+  `INCOMPLETE` and `MET` of `UNMET`, `parse_verdict` read only the first
+  non-empty line, and `"NOT COMPLETE"` parsed as *Complete* — an exact
+  inversion. Measured against a 27-row corpus of judge phrasings the old parser
+  got 11 wrong, every one failing in the same direction: reporting work complete
+  that the judge had called incomplete.
+- **The blocked-on-user gate misread completed work** (dirge-5mtx.4). Gate 0
+  finalizes the run and skips the verifier, critic, todo and open-issues gates;
+  it decided by testing for a trailing `?`. Five of five completed-work offers
+  ("want me to wire it in too?") read as blocked. Now classified when a judge is
+  configured, with a free structural pre-filter and the heuristic as fallback.
+- **Boundary nudges stacked** (dirge-5mtx.2). Up to five harness messages could
+  land before one assistant turn; the finalization boundary had picked exactly
+  one since dirge-vcsn, the mid-turn boundary never did. One arbiter now chooses,
+  in strict priority.
+- **A failed judge call looked like a clean review** (dirge-q7vw). Both returned
+  no messages and no findings, so a transient error recorded the reviewed-diff
+  fingerprint and the next reaction skipped that diff forever.
+- **The review dedupe skipped completeness too** (dirge-mu46). It now also
+  requires that the previous reaction raised diff findings — the duplicate case
+  it exists for. A completeness-only verdict has nothing to duplicate and is
+  re-judged.
+
 ## [0.20.0] - 2026-07-31
 
 ### Added

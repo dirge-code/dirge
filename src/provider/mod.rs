@@ -137,6 +137,11 @@ pub struct AnyAgent {
     /// forwarded to `LoopConfig.verification_tiers_mode`. Defaults to `Off`
     /// (dirge-uw2l.2).
     verification_tiers_mode: crate::agent::agent_loop::types::GateMode,
+    /// dirge-w2de: the project's real gate command (`verification_command`
+    /// config). Forwarded to `LoopConfig.verifier` at spawn so the gate
+    /// only reports a full green after THIS command passed. `None` keeps
+    /// the verifier byte-identical to before.
+    verification_command: Option<String>,
     /// Set by `build_agent` from `Config::resolve_safe_state_abort_mode`;
     /// forwarded to `LoopConfig.safe_state_abort_mode`. Defaults to `Off`
     /// (dirge-uw2l.4; the rung is opt-in and off is byte-identical).
@@ -148,6 +153,13 @@ pub struct AnyAgent {
     /// same critic provider as `critic_fn` but baking its own
     /// `GOAL_PREAMBLE`; forwarded to `LoopConfig.goal_fn`. `None` = off.
     goal_fn: Option<crate::agent::agent_loop::critic::CriticFn>,
+    /// dirge-5mtx.3: classify judge. Built at `build_agent` time from the
+    /// same critic provider/client as `critic_fn`/`goal_fn`, but under
+    /// `CLASSIFY_PREAMBLE` and a constrained prompt; forwarded to
+    /// `LoopConfig.classify_fn`. `None` = off (default; no consumer yet —
+    /// dirge-5mtx.4 is the first caller).
+    #[allow(dead_code)]
+    classify_fn: Option<crate::agent::agent_loop::critic::ClassifyFn>,
     /// Goal gate: optional natural-language stop condition for autonomous
     /// runs (`--goal`). Forwarded to `LoopConfig.goal`; active only when a
     /// `goal_fn` (the judge) is also present. `None` = off (default).
@@ -167,6 +179,9 @@ pub struct AnyAgent {
     /// Set by `build_agent` from `Config::progress_stall_threshold`;
     /// forwarded to the loop's progress monitor. `None` = off.
     progress_stall_threshold: Option<usize>,
+    /// dirge-t5dh: barren boundaries before the exploration-prologue
+    /// checkpoint. `None` uses [`crate::agent::agent_loop::progress::DEFAULT_PROLOGUE_CAP`].
+    progress_prologue_cap: Option<usize>,
     /// dirge-nqr: hard cap on assistant turns per run. Set via
     /// `with_max_turns`. Forwarded to `LoopSpawnConfig.max_turns`
     /// at spawn time. `None` = unlimited (legacy).
@@ -334,13 +349,16 @@ impl AnyAgent {
             code_review_mode: crate::agent::agent_loop::types::CodeReviewMode::default(),
             open_issues_gate_mode: crate::agent::agent_loop::types::GateMode::Off,
             verification_tiers_mode: crate::agent::agent_loop::types::GateMode::Off,
+            verification_command: None,
             safe_state_abort_mode: crate::agent::agent_loop::types::SafeStateMode::Off,
             session_id: None,
             goal_fn: None,
             goal: None,
+            classify_fn: None,
             summarize_fn: None,
             context_depth_reminder_threshold: None,
             progress_stall_threshold: None,
+            progress_prologue_cap: None,
             max_turns: None,
             review_stream_fn: None,
             review_provider_name: None,
@@ -554,6 +572,13 @@ impl AnyAgent {
         self
     }
 
+    /// dirge-w2de: set the project gate command (config
+    /// `verification_command`).
+    pub fn with_verification_command(mut self, command: Option<String>) -> Self {
+        self.verification_command = command;
+        self
+    }
+
     /// dirge-uw2l.4: set the safe-state abort rung mode.
     pub fn with_safe_state_abort_mode(
         mut self,
@@ -574,6 +599,19 @@ impl AnyAgent {
     /// independent of any critic preamble override or `critic: false` prompt.
     pub fn with_goal_fn(mut self, goal_fn: crate::agent::agent_loop::critic::CriticFn) -> Self {
         self.goal_fn = Some(goal_fn);
+        self
+    }
+
+    /// dirge-5mtx.3: attach the classify judge. Built from the same critic
+    /// provider/client as `critic_fn`/`goal_fn` but under
+    /// `CLASSIFY_PREAMBLE` and a constrained prompt, so it returns an option
+    /// INDEX instead of prose. First consumer is dirge-5mtx.4.
+    #[allow(dead_code)]
+    pub fn with_classify_fn(
+        mut self,
+        classify_fn: crate::agent::agent_loop::critic::ClassifyFn,
+    ) -> Self {
+        self.classify_fn = Some(classify_fn);
         self
     }
 
@@ -611,6 +649,14 @@ impl AnyAgent {
     /// session.
     pub fn with_progress_stall_threshold(mut self, threshold: usize) -> Self {
         self.progress_stall_threshold = Some(threshold);
+        self
+    }
+
+    /// dirge-t5dh: override the exploration-prologue cap. Only meaningful
+    /// alongside `with_progress_stall_threshold`; unset uses the provisional
+    /// default.
+    pub fn with_progress_prologue_cap(mut self, cap: usize) -> Self {
+        self.progress_prologue_cap = Some(cap);
         self
     }
 

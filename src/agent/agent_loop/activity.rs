@@ -115,6 +115,12 @@ impl LoopGuards {
         self.failures.record(outcome, &call.name, excerpt);
     }
 
+    /// Current consecutive errored-tool-result streak (the mechanical,
+    /// unweighted one). Feeds the capability tally's high-water mark.
+    pub fn failure_streak(&self) -> usize {
+        self.failures.consecutive()
+    }
+
     /// Turn-boundary poll for the failure tracker's recovery checkpoint.
     pub fn poll_reflection(&self) -> Vec<LoopMessage> {
         self.failures.poll_reflection()
