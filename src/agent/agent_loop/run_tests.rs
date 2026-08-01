@@ -6673,3 +6673,85 @@ fn quiet_boundary_emits_nothing() {
     assert_eq!(track, 0);
     assert_eq!(verify, 0);
 }
+
+// ── dirge-5mtx.4: is the model BLOCKED on the user, or OFFERING a next step? ──
+//
+// `awaiting_user_response` is gate 0 of `poll_finalization_follow_up`: when it
+// returns true the run finalizes immediately and the verifier, critic, todo and
+// open-issues gates are all SKIPPED for that boundary. A false positive
+// therefore disables the entire finalization stack, silently — skipping a gate
+// produces no output, so nothing in the transcript shows it happened.
+//
+// The existing tests above cover the SYNTACTIC shapes (bolded, followed by an
+// option list, inside a code fence). They do not cover the semantic split that
+// actually decides whether skipping the gates is right:
+//
+//   BLOCKED  — the model cannot proceed without a decision. Finalizing is
+//              correct; re-entering would make it guess.
+//   OFFERING — the model finished the work and proposed more. Finalizing is
+//              WRONG: the work is exactly what the gates exist to check.
+//
+// Both end in '?', so the trailing-'?' heuristic cannot tell them apart. These
+// two tests fix the current error rate in place so any change to this gate has
+// to confront it.
+
+/// Cases the trailing-'?' heuristic classifies correctly.
+#[test]
+fn awaiting_user_corpus_heuristic_is_right_here() {
+    // Genuinely blocked — a decision is required to continue.
+    for t in [
+        "Which database should I use?",
+        "Do you want me to use the async or the blocking client?",
+        "I can't tell which config is authoritative — which one should I edit?",
+        "Before I touch the migration, should I back up the table first?",
+    ] {
+        assert!(
+            awaiting_user_response(&[assistant_text(t)]),
+            "should read as blocked: {t}"
+        );
+    }
+    // Plain statements — not questions at all.
+    for t in [
+        "I've updated the file and the tests pass.",
+        "Done — the parser now handles the negated forms.",
+        "That change is already covered by the existing test.",
+    ] {
+        assert!(
+            !awaiting_user_response(&[assistant_text(t)]),
+            "should not read as blocked: {t}"
+        );
+    }
+}
+
+/// Cases it gets WRONG. Every one of these is the model finishing work and
+/// offering to do more — an offer, not a block — so finalizing without running
+/// the gates skips exactly the work the gates were built to check.
+///
+/// These assert the CURRENT (incorrect) behaviour deliberately, so the error
+/// rate is visible and versioned rather than discovered later. When a
+/// classifier lands (dirge-5mtx.4) these assertions must flip, and the diff
+/// that flips them IS the measured improvement.
+#[test]
+fn awaiting_user_corpus_known_misclassifications() {
+    let offers_misread_as_blocked = [
+        "I've added the parser and its tests. Want me to wire it into the loop as well?",
+        "The bug is fixed and the suite is green. Shall I also update the changelog?",
+        "That's the refactor done. Should I run the full test suite now?",
+        "Implemented and committed. Anything else you'd like me to pick up?",
+        "The migration script is written. Would you like me to run it against staging?",
+    ];
+    let mut misread = 0;
+    for t in offers_misread_as_blocked {
+        if awaiting_user_response(&[assistant_text(t)]) {
+            misread += 1;
+        }
+    }
+    assert_eq!(
+        misread,
+        offers_misread_as_blocked.len(),
+        "documented state: the heuristic reads EVERY completed-work offer as \
+         'blocked on the user' and skips the finalization gates. If this count \
+         dropped, a classifier landed — update this test to assert the \
+         improvement rather than the defect."
+    );
+}
