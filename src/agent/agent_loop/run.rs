@@ -1848,6 +1848,45 @@ pub async fn run_agent_loop(
 /// `poll_budget` is NOT called when something else wins: it consumes a budget
 /// mark, and unlike `record_turn` it has no state to advance, so skipping it
 /// preserves the mark for a later boundary.
+/// Record one tool result's capability signals on the run tally [dirge-5mtx.7].
+///
+/// Every call counts toward `tool_calls` (the denominator for every rate) and,
+/// when it failed, toward `errored_tool_calls`. A failed call whose name is in
+/// no tool the run was given is ALSO recorded as a hallucinated name — the
+/// model invented the name rather than misusing a real tool, which is a
+/// materially different capability signal.
+///
+/// `prepare_tool_call` (tools.rs) is where the miss is actually detected: it
+/// short-circuits with "Tool X not found" plus a nearest-name suggestion. But
+/// it runs inside `execute_tool_calls_{sequential,parallel}`, neither of which
+/// has the tally, and the parallel path shares its preflight across futures.
+/// Re-deriving the classification here from the same tool list keeps the
+/// counter next to every other one rather than threading `&mut GateTally`
+/// through two batch executors.
+///
+/// The two counts STACK deliberately: a hallucinated call is both errored and
+/// hallucinated, exactly as `repair_invalid` already stacks with errored. With
+/// the current weights that orders the failure kinds — a plain error is 1, an
+/// invented tool name 3, arguments too malformed to repair 5 — which is the
+/// intended ranking.
+///
+/// Adding this signal can only ever move a run DOWN a tier, never up, so the
+/// worst case is a run that read `Strong` reading `Nominal`, which is today's
+/// default behaviour. That is why restoring it is safe despite its effect on
+/// tiering being unmeasured: the counter was always zero, so nobody has data
+/// on how often models invent tool names.
+fn record_tool_result_signals(
+    tally: &mut GateTally,
+    name: &str,
+    is_error: bool,
+    known_tools: &[&str],
+) {
+    tally.record_tool_call(is_error);
+    if is_error && !known_tools.contains(&name) {
+        tally.record_hallucinated_tool_name();
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn poll_boundary_nudge(
     config: &LoopConfig,
@@ -2619,6 +2658,11 @@ pub async fn run_loop(
                     .await;
                     tool_results.extend(batch.messages.clone());
                     has_more_tool_calls = !batch.terminate;
+                    // dirge-5mtx.7: the tool set this batch was dispatched
+                    // against, for the hallucinated-name classification below.
+                    // Built once per batch rather than per result.
+                    let known_tool_names: Vec<&str> =
+                        current_context.tools.iter().map(|t| t.name()).collect();
                     for result in &batch.messages {
                         // Classify + feed both guards. Match the result back
                         // to its originating call so a timeout can be tied to
@@ -2638,7 +2682,12 @@ pub async fn run_loop(
                                 arguments: serde_json::Value::Null,
                             });
                         guards.record_result(&originating, result.is_error, &excerpt);
-                        tally.record_tool_call(result.is_error);
+                        record_tool_result_signals(
+                            &mut tally,
+                            &originating.name,
+                            result.is_error,
+                            &known_tool_names,
+                        );
                         tally.record_failure_streak(guards.failure_streak() as u32);
                         current_context.messages.push(tool_result_to_value(result));
                         new_messages.push(LoopMessage::ToolResult(result.clone()));

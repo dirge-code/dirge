@@ -6837,30 +6837,45 @@ fn fast_verify_threshold_is_unchanged_at_nominal() {
     ));
 }
 
-/// A run with zero observed failures gets more rope before the harness
-/// interrupts it. The direction is the point: extra latitude for a model
-/// demonstrably coping cannot cause a nudge storm, whereas the opposite
-/// direction could.
+/// Strong must NOT relax the verify nudge — it behaves exactly as Nominal.
+///
+/// An earlier cut scaled this threshold up for Strong, reasoning that extra
+/// latitude for a demonstrably-coping model could not cause a nudge storm.
+/// The reasoning holds but the risk is inverted: the counters observe
+/// tool-call mechanics only, so a Strong reading says nothing about whether
+/// the model verifies its work — and both failures on record (the 60-turn
+/// thrash, the wrong-gate green) came from models this estimator reads as
+/// Strong. Relaxing verification pressure on that exact class is backwards.
 #[test]
-fn strong_runs_get_more_latitude_before_the_verify_nudge() {
-    // At the Nominal threshold, Strong is not yet nudged.
+fn strong_does_not_relax_the_verify_nudge() {
+    for edits in [3u32, 4, 10] {
+        assert_eq!(
+            should_nudge_fast_verify(GateMode::Advisory, 0, edits, CapabilityTier::Strong),
+            should_nudge_fast_verify(GateMode::Advisory, 0, edits, CapabilityTier::Nominal),
+            "Strong must be bit-identical to Nominal at {edits} edits"
+        );
+    }
+    // Nominal still fires at the base threshold, so this is not "gate off".
     assert!(should_nudge_fast_verify(
         GateMode::Advisory,
         0,
         3,
         CapabilityTier::Nominal
     ));
+}
+
+/// Struggling is the only tier that moves a threshold, and only toward
+/// earlier help: it is nudged to verify before the base count is reached.
+#[test]
+fn struggling_runs_are_asked_to_verify_sooner() {
     assert!(
-        !should_nudge_fast_verify(GateMode::Advisory, 0, 3, CapabilityTier::Strong),
-        "a run with no observed failures should not be interrupted at the default threshold"
+        !should_nudge_fast_verify(GateMode::Advisory, 0, 1, CapabilityTier::Nominal),
+        "one edit is below the base threshold"
     );
-    // It still fires eventually — latitude, not exemption.
-    assert!(should_nudge_fast_verify(
-        GateMode::Advisory,
-        0,
-        4,
-        CapabilityTier::Strong
-    ));
+    assert!(
+        should_nudge_fast_verify(GateMode::Advisory, 0, 2, CapabilityTier::Struggling),
+        "a failing run should be asked to verify before the base count"
+    );
 }
 
 /// Off mode stays off at every tier. The tier scales WHEN a gate fires, never
@@ -6893,4 +6908,62 @@ fn tier_does_not_bypass_the_nudge_budget() {
             "spent budget must hold at {tier:?}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// dirge-5mtx.7: hallucinated tool names must reach the capability estimator.
+//
+// `record_hallucinated_tool_name` had a unit test that called it directly and
+// ZERO production callers, so the counter was structurally always 0 and its
+// weight could never contribute. These drive the function the loop actually
+// calls, which is the part that was missing.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn unknown_tool_name_is_counted_as_hallucinated() {
+    let known = ["read", "write", "bash"];
+    let mut tally = crate::agent::agent_loop::gate_tally::GateTally::new();
+    record_tool_result_signals(&mut tally, "search_files", true, &known);
+    assert_eq!(tally.hallucinated_tool_names(), 1);
+    // It is ALSO an errored call — the stacking is deliberate, matching how
+    // repair_invalid already stacks with errored.
+    assert_eq!(tally.errored_tool_calls(), 1);
+    assert_eq!(tally.tool_calls(), 1);
+}
+
+#[test]
+fn known_tool_that_errors_is_not_hallucinated() {
+    let known = ["read", "write", "bash"];
+    let mut tally = crate::agent::agent_loop::gate_tally::GateTally::new();
+    record_tool_result_signals(&mut tally, "bash", true, &known);
+    assert_eq!(
+        tally.hallucinated_tool_names(),
+        0,
+        "a real tool misused is a different signal from an invented name"
+    );
+    assert_eq!(tally.errored_tool_calls(), 1);
+}
+
+#[test]
+fn successful_call_is_never_hallucinated() {
+    let known = ["read"];
+    let mut tally = crate::agent::agent_loop::gate_tally::GateTally::new();
+    // A name that isn't in the list can't actually succeed, but the guard is
+    // on is_error so the classification can never fire on a working call.
+    record_tool_result_signals(&mut tally, "mystery", false, &known);
+    assert_eq!(tally.hallucinated_tool_names(), 0);
+    assert_eq!(tally.errored_tool_calls(), 0);
+    assert_eq!(tally.tool_calls(), 1);
+}
+
+#[test]
+fn hallucinated_names_accumulate_across_calls() {
+    let known = ["read"];
+    let mut tally = crate::agent::agent_loop::gate_tally::GateTally::new();
+    record_tool_result_signals(&mut tally, "view", true, &known);
+    record_tool_result_signals(&mut tally, "open_file", true, &known);
+    record_tool_result_signals(&mut tally, "read", true, &known);
+    assert_eq!(tally.hallucinated_tool_names(), 2);
+    assert_eq!(tally.errored_tool_calls(), 3);
+    assert_eq!(tally.tool_calls(), 3);
 }
