@@ -1850,6 +1850,7 @@ pub(crate) fn poll_boundary_nudge(
     track_nudges: &mut u8,
     verify_nudges: &mut u8,
     tally: &mut GateTally,
+    tier: super::capability::CapabilityTier,
 ) -> Option<(LoopMessage, BoundaryNudge)> {
     // Unconditional: the progress counters must advance every boundary.
     let progress_signal = config.progress.as_ref().and_then(|progress| {
@@ -1904,6 +1905,7 @@ pub(crate) fn poll_boundary_nudge(
     if let Some(reminder) = build_fast_verify_reminder(
         config.verification_tiers_mode,
         *verify_nudges,
+        tier,
         config
             .verifier
             .as_ref()
@@ -2771,6 +2773,7 @@ pub async fn run_loop(
                 &mut track_nudges,
                 &mut verify_nudges,
                 &mut tally,
+                capability.tier(),
             ) {
                 emit_harness_notices(emit, std::slice::from_ref(&msg)).await;
                 current_context.messages.push(loop_message_to_value(&msg));
@@ -3178,10 +3181,15 @@ fn track_work_reminder_message() -> LoopMessage {
 /// Whether to remind the model to run a FAST check mid-run (dirge-uw2l.2).
 /// True only when tiers are engaged, the one-shot budget is unspent, and
 /// enough code edits have piled up since the last verification of any tier.
-fn should_nudge_fast_verify(mode: GateMode, verify_nudges: u8, edits_since_verify: u32) -> bool {
+fn should_nudge_fast_verify(
+    mode: GateMode,
+    verify_nudges: u8,
+    edits_since_verify: u32,
+    tier: super::capability::CapabilityTier,
+) -> bool {
     mode != GateMode::Off
         && verify_nudges < MAX_VERIFY_NUDGES
-        && edits_since_verify >= FAST_VERIFY_EDIT_THRESHOLD
+        && edits_since_verify >= tier.scale_threshold(FAST_VERIFY_EDIT_THRESHOLD)
 }
 
 /// Pure decision + message builder for the mid-run fast-check reminder
@@ -3193,9 +3201,10 @@ fn should_nudge_fast_verify(mode: GateMode, verify_nudges: u8, edits_since_verif
 fn build_fast_verify_reminder(
     mode: GateMode,
     verify_nudges: u8,
+    tier: super::capability::CapabilityTier,
     edits_since_verify: u32,
 ) -> Option<LoopMessage> {
-    if !should_nudge_fast_verify(mode, verify_nudges, edits_since_verify) {
+    if !should_nudge_fast_verify(mode, verify_nudges, edits_since_verify, tier) {
         return None;
     }
     Some(LoopMessage::User(super::message::UserMessage::text(

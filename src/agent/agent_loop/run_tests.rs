@@ -6294,31 +6294,19 @@ fn last_action_failed_and_stopped_bounded() {
 #[test]
 fn should_nudge_fast_verify_gate() {
     // Fires: tiered mode + budget available + threshold reached.
-    assert!(should_nudge_fast_verify(
-        GateMode::Advisory,
-        0,
-        FAST_VERIFY_EDIT_THRESHOLD
-    ));
-    assert!(should_nudge_fast_verify(
-        GateMode::Blocking,
-        0,
-        FAST_VERIFY_EDIT_THRESHOLD
-    ));
+    assert!(should_nudge_fast_verify(GateMode::Advisory, 0, FAST_VERIFY_EDIT_THRESHOLD
+    , crate::agent::agent_loop::capability::CapabilityTier::Nominal));
+    assert!(should_nudge_fast_verify(GateMode::Blocking, 0, FAST_VERIFY_EDIT_THRESHOLD
+    , crate::agent::agent_loop::capability::CapabilityTier::Nominal));
     // Off is byte-identical to the untiered loop — never nudges, however
     // many edits pile up.
-    assert!(!should_nudge_fast_verify(GateMode::Off, 0, 99));
+    assert!(!should_nudge_fast_verify(GateMode::Off, 0, 99, crate::agent::agent_loop::capability::CapabilityTier::Nominal));
     // Below threshold: one or two edits may be mid-sequence.
-    assert!(!should_nudge_fast_verify(
-        GateMode::Advisory,
-        0,
-        FAST_VERIFY_EDIT_THRESHOLD - 1
-    ));
+    assert!(!should_nudge_fast_verify(GateMode::Advisory, 0, FAST_VERIFY_EDIT_THRESHOLD - 1
+    , crate::agent::agent_loop::capability::CapabilityTier::Nominal));
     // One-shot: budget spent.
-    assert!(!should_nudge_fast_verify(
-        GateMode::Advisory,
-        MAX_VERIFY_NUDGES,
-        99
-    ));
+    assert!(!should_nudge_fast_verify(GateMode::Advisory, MAX_VERIFY_NUDGES, 99
+    , crate::agent::agent_loop::capability::CapabilityTier::Nominal));
 }
 
 /// The built message carries the verifier tag (so the UI attributes it to
@@ -6326,7 +6314,7 @@ fn should_nudge_fast_verify_gate() {
 /// deferring the full suite — that split is the whole point of the round.
 #[test]
 fn build_fast_verify_reminder_message() {
-    let msg = build_fast_verify_reminder(GateMode::Advisory, 0, FAST_VERIFY_EDIT_THRESHOLD)
+    let msg = build_fast_verify_reminder(GateMode::Advisory, 0, crate::agent::agent_loop::capability::CapabilityTier::Nominal, FAST_VERIFY_EDIT_THRESHOLD)
         .expect("threshold reached in a tiered mode");
     let text = match msg {
         LoopMessage::User(u) => u.text_joined(),
@@ -6335,16 +6323,16 @@ fn build_fast_verify_reminder_message() {
     assert!(text.contains(VERIFY_TAG), "carries the tag: {text}");
     assert!(text.contains("FAST"), "asks for the fast tier: {text}");
     assert!(text.contains("full suite"), "defers the slow tier: {text}");
-    assert!(build_fast_verify_reminder(GateMode::Off, 0, 99).is_none());
-    assert!(build_fast_verify_reminder(GateMode::Advisory, 0, 1).is_none());
+    assert!(build_fast_verify_reminder(GateMode::Off, 0, crate::agent::agent_loop::capability::CapabilityTier::Nominal, 99).is_none());
+    assert!(build_fast_verify_reminder(GateMode::Advisory, 0, crate::agent::agent_loop::capability::CapabilityTier::Nominal, 1).is_none());
 }
 
 /// Bounded: once the budget is spent the reminder can never fire again,
 /// however far the edit count runs. Guarantees it can't loop.
 #[test]
 fn fast_verify_nudge_bounded_once() {
-    assert!(build_fast_verify_reminder(GateMode::Advisory, MAX_VERIFY_NUDGES, 10).is_none());
-    assert!(build_fast_verify_reminder(GateMode::Blocking, MAX_VERIFY_NUDGES, 10).is_none());
+    assert!(build_fast_verify_reminder(GateMode::Advisory, MAX_VERIFY_NUDGES, crate::agent::agent_loop::capability::CapabilityTier::Nominal, 10).is_none());
+    assert!(build_fast_verify_reminder(GateMode::Blocking, MAX_VERIFY_NUDGES, crate::agent::agent_loop::capability::CapabilityTier::Nominal, 10).is_none());
 }
 
 // ── harness-notice mirror (dirge-uw2l.7) ────────────────────────────────
@@ -6601,6 +6589,7 @@ fn boundary_emits_at_most_one_nudge() {
         &mut track,
         &mut verify,
         &mut tally,
+        crate::agent::agent_loop::capability::CapabilityTier::Nominal,
     );
     let (_msg, which) = hit.expect("something should fire");
     // Track-work outranks fast-verify and progress.
@@ -6642,6 +6631,7 @@ fn safe_state_outranks_everything_else() {
         &mut track,
         &mut verify,
         &mut tally,
+        crate::agent::agent_loop::capability::CapabilityTier::Nominal,
     );
     let (_m, which) = hit.expect("safe-state fires");
     assert_eq!(which, crate::agent::agent_loop::gate_tally::BoundaryNudge::SafeState);
@@ -6669,6 +6659,7 @@ fn quiet_boundary_emits_nothing() {
         &mut track,
         &mut verify,
         &mut tally,
+        crate::agent::agent_loop::capability::CapabilityTier::Nominal,
     );
     assert!(hit.is_none());
     assert_eq!(track, 0);
@@ -6924,4 +6915,96 @@ async fn blocking_completeness_only_verdict_is_re_judged_on_unchanged_diff() {
         last_findings.is_none(),
         "no diff findings were ever raised, so nothing was there to duplicate"
     );
+}
+
+// ── dirge-5mtx.7: the derivation. Thresholds keyed on the OBSERVED tier. ─────
+//
+// Only Strong changes anything, and only in the direction of LESS
+// intervention. Nominal is the bit-identical default, so an unmeasured or
+// in-range run behaves exactly as before — which matters because a behavioural
+// change cannot be validated against the measured ~2x run-to-run noise floor
+// (dirge-5mtx.6, FM-5). What CAN be asserted is the structural claim these
+// tests make: which way each tier moves, and that the default path is untouched.
+//
+// Struggling is deliberately NOT keyed on here. It sits below the supported
+// capability range and has never been observed firing; wiring a threshold to a
+// state we have never seen is the mistake FM-4 names.
+
+use crate::agent::agent_loop::capability::CapabilityTier;
+
+/// Nominal reproduces today's constant exactly. This is the no-op guarantee
+/// the whole design rests on: a default install is unaffected.
+#[test]
+fn fast_verify_threshold_is_unchanged_at_nominal() {
+    // Three edits is the shipped threshold — fires at 3, not at 2.
+    assert!(!should_nudge_fast_verify(
+        GateMode::Advisory,
+        0,
+        2,
+        CapabilityTier::Nominal
+    ));
+    assert!(should_nudge_fast_verify(
+        GateMode::Advisory,
+        0,
+        3,
+        CapabilityTier::Nominal
+    ));
+}
+
+/// A run with zero observed failures gets more rope before the harness
+/// interrupts it. The direction is the point: extra latitude for a model
+/// demonstrably coping cannot cause a nudge storm, whereas the opposite
+/// direction could.
+#[test]
+fn strong_runs_get_more_latitude_before_the_verify_nudge() {
+    // At the Nominal threshold, Strong is not yet nudged.
+    assert!(should_nudge_fast_verify(
+        GateMode::Advisory,
+        0,
+        3,
+        CapabilityTier::Nominal
+    ));
+    assert!(
+        !should_nudge_fast_verify(GateMode::Advisory, 0, 3, CapabilityTier::Strong),
+        "a run with no observed failures should not be interrupted at the default threshold"
+    );
+    // It still fires eventually — latitude, not exemption.
+    assert!(should_nudge_fast_verify(
+        GateMode::Advisory,
+        0,
+        4,
+        CapabilityTier::Strong
+    ));
+}
+
+/// Off mode stays off at every tier. The tier scales WHEN a gate fires, never
+/// WHETHER an operator disabled it.
+#[test]
+fn tier_never_re_enables_a_disabled_gate() {
+    for tier in [
+        CapabilityTier::Strong,
+        CapabilityTier::Nominal,
+        CapabilityTier::Struggling,
+    ] {
+        assert!(
+            !should_nudge_fast_verify(GateMode::Off, 0, 99, tier),
+            "off must stay off at {tier:?}"
+        );
+    }
+}
+
+/// The budget is still respected at every tier — scaling the threshold must
+/// not become a way around the per-run ceiling.
+#[test]
+fn tier_does_not_bypass_the_nudge_budget() {
+    for tier in [
+        CapabilityTier::Strong,
+        CapabilityTier::Nominal,
+        CapabilityTier::Struggling,
+    ] {
+        assert!(
+            !should_nudge_fast_verify(GateMode::Advisory, MAX_VERIFY_NUDGES, 99, tier),
+            "spent budget must hold at {tier:?}"
+        );
+    }
 }

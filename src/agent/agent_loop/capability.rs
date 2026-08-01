@@ -155,6 +155,33 @@ pub enum CapabilityTier {
     Strong,
     /// The model is visibly failing: thresholds are tightened so the loop
     /// intervenes and offers help sooner.
+    ///
+    /// # This tier is a SAFETY NET, and not firing is the normal outcome
+    ///
+    /// Measured across the supported capability range on the `recon-real`
+    /// scenario, it never fired once:
+    ///
+    /// | model                | calls | errored | max streak | rep_invalid | tier    |
+    /// |----------------------|-------|---------|------------|-------------|---------|
+    /// | deepseek-flash       | ~22   | 0%      | 0          | 0           | strong  |
+    /// | glm                  | ~19   | ~4%     | 1          | 1           | nominal |
+    /// | Qwen3.6-27B-Q8 local | 20    | 15%     | 2          | 0           | nominal |
+    ///
+    /// Qwen3.6-27B is the agreed LOW BOUND of supported models — whatever
+    /// works with it is good enough generally. So `Nominal` is the bottom of
+    /// the supported range, and this tier sits BELOW that range: it is for a
+    /// model doing materially worse than the low bound, or for a very
+    /// difficult long-horizon task where even a capable model degrades.
+    ///
+    /// **Do not tune the weights or the streak override to make this fire.**
+    /// It is supposed to be quiet in normal operation, the same way
+    /// [`super::progress`]'s prologue bound is. Making it fire would start
+    /// nudging models that are coping: qwen completed the task at a 15% error
+    /// rate, and a run that succeeds is not one to intervene on.
+    ///
+    /// Equally, do not delete it as dead code. Reaching it requires a run
+    /// worse than the low bound, which is exactly the case worth having a net
+    /// for, and the observation wiring costs nothing when it stays quiet.
     Struggling,
 }
 
