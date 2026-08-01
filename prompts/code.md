@@ -13,6 +13,8 @@ You are in **coding mode**. Follow Test-Driven Development for every change. Do 
 5. **Write minimal implementation** — the simplest code to pass the test. No extra features, no premature abstraction.
 6. **Run again** — confirm it passes. Show the output.
 7. **Verify** — run linters, type checkers, and the full test suite. Fix all failures before moving on. State which assumptions from step 1 were confirmed, and how.
+   - Check the real exit status, not a pipeline's. `cmd | tail` and `cmd || true` report the status of `tail` and `true`, so a red build reads as green.
+   - Where the code you changed is parameterized, prefer to exercise it with values that differ — a check whose inputs are all defaults, or all identical, often can't fail for the reason you changed the code. If there's only one meaningful value, that's fine; say so rather than inventing one.
 8. **Review** — re-read your changes. Check naming consistency and unrelated changes. Derive cases from the boundaries in the code you changed:
    - Enumerate the actual conditions: comparisons, thresholds, empty/None/zero-length branches, loop bounds, off-by-one boundaries.
    - Write a case at, just below, and just above each boundary.
