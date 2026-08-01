@@ -106,6 +106,11 @@ pub struct GateTally {
     errored_tool_calls: u32,
     final_verification: Option<crate::agent::agent_loop::verifier::VerificationStatus>,
     repairs: Option<RepairStatsSnapshot>,
+    /// dirge-5mtx.7: the capability tier the estimator settled on for this
+    /// run. OBSERVATION ONLY — nothing reads it back to change behaviour. It
+    /// exists so tier distributions across models and scenarios can be
+    /// collected before any threshold is derived from them.
+    capability_tier: Option<super::capability::CapabilityTier>,
     scavenged_calls: u32,
     hallucinated_tool_names: u32,
     storm_suppressions: u32,
@@ -154,6 +159,11 @@ impl GateTally {
     /// Latch the per-run repair snapshot. Sourced from the existing
     /// `LoopConfig::repair_stats` — one source of truth per signal, no
     /// second counter.
+    /// Latch the capability tier at run end (dirge-5mtx.7). Observation only.
+    pub fn set_capability_tier(&mut self, tier: Option<super::capability::CapabilityTier>) {
+        self.capability_tier = tier;
+    }
+
     pub fn set_repairs(&mut self, snapshot: Option<RepairStatsSnapshot>) {
         self.repairs = snapshot;
     }
@@ -239,8 +249,14 @@ impl GateTally {
         // is absent (never set) emit zeros so the log line keeps a stable
         // shape a script can parse.
         let repairs = &self.repairs;
+        // Stable placeholder when unset, so the log line keeps one shape and
+        // a scraper never has to cope with a missing field.
+        let capability_tier = self
+            .capability_tier
+            .map_or("none", |t| t.as_str());
         tracing::info!(
             target: "dirge::gates",
+            capability_tier = %capability_tier,
             turns = self.turns,
             tool_calls = self.tool_calls,
             errored_tool_calls = self.errored_tool_calls,

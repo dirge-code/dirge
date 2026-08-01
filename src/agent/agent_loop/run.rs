@@ -1850,7 +1850,12 @@ pub(crate) fn poll_boundary_nudge(
 /// One-shot run-finish instrumentation: latch the verifier status and
 /// emit the aggregated gate/nudge/capability tally as one `dirge::gates`
 /// event. Observation only — no control-flow effect.
-fn finish_tally(tally: &mut GateTally, config: &LoopConfig) {
+fn finish_tally(
+    tally: &mut GateTally,
+    config: &LoopConfig,
+    capability: &super::capability::CapabilityEstimator,
+) {
+    tally.set_capability_tier(Some(capability.tier()));
     tally.set_verification(
         config
             .verifier
@@ -1928,6 +1933,13 @@ pub async fn run_loop(
     // dirge-5mtx.1: per-run gate/capability tally. Declared before the
     // initial steering poll so both steering-poll sites can record into it.
     let mut tally = GateTally::new();
+    // dirge-5mtx.7: capability estimation, OBSERVATION ONLY. It is fed at each
+    // turn boundary and its tier is latched onto the tally at run end; nothing
+    // reads it back to change behaviour. The point is to collect tier
+    // distributions across models and scenarios BEFORE deriving any threshold
+    // from them — the alternative is picking another constant and calling it
+    // adaptive.
+    let mut capability = super::capability::CapabilityEstimator::new();
 
     // Pi line 167: initial steering poll.
     // Phase 4 part 2: composes with the file-touch tracker's
@@ -2296,7 +2308,7 @@ pub async fn run_loop(
                         tool_results: Vec::new(),
                     })
                     .await;
-                finish_tally(&mut tally, &config);
+                finish_tally(&mut tally, &config, &capability);
                 let _ = emit
                     .send(LoopEvent::AgentEnd {
                         messages: new_messages.clone(),
@@ -2599,6 +2611,23 @@ pub async fn run_loop(
                 }
             }
 
+            // dirge-5mtx.7: feed the capability estimator. Repair counts come
+            // from the per-run RepairStats on the config (the tally latches
+            // that snapshot only at run end), everything else off the tally.
+            {
+                let repairs = config.repair_stats.snapshot();
+                capability.observe(&super::capability::CapabilityCounters {
+                    tool_calls: tally.tool_calls(),
+                    errored_tool_calls: tally.errored_tool_calls(),
+                    repair_invalid: repairs.invalid as u32,
+                    repair_successful: repairs.total_successful() as u32,
+                    hallucinated_tool_names: tally.hallucinated_tool_names(),
+                    storm_suppressions: tally.storm_suppressions(),
+                    scavenged_calls: tally.scavenged_calls(),
+                    max_failure_streak: tally.max_failure_streak(),
+                });
+            }
+
             // dirge-5mtx.2: ONE harness nudge per boundary, chosen by
             // `poll_boundary_nudge` in strict priority. These used to be three
             // independent pushes here plus three more inside the steering poll,
@@ -2876,7 +2905,7 @@ pub async fn run_loop(
                     new_messages: new_messages.clone(),
                 };
                 if hook(hook_ctx).await {
-                    finish_tally(&mut tally, &config);
+                    finish_tally(&mut tally, &config, &capability);
                     let _ = emit
                         .send(LoopEvent::AgentEnd {
                             messages: new_messages.clone(),
@@ -3010,7 +3039,7 @@ pub async fn run_loop(
     }
 
     // Pi line 268: final agent_end.
-    finish_tally(&mut tally, &config);
+    finish_tally(&mut tally, &config, &capability);
     let _ = emit
         .send(LoopEvent::AgentEnd {
             messages: new_messages.clone(),

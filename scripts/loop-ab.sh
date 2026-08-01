@@ -413,6 +413,7 @@ run_arm() { # $1 = overrides, $2 = tag, $3 = model
       rep_invalid="$(get_field repair_invalid "$gates_line")"
       rep_total="$(get_field repair_total_successful "$gates_line")"
       verification="$(get_field final_verification "$gates_line")"
+      captier="$(get_field capability_tier "$gates_line")"
       # MECHANISM CHECK. Without this an A/B cannot distinguish "the change
       # helped" from "the change never fired" — the arms differ in config but
       # nothing confirms the code path under test was reached. Sum of every
@@ -431,31 +432,37 @@ run_arm() { # $1 = overrides, $2 = tag, $3 = model
       tally_found=0
       turns=0; tool_calls_f=0; errored=0; scavenged=0; storm=0
       maxstreak=0; rep_invalid=0; rep_total=0; verification="-"
-      nudge_prologue=0; nudges_total=0
+      nudge_prologue=0; nudges_total=0; captier="-"
     fi
 
     fw="$(first_write "$out")"
     ok="$(check_correct "$out")"
 
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
       "$2" "$3" "$i" "$turns" "$tool_calls_f" "$errored" "$scavenged" "$storm" \
       "$maxstreak" "$rep_invalid" "$rep_total" "$verification" "$fw" "$ok" "$tally_found" \
-      "$nudge_prologue" "$nudges_total" \
+      "$nudge_prologue" "$nudges_total" "$captier" \
       >> "$WORK/results.tsv"
 
     if [ "$tally_found" = 1 ]; then tally_str=found; else tally_str=missing; fi
-    printf '  [%s %s %s/%s] turns=%s tools=%s err=%s scav=%s storm=%s streak=%s rep_inv=%s rep_ok=%s verify=%s first_write=%s correct=%s nudges=%s prologue=%s tally=%s\n' \
+    printf '  [%s %s %s/%s] turns=%s tools=%s err=%s scav=%s storm=%s streak=%s rep_inv=%s rep_ok=%s verify=%s first_write=%s correct=%s nudges=%s prologue=%s tier=%s tally=%s\n' \
       "$2" "$3" "$i" "$REPEATS" "$turns" "$tool_calls_f" "$errored" "$scavenged" "$storm" \
       "$maxstreak" "$rep_invalid" "$rep_total" "$verification" "$fw" "$ok" \
-      "$nudges_total" "$nudge_prologue" "$tally_str"
+      "$nudges_total" "$nudge_prologue" "$captier" "$tally_str"
     if [ "$tally_found" = 0 ]; then
       printf '    ^ no dirge::gates line in %s (harness bug, not a zero tally)\n' "$logfile"
     fi
   done
 }
 
+# Pin the binary. A multi-model A/B runs for many minutes, and a concurrent
+# `cargo build` in the same checkout swaps target/debug/dirge underneath it —
+# arms then silently run against different code, which is a whole class of
+# invalid result that is very hard to spot afterwards. I hit exactly that
+# while verifying this change. Copy once, run the copy.
 # Resolve the binary to an absolute path before we cd into the fixture.
-OLDPWD_BINARY="$(cd "$(dirname "$BINARY")" && pwd)/$(basename "$BINARY")"
+OLDPWD_BINARY="$WORK/dirge-pinned"
+cp "$(cd "$(dirname "$BINARY")" && pwd)/$(basename "$BINARY")" "$OLDPWD_BINARY"
 
 # Model matrix: -m "a,b" runs the full comparison per model; empty means
 # the config's own provider, single model.
@@ -489,6 +496,7 @@ done
 # total is reported without a directional claim (more repairs is not
 # clearly good or bad). A missing tally anywhere is surfaced, never hidden.
 awk -F'\t' '
+BEGIN { tiercols["struggling"]=1; tiercols["nominal"]=1; tiercols["strong"]=1 }
 {
   key = $1 SUBSEP $2
   if (!(key in seen)) {
@@ -518,6 +526,7 @@ awk -F'\t' '
   if ($13 == "-") never[key]++
   ok[key] += $14
   tallyfound[key] += $15
+  if ($18 != "" && $18 != "-") tiers[key,$18]++
   if ($15 == 0) missing[key]++
   green[key] += ($12 == "VerifiedGreen")
 }
@@ -543,6 +552,16 @@ function dir3(c, t, lower_is_better, eps, noise,    d) {
 # The control arm observed spread for a column: the smallest effect this
 # sample size could honestly distinguish from chance.
 function noisefloor(ck, c) { return mx[ck,c] - mn[ck,c] }
+# dirge-5mtx.7 is observation-only, so the tier is REPORTED, never scored.
+# Collecting how it distributes across models and scenarios is the whole
+# point of wiring it before deriving any threshold from it.
+function tierdist(key,    out, t) {
+  out = ""
+  for (t in tiercols) {
+    if (tiers[key,t] > 0) out = out (out == "" ? "" : " ") t ":" tiers[key,t]
+  }
+  return out == "" ? "-" : out
+}
 function rate(key,    k) {
   k = key SUBSEP "ok"
   return n[key] ? sprintf("%d/%d (%.0f%%)", ok[key], n[key], 100 * ok[key] / n[key]) : "-"
@@ -585,6 +604,7 @@ END {
     row("green_rate", sprintf("%d/%d (%.0f%%)", green[ck], n[ck], 100 * green[ck] / n[ck]),
         sprintf("%d/%d (%.0f%%)", green[tk], n[tk], 100 * green[tk] / n[tk]),
         dir3(green[ck] / n[ck], green[tk] / n[tk], 0, 0.05, 0))
+    row("capability_tier", tierdist(ck), tierdist(tk), "observed")
     row("tally_found", sprintf("%d/%d", tallyfound[ck], n[ck]), sprintf("%d/%d", tallyfound[tk], n[tk]), "must be full")
     printf "\n"
   }

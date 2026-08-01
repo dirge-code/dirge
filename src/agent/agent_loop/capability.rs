@@ -160,6 +160,17 @@ pub enum CapabilityTier {
 
 #[allow(dead_code)] // pending dirge-5mtx.7 loop-control wiring
 impl CapabilityTier {
+    /// Stable lowercase wire name, for the `dirge::gates` telemetry line and
+    /// anything scraping it. Kept stable across refactors — the A/B harness
+    /// keys on these strings.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CapabilityTier::Struggling => "struggling",
+            CapabilityTier::Nominal => "nominal",
+            CapabilityTier::Strong => "strong",
+        }
+    }
+
     /// Scale a THRESHOLD — "intervene after N". Lower means sooner.
     ///
     /// `Nominal` returns `base` bit-identically (the no-op path). `Strong`
