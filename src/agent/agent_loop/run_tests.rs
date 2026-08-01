@@ -6532,3 +6532,144 @@ fn safe_state_repo_falls_back_to_cwd_in_production() {
         "an explicit override still wins"
     );
 }
+
+// ---------------------------------------------------------------------------
+// dirge-5mtx.2 — the mid-turn boundary arbiter.
+//
+// The finalization boundary has emitted at most one gate per pass since
+// dirge-vcsn. The mid-turn boundary did not: track-work, fast-verify, the
+// progress signal, the file-touch reminder and the safe-state/reflection
+// rungs each pushed independently, so up to five harness messages could land
+// before a single assistant turn.
+// ---------------------------------------------------------------------------
+
+/// Guards with both engines effectively disarmed, so a test can trip exactly
+/// the nudges it means to.
+fn quiet_guards() -> crate::agent::agent_loop::activity::LoopGuards {
+    crate::agent::agent_loop::activity::LoopGuards::new(
+        crate::agent::agent_loop::storm::StormBreaker::new(99, 99, None, None),
+        crate::agent::agent_loop::failure_tracker::FailureTracker::new(99),
+    )
+}
+
+/// Several nudges eligible at once → exactly ONE message, and it is the
+/// highest-priority one. Before the arbiter these stacked.
+#[test]
+fn boundary_emits_at_most_one_nudge() {
+    let mut cfg = build_config();
+    cfg.session_id = Some("s1".into());
+    cfg.verification_tiers_mode = GateMode::Advisory;
+    // Verifier with edits and nothing run → fast-verify is eligible.
+    let verifier = crate::agent::agent_loop::verifier::VerifierGate::new();
+    for i in 0..5 {
+        verifier.record_outcome(
+            "edit",
+            &serde_json::json!({ "path": format!("src/f{i}.rs") }),
+            &crate::agent::agent_loop::result::LoopToolResult {
+                content: vec![serde_json::json!({"type":"text","text":"ok"})],
+                details: serde_json::json!(null),
+                terminate: None,
+            },
+            false,
+        );
+    }
+    cfg.verifier = Some(verifier);
+    // Progress monitor primed to be barren.
+    cfg.progress = Some(crate::agent::agent_loop::progress::ProgressTracker::new(2, 2));
+
+    let guards = quiet_guards();
+    let mut tally = crate::agent::agent_loop::gate_tally::GateTally::new();
+    let mut track = 0u8;
+    let mut verify = 0u8;
+    // An edit this turn makes the track-work nudge eligible too.
+    let msgs = vec![LoopMessage::Assistant(AssistantMessage::new(
+        vec![ContentBlock::ToolCall {
+            id: "c1".into(),
+            name: "edit".into(),
+            arguments: serde_json::json!({"path": "src/f0.rs"}),
+        }],
+        StopReason::Stop,
+    ))];
+
+    let hit = crate::agent::agent_loop::run::poll_boundary_nudge(
+        &cfg,
+        &guards,
+        None,
+        &msgs,
+        1,
+        &mut track,
+        &mut verify,
+        &mut tally,
+    );
+    let (_msg, which) = hit.expect("something should fire");
+    // Track-work outranks fast-verify and progress.
+    assert_eq!(which, crate::agent::agent_loop::gate_tally::BoundaryNudge::TrackWork);
+    // Exactly one nudge recorded across every variant.
+    let total: u32 = [
+        crate::agent::agent_loop::gate_tally::BoundaryNudge::TrackWork,
+        crate::agent::agent_loop::gate_tally::BoundaryNudge::FastVerify,
+        crate::agent::agent_loop::gate_tally::BoundaryNudge::FileTouch,
+        crate::agent::agent_loop::gate_tally::BoundaryNudge::ProgressStall,
+        crate::agent::agent_loop::gate_tally::BoundaryNudge::ProgressPrologue,
+        crate::agent::agent_loop::gate_tally::BoundaryNudge::ProgressBudget,
+        crate::agent::agent_loop::gate_tally::BoundaryNudge::SafeState,
+        crate::agent::agent_loop::gate_tally::BoundaryNudge::ReflectionCheckpoint,
+    ]
+    .iter()
+    .map(|n| tally.nudge_count(*n))
+    .sum();
+    assert_eq!(total, 1, "exactly one nudge per boundary");
+}
+
+/// Safe-state (EXEC rung 3) supersedes the recovery checkpoint it replaces.
+/// This used to be a hand-written special case; it is now just precedence.
+#[test]
+fn safe_state_outranks_everything_else() {
+    let mut cfg = build_config();
+    cfg.session_id = Some("s1".into());
+    let guards = quiet_guards();
+    let mut tally = crate::agent::agent_loop::gate_tally::GateTally::new();
+    let mut track = 0u8;
+    let mut verify = 0u8;
+
+    let hit = crate::agent::agent_loop::run::poll_boundary_nudge(
+        &cfg,
+        &guards,
+        Some("abort and re-plan".into()),
+        &[],
+        1,
+        &mut track,
+        &mut verify,
+        &mut tally,
+    );
+    let (_m, which) = hit.expect("safe-state fires");
+    assert_eq!(which, crate::agent::agent_loop::gate_tally::BoundaryNudge::SafeState);
+    assert_eq!(
+        tally.nudge_count(crate::agent::agent_loop::gate_tally::BoundaryNudge::ReflectionCheckpoint),
+        0,
+        "rung 3 replaces rung 2, never adds to it"
+    );
+}
+
+/// Nothing eligible → no message, and no budget spent.
+#[test]
+fn quiet_boundary_emits_nothing() {
+    let cfg = build_config();
+    let guards = quiet_guards();
+    let mut tally = crate::agent::agent_loop::gate_tally::GateTally::new();
+    let mut track = 0u8;
+    let mut verify = 0u8;
+    let hit = crate::agent::agent_loop::run::poll_boundary_nudge(
+        &cfg,
+        &guards,
+        None,
+        &[],
+        1,
+        &mut track,
+        &mut verify,
+        &mut tally,
+    );
+    assert!(hit.is_none());
+    assert_eq!(track, 0);
+    assert_eq!(verify, 0);
+}

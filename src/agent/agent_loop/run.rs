@@ -58,55 +58,24 @@ use super::gate_tally::{BoundaryNudge, GateSource, GateTally};
 use super::verifier::VERIFY_TAG;
 use crate::sync_util::LockExt;
 
-/// Phase 4 part 2: poll the configured `get_steering_messages`
-/// hook AND the file-touch tracker (when present), concatenating
-/// their outputs. The tracker reminder follows any queued steering
-/// messages so the user's explicit guidance is observed first.
+/// Poll the user's steering queue. USER INPUT ONLY.
 ///
-/// Kept as a free fn so the inner/outer steering-poll sites stay
-/// terse. Returns an empty Vec when neither source has anything to
-/// inject — preserves the legacy fast path byte-for-byte.
-/// Returns the polled messages plus whether any came from genuine USER
-/// steering (the interjection queue) — the file-touch reminder doesn't
-/// count. The bool drives the turn-budget reset (dirge-st8r): active human
-/// steering gets a fresh budget; ambient reminders do not.
-async fn poll_steering_and_reminder(
-    config: &LoopConfig,
-    guards: &super::activity::LoopGuards,
-    safe_state_msg: Option<String>,
-    tally: &mut GateTally,
-) -> (Vec<LoopMessage>, bool) {
-    let mut out = match &config.get_steering_messages {
+/// Until dirge-5mtx.2 this also produced the file-touch reminder and the
+/// safe-state / recovery checkpoint, which is how those three came to stack
+/// with the three nudges emitted earlier in the same iteration. They are
+/// harness nudges and now go through [`poll_boundary_nudge`], which picks at
+/// most one. Steering is not a nudge — it is the human talking — so it keeps
+/// its own path and is never suppressed by an arbiter.
+///
+/// The bool reports whether anything came from genuine user steering; it
+/// drives the turn-budget reset (dirge-st8r). Ambient harness reminders never
+/// reset the budget, which is why they must not flow through here.
+async fn poll_steering(config: &LoopConfig) -> (Vec<LoopMessage>, bool) {
+    let out = match &config.get_steering_messages {
         Some(get) => get().await,
         None => Vec::new(),
     };
     let had_user_steering = !out.is_empty();
-    if let Some(tracker) = &config.file_touch_tracker {
-        let reminder = tracker.poll_reminder();
-        if !reminder.is_empty() {
-            tally.record_nudge(BoundaryNudge::FileTouch);
-        }
-        out.extend(reminder);
-    }
-    // dirge-uw2l.4: the safe-state rung REPLACES (does not add to) the rung-2
-    // recovery checkpoint on a boundary it fires — emitting both would tell
-    // the model to both "diagnose and retry" (rung 2) and "abort and re-plan"
-    // (rung 3), which are contradictory. When safe-state declines, or when it
-    // is off (the default), the regular checkpoint runs exactly as before, so
-    // off-mode is byte-identical.
-    if let Some(msg) = safe_state_msg {
-        tally.record_nudge(BoundaryNudge::SafeState);
-        out.push(LoopMessage::User(super::message::UserMessage::text(msg)));
-    } else {
-        // Cross-turn recovery checkpoint: fired when consecutive *distinct*
-        // tool errors pile up (storm only catches identical repeats). Follows
-        // any user steering so the human's guidance is read first.
-        let checkpoint = guards.poll_reflection();
-        if !checkpoint.is_empty() {
-            tally.record_nudge(BoundaryNudge::ReflectionCheckpoint);
-        }
-        out.extend(checkpoint);
-    }
     (out, had_user_steering)
 }
 
@@ -1743,6 +1712,141 @@ pub async fn run_agent_loop(
     .await
 }
 
+/// The mid-turn boundary arbiter: at most ONE harness nudge per boundary
+/// [dirge-5mtx.2].
+///
+/// The finalization boundary has had this discipline since dirge-vcsn —
+/// [`poll_finalization_follow_up`] polls its gates in strict priority and
+/// returns the first non-empty source. The mid-turn boundary never got it:
+/// track-work, fast-verify, the progress signal, the file-touch reminder and
+/// the safe-state/reflection rungs each pushed independently, so up to five
+/// harness messages could land before one assistant turn. The only mutual
+/// exclusions were two hand-written special cases, and the priority reasoning
+/// was written in a comment ("runs LAST ... shouldn't pre-empt them") while
+/// the code emitted everything anyway.
+///
+/// Priority runs most-specific first. A safe-state abort supersedes the
+/// recovery checkpoint it replaces (telling the model to both retry and abort
+/// is contradictory — the exclusion that used to be special-cased is now just
+/// ordering). Progress is last because a stall diagnosis is the broadest thing
+/// we can say, and saying it over a concrete instruction is noise.
+///
+/// ONE WART, deliberate. `ProgressTracker::record_turn` both advances the
+/// barren-boundary counters AND returns the message, so it must be called on
+/// every boundary or the stall and prologue signals freeze — it cannot be
+/// short-circuited by a higher-priority winner. When something outranks it,
+/// its message is dropped and that nudge's budget is spent on nothing. The
+/// cost is bounded (MAX_STALL_NUDGES is 2, MAX_PROLOGUE_NUDGES is 1) and only
+/// applies on a boundary where the model already received something more
+/// specific. Splitting `record_turn` into advance-then-peek would remove it;
+/// that is a change to progress.rs's contract and is left for dirge-5mtx.7,
+/// which reworks these budgets anyway.
+///
+/// `poll_budget` is NOT called when something else wins: it consumes a budget
+/// mark, and unlike `record_turn` it has no state to advance, so skipping it
+/// preserves the mark for a later boundary.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn poll_boundary_nudge(
+    config: &LoopConfig,
+    guards: &super::activity::LoopGuards,
+    safe_state_msg: Option<String>,
+    new_messages: &[LoopMessage],
+    turns_taken: usize,
+    track_nudges: &mut u8,
+    verify_nudges: &mut u8,
+    tally: &mut GateTally,
+) -> Option<(LoopMessage, BoundaryNudge)> {
+    // Unconditional: the progress counters must advance every boundary.
+    let progress_signal = config.progress.as_ref().and_then(|progress| {
+        let snapshot = super::progress::ProgressSnapshot {
+            todos_unfinished: crate::agent::tools::todo::unfinished_count(),
+            files_touched: crate::agent::tools::modified::count(),
+            // Deliberately the LATCHED green (`GateMode::Off`), not the
+            // tier-aware one. Staleness (dirge-uw2l.3) flips a tiered status
+            // back to Unverified on every post-green edit, so reading it here
+            // would manufacture a fresh false→true edge on each edit→test
+            // cycle and reset the stall counter forever — silently disabling
+            // the monitor for green-but-not-converging runs, the exact case it
+            // exists to catch. Staleness answers "verify again?"; progress
+            // answers "did this run reach a new state?".
+            verified_green: matches!(
+                config.verifier.as_ref().map(|v| v.status(GateMode::Off)),
+                Some(super::verifier::VerificationStatus::VerifiedGreen)
+            ),
+            // dirge-t5dh: the prologue bound also watches tool calls, since a
+            // turn batching forty reads is one boundary but forty calls.
+            tool_calls: tally.tool_calls() as usize,
+        };
+        progress.record_turn(snapshot)
+    });
+
+    // 1. Safe-state abort (EXEC rung 3) — supersedes the rung-2 checkpoint.
+    if let Some(msg) = safe_state_msg {
+        tally.record_nudge(BoundaryNudge::SafeState);
+        return Some((
+            LoopMessage::User(super::message::UserMessage::text(msg)),
+            BoundaryNudge::SafeState,
+        ));
+    }
+    // 2. Cross-turn recovery checkpoint (rung 2) — distinct tool errors piling
+    //    up, which storm's identical-repeat rule never sees.
+    if let Some(msg) = guards.poll_reflection().into_iter().next() {
+        tally.record_nudge(BoundaryNudge::ReflectionCheckpoint);
+        return Some((msg, BoundaryNudge::ReflectionCheckpoint));
+    }
+    // 3. Work tracking — edits with nothing on the board.
+    if let Some(reminder) = build_early_track_work_reminder(
+        config.session_id.as_deref(),
+        *track_nudges,
+        crate::agent::tools::todo::unfinished_count(),
+        turn_made_file_edits(new_messages),
+    ) {
+        *track_nudges += 1;
+        tally.record_nudge(BoundaryNudge::TrackWork);
+        return Some((reminder, BoundaryNudge::TrackWork));
+    }
+    // 4. Fast verify — edits piling up with nothing run since.
+    if let Some(reminder) = build_fast_verify_reminder(
+        config.verification_tiers_mode,
+        *verify_nudges,
+        config
+            .verifier
+            .as_ref()
+            .map_or(0, |v| v.edits_since_verify()),
+    ) {
+        *verify_nudges += 1;
+        tally.record_nudge(BoundaryNudge::FastVerify);
+        return Some((reminder, BoundaryNudge::FastVerify));
+    }
+    // 5. File-touch — the same file re-edited over and over.
+    if let Some(tracker) = &config.file_touch_tracker
+        && let Some(reminder) = tracker.poll_reminder().into_iter().next()
+    {
+        tally.record_nudge(BoundaryNudge::FileTouch);
+        return Some((reminder, BoundaryNudge::FileTouch));
+    }
+    // 6. Progress — broadest, so last. Prologue and stall are mutually
+    //    exclusive inside the tracker (unarmed vs armed).
+    if let Some(msg) = progress_signal {
+        let which = if super::progress::is_prologue_checkpoint(&msg) {
+            BoundaryNudge::ProgressPrologue
+        } else {
+            BoundaryNudge::ProgressStall
+        };
+        tally.record_nudge(which);
+        return Some((msg, which));
+    }
+    // 7. Budget countdown. Only polled when nothing else fired, so an unused
+    //    mark survives to a later boundary.
+    if let Some(progress) = config.progress.as_ref()
+        && let Some(msg) = progress.poll_budget(turns_taken, config.max_turns.unwrap_or(0))
+    {
+        tally.record_nudge(BoundaryNudge::ProgressBudget);
+        return Some((msg, BoundaryNudge::ProgressBudget));
+    }
+    None
+}
+
 /// One-shot run-finish instrumentation: latch the verifier status and
 /// emit the aggregated gate/nudge/capability tally as one `dirge::gates`
 /// event. Observation only — no control-flow effect.
@@ -1829,10 +1933,8 @@ pub async fn run_loop(
     // Phase 4 part 2: composes with the file-touch tracker's
     // reminder poll when configured.
     let (mut pending_messages, _initial_user_steering): (Vec<LoopMessage>, bool) =
-        // The initial poll runs before any results, so there is nothing for
-        // the safe-state rung to decide yet — None falls through to
-        // poll_reflection unchanged.
-        poll_steering_and_reminder(&config, &guards, None, &mut tally).await;
+        // The initial poll runs before any results — user steering only.
+        poll_steering(&config).await;
 
     // dirge-nqr: count assistant turns so a hard cap can stop a
     // runaway run. `max_turns = None` means unlimited (legacy).
@@ -2497,98 +2599,58 @@ pub async fn run_loop(
                 }
             }
 
-            // dirge-track v2: early model-facing nudge when the model
-            // edited files without an active todo — fires at most once
-            // per run (shares the one-shot budget with the finalization
-            // advisory).
-            if let Some(reminder) = build_early_track_work_reminder(
-                config.session_id.as_deref(),
-                track_nudges,
-                crate::agent::tools::todo::unfinished_count(),
-                turn_made_file_edits(&new_messages),
-            ) {
-                tally.record_nudge(BoundaryNudge::TrackWork);
-                track_nudges += 1;
-                emit_harness_notices(emit, std::slice::from_ref(&reminder)).await;
-                current_context
-                    .messages
-                    .push(loop_message_to_value(&reminder));
-                new_messages.push(reminder);
-            }
-
-            // dirge-uw2l.2: mid-run fast-check reminder — edits piling up
-            // with nothing run since. One-shot per run; follows the track
-            // nudge so work-tracking guidance lands first.
-            if let Some(reminder) = build_fast_verify_reminder(
-                config.verification_tiers_mode,
-                verify_nudges,
-                config
-                    .verifier
-                    .as_ref()
-                    .map_or(0, |v| v.edits_since_verify()),
-            ) {
-                tally.record_nudge(BoundaryNudge::FastVerify);
-                verify_nudges += 1;
-                emit_harness_notices(emit, std::slice::from_ref(&reminder)).await;
-                current_context
-                    .messages
-                    .push(loop_message_to_value(&reminder));
-                new_messages.push(reminder);
-            }
-
-            // dirge-uw2l.3: progress monitor. Runs LAST of the boundary
-            // nudges so the cheaper, more specific ones (track work, fast
-            // verify) get first say — a stall checkpoint is the broadest
-            // message of the three and shouldn't pre-empt them. At most one
-            // of stall/budget is injected per boundary, stall first: a run
-            // that is both stalled and near its cap needs the diagnosis
-            // before the countdown.
-            if let Some(progress) = config.progress.as_ref() {
-                let snapshot = super::progress::ProgressSnapshot {
-                    todos_unfinished: crate::agent::tools::todo::unfinished_count(),
-                    files_touched: crate::agent::tools::modified::count(),
-                    // Deliberately the LATCHED green (`GateMode::Off`), not
-                    // the tier-aware one. Staleness (dirge-uw2l.3) flips a
-                    // tiered status back to Unverified on every post-green
-                    // edit, so reading it here would manufacture a fresh
-                    // false→true edge on each edit→test cycle and reset the
-                    // stall counter forever — silently disabling the monitor
-                    // for green-but-not-converging runs, the exact case it
-                    // exists to catch. Staleness answers "verify again?";
-                    // progress answers "did this run reach a new state?".
-                    // Off-mode status still flips red→green, so fixing a red
-                    // build correctly counts as progress.
-                    verified_green: matches!(
-                        config.verifier.as_ref().map(|v| v.status(GateMode::Off)),
-                        Some(super::verifier::VerificationStatus::VerifiedGreen)
-                    ),
-                    // dirge-t5dh: the prologue bound also watches tool calls,
-                    // since a turn batching forty reads is one boundary but
-                    // forty calls. The tally already counts them for the run.
-                    tool_calls: tally.tool_calls() as usize,
-                };
-                let signal = if let Some(m) = progress.record_turn(snapshot) {
-                    // record_turn returns either a stall checkpoint or a
-                    // prologue one; the tag is the only difference.
-                    if super::progress::is_prologue_checkpoint(&m) {
-                        tally.record_nudge(BoundaryNudge::ProgressPrologue);
-                    } else {
-                        tally.record_nudge(BoundaryNudge::ProgressStall);
-                    }
-                    Some(m)
-                } else if let Some(m) =
-                    progress.poll_budget(turns_taken, config.max_turns.unwrap_or(0))
+            // dirge-5mtx.2: ONE harness nudge per boundary, chosen by
+            // `poll_boundary_nudge` in strict priority. These used to be three
+            // independent pushes here plus three more inside the steering poll,
+            // so up to five could stack before a single assistant turn.
+            //
+            // The safe-state decision is computed here (it was at the steering
+            // poll) because the arbiter ranks it against the checkpoint it
+            // supersedes. Every input it reads — the guards, the verifier, the
+            // reflexion log — is already current at this point: tool results
+            // were recorded above.
+            let safe_state_msg = if config.safe_state_abort_mode != super::types::SafeStateMode::Off
+            {
+                let excerpts = guards.recent_excerpts();
+                let fresh_green = config.verifier.as_ref().is_some_and(|v| v.is_fresh_green());
+                if fresh_green && config.safe_state_abort_mode == super::types::SafeStateMode::Auto
                 {
-                    tally.record_nudge(BoundaryNudge::ProgressBudget);
-                    Some(m)
-                } else {
-                    None
-                };
-                if let Some(msg) = signal {
-                    emit_harness_notices(emit, std::slice::from_ref(&msg)).await;
-                    current_context.messages.push(loop_message_to_value(&msg));
-                    new_messages.push(msg);
+                    let fp = safe_state_repo(&config)
+                        .as_deref()
+                        .and_then(super::worktree_probe::fingerprint);
+                    safe_state.set_green_fingerprint(fp);
                 }
+                let green_fp = safe_state.green_fingerprint().cloned();
+                let repo = safe_state_repo(&config);
+                safe_state.decide(
+                    config.safe_state_abort_mode,
+                    fresh_green,
+                    guards.safe_state_due(),
+                    config
+                        .verifier
+                        .as_ref()
+                        .map_or(0, |v| v.edits_since_verify()),
+                    crate::agent::tools::snapshots::current_turn_id().as_deref(),
+                    &reflections,
+                    &excerpts,
+                    |green| coverage_verified_restore(repo.as_deref(), green_fp.as_ref(), green),
+                )
+            } else {
+                None
+            };
+            if let Some((msg, _which)) = poll_boundary_nudge(
+                &config,
+                &guards,
+                safe_state_msg,
+                &new_messages,
+                turns_taken,
+                &mut track_nudges,
+                &mut verify_nudges,
+                &mut tally,
+            ) {
+                emit_harness_notices(emit, std::slice::from_ref(&msg)).await;
+                current_context.messages.push(loop_message_to_value(&msg));
+                new_messages.push(msg);
             }
 
             // Pi line 218: turn_end.
@@ -2824,46 +2886,10 @@ pub async fn run_loop(
                 }
             }
 
-            // Pi line 253: refresh steering for next iteration.
-            // Phase 4 part 2: also polls the file-touch tracker.
-            // dirge-uw2l.4: ask the safe-state engine whether this boundary
-            // should replace the rung-2 checkpoint with a re-plan. Off (the
-            // default) computes None and the checkpoint runs as before.
-            let safe_state_msg = if config.safe_state_abort_mode != super::types::SafeStateMode::Off
-            {
-                let excerpts = guards.recent_excerpts();
-                let fresh_green = config.verifier.as_ref().is_some_and(|v| v.is_fresh_green());
-                // dirge-uw2l.6: stamp the working-tree fingerprint at the same
-                // instant as the green marker, so the two always describe one
-                // moment. Auto only — Advisory never restores, so it must not
-                // pay a `git status` on every green turn.
-                if fresh_green && config.safe_state_abort_mode == super::types::SafeStateMode::Auto
-                {
-                    let fp = safe_state_repo(&config)
-                        .as_deref()
-                        .and_then(super::worktree_probe::fingerprint);
-                    safe_state.set_green_fingerprint(fp);
-                }
-                let green_fp = safe_state.green_fingerprint().cloned();
-                let repo = safe_state_repo(&config);
-                safe_state.decide(
-                    config.safe_state_abort_mode,
-                    fresh_green,
-                    guards.safe_state_due(),
-                    config
-                        .verifier
-                        .as_ref()
-                        .map_or(0, |v| v.edits_since_verify()),
-                    crate::agent::tools::snapshots::current_turn_id().as_deref(),
-                    &reflections,
-                    &excerpts,
-                    |green| coverage_verified_restore(repo.as_deref(), green_fp.as_ref(), green),
-                )
-            } else {
-                None
-            };
-            let (next_pending, had_user_steering) =
-                poll_steering_and_reminder(&config, &guards, safe_state_msg, &mut tally).await;
+            // Pi line 253: refresh steering for the next iteration. User
+            // input only — the safe-state decision and every other harness
+            // nudge are chosen by `poll_boundary_nudge` above (dirge-5mtx.2).
+            let (next_pending, had_user_steering) = poll_steering(&config).await;
             pending_messages = next_pending;
             // dirge-uw2l.7: surface harness steers to headless consumers.
             emit_harness_notices(emit, &pending_messages).await;
