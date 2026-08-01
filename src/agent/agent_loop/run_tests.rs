@@ -6508,3 +6508,27 @@ mod auto_restore_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+/// dirge-uw2l.6: `code_review_repo` is a TEST-ONLY override — production
+/// leaves it None and means "the process CWD" (the same convention the
+/// code-review diff capture follows). Reading the field directly would give
+/// the safe-state coverage check no repo in every real session, so auto
+/// would silently decline forever and read as a feature that never fires.
+#[test]
+fn safe_state_repo_falls_back_to_cwd_in_production() {
+    let mut cfg = build_config();
+    cfg.code_review_repo = None;
+    assert_eq!(
+        safe_state_repo(&cfg),
+        std::env::current_dir().ok(),
+        "production (None) must resolve to the CWD, not to no-repo"
+    );
+
+    let explicit = std::path::PathBuf::from("/tmp/some-repo");
+    cfg.code_review_repo = Some(explicit.clone());
+    assert_eq!(
+        safe_state_repo(&cfg),
+        Some(explicit),
+        "an explicit override still wins"
+    );
+}

@@ -99,6 +99,21 @@ async fn poll_steering_and_reminder(
     (out, had_user_steering)
 }
 
+/// The repo the safe-state coverage check runs against (dirge-uw2l.6).
+///
+/// `code_review_repo` is an explicit override that only tests set; in
+/// production it is `None` and the intended root is the process CWD — the
+/// same fallback the code-review diff capture uses (run.rs, dirge-9b2k).
+/// Reading the field directly without this fallback would leave auto with
+/// no repo in every real session, so it would silently decline forever and
+/// look like a feature that simply never fires.
+fn safe_state_repo(config: &LoopConfig) -> Option<std::path::PathBuf> {
+    config
+        .code_review_repo
+        .clone()
+        .or_else(|| std::env::current_dir().ok())
+}
+
 /// Restore the tree to its last verified-green state — but ONLY after
 /// proving the snapshot store can put back everything that changed
 /// (dirge-uw2l.6). Returns the number of files restored, or `None` when it
@@ -2746,14 +2761,13 @@ pub async fn run_loop(
                 // pay a `git status` on every green turn.
                 if fresh_green && config.safe_state_abort_mode == super::types::SafeStateMode::Auto
                 {
-                    let fp = config
-                        .code_review_repo
+                    let fp = safe_state_repo(&config)
                         .as_deref()
                         .and_then(super::worktree_probe::fingerprint);
                     safe_state.set_green_fingerprint(fp);
                 }
                 let green_fp = safe_state.green_fingerprint().cloned();
-                let repo = config.code_review_repo.clone();
+                let repo = safe_state_repo(&config);
                 safe_state.decide(
                     config.safe_state_abort_mode,
                     fresh_green,
