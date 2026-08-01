@@ -4,6 +4,51 @@ All notable changes to dirge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.21.1] - 2026-08-01
+
+### Fixed
+- **A capability signal never reached the estimator.**
+  `record_hallucinated_tool_name` had zero production callers — its only caller
+  was a unit test invoking the recorder directly, so it passed while the counter
+  sat at 0 in every real run. A weighted input the estimator could never see,
+  and undetectable, because a counter reading zero looks identical to the
+  behaviour never happening. A hallucinated call now counts as both errored and
+  hallucinated, matching how `repair_invalid` already stacks; with the current
+  weights that orders the failure kinds — plain error 1, invented tool name 3,
+  unrepairable arguments 5.
+
+### Changed
+- **The capability tier may add support, never remove it** (dirge-5mtx.7).
+  `Strong` now scales identically to `Nominal`, and the
+  `FAST_VERIFY_EDIT_THRESHOLD` derivation it drove is removed; only `Struggling`
+  moves a threshold or a budget. `CapabilityCounters` observes tool-call
+  mechanics only — errored calls, repaired arguments, invented names, scavenged
+  text, storms, streaks — and nothing in that set changes based on whether the
+  model verifies its work or makes progress. So a `Strong` reading is evidence
+  about argument hygiene and cannot license relaxing a progress or verification
+  guard. Both failures this work exists because of came from models the
+  estimator reads as `Strong`: the 60-turn reconnaissance thrash was
+  deepseek-flash at a 0% tool-call error rate. Defaults are untouched —
+  `Nominal` and `Strong` are both bit-identical to the pre-estimator constants.
+
+  The audit behind it, recorded in
+  [docs/verification-discipline.md](docs/verification-discipline.md): of 13
+  capability-tuned constants, two are structural no-ops (budgets of exactly 1,
+  where the floor eats the scaling), two are cost ceilings that must not scale
+  up, one is a category error (network retry budgets are not a model property),
+  and one is inert where it is consumed.
+
+### Internal
+- **A test raced a Janet VM against a wall clock** and flaked twice on loaded
+  CI. The timeout extension only engages if a dialog is already in flight when
+  the base budget expires, so the test required the worker to cold-start and
+  reach `harness/confirm` inside that budget — scheduler-dependent latency with
+  no upper bound, which no choice of budget fixes. The decision is now a pure
+  function with an exhaustive truth table, and the part that genuinely needs a
+  worker is checked by sampling the in-flight flag when the dialog request is
+  received, which is clock-free. Verified by mutation rather than by a green
+  run.
+
 ## [0.21.0] - 2026-08-01
 
 ### Added
