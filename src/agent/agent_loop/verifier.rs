@@ -258,9 +258,22 @@ impl VerifierGate {
             "bash" => {
                 let command = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
                 if is_verification_command(command) {
-                    inner.ran_verification = true;
                     // Latest outcome wins.
                     let failed = is_error || result_indicates_failure(result);
+                    // A masked command whose reported status is SUCCESS proves
+                    // nothing: the zero belongs to `tail`, or to `true`, or to
+                    // the `echo` after the semicolon. Decline to record it at
+                    // all, so the status stays Unverified and the gate asks
+                    // again — "we don't know" is the honest answer, and it
+                    // fails toward nagging rather than toward a false green.
+                    //
+                    // A masked command that still reports FAILURE is
+                    // trustworthy in that direction: something in the chain
+                    // genuinely failed. Record the red.
+                    if masks_failure(command) && !failed {
+                        return;
+                    }
+                    inner.ran_verification = true;
                     inner.verification_failed = failed;
                     // Any verification attempt clears the mid-run counter —
                     // the model did go and check, whatever the outcome.
@@ -510,6 +523,66 @@ pub fn ci_hint(commands: &[String]) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!(" This project's CI runs: {list} — a green check that isn't one of those may not be what gets enforced.")
+}
+
+
+/// Does this command's shell shape MASK a non-zero exit from the verification
+/// step, so a reported success proves nothing?
+///
+/// The verifier reads pass/fail from bash's `Exit code: N` line, which carries
+/// the exit status of the whole command. Several ordinary shapes make that
+/// status belong to something other than the check:
+///
+/// - `cargo clippy | tail -2` — the status is `tail`'s. Without `pipefail` a
+///   red build exits 0.
+/// - `cargo test || true` — explicitly discards the failure.
+/// - `cargo test; echo done` — the status is `echo`'s.
+/// - `cargo test &` — backgrounded; nothing is waited on.
+///
+/// `&&` is NOT masking: it short-circuits, so a failing left side is the exit
+/// status. Redirections like `2>&1` contain no pipe.
+///
+/// This exists because it is the exact failure that kept recurring while
+/// building this epic: an agent ran `cargo clippy --all-targets | tail -2`,
+/// read `$?`, saw zero, and reported success over six hard errors. The verifier
+/// would have believed it too — measured, `cargo test || true` latched
+/// VerifiedGreen. A gate that cannot fail for the reason that matters is worse
+/// than no gate, because it is trusted.
+fn masks_failure(command: &str) -> bool {
+    let bytes = command.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'|' => {
+                // `||` discards a failure; a lone `|` hands the status to the
+                // next stage. Both mask.
+                return true;
+            }
+            b';' => {
+                // Only masks when something follows — a trailing `;` does not.
+                if command[i + 1..].trim().is_empty() {
+                    return false;
+                }
+                return true;
+            }
+            b'&' => {
+                // `&&` is fine (short-circuits); a lone `&` backgrounds.
+                if bytes.get(i + 1) == Some(&b'&') {
+                    i += 2;
+                    continue;
+                }
+                // `2>&1` and friends: `&` preceded by `>` is a redirection.
+                if i > 0 && bytes[i - 1] == b'>' {
+                    i += 1;
+                    continue;
+                }
+                return true;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Concatenate the text blocks of a tool result for failure scanning.
@@ -2300,5 +2373,122 @@ mod tests {
         let n = nudge(&g).expect("nudge fires");
         assert!(n.starts_with(VERIFY_NUDGE), "original text is preserved");
         assert!(n.contains("cargo clippy"), "and CI is named: {n}");
+    }
+
+
+    // ── A gate that cannot fail for the reason that matters ────────────────
+    //
+    // Measured before the fix: `cargo test || true`, `cargo clippy | tail -2`
+    // and `cargo test; echo done` ALL latched VerifiedGreen. The verifier reads
+    // the exit status of the whole command, and in each of those the status
+    // belongs to something other than the check.
+
+    #[test]
+    fn masking_shapes_are_detected() {
+        for cmd in [
+            "cargo clippy --all-targets | tail -2",
+            "cargo test || true",
+            "cargo test || echo ignored",
+            "cargo test; echo done",
+            "cargo test &",
+            "cargo clippy 2>&1 | head -20",
+        ] {
+            assert!(masks_failure(cmd), "should be detected as masking: {cmd}");
+        }
+    }
+
+    /// `&&` short-circuits, so a failing left side IS the exit status — not
+    /// masking. Redirections carry no pipe. Over-detecting here would decline
+    /// perfectly good verifications and nag forever, which is the failure mode
+    /// this whole area is trying to avoid.
+    #[test]
+    fn non_masking_shapes_are_not_flagged() {
+        for cmd in [
+            "cargo clippy --all-targets -- -D warnings",
+            "cargo fmt --all --check && cargo clippy --all-targets",
+            "cargo test 2>&1",
+            "RUSTFLAGS=\"-D warnings\" cargo clippy --all-targets",
+            "cargo test;",
+        ] {
+            assert!(!masks_failure(cmd), "must not be flagged: {cmd}");
+        }
+    }
+
+    /// The bug, end to end: a masked command reporting success must NOT latch
+    /// green. Status stays Unverified so the gate asks again.
+    #[test]
+    fn masked_success_does_not_latch_green() {
+        for cmd in [
+            "cargo test || true",
+            "cargo clippy --all-targets | tail -2",
+            "cargo test; echo done",
+        ] {
+            let g = VerifierGate::new();
+            g.record_outcome("edit", &json!({"path": "src/a.rs"}), &ok_result(), false);
+            g.record_outcome("bash", &json!({"command": cmd}), &ok_result(), false);
+            assert_eq!(
+                g.status(GateMode::Off),
+                VerificationStatus::Unverified,
+                "a masked success proves nothing and must not read as green: {cmd}"
+            );
+        }
+    }
+
+    /// A masked command that still reports FAILURE is trustworthy in that
+    /// direction — something in the chain genuinely failed — so the red is
+    /// recorded. Declining it would let a real failure go unreported.
+    #[test]
+    fn masked_failure_is_still_recorded_as_red() {
+        let g = VerifierGate::new();
+        g.record_outcome("edit", &json!({"path": "src/a.rs"}), &ok_result(), false);
+        g.record_outcome(
+            "bash",
+            &json!({"command": "cargo test | tail -2"}),
+            &failed_result(),
+            false,
+        );
+        assert_eq!(g.status(GateMode::Off), VerificationStatus::VerifiedRed);
+    }
+
+    /// An unmasked command is unaffected — the common path stays green.
+    #[test]
+    fn unmasked_success_still_latches_green() {
+        let g = VerifierGate::new();
+        g.record_outcome("edit", &json!({"path": "src/a.rs"}), &ok_result(), false);
+        g.record_outcome(
+            "bash",
+            &json!({"command": "cargo clippy --all-targets -- -D warnings"}),
+            &ok_result(),
+            false,
+        );
+        assert_eq!(g.status(GateMode::Off), VerificationStatus::VerifiedGreen);
+    }
+
+    /// A masked command must not reset the mid-run edit counter either — the
+    /// model did not actually establish anything, so the fast-verify reminder
+    /// should still be on its way.
+    #[test]
+    fn masked_command_does_not_clear_edits_since_verify() {
+        let g = VerifierGate::new();
+        for i in 0..3 {
+            g.record_outcome(
+                "edit",
+                &json!({ "path": format!("src/f{i}.rs") }),
+                &ok_result(),
+                false,
+            );
+        }
+        let before = g.edits_since_verify();
+        g.record_outcome(
+            "bash",
+            &json!({"command": "cargo test || true"}),
+            &ok_result(),
+            false,
+        );
+        assert_eq!(
+            g.edits_since_verify(),
+            before,
+            "a masked check did not verify anything, so the counter must stand"
+        );
     }
 }
