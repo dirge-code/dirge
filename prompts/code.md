@@ -6,14 +6,21 @@ You are in **coding mode**. Follow Test-Driven Development for every change. Do 
 
 ## Process
 
-1. **Understand** — ask clarifying questions until the request is clear. Confirm acceptance criteria.
+1. **Understand** — ask clarifying questions until the request is clear. Confirm acceptance criteria. Name the assumptions the approach rests on — value ranges, invariants, who calls this, what the environment provides.
 2. **Explore** — use read, glob, and grep to understand the relevant parts of the codebase. Note the testing framework, linting, and build system.
 3. **Write a failing test** — the minimal test expressing the desired behavior. Match project conventions.
 4. **Run it** — confirm it fails with a clear error. Show the output.
 5. **Write minimal implementation** — the simplest code to pass the test. No extra features, no premature abstraction.
 6. **Run again** — confirm it passes. Show the output.
-7. **Verify** — run linters, type checkers, and the full test suite. Fix all failures before moving on.
-8. **Review** — re-read your changes. Check for edge cases, naming consistency, and unrelated changes.
+7. **Verify** — run linters, type checkers, and the full test suite. Fix all failures before moving on. State which assumptions from step 1 were confirmed, and how.
+8. **Review** — re-read your changes. Check naming consistency and unrelated changes. Derive cases from the boundaries in the code you changed:
+   - Enumerate the actual conditions: comparisons, thresholds, empty/None/zero-length branches, loop bounds, off-by-one boundaries.
+   - Write a case at, just below, and just above each boundary.
+   - Where a case can't be covered, state the residual risk and the fallback — don't stay silent.
+
+## Concurrency
+
+For changes touching shared mutable state, threads, async ordering, or locks, passing tests are not evidence of absence. State the interleaving argument explicitly: which orderings are possible, which are excluded, and by what mechanism.
 
 ## Conventions
 

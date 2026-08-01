@@ -54,6 +54,7 @@ use super::storm::StormBreaker;
 use super::stream::{StreamFn, stream_assistant_response};
 use super::tool::AbortSignal;
 use super::types::{CodeReviewMode, Context, GateMode, LoopConfig};
+use super::verifier::VERIFY_TAG;
 use crate::sync_util::LockExt;
 
 /// Phase 4 part 2: poll the configured `get_steering_messages`
@@ -71,6 +72,7 @@ use crate::sync_util::LockExt;
 async fn poll_steering_and_reminder(
     config: &LoopConfig,
     guards: &super::activity::LoopGuards,
+    safe_state_msg: Option<String>,
 ) -> (Vec<LoopMessage>, bool) {
     let mut out = match &config.get_steering_messages {
         Some(get) => get().await,
@@ -80,11 +82,144 @@ async fn poll_steering_and_reminder(
     if let Some(tracker) = &config.file_touch_tracker {
         out.extend(tracker.poll_reminder());
     }
-    // Cross-turn recovery checkpoint: fired when consecutive *distinct*
-    // tool errors pile up (storm only catches identical repeats). Follows
-    // any user steering so the human's guidance is read first.
-    out.extend(guards.poll_reflection());
+    // dirge-uw2l.4: the safe-state rung REPLACES (does not add to) the rung-2
+    // recovery checkpoint on a boundary it fires — emitting both would tell
+    // the model to both "diagnose and retry" (rung 2) and "abort and re-plan"
+    // (rung 3), which are contradictory. When safe-state declines, or when it
+    // is off (the default), the regular checkpoint runs exactly as before, so
+    // off-mode is byte-identical.
+    if let Some(msg) = safe_state_msg {
+        out.push(LoopMessage::User(super::message::UserMessage::text(msg)));
+    } else {
+        // Cross-turn recovery checkpoint: fired when consecutive *distinct*
+        // tool errors pile up (storm only catches identical repeats). Follows
+        // any user steering so the human's guidance is read first.
+        out.extend(guards.poll_reflection());
+    }
     (out, had_user_steering)
+}
+
+/// The repo the safe-state coverage check runs against (dirge-uw2l.6).
+///
+/// `code_review_repo` is an explicit override that only tests set; in
+/// production it is `None` and the intended root is the process CWD — the
+/// same fallback the code-review diff capture uses (run.rs, dirge-9b2k).
+/// Reading the field directly without this fallback would leave auto with
+/// no repo in every real session, so it would silently decline forever and
+/// look like a feature that simply never fires.
+fn safe_state_repo(config: &LoopConfig) -> Option<std::path::PathBuf> {
+    config
+        .code_review_repo
+        .clone()
+        .or_else(|| std::env::current_dir().ok())
+}
+
+/// Restore the tree to its last verified-green state — but ONLY after
+/// proving the snapshot store can put back everything that changed
+/// (dirge-uw2l.6). Returns the number of files restored, or `None` when it
+/// declined and the caller should fall back to the advisory wording.
+///
+/// This is the one function in the safe-state rung that writes to the user's
+/// files, so every precondition is a hard decline rather than a best effort:
+///
+/// - no repo, or not a git work tree → decline (no ground truth to check)
+/// - no green fingerprint → decline (nothing to diff against)
+/// - a file changed since green that the store never captured → decline
+///
+/// That last case is the whole reason auto was deferred in R3.
+/// `snapshots::capture` is wired into the edit tools and not into `bash`, so
+/// a `sed -i`, a `>` redirect or an in-place formatter mutates a file with
+/// no pre-state recorded. Restoring the captured edits while leaving those
+/// alone yields a tree in a state that never existed — likely not
+/// compiling — which is strictly worse than the broken tree we started
+/// from, and arrived at behind the model's back. Detecting it via git and
+/// declining is what makes auto safe to ship at all.
+fn coverage_verified_restore(
+    repo: Option<&std::path::Path>,
+    green_fp: Option<&super::worktree_probe::TreeFingerprint>,
+    green_turn: &str,
+) -> Option<usize> {
+    let repo = repo?;
+    let green_fp = green_fp?;
+    let now = super::worktree_probe::fingerprint(repo)?;
+    let mutated = super::worktree_probe::changed_between(green_fp, &now);
+    if mutated.is_empty() {
+        // Nothing changed since green — there is nothing to restore, and
+        // claiming a restore would be a lie.
+        return None;
+    }
+    let restorable = crate::agent::tools::snapshots::restorable_paths_after(green_turn);
+    if !super::worktree_probe::coverage_is_complete(&mutated, &restorable) {
+        tracing::info!(
+            target: "dirge::loop",
+            mutated = mutated.len(),
+            restorable = restorable.len(),
+            "safe-state auto declined: snapshot coverage incomplete \
+             (a file changed that the store never captured — likely a bash \
+             write); falling back to advisory"
+        );
+        return None;
+    }
+    let restored = crate::agent::tools::snapshots::restore_after_green_turn(green_turn);
+    if restored.is_empty() {
+        return None;
+    }
+    tracing::info!(
+        target: "dirge::loop",
+        files = restored.len(),
+        "safe-state auto restored the tree to its last verified-green state"
+    );
+    Some(restored.len())
+}
+
+/// Every tag the harness prefixes onto a message it injects on the model's
+/// behalf (dirge-uw2l.7). The TUI keys on these to attribute the message to
+/// the system rather than the user; [`emit_harness_notices`] uses the same
+/// list so headless consumers can see the injection too.
+const HARNESS_TAGS: &[&str] = &[
+    TODO_NUDGE_TAG,
+    OPEN_ISSUES_NUDGE_TAG,
+    RESUME_NUDGE_TAG,
+    TRACK_WORK_TAG,
+    VERIFY_TAG,
+    super::critic::CRITIC_TAG,
+    super::goal::GOAL_TAG,
+    super::progress::STALL_TAG,
+    super::progress::BUDGET_TAG,
+    super::safe_state::SAFE_STATE_TAG,
+];
+
+/// The harness tag `text` carries, if any.
+fn harness_tag_of(text: &str) -> Option<&'static str> {
+    let t = text.trim_start();
+    HARNESS_TAGS.iter().copied().find(|tag| t.starts_with(tag))
+}
+
+/// Mirror harness-injected messages to a `SystemNotice` (dirge-uw2l.7).
+///
+/// These are injected as USER-role messages so the model acts on them, and
+/// the TUI renders them under a system handle by matching their tag. Headless
+/// consumers had no equivalent: `--print` shows only the final answer, and
+/// the stream-json `user` event carries tool results only. So a `--print` or
+/// `--loop` user saw the model abruptly change course — run a check, re-plan,
+/// abandon an approach — with nothing explaining why, and no way to tell an
+/// injected steer from the model's own judgement.
+///
+/// Emitting a notice costs nothing when no tag matches (an ordinary user
+/// message or steering text mirrors nothing), so this is additive.
+async fn emit_harness_notices(emit: &mpsc::Sender<LoopEvent>, msgs: &[LoopMessage]) {
+    for m in msgs {
+        let LoopMessage::User(u) = m else { continue };
+        let text = u.text_joined();
+        if harness_tag_of(&text).is_none() {
+            continue;
+        }
+        let _ = emit
+            .send(LoopEvent::SystemNotice {
+                content: text.clone(),
+            })
+            .await;
+    }
 }
 
 /// Joined text of a tool result's content blocks — fed to the failure
@@ -140,6 +275,17 @@ const MAX_OPEN_ISSUES_NUDGES: u8 = 2;
 /// One-shot: fire at most once per run when the model edits files but has
 /// no active todo — a gap the normal unfinished-todo nudge can't cover.
 const MAX_TRACK_NUDGES: u8 = 1;
+
+/// One-shot: fire at most once per run when code edits pile up with no
+/// verification since (dirge-uw2l.2). Bounded to a single message so the
+/// mid-run reminder can never become nagging.
+const MAX_VERIFY_NUDGES: u8 = 1;
+
+/// Code edits since the last verification before the mid-run fast-check
+/// reminder fires. One or two edits may be mid-sequence; three-plus with
+/// nothing run is integrating without testing — the pattern RAX's
+/// front-line-tester finding says to interrupt early.
+const FAST_VERIFY_EDIT_THRESHOLD: u32 = 3;
 
 /// Consecutive errored tool results before the failure tracker injects a
 /// recovery checkpoint. Tuned low — the tool-repair literature finds the
@@ -227,15 +373,46 @@ const MAX_TRANSIENT_RECOVERIES: u8 = 3;
 /// constant keeps emitter and detector from drifting.
 pub(crate) const MAX_TURNS_NOTICE_PREFIX: &str = "[dirge] Max agent turns";
 
+/// Build the max-turns truncation notice, appending the residual-objectives
+/// block (dirge-uw2l.5) when the live board has outstanding work. Pure: takes
+/// the board so the prefix-survival property — the headless detector in
+/// `provider::run` matches `content.starts_with(MAX_TURNS_NOTICE_PREFIX)` — is
+/// unit-testable (see `max_turns_notice_keeps_truncation_prefix`). Empty board
+/// → no block → byte-identical to the old notice.
+fn max_turns_notice(cap: usize, board: &[crate::agent::tools::todo::TodoItem]) -> String {
+    let mut notice = format!(
+        "{MAX_TURNS_NOTICE_PREFIX} ({cap}) reached. Stopping the run. Increase --max-agent-turns or `max_agent_turns` in config.json to allow more."
+    );
+    if let Some(block) = super::residual::residual_block(board) {
+        notice.push_str("\n\n");
+        notice.push_str(&block);
+    }
+    notice
+}
+
 /// The unfinished-todo nudge message. Pure (no globals) so the singular/plural
 /// wording is unit-testable independent of the todo store.
-fn todo_nudge_message(unfinished: usize) -> LoopMessage {
-    LoopMessage::User(super::message::UserMessage::text(format!(
+///
+/// dirge-uw2l.5: when at least one outstanding item is low-priority the nudge
+/// names them as the explicit cancel candidates. RAX's planner treated
+/// rejecting a low-priority unachievable goal as a validation objective, not a
+/// failure (paper §3.1b), and the todo store already carries priority that
+/// nothing surfaced back. When `low == 0` the message is byte-identical to the
+/// pre-uw2l.5 wording, so the common case changes nothing.
+fn todo_nudge_message(unfinished: usize, low: usize) -> LoopMessage {
+    let mut body = format!(
         "{TODO_NUDGE_TAG} You still have {unfinished} unfinished todo{} (pending or in progress). \
          Finish the remaining work, or if it's genuinely done or no longer needed, \
          update the todo list (mark items completed/cancelled) before stopping.",
         if unfinished == 1 { "" } else { "s" }
-    )))
+    );
+    if low > 0 {
+        body.push_str(&format!(
+            " You have {low} low-priority item{} left — if one won't fit, cancel it with a one-line reason rather than leaving it open.",
+            if low == 1 { "" } else { "s" }
+        ));
+    }
+    LoopMessage::User(super::message::UserMessage::text(body))
 }
 
 /// The plan-only variant of the nudge (dirge-u1ay): the turn wrote a todo
@@ -331,7 +508,10 @@ async fn poll_goal_gate(
         // the goal judge treats it as a SOFT advisory (see
         // `goal_verification_note`) so a non-testable task can't trap the
         // bounded goal loop.
-        let verification = config.verifier.as_ref().map(|v| v.status());
+        let verification = config
+            .verifier
+            .as_ref()
+            .map(|v| v.status(config.verification_tiers_mode));
         let msgs =
             super::goal::run_goal_gate(judge, goal, system_prompt, &transcript, verification).await;
         if !msgs.is_empty() {
@@ -462,7 +642,7 @@ async fn poll_finalization_follow_up(
     // 2. F6 verifier gate — one-time "verify before done" when code was edited
     //    but nothing was run to check it.
     if let Some(verifier) = &config.verifier {
-        let msgs = verifier.check_before_finalize();
+        let msgs = verifier.check_before_finalize(config.verification_tiers_mode);
         if !msgs.is_empty() {
             return (msgs, FollowUpSource::Verifier);
         }
@@ -544,7 +724,10 @@ async fn poll_finalization_follow_up(
                 // judge can be pickier about unverified changes. dirge-bedj: judge
                 // within the agent's own system prompt so it never demands a
                 // forbidden action.
-                let verification = config.verifier.as_ref().map(|v| v.status());
+                let verification = config
+                    .verifier
+                    .as_ref()
+                    .map(|v| v.status(config.verification_tiers_mode));
                 let (msgs, raised_findings) = super::critic::run_unified_review(
                     judge,
                     system_prompt,
@@ -618,11 +801,12 @@ async fn poll_finalization_follow_up(
     if *todo_nudges < MAX_TODO_NUDGES {
         let edited = turn_made_file_edits(new_messages);
         if edited || (*todo_nudges == 0 && turn_wrote_todos(new_messages)) {
-            let unfinished = crate::agent::tools::todo::unfinished_count();
+            let (high, normal, low) = crate::agent::tools::todo::unfinished_by_priority();
+            let unfinished = high + normal + low;
             if unfinished > 0 {
                 *todo_nudges += 1;
                 let msg = if edited {
-                    todo_nudge_message(unfinished)
+                    todo_nudge_message(unfinished, low)
                 } else {
                     plan_only_nudge_message(unfinished)
                 };
@@ -1600,7 +1784,10 @@ pub async fn run_loop(
     // Phase 4 part 2: composes with the file-touch tracker's
     // reminder poll when configured.
     let (mut pending_messages, _initial_user_steering): (Vec<LoopMessage>, bool) =
-        poll_steering_and_reminder(&config, &guards).await;
+        // The initial poll runs before any results, so there is nothing for
+        // the safe-state rung to decide yet — None falls through to
+        // poll_reflection unchanged.
+        poll_steering_and_reminder(&config, &guards, None).await;
 
     // dirge-nqr: count assistant turns so a hard cap can stop a
     // runaway run. `max_turns = None` means unlimited (legacy).
@@ -1611,6 +1798,13 @@ pub async fn run_loop(
     // can remind it of every dead end (not just the latest repeat).
     // Lives outside the outer loop so it persists across turns.
     let mut reflections = super::reflexion::ReflectionLog::new();
+
+    // dirge-uw2l.4: safe-state abort rung. Off (the default) is byte-identical
+    // — decide() short-circuits on Off before any work, so the default loop is
+    // untouched. Advisory adds a third failure-ladder rung that re-plans from
+    // the last verified-green tree when the failure streak reaches 2× the
+    // checkpoint threshold.
+    let mut safe_state = super::safe_state::SafeStateEngine::new();
 
     // dirge-8v98: the unified finalization judge fires at most once per run in
     // Off/Advisory mode (one-shot); Blocking mode persists across finalizations
@@ -1676,6 +1870,7 @@ pub async fn run_loop(
 
     // dirge-track: file-edits-without-tracked-todos advisory (one-shot).
     let mut track_nudges: u8 = 0;
+    let mut verify_nudges: u8 = 0;
 
     // Compute the issue db path once for both the issue-board reminder and
     // the open-issues gate. Fail-open: absent db → None, gate is inert.
@@ -2256,10 +2451,67 @@ pub async fn run_loop(
                 turn_made_file_edits(&new_messages),
             ) {
                 track_nudges += 1;
+                emit_harness_notices(emit, std::slice::from_ref(&reminder)).await;
                 current_context
                     .messages
                     .push(loop_message_to_value(&reminder));
                 new_messages.push(reminder);
+            }
+
+            // dirge-uw2l.2: mid-run fast-check reminder — edits piling up
+            // with nothing run since. One-shot per run; follows the track
+            // nudge so work-tracking guidance lands first.
+            if let Some(reminder) = build_fast_verify_reminder(
+                config.verification_tiers_mode,
+                verify_nudges,
+                config
+                    .verifier
+                    .as_ref()
+                    .map_or(0, |v| v.edits_since_verify()),
+            ) {
+                verify_nudges += 1;
+                emit_harness_notices(emit, std::slice::from_ref(&reminder)).await;
+                current_context
+                    .messages
+                    .push(loop_message_to_value(&reminder));
+                new_messages.push(reminder);
+            }
+
+            // dirge-uw2l.3: progress monitor. Runs LAST of the boundary
+            // nudges so the cheaper, more specific ones (track work, fast
+            // verify) get first say — a stall checkpoint is the broadest
+            // message of the three and shouldn't pre-empt them. At most one
+            // of stall/budget is injected per boundary, stall first: a run
+            // that is both stalled and near its cap needs the diagnosis
+            // before the countdown.
+            if let Some(progress) = config.progress.as_ref() {
+                let snapshot = super::progress::ProgressSnapshot {
+                    todos_unfinished: crate::agent::tools::todo::unfinished_count(),
+                    files_touched: crate::agent::tools::modified::count(),
+                    // Deliberately the LATCHED green (`GateMode::Off`), not
+                    // the tier-aware one. Staleness (dirge-uw2l.3) flips a
+                    // tiered status back to Unverified on every post-green
+                    // edit, so reading it here would manufacture a fresh
+                    // false→true edge on each edit→test cycle and reset the
+                    // stall counter forever — silently disabling the monitor
+                    // for green-but-not-converging runs, the exact case it
+                    // exists to catch. Staleness answers "verify again?";
+                    // progress answers "did this run reach a new state?".
+                    // Off-mode status still flips red→green, so fixing a red
+                    // build correctly counts as progress.
+                    verified_green: matches!(
+                        config.verifier.as_ref().map(|v| v.status(GateMode::Off)),
+                        Some(super::verifier::VerificationStatus::VerifiedGreen)
+                    ),
+                };
+                let signal = progress
+                    .record_turn(snapshot)
+                    .or_else(|| progress.poll_budget(turns_taken, config.max_turns.unwrap_or(0)));
+                if let Some(msg) = signal {
+                    emit_harness_notices(emit, std::slice::from_ref(&msg)).await;
+                    current_context.messages.push(loop_message_to_value(&msg));
+                    new_messages.push(msg);
+                }
             }
 
             // Pi line 218: turn_end.
@@ -2496,9 +2748,47 @@ pub async fn run_loop(
 
             // Pi line 253: refresh steering for next iteration.
             // Phase 4 part 2: also polls the file-touch tracker.
+            // dirge-uw2l.4: ask the safe-state engine whether this boundary
+            // should replace the rung-2 checkpoint with a re-plan. Off (the
+            // default) computes None and the checkpoint runs as before.
+            let safe_state_msg = if config.safe_state_abort_mode != super::types::SafeStateMode::Off
+            {
+                let excerpts = guards.recent_excerpts();
+                let fresh_green = config.verifier.as_ref().is_some_and(|v| v.is_fresh_green());
+                // dirge-uw2l.6: stamp the working-tree fingerprint at the same
+                // instant as the green marker, so the two always describe one
+                // moment. Auto only — Advisory never restores, so it must not
+                // pay a `git status` on every green turn.
+                if fresh_green && config.safe_state_abort_mode == super::types::SafeStateMode::Auto
+                {
+                    let fp = safe_state_repo(&config)
+                        .as_deref()
+                        .and_then(super::worktree_probe::fingerprint);
+                    safe_state.set_green_fingerprint(fp);
+                }
+                let green_fp = safe_state.green_fingerprint().cloned();
+                let repo = safe_state_repo(&config);
+                safe_state.decide(
+                    config.safe_state_abort_mode,
+                    fresh_green,
+                    guards.safe_state_due(),
+                    config
+                        .verifier
+                        .as_ref()
+                        .map_or(0, |v| v.edits_since_verify()),
+                    crate::agent::tools::snapshots::current_turn_id().as_deref(),
+                    &reflections,
+                    &excerpts,
+                    |green| coverage_verified_restore(repo.as_deref(), green_fp.as_ref(), green),
+                )
+            } else {
+                None
+            };
             let (next_pending, had_user_steering) =
-                poll_steering_and_reminder(&config, &guards).await;
+                poll_steering_and_reminder(&config, &guards, safe_state_msg).await;
             pending_messages = next_pending;
+            // dirge-uw2l.7: surface harness steers to headless consumers.
+            emit_harness_notices(emit, &pending_messages).await;
 
             // dirge-st8r: a fresh USER steering message means the human is
             // actively driving the run — give them a fresh turn budget
@@ -2525,9 +2815,7 @@ pub async fn run_loop(
                     cap = cap,
                     "max_turns reached — terminating run"
                 );
-                let notice = format!(
-                    "{MAX_TURNS_NOTICE_PREFIX} ({cap}) reached. Stopping the run. Increase --max-agent-turns or `max_agent_turns` in config.json to allow more."
-                );
+                let notice = max_turns_notice(cap, &crate::agent::tools::todo::snapshot());
                 // Surface to the user as a `<system>` log line (warning
                 // color) rather than a `MessageStart { User }` — the
                 // latter rendered with the `<you>` prefix as if the user
@@ -2596,6 +2884,7 @@ pub async fn run_loop(
         .await;
         if !follow_up.is_empty() {
             tracing::trace!(target: "dirge::loop", ?source, "finalization follow-up interjected");
+            emit_harness_notices(emit, &follow_up).await;
             pending_messages = follow_up;
             continue 'outer;
         }
@@ -2652,6 +2941,39 @@ fn track_work_reminder_message() -> LoopMessage {
         "{TRACK_WORK_TAG} You're editing files without an active todo. Before continuing, \
          add this task to your active work list with write_todo_list and mark the item \
          you're working on in_progress, so your progress is tracked."
+    )))
+}
+
+/// Whether to remind the model to run a FAST check mid-run (dirge-uw2l.2).
+/// True only when tiers are engaged, the one-shot budget is unspent, and
+/// enough code edits have piled up since the last verification of any tier.
+fn should_nudge_fast_verify(mode: GateMode, verify_nudges: u8, edits_since_verify: u32) -> bool {
+    mode != GateMode::Off
+        && verify_nudges < MAX_VERIFY_NUDGES
+        && edits_since_verify >= FAST_VERIFY_EDIT_THRESHOLD
+}
+
+/// Pure decision + message builder for the mid-run fast-check reminder
+/// (dirge-uw2l.2). The RAX finding this implements: most bugs were caught by
+/// developers front-line testing DURING integration, not by the expensive
+/// end-stage campaign — so ask for the cheap tier now and keep the slow tier
+/// for the boundary. Split out from the inner loop so it's unit-testable
+/// without the run loop.
+fn build_fast_verify_reminder(
+    mode: GateMode,
+    verify_nudges: u8,
+    edits_since_verify: u32,
+) -> Option<LoopMessage> {
+    if !should_nudge_fast_verify(mode, verify_nudges, edits_since_verify) {
+        return None;
+    }
+    Some(LoopMessage::User(super::message::UserMessage::text(
+        format!(
+            "{VERIFY_TAG} You've made {edits_since_verify} code edits without running any check. \
+             Run a FAST one now — a typecheck, a linter, or just the test covering what you're \
+             touching — so a mistake surfaces here instead of several edits from now. Save the \
+             full suite for when the work is done."
+        ),
     )))
 }
 

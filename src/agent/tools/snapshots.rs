@@ -268,6 +268,82 @@ pub fn clear() {
     s.pool.clear();
 }
 
+/// The user-message id of the currently open turn bucket (the last
+/// [`begin_turn`]), or `None` before any turn opens (dirge-uw2l.4). Cheap
+/// read under the store lock; used to stamp the safe-state abort's last-green
+/// marker on the bucket that was active when verification went green.
+pub fn current_turn_id() -> Option<String> {
+    let s = STORE.lock_ignore_poison();
+    s.turns.last().map(|t| t.turn_id.clone())
+}
+
+/// Roll files back to the verified-green point reached during `green_turn_id`'s
+/// turn, by restoring from the turn IMMEDIATELY AFTER it (dirge-uw2l.4).
+///
+/// Snapshots are pre-mutation, keyed per user message, so a green point reached
+/// mid-turn can't be restored to directly: the green turn's own bucket holds
+/// the file's pre-turn state (before the green-making work), not its green
+/// content. The post-green region, though, captured each file's pre-state as
+/// the green content (the file sat green while the next turn opened) — so
+/// restoring from the first turn after green reverts exactly the post-green
+/// edits and lands on green. This is the cross-user-message failure pattern the
+/// safe-state rung exists for; it is correct because the marker is only ever
+/// stamped on a turn that ENDED fresh-green (no edits after its passing
+/// verify), so that turn's end-state IS the green content the next turn saw.
+///
+/// Returns the restored paths. Returns EMPTY — touching no files — when there
+/// is no clean restore target: `green_turn_id` is the LATEST bucket (green and
+/// the failing edits are in the same user message, so no within-turn restore is
+/// possible) or `green_turn_id` isn't a known bucket. This empty-on-decline
+/// contract is what keeps a future `auto` mode from performing a coarse,
+/// lossy restore. Pure wrapper over [`restore_from`] — no new restore or
+/// atomic-write logic.
+/// The paths [`restore_after_green_turn`] WOULD restore, without touching
+/// anything (dirge-uw2l.6).
+///
+/// This is the store's half of the auto-mode coverage check: auto may only
+/// fire when everything that actually changed since green is something the
+/// store can put back. Returns empty under exactly the conditions
+/// [`restore_after_green_turn`] declines, so the two agree by construction.
+pub fn restorable_paths_after(green_turn_id: &str) -> Vec<PathBuf> {
+    let s = STORE.lock_ignore_poison();
+    let Some(idx) = s.turns.iter().position(|t| t.turn_id == green_turn_id) else {
+        return Vec::new();
+    };
+    if idx + 1 >= s.turns.len() {
+        return Vec::new();
+    }
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for bucket in &s.turns[idx + 1..] {
+        for path in bucket.captures.keys() {
+            if !paths.contains(path) {
+                paths.push(path.clone());
+            }
+        }
+    }
+    paths
+}
+
+pub fn restore_after_green_turn(green_turn_id: &str) -> Vec<PathBuf> {
+    // Resolve the next bucket id under the lock, then drop the lock before
+    // restore_from re-acquires it (restoring while holding the store lock
+    // would self-deadlock).
+    let next_id = {
+        let s = STORE.lock_ignore_poison();
+        let Some(idx) = s.turns.iter().position(|t| t.turn_id == green_turn_id) else {
+            return Vec::new();
+        };
+        if idx + 1 >= s.turns.len() {
+            // green is the latest bucket — within one user message. No
+            // within-turn restore is possible; decline rather than restore
+            // the green-making work away.
+            return Vec::new();
+        }
+        s.turns[idx + 1].turn_id.clone()
+    };
+    restore_from(&next_id)
+}
+
 /// Process-wide gate for tests that touch the global store, so they
 /// don't observe each other's turns/objects when run in parallel.
 /// Lives at module scope so cross-module tests (e.g. the UI rewind
@@ -539,6 +615,92 @@ mod tests {
                 0,
                 "rewound turn's pooled content must be released"
             );
+        });
+    }
+
+    // dirge-uw2l.4: the safe-state abort keys the last-green marker on the
+    // user-turn bucket active when verification went green, and restores from
+    // the turn AFTER it. These cover the snapshot helpers the rung uses; the
+    // decision to actually call restore (advisory does NOT) lives in
+    // safe_state.
+
+    #[test]
+    fn current_turn_id_tracks_begin_turn() {
+        isolated(|_dir| {
+            assert!(current_turn_id().is_none(), "nothing opened yet");
+            begin_turn("u1");
+            assert_eq!(current_turn_id().as_deref(), Some("u1"));
+            begin_turn("u2");
+            assert_eq!(current_turn_id().as_deref(), Some("u2"));
+        });
+    }
+
+    #[test]
+    fn restore_after_green_turn_reverts_post_green_region() {
+        isolated(|dir| {
+            let p = dir.join("a.txt");
+            // u1 = the green turn: captures pre-state "v0", then its own work
+            // brings the file to "v1" (the green content, NOT snapshotted).
+            std::fs::write(&p, "v0").unwrap();
+            begin_turn("u1");
+            capture(&p);
+            std::fs::write(&p, "v1").unwrap();
+            // u2 = the failing turn: captures pre-state "v1" (== green), then
+            // breaks the file to "v2".
+            begin_turn("u2");
+            capture(&p);
+            std::fs::write(&p, "v2").unwrap();
+            assert_eq!(std::fs::read_to_string(&p).unwrap(), "v2");
+
+            let restored = restore_after_green_turn("u1");
+            assert_eq!(restored.len(), 1, "the post-green file was reverted");
+            // Restored to u2's pre-state == u1's green content "v1".
+            assert_eq!(std::fs::read_to_string(&p).unwrap(), "v1");
+        });
+    }
+
+    #[test]
+    fn restore_after_green_turn_empty_when_green_is_latest() {
+        isolated(|dir| {
+            let p = dir.join("a.txt");
+            std::fs::write(&p, "v0").unwrap();
+            begin_turn("u1");
+            capture(&p);
+            std::fs::write(&p, "v1").unwrap();
+            // green is the only/latest bucket — within one user message, no
+            // within-turn restore is possible, so it declines (returns empty
+            // and touches no files).
+            let restored = restore_after_green_turn("u1");
+            assert!(restored.is_empty(), "no clean restore within a turn");
+            assert_eq!(std::fs::read_to_string(&p).unwrap(), "v1", "file untouched");
+        });
+    }
+
+    #[test]
+    fn restore_after_green_turn_empty_when_id_unknown() {
+        isolated(|_dir| {
+            begin_turn("u1");
+            let restored = restore_after_green_turn("nope");
+            assert!(restored.is_empty(), "unknown green id restores nothing");
+        });
+    }
+
+    #[test]
+    fn restore_after_green_turn_preserves_green_turn_bucket() {
+        isolated(|dir| {
+            let p = dir.join("a.txt");
+            std::fs::write(&p, "v0").unwrap();
+            begin_turn("u1");
+            capture(&p);
+            std::fs::write(&p, "v1").unwrap();
+            begin_turn("u2");
+            capture(&p);
+            std::fs::write(&p, "v2").unwrap();
+
+            restore_after_green_turn("u1");
+            // Only the post-green bucket (u2) is dropped; the green bucket u1
+            // survives so a further restore could still target it.
+            assert_eq!(current_turn_id().as_deref(), Some("u1"));
         });
     }
 }

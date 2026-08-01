@@ -237,6 +237,12 @@ impl AnyAgent {
         cfg.file_touch_tracker = self.context_depth_reminder_threshold.map(|t| {
             crate::agent::agent_loop::context_depth::FileTouchTracker::new(t, prompt.text)
         });
+        // dirge-uw2l.3: progress monitor — stall + turn-budget signals,
+        // built fresh per session. `None` keeps it off, byte-identical to
+        // a loop without it.
+        cfg.progress = self
+            .progress_stall_threshold
+            .map(crate::agent::agent_loop::progress::ProgressTracker::new);
         // F6: pre-finalization verifier gate, always on (baked-in). Nudges
         // to verify before finishing when code was edited but not run.
         cfg.verifier = Some(crate::agent::agent_loop::verifier::VerifierGate::new());
@@ -251,6 +257,8 @@ impl AnyAgent {
         // (Blocking = legacy sync re-entry, Advisory = background notice).
         cfg.code_review_mode = self.code_review_mode;
         cfg.open_issues_gate_mode = self.open_issues_gate_mode;
+        cfg.verification_tiers_mode = self.verification_tiers_mode;
+        cfg.safe_state_abort_mode = self.safe_state_abort_mode;
         cfg.session_id = self.session_id.clone();
         cfg.goal_fn = self.goal_fn.clone();
         // Goal gate stop condition (`--goal`). Engages only when

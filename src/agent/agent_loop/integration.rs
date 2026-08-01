@@ -428,6 +428,10 @@ pub struct LoopSpawnConfig {
     /// Phase 4 part 2: optional file-touch tracker for the
     /// context-depth reminder system. `None` keeps the feature
     /// off (legacy behavior, byte-identical to today).
+    /// Progress monitor (dirge-uw2l.3) — stall + turn-budget signals.
+    /// Built per session by `spawn_runner` from the agent's configured
+    /// threshold. `None` disables it.
+    pub progress: Option<std::sync::Arc<super::progress::ProgressTracker>>,
     pub file_touch_tracker:
         Option<std::sync::Arc<crate::agent::agent_loop::context_depth::FileTouchTracker>>,
 
@@ -452,6 +456,12 @@ pub struct LoopSpawnConfig {
     /// Engagement mode for the open-issues finalization gate. Forwarded to
     /// `LoopConfig.open_issues_gate_mode`. Default `Off` (opt-in).
     pub open_issues_gate_mode: crate::agent::agent_loop::types::GateMode,
+    /// Forwarded to `LoopConfig.verification_tiers_mode`. Default `Off`
+    /// (opt-in; `Off` is byte-identical to the untiered gate).
+    pub verification_tiers_mode: crate::agent::agent_loop::types::GateMode,
+    /// Forwarded to `LoopConfig.safe_state_abort_mode`. Default `Off`
+    /// (opt-in; off is byte-identical to the loop without the rung).
+    pub safe_state_abort_mode: crate::agent::agent_loop::types::SafeStateMode,
 
     /// Active session id forwarded to `LoopConfig.session_id` for
     /// session-scoped gate queries. `None` in sub-runners.
@@ -517,12 +527,15 @@ impl LoopSpawnConfig {
             escalation_stream_fn: None,
             escalation_provider_name: None,
             escalation_max_per_session: None,
+            progress: None,
             file_touch_tracker: None,
             verifier: None,
             critic_fn: None,
             code_review_fn: None,
             code_review_mode: crate::agent::agent_loop::types::CodeReviewMode::default(),
             open_issues_gate_mode: crate::agent::agent_loop::types::GateMode::Off,
+            verification_tiers_mode: crate::agent::agent_loop::types::GateMode::Off,
+            safe_state_abort_mode: crate::agent::agent_loop::types::SafeStateMode::Off,
             session_id: None,
             goal_fn: None,
             goal: None,
@@ -601,12 +614,15 @@ pub fn spawn_loop_runner(cfg: LoopSpawnConfig) -> LoopRunner {
             cfg.escalation_max_per_session.unwrap_or(3),
         )),
         file_touch_tracker: cfg.file_touch_tracker.clone(),
+        progress: cfg.progress.clone(),
         verifier: cfg.verifier.clone(),
         critic_fn: cfg.critic_fn.clone(),
         code_review_fn: cfg.code_review_fn.clone(),
         code_review_mode: cfg.code_review_mode,
         code_review_repo: None,
         open_issues_gate_mode: cfg.open_issues_gate_mode,
+        verification_tiers_mode: cfg.verification_tiers_mode,
+        safe_state_abort_mode: cfg.safe_state_abort_mode,
         session_id: cfg.session_id.clone(),
         goal_fn: cfg.goal_fn.clone(),
         goal: cfg.goal.clone(),

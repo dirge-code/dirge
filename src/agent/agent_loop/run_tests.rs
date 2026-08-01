@@ -134,12 +134,15 @@ fn build_config() -> LoopConfig {
         escalation_max_per_session: 3,
         escalation_remaining: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(3)),
         file_touch_tracker: None,
+        progress: None,
         verifier: None,
         critic_fn: None,
         code_review_fn: None,
         code_review_mode: crate::agent::agent_loop::types::CodeReviewMode::default(),
         code_review_repo: None,
         open_issues_gate_mode: crate::agent::agent_loop::types::GateMode::Off,
+        verification_tiers_mode: crate::agent::agent_loop::types::GateMode::Off,
+        safe_state_abort_mode: crate::agent::agent_loop::types::SafeStateMode::Off,
         session_id: None,
         goal_fn: None,
         goal: None,
@@ -3945,16 +3948,77 @@ async fn context_compacted_reports_compaction_kind() {
 /// The unfinished-todo nudge wording agrees in number with the count.
 #[test]
 fn todo_nudge_message_pluralizes() {
-    let one = match todo_nudge_message(1) {
+    let one = match todo_nudge_message(1, 0) {
         LoopMessage::User(u) => u.text_joined(),
         _ => panic!("expected a user message"),
     };
     assert!(one.contains("1 unfinished todo "), "singular: {one}");
-    let many = match todo_nudge_message(3) {
+    let many = match todo_nudge_message(3, 0) {
         LoopMessage::User(u) => u.text_joined(),
         _ => panic!("expected a user message"),
     };
     assert!(many.contains("3 unfinished todos "), "plural: {many}");
+}
+
+/// dirge-uw2l.5: `low == 0` must reproduce the pre-uw2l.5 wording exactly, so
+/// the common case (no low-priority items) changes nothing.
+#[test]
+fn todo_nudge_message_byte_identical_when_no_low_priority() {
+    let want = format!(
+        "{TODO_NUDGE_TAG} You still have 2 unfinished todos (pending or in progress). \
+         Finish the remaining work, or if it's genuinely done or no longer needed, \
+         update the todo list (mark items completed/cancelled) before stopping."
+    );
+    let got = match todo_nudge_message(2, 0) {
+        LoopMessage::User(u) => u.text_joined(),
+        _ => panic!("expected a user message"),
+    };
+    assert_eq!(got, want);
+}
+
+/// dirge-uw2l.5: when a low-priority item is outstanding the nudge names it as
+/// the cancel candidate (RAX treated rejecting a low-priority unachievable
+/// goal as a validation objective, not a failure — paper §3.1b).
+#[test]
+fn todo_nudge_message_names_low_priority_as_cancel_candidate() {
+    let got = match todo_nudge_message(3, 1) {
+        LoopMessage::User(u) => u.text_joined(),
+        _ => panic!("expected a user message"),
+    };
+    assert!(
+        got.contains("1 low-priority item "),
+        "names the low count: {got}"
+    );
+    assert!(got.contains("cancel"), "invites cancellation: {got}");
+}
+
+/// dirge-uw2l.5: the residual-objectives block is appended AFTER the `[dirge]`
+/// prefix, so the headless truncation detector in `provider::run` — which
+/// matches `content.starts_with(MAX_TURNS_NOTICE_PREFIX)` (provider/run.rs) —
+/// still fires. This test is what keeps the emitter and the detector from
+/// drifting: if a future change reorders or drops the prefix, it fails here
+/// rather than silently breaking truncation detection.
+#[test]
+fn max_turns_notice_keeps_truncation_prefix_with_residual_block() {
+    use crate::agent::tools::todo::TodoItem;
+    let board = vec![TodoItem {
+        content: "ship the residual handoff".into(),
+        status: "open".into(),
+        priority: "normal".into(),
+    }];
+    let notice = max_turns_notice(50, &board);
+    assert!(
+        notice.starts_with(MAX_TURNS_NOTICE_PREFIX),
+        "truncation prefix dropped: {notice}"
+    );
+    assert!(
+        notice.contains("Objectives still outstanding"),
+        "residual block missing: {notice}"
+    );
+    // Empty board → no block, still prefixed, byte-identical to the old notice.
+    let bare = max_turns_notice(50, &[]);
+    assert!(bare.starts_with(MAX_TURNS_NOTICE_PREFIX));
+    assert!(!bare.contains("Objectives still outstanding"));
 }
 
 /// dirge-1g3v: the reviewer engages only on what THIS run changed. Given the
@@ -6220,4 +6284,251 @@ fn last_action_failed_and_stopped_bounded() {
     ];
     let resume_nudges = MAX_RESUME_NUDGE;
     assert!(!(resume_nudges < MAX_RESUME_NUDGE && last_action_failed_and_stopped(&msgs)));
+}
+
+// ── mid-run fast-check reminder (dirge-uw2l.2, RAX R1) ──────────────────
+
+/// The mid-run reminder fires only with tiers engaged, budget unspent, and
+/// enough unverified edits piled up. Pure — no gate, no LLM.
+#[test]
+fn should_nudge_fast_verify_gate() {
+    // Fires: tiered mode + budget available + threshold reached.
+    assert!(should_nudge_fast_verify(
+        GateMode::Advisory,
+        0,
+        FAST_VERIFY_EDIT_THRESHOLD
+    ));
+    assert!(should_nudge_fast_verify(
+        GateMode::Blocking,
+        0,
+        FAST_VERIFY_EDIT_THRESHOLD
+    ));
+    // Off is byte-identical to the untiered loop — never nudges, however
+    // many edits pile up.
+    assert!(!should_nudge_fast_verify(GateMode::Off, 0, 99));
+    // Below threshold: one or two edits may be mid-sequence.
+    assert!(!should_nudge_fast_verify(
+        GateMode::Advisory,
+        0,
+        FAST_VERIFY_EDIT_THRESHOLD - 1
+    ));
+    // One-shot: budget spent.
+    assert!(!should_nudge_fast_verify(
+        GateMode::Advisory,
+        MAX_VERIFY_NUDGES,
+        99
+    ));
+}
+
+/// The built message carries the verifier tag (so the UI attributes it to
+/// the system, dirge-i75f) and asks for the CHEAP tier now, explicitly
+/// deferring the full suite — that split is the whole point of the round.
+#[test]
+fn build_fast_verify_reminder_message() {
+    let msg = build_fast_verify_reminder(GateMode::Advisory, 0, FAST_VERIFY_EDIT_THRESHOLD)
+        .expect("threshold reached in a tiered mode");
+    let text = match msg {
+        LoopMessage::User(u) => u.text_joined(),
+        _ => panic!("expected a user message"),
+    };
+    assert!(text.contains(VERIFY_TAG), "carries the tag: {text}");
+    assert!(text.contains("FAST"), "asks for the fast tier: {text}");
+    assert!(text.contains("full suite"), "defers the slow tier: {text}");
+    assert!(build_fast_verify_reminder(GateMode::Off, 0, 99).is_none());
+    assert!(build_fast_verify_reminder(GateMode::Advisory, 0, 1).is_none());
+}
+
+/// Bounded: once the budget is spent the reminder can never fire again,
+/// however far the edit count runs. Guarantees it can't loop.
+#[test]
+fn fast_verify_nudge_bounded_once() {
+    assert!(build_fast_verify_reminder(GateMode::Advisory, MAX_VERIFY_NUDGES, 10).is_none());
+    assert!(build_fast_verify_reminder(GateMode::Blocking, MAX_VERIFY_NUDGES, 10).is_none());
+}
+
+// ── harness-notice mirror (dirge-uw2l.7) ────────────────────────────────
+
+/// Every tag the harness injects under must be recognized, or that steer
+/// stays invisible to headless consumers. Pins the list against a tag being
+/// added to a nudge but forgotten here.
+#[test]
+fn harness_tag_of_recognizes_every_injection_tag() {
+    for tag in HARNESS_TAGS {
+        let text = format!("{tag} some guidance text");
+        assert_eq!(
+            harness_tag_of(&text),
+            Some(*tag),
+            "tag {tag} not recognized"
+        );
+    }
+    // Leading whitespace is tolerated (messages are built with formatters).
+    assert_eq!(harness_tag_of("  [stall] x"), Some("[stall]"));
+}
+
+/// An ordinary user message — or user steering — mirrors nothing. The notice
+/// is for harness-authored injections only, so a human's own words are never
+/// echoed back at them as a system line.
+#[test]
+fn harness_tag_of_ignores_ordinary_user_text() {
+    assert!(harness_tag_of("fix the failing test").is_none());
+    assert!(harness_tag_of("[not-a-real-tag] hello").is_none());
+    assert!(harness_tag_of("").is_none());
+    // A tag mentioned mid-sentence isn't an injection.
+    assert!(harness_tag_of("I saw a [stall] in the log").is_none());
+}
+
+// ── safe-state auto restore, end to end (dirge-uw2l.6) ──────────────────
+// `coverage_verified_restore` is the ONLY function in the safe-state rung
+// that writes to the user's files, so it gets a real git repo, a real
+// snapshot store, and real files on disk rather than a mocked seam.
+
+#[cfg(test)]
+mod auto_restore_tests {
+    use super::*;
+    use crate::agent::tools::snapshots;
+    use std::path::{Path, PathBuf};
+
+    fn git(dir: &Path, args: &[&str]) -> bool {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// A git repo with one committed source file, plus an isolated snapshot
+    /// store. Returns None when git is unavailable so the test skips.
+    fn repo(tag: &str) -> Option<PathBuf> {
+        let dir = std::env::temp_dir().join(format!("dirge-auto-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).ok()?;
+        if !git(&dir, &["init", "-q"]) {
+            return None;
+        }
+        let _ = git(&dir, &["config", "user.email", "t@t"]);
+        let _ = git(&dir, &["config", "user.name", "t"]);
+        std::fs::write(dir.join("src/a.rs"), "fn a() { /* green */ }\n").ok()?;
+        git(&dir, &["add", "-A"]).then_some(())?;
+        git(&dir, &["commit", "-qm", "green"]).then_some(())?;
+        Some(dir)
+    }
+
+    /// The happy path: every file that changed since green went through an
+    /// edit tool, so the store covers it and the tree is put back.
+    #[test]
+    fn restores_when_every_change_is_covered() {
+        let _g = snapshots::TEST_GATE.lock_ignore_poison();
+        snapshots::clear();
+        let Some(dir) = repo("covered") else { return };
+        let file = dir.join("src/a.rs");
+
+        // Green: clean tree, fingerprint it.
+        snapshots::begin_turn("green-turn");
+        let green_fp = crate::agent::agent_loop::worktree_probe::fingerprint(&dir).expect("git");
+
+        // Post-green turn: edit THROUGH the capture path, as an edit tool does.
+        snapshots::begin_turn("after-green");
+        snapshots::capture(&file);
+        std::fs::write(&file, "fn a() { BROKEN }\n").unwrap();
+
+        let n = coverage_verified_restore(Some(&dir), Some(&green_fp), "green-turn");
+        assert_eq!(n, Some(1), "one covered file restored");
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "fn a() { /* green */ }\n",
+            "file is back at its green content"
+        );
+        snapshots::clear();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The case the whole gate exists for: a file mutated OUT OF BAND (as
+    /// `sed -i` or a formatter would) is invisible to the snapshot store, so
+    /// coverage is incomplete and nothing is touched. A partial restore here
+    /// would leave a tree that never existed.
+    #[test]
+    fn declines_and_touches_nothing_when_a_bash_style_mutation_is_present() {
+        let _g = snapshots::TEST_GATE.lock_ignore_poison();
+        snapshots::clear();
+        let Some(dir) = repo("uncovered") else { return };
+        let covered = dir.join("src/a.rs");
+        let sedded = dir.join("src/sedded.rs");
+
+        snapshots::begin_turn("green-turn");
+        let green_fp = crate::agent::agent_loop::worktree_probe::fingerprint(&dir).expect("git");
+
+        snapshots::begin_turn("after-green");
+        snapshots::capture(&covered);
+        std::fs::write(&covered, "fn a() { BROKEN }\n").unwrap();
+        // No capture() — exactly what a `bash` write looks like to the store.
+        std::fs::write(&sedded, "fn sed() {}\n").unwrap();
+
+        let n = coverage_verified_restore(Some(&dir), Some(&green_fp), "green-turn");
+        assert_eq!(n, None, "incomplete coverage must decline");
+        assert_eq!(
+            std::fs::read_to_string(&covered).unwrap(),
+            "fn a() { BROKEN }\n",
+            "declining must leave the tree exactly as it was — no partial restore"
+        );
+        assert!(sedded.exists(), "the uncaptured file is untouched too");
+        snapshots::clear();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// No repo, no green fingerprint, and nothing-changed all decline.
+    /// These are the "proceed blind" cases; every one must be a no-op.
+    #[test]
+    fn declines_without_ground_truth_or_changes() {
+        let _g = snapshots::TEST_GATE.lock_ignore_poison();
+        snapshots::clear();
+        let Some(dir) = repo("blind") else { return };
+
+        snapshots::begin_turn("green-turn");
+        let green_fp = crate::agent::agent_loop::worktree_probe::fingerprint(&dir).expect("git");
+        snapshots::begin_turn("after-green");
+
+        assert_eq!(
+            coverage_verified_restore(None, Some(&green_fp), "green-turn"),
+            None,
+            "no repo path → decline"
+        );
+        assert_eq!(
+            coverage_verified_restore(Some(&dir), None, "green-turn"),
+            None,
+            "no green fingerprint → decline"
+        );
+        assert_eq!(
+            coverage_verified_restore(Some(&dir), Some(&green_fp), "green-turn"),
+            None,
+            "nothing changed since green → nothing to restore, and no false claim"
+        );
+        snapshots::clear();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// dirge-uw2l.6: `code_review_repo` is a TEST-ONLY override — production
+/// leaves it None and means "the process CWD" (the same convention the
+/// code-review diff capture follows). Reading the field directly would give
+/// the safe-state coverage check no repo in every real session, so auto
+/// would silently decline forever and read as a feature that never fires.
+#[test]
+fn safe_state_repo_falls_back_to_cwd_in_production() {
+    let mut cfg = build_config();
+    cfg.code_review_repo = None;
+    assert_eq!(
+        safe_state_repo(&cfg),
+        std::env::current_dir().ok(),
+        "production (None) must resolve to the CWD, not to no-repo"
+    );
+
+    let explicit = std::path::PathBuf::from("/tmp/some-repo");
+    cfg.code_review_repo = Some(explicit.clone());
+    assert_eq!(
+        safe_state_repo(&cfg),
+        Some(explicit),
+        "an explicit override still wins"
+    );
 }

@@ -208,6 +208,29 @@ impl FailureTracker {
         }
         out
     }
+
+    /// Whether the failure streak has reached 2× the recovery-checkpoint
+    /// threshold (dirge-uw2l.4). This is the safe-state abort rung's
+    /// escalation signal — it fires only when the model is deep in a failing
+    /// streak that the rung-2 checkpoint has already nudged and failed to
+    /// break. Uses the weighted `escalation` score (timeouts count double), so
+    /// a stuck, timeout-heavy run trips it sooner. Read-only: it never mutates
+    /// the tracker and never spends a checkpoint, so the boundary poll can
+    /// consult it cheaply every iteration. Knowledge of `threshold` stays
+    /// here (the tracker owns it; the safe-state engine never sees the raw
+    /// number).
+    pub fn safe_state_due(&self) -> bool {
+        let inner = self.inner.lock_ignore_poison();
+        inner.escalation >= self.threshold.saturating_mul(2)
+    }
+
+    /// The `(tool, excerpt)` pairs for the most recent failures in the current
+    /// streak (dirge-uw2l.4). Cloned out (bounded to `MAX_QUOTED`) so the
+    /// safe-state replan message can quote what already failed without the
+    /// re-plan repeating it. Empty once a success clears the streak.
+    pub fn recent_excerpts(&self) -> Vec<(String, String)> {
+        self.inner.lock_ignore_poison().recent.clone()
+    }
 }
 
 /// Collapse an excerpt to a single bounded line for the checkpoint.
@@ -561,5 +584,102 @@ mod tests {
             t.poll_reflection().is_empty(),
             "success reset the denial streak; 1 denial < threshold"
         );
+    }
+
+    // dirge-uw2l.4: the safe-state abort rung fires off the failure tracker's
+    // 2× threshold. Pure read-only signal — never mutates the tracker, never
+    // spends a checkpoint.
+    #[test]
+    fn safe_state_due_false_below_double_threshold() {
+        use super::super::activity::Outcome;
+        let t = FailureTracker::new(3); // 2× = 6
+        // At the rung-2 checkpoint (escalation 3) the rung-3 signal is NOT due.
+        for _ in 0..3 {
+            t.record(Outcome::Error, "edit", "no match");
+        }
+        assert!(!t.safe_state_due(), "at threshold, not yet 2x");
+        // Climb to one short of 2x.
+        for _ in 0..2 {
+            t.record(Outcome::Error, "edit", "no match");
+        }
+        assert!(!t.safe_state_due(), "5 < 2x threshold 6");
+    }
+
+    #[test]
+    fn safe_state_due_true_at_double_threshold() {
+        use super::super::activity::Outcome;
+        let t = FailureTracker::new(3);
+        for _ in 0..6 {
+            t.record(Outcome::Error, "edit", "no match");
+        }
+        assert!(t.safe_state_due(), "6 == 2x threshold");
+        // A timeout-heavy streak reaches 2x sooner (timeouts count double).
+        let t = FailureTracker::new(3);
+        for _ in 0..3 {
+            t.record(Outcome::Timeout, "bash", "Command timed out after 120s");
+        }
+        assert!(
+            t.safe_state_due(),
+            "3 timeouts == escalation 6 == 2x threshold"
+        );
+    }
+
+    #[test]
+    fn safe_state_due_resets_on_success() {
+        use super::super::activity::Outcome;
+        let t = FailureTracker::new(3);
+        for _ in 0..6 {
+            t.record(Outcome::Error, "edit", "no match");
+        }
+        assert!(t.safe_state_due());
+        t.record(Outcome::Ok, "read", "ok");
+        assert!(!t.safe_state_due(), "a success clears the streak");
+    }
+
+    #[test]
+    fn safe_state_due_re_arms_after_success() {
+        use super::super::activity::Outcome;
+        let t = FailureTracker::new(3);
+        for _ in 0..6 {
+            t.record(Outcome::Error, "edit", "no match");
+        }
+        t.record(Outcome::Ok, "read", "ok");
+        // A fresh streak must re-climb the full 2x — the signal does not carry
+        // over from the cleared streak.
+        for _ in 0..5 {
+            t.record(Outcome::Error, "edit", "no match");
+        }
+        assert!(!t.safe_state_due(), "5 < 6 after re-arm");
+        t.record(Outcome::Error, "edit", "no match");
+        assert!(t.safe_state_due(), "6 re-trips after a fresh streak");
+    }
+
+    #[test]
+    fn safe_state_due_ignores_denial_streak() {
+        use super::super::activity::Outcome;
+        let t = FailureTracker::new(3);
+        // Permission denials are a policy wall, not a mechanical failure
+        // (dirge-iwwq) — they must NOT trip the safe-state abort, which is
+        // about a plan that's mechanically failing, not one the user blocked.
+        for _ in 0..6 {
+            t.record(Outcome::Denied, "write", "Permission denied: x");
+        }
+        assert!(!t.safe_state_due(), "denials never feed escalation");
+    }
+
+    #[test]
+    fn recent_excerpts_exposed_for_replan() {
+        use super::super::activity::Outcome;
+        let t = FailureTracker::new(3);
+        t.record(Outcome::Error, "edit", "old_string not found");
+        t.record(Outcome::Error, "bash", "command failed");
+        let excerpts = t.recent_excerpts();
+        assert_eq!(excerpts.len(), 2);
+        assert_eq!(excerpts[0].0, "edit");
+        assert!(excerpts[0].1.contains("old_string not found"));
+        assert_eq!(excerpts[1].0, "bash");
+        // A success clears the streak and its excerpts.
+        t.record(Outcome::Ok, "read", "ok");
+        assert!(t.recent_excerpts().is_empty(), "success clears recent");
     }
 }

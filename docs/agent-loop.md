@@ -21,6 +21,8 @@ When the assistant tries to stop, `poll_finalization_follow_up` (in `run.rs`) co
 5. **Goal gate** — user-defined `--goal` stop condition, judged by the same provider, bounded by `MAX_GOAL_REACT`.
 6. **Todo nudge** — unfinished todos, bounded by `MAX_TODO_NUDGES`.
 
+Three further signals sit alongside these rather than in the gate chain — tiered verification, a stall/turn-budget progress monitor, and the safe-state abort rung that replaces the rung-2 recovery checkpoint when it fires. All are off by default; see [failure-ladder.md](failure-ladder.md).
+
 Because only one gate fires per finalization, lower-priority gates are deferred a turn (intentional: a red build surfaces the verifier nudge now; the critic and reviewer run at the *next* finalization once it's green). All gates fail **open** — an errored judge never blocks finalization.
 
 ### Inner loop

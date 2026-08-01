@@ -956,6 +956,35 @@ pub struct Config {
     /// closes or defers its session-scoped issues. See
     /// [`resolve_open_issues_gate_mode`](Self::resolve_open_issues_gate_mode).
     pub open_issues_gate: Option<String>,
+    /// How tiered verification engages (dirge-uw2l.2). One of `off` /
+    /// `advisory` / `blocking` (case-insensitive, trimmed). `off`
+    /// *(default)* is byte-identical to the untiered gate: build/test
+    /// commands are recognized but never classified, and the run gets at
+    /// most the one legacy nudge. `advisory` splits commands into a fast
+    /// tier (typecheck/lint/targeted test) and a slow tier (full
+    /// suite/build), reminds the agent once mid-run to run a fast check
+    /// when edits pile up unverified, and escalates once at finalization
+    /// when only the fast tier ever passed. `blocking` repeats that
+    /// escalation, bounded. See
+    /// [`resolve_verification_tiers_mode`](Self::resolve_verification_tiers_mode).
+    pub verification_tiers: Option<String>,
+    /// How the safe-state abort rung engages (dirge-uw2l.4). One of `off` /
+    /// `advisory` (case-insensitive, trimmed). `off` *(default)* is
+    /// byte-identical to the loop without the rung: nothing is injected, no
+    /// green marker is kept, no file is touched. `advisory` adds a third
+    /// failure-ladder rung that, when the failure streak reaches 2× the
+    /// recovery-checkpoint threshold AND unverified code edits sit on the tree
+    /// AND a verified-green point exists behind the run, replaces that
+    /// boundary's checkpoint with a single "abort this approach, re-plan"
+    /// message carrying the reflexion log and the failure excerpts. It performs
+    /// NO file writes — the model decides whether to revert (via `/rewind` or
+    /// re-editing) and re-plan. An automatic restore (`auto`) is destructive
+    /// behind the model's back and is blocked on snapshot coverage for
+    /// `bash`-mutated files — see dirge-uw2l.6 — so `auto` (and any other
+    /// unrecognized value) is rejected and falls back to `off` with a warning
+    /// rather than silently doing something other than what its name says.
+    /// See [`resolve_safe_state_abort_mode`](Self::resolve_safe_state_abort_mode).
+    pub safe_state_abort: Option<String>,
     /// How the ingestion-time injection scanner handles untrusted tool
     /// results (read, MCP, websearch). One of `off` / `advisory` / `block`
     /// (case-insensitive, trimmed). `advisory` *(default)* fences positive
@@ -1039,6 +1068,12 @@ pub struct Config {
     /// re-focusing; higher to silence the reminder for routine
     /// multi-step refactors.
     pub context_depth_reminder_threshold: Option<usize>,
+    /// Barren turn boundaries before the progress monitor asks the model
+    /// to name what's blocking and change approach or cut scope
+    /// (dirge-uw2l.3). Absent *(default)* disables the monitor entirely —
+    /// no stall checkpoints and no turn-budget notices, byte-identical to
+    /// a loop without it. Clamped to a minimum of 2.
+    pub progress_stall_threshold: Option<usize>,
     /// Phase 3 (`dirge-phyi`, vix port): opt-in phased plan workflow —
     /// explore → plan → reviewer-runs-code loop, each phase a fresh
     /// context-reset fork. `None`/`false` (default) keeps the normal
@@ -1263,6 +1298,61 @@ impl Config {
                  (valid: off | advisory | blocking)"
             );
             GateMode::Off
+        })
+    }
+
+    /// [`verification_tiers`](Self::verification_tiers): `off`/`advisory`/
+    /// `blocking`, parsed case-insensitively and trimmed. `None` and an
+    /// empty value resolve to `Off` (opt-in, like the open-issues gate —
+    /// tiering can only ever ADD messages, so it stays dark by default).
+    /// An unrecognized non-empty value also resolves to `Off` but logs a
+    /// warning, so a typo never silently arms the gate.
+    pub fn resolve_verification_tiers_mode(&self) -> crate::agent::agent_loop::types::GateMode {
+        use crate::agent::agent_loop::types::GateMode;
+        let Some(raw) = self.verification_tiers.as_deref() else {
+            return GateMode::Off;
+        };
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return GateMode::Off;
+        }
+        GateMode::from_wire(trimmed).unwrap_or_else(|| {
+            tracing::warn!(
+                target: "dirge::config",
+                value = trimmed,
+                "unrecognized `verification_tiers` value; falling back to `off` \
+                 (valid: off | advisory | blocking)"
+            );
+            GateMode::Off
+        })
+    }
+
+    /// [`safe_state_abort`](Self::safe_state_abort): `off`/`advisory`/`auto`,
+    /// parsed case-insensitively and trimmed. `None` and an empty value
+    /// resolve to `Off` (opt-in — the rung rewrites a failing plan, which is
+    /// intrusive). An unrecognized non-empty value also resolves to `Off` but
+    /// logs a warning, so a typo never silently arms a destructive path.
+    ///
+    /// `auto` restores the tree itself, and only after proving against git
+    /// that the snapshot store covers every file changed since the green
+    /// point (dirge-uw2l.6); short of that it behaves as `advisory`.
+    pub fn resolve_safe_state_abort_mode(&self) -> crate::agent::agent_loop::types::SafeStateMode {
+        use crate::agent::agent_loop::types::SafeStateMode;
+        let Some(raw) = self.safe_state_abort.as_deref() else {
+            return SafeStateMode::Off;
+        };
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return SafeStateMode::Off;
+        }
+        SafeStateMode::from_wire(trimmed).unwrap_or_else(|| {
+            tracing::warn!(
+                target: "dirge::config",
+                value = trimmed,
+                "unrecognized `safe_state_abort` value; falling back to `off` \
+                 (valid: off | advisory | auto)"
+            );
+            SafeStateMode::Off
         })
     }
 
@@ -2009,6 +2099,91 @@ mod tests {
         );
         assert_eq!(resolve(Some("")), SubagentWriteIsolation::Auto);
         assert_eq!(resolve(Some("unknown")), SubagentWriteIsolation::Auto);
+    }
+
+    /// The progress monitor is off unless a threshold is configured, and
+    /// the value passes through verbatim (the clamp lives in the tracker).
+    #[test]
+    fn progress_stall_threshold_defaults_to_absent() {
+        let cfg: Config = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(cfg.progress_stall_threshold, None);
+        let cfg: Config = serde_json::from_str(r#"{ "progress_stall_threshold": 4 }"#).unwrap();
+        assert_eq!(cfg.progress_stall_threshold, Some(4));
+    }
+
+    #[test]
+    fn resolve_verification_tiers_mode_each_string_and_default() {
+        use crate::agent::agent_loop::types::GateMode;
+
+        let mk = |raw: &str| {
+            Config::deserialize(serde_json::json!({ "verification_tiers": raw }))
+                .unwrap()
+                .resolve_verification_tiers_mode()
+        };
+        assert_eq!(mk("off"), GateMode::Off);
+        assert_eq!(mk("OFF"), GateMode::Off);
+        assert_eq!(mk("  Blocking  "), GateMode::Blocking);
+        assert_eq!(mk("advisory"), GateMode::Advisory);
+
+        // Absent / empty → default Off. Tiering can only ADD messages, so it
+        // stays dark until asked for.
+        let cfg: Config = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(cfg.resolve_verification_tiers_mode(), GateMode::Off);
+        let cfg: Config = serde_json::from_str(r#"{ "verification_tiers": "   " }"#).unwrap();
+        assert_eq!(cfg.resolve_verification_tiers_mode(), GateMode::Off);
+    }
+
+    /// A typo must never silently arm the gate.
+    #[test]
+    fn resolve_verification_tiers_mode_unknown_warns_and_defaults() {
+        use crate::agent::agent_loop::types::GateMode;
+        let cfg: Config = serde_json::from_str(r#"{ "verification_tiers": "nuclear" }"#).unwrap();
+        assert_eq!(cfg.resolve_verification_tiers_mode(), GateMode::Off);
+    }
+
+    #[test]
+    fn resolve_safe_state_abort_mode_each_string_and_default() {
+        use crate::agent::agent_loop::types::SafeStateMode;
+
+        let mk = |raw: &str| {
+            Config::deserialize(serde_json::json!({ "safe_state_abort": raw }))
+                .unwrap()
+                .resolve_safe_state_abort_mode()
+        };
+        assert_eq!(mk("off"), SafeStateMode::Off);
+        assert_eq!(mk("OFF"), SafeStateMode::Off);
+        assert_eq!(mk("  Advisory  "), SafeStateMode::Advisory);
+
+        // Absent / empty -> default Off. The rung rewrites a failing plan, so
+        // it stays dark until asked for.
+        let cfg: Config = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(cfg.resolve_safe_state_abort_mode(), SafeStateMode::Off);
+        let cfg: Config = serde_json::from_str(r#"{ "safe_state_abort": "   " }"#).unwrap();
+        assert_eq!(cfg.resolve_safe_state_abort_mode(), SafeStateMode::Off);
+    }
+
+    /// A typo must never silently arm the rung — least of all now that
+    /// `auto` writes to the user's files.
+    #[test]
+    fn resolve_safe_state_abort_mode_unknown_defaults_off() {
+        use crate::agent::agent_loop::types::SafeStateMode;
+        let cfg: Config = serde_json::from_str(r#"{ "safe_state_abort": "nuclear" }"#).unwrap();
+        assert_eq!(cfg.resolve_safe_state_abort_mode(), SafeStateMode::Off);
+    }
+
+    /// `auto` resolves to `Auto` now that the coverage gate (dirge-uw2l.6)
+    /// makes it safe. It stays strictly opt-in — absence is still `Off` —
+    /// and the gate, not the config, is what prevents a partial restore.
+    #[test]
+    fn resolve_safe_state_abort_mode_accepts_auto() {
+        use crate::agent::agent_loop::types::SafeStateMode;
+        let cfg: Config = serde_json::from_str(r#"{ "safe_state_abort": "auto" }"#).unwrap();
+        assert_eq!(cfg.resolve_safe_state_abort_mode(), SafeStateMode::Auto);
+        let cfg: Config = serde_json::from_str(r#"{ "safe_state_abort": "  AUTO " }"#).unwrap();
+        assert_eq!(cfg.resolve_safe_state_abort_mode(), SafeStateMode::Auto);
+        // Absent is still Off — enabling a destructive path is never implicit.
+        let cfg: Config = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(cfg.resolve_safe_state_abort_mode(), SafeStateMode::Off);
     }
 
     #[test]

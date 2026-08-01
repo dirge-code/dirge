@@ -128,6 +128,48 @@ async fn drain_to_done(
     (events, final_response)
 }
 
+/// True when the run failed because the PROVIDER was unavailable rather
+/// than because dirge is broken — a quota ceiling, a rate limit, an auth
+/// failure, or a dead network.
+///
+/// These scenarios already skip when the API key is unset. A key that is
+/// set but whose account has hit its billing ceiling is the same class of
+/// environmental unavailability, and failing the suite for it makes
+/// `cargo test` red for a reason no code change can fix — which trains
+/// people to ignore a red suite. (GLM answers an exhausted 5-hour window
+/// with HTTP 429 code 1308; `classify_error` already recognizes it, so
+/// this reuses that classifier rather than matching provider strings
+/// here.) Genuine failures — [`ErrorKind::Other`], a wrong answer, a
+/// missing tool call — still fail as before.
+fn provider_unavailable(events: &[AgentEvent]) -> Option<String> {
+    use crate::agent::recovery::{ErrorKind, classify_error};
+    events.iter().find_map(|e| match e {
+        AgentEvent::Error(msg) => match classify_error(msg) {
+            ErrorKind::UsageCap | ErrorKind::RateLimit | ErrorKind::Auth | ErrorKind::Network => {
+                Some(msg.to_string())
+            }
+            _ => None,
+        },
+        _ => None,
+    })
+}
+
+/// Skip-guard wrapper: prints the standard `[skipped]` line and returns
+/// true when the provider was unavailable. Every scenario calls this
+/// immediately after draining, BEFORE asserting on the response — an
+/// errored run has no response to assert against, so the content
+/// assertion would otherwise fire first and report a confusing failure.
+fn skip_if_provider_unavailable(events: &[AgentEvent]) -> bool {
+    match provider_unavailable(events) {
+        Some(msg) => {
+            let brief: String = msg.chars().take(160).collect();
+            eprintln!("[skipped] provider unavailable (quota/rate-limit/auth/network): {brief}");
+            true
+        }
+        None => false,
+    }
+}
+
 /// Render an AgentEvent stream as a multi-line summary for the
 /// stderr trace. Aids debugging when a scenario fails.
 fn dump_events(events: &[AgentEvent]) {
@@ -232,11 +274,14 @@ async fn h7_scenario_1_simple_text() {
         escalation_provider_name: None,
         escalation_max_per_session: None,
         file_touch_tracker: None,
+        progress: None,
         verifier: None,
         critic_fn: None,
         code_review_fn: None,
         code_review_mode: crate::agent::agent_loop::types::CodeReviewMode::default(),
         open_issues_gate_mode: crate::agent::agent_loop::types::GateMode::Off,
+        verification_tiers_mode: crate::agent::agent_loop::types::GateMode::Off,
+        safe_state_abort_mode: crate::agent::agent_loop::types::SafeStateMode::Off,
         session_id: None,
         goal_fn: None,
         goal: None,
@@ -247,6 +292,9 @@ async fn h7_scenario_1_simple_text() {
     let runner = spawn_loop_runner(cfg).into_agent_runner();
     let (events, response) = drain_to_done(runner).await;
     dump_events(&events);
+    if skip_if_provider_unavailable(&events) {
+        return;
+    }
 
     // Expectations:
     //   - Done event fires.
@@ -319,11 +367,14 @@ async fn h7_scenario_2_turn_boundaries() {
         escalation_provider_name: None,
         escalation_max_per_session: None,
         file_touch_tracker: None,
+        progress: None,
         verifier: None,
         critic_fn: None,
         code_review_fn: None,
         code_review_mode: crate::agent::agent_loop::types::CodeReviewMode::default(),
         open_issues_gate_mode: crate::agent::agent_loop::types::GateMode::Off,
+        verification_tiers_mode: crate::agent::agent_loop::types::GateMode::Off,
+        safe_state_abort_mode: crate::agent::agent_loop::types::SafeStateMode::Off,
         session_id: None,
         goal_fn: None,
         goal: None,
@@ -334,6 +385,9 @@ async fn h7_scenario_2_turn_boundaries() {
     let runner = spawn_loop_runner(cfg).into_agent_runner();
     let (events, response) = drain_to_done(runner).await;
     dump_events(&events);
+    if skip_if_provider_unavailable(&events) {
+        return;
+    }
 
     // Expect exactly one TurnStart and one TurnEnd before Done.
     let turn_starts = events
@@ -440,11 +494,14 @@ async fn h7_scenario_5_auth_error_surfaces() {
         escalation_provider_name: None,
         escalation_max_per_session: None,
         file_touch_tracker: None,
+        progress: None,
         verifier: None,
         critic_fn: None,
         code_review_fn: None,
         code_review_mode: crate::agent::agent_loop::types::CodeReviewMode::default(),
         open_issues_gate_mode: crate::agent::agent_loop::types::GateMode::Off,
+        verification_tiers_mode: crate::agent::agent_loop::types::GateMode::Off,
+        safe_state_abort_mode: crate::agent::agent_loop::types::SafeStateMode::Off,
         session_id: None,
         goal_fn: None,
         goal: None,
@@ -455,6 +512,10 @@ async fn h7_scenario_5_auth_error_surfaces() {
     let runner = spawn_loop_runner(cfg).into_agent_runner();
     let (events, _) = drain_to_done(runner).await;
     dump_events(&events);
+    // NO `skip_if_provider_unavailable` here, deliberately. This scenario
+    // drives an auth failure ON PURPOSE with a bad key; the error IS the
+    // thing under test, so the skip-guard that protects the other scenarios
+    // would defeat this one entirely.
 
     // Auth error → either Error event (non-retryable
     // classification per recovery::classify_error) OR Done
@@ -613,11 +674,14 @@ async fn h7_scenario_3_tool_dispatch() {
         escalation_provider_name: None,
         escalation_max_per_session: None,
         file_touch_tracker: None,
+        progress: None,
         verifier: None,
         critic_fn: None,
         code_review_fn: None,
         code_review_mode: crate::agent::agent_loop::types::CodeReviewMode::default(),
         open_issues_gate_mode: crate::agent::agent_loop::types::GateMode::Off,
+        verification_tiers_mode: crate::agent::agent_loop::types::GateMode::Off,
+        safe_state_abort_mode: crate::agent::agent_loop::types::SafeStateMode::Off,
         session_id: None,
         goal_fn: None,
         goal: None,
@@ -628,6 +692,9 @@ async fn h7_scenario_3_tool_dispatch() {
     let runner = spawn_loop_runner(cfg).into_agent_runner();
     let (events, response) = drain_to_done(runner).await;
     dump_events(&events);
+    if skip_if_provider_unavailable(&events) {
+        return;
+    }
 
     // Expectations:
     //   - At least one ToolCall event (model used the tool)
@@ -738,11 +805,14 @@ async fn h7_glm_scenario_1_simple_text() {
         escalation_provider_name: None,
         escalation_max_per_session: None,
         file_touch_tracker: None,
+        progress: None,
         verifier: None,
         critic_fn: None,
         code_review_fn: None,
         code_review_mode: crate::agent::agent_loop::types::CodeReviewMode::default(),
         open_issues_gate_mode: crate::agent::agent_loop::types::GateMode::Off,
+        verification_tiers_mode: crate::agent::agent_loop::types::GateMode::Off,
+        safe_state_abort_mode: crate::agent::agent_loop::types::SafeStateMode::Off,
         session_id: None,
         goal_fn: None,
         goal: None,
@@ -753,6 +823,9 @@ async fn h7_glm_scenario_1_simple_text() {
     let runner = spawn_loop_runner(cfg).into_agent_runner();
     let (events, response) = drain_to_done(runner).await;
     dump_events(&events);
+    if skip_if_provider_unavailable(&events) {
+        return;
+    }
 
     let done = response.unwrap_or_default();
     assert!(
@@ -881,11 +954,14 @@ async fn h7_glm_scenario_3_tool_dispatch() {
         escalation_provider_name: None,
         escalation_max_per_session: None,
         file_touch_tracker: None,
+        progress: None,
         verifier: None,
         critic_fn: None,
         code_review_fn: None,
         code_review_mode: crate::agent::agent_loop::types::CodeReviewMode::default(),
         open_issues_gate_mode: crate::agent::agent_loop::types::GateMode::Off,
+        verification_tiers_mode: crate::agent::agent_loop::types::GateMode::Off,
+        safe_state_abort_mode: crate::agent::agent_loop::types::SafeStateMode::Off,
         session_id: None,
         goal_fn: None,
         goal: None,
@@ -896,6 +972,9 @@ async fn h7_glm_scenario_3_tool_dispatch() {
     let runner = spawn_loop_runner(cfg).into_agent_runner();
     let (events, response) = drain_to_done(runner).await;
     dump_events(&events);
+    if skip_if_provider_unavailable(&events) {
+        return;
+    }
 
     let tool_calls = events
         .iter()
@@ -966,11 +1045,14 @@ fn cerebras_spawn_config(
         escalation_provider_name: None,
         escalation_max_per_session: None,
         file_touch_tracker: None,
+        progress: None,
         verifier: None,
         critic_fn: None,
         code_review_fn: None,
         code_review_mode: crate::agent::agent_loop::types::CodeReviewMode::default(),
         open_issues_gate_mode: crate::agent::agent_loop::types::GateMode::Off,
+        verification_tiers_mode: crate::agent::agent_loop::types::GateMode::Off,
+        safe_state_abort_mode: crate::agent::agent_loop::types::SafeStateMode::Off,
         session_id: None,
         goal_fn: None,
         goal: None,
@@ -1003,6 +1085,9 @@ async fn h7_cerebras_streaming_returns_non_empty_assistant_text() {
     .into_agent_runner();
     let (events, response) = drain_to_done(runner).await;
     dump_events(&events);
+    if skip_if_provider_unavailable(&events) {
+        return;
+    }
 
     assert!(
         !events
@@ -1103,6 +1188,9 @@ async fn h7_cerebras_tool_dispatch_completes_round_trip() {
     .into_agent_runner();
     let (events, response) = drain_to_done(runner).await;
     dump_events(&events);
+    if skip_if_provider_unavailable(&events) {
+        return;
+    }
 
     let tool_calls = events
         .iter()
@@ -1129,3 +1217,60 @@ async fn h7_cerebras_tool_dispatch_completes_round_trip() {
 
 #[allow(unused_imports, dead_code)]
 fn _ensure_arc_used(_: Arc<()>) {}
+
+#[cfg(test)]
+mod skip_guard_tests {
+    use super::provider_unavailable;
+    use crate::event::AgentEvent;
+
+    fn err(msg: &str) -> Vec<AgentEvent> {
+        vec![AgentEvent::Error(msg.to_string().into())]
+    }
+
+    /// The environmental failures that must SKIP rather than fail: no code
+    /// change can turn these green, so failing on them just teaches people
+    /// to ignore a red suite.
+    #[test]
+    fn environmental_failures_are_skippable() {
+        // GLM's exhausted 5-hour window — the case that motivated this.
+        assert!(
+            provider_unavailable(&err(
+                r#"ProviderError: Invalid status code 429 Too Many Requests with message: {"error":{"code":"1308","message":"已达到 5 小时的使用上限。"}}"#
+            ))
+            .is_some(),
+            "GLM usage cap must skip"
+        );
+        assert!(
+            provider_unavailable(&err("Invalid status code 401 Unauthorized")).is_some(),
+            "auth failure must skip"
+        );
+        assert!(
+            provider_unavailable(&err("error sending request: connection refused")).is_some(),
+            "network failure must skip"
+        );
+    }
+
+    /// The guard must NOT swallow a real defect. An unclassified provider
+    /// error, or a run that simply produced no Error event, still fails —
+    /// otherwise the smoke tests would be green no matter what broke.
+    #[test]
+    fn genuine_failures_still_fail() {
+        assert!(
+            provider_unavailable(&err("assistant produced a malformed tool call")).is_none(),
+            "an unclassified error is a real failure"
+        );
+        assert!(
+            provider_unavailable(&err("Invalid status code 400 Bad Request")).is_none(),
+            "a 400 is our bug, not the provider being away"
+        );
+        assert!(
+            provider_unavailable(&[]).is_none(),
+            "no error event at all is not a skip"
+        );
+        // A successful run is never a skip.
+        assert!(
+            provider_unavailable(&[AgentEvent::Token("hi".to_string().into())]).is_none(),
+            "a normal event stream is not a skip"
+        );
+    }
+}

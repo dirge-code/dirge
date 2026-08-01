@@ -133,6 +133,14 @@ pub struct AnyAgent {
     /// forwarded to `LoopConfig.open_issues_gate_mode`. Defaults to `Off`
     /// (opt-in — nagging is intrusive).
     open_issues_gate_mode: crate::agent::agent_loop::types::GateMode,
+    /// Set by `build_agent` from `Config::resolve_verification_tiers_mode`;
+    /// forwarded to `LoopConfig.verification_tiers_mode`. Defaults to `Off`
+    /// (dirge-uw2l.2).
+    verification_tiers_mode: crate::agent::agent_loop::types::GateMode,
+    /// Set by `build_agent` from `Config::resolve_safe_state_abort_mode`;
+    /// forwarded to `LoopConfig.safe_state_abort_mode`. Defaults to `Off`
+    /// (dirge-uw2l.4; the rung is opt-in and off is byte-identical).
+    safe_state_abort_mode: crate::agent::agent_loop::types::SafeStateMode,
     /// Active session id forwarded to `LoopConfig.session_id` for the
     /// open-issues gate and session-scoped tools. `None` in sub-runners.
     session_id: Option<String>,
@@ -156,6 +164,9 @@ pub struct AnyAgent {
     /// `FileTouchTracker` for each session because the tracker is
     /// per-prompt (`active_task` is the initial prompt).
     context_depth_reminder_threshold: Option<usize>,
+    /// Set by `build_agent` from `Config::progress_stall_threshold`;
+    /// forwarded to the loop's progress monitor. `None` = off.
+    progress_stall_threshold: Option<usize>,
     /// dirge-nqr: hard cap on assistant turns per run. Set via
     /// `with_max_turns`. Forwarded to `LoopSpawnConfig.max_turns`
     /// at spawn time. `None` = unlimited (legacy).
@@ -322,11 +333,14 @@ impl AnyAgent {
             code_review_fn: None,
             code_review_mode: crate::agent::agent_loop::types::CodeReviewMode::default(),
             open_issues_gate_mode: crate::agent::agent_loop::types::GateMode::Off,
+            verification_tiers_mode: crate::agent::agent_loop::types::GateMode::Off,
+            safe_state_abort_mode: crate::agent::agent_loop::types::SafeStateMode::Off,
             session_id: None,
             goal_fn: None,
             goal: None,
             summarize_fn: None,
             context_depth_reminder_threshold: None,
+            progress_stall_threshold: None,
             max_turns: None,
             review_stream_fn: None,
             review_provider_name: None,
@@ -532,6 +546,23 @@ impl AnyAgent {
         self
     }
 
+    pub fn with_verification_tiers_mode(
+        mut self,
+        mode: crate::agent::agent_loop::types::GateMode,
+    ) -> Self {
+        self.verification_tiers_mode = mode;
+        self
+    }
+
+    /// dirge-uw2l.4: set the safe-state abort rung mode.
+    pub fn with_safe_state_abort_mode(
+        mut self,
+        mode: crate::agent::agent_loop::types::SafeStateMode,
+    ) -> Self {
+        self.safe_state_abort_mode = mode;
+        self
+    }
+
     /// dirge-ksjl: attach the active session id.
     pub fn with_session_id(mut self, session_id: Option<String>) -> Self {
         self.session_id = session_id;
@@ -570,6 +601,16 @@ impl AnyAgent {
     /// session seeded with the initial prompt.
     pub fn with_context_depth_reminder(mut self, threshold: usize) -> Self {
         self.context_depth_reminder_threshold = Some(threshold);
+        self
+    }
+
+    /// dirge-uw2l.3: enable the progress monitor with the given barren-turn
+    /// stall threshold. Called by `build_agent` only when
+    /// `config.progress_stall_threshold` is `Some`. Carries the threshold
+    /// rather than a tracker so `spawn_runner` builds a fresh one per
+    /// session.
+    pub fn with_progress_stall_threshold(mut self, threshold: usize) -> Self {
+        self.progress_stall_threshold = Some(threshold);
         self
     }
 

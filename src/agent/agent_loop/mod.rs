@@ -42,13 +42,16 @@ pub mod message;
 pub mod plugin_hooks;
 #[cfg(all(test, feature = "plugin"))]
 mod plugin_hooks_tests;
+pub mod progress;
 pub mod reflexion;
+pub mod residual;
 pub mod result;
 pub mod retry;
 pub mod rig_stream;
 pub mod rig_stream_factory;
 pub mod rig_tool;
 pub mod run;
+pub mod safe_state;
 pub mod scavenge;
 pub mod schema_flatten;
 pub mod steering;
@@ -60,6 +63,7 @@ pub mod tool_input_repair;
 pub mod tools;
 pub mod types;
 pub mod verifier;
+pub mod worktree_probe;
 
 pub use bridge::EventBridge;
 pub use hooks::{
