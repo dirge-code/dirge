@@ -4,6 +4,84 @@ All notable changes to dirge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- Four loop features adapted from the validation report for NASA's Deep Space 1
+  Remote Agent Experiment (Nayak et al., ISAIRAS'99). A 1999 paper about a symbolic
+  planner flying a spacecraft transfers less than you'd hope, but its control
+  structure — the failure ladder, the fidelity pyramid, progress-versus-budget —
+  maps onto an agent loop cleanly. All off or inert by default; see
+  [docs/failure-ladder.md](docs/failure-ladder.md).
+
+  **Tiered verification** (`verification_tiers`, dirge-uw2l.2). The verifier gate
+  asked one question — did *some* build/test run and pass — and asked it only at
+  finalization, so `cargo check` and `cargo test --all-features` were the same thing
+  to it. Commands now classify Fast (typecheck, lint, one targeted test) or Slow
+  (full suite or build). Three code edits with nothing run since gets one mid-run
+  nudge for a fast check; fast-green with the suite never green escalates once at
+  finalization. Unknown commands tier as Slow, so an unrecognized one costs a missed
+  escalation rather than a false nag. RAX put ~200 planner variations on simulators
+  running 7× real time and reserved flight hardware for nominal runs; the same
+  section notes most bugs were caught during integration, not by the expensive
+  end-stage campaign.
+
+  **Progress monitor** (`progress_stall_threshold`, dirge-uw2l.3). Every existing
+  guard keys on errors — the storm breaker needs an identical repeated call, the
+  failure tracker needs errored results. A model making successful, varied, useless
+  calls tripped none of them and simply burned the run. The monitor watches turn
+  boundaries for a todo closed, a file touched for the first time, or verification
+  going green, and asks what's blocking when enough pass without one. It arms only
+  after the first progress event, so an exploration phase is never nudged. Also adds
+  turn-budget notices at 60% and 85% of `max_agent_turns`: the cap was enforced but
+  invisible to the model, and a silent hard stop can't prompt triage the way a
+  countdown can.
+
+  **Safe-state abort** (`safe_state_abort`, dirge-uw2l.4 / .6). The executive's
+  failure ladder in the paper has three rungs; dirge had two — reflect-then-pivot,
+  then a recovery checkpoint — and both keep the model digging in a tree that may be
+  half-mutated. The third fires when the failure streak reaches twice the checkpoint
+  threshold with unverified edits and a green point behind it, replacing that
+  boundary's checkpoint (telling the model to both retry and abort is contradictory)
+  and asking for one new approach rather than a menu. `advisory` writes nothing.
+  `auto` restores the tree, but only after proving against git that the snapshot
+  store covers every file changed since green: `snapshots::capture` is wired into the
+  edit tools and not into `bash`, so a `sed -i` or an in-place formatter leaves no
+  pre-state, and restoring around it would produce a tree that never existed. One
+  uncaptured file and it declines to advisory.
+
+  **Residual objectives** (always on, dirge-uw2l.5). A run cut short by `max_turns`
+  now lists what's still outstanding on the todo board, so a resumed session doesn't
+  re-derive scope from the transcript. RAX's 2-day scenario aborted at ~70% of its
+  objectives; the team flew a 6-hour follow-up targeting precisely the remaining 30%,
+  which is only possible if something says what's left.
+
+- Prompt guidance from the same source. `debug.md` gets a confirm-the-inputs step
+  ahead of hypothesis forming — in flight, the planner took an unexpected search path
+  purely because the goals file on the spacecraft differed from the testbed copy, and
+  no amount of logic debugging finds that. `code.md` and `default.md` replace "check
+  for edge cases" with a method: enumerate the conditions in the code you changed,
+  write a case at, just below and just above each boundary, and state the residual
+  risk where one can't be covered. Both also gain an assumption ledger, and `code.md`
+  a rule that passing tests are not evidence of absence for shared mutable state.
+
+### Fixed
+- `edits_since_verify` counted tool calls rather than code files, so a model asked to
+  change four files in one `apply_patch` registered a single edit and the mid-run
+  fast-check threshold was effectively unreachable for any model that batches — which
+  is most of the capable ones. Found by an end-to-end run, not by the unit tests.
+- Harness-injected messages were invisible to anything headless. They are user-role
+  messages the TUI attributes to the system by matching their tag; `--print` shows
+  only the final answer and the stream-json `user` event carries tool results only. A
+  `--print` or `--loop` user watched the model abruptly change course with nothing to
+  explain why, and no way to tell an injected steer from the model's own judgement.
+  Every injection site now mirrors to a `SystemNotice`.
+- The h7 smoke tests failed the whole suite when a provider hit a quota ceiling. They
+  already skipped on a missing API key; a key that is set but out of quota is the same
+  environmental unavailability, and a suite that goes red for something no code change
+  can fix is one people learn to ignore. The auth-error scenario deliberately keeps
+  asserting, since the error is what it tests.
+
 ## [0.19.29] - 2026-07-31
 
 ### Fixed
