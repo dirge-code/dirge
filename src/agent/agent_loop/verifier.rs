@@ -156,6 +156,10 @@ struct Inner {
     /// Full-suite escalations already spent. Separate budget from
     /// [`Inner::fired`] — see the module docs.
     escalations: u8,
+    /// Build/test commands this project's CI runs, resolved once at
+    /// construction. Empty when there is no CI or nothing recognizable.
+    /// Advisory text only — never consulted for a verdict.
+    ci_commands: Vec<String>,
     /// dirge-w2de: the configured project gate's signature. `None` when
     /// the user did not opt in (no `verification_command` config key) —
     /// behaviour is byte-identical to before.
@@ -184,6 +188,10 @@ fn escalation_cap(mode: GateMode) -> u8 {
 }
 
 impl VerifierGate {
+    // `new` and `with_project_gate` are the plain constructors, used
+    // throughout the tests; production goes through
+    // `with_project_gate_and_ci` so the CI advisory is populated.
+    #[allow(dead_code)]
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(Inner::default()),
@@ -196,10 +204,22 @@ impl VerifierGate {
     /// [`VerificationStatus::FastGreenOnly`] until the gate itself
     /// passes. `None` (default) keeps behaviour byte-identical to
     /// [`VerifierGate::new`].
+    #[allow(dead_code)]
     pub fn with_project_gate(project_gate: Option<String>) -> Arc<Self> {
+        Self::with_project_gate_and_ci(project_gate, Vec::new())
+    }
+
+    /// As [`Self::with_project_gate`], plus the CI command list used for the
+    /// advisory hint (dirge-w2de part 2). Resolved once by the caller so the
+    /// filesystem is read at construction, not on every nudge.
+    pub fn with_project_gate_and_ci(
+        project_gate: Option<String>,
+        ci_commands: Vec<String>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(Inner {
                 project_gate: project_gate.as_deref().and_then(gate_signature),
+                ci_commands,
                 ..Inner::default()
             }),
         })
@@ -356,7 +376,13 @@ impl VerifierGate {
             };
             if let Some(text) = nudge {
                 inner.fired = true;
-                return vec![LoopMessage::User(UserMessage::text(text))];
+                // dirge-w2de part 2: name what CI actually enforces, at the
+                // moment the model is being told to verify. Information only —
+                // it changes no verdict, so it cannot cause a false green.
+                let hint = ci_hint(&inner.ci_commands);
+                return vec![LoopMessage::User(UserMessage::text(format!(
+                    "{text}{hint}"
+                )))];
             }
         }
         if inner.is_fast_green_only() && inner.escalations < escalation_cap(mode) {
@@ -365,6 +391,125 @@ impl VerifierGate {
         }
         Vec::new()
     }
+}
+
+
+/// The build/test commands this project's CI actually runs (dirge-w2de part 2).
+///
+/// # Why this is a LIST and not a gate
+///
+/// Part 1 lets a user name one authoritative command via `verification_command`.
+/// The obvious follow-up was to auto-detect that command from CI so a default
+/// config is protected too. That does not work, and the evidence is this very
+/// repo: its `ci.yml` yields four distinct recognized signatures — `cargo fmt`
+/// and `cargo clippy` (Fast), `cargo build` and `cargo nextest` (Slow). Two are
+/// equally "strongest", so any rule that picks one is guessing, and a WRONG
+/// auto-gate is worse than none: it downgrades every honest green to
+/// fast-green-only and nags forever. Refusing to guess means returning nothing
+/// on exactly the repo the feature was written for.
+///
+/// The premise was wrong. Real CI does not have one gate; it has several, all
+/// required. So this returns the recognized set as INFORMATION, and the
+/// verifier folds it into its nudge text. That addresses the actual failure —
+/// an agent ran `cargo test`, saw it pass, and reported success without knowing
+/// clippy was what CI enforced — without touching any verdict. It cannot
+/// produce a false green or a false nag, because it changes no decision.
+///
+/// Commands carrying `${{ ... }}` are skipped: the expansion is unknown, and a
+/// half-substituted command is not something to hand a model as fact.
+pub fn ci_verification_commands(repo_root: &std::path::Path) -> Vec<String> {
+    let dir = repo_root.join(".github").join("workflows");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    // Sort so the result never depends on readdir order — advice that changes
+    // between runs reads as noise.
+    let mut files: Vec<std::path::PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| {
+            matches!(
+                p.extension().and_then(|e| e.to_str()),
+                Some("yml") | Some("yaml")
+            )
+        })
+        .collect();
+    files.sort();
+
+    let mut out: Vec<String> = Vec::new();
+    for f in files {
+        let Ok(text) = std::fs::read_to_string(&f) else {
+            continue;
+        };
+        for cmd in run_step_commands(&text) {
+            if cmd.contains("${{") || !is_verification_command(&cmd) {
+                continue;
+            }
+            // Dedupe by SIGNATURE, not by string: three clippy invocations with
+            // different feature flags are one instruction to the reader.
+            let sig = gate_signature(&cmd);
+            if out.iter().any(|existing| gate_signature(existing) == sig) {
+                continue;
+            }
+            out.push(cmd);
+        }
+    }
+    out
+}
+
+/// Shell commands from YAML `run:` steps. Handles both `run: cmd` and the block
+/// scalar `run: |` followed by indented lines, since real workflows use both.
+/// Deliberately line-oriented — a YAML dependency to read four lines would be a
+/// poor trade, and a mis-parse here degrades to "no advice", never to a wrong
+/// verdict.
+fn run_step_commands(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut block: Option<usize> = None; // indent of an open `run: |` block
+    for line in text.lines() {
+        let indent = line.len() - line.trim_start().len();
+        let trimmed = line.trim_start();
+        if let Some(block_indent) = block {
+            // A block continues while indented deeper than the `run:` key.
+            if trimmed.is_empty() {
+                continue;
+            }
+            if indent > block_indent {
+                out.push(trimmed.to_string());
+                continue;
+            }
+            block = None;
+        }
+        // A step may be a list item (`- run: cmd`) or a plain key under one
+        // (`run: cmd`). Both occur in the same real workflow, and missing the
+        // list form silently drops every step written that way — which is most
+        // of them in most repos.
+        let key = trimmed.strip_prefix("- ").unwrap_or(trimmed);
+        let Some(rest) = key.strip_prefix("run:") else {
+            continue;
+        };
+        let rest = rest.trim();
+        if rest == "|" || rest == ">" || rest == "|-" || rest == ">-" {
+            block = Some(indent);
+        } else if !rest.is_empty() {
+            out.push(rest.to_string());
+        }
+    }
+    out
+}
+
+/// Render the CI command list as a sentence appended to a verifier nudge.
+/// Empty list → empty string, so the nudge is byte-identical when there is
+/// nothing to say.
+pub fn ci_hint(commands: &[String]) -> String {
+    if commands.is_empty() {
+        return String::new();
+    }
+    let list = commands
+        .iter()
+        .map(|c| format!("`{c}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(" This project's CI runs: {list} — a green check that isn't one of those may not be what gets enforced.")
 }
 
 /// Concatenate the text blocks of a tool result for failure scanning.
@@ -2032,5 +2177,128 @@ mod tests {
         g.record_outcome("edit", &json!({"path": "src/auth.rs"}), &ok_result(), false);
         g.record_outcome("bash", &json!({"command": "cargo test"}), &ok_result(), false);
         assert_eq!(g.status(GateMode::Off), VerificationStatus::VerifiedGreen);
+    }
+
+    // ── dirge-w2de part 2: what CI actually runs, as advice ────────────────
+
+    /// Per-test scratch dir, following the convention in worktree_probe.rs
+    /// (process + thread id) rather than adding a dev-dependency for it.
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "dirge-ci-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn wf(dir: &std::path::Path, name: &str, body: &str) {
+        let w = dir.join(".github").join("workflows");
+        std::fs::create_dir_all(&w).unwrap();
+        std::fs::write(w.join(name), body).unwrap();
+    }
+
+    #[test]
+    fn no_github_dir_yields_nothing() {
+        let t = scratch("nogh");
+        assert!(ci_verification_commands(t.as_path()).is_empty());
+    }
+
+    #[test]
+    fn one_line_and_block_scalar_run_steps_both_parse() {
+        let t = scratch("block");
+        wf(
+            t.as_path(),
+            "ci.yml",
+            "jobs:\n  a:\n    steps:\n      - run: cargo clippy --all-targets\n             \n  b:\n    steps:\n      - run: |\n          cargo nextest run\n",
+        );
+        let got = ci_verification_commands(t.as_path());
+        assert!(got.iter().any(|c| c.contains("clippy")), "{got:?}");
+        assert!(got.iter().any(|c| c.contains("nextest")), "{got:?}");
+    }
+
+    #[test]
+    fn non_verification_steps_are_ignored() {
+        let t = scratch("nonverif");
+        wf(
+            t.as_path(),
+            "ci.yml",
+            "steps:\n  - run: actions/checkout@v4\n  - run: echo hello\n  - run: cargo clippy\n",
+        );
+        let got = ci_verification_commands(t.as_path());
+        assert_eq!(got.len(), 1, "only the real check survives: {got:?}");
+        assert!(got[0].contains("clippy"));
+    }
+
+    /// Interpolated commands are skipped — the expansion is unknown, and a
+    /// half-substituted command is not something to hand a model as fact.
+    #[test]
+    fn interpolated_commands_are_skipped() {
+        let t = scratch("interp");
+        wf(
+            t.as_path(),
+            "ci.yml",
+            "steps:\n  - run: cargo build ${{ matrix.features }}\n  - run: cargo clippy\n",
+        );
+        let got = ci_verification_commands(t.as_path());
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert!(got[0].contains("clippy"));
+    }
+
+    /// Deduped by SIGNATURE: three clippy invocations differing only in
+    /// feature flags are one instruction to the reader, not three.
+    #[test]
+    fn same_signature_is_reported_once() {
+        let t = scratch("samesig");
+        wf(
+            t.as_path(),
+            "ci.yml",
+            "steps:\n  - run: cargo clippy --all-targets -- -D warnings\n             \n  - run: cargo clippy --features sandbox-microvm --all-targets -- -D warnings\n",
+        );
+        assert_eq!(ci_verification_commands(t.as_path()).len(), 1);
+    }
+
+    /// The motivating case. This repo's own CI is what the original incident
+    /// happened against: an agent ran `cargo test`, saw it pass, reported
+    /// success, and clippy had six hard errors. The advisory has to name
+    /// clippy, or it does not address the thing it was written for.
+    #[test]
+    fn this_repos_real_ci_names_clippy() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let got = ci_verification_commands(root);
+        assert!(
+            got.iter().any(|c| c.contains("clippy")),
+            "must surface the gate the motivating incident missed: {got:?}"
+        );
+        // And the hint reads as a sentence naming it.
+        let hint = ci_hint(&got);
+        assert!(hint.contains("clippy"), "{hint}");
+        assert!(hint.contains("CI runs"), "{hint}");
+    }
+
+    /// Empty list → byte-identical nudge. A project with no CI must not get a
+    /// trailing fragment.
+    #[test]
+    fn no_ci_commands_leaves_the_nudge_unchanged() {
+        assert_eq!(ci_hint(&[]), "");
+        let g = VerifierGate::with_project_gate_and_ci(None, Vec::new());
+        g.record_outcome("edit", &json!({"path": "src/a.rs"}), &ok_result(), false);
+        let n = nudge(&g).expect("nudge fires");
+        assert_eq!(n, VERIFY_NUDGE, "no CI → the original text, exactly");
+    }
+
+    /// With CI commands, the nudge names them — this is the whole payload.
+    #[test]
+    fn nudge_names_the_ci_commands() {
+        let g = VerifierGate::with_project_gate_and_ci(
+            None,
+            vec!["cargo clippy --all-targets -- -D warnings".to_string()],
+        );
+        g.record_outcome("edit", &json!({"path": "src/a.rs"}), &ok_result(), false);
+        let n = nudge(&g).expect("nudge fires");
+        assert!(n.starts_with(VERIFY_NUDGE), "original text is preserved");
+        assert!(n.contains("cargo clippy"), "and CI is named: {n}");
     }
 }

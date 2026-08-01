@@ -252,12 +252,18 @@ impl AnyAgent {
         // to verify before finishing when code was edited but not run.
         // dirge-w2de: a configured `verification_command` makes the gate
         // require the REAL CI command to pass before reporting green.
-        cfg.verifier = Some(match self.verification_command.clone() {
-            Some(cmd) => {
-                crate::agent::agent_loop::verifier::VerifierGate::with_project_gate(Some(cmd))
-            }
-            None => crate::agent::agent_loop::verifier::VerifierGate::new(),
-        });
+        // dirge-w2de part 2: what this project's CI actually runs, resolved
+        // once. Advisory only — it is named in the verify nudge so the model
+        // knows which check is enforced, and never consulted for a verdict.
+        let ci_commands = crate::agent::agent_loop::verifier::ci_verification_commands(
+            &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+        );
+        cfg.verifier = Some(
+            crate::agent::agent_loop::verifier::VerifierGate::with_project_gate_and_ci(
+                self.verification_command.clone(),
+                ci_commands,
+            ),
+        );
         // F6 tier 3: thread the bounded critic (only Some when
         // critic_provider is configured). `None` → no critic.
         cfg.critic_fn = self.critic_fn.clone();
