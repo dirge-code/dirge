@@ -1975,9 +1975,36 @@ mod integration {
     #[test]
     fn dyld_fallback_library_path_valid_on_macos() {
         // Regression guard: the DYLD_FALLBACK_LIBRARY_PATH the spawn code
-        // builds must contain a directory where libkrunfw.5.dylib lives.
+        // builds must contain a directory where libkrunfw lives.
         // Uses the same logic as mod.rs: MicrovmSandbox::start().
         use std::path::Path;
+
+        // Prerequisite, not the assertion. What this guards is our brew-prefix
+        // RESOLUTION: with the formula installed, a prefix set that doesn't
+        // contain the dylib means the resolution is broken. With the formula
+        // absent there is nothing to resolve to and the machine simply isn't
+        // set up for microVMs — every sibling test here skips on a missing
+        // prerequisite (`vm_available`, PTY allocation) and this one hard-
+        // failed instead, so the suite read red on any Mac without libkrun
+        // (dirge-jbhz).
+        //
+        // Asked of brew directly rather than by looking for the file under a
+        // prefix WE resolved — otherwise the skip condition would be the same
+        // condition the test asserts, and the guard would silently become
+        // vacuous instead of failing.
+        let formula_installed = std::process::Command::new("brew")
+            .args(["list", "--formula", "libkrunfw"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !formula_installed {
+            eprintln!(
+                "skipping: libkrunfw is not installed — brew tap libkrun/krun && \
+                 brew trust libkrun/krun && brew install libkrun libkrunfw"
+            );
+            return;
+        }
 
         // Resolve brew prefix (same as the spawn code).
         let brew_prefixes: Vec<String> = [
@@ -2023,8 +2050,8 @@ mod integration {
             "brew --prefix returned no prefixes — is Homebrew installed?"
         );
 
-        // Each prefix should have a /lib subdirectory with libkrunfw.5.dylib.
-        let krunfw_name = "libkrunfw.5.dylib";
+        // Each prefix should have a /lib subdirectory with libkrunfw in it.
+        let krunfw_name = crate::sandbox::check::LIBKRUNFW_LIB;
         let found = brew_prefixes.iter().any(|p| {
             let lib_path = Path::new(p).join("lib").join(krunfw_name);
             let exists = lib_path.exists();
@@ -2038,7 +2065,7 @@ mod integration {
 
         assert!(
             found,
-            "libkrunfw.5.dylib not found under any brew prefix -- {} --          install it: brew tap libkrun/krun && brew trust libkrun/krun &&          brew install libkrun libkrunfw",
+            "{krunfw_name} not found under any brew prefix -- {} --          install it: brew tap libkrun/krun && brew trust libkrun/krun &&          brew install libkrun libkrunfw",
             brew_prefixes
                 .iter()
                 .map(|p| format!("{p}/lib/{krunfw_name}"))
