@@ -1333,6 +1333,7 @@ mod tests {
     // recovery hint so the agent can fetch the missing middle.
     #[test]
     fn regression_notify_relays_large_completed_payload() {
+        let _relay_dir = crate::agent::tools::output_relay::TransientDirGuard::new();
         let store = BackgroundStore::new();
         store.insert("t1".into());
         // Multi-line payload well past the 8 KiB byte threshold AND
@@ -1353,8 +1354,48 @@ mod tests {
             "relayed summary must mention `read` tool: {text}",
         );
         assert!(
-            text.contains("transient") || text.contains(".dirge"),
+            text.contains(
+                &crate::agent::tools::output_relay::transient_base()
+                    .display()
+                    .to_string()
+            ),
             "relayed summary must reference the transient path: {text}",
+        );
+    }
+
+    // dirge-cnx3: the truncation marker is prefixed to the payload BEFORE it
+    // reaches the store, so it has to survive the relay's head/tail summary
+    // (which keeps the first 50 lines) AND the coordinator's notification
+    // rendering. If it didn't, a cut-off subagent would go back to reading as
+    // `completed:` for exactly the large payloads the relay fires on.
+    #[test]
+    fn truncation_marker_survives_relay_and_notification() {
+        use crate::agent::tools::task::SUBAGENT_TRUNCATED_MARKER;
+        let _relay_dir = crate::agent::tools::output_relay::TransientDirGuard::new();
+        let store = BackgroundStore::new();
+        store.enable_coordinator(crate::config::SubagentDispatchStrategy::Full);
+        store
+            .insert_coordinator_dispatch("t1".into(), "audit the loop".into(), false, false, None)
+            .unwrap();
+        let body: String = (0..5_000)
+            .map(|i| format!("subagent narration line {i}\n"))
+            .collect();
+        let marked = format!("{SUBAGENT_TRUNCATED_MARKER}\n\n{body}");
+        store.notify("t1", TaskState::Completed(marked));
+
+        let drained = store.drain_notifications();
+        let rendered = format_notifications(&store, &drained);
+        assert!(
+            rendered.contains(SUBAGENT_TRUNCATED_MARKER),
+            "coordinator must still see the cutoff marker after relay: {rendered}",
+        );
+        // And it stays adjacent to the `completed:` heading rather than being
+        // pushed past the elision — the parent reads the two together.
+        let completed_at = rendered.find("completed:").expect("completed heading");
+        let marker_at = rendered.find(SUBAGENT_TRUNCATED_MARKER).unwrap();
+        assert!(
+            marker_at > completed_at && marker_at - completed_at < 32,
+            "marker must lead the payload, not trail it: {rendered}",
         );
     }
 
@@ -1666,6 +1707,7 @@ mod tests {
     // recovery hint (full payload is on disk).
     #[tokio::test]
     async fn ui_sink_event_carries_relayed_payload() {
+        let _relay_dir = crate::agent::tools::output_relay::TransientDirGuard::new();
         let (tx, mut rx) = mpsc::unbounded_channel();
         let store = BackgroundStore::with_ui_sink(tx);
         store.insert("t1".into());

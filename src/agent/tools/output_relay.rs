@@ -39,7 +39,6 @@
 //! cwd or `~/.dirge/`) accept reading them back.
 
 #[cfg(test)]
-#[allow(unused_imports)]
 use crate::sync_util::LockExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -120,9 +119,60 @@ fn fits_inline(output: &str, inline_max_bytes: usize) -> bool {
     line_count <= DEFAULT_LINE_THRESHOLD
 }
 
+/// dirge-rdwt: test-only redirect for [`transient_base`]. Tests that push a
+/// payload through the REAL relay (to assert the head/tail summary, the
+/// recovery hint, or that a marker survives) otherwise write megabytes into
+/// the developer's actual `~/.dirge/transient/`, where it lingers until some
+/// later relay write happens to trigger the 24h sweep — and looks exactly
+/// like production payloads when triaging a subagent report. Acquire via
+/// [`TransientDirGuard::new`], which also serializes those tests.
+#[cfg(test)]
+static TRANSIENT_BASE_OVERRIDE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+/// Serializes tests holding a [`TransientDirGuard`] so one test's override
+/// can't be observed by another running in parallel.
+#[cfg(test)]
+static TRANSIENT_DIR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// RAII redirect of the transient tree into a unique temp dir, removed on
+/// drop. Held for the duration of any test that exercises the real relay.
+#[cfg(test)]
+pub(crate) struct TransientDirGuard {
+    dir: PathBuf,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl TransientDirGuard {
+    pub(crate) fn new() -> Self {
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let lock = TRANSIENT_DIR_LOCK.lock_ignore_poison();
+        let dir = std::env::temp_dir().join(format!(
+            "dirge-relay-test-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed),
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        *TRANSIENT_BASE_OVERRIDE.lock_ignore_poison() = Some(dir.clone());
+        Self { dir, _lock: lock }
+    }
+}
+
+#[cfg(test)]
+impl Drop for TransientDirGuard {
+    fn drop(&mut self) {
+        *TRANSIENT_BASE_OVERRIDE.lock_ignore_poison() = None;
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
 /// Resolve the base transient directory: `~/.dirge/transient/`.
 /// Falls back to the system temp dir if the user has no HOME.
 pub fn transient_base() -> PathBuf {
+    #[cfg(test)]
+    if let Some(dir) = TRANSIENT_BASE_OVERRIDE.lock_ignore_poison().clone() {
+        return dir;
+    }
     if let Some(home) = dirs::home_dir() {
         home.join(".dirge").join("transient")
     } else {
@@ -376,6 +426,7 @@ mod tests {
     /// can't shift the threshold under us.
     #[test]
     fn one_byte_over_threshold_relays() {
+        let _relay_dir = TransientDirGuard::new();
         let inline_max = inline_max_bytes_for("nonexistent-tool");
         let payload: String = "x".repeat(inline_max + 1);
         let outcome = relay_if_large("nonexistent-tool", payload, "");
@@ -399,6 +450,7 @@ mod tests {
     /// when the byte total is small.
     #[test]
     fn line_threshold_trips_relay() {
+        let _relay_dir = TransientDirGuard::new();
         let lines: Vec<String> = (0..DEFAULT_LINE_THRESHOLD + 5)
             .map(|i| format!("line {i}"))
             .collect();
@@ -425,6 +477,7 @@ mod tests {
     /// Summary contains head + tail + hint pointing at the full file.
     #[test]
     fn summary_contains_head_tail_and_hint() {
+        let _relay_dir = TransientDirGuard::new();
         let mut lines: Vec<String> = Vec::new();
         for i in 0..500 {
             lines.push(format!("LINE{i}"));
@@ -441,11 +494,10 @@ mod tests {
         // Hint must mention `read`.
         assert!(text.contains("`read`"), "hint missing `read` reference");
         // Path hint must mention the transient path.
+        // Compare against the live base rather than hardcoded substrings, so
+        // the assertion holds under the test redirect too (dirge-rdwt).
         assert!(
-            text.contains("~/.dirge")
-                || text.contains(".dirge/transient")
-                || text.contains("/transient/")
-                || text.contains("dirge-transient"),
+            text.contains(&transient_base().display().to_string()),
             "hint should reference the transient directory: {text}",
         );
         if let Some(p) = outcome.relayed_to {
@@ -497,6 +549,7 @@ mod tests {
     #[test]
     fn relay_prepends_header_note() {
         let _guard = THRESHOLD_LOCK.lock_ignore_poison();
+        let _relay_dir = TransientDirGuard::new();
         let payload: String = "x".repeat(inline_max_bytes_for("bash") + 1);
         let outcome = relay_if_large("bash", payload, "Exit code: 137");
         assert!(outcome.text.starts_with("Exit code: 137"));
@@ -510,6 +563,7 @@ mod tests {
     #[test]
     fn config_override_changes_threshold() {
         let _guard = THRESHOLD_LOCK.lock_ignore_poison();
+        let _relay_dir = TransientDirGuard::new();
         // Snapshot whatever the global was so we can restore
         // it for other parallel tests.
         let prev = BASH_INLINE_MAX.load(Ordering::Relaxed);
@@ -534,6 +588,7 @@ mod tests {
     /// PID dirs are also removed.
     #[test]
     fn aged_cleanup_removes_stale_files() {
+        let _relay_dir = TransientDirGuard::new();
         let base = transient_base();
         let pid_dir = base.join("test-aged-cleanup-pid-9999");
         let _ = std::fs::remove_dir_all(&pid_dir);

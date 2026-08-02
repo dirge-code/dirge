@@ -732,6 +732,47 @@ fn value_brief(v: &serde_json::Value) -> String {
     }
 }
 
+/// dirge-cnx3: leads a payload whose subagent was stopped by the turn cap
+/// rather than finishing. The parent renders subagent results under a
+/// `completed:` heading (`background.rs::format_notifications`), so without an
+/// in-band marker a cut-off run is indistinguishable from a finished one.
+pub(crate) const SUBAGENT_TRUNCATED_MARKER: &str = "[dirge] SUBAGENT STOPPED EARLY — turn cap reached. The text below is its \
+     last narration, NOT a final answer. Its work is incomplete: re-dispatch \
+     the remainder or verify the claims yourself before relying on them.";
+
+/// dirge-vxmi: leads a payload assembled from the accumulated token stream
+/// because the run produced no final assistant text. That stream is every
+/// turn's running narration, not a report.
+pub(crate) const SUBAGENT_TRACE_FALLBACK_MARKER: &str = "[dirge] SUBAGENT PRODUCED NO FINAL ANSWER — the text below is its \
+     turn-by-turn narration, not a report. Treat any conclusion in it as \
+     unverified.";
+
+/// Prefix the appropriate marker (if any) onto a subagent's payload.
+///
+/// The turn-cap marker wins when both conditions hold: a run that blew its
+/// budget is the more actionable fact, and "no final answer" is the expected
+/// consequence of being cut off mid-turn rather than an independent signal.
+fn mark_subagent_payload(
+    body: String,
+    turn_cap_notice: Option<String>,
+    no_final_text: bool,
+) -> String {
+    let marker = match (&turn_cap_notice, no_final_text) {
+        (Some(_), _) => SUBAGENT_TRUNCATED_MARKER,
+        (None, true) => SUBAGENT_TRACE_FALLBACK_MARKER,
+        (None, false) => return body,
+    };
+    let mut out = String::with_capacity(marker.len() + body.len() + 128);
+    out.push_str(marker);
+    if let Some(notice) = turn_cap_notice {
+        out.push('\n');
+        out.push_str(&notice);
+    }
+    out.push_str("\n\n");
+    out.push_str(&body);
+    out
+}
+
 /// Drain a tooled subagent's `AgentRunner` to completion, relaying each
 /// event into the subagent chat-window channel. This is the first live
 /// producer for the dormant `SubagentChatEvent::{Token,Reasoning,ToolCall,
@@ -742,6 +783,20 @@ fn value_brief(v: &serde_json::Value) -> String {
 /// Returns the final assistant text (`Done.response`, falling back to the
 /// accumulated token stream) or the first error. `AbortRunnerOnDrop` is held
 /// for the drain so a cancelled/early-returning caller actually kills the fork.
+///
+/// dirge-cnx3 / dirge-vxmi: the payload is MARKED when it isn't a real answer.
+/// A subagent's terminal state is not visible in `Done` alone:
+///
+///   - Turn cap: `run.rs` emits the max-turns notice as a `SystemNotice` and
+///     appends it as a USER message, so `AgentEnd`'s last ASSISTANT message —
+///     and hence `Done.response` — is the in-flight tool-call turn's preamble.
+///     A bare "Now let me check the next file" then reaches the parent under a
+///     `completed:` heading and reconciles as finished work.
+///   - No final text: an empty `Done.response` falls back to the accumulated
+///     token stream, which is every turn's narration rather than a report.
+///
+/// Both cases get a leading marker so the dispatching agent can tell a
+/// finished subagent from a cut-off one. A clean answer is returned verbatim.
 async fn drain_subagent_runner(
     runner: crate::agent::runner::AgentRunner,
     id: &str,
@@ -759,8 +814,17 @@ async fn drain_subagent_runner(
     let _guard = AbortRunnerOnDrop { task, cancel_tx };
     let mut rx = event_rx;
     let mut text = String::new();
+    // The max-turns notice, if the run hit its cap. Captured here because
+    // `SystemNotice` is otherwise UI-only — nothing downstream of the fork
+    // ever sees it, so without this the cutoff is invisible to the parent.
+    let mut turn_cap_notice: Option<String> = None;
     while let Some(event) = rx.recv().await {
         match event {
+            AgentEvent::SystemNotice { content } => {
+                if content.starts_with(crate::agent::agent_loop::run::MAX_TURNS_NOTICE_PREFIX) {
+                    turn_cap_notice = Some(content.to_string());
+                }
+            }
             AgentEvent::Token(t) => {
                 text.push_str(&t);
             }
@@ -779,11 +843,13 @@ async fn drain_subagent_runner(
                 output_summary: one_line(&output, 120),
             }),
             AgentEvent::Done { response, .. } => {
-                let response = if response.is_empty() {
-                    text
+                let no_final_text = response.is_empty();
+                let body = if no_final_text {
+                    std::mem::take(&mut text)
                 } else {
                     response.to_string()
                 };
+                let response = mark_subagent_payload(body, turn_cap_notice.take(), no_final_text);
                 emit(SubagentChatEvent::Token {
                     id: id.to_string(),
                     text: response.clone(),
@@ -2348,6 +2414,140 @@ mod tests {
         );
     }
 
+    /// Replay helper shared by the truncation/fallback drain tests below.
+    fn replay_runner(events: Vec<crate::event::AgentEvent>) -> crate::agent::runner::AgentRunner {
+        use tokio::sync::mpsc;
+        let (tx, event_rx) = mpsc::channel(events.len().max(1));
+        for e in events {
+            tx.try_send(e).expect("test channel sized to fit events");
+        }
+        drop(tx);
+        let (interject_tx, _) = mpsc::channel(1);
+        let (cancel_tx, _) = mpsc::channel(1);
+        crate::agent::runner::AgentRunner {
+            event_rx,
+            task: tokio::spawn(async {}),
+            interject_tx,
+            cancel_tx,
+        }
+    }
+
+    // dirge-cnx3: a subagent killed by the turn cap must NOT hand the parent a
+    // bare narration string that reads as a finished answer. The loop emits the
+    // max-turns notice as `AgentEvent::SystemNotice` and then an `AgentEnd`
+    // whose last ASSISTANT message is the in-flight tool-call turn — so
+    // `Done.response` is the preamble the model wrote before calling tools.
+    // The drain must fold the notice into the payload.
+    #[tokio::test]
+    async fn drain_marks_payload_when_subagent_hits_turn_cap() {
+        use crate::event::AgentEvent;
+        let runner = replay_runner(vec![
+            AgentEvent::Token("Now let me check the next file".into()),
+            AgentEvent::SystemNotice {
+                content: "[dirge] Max agent turns (25) reached. Stopping the run.".into(),
+            },
+            AgentEvent::Done {
+                response: "Now let me check the next file".into(),
+                tokens: 0,
+                cost: 0.0,
+            },
+        ]);
+        let text = drain_subagent_runner(runner, "sub-1", |_| {})
+            .await
+            .expect("drain returns the payload");
+        assert!(
+            text.starts_with(SUBAGENT_TRUNCATED_MARKER),
+            "cut-off payload must lead with the truncation marker: {text:?}",
+        );
+        assert!(
+            text.contains("Max agent turns (25) reached"),
+            "the notice itself must survive so the parent knows the cap: {text:?}",
+        );
+        assert!(
+            text.contains("Now let me check the next file"),
+            "the agent's own trailing text must still be delivered: {text:?}",
+        );
+    }
+
+    // An unrelated SystemNotice (or none at all) must leave a clean answer
+    // untouched — the marker is for the turn-cap case only.
+    #[tokio::test]
+    async fn drain_leaves_clean_answer_unmarked() {
+        use crate::event::AgentEvent;
+        let runner = replay_runner(vec![
+            AgentEvent::SystemNotice {
+                content: "[dirge] compacted context".into(),
+            },
+            AgentEvent::Done {
+                response: "## Findings\n1. real finding".into(),
+                tokens: 0,
+                cost: 0.0,
+            },
+        ]);
+        let text = drain_subagent_runner(runner, "sub-1", |_| {})
+            .await
+            .expect("drain returns the payload");
+        assert_eq!(
+            text, "## Findings\n1. real finding",
+            "a finished subagent's answer must round-trip verbatim",
+        );
+    }
+
+    // dirge-vxmi: an empty `Done.response` falls back to the accumulated token
+    // stream — every turn's narration, not an answer. Deliver it labelled so
+    // the parent doesn't reconcile a trace as a findings report.
+    #[tokio::test]
+    async fn drain_labels_token_trace_fallback() {
+        use crate::event::AgentEvent;
+        let runner = replay_runner(vec![
+            AgentEvent::Token("Let me look at the config.".into()),
+            AgentEvent::Token("Now the handler.".into()),
+            AgentEvent::Done {
+                response: String::new().into(),
+                tokens: 0,
+                cost: 0.0,
+            },
+        ]);
+        let text = drain_subagent_runner(runner, "sub-1", |_| {})
+            .await
+            .expect("drain returns the payload");
+        assert!(
+            text.starts_with(SUBAGENT_TRACE_FALLBACK_MARKER),
+            "trace fallback must be labelled, not passed off as an answer: {text:?}",
+        );
+        assert!(
+            text.contains("Let me look at the config.") && text.contains("Now the handler."),
+            "the accumulated trace must still be delivered: {text:?}",
+        );
+    }
+
+    // Both conditions at once (cap reached AND no final text): the parent gets
+    // the turn-cap marker, which is the more actionable of the two.
+    #[tokio::test]
+    async fn drain_prefers_turn_cap_marker_over_trace_marker() {
+        use crate::event::AgentEvent;
+        let runner = replay_runner(vec![
+            AgentEvent::Token("mid-work narration".into()),
+            AgentEvent::SystemNotice {
+                content: "[dirge] Max agent turns (25) reached. Stopping the run.".into(),
+            },
+            AgentEvent::Done {
+                response: String::new().into(),
+                tokens: 0,
+                cost: 0.0,
+            },
+        ]);
+        let text = drain_subagent_runner(runner, "sub-1", |_| {})
+            .await
+            .expect("drain returns the payload");
+        assert!(text.starts_with(SUBAGENT_TRUNCATED_MARKER), "{text:?}");
+        assert!(
+            !text.contains(SUBAGENT_TRACE_FALLBACK_MARKER),
+            "one marker, not two: {text:?}",
+        );
+        assert!(text.contains("mid-work narration"), "{text:?}");
+    }
+
     // dirge-ykeu Phase 4: with a routing table installed, the `task` tool
     // advertises an `agent` enum and resolves/rejects profile names. NOTE:
     // SUBAGENT_ROUTES is a set-once OnceLock, so this is the only test in the
@@ -2436,6 +2636,7 @@ mod tests {
     // chars" behavior that lost subagent output.
     #[test]
     fn task_large_output_relayed_to_disk_with_summary() {
+        let _relay_dir = crate::agent::tools::output_relay::TransientDirGuard::new();
         // 64 KiB payload — well past the default 8 KiB inline budget.
         let huge: String = "subagent line\n".repeat(5_000);
         let original_len = huge.len();
@@ -2466,7 +2667,11 @@ mod tests {
             "summary must mention the `read` tool so the agent can recover the full payload: {summary}",
         );
         assert!(
-            summary.contains("transient") || summary.contains(".dirge"),
+            summary.contains(
+                &crate::agent::tools::output_relay::transient_base()
+                    .display()
+                    .to_string()
+            ),
             "summary must reference the transient path: {summary}",
         );
 
