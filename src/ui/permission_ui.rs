@@ -9,33 +9,90 @@ pub(crate) fn is_placeholder_pattern(p: &str) -> bool {
     p == ALLOW_PLACEHOLDER
 }
 
-/// Find the head (first word) of the first command segment in a bash
-/// line that ISN'T a benign navigation/no-op prefix. Used so an
-/// allow-always suggestion targets the command that actually needs
-/// permission (e.g. `python3` in `cd /x && python3 …`) rather than an
-/// already-auto-allowed prefix like `cd`. Returns `None` when every
-/// segment is benign (then the caller falls back to the first token).
+/// Why "allow always" can't produce a usable grant for this input, or `None`
+/// when it can. The dialog prints this and downgrades to allow-once.
 ///
-/// Splits on shell segment separators only to locate the head — the
-/// goal is just to skip a leading benign command, so a heredoc/quoted
-/// body further right is irrelevant (the first significant head appears
-/// before it).
-fn significant_bash_head(command: &str) -> Option<&str> {
-    // Only prefixes that are THEMSELVES auto-allowed by
-    // `default_bash_rules` belong here — skipping a prefix that still
-    // needs approval would make the suggested pattern miss it and the
-    // agent would keep re-prompting on that segment (dirge-9zbd). So
-    // `source`/`.` are intentionally NOT here: they execute arbitrary
-    // script code and are not auto-allowed, so the suggestion should
-    // target them.
-    const BENIGN: &[&str] = &[
-        "cd", "pushd", "popd", "export", "set", "unset", ":", "true", "env",
-    ];
+/// dirge-jktn: the complex-command arm exists because the engine REFUSES to
+/// honor a session grant on a command containing substitution / a subshell /
+/// arithmetic expansion (`SessionAllowlistPolicy::decide`, dirge-g9qj — the
+/// inner command is invisible, so a head-shaped grant like `echo *` must not
+/// cover `echo $(rm -rf ~)`). Offering "allow always" anyway saved an entry
+/// that could never match, told the user it was saved, and then re-prompted
+/// on the very next identical command.
+pub(crate) fn allow_always_downgrade_reason(tool: &str, input: &str) -> Option<&'static str> {
+    if input.trim().is_empty() {
+        return Some("can't derive a useful pattern from empty input");
+    }
+    if tool == "bash" && crate::semantic::adapters::bash::command_is_complex(input) {
+        return Some(
+            "commands with shell substitution or a subshell are never covered by a saved rule \
+             (the inner command can't be inspected), so this can only be allowed once",
+        );
+    }
+    None
+}
+
+/// Whether a bash segment is ALREADY authorized by the built-in rules, so
+/// an allow-always grant derived from it would add nothing.
+///
+/// Last-match-wins over `default_bash_rules`, mirroring how the engine orders
+/// them (`permission::engine::build`), and only `Allow` counts — a `Deny` rule
+/// matching the segment obviously doesn't make it permitted.
+fn segment_already_allowed(segment: &str) -> bool {
+    use crate::permission::{Action, default_bash_rules, pattern::Pattern};
+    default_bash_rules()
+        .into_iter()
+        .rfind(|(pat, _)| Pattern::new_command(pat).matches(segment))
+        .is_some_and(|(_, action)| action == Action::Allow)
+}
+
+/// Split a bash line into command segments.
+///
+/// Prefers the same tree-sitter splitter the permission layer itself runs
+/// (`parse_bash_segments_full`), so the suggestion is derived from the exact
+/// segments that were authorized — a quoted `|` or a heredoc body can't
+/// manufacture a phantom segment. Falls back to the coarse separator split
+/// when that parser is unavailable or declines to decompose the command.
+fn bash_segments(command: &str) -> Vec<String> {
+    if let Ok((segments, complex)) =
+        crate::semantic::adapters::bash::parse_bash_segments_full(command)
+        && !complex
+        && segments.len() > 1
+    {
+        return segments;
+    }
     command
         .split(['&', '|', ';', '\n'])
-        .map(str::trim)
-        .filter_map(|seg| seg.split_whitespace().next())
-        .find(|head| !BENIGN.contains(head))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Find the head (first word) of the first command segment in a bash line that
+/// is NOT already auto-allowed. Used so an allow-always suggestion targets the
+/// command that actually needs permission (e.g. `python3` in `cd /x &&
+/// python3 …`) rather than a prefix that already passes. Returns `None` when
+/// every segment already passes (then the caller falls back to the first
+/// token).
+///
+/// dirge-mirm: this used to consult a hardcoded 9-entry list of shell
+/// builtins, while `default_bash_rules` auto-allows ~22 more (`cat`, `ls`,
+/// `grep`, `echo`, `head`, `tail`, `rg`, `find`, …). The two drifted, and a
+/// compound led by one of the missing entries — `cat f.txt | clojure -M -` —
+/// produced a suggestion the defaults already covered. "Allow always" then
+/// saved a rule that granted nothing and the blocking segment re-prompted on
+/// every invocation. Asking the rule set directly makes that class of drift
+/// impossible: whatever `default_bash_rules` allows is skipped, by
+/// construction.
+///
+/// `source`/`.` are still correctly targeted rather than skipped — they
+/// execute arbitrary script code and no built-in rule allows them.
+fn significant_bash_head(command: &str) -> Option<String> {
+    bash_segments(command).into_iter().find_map(|seg| {
+        (!segment_already_allowed(&seg))
+            .then(|| seg.split_whitespace().next().map(str::to_string))
+            .flatten()
+    })
 }
 
 pub(crate) fn suggest_pattern(tool: &str, input: &str) -> String {
@@ -47,20 +104,26 @@ pub(crate) fn suggest_pattern(tool: &str, input: &str) -> String {
     // suggested pattern, the user edits it before confirming.
     const PLACEHOLDER: &str = ALLOW_PLACEHOLDER;
     let trimmed = input.trim();
-    if trimmed.is_empty() {
+    // Covers empty input AND commands no session grant can ever match
+    // (dirge-jktn); both downgrade the dialog to allow-once.
+    if allow_always_downgrade_reason(tool, input).is_some() {
         return PLACEHOLDER.to_string();
     }
     match tool {
         "bash" => {
-            // Base the suggestion on the first SIGNIFICANT command, not
-            // literally the first token. A compound command is split into
-            // a permission claim per segment; benign navigation prefixes
-            // like `cd` are already auto-allowed (`default_bash_rules`),
-            // so suggesting `cd *` for `cd /x && python3 …` saves a rule
-            // that covers nothing — the `python3` segment keeps
-            // prompting. Skip the benign prefix and suggest `python3 *`.
-            let head = significant_bash_head(trimmed)
-                .unwrap_or_else(|| trimmed.split_whitespace().next().unwrap_or(PLACEHOLDER));
+            // Base the suggestion on the first segment that actually needs
+            // permission, not literally the first token. A compound command
+            // is split into a permission claim per segment, so a suggestion
+            // derived from an already-allowed prefix saves a rule that
+            // covers nothing while the blocking segment keeps prompting —
+            // `cd /x && python3 …` must yield `python3 *`, not `cd *`.
+            let head = significant_bash_head(trimmed).unwrap_or_else(|| {
+                trimmed
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or(PLACEHOLDER)
+                    .to_string()
+            });
             format!("{} *", head)
         }
         // Path-arg tools: suggest a `<parent>/**` glob from the input
@@ -186,8 +249,15 @@ mod tests {
             "python3 *"
         );
         // Multiple benign prefixes are all skipped.
+        // NOTE: the trailing command must be one that genuinely needs
+        // approval. This case used to end in `npm run build`, which the
+        // built-in `npm run **` rule already allows — so the asserted `npm *`
+        // was itself a dead-or-over-broad suggestion (it would have granted
+        // `npm install`/`npm publish` for a command that needed no grant at
+        // all). `npm install` is deliberately NOT auto-allowed, so it's a
+        // real target (dirge-mirm).
         assert_eq!(
-            suggest_pattern("bash", "export X=1 && cd app && npm run build"),
+            suggest_pattern("bash", "export X=1 && cd app && npm install"),
             "npm *"
         );
         // A plain significant command is unchanged.
@@ -212,6 +282,115 @@ mod tests {
             suggest_pattern("bash", "export TOKEN=x && unset Y && mycli run"),
             "mycli *"
         );
+    }
+
+    /// dirge-mirm: the skip-set was a hardcoded list of 9 shell builtins while
+    /// `default_bash_rules` auto-allows ~22 more (`cat`, `ls`, `grep`, `echo`,
+    /// …). A compound led by one of those resolved to a suggestion the default
+    /// rules ALREADY cover, so "allow always" saved a rule that granted
+    /// nothing and the blocking segment re-prompted forever.
+    ///
+    /// Reported case: `cat f.txt | clojure -M -` suggested `cat *` (subsumed
+    /// by the built-in `cat **`), so every subsequent invocation asked again.
+    #[test]
+    fn compound_skips_every_already_allowed_prefix_not_just_builtins() {
+        assert_eq!(
+            suggest_pattern("bash", "cat f.txt | clojure -M -"),
+            "clojure *",
+            "the reported re-prompt case",
+        );
+        assert_eq!(suggest_pattern("bash", "ls src | xargs wc"), "xargs *");
+        assert_eq!(
+            suggest_pattern("bash", "grep -l TODO . | xargs sed -i s/a/b/"),
+            "xargs *"
+        );
+        assert_eq!(suggest_pattern("bash", "echo hi | mycli stdin"), "mycli *");
+        // A default-allowed SUBCOMMAND rule is honored at segment granularity:
+        // `git status` passes, bare `git` does not, so a compound with an
+        // un-allowed git verb targets the git segment rather than skipping it.
+        assert_eq!(
+            suggest_pattern("bash", "git status && git push origin main"),
+            "git *"
+        );
+    }
+
+    /// Drift guard for the above: derived from `default_bash_rules` itself, so
+    /// adding a rule there can never silently reintroduce the dead-suggestion
+    /// bug. For every built-in Allow rule, a compound of "that command, then
+    /// something un-allowed" must target the un-allowed part.
+    #[test]
+    fn suggestion_never_lands_on_an_already_allowed_head() {
+        use crate::permission::{Action, default_bash_rules};
+        for (pat, action) in default_bash_rules() {
+            if action != Action::Allow {
+                continue;
+            }
+            // Concrete invocation of the rule: drop the trailing glob.
+            let invocation = pat
+                .trim_end_matches("**")
+                .trim_end_matches('*')
+                .trim()
+                .to_string();
+            if invocation.is_empty() {
+                continue;
+            }
+            let cmd = format!("{invocation} && zzunallowed --go");
+            assert_eq!(
+                suggest_pattern("bash", &cmd),
+                "zzunallowed *",
+                "rule {pat:?} left the suggestion on an already-allowed prefix",
+            );
+        }
+    }
+
+    /// dirge-jktn: the engine never honors a session grant on a complex
+    /// command (substitution / subshell / arithmetic expansion) — see
+    /// `SessionAllowlistPolicy::decide`, dirge-g9qj. So offering "allow
+    /// always" for one saves an entry that provably cannot match, prints a
+    /// confirmation that it was saved, and re-prompts on the very next
+    /// identical invocation. Suppress the suggestion instead, so the dialog
+    /// takes its existing downgrade-to-allow-once path.
+    #[test]
+    fn complex_commands_get_no_allow_always_pattern() {
+        for cmd in [
+            "echo $(date)",
+            "rm -rf $(cat /tmp/target)",
+            "ls `which python3`",
+            "foo <(bar)",
+        ] {
+            let p = suggest_pattern("bash", cmd);
+            assert!(
+                is_placeholder_pattern(&p),
+                "a grant for {cmd:?} could never fire, so none should be offered; got {p:?}",
+            );
+        }
+        // A plain compound is unaffected — grants for these DO fire.
+        assert!(!is_placeholder_pattern(&suggest_pattern(
+            "bash",
+            "cat f.txt | clojure -M -"
+        )));
+        assert!(!is_placeholder_pattern(&suggest_pattern(
+            "bash",
+            "cargo test --all"
+        )));
+    }
+
+    /// The reason string shown on the downgrade must match why it happened —
+    /// the empty-input path and the complex-command path are different facts,
+    /// and telling a user their substitution command had "empty input" would
+    /// be nonsense.
+    #[test]
+    fn allow_always_downgrade_reasons_are_distinct_and_accurate() {
+        let empty = allow_always_downgrade_reason("bash", "");
+        let complex = allow_always_downgrade_reason("bash", "echo $(date)");
+        assert!(empty.is_some() && complex.is_some());
+        assert_ne!(empty, complex);
+        assert!(
+            complex.unwrap().contains("substitution"),
+            "complex reason should name the cause: {complex:?}",
+        );
+        // A grantable command has no downgrade reason at all.
+        assert_eq!(allow_always_downgrade_reason("bash", "cargo test"), None);
     }
 
     // Non-empty inputs still produce the expected suggestion.

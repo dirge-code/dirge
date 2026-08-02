@@ -25,6 +25,12 @@ pub(crate) fn suggest_pattern(tool: &str, input: &str) -> String {
     permission_ui::suggest_pattern(tool, input)
 }
 
+/// Why "allow always" can't produce a usable grant for this input, or `None`
+/// when it can. Paired with `is_placeholder_pattern` at the dialog.
+pub(crate) fn allow_always_downgrade_reason(tool: &str, input: &str) -> Option<&'static str> {
+    permission_ui::allow_always_downgrade_reason(tool, input)
+}
+
 /// Fuzzy match via `nucleo-matcher`, ranked by score descending so
 /// the best matches surface first
 /// (`maki-ui/src/components/search_modal.rs:147-185`).

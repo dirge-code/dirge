@@ -92,7 +92,8 @@ use crate::ui::keymap::{KeyAction, Keymaps};
 use crate::ui::panel_render::{build_left_panel_info, build_panel_data};
 use crate::ui::renderer::{LineEntry, Renderer};
 use crate::ui::search_rewind::{
-    is_placeholder_pattern, open_rewind_picker, rewind_session, suggest_pattern,
+    allow_always_downgrade_reason, is_placeholder_pattern, open_rewind_picker, rewind_session,
+    suggest_pattern,
 };
 use crate::ui::slash::{SlashOutcome, handle_slash};
 use crate::ui::status::StatusLine;
@@ -1284,8 +1285,18 @@ pub async fn run_interactive(
                                     let pattern =
                                         suggest_pattern(&p.req.tool, &p.req.input);
                                     if is_placeholder_pattern(&pattern) {
+                                        // dirge-jktn: say WHY we're downgrading.
+                                        // Empty input and "no session grant can
+                                        // ever match this command" are different
+                                        // facts and the old message only named
+                                        // the first.
+                                        let reason = allow_always_downgrade_reason(
+                                            &p.req.tool,
+                                            &p.req.input,
+                                        )
+                                        .unwrap_or("can't derive a useful pattern");
                                         renderer.write_line(
-                                            "  -> can't derive a useful pattern from empty input; allowing once only",
+                                            &format!("  -> {reason}; allowing once only"),
                                             theme::dim(),
                                         )?;
                                         Some(UserDecision::AllowOnce)

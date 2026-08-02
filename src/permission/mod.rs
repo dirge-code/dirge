@@ -226,13 +226,17 @@ pub fn default_bash_rules() -> Vec<(&'static str, Action)> {
         // Benign shell builtins — set env vars / navigate / no-ops, no
         // filesystem or code-execution side effects (a `$(...)` inside
         // would flip the whole command to the complex/whole-command
-        // check, not these rules). These MUST stay in sync with the
-        // `significant_bash_head` skip-list (dirge-9zbd): that function
-        // skips these prefixes when suggesting an "allow always" pattern,
-        // so a compound like `export X=1 && cd app && <cmd>` resolves to
-        // `<cmd> *` — which only covers the whole command if the skipped
-        // prefixes are themselves auto-allowed. `*` (not `**`) so a bare
-        // builtin with no args (`pushd`, `:`) also matches.
+        // check, not these rules). `*` (not `**`) so a bare builtin with
+        // no args (`pushd`, `:`) also matches.
+        //
+        // dirge-mirm: these used to need manual syncing with a hardcoded
+        // skip-list in `ui::permission_ui::significant_bash_head`, and the
+        // two drifted — everything in the read-only bucket above was
+        // allowed here but missing there, so "allow always" on a compound
+        // led by `cat`/`ls`/`grep` saved a rule that granted nothing and
+        // re-prompted forever. That function now queries THIS list
+        // directly, so no manual sync is required: adding a rule anywhere
+        // in this function is picked up automatically.
         ("export *", Action::Allow),
         ("set *", Action::Allow),
         ("unset *", Action::Allow),
