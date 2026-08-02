@@ -106,14 +106,30 @@ pub fn build_evaluator_prompt(req: &ApprovalRequest) -> String {
 
 /// Parse the evaluator's reply. Fail-safe: anything that isn't a clear
 /// ALLOW is treated as DENY (an ambiguous judge must not auto-approve).
+///
+/// dirge-97mr: the ALLOW arm is deliberately STRICTER than the DENY arm. It
+/// used to be `starts_with("ALLOW")`, which let prose that merely begins with
+/// the word — "Allowing this would be risky…", "ALLOW? No — …" — auto-approve
+/// the command with no human in the loop. A chatty or reasoning model
+/// produces exactly that shape. An ALLOW must therefore be the WHOLE line
+/// (bare verdict, trailing punctuation tolerated); DENY stays prefix-matched
+/// because it carries a free-text reason and erring toward DENY only costs a
+/// prompt.
 pub fn parse_decision(response: &str) -> ApprovalDecision {
+    /// A line is an ALLOW only if nothing but the verdict is on it.
+    fn is_bare_allow(upper: &str) -> bool {
+        upper
+            .trim_end_matches(['.', '!', '"', '\'', '*', '`', ' ', '\t'])
+            .trim()
+            == "ALLOW"
+    }
     for line in response.lines() {
         let t = line.trim();
         if t.is_empty() {
             continue;
         }
         let upper = t.to_ascii_uppercase();
-        if upper.starts_with("ALLOW") {
+        if is_bare_allow(&upper) {
             return ApprovalDecision::Allow;
         }
         if upper.starts_with("DENY") {
@@ -212,6 +228,49 @@ mod tests {
             ApprovalDecision::Deny(_)
         ));
         assert!(matches!(parse_decision(""), ApprovalDecision::Deny(_)));
+    }
+
+    /// dirge-97mr: the ALLOW arm used to be `starts_with("ALLOW")` on the
+    /// uppercased line, so a chatty or reasoning-model line that merely BEGINS
+    /// with the word — while saying the opposite — auto-approved the command
+    /// with no human in the loop. This is the one function standing between
+    /// the evaluator and execution; it must fail closed.
+    #[test]
+    fn chatty_allow_prefixed_prose_does_not_auto_approve() {
+        for reply in [
+            "Allowing this would be risky because it writes outside the project.",
+            "ALLOW? No — this fetches and executes remote code.",
+            "Allowed operations are limited here, so I must refuse.",
+            "allows arbitrary code execution",
+        ] {
+            assert!(
+                matches!(parse_decision(reply), ApprovalDecision::Deny(_)),
+                "prose beginning with the word ALLOW must not auto-approve: {reply:?}",
+            );
+        }
+    }
+
+    /// The tightened parser must not break the documented contract: a bare
+    /// verdict, surrounding whitespace, and leading non-verdict chatter
+    /// followed by a standalone verdict line all still work.
+    #[test]
+    fn tightened_parser_still_accepts_real_verdicts() {
+        assert!(matches!(parse_decision("ALLOW"), ApprovalDecision::Allow));
+        assert!(matches!(
+            parse_decision("  allow  "),
+            ApprovalDecision::Allow
+        ));
+        assert!(matches!(
+            parse_decision("Let me think about this.\nALLOW"),
+            ApprovalDecision::Allow
+        ));
+        // Trailing punctuation the model might add to an otherwise bare verdict.
+        assert!(matches!(parse_decision("ALLOW."), ApprovalDecision::Allow));
+        // Deny keeps taking a free-text reason.
+        match parse_decision("DENY: writes to /etc") {
+            ApprovalDecision::Deny(r) => assert_eq!(r, "writes to /etc"),
+            _ => panic!("expected deny"),
+        }
     }
 
     #[test]
