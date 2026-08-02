@@ -258,10 +258,10 @@ pub fn select_attach_adapter(
         return resolve_adapter(name);
     }
     let available = get_available_adapters();
-    if port.is_some() {
-        if let Some(debugpy) = available.iter().find(|a| a.name == "debugpy") {
-            return Some(debugpy.clone());
-        }
+    if port.is_some()
+        && let Some(debugpy) = available.iter().find(|a| a.name == "debugpy")
+    {
+        return Some(debugpy.clone());
     }
     for preferred in EXTENSIONLESS_DEBUGGER_ORDER {
         if let Some(a) = available.iter().find(|a| a.name == *preferred) {
@@ -730,7 +730,7 @@ mod tests {
     #[test]
     fn every_bundled_adapter_connect_mode_is_valid() {
         let defaults = load_defaults();
-        for (_name, cfg) in &defaults {
+        for cfg in defaults.values() {
             match cfg.connect_mode {
                 ConnectMode::Stdio | ConnectMode::Socket => {}
             }

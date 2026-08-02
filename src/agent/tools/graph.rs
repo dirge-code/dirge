@@ -226,7 +226,7 @@ mod tests {
             .unwrap()
     }
 
-    fn setup_test_db(db_path: &PathBuf, session_id: &str) {
+    fn setup_test_db(db_path: &std::path::Path, session_id: &str) {
         let db = SessionDb::open(db_path).unwrap();
         crate::extras::entity_search::tests::setup_graph(&db.conn);
         // setup_graph inserts session 'ts' — add our test session
@@ -243,7 +243,7 @@ mod tests {
             entity_db::upsert_entity(&db.conn, session_id, None, "error", "E0308", None).unwrap();
         let e2 = entity_db::upsert_entity(&db.conn, session_id, None, "file", "src/main.rs", None)
             .unwrap();
-        let _ = entity_db::insert_relation(&db.conn, e1, e2, "occurred_in", session_id).unwrap();
+        entity_db::insert_relation(&db.conn, e1, e2, "occurred_in", session_id).unwrap();
     }
 
     #[test]

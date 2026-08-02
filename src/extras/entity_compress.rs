@@ -584,10 +584,10 @@ mod tests {
         ];
         let mut ids = Vec::with_capacity(1000);
 
-        for kind_idx in 0..10 {
+        for kind in &kinds {
             for n in 0..100 {
-                let name = format!("{}{}", kinds[kind_idx], n);
-                let id = insert_entity(&conn, sid, Some(1), kinds[kind_idx], &name, None).unwrap();
+                let name = format!("{kind}{n}");
+                let id = insert_entity(&conn, sid, Some(1), kind, &name, None).unwrap();
                 ids.push(id);
             }
         }

@@ -318,10 +318,10 @@ impl Tool for DebugTool {
 
                 let program_args = args.args.unwrap_or_default();
                 let mut extra = adapter.launch_defaults.clone();
-                if let Some(ref env) = args.env {
-                    if let Some(obj) = extra.as_object_mut() {
-                        obj.insert("env".to_string(), env.clone());
-                    }
+                if let Some(ref env) = args.env
+                    && let Some(obj) = extra.as_object_mut()
+                {
+                    obj.insert("env".to_string(), env.clone());
                 }
                 let summary = mgr
                     .launch(
@@ -728,14 +728,14 @@ async fn run_to_cursor(
 
     // Get hover info from LSP at the stopped location.
     let mut result = format_continue_outcome(&outcome);
-    if let Some(ref reason) = outcome.stop_reason {
-        if reason != "terminated" {
-            let path = Path::new(file);
-            let hover_results = lsp.hover(path, line.saturating_sub(1), 0).await;
-            if !hover_results.is_empty() {
-                let hover_json = serde_json::to_string_pretty(&hover_results).unwrap_or_default();
-                result.push_str(&format!("\n\nHover info at {file}:{line}:\n{hover_json}"));
-            }
+    if let Some(ref reason) = outcome.stop_reason
+        && reason != "terminated"
+    {
+        let path = Path::new(file);
+        let hover_results = lsp.hover(path, line.saturating_sub(1), 0).await;
+        if !hover_results.is_empty() {
+            let hover_json = serde_json::to_string_pretty(&hover_results).unwrap_or_default();
+            result.push_str(&format!("\n\nHover info at {file}:{line}:\n{hover_json}"));
         }
     }
     Ok(result)
@@ -756,36 +756,35 @@ async fn backtrace_diagnostics(
 
     let mut seen_files = std::collections::HashSet::new();
     for (i, frame) in frames.iter().enumerate() {
-        if let Some(ref source) = frame.source {
-            if let Some(ref path) = source.path {
-                if seen_files.insert(path.clone()) {
-                    let frame_loc = match source.name.as_deref() {
-                        Some(name) => format!("{name}:{}", frame.line),
-                        None => path.clone(),
-                    };
+        if let Some(ref source) = frame.source
+            && let Some(ref path) = source.path
+            && seen_files.insert(path.clone())
+        {
+            let frame_loc = match source.name.as_deref() {
+                Some(name) => format!("{name}:{}", frame.line),
+                None => path.clone(),
+            };
 
-                    let p = std::path::PathBuf::from(path);
-                    // Touch file to ensure LSP server is aware of it.
-                    lsp.touch_file(&p, crate::lsp::manager::TouchMode::Notify)
-                        .await;
+            let p = std::path::PathBuf::from(path);
+            // Touch file to ensure LSP server is aware of it.
+            lsp.touch_file(&p, crate::lsp::manager::TouchMode::Notify)
+                .await;
 
-                    let diags = all_diags.get(&p).map(|v| v.as_slice()).unwrap_or(&[]);
-                    if diags.is_empty() {
-                        out.push_str(&format!("  [{i}] {frame_loc} — no diagnostics\n"));
-                    } else {
-                        out.push_str(&format!(
-                            "  [{i}] {frame_loc} — {} diagnostics:\n",
-                            diags.len()
-                        ));
-                        for d in diags.iter().take(5) {
-                            let severity = format!("{:?}", d.severity);
-                            out.push_str(&format!(
-                                "      L{} — {severity}: {}\n",
-                                d.range.start.line + 1,
-                                d.message
-                            ));
-                        }
-                    }
+            let diags = all_diags.get(&p).map(|v| v.as_slice()).unwrap_or(&[]);
+            if diags.is_empty() {
+                out.push_str(&format!("  [{i}] {frame_loc} — no diagnostics\n"));
+            } else {
+                out.push_str(&format!(
+                    "  [{i}] {frame_loc} — {} diagnostics:\n",
+                    diags.len()
+                ));
+                for d in diags.iter().take(5) {
+                    let severity = format!("{:?}", d.severity);
+                    out.push_str(&format!(
+                        "      L{} — {severity}: {}\n",
+                        d.range.start.line + 1,
+                        d.message
+                    ));
                 }
             }
         }
@@ -810,50 +809,47 @@ async fn error_analysis(
 
     let mut seen_files = std::collections::HashSet::new();
     for (i, frame) in frames.iter().enumerate() {
-        if let Some(ref source) = frame.source {
-            if let Some(ref path) = source.path {
-                if seen_files.insert(path.clone()) {
-                    let p = std::path::PathBuf::from(path);
-                    lsp.touch_file(&p, crate::lsp::manager::TouchMode::Notify)
-                        .await;
+        if let Some(ref source) = frame.source
+            && let Some(ref path) = source.path
+            && seen_files.insert(path.clone())
+        {
+            let p = std::path::PathBuf::from(path);
+            lsp.touch_file(&p, crate::lsp::manager::TouchMode::Notify)
+                .await;
 
-                    let frame_loc = match source.name.as_deref() {
-                        Some(name) => format!("{name}:{}", frame.line),
-                        None => path.clone(),
-                    };
+            let frame_loc = match source.name.as_deref() {
+                Some(name) => format!("{name}:{}", frame.line),
+                None => path.clone(),
+            };
 
-                    out.push_str(&format!("Frame [{i}]: {frame_loc}\n"));
+            out.push_str(&format!("Frame [{i}]: {frame_loc}\n"));
 
-                    let diags = all_diags.get(&p).map(|v| v.as_slice()).unwrap_or(&[]);
-                    let error_diags: Vec<_> = diags
-                        .iter()
-                        .filter(|d| {
-                            matches!(d.severity, Some(lsp_types::DiagnosticSeverity::ERROR))
-                        })
-                        .collect();
+            let diags = all_diags.get(&p).map(|v| v.as_slice()).unwrap_or(&[]);
+            let error_diags: Vec<_> = diags
+                .iter()
+                .filter(|d| matches!(d.severity, Some(lsp_types::DiagnosticSeverity::ERROR)))
+                .collect();
 
-                    if error_diags.is_empty() {
-                        out.push_str("  No error diagnostics in this file.\n");
-                    } else {
-                        for d in error_diags.iter().take(5) {
-                            let bp_line = d.range.start.line + 1;
-                            out.push_str(&format!("  Error at line {bp_line}: {}\n", d.message));
-                            out.push_str(&format!(
-                                "    → debug set_breakpoints file={path} line={bp_line}\n"
-                            ));
-                        }
-                    }
-
-                    // Show document symbols for context.
-                    let symbols = lsp.document_symbol(&p).await;
-                    if !symbols.is_empty() {
-                        let sym_json = serde_json::to_string_pretty(&symbols).unwrap_or_default();
-                        let capped = head_cap(sym_json, 2048, "document symbols");
-                        out.push_str(&format!("  Top-level symbols:\n{capped}\n"));
-                    }
-                    out.push('\n');
+            if error_diags.is_empty() {
+                out.push_str("  No error diagnostics in this file.\n");
+            } else {
+                for d in error_diags.iter().take(5) {
+                    let bp_line = d.range.start.line + 1;
+                    out.push_str(&format!("  Error at line {bp_line}: {}\n", d.message));
+                    out.push_str(&format!(
+                        "    → debug set_breakpoints file={path} line={bp_line}\n"
+                    ));
                 }
             }
+
+            // Show document symbols for context.
+            let symbols = lsp.document_symbol(&p).await;
+            if !symbols.is_empty() {
+                let sym_json = serde_json::to_string_pretty(&symbols).unwrap_or_default();
+                let capped = head_cap(sym_json, 2048, "document symbols");
+                out.push_str(&format!("  Top-level symbols:\n{capped}\n"));
+            }
+            out.push('\n');
         }
     }
 

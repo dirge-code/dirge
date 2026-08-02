@@ -38,8 +38,15 @@ jobs:
   # as needing native deps, but clippy only checks and never links, so libkrun
   # / libkrunfw are not required — build.rs just warns and carries on, exactly
   # as the existing `build (sandbox-microvm)` job already does. Without this
-  # gate the feature accumulated 50 findings unnoticed (dirge-xw43). Extending
-  # coverage to `dap` / `--all-features` is still a follow-up.
+  # gate the feature accumulated 50 findings unnoticed (dirge-xw43), and
+  # `--all-features` had gone the same way by the time it was measured — 17
+  # findings across 8 files (dirge-9m05).
+  #
+  # `--all-features` is one step rather than one per feature: it subsumes `dap`,
+  # `plugin`, `semantic` and the rest, and `--features dap` alone was clean once
+  # the all-features findings were fixed. The three narrower configs stay
+  # because `--all-features` cannot reach a `cfg(not(feature = …))` path —
+  # `windows-default` in particular is subtractive, not additive.
   clippy:
     runs-on: ubuntu-latest
     steps:
@@ -59,6 +66,9 @@ jobs:
 
       - name: Clippy (sandbox-microvm)
         run: cargo clippy --features sandbox-microvm --all-targets -- -D warnings
+
+      - name: Clippy (all features)
+        run: cargo clippy --all-features --all-targets -- -D warnings
 
   audit:
     runs-on: ubuntu-latest
