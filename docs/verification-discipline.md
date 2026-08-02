@@ -22,7 +22,7 @@ reason this page exists as its own document rather than a paragraph in
 
 ## The pattern
 
-Six failures, one shape:
+Nine failures, one shape:
 
 | | What happened |
 |---|---|
@@ -32,6 +32,9 @@ Six failures, one shape:
 | Can't discriminate | An A/B with no arm overrides "passed" while shipping a broken multi-value parser — neither path was exercised |
 | Mechanism unconfirmed | Arms compared on outcomes without checking whether the code under test ever ran. It hadn't |
 | Partial gate set | clippy and the suite were green for the whole epic on a branch that failed `cargo fmt --all --check` in 31 places |
+| Signal never fed | A counter weighted into the capability formula had zero production callers. Its test called the recorder directly, so it passed while the counter was structurally always 0 |
+| Plumbing misreported | `gh api … \| grep -q` under `pipefail`: grep exits on match, the producer takes SIGPIPE, and a healthy channel reports as missing |
+| Prerequisite as outcome | A test hard-failed when a library wasn't installed, so the macOS suite was permanently red on a correct tree |
 
 A gate that cannot fail is worse than no gate, because it is trusted.
 
@@ -42,6 +45,29 @@ tooling was not at fault: this repo's CI advisory already names `cargo fmt
 and the tests instead, every time, and both were honestly green. Which is the
 point — **a single-command gate is a habit, not a design**, and no amount of
 knowing better substitutes for running the whole set.
+
+The last three came later, and they move the problem one layer out. The first
+six are about running the wrong check, or ignoring its answer. These three are
+about a check that ran, answered, and whose answer meant nothing:
+
+- **Signal never fed** — the producer was never wired, and a unit test that
+  calls the recorder directly cannot tell. Test the function the production
+  path calls, not the one you wish it called.
+- **Plumbing misreported** — the exit status carried "I could not ask the
+  question" in the same channel as "the answer is no". A check whose failure to
+  run is indistinguishable from a finding cannot be believed on a red. Capture,
+  then match; never `cmd | grep -q` when `cmd`'s output can outlive the match.
+- **Prerequisite as outcome** — a missing environment dependency is a skip, not
+  a failure. But converting one to a skip has its own trap: if the skip
+  condition implies the assertion, the guard becomes vacuous rather than
+  lenient, and nothing announces that it can no longer fail. Establish a
+  precondition with a mechanism independent of the thing under test.
+
+The general form, which every row of the table satisfies: **a check is only
+worth its verdict if you know what would have made it say the other thing.**
+Running it once against a known-good input and once against a known-bad one is
+cheap and answers that directly. The `pipefail` bug above was found exactly
+that way — the known-good run went red on one channel out of five.
 
 ## Project gate (`verification_command`)
 
