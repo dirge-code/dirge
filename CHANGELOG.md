@@ -4,6 +4,72 @@ All notable changes to dirge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.21.2] - 2026-08-01
+
+### Fixed
+- **Releases reached only some of their distribution channels, silently.**
+  v0.20.0 shipped to 4 of 6: `cargo install dirge-agent` went straight from
+  0.19.29 to 0.21.0, and the site still read v0.19.29, so it had missed 0.20.0
+  as well. The split was clean — every automated channel fired, both manual
+  ones were skipped — so both are automated now, `cargo publish` and the site
+  version bump, off the tag like the rest.
+
+  Automating them alone would only convert "someone forgot" into "a job
+  silently no-opped": the homebrew and site steps rewrite markup with `sed`,
+  and an unmatched `sed` exits 0. So a final job reads every channel back from
+  its published source — the registry index, the tap's formula, the site's
+  version span, `nix/bin.nix` on `main`, and every release asset with its
+  checksum — and fails if any disagrees with the tag. A channel that didn't
+  ship is now a red X on the release run rather than something found two
+  releases later. See [docs/releasing.md](docs/releasing.md).
+
+- **The macOS test suite was red on a correct tree**, in two unrelated ways.
+  A dependency check asserted the unversioned `libkrunfw.dylib` while the code
+  emitted `libkrunfw.5.dylib` — the code was right, since libkrun carries no
+  `LC_RPATH` and dlopens libkrunfw by bare versioned name, and the unversioned
+  symlink the loader never consults can exist where the dlopen still fails. The
+  name was hand-written in four places, so it is one constant now, paired with
+  a test pinning the versioned literal — de-duplication alone would make the
+  decision unfalsifiable.
+
+  Separately, a test hard-failed whenever libkrunfw simply was not installed,
+  where its ~20 siblings skip on a missing prerequisite. It skips now. The
+  precondition asks Homebrew directly rather than reusing the prefix resolution
+  under test: had it reused it, the skip condition would have been the
+  assertion, and the guard would have gone vacuous instead of red. CI has no
+  macOS runner, so none of this was visible to the gate.
+
+### Changed
+- **The capability tier now derives the recovery-checkpoint threshold**
+  (dirge-z85a). `FAILURE_REFLECTION_THRESHOLD` was consumed once, at tracker
+  construction during run setup — where the estimator is always `Nominal` by
+  warm-up, so a derivation there would read the neutral tier every time and be
+  inert. It is read at every poll instead, and `Struggling` gets the checkpoint
+  after 2 consecutive failures rather than 3.
+
+  This is the one guard whose input and trigger are the same observation: the
+  estimator is built from failure counts and streaks, and this fires on
+  consecutive errored results. Adaptation stays one-directional — `Nominal` and
+  `Strong` are bit-identical to before. Two things in the same tracker
+  deliberately do not move: the permission checkpoint, because a denial streak
+  is a policy wall and nothing the estimator counts measures it, and the
+  safe-state abort's 2× signal, because that rung spends a hard-capped abort
+  and writes to the tree in `auto` mode.
+
+  No improvement is claimed. The measured ~2x noise floor makes an effect this
+  size undetectable at any sample count the project can afford, so it ships on
+  the structural argument or not at all.
+
+### Internal
+- **`--all-features` had accumulated 17 clippy findings** across 8 files, the
+  same way `sandbox-microvm` accumulated 50 before it was gated. Cleared, and
+  the configuration is now linted in CI — clearing without gating just restarts
+  the clock. One `--all-features` pass rather than one per feature: it subsumes
+  `dap`, `plugin` and `semantic`, and `--features dap` alone proved clean once
+  these were fixed. The three narrower configurations stay, since
+  `--all-features` cannot reach a `cfg(not(feature = …))` path and
+  `windows-default` is subtractive.
+
 ## [0.21.1] - 2026-08-01
 
 ### Fixed
