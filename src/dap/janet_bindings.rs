@@ -654,11 +654,11 @@ async fn handle_dap_command(cmd: DapCommand) {
     // context with full process privileges. dirge-l9j6: the decision
     // FAILS CLOSED — a poisoned permission lock denies rather than
     // silently skipping the gate.
-    if let DapCommand::Evaluate { expression, .. } = &cmd {
-        if let Err(reason) = decide_eval_permission(&DAP_PERM_CHECK, expression) {
-            send_dap_reply(&cmd, Err(reason));
-            return;
-        }
+    if let DapCommand::Evaluate { expression, .. } = &cmd
+        && let Err(reason) = decide_eval_permission(&DAP_PERM_CHECK, expression)
+    {
+        send_dap_reply(&cmd, Err(reason));
+        return;
     }
 
     let result: Result<String, ToolError> = match &cmd {

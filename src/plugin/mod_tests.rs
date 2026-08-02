@@ -2844,7 +2844,7 @@ fn validate_all_plugins_compile() {
 
     for entry in std::fs::read_dir(&plugin_dir).unwrap() {
         let path = entry.unwrap().path();
-        if path.extension().map_or(false, |e| e == "janet") {
+        if path.extension().is_some_and(|e| e == "janet") {
             let source = std::fs::read_to_string(&path).unwrap();
             mgr.eval(&source)
                 .unwrap_or_else(|e| panic!("{} failed to compile: {e}", path.display()));

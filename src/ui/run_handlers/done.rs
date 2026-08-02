@@ -535,62 +535,52 @@ pub(crate) async fn finish_done(
                 let mut mgr = pm.lock_ignore_poison();
                 let entities = mgr.drain_entity_records();
                 let relations = mgr.drain_relation_records();
-                if !entities.is_empty() || !relations.is_empty() {
-                    if let Ok(db) =
+                if (!entities.is_empty() || !relations.is_empty())
+                    && let Ok(db) =
                         crate::extras::session_db::SessionDb::open(&paths.session_db_path())
-                    {
-                        use crate::extras::entity_db;
-                        let sid = crate::text::db_session_id(ctx.session.id.as_str());
-                        for ent in &entities {
-                            let _ = entity_db::upsert_entity(
+                {
+                    use crate::extras::entity_db;
+                    let sid = crate::text::db_session_id(ctx.session.id.as_str());
+                    for ent in &entities {
+                        let _ = entity_db::upsert_entity(
+                            &db.conn,
+                            &sid,
+                            None,
+                            &ent.kind,
+                            &ent.name,
+                            ent.extra.as_deref(),
+                        );
+                    }
+                    for rel in &relations {
+                        let source_id =
+                            entity_db::resolve_entity(&db.conn, &rel.source_kind, &rel.source_name);
+                        let target_id =
+                            entity_db::resolve_entity(&db.conn, &rel.target_kind, &rel.target_name);
+                        if let (Ok(Some(src_eid)), Ok(Some(tgt_eid))) = (source_id, target_id) {
+                            let _ = entity_db::insert_relation(
                                 &db.conn,
+                                src_eid,
+                                tgt_eid,
+                                &rel.rel_type,
                                 &sid,
-                                None,
-                                &ent.kind,
-                                &ent.name,
-                                ent.extra.as_deref(),
                             );
-                        }
-                        for rel in &relations {
-                            let source_id = entity_db::resolve_entity(
-                                &db.conn,
-                                &rel.source_kind,
-                                &rel.source_name,
-                            );
-                            let target_id = entity_db::resolve_entity(
-                                &db.conn,
-                                &rel.target_kind,
-                                &rel.target_name,
-                            );
-                            if let (Ok(Some(src_eid)), Ok(Some(tgt_eid))) = (source_id, target_id) {
-                                let _ = entity_db::insert_relation(
-                                    &db.conn,
-                                    src_eid,
-                                    tgt_eid,
-                                    &rel.rel_type,
-                                    &sid,
-                                );
-                            }
                         }
                     }
                 }
             }
 
             // Build graph context for next turn's system prompt.
-            if let Some(pm) = plugin_manager {
-                if let Ok(db) = crate::extras::session_db::SessionDb::open(&paths.session_db_path())
+            if let Some(pm) = plugin_manager
+                && let Ok(db) = crate::extras::session_db::SessionDb::open(&paths.session_db_path())
+            {
+                let sid = crate::text::db_session_id(ctx.session.id.as_str());
+                if let Ok(context) =
+                    crate::extras::entity_compress::build_graph_context(&db.conn, &sid)
+                    && !context.is_empty()
                 {
-                    let sid = crate::text::db_session_id(ctx.session.id.as_str());
-                    if let Ok(context) =
-                        crate::extras::entity_compress::build_graph_context(&db.conn, &sid)
-                    {
-                        if !context.is_empty() {
-                            let mut mgr = pm.lock_ignore_poison();
-                            let escaped = crate::plugin::escape_janet_string(&context);
-                            let _ =
-                                mgr.eval(&format!("(harness/append-system-prompt {})", escaped));
-                        }
-                    }
+                    let mut mgr = pm.lock_ignore_poison();
+                    let escaped = crate::plugin::escape_janet_string(&context);
+                    let _ = mgr.eval(&format!("(harness/append-system-prompt {})", escaped));
                 }
             }
         }

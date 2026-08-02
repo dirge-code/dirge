@@ -13,6 +13,34 @@ pub enum Status {
     Error,
 }
 
+/// Leaf filename of the libkrun shared library on this platform.
+#[cfg(feature = "sandbox-microvm")]
+pub const LIBKRUN_LIB: &str = if cfg!(target_os = "macos") {
+    "libkrun.dylib"
+} else {
+    "libkrun.so"
+};
+
+/// Leaf filename of the libkrunfw shared library on this platform.
+///
+/// On macOS this is the VERSIONED name, deliberately. libkrun carries no
+/// LC_RPATH and dlopens libkrunfw by bare name at runtime, and the name it
+/// asks for is `libkrunfw.5.dylib` — the unversioned `libkrunfw.dylib` is a
+/// symlink the loader never consults. Checking for the unversioned name would
+/// report OK on a machine where the dlopen fails.
+///
+/// dirge-jbhz: this is a const because the string was written out in four
+/// places — the check, the spawn path's existence probe, and two tests — and
+/// one of the tests had drifted to the unversioned name. Since CI has no macOS
+/// runner (dirge-u35k) that drift was invisible to the gate and only showed up
+/// as a red suite for anyone running it on a Mac.
+#[cfg(feature = "sandbox-microvm")]
+pub const LIBKRUNFW_LIB: &str = if cfg!(target_os = "macos") {
+    "libkrunfw.5.dylib"
+} else {
+    "libkrunfw.so"
+};
+
 /// One dependency check result.
 #[derive(Debug, Clone)]
 pub struct CheckResult {
@@ -107,11 +135,7 @@ pub fn check_microvm() -> Vec<CheckResult> {
     }
 
     // libkrun shared library (libkrun.so on Linux, libkrun.dylib on macOS)
-    let libkrun_name = if cfg!(target_os = "macos") {
-        "libkrun.dylib"
-    } else {
-        "libkrun.so"
-    };
+    let libkrun_name = LIBKRUN_LIB;
     let libkrun_ok = check_shared_library(libkrun_name);
     results.push(CheckResult {
         name: libkrun_name,
@@ -136,14 +160,10 @@ pub fn check_microvm() -> Vec<CheckResult> {
         },
     });
 
-    // libkrunfw shared library
-    // On macOS, check the versioned leaf name that libkrun dlopens at
-    // runtime (libkrunfw.5.dylib), not just the unversioned symlink.
-    let libkrunfw_name = if cfg!(target_os = "macos") {
-        "libkrunfw.5.dylib"
-    } else {
-        "libkrunfw.so"
-    };
+    // libkrunfw shared library. On macOS this is the versioned leaf name that
+    // libkrun dlopens at runtime, not the unversioned symlink — see
+    // [`LIBKRUNFW_LIB`].
+    let libkrunfw_name = LIBKRUNFW_LIB;
     let libkrunfw_ok = check_shared_library(libkrunfw_name);
     results.push(CheckResult {
         name: libkrunfw_name,
@@ -472,24 +492,31 @@ mod tests {
             names.contains(&"dirge-microvm-runner"),
             "should include runner check, got: {names:?}"
         );
-        // Library check uses platform-appropriate extension (.so on Linux, .dylib on macOS)
-        let libkrun_name = if cfg!(target_os = "macos") {
-            "libkrun.dylib"
-        } else {
-            "libkrun.so"
-        };
+        // Derived from the same consts the checks are built from, not spelled
+        // out again: this assertion previously hardcoded the UNVERSIONED
+        // `libkrunfw.dylib` while the check emitted `libkrunfw.5.dylib`, and
+        // with no macOS runner in CI (dirge-u35k) nothing caught it.
         assert!(
-            names.contains(&libkrun_name),
-            "should include {libkrun_name} check, got: {names:?}"
+            names.contains(&LIBKRUN_LIB),
+            "should include {LIBKRUN_LIB} check, got: {names:?}"
         );
-        let libkrunfw_name = if cfg!(target_os = "macos") {
-            "libkrunfw.dylib"
-        } else {
-            "libkrunfw.so"
-        };
         assert!(
-            names.contains(&libkrunfw_name),
-            "should include {libkrunfw_name} check, got: {names:?}"
+            names.contains(&LIBKRUNFW_LIB),
+            "should include {LIBKRUNFW_LIB} check, got: {names:?}"
         );
+    }
+
+    /// Pins the decision the const encodes, which de-duplication alone can't.
+    /// Now that `LIBKRUNFW_LIB` feeds both `check_microvm` and the assertion
+    /// above, changing it to the unversioned name would move the test with it
+    /// and nothing would object — but it would still be wrong: libkrun dlopens
+    /// libkrunfw by bare VERSIONED name, and the unversioned symlink the
+    /// loader never consults can exist where the dlopen still fails
+    /// (dirge-jbhz).
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn libkrunfw_check_uses_the_versioned_dlopen_name() {
+        assert_eq!(LIBKRUNFW_LIB, "libkrunfw.5.dylib");
+        assert_eq!(LIBKRUN_LIB, "libkrun.dylib");
     }
 }

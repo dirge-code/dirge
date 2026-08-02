@@ -318,8 +318,9 @@ impl MicrovmSandbox {
                 .filter(|d| seen.insert(d.clone()))
                 .collect();
 
-            // Derive the dlopen bare name libkrun uses.
-            let krunfw_name = "libkrunfw.5.dylib";
+            // The dlopen bare name libkrun uses — see
+            // [`crate::sandbox::check::LIBKRUNFW_LIB`].
+            let krunfw_name = crate::sandbox::check::LIBKRUNFW_LIB;
             let krunfw_exists = brew_lib_dirs
                 .iter()
                 .any(|d| Path::new(d).join(krunfw_name).exists());

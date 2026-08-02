@@ -126,11 +126,9 @@ pub fn render_frame(scene: &Scene, f: &mut Frame<'_>) {
         #[allow(unused_variables)]
         let is_debug = scene.right_panel_mode == PanelMode::Debug;
         #[cfg(feature = "dap")]
-        if is_debug {
-            if let Some(dbg_data) = scene.debug_panel_data {
-                use super::panels::debug::DebugRightPanel;
-                f.render_widget(DebugRightPanel::new(dbg_data), layout.right_panel);
-            }
+        if is_debug && let Some(dbg_data) = scene.debug_panel_data {
+            use super::panels::debug::DebugRightPanel;
+            f.render_widget(DebugRightPanel::new(dbg_data), layout.right_panel);
         }
         // Render normal right panel only when NOT in debug mode (or when
         // dap feature is off).

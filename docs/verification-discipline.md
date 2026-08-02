@@ -22,7 +22,7 @@ reason this page exists as its own document rather than a paragraph in
 
 ## The pattern
 
-Six failures, one shape:
+Nine failures, one shape:
 
 | | What happened |
 |---|---|
@@ -32,6 +32,9 @@ Six failures, one shape:
 | Can't discriminate | An A/B with no arm overrides "passed" while shipping a broken multi-value parser — neither path was exercised |
 | Mechanism unconfirmed | Arms compared on outcomes without checking whether the code under test ever ran. It hadn't |
 | Partial gate set | clippy and the suite were green for the whole epic on a branch that failed `cargo fmt --all --check` in 31 places |
+| Signal never fed | A counter weighted into the capability formula had zero production callers. Its test called the recorder directly, so it passed while the counter was structurally always 0 |
+| Plumbing misreported | `gh api … \| grep -q` under `pipefail`: grep exits on match, the producer takes SIGPIPE, and a healthy channel reports as missing |
+| Prerequisite as outcome | A test hard-failed when a library wasn't installed, so the macOS suite was permanently red on a correct tree |
 
 A gate that cannot fail is worse than no gate, because it is trusted.
 
@@ -42,6 +45,29 @@ tooling was not at fault: this repo's CI advisory already names `cargo fmt
 and the tests instead, every time, and both were honestly green. Which is the
 point — **a single-command gate is a habit, not a design**, and no amount of
 knowing better substitutes for running the whole set.
+
+The last three came later, and they move the problem one layer out. The first
+six are about running the wrong check, or ignoring its answer. These three are
+about a check that ran, answered, and whose answer meant nothing:
+
+- **Signal never fed** — the producer was never wired, and a unit test that
+  calls the recorder directly cannot tell. Test the function the production
+  path calls, not the one you wish it called.
+- **Plumbing misreported** — the exit status carried "I could not ask the
+  question" in the same channel as "the answer is no". A check whose failure to
+  run is indistinguishable from a finding cannot be believed on a red. Capture,
+  then match; never `cmd | grep -q` when `cmd`'s output can outlive the match.
+- **Prerequisite as outcome** — a missing environment dependency is a skip, not
+  a failure. But converting one to a skip has its own trap: if the skip
+  condition implies the assertion, the guard becomes vacuous rather than
+  lenient, and nothing announces that it can no longer fail. Establish a
+  precondition with a mechanism independent of the thing under test.
+
+The general form, which every row of the table satisfies: **a check is only
+worth its verdict if you know what would have made it say the other thing.**
+Running it once against a known-good input and once against a known-bad one is
+cheap and answers that directly. The `pipefail` bug above was found exactly
+that way — the known-good run went red on one channel out of five.
 
 ## Project gate (`verification_command`)
 
@@ -182,6 +208,29 @@ Adaptation is **one-directional**: the tier may add support, never remove it.
 `Nominal` and `Strong` are both bit-identical to the pre-estimator constants,
 so a default install is untouched; only `Struggling` moves anything, and only
 toward earlier and more frequent help.
+
+Two thresholds are derived, both scaled down by `Struggling` alone:
+
+| Constant | Base | `Struggling` | Guard |
+|---|---|---|---|
+| `FAST_VERIFY_EDIT_THRESHOLD` | 3 | 2 | verify after N edits with nothing run |
+| `FAILURE_REFLECTION_THRESHOLD` | 3 | 2 | recovery checkpoint after N consecutive failures |
+
+The second is the best-matched derivation in the loop and the only one where the
+signal and the trigger are the same observation: the estimator is *built* from
+failure counts and streaks, and this guard fires on consecutive errored results.
+It is read at every poll rather than at tracker construction — the tracker is
+built at run start, where the estimator is always `Nominal` by warm-up, so a
+threshold fixed there would read the neutral tier every time and be inert by
+construction. That is the shape to check for before wiring anything else here.
+
+Two things the tier deliberately does **not** move, both inside that same
+tracker: the permission checkpoint (a denial streak is a policy wall, and
+nothing the estimator counts measures how often the user's rules block a call)
+and the safe-state abort's 2× signal (that rung spends one of two hard-capped
+aborts and, in `auto` mode, writes to the tree — pulling it forward is not
+"support"). And the derived value is floored at 2: at 1 the checkpoint fires on
+the first errored call, which is not what a *repeated*-failure guard is for.
 
 `Strong` driving nothing is the part that took a correction to get right. The
 counters observe **tool-call mechanics only** — errored calls, repaired

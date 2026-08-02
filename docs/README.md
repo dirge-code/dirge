@@ -23,4 +23,5 @@ For configuration keys and provider setup, see [config.md](config.md).
 | [tool-input-repair.md](tool-input-repair.md) | Repair layer for malformed tool calls — repair kinds, `dirge-hints` schema annotations, telemetry |
 | [plugins.md](plugins.md) | Janet plugin authoring — hook reference, `harness/*` API, examples |
 | [themes.md](themes.md) | Built-in palettes and custom theme JSON schema |
+| [releasing.md](releasing.md) | Cutting a release — the six distribution channels, what drives each, required secrets |
 | [storyboards/](storyboards/) | Step-by-step walkthroughs of user-facing flows |

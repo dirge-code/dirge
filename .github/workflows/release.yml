@@ -285,3 +285,187 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git commit -am "dirge $VERSION"
           git push
+
+  # Publish to crates.io (dirge-agent). Was manual, and 0.20.0 never reached
+  # the registry as a result — `cargo install dirge-agent` went 0.19.29 →
+  # 0.21.0 (dirge-a9pc). Needs a CARGO_REGISTRY_TOKEN repo secret scoped to
+  # publish-update on the crate.
+  #
+  # `needs: build` because publishing is PERMANENT — a version can be yanked
+  # but never replaced. Gating on all five targets building means a tag that
+  # doesn't compile everywhere doesn't become an immovable registry entry.
+  crates-io:
+    name: Publish to crates.io
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      # A tag whose version doesn't match the manifest would publish the
+      # WRONG version under the right tag, which no later check can undo.
+      - name: Check the tag matches Cargo.toml
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          manifest="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          if [ "$tag" != "$manifest" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} disagrees with Cargo.toml version ${manifest}" >&2
+            exit 1
+          fi
+          echo "tag and manifest agree on ${manifest}"
+
+      - name: Publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
+            echo "::error::CARGO_REGISTRY_TOKEN is not set — add it as a repo secret" >&2
+            exit 1
+          fi
+          # Idempotent: re-running a completed release must not fail. cargo
+          # refuses to overwrite an existing version, and that refusal is the
+          # success case here.
+          set -o pipefail
+          if cargo publish --locked 2>&1 | tee /tmp/publish.log; then
+            exit 0
+          fi
+          if grep -qE "already (uploaded|exists)|crate version .* is already" /tmp/publish.log; then
+            echo "dirge-agent ${GITHUB_REF_NAME#v} is already on crates.io — nothing to do"
+            exit 0
+          fi
+          exit 1
+
+  # Bump the version shown next to the logo on https://dirge-code.github.io/.
+  # Also manual until now, and also missed for 0.20.0 — the site still read
+  # v0.19.29 when 0.21.0 was cut (dirge-a9pc). Same shape as the homebrew job:
+  # needs a SITE_REPO_TOKEN secret (PAT with contents:write on the site repo)
+  # because GITHUB_TOKEN can't push to another repository.
+  site:
+    name: Bump site version
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the site
+        uses: actions/checkout@v7
+        with:
+          repository: dirge-code/dirge-code.github.io
+          token: ${{ secrets.SITE_REPO_TOKEN }}
+          path: site
+
+      - name: Rewrite the brand-ver span
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          f=site/index.html
+          sed -i "s|\(class=\"brand-ver\">\)v[0-9][^<]*|\1v${version}|" "$f"
+          # An unmatched sed is a silent no-op, which is exactly the failure
+          # mode this job exists to remove. Prove the string is there now.
+          grep -q "class=\"brand-ver\">v${version}<" "$f" || {
+            echo "::error::brand-ver span did not end up at v${version} — has the markup changed?" >&2
+            exit 1
+          }
+
+      - name: Commit and push
+        run: |
+          set -euo pipefail
+          cd site
+          if git diff --quiet; then
+            echo "Site already at ${GITHUB_REF_NAME} — nothing to do."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "Bump version to ${GITHUB_REF_NAME}"
+          git push
+
+  # The actual fix for dirge-a9pc. Every job above can report success while
+  # shipping nothing: the homebrew and site seds no-op silently if the markup
+  # moves, and a skipped job is green by default. This reads each channel back
+  # from its published source and fails if any of them disagrees with the tag,
+  # so "a channel didn't ship" is a red X instead of something noticed two
+  # releases later.
+  verify-channels:
+    name: Verify all release channels
+    needs: [build, nix-binary-package, homebrew, crates-io, site]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check every channel carries this version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          tag="$GITHUB_REF_NAME"
+          version="${tag#v}"
+          failed=0
+          fail() { echo "::error::$1"; failed=1; }
+          ok()   { echo "ok: $1"; }
+          # Fetch to a file, THEN match. `gh api … | grep -q` looks equivalent
+          # and isn't: grep -q exits on the first match, gh takes SIGPIPE, and
+          # pipefail reports the pipeline as failed — a missing-channel error
+          # for a channel that is fine. It only shows up on inputs long enough
+          # to still be streaming (index.html), which is the worst way to find
+          # out.
+          fetch() { gh api "$1" -H "Accept: application/vnd.github.raw" > "$2"; }
+
+          # 1. GitHub release — every packaged target plus its checksum.
+          assets="$(gh release view "$tag" -R "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')"
+          for want in \
+            dirge-x86_64-unknown-linux-gnu.tar.gz \
+            dirge-x86_64-unknown-linux-musl.tar.gz \
+            dirge-x86_64-apple-darwin.tar.gz \
+            dirge-aarch64-apple-darwin.tar.gz \
+            dirge-x86_64-pc-windows-msvc.zip \
+            sbom.spdx.json
+          do
+            if grep -Fxq "$want" <<< "$assets"; then ok "release asset $want"
+            else fail "release $tag is missing asset $want"; fi
+            case "$want" in
+              sbom.spdx.json) ;;
+              *) if grep -Fxq "$want.sha256" <<< "$assets"; then ok "release asset $want.sha256"
+                 else fail "release $tag is missing checksum $want.sha256"; fi ;;
+            esac
+          done
+
+          # 2. crates.io. The sparse index is CDN-cached, so give it a few
+          #    minutes before calling it missing.
+          on_registry() {
+            curl -sf https://index.crates.io/di/rg/dirge-agent > /tmp/crates-index.json || return 1
+            [ "$(jq -sr --arg v "$version" 'any(.[]; .vers == $v)' /tmp/crates-index.json)" = true ]
+          }
+          for attempt in $(seq 1 10); do
+            on_registry && break
+            echo "crates.io index has no ${version} yet (attempt ${attempt}/10)"
+            [ "$attempt" -lt 10 ] && sleep 30
+          done
+          if on_registry
+          then ok "crates.io has dirge-agent ${version}"
+          else fail "crates.io has no dirge-agent ${version}"; fi
+
+          # 3. nix/bin.nix, committed back to main by the bump job.
+          fetch "repos/$GITHUB_REPOSITORY/contents/nix/bin.nix?ref=main" /tmp/bin.nix
+          if grep -q "version = \"${version}\";" /tmp/bin.nix
+          then ok "nix/bin.nix on main is at ${version}"
+          else fail "nix/bin.nix on main is not at ${version}"; fi
+
+          # 4. Homebrew tap.
+          fetch repos/dirge-code/homebrew-dirge/contents/Formula/dirge.rb /tmp/dirge.rb
+          if grep -q "version \"${version}\"" /tmp/dirge.rb
+          then ok "homebrew formula is at ${version}"
+          else fail "homebrew formula is not at ${version}"; fi
+
+          # 5. Site.
+          fetch repos/dirge-code/dirge-code.github.io/contents/index.html /tmp/index.html
+          if grep -q "class=\"brand-ver\">v${version}<" /tmp/index.html
+          then ok "site brand-ver is at v${version}"
+          else fail "site brand-ver is not at v${version}"; fi
+
+          if [ "$failed" -ne 0 ]; then
+            echo "::error::one or more release channels did not receive ${tag}"
+            exit 1
+          fi
+          echo "all six channels carry ${tag}"
