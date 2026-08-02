@@ -4,6 +4,61 @@ All notable changes to dirge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.21.3] - 2026-08-02
+
+### Fixed
+- **A subagent that ran out of turns reported back as if it had finished.**
+  A coordinator dispatching a batch got `completed:` followed by whatever the
+  agent happened to be narrating when its 25-turn cap hit — "Now let me check
+  the next file" — and reconciled it as delivered work. Two things combined:
+  the loop appends the max-turns notice as a *user* message, so the last
+  *assistant* message (and therefore `Done.response`) is the in-flight
+  tool-call turn's preamble; and the drain that carries a subagent's result
+  back to its parent silently discarded `SystemNotice`, the only event
+  carrying that notice. The headless path had detected this for a while via
+  `MAX_TURNS_NOTICE_PREFIX`; the `task` tool had no equivalent.
+
+  Cut-off payloads are now marked, positioned so the marker survives the
+  disk relay's head/tail summary. The same applies to the empty-response
+  fallback, which returns the accumulated multi-turn token stream — running
+  narration rather than a report — and used to pass it off unlabelled. A
+  clean answer still round-trips verbatim.
+
+- **"Allow always" could save a rule that never fired, so the same command
+  prompted forever.** The pattern was derived by skipping a hardcoded list of
+  nine shell builtins, but the built-in rules auto-allow around twenty more
+  (`cat`, `ls`, `grep`, `echo`, `head`, `tail`, `rg`, `find`, …). The two
+  drifted. `cat f.txt | clojure -M -` therefore suggested `cat *` — already
+  covered by the built-in `cat **` — so the grant added nothing, the
+  `clojure` segment kept asking, and every subsequent invocation re-prompted.
+
+  The suggestion is now derived from the rule set itself and targets the
+  first segment that isn't already allowed, with a generated guard so the
+  two can't drift again. Segments come from the same tree-sitter splitter
+  the permission layer runs, so a quoted `|` or a heredoc body can't
+  manufacture a phantom segment.
+
+- **Allow-always is no longer offered for substitution/subshell commands.**
+  Session grants are deliberately never honored for those — the inner command
+  is invisible, so `echo *` must not cover `echo $(rm -rf ~)`. But the dialog
+  offered it anyway, saved the entry, said so, and re-prompted on the next
+  identical command. It now allows once and explains why.
+
+- **The auto-approval evaluator could be talked into approving.**
+  `approval_provider` verdicts were parsed by checking whether a line *started
+  with* "ALLOW", so a chatty or reasoning model emitting "Allowing this would
+  be risky because…" auto-approved the command with no human involved — the
+  inverse of the parser's documented fail-safe contract, on the only gate
+  between the evaluator and execution. ALLOW must now be the whole line;
+  DENY stays prefix-matched, since it carries a reason and erring that way
+  costs a prompt rather than an unreviewed command.
+
+### Internal
+- Three relay tests pushed 5000-line payloads through the real relay and never
+  cleaned up, accumulating megabytes in `~/.dirge/transient` that look exactly
+  like production payloads when triaging a subagent report. `transient_base`
+  now takes a test-only redirect into a temp dir.
+
 ## [0.21.2] - 2026-08-01
 
 ### Fixed
@@ -2931,7 +2986,8 @@ agent in Rust with:
   LSP integration, and a Janet plugin system.
 - Session save/load/resume with LLM-summarization compaction.
 
-[Unreleased]: https://github.com/dirge-code/dirge/compare/v0.16.0...HEAD
+[Unreleased]: https://github.com/dirge-code/dirge/compare/v0.21.3...HEAD
+[0.21.3]: https://github.com/dirge-code/dirge/compare/v0.21.2...v0.21.3
 [0.16.0]: https://github.com/dirge-code/dirge/compare/v0.15.0...v0.16.0
 [0.4.1]: https://github.com/dirge-code/dirge/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/dirge-code/dirge/compare/v0.3.1...v0.4.0
