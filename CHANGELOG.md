@@ -4,7 +4,7 @@ All notable changes to dirge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.21.4] - 2026-08-03
 
 ### Security
 - Bumped `russh` to 0.62.5 for GHSA-m65r-rprj-r5rg (channel-scoped server
