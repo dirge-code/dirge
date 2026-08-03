@@ -393,3 +393,74 @@
             nil))
         nil))
     nil))
+
+(defn- json-extract-scalar [s key]
+  "Value for `key` as a string, accepting BOTH a quoted string and a bare
+  JSON number/literal.
+
+  `json-extract-string` matches quoted values only. A port is the natural
+  thing for a model to write unquoted (`{\"port\": 51208}`), and that would
+  silently read as nil — the connect tool would fall back to .nrepl-port
+  and ignore the port it was explicitly handed."
+  (def quoted (json-extract-string s key))
+  (if quoted
+    quoted
+    (do
+      (def search (string "\"" key "\""))
+      (if-let [start (string/find search s)]
+        (let [after-key (string/slice s (+ start (length search)))
+              colon (string/find ":" after-key)]
+          (if colon
+            (let [rest (string/trim (string/slice after-key (+ colon 1)))
+                  # A bare value runs to the next ',' or '}'.
+                  stop (min (or (string/find "," rest) (length rest))
+                            (or (string/find "}" rest) (length rest)))
+                  raw (string/trim (string/slice rest 0 stop))]
+              (if (= raw "") nil raw))
+            nil))
+        nil))))
+
+# ── connection discovery ────────────────────────────────────────
+
+(defn nrepl-port-in-dir [dir]
+  "The nREPL port recorded in `dir`/.nrepl-port, or nil when the file is
+  absent, unreadable, or blank.
+
+  A Clojure REPL writes this file when it starts. Returning nil (rather
+  than \"\") for a blank file matters: an empty port would be handed
+  straight to `net/connect`."
+  (def p (try (string/trim (slurp (string dir "/.nrepl-port"))) ([_] nil)))
+  (if (or (nil? p) (= p "")) nil p))
+
+(defn nrepl-discovered-port []
+  "The port from .nrepl-port in the current project root, or nil."
+  (nrepl-port-in-dir (harness/get-cwd)))
+
+(defn nrepl-ensure-connected []
+  "Connect from .nrepl-port if not already connected. Returns a status
+  string; raises when no port can be discovered.
+
+  This is what makes a REPL started DURING the session usable. `on-init`
+  reads .nrepl-port once at startup, so a server the agent starts itself
+  a few turns later was never picked up — and the agent has no way to run
+  /nrepl-connect. Connecting lazily at first eval closes that gap."
+  (if nrepl-connected
+    (string "already connected to nREPL at " nrepl-host ":" nrepl-port)
+    (if-let [port (nrepl-discovered-port)]
+      (nrepl-connect nrepl-host port)
+      (error "no .nrepl-port in the project root"))))
+
+(defn nrepl-not-connected-message [cause]
+  "The disconnected-eval error the AGENT reads.
+
+  It used to say \"Use /nrepl-connect first\". Slash commands are typed by
+  the user — no harness call and no builtin tool lets the agent issue one
+  — so the model was told to do the one thing it cannot, and every session
+  stalled there until a human intervened. Name the tool instead, and carry
+  the cause so \"no REPL running\" is distinguishable from \"connect failed\"."
+  (string
+    "nrepl_eval error: not connected to an nREPL server (" cause "). "
+    "Start one in the project — a Clojure REPL writes .nrepl-port, e.g. "
+    "`clojure -M:nrepl` or `lein repl :headless` in the background — then "
+    "call nrepl_eval again; it connects on its own once that file exists. "
+    "To reach a server on a different host/port, call the nrepl_connect tool."))

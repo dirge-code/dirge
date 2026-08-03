@@ -8,10 +8,18 @@ REPL use.
 
 **Connection.** On startup the plugin reads `.nrepl-port` from the project
 root and opens an nREPL session. If there is no `.nrepl-port` (i.e. no REPL
-running) it stays idle—no errors, no noise. Connect later with
-`/nrepl-connect`.
+running) it stays idle—no errors, no noise.
 
-**Agent tool.** The `nrepl_eval` tool appears in the LLM's tool list.
+A REPL started *later* is picked up without you doing anything: `on-init`
+fires once, so `nrepl_eval` re-reads `.nrepl-port` and connects on its first
+call. This matters when the agent starts the REPL itself mid-session—the
+startup read has long since happened. `/nrepl-connect` remains for
+interactive use.
+
+**Agent tools.** `nrepl_eval` and `nrepl_connect` appear in the LLM's tool
+list. Both exist as tools deliberately: the agent cannot type a slash
+command, so a plugin whose only connect path is `/nrepl-connect` strands the
+model asking you to run it.
 A skill prompt injected at the start of every session explains common
 patterns (require with `:reload`, run tests, inspect vars). The model only
 calls it when it knows Clojure is in play.
@@ -58,16 +66,26 @@ Files load in lexicographic order into a shared Janet environment.
 | `/nrepl-timeout [seconds]` | Get/set per-eval timeout (default 120 s) |
 | `/nrepl-interrupt` | Interrupt a long-running eval |
 
-## LLM tool
+## LLM tools
 
-The model sees `nrepl_eval` with one parameter:
+`nrepl_eval` — evaluate Clojure:
 
 ```json
 {"code": "(+ 1 2 3)"}
 ```
 
 Returns the value, stdout, stderr, current namespace, and an optional
-repair notice when delimiters were fixed.
+repair notice when delimiters were fixed. Connects from `.nrepl-port` first
+if not already connected.
+
+`nrepl_connect` — connect or reconnect. Both parameters optional; with none,
+reads `.nrepl-port`:
+
+```json
+{"host": "127.0.0.1", "port": 51208}
+```
+
+Only needed for a non-default host/port or after a server restart.
 
 ## Prerequisites
 
@@ -87,7 +105,7 @@ nothing.
 | Interface | MCP tool via io | dirge tool + slash commands |
 | Delimiter repair | edamame + parinfer-rust/parinferish | Pure Janet stack matcher |
 | Session persistence | Disk-based save/load | Ephemeral (lives as long as the REPL) |
-| Port discovery | lsof + `.nrepl-port` | `.nrepl-port` only |
+| Port discovery | lsof + `.nrepl-port` | `.nrepl-port` (re-read lazily on eval) |
 | Env detection | clj/bb/basilisp/shadow | None |
 | Eval timeout | Configurable per-call | Per-eval with interrupt |
 | Formatting | cljfmt (optional) | None |
