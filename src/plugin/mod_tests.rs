@@ -2794,6 +2794,148 @@ fn shipped_nrepl_plugin_loads_and_registers() {
         tools.iter().any(|t| t == "nrepl_eval"),
         "nrepl_eval tool not registered; got {tools:?}"
     );
+    // dirge-hli5: the agent cannot type a slash command, so a connect path
+    // has to exist as a TOOL or the model is structurally stuck behind
+    // `/nrepl-connect` — exactly the reported dead end.
+    assert!(
+        tools.iter().any(|t| t == "nrepl_connect"),
+        "nrepl_connect tool not registered; the agent has no way to connect: {tools:?}"
+    );
+}
+
+/// Load 00-state.janet into a bare manager. No network, no hooks — just
+/// the pure helpers.
+#[cfg(feature = "plugin")]
+fn nrepl_state_env() -> PluginManager {
+    let state = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins/nrepl/00-state.janet"),
+    )
+    .unwrap();
+    let mut mgr = PluginManager::try_new().unwrap();
+    mgr.eval(&state).unwrap();
+    mgr
+}
+
+/// dirge-hli5: port discovery is what lets a disconnected `nrepl_eval`
+/// connect itself. It has to read the file the Clojure REPL writes, and
+/// report "nothing here" as nil rather than an empty-string port that
+/// would be passed to `net/connect`.
+#[cfg(feature = "plugin")]
+#[test]
+fn nrepl_plugin_discovers_a_port_file_in_a_directory() {
+    let mut mgr = nrepl_state_env();
+    let dir = std::env::temp_dir().join(format!(
+        "dirge-nrepl-port-{}-{}",
+        std::process::id(),
+        crate::time_util::now_unix_nanos(),
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let d = dir.display().to_string();
+
+    // No file yet — the common case when the agent hasn't started a REPL.
+    assert_eq!(
+        mgr.eval(&format!(r#"(nrepl-port-in-dir "{d}")"#)).unwrap(),
+        "nil"
+    );
+
+    // The REPL writes the port; trailing newline is normal.
+    std::fs::write(dir.join(".nrepl-port"), "51208\n").unwrap();
+    assert_eq!(
+        mgr.eval(&format!(r#"(nrepl-port-in-dir "{d}")"#)).unwrap(),
+        "51208"
+    );
+
+    // A blank / whitespace-only file is "no port", not "".
+    std::fs::write(dir.join(".nrepl-port"), "  \n").unwrap();
+    assert_eq!(
+        mgr.eval(&format!(r#"(nrepl-port-in-dir "{d}")"#)).unwrap(),
+        "nil"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// dirge-hli5: `json-extract-string` only matches QUOTED values, so an LLM
+/// writing `{"port": 51208}` (the natural shape for a number) would have
+/// its port silently dropped. The connect tool reads scalars instead.
+#[cfg(feature = "plugin")]
+#[test]
+fn nrepl_plugin_reads_a_numeric_port_from_tool_args() {
+    let mut mgr = nrepl_state_env();
+    assert_eq!(
+        mgr.eval(r#"(json-extract-scalar `{"port": 51208}` "port")"#)
+            .unwrap(),
+        "51208"
+    );
+    // Quoted values still work, and so does a key that isn't last.
+    assert_eq!(
+        mgr.eval(r#"(json-extract-scalar `{"port": "51208"}` "port")"#)
+            .unwrap(),
+        "51208"
+    );
+    assert_eq!(
+        mgr.eval(r#"(json-extract-scalar `{"port": 7888, "host": "1.2.3.4"}` "port")"#)
+            .unwrap(),
+        "7888"
+    );
+    assert_eq!(
+        mgr.eval(r#"(json-extract-scalar `{"host": "1.2.3.4"}` "port")"#)
+            .unwrap(),
+        "nil"
+    );
+}
+
+/// dirge-hli5 (the reported bug): the disconnected-eval message used to
+/// read "Use /nrepl-connect first". Slash commands are user-typed input —
+/// there is no `harness/*` call and no builtin tool that lets the agent
+/// issue one — so the model was being told to do the one thing it cannot,
+/// and the session stalled until the human typed it. The message must
+/// point at something the agent can actually reach.
+#[cfg(feature = "plugin")]
+#[test]
+fn nrepl_disconnected_message_does_not_tell_the_agent_to_run_a_slash_command() {
+    let mut mgr = nrepl_state_env();
+    let msg = mgr
+        .eval(r#"(nrepl-not-connected-message "no .nrepl-port found")"#)
+        .unwrap();
+    assert!(
+        !msg.contains("/nrepl-connect"),
+        "the agent cannot run slash commands; message still points at one: {msg}"
+    );
+    assert!(
+        msg.contains("nrepl_connect"),
+        "message must name the tool the agent CAN call: {msg}"
+    );
+    // The underlying cause is carried through, so the model can tell
+    // "no REPL running" from "connection refused".
+    assert!(msg.contains("no .nrepl-port found"), "cause dropped: {msg}");
+}
+
+/// The injected skill prompt is read by the model on every session. It
+/// used to teach `/nrepl-connect` as *the* way to connect — training the
+/// model into the dead end above. It must describe the tools; slash
+/// commands are for the human.
+#[cfg(feature = "plugin")]
+#[test]
+fn nrepl_skill_prompt_teaches_tools_not_slash_commands() {
+    let hooks = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins/nrepl/01-hooks.janet"),
+    )
+    .unwrap();
+    let mut mgr = nrepl_state_env();
+    mgr.eval(&hooks).unwrap();
+    let prompt = mgr.eval("nrepl-skill-prompt").unwrap();
+    assert!(
+        prompt.contains("nrepl_connect"),
+        "skill prompt never mentions the connect tool: {prompt}"
+    );
+    assert!(
+        !prompt.contains("/nrepl-connect"),
+        "skill prompt still instructs the model to run a user-only slash command: {prompt}"
+    );
+    assert!(
+        !prompt.contains("/nrepl-status"),
+        "skill prompt still instructs the model to run a user-only slash command: {prompt}"
+    );
 }
 
 /// The plugin's pure-Janet paren repair closes unbalanced delimiters in

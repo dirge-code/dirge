@@ -3,10 +3,11 @@
 # on-init: tries to auto-connect by reading .nrepl-port from cwd.
 # before-agent-start: injects skill instructions for nrepl_eval tool.
 
+# Best-effort connect at startup. It is NOT the only path: a REPL started
+# later in the session is picked up lazily by `nrepl_eval` (on-init fires
+# once, so anything after it would otherwise never connect).
 (defn on-init [ctx]
-  (def cwd (harness/get-cwd))
-  (def port-file (string cwd "/.nrepl-port"))
-  (if-let [port-str (try (string/trim (slurp port-file)) ([_] nil))]
+  (if-let [port-str (nrepl-discovered-port)]
     (do
       (harness/log (string "nrepl: found .nrepl-port → " port-str))
       # Janet `try` takes ONE body form, so multi-step bodies must be
@@ -40,9 +41,12 @@
     "- Run tests from the REPL\n"
     "\n"
     "### How to connect\n"
-    "Use the `/nrepl-connect [host] [port]` slash command. "
-    "If no port is given, reads from `.nrepl-port` in the project root. "
-    "Check connection status with `/nrepl-status`.\n"
+    "`nrepl_eval` connects on its own using `.nrepl-port` in the project root, "
+    "so usually you just call it. If no REPL is running yet, start one in the "
+    "background (`clojure -M:nrepl`, `lein repl :headless`, …) — it writes "
+    "`.nrepl-port` — then call `nrepl_eval` again. Use the `nrepl_connect` tool "
+    "only for a non-default host/port or to reconnect after the server restarts. "
+    "Do NOT ask the user to connect for you.\n"
     "\n"
     "### Common patterns\n"
     "\n"
@@ -85,8 +89,8 @@
     "If you see a repair notice, your code had mismatched delimiters.\n"
     "- **Session persists:** State survives across tool calls until the nREPL server restarts.\n"
     "- **Always :reload:** When requiring namespaces after editing, use `:reload` to pick up changes.\n"
-    "- **Connection management:** Use `/nrepl-status` to check connectivity, "
-    "`/nrepl-disconnect` to close, `/nrepl-connect` to reconnect.\n"))
+    "- **Reconnecting:** If evaluation starts failing because the server restarted, "
+    "call `nrepl_connect` again.\n"))
 
 (defn before-agent-start [ctx]
   (harness/append-system-prompt nrepl-skill-prompt)

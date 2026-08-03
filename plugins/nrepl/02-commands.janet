@@ -13,12 +13,8 @@
   (def port
     (if (> (length parts) 1)
       (get parts 1)
-      (do
-        (def cwd (harness/get-cwd))
-        (def port-file (string cwd "/.nrepl-port"))
-        (if-let [p (try (string/trim (slurp port-file)) ([_] nil))]
-          p
-          (error "no port specified and no .nrepl-port found")))))
+      (or (nrepl-discovered-port)
+          (error "no port specified and no .nrepl-port found"))))
   (nrepl-connect host port))
 
 (defn nrepl-disconnect-cmd [_args]
