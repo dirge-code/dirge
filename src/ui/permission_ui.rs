@@ -1,4 +1,153 @@
+use crossterm::style::Color;
+
+use crate::ui::events::sanitize_output;
+use crate::ui::theme;
+
 const ALLOW_PLACEHOLDER: &str = "<edit this pattern>";
+
+/// The action-keys row. Must stay LAST in the overlay: the painter treats
+/// the final line as a sticky tail pinned to the bottom of the box, so it
+/// survives even when the body scrolls.
+pub(crate) const PERMISSION_ACTION_KEYS: &str =
+    "[y] allow once  [a] allow always  [n] deny  [d] deny + redirect  [ESC] abort";
+
+/// Prompt shown while the user is typing the redirection note.
+pub(crate) const DENY_NOTE_PROMPT: &str =
+    "denying — tell the agent what to do instead (Enter sends · Esc goes back):";
+
+/// Everything the permission prompt renders. A struct rather than a
+/// positional argument list: `details` and `reason` are both
+/// `Option<&str>` and swapping them would silently mislabel the prompt.
+pub(crate) struct PermissionPrompt<'a> {
+    pub(crate) tool: &'a str,
+    /// The permission match key (see [`crate::permission::ask::AskRequest`]).
+    pub(crate) input: &'a str,
+    pub(crate) details: Option<&'a str>,
+    pub(crate) reason: Option<&'a str>,
+    /// Resolves path-shaped inputs to an absolute path; `""` when unknown.
+    pub(crate) working_dir: &'a str,
+    /// `Some` while the user is typing a deny redirection note.
+    pub(crate) deny_note: Option<&'a str>,
+}
+
+impl<'a> PermissionPrompt<'a> {
+    pub(crate) fn new(
+        req: &'a crate::permission::ask::AskRequest,
+        working_dir: &'a str,
+        deny_note: Option<&'a str>,
+    ) -> Self {
+        Self {
+            tool: &req.tool,
+            input: &req.input,
+            details: req.details.as_deref(),
+            reason: req.reason.as_deref(),
+            working_dir,
+            deny_note,
+        }
+    }
+}
+
+/// Build the body of the permission prompt overlay.
+///
+/// One line per fact, in decision order: what tool, what it would act on,
+/// any detail the match key omits, why an evaluator flagged it, then the
+/// action keys. The painter soft-wraps each line and grows the box to fit
+/// (see `layout::overlay_max_rows`), so nothing here is pre-truncated —
+/// dirge-hzd8 (#744) was exactly the failure of showing the user less of
+/// the tool call than they need to judge it.
+///
+/// With [`PermissionPrompt::deny_note`] set, the action-keys row is
+/// replaced by the note entry field. The field stays LAST so the painter
+/// pins it to the bottom of the box and it can't scroll away under a long
+/// command.
+pub(crate) fn build_permission_overlay(p: &PermissionPrompt<'_>) -> Vec<(String, Color)> {
+    let &PermissionPrompt {
+        tool,
+        input,
+        details,
+        reason,
+        working_dir,
+        deny_note,
+    } = p;
+    let color = theme::perm();
+    let safe_tool = sanitize_output(tool);
+    let safe_input = sanitize_output(input);
+    // Spacer rows are empty strings — the widget wraps + paints them as a
+    // blank row each, effectively adding breathing room above / below the
+    // prompt text.
+    let mut overlay: Vec<(String, Color)> = Vec::new();
+    overlay.push(("⚠ PERMISSION REQUIRED".to_string(), color));
+    overlay.push((String::new(), color));
+    overlay.push((format!("tool: {}", safe_tool), color));
+
+    // Show path context for file-operating tools instead of the generic
+    // "args:" label.
+    let arg_label = match tool {
+        "read" | "write" | "edit" | "list_dir" | "apply_patch" | "find_files" | "glob"
+        | "list_symbols" | "get_symbol_body" | "find_definition" | "find_callers"
+        | "find_callees" => {
+            if !working_dir.is_empty() {
+                let abs = crate::permission::checker::resolve_absolute(input, working_dir);
+                let hint = if abs.starts_with(working_dir) {
+                    "(inside project)"
+                } else {
+                    "(outside project)"
+                };
+                // Show both the raw input AND the resolved absolute path so
+                // the user can see what file will actually be modified —
+                // crucial when the LLM sends nonsense like path: "1" that
+                // resolves to /cwd/1.
+                if abs == input || abs == safe_input {
+                    format!("path: {} {}", abs, hint)
+                } else {
+                    format!("path: {} → {} {}", safe_input, abs, hint)
+                }
+            } else {
+                format!("path: {}", safe_input)
+            }
+        }
+        "bash" => format!("command: {}", safe_input),
+        "task" | "task_status" => format!("task: {}", safe_input),
+        "webfetch" | "websearch" => format!("url: {}", safe_input),
+        _ if tool.starts_with("mcp_tool") => format!("mcp: {}", safe_input),
+        _ => format!("args: {}", safe_input),
+    };
+    overlay.push((arg_label, color));
+
+    // dirge-hzd8: detail the match key can't carry — MCP arguments, above
+    // all. Each source line becomes its own overlay row so pretty-printed
+    // JSON keeps its shape instead of collapsing into one wrapped blob.
+    if let Some(details) = details.filter(|d| !d.trim().is_empty()) {
+        let safe = sanitize_output(details);
+        let mut lines = safe.lines();
+        if let Some(first) = lines.next() {
+            overlay.push((format!("args: {}", first), color));
+            for line in lines {
+                overlay.push((line.to_string(), color));
+            }
+        }
+    }
+
+    // dirge-r16x: when this prompt is an escalated approval_provider denial,
+    // show WHY the evaluator flagged it so the user can judge before
+    // deciding.
+    if let Some(reason) = reason {
+        overlay.push((
+            format!("flagged by approval check: {}", sanitize_output(reason)),
+            color,
+        ));
+    }
+    overlay.push((String::new(), color));
+    match deny_note {
+        Some(note) => {
+            overlay.push((DENY_NOTE_PROMPT.to_string(), color));
+            // Cursor block so an empty field still reads as "type here".
+            overlay.push((format!("> {}▌", sanitize_output(note)), color));
+        }
+        None => overlay.push((PERMISSION_ACTION_KEYS.to_string(), color)),
+    }
+    overlay
+}
 
 /// Whether a pattern was returned by `suggest_pattern` as the
 /// "empty input — please type a real pattern" placeholder rather
@@ -170,6 +319,193 @@ pub(crate) fn suggest_pattern(tool: &str, input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn body(rows: &[(String, Color)]) -> String {
+        rows.iter()
+            .map(|(t, _)| t.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Minimal prompt for a tool + input; other fields default to absent.
+    fn prompt<'a>(tool: &'a str, input: &'a str) -> PermissionPrompt<'a> {
+        PermissionPrompt {
+            tool,
+            input,
+            details: None,
+            reason: None,
+            working_dir: "",
+            deny_note: None,
+        }
+    }
+
+    fn rows_for(p: &PermissionPrompt<'_>) -> Vec<(String, Color)> {
+        build_permission_overlay(p)
+    }
+
+    /// dirge-hzd8 (#744): the prompt must carry the WHOLE bash command —
+    /// no truncation, no ellipsis, embedded newlines preserved as their own
+    /// rows so a heredoc / multi-line compound stays readable. The box
+    /// grows (and, past that, scrolls) to fit whatever this returns.
+    #[test]
+    fn bash_prompt_carries_the_entire_command_verbatim() {
+        let cmd = format!(
+            "cd /srv && ./deploy.sh --target prod --token {} && rm -rf ./stale",
+            "x".repeat(600)
+        );
+        let text = body(&rows_for(&prompt("bash", &cmd)));
+        assert!(
+            text.contains(&cmd),
+            "command was altered or clipped:\n{text}"
+        );
+        assert!(!text.contains('…'), "command must not be elided:\n{text}");
+        // Multi-line commands keep every line.
+        let heredoc = "python3 - <<PY\nimport os\nos.remove('/etc/hosts')\nPY";
+        let text = body(&rows_for(&prompt("bash", heredoc)));
+        for line in heredoc.lines() {
+            assert!(text.contains(line), "dropped {line:?} from:\n{text}");
+        }
+    }
+
+    /// The action keys must be the LAST row — the painter pins the final
+    /// row to the bottom of the box, which is what keeps [y]/[a]/[n]/[d]
+    /// on screen when a long command scrolls.
+    #[test]
+    fn action_keys_are_the_sticky_last_row() {
+        for (tool, input) in [
+            ("bash", "cargo test"),
+            ("write", "src/main.rs"),
+            ("mcp_tool", "mcp_tool:db:query"),
+        ] {
+            let p = PermissionPrompt {
+                details: Some("{}"),
+                reason: Some("risky"),
+                working_dir: "/proj",
+                ..prompt(tool, input)
+            };
+            assert_eq!(
+                rows_for(&p).last().map(|(t, _)| t.as_str()),
+                Some(PERMISSION_ACTION_KEYS),
+                "{tool}: action keys must stay last",
+            );
+        }
+    }
+
+    /// dirge-hzd8: `d` opens a note that rides along with the denial. While
+    /// it's open the entry field REPLACES the action keys as the last row,
+    /// so the painter pins the field (not stale keys) to the bottom of the
+    /// box — the user can always see what they are typing.
+    #[test]
+    fn deny_note_entry_replaces_the_action_keys_as_the_sticky_row() {
+        let long = "rm -rf /var/data\n".repeat(40);
+        let p = PermissionPrompt {
+            deny_note: Some("use git clean -n first"),
+            ..prompt("bash", &long)
+        };
+        let rows = rows_for(&p);
+        let text = body(&rows);
+        let last = rows.last().map(|(t, _)| t.as_str()).unwrap_or_default();
+        assert!(
+            last.contains("use git clean -n first"),
+            "the entry field must be the pinned last row, got {last:?}"
+        );
+        assert!(
+            !text.contains(PERMISSION_ACTION_KEYS),
+            "y/a/n keys are inert while typing and must not be shown:\n{text}"
+        );
+        assert!(text.contains(DENY_NOTE_PROMPT), "missing hint:\n{text}");
+        // The command is still fully visible above the field.
+        assert!(text.contains("rm -rf /var/data"));
+    }
+
+    /// An empty note still shows the field (with a cursor) — otherwise
+    /// pressing `d` would look like nothing happened.
+    #[test]
+    fn empty_deny_note_still_renders_the_field() {
+        let rows = rows_for(&PermissionPrompt {
+            deny_note: Some(""),
+            ..prompt("bash", "rm -rf /")
+        });
+        let last = rows.last().map(|(t, _)| t.as_str()).unwrap_or_default();
+        assert!(last.starts_with('>'), "no entry field: {last:?}");
+        assert!(last.contains('▌'), "no cursor: {last:?}");
+    }
+
+    /// dirge-hzd8: an MCP call's permission key is only
+    /// `mcp_tool:<server>:<tool>` — approving it blind was approving an
+    /// unknown payload. The arguments now show in the prompt, one row per
+    /// line so pretty-printed JSON keeps its shape.
+    #[test]
+    fn mcp_prompt_shows_the_call_arguments() {
+        let args = "{\n  \"query\": \"DROP TABLE users\",\n  \"confirm\": true\n}";
+        let rows = rows_for(&PermissionPrompt {
+            details: Some(args),
+            working_dir: "/proj",
+            ..prompt("mcp_tool", "mcp_tool:db:execute_sql")
+        });
+        let text = body(&rows);
+        assert!(text.contains("mcp_tool:db:execute_sql"));
+        assert!(
+            text.contains("DROP TABLE users"),
+            "the payload the user is approving must be visible:\n{text}"
+        );
+        // One overlay row per source line — not one wrapped blob.
+        assert!(
+            rows.iter().any(|(t, _)| t.trim() == "\"confirm\": true"),
+            "JSON lines should map to their own rows:\n{text}"
+        );
+    }
+
+    /// Absent / blank details add no rows at all — a no-argument call
+    /// shouldn't grow a stray empty "args:" line.
+    #[test]
+    fn blank_details_add_no_rows() {
+        let base = body(&rows_for(&prompt("mcp_tool", "mcp_tool:x:y")));
+        for blank in ["", "   ", "\n\t"] {
+            let with = body(&rows_for(&PermissionPrompt {
+                details: Some(blank),
+                ..prompt("mcp_tool", "mcp_tool:x:y")
+            }));
+            assert_eq!(with, base, "blank {blank:?} added rows");
+        }
+    }
+
+    /// Control bytes in the tool call can't smuggle ANSI into the prompt —
+    /// a command that repainted the box could hide what it was really
+    /// asking for. Covers the deny-note field too: it echoes pasted text.
+    #[test]
+    fn overlay_strips_escape_sequences() {
+        let text = body(&rows_for(&PermissionPrompt {
+            details: Some("\x1b[31mred"),
+            reason: Some("\x1b[5mflagged"),
+            deny_note: Some("\x1b[2Jwipe"),
+            ..prompt("bash", "echo \x1b[2J\x1b[1;31mSAFE\x1b[0m && rm -rf /")
+        }));
+        assert!(
+            !text.contains('\x1b'),
+            "escape leaked into prompt: {text:?}"
+        );
+        // The actual command text survives — only the escapes go.
+        assert!(text.contains("rm -rf /"));
+    }
+
+    /// Path tools resolve the input against the working dir and say whether
+    /// the target is inside the project — the LLM sending `path: "1"` must
+    /// not read as a harmless relative file.
+    #[test]
+    fn path_tools_show_the_resolved_absolute_path() {
+        let text = body(&rows_for(&PermissionPrompt {
+            working_dir: "/proj",
+            ..prompt("write", "1")
+        }));
+        assert!(text.contains("/proj/1"), "unresolved path in:\n{text}");
+        assert!(text.contains("(inside project)"), "missing hint:\n{text}");
+        let text = body(&rows_for(&PermissionPrompt {
+            working_dir: "/proj",
+            ..prompt("write", "/etc/passwd")
+        }));
+        assert!(text.contains("(outside project)"), "missing hint:\n{text}");
+    }
 
     /// `suggest_pattern` returns a literal placeholder for empty
     /// input. The ask-dialog path that consumes it must detect the

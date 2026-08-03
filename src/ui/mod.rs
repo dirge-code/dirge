@@ -751,6 +751,22 @@ pub async fn run_interactive(
                     entry.paste(text);
                     render_custom_entry(&mut renderer, &entry.buf, entry.input_anchor);
                     renderer.request_repaint();
+                } else if let state::InputMode::Permission(p) = &mut ui.input_mode
+                    && let Some(note) = &mut p.deny_note
+                {
+                    // dirge-hzd8: pasting a path / snippet into the deny-note
+                    // field. Newlines would break the single-line field, so
+                    // they collapse to spaces.
+                    note.push_str(&text.replace(['\n', '\r'], " "));
+                    let overlay = permission_ui::build_permission_overlay(
+                        &permission_ui::PermissionPrompt::new(
+                            &p.req,
+                            session.working_dir.as_str(),
+                            p.deny_note.as_deref(),
+                        ),
+                    );
+                    renderer.update_alert_overlay(overlay);
+                    renderer.request_repaint();
                 }
                 continue;
             }
@@ -1269,52 +1285,123 @@ pub async fn run_interactive(
                         // Ctrl+D = "I want out" → Deny. The `a` branch also
                         // prints the will-allow line (or downgrades to allow-
                         // once when the input yields no useful pattern).
+                        //
+                        // dirge-hzd8: `d` opens a one-line field for a note to
+                        // the agent ("what to do instead"), which rides along
+                        // with the denial. While it's open every printable key
+                        // is text, so the y/a/n keys are inert until Enter
+                        // (send) or Esc (back).
                         let is_ctrl_c = key.code == KeyCode::Char('c')
                             && key.modifiers.contains(KeyModifiers::CONTROL);
                         let is_ctrl_d = key.code == KeyCode::Char('d')
                             && key.modifiers.contains(KeyModifiers::CONTROL);
-                        let decision: Option<UserDecision> = if is_ctrl_c || is_ctrl_d {
-                            Some(UserDecision::Deny)
-                        } else {
-                            match key.code {
-                                KeyCode::Char('y') => Some(UserDecision::AllowOnce),
-                                KeyCode::Char('a') => {
-                                    let state::InputMode::Permission(p) = &ui.input_mode else {
-                                        unreachable!()
-                                    };
-                                    let pattern =
-                                        suggest_pattern(&p.req.tool, &p.req.input);
-                                    if is_placeholder_pattern(&pattern) {
-                                        // dirge-jktn: say WHY we're downgrading.
-                                        // Empty input and "no session grant can
-                                        // ever match this command" are different
-                                        // facts and the old message only named
-                                        // the first.
-                                        let reason = allow_always_downgrade_reason(
-                                            &p.req.tool,
-                                            &p.req.input,
-                                        )
-                                        .unwrap_or("can't derive a useful pattern");
-                                        renderer.write_line(
-                                            &format!("  -> {reason}; allowing once only"),
-                                            theme::dim(),
-                                        )?;
-                                        Some(UserDecision::AllowOnce)
-                                    } else {
-                                        renderer.write_line(
-                                            &format!(
-                                                "  -> will allow: {}",
-                                                sanitize_output(&pattern),
-                                            ),
-                                            Color::Green,
-                                        )?;
-                                        Some(UserDecision::AllowAlways(pattern))
+                        let mut decision: Option<UserDecision> = None;
+                        let mut refresh_overlay = false;
+                        {
+                            let state::InputMode::Permission(p) = &mut ui.input_mode else {
+                                unreachable!()
+                            };
+                            if p.deny_note.is_some() {
+                                // Take the buffer out so the arms can mutate it
+                                // and still touch `p` (Esc drops it entirely).
+                                let mut note = p.deny_note.take().unwrap_or_default();
+                                let mut still_typing = true;
+                                if is_ctrl_c || is_ctrl_d {
+                                    decision = Some(UserDecision::deny());
+                                    still_typing = false;
+                                } else {
+                                    match key.code {
+                                        KeyCode::Enter => {
+                                            let note = note.trim().to_string();
+                                            decision = Some(UserDecision::Deny {
+                                                note: (!note.is_empty()).then_some(note),
+                                            });
+                                            still_typing = false;
+                                        }
+                                        // Back to the action keys, draft discarded.
+                                        KeyCode::Esc => still_typing = false,
+                                        KeyCode::Backspace => {
+                                            note.pop();
+                                        }
+                                        KeyCode::Char(c)
+                                            if !key
+                                                .modifiers
+                                                .contains(KeyModifiers::CONTROL) =>
+                                        {
+                                            note.push(c)
+                                        }
+                                        _ => {}
                                     }
                                 }
-                                KeyCode::Char('n') | KeyCode::Esc => Some(UserDecision::Deny),
-                                _ => None,
+                                if still_typing {
+                                    p.deny_note = Some(note);
+                                }
+                                refresh_overlay = decision.is_none();
+                            } else if is_ctrl_c || is_ctrl_d {
+                                decision = Some(UserDecision::deny());
+                            } else {
+                                match key.code {
+                                    KeyCode::Char('y') => {
+                                        decision = Some(UserDecision::AllowOnce)
+                                    }
+                                    KeyCode::Char('a') => {
+                                        let pattern =
+                                            suggest_pattern(&p.req.tool, &p.req.input);
+                                        if is_placeholder_pattern(&pattern) {
+                                            // dirge-jktn: say WHY we're downgrading.
+                                            // Empty input and "no session grant can
+                                            // ever match this command" are different
+                                            // facts and the old message only named
+                                            // the first.
+                                            let reason = allow_always_downgrade_reason(
+                                                &p.req.tool,
+                                                &p.req.input,
+                                            )
+                                            .unwrap_or("can't derive a useful pattern");
+                                            renderer.write_line(
+                                                &format!("  -> {reason}; allowing once only"),
+                                                theme::dim(),
+                                            )?;
+                                            decision = Some(UserDecision::AllowOnce);
+                                        } else {
+                                            renderer.write_line(
+                                                &format!(
+                                                    "  -> will allow: {}",
+                                                    sanitize_output(&pattern),
+                                                ),
+                                                Color::Green,
+                                            )?;
+                                            decision = Some(UserDecision::AllowAlways(pattern));
+                                        }
+                                    }
+                                    KeyCode::Char('n') | KeyCode::Esc => {
+                                        decision = Some(UserDecision::deny())
+                                    }
+                                    KeyCode::Char('d') => {
+                                        p.deny_note = Some(String::new());
+                                        refresh_overlay = true;
+                                    }
+                                    _ => {}
+                                }
                             }
-                        };
+                            if refresh_overlay {
+                                let overlay = permission_ui::build_permission_overlay(
+                                    &permission_ui::PermissionPrompt::new(
+                                        &p.req,
+                                        session.working_dir.as_str(),
+                                        p.deny_note.as_deref(),
+                                    ),
+                                );
+                                // Keep the scroll offset: the user may have
+                                // paged down to read a long command before
+                                // reaching for `d`.
+                                renderer.update_alert_overlay(overlay);
+                                renderer.request_repaint();
+                            }
+                        }
+                        if refresh_overlay {
+                            continue;
+                        }
 
                         // Phase 2: decision made — run the post-decision work
                         // (overlay clear, reply, avatar, cascade-deny, allow-
@@ -1334,7 +1421,13 @@ pub async fn run_interactive(
                                 UserDecision::AllowAlways(p) => Some(p.clone()),
                                 _ => None,
                             };
-                            let was_denied = matches!(decision, UserDecision::Deny);
+                            let was_denied = matches!(decision, UserDecision::Deny { .. });
+                            // Echo the redirection back so the user can see
+                            // what the agent was actually told (dirge-hzd8).
+                            let deny_note = match &decision {
+                                UserDecision::Deny { note } => note.clone(),
+                                _ => None,
+                            };
                             // Alert decided — clear the overlay so the [ALERT]
                             // frame swaps back to the input editor.
                             renderer.clear_alert_overlay();
@@ -1354,10 +1447,19 @@ pub async fn run_interactive(
                             // then interject so the runner halts at the next
                             // tool-result boundary.
                             if was_denied {
+                                if let Some(note) = &deny_note {
+                                    renderer.write_line(
+                                        &format!("  ↳ told the agent: {}", sanitize_output(note)),
+                                        theme::dim(),
+                                    )?;
+                                }
                                 if let Some(rx) = ask_rx.as_mut() {
                                     let mut cascaded = 0usize;
                                     while let Ok(stale) = rx.try_recv() {
-                                        let _ = stale.reply.send(UserDecision::Deny);
+                                        // The note answers the request the user
+                                        // was actually shown; siblings just get
+                                        // the plain refusal.
+                                        let _ = stale.reply.send(UserDecision::deny());
                                         cascaded += 1;
                                     }
                                     if cascaded > 0 {
@@ -4405,71 +4507,13 @@ pub async fn run_interactive(
                         // event — two boxes for one decision. Removed: the
                         // overlay is the single source of truth.
                         {
-                            let safe_tool = sanitize_output(&ask_req.tool);
-                            let safe_input = sanitize_output(&ask_req.input);
-                            // Spacer rows are empty strings — the widget
-                            // wraps + paints them as a blank row each,
-                            // effectively adding breathing room above / below
-                            // the prompt text.
-                            let mut overlay: Vec<(String, Color)> = Vec::new();
-                            overlay.push(("⚠ PERMISSION REQUIRED".to_string(), theme::perm()));
-                            overlay.push((String::new(), theme::perm()));
-                            overlay.push((format!("tool: {}", safe_tool), theme::perm()));
-
-                            // Show path context for file-operating tools
-                            // instead of the generic "args:" label.
-                            let arg_label = match ask_req.tool.as_str() {
-                                "read" | "write" | "edit" | "list_dir"
-                                | "apply_patch" | "find_files" | "glob"
-                                | "list_symbols" | "get_symbol_body"
-                                | "find_definition" | "find_callers" | "find_callees" => {
-                                    let cwd = session.working_dir.as_str();
-                                    if !cwd.is_empty() {
-                                        let abs = crate::permission::checker::resolve_absolute(
-                                            &ask_req.input, cwd,
-                                        );
-                                        let hint = if abs.starts_with(cwd) {
-                                            "(inside project)"
-                                        } else {
-                                            "(outside project)"
-                                        };
-                                        // Show both the raw input AND the resolved absolute
-                                        // path so the user can see what file will actually
-                                        // be modified — crucial when LLM sends nonsense like
-                                        // path: "1" that resolves to /cwd/1.
-                                        if abs == ask_req.input || abs == safe_input {
-                                            format!("path: {} {}", abs, hint)
-                                        } else {
-                                            format!("path: {} → {} {}", safe_input, abs, hint)
-                                        }
-                                    } else {
-                                        format!("path: {}", safe_input)
-                                    }
-                                }
-                                "bash" => format!("command: {}", safe_input),
-                                "task" | "task_status" => format!("task: {}", safe_input),
-                                "webfetch" | "websearch" => format!("url: {}", safe_input),
-                                _ if ask_req.tool.starts_with("mcp_tool") => {
-                                    format!("mcp: {}", safe_input)
-                                }
-                                _ => format!("args: {}", safe_input),
-                            };
-                            overlay.push((arg_label, theme::perm()));
-                            // dirge-r16x: when this prompt is an escalated
-                            // approval_provider denial, show WHY the evaluator
-                            // flagged it so the user can judge before deciding.
-                            if let Some(reason) = &ask_req.reason {
-                                overlay.push((
-                                    format!("flagged by approval check: {}", sanitize_output(reason)),
-                                    theme::perm(),
-                                ));
-                            }
-                            overlay.push((String::new(), theme::perm()));
-                            overlay.push((
-                                "[y] allow once  [a] allow always  [n] deny  [ESC] abort"
-                                    .to_string(),
-                                theme::perm(),
-                            ));
+                            let overlay = permission_ui::build_permission_overlay(
+                                &permission_ui::PermissionPrompt::new(
+                                    &ask_req,
+                                    session.working_dir.as_str(),
+                                    None,
+                                ),
+                            );
                             renderer.set_alert_overlay(overlay);
                             renderer.request_repaint();
                         }
@@ -4484,6 +4528,7 @@ pub async fn run_interactive(
                         ui.input_mode = state::InputMode::Permission(state::PermissionState {
                             req: ask_req,
                             pending_chamber_tool,
+                            deny_note: None,
                         });
                         crate::ui::desktop_notify::notify(
                             cfg,

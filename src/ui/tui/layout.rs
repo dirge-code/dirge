@@ -32,6 +32,24 @@ pub const RIGHT_PANEL_MIN_W: u16 = 16;
 /// clamp at this value before passing `input_rows`.
 pub const MAX_INPUT_ROWS: u16 = 8;
 
+/// Chat rows kept visible above a modal overlay that has grown past
+/// [`MAX_INPUT_ROWS`]. Enough to keep the last couple of agent lines on
+/// screen while the user reads the prompt.
+pub const MIN_CHAT_ROWS: u16 = 4;
+
+/// Bottom-strip row budget for a modal OVERLAY (permission prompt, shell
+/// box) on a `rows`-tall terminal.
+///
+/// dirge-hzd8 (#744): overlays are not the editor. The editor is capped at
+/// [`MAX_INPUT_ROWS`] so a pasted 50-line block can't crowd out the chat,
+/// but a permission prompt must show the whole tool call — a user can't
+/// judge `rm -rf "$BUILD"/*` from its first three wrapped rows. So an
+/// overlay may take everything except [`MIN_CHAT_ROWS`] of chat and the 5
+/// fixed frame/status rows (see the vertical layout in [`Layout`]).
+pub fn overlay_max_rows(rows: u16) -> u16 {
+    rows.saturating_sub(MIN_CHAT_ROWS + 5).max(1)
+}
+
 /// All region rects for one frame.
 ///
 /// Layout rows top → bottom:
@@ -116,7 +134,31 @@ impl Layout {
         show_left: bool,
         show_right: bool,
     ) -> Self {
-        let input_rows = input_rows.clamp(1, MAX_INPUT_ROWS);
+        Self::with_panels_capped(
+            cols,
+            rows,
+            input_rows,
+            show_left,
+            show_right,
+            MAX_INPUT_ROWS,
+        )
+    }
+
+    /// [`Layout::with_panels`] with an explicit `max_input_rows` ceiling.
+    ///
+    /// The editor passes [`MAX_INPUT_ROWS`]; a modal overlay passes
+    /// [`overlay_max_rows`] so the permission prompt can grow to fit the
+    /// whole tool call instead of being clipped at the editor's cap
+    /// (dirge-hzd8 / #744).
+    pub fn with_panels_capped(
+        cols: u16,
+        rows: u16,
+        input_rows: u16,
+        show_left: bool,
+        show_right: bool,
+        max_input_rows: u16,
+    ) -> Self {
+        let input_rows = input_rows.clamp(1, max_input_rows.max(1));
         let full = Rect::new(0, 0, cols, rows);
 
         // Vertical layout. From bottom up:
@@ -389,6 +431,59 @@ mod tests {
         let max = Layout::new(200, 40, MAX_INPUT_ROWS);
         assert_eq!(big.input_box.height, max.input_box.height);
         assert_eq!(big.chat.height, max.chat.height);
+    }
+
+    /// dirge-hzd8 (#744): a modal overlay may exceed the editor's row cap —
+    /// the permission prompt has to show the whole command. It still leaves
+    /// `MIN_CHAT_ROWS` of chat visible.
+    #[test]
+    fn overlay_cap_grows_past_editor_cap_but_keeps_a_chat_floor() {
+        let rows = 40u16;
+        let cap = overlay_max_rows(rows);
+        assert!(
+            cap > MAX_INPUT_ROWS,
+            "a 40-row terminal has room for an overlay taller than the editor cap; got {cap}"
+        );
+        let l = Layout::with_panels_capped(200, rows, 99, true, true, cap);
+        assert_eq!(l.input_box.height, cap + 2, "overlay box grows to the cap");
+        assert_eq!(
+            l.chat.height, MIN_CHAT_ROWS,
+            "the chat floor is exactly MIN_CHAT_ROWS at the cap"
+        );
+        // Vertical tiling still covers the viewport: top frame + chat +
+        // chat bottom frame + strip + status.
+        assert_eq!(1 + l.chat.height + 1 + l.input_box.height + 1, rows);
+    }
+
+    /// The cap degrades gracefully on short terminals: never 0 (a
+    /// zero-height box paints nothing), and never GROWS the overlay past
+    /// the editor cap when there isn't room — a 20-row terminal must not
+    /// give the prompt 11 rows and leave the chat with nothing.
+    #[test]
+    fn overlay_max_rows_is_safe_on_short_terminals() {
+        for rows in 0..=17u16 {
+            let cap = overlay_max_rows(rows);
+            assert!(cap >= 1, "rows={rows} yielded a zero cap");
+            assert!(
+                cap <= MAX_INPUT_ROWS,
+                "rows={rows}: overlay cap {cap} exceeds the editor cap on a short terminal"
+            );
+            // Constructing at the cap stays in-bounds (no panic, no
+            // arithmetic overflow on a degenerate viewport).
+            let l = Layout::with_panels_capped(80, rows, 99, true, true, cap);
+            assert!(l.chat.x + l.chat.width <= 80);
+        }
+        // Room appears at rows = MIN_CHAT_ROWS + 5 + MAX_INPUT_ROWS + 1.
+        assert!(overlay_max_rows(18) > MAX_INPUT_ROWS);
+    }
+
+    /// The editor is NOT affected by the overlay cap — `with_panels` still
+    /// clamps at MAX_INPUT_ROWS so a pasted 50-line block can't swallow the
+    /// chat.
+    #[test]
+    fn editor_still_clamps_to_max_input_rows_on_a_tall_terminal() {
+        let l = Layout::with_panels(200, 60, 99, true, true);
+        assert_eq!(l.input_box.height, MAX_INPUT_ROWS + 2);
     }
 
     /// Degenerate viewport: very small rows shouldn't panic or

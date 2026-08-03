@@ -345,7 +345,7 @@ libkrun-sys = { version = "0.9.5", optional = true }
 # russh: pure-Rust SSH client (no libssh2/OpenSSL — uses the `ring` crypto
 # backend so the build needs no system OpenSSL or cmake). Used by the
 # microVM sandbox to execute commands inside the guest VM.
-russh = { version = "0.62.4", default-features = false, features = ["ring"], optional = true }
+russh = { version = "0.62.5", default-features = false, features = ["ring"], optional = true }
 # sha2 + hex: OCI layer digest verification for the microVM sandbox.
 # Every blob downloaded from the registry is SHA-256 hashed and compared
 # against the manifest's declared digest before extraction.

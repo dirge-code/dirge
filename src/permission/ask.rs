@@ -7,7 +7,16 @@ pub type AskReceiver = mpsc::Receiver<AskRequest>;
 #[derive(Debug)]
 pub struct AskRequest {
     pub tool: String,
+    /// The permission MATCH key — what rules and "allow always" patterns are
+    /// derived from. For tools whose match key isn't the whole story (an MCP
+    /// call matches on `mcp_tool:<server>:<tool>`, which says nothing about
+    /// what it was asked to do), the rest goes in [`Self::details`].
     pub input: String,
+    /// Display-only detail about the call that the match key omits — MCP tool
+    /// arguments, for instance (dirge-hzd8 / #744). Rendered under the input
+    /// in the prompt; never used for rule matching or pattern suggestion, so
+    /// it can carry anything the user needs to see to decide.
+    pub details: Option<String>,
     /// Why an `approval_provider` flagged this call, when the prompt is an
     /// escalated evaluator denial (dirge-r16x). `None` for an ordinary
     /// permission prompt. Shown to the user so they know what the evaluator
@@ -20,7 +29,20 @@ pub struct AskRequest {
 pub enum UserDecision {
     AllowOnce,
     AllowAlways(String),
-    Deny,
+    Deny {
+        /// What the user typed at the deny prompt: what the agent should do
+        /// INSTEAD (dirge-hzd8). Folded into the tool-result error so the
+        /// model gets the redirection rather than a bare refusal it can only
+        /// guess its way around. `None` for a plain deny.
+        note: Option<String>,
+    },
+}
+
+impl UserDecision {
+    /// A plain deny with no guidance attached.
+    pub fn deny() -> Self {
+        Self::Deny { note: None }
+    }
 }
 
 /// Drain `ask_rx` in headless modes (`--print`, `--loop`) by denying
@@ -49,7 +71,7 @@ pub fn spawn_headless_ask_responder(mut ask_rx: AskReceiver) -> tokio::task::Joi
             // Caller is awaiting `req.reply`; Deny is a clearer signal
             // than dropping the sender (which would surface as
             // "Permission system unavailable").
-            let _ = req.reply.send(UserDecision::Deny);
+            let _ = req.reply.send(UserDecision::deny());
         }
     })
 }
@@ -69,6 +91,7 @@ mod tests {
         tx.send(AskRequest {
             tool: "bash".to_string(),
             input: "which allium".to_string(),
+            details: None,
             reason: None,
             reply: reply_tx,
         })
@@ -76,7 +99,7 @@ mod tests {
         .unwrap();
 
         let decision = reply_rx.await.expect("responder should answer the ask");
-        assert!(matches!(decision, UserDecision::Deny));
+        assert!(matches!(decision, UserDecision::Deny { .. }));
     }
 
     /// Closing the sender ends the drain task cleanly (no leak/panic).

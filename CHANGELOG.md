@@ -4,6 +4,40 @@ All notable changes to dirge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Security
+- Bumped `russh` to 0.62.5 for GHSA-m65r-rprj-r5rg (channel-scoped server
+  callbacks reachable without an open channel). dirge uses russh as an SSH
+  *client* into the microVM guest, so the server-side callback path isn't
+  one we run, but the advisory fails the OSV scan and the fix is a patch bump.
+
+### Fixed
+- **The permission prompt hid most of the command it was asking about**
+  (#744). The renderer sized the alert box to fit the whole tool call, but
+  `Layout` then clamped it back to the input editor's 8-row cap, so on any
+  terminal a bash command longer than about three wrapped rows was cut to a
+  "↓ N more line(s)" hint. You could scroll it, but the box never grew — the
+  usual outcome was approving a command you hadn't read. Overlays now get
+  their own ceiling (everything but a 4-row chat floor); the editor keeps its
+  cap so a pasted block still can't crowd out the chat. The same clamp was
+  silently capping the shell overlay at 8 rows instead of its intended 12.
+
+- **MCP tool calls prompted with no arguments at all.** The permission match
+  key is `mcp_tool:<server>:<tool>`, and that was the entire prompt — nothing
+  distinguished a harmless query from `execute_sql {"query": "DROP TABLE
+  users"}`. The arguments now show under the tool name, pretty-printed, with
+  an explicit marker if an oversized blob has to be cut. Display only: rule
+  matching and the "allow always" pattern are unchanged.
+
+### Added
+- **Deny with a redirect.** `d` at a permission prompt opens a one-line field
+  for a note that rides along with the denial ("edit `src/config.rs` instead,
+  that file is generated"). It reaches the model in the tool result, so it
+  can act on the correction instead of guessing its way around a bare
+  refusal and retrying a variant of the same call. `n` / `Esc` still deny
+  immediately.
+
 ## [0.21.3] - 2026-08-02
 
 ### Fixed

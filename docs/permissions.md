@@ -184,6 +184,39 @@ This is orthogonal to the security mode: in `--yolo` nothing prompts so the
 evaluator is never consulted; in the other modes it stands in for the human
 on each `Ask`.
 
+## The prompt
+
+An `Ask` decision paints the `[ALERT]` box over the input editor. It shows
+the tool, what it would act on, and — when the permission match key doesn't
+tell the whole story — the rest of the call: for `bash` the **entire**
+command (multi-line commands and heredocs included), for an MCP tool the
+JSON arguments, for a path tool the resolved absolute path plus whether it
+is inside the project. An escalated `approval_provider` denial also shows
+what the evaluator objected to.
+
+The box grows to fit the call, shrinking the chat to a 4-row floor. If the
+call is longer than that, `↑`/`↓`, `PgUp`/`PgDn` and `Ctrl+O` scroll it and
+a hint reports how much is left — the action keys stay pinned to the bottom
+row so they never scroll away. Nothing is silently truncated; the one thing
+that can be cut is an oversized MCP argument blob, which says so explicitly.
+
+| Key | Effect |
+|-----|--------|
+| `y` | allow once |
+| `a` | allow always (see below) |
+| `n` | deny |
+| `d` | deny, and type a note telling the agent what to do instead |
+| `Esc` / `Ctrl+C` | deny |
+
+`d` opens a one-line field; `Enter` sends the denial with your note attached
+to the tool result the model reads, `Esc` discards the draft and returns to
+the keys. Use it to redirect rather than just block — "edit `src/config.rs`
+instead, that file is generated" saves the model from guessing its way
+around the refusal and retrying a variant of the same call.
+
+Denying also rejects any sibling tool calls the agent had already queued for
+that turn, and halts the run at the next tool-result boundary.
+
 ## "Allow always" and the session allowlist
 
 Choosing **(a) allow always** at a prompt adds a session-scoped grant

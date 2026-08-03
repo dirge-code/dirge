@@ -636,6 +636,7 @@ async fn handle_ask_inner(
     permission: &PermCheck,
     tool: &str,
     input: &str,
+    details: Option<&str>,
     reason: Option<&str>,
 ) -> Result<(), ToolError> {
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
@@ -643,6 +644,7 @@ async fn handle_ask_inner(
         .send(AskRequest {
             tool: tool.to_string(),
             input: input.to_string(),
+            details: details.map(str::to_string),
             reason: reason.map(str::to_string),
             reply: reply_tx,
         })
@@ -656,7 +658,30 @@ async fn handle_ask_inner(
                 .add_session_allowlist(tool.to_string(), &pattern);
             Ok(())
         }
-        _ => Err(ToolError::Msg(format!("{DENIAL_PREFIX} by user"))),
+        Ok(UserDecision::Deny { note }) => {
+            Err(ToolError::Msg(user_denial_message(note.as_deref())))
+        }
+        // Reply channel dropped without a decision — treat as a plain deny
+        // rather than letting the tool hang or look approved.
+        Err(_) => Err(ToolError::Msg(user_denial_message(None))),
+    }
+}
+
+/// The tool-result error text for a user deny, with the user's redirection
+/// note folded in when they typed one (dirge-hzd8).
+///
+/// A bare "Permission denied" tells the model only that it's blocked; it
+/// then guesses at a workaround, often re-attempting a variant of the same
+/// call. The note is the user saying what to do INSTEAD, so it goes in the
+/// result the model actually reads. [`DENIAL_PREFIX`] stays leading either
+/// way — [`is_permission_denial`] keys off it.
+pub fn user_denial_message(note: Option<&str>) -> String {
+    match note.map(str::trim).filter(|n| !n.is_empty()) {
+        Some(note) => format!(
+            "{DENIAL_PREFIX} by user. The user did not approve this call and \
+             instructs you to do the following instead: {note}"
+        ),
+        None => format!("{DENIAL_PREFIX} by user"),
     }
 }
 
@@ -732,6 +757,7 @@ async fn resolve_auto_verdict(
     perm: &PermCheck,
     tool: &str,
     input: &str,
+    details: Option<&str>,
 ) -> Result<bool, ToolError> {
     // Deny and Abstain share one path: prompt the human, terminal only when
     // there's nobody to ask. They differ in the no-human message and in
@@ -747,7 +773,7 @@ async fn resolve_auto_verdict(
     let Some(tx) = ask_tx else {
         return Err(ToolError::Msg(no_human_msg));
     };
-    handle_ask_inner(tx, perm, tool, input, reason.as_deref()).await?;
+    handle_ask_inner(tx, perm, tool, input, details, reason.as_deref()).await?;
     Ok(false)
 }
 
@@ -806,6 +832,24 @@ pub async fn enforce(
     tool: &str,
     scope: Scope<'_>,
 ) -> Result<String, ToolError> {
+    enforce_with_details(permission, ask_tx, tool, scope, None).await
+}
+
+/// [`enforce`] plus display-only `details` for the permission prompt.
+///
+/// dirge-hzd8 (#744): for most tools the match key IS the tool call — a bash
+/// command, a path, a URL. For MCP tools it is `mcp_tool:<server>:<tool>`,
+/// which tells the user nothing about what the call would DO. `details`
+/// carries that (the JSON arguments) to the prompt without touching rule
+/// matching or the "allow always" pattern, both of which stay keyed on
+/// `scope`.
+pub async fn enforce_with_details(
+    permission: &Option<PermCheck>,
+    ask_tx: &Option<AskSender>,
+    tool: &str,
+    scope: Scope<'_>,
+    details: Option<&str>,
+) -> Result<String, ToolError> {
     let raw_scope: &str = match &scope {
         Scope::Raw(s) | Scope::Path(s) | Scope::PathResolve(s) => s,
     };
@@ -852,7 +896,7 @@ pub async fn enforce(
             // prompt. dirge-a5ir: a Deny escalates to the human, it doesn't
             // short-circuit — handled in `resolve_auto_verdict`.
             let verdict = try_auto_approve(perm, tool, raw_scope, Vec::new()).await;
-            resolve_auto_verdict(verdict, ask_tx, perm, tool, raw_scope).await?;
+            resolve_auto_verdict(verdict, ask_tx, perm, tool, raw_scope, details).await?;
             // Approved (auto or by the human) → clear the loop-guard counter
             // so a repeated call the user keeps allowing never trips the
             // doom-loop hard-deny (only repeatedly-denied prompts accumulate).
@@ -898,7 +942,9 @@ pub async fn enforce_request(
             // dirge-a5ir: a Deny escalates to the human (see `enforce`).
             let resources = crate::permission::approval::summarize_claims(&req.claims);
             let verdict = try_auto_approve(perm, &req.tool, &req.display_input, resources).await;
-            resolve_auto_verdict(verdict, ask_tx, perm, &req.tool, &req.display_input).await?;
+            // No `details`: `display_input` is already the whole command.
+            resolve_auto_verdict(verdict, ask_tx, perm, &req.tool, &req.display_input, None)
+                .await?;
             // Approved → clear the loop-guard counter (see `enforce`).
             perm.lock_ignore_poison().note_allowed_request(&req);
             Ok(())
@@ -916,6 +962,20 @@ pub async fn check_perm(
     input_key: &str,
 ) -> Result<(), ToolError> {
     enforce(permission, ask_tx, tool, Scope::Raw(input_key))
+        .await
+        .map(|_| ())
+}
+
+/// [`check_perm`] with display-only `details` for the prompt. See
+/// [`enforce_with_details`].
+pub async fn check_perm_with_details(
+    permission: &Option<PermCheck>,
+    ask_tx: &Option<AskSender>,
+    tool: &str,
+    input_key: &str,
+    details: Option<&str>,
+) -> Result<(), ToolError> {
+    enforce_with_details(permission, ask_tx, tool, Scope::Raw(input_key), details)
         .await
         .map(|_| ())
 }
@@ -997,6 +1057,39 @@ mod tests {
         Action, OpSpec, PermissionConfig, RuleConfig, SecurityMode, checker::PermissionChecker,
     };
     use std::sync::{Arc, Mutex};
+
+    /// dirge-hzd8: a bare "Permission denied" leaves the model guessing, so
+    /// it retries a variant of the same call. The note the user types at the
+    /// deny prompt is guidance about what to do INSTEAD, and it has to reach
+    /// the model in the tool result.
+    #[test]
+    fn deny_note_reaches_the_model_behind_the_stable_prefix() {
+        let msg = user_denial_message(Some("use `git clean -n` and show me the list first"));
+        assert!(
+            msg.contains("git clean -n"),
+            "the user's redirection must survive: {msg}"
+        );
+        // The failure tracker / critic key off this prefix to tell a policy
+        // refusal from a mechanical error — it must stay leading.
+        assert!(msg.starts_with(DENIAL_PREFIX), "prefix moved: {msg}");
+        assert!(is_permission_denial(&msg));
+    }
+
+    /// No note (plain `n`, Esc, Ctrl+C, cascade-deny, headless) keeps the
+    /// original wording — nothing invented on the user's behalf.
+    #[test]
+    fn plain_deny_message_is_unchanged_and_blank_notes_do_not_count() {
+        let plain = user_denial_message(None);
+        assert_eq!(plain, format!("{DENIAL_PREFIX} by user"));
+        for blank in ["", "   ", "\n\t "] {
+            assert_eq!(
+                user_denial_message(Some(blank)),
+                plain,
+                "whitespace-only note {blank:?} should not add a dangling clause",
+            );
+            assert!(is_permission_denial(&user_denial_message(Some(blank))));
+        }
+    }
 
     // ---- Pre-edit baseline for the syntax gate (dirge-ytu1) ----
     // `.janet` has no tree-sitter grammar, so these exercise the
@@ -1156,6 +1249,52 @@ mod tests {
             result.is_ok(),
             "human override of an evaluator deny should allow: {result:?}"
         );
+        human.await.unwrap();
+    }
+
+    /// dirge-hzd8, end to end: the note the user types at the prompt comes
+    /// back as the tool's error text, so the model reads the redirection
+    /// instead of just "denied". Also pins that the display-only `details`
+    /// reach the prompt without touching the match key.
+    #[tokio::test]
+    async fn deny_with_a_note_surfaces_as_the_tool_error() {
+        use crate::permission::ask::{AskRequest, UserDecision};
+        let config = PermissionConfig {
+            rules: vec![rule(OpSpec::Edit, "**", Action::Ask)],
+            ..Default::default()
+        };
+        let perm: PermCheck = Arc::new(Mutex::new(PermissionChecker::new(
+            &config,
+            SecurityMode::Standard,
+            Some(std::path::PathBuf::from("/tmp")),
+        )));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<AskRequest>(1);
+
+        let human = tokio::spawn(async move {
+            let req = rx.recv().await.expect("a prompt must reach the human");
+            assert_eq!(req.details.as_deref(), Some("{\"path\": \"/tmp/x.rs\"}"));
+            // The match key is untouched by `details`.
+            assert_eq!(req.input, "/tmp/x.rs");
+            let _ = req.reply.send(UserDecision::Deny {
+                note: Some("edit src/config.rs instead, that file is generated".into()),
+            });
+        });
+
+        let err = enforce_with_details(
+            &Some(perm),
+            &Some(tx),
+            "write",
+            Scope::PathResolve("/tmp/x.rs"),
+            Some("{\"path\": \"/tmp/x.rs\"}"),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("edit src/config.rs instead"),
+            "the user's redirection must reach the model: {err}"
+        );
+        assert!(is_permission_denial(&err), "still a denial: {err}");
         human.await.unwrap();
     }
 

@@ -304,7 +304,8 @@ pub(crate) enum InputMode {
         /// The selectable option labels, in display order.
         options: Vec<String>,
     },
-    /// Tool permission prompt: y (allow once) / a (allow always) / n / Esc.
+    /// Tool permission prompt: y (allow once) / a (allow always) / n / d
+    /// (deny + redirect) / Esc.
     /// The `(O_O)` alert overlay is already painted; the dispatcher reads
     /// the keystroke, replies, and runs the chamber-reopen / cascade-deny
     /// / allowlist-save post-work.
@@ -321,6 +322,13 @@ pub(crate) struct PermissionState {
     /// If a tool chamber was closed to make room for the alert, the name
     /// to reopen it under once the user allows (`None` = nothing to reopen).
     pub(crate) pending_chamber_tool: Option<String>,
+    /// `Some` while the user is typing a redirection note on the `d`
+    /// (deny + tell the agent what to do instead) path — dirge-hzd8.
+    /// Mirrors [`QuestionState::entry`], but the text renders inside the
+    /// alert overlay rather than the chat scrollback, so no anchor is
+    /// needed. Enter sends the deny with this note; Esc discards it and
+    /// returns to the y/a/n/d keys.
+    pub(crate) deny_note: Option<String>,
 }
 
 /// In-flight state for the `question` tool modal — replaces the former

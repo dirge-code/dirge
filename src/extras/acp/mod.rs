@@ -1087,7 +1087,7 @@ fn spawn_acp_ask_drain(
             // ("Permission system unavailable"), but Deny is a
             // clearer signal that the call was *refused* rather
             // than the system being broken.
-            let _ = req.reply.send(crate::permission::ask::UserDecision::Deny);
+            let _ = req.reply.send(crate::permission::ask::UserDecision::deny());
         }
     });
 }
@@ -1223,6 +1223,7 @@ mod tests {
             .send(crate::permission::ask::AskRequest {
                 tool: "bash".to_string(),
                 input: "rm -rf /".to_string(),
+                details: None,
                 reason: None,
                 reply: reply_tx,
             })
@@ -1234,7 +1235,7 @@ mod tests {
             .expect("must reply within 200ms — F1 regression")
             .expect("reply channel must not be dropped");
         assert!(
-            matches!(resp, crate::permission::ask::UserDecision::Deny),
+            matches!(resp, crate::permission::ask::UserDecision::Deny { .. }),
             "ACP ask must auto-deny; got {:?}",
             resp,
         );
@@ -1737,6 +1738,7 @@ mod tests {
                 .send(crate::permission::ask::AskRequest {
                     tool: format!("bash-{i}"),
                     input: format!("cmd-{i}"),
+                    details: None,
                     reason: None,
                     reply: reply_tx,
                 })
@@ -1750,7 +1752,10 @@ mod tests {
                 .await
                 .expect("each reply must arrive promptly")
                 .expect("reply channel dropped");
-            assert!(matches!(resp, crate::permission::ask::UserDecision::Deny));
+            assert!(matches!(
+                resp,
+                crate::permission::ask::UserDecision::Deny { .. }
+            ));
         }
     }
 }
