@@ -6,6 +6,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security
+- Bumped `russh` to 0.62.5 for GHSA-m65r-rprj-r5rg (channel-scoped server
+  callbacks reachable without an open channel). dirge uses russh as an SSH
+  *client* into the microVM guest, so the server-side callback path isn't
+  one we run, but the advisory fails the OSV scan and the fix is a patch bump.
+
 ### Fixed
 - **The permission prompt hid most of the command it was asking about**
   (#744). The renderer sized the alert box to fit the whole tool call, but
