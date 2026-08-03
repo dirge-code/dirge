@@ -184,6 +184,14 @@ This is orthogonal to the security mode: in `--yolo` nothing prompts so the
 evaluator is never consulted; in the other modes it stands in for the human
 on each `Ask`.
 
+**Scope.** The evaluator is session-scoped and does *not* follow a subagent
+into an isolated worktree. A worktree writer gets a fresh checker (no session
+grants, no retry counters — they're anchored to the parent checkout), and it
+gets no evaluator either: with both, the grants you made yourself would be
+dropped while the thing that auto-allows without asking you survived, which
+would make a background writer more permissive than the session that spawned
+it. Worktree writers prompt you instead (dirge-4wpc).
+
 ## The prompt
 
 An `Ask` decision paints the `[ALERT]` box over the input editor. It shows
