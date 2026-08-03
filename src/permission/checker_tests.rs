@@ -1646,3 +1646,72 @@ fn why_classifies_complex_command_like_enforcement() {
     let plain = checker.build_request("bash", "cat file.txt", false);
     assert!(!plain.claims[0].resource.is_complex_command());
 }
+
+/// dirge-4wpc: a worktree writer's checker must NOT inherit the LLM
+/// auto-approver.
+///
+/// `for_working_dir` deliberately drops the session allowlist — a grant the
+/// user made against the parent checkout means something different under a
+/// worktree root. But it used to keep `approval_fn`, and those two together
+/// invert the trust model: the user's own "allow always" decisions vanish,
+/// while the evaluator that can auto-allow WITHOUT asking survives. Every
+/// call the user had already settled came back as an `Ask` that the LLM
+/// answered on their behalf, so the writer ran with a weaker human backstop
+/// than the session that spawned it.
+///
+/// Dropping the evaluator makes the worktree strictly no more permissive
+/// than the parent: those Asks now reach the human (`ask_tx` is threaded
+/// into `build_rooted_writer_tools`, so there IS one to reach).
+#[test]
+fn worktree_checker_does_not_inherit_the_llm_auto_approver() {
+    use crate::permission::approval::ApprovalDecision;
+    use std::sync::Arc;
+
+    let mut parent = PermissionChecker::new(
+        &PermissionConfig::default(),
+        SecurityMode::Standard,
+        Some(std::path::PathBuf::from("/tmp/proj")),
+    );
+    parent.set_approval_fn(Arc::new(|_req| {
+        Box::pin(async move { Ok(ApprovalDecision::Allow) })
+    }));
+    assert!(
+        parent.approval_fn().is_some(),
+        "parent should have the evaluator installed"
+    );
+
+    let child = parent.for_working_dir(std::path::PathBuf::from("/tmp/wt"));
+    assert!(
+        child.approval_fn().is_none(),
+        "worktree writer inherited the auto-approver; its Ask decisions would \
+         be auto-allowed instead of reaching the human",
+    );
+    // The parent is untouched — this is a derivation, not a move.
+    assert!(parent.approval_fn().is_some());
+}
+
+/// The rest of `for_working_dir`'s contract is unchanged: prompt deny-lists
+/// (the one terminal, un-loosenable policy) still propagate, the worktree
+/// root is adopted, and session grants stay behind.
+#[test]
+fn worktree_checker_keeps_deny_list_and_root_but_not_session_grants() {
+    let mut parent = PermissionChecker::new(
+        &PermissionConfig::default(),
+        SecurityMode::Standard,
+        Some(std::path::PathBuf::from("/tmp/proj")),
+    );
+    parent.set_prompt_deny_tools(vec!["edit".to_string()]);
+    parent.add_session_allowlist("bash".to_string(), "cargo *");
+    assert!(!parent.allowlist_entries().is_empty());
+
+    let child = parent.for_working_dir(std::path::PathBuf::from("/tmp/wt"));
+    assert_eq!(child.working_dir(), "/tmp/wt");
+    assert!(
+        child.any_prompt_denied(&["edit"]),
+        "a prompt deny-list must survive into the worktree — it outranks Yolo",
+    );
+    assert!(
+        child.allowlist_entries().is_empty(),
+        "parent-relative session grants must not leak into the worktree root",
+    );
+}

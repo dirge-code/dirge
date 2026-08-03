@@ -130,12 +130,25 @@ impl PermissionChecker {
 
     /// Build a fresh checker for an isolated worktree without sharing mutable
     /// session grants or retry counters with the parent session.
+    ///
+    /// dirge-4wpc: the LLM auto-approver (`approval_fn`) is deliberately NOT
+    /// inherited. Dropping the session allowlist is correct — a grant the user
+    /// made against the parent checkout doesn't mean the same thing under a
+    /// worktree root — but keeping the evaluator alongside that inverted the
+    /// trust model: the user's own "allow always" decisions vanished while the
+    /// thing that can auto-allow *without asking them* survived. Every call
+    /// they'd already settled came back as an `Ask` that the LLM answered on
+    /// their behalf, leaving the writer with a weaker human backstop than the
+    /// session that spawned it.
+    ///
+    /// Without it, a worktree writer is strictly no more permissive than its
+    /// parent: `Ask` reaches the human, who is reachable — `ask_tx` is threaded
+    /// through `build_rooted_writer_tools` into these tools.
     pub fn for_working_dir(&self, working_dir: std::path::PathBuf) -> Self {
         let mut checker = Self::new(&self.config, self.mode, Some(working_dir));
+        // Prompt deny-lists DO propagate: terminal, un-loosenable, and
+        // path-independent, so they carry no cross-root ambiguity.
         checker.set_prompt_deny_tools(self.prompt_deny_tools.clone());
-        if let Some(approval_fn) = self.approval_fn() {
-            checker.set_approval_fn(approval_fn);
-        }
         checker
     }
 
