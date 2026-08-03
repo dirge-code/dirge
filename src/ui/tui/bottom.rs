@@ -939,11 +939,12 @@ mod tests {
     }
 
     /// The renderer (scroll-key clamp) and the painter (body windowing)
-    /// must derive scroll geometry from the SAME inner height. inner_h=8
-    /// is the real painted height after `Layout::with_panels` clamps
-    /// input_rows to `MAX_INPUT_ROWS` (=8); 19 was the renderer's old
-    /// (wrong) pre-clamp value that made a long command look
-    /// non-scrollable (dirge-agbo).
+    /// must derive scroll geometry from the SAME inner height — the one
+    /// `Layout` actually painted after clamping input_rows, not the
+    /// pre-clamp request. Feeding the un-clamped value (19 here) made a
+    /// long command look non-scrollable, so the keys did nothing
+    /// (dirge-agbo). The clamp for an overlay is `overlay_max_rows`
+    /// (dirge-hzd8); 8 below is just a small painted box.
     #[test]
     fn overlay_scroll_geom_uses_painted_height() {
         // Long alert on a small box: the tail of the command is

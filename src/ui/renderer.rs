@@ -972,15 +972,15 @@ impl Renderer {
         };
 
         // Size the input box to fit the overlay (or, for the
-        // editor, the wrapped editor row count). For overlays we
-        // bypass MAX_INPUT_VISIBLE_LINES because the user
-        // **must** see the action keys row regardless of how
-        // long the alert body is — clipping at 8 was hiding
-        // [y]/[a]/[n]/[ESC]. The chat shrinks to accommodate, with
-        // a floor of 4 rows so the user still sees recent context
-        // above the alert. The editor stays clamped at MAX so the
-        // user can't accidentally crowd the chat by pasting a 50-
-        // line block.
+        // editor, the wrapped editor row count). Overlays get the
+        // taller `overlay_max_rows` ceiling instead of
+        // MAX_INPUT_VISIBLE_LINES: the user **must** see the whole
+        // tool call plus the action keys row before deciding, and
+        // clipping at 8 hid both. The chat shrinks to accommodate,
+        // with a floor of MIN_CHAT_ROWS so recent context stays
+        // visible above the alert. The editor stays clamped at MAX
+        // so the user can't accidentally crowd the chat by pasting
+        // a 50-line block.
         let (cols_q, rows_q) = self.cached_tty_size;
         let effective_input_rows = if let Some(lines) = alert_overlay.as_ref() {
             let probe = crate::ui::tui::layout::Layout::with_panels(
@@ -992,9 +992,12 @@ impl Renderer {
             );
             let wrapped =
                 crate::ui::tui::bottom::overlay_wrapped_row_count(lines, probe.input_box.width);
-            // Leave at least 4 rows for the chat (+ 5 fixed rows
-            // of frames/status), so input_rows ≤ rows - 9.
-            let ceiling = (rows_q as i32 - 9).max(1) as u16;
+            // Leave at least MIN_CHAT_ROWS for the chat (+ 5 fixed rows
+            // of frames/status) — `overlay_max_rows` owns that arithmetic,
+            // and `render_frame` passes the same value to Layout as the
+            // clamp, so the box we size here is the box that gets painted
+            // (dirge-hzd8).
+            let ceiling = crate::ui::tui::layout::overlay_max_rows(rows_q);
             let rows = (wrapped as u16).clamp(1, ceiling);
             // Mirror the painter's head/tail split so the scroll handlers
             // (dirge-coy3) know how far a too-tall command can scroll. When
@@ -1002,14 +1005,13 @@ impl Renderer {
             // scroll-status line, so content rows = head_budget - 1.
             let (head, tail) =
                 crate::ui::tui::bottom::overlay_head_tail_wrapped(lines, probe.input_box.width);
-            // The painter's inner height is the POST `Layout::with_panels`
-            // clamp to MAX_INPUT_ROWS — `rows` here is only the pre-clamp
-            // ceiling. Computing scroll geometry from the un-clamped value
-            // made a long command look like it fit (max_scroll=0) while the
-            // painter reported "N more lines", so the keys did nothing
-            // (dirge-agbo). Route both the renderer and the painter through
-            // the same `overlay_scroll_geom` helper with this clamped height.
-            let inner_h = rows.min(crate::ui::tui::layout::MAX_INPUT_ROWS) as usize;
+            // The painter's inner height is the POST-`Layout` clamp, not the
+            // pre-clamp ceiling. Computing scroll geometry from the un-clamped
+            // value made a long command look like it fit (max_scroll=0) while
+            // the painter reported "N more lines", so the keys did nothing
+            // (dirge-agbo). `rows` is already clamped to the same overlay
+            // ceiling `render_frame` applies, so the two agree by construction.
+            let inner_h = rows.min(ceiling) as usize;
             *alert_max_scroll =
                 crate::ui::tui::bottom::overlay_scroll_geom(head, tail, inner_h).max_scroll;
             *alert_scroll = (*alert_scroll).min(*alert_max_scroll);
@@ -1024,7 +1026,7 @@ impl Renderer {
             );
             let wrapped =
                 crate::ui::tui::bottom::overlay_wrapped_row_count(lines, probe.input_box.width);
-            let ceiling = (rows_q as i32 - 9).max(1) as u16;
+            let ceiling = crate::ui::tui::layout::overlay_max_rows(rows_q);
             // Cap the shell box height so long sessions don't crowd out the
             // chat; the painter clips, and the box shows the tail of output.
             (wrapped as u16).clamp(1, ceiling.min(SHELL_BOX_MAX_ROWS))
@@ -1440,9 +1442,11 @@ impl Renderer {
     /// here on prompt-open, and calls `clear_alert_overlay` on
     /// response.
     ///
-    /// Lines are painted centered horizontally within the frame's
-    /// inner band. Caller is responsible for keeping line count
-    /// within `MAX_INPUT_VISIBLE_LINES` — taller overlays clip.
+    /// Lines are painted left-flush within the frame's inner band and
+    /// soft-wrapped to its width. The box grows to fit them (up to
+    /// `layout::overlay_max_rows`); anything past that stays reachable
+    /// by scrolling, with the action-keys row pinned to the bottom.
+    /// Callers do not need to pre-truncate.
     pub fn set_alert_overlay(&mut self, rows: Vec<(String, Color)>) {
         self.alert_overlay = Some(rows);
         // A fresh prompt always opens showing the TOP of the detail (the
@@ -1452,6 +1456,19 @@ impl Renderer {
         if self.alert_title.is_empty() {
             self.alert_title = "[ALERT]".to_string();
         }
+        self.last_paint = None;
+        self.needs_paint = true;
+    }
+
+    /// Replace the alert body while KEEPING the current scroll position.
+    ///
+    /// Used for in-place updates of a prompt that's already open — the
+    /// deny-note field repaints on every keystroke (dirge-hzd8), and
+    /// resetting the scroll each time would yank a user who had scrolled
+    /// down to read a long command back to the top mid-sentence. The
+    /// offset is re-clamped against the new body on the next paint.
+    pub fn update_alert_overlay(&mut self, rows: Vec<(String, Color)>) {
+        self.alert_overlay = Some(rows);
         self.last_paint = None;
         self.needs_paint = true;
     }

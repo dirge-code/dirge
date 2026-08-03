@@ -16,7 +16,9 @@ use ratatui::style::{Color as RColor, Style};
 use super::bottom::{AvatarSpec, BottomBody, BottomStrip};
 use super::chat::{ChatPane, crossterm_to_ratatui};
 use super::frame::{ChatBotFrame, TopFrame};
-use super::layout::{LEFT_PANEL_MIN_W, Layout, RIGHT_PANEL_MIN_W};
+use super::layout::{
+    LEFT_PANEL_MIN_W, Layout, MAX_INPUT_ROWS, RIGHT_PANEL_MIN_W, overlay_max_rows,
+};
 use super::panels::{LeftPanel, RightPanel};
 use crate::ui::renderer::{
     LeftPanelInfo, LineEntry, PanelData, PanelMode, SelectionRange, SubagentStatusRow,
@@ -92,12 +94,23 @@ pub struct Scene<'a> {
 /// area + the scene's input_rows.
 pub fn render_frame(scene: &Scene, f: &mut Frame<'_>) {
     let area = f.area();
-    let layout = Layout::with_panels(
+    // dirge-hzd8 (#744): the editor is capped at MAX_INPUT_ROWS so a pasted
+    // block can't crowd out the chat, but a modal overlay — the permission
+    // prompt above all — must be free to grow until the whole tool call is
+    // on screen. The renderer sizes `input_rows` for the overlay already;
+    // this is the matching ceiling, or the prompt gets clipped back to 8
+    // rows and the command is hidden behind a scroll hint.
+    let row_cap = match scene.body {
+        BottomBody::Overlay { .. } => overlay_max_rows(area.height),
+        _ => MAX_INPUT_ROWS,
+    };
+    let layout = Layout::with_panels_capped(
         area.width,
         area.height,
         scene.input_rows,
         scene.show_left_panel,
         scene.show_right_panel,
+        row_cap,
     );
     let frame_style = Style::default().fg(crossterm_to_ratatui(scene.frame_color));
 
@@ -660,6 +673,81 @@ mod tests {
             body_row.contains("PERMISSION REQUIRED"),
             "got body {:?}",
             body_row
+        );
+    }
+
+    /// dirge-hzd8 (#744): a permission prompt for a long bash command must
+    /// show the WHOLE command. The renderer sized the box to fit, but
+    /// `Layout` then clamped it back to the editor's 8-row cap, so
+    /// everything past the first few wrapped rows was hidden behind the
+    /// scroll hint — the user approved a command they could not read.
+    #[test]
+    fn tall_permission_overlay_shows_the_whole_command() {
+        use crossterm::style::Color as CC;
+        let buf: Vec<LineEntry> = Vec::new();
+        let pd = PanelData::default();
+        let info = LeftPanelInfo::default();
+        let subs: Vec<SubagentStatusRow> = Vec::new();
+
+        // A 12-line command — well past the editor's 8-row cap, well within
+        // a 40-row terminal's overlay budget.
+        let cmd_lines: Vec<String> = (0..12).map(|i| format!("step-{i}-marker")).collect();
+        let overlay_lines: Vec<(String, CC)> = vec![
+            ("⚠ PERMISSION REQUIRED".into(), CC::Yellow),
+            (String::new(), CC::Yellow),
+            ("tool: bash".into(), CC::Yellow),
+            (
+                format!("command: {}", cmd_lines.join(" && \\\n")),
+                CC::Yellow,
+            ),
+            (String::new(), CC::Yellow),
+            (
+                "[y] allow once  [a] allow always  [n] deny  [ESC] abort".into(),
+                CC::Yellow,
+            ),
+        ];
+
+        let (cols, rows) = (160u16, 40u16);
+        // Size the box the way `Renderer::render` does.
+        let probe = Layout::with_panels(cols, rows, 1, true, true);
+        let wrapped = crate::ui::tui::bottom::overlay_wrapped_row_count(
+            &overlay_lines,
+            probe.input_box.width,
+        );
+        let input_rows = (wrapped as u16).clamp(1, overlay_max_rows(rows));
+
+        let mut scene = empty_scene(&buf, &pd, &info, &subs, "permission required");
+        scene.input_rows = input_rows;
+        scene.body = BottomBody::Overlay {
+            title: "[ALERT]",
+            lines: &overlay_lines,
+            scroll: 0,
+        };
+
+        let mut backend = TestBackend::new(cols, rows);
+        let mut terminal = Terminal::new(backend.clone()).unwrap();
+        terminal.draw(|f| render_frame(&scene, f)).unwrap();
+        backend = terminal.backend().clone();
+        let screen = dump(&backend, cols, rows);
+
+        for marker in &cmd_lines {
+            assert!(
+                screen.contains(marker.as_str()),
+                "command line {marker:?} was elided from the prompt:\n{screen}"
+            );
+        }
+        assert!(
+            !screen.contains("more line(s)"),
+            "the command fits — no scroll hint should be needed:\n{screen}"
+        );
+        // The action keys are still on screen, and the chat kept its floor.
+        assert!(screen.contains("[y] allow once"), "action keys missing");
+        let painted =
+            Layout::with_panels_capped(cols, rows, input_rows, true, true, overlay_max_rows(rows));
+        assert!(
+            painted.chat.height >= crate::ui::tui::layout::MIN_CHAT_ROWS,
+            "chat floor violated: {}",
+            painted.chat.height
         );
     }
 

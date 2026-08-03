@@ -49,6 +49,7 @@ pub(crate) fn prompt_from_ask_sender(ask_tx: Option<AskSender>) -> BillingFallba
                 ask_tx.send(AskRequest {
                     tool: "openai_api_billing".to_string(),
                     input,
+                    details: None,
                     reason: None,
                     reply,
                 }),
@@ -70,7 +71,7 @@ pub(crate) fn prompt_from_ask_sender(ask_tx: Option<AskSender>) -> BillingFallba
                 Ok(Ok(UserDecision::AllowOnce | UserDecision::AllowAlways(_))) => {
                     BillingFallbackDecision::UseApiKey
                 }
-                Ok(Ok(UserDecision::Deny)) => BillingFallbackDecision::Decline,
+                Ok(Ok(UserDecision::Deny { .. })) => BillingFallbackDecision::Decline,
                 Ok(Err(_)) => BillingFallbackDecision::Unavailable(
                     "OpenAI API-key billing fallback requires interactive confirmation, but the confirmation was cancelled."
                         .to_string(),
@@ -462,6 +463,7 @@ mod tests {
         tx.try_send(AskRequest {
             tool: "already_queued".to_string(),
             input: "pending".to_string(),
+            details: None,
             reason: None,
             reply,
         })

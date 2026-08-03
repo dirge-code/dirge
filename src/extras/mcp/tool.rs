@@ -13,7 +13,7 @@ use rmcp::model::{CallToolRequestParams, JsonObject, RawContent};
 use tokio::sync::Mutex;
 
 use crate::agent::agent_loop::types::InjectionScanMode;
-use crate::agent::tools::check_perm;
+use crate::agent::tools::check_perm_with_details;
 use crate::extras::content_guard::guard_untrusted_result;
 use crate::extras::mcp::client::{SharedConnection, raw_connect};
 use crate::extras::mcp::config::McpServerConfig;
@@ -93,6 +93,40 @@ fn is_transport_failure(err: &ServiceError) -> bool {
 /// MCP tool permission trust model — read before assuming an MCP
 /// tool obeys the same rules as a built-in:
 ///
+/// Longest argument blob shown in the permission prompt. Past this the
+/// detail is cut with an explicit "+N chars" marker — an MCP tool handed a
+/// 200 KB document would otherwise bury the decision. The prompt box
+/// scrolls, so a few thousand chars stay readable.
+const MAX_ARGS_DETAIL_CHARS: usize = 4000;
+
+/// Render an MCP call's raw JSON arguments for the permission prompt, or
+/// `None` when there are none to show (dirge-hzd8 / #744).
+///
+/// Pretty-printed when it parses, so the user reads one field per line
+/// instead of a single 500-char row; passed through verbatim when it
+/// doesn't (a malformed blob is exactly what the user should see before
+/// approving). Purely for display — permission matching keys off
+/// `mcp_tool:<server>:<tool>` and is untouched by this.
+fn mcp_args_detail(args: &str) -> Option<String> {
+    let trimmed = args.trim();
+    if trimmed.is_empty() || trimmed == "{}" {
+        return None;
+    }
+    let rendered = serde_json::from_str::<serde_json::Value>(trimmed)
+        .ok()
+        .and_then(|v| serde_json::to_string_pretty(&v).ok())
+        .unwrap_or_else(|| trimmed.to_string());
+    let total = rendered.chars().count();
+    if total <= MAX_ARGS_DETAIL_CHARS {
+        return Some(rendered);
+    }
+    let head: String = rendered.chars().take(MAX_ARGS_DETAIL_CHARS).collect();
+    Some(format!(
+        "{head}\n… +{} chars not shown",
+        total - MAX_ARGS_DETAIL_CHARS
+    ))
+}
+
 /// All MCP tool calls route through `check_perm` with the umbrella
 /// tool name `"mcp_tool"` and a perm key shaped
 /// `mcp_tool:<server>:<name>`. They do NOT alias to dirge built-ins
@@ -187,9 +221,19 @@ impl ToolDyn for McpTool {
                 }
             }
             let perm_key = format!("mcp_tool:{server_name}:{tool_name}");
-            check_perm(&permission, &ask_tx, "mcp_tool", &perm_key)
-                .await
-                .map_err(|e| ToolError::ToolCallError(Box::new(McpToolError(e.to_string()))))?;
+            // dirge-hzd8 (#744): the match key is just `server:tool`, so a
+            // prompt built from it alone asked the user to approve
+            // `db:execute_sql` with no way to see that the query is a DROP.
+            // The arguments ride along as display-only detail.
+            check_perm_with_details(
+                &permission,
+                &ask_tx,
+                "mcp_tool",
+                &perm_key,
+                mcp_args_detail(&args).as_deref(),
+            )
+            .await
+            .map_err(|e| ToolError::ToolCallError(Box::new(McpToolError(e.to_string()))))?;
 
             // Malformed JSON used to silently default to `None` via
             // `unwrap_or_default()` — the MCP server got an empty
@@ -671,6 +715,54 @@ mod tests {
         // Past the deadline — saturates to ZERO, not negative.
         std::thread::sleep(Duration::from_millis(110));
         assert_eq!(deadline.remaining(), Duration::ZERO);
+    }
+
+    // ── dirge-hzd8 (#744): args shown in the permission prompt ─────
+
+    /// The permission key is only `mcp_tool:<server>:<tool>`, so without a
+    /// detail line the user approves an unknown payload. Valid JSON is
+    /// pretty-printed — the prompt paints one row per line, so this is what
+    /// turns a 400-char blob into something readable.
+    #[test]
+    fn args_detail_pretty_prints_json() {
+        let d = mcp_args_detail(r#"{"query":"DROP TABLE users","confirm":true}"#)
+            .expect("args should produce a detail");
+        assert!(d.contains("DROP TABLE users"));
+        assert!(d.lines().count() > 1, "should be pretty-printed: {d:?}");
+    }
+
+    /// No arguments → no detail line (an empty `args:` row is noise).
+    #[test]
+    fn args_detail_is_none_when_there_is_nothing_to_show() {
+        for empty in ["", "   ", "\n", "{}", " {} "] {
+            assert_eq!(mcp_args_detail(empty), None, "{empty:?} should be silent");
+        }
+    }
+
+    /// Malformed JSON is shown VERBATIM rather than dropped — a blob the
+    /// server will reject (or interpret unexpectedly) is exactly what the
+    /// user should see before approving.
+    #[test]
+    fn args_detail_passes_through_unparseable_args() {
+        let d = mcp_args_detail("{not json, rm -rf /}").expect("still shown");
+        assert_eq!(d, "{not json, rm -rf /}");
+    }
+
+    /// A giant payload is cut with an explicit marker — truncation the user
+    /// can SEE, never a silent elision.
+    #[test]
+    fn args_detail_marks_truncation_explicitly() {
+        let huge = format!("{{\"doc\":\"{}\"}}", "z".repeat(MAX_ARGS_DETAIL_CHARS * 2));
+        let d = mcp_args_detail(&huge).expect("detail");
+        assert!(
+            d.contains("chars not shown"),
+            "truncation must be disclosed: {}",
+            &d[d.len().saturating_sub(80)..]
+        );
+        assert!(d.chars().count() < huge.chars().count());
+        // Anything within the cap is untouched.
+        let ok = format!("{{\"doc\":\"{}\"}}", "z".repeat(100));
+        assert!(!mcp_args_detail(&ok).unwrap().contains("chars not shown"));
     }
 
     // ── dirge-mgub: per-server external-path guard ────────────────
