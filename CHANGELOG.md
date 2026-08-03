@@ -4,6 +4,37 @@ All notable changes to dirge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.21.5] - 2026-08-03
+
+### Fixed
+- **The agent could never connect to nREPL on its own.** With no connection,
+  `nrepl_eval` returned "Use `/nrepl-connect` first" — but slash commands are
+  typed by the user, and no harness call or builtin tool lets the agent issue
+  one. The plugin registered no connect tool either, so the model's only move
+  was to ask you and wait, which is exactly where sessions stalled. Auto-connect
+  compounded it: `on-init` reads `.nrepl-port` once at startup, so a REPL the
+  agent started itself a few turns later was never picked up even though the
+  port file was sitting right there.
+
+  `nrepl_eval` now re-reads `.nrepl-port` and connects on demand, and there's
+  an `nrepl_connect` tool for a non-default host/port or a reconnect after a
+  server restart. It accepts an unquoted port, which a model writes at least
+  as often as it quotes one — the old string-only extractor dropped those
+  silently. The error text and the injected skill prompt name the tools;
+  slash commands remain for interactive use.
+
+### Security
+- **A worktree writer no longer inherits the LLM auto-approver.**
+  `for_working_dir` drops the parent's session allowlist on purpose — a grant
+  made against the parent checkout doesn't mean the same thing under a
+  worktree root — but it kept `approval_provider`'s evaluator. Together those
+  invert the trust model: your own "allow always" decisions vanish while the
+  thing that can auto-allow *without asking you* survives. Calls you had
+  already settled came back as `Ask` and the evaluator answered on your
+  behalf, so a background writer ran with a weaker human backstop than the
+  session that spawned it. Worktree writers now prompt you. Prompt deny-lists
+  still propagate — they're terminal and path-independent.
+
 ## [0.21.4] - 2026-08-03
 
 ### Security
