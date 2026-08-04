@@ -5237,6 +5237,290 @@ async fn open_issues_gate_blocking_has_bound() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+/// dirge-1elu.4 (site 2): open-issues gate in Advisory mode must inject a
+/// model-visible, tagged User message — not a display-only SystemNotice the
+/// model never sees. Driven through the production path: the messages come
+/// out of `poll_finalization_follow_up` (the function the loop calls), and
+/// the SystemNotice comes out of `emit_harness_notices` (the mirror the loop
+/// runs on the returned messages).
+#[tokio::test]
+async fn open_issues_gate_advisory_injects_model_visible_message() {
+    use crate::agent::agent_loop::run::OPEN_ISSUES_NUDGE_TAG;
+    let config = build_config();
+    let mut gates = GateStates {
+        critic_done: true,
+        code_review_reacts: 0u8,
+        goal_reacts: 0u8,
+        todo_nudges: MAX_TODO_NUDGES,
+        resume_nudges: 0,
+        open_issues_nudges: 0,
+        ..Default::default()
+    };
+    let (review_emit, mut review_emit_rx) = tokio::sync::mpsc::channel(64);
+
+    let dir = temp_dir("open-issues-advisory");
+    let db_path = dir.join("state.db");
+    let store = crate::extras::issue_db::IssueStore::open_at(&db_path).unwrap();
+    let sid = "open-issues-advisory-sess";
+    store
+        .create("close the telemetry wiring", "", None, Some(sid), None)
+        .unwrap();
+
+    let (msgs, source) = poll_finalization_follow_up(
+        &config,
+        "sys",
+        &[assistant_calling("edit")],
+        &mut gates,
+        GateInputs {
+            code_review_baseline: None,
+            open_issues_gate_mode: GateMode::Advisory,
+            issue_db_path: Some(db_path.as_path()),
+            session_id: Some(sid),
+        },
+        &review_emit,
+    )
+    .await;
+
+    assert_eq!(source, FollowUpSource::OpenIssues);
+    assert_eq!(gates.open_issues_nudges, 1, "one-shot budget spent");
+    assert_eq!(msgs.len(), 1);
+    let content = match &msgs[0] {
+        LoopMessage::User(u) => u.text_joined(),
+        _ => panic!("advisory must inject a User message, got {:?}", msgs[0]),
+    };
+    assert!(
+        content.starts_with(OPEN_ISSUES_NUDGE_TAG),
+        "expected [open-issues] tag, got: {content}"
+    );
+    assert!(
+        content.contains("close or defer them when done"),
+        "the model must see the imperative: {content}"
+    );
+
+    // The human-visible side is unchanged: the loop mirrors the tagged User
+    // message to a SystemNotice — exactly what the old path emitted directly.
+    emit_harness_notices(&review_emit, &msgs).await;
+    match review_emit_rx.recv().await {
+        Some(LoopEvent::SystemNotice { content }) => assert!(
+            content.contains("close or defer them when done"),
+            "SystemNotice must carry the reminder text: {content}"
+        ),
+        other => panic!("expected a SystemNotice, got {other:?}"),
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// dirge-1elu.4 (test 3, site 2): the conversion must not change frequency —
+/// the advisory stays one-shot; a finalization after the budget is spent
+/// produces nothing.
+#[tokio::test]
+async fn open_issues_advisory_is_still_one_shot() {
+    let config = build_config();
+    let mut gates = GateStates {
+        critic_done: true,
+        code_review_reacts: 0u8,
+        goal_reacts: 0u8,
+        todo_nudges: MAX_TODO_NUDGES,
+        resume_nudges: 0,
+        open_issues_nudges: 1,          // budget already spent this run
+        track_nudges: MAX_TRACK_NUDGES, // keep the untracked-work advisory silent too
+        ..Default::default()
+    };
+    let (review_emit, _review_emit_rx) = tokio::sync::mpsc::channel(64);
+
+    let dir = temp_dir("open-issues-advisory-once");
+    let db_path = dir.join("state.db");
+    let store = crate::extras::issue_db::IssueStore::open_at(&db_path).unwrap();
+    store
+        .create("still open", "", None, Some("advisory-once-sess"), None)
+        .unwrap();
+
+    let (msgs, source) = poll_finalization_follow_up(
+        &config,
+        "sys",
+        &[assistant_calling("edit")],
+        &mut gates,
+        GateInputs {
+            code_review_baseline: None,
+            open_issues_gate_mode: GateMode::Advisory,
+            issue_db_path: Some(db_path.as_path()),
+            session_id: Some("advisory-once-sess"),
+        },
+        &review_emit,
+    )
+    .await;
+
+    assert!(msgs.is_empty(), "spent budget must stay silent: {msgs:?}");
+    assert_eq!(source, FollowUpSource::None);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// dirge-1elu.4 (site 3): the file-edits-without-todos advisory must inject a
+/// model-visible, tagged User message — not a display-only SystemNotice.
+/// Shares the `[track]` tag with the boundary nudge. Driven through the
+/// production path (`poll_finalization_follow_up` + the `emit_harness_notices`
+/// mirror the loop runs).
+#[tokio::test]
+async fn untracked_work_advisory_injects_model_visible_message() {
+    use crate::agent::agent_loop::run::TRACK_WORK_TAG;
+    // The advisory requires an EMPTY active-todo list; parallel tests may
+    // have left items in the process-global board, so clear it first.
+    crate::agent::tools::todo::TODO_LIST.lock().unwrap().clear();
+    let config = build_config();
+    let mut gates = GateStates {
+        critic_done: true,
+        code_review_reacts: 0u8,
+        goal_reacts: 0u8,
+        todo_nudges: MAX_TODO_NUDGES,
+        resume_nudges: 0,
+        open_issues_nudges: MAX_OPEN_ISSUES_NUDGES, // keep site 2 from preempting
+        track_nudges: 0,
+        ..Default::default()
+    };
+    let (review_emit, mut review_emit_rx) = tokio::sync::mpsc::channel(64);
+
+    let (msgs, source) = poll_finalization_follow_up(
+        &config,
+        "sys",
+        &[assistant_calling("edit")],
+        &mut gates,
+        GateInputs {
+            code_review_baseline: None,
+            open_issues_gate_mode: GateMode::Off,
+            issue_db_path: None,
+            session_id: Some("untracked-advisory-sess"),
+        },
+        &review_emit,
+    )
+    .await;
+
+    assert_eq!(source, FollowUpSource::Todo);
+    assert_eq!(gates.track_nudges, 1, "one-shot budget spent");
+    assert_eq!(msgs.len(), 1);
+    let content = match &msgs[0] {
+        LoopMessage::User(u) => u.text_joined(),
+        _ => panic!("advisory must inject a User message, got {:?}", msgs[0]),
+    };
+    assert!(
+        content.starts_with(TRACK_WORK_TAG),
+        "expected [track] tag, got: {content}"
+    );
+    assert!(
+        content.contains("write_todo_list"),
+        "the model must see the imperative: {content}"
+    );
+
+    // The human-visible side is unchanged: the mirror emits the SystemNotice.
+    emit_harness_notices(&review_emit, &msgs).await;
+    match review_emit_rx.recv().await {
+        Some(LoopEvent::SystemNotice { content }) => assert!(
+            content.contains("write_todo_list"),
+            "SystemNotice must carry the reminder: {content}"
+        ),
+        other => panic!("expected a SystemNotice, got {other:?}"),
+    }
+}
+
+/// dirge-1elu.4 (test 3, site 3): the conversion must not change frequency —
+/// a finalization after the one-shot budget is spent produces nothing.
+#[tokio::test]
+async fn untracked_work_advisory_is_still_one_shot() {
+    crate::agent::tools::todo::TODO_LIST.lock().unwrap().clear();
+    let config = build_config();
+    let mut gates = GateStates {
+        critic_done: true,
+        code_review_reacts: 0u8,
+        goal_reacts: 0u8,
+        todo_nudges: MAX_TODO_NUDGES,
+        resume_nudges: 0,
+        open_issues_nudges: MAX_OPEN_ISSUES_NUDGES,
+        track_nudges: 1, // budget already spent this run
+        ..Default::default()
+    };
+    let (review_emit, _review_emit_rx) = tokio::sync::mpsc::channel(64);
+
+    let (msgs, source) = poll_finalization_follow_up(
+        &config,
+        "sys",
+        &[assistant_calling("edit")],
+        &mut gates,
+        GateInputs {
+            code_review_baseline: None,
+            open_issues_gate_mode: GateMode::Off,
+            issue_db_path: None,
+            session_id: Some("untracked-once-sess"),
+        },
+        &review_emit,
+    )
+    .await;
+
+    assert!(msgs.is_empty(), "spent budget must stay silent: {msgs:?}");
+    assert_eq!(source, FollowUpSource::None);
+}
+
+/// dirge-1elu.4 (test 5 / site 4): max_turns truncation stays notice-only —
+/// the run is ending, there is no next model turn to steer, so it must NOT
+/// become a steering message. Regression guard against converting it: the
+/// notice goes to the user, the transcript records the truncation, and the
+/// factory is called exactly once (the notice does not re-enter the loop).
+#[tokio::test]
+async fn max_turns_truncation_stays_notice_only() {
+    use crate::agent::agent_loop::run::MAX_TURNS_NOTICE_PREFIX;
+    let calls = std::sync::Arc::new(AtomicUsize::new(0));
+    let calls2 = calls.clone();
+    let factory: StreamFn = std::sync::Arc::new(move |_ctx, _opts| {
+        calls2.fetch_add(1, Ordering::SeqCst);
+        let msg = tool_use_response("call-1", "bash", serde_json::json!({"command": "true"}));
+        let reason = msg.stop_reason;
+        Box::pin(futures::stream::iter(vec![StreamEvent::Done {
+            reason,
+            message: msg,
+            usage: None,
+        }]))
+    });
+    let mut ctx = empty_context();
+    ctx.tools.push(std::sync::Arc::new(RecBashTool::new()));
+    let mut cfg = build_config();
+    cfg.max_turns = Some(1);
+
+    let (tx, mut rx) = mpsc::channel::<LoopEvent>(256);
+    let messages = run_agent_loop(
+        vec![user("start")],
+        ctx,
+        cfg,
+        AbortSignal::new(),
+        &tx,
+        &factory,
+        None, // summarize_fn — test default
+        None, // memory_provider — test default
+    )
+    .await;
+    drop(tx);
+
+    // Exactly one model turn: the notice did not re-enter the loop.
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "truncation must not steer another turn"
+    );
+    // The notice reached the user as a SystemNotice.
+    let events = drain(&mut rx).await;
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            LoopEvent::SystemNotice { content }
+                if content.starts_with(MAX_TURNS_NOTICE_PREFIX)
+        )),
+        "expected the max_turns SystemNotice among {events:?}"
+    );
+    // The transcript records the truncation (contract nicety) — a record,
+    // not a steer.
+    assert!(
+        flat_text(&messages).contains(MAX_TURNS_NOTICE_PREFIX),
+        "truncation notice should be recorded in the returned transcript"
+    );
+}
 
 /// Zero open session issues → inert (FollowUpSource::None).
 #[tokio::test]
@@ -5312,65 +5596,6 @@ async fn open_issues_gate_missing_db_is_inert() {
 
     assert!(msgs.is_empty(), "missing db should be inert (fail-open)");
     assert_eq!(source, FollowUpSource::None);
-}
-
-/// Advisory mode emits a SystemNotice when issues are open but does
-/// NOT re-enter the loop.
-#[tokio::test]
-async fn open_issues_gate_advisory_emits_notice_but_does_not_reenter() {
-    let config = build_config();
-    let mut gates = GateStates {
-        critic_done: true,
-        code_review_reacts: 0u8,
-        goal_reacts: 0u8,
-        todo_nudges: MAX_TODO_NUDGES,
-        resume_nudges: 0,
-        open_issues_nudges: 0,
-        ..Default::default()
-    };
-    let (review_emit, mut review_emit_rx) = tokio::sync::mpsc::channel(64);
-
-    let dir = temp_dir("open-issues-advisory");
-    let db_path = dir.join("state.db");
-    let store = crate::extras::issue_db::IssueStore::open_at(&db_path).unwrap();
-    let sid = "open-issues-advisory-sess";
-    store
-        .create("wire up telemetry", "", None, Some(sid), None)
-        .unwrap();
-
-    // dirge-g2ex: open-issues gate now requires the turn to have made file edits.
-    let (msgs, source) = poll_finalization_follow_up(
-        &config,
-        "sys",
-        &[assistant_calling("edit")],
-        &mut gates,
-        GateInputs {
-            code_review_baseline: None,
-            open_issues_gate_mode: GateMode::Advisory,
-            issue_db_path: Some(db_path.as_path()),
-            session_id: Some(sid),
-        },
-        &review_emit,
-    )
-    .await;
-
-    // Advisory does NOT re-enter (returns empty messages).
-    assert!(msgs.is_empty(), "advisory should not re-enter");
-    assert_eq!(source, FollowUpSource::None);
-    assert_eq!(gates.open_issues_nudges, 1, "counts the advisory");
-
-    // Check that a SystemNotice was emitted.
-    match review_emit_rx.try_recv() {
-        Ok(crate::agent::agent_loop::message::LoopEvent::SystemNotice { content }) => {
-            assert!(
-                content.contains("issue(s) from this session are still open"),
-                "{content}"
-            );
-        }
-        other => panic!("expected SystemNotice, got {other:?}"),
-    }
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ── Blocking review dedupe (dirge-9b2k): skip re-reviewing an unchanged diff ─

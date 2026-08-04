@@ -604,7 +604,10 @@ async fn poll_finalization_follow_up(
     new_messages: &[LoopMessage],
     gates: &mut GateStates,
     inputs: GateInputs<'_>,
-    emit: &mpsc::Sender<LoopEvent>,
+    // dirge-1elu.4: all follow-up delivery now flows through the returned
+    // messages — the loop mirrors them to SystemNotice with
+    // emit_harness_notices — so no gate emits on this channel anymore.
+    _emit: &mpsc::Sender<LoopEvent>,
 ) -> (Vec<LoopMessage>, FollowUpSource) {
     // Destructured rather than accessed through `gates.` / `inputs.` so the
     // gate bodies below read exactly as they did when these were seventeen
@@ -943,18 +946,25 @@ async fn poll_finalization_follow_up(
         if count > 0 {
             match open_issues_gate_mode {
                 GateMode::Advisory => {
-                    // One-shot notice (fires at most once per run), then fall
-                    // through — does not re-enter the loop.
+                    // One-shot (fires at most once per run), then re-enter
+                    // ONCE with a model-visible, tagged message. The text is
+                    // an imperative aimed at the model — a display-only
+                    // SystemNotice it never sees would change nothing
+                    // (dirge-1elu.4, arXiv:2604.25850v4 §C.1.4/§C.2.4). The
+                    // loop's emit_harness_notices mirror renders the same
+                    // SystemNotice the old path emitted directly, so what the
+                    // human sees is unchanged.
                     if *open_issues_nudges == 0 {
                         *open_issues_nudges += 1;
-                        let _ = emit
-                            .send(LoopEvent::SystemNotice {
-                                content: format!(
-                                    "{count} issue(s) from this session are still open — \
-                                     close or defer them when done."
+                        return (
+                            vec![LoopMessage::User(super::message::UserMessage::text(
+                                format!(
+                                    "{OPEN_ISSUES_NUDGE_TAG} {count} issue(s) from this session \
+                                     are still open — close or defer them when done."
                                 ),
-                            })
-                            .await;
+                            ))],
+                            FollowUpSource::OpenIssues,
+                        );
                     }
                 }
                 GateMode::Blocking => {
@@ -1003,6 +1013,13 @@ async fn poll_finalization_follow_up(
     }
     // dirge-track: file-edits-without-todos advisory — fires at most once per
     // run when the model edited files this turn but has no active todo tracked.
+    // The boundary nudge (poll_boundary_nudge → build_early_track_work_reminder)
+    // shares the same `track_nudges` budget, so only one of the two can ever
+    // fire; this finalization-time copy catches runs that finalize without
+    // passing a boundary. The text is an imperative aimed at the model, so it
+    // must be a model-visible tagged message (dirge-1elu.4) — the loop's
+    // emit_harness_notices mirror emits the SystemNotice the old path emitted
+    // directly, keeping what the human sees unchanged.
     if should_advise_untracked_work(
         session_id,
         *track_nudges,
@@ -1010,11 +1027,16 @@ async fn poll_finalization_follow_up(
         turn_made_file_edits(new_messages),
     ) {
         *track_nudges += 1;
-        let _ = emit
-            .send(LoopEvent::SystemNotice {
-                content: "You modified files this turn but have no active todo. If this task isn't finished, add it with write_todo_list and mark it in_progress so it stays your tracked priority (and gets closed when done).".to_string(),
-            })
-            .await;
+        return (
+            vec![LoopMessage::User(super::message::UserMessage::text(
+                format!(
+                    "{TRACK_WORK_TAG} You modified files this turn but have no active todo. If this \
+                 task isn't finished, add it with write_todo_list and mark it in_progress so it \
+                 stays your tracked priority (and gets closed when done)."
+                ),
+            ))],
+            FollowUpSource::Todo,
+        );
     }
     (Vec::new(), FollowUpSource::None)
 }
@@ -3215,6 +3237,11 @@ pub async fn run_loop(
                 // color) rather than a `MessageStart { User }` — the
                 // latter rendered with the `<you>` prefix as if the user
                 // had typed it.
+                //
+                // dirge-1elu.4 audit (site 4): deliberately notice-only and
+                // never a steering message — the run is ending, there is no
+                // next model turn to read one. The transcript entry below is
+                // a record of truncation for callers, not a steer.
                 let _ = emit
                     .send(LoopEvent::SystemNotice {
                         content: notice.clone(),

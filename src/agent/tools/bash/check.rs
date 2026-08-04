@@ -84,7 +84,7 @@ fn normalize_lexical(p: &std::path::Path) -> std::path::PathBuf {
 /// against. Best-effort, quote-trimming; conservatively applies ALL `cd`s
 /// in the compound (so the effective dir is the last one).
 #[cfg(feature = "semantic-bash")]
-fn fold_cd_dirs(base: &str, segments: &[String]) -> String {
+pub(crate) fn fold_cd_dirs(base: &str, segments: &[String]) -> String {
     let mut dir = std::path::PathBuf::from(base);
     for seg in segments {
         let mut it = seg.split_whitespace();

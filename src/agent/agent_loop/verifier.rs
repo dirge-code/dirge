@@ -297,7 +297,7 @@ impl VerifierGate {
                         && is_script_name_only(command)
                         && script_name_paths(command)
                             .iter()
-                            .any(|p| script_is_agent_authored(p, inner.run_started_at))
+                            .any(|p| script_is_agent_authored(command, p, inner.run_started_at))
                     {
                         return;
                     }
@@ -1081,29 +1081,56 @@ fn script_name_paths(command: &str) -> Vec<std::path::PathBuf> {
 /// neither can answer (missing file, unreadable mtime, no run start),
 /// treat it as NOT authored — degrade toward today's behaviour, never
 /// toward a new false nag (dirge-1elu.2).
+/// Resolve a command's script path the way bash would: fold the command's
+/// leading `cd`/`pushd` segments onto the run cwd — the SAME lexical folder
+/// the permission layer uses (`fold_cd_dirs`), not a second implementation
+/// (dirge-1elu.2 follow-up). `cd sub && ./check.sh` resolves `./check.sh`
+/// against `sub/`. Without the semantic-bash feature the path resolves
+/// against the run cwd exactly as before.
+#[cfg(feature = "semantic-bash")]
+fn resolve_script_path(command: &str, path: &std::path::Path) -> std::path::PathBuf {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let segments: Vec<String> = command
+        .split(['&', '|', ';', '\n'])
+        .map(str::to_string)
+        .collect();
+    let effective =
+        crate::agent::tools::bash::check::fold_cd_dirs(&cwd.to_string_lossy(), &segments);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::path::Path::new(&effective).join(path)
+    }
+}
+
+/// Non-semantic-bash builds keep today's behaviour: no cd folding.
+#[cfg(not(feature = "semantic-bash"))]
+fn resolve_script_path(_command: &str, path: &std::path::Path) -> std::path::PathBuf {
+    path.to_path_buf()
+}
+
 fn script_is_agent_authored(
+    command: &str,
     path: &std::path::Path,
     run_started_at: Option<std::time::SystemTime>,
 ) -> bool {
     // Registry entries are canonical absolute paths, so a relative command
-    // word (`./check.sh`) must canonicalize against the run's cwd to match —
-    // which is also the cwd bash inherits, since the tool spawns without a
-    // `current_dir` override. The raw spelling is checked too, for entries
-    // recorded before canonicalization succeeded.
-    let canonical = crate::permission::path::canonical_or_self(path);
+    // word (`./check.sh`) must canonicalize against the effective run cwd to
+    // match — which is also the cwd bash inherits, since the tool spawns
+    // without a `current_dir` override. `cd`/`pushd` segments are folded in
+    // first (dirge-1elu.2 follow-up). The raw spelling is checked too, for
+    // entries recorded before canonicalization succeeded.
+    let resolved = resolve_script_path(command, path);
+    let canonical = crate::permission::path::canonical_or_self(&resolved);
     let in_registry = crate::agent::tools::modified::MODIFIED_FILES
         .lock()
-        .is_ok_and(|s| s.contains(&canonical) || s.contains(path));
+        .is_ok_and(|s| s.contains(&canonical) || s.contains(&resolved));
     if in_registry {
         return true;
     }
     let Some(run_start) = run_started_at else {
         return false;
     };
-    // Known limit: a `cd <dir> && ./check.sh` command resolves the script
-    // against the cd'd directory, not the run cwd — the permission layer
-    // folds leading cds lexically, the gate does not. Every other shape
-    // (absolute, cwd-relative, bash-authored, registry-authored) resolves.
     std::fs::metadata(&canonical)
         .and_then(|m| m.modified())
         .is_ok_and(|mtime| mtime >= run_start)
@@ -2931,5 +2958,58 @@ mod tests {
             "mtime at-or-after run start reads as authored this run"
         );
         let _ = std::fs::remove_file(&script);
+    }
+
+    /// dirge-1elu.2 follow-up (cd-fold): `cd <dir> && ./check.sh` resolves the
+    /// script against the cd'd directory — a proxy validator authored this
+    /// run under that directory must NOT latch green. The run cwd alone would
+    /// miss it (under-detection, the failure direction that matters).
+    #[test]
+    fn cd_folded_script_authored_this_run_does_not_latch_green() {
+        let dir = std::env::temp_dir().join(format!(
+            "dirge-elu2-cd-{}-{}",
+            std::process::id(),
+            SCRIPT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("check.sh");
+        let g = VerifierGate::new(); // gate FIRST: mtime is the only witness
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+        g.record_outcome("edit", &json!({"path": "src/a.rs"}), &ok_result(), false);
+        let command = format!("cd {} && ./check.sh", dir.to_string_lossy());
+        g.record_outcome("bash", &json!({"command": command}), &ok_result(), false);
+        assert_eq!(
+            g.status(GateMode::Off),
+            VerificationStatus::Unverified,
+            "a cd'd-into proxy validator authored this run must not read as green"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Over-detection guard for the cd-fold: the same shape with a script
+    /// that predates the run still latches green.
+    #[test]
+    fn cd_folded_pre_existing_script_still_latches_green() {
+        let dir = std::env::temp_dir().join(format!(
+            "dirge-elu2-cd2-{}-{}",
+            std::process::id(),
+            SCRIPT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("run-tests.sh");
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+        predate(&script);
+        let g = VerifierGate::new(); // gate AFTER: the script predates the run
+        g.record_outcome("edit", &json!({"path": "src/a.rs"}), &ok_result(), false);
+        let command = format!("cd {} && ./run-tests.sh", dir.to_string_lossy());
+        g.record_outcome("bash", &json!({"command": command}), &ok_result(), false);
+        assert_eq!(
+            g.status(GateMode::Off),
+            VerificationStatus::VerifiedGreen,
+            "a pre-existing repo script behind a cd must still count"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

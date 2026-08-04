@@ -143,10 +143,21 @@ pub struct TurnUpdate {
 /// (dirge-ksjl), and any future opt-in finalization gates that need an
 /// on/off/nagging toggle.
 ///
+/// Advisory vs Blocking is a POLICY choice, not a delivery mechanism: both
+/// may inject a model-visible `LoopMessage::User` (tagged, so the TUI
+/// attributes it to the system and `emit_harness_notices` mirrors it to a
+/// `SystemNotice`). The difference is how hard the gate pushes back.
+///
 /// - `Off` — the gate is not armed: zero cost.
-/// - `Advisory` *(default)* — surface findings/reminders as a non-blocking
-///   `SystemNotice`. It never re-enters the loop and never spends a react
-///   budget, so a tight debug loop is never held up waiting on it.
+/// - `Advisory` *(default)* — non-blocking and one-shot: fires at most once
+///   per run (per its own budget), never spends a react budget, and never
+///   repeatedly re-enters the loop on the same finding, so a tight debug
+///   loop is never held up waiting on it. Whether the one shot is a
+///   model-visible message is a SEPARATE decision: if the gate's text is an
+///   imperative steering what the model does next, it must be a tagged
+///   `LoopMessage::User` — a display-only `SystemNotice` the model never
+///   sees changes nothing (dirge-1elu.4, arXiv:2604.25850v4 §C.1.4/§C.2.4).
+///   Only FYI-for-the-human text belongs in a bare notice.
 /// - `Blocking` — await the gate and re-enter the loop on relevant
 ///   findings, bounded by a per-gate react cap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
