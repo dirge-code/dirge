@@ -3111,10 +3111,17 @@ mod tests {
         g.record_outcome("edit", &json!({"path": "src/a.rs"}), &ok_result(), false);
         let command = format!("cd {} && ./check.sh", dir.to_string_lossy());
         g.record_outcome("bash", &json!({"command": command}), &ok_result(), false);
+        let resolved = resolve_script_path(&command, std::path::Path::new("./check.sh"));
+        let canonical = crate::permission::path::canonical_or_self(&resolved);
         assert_eq!(
             g.status(GateMode::Off),
             VerificationStatus::Unverified,
-            "a cd'd-into proxy validator authored this run must not read as green"
+            "a cd'd-into proxy validator authored this run must not read as green \
+             [diag: cmd={command:?} resolved={resolved:?} canonical={canonical:?} \
+              exists={} script={script:?} script_exists={} cwd={:?}]",
+            canonical.exists(),
+            script.exists(),
+            std::env::current_dir(),
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
