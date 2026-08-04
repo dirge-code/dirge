@@ -2011,6 +2011,7 @@ pub(crate) fn poll_boundary_nudge(
         tally.record_nudge(BoundaryNudge::ProgressBudget);
         return Some((msg, BoundaryNudge::ProgressBudget));
     }
+    tally.end_boundary();
     None
 }
 
@@ -3298,7 +3299,11 @@ pub async fn run_loop(
             emit,
         )
         .await;
+        // dirge-1elu.6: one finalization boundary — the source gate (and
+        // any future co-firing gate) becomes one co-occurrence event.
+        tally.begin_boundary();
         tally.record_gate(source.into());
+        tally.end_boundary();
         if !follow_up.is_empty() {
             tracing::trace!(target: "dirge::loop", ?source, "finalization follow-up interjected");
             emit_harness_notices(emit, &follow_up).await;

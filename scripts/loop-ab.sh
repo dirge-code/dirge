@@ -379,6 +379,7 @@ build_config() { # $1 = cfgdir, $2 = overrides, $3 = model
 # $WORK/results.tsv as:
 # tag  model  repeat  turns  tool_calls  errored  scavenged  storm
 # maxstreak  repair_invalid  repair_total  verification  first_write  correct  tally
+# prologue_nudges  nudges_total  capability_tier  boundaries
 run_arm() { # $1 = overrides, $2 = tag, $3 = model
   local i cfgdir datadir out err logfile ok tally_str
   local gates_line tally_found turns tool_calls_f errored scavenged storm maxstreak rep_invalid rep_total verification fw
@@ -414,6 +415,12 @@ run_arm() { # $1 = overrides, $2 = tag, $3 = model
       rep_total="$(get_field repair_total_successful "$gates_line")"
       verification="$(get_field final_verification "$gates_line")"
       captier="$(get_field capability_tier "$gates_line")"
+      # dirge-1elu.6: boundary co-occurrence shapes, e.g. `Verifier+Critic;Todo`.
+      # Absent on a build that predates the field, which reads as `none` —
+      # distinct from a missing tally line, which is a harness bug and is
+      # reported as such.
+      boundaries="$(get_field boundaries "$gates_line")"
+      boundaries="${boundaries:-none}"
       # MECHANISM CHECK. Without this an A/B cannot distinguish "the change
       # helped" from "the change never fired" — the arms differ in config but
       # nothing confirms the code path under test was reached. Sum of every
@@ -432,16 +439,16 @@ run_arm() { # $1 = overrides, $2 = tag, $3 = model
       tally_found=0
       turns=0; tool_calls_f=0; errored=0; scavenged=0; storm=0
       maxstreak=0; rep_invalid=0; rep_total=0; verification="-"
-      nudge_prologue=0; nudges_total=0; captier="-"
+      nudge_prologue=0; nudges_total=0; captier="-"; boundaries="none"
     fi
 
     fw="$(first_write "$out")"
     ok="$(check_correct "$out")"
 
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
       "$2" "$3" "$i" "$turns" "$tool_calls_f" "$errored" "$scavenged" "$storm" \
       "$maxstreak" "$rep_invalid" "$rep_total" "$verification" "$fw" "$ok" "$tally_found" \
-      "$nudge_prologue" "$nudges_total" "$captier" \
+      "$nudge_prologue" "$nudges_total" "$captier" "$boundaries" \
       >> "$WORK/results.tsv"
 
     if [ "$tally_found" = 1 ]; then tally_str=found; else tally_str=missing; fi
@@ -487,6 +494,10 @@ for model in "${MODEL_LIST[@]}"; do
   run_arm "$ARM_A" control "$model"
   echo "treatment:"
   run_arm "$ARM_B" treatment "$model"
+  for arm in "${ARMS[@]}"; do
+    echo "${arm%%:*}:"
+    run_arm "${arm#*:}" "${arm%%:*}" "$model"
+  done
   echo
 done
 
@@ -502,6 +513,7 @@ BEGIN { tiercols["struggling"]=1; tiercols["nominal"]=1; tiercols["strong"]=1 }
   if (!(key in seen)) {
     seen[key] = 1
     if (!(("m" $2) in mseen)) { mseen["m" $2] = 1; mlist[++nm] = $2 }
+    if (!(("a" $1) in aseen)) { aseen["a" $1] = 1; alist[++na] = $1 }
   }
   n[key]++
   # 4..11 are the numeric run metrics; 16 (prologue nudges) and 17 (all
@@ -526,6 +538,17 @@ BEGIN { tiercols["struggling"]=1; tiercols["nominal"]=1; tiercols["strong"]=1 }
   if ($13 == "-") never[key]++
   ok[key] += $14
   tallyfound[key] += $15
+  # dirge-1elu.6: boundary co-occurrence events (col 19). Each event is a
+  # shape like `Verifier+Critic` (co-firing members joined by `+`, events
+  # separated by `;` in the run). `none` / `-` means no event fired.
+  if ($19 != "" && $19 != "none" && $19 != "-") {
+    split($19, evs, ";")
+    for (i in evs) {
+      s = evs[i]
+      if ((key, s) in evcnt) evcnt[key, s]++
+      else { evcnt[key, s] = 1; evlist[key, ++evn[key]] = s }
+    }
+  }
   if ($18 != "" && $18 != "-") tiers[key,$18]++
   if ($15 == 0) missing[key]++
   green[key] += ($12 == "VerifiedGreen")
@@ -585,6 +608,15 @@ function row(name, c, t, d) {
   else if (d == "worse") wm[name]++
   else if (d == "flat") fm[name]++
 }
+# dirge-1elu.6: like row(), but tallies into bm2/wm2/fm2 so the extra-arm
+# comparisons do not disturb the two-arm consistency summary.
+function row2(name, c, t, d) {
+  printf "%-26s %-26s %-26s %s\n", name, c, t, d
+  if (d == "better") bm2[name]++
+  else if (d == "worse") wm2[name]++
+  else if (d == "flat") fm2[name]++
+  if (!(name in names2)) names2[name] = 1
+}
 END {
   for (mi = 1; mi <= nm; mi++) {
     m = mlist[mi]
@@ -621,6 +653,64 @@ END {
         dir3(green[ck] / n[ck], green[tk] / n[tk], 0, 0.05, ratefloor(ck, tk)))
     row("capability_tier", tierdist(ck), tierdist(tk), "observed")
     row("tally_found", sprintf("%d/%d", tallyfound[ck], n[ck]), sprintf("%d/%d", tallyfound[tk], n[tk]), "must be full")
+
+    # dirge-1elu.6: co-occurrence per arm — which gates and nudges fired
+    # together at one decision point, with counts. An arm whose boundaries
+    # field is `none` in every run is reported as such (mechanism: nothing
+    # fired — same discipline as the nudge sums).
+    for (ai = 1; ai <= na; ai++) {
+      ak = alist[ai]
+      kk = ak SUBSEP m
+      if (evn[kk] > 0) {
+        desc = ""
+        for (ei = 1; ei <= evn[kk]; ei++) {
+          shp = evlist[kk, ei]
+          desc = desc (desc == "" ? "" : ", ") shp " x" evcnt[kk, shp]
+        }
+        printf "  co-occurrence %s: %s\n", ak, desc
+      } else {
+        printf "  co-occurrence %s: none (no boundary events in any run)\n", ak
+      }
+    }
+
+    # dirge-1elu.6: N-arm mode — every arm beyond control/treatment gets the
+    # same comparison against the control arm. Uses row2() so the two-arm
+    # consistency summary below is not polluted.
+    for (ai = 1; ai <= na; ai++) {
+      ak = alist[ai]
+      if (ak == "control" || ak == "treatment") continue
+      ek = ak SUBSEP m
+      # An arm can be absent for THIS model — a launch that failed, or an
+      # N-arm matrix that is not fully crossed. Say so and move on: every
+      # rate below divides by n[ek], so proceeding would divide by zero and
+      # abort the whole report. Reporting the absence rather than skipping
+      # silently is the same discipline as `tally=missing` — a gap in the
+      # data is a fact about the run, not a zero.
+      if (!(ek in n) || n[ek] == 0) {
+        printf "== model: %s — arm: %s ==\n  no runs for this model — arm not comparable\n", m, ak
+        continue
+      }
+      printf "== model: %s — arm: %s ==\n", m, ak
+      printf "%-26s %-26s %-26s %s\n", "metric", "control", ak, "delta"
+      row2("turns", spread(ck, 4), spread(ek, 4), dir3(mean(ck, 4), mean(ek, 4), 1, 0.5, noisefloor(ck, 4)))
+      row2("tool_calls", spread(ck, 5), spread(ek, 5), dir3(mean(ck, 5), mean(ek, 5), 1, 0.5, noisefloor(ck, 5)))
+      row2("errored_tool_calls", spread(ck, 6), spread(ek, 6), dir3(mean(ck, 6), mean(ek, 6), 1, 0.5, noisefloor(ck, 6)))
+      row2("scavenged_calls", spread(ck, 7), spread(ek, 7), dir3(mean(ck, 7), mean(ek, 7), 1, 0.5, noisefloor(ck, 7)))
+      row2("storm_suppressions", spread(ck, 8), spread(ek, 8), dir3(mean(ck, 8), mean(ek, 8), 1, 0.5, noisefloor(ck, 8)))
+      row2("max_failure_streak", spread(ck, 9), spread(ek, 9), dir3(mean(ck, 9), mean(ek, 9), 1, 0.5, noisefloor(ck, 9)))
+      row2("repair_invalid", spread(ck, 10), spread(ek, 10), dir3(mean(ck, 10), mean(ek, 10), 1, 0.5, noisefloor(ck, 10)))
+      row2("repair_total_successful", spread(ck, 11), spread(ek, 11), sprintf("%+.1f", mean(ek, 11) - mean(ck, 11)))
+      eval2 = (fwn[ek] ? sprintf("%.1f (%.0f..%.0f) [never=%d]", fws[ek] / fwn[ek], fwmin[ek], fwmax[ek], never[ek]) : "- [never=" never[ek] "]")
+      row2("first_write", cval, eval2, "n/a")
+      row2("nudges_fired", spread(ck, 17), spread(ek, 17), "mechanism")
+      row2("  of which prologue", spread(ck, 16), spread(ek, 16), "mechanism")
+      row2("success_rate", rate(ck), rate(ek), dir3(ok[ck] / n[ck], ok[ek] / n[ek], 0, 0.05, ratefloor(ck, ek)))
+      row2("green_rate", sprintf("%d/%d (%.0f%%)", green[ck], n[ck], 100 * green[ck] / n[ck]),
+          sprintf("%d/%d (%.0f%%)", green[ek], n[ek], 100 * green[ek] / n[ek]),
+          dir3(green[ck] / n[ck], green[ek] / n[ek], 0, 0.05, ratefloor(ck, ek)))
+      row2("tally_found", sprintf("%d/%d", tallyfound[ck], n[ck]), sprintf("%d/%d", tallyfound[ek], n[ek]), "must be full")
+      printf "\n"
+    }
     printf "\n"
   }
 
@@ -642,6 +732,23 @@ END {
   for (k in missing) total_missing += missing[k]
   if (total_missing > 0) {
     printf "  WARNING: %d run(s) produced no dirge::gates line (missing tally is a harness bug — check DIRGE_LOG/RUST_LOG).\n", total_missing
+
+  # dirge-1elu.6: N-arm consistency across models (only meaningful with
+  # several models and at least one extra arm). bm2/wm2/fm2 were filled by
+  # the extra-arm blocks above.
+  if (na > 2 && nm > 1) {
+    printf "== summary across models, extra arms ==\n"
+    for (ai = 1; ai <= na; ai++) {
+      ak = alist[ai]
+      if (ak == "control" || ak == "treatment") continue
+      printf "  arm %s (vs control)\n", ak
+      for (ni2 in names2) {
+        b = bm2[ni2]; w = wm2[ni2]; f = fm2[ni2]
+        if (b + w + f == 0) continue
+        printf "    %-26s better %d, worse %d, flat %d of %d models\n", ni2, b, w, f, nm
+      }
+    }
+  }
   }
 }
 ' "$WORK/results.tsv"

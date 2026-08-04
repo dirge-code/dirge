@@ -7420,3 +7420,73 @@ fn hallucinated_names_accumulate_across_calls() {
     assert_eq!(tally.errored_tool_calls(), 3);
     assert_eq!(tally.tool_calls(), 3);
 }
+
+// dirge-1elu.6 test 4: the tally's boundary recording is observation only.
+// Two identical runs of a scenario where a finalization gate (the goal
+// judge) fires must produce identical messages and turn counts — the new
+// bookkeeping changes nothing — and each run's `dirge::gates` line must
+// carry the populated `boundaries=` field (recorded, and ignored).
+#[tokio::test]
+async fn boundary_recording_does_not_change_loop_output() {
+    use crate::agent::agent_loop::critic::CriticFn;
+    use crate::agent::agent_loop::gate_tally::tests::field_capture;
+
+    let run_once = || async {
+        let (cap, _guard) = field_capture();
+        let mut ctx = empty_context();
+        ctx.tools.push(std::sync::Arc::new(RecBashTool::new()));
+        let mut cfg = build_config();
+        cfg.goal = Some("all tests pass and committed".into());
+        cfg.goal_fn = Some(std::sync::Arc::new(|_p| {
+            Box::pin(async { Ok("GOAL: UNMET\n- tests still failing".to_string()) })
+        }));
+        let factory = canned_factory(vec![text_response("done")]);
+        let (tx, _rx) = tokio::sync::mpsc::channel(128);
+        let msgs = run_agent_loop(
+            vec![user("task")],
+            ctx,
+            cfg,
+            AbortSignal::new(),
+            &tx,
+            &factory,
+            None,
+            None,
+        )
+        .await;
+        drop(tx);
+        (msgs, cap.snapshot())
+    };
+
+    let (msgs_a, log_a) = run_once().await;
+    let (msgs_b, log_b) = run_once().await;
+
+    assert_eq!(
+        flat_text(&msgs_a),
+        flat_text(&msgs_b),
+        "boundary recording must not change the loop's output"
+    );
+    let gates_a: Vec<&str> = log_a
+        .lines()
+        .filter(|l| l.contains("dirge::gates"))
+        .collect();
+    assert!(
+        !gates_a.is_empty(),
+        "the run must emit a dirge::gates line: {log_a}"
+    );
+    assert!(
+        gates_a.iter().any(|l| l.contains("boundaries=")),
+        "the tally line must carry the populated boundaries= field: {gates_a:?}"
+    );
+    assert!(
+        gates_a.iter().any(|l| l.contains("Goal")),
+        "the goal gate must have fired and been recorded: {gates_a:?}"
+    );
+    let gates_b: Vec<&str> = log_b
+        .lines()
+        .filter(|l| l.contains("dirge::gates"))
+        .collect();
+    assert!(
+        !gates_b.is_empty(),
+        "the second run must also emit a dirge::gates line: {log_b}"
+    );
+}
