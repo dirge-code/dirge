@@ -124,6 +124,79 @@ pub enum VerificationTier {
     Slow,
 }
 
+/// Cross-boundary handoff of a run's final [`VerificationStatus`]
+/// (dirge-1elu.7).
+///
+/// # Why a process-global, and why keyed by session
+///
+/// The status is computed inside `run_loop` from a [`VerifierGate`] the loop
+/// owns; the consumer is the post-session pass in `ui::run_handlers::done`,
+/// which runs on the UI side off an `AgentEvent`. Nothing carries a value
+/// between those two points today, and the obvious routes all cost more than
+/// the signal is worth:
+///
+/// - returning it from `run_agent_loop` does not reach `handle_done` at all,
+///   which fires on the EVENT, not the return;
+/// - carrying it on `AgentEnd` -> `AgentEvent::Done` puts a verifier-internal
+///   type into the UI/stream event contract and touches ~15 construction sites
+///   across subagents, plan runtime, and background review, none of which have
+///   anything to do with verification;
+/// - "persist it on the session" does not avoid the problem, it relocates it:
+///   the session is owned by the UI, so the value still has to travel first.
+///
+/// So this is the same shape as [`crate::agent::tools::modified`] and
+/// `crate::agent::tools::snapshots`, which are process-globals for the same
+/// structural reason. The difference is the key: those are single-slot, and a
+/// single slot here would let a subagent or MCP-delegate run, which share the
+/// process, hand its status to the wrong session. Keying by session id makes a
+/// wrong-session read impossible by construction rather than by convention.
+///
+/// Staleness is handled by taking on read AND recording unconditionally
+/// (including `None`): a run that verified nothing clears its entry rather
+/// than letting an earlier green be re-read.
+mod run_status {
+    use super::VerificationStatus;
+    use crate::sync_util::LockExt;
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex};
+
+    /// Bound on retained entries. Only a session that never reads its own
+    /// status leaks one, so this is a backstop, not a working limit.
+    const MAX_RETAINED: usize = 64;
+
+    static LAST_RUN: LazyLock<Mutex<HashMap<String, VerificationStatus>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    /// Record the status a run finished with. Called once per run from
+    /// `finish_tally`. Recording `None` REMOVES any prior entry: a run that
+    /// ran no verification must not leave an earlier run's green behind.
+    pub fn record(session_id: Option<&str>, status: Option<VerificationStatus>) {
+        let Some(id) = session_id else {
+            return;
+        };
+        let mut map = LAST_RUN.lock_ignore_poison();
+        match status {
+            Some(s) => {
+                if map.len() >= MAX_RETAINED && !map.contains_key(id) {
+                    map.clear();
+                }
+                map.insert(id.to_string(), s);
+            }
+            None => {
+                map.remove(id);
+            }
+        }
+    }
+
+    /// Take this session's status, clearing it. Consuming, so a later run that
+    /// recorded nothing cannot re-read a stale value.
+    pub fn take(session_id: &str) -> Option<VerificationStatus> {
+        LAST_RUN.lock_ignore_poison().remove(session_id)
+    }
+}
+
+pub use run_status::{record as record_run_verification, take as take_run_verification};
+
 /// Per-run verifier gate. See module docs.
 #[derive(Debug)]
 pub struct VerifierGate {
@@ -3040,5 +3113,61 @@ mod tests {
             "a pre-existing repo script behind a cd must still count"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+    // ── dirge-1elu.7: session-keyed run-status handoff ──────────────
+
+    /// The producer/consumer pair actually connects, and the value that
+    /// comes out is the one that went in.
+    #[test]
+    fn run_status_round_trips_for_its_own_session() {
+        record_run_verification(
+            Some("s-round-trip"),
+            Some(VerificationStatus::VerifiedGreen),
+        );
+        assert_eq!(
+            take_run_verification("s-round-trip"),
+            Some(VerificationStatus::VerifiedGreen)
+        );
+    }
+
+    /// The property the whole session-keyed design exists for: a subagent or
+    /// MCP-delegate run sharing the process must not hand its status to a
+    /// different session.
+    #[test]
+    fn run_status_never_leaks_across_sessions() {
+        record_run_verification(Some("s-owner"), Some(VerificationStatus::VerifiedRed));
+        assert_eq!(take_run_verification("s-other"), None);
+        // The owner's entry is untouched by the foreign read.
+        assert_eq!(
+            take_run_verification("s-owner"),
+            Some(VerificationStatus::VerifiedRed)
+        );
+    }
+
+    /// Taking is consuming, so a second post-session pass in the same session
+    /// reads "could not tell" rather than re-crediting a stale green.
+    #[test]
+    fn run_status_is_taken_not_copied() {
+        record_run_verification(Some("s-once"), Some(VerificationStatus::VerifiedGreen));
+        assert!(take_run_verification("s-once").is_some());
+        assert_eq!(take_run_verification("s-once"), None);
+    }
+
+    /// A run that verified nothing CLEARS its slot. Without this a later run
+    /// with no verification would inherit the previous run's green — the
+    /// stale-read failure this handoff exists to avoid.
+    #[test]
+    fn recording_none_clears_a_prior_status() {
+        record_run_verification(Some("s-clear"), Some(VerificationStatus::VerifiedGreen));
+        record_run_verification(Some("s-clear"), None);
+        assert_eq!(take_run_verification("s-clear"), None);
+    }
+
+    /// No session id (headless paths that never set one) records nothing
+    /// rather than colliding on a shared empty key.
+    #[test]
+    fn missing_session_id_records_nothing() {
+        record_run_verification(None, Some(VerificationStatus::VerifiedGreen));
+        assert_eq!(take_run_verification(""), None);
     }
 }

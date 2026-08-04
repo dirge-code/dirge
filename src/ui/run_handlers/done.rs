@@ -658,12 +658,15 @@ pub(crate) fn finalize_idle_turn(
     // skills curator, then memory curator, strictly ordered inside ONE detached
     // task so a skill the review creates is flushed before the curator reads it
     // and the three runners never fire concurrently. Fire-and-forget.
-    // dirge-1elu.5: deterministic expectation signals. The verifier gate is
-    // a run_loop local, gone by the time the idle path runs — so only
-    // command expectations are observable here, evaluated from the digest's
-    // commands. (The verification-green expectation was removed with the
-    // change that made it unreachable: an inert gate is worse than none.)
+    // dirge-1elu.7: deterministic expectation signals. The verifier gate is a
+    // run_loop local and is gone by the time this idle path runs, so the run
+    // hands its final status over through the session-keyed slot in
+    // `verifier::run_status`. Taking it is consuming: a later run that
+    // verified nothing finds an empty slot and reads as "could not tell"
+    // (NEITHER counter moves) rather than inheriting an earlier green.
     let expectation_commands = digest.commands.clone();
+    let final_verification =
+        crate::agent::agent_loop::verifier::take_run_verification(session.id.as_ref());
     crate::agent::post_session::spawn_post_session(
         agent.clone(),
         paths,
@@ -671,6 +674,7 @@ pub(crate) fn finalize_idle_turn(
         base,
         graduation_enabled,
         crate::extras::memory_db::ExpectationSignals {
+            final_verification,
             commands: expectation_commands,
         },
     );

@@ -7490,3 +7490,56 @@ async fn boundary_recording_does_not_change_loop_output() {
         "the second run must also emit a dirge::gates line: {log_b}"
     );
 }
+
+/// dirge-1elu.7: the PRODUCTION path for the run-status handoff. A loop that
+/// edits code and runs a passing check must leave its status in the
+/// session-keyed slot that the post-session pass reads.
+///
+/// This is the half a direct `record`/`take` unit test cannot prove: those
+/// exercise the slot, this exercises the WIRING from `finish_tally` into it.
+/// Without this, the slot could work perfectly while nothing ever wrote to it
+/// (docs/verification-discipline.md, "Signal never fed").
+#[tokio::test]
+async fn finish_tally_hands_the_run_status_to_the_session_slot() {
+    let repo = temp_git_worktree();
+    let mut ctx = empty_context();
+    ctx.tools.push(std::sync::Arc::new(RecBashTool::new()));
+    let mut cfg = build_config();
+    cfg.session_id = Some("s-production-handoff".to_string());
+    cfg.verifier = Some(crate::agent::agent_loop::verifier::VerifierGate::new());
+    cfg.code_review_repo = Some(repo.clone());
+
+    // Nothing left over from an earlier test in this process.
+    let _ = crate::agent::agent_loop::verifier::take_run_verification("s-production-handoff");
+
+    let factory = canned_factory(vec![
+        tool_use_response(
+            "call-1",
+            "bash",
+            serde_json::json!({"command": "make check"}),
+        ),
+        text_response("done"),
+    ]);
+
+    let (tx, mut _rx) = mpsc::channel::<LoopEvent>(128);
+    let _ = run_agent_loop(
+        vec![user("check it")],
+        ctx,
+        cfg,
+        AbortSignal::new(),
+        &tx,
+        &factory,
+        None,
+        None,
+    )
+    .await;
+    drop(tx);
+
+    let status = crate::agent::agent_loop::verifier::take_run_verification("s-production-handoff");
+    assert!(
+        status.is_some(),
+        "the run must hand its verification status to the session slot; got None"
+    );
+
+    let _ = std::fs::remove_dir_all(&repo);
+}

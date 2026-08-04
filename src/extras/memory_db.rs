@@ -27,7 +27,7 @@
 //! markdown store minted a fresh id on every replace, so any
 //! consolidation reset an entry's age tracking to zero.
 
-use crate::agent::agent_loop::verifier::{GateSignature, gate_signature};
+use crate::agent::agent_loop::verifier::{GateSignature, VerificationStatus, gate_signature};
 #[allow(unused_imports)]
 use crate::sync_util::LockExt;
 use std::collections::HashMap;
@@ -342,6 +342,13 @@ struct ActiveRow {
 /// tell" with "did not work" decays honest memories toward eviction).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MemoryExpectation {
+    /// The run's final verification was GREEN (`VerifiedGreen`) — the
+    /// observable condition under which the memory should have applied.
+    /// Judged by the same three cases as `CommandRan`: green → success,
+    /// observable-but-not-green (VerifiedRed) → failure, no verification
+    /// (no verifier, or Unverified/NoCodeEdited) → neither counter.
+    /// Falsifiable because the middle case genuinely moves `failure_count`.
+    VerificationGreen,
     /// `when` (the situation) and `expect` (the rule), e.g. "run cargo fmt
     /// before commit" → when=`git commit`, expect=`cargo fmt`. A session
     /// that committed without formatting is a real, measured failure.
@@ -357,8 +364,12 @@ pub enum MemoryExpectation {
 impl MemoryExpectation {
     /// Wire form for the `expectation` column: `command_ran:<when>|<expect>`.
     pub fn as_wire(&self) -> String {
-        let MemoryExpectation::CommandRan { when, expect } = self;
-        format!("command_ran:{}|{}", when.to_wire(), expect.to_wire())
+        match self {
+            MemoryExpectation::VerificationGreen => "verification_green".to_string(),
+            MemoryExpectation::CommandRan { when, expect } => {
+                format!("command_ran:{}|{}", when.to_wire(), expect.to_wire())
+            }
+        }
     }
 
     /// Parse the wire form. Unknown or unparseable strings — including the
@@ -367,6 +378,9 @@ impl MemoryExpectation {
     /// half-parsed into something that then mis-evaluates (migration
     /// safety: a future version's expectations are never mis-evaluated).
     pub fn from_wire(s: &str) -> Option<Self> {
+        if s == "verification_green" {
+            return Some(MemoryExpectation::VerificationGreen);
+        }
         let rest = s.strip_prefix("command_ran:")?;
         let (when, expect) = rest.split_once('|')?;
         if when.is_empty() || expect.is_empty() {
@@ -380,19 +394,33 @@ impl MemoryExpectation {
 
     /// Deterministic evaluation. No LLM; a pure function of the signals.
     pub fn evaluate(&self, signals: &ExpectationSignals) -> ExpectationVerdict {
-        let MemoryExpectation::CommandRan { when, expect } = self;
-        let when_ran = signals
-            .commands
-            .iter()
-            .any(|c| gate_signature(c).as_ref() == Some(when));
-        let expect_ran = signals
-            .commands
-            .iter()
-            .any(|c| gate_signature(c).as_ref() == Some(expect));
-        match (when_ran, expect_ran) {
-            (false, _) => ExpectationVerdict::NotObservable,
-            (true, true) => ExpectationVerdict::Met,
-            (true, false) => ExpectationVerdict::NotMet,
+        match self {
+            MemoryExpectation::VerificationGreen => match signals.final_verification {
+                // Green → the rule was followed.
+                Some(VerificationStatus::VerifiedGreen) => ExpectationVerdict::Met,
+                // Observable but NOT green → the rule was not followed. This
+                // is the falsifiability case: it genuinely moves failure.
+                Some(VerificationStatus::VerifiedRed) => ExpectationVerdict::NotMet,
+                // No verification ran (no verifier configured, or the run
+                // ended Unverified / with nothing to verify) — "could not
+                // tell", which moves NEITHER counter.
+                _ => ExpectationVerdict::NotObservable,
+            },
+            MemoryExpectation::CommandRan { when, expect } => {
+                let when_ran = signals
+                    .commands
+                    .iter()
+                    .any(|c| gate_signature(c).as_ref() == Some(when));
+                let expect_ran = signals
+                    .commands
+                    .iter()
+                    .any(|c| gate_signature(c).as_ref() == Some(expect));
+                match (when_ran, expect_ran) {
+                    (false, _) => ExpectationVerdict::NotObservable,
+                    (true, true) => ExpectationVerdict::Met,
+                    (true, false) => ExpectationVerdict::NotMet,
+                }
+            }
         }
     }
 }
@@ -402,6 +430,13 @@ impl MemoryExpectation {
 /// No LLM in this path (dirge-1elu.5).
 #[derive(Debug, Clone, Default)]
 pub struct ExpectationSignals {
+    /// The run's final verification status, as produced by the verifier
+    /// gate at the end of the run (dirge-1elu.7). `None` when no verifier
+    /// produced a status this run — the "could not tell" case, which moves
+    /// NEITHER counter. The idle-path spawn site passes `None` because the
+    /// gate is a run_loop local by then; the compaction site passes the
+    /// live status.
+    pub final_verification: Option<VerificationStatus>,
     /// Command strings recorded this run, matched with `gate_signature`.
     pub commands: Vec<String>,
 }
@@ -5125,6 +5160,7 @@ mod tests {
         let uid = store.snapshot.lock_ignore_poison()[0].uid.clone();
 
         let signals = ExpectationSignals {
+            final_verification: None,
             commands: vec![
                 "cargo fmt --check".to_string(),
                 "git commit -m x".to_string(),
@@ -5176,6 +5212,7 @@ mod tests {
         // The situation arose (git commit ran) and the rule did not
         // (cargo fmt never ran) — a measured failure.
         let signals = ExpectationSignals {
+            final_verification: None,
             commands: vec!["git commit -m x".to_string()],
         };
         let summary = store.settle_expectations(&signals).unwrap();
@@ -5217,6 +5254,7 @@ mod tests {
         let uid = store.snapshot.lock_ignore_poison()[0].uid.clone();
 
         let signals = ExpectationSignals {
+            final_verification: None,
             commands: vec!["cargo check".to_string()],
         };
         let summary = store.settle_expectations(&signals).unwrap();
@@ -5249,7 +5287,16 @@ mod tests {
             None
         );
         assert_eq!(MemoryExpectation::from_wire(""), None);
-        assert_eq!(MemoryExpectation::from_wire("verification_green"), None);
+        // The restored variant round-trips; the OLD single-signature form
+        // stays None (inert, never half-parsed).
+        assert_eq!(
+            MemoryExpectation::from_wire("verification_green"),
+            Some(MemoryExpectation::VerificationGreen)
+        );
+        assert_eq!(
+            MemoryExpectation::VerificationGreen.as_wire(),
+            "verification_green"
+        );
         assert_eq!(
             MemoryExpectation::from_wire("command_ran:git commit|cargo fmt"),
             Some(MemoryExpectation::CommandRan {
@@ -5275,6 +5322,7 @@ mod tests {
         store.refresh_snapshot().unwrap();
 
         let signals = ExpectationSignals {
+            final_verification: None,
             commands: vec!["git commit -m x".to_string()],
         };
         let summary = store.settle_expectations(&signals).unwrap();
@@ -5312,11 +5360,60 @@ mod tests {
         // still the empty frozen set from load time.
 
         let signals = ExpectationSignals {
+            final_verification: None,
             commands: vec!["git commit -m x".to_string(), "cargo fmt".to_string()],
         };
         let summary = store.settle_expectations(&signals).unwrap();
         assert_eq!(summary.considered, 0, "not injected ⇒ not evaluated");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The three-case discipline for the VerificationGreen arm, driven
+    /// through the production settle: green → Met → success_count; an
+    /// observable run that did NOT reach green → NotMet → failure_count;
+    /// no verification ran → NotObservable → NEITHER counter.
+    #[test]
+    fn verification_green_settle_is_three_case() {
+        for (status, expect_met, expect_not_met, expect_success, expect_failure) in [
+            (
+                Some(VerificationStatus::VerifiedGreen),
+                1usize,
+                0usize,
+                1i64,
+                0i64,
+            ),
+            (Some(VerificationStatus::VerifiedRed), 0, 1, 0, 1),
+            (None, 0, 0, 0, 0),
+        ] {
+            let (paths, dir) = temp_project();
+            let store = SqliteMemoryStore::load(&paths).unwrap();
+            store
+                .add_entry("memory", "run checks", Some(MemoryKind::Procedural))
+                .unwrap();
+            store
+                .set_expectation(
+                    "memory",
+                    "run checks",
+                    Some(MemoryExpectation::VerificationGreen),
+                )
+                .unwrap();
+            store.refresh_snapshot().unwrap();
+            let uid = store.snapshot.lock_ignore_poison()[0].uid.clone();
+
+            let signals = ExpectationSignals {
+                final_verification: status,
+                commands: vec![],
+            };
+            let summary = store.settle_expectations(&signals).unwrap();
+            assert_eq!(summary.met, expect_met, "status={status:?}");
+            assert_eq!(summary.not_met, expect_not_met, "status={status:?}");
+            let row = SqliteMemoryStore::row_by_uid(&store.conn.lock_ignore_poison(), &uid)
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.success_count, expect_success, "status={status:?}");
+            assert_eq!(row.failure_count, expect_failure, "status={status:?}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     /// Migration safety, checked hardest: a DB that predates the expectation

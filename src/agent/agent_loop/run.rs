@@ -2024,12 +2024,16 @@ fn finish_tally(
     capability: &super::capability::CapabilityEstimator,
 ) {
     tally.set_capability_tier(Some(capability.tier()));
-    tally.set_verification(
-        config
-            .verifier
-            .as_ref()
-            .map(|v| v.status(config.verification_tiers_mode)),
-    );
+    let verification = config
+        .verifier
+        .as_ref()
+        .map(|v| v.status(config.verification_tiers_mode));
+    tally.set_verification(verification);
+    // dirge-1elu.7: hand this run's status to the post-session pass, which
+    // runs on the UI side and cannot see the loop's verifier. Recorded
+    // unconditionally — a `None` here CLEARS any prior entry, so a run that
+    // verified nothing never inherits an earlier run's green.
+    super::verifier::record_run_verification(config.session_id.as_deref(), verification);
     tally.set_repairs(Some(config.repair_stats.snapshot()));
     tally.emit();
 }
