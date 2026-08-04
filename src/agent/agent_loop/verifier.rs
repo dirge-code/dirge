@@ -201,6 +201,30 @@ pub use run_status::{record as record_run_verification, take as take_run_verific
 /// (latest-first; dirge-d0e5.3).
 const MAX_OBSERVED_COMMANDS: usize = 6;
 
+/// Slack subtracted from the captured run start before comparing a script's
+/// mtime against it (dirge-1elu.2).
+///
+/// Linux updates filesystem timestamps from a clock the kernel caches at
+/// timer-tick granularity, so a file written microseconds AFTER
+/// `SystemTime::now()` can land an mtime marginally BEFORE it. macOS's
+/// finer-grained clock hides this, which is why it only ever surfaced on
+/// Linux CI: a script the agent had just written read as pre-existing and
+/// latched a green it should have declined.
+///
+/// One second is far beyond any tick granularity and far below the interval
+/// that would sweep in genuinely pre-existing files. The failure direction is
+/// the safe one either way: erring toward "authored this run" declines a green
+/// and asks again, which is the direction this whole gate already prefers.
+const MTIME_SLACK: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The run-start instant to compare mtimes against, backdated by
+/// [`MTIME_SLACK`].
+fn run_start_marker() -> std::time::SystemTime {
+    std::time::SystemTime::now()
+        .checked_sub(MTIME_SLACK)
+        .unwrap_or_else(std::time::SystemTime::now)
+}
+
 /// Per-run verifier gate. See module docs.
 #[derive(Debug)]
 pub struct VerifierGate {
@@ -282,7 +306,7 @@ impl VerifierGate {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(Inner {
-                run_started_at: Some(std::time::SystemTime::now()),
+                run_started_at: Some(run_start_marker()),
                 ..Inner::default()
             }),
         })
@@ -310,7 +334,7 @@ impl VerifierGate {
             inner: Mutex::new(Inner {
                 project_gate: project_gate.as_deref().and_then(gate_signature),
                 ci_commands,
-                run_started_at: Some(std::time::SystemTime::now()),
+                run_started_at: Some(run_start_marker()),
                 ..Inner::default()
             }),
         })
@@ -3111,17 +3135,10 @@ mod tests {
         g.record_outcome("edit", &json!({"path": "src/a.rs"}), &ok_result(), false);
         let command = format!("cd {} && ./check.sh", dir.to_string_lossy());
         g.record_outcome("bash", &json!({"command": command}), &ok_result(), false);
-        let resolved = resolve_script_path(&command, std::path::Path::new("./check.sh"));
-        let canonical = crate::permission::path::canonical_or_self(&resolved);
         assert_eq!(
             g.status(GateMode::Off),
             VerificationStatus::Unverified,
-            "a cd'd-into proxy validator authored this run must not read as green \
-             [diag: cmd={command:?} resolved={resolved:?} canonical={canonical:?} \
-              exists={} script={script:?} script_exists={} cwd={:?}]",
-            canonical.exists(),
-            script.exists(),
-            std::env::current_dir(),
+            "a cd'd-into proxy validator authored this run must not read as green"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3206,5 +3223,52 @@ mod tests {
     fn missing_session_id_records_nothing() {
         record_run_verification(None, Some(VerificationStatus::VerifiedGreen));
         assert_eq!(take_run_verification(""), None);
+    }
+    /// dirge-1elu.2: the run-start marker is backdated, so a script whose
+    /// mtime lands marginally BEFORE `SystemTime::now()` still reads as
+    /// authored this run.
+    ///
+    /// Linux sets filesystem timestamps from a clock the kernel caches at
+    /// timer-tick granularity, so a file written microseconds after the gate
+    /// was constructed can carry an earlier mtime. Without the slack that
+    /// script reads as pre-existing and latches a green it should decline —
+    /// which is exactly what happened on Linux CI while macOS stayed green.
+    ///
+    /// Simulated deterministically rather than by racing a real clock: the
+    /// script's mtime is compared against a marker taken AFTER it, which is
+    /// the same ordering the coarse-clock case produces.
+    #[test]
+    fn mtime_marginally_before_run_start_still_reads_as_authored() {
+        let dir = std::env::temp_dir().join(format!(
+            "dirge-elu2-slack-{}-{}",
+            std::process::id(),
+            SCRIPT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("check.sh");
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+
+        let mtime = std::fs::metadata(&script).unwrap().modified().unwrap();
+
+        // The coarse-clock case: the run "started" slightly AFTER the file's
+        // mtime. Without backdating this reads as pre-existing and latches a
+        // green; with MTIME_SLACK it correctly reads as authored this run.
+        let skewed_now = mtime + std::time::Duration::from_millis(500);
+        assert!(
+            script_is_agent_authored("./check.sh", &script, Some(skewed_now - MTIME_SLACK)),
+            "an mtime marginally before run start must still read as authored"
+        );
+
+        // Bounded: a run that started well after the file was written still
+        // treats it as pre-existing, so the slack can't sweep in real repo
+        // scripts.
+        let much_later = mtime + MTIME_SLACK + std::time::Duration::from_secs(60);
+        assert!(
+            !script_is_agent_authored("./check.sh", &script, Some(much_later - MTIME_SLACK)),
+            "the slack must not sweep in genuinely pre-existing files"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
