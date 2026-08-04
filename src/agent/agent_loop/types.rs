@@ -597,6 +597,14 @@ pub struct LoopConfig {
     /// from `Config::resolve_publish_guard_mode`.
     pub publish_guard_mode: GateMode,
 
+    /// dirge-d0e5.2: the deterministic claim/evidence gate's engagement mode
+    /// (`off`/`advisory`/`blocking`). `off` *(default)* is byte-identical to
+    /// the loop without the gate. Both `advisory` and `blocking` deliver the
+    /// same one-shot model-visible nudge — the gate only ever speaks, it
+    /// cannot block finalization, so the tri-state is really "on or off" with
+    /// room for a future hard mode. Set from `Config::resolve_claim_gate_mode`.
+    pub claim_gate_mode: GateMode,
+
     /// Active session id for the open-issues gate and tools that need
     /// session-scoping. `None` in review/curator sub-runners and most
     /// tests — the gate is inert without it.
@@ -840,6 +848,7 @@ impl Clone for LoopConfig {
             verification_tiers_mode: self.verification_tiers_mode,
             safe_state_abort_mode: self.safe_state_abort_mode,
             publish_guard_mode: self.publish_guard_mode,
+            claim_gate_mode: self.claim_gate_mode,
             progress: self.progress.clone(),
             session_id: self.session_id.clone(),
             goal_fn: self.goal_fn.clone(),
@@ -903,6 +912,7 @@ impl LoopConfig {
             verification_tiers_mode: GateMode::Off,
             safe_state_abort_mode: SafeStateMode::Off,
             publish_guard_mode: GateMode::Off,
+            claim_gate_mode: GateMode::Off,
             progress: None,
             session_id: None,
             goal_fn: None,

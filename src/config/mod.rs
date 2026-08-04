@@ -994,6 +994,14 @@ pub struct Config {
     /// with no override token (the paper's overrideable iteration-5 guard
     /// leaked). See [`resolve_publish_guard_mode`](Self::resolve_publish_guard_mode).
     pub publish_guard: Option<String>,
+    /// How the deterministic claim/evidence gate engages (dirge-d0e5.2):
+    /// `off` / `advisory` / `blocking` (case-insensitive, trimmed). `off`
+    /// *(default)* is byte-identical to the loop without the gate. Either
+    /// non-`off` mode delivers the same one-shot model-visible nudge when
+    /// the final answer claims a verification result or a change the run's
+    /// evidence does not support. See
+    /// [`resolve_claim_gate_mode`](Self::resolve_claim_gate_mode).
+    pub claim_gate: Option<String>,
     /// How the ingestion-time injection scanner handles untrusted tool
     /// results (read, MCP, websearch). One of `off` / `advisory` / `block`
     /// (case-insensitive, trimmed). `advisory` *(default)* fences positive
@@ -1406,6 +1414,32 @@ impl Config {
                 target: "dirge::config",
                 value = trimmed,
                 "unrecognized `publish_guard` value; falling back to `off` \
+                 (valid: off | advisory | blocking)"
+            );
+            GateMode::Off
+        })
+    }
+
+    /// Resolve the claim gate's engagement mode from
+    /// [`claim_gate`](Self::claim_gate): `off`/`advisory`/`blocking`,
+    /// parsed case-insensitively and trimmed. `None` and an empty value
+    /// resolve to `Off` (opt-in — the gate nags the model, so it must be
+    /// switched on explicitly; dirge-d0e5.2). An unrecognized non-empty
+    /// value also resolves to `Off` but logs a warning.
+    pub fn resolve_claim_gate_mode(&self) -> crate::agent::agent_loop::types::GateMode {
+        use crate::agent::agent_loop::types::GateMode;
+        let Some(raw) = self.claim_gate.as_deref() else {
+            return GateMode::Off;
+        };
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return GateMode::Off;
+        }
+        GateMode::from_wire(trimmed).unwrap_or_else(|| {
+            tracing::warn!(
+                target: "dirge::config",
+                value = trimmed,
+                "unrecognized `claim_gate` value; falling back to `off` \
                  (valid: off | advisory | blocking)"
             );
             GateMode::Off
@@ -2267,6 +2301,20 @@ mod tests {
         // Absent is still Off — enabling a destructive path is never implicit.
         let cfg: Config = serde_json::from_str(r#"{}"#).unwrap();
         assert_eq!(cfg.resolve_safe_state_abort_mode(), SafeStateMode::Off);
+    }
+
+    #[test]
+    fn resolve_claim_gate_mode_each_string_and_default() {
+        use crate::agent::agent_loop::types::GateMode;
+        for raw in ["off", "advisory", "blocking"] {
+            let cfg = Config::deserialize(serde_json::json!({ "claim_gate": raw })).unwrap();
+            assert_eq!(cfg.resolve_claim_gate_mode().as_str(), raw);
+        }
+        // Absent key and an empty value both resolve to Off (opt-in).
+        let absent = Config::deserialize(serde_json::json!({})).unwrap();
+        assert_eq!(absent.resolve_claim_gate_mode(), GateMode::Off);
+        let empty = Config::deserialize(serde_json::json!({ "claim_gate": "" })).unwrap();
+        assert_eq!(empty.resolve_claim_gate_mode(), GateMode::Off);
     }
 
     #[test]

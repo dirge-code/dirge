@@ -38,6 +38,8 @@ pub enum GateSource {
     Hook,
     ResumeAfterFailure,
     Verifier,
+    /// Deterministic claim/evidence gate (dirge-d0e5.2). No LLM call.
+    ClaimGate,
     Critic,
     Goal,
     Todo,
@@ -80,11 +82,12 @@ impl GateSource {
             GateSource::Hook => 1,
             GateSource::ResumeAfterFailure => 2,
             GateSource::Verifier => 3,
-            GateSource::Critic => 4,
-            GateSource::Goal => 5,
-            GateSource::Todo => 6,
-            GateSource::OpenIssues => 7,
-            GateSource::None => 8,
+            GateSource::ClaimGate => 4,
+            GateSource::Critic => 5,
+            GateSource::Goal => 6,
+            GateSource::Todo => 7,
+            GateSource::OpenIssues => 8,
+            GateSource::None => 9,
         }
     }
 }
@@ -110,7 +113,7 @@ impl BoundaryNudge {
 /// discard.
 #[derive(Clone, Debug, Default)]
 pub struct GateTally {
-    gates: [u32; 9],
+    gates: [u32; 10],
     nudges: [u32; 9],
     turns: u32,
     tool_calls: u32,

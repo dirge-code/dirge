@@ -450,6 +450,10 @@ impl VerifierGate {
     /// Code edits since the last verification command of any tier. Feeds
     /// the mid-run nudge; never mutates the gate (same read-only contract
     /// as [`VerifierGate::status`]).
+    pub fn ran_verification(&self) -> bool {
+        self.inner.lock_ignore_poison().ran_verification
+    }
+
     pub fn edits_since_verify(&self) -> u32 {
         self.inner.lock_ignore_poison().edits_since_verify
     }

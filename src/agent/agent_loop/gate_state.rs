@@ -76,6 +76,18 @@ pub struct GateStates {
     /// **Re-fire guard.** Bounded by `MAX_RESUME_NUDGE`.
     pub resume_nudges: u8,
 
+    /// **Re-fire guard.** Bounded by `claim_gate::MAX_CLAIM_NUDGES`
+    /// [dirge-d0e5.2]. No LLM call — the deterministic claim/evidence gate.
+    pub claim_nudges: u8,
+
+    /// **Memo,** not a bound. The run-start [`crate::agent::tools::modified::epoch`]
+    /// captured when this `GateStates` was constructed, so the claim gate can
+    /// ask "how many files were mutated THIS run" via
+    /// [`crate::agent::tools::modified::since`] instead of "ever". Zero is the
+    /// inert `Default` value (tests that construct directly); the production
+    /// `run_loop` stamps it at construction.
+    pub run_epoch: u64,
+
     /// **Re-fire guard.** Bounded by `MAX_OPEN_ISSUES_NUDGES` [dirge-ksjl].
     /// The gate reads the issue DB, not a provider.
     pub open_issues_nudges: u8,

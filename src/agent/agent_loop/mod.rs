@@ -24,6 +24,7 @@
 pub mod activity;
 pub mod bridge;
 pub mod capability;
+pub mod claim_gate;
 pub mod code_review;
 pub mod context_depth;
 pub mod context_manager;

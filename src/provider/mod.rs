@@ -150,6 +150,10 @@ pub struct AnyAgent {
     /// forwarded to `LoopConfig.publish_guard_mode`. Defaults to `Off`
     /// (dirge-1elu.1; the guard is opt-in and off is byte-identical).
     publish_guard_mode: crate::agent::agent_loop::types::GateMode,
+    /// Set by `build_agent` from `Config::resolve_claim_gate_mode`;
+    /// forwarded to `LoopConfig.claim_gate_mode`. Defaults to `Off`
+    /// (dirge-d0e5.2; the gate is opt-in and off is byte-identical).
+    claim_gate_mode: crate::agent::agent_loop::types::GateMode,
     /// Active session id forwarded to `LoopConfig.session_id` for the
     /// open-issues gate and session-scoped tools. `None` in sub-runners.
     session_id: Option<String>,
@@ -356,6 +360,7 @@ impl AnyAgent {
             verification_command: None,
             safe_state_abort_mode: crate::agent::agent_loop::types::SafeStateMode::Off,
             publish_guard_mode: crate::agent::agent_loop::types::GateMode::Off,
+            claim_gate_mode: crate::agent::agent_loop::types::GateMode::Off,
             session_id: None,
             goal_fn: None,
             goal: None,
@@ -590,6 +595,12 @@ impl AnyAgent {
         mode: crate::agent::agent_loop::types::GateMode,
     ) -> Self {
         self.publish_guard_mode = mode;
+        self
+    }
+
+    /// dirge-d0e5.2: set the claim gate mode.
+    pub fn with_claim_gate_mode(mut self, mode: crate::agent::agent_loop::types::GateMode) -> Self {
+        self.claim_gate_mode = mode;
         self
     }
 

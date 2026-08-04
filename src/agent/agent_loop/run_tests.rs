@@ -145,6 +145,7 @@ fn build_config() -> LoopConfig {
         verification_tiers_mode: crate::agent::agent_loop::types::GateMode::Off,
         safe_state_abort_mode: crate::agent::agent_loop::types::SafeStateMode::Off,
         publish_guard_mode: crate::agent::agent_loop::types::GateMode::Off,
+        claim_gate_mode: crate::agent::agent_loop::types::GateMode::Off,
         session_id: None,
         goal_fn: None,
         goal: None,
@@ -4736,6 +4737,125 @@ async fn todo_gate_skips_readonly_turn_even_with_unfinished_todos() {
     assert_eq!(source, FollowUpSource::None);
     assert!(msgs.is_empty(), "no todo nudge on a read-only turn");
     assert_eq!(gates.todo_nudges, 0, "todo budget untouched");
+}
+
+/// dirge-d0e5.2 spec case 7: the claim gate's nudge is a model-visible
+/// `LoopMessage::User` in the messages the finalization poll produces — not
+/// merely an emitted event. A verification claim ("4954 passed") with no
+/// verification command observed this run must fire.
+#[tokio::test]
+async fn claim_gate_fires_model_visible_nudge_on_unsupported_verification_claim() {
+    let mut config = build_config();
+    config.claim_gate_mode = GateMode::Advisory;
+    let epoch = crate::agent::tools::modified::epoch();
+    let mut gates = GateStates {
+        run_epoch: epoch,
+        ..Default::default()
+    };
+    let (emit, _emit_rx) = tokio::sync::mpsc::channel(64);
+    let new_messages = vec![assistant_text("All done. 4954 passed, 0 failed.")];
+
+    let (msgs, source) = poll_finalization_follow_up(
+        &config,
+        "sys",
+        &new_messages,
+        &mut gates,
+        GateInputs::default(),
+        &emit,
+    )
+    .await;
+
+    assert_eq!(source, FollowUpSource::ClaimGate);
+    assert_eq!(msgs.len(), 1, "exactly one nudge");
+    let LoopMessage::User(user) = &msgs[0] else {
+        panic!(
+            "claim nudge must be a model-visible User message; got {:?}",
+            msgs[0]
+        );
+    };
+    let text: String = user
+        .content
+        .iter()
+        .filter_map(|b| match b {
+            crate::agent::agent_loop::message::UserPart::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        text.contains(crate::agent::agent_loop::claim_gate::CLAIM_GATE_TAG),
+        "nudge must carry the claim-check tag; got: {text}"
+    );
+    assert_eq!(gates.claim_nudges, 1, "one-shot budget spent");
+}
+
+/// The discriminating pair (spec case 2): the SAME verification claim with a
+/// verification command actually observed this run is silent.
+#[tokio::test]
+async fn claim_gate_is_silent_when_verification_ran() {
+    let mut config = build_config();
+    config.claim_gate_mode = GateMode::Advisory;
+    let verifier = crate::agent::agent_loop::verifier::VerifierGate::new();
+    verifier.record_outcome(
+        "bash",
+        &serde_json::json!({ "command": "cargo test" }),
+        &crate::agent::agent_loop::result::LoopToolResult {
+            content: vec![serde_json::json!({ "type": "text", "text": "ok" })],
+            details: serde_json::json!(null),
+            terminate: None,
+        },
+        false,
+    );
+    config.verifier = Some(verifier);
+    let epoch = crate::agent::tools::modified::epoch();
+    let mut gates = GateStates {
+        run_epoch: epoch,
+        ..Default::default()
+    };
+    let (emit, _emit_rx) = tokio::sync::mpsc::channel(64);
+    let new_messages = vec![assistant_text("All done. 4954 passed, 0 failed.")];
+
+    let (msgs, source) = poll_finalization_follow_up(
+        &config,
+        "sys",
+        &new_messages,
+        &mut gates,
+        GateInputs::default(),
+        &emit,
+    )
+    .await;
+
+    assert_eq!(source, FollowUpSource::None, "evidence satisfied → silent");
+    assert!(msgs.is_empty());
+    assert_eq!(gates.claim_nudges, 0, "no budget spent");
+}
+
+/// Spec case 6: `off` mode is byte-identical — nothing fires even for a claim
+/// with zero evidence.
+#[tokio::test]
+async fn claim_gate_off_mode_is_silent() {
+    let config = build_config(); // claim_gate_mode defaults to Off
+    let epoch = crate::agent::tools::modified::epoch();
+    let mut gates = GateStates {
+        run_epoch: epoch,
+        ..Default::default()
+    };
+    let (emit, _emit_rx) = tokio::sync::mpsc::channel(64);
+    let new_messages = vec![assistant_text("All done. 4954 passed, 0 failed.")];
+
+    let (msgs, source) = poll_finalization_follow_up(
+        &config,
+        "sys",
+        &new_messages,
+        &mut gates,
+        GateInputs::default(),
+        &emit,
+    )
+    .await;
+
+    assert_eq!(source, FollowUpSource::None, "off mode must not fire");
+    assert!(msgs.is_empty());
+    assert_eq!(gates.claim_nudges, 0, "no budget spent");
 }
 
 /// A turn that made a file edit with unfinished todos still fires the nudge —

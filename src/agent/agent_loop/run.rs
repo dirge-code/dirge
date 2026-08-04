@@ -296,6 +296,10 @@ enum FollowUpSource {
     ResumeAfterFailure,
     /// Verifier gate: code was edited but nothing was run to check it.
     Verifier,
+    /// Deterministic claim/evidence gate (dirge-d0e5.2): the final answer
+    /// claimed a verification result or a change the run's evidence does not
+    /// support. No LLM call.
+    ClaimGate,
     /// Unified finalization judge (dirge-8v98): completeness verdict + diff
     /// findings in one call. One-shot (Off/Advisory) or persistent up to
     /// [`super::code_review::MAX_REVIEW_REACT`] (Blocking).
@@ -319,6 +323,7 @@ impl From<FollowUpSource> for GateSource {
             FollowUpSource::Hook => GateSource::Hook,
             FollowUpSource::ResumeAfterFailure => GateSource::ResumeAfterFailure,
             FollowUpSource::Verifier => GateSource::Verifier,
+            FollowUpSource::ClaimGate => GateSource::ClaimGate,
             FollowUpSource::Critic => GateSource::Critic,
             FollowUpSource::Goal => GateSource::Goal,
             FollowUpSource::Todo => GateSource::Todo,
@@ -624,6 +629,8 @@ async fn poll_finalization_follow_up(
         resume_nudges,
         open_issues_nudges,
         track_nudges,
+        claim_nudges,
+        run_epoch,
     } = gates;
     let GateInputs {
         code_review_baseline,
@@ -717,6 +724,53 @@ async fn poll_finalization_follow_up(
         let msgs = verifier.check_before_finalize(config.verification_tiers_mode);
         if !msgs.is_empty() {
             return (msgs, FollowUpSource::Verifier);
+        }
+    }
+
+    // 2.5 Claim/evidence gate (dirge-d0e5.2) — deterministic, no LLM. Fires
+    //     once when the final answer asserts a verification result or a change
+    //     the run's evidence does not support: a test count / named-gate claim
+    //     ("4954 passed", "clippy clean") with NO verification command
+    //     observed this run, or a first-person "I fixed …" claim with zero
+    //     files mutated. Sits AFTER the verifier gate so the more actionable
+    //     "actually run the check" nudge wins when both would fire; the claim
+    //     gate is the backstop for a model that finalizes while still claiming
+    //     an unrun result. Off by default and byte-identical when off.
+    if config.claim_gate_mode != GateMode::Off
+        && *claim_nudges < super::claim_gate::MAX_CLAIM_NUDGES
+        && let Some(LoopMessage::Assistant(last)) = new_messages.last()
+    {
+        {
+            let answer: String = last
+                .content
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let claims = super::claim_gate::scan_final_answer(&answer);
+            let ran_verification = config
+                .verifier
+                .as_ref()
+                .is_some_and(|v| v.ran_verification());
+            let files_mutated = crate::agent::tools::modified::since(*run_epoch).len();
+            if let Some(kind) =
+                super::claim_gate::unsupported_claims(&claims, ran_verification, files_mutated)
+            {
+                *claim_nudges += 1;
+                return (
+                    vec![LoopMessage::User(super::message::UserMessage {
+                        content: vec![super::message::UserPart::text(format!(
+                            "{} {}",
+                            super::claim_gate::CLAIM_GATE_TAG,
+                            kind.nudge_text()
+                        ))],
+                    })],
+                    FollowUpSource::ClaimGate,
+                );
+            }
         }
     }
     // 3. Unified finalization judge (dirge-8v98) — ONE judge call that both
@@ -2147,7 +2201,10 @@ pub async fn run_loop(
     // dirge-5mtx.5: every finalization gate's re-fire state, in one place. Each
     // field is labelled cost-ceiling or re-fire-guard on `GateStates` itself —
     // that distinction is what decides which are safe to relax.
-    let mut gates = GateStates::default();
+    let mut gates = GateStates {
+        run_epoch: crate::agent::tools::modified::epoch(),
+        ..Default::default()
+    };
 
     // dirge-1g3v: snapshot the working-tree diff at run start so the reviewer
     // can tell what THIS run changed. Without a baseline it diffed the whole
