@@ -877,6 +877,21 @@ async fn poll_finalization_follow_up(
                     .verifier
                     .as_ref()
                     .map(|v| v.status(config.verification_tiers_mode));
+                let evidence = super::critic::Evidence {
+                    files_mutated: crate::agent::tools::modified::since(*run_epoch)
+                        .iter()
+                        .map(|p| p.display().to_string())
+                        .collect(),
+                    observed_commands: config
+                        .verifier
+                        .as_ref()
+                        .map(|v| v.observed_commands())
+                        .unwrap_or_default(),
+                    tool_calls: new_messages
+                        .iter()
+                        .filter(|m| matches!(m, super::message::LoopMessage::ToolResult(_)))
+                        .count(),
+                };
                 let outcome = super::critic::run_unified_review(
                     judge,
                     system_prompt,
@@ -884,6 +899,7 @@ async fn poll_finalization_follow_up(
                     diff_owned.as_deref(),
                     verification,
                     last_review_findings.as_deref(),
+                    Some(&evidence),
                 )
                 .await;
                 let msgs = outcome.messages;

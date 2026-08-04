@@ -251,6 +251,11 @@ the latest request and the transcript.\n\
 - If the assistant ended by asking the user a question or presenting options and is waiting on their \
 decision, that is a CORRECT stopping point, not incompleteness — never tell it to proceed anyway, \
 pick a default, or guess. Judge only the work done up to the question.\n\
+- The `--- evidence ... ---` block in the prompt is a factual record of this run. Check the \
+assistant's claims against it: a claim that names a file it changed, a command it ran, or a result \
+it produced, where the evidence shows no such thing, is an UNSUPPORTED claim — flag it with the \
+concrete mismatch. Never invent a mismatch the evidence does not show, and never flag a claim the \
+evidence supports.\n\
 - Do NOT invent new requirements, scope, or \"nice to haves\". If you cannot determine correctness from \
 the spec and evidence available, ABSTAIN — say what's missing (e.g. no test covering this change, \
 unclear acceptance criteria). An abstention is safer than a false pass. If you are unsure whether \
@@ -327,6 +332,55 @@ fn verification_block(verification: Option<VerificationStatus>) -> &'static str 
         // add nothing, so the critic behaves exactly as before.
         Some(VerificationStatus::NoCodeEdited) | None => "",
     }
+}
+
+/// Deterministic evidence about THIS run, rendered into the critic prompt so
+/// the judge can check the assistant's factual claims against what actually
+/// happened (dirge-d0e5.3). Complements the aggregate
+/// [`VerificationStatus`] block: this names files, commands, and counts, so
+/// a claim like "I applied the two awk fixes" is checkable against the file
+/// list rather than only against "unverified".
+#[derive(Debug, Default, Clone)]
+pub struct Evidence {
+    /// Paths the tracker recorded as mutated since the run's epoch.
+    pub files_mutated: Vec<String>,
+    /// Verification commands observed this run, each with whether it failed,
+    /// latest-first (see [`crate::agent::agent_loop::verifier`]).
+    pub observed_commands: Vec<(String, bool)>,
+    /// Tool-result messages in this finalization's message list.
+    pub tool_calls: usize,
+}
+
+/// Render the evidence block for the critic prompt (dirge-d0e5.3). Empty
+/// when there is no evidence to show. The block renders even when the lists
+/// are empty — `(none)` is the honest signal that a claim has nothing to
+/// stand on, and absence is as informative as presence.
+fn evidence_block(evidence: Option<&Evidence>) -> String {
+    let Some(e) = evidence else {
+        return String::new();
+    };
+    let files = if e.files_mutated.is_empty() {
+        "(none)".to_string()
+    } else {
+        e.files_mutated.join(", ")
+    };
+    let commands = if e.observed_commands.is_empty() {
+        "(none observed)".to_string()
+    } else {
+        e.observed_commands
+            .iter()
+            .map(|(cmd, failed)| format!("{cmd} — {}", if *failed { "FAILED" } else { "passed" }))
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+    format!(
+        "\n\n--- evidence of what happened this run (check the assistant's claims against this; \
+         a claim naming a file, a command, or an outcome that is absent here is UNSUPPORTED) ---\n\
+         files mutated: {files}\n\
+         verification commands observed: {commands}\n\
+         tool calls: {}\n--- end evidence ---",
+        e.tool_calls
+    )
 }
 
 /// Classified verdict signal, strongest (most action-forcing) first. Shared by
@@ -493,6 +547,7 @@ pub fn build_unified_prompt(
     // silently dropping an unaddressed one is the opposite failure). `None`/blank
     // = no section.
     prior_findings: Option<&str>,
+    evidence: Option<&Evidence>,
 ) -> String {
     let rules = strip_compaction_summary(rules).trim();
     let rules_block = if rules.is_empty() {
@@ -523,8 +578,9 @@ pub fn build_unified_prompt(
         "{UNIFIED_FORMAT}\n\n\
          --- assistant instructions & constraints (judge within these; never demand a \
          forbidden/out-of-scope action) ---\n{rules_block}\n--- end instructions ---\n\n\
-         --- transcript ---\n{transcript}\n--- end transcript ---{diff_block}{prior_findings_block}{}",
-        verification_block(verification)
+         --- transcript ---\n{transcript}\n--- end transcript ---{diff_block}{prior_findings_block}{}{}",
+        verification_block(verification),
+        evidence_block(evidence)
     )
 }
 
@@ -628,8 +684,16 @@ pub async fn run_unified_review(
     diff: Option<&str>,
     verification: Option<VerificationStatus>,
     prior_findings: Option<&str>,
+    evidence: Option<&Evidence>,
 ) -> ReviewOutcome {
-    let prompt = build_unified_prompt(rules, transcript, diff, verification, prior_findings);
+    let prompt = build_unified_prompt(
+        rules,
+        transcript,
+        diff,
+        verification,
+        prior_findings,
+        evidence,
+    );
     let response = run_judge!(
         judge,
         prompt,
@@ -663,6 +727,63 @@ pub async fn run_unified_review(
 mod tests {
     use super::*;
 
+    /// dirge-d0e5.3 test 8: the evidence block must reach the critic prompt
+    /// with REAL values — mutated file names, observed verification commands
+    /// with outcomes, and the tool-call count — so the judge can check the
+    /// assistant's factual claims against what actually happened.
+    #[test]
+    fn evidence_block_reaches_prompt_with_real_values() {
+        let evidence = Evidence {
+            files_mutated: vec!["src/agent/loop.rs".to_string(), "Cargo.toml".to_string()],
+            observed_commands: vec![
+                ("cargo test".to_string(), false),
+                ("cargo clippy".to_string(), true),
+            ],
+            tool_calls: 9,
+        };
+        let p = build_unified_prompt("", "t", None, None, None, Some(&evidence));
+        assert!(
+            p.contains("src/agent/loop.rs"),
+            "mutated file must be named"
+        );
+        assert!(p.contains("Cargo.toml"), "mutated file must be named");
+        assert!(p.contains("cargo test"), "observed command must be named");
+        assert!(p.contains("FAILED"), "a failed command must be marked");
+        assert!(p.contains("passed"), "a passing command must be marked");
+        assert!(
+            p.contains("tool calls: 9"),
+            "tool-call count must be present"
+        );
+        assert!(
+            p.contains("UNSUPPORTED"),
+            "the block must say what an absent fact means"
+        );
+        // No evidence → no block; empty-but-present evidence renders the
+        // honest `(none)` markers rather than a gap.
+        assert_eq!(evidence_block(None), "");
+        let empty = build_unified_prompt("", "t", None, None, None, Some(&Evidence::default()));
+        assert!(
+            empty.contains("(none)"),
+            "empty evidence must be marked, not elided"
+        );
+    }
+
+    /// dirge-d0e5.3 test 9: the system preamble must ask the critic to check
+    /// the assistant's claims against the evidence block. Style mirrors
+    /// `preamble_is_calibrated_and_constraint_aware`.
+    #[test]
+    fn preamble_asks_for_claim_check_against_evidence() {
+        let lower = CRITIC_PREAMBLE.to_ascii_lowercase();
+        assert!(
+            lower.contains("evidence"),
+            "preamble must point the critic at the evidence block"
+        );
+        assert!(
+            lower.contains("unsupported") || lower.contains("does not show"),
+            "preamble must tell the critic to flag unsupported claims"
+        );
+    }
+
     /// dirge-uw2l.2: the fast-green-only block must name the gap (the full
     /// suite never ran) while keeping the same calibrated escape hatch as
     /// the `Unverified` block — it is a nudge, not a hard rule, so a project
@@ -695,7 +816,7 @@ mod tests {
         transcript: &str,
         verification: Option<VerificationStatus>,
     ) -> String {
-        build_unified_prompt(rules, transcript, None, verification, None)
+        build_unified_prompt(rules, transcript, None, verification, None, None)
     }
 
     #[test]
@@ -1080,6 +1201,7 @@ mod tests {
             None,
             Some(VerificationStatus::Unverified),
             None,
+            None,
         )
         .await;
         let prompt = seen.lock().unwrap().clone();
@@ -1098,7 +1220,7 @@ mod tests {
         let judge: CriticFn =
             Arc::new(|_p| Box::pin(async { Ok("VERDICT: COMPLETE\nFINDINGS: none".to_string()) }));
         assert!(
-            run_unified_review(&judge, "rules", "did stuff", None, None, None)
+            run_unified_review(&judge, "rules", "did stuff", None, None, None, None)
                 .await
                 .messages
                 .is_empty()
@@ -1205,10 +1327,11 @@ mod tests {
             Some("@@ -1 +1 @@\n-a\n+b"),
             None,
             None,
+            None,
         );
         assert!(with.contains("diff under review"));
         assert!(with.contains("+b"));
-        let without = build_unified_prompt("rules", "did stuff", None, None, None);
+        let without = build_unified_prompt("rules", "did stuff", None, None, None, None);
         assert!(!without.contains("diff under review"));
         // Both carry the combined verdict+findings format contract.
         assert!(with.contains("FINDINGS:"));
@@ -1225,6 +1348,7 @@ mod tests {
             Some("@@ -1 +1 @@\n-a\n+b"),
             None,
             None,
+            None,
         );
         assert!(!p.contains("earlier review"));
         assert!(p.contains("diff under review"));
@@ -1233,7 +1357,14 @@ mod tests {
     #[test]
     fn unified_prompt_omits_prior_findings_section_when_blank() {
         // A whitespace-only string carries no real findings — still no section.
-        let p = build_unified_prompt("rules", "did stuff", Some("diff"), None, Some("  \n "));
+        let p = build_unified_prompt(
+            "rules",
+            "did stuff",
+            Some("diff"),
+            None,
+            Some("  \n "),
+            None,
+        );
         assert!(!p.contains("earlier review"));
     }
 
@@ -1245,6 +1376,7 @@ mod tests {
             Some("diff"),
             None,
             Some("- High — sql injection"),
+            None,
         );
         assert!(
             p.contains("earlier review"),
@@ -1268,7 +1400,7 @@ mod tests {
     async fn run_unified_review_fails_open_on_error() {
         let judge: CriticFn = Arc::new(|_p| Box::pin(async { anyhow::bail!("provider down") }));
         assert!(
-            run_unified_review(&judge, "rules", "did stuff", Some("diff"), None, None)
+            run_unified_review(&judge, "rules", "did stuff", Some("diff"), None, None, None)
                 .await
                 .messages
                 .is_empty(),
@@ -1424,7 +1556,7 @@ mod tests {
     #[tokio::test]
     async fn judge_error_is_not_reported_as_judged() {
         let judge: CriticFn = Arc::new(|_p| Box::pin(async { anyhow::bail!("provider down") }));
-        let out = run_unified_review(&judge, "", "did stuff", Some("diff"), None, None).await;
+        let out = run_unified_review(&judge, "", "did stuff", Some("diff"), None, None, None).await;
         assert!(!out.judged, "a failed call must not claim to have judged");
         assert!(
             out.messages.is_empty(),
@@ -1437,7 +1569,7 @@ mod tests {
     async fn clean_review_is_reported_as_judged() {
         let judge: CriticFn =
             Arc::new(|_p| Box::pin(async { Ok("VERDICT: COMPLETE".to_string()) }));
-        let out = run_unified_review(&judge, "", "did stuff", Some("diff"), None, None).await;
+        let out = run_unified_review(&judge, "", "did stuff", Some("diff"), None, None, None).await;
         assert!(out.judged, "a real response must count as judged");
         assert!(
             out.messages.is_empty(),
@@ -1451,8 +1583,8 @@ mod tests {
     async fn error_and_clean_review_differ_only_in_judged() {
         let err: CriticFn = Arc::new(|_p| Box::pin(async { anyhow::bail!("down") }));
         let ok: CriticFn = Arc::new(|_p| Box::pin(async { Ok("VERDICT: COMPLETE".to_string()) }));
-        let a = run_unified_review(&err, "", "t", Some("d"), None, None).await;
-        let b = run_unified_review(&ok, "", "t", Some("d"), None, None).await;
+        let a = run_unified_review(&err, "", "t", Some("d"), None, None, None).await;
+        let b = run_unified_review(&ok, "", "t", Some("d"), None, None, None).await;
         assert_eq!(a.messages.len(), b.messages.len());
         assert_eq!(a.raised_findings, b.raised_findings);
         assert_ne!(a.judged, b.judged, "only `judged` separates them");

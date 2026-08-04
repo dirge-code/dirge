@@ -197,6 +197,10 @@ mod run_status {
 
 pub use run_status::{record as record_run_verification, take as take_run_verification};
 
+/// Cap on the verification commands kept for the critic's evidence block
+/// (latest-first; dirge-d0e5.3).
+const MAX_OBSERVED_COMMANDS: usize = 6;
+
 /// Per-run verifier gate. See module docs.
 #[derive(Debug)]
 pub struct VerifierGate {
@@ -245,6 +249,11 @@ struct Inner {
     /// (dirge-1elu.2). `None` only in the derived default; every
     /// constructor stamps it.
     run_started_at: Option<std::time::SystemTime>,
+    /// The most recent verification commands and whether each failed,
+    /// latest-first. Feeds the critic's evidence block (dirge-d0e5.3) so the
+    /// judge can check claims against the commands that actually ran; capped
+    /// to keep the prompt block small.
+    observed_commands: std::collections::VecDeque<(String, bool)>,
 }
 
 impl Inner {
@@ -376,6 +385,10 @@ impl VerifierGate {
                     }
                     inner.ran_verification = true;
                     inner.verification_failed = failed;
+                    inner
+                        .observed_commands
+                        .push_front((command.to_string(), failed));
+                    inner.observed_commands.truncate(MAX_OBSERVED_COMMANDS);
                     // Any verification attempt clears the mid-run counter —
                     // the model did go and check, whatever the outcome.
                     inner.edits_since_verify = 0;
@@ -452,6 +465,19 @@ impl VerifierGate {
     /// as [`VerifierGate::status`]).
     pub fn ran_verification(&self) -> bool {
         self.inner.lock_ignore_poison().ran_verification
+    }
+
+    /// Verification commands observed this run, latest-first, each with
+    /// whether it failed. Empty when no build/test command ran (or when
+    /// masking or a self-authored script declined the green). Feeds the
+    /// critic's evidence block (dirge-d0e5.3).
+    pub fn observed_commands(&self) -> Vec<(String, bool)> {
+        self.inner
+            .lock_ignore_poison()
+            .observed_commands
+            .iter()
+            .cloned()
+            .collect()
     }
 
     pub fn edits_since_verify(&self) -> u32 {
