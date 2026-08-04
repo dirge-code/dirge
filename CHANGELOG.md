@@ -4,6 +4,60 @@ All notable changes to dirge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.21.6] - 2026-08-04
+
+### Added
+- **A publish-state guard.** Once verification goes green, nothing stopped the
+  agent throwing that work away — a `git reset --hard`, a `git checkout -- .`,
+  or an `rm` of a file in the verified diff, reported as success on the
+  discarding command's exit status. The safe-state rung only notices after six
+  weighted failures, which a confident cleanup never produces. The guard arms at
+  the fresh-green instant from the same worktree fingerprint safe-state already
+  stamps, and blocks operations that *discard* verified work. Editing a
+  protected file is untouched: dirge sessions keep working after green, and
+  blocking rewrites would nag on every edit-test cycle. `publish_guard`:
+  `off` (default) | `advisory` | `blocking`.
+- **A claim/evidence gate.** Fires when the final answer makes a specific claim
+  the run's evidence does not support — a test count or named-gate result when
+  the verifier saw no verification command at all, or an applied/fixed/changed
+  claim when zero files moved. Deterministic, with quoted and attributed claims
+  carved out. `claim_gate`: `off` (default) | `advisory` | `blocking`.
+- **Falsifiable expectations on learned memories.** A procedural memory can name
+  a trigger and an expected outcome, settled deterministically against the
+  session digest and the run's verification status. Success, failure, and "the
+  situation never arose" stay distinct — collapsing the last two is what makes
+  an expectation unfalsifiable.
+- **Gate co-occurrence** in the per-run tally, plus `scripts/loop-ab-selftest.sh`
+  covering the A/B harness's reporting layer.
+
+### Fixed
+- **Agent-authored check scripts could latch a green verification.** Script-name
+  recognition accepted any path whose basename carried a marker, so a validator
+  the model wrote this run satisfied the gate without the project's tests ever
+  running. A script that *invokes* a real test command still counts — that's a
+  wrapper, not a proxy. Related: the run-start marker is now backdated, because
+  Linux sets filesystem timestamps from a clock cached at timer-tick
+  granularity and a just-written script could read as pre-existing.
+- **A newline is a command separator.** `masks_failure` handled `;` but not its
+  bash synonym, so a validation block chained with newlines and ending in `echo
+  passed` latched green with the status belonging to the echo. The same
+  oversight let a newline bypass the new publish guard.
+- **Two advisory gates steered nobody.** The open-issues and untracked-work
+  reminders emitted a `SystemNotice`, which is a UI event the model never sees,
+  so both fired, rendered, and changed nothing. They now inject a model-visible
+  message; what the human sees is unchanged.
+- **`delegate` reported the wrong files.** `files_changed` unioned a
+  session-cumulative set, so a call that changed nothing still listed the
+  previous call's files — the field a caller uses to check whether work
+  happened. Now scoped to the delegation, alongside a new `evidence` object
+  carrying the verification commands actually observed.
+- **The default test suite failed on live-provider conditions.** A retired
+  DeepSeek model name, and a Cerebras scenario asserting on the wording a live
+  model returned. Environmental conditions now skip rather than fail, keyed on
+  the provider's own rejection so the guard stays lenient instead of vacuous.
+- **`cargo check --no-default-features`** built again — three call sites, not
+  the one previously recorded.
+
 ## [0.21.5] - 2026-08-03
 
 ### Fixed
