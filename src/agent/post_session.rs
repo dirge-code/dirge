@@ -112,6 +112,11 @@ pub fn spawn_post_session(
     digest: crate::agent::session_digest::SessionDigest,
     base: String,
     graduation_enabled: bool,
+    // dirge-1elu.5: deterministic signals the expectation-settle stage
+    // evaluates procedural-memory expectations against. Built at the call
+    // site from the digest (commands) and whatever verification status the
+    // caller can still see; no LLM is involved in the evaluation path.
+    signals: crate::extras::memory_db::ExpectationSignals,
 ) {
     tokio::spawn(async move {
         // dirge-ba0m: at most one orchestrator in flight per
@@ -152,6 +157,10 @@ pub fn spawn_post_session(
             (
                 "skills-curator",
                 Box::pin(stage_skills_curator(agent.clone(), paths.clone())),
+            ),
+            (
+                "expectation-settle",
+                Box::pin(stage_expectation_settle(paths.clone(), signals)),
             ),
             (
                 "memory-curator",
@@ -284,6 +293,54 @@ async fn stage_memory_curator(agent: AnyAgent, paths: ProjectPaths, graduation_e
 
     if let Some(report) = mechanical_report {
         crate::agent::review::run_memory_curator_review(agent, paths, report).await;
+    }
+}
+
+/// dirge-1elu.5: deterministic settle of this run's memory expectations.
+/// No LLM: reads the frozen session-start snapshot, evaluates each
+/// procedural memory that carries an expectation against the session's
+/// deterministic signals (digest commands + finalization verifier status),
+/// and moves only the bounded signed effectiveness counters. "Could not
+/// tell" moves NEITHER counter; nothing is ever deleted. Runs after
+/// background-review (whose writes are session-derived, not snapshot) and
+/// before the curators, preserving the strict ordering the orchestrator
+/// guarantees.
+async fn stage_expectation_settle(
+    paths: ProjectPaths,
+    signals: crate::extras::memory_db::ExpectationSignals,
+) {
+    let store = match crate::extras::memory_db::SqliteMemoryStore::load(&paths) {
+        Ok(store) => store,
+        Err(e) => {
+            tracing::debug!(
+                target: "dirge::expectation_settle",
+                error = %e,
+                "expectation settle skipped — memory store unavailable",
+            );
+            return;
+        }
+    };
+    match tokio::task::spawn_blocking(move || store.settle_expectations(&signals)).await {
+        Ok(Ok(summary)) => {
+            tracing::info!(
+                target: "dirge::expectation_settle",
+                considered = summary.considered,
+                met = summary.met,
+                not_met = summary.not_met,
+                not_observable = summary.not_observable,
+                "memory expectations settled (met→success, not-met→failure, not-observable→no move)",
+            );
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(
+                target: "dirge::expectation_settle",
+                error = %e,
+                "memory expectation settle failed",
+            );
+        }
+        Err(_) => {
+            tracing::debug!(target: "dirge::expectation_settle", "expectation settle task panicked");
+        }
     }
 }
 

@@ -240,12 +240,19 @@ pub(crate) async fn handle_context_compacted(
         // build the digest on-thread, defer its git subprocess to the task.
         let base = crate::agent::review::build_transcript(ctx.session);
         let digest = crate::agent::session_digest::SessionDigest::from_session(ctx.session);
+        // dirge-1elu.5: deterministic expectation signals. The verifier gate
+        // is a run_loop local, not reachable from the Config here, so only
+        // command expectations evaluate — from the digest.
+        let expectation_commands = digest.commands.clone();
         crate::agent::post_session::spawn_post_session(
             agent.clone(),
             paths,
             digest,
             base,
             ctx.cfg.memory_graduation.unwrap_or(true),
+            crate::extras::memory_db::ExpectationSignals {
+                commands: expectation_commands,
+            },
         );
     }
     Ok(())

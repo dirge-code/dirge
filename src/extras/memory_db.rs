@@ -27,6 +27,7 @@
 //! markdown store minted a fresh id on every replace, so any
 //! consolidation reset an entry's age tracking to zero.
 
+use crate::agent::agent_loop::verifier::{GateSignature, gate_signature};
 #[allow(unused_imports)]
 use crate::sync_util::LockExt;
 use std::collections::HashMap;
@@ -324,6 +325,107 @@ struct ActiveRow {
     failure_count: i64,
     /// dirge-fa10: truth-likelihood in [0,1]. See [`DEFAULT_CONFIDENCE`].
     confidence: f64,
+    /// dirge-1elu.5: falsifiable expectation this procedural memory carries,
+    /// if any. NULL for every pre-existing memory — the migration backfills
+    /// nothing, and an expectation is only ever attached explicitly.
+    expectation: Option<MemoryExpectation>,
+}
+
+/// dirge-1elu.5: a falsifiable expectation a procedural memory may carry.
+/// Ask what the memory expects to IMPROVE, expressed as a trigger/behavior
+/// pair: `when` is the observable situation under which the memory should
+/// have applied, `expect` is the behavior it prescribes. Both are command
+/// signatures, evaluated deterministically in the post-session pass against
+/// the run's digest commands — never by an LLM, never by the model's
+/// discretionary `mark`. Met → success, unmet → NotMet → failure, situation
+/// never arose → NotObservable → neither counter (conflating "could not
+/// tell" with "did not work" decays honest memories toward eviction).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemoryExpectation {
+    /// `when` (the situation) and `expect` (the rule), e.g. "run cargo fmt
+    /// before commit" → when=`git commit`, expect=`cargo fmt`. A session
+    /// that committed without formatting is a real, measured failure.
+    /// Ordering within a session's command list is NOT considered — presence
+    /// of both signatures is enough (the digest's command order is
+    /// first-seen, not a reliable timeline).
+    CommandRan {
+        when: GateSignature,
+        expect: GateSignature,
+    },
+}
+
+impl MemoryExpectation {
+    /// Wire form for the `expectation` column: `command_ran:<when>|<expect>`.
+    pub fn as_wire(&self) -> String {
+        let MemoryExpectation::CommandRan { when, expect } = self;
+        format!("command_ran:{}|{}", when.to_wire(), expect.to_wire())
+    }
+
+    /// Parse the wire form. Unknown or unparseable strings — including the
+    /// old single-signature form `command_ran:cargo fmt` — return `None`:
+    /// the memory reads as "no expectation" and is inert, never
+    /// half-parsed into something that then mis-evaluates (migration
+    /// safety: a future version's expectations are never mis-evaluated).
+    pub fn from_wire(s: &str) -> Option<Self> {
+        let rest = s.strip_prefix("command_ran:")?;
+        let (when, expect) = rest.split_once('|')?;
+        if when.is_empty() || expect.is_empty() {
+            return None;
+        }
+        Some(MemoryExpectation::CommandRan {
+            when: GateSignature::from_wire(when)?,
+            expect: GateSignature::from_wire(expect)?,
+        })
+    }
+
+    /// Deterministic evaluation. No LLM; a pure function of the signals.
+    pub fn evaluate(&self, signals: &ExpectationSignals) -> ExpectationVerdict {
+        let MemoryExpectation::CommandRan { when, expect } = self;
+        let when_ran = signals
+            .commands
+            .iter()
+            .any(|c| gate_signature(c).as_ref() == Some(when));
+        let expect_ran = signals
+            .commands
+            .iter()
+            .any(|c| gate_signature(c).as_ref() == Some(expect));
+        match (when_ran, expect_ran) {
+            (false, _) => ExpectationVerdict::NotObservable,
+            (true, true) => ExpectationVerdict::Met,
+            (true, false) => ExpectationVerdict::NotMet,
+        }
+    }
+}
+
+/// Deterministic inputs the settle pass evaluates expectations against.
+/// Built at the post-session spawn site from the session digest (commands).
+/// No LLM in this path (dirge-1elu.5).
+#[derive(Debug, Clone, Default)]
+pub struct ExpectationSignals {
+    /// Command strings recorded this run, matched with `gate_signature`.
+    pub commands: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpectationVerdict {
+    /// The situation arose AND the rule was followed → success.
+    Met,
+    /// The situation arose AND the rule was NOT followed → failure.
+    NotMet,
+    /// The situation never arose this run ("could not tell") — moves
+    /// NEITHER counter. Conflating this with NotMet decays honest memories
+    /// toward eviction.
+    NotObservable,
+}
+
+/// What one settle pass did, for the `dirge::expectation_settle` log line
+/// and tests.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SettleSummary {
+    pub considered: usize,
+    pub met: usize,
+    pub not_met: usize,
+    pub not_observable: usize,
 }
 
 /// What a budget compaction did: `demoted` hot entries moved to the
@@ -384,6 +486,7 @@ pub struct CurationEntry {
 /// injection.
 /// One frozen-snapshot entry (active at load time, passed the
 /// render-time threat scan).
+#[derive(Clone)]
 struct SnapshotEntry {
     target: String,
     kind: String,
@@ -657,7 +760,7 @@ impl SqliteMemoryStore {
     ) -> Result<Vec<ActiveRow>, String> {
         let sql = format!(
             "SELECT id, uid, kind, content, salience, status, tier, last_used_at,
-                    success_count, failure_count, confidence
+                    success_count, failure_count, confidence, expectation
              FROM memories WHERE target = ?1 AND {extra_where} ORDER BY id"
         );
         let mut stmt = conn
@@ -677,6 +780,10 @@ impl SqliteMemoryStore {
                     success_count: row.get(8)?,
                     failure_count: row.get(9)?,
                     confidence: row.get(10)?,
+                    expectation: row
+                        .get(11)
+                        .ok()
+                        .and_then(|s: String| MemoryExpectation::from_wire(&s)),
                 })
             })
             .map_err(|e| format!("Failed to query entries: {e}"))?
@@ -1348,6 +1455,129 @@ impl SqliteMemoryStore {
             "tier": row.tier,
             "content": row.content,
         }))
+    }
+
+    /// dirge-1elu.5: attach (or clear) a falsifiable expectation to a
+    /// procedural memory, matched by substring like `replace`/`remove`.
+    /// Procedural-only; `None` clears. Never backfills — existing memories
+    /// carry no expectation until this (or a future review pass) sets one,
+    /// which is what keeps the migration inert.
+    ///
+    /// Deliberately has no production caller yet: the review pass attaches
+    /// expectations (its own LLM decision), and today the capability is
+    /// exercised by tests and the future review path. Evaluation — the
+    /// settle — is the always-on side.
+    #[allow(dead_code)]
+    pub fn set_expectation(
+        &self,
+        target: &str,
+        old_text: &str,
+        expectation: Option<MemoryExpectation>,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock_ignore_poison();
+        let rows = Self::active_rows(&conn, target)?;
+        let idx = find_unique_match(&rows, old_text)?;
+        let row = &rows[idx];
+        if row.kind != "procedural" {
+            return Err(format!(
+                "Expectations are procedural-only; entry {} is `{}`.",
+                row.uid, row.kind
+            ));
+        }
+        let wire = expectation.as_ref().map(MemoryExpectation::as_wire);
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE memories SET expectation = ?1, updated_at = ?2 WHERE id = ?3",
+            params![wire, now, row.id],
+        )
+        .map_err(|e| format!("Failed to set expectation: {e}"))?;
+        Ok(())
+    }
+
+    /// Row lookup by uid — the frozen snapshot's key. Includes the
+    /// expectation column (dirge-1elu.5).
+    fn row_by_uid(conn: &Connection, uid: &str) -> Result<Option<ActiveRow>, String> {
+        let sql = "SELECT id, uid, kind, content, salience, status, tier, last_used_at,
+                          success_count, failure_count, confidence, expectation
+                   FROM memories WHERE uid = ?1";
+        let mut stmt = conn
+            .prepare(sql)
+            .map_err(|e| format!("Failed to prepare query: {e}"))?;
+        let mut rows = stmt
+            .query_map(params![uid], |row| {
+                Ok(ActiveRow {
+                    id: row.get(0)?,
+                    uid: row.get(1)?,
+                    kind: row.get(2)?,
+                    content: row.get(3)?,
+                    salience: row.get(4)?,
+                    status: row.get(5)?,
+                    tier: row.get(6)?,
+                    last_used_at: row.get(7)?,
+                    success_count: row.get(8)?,
+                    failure_count: row.get(9)?,
+                    confidence: row.get(10)?,
+                    expectation: row
+                        .get(11)
+                        .ok()
+                        .and_then(|s: String| MemoryExpectation::from_wire(&s)),
+                })
+            })
+            .map_err(|e| format!("Failed to query entry: {e}"))?;
+        rows.next()
+            .transpose()
+            .map_err(|e| format!("Failed to read entry: {e}"))
+    }
+
+    /// dirge-1elu.5: evaluate this run's memory expectations against
+    /// deterministic signals. Considered = memories in the FROZEN
+    /// session-start snapshot, kind `procedural`, carrying an expectation.
+    /// Met → `success_count += 1`; NotMet → `failure_count += 1`;
+    /// NotObservable → NEITHER ("could not
+    /// tell" is not "did not work" — conflating them decays honest
+    /// memories toward eviction). Never
+    /// deletes; never touches any other column. This is the ONLY counter
+    /// mover besides the model's `mark` action — the production path for
+    /// expectation evaluation, with no LLM and no agent `mark` in it.
+    pub fn settle_expectations(
+        &self,
+        signals: &ExpectationSignals,
+    ) -> Result<SettleSummary, String> {
+        let conn = self.conn.lock_ignore_poison();
+        let mut summary = SettleSummary::default();
+        let now = chrono::Utc::now().to_rfc3339();
+        let snapshot: Vec<SnapshotEntry> = self.snapshot.lock_ignore_poison().clone();
+        for entry in snapshot.iter().filter(|e| e.kind == "procedural") {
+            let Some(row) = Self::row_by_uid(&conn, &entry.uid)? else {
+                continue;
+            };
+            let Some(exp) = row.expectation else {
+                continue;
+            };
+            summary.considered += 1;
+            match exp.evaluate(signals) {
+                ExpectationVerdict::Met => {
+                    conn.execute(
+                        "UPDATE memories SET success_count = success_count + 1, \
+                         updated_at = ?1 WHERE id = ?2",
+                        params![now, row.id],
+                    )
+                    .map_err(|e| format!("Failed to record expectation success: {e}"))?;
+                    summary.met += 1;
+                }
+                ExpectationVerdict::NotMet => {
+                    conn.execute(
+                        "UPDATE memories SET failure_count = failure_count + 1, \
+                         updated_at = ?1 WHERE id = ?2",
+                        params![now, row.id],
+                    )
+                    .map_err(|e| format!("Failed to record expectation failure: {e}"))?;
+                    summary.not_met += 1;
+                }
+                ExpectationVerdict::NotObservable => summary.not_observable += 1,
+            }
+        }
+        Ok(summary)
     }
 
     /// Record that a procedural playbook succeeded or failed in
@@ -4858,5 +5088,289 @@ mod tests {
             .record_graduation("idempotent-hash", "2025-06-02T12:00:00Z")
             .unwrap();
         assert!(store.is_graduated("idempotent-hash").unwrap());
+    }
+
+    // ── dirge-1elu.5: falsifiable expectations, settled in the post-session pass ──
+    // Evaluation is deterministic (no LLM) and only ever moves the bounded
+    // signed effectiveness counters; it never deletes. `settle_expectations`
+    // is the EXACT method the post-session expectation-settle stage calls —
+    // these tests drive the production path, not a recorder helper.
+
+    /// Case 1 (+ the spec's case 5, which is this same path): the situation
+    /// arose and the rule was followed — success increments, failure does
+    /// not — evaluated through the production settle, with NO agent `mark`
+    /// call anywhere.
+    #[test]
+    fn expectation_met_increments_success_through_production_settle() {
+        let (paths, dir) = temp_project();
+        let store = SqliteMemoryStore::load(&paths).unwrap();
+        store
+            .add_entry(
+                "memory",
+                "run cargo fmt before commit",
+                Some(MemoryKind::Procedural),
+            )
+            .unwrap();
+        store
+            .set_expectation(
+                "memory",
+                "run cargo fmt before commit",
+                Some(MemoryExpectation::CommandRan {
+                    when: GateSignature::from_wire("git commit").unwrap(),
+                    expect: GateSignature::from_wire("cargo fmt").unwrap(),
+                }),
+            )
+            .unwrap();
+        store.refresh_snapshot().unwrap();
+        let uid = store.snapshot.lock_ignore_poison()[0].uid.clone();
+
+        let signals = ExpectationSignals {
+            commands: vec![
+                "cargo fmt --check".to_string(),
+                "git commit -m x".to_string(),
+            ],
+        };
+        let summary = store.settle_expectations(&signals).unwrap();
+        assert_eq!(
+            (summary.considered, summary.met, summary.not_met),
+            (1, 1, 0)
+        );
+        let row = SqliteMemoryStore::row_by_uid(&store.conn.lock_ignore_poison(), &uid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.success_count, 1,
+            "met expectation bumps success — no mark call"
+        );
+        assert_eq!(row.failure_count, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Case 2 — the one that was missing all along: the situation arose and
+    /// the rule was NOT followed. A session that committed without
+    /// formatting is a real, measured failure of this memory.
+    #[test]
+    fn when_ran_but_expect_did_not_is_a_failure() {
+        let (paths, dir) = temp_project();
+        let store = SqliteMemoryStore::load(&paths).unwrap();
+        store
+            .add_entry(
+                "memory",
+                "run cargo fmt before commit",
+                Some(MemoryKind::Procedural),
+            )
+            .unwrap();
+        store
+            .set_expectation(
+                "memory",
+                "run cargo fmt before commit",
+                Some(MemoryExpectation::CommandRan {
+                    when: GateSignature::from_wire("git commit").unwrap(),
+                    expect: GateSignature::from_wire("cargo fmt").unwrap(),
+                }),
+            )
+            .unwrap();
+        store.refresh_snapshot().unwrap();
+        let uid = store.snapshot.lock_ignore_poison()[0].uid.clone();
+
+        // The situation arose (git commit ran) and the rule did not
+        // (cargo fmt never ran) — a measured failure.
+        let signals = ExpectationSignals {
+            commands: vec!["git commit -m x".to_string()],
+        };
+        let summary = store.settle_expectations(&signals).unwrap();
+        assert_eq!(
+            (summary.considered, summary.met, summary.not_met),
+            (1, 0, 1)
+        );
+        let row = SqliteMemoryStore::row_by_uid(&store.conn.lock_ignore_poison(), &uid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.failure_count, 1, "unmet expectation bumps failure");
+        assert_eq!(row.success_count, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Case 3: the situation never arose this run — NEITHER counter moves.
+    #[test]
+    fn when_never_ran_moves_neither_counter() {
+        let (paths, dir) = temp_project();
+        let store = SqliteMemoryStore::load(&paths).unwrap();
+        store
+            .add_entry(
+                "memory",
+                "run cargo fmt before commit",
+                Some(MemoryKind::Procedural),
+            )
+            .unwrap();
+        store
+            .set_expectation(
+                "memory",
+                "run cargo fmt before commit",
+                Some(MemoryExpectation::CommandRan {
+                    when: GateSignature::from_wire("git commit").unwrap(),
+                    expect: GateSignature::from_wire("cargo fmt").unwrap(),
+                }),
+            )
+            .unwrap();
+        store.refresh_snapshot().unwrap();
+        let uid = store.snapshot.lock_ignore_poison()[0].uid.clone();
+
+        let signals = ExpectationSignals {
+            commands: vec!["cargo check".to_string()],
+        };
+        let summary = store.settle_expectations(&signals).unwrap();
+        assert_eq!(
+            (
+                summary.considered,
+                summary.met,
+                summary.not_met,
+                summary.not_observable
+            ),
+            (1, 0, 0, 1)
+        );
+        let row = SqliteMemoryStore::row_by_uid(&store.conn.lock_ignore_poison(), &uid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.success_count, 0, "not-observable is not a success");
+        assert_eq!(row.failure_count, 0, "not-observable is not a failure");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Case 4 — migration safety for the wire form: the OLD single-signature
+    /// form `command_ran:cargo fmt` reads as None (inert), never half-parsed
+    /// into something that then mis-evaluates. Unknown strings too.
+    #[test]
+    fn old_single_signature_wire_form_reads_as_none() {
+        assert_eq!(MemoryExpectation::from_wire("command_ran:cargo fmt"), None);
+        assert_eq!(MemoryExpectation::from_wire("command_ran:cargo fmt|"), None);
+        assert_eq!(
+            MemoryExpectation::from_wire("command_ran:|git commit"),
+            None
+        );
+        assert_eq!(MemoryExpectation::from_wire(""), None);
+        assert_eq!(MemoryExpectation::from_wire("verification_green"), None);
+        assert_eq!(
+            MemoryExpectation::from_wire("command_ran:git commit|cargo fmt"),
+            Some(MemoryExpectation::CommandRan {
+                when: GateSignature::from_wire("git commit").unwrap(),
+                expect: GateSignature::from_wire("cargo fmt").unwrap(),
+            })
+        );
+    }
+
+    /// A memory with NO expectation is never evaluated — inertness for
+    /// everything the migration didn't touch.
+    #[test]
+    fn memory_without_expectation_is_untouched() {
+        let (paths, dir) = temp_project();
+        let store = SqliteMemoryStore::load(&paths).unwrap();
+        store
+            .add_entry(
+                "memory",
+                "no expectation here",
+                Some(MemoryKind::Procedural),
+            )
+            .unwrap();
+        store.refresh_snapshot().unwrap();
+
+        let signals = ExpectationSignals {
+            commands: vec!["git commit -m x".to_string()],
+        };
+        let summary = store.settle_expectations(&signals).unwrap();
+        assert_eq!(
+            summary.considered, 0,
+            "no expectation ⇒ not even considered"
+        );
+        assert_eq!((summary.met, summary.not_met), (0, 0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A memory NOT in the frozen session-start snapshot is not evaluated.
+    #[test]
+    fn expectation_outside_frozen_snapshot_is_not_evaluated() {
+        let (paths, dir) = temp_project();
+        let store = SqliteMemoryStore::load(&paths).unwrap();
+        store
+            .add_entry(
+                "memory",
+                "added after snapshot froze",
+                Some(MemoryKind::Procedural),
+            )
+            .unwrap();
+        store
+            .set_expectation(
+                "memory",
+                "added after snapshot froze",
+                Some(MemoryExpectation::CommandRan {
+                    when: GateSignature::from_wire("git commit").unwrap(),
+                    expect: GateSignature::from_wire("cargo fmt").unwrap(),
+                }),
+            )
+            .unwrap();
+        // NOTE: refresh_snapshot deliberately NOT called — the snapshot is
+        // still the empty frozen set from load time.
+
+        let signals = ExpectationSignals {
+            commands: vec!["git commit -m x".to_string(), "cargo fmt".to_string()],
+        };
+        let summary = store.settle_expectations(&signals).unwrap();
+        assert_eq!(summary.considered, 0, "not injected ⇒ not evaluated");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Migration safety, checked hardest: a DB that predates the expectation
+    /// column opens, migrates in place, keeps its data, and backfills NO
+    /// default expectation onto existing memories.
+    #[test]
+    fn older_db_without_expectation_column_migrates_in_place() {
+        let (paths, dir) = temp_project();
+        {
+            let store = SqliteMemoryStore::load(&paths).unwrap();
+            store
+                .add_entry("memory", "legacy playbook", Some(MemoryKind::Procedural))
+                .unwrap();
+        }
+        // Rewind to a v15-era schema: drop the column, pin user_version.
+        let conn = rusqlite::Connection::open(paths.session_db_path()).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE memories DROP COLUMN expectation;\nPRAGMA user_version = 15;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = SqliteMemoryStore::load(&paths).unwrap();
+        let uid = store.snapshot.lock_ignore_poison()[0].uid.clone();
+        let row = SqliteMemoryStore::row_by_uid(&store.conn.lock_ignore_poison(), &uid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.expectation, None,
+            "migrated row keeps NULL — nothing backfilled"
+        );
+        assert_eq!(row.success_count, 0, "legacy counters untouched");
+
+        // And the capability is live on the migrated DB — attach works.
+        store
+            .set_expectation(
+                "memory",
+                "legacy playbook",
+                Some(MemoryExpectation::CommandRan {
+                    when: GateSignature::from_wire("git commit").unwrap(),
+                    expect: GateSignature::from_wire("cargo test").unwrap(),
+                }),
+            )
+            .unwrap();
+        let row = SqliteMemoryStore::row_by_uid(&store.conn.lock_ignore_poison(), &uid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.expectation,
+            Some(MemoryExpectation::CommandRan {
+                when: GateSignature::from_wire("git commit").unwrap(),
+                expect: GateSignature::from_wire("cargo test").unwrap(),
+            })
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

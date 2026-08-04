@@ -825,9 +825,38 @@ fn cargo_tier(args: &[&str]) -> VerificationTier {
 /// signature, so matching is robust to env prefixes and flag placement
 /// without being string-identical.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct GateSignature {
+pub(crate) struct GateSignature {
     program: String,
     subcommand: Option<String>,
+}
+
+impl GateSignature {
+    /// dirge-1elu.5: wire form for the `command_ran:` memory expectation.
+    /// `<program> <subcommand>` — a program is a single shell word, so a
+    /// first-space split is unambiguous.
+    pub(crate) fn to_wire(&self) -> String {
+        match &self.subcommand {
+            Some(s) => format!("{} {}", self.program, s),
+            None => self.program.clone(),
+        }
+    }
+
+    pub(crate) fn from_wire(s: &str) -> Option<Self> {
+        let mut it = s.splitn(2, ' ');
+        let program = it.next()?.trim().to_string();
+        if program.is_empty() {
+            return None;
+        }
+        let subcommand = it
+            .next()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+        Some(GateSignature {
+            program,
+            subcommand,
+        })
+    }
 }
 
 /// Tokenize a shell command keeping quoted values as ONE word
@@ -900,7 +929,7 @@ fn gate_signatures(command: &str) -> Vec<GateSignature> {
 /// The single signature of a command treated as a gate SPECIFICATION (the
 /// `verification_command` config value). A spec naming a chain is taken by
 /// its last segment: `cargo fmt && cargo clippy` specifies the clippy gate.
-fn gate_signature(command: &str) -> Option<GateSignature> {
+pub(crate) fn gate_signature(command: &str) -> Option<GateSignature> {
     gate_signatures(command).pop()
 }
 
