@@ -737,7 +737,7 @@ async fn poll_finalization_follow_up(
     //     gate is the backstop for a model that finalizes while still claiming
     //     an unrun result. Off by default and byte-identical when off.
     if config.claim_gate_mode != GateMode::Off
-        && *claim_nudges < super::claim_gate::MAX_CLAIM_NUDGES
+        && *claim_nudges < super::claim_gate::claim_nudge_cap(config.claim_gate_mode)
         && let Some(LoopMessage::Assistant(last)) = new_messages.last()
     {
         {

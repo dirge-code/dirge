@@ -22,12 +22,28 @@
 //! not widen them to catch more — a missed fabrication is recoverable; a
 //! gate that nags on honest work gets turned off and then catches nothing.
 
+use super::types::GateMode;
+
 /// Tag prefixing the model-visible nudge, so it is greppable in transcripts.
 pub(crate) const CLAIM_GATE_TAG: &str = "[claim-check]";
 
-/// One-shot per run. The nudge exists to correct a claim or actually run the
-/// check; a model that ignores it once will not be nagged forever.
-pub(crate) const MAX_CLAIM_NUDGES: u8 = 1;
+/// Per-run nudge ceiling, by mode.
+///
+/// `advisory` is one-shot: say it once, and a model that ignores it is not
+/// nagged forever. `blocking` re-enters up to three times, so a run that keeps
+/// finalizing on an unsupported claim keeps being asked — bounded, because a
+/// model that cannot satisfy the check after three tries will not on the
+/// fourth. Mirrors [`super::code_review::MAX_REVIEW_REACT`].
+///
+/// Without this the two modes were byte-identical and the config surface
+/// advertised a distinction that did not exist.
+pub(crate) fn claim_nudge_cap(mode: GateMode) -> u8 {
+    match mode {
+        GateMode::Off => 0,
+        GateMode::Advisory => 1,
+        GateMode::Blocking => 3,
+    }
+}
 
 /// Which unsupported claim fired.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -355,6 +371,22 @@ mod tests {
         assert_eq!(
             fires("The transcript says \"4954 passed\".", false, 0),
             None
+        );
+    }
+    /// dirge-d0e5.2 follow-up: `advisory` and `blocking` must actually differ.
+    /// They were byte-identical at first — both gated on a single `MAX_CLAIM_NUDGES`
+    /// — so the config surface advertised a distinction that did not exist.
+    #[test]
+    fn advisory_and_blocking_have_different_budgets() {
+        assert_eq!(claim_nudge_cap(GateMode::Off), 0, "off must never fire");
+        assert_eq!(
+            claim_nudge_cap(GateMode::Advisory),
+            1,
+            "advisory is one-shot"
+        );
+        assert!(
+            claim_nudge_cap(GateMode::Blocking) > claim_nudge_cap(GateMode::Advisory),
+            "blocking must re-enter more than advisory, else the mode is decorative"
         );
     }
 }

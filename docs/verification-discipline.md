@@ -19,6 +19,9 @@ reason this page exists as its own document rather than a paragraph in
 | Masked-command guard | — | always on |
 | Exploration-prologue bound | `progress_prologue_cap` | `24` |
 | Capability tier | — | observed always; only `Struggling` changes behaviour |
+| Publish-state guard | `publish_guard` | `off` |
+| Claim/evidence gate | `claim_gate` | `off` |
+| Agent-authored validator check | — | always on |
 
 ## The pattern
 
@@ -145,6 +148,28 @@ chain genuinely failed, and that direction is trustworthy.
 the exit status. Redirections carry no pipe. Over-detecting would decline good
 verifications and nag forever, which is the same harm pointed the other way.
 
+A newline is `;`. It was missed at first — the guard scanned for `|`, `;` and `&`
+and nothing else — so this latched green with the status belonging to the `echo`:
+
+```
+diff expected.txt actual.txt
+cmp -s a.bin b.bin
+echo "all checks passed"
+```
+
+Every assertion ran, one printed a mismatch, none stopped the block. The segment
+splitter feeding `is_verification_command` already documented the separators as
+`& | ; \n`; the mask check was written against the same grammar and missed one.
+A backslash-continued newline is not a separator — `cargo test && \` short-circuits
+and its status is honest.
+
+The same oversight let a newline slip a destructive command past the
+publish-state guard's segment splitter, so both were fixed together.
+
+The cost is accepted deliberately: an honest multi-line verification whose last
+line is not the check now gets declined, exactly as `echo start; cargo test`
+already was. In both the status genuinely is not the check's.
+
 ## Exploration-prologue bound (`progress_prologue_cap`)
 
 The progress monitor's stall counter arms only on a progress event, so a run
@@ -253,6 +278,113 @@ measures.** And note that a budget of exactly 1 cannot be scaled at all —
 `1 × 3/2` truncates back to 1 — so routing a one-shot budget through the
 estimator looks like adaptation and does nothing.
 
+## Publish-state guard (`publish_guard`)
+
+**Config:** `publish_guard`: `off` (default) | `advisory` | `blocking`
+
+Everything above is about a check that lied. This one is about a check that told
+the truth and then had its subject deleted.
+
+The failure: verification goes green, and the agent then throws that work away as
+a tidy-up — `rm` of a file in the verified diff, `git reset --hard`, `git checkout
+-- .`, `git clean -fd` — and reports success on the discarding command's exit
+status. Nothing was watching. `safe_state_abort` is the only rung near this, and
+it needs a failure streak of six weighted failures; a confident cleanup produces
+no failures at all.
+
+Prose did not fix it and there is direct evidence for that. The harness studied in
+[arXiv:2604.25850v4](https://arxiv.org/abs/2604.25850) already carried "do not
+destroy verified state" in its seed system prompt. Three of its four
+score-improving iterations were execution-time interlocks enforcing that same
+sentence, and its own ablation put an evolved system prompt alone at **−2.3pp**
+while tools, middleware and memory each scored positive on their own.
+
+The guard arms at the fresh-green instant from the same `worktree_probe`
+fingerprint `safe_state_abort` already stamps — one git sample, one notion of
+what the run changed at green. A later green replaces the set; going stale (an
+edit after green) does not clear it, because previously verified work is still
+worth not destroying.
+
+**It blocks discarding, never modifying.** `write`, `edit`, `sed -i`, appends to a
+protected file all pass. That is a deliberate departure from the source: its
+setting was one-shot benchmark submission where the deliverable is final once
+verified, but a dirge session keeps working after green, and porting the rewrite
+block would nag on every edit-test-edit cycle — the over-detection failure this
+page warns about, pointed the other way.
+
+`/tmp` is never protected, paths outside the verified set are never protected, and
+before any green has latched nothing is.
+
+**There is no override token,** and that is the load-bearing detail. The source
+harness shipped an overrideable version first and measured it leaking: the agent
+attached the token and the deletion went through anyway. The task only flipped
+when deletion of a non-temp protected output became un-overrideable. `advisory`
+and `off` are the escape hatches, and they belong to the user, not the model.
+
+## Claim/evidence gate (`claim_gate`)
+
+**Config:** `claim_gate`: `off` (default) | `advisory` | `blocking`
+
+Fires when the final answer asserts something the run's evidence does not support:
+
+- a verification outcome — a test count (`4954 passed`) or a named gate (`clippy
+  clean`, `fmt clean`, `all green`) — while the verifier recorded **no** build or
+  test command this run;
+- having applied, fixed, or changed something while **zero** files were mutated.
+
+Both shapes are from a real delegation that reported passing gates it had never
+run and fixes it had never applied, in a single turn, having changed nothing.
+
+**Deterministic, with no model in the loop.** A judge asked to detect lying can be
+argued out of it, and can invent accusations that are worse than the miss. A
+pattern over "N passed" conjoined with "the verifier observed zero verification
+commands" does neither.
+
+The conjunction is also the over-detection control. A specific numeric or
+named-gate claim *together with* no observed verification is unlikely to be
+innocent; either half alone is ordinary. Quoted spans and sentences attributed to
+another actor (`CI reported ...`, `you said ...`) are stripped before scanning, so
+a pasted log is never read as the model's own claim.
+
+Do not widen the carve-outs to catch more. A missed fabrication is recoverable; a
+gate that fires on honest work gets switched off, and then it catches nothing.
+
+`advisory` is one-shot. `blocking` re-enters up to three times, bounded because a
+model that cannot satisfy the check in three tries will not on the fourth.
+
+It sits **after** the verifier gate, so when both would fire the more actionable
+"go run the check" nudge wins and this stays the backstop for a model that
+finalizes while still claiming an unrun result.
+
+## Agent-authored validators
+
+Always on, no config.
+
+`script_name_is_verification` accepts any path-shaped command word whose basename
+carries a marker — `./check.sh`, `/tmp/validate.sh`, `scripts/run-tests.sh`. The
+first two are things a model can write in one turn, so a run could author its own
+validator, run it, watch it exit 0, and satisfy the gate without the project's
+tests ever executing. The masked-command guard cannot help: the script exits 0
+honestly.
+
+Recognition that rests **solely** on the script-name branch now declines to record
+a green when that script was created or modified during this run. A script that
+also carries a real word marker still counts — a `check.sh` that *invokes* `cargo
+test` is a wrapper, not a proxy.
+
+Same asymmetry as the masked-command rule beside it: a self-authored script
+reporting success proves nothing, because generator and validator share
+assumptions; one reporting failure is still trustworthy, so the red stands.
+
+Provenance comes from the modified-files registry **or** an mtime at or after run
+start, since a script created by `bash` (`cat > check.sh`) never reaches the
+registry. The run-start marker is backdated one second: Linux sets filesystem
+timestamps from a clock cached at timer-tick granularity, so a file written
+microseconds after `SystemTime::now()` can carry an earlier mtime. That gap was
+real — it passed on macOS and failed on every Linux CI job that runs tests, and
+in production it would have let a just-written proxy validator read as
+pre-existing.
+
 ## Measuring a loop-control change
 
 `scripts/loop-ab.sh` runs the same task N times per arm and compares. Three
@@ -280,3 +412,29 @@ The practical consequence: at n≤3 against a ~2× floor, effects justified by
 "this reduces turns" are not measurable at any sample size worth paying for.
 Prefer changes whose success criterion is **structural** — did the mechanism
 fire when it should, and stay silent otherwise — because those hold at n=1.
+
+**Gate co-occurrence.** Per-run totals cannot tell two gates that always fire at
+the same boundary from two that never overlap, and that distinction is where the
+ceiling lives. The ablation in [arXiv:2604.25850v4](https://arxiv.org/abs/2604.25850)
+had three single-component gains summing to +11.1pp deliver +7.3pp stacked, and
+on its hard tier the memory-only variant beat the full harness outright — several
+components were pushing toward the same closure-style re-check and spending turns
+on redundant verification. dirge ships more finalization gates than that harness
+ever had.
+
+`GateTally` now records which gates and nudges fired *together* at one decision
+point and emits it as `boundaries=` on the `dirge::gates` line;
+`scripts/loop-ab.sh` scrapes it per arm and supports comparing more than two arms,
+which is the shape that ablation needs. It stays observation-only — the tally has
+no control-flow effect, and a test asserts the loop's output is identical with the
+new fields populated.
+
+Finding that two gates fire redundantly is *not* licence to remove one. That is a
+separate decision with its own evidence bar, and the source loop is the
+cautionary tale: it optimised an aggregate dominated by its medium tier and
+silently gave back the hard-tier gain.
+
+**The harness has its own tests now.** `scripts/loop-ab-selftest.sh` runs the real
+reporting awk against a synthetic TSV — no models, no network. It exists because
+four bugs shipped in that awk at once, all silent: the report still printed, it
+just said `none` forever. None of them could fail a Rust test.
