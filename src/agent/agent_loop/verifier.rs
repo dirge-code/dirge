@@ -1226,7 +1226,7 @@ fn script_is_agent_authored(
     let canonical = crate::permission::path::canonical_or_self(&resolved);
     let in_registry = crate::agent::tools::modified::MODIFIED_FILES
         .lock()
-        .is_ok_and(|s| s.contains(&canonical) || s.contains(&resolved));
+        .is_ok_and(|s| s.contains_key(&canonical) || s.contains_key(&resolved));
     if in_registry {
         return true;
     }
@@ -2866,7 +2866,7 @@ mod tests {
         assert!(
             crate::agent::tools::modified::MODIFIED_FILES
                 .lock()
-                .is_ok_and(|s| !s.contains(&script))
+                .is_ok_and(|s| !s.contains_key(&script))
         );
 
         g.record_outcome("edit", &json!({"path": "src/a.rs"}), &ok_result(), false);
