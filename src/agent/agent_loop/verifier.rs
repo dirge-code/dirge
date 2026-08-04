@@ -124,6 +124,107 @@ pub enum VerificationTier {
     Slow,
 }
 
+/// Cross-boundary handoff of a run's final [`VerificationStatus`]
+/// (dirge-1elu.7).
+///
+/// # Why a process-global, and why keyed by session
+///
+/// The status is computed inside `run_loop` from a [`VerifierGate`] the loop
+/// owns; the consumer is the post-session pass in `ui::run_handlers::done`,
+/// which runs on the UI side off an `AgentEvent`. Nothing carries a value
+/// between those two points today, and the obvious routes all cost more than
+/// the signal is worth:
+///
+/// - returning it from `run_agent_loop` does not reach `handle_done` at all,
+///   which fires on the EVENT, not the return;
+/// - carrying it on `AgentEnd` -> `AgentEvent::Done` puts a verifier-internal
+///   type into the UI/stream event contract and touches ~15 construction sites
+///   across subagents, plan runtime, and background review, none of which have
+///   anything to do with verification;
+/// - "persist it on the session" does not avoid the problem, it relocates it:
+///   the session is owned by the UI, so the value still has to travel first.
+///
+/// So this is the same shape as [`crate::agent::tools::modified`] and
+/// `crate::agent::tools::snapshots`, which are process-globals for the same
+/// structural reason. The difference is the key: those are single-slot, and a
+/// single slot here would let a subagent or MCP-delegate run, which share the
+/// process, hand its status to the wrong session. Keying by session id makes a
+/// wrong-session read impossible by construction rather than by convention.
+///
+/// Staleness is handled by taking on read AND recording unconditionally
+/// (including `None`): a run that verified nothing clears its entry rather
+/// than letting an earlier green be re-read.
+mod run_status {
+    use super::VerificationStatus;
+    use crate::sync_util::LockExt;
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex};
+
+    /// Bound on retained entries. Only a session that never reads its own
+    /// status leaks one, so this is a backstop, not a working limit.
+    const MAX_RETAINED: usize = 64;
+
+    static LAST_RUN: LazyLock<Mutex<HashMap<String, VerificationStatus>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    /// Record the status a run finished with. Called once per run from
+    /// `finish_tally`. Recording `None` REMOVES any prior entry: a run that
+    /// ran no verification must not leave an earlier run's green behind.
+    pub fn record(session_id: Option<&str>, status: Option<VerificationStatus>) {
+        let Some(id) = session_id else {
+            return;
+        };
+        let mut map = LAST_RUN.lock_ignore_poison();
+        match status {
+            Some(s) => {
+                if map.len() >= MAX_RETAINED && !map.contains_key(id) {
+                    map.clear();
+                }
+                map.insert(id.to_string(), s);
+            }
+            None => {
+                map.remove(id);
+            }
+        }
+    }
+
+    /// Take this session's status, clearing it. Consuming, so a later run that
+    /// recorded nothing cannot re-read a stale value.
+    pub fn take(session_id: &str) -> Option<VerificationStatus> {
+        LAST_RUN.lock_ignore_poison().remove(session_id)
+    }
+}
+
+pub use run_status::{record as record_run_verification, take as take_run_verification};
+
+/// Cap on the verification commands kept for the critic's evidence block
+/// (latest-first; dirge-d0e5.3).
+const MAX_OBSERVED_COMMANDS: usize = 6;
+
+/// Slack subtracted from the captured run start before comparing a script's
+/// mtime against it (dirge-1elu.2).
+///
+/// Linux updates filesystem timestamps from a clock the kernel caches at
+/// timer-tick granularity, so a file written microseconds AFTER
+/// `SystemTime::now()` can land an mtime marginally BEFORE it. macOS's
+/// finer-grained clock hides this, which is why it only ever surfaced on
+/// Linux CI: a script the agent had just written read as pre-existing and
+/// latched a green it should have declined.
+///
+/// One second is far beyond any tick granularity and far below the interval
+/// that would sweep in genuinely pre-existing files. The failure direction is
+/// the safe one either way: erring toward "authored this run" declines a green
+/// and asks again, which is the direction this whole gate already prefers.
+const MTIME_SLACK: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The run-start instant to compare mtimes against, backdated by
+/// [`MTIME_SLACK`].
+fn run_start_marker() -> std::time::SystemTime {
+    std::time::SystemTime::now()
+        .checked_sub(MTIME_SLACK)
+        .unwrap_or_else(std::time::SystemTime::now)
+}
+
 /// Per-run verifier gate. See module docs.
 #[derive(Debug)]
 pub struct VerifierGate {
@@ -167,6 +268,16 @@ struct Inner {
     /// The project gate has been seen PASS this run. A failing gate run
     /// must not set this — the red dominates downstream.
     ran_project_gate: bool,
+    /// When this gate was built — the run start. A script file whose mtime
+    /// is at-or-after this is treated as authored by the agent THIS run
+    /// (dirge-1elu.2). `None` only in the derived default; every
+    /// constructor stamps it.
+    run_started_at: Option<std::time::SystemTime>,
+    /// The most recent verification commands and whether each failed,
+    /// latest-first. Feeds the critic's evidence block (dirge-d0e5.3) so the
+    /// judge can check claims against the commands that actually ran; capped
+    /// to keep the prompt block small.
+    observed_commands: std::collections::VecDeque<(String, bool)>,
 }
 
 impl Inner {
@@ -194,7 +305,10 @@ impl VerifierGate {
     #[allow(dead_code)]
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            inner: Mutex::new(Inner::default()),
+            inner: Mutex::new(Inner {
+                run_started_at: Some(run_start_marker()),
+                ..Inner::default()
+            }),
         })
     }
 
@@ -220,6 +334,7 @@ impl VerifierGate {
             inner: Mutex::new(Inner {
                 project_gate: project_gate.as_deref().and_then(gate_signature),
                 ci_commands,
+                run_started_at: Some(run_start_marker()),
                 ..Inner::default()
             }),
         })
@@ -273,8 +388,31 @@ impl VerifierGate {
                     if masks_failure(command) && !failed {
                         return;
                     }
+                    // dirge-1elu.2: decline a green that rests SOLELY on a
+                    // script-name match when the script was authored THIS
+                    // run. A self-written validator proves nothing — the
+                    // generator and the validator can share the same wrong
+                    // assumptions — so leave `ran_verification` false, keep
+                    // `edits_since_verify` counting, and let the gate ask
+                    // again. A self-authored script that reports FAILURE is
+                    // still trustworthy in that direction: the red is
+                    // recorded below. A command that also carries a real
+                    // word marker (`./check.sh && cargo test`) stays
+                    // recognized — that's a wrapper, not a proxy.
+                    if !failed
+                        && is_script_name_only(command)
+                        && script_name_paths(command)
+                            .iter()
+                            .any(|p| script_is_agent_authored(command, p, inner.run_started_at))
+                    {
+                        return;
+                    }
                     inner.ran_verification = true;
                     inner.verification_failed = failed;
+                    inner
+                        .observed_commands
+                        .push_front((command.to_string(), failed));
+                    inner.observed_commands.truncate(MAX_OBSERVED_COMMANDS);
                     // Any verification attempt clears the mid-run counter —
                     // the model did go and check, whatever the outcome.
                     inner.edits_since_verify = 0;
@@ -349,6 +487,23 @@ impl VerifierGate {
     /// Code edits since the last verification command of any tier. Feeds
     /// the mid-run nudge; never mutates the gate (same read-only contract
     /// as [`VerifierGate::status`]).
+    pub fn ran_verification(&self) -> bool {
+        self.inner.lock_ignore_poison().ran_verification
+    }
+
+    /// Verification commands observed this run, latest-first, each with
+    /// whether it failed. Empty when no build/test command ran (or when
+    /// masking or a self-authored script declined the green). Feeds the
+    /// critic's evidence block (dirge-d0e5.3).
+    pub fn observed_commands(&self) -> Vec<(String, bool)> {
+        self.inner
+            .lock_ignore_poison()
+            .observed_commands
+            .iter()
+            .cloned()
+            .collect()
+    }
+
     pub fn edits_since_verify(&self) -> u32 {
         self.inner.lock_ignore_poison().edits_since_verify
     }
@@ -560,6 +715,24 @@ fn masks_failure(command: &str) -> bool {
             }
             b';' => {
                 // Only masks when something follows — a trailing `;` does not.
+                if command[i + 1..].trim().is_empty() {
+                    return false;
+                }
+                return true;
+            }
+            b'\n' => {
+                // A newline between commands is an exact synonym for `;`
+                // (dirge-1elu.3): the exit status belongs to the LAST
+                // command, so an earlier failure is discarded. Only masks
+                // when something follows — a trailing newline does not.
+                //
+                // A backslash immediately before the newline is a line
+                // continuation, not a separator — `cargo test && \<newline>
+                // echo done` short-circuits and its status is honest.
+                if i > 0 && bytes[i - 1] == b'\\' {
+                    i += 1;
+                    continue;
+                }
                 if command[i + 1..].trim().is_empty() {
                     return false;
                 }
@@ -779,9 +952,38 @@ fn cargo_tier(args: &[&str]) -> VerificationTier {
 /// signature, so matching is robust to env prefixes and flag placement
 /// without being string-identical.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct GateSignature {
+pub(crate) struct GateSignature {
     program: String,
     subcommand: Option<String>,
+}
+
+impl GateSignature {
+    /// dirge-1elu.5: wire form for the `command_ran:` memory expectation.
+    /// `<program> <subcommand>` — a program is a single shell word, so a
+    /// first-space split is unambiguous.
+    pub(crate) fn to_wire(&self) -> String {
+        match &self.subcommand {
+            Some(s) => format!("{} {}", self.program, s),
+            None => self.program.clone(),
+        }
+    }
+
+    pub(crate) fn from_wire(s: &str) -> Option<Self> {
+        let mut it = s.splitn(2, ' ');
+        let program = it.next()?.trim().to_string();
+        if program.is_empty() {
+            return None;
+        }
+        let subcommand = it
+            .next()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+        Some(GateSignature {
+            program,
+            subcommand,
+        })
+    }
 }
 
 /// Tokenize a shell command keeping quoted values as ONE word
@@ -854,7 +1056,7 @@ fn gate_signatures(command: &str) -> Vec<GateSignature> {
 /// The single signature of a command treated as a gate SPECIFICATION (the
 /// `verification_command` config value). A spec naming a chain is taken by
 /// its last segment: `cargo fmt && cargo clippy` specifies the clippy gate.
-fn gate_signature(command: &str) -> Option<GateSignature> {
+pub(crate) fn gate_signature(command: &str) -> Option<GateSignature> {
     gate_signatures(command).pop()
 }
 
@@ -949,13 +1151,24 @@ fn js_runner_tier(args: &[&str]) -> VerificationTier {
 /// Two-word markers whose leading word isn't a marker on its own.
 const PAIR_MARKERS: &[(&str, &str)] = &[("go", "vet"), ("go", "run"), ("go", "test")];
 
-fn segment_is_verification(segment: &str) -> bool {
+/// Why a segment counted as verification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SegmentMatch {
+    /// No marker and no script-name match.
+    None,
+    /// A word or pair marker matched (`cargo test`, `pytest`, `make check`).
+    Word,
+    /// Only the path-shaped command word matched (`./check.sh`).
+    ScriptName,
+}
+
+fn segment_match(segment: &str) -> SegmentMatch {
     let tokens: Vec<String> = segment
         .split_whitespace()
         .map(|t| t.to_ascii_lowercase())
         .collect();
     if tokens.iter().any(|t| NON_VERIFY.contains(&t.as_str())) {
-        return false;
+        return SegmentMatch::None;
     }
     // Whole-word markers. A `--check`-style flag is its dash-stripped
     // word, so `prettier --check .` and `cmake --build` register.
@@ -963,20 +1176,120 @@ fn segment_is_verification(segment: &str) -> bool {
         .iter()
         .any(|t| WORD_MARKERS.contains(&t.trim_start_matches('-')))
     {
-        return true;
+        return SegmentMatch::Word;
     }
     if tokens
         .windows(2)
         .any(|w| PAIR_MARKERS.contains(&(w[0].as_str(), w[1].as_str())))
     {
-        return true;
+        return SegmentMatch::Word;
     }
     // The command word may be a path to a repo script: match markers
     // inside its basename, split on `-`/`_`/`.`, accepting a plural form,
     // so `./run-tests.sh` and `scripts/lint.sh` register. Only the
     // executed word gets this treatment — an argument like `ls tests/`
     // must not count (dirge-eg37).
-    command_word(&tokens).is_some_and(script_name_is_verification)
+    if command_word(&tokens).is_some_and(script_name_is_verification) {
+        return SegmentMatch::ScriptName;
+    }
+    SegmentMatch::None
+}
+
+/// Behavioural wrapper for the call sites that only need the bool.
+fn segment_is_verification(segment: &str) -> bool {
+    !matches!(segment_match(segment), SegmentMatch::None)
+}
+
+/// True when a command is recognized as verification ONLY through the
+/// script-name path — no word/pair marker appears in any segment
+/// (dirge-1elu.2). A command that also carries a real marker stays
+/// recognized regardless of provenance: a self-written `check.sh` that
+/// invokes `cargo test` is a wrapper, not a proxy.
+fn is_script_name_only(command: &str) -> bool {
+    let mut script = false;
+    for seg in command.split(['&', '|', ';', '\n']) {
+        match segment_match(seg) {
+            SegmentMatch::Word => return false,
+            SegmentMatch::ScriptName => script = true,
+            SegmentMatch::None => {}
+        }
+    }
+    script
+}
+
+/// The path-shaped command words of the segments that matched only by
+/// script name, in their ORIGINAL case — paths are case-sensitive, so the
+/// lowercased tokens used for marker matching can't be reused here.
+fn script_name_paths(command: &str) -> Vec<std::path::PathBuf> {
+    command
+        .split(['&', '|', ';', '\n'])
+        .filter(|seg| matches!(segment_match(seg), SegmentMatch::ScriptName))
+        .filter_map(|seg| {
+            let tokens: Vec<String> = seg.split_whitespace().map(str::to_string).collect();
+            command_word(&tokens).map(std::path::PathBuf::from)
+        })
+        .collect()
+}
+
+/// Did the agent author `path` THIS run? Two OR'd sources — the
+/// modified-files registry (write/edit/apply_patch) and the file's mtime
+/// at-or-after run start (a bash heredoc the registry never sees). If
+/// neither can answer (missing file, unreadable mtime, no run start),
+/// treat it as NOT authored — degrade toward today's behaviour, never
+/// toward a new false nag (dirge-1elu.2).
+/// Resolve a command's script path the way bash would: fold the command's
+/// leading `cd`/`pushd` segments onto the run cwd — the SAME lexical folder
+/// the permission layer uses (`fold_cd_dirs`), not a second implementation
+/// (dirge-1elu.2 follow-up). `cd sub && ./check.sh` resolves `./check.sh`
+/// against `sub/`. Without the semantic-bash feature the path resolves
+/// against the run cwd exactly as before.
+#[cfg(feature = "semantic-bash")]
+fn resolve_script_path(command: &str, path: &std::path::Path) -> std::path::PathBuf {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let segments: Vec<String> = command
+        .split(['&', '|', ';', '\n'])
+        .map(str::to_string)
+        .collect();
+    let effective =
+        crate::agent::tools::bash::check::fold_cd_dirs(&cwd.to_string_lossy(), &segments);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::path::Path::new(&effective).join(path)
+    }
+}
+
+/// Non-semantic-bash builds keep today's behaviour: no cd folding.
+#[cfg(not(feature = "semantic-bash"))]
+fn resolve_script_path(_command: &str, path: &std::path::Path) -> std::path::PathBuf {
+    path.to_path_buf()
+}
+
+fn script_is_agent_authored(
+    command: &str,
+    path: &std::path::Path,
+    run_started_at: Option<std::time::SystemTime>,
+) -> bool {
+    // Registry entries are canonical absolute paths, so a relative command
+    // word (`./check.sh`) must canonicalize against the effective run cwd to
+    // match — which is also the cwd bash inherits, since the tool spawns
+    // without a `current_dir` override. `cd`/`pushd` segments are folded in
+    // first (dirge-1elu.2 follow-up). The raw spelling is checked too, for
+    // entries recorded before canonicalization succeeded.
+    let resolved = resolve_script_path(command, path);
+    let canonical = crate::permission::path::canonical_or_self(&resolved);
+    let in_registry = crate::agent::tools::modified::MODIFIED_FILES
+        .lock()
+        .is_ok_and(|s| s.contains_key(&canonical) || s.contains_key(&resolved));
+    if in_registry {
+        return true;
+    }
+    let Some(run_start) = run_started_at else {
+        return false;
+    };
+    std::fs::metadata(&canonical)
+        .and_then(|m| m.modified())
+        .is_ok_and(|mtime| mtime >= run_start)
 }
 
 /// First token that isn't a `VAR=value` environment prefix.
@@ -2406,6 +2719,7 @@ mod tests {
             "cargo test; echo done",
             "cargo test &",
             "cargo clippy 2>&1 | head -20",
+            "cargo test\necho done",
         ] {
             assert!(masks_failure(cmd), "should be detected as masking: {cmd}");
         }
@@ -2423,6 +2737,8 @@ mod tests {
             "cargo test 2>&1",
             "RUSTFLAGS=\"-D warnings\" cargo clippy --all-targets",
             "cargo test;",
+            "cargo test\n",
+            "cargo test && \\\necho done",
         ] {
             assert!(!masks_failure(cmd), "must not be flagged: {cmd}");
         }
@@ -2448,6 +2764,24 @@ mod tests {
         }
     }
 
+    /// The bug, end to end (dirge-1elu.3): a newline-chained validation
+    /// block whose exit status belongs to a trailing `echo` must NOT latch
+    /// green — every assertion may have failed while the status is honestly
+    /// 0. Same treatment as the `;` shape: success is not recorded.
+    #[test]
+    fn newline_chained_validation_block_does_not_latch_green() {
+        let cmd = "diff expected.txt actual.txt\ncmp -s a.bin b.bin\ntest -f out/report.json\necho \"all checks passed\"";
+        assert!(masks_failure(cmd), "the block's status is the echo's");
+        let g = VerifierGate::new();
+        g.record_outcome("edit", &json!({"path":"src/a.rs"}), &ok_result(), false);
+        g.record_outcome("bash", &json!({"command": cmd}), &ok_result(), false);
+        assert_eq!(
+            g.status(GateMode::Off),
+            VerificationStatus::Unverified,
+            "a masked success proves nothing and must not read as green"
+        );
+    }
+
     /// A masked command that still reports FAILURE is trustworthy in that
     /// direction — something in the chain genuinely failed — so the red is
     /// recorded. Declining it would let a real failure go unreported.
@@ -2460,6 +2794,23 @@ mod tests {
             &json!({"command": "cargo test | tail -2"}),
             &failed_result(),
             false,
+        );
+        assert_eq!(g.status(GateMode::Off), VerificationStatus::VerifiedRed);
+    }
+
+    /// A masked multi-line command that still reports FAILURE is
+    /// trustworthy in that direction — something in the chain genuinely
+    /// failed — so the red is recorded (dirge-1elu.3, same asymmetry as the
+    /// `;` shape).
+    #[test]
+    fn masked_newline_failure_is_still_recorded_as_red() {
+        let g = VerifierGate::new();
+        g.record_outcome("edit", &json!({"path":"src/a.rs"}), &ok_result(), false);
+        g.record_outcome(
+            "bash",
+            &json!({"command":"cargo test\necho done"}),
+            &ok_result(),
+            true,
         );
         assert_eq!(g.status(GateMode::Off), VerificationStatus::VerifiedRed);
     }
@@ -2504,5 +2855,420 @@ mod tests {
             before,
             "a masked check did not verify anything, so the counter must stand"
         );
+    }
+
+    // ── dirge-1elu.2: decline green from agent-authored scripts ────────────
+    // A model can write its own validator, run it, watch it exit 0, and
+    // satisfy the gate without ever running the project's tests. A script
+    // authored THIS RUN proves nothing (generator and validator can share
+    // the same wrong assumptions), so the green is declined — except a
+    // self-authored script reporting FAILURE, which is still trustworthy
+    // in that direction.
+
+    static SCRIPT_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// A unique temp script path (per test) so parallel tests never share
+    /// a file. The basename carries a marker word so the command registers
+    /// as verification via the script-name path.
+    fn script_path(marker: &str) -> std::path::PathBuf {
+        let n = SCRIPT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::env::temp_dir().join(format!("dirge-elu2-{}-{n}-{marker}.sh", std::process::id()))
+    }
+
+    /// Pin a file's mtime to before this gate's run start, so the
+    /// modified-files registry is the ONLY source that can answer
+    /// "authored".
+    fn predate(file: &std::path::Path) {
+        std::fs::File::open(file)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600))
+            .unwrap();
+    }
+
+    /// The bug, reproduced: the agent writes `check.sh` THIS run (in the
+    /// modified-files registry) and runs it; exit 0 must NOT read as green.
+    #[test]
+    fn agent_authored_script_does_not_latch_green() {
+        let script = script_path("check");
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+        predate(&script); // only the registry can answer "authored"
+        crate::agent::tools::modified::mark_modified(&script);
+
+        let g = VerifierGate::new();
+        g.record_outcome("edit", &json!({"path": "src/a.rs"}), &ok_result(), false);
+        g.record_outcome(
+            "bash",
+            &json!({"command": script.to_string_lossy().to_string()}),
+            &ok_result(),
+            false,
+        );
+        assert_eq!(
+            g.status(GateMode::Off),
+            VerificationStatus::Unverified,
+            "a script authored this run proves nothing — must not read as green"
+        );
+        let _ = std::fs::remove_file(&script);
+    }
+
+    /// The bash-authored path: the file is only detectable by mtime — a
+    /// `cat > check.sh` heredoc the registry never sees.
+    #[test]
+    fn bash_authored_script_does_not_latch_green() {
+        let script = script_path("validate");
+        let g = VerifierGate::new(); // gate FIRST: mtime must be >= run start
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+        assert!(
+            crate::agent::tools::modified::MODIFIED_FILES
+                .lock()
+                .is_ok_and(|s| !s.contains_key(&script))
+        );
+
+        g.record_outcome("edit", &json!({"path": "src/a.rs"}), &ok_result(), false);
+        g.record_outcome(
+            "bash",
+            &json!({"command": script.to_string_lossy().to_string()}),
+            &ok_result(),
+            false,
+        );
+        assert_eq!(
+            g.status(GateMode::Off),
+            VerificationStatus::Unverified,
+            "a script created by bash this run must not read as green"
+        );
+        let _ = std::fs::remove_file(&script);
+    }
+
+    /// Over-detection guard: a legitimate repo script that PREDATES the
+    /// run (old mtime, not in the registry) still counts.
+    #[test]
+    fn pre_existing_repo_script_still_latches_green() {
+        let script = script_path("run-tests");
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+        predate(&script);
+        let g = VerifierGate::new(); // gate AFTER: the script predates the run
+
+        g.record_outcome("edit", &json!({"path": "src/a.rs"}), &ok_result(), false);
+        g.record_outcome(
+            "bash",
+            &json!({"command": script.to_string_lossy().to_string()}),
+            &ok_result(),
+            false,
+        );
+        assert_eq!(
+            g.status(GateMode::Off),
+            VerificationStatus::VerifiedGreen,
+            "a repo script that predates the run must still count"
+        );
+        let _ = std::fs::remove_file(&script);
+    }
+
+    /// Wrapper, not proxy: a self-authored script whose command line ALSO
+    /// carries a real word marker stays recognized regardless of who wrote
+    /// it.
+    #[test]
+    fn self_authored_script_with_real_marker_still_counts() {
+        let script = script_path("check");
+        std::fs::write(&script, "#!/bin/sh\ncargo test\nexit 0\n").unwrap();
+        predate(&script);
+        crate::agent::tools::modified::mark_modified(&script);
+
+        let g = VerifierGate::new();
+        g.record_outcome("edit", &json!({"path": "src/a.rs"}), &ok_result(), false);
+        let command = format!("{} && cargo test", script.to_string_lossy());
+        g.record_outcome("bash", &json!({"command": command}), &ok_result(), false);
+        assert_eq!(
+            g.status(GateMode::Off),
+            VerificationStatus::VerifiedGreen,
+            "a real word marker is present — wrapper, not proxy"
+        );
+        let _ = std::fs::remove_file(&script);
+    }
+
+    /// The asymmetry: a self-authored script reporting FAILURE is still
+    /// trustworthy in that direction — record the red.
+    #[test]
+    fn agent_authored_script_failure_is_still_red() {
+        let script = script_path("check");
+        std::fs::write(&script, "#!/bin/sh\nexit 1\n").unwrap();
+        crate::agent::tools::modified::mark_modified(&script);
+
+        let g = VerifierGate::new();
+        g.record_outcome("edit", &json!({"path": "src/a.rs"}), &ok_result(), false);
+        g.record_outcome(
+            "bash",
+            &json!({"command": script.to_string_lossy().to_string()}),
+            &ok_result(),
+            true,
+        );
+        assert_eq!(
+            g.status(GateMode::Off),
+            VerificationStatus::VerifiedRed,
+            "a self-authored script reporting failure is trustworthy"
+        );
+        let _ = std::fs::remove_file(&script);
+    }
+
+    /// Unknown provenance: the path doesn't exist on disk and is not in the
+    /// registry — behave exactly as today.
+    #[test]
+    fn script_with_unknown_provenance_behaves_as_today() {
+        let script = script_path("check"); // never written to disk
+        let g = VerifierGate::new();
+        g.record_outcome("edit", &json!({"path": "src/a.rs"}), &ok_result(), false);
+        g.record_outcome(
+            "bash",
+            &json!({"command": script.to_string_lossy().to_string()}),
+            &ok_result(),
+            false,
+        );
+        assert_eq!(
+            g.status(GateMode::Off),
+            VerificationStatus::VerifiedGreen,
+            "can't tell who wrote it — degrade toward today's behaviour"
+        );
+    }
+
+    /// The same-call heredoc+exec shape: `cat > check.sh <<'EOF'` writes the
+    /// script and a later line of the SAME bash call runs it. The newline
+    /// split lands the exec word in its own segment, so it must be caught
+    /// like any other script-name run — the mtime witness (gate first) does
+    /// the detecting.
+    #[test]
+    fn heredoc_then_execute_in_one_bash_call_is_caught() {
+        let script = script_path("check");
+        let g = VerifierGate::new(); // gate FIRST: mtime is the only witness
+        let command = format!(
+            "cat > {} <<'EOF'\nexit 0\nEOF\n{}",
+            script.to_string_lossy(),
+            script.to_string_lossy()
+        );
+        // The tool call wrote the file; the registry never sees it.
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+        g.record_outcome("edit", &json!({"path": "src/a.rs"}), &ok_result(), false);
+        g.record_outcome("bash", &json!({"command": command}), &ok_result(), false);
+        assert_eq!(
+            g.status(GateMode::Off),
+            VerificationStatus::Unverified,
+            "heredoc-write + same-call execute must not read as green"
+        );
+        let _ = std::fs::remove_file(&script);
+    }
+
+    /// A RELATIVE script word (`../check.sh`) resolves against the run's
+    /// cwd — the same cwd bash inherits — so the registry entry, recorded
+    /// under the same relative spelling, must match. Pins the
+    /// canonicalize-against-run-cwd behaviour.
+    #[test]
+    fn relative_script_path_resolves_against_the_run_cwd() {
+        let rel = std::path::Path::new("..").join(format!(
+            "dirge-elu2-{}-{}.sh",
+            std::process::id(),
+            SCRIPT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::write(&rel, "#!/bin/sh\nexit 0\n").unwrap();
+        predate(&rel); // only the registry can answer "authored"
+        crate::agent::tools::modified::mark_modified(&rel);
+
+        let g = VerifierGate::new();
+        g.record_outcome("edit", &json!({"path": "src/a.rs"}), &ok_result(), false);
+        g.record_outcome(
+            "bash",
+            &json!({"command": rel.to_string_lossy().to_string()}),
+            &ok_result(),
+            false,
+        );
+        assert_eq!(
+            g.status(GateMode::Off),
+            VerificationStatus::Unverified,
+            "a relative-path script authored this run must not read as green"
+        );
+        let _ = std::fs::remove_file(&rel);
+    }
+
+    /// The accepted over-detection trade: a pre-existing script whose mtime
+    /// is refreshed DURING the run (touch, chmod, a build regenerating it)
+    /// is indistinguishable from one bash created this run, so its green is
+    /// declined too. Fail-safe direction — a missed decline would let a
+    /// proxy validator through, which is the worse failure.
+    #[test]
+    fn touched_during_run_script_is_treated_as_authored() {
+        let script = script_path("run-tests");
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+        let g = VerifierGate::new(); // run starts
+        predate(&script); // the script predates the run…
+        // …but something touches it mid-run (touch / build regen).
+        std::fs::File::open(&script)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now())
+            .unwrap();
+        g.record_outcome("edit", &json!({"path": "src/a.rs"}), &ok_result(), false);
+        g.record_outcome(
+            "bash",
+            &json!({"command": script.to_string_lossy().to_string()}),
+            &ok_result(),
+            false,
+        );
+        assert_eq!(
+            g.status(GateMode::Off),
+            VerificationStatus::Unverified,
+            "mtime at-or-after run start reads as authored this run"
+        );
+        let _ = std::fs::remove_file(&script);
+    }
+
+    /// dirge-1elu.2 follow-up (cd-fold): `cd <dir> && ./check.sh` resolves the
+    /// script against the cd'd directory — a proxy validator authored this
+    /// run under that directory must NOT latch green. The run cwd alone would
+    /// miss it (under-detection, the failure direction that matters).
+    #[test]
+    fn cd_folded_script_authored_this_run_does_not_latch_green() {
+        let dir = std::env::temp_dir().join(format!(
+            "dirge-elu2-cd-{}-{}",
+            std::process::id(),
+            SCRIPT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("check.sh");
+        let g = VerifierGate::new(); // gate FIRST: mtime is the only witness
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+        g.record_outcome("edit", &json!({"path": "src/a.rs"}), &ok_result(), false);
+        let command = format!("cd {} && ./check.sh", dir.to_string_lossy());
+        g.record_outcome("bash", &json!({"command": command}), &ok_result(), false);
+        assert_eq!(
+            g.status(GateMode::Off),
+            VerificationStatus::Unverified,
+            "a cd'd-into proxy validator authored this run must not read as green"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Over-detection guard for the cd-fold: the same shape with a script
+    /// that predates the run still latches green.
+    #[test]
+    fn cd_folded_pre_existing_script_still_latches_green() {
+        let dir = std::env::temp_dir().join(format!(
+            "dirge-elu2-cd2-{}-{}",
+            std::process::id(),
+            SCRIPT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("run-tests.sh");
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+        predate(&script);
+        let g = VerifierGate::new(); // gate AFTER: the script predates the run
+        g.record_outcome("edit", &json!({"path": "src/a.rs"}), &ok_result(), false);
+        let command = format!("cd {} && ./run-tests.sh", dir.to_string_lossy());
+        g.record_outcome("bash", &json!({"command": command}), &ok_result(), false);
+        assert_eq!(
+            g.status(GateMode::Off),
+            VerificationStatus::VerifiedGreen,
+            "a pre-existing repo script behind a cd must still count"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    // ── dirge-1elu.7: session-keyed run-status handoff ──────────────
+
+    /// The producer/consumer pair actually connects, and the value that
+    /// comes out is the one that went in.
+    #[test]
+    fn run_status_round_trips_for_its_own_session() {
+        record_run_verification(
+            Some("s-round-trip"),
+            Some(VerificationStatus::VerifiedGreen),
+        );
+        assert_eq!(
+            take_run_verification("s-round-trip"),
+            Some(VerificationStatus::VerifiedGreen)
+        );
+    }
+
+    /// The property the whole session-keyed design exists for: a subagent or
+    /// MCP-delegate run sharing the process must not hand its status to a
+    /// different session.
+    #[test]
+    fn run_status_never_leaks_across_sessions() {
+        record_run_verification(Some("s-owner"), Some(VerificationStatus::VerifiedRed));
+        assert_eq!(take_run_verification("s-other"), None);
+        // The owner's entry is untouched by the foreign read.
+        assert_eq!(
+            take_run_verification("s-owner"),
+            Some(VerificationStatus::VerifiedRed)
+        );
+    }
+
+    /// Taking is consuming, so a second post-session pass in the same session
+    /// reads "could not tell" rather than re-crediting a stale green.
+    #[test]
+    fn run_status_is_taken_not_copied() {
+        record_run_verification(Some("s-once"), Some(VerificationStatus::VerifiedGreen));
+        assert!(take_run_verification("s-once").is_some());
+        assert_eq!(take_run_verification("s-once"), None);
+    }
+
+    /// A run that verified nothing CLEARS its slot. Without this a later run
+    /// with no verification would inherit the previous run's green — the
+    /// stale-read failure this handoff exists to avoid.
+    #[test]
+    fn recording_none_clears_a_prior_status() {
+        record_run_verification(Some("s-clear"), Some(VerificationStatus::VerifiedGreen));
+        record_run_verification(Some("s-clear"), None);
+        assert_eq!(take_run_verification("s-clear"), None);
+    }
+
+    /// No session id (headless paths that never set one) records nothing
+    /// rather than colliding on a shared empty key.
+    #[test]
+    fn missing_session_id_records_nothing() {
+        record_run_verification(None, Some(VerificationStatus::VerifiedGreen));
+        assert_eq!(take_run_verification(""), None);
+    }
+    /// dirge-1elu.2: the run-start marker is backdated, so a script whose
+    /// mtime lands marginally BEFORE `SystemTime::now()` still reads as
+    /// authored this run.
+    ///
+    /// Linux sets filesystem timestamps from a clock the kernel caches at
+    /// timer-tick granularity, so a file written microseconds after the gate
+    /// was constructed can carry an earlier mtime. Without the slack that
+    /// script reads as pre-existing and latches a green it should decline —
+    /// which is exactly what happened on Linux CI while macOS stayed green.
+    ///
+    /// Simulated deterministically rather than by racing a real clock: the
+    /// script's mtime is compared against a marker taken AFTER it, which is
+    /// the same ordering the coarse-clock case produces.
+    #[test]
+    fn mtime_marginally_before_run_start_still_reads_as_authored() {
+        let dir = std::env::temp_dir().join(format!(
+            "dirge-elu2-slack-{}-{}",
+            std::process::id(),
+            SCRIPT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("check.sh");
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+
+        let mtime = std::fs::metadata(&script).unwrap().modified().unwrap();
+
+        // The coarse-clock case: the run "started" slightly AFTER the file's
+        // mtime. Without backdating this reads as pre-existing and latches a
+        // green; with MTIME_SLACK it correctly reads as authored this run.
+        let skewed_now = mtime + std::time::Duration::from_millis(500);
+        assert!(
+            script_is_agent_authored("./check.sh", &script, Some(skewed_now - MTIME_SLACK)),
+            "an mtime marginally before run start must still read as authored"
+        );
+
+        // Bounded: a run that started well after the file was written still
+        // treats it as pre-existing, so the slack can't sweep in real repo
+        // scripts.
+        let much_later = mtime + MTIME_SLACK + std::time::Duration::from_secs(60);
+        assert!(
+            !script_is_agent_authored("./check.sh", &script, Some(much_later - MTIME_SLACK)),
+            "the slack must not sweep in genuinely pre-existing files"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -41,6 +41,7 @@ pub(crate) fn headless_result_json(
     result: &str,
     session_id: &str,
     files_changed: &[String],
+    evidence: &serde_json::Value,
 ) -> serde_json::Value {
     let (subtype, is_error) = match end {
         RunEnd::Completed => ("success", false),
@@ -65,24 +66,32 @@ pub(crate) fn headless_result_json(
         // project isn't a git repo, git isn't on PATH, or the edits were
         // committed mid-run — see dirge MCP `delegate` (issue #704).
         "files_changed": files_changed,
+        // dirge-d0e5.1: what this run actually did — turns, tool calls,
+        // and the verification status observed (or `observed: false` when
+        // no verification command ran at all). Lets a caller check a
+        // claimed test result against observed state without re-running.
+        "evidence": evidence,
         "total_cost_usd": 0.0,
     })
 }
 
-/// Files the run modified — snapshot the process-global modified-files
-/// tracker (write/edit/edit_lines/edit_minified/apply_patch/bash all mark
-/// it) and project each to a `cwd`-relative string when it lives under the
-/// working dir, else its absolute path. Sorted + deduped. Empty when
-/// nothing was touched. The tracker is authoritative and git-independent,
-/// which is the point: a git-status diff silently reports nothing when the
-/// project isn't a repo (issue #704).
-fn headless_files_changed() -> Vec<String> {
+/// Files the run modified — snapshot the modified-files tracker for
+/// entries marked AFTER `since_epoch` (captured at run start, see
+/// [`run_print`]) and project each to a `cwd`-relative string when it
+/// lives under the working dir, else its absolute path. Sorted +
+/// deduped. Empty when nothing was touched. The tracker is
+/// authoritative and git-independent, which is the point: a git-status
+/// diff silently reports nothing when the project isn't a repo, when
+/// git is off PATH, or when the run committed its edits mid-way (issue
+/// #704). Scoping to the epoch keeps the delta per-run rather than
+/// session-cumulative (dirge-d0e5.1).
+fn headless_files_changed(since_epoch: u64) -> Vec<String> {
     // Canonicalize cwd to match the tracker, which stores canonical paths;
     // a raw cwd wouldn't strip on symlinked dirs (e.g. macOS /tmp).
     let cwd = std::env::current_dir()
         .ok()
         .map(|c| crate::permission::path::canonical_or_self(&c));
-    let mut v: Vec<String> = crate::agent::tools::modified::recent(usize::MAX)
+    let mut v: Vec<String> = crate::agent::tools::modified::since(since_epoch)
         .into_iter()
         .map(|p| {
             cwd.as_ref()
@@ -95,6 +104,40 @@ fn headless_files_changed() -> Vec<String> {
     v.sort();
     v.dedup();
     v
+}
+
+/// Evidence of what THIS run actually did, so a caller can check a
+/// claimed result against observed state without re-running anything
+/// (dirge-d0e5.1). Turns and tool-call count are counted by the headless
+/// driver itself; the verification status is the loop's own final read,
+/// handed across the session boundary by `finish_tally` —
+/// `take_run_verification` CONSUMES it, so a run that verified nothing
+/// reports `observed: false` rather than inheriting an earlier run's
+/// green. `None` session id never recorded anything (`record` keys on
+/// the id), so it reads as no verification observed.
+fn run_evidence(
+    num_turns: u32,
+    tool_calls: &[crate::session::ToolCallEntry],
+    session_id: Option<&str>,
+) -> serde_json::Value {
+    use crate::agent::agent_loop::verifier::{VerificationStatus, take_run_verification};
+    let verification = match take_run_verification(session_id.unwrap_or("")) {
+        Some(status) => {
+            let observed = matches!(
+                status,
+                VerificationStatus::VerifiedGreen
+                    | VerificationStatus::VerifiedRed
+                    | VerificationStatus::FastGreenOnly
+            );
+            serde_json::json!({ "observed": observed, "status": format!("{status:?}") })
+        }
+        None => serde_json::json!({ "observed": false, "status": serde_json::Value::Null }),
+    };
+    serde_json::json!({
+        "turns": num_turns,
+        "tool_calls": tool_calls.len(),
+        "verification": verification,
+    })
 }
 
 /// Build a stream-json `assistant` event for one turn (dirge-kuqp).
@@ -185,6 +228,14 @@ impl AnyAgent {
         let agent = self.clone().with_max_turns(Some(max_turns));
         let start_instant = std::time::Instant::now();
         let session_id = runner::uuid_v4_simple();
+        // dirge-d0e5.1: scope this run's `files_changed` to files touched
+        // DURING this delegation, not since the session began. The child
+        // process rehydrates the session's cumulative registry before
+        // run_print starts (session/rehydrate.rs replays `mark_modified`),
+        // so capturing the epoch here excludes every replayed file — a
+        // delegation that changes nothing reports an empty delta even when
+        // earlier delegations in the same session changed files.
+        let since_epoch = crate::agent::tools::modified::epoch();
         let mut num_turns: u32 = 0;
         let suppress_inline = !matches!(output_format, crate::cli::OutputFormat::Text);
 
@@ -479,7 +530,8 @@ impl AnyAgent {
             num_turns,
             &full_response,
             &session_id,
-            &headless_files_changed(),
+            &headless_files_changed(since_epoch),
+            &run_evidence(num_turns, &tool_calls, self.session_id.as_deref()),
         );
 
         match output_format {
@@ -559,24 +611,56 @@ mod tests {
     /// — `--print` consumers parse this JSON, not stderr.
     #[test]
     fn result_envelope_reflects_run_end() {
-        let ok = headless_result_json(RunEnd::Completed, 10, 2, "answer", "sid", &[]);
+        let ok = headless_result_json(
+            RunEnd::Completed,
+            10,
+            2,
+            "answer",
+            "sid",
+            &[],
+            &serde_json::json!({}),
+        );
         assert_eq!(ok["subtype"], "success");
         assert_eq!(ok["is_error"], false);
         assert_eq!(ok["result"], "answer");
 
-        let capped = headless_result_json(RunEnd::Truncated, 10, 100, "partial", "sid", &[]);
+        let capped = headless_result_json(
+            RunEnd::Truncated,
+            10,
+            100,
+            "partial",
+            "sid",
+            &[],
+            &serde_json::json!({}),
+        );
         assert_eq!(capped["subtype"], "error_max_turns");
         assert_eq!(capped["is_error"], true);
         assert_eq!(capped["result"], "partial", "partial text still delivered");
 
-        let died = headless_result_json(RunEnd::Incomplete, 10, 1, "fragment", "sid", &[]);
+        let died = headless_result_json(
+            RunEnd::Incomplete,
+            10,
+            1,
+            "fragment",
+            "sid",
+            &[],
+            &serde_json::json!({}),
+        );
         assert_eq!(died["subtype"], "error");
         assert_eq!(died["is_error"], true);
 
         // dirge-u6zc: a usage-cap pause is a distinct, resumable outcome —
         // its own subtype so a wrapper can re-run after the reset, not the
         // generic "error" it'd share with a runner death.
-        let capped = headless_result_json(RunEnd::UsageCapped, 10, 5, "partial", "sid", &[]);
+        let capped = headless_result_json(
+            RunEnd::UsageCapped,
+            10,
+            5,
+            "partial",
+            "sid",
+            &[],
+            &serde_json::json!({}),
+        );
         assert_eq!(capped["subtype"], "error_usage_cap");
         assert_eq!(capped["is_error"], true);
         assert_eq!(capped["result"], "partial", "partial work still delivered");
@@ -588,15 +672,88 @@ mod tests {
     /// run touched nothing; never absent.
     #[test]
     fn result_envelope_carries_files_changed() {
-        let none = headless_result_json(RunEnd::Completed, 1, 1, "ok", "sid", &[]);
+        let none = headless_result_json(
+            RunEnd::Completed,
+            1,
+            1,
+            "ok",
+            "sid",
+            &[],
+            &serde_json::json!({}),
+        );
         assert_eq!(none["files_changed"], serde_json::json!([]));
 
         let files = ["src/a.rs".to_string(), "tests/b.rs".to_string()];
-        let env = headless_result_json(RunEnd::Completed, 1, 1, "ok", "sid", &files);
+        let env = headless_result_json(
+            RunEnd::Completed,
+            1,
+            1,
+            "ok",
+            "sid",
+            &files,
+            &serde_json::json!({}),
+        );
         assert_eq!(
             env["files_changed"],
             serde_json::json!(["src/a.rs", "tests/b.rs"])
         );
+    }
+
+    /// dirge-d0e5.1: `headless_files_changed` reports the tracker's
+    /// per-run delta — files marked after the run's epoch capture — and
+    /// nothing else. This is the #704 property (the tracker reports
+    /// edited files with no git involved, so a run that committed its
+    /// edits mid-way still reports them) scoped to the run rather than
+    /// the session.
+    #[test]
+    fn files_changed_reports_only_the_runs_epoch_delta() {
+        let dir = std::env::temp_dir().join("dirge-d0e5-headless");
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.rs");
+        let b = dir.join("b.rs");
+        std::fs::write(&a, "x").unwrap();
+        std::fs::write(&b, "x").unwrap();
+
+        // Files the SESSION already had (replayed into the registry by
+        // rehydration before the run started).
+        crate::agent::tools::modified::mark_modified(&a);
+        crate::agent::tools::modified::mark_modified(&b);
+        let epoch = crate::agent::tools::modified::epoch();
+
+        // This run changes nothing → empty delta (spec acceptance 1).
+        let changed = headless_files_changed(epoch);
+        assert!(
+            changed.is_empty(),
+            "a delegation that changes nothing must report no files, got {changed:?}"
+        );
+
+        // This run touches a (via the tracker — no git involved) → only a.
+        crate::agent::tools::modified::mark_modified(&a);
+        let changed = headless_files_changed(epoch);
+        assert!(
+            changed.iter().any(|p| p.ends_with("a.rs")),
+            "the run must report the file it touched: {changed:?}"
+        );
+        assert!(
+            !changed.iter().any(|p| p.ends_with("b.rs")),
+            "a session file untouched this run must not appear: {changed:?}"
+        );
+        crate::agent::tools::modified::clear_modified();
+    }
+
+    /// dirge-d0e5.1: the envelope carries the evidence object. When no
+    /// verification status was recorded the evidence reports no
+    /// verification observed — the field a caller checks against a
+    /// claimed test result.
+    #[test]
+    fn result_envelope_carries_evidence() {
+        let ev = serde_json::json!({
+            "turns": 3,
+            "tool_calls": 7,
+            "verification": { "observed": false, "status": null },
+        });
+        let env = headless_result_json(RunEnd::Completed, 1, 3, "ok", "sid", &[], &ev);
+        assert_eq!(env["evidence"], ev);
     }
 
     /// dirge-kuqp: a turn's assistant event carries its streamed text

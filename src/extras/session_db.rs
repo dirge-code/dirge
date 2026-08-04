@@ -28,9 +28,9 @@ use regex::Regex;
 // caps at v13 so the user_version pragma never outruns the tables that
 // actually exist.
 #[cfg(feature = "experimental-graph-search")]
-pub(crate) const SCHEMA_VERSION: u32 = 15;
+pub(crate) const SCHEMA_VERSION: u32 = 16;
 #[cfg(not(feature = "experimental-graph-search"))]
-pub(crate) const SCHEMA_VERSION: u32 = 13;
+pub(crate) const SCHEMA_VERSION: u32 = 14;
 
 /// Thread-safe snapshot of the most recent `SessionDb::open()` failure.
 /// Port of Hermes's `_last_init_error` (hermes_state.py:66-67).
@@ -341,6 +341,12 @@ impl SessionDb {
         #[cfg(feature = "experimental-graph-search")]
         if current < 15 {
             self.run_migration_v15()?;
+        }
+
+        // dirge-1elu.5: expectation column on memories. Ungated — applies to
+        // every build; adds a nullable column and backfills nothing.
+        if current < 16 {
+            self.run_migration_v16()?;
         }
 
         if current < SCHEMA_VERSION {
@@ -996,6 +1002,24 @@ impl SessionDb {
             )
             .map_err(|e| format!("Migration v14 failed: {e}"))?;
 
+        Ok(())
+    }
+
+    /// dirge-1elu.5: optional falsifiable `expectation` on memories. A
+    /// column added, NOTHING backfilled — existing rows stay NULL, so an
+    /// older DB opens and behaves exactly as before. Idempotent (guarded by
+    /// a column-existence check, like the v9/v11 column drops).
+    fn run_migration_v16(&self) -> Result<(), String> {
+        let has_expectation: bool = self
+            .conn
+            .prepare("SELECT 1 FROM pragma_table_info('memories') WHERE name = 'expectation'")
+            .and_then(|mut s| s.exists([]))
+            .unwrap_or(false);
+        if !has_expectation {
+            self.conn
+                .execute_batch("ALTER TABLE memories ADD COLUMN expectation TEXT;")
+                .map_err(|e| format!("Migration v16 failed: {e}"))?;
+        }
         Ok(())
     }
 

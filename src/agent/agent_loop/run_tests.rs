@@ -144,6 +144,8 @@ fn build_config() -> LoopConfig {
         open_issues_gate_mode: crate::agent::agent_loop::types::GateMode::Off,
         verification_tiers_mode: crate::agent::agent_loop::types::GateMode::Off,
         safe_state_abort_mode: crate::agent::agent_loop::types::SafeStateMode::Off,
+        publish_guard_mode: crate::agent::agent_loop::types::GateMode::Off,
+        claim_gate_mode: crate::agent::agent_loop::types::GateMode::Off,
         session_id: None,
         goal_fn: None,
         goal: None,
@@ -1564,6 +1566,233 @@ async fn test_full_loop_with_tool_then_final_text() {
     let kinds: Vec<_> = drain(&mut rx).await.iter().map(|e| e.kind()).collect();
     assert!(kinds.contains(&"tool_execution_start"));
     assert!(kinds.contains(&"tool_execution_end"));
+}
+
+/// Recording stand-in for the real `bash` tool: same name and `command` arg
+/// shape, but just records the command and returns success. The loop's
+/// verifier plumbing (tools.rs:632) keys on the `bash` name + `command` arg,
+/// so a recorded pass latches fresh-green exactly as a real pass would —
+/// which is what lets a loop-level publish-guard test arm through the real
+/// green path.
+#[derive(Debug)]
+struct RecBashTool {
+    executed: std::sync::Arc<Mutex<Vec<String>>>,
+}
+
+impl RecBashTool {
+    fn new() -> Self {
+        Self {
+            executed: std::sync::Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+}
+
+impl LoopTool for RecBashTool {
+    fn name(&self) -> &str {
+        "bash"
+    }
+
+    fn description(&self) -> &str {
+        "record-only bash"
+    }
+
+    fn label(&self) -> &str {
+        "bash"
+    }
+
+    fn parameters(&self) -> &Value {
+        static EMPTY: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+        EMPTY.get_or_init(
+            || serde_json::json!({"type":"object","properties":{"command":{"type":"string"}}}),
+        )
+    }
+
+    fn execute<'a>(
+        &'a self,
+        _id: &'a str,
+        args: Value,
+        _signal: AbortSignal,
+        _on_update: LoopToolUpdate,
+    ) -> Pin<Box<dyn Future<Output = Result<super::super::LoopToolResult, String>> + Send + 'a>>
+    {
+        let executed = self.executed.clone();
+        Box::pin(async move {
+            let command = args
+                .get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            executed.lock().unwrap().push(command);
+            Ok(super::super::LoopToolResult {
+                content: vec![serde_json::json!({"type":"text","text":"ok"})],
+                details: args,
+                terminate: None,
+            })
+        })
+    }
+}
+
+/// A throwaway git work tree whose only untracked file is `out.json` — the
+/// shape the fingerprint sees at green: every file differing from HEAD,
+/// including bash-mutated / untracked output.
+fn temp_git_worktree() -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "dirge-pubg-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let _ = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&dir)
+        .output();
+    std::fs::write(dir.join("out.json"), "verified content").unwrap();
+    dir
+}
+
+fn flat_text(messages: &[LoopMessage]) -> String {
+    let mut out = String::new();
+    for m in messages {
+        match m {
+            LoopMessage::User(u) => out.push_str(&u.text_joined()),
+            LoopMessage::Assistant(a) => {
+                for b in &a.content {
+                    if let ContentBlock::Text { text } = b {
+                        out.push_str(text);
+                    }
+                }
+            }
+            LoopMessage::ToolResult(t) => {
+                for b in &t.content {
+                    if let ContentBlock::Text { text } = b {
+                        out.push_str(text);
+                    }
+                }
+            }
+            _ => {}
+        }
+        out.push('\n');
+    }
+    out
+}
+
+#[tokio::test]
+async fn publish_guard_blocks_destructive_bash_after_real_green() {
+    let rec_bash = std::sync::Arc::new(RecBashTool::new());
+    let repo = temp_git_worktree();
+    let mut ctx = empty_context();
+    ctx.tools.push(rec_bash.clone());
+    let mut cfg = build_config();
+    cfg.publish_guard_mode = crate::agent::agent_loop::types::GateMode::Blocking;
+    cfg.verifier = Some(crate::agent::agent_loop::verifier::VerifierGate::new());
+    cfg.code_review_repo = Some(repo.clone());
+
+    let factory = canned_factory(vec![
+        tool_use_response(
+            "call-1",
+            "bash",
+            serde_json::json!({"command": "make check"}),
+        ),
+        tool_use_response(
+            "call-2",
+            "bash",
+            serde_json::json!({"command": "rm out.json"}),
+        ),
+        text_response("done"),
+    ]);
+
+    let (tx, mut _rx) = mpsc::channel::<LoopEvent>(128);
+    let messages = run_agent_loop(
+        vec![user("verify and clean up")],
+        ctx,
+        cfg,
+        AbortSignal::new(),
+        &tx,
+        &factory,
+        None, // summarize_fn — test default
+        None, // memory_provider — test default
+    )
+    .await;
+    drop(tx);
+
+    // The green-making `make check` ran; the destructive `rm` never did —
+    // it was suppressed pre-dispatch, which is the whole point of the guard.
+    let executed = rec_bash.executed.lock().unwrap().clone();
+    assert_eq!(
+        executed,
+        vec!["make check".to_string()],
+        "rm must not dispatch"
+    );
+
+    // The model sees an error result explaining the block, tagged like the
+    // other harness injections.
+    let text = flat_text(&messages);
+    assert!(
+        text.contains("[publish-guard]"),
+        "blocked result must carry the harness tag: {text}"
+    );
+    assert!(
+        text.contains("rm out.json") && text.contains("out.json"),
+        "blocked result must name the command and the protected path: {text}"
+    );
+    assert!(
+        text.contains("verified-green") || text.contains("verified"),
+        "blocked result must say why: {text}"
+    );
+
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+#[tokio::test]
+async fn publish_guard_off_is_byte_identical_default() {
+    let rec_bash = std::sync::Arc::new(RecBashTool::new());
+    let repo = temp_git_worktree();
+    let mut ctx = empty_context();
+    ctx.tools.push(rec_bash.clone());
+    let mut cfg = build_config();
+    cfg.publish_guard_mode = crate::agent::agent_loop::types::GateMode::Off;
+    cfg.verifier = Some(crate::agent::agent_loop::verifier::VerifierGate::new());
+    cfg.code_review_repo = Some(repo.clone());
+
+    let factory = canned_factory(vec![
+        tool_use_response(
+            "call-1",
+            "bash",
+            serde_json::json!({"command": "make check"}),
+        ),
+        tool_use_response(
+            "call-2",
+            "bash",
+            serde_json::json!({"command": "rm out.json"}),
+        ),
+        text_response("done"),
+    ]);
+
+    let (tx, mut _rx) = mpsc::channel::<LoopEvent>(128);
+    let messages = run_agent_loop(
+        vec![user("verify and clean up")],
+        ctx,
+        cfg,
+        AbortSignal::new(),
+        &tx,
+        &factory,
+        None, // summarize_fn — test default
+        None, // memory_provider — test default
+    )
+    .await;
+    drop(tx);
+
+    // Off mode is a pure pass-through: both commands executed.
+    let executed = rec_bash.executed.lock().unwrap().clone();
+    assert_eq!(
+        executed,
+        vec!["make check".to_string(), "rm out.json".to_string()]
+    );
+    // No guard message anywhere.
+    assert!(!flat_text(&messages).contains("[publish-guard]"));
+
+    let _ = std::fs::remove_dir_all(&repo);
 }
 
 /// Port of pi test "should use prepareNextTurn snapshot before
@@ -4510,6 +4739,125 @@ async fn todo_gate_skips_readonly_turn_even_with_unfinished_todos() {
     assert_eq!(gates.todo_nudges, 0, "todo budget untouched");
 }
 
+/// dirge-d0e5.2 spec case 7: the claim gate's nudge is a model-visible
+/// `LoopMessage::User` in the messages the finalization poll produces — not
+/// merely an emitted event. A verification claim ("4954 passed") with no
+/// verification command observed this run must fire.
+#[tokio::test]
+async fn claim_gate_fires_model_visible_nudge_on_unsupported_verification_claim() {
+    let mut config = build_config();
+    config.claim_gate_mode = GateMode::Advisory;
+    let epoch = crate::agent::tools::modified::epoch();
+    let mut gates = GateStates {
+        run_epoch: epoch,
+        ..Default::default()
+    };
+    let (emit, _emit_rx) = tokio::sync::mpsc::channel(64);
+    let new_messages = vec![assistant_text("All done. 4954 passed, 0 failed.")];
+
+    let (msgs, source) = poll_finalization_follow_up(
+        &config,
+        "sys",
+        &new_messages,
+        &mut gates,
+        GateInputs::default(),
+        &emit,
+    )
+    .await;
+
+    assert_eq!(source, FollowUpSource::ClaimGate);
+    assert_eq!(msgs.len(), 1, "exactly one nudge");
+    let LoopMessage::User(user) = &msgs[0] else {
+        panic!(
+            "claim nudge must be a model-visible User message; got {:?}",
+            msgs[0]
+        );
+    };
+    let text: String = user
+        .content
+        .iter()
+        .filter_map(|b| match b {
+            crate::agent::agent_loop::message::UserPart::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        text.contains(crate::agent::agent_loop::claim_gate::CLAIM_GATE_TAG),
+        "nudge must carry the claim-check tag; got: {text}"
+    );
+    assert_eq!(gates.claim_nudges, 1, "one-shot budget spent");
+}
+
+/// The discriminating pair (spec case 2): the SAME verification claim with a
+/// verification command actually observed this run is silent.
+#[tokio::test]
+async fn claim_gate_is_silent_when_verification_ran() {
+    let mut config = build_config();
+    config.claim_gate_mode = GateMode::Advisory;
+    let verifier = crate::agent::agent_loop::verifier::VerifierGate::new();
+    verifier.record_outcome(
+        "bash",
+        &serde_json::json!({ "command": "cargo test" }),
+        &crate::agent::agent_loop::result::LoopToolResult {
+            content: vec![serde_json::json!({ "type": "text", "text": "ok" })],
+            details: serde_json::json!(null),
+            terminate: None,
+        },
+        false,
+    );
+    config.verifier = Some(verifier);
+    let epoch = crate::agent::tools::modified::epoch();
+    let mut gates = GateStates {
+        run_epoch: epoch,
+        ..Default::default()
+    };
+    let (emit, _emit_rx) = tokio::sync::mpsc::channel(64);
+    let new_messages = vec![assistant_text("All done. 4954 passed, 0 failed.")];
+
+    let (msgs, source) = poll_finalization_follow_up(
+        &config,
+        "sys",
+        &new_messages,
+        &mut gates,
+        GateInputs::default(),
+        &emit,
+    )
+    .await;
+
+    assert_eq!(source, FollowUpSource::None, "evidence satisfied → silent");
+    assert!(msgs.is_empty());
+    assert_eq!(gates.claim_nudges, 0, "no budget spent");
+}
+
+/// Spec case 6: `off` mode is byte-identical — nothing fires even for a claim
+/// with zero evidence.
+#[tokio::test]
+async fn claim_gate_off_mode_is_silent() {
+    let config = build_config(); // claim_gate_mode defaults to Off
+    let epoch = crate::agent::tools::modified::epoch();
+    let mut gates = GateStates {
+        run_epoch: epoch,
+        ..Default::default()
+    };
+    let (emit, _emit_rx) = tokio::sync::mpsc::channel(64);
+    let new_messages = vec![assistant_text("All done. 4954 passed, 0 failed.")];
+
+    let (msgs, source) = poll_finalization_follow_up(
+        &config,
+        "sys",
+        &new_messages,
+        &mut gates,
+        GateInputs::default(),
+        &emit,
+    )
+    .await;
+
+    assert_eq!(source, FollowUpSource::None, "off mode must not fire");
+    assert!(msgs.is_empty());
+    assert_eq!(gates.claim_nudges, 0, "no budget spent");
+}
+
 /// A turn that made a file edit with unfinished todos still fires the nudge —
 /// the precondition only narrows the gate, it doesn't disable it.
 #[tokio::test]
@@ -5009,6 +5357,290 @@ async fn open_issues_gate_blocking_has_bound() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+/// dirge-1elu.4 (site 2): open-issues gate in Advisory mode must inject a
+/// model-visible, tagged User message — not a display-only SystemNotice the
+/// model never sees. Driven through the production path: the messages come
+/// out of `poll_finalization_follow_up` (the function the loop calls), and
+/// the SystemNotice comes out of `emit_harness_notices` (the mirror the loop
+/// runs on the returned messages).
+#[tokio::test]
+async fn open_issues_gate_advisory_injects_model_visible_message() {
+    use crate::agent::agent_loop::run::OPEN_ISSUES_NUDGE_TAG;
+    let config = build_config();
+    let mut gates = GateStates {
+        critic_done: true,
+        code_review_reacts: 0u8,
+        goal_reacts: 0u8,
+        todo_nudges: MAX_TODO_NUDGES,
+        resume_nudges: 0,
+        open_issues_nudges: 0,
+        ..Default::default()
+    };
+    let (review_emit, mut review_emit_rx) = tokio::sync::mpsc::channel(64);
+
+    let dir = temp_dir("open-issues-advisory");
+    let db_path = dir.join("state.db");
+    let store = crate::extras::issue_db::IssueStore::open_at(&db_path).unwrap();
+    let sid = "open-issues-advisory-sess";
+    store
+        .create("close the telemetry wiring", "", None, Some(sid), None)
+        .unwrap();
+
+    let (msgs, source) = poll_finalization_follow_up(
+        &config,
+        "sys",
+        &[assistant_calling("edit")],
+        &mut gates,
+        GateInputs {
+            code_review_baseline: None,
+            open_issues_gate_mode: GateMode::Advisory,
+            issue_db_path: Some(db_path.as_path()),
+            session_id: Some(sid),
+        },
+        &review_emit,
+    )
+    .await;
+
+    assert_eq!(source, FollowUpSource::OpenIssues);
+    assert_eq!(gates.open_issues_nudges, 1, "one-shot budget spent");
+    assert_eq!(msgs.len(), 1);
+    let content = match &msgs[0] {
+        LoopMessage::User(u) => u.text_joined(),
+        _ => panic!("advisory must inject a User message, got {:?}", msgs[0]),
+    };
+    assert!(
+        content.starts_with(OPEN_ISSUES_NUDGE_TAG),
+        "expected [open-issues] tag, got: {content}"
+    );
+    assert!(
+        content.contains("close or defer them when done"),
+        "the model must see the imperative: {content}"
+    );
+
+    // The human-visible side is unchanged: the loop mirrors the tagged User
+    // message to a SystemNotice — exactly what the old path emitted directly.
+    emit_harness_notices(&review_emit, &msgs).await;
+    match review_emit_rx.recv().await {
+        Some(LoopEvent::SystemNotice { content }) => assert!(
+            content.contains("close or defer them when done"),
+            "SystemNotice must carry the reminder text: {content}"
+        ),
+        other => panic!("expected a SystemNotice, got {other:?}"),
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// dirge-1elu.4 (test 3, site 2): the conversion must not change frequency —
+/// the advisory stays one-shot; a finalization after the budget is spent
+/// produces nothing.
+#[tokio::test]
+async fn open_issues_advisory_is_still_one_shot() {
+    let config = build_config();
+    let mut gates = GateStates {
+        critic_done: true,
+        code_review_reacts: 0u8,
+        goal_reacts: 0u8,
+        todo_nudges: MAX_TODO_NUDGES,
+        resume_nudges: 0,
+        open_issues_nudges: 1,          // budget already spent this run
+        track_nudges: MAX_TRACK_NUDGES, // keep the untracked-work advisory silent too
+        ..Default::default()
+    };
+    let (review_emit, _review_emit_rx) = tokio::sync::mpsc::channel(64);
+
+    let dir = temp_dir("open-issues-advisory-once");
+    let db_path = dir.join("state.db");
+    let store = crate::extras::issue_db::IssueStore::open_at(&db_path).unwrap();
+    store
+        .create("still open", "", None, Some("advisory-once-sess"), None)
+        .unwrap();
+
+    let (msgs, source) = poll_finalization_follow_up(
+        &config,
+        "sys",
+        &[assistant_calling("edit")],
+        &mut gates,
+        GateInputs {
+            code_review_baseline: None,
+            open_issues_gate_mode: GateMode::Advisory,
+            issue_db_path: Some(db_path.as_path()),
+            session_id: Some("advisory-once-sess"),
+        },
+        &review_emit,
+    )
+    .await;
+
+    assert!(msgs.is_empty(), "spent budget must stay silent: {msgs:?}");
+    assert_eq!(source, FollowUpSource::None);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// dirge-1elu.4 (site 3): the file-edits-without-todos advisory must inject a
+/// model-visible, tagged User message — not a display-only SystemNotice.
+/// Shares the `[track]` tag with the boundary nudge. Driven through the
+/// production path (`poll_finalization_follow_up` + the `emit_harness_notices`
+/// mirror the loop runs).
+#[tokio::test]
+async fn untracked_work_advisory_injects_model_visible_message() {
+    use crate::agent::agent_loop::run::TRACK_WORK_TAG;
+    // The advisory requires an EMPTY active-todo list; parallel tests may
+    // have left items in the process-global board, so clear it first.
+    crate::agent::tools::todo::TODO_LIST.lock().unwrap().clear();
+    let config = build_config();
+    let mut gates = GateStates {
+        critic_done: true,
+        code_review_reacts: 0u8,
+        goal_reacts: 0u8,
+        todo_nudges: MAX_TODO_NUDGES,
+        resume_nudges: 0,
+        open_issues_nudges: MAX_OPEN_ISSUES_NUDGES, // keep site 2 from preempting
+        track_nudges: 0,
+        ..Default::default()
+    };
+    let (review_emit, mut review_emit_rx) = tokio::sync::mpsc::channel(64);
+
+    let (msgs, source) = poll_finalization_follow_up(
+        &config,
+        "sys",
+        &[assistant_calling("edit")],
+        &mut gates,
+        GateInputs {
+            code_review_baseline: None,
+            open_issues_gate_mode: GateMode::Off,
+            issue_db_path: None,
+            session_id: Some("untracked-advisory-sess"),
+        },
+        &review_emit,
+    )
+    .await;
+
+    assert_eq!(source, FollowUpSource::Todo);
+    assert_eq!(gates.track_nudges, 1, "one-shot budget spent");
+    assert_eq!(msgs.len(), 1);
+    let content = match &msgs[0] {
+        LoopMessage::User(u) => u.text_joined(),
+        _ => panic!("advisory must inject a User message, got {:?}", msgs[0]),
+    };
+    assert!(
+        content.starts_with(TRACK_WORK_TAG),
+        "expected [track] tag, got: {content}"
+    );
+    assert!(
+        content.contains("write_todo_list"),
+        "the model must see the imperative: {content}"
+    );
+
+    // The human-visible side is unchanged: the mirror emits the SystemNotice.
+    emit_harness_notices(&review_emit, &msgs).await;
+    match review_emit_rx.recv().await {
+        Some(LoopEvent::SystemNotice { content }) => assert!(
+            content.contains("write_todo_list"),
+            "SystemNotice must carry the reminder: {content}"
+        ),
+        other => panic!("expected a SystemNotice, got {other:?}"),
+    }
+}
+
+/// dirge-1elu.4 (test 3, site 3): the conversion must not change frequency —
+/// a finalization after the one-shot budget is spent produces nothing.
+#[tokio::test]
+async fn untracked_work_advisory_is_still_one_shot() {
+    crate::agent::tools::todo::TODO_LIST.lock().unwrap().clear();
+    let config = build_config();
+    let mut gates = GateStates {
+        critic_done: true,
+        code_review_reacts: 0u8,
+        goal_reacts: 0u8,
+        todo_nudges: MAX_TODO_NUDGES,
+        resume_nudges: 0,
+        open_issues_nudges: MAX_OPEN_ISSUES_NUDGES,
+        track_nudges: 1, // budget already spent this run
+        ..Default::default()
+    };
+    let (review_emit, _review_emit_rx) = tokio::sync::mpsc::channel(64);
+
+    let (msgs, source) = poll_finalization_follow_up(
+        &config,
+        "sys",
+        &[assistant_calling("edit")],
+        &mut gates,
+        GateInputs {
+            code_review_baseline: None,
+            open_issues_gate_mode: GateMode::Off,
+            issue_db_path: None,
+            session_id: Some("untracked-once-sess"),
+        },
+        &review_emit,
+    )
+    .await;
+
+    assert!(msgs.is_empty(), "spent budget must stay silent: {msgs:?}");
+    assert_eq!(source, FollowUpSource::None);
+}
+
+/// dirge-1elu.4 (test 5 / site 4): max_turns truncation stays notice-only —
+/// the run is ending, there is no next model turn to steer, so it must NOT
+/// become a steering message. Regression guard against converting it: the
+/// notice goes to the user, the transcript records the truncation, and the
+/// factory is called exactly once (the notice does not re-enter the loop).
+#[tokio::test]
+async fn max_turns_truncation_stays_notice_only() {
+    use crate::agent::agent_loop::run::MAX_TURNS_NOTICE_PREFIX;
+    let calls = std::sync::Arc::new(AtomicUsize::new(0));
+    let calls2 = calls.clone();
+    let factory: StreamFn = std::sync::Arc::new(move |_ctx, _opts| {
+        calls2.fetch_add(1, Ordering::SeqCst);
+        let msg = tool_use_response("call-1", "bash", serde_json::json!({"command": "true"}));
+        let reason = msg.stop_reason;
+        Box::pin(futures::stream::iter(vec![StreamEvent::Done {
+            reason,
+            message: msg,
+            usage: None,
+        }]))
+    });
+    let mut ctx = empty_context();
+    ctx.tools.push(std::sync::Arc::new(RecBashTool::new()));
+    let mut cfg = build_config();
+    cfg.max_turns = Some(1);
+
+    let (tx, mut rx) = mpsc::channel::<LoopEvent>(256);
+    let messages = run_agent_loop(
+        vec![user("start")],
+        ctx,
+        cfg,
+        AbortSignal::new(),
+        &tx,
+        &factory,
+        None, // summarize_fn — test default
+        None, // memory_provider — test default
+    )
+    .await;
+    drop(tx);
+
+    // Exactly one model turn: the notice did not re-enter the loop.
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "truncation must not steer another turn"
+    );
+    // The notice reached the user as a SystemNotice.
+    let events = drain(&mut rx).await;
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            LoopEvent::SystemNotice { content }
+                if content.starts_with(MAX_TURNS_NOTICE_PREFIX)
+        )),
+        "expected the max_turns SystemNotice among {events:?}"
+    );
+    // The transcript records the truncation (contract nicety) — a record,
+    // not a steer.
+    assert!(
+        flat_text(&messages).contains(MAX_TURNS_NOTICE_PREFIX),
+        "truncation notice should be recorded in the returned transcript"
+    );
+}
 
 /// Zero open session issues → inert (FollowUpSource::None).
 #[tokio::test]
@@ -5084,65 +5716,6 @@ async fn open_issues_gate_missing_db_is_inert() {
 
     assert!(msgs.is_empty(), "missing db should be inert (fail-open)");
     assert_eq!(source, FollowUpSource::None);
-}
-
-/// Advisory mode emits a SystemNotice when issues are open but does
-/// NOT re-enter the loop.
-#[tokio::test]
-async fn open_issues_gate_advisory_emits_notice_but_does_not_reenter() {
-    let config = build_config();
-    let mut gates = GateStates {
-        critic_done: true,
-        code_review_reacts: 0u8,
-        goal_reacts: 0u8,
-        todo_nudges: MAX_TODO_NUDGES,
-        resume_nudges: 0,
-        open_issues_nudges: 0,
-        ..Default::default()
-    };
-    let (review_emit, mut review_emit_rx) = tokio::sync::mpsc::channel(64);
-
-    let dir = temp_dir("open-issues-advisory");
-    let db_path = dir.join("state.db");
-    let store = crate::extras::issue_db::IssueStore::open_at(&db_path).unwrap();
-    let sid = "open-issues-advisory-sess";
-    store
-        .create("wire up telemetry", "", None, Some(sid), None)
-        .unwrap();
-
-    // dirge-g2ex: open-issues gate now requires the turn to have made file edits.
-    let (msgs, source) = poll_finalization_follow_up(
-        &config,
-        "sys",
-        &[assistant_calling("edit")],
-        &mut gates,
-        GateInputs {
-            code_review_baseline: None,
-            open_issues_gate_mode: GateMode::Advisory,
-            issue_db_path: Some(db_path.as_path()),
-            session_id: Some(sid),
-        },
-        &review_emit,
-    )
-    .await;
-
-    // Advisory does NOT re-enter (returns empty messages).
-    assert!(msgs.is_empty(), "advisory should not re-enter");
-    assert_eq!(source, FollowUpSource::None);
-    assert_eq!(gates.open_issues_nudges, 1, "counts the advisory");
-
-    // Check that a SystemNotice was emitted.
-    match review_emit_rx.try_recv() {
-        Ok(crate::agent::agent_loop::message::LoopEvent::SystemNotice { content }) => {
-            assert!(
-                content.contains("issue(s) from this session are still open"),
-                "{content}"
-            );
-        }
-        other => panic!("expected SystemNotice, got {other:?}"),
-    }
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ── Blocking review dedupe (dirge-9b2k): skip re-reviewing an unchanged diff ─
@@ -6966,4 +7539,127 @@ fn hallucinated_names_accumulate_across_calls() {
     assert_eq!(tally.hallucinated_tool_names(), 2);
     assert_eq!(tally.errored_tool_calls(), 3);
     assert_eq!(tally.tool_calls(), 3);
+}
+
+// dirge-1elu.6 test 4: the tally's boundary recording is observation only.
+// Two identical runs of a scenario where a finalization gate (the goal
+// judge) fires must produce identical messages and turn counts — the new
+// bookkeeping changes nothing — and each run's `dirge::gates` line must
+// carry the populated `boundaries=` field (recorded, and ignored).
+#[tokio::test]
+async fn boundary_recording_does_not_change_loop_output() {
+    use crate::agent::agent_loop::critic::CriticFn;
+    use crate::agent::agent_loop::gate_tally::tests::field_capture;
+
+    let run_once = || async {
+        let (cap, _guard) = field_capture();
+        let mut ctx = empty_context();
+        ctx.tools.push(std::sync::Arc::new(RecBashTool::new()));
+        let mut cfg = build_config();
+        cfg.goal = Some("all tests pass and committed".into());
+        cfg.goal_fn = Some(std::sync::Arc::new(|_p| {
+            Box::pin(async { Ok("GOAL: UNMET\n- tests still failing".to_string()) })
+        }));
+        let factory = canned_factory(vec![text_response("done")]);
+        let (tx, _rx) = tokio::sync::mpsc::channel(128);
+        let msgs = run_agent_loop(
+            vec![user("task")],
+            ctx,
+            cfg,
+            AbortSignal::new(),
+            &tx,
+            &factory,
+            None,
+            None,
+        )
+        .await;
+        drop(tx);
+        (msgs, cap.snapshot())
+    };
+
+    let (msgs_a, log_a) = run_once().await;
+    let (msgs_b, log_b) = run_once().await;
+
+    assert_eq!(
+        flat_text(&msgs_a),
+        flat_text(&msgs_b),
+        "boundary recording must not change the loop's output"
+    );
+    let gates_a: Vec<&str> = log_a
+        .lines()
+        .filter(|l| l.contains("dirge::gates"))
+        .collect();
+    assert!(
+        !gates_a.is_empty(),
+        "the run must emit a dirge::gates line: {log_a}"
+    );
+    assert!(
+        gates_a.iter().any(|l| l.contains("boundaries=")),
+        "the tally line must carry the populated boundaries= field: {gates_a:?}"
+    );
+    assert!(
+        gates_a.iter().any(|l| l.contains("Goal")),
+        "the goal gate must have fired and been recorded: {gates_a:?}"
+    );
+    let gates_b: Vec<&str> = log_b
+        .lines()
+        .filter(|l| l.contains("dirge::gates"))
+        .collect();
+    assert!(
+        !gates_b.is_empty(),
+        "the second run must also emit a dirge::gates line: {log_b}"
+    );
+}
+
+/// dirge-1elu.7: the PRODUCTION path for the run-status handoff. A loop that
+/// edits code and runs a passing check must leave its status in the
+/// session-keyed slot that the post-session pass reads.
+///
+/// This is the half a direct `record`/`take` unit test cannot prove: those
+/// exercise the slot, this exercises the WIRING from `finish_tally` into it.
+/// Without this, the slot could work perfectly while nothing ever wrote to it
+/// (docs/verification-discipline.md, "Signal never fed").
+#[tokio::test]
+async fn finish_tally_hands_the_run_status_to_the_session_slot() {
+    let repo = temp_git_worktree();
+    let mut ctx = empty_context();
+    ctx.tools.push(std::sync::Arc::new(RecBashTool::new()));
+    let mut cfg = build_config();
+    cfg.session_id = Some("s-production-handoff".to_string());
+    cfg.verifier = Some(crate::agent::agent_loop::verifier::VerifierGate::new());
+    cfg.code_review_repo = Some(repo.clone());
+
+    // Nothing left over from an earlier test in this process.
+    let _ = crate::agent::agent_loop::verifier::take_run_verification("s-production-handoff");
+
+    let factory = canned_factory(vec![
+        tool_use_response(
+            "call-1",
+            "bash",
+            serde_json::json!({"command": "make check"}),
+        ),
+        text_response("done"),
+    ]);
+
+    let (tx, mut _rx) = mpsc::channel::<LoopEvent>(128);
+    let _ = run_agent_loop(
+        vec![user("check it")],
+        ctx,
+        cfg,
+        AbortSignal::new(),
+        &tx,
+        &factory,
+        None,
+        None,
+    )
+    .await;
+    drop(tx);
+
+    let status = crate::agent::agent_loop::verifier::take_run_verification("s-production-handoff");
+    assert!(
+        status.is_some(),
+        "the run must hand its verification status to the session slot; got None"
+    );
+
+    let _ = std::fs::remove_dir_all(&repo);
 }

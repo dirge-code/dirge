@@ -547,6 +547,11 @@ pub async fn build_agent(
     // dirge-uw2l.4: safe-state abort rung (off by default; advisory adds a
     // third failure-ladder rung that re-plans from the last verified-green
     // tree). See resolve_safe_state_abort_mode.
+    // dirge-1elu.1: publish-state guard (off by default; blocking
+    // intercepts commands that would discard verified-green work).
+    agent = agent.with_publish_guard_mode(cfg.resolve_publish_guard_mode());
+    // dirge-d0e5.2: deterministic claim/evidence gate (off by default).
+    agent = agent.with_claim_gate_mode(cfg.resolve_claim_gate_mode());
     agent = agent.with_safe_state_abort_mode(cfg.resolve_safe_state_abort_mode());
     agent = agent.with_session_id(session_id);
 

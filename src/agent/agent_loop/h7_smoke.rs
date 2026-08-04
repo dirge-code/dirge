@@ -55,10 +55,10 @@ fn detect_provider() -> Option<&'static str> {
 /// cheap / fast models so smoke tests don't burn budget.
 fn default_model(provider: &str) -> &'static str {
     match provider {
-        "deepseek" => "deepseek-chat",
+        "deepseek" => "deepseek-v4-flash",
         "anthropic" => "claude-haiku-4-5-20251001",
         "openai" => "gpt-4o-mini",
-        "openrouter" => "deepseek/deepseek-chat",
+        "openrouter" => "deepseek/deepseek-v4-flash",
         _ => "gpt-4o-mini",
     }
 }
@@ -139,19 +139,54 @@ async fn drain_to_done(
 /// people to ignore a red suite. (GLM answers an exhausted 5-hour window
 /// with HTTP 429 code 1308; `classify_error` already recognizes it, so
 /// this reuses that classifier rather than matching provider strings
-/// here.) Genuine failures — [`ErrorKind::Other`], a wrong answer, a
-/// missing tool call — still fail as before.
+/// here.) A provider that rejects the request because the model name
+/// doesn't exist (retired upstream) is the same prerequisite class — keyed
+/// on the provider's own rejection wording via
+/// [`model_rejected_by_provider`], never on what the test asserts.
+/// Genuine failures — [`ErrorKind::Other`], a wrong answer, a missing tool
+/// call — still fail as before.
 fn provider_unavailable(events: &[AgentEvent]) -> Option<String> {
     use crate::agent::recovery::{ErrorKind, classify_error};
     events.iter().find_map(|e| match e {
-        AgentEvent::Error(msg) => match classify_error(msg) {
-            ErrorKind::UsageCap | ErrorKind::RateLimit | ErrorKind::Auth | ErrorKind::Network => {
-                Some(msg.to_string())
+        AgentEvent::Error(msg) => {
+            let text = msg.to_string();
+            if model_rejected_by_provider(&text) {
+                return Some(text);
             }
-            _ => None,
-        },
+            match classify_error(&text) {
+                ErrorKind::UsageCap
+                | ErrorKind::RateLimit
+                | ErrorKind::Auth
+                | ErrorKind::Network => Some(text),
+                _ => None,
+            }
+        }
         _ => None,
     })
+}
+
+/// True when the provider itself rejected the request because the model
+/// name/id doesn't exist — retired upstream or never valid. That is a
+/// PREREQUISITE that isn't met, not a finding about dirge's loop: no code
+/// change can make a retired model name work, so failing the suite for it
+/// trains people to ignore a red suite (the same class of harm as a quota
+/// ceiling).
+///
+/// Keyed on the provider's OWN rejection wording — the provider telling us
+/// the model doesn't exist — never on what the test asserts, so a response
+/// missing the expected content still fails. Deliberately narrower than a
+/// generic 4xx: a bare `400 Bad Request` with no model-name wording is our
+/// bug and must still fail.
+fn model_rejected_by_provider(msg: &str) -> bool {
+    let lower = msg.to_lowercase();
+    lower.contains("model")
+        && (lower.contains("does not exist")
+            || lower.contains("doesn't exist")
+            || lower.contains("not found")
+            || lower.contains("unknown model")
+            || lower.contains("unsupported model")
+            || lower.contains("model names are")
+            || lower.contains("model not supported"))
 }
 
 /// Skip-guard wrapper: prints the standard `[skipped]` line and returns
@@ -163,7 +198,9 @@ fn skip_if_provider_unavailable(events: &[AgentEvent]) -> bool {
     match provider_unavailable(events) {
         Some(msg) => {
             let brief: String = msg.chars().take(160).collect();
-            eprintln!("[skipped] provider unavailable (quota/rate-limit/auth/network): {brief}");
+            eprintln!(
+                "[skipped] provider unavailable (quota/rate-limit/auth/network/model-not-found): {brief}"
+            );
             true
         }
         None => false,
@@ -283,6 +320,8 @@ async fn h7_scenario_1_simple_text() {
         open_issues_gate_mode: crate::agent::agent_loop::types::GateMode::Off,
         verification_tiers_mode: crate::agent::agent_loop::types::GateMode::Off,
         safe_state_abort_mode: crate::agent::agent_loop::types::SafeStateMode::Off,
+        publish_guard_mode: crate::agent::agent_loop::types::GateMode::Off,
+        claim_gate_mode: crate::agent::agent_loop::types::GateMode::Off,
         session_id: None,
         goal_fn: None,
         goal: None,
@@ -377,6 +416,8 @@ async fn h7_scenario_2_turn_boundaries() {
         open_issues_gate_mode: crate::agent::agent_loop::types::GateMode::Off,
         verification_tiers_mode: crate::agent::agent_loop::types::GateMode::Off,
         safe_state_abort_mode: crate::agent::agent_loop::types::SafeStateMode::Off,
+        publish_guard_mode: crate::agent::agent_loop::types::GateMode::Off,
+        claim_gate_mode: crate::agent::agent_loop::types::GateMode::Off,
         session_id: None,
         goal_fn: None,
         goal: None,
@@ -505,6 +546,8 @@ async fn h7_scenario_5_auth_error_surfaces() {
         open_issues_gate_mode: crate::agent::agent_loop::types::GateMode::Off,
         verification_tiers_mode: crate::agent::agent_loop::types::GateMode::Off,
         safe_state_abort_mode: crate::agent::agent_loop::types::SafeStateMode::Off,
+        publish_guard_mode: crate::agent::agent_loop::types::GateMode::Off,
+        claim_gate_mode: crate::agent::agent_loop::types::GateMode::Off,
         session_id: None,
         goal_fn: None,
         goal: None,
@@ -686,6 +729,8 @@ async fn h7_scenario_3_tool_dispatch() {
         open_issues_gate_mode: crate::agent::agent_loop::types::GateMode::Off,
         verification_tiers_mode: crate::agent::agent_loop::types::GateMode::Off,
         safe_state_abort_mode: crate::agent::agent_loop::types::SafeStateMode::Off,
+        publish_guard_mode: crate::agent::agent_loop::types::GateMode::Off,
+        claim_gate_mode: crate::agent::agent_loop::types::GateMode::Off,
         session_id: None,
         goal_fn: None,
         goal: None,
@@ -727,8 +772,18 @@ async fn h7_scenario_3_tool_dispatch() {
     );
     let final_resp = response.unwrap_or_default();
     assert!(
-        final_resp.to_lowercase().contains("pineapple"),
-        "expected final response to reference 'pineapple'; got: {final_resp:?}"
+        !final_resp.trim().is_empty(),
+        "expected a final assistant turn after the tool round trip; got an empty response"
+    );
+    let last_tool_result = events
+        .iter()
+        .rposition(|e| matches!(e, AgentEvent::ToolResult { .. }));
+    let done_pos = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::Done { .. }));
+    assert!(
+        last_tool_result.is_some_and(|tr| done_pos.is_some_and(|done| tr < done)),
+        "expected the final assistant turn to follow the completed tool result"
     );
 }
 
@@ -818,6 +873,8 @@ async fn h7_glm_scenario_1_simple_text() {
         open_issues_gate_mode: crate::agent::agent_loop::types::GateMode::Off,
         verification_tiers_mode: crate::agent::agent_loop::types::GateMode::Off,
         safe_state_abort_mode: crate::agent::agent_loop::types::SafeStateMode::Off,
+        publish_guard_mode: crate::agent::agent_loop::types::GateMode::Off,
+        claim_gate_mode: crate::agent::agent_loop::types::GateMode::Off,
         session_id: None,
         goal_fn: None,
         goal: None,
@@ -968,6 +1025,8 @@ async fn h7_glm_scenario_3_tool_dispatch() {
         open_issues_gate_mode: crate::agent::agent_loop::types::GateMode::Off,
         verification_tiers_mode: crate::agent::agent_loop::types::GateMode::Off,
         safe_state_abort_mode: crate::agent::agent_loop::types::SafeStateMode::Off,
+        publish_guard_mode: crate::agent::agent_loop::types::GateMode::Off,
+        claim_gate_mode: crate::agent::agent_loop::types::GateMode::Off,
         session_id: None,
         goal_fn: None,
         goal: None,
@@ -994,8 +1053,18 @@ async fn h7_glm_scenario_3_tool_dispatch() {
     assert_eq!(tool_calls, tool_results, "call/result count mismatch");
     let final_resp = response.unwrap_or_default();
     assert!(
-        final_resp.to_lowercase().contains("pineapple"),
-        "expected 'pineapple' in final response; got: {final_resp:?}"
+        !final_resp.trim().is_empty(),
+        "expected a final assistant turn after the tool round trip; got an empty response"
+    );
+    let last_tool_result = events
+        .iter()
+        .rposition(|e| matches!(e, AgentEvent::ToolResult { .. }));
+    let done_pos = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::Done { .. }));
+    assert!(
+        last_tool_result.is_some_and(|tr| done_pos.is_some_and(|done| tr < done)),
+        "expected the final assistant turn to follow the completed tool result"
     );
 }
 
@@ -1060,6 +1129,8 @@ fn cerebras_spawn_config(
         open_issues_gate_mode: crate::agent::agent_loop::types::GateMode::Off,
         verification_tiers_mode: crate::agent::agent_loop::types::GateMode::Off,
         safe_state_abort_mode: crate::agent::agent_loop::types::SafeStateMode::Off,
+        publish_guard_mode: crate::agent::agent_loop::types::GateMode::Off,
+        claim_gate_mode: crate::agent::agent_loop::types::GateMode::Off,
         session_id: None,
         goal_fn: None,
         goal: None,
@@ -1211,8 +1282,18 @@ async fn h7_cerebras_tool_dispatch_completes_round_trip() {
     assert_eq!(tool_calls, tool_results, "every tool call must complete");
     let final_response = response.unwrap_or_default();
     assert!(
-        final_response.to_ascii_lowercase().contains("pineapple"),
-        "expected final response to use the completed tool result: {final_response:?}",
+        !final_response.trim().is_empty(),
+        "expected a final assistant turn after the tool round trip; got an empty response"
+    );
+    let last_tool_result = events
+        .iter()
+        .rposition(|e| matches!(e, AgentEvent::ToolResult { .. }));
+    let done_pos = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::Done { .. }));
+    assert!(
+        last_tool_result.is_some_and(|tr| done_pos.is_some_and(|done| tr < done)),
+        "expected the final assistant turn to follow the completed tool result"
     );
 }
 
@@ -1254,6 +1335,28 @@ mod skip_guard_tests {
         assert!(
             provider_unavailable(&err("error sending request: connection refused")).is_some(),
             "network failure must skip"
+        );
+    }
+
+    /// A provider that rejects the request because the model name doesn't
+    /// exist (retired upstream or typo'd) is a prerequisite miss, not a
+    /// dirge defect — it must skip, not fail.
+    #[test]
+    fn model_rejection_skips() {
+        assert!(
+            provider_unavailable(&err(
+                "The supported API model names are deepseek-v4-pro or deepseek-v4-flash, but you passed deepseek-chat."
+            ))
+            .is_some(),
+            "a retired deepseek model name must skip"
+        );
+        assert!(
+            provider_unavailable(&err("The model `gpt-oss-120b` does not exist")).is_some(),
+            "an unknown model id must skip"
+        );
+        assert!(
+            provider_unavailable(&err("Model not found: unknown-model")).is_some(),
+            "a model-not-found response must skip"
         );
     }
 

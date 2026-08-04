@@ -142,6 +142,7 @@ impl Tool for WriteTool {
         let was_creation = !path.exists();
         // Only a REPAIR rewrites the model's bytes; a pre-existing-error note
         // means the text went out verbatim, so there is nothing to verify.
+        #[cfg_attr(not(feature = "lsp"), allow(unused_variables))]
         let was_repaired = syntax_note
             .as_ref()
             .is_some_and(crate::agent::tools::GateNote::is_repair);

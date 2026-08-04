@@ -24,6 +24,7 @@
 pub mod activity;
 pub mod bridge;
 pub mod capability;
+pub mod claim_gate;
 pub mod code_review;
 pub mod context_depth;
 pub mod context_manager;
@@ -46,6 +47,7 @@ pub mod plugin_hooks;
 #[cfg(all(test, feature = "plugin"))]
 mod plugin_hooks_tests;
 pub mod progress;
+pub mod publish_guard;
 pub mod reflexion;
 pub mod residual;
 pub mod result;

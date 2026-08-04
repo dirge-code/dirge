@@ -172,6 +172,10 @@ impl DirgeMcp {
                     "files_changed": files_changed,
                     "turns": env.turns,
                     "duration_ms": env.duration_ms,
+                    // dirge-d0e5.1: observed evidence from the child run —
+                    // verification status, turns, tool calls — so a caller
+                    // can check a claimed test result against it.
+                    "evidence": env.evidence,
                 });
                 Ok(tool_json(&result))
             }
@@ -254,6 +258,12 @@ struct Envelope {
     /// git-independent (issue #704); the git-status diff is only a
     /// supplement for anything the tools didn't record.
     files_changed: Vec<String>,
+    /// dirge-d0e5.1: what the child run actually did — turns, tool-call
+    /// count, and the verification status observed (or `observed: false`
+    /// when no verification command ran at all). Forwarded verbatim so a
+    /// delegate caller can check a claimed test result against observed
+    /// state without re-running the suite.
+    evidence: serde_json::Value,
 }
 
 /// SIGKILL a whole process group on drop. Mirrors
@@ -448,6 +458,13 @@ async fn run_delegation(
                     .collect()
             })
             .unwrap_or_default(),
+        evidence: env_val.get("evidence").cloned().unwrap_or_else(|| {
+            serde_json::json!({
+                "turns": 0,
+                "tool_calls": 0,
+                "verification": { "observed": false, "status": null },
+            })
+        }),
     })
 }
 

@@ -143,10 +143,21 @@ pub struct TurnUpdate {
 /// (dirge-ksjl), and any future opt-in finalization gates that need an
 /// on/off/nagging toggle.
 ///
+/// Advisory vs Blocking is a POLICY choice, not a delivery mechanism: both
+/// may inject a model-visible `LoopMessage::User` (tagged, so the TUI
+/// attributes it to the system and `emit_harness_notices` mirrors it to a
+/// `SystemNotice`). The difference is how hard the gate pushes back.
+///
 /// - `Off` — the gate is not armed: zero cost.
-/// - `Advisory` *(default)* — surface findings/reminders as a non-blocking
-///   `SystemNotice`. It never re-enters the loop and never spends a react
-///   budget, so a tight debug loop is never held up waiting on it.
+/// - `Advisory` *(default)* — non-blocking and one-shot: fires at most once
+///   per run (per its own budget), never spends a react budget, and never
+///   repeatedly re-enters the loop on the same finding, so a tight debug
+///   loop is never held up waiting on it. Whether the one shot is a
+///   model-visible message is a SEPARATE decision: if the gate's text is an
+///   imperative steering what the model does next, it must be a tagged
+///   `LoopMessage::User` — a display-only `SystemNotice` the model never
+///   sees changes nothing (dirge-1elu.4, arXiv:2604.25850v4 §C.1.4/§C.2.4).
+///   Only FYI-for-the-human text belongs in a bare notice.
 /// - `Blocking` — await the gate and re-enter the loop on relevant
 ///   findings, bounded by a per-gate react cap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -578,6 +589,22 @@ pub struct LoopConfig {
     /// writes. Set by `build_agent` from `Config::resolve_safe_state_abort_mode`.
     pub safe_state_abort_mode: SafeStateMode,
 
+    /// How the publish-state guard engages (dirge-1elu.1). `Off` *(default)*
+    /// is byte-identical to the loop without the guard. `Advisory` injects a
+    /// model-visible warning (bounded at 2 per run) when a command would
+    /// discard verified-green work; `Blocking` suppresses the call pre-dispatch
+    /// and returns an error naming the protected paths. Set by `build_agent`
+    /// from `Config::resolve_publish_guard_mode`.
+    pub publish_guard_mode: GateMode,
+
+    /// dirge-d0e5.2: the deterministic claim/evidence gate's engagement mode
+    /// (`off`/`advisory`/`blocking`). `off` *(default)* is byte-identical to
+    /// the loop without the gate. Both `advisory` and `blocking` deliver the
+    /// same one-shot model-visible nudge — the gate only ever speaks, it
+    /// cannot block finalization, so the tri-state is really "on or off" with
+    /// room for a future hard mode. Set from `Config::resolve_claim_gate_mode`.
+    pub claim_gate_mode: GateMode,
+
     /// Active session id for the open-issues gate and tools that need
     /// session-scoping. `None` in review/curator sub-runners and most
     /// tests — the gate is inert without it.
@@ -766,6 +793,7 @@ impl std::fmt::Debug for LoopConfig {
             .field("open_issues_gate_mode", &self.open_issues_gate_mode)
             .field("verification_tiers_mode", &self.verification_tiers_mode)
             .field("safe_state_abort_mode", &self.safe_state_abort_mode)
+            .field("publish_guard_mode", &self.publish_guard_mode)
             .field("progress", &self.progress.is_some())
             .field("session_id", &self.session_id)
             .field("goal_fn", &self.goal_fn.as_ref().map(|_| "<judge>"))
@@ -819,6 +847,8 @@ impl Clone for LoopConfig {
             open_issues_gate_mode: self.open_issues_gate_mode,
             verification_tiers_mode: self.verification_tiers_mode,
             safe_state_abort_mode: self.safe_state_abort_mode,
+            publish_guard_mode: self.publish_guard_mode,
+            claim_gate_mode: self.claim_gate_mode,
             progress: self.progress.clone(),
             session_id: self.session_id.clone(),
             goal_fn: self.goal_fn.clone(),
@@ -881,6 +911,8 @@ impl LoopConfig {
             open_issues_gate_mode: GateMode::Off,
             verification_tiers_mode: GateMode::Off,
             safe_state_abort_mode: SafeStateMode::Off,
+            publish_guard_mode: GateMode::Off,
+            claim_gate_mode: GateMode::Off,
             progress: None,
             session_id: None,
             goal_fn: None,

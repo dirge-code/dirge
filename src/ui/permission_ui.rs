@@ -168,10 +168,12 @@ pub(crate) fn is_placeholder_pattern(p: &str) -> bool {
 /// cover `echo $(rm -rf ~)`). Offering "allow always" anyway saved an entry
 /// that could never match, told the user it was saved, and then re-prompted
 /// on the very next identical command.
+#[cfg_attr(not(feature = "semantic"), allow(unused_variables))]
 pub(crate) fn allow_always_downgrade_reason(tool: &str, input: &str) -> Option<&'static str> {
     if input.trim().is_empty() {
         return Some("can't derive a useful pattern from empty input");
     }
+    #[cfg(feature = "semantic")]
     if tool == "bash" && crate::semantic::adapters::bash::command_is_complex(input) {
         return Some(
             "commands with shell substitution or a subshell are never covered by a saved rule \
@@ -203,6 +205,7 @@ fn segment_already_allowed(segment: &str) -> bool {
 /// manufacture a phantom segment. Falls back to the coarse separator split
 /// when that parser is unavailable or declines to decompose the command.
 fn bash_segments(command: &str) -> Vec<String> {
+    #[cfg(feature = "semantic")]
     if let Ok((segments, complex)) =
         crate::semantic::adapters::bash::parse_bash_segments_full(command)
         && !complex

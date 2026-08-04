@@ -240,12 +240,26 @@ pub(crate) async fn handle_context_compacted(
         // build the digest on-thread, defer its git subprocess to the task.
         let base = crate::agent::review::build_transcript(ctx.session);
         let digest = crate::agent::session_digest::SessionDigest::from_session(ctx.session);
+        // dirge-1elu.7: deterministic expectation signals. The verifier gate
+        // is a run_loop local and `Config` carries no verifier, so the run
+        // hands its final status over through the session-keyed slot in
+        // `verifier::run_status`. Compaction fires MID-run, so the slot is
+        // usually still empty here — that reads as "could not tell" (neither
+        // counter moves), never as a fake green or red. Command expectations
+        // evaluate from the digest either way.
+        let expectation_commands = digest.commands.clone();
+        let final_verification =
+            crate::agent::agent_loop::verifier::take_run_verification(ctx.session.id.as_ref());
         crate::agent::post_session::spawn_post_session(
             agent.clone(),
             paths,
             digest,
             base,
             ctx.cfg.memory_graduation.unwrap_or(true),
+            crate::extras::memory_db::ExpectationSignals {
+                final_verification,
+                commands: expectation_commands,
+            },
         );
     }
     Ok(())

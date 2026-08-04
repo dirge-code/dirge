@@ -168,6 +168,7 @@ const HARNESS_TAGS: &[&str] = &[
     super::progress::STALL_TAG,
     super::progress::BUDGET_TAG,
     super::safe_state::SAFE_STATE_TAG,
+    super::publish_guard::PUBLISH_GUARD_TAG,
 ];
 
 /// The harness tag `text` carries, if any.
@@ -295,6 +296,10 @@ enum FollowUpSource {
     ResumeAfterFailure,
     /// Verifier gate: code was edited but nothing was run to check it.
     Verifier,
+    /// Deterministic claim/evidence gate (dirge-d0e5.2): the final answer
+    /// claimed a verification result or a change the run's evidence does not
+    /// support. No LLM call.
+    ClaimGate,
     /// Unified finalization judge (dirge-8v98): completeness verdict + diff
     /// findings in one call. One-shot (Off/Advisory) or persistent up to
     /// [`super::code_review::MAX_REVIEW_REACT`] (Blocking).
@@ -318,6 +323,7 @@ impl From<FollowUpSource> for GateSource {
             FollowUpSource::Hook => GateSource::Hook,
             FollowUpSource::ResumeAfterFailure => GateSource::ResumeAfterFailure,
             FollowUpSource::Verifier => GateSource::Verifier,
+            FollowUpSource::ClaimGate => GateSource::ClaimGate,
             FollowUpSource::Critic => GateSource::Critic,
             FollowUpSource::Goal => GateSource::Goal,
             FollowUpSource::Todo => GateSource::Todo,
@@ -603,7 +609,10 @@ async fn poll_finalization_follow_up(
     new_messages: &[LoopMessage],
     gates: &mut GateStates,
     inputs: GateInputs<'_>,
-    emit: &mpsc::Sender<LoopEvent>,
+    // dirge-1elu.4: all follow-up delivery now flows through the returned
+    // messages — the loop mirrors them to SystemNotice with
+    // emit_harness_notices — so no gate emits on this channel anymore.
+    _emit: &mpsc::Sender<LoopEvent>,
 ) -> (Vec<LoopMessage>, FollowUpSource) {
     // Destructured rather than accessed through `gates.` / `inputs.` so the
     // gate bodies below read exactly as they did when these were seventeen
@@ -620,6 +629,8 @@ async fn poll_finalization_follow_up(
         resume_nudges,
         open_issues_nudges,
         track_nudges,
+        claim_nudges,
+        run_epoch,
     } = gates;
     let GateInputs {
         code_review_baseline,
@@ -713,6 +724,53 @@ async fn poll_finalization_follow_up(
         let msgs = verifier.check_before_finalize(config.verification_tiers_mode);
         if !msgs.is_empty() {
             return (msgs, FollowUpSource::Verifier);
+        }
+    }
+
+    // 2.5 Claim/evidence gate (dirge-d0e5.2) — deterministic, no LLM. Fires
+    //     once when the final answer asserts a verification result or a change
+    //     the run's evidence does not support: a test count / named-gate claim
+    //     ("4954 passed", "clippy clean") with NO verification command
+    //     observed this run, or a first-person "I fixed …" claim with zero
+    //     files mutated. Sits AFTER the verifier gate so the more actionable
+    //     "actually run the check" nudge wins when both would fire; the claim
+    //     gate is the backstop for a model that finalizes while still claiming
+    //     an unrun result. Off by default and byte-identical when off.
+    if config.claim_gate_mode != GateMode::Off
+        && *claim_nudges < super::claim_gate::MAX_CLAIM_NUDGES
+        && let Some(LoopMessage::Assistant(last)) = new_messages.last()
+    {
+        {
+            let answer: String = last
+                .content
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let claims = super::claim_gate::scan_final_answer(&answer);
+            let ran_verification = config
+                .verifier
+                .as_ref()
+                .is_some_and(|v| v.ran_verification());
+            let files_mutated = crate::agent::tools::modified::since(*run_epoch).len();
+            if let Some(kind) =
+                super::claim_gate::unsupported_claims(&claims, ran_verification, files_mutated)
+            {
+                *claim_nudges += 1;
+                return (
+                    vec![LoopMessage::User(super::message::UserMessage {
+                        content: vec![super::message::UserPart::text(format!(
+                            "{} {}",
+                            super::claim_gate::CLAIM_GATE_TAG,
+                            kind.nudge_text()
+                        ))],
+                    })],
+                    FollowUpSource::ClaimGate,
+                );
+            }
         }
     }
     // 3. Unified finalization judge (dirge-8v98) — ONE judge call that both
@@ -819,6 +877,21 @@ async fn poll_finalization_follow_up(
                     .verifier
                     .as_ref()
                     .map(|v| v.status(config.verification_tiers_mode));
+                let evidence = super::critic::Evidence {
+                    files_mutated: crate::agent::tools::modified::since(*run_epoch)
+                        .iter()
+                        .map(|p| p.display().to_string())
+                        .collect(),
+                    observed_commands: config
+                        .verifier
+                        .as_ref()
+                        .map(|v| v.observed_commands())
+                        .unwrap_or_default(),
+                    tool_calls: new_messages
+                        .iter()
+                        .filter(|m| matches!(m, super::message::LoopMessage::ToolResult(_)))
+                        .count(),
+                };
                 let outcome = super::critic::run_unified_review(
                     judge,
                     system_prompt,
@@ -826,6 +899,7 @@ async fn poll_finalization_follow_up(
                     diff_owned.as_deref(),
                     verification,
                     last_review_findings.as_deref(),
+                    Some(&evidence),
                 )
                 .await;
                 let msgs = outcome.messages;
@@ -942,18 +1016,25 @@ async fn poll_finalization_follow_up(
         if count > 0 {
             match open_issues_gate_mode {
                 GateMode::Advisory => {
-                    // One-shot notice (fires at most once per run), then fall
-                    // through — does not re-enter the loop.
+                    // One-shot (fires at most once per run), then re-enter
+                    // ONCE with a model-visible, tagged message. The text is
+                    // an imperative aimed at the model — a display-only
+                    // SystemNotice it never sees would change nothing
+                    // (dirge-1elu.4, arXiv:2604.25850v4 §C.1.4/§C.2.4). The
+                    // loop's emit_harness_notices mirror renders the same
+                    // SystemNotice the old path emitted directly, so what the
+                    // human sees is unchanged.
                     if *open_issues_nudges == 0 {
                         *open_issues_nudges += 1;
-                        let _ = emit
-                            .send(LoopEvent::SystemNotice {
-                                content: format!(
-                                    "{count} issue(s) from this session are still open — \
-                                     close or defer them when done."
+                        return (
+                            vec![LoopMessage::User(super::message::UserMessage::text(
+                                format!(
+                                    "{OPEN_ISSUES_NUDGE_TAG} {count} issue(s) from this session \
+                                     are still open — close or defer them when done."
                                 ),
-                            })
-                            .await;
+                            ))],
+                            FollowUpSource::OpenIssues,
+                        );
                     }
                 }
                 GateMode::Blocking => {
@@ -1002,6 +1083,13 @@ async fn poll_finalization_follow_up(
     }
     // dirge-track: file-edits-without-todos advisory — fires at most once per
     // run when the model edited files this turn but has no active todo tracked.
+    // The boundary nudge (poll_boundary_nudge → build_early_track_work_reminder)
+    // shares the same `track_nudges` budget, so only one of the two can ever
+    // fire; this finalization-time copy catches runs that finalize without
+    // passing a boundary. The text is an imperative aimed at the model, so it
+    // must be a model-visible tagged message (dirge-1elu.4) — the loop's
+    // emit_harness_notices mirror emits the SystemNotice the old path emitted
+    // directly, keeping what the human sees unchanged.
     if should_advise_untracked_work(
         session_id,
         *track_nudges,
@@ -1009,11 +1097,16 @@ async fn poll_finalization_follow_up(
         turn_made_file_edits(new_messages),
     ) {
         *track_nudges += 1;
-        let _ = emit
-            .send(LoopEvent::SystemNotice {
-                content: "You modified files this turn but have no active todo. If this task isn't finished, add it with write_todo_list and mark it in_progress so it stays your tracked priority (and gets closed when done).".to_string(),
-            })
-            .await;
+        return (
+            vec![LoopMessage::User(super::message::UserMessage::text(
+                format!(
+                    "{TRACK_WORK_TAG} You modified files this turn but have no active todo. If this \
+                 task isn't finished, add it with write_todo_list and mark it in_progress so it \
+                 stays your tracked priority (and gets closed when done)."
+                ),
+            ))],
+            FollowUpSource::Todo,
+        );
     }
     (Vec::new(), FollowUpSource::None)
 }
@@ -1988,6 +2081,7 @@ pub(crate) fn poll_boundary_nudge(
         tally.record_nudge(BoundaryNudge::ProgressBudget);
         return Some((msg, BoundaryNudge::ProgressBudget));
     }
+    tally.end_boundary();
     None
 }
 
@@ -2000,12 +2094,16 @@ fn finish_tally(
     capability: &super::capability::CapabilityEstimator,
 ) {
     tally.set_capability_tier(Some(capability.tier()));
-    tally.set_verification(
-        config
-            .verifier
-            .as_ref()
-            .map(|v| v.status(config.verification_tiers_mode)),
-    );
+    let verification = config
+        .verifier
+        .as_ref()
+        .map(|v| v.status(config.verification_tiers_mode));
+    tally.set_verification(verification);
+    // dirge-1elu.7: hand this run's status to the post-session pass, which
+    // runs on the UI side and cannot see the loop's verifier. Recorded
+    // unconditionally — a `None` here CLEARS any prior entry, so a run that
+    // verified nothing never inherits an earlier run's green.
+    super::verifier::record_run_verification(config.session_id.as_deref(), verification);
     tally.set_repairs(Some(config.repair_stats.snapshot()));
     tally.emit();
 }
@@ -2109,10 +2207,20 @@ pub async fn run_loop(
     // checkpoint threshold.
     let mut safe_state = super::safe_state::SafeStateEngine::new();
 
+    // dirge-1elu.1: publish-state guard. Off (the default) is byte-identical
+    // to the loop without the guard — inspect() short-circuits before any
+    // work. Arms at the fresh-green instant from the SAME fingerprint the
+    // safe-state rung stamps; persists across turns so verified work from an
+    // earlier turn stays protected.
+    let mut publish_guard = super::publish_guard::PublishGuard::new();
+
     // dirge-5mtx.5: every finalization gate's re-fire state, in one place. Each
     // field is labelled cost-ceiling or re-fire-guard on `GateStates` itself —
     // that distinction is what decides which are safe to relax.
-    let mut gates = GateStates::default();
+    let mut gates = GateStates {
+        run_epoch: crate::agent::tools::modified::epoch(),
+        ..Default::default()
+    };
 
     // dirge-1g3v: snapshot the working-tree diff at run start so the reviewer
     // can tell what THIS run changed. Without a baseline it diffed the whole
@@ -2569,7 +2677,7 @@ pub async fn run_loop(
             let mut storm_give_up_tools: Option<Vec<String>> = None;
             if !tool_calls.is_empty() {
                 let original_count = tool_calls.len();
-                let (surviving_calls, storm_report) = guards.inspect_calls(&tool_calls);
+                let (mut surviving_calls, storm_report) = guards.inspect_calls(&tool_calls);
                 for _ in 0..storm_report.storms_broken {
                     tally.record_storm_suppression();
                 }
@@ -2643,6 +2751,80 @@ pub async fn run_loop(
                     storm_give_up_tools = Some(tool_calls.iter().map(|c| c.name.clone()).collect());
                 }
 
+                // dirge-1elu.1: publish-state guard — pre-dispatch, after the
+                // storm breaker. `blocking` drops the call (an error result
+                // naming the protected paths is backfilled below); `advisory`
+                // lets the call run but injects a tagged, model-visible
+                // warning, bounded at 2 per run then silent. Off passes
+                // everything through untouched.
+                let mut blocked: Vec<(
+                    super::tools::ToolCall,
+                    super::publish_guard::PublishVerdict,
+                )> = Vec::new();
+                let mut warned: Vec<(
+                    super::tools::ToolCall,
+                    super::publish_guard::PublishVerdict,
+                )> = Vec::new();
+                if config.publish_guard_mode != super::types::GateMode::Off {
+                    for call in &surviving_calls {
+                        match publish_guard.inspect(config.publish_guard_mode, call) {
+                            super::publish_guard::PublishVerdict::Pass => {}
+                            v @ super::publish_guard::PublishVerdict::Hit {
+                                block: true, ..
+                            } => {
+                                blocked.push((call.clone(), v));
+                            }
+                            v @ super::publish_guard::PublishVerdict::Hit {
+                                block: false, ..
+                            } => {
+                                warned.push((call.clone(), v));
+                            }
+                        }
+                    }
+                    if !blocked.is_empty() {
+                        let blocked_ids: std::collections::HashSet<&str> =
+                            blocked.iter().map(|(c, _)| c.id.as_str()).collect();
+                        surviving_calls.retain(|c| !blocked_ids.contains(c.id.as_str()));
+                    }
+                    // Advisory warnings are model-visible User messages tagged
+                    // like the other harness injections, so emit_harness_notices
+                    // mirrors them to a SystemNotice for headless consumers.
+                    if !warned.is_empty() {
+                        let mut body = format!(
+                            "{} Advisory: a command in this batch would discard verified-green work. \
+                             It is being allowed to run (advisory mode) — make a scratch copy under \
+                             /tmp if you meant to clean up:\n",
+                            super::publish_guard::PUBLISH_GUARD_TAG
+                        );
+                        for (call, verdict) in &warned {
+                            if let super::publish_guard::PublishVerdict::Hit {
+                                protected,
+                                reason,
+                                ..
+                            } = verdict
+                            {
+                                let command = call
+                                    .arguments
+                                    .get("command")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+                                let paths = protected
+                                    .iter()
+                                    .map(|p| p.display().to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                body.push_str(&format!(
+                                    "- `{command}` ({reason}) discards: {paths}\n"
+                                ));
+                            }
+                        }
+                        let msg = LoopMessage::User(super::message::UserMessage::text(body));
+                        emit_harness_notices(emit, std::slice::from_ref(&msg)).await;
+                        current_context.messages.push(loop_message_to_value(&msg));
+                        new_messages.push(msg);
+                    }
+                }
+
                 // Dispatch surviving calls through the unified dispatch.
                 // `execute_tool_calls` takes pre-extracted tool calls.
                 if !surviving_calls.is_empty() {
@@ -2691,6 +2873,45 @@ pub async fn run_loop(
                         tally.record_failure_streak(guards.failure_streak() as u32);
                         current_context.messages.push(tool_result_to_value(result));
                         new_messages.push(LoopMessage::ToolResult(result.clone()));
+                    }
+                }
+
+                // dirge-1elu.1: publish-blocked calls return an error result,
+                // so history stays well-formed and the model sees WHY the call
+                // was suppressed and what to do instead. Because these ids are
+                // already covered, the dirge-tc4r backfill below synthesizes
+                // nothing for them.
+                for (call, verdict) in &blocked {
+                    if let super::publish_guard::PublishVerdict::Hit {
+                        protected, reason, ..
+                    } = verdict
+                    {
+                        let command = call
+                            .arguments
+                            .get("command")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let paths = protected
+                            .iter()
+                            .map(|p| p.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let text = format!(
+                            "{} The command `{command}` ({reason}) would discard verified-green work \
+                             ({paths}) and was blocked. Make a scratch copy under /tmp if you meant to \
+                             clean up — the verified work is not recoverable once discarded.",
+                            super::publish_guard::PUBLISH_GUARD_TAG
+                        );
+                        let tr = ToolResultMessage {
+                            tool_call_id: call.id.clone(),
+                            tool_name: call.name.clone(),
+                            content: vec![ContentBlock::Text { text }],
+                            details: Value::Null,
+                            is_error: true,
+                        };
+                        current_context.messages.push(tool_result_to_value(&tr));
+                        new_messages.push(LoopMessage::ToolResult(tr.clone()));
+                        tool_results.push(tr);
                     }
                 }
 
@@ -2769,17 +2990,25 @@ pub async fn run_loop(
             // supersedes. Every input it reads — the guards, the verifier, the
             // reflexion log — is already current at this point: tool results
             // were recorded above.
+            // dirge-1elu.1: the publish-state guard and the safe-state rung
+            // arm from ONE fingerprint, taken at the fresh-green instant — a
+            // single git sample is the source of truth for "what this run
+            // changed at green". A later fresh-green replaces the protected
+            // set; going stale (an edit after green) never clears it.
+            let fresh_green = config.verifier.as_ref().is_some_and(|v| v.is_fresh_green());
+            if fresh_green
+                && (config.publish_guard_mode != super::types::GateMode::Off
+                    || config.safe_state_abort_mode == super::types::SafeStateMode::Auto)
+            {
+                let repo = safe_state_repo(&config);
+                let fp = repo.as_deref().and_then(super::worktree_probe::fingerprint);
+                publish_guard.arm(fp.clone(), repo);
+                safe_state.set_green_fingerprint(fp);
+            }
+
             let safe_state_msg = if config.safe_state_abort_mode != super::types::SafeStateMode::Off
             {
                 let excerpts = guards.recent_excerpts();
-                let fresh_green = config.verifier.as_ref().is_some_and(|v| v.is_fresh_green());
-                if fresh_green && config.safe_state_abort_mode == super::types::SafeStateMode::Auto
-                {
-                    let fp = safe_state_repo(&config)
-                        .as_deref()
-                        .and_then(super::worktree_probe::fingerprint);
-                    safe_state.set_green_fingerprint(fp);
-                }
                 let green_fp = safe_state.green_fingerprint().cloned();
                 let repo = safe_state_repo(&config);
                 safe_state.decide(
@@ -3086,6 +3315,11 @@ pub async fn run_loop(
                 // color) rather than a `MessageStart { User }` — the
                 // latter rendered with the `<you>` prefix as if the user
                 // had typed it.
+                //
+                // dirge-1elu.4 audit (site 4): deliberately notice-only and
+                // never a steering message — the run is ending, there is no
+                // next model turn to read one. The transcript entry below is
+                // a record of truncation for callers, not a steer.
                 let _ = emit
                     .send(LoopEvent::SystemNotice {
                         content: notice.clone(),
@@ -3142,7 +3376,11 @@ pub async fn run_loop(
             emit,
         )
         .await;
+        // dirge-1elu.6: one finalization boundary — the source gate (and
+        // any future co-firing gate) becomes one co-occurrence event.
+        tally.begin_boundary();
         tally.record_gate(source.into());
+        tally.end_boundary();
         if !follow_up.is_empty() {
             tracing::trace!(target: "dirge::loop", ?source, "finalization follow-up interjected");
             emit_harness_notices(emit, &follow_up).await;
