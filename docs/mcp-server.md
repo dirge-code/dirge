@@ -66,6 +66,10 @@ Returns:
   "status": "completed" | "max_turns" | "error",
   "summary": "what dirge did",
   "files_changed": ["src/foo.rs", "tests/foo.rs"],
+  "evidence": {
+    "verification_commands": [{ "command": "cargo test", "passed": true }],
+    "tool_calls": 24
+  },
   "turns": 7,
   "duration_ms": 41230
 }
@@ -73,6 +77,22 @@ Returns:
 `summary` + `files_changed` is enough to decide: accept, ask for a fix
 (call `delegate` again — same session), or move on. Review the actual
 diff with your own tools (`git diff`).
+
+**`files_changed` is scoped to this delegation**, not the session. It used
+to union a session-cumulative set, so a call that changed nothing still
+listed the previous call's files — which is exactly backwards for the field
+a caller uses to check whether work happened. It stays git-independent
+(git is blind in a non-repo, off `PATH`, or when the run committed its
+edits mid-way), but the tracker's contribution is now bounded by an epoch
+captured at the start of the call.
+
+**`evidence` is what actually happened**, for checking the summary against.
+`verification_commands` lists the build/test commands the run really ran
+and how they ended. A summary claiming a test result while
+`verification_commands` is empty did not run one — a mismatch you can see
+without re-running anything. This exists because a delegation once reported
+passing gates it had never run, and the response's own fields agreed with
+it.
 
 ### `new_session`
 `new_session(label?)` → `{ session_id, label }`. Rotate to a fresh
