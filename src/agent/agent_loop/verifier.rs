@@ -167,6 +167,11 @@ struct Inner {
     /// The project gate has been seen PASS this run. A failing gate run
     /// must not set this — the red dominates downstream.
     ran_project_gate: bool,
+    /// When this gate was built — the run start. A script file whose mtime
+    /// is at-or-after this is treated as authored by the agent THIS run
+    /// (dirge-1elu.2). `None` only in the derived default; every
+    /// constructor stamps it.
+    run_started_at: Option<std::time::SystemTime>,
 }
 
 impl Inner {
@@ -194,7 +199,10 @@ impl VerifierGate {
     #[allow(dead_code)]
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            inner: Mutex::new(Inner::default()),
+            inner: Mutex::new(Inner {
+                run_started_at: Some(std::time::SystemTime::now()),
+                ..Inner::default()
+            }),
         })
     }
 
@@ -220,6 +228,7 @@ impl VerifierGate {
             inner: Mutex::new(Inner {
                 project_gate: project_gate.as_deref().and_then(gate_signature),
                 ci_commands,
+                run_started_at: Some(std::time::SystemTime::now()),
                 ..Inner::default()
             }),
         })
@@ -271,6 +280,25 @@ impl VerifierGate {
                     // trustworthy in that direction: something in the chain
                     // genuinely failed. Record the red.
                     if masks_failure(command) && !failed {
+                        return;
+                    }
+                    // dirge-1elu.2: decline a green that rests SOLELY on a
+                    // script-name match when the script was authored THIS
+                    // run. A self-written validator proves nothing — the
+                    // generator and the validator can share the same wrong
+                    // assumptions — so leave `ran_verification` false, keep
+                    // `edits_since_verify` counting, and let the gate ask
+                    // again. A self-authored script that reports FAILURE is
+                    // still trustworthy in that direction: the red is
+                    // recorded below. A command that also carries a real
+                    // word marker (`./check.sh && cargo test`) stays
+                    // recognized — that's a wrapper, not a proxy.
+                    if !failed
+                        && is_script_name_only(command)
+                        && script_name_paths(command)
+                            .iter()
+                            .any(|p| script_is_agent_authored(p, inner.run_started_at))
+                    {
                         return;
                     }
                     inner.ran_verification = true;
@@ -967,13 +995,24 @@ fn js_runner_tier(args: &[&str]) -> VerificationTier {
 /// Two-word markers whose leading word isn't a marker on its own.
 const PAIR_MARKERS: &[(&str, &str)] = &[("go", "vet"), ("go", "run"), ("go", "test")];
 
-fn segment_is_verification(segment: &str) -> bool {
+/// Why a segment counted as verification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SegmentMatch {
+    /// No marker and no script-name match.
+    None,
+    /// A word or pair marker matched (`cargo test`, `pytest`, `make check`).
+    Word,
+    /// Only the path-shaped command word matched (`./check.sh`).
+    ScriptName,
+}
+
+fn segment_match(segment: &str) -> SegmentMatch {
     let tokens: Vec<String> = segment
         .split_whitespace()
         .map(|t| t.to_ascii_lowercase())
         .collect();
     if tokens.iter().any(|t| NON_VERIFY.contains(&t.as_str())) {
-        return false;
+        return SegmentMatch::None;
     }
     // Whole-word markers. A `--check`-style flag is its dash-stripped
     // word, so `prettier --check .` and `cmake --build` register.
@@ -981,20 +1020,93 @@ fn segment_is_verification(segment: &str) -> bool {
         .iter()
         .any(|t| WORD_MARKERS.contains(&t.trim_start_matches('-')))
     {
-        return true;
+        return SegmentMatch::Word;
     }
     if tokens
         .windows(2)
         .any(|w| PAIR_MARKERS.contains(&(w[0].as_str(), w[1].as_str())))
     {
-        return true;
+        return SegmentMatch::Word;
     }
     // The command word may be a path to a repo script: match markers
     // inside its basename, split on `-`/`_`/`.`, accepting a plural form,
     // so `./run-tests.sh` and `scripts/lint.sh` register. Only the
     // executed word gets this treatment — an argument like `ls tests/`
     // must not count (dirge-eg37).
-    command_word(&tokens).is_some_and(script_name_is_verification)
+    if command_word(&tokens).is_some_and(script_name_is_verification) {
+        return SegmentMatch::ScriptName;
+    }
+    SegmentMatch::None
+}
+
+/// Behavioural wrapper for the call sites that only need the bool.
+fn segment_is_verification(segment: &str) -> bool {
+    !matches!(segment_match(segment), SegmentMatch::None)
+}
+
+/// True when a command is recognized as verification ONLY through the
+/// script-name path — no word/pair marker appears in any segment
+/// (dirge-1elu.2). A command that also carries a real marker stays
+/// recognized regardless of provenance: a self-written `check.sh` that
+/// invokes `cargo test` is a wrapper, not a proxy.
+fn is_script_name_only(command: &str) -> bool {
+    let mut script = false;
+    for seg in command.split(['&', '|', ';', '\n']) {
+        match segment_match(seg) {
+            SegmentMatch::Word => return false,
+            SegmentMatch::ScriptName => script = true,
+            SegmentMatch::None => {}
+        }
+    }
+    script
+}
+
+/// The path-shaped command words of the segments that matched only by
+/// script name, in their ORIGINAL case — paths are case-sensitive, so the
+/// lowercased tokens used for marker matching can't be reused here.
+fn script_name_paths(command: &str) -> Vec<std::path::PathBuf> {
+    command
+        .split(['&', '|', ';', '\n'])
+        .filter(|seg| matches!(segment_match(seg), SegmentMatch::ScriptName))
+        .filter_map(|seg| {
+            let tokens: Vec<String> = seg.split_whitespace().map(str::to_string).collect();
+            command_word(&tokens).map(std::path::PathBuf::from)
+        })
+        .collect()
+}
+
+/// Did the agent author `path` THIS run? Two OR'd sources — the
+/// modified-files registry (write/edit/apply_patch) and the file's mtime
+/// at-or-after run start (a bash heredoc the registry never sees). If
+/// neither can answer (missing file, unreadable mtime, no run start),
+/// treat it as NOT authored — degrade toward today's behaviour, never
+/// toward a new false nag (dirge-1elu.2).
+fn script_is_agent_authored(
+    path: &std::path::Path,
+    run_started_at: Option<std::time::SystemTime>,
+) -> bool {
+    // Registry entries are canonical absolute paths, so a relative command
+    // word (`./check.sh`) must canonicalize against the run's cwd to match —
+    // which is also the cwd bash inherits, since the tool spawns without a
+    // `current_dir` override. The raw spelling is checked too, for entries
+    // recorded before canonicalization succeeded.
+    let canonical = crate::permission::path::canonical_or_self(path);
+    let in_registry = crate::agent::tools::modified::MODIFIED_FILES
+        .lock()
+        .is_ok_and(|s| s.contains(&canonical) || s.contains(path));
+    if in_registry {
+        return true;
+    }
+    let Some(run_start) = run_started_at else {
+        return false;
+    };
+    // Known limit: a `cd <dir> && ./check.sh` command resolves the script
+    // against the cd'd directory, not the run cwd — the permission layer
+    // folds leading cds lexically, the gate does not. Every other shape
+    // (absolute, cwd-relative, bash-authored, registry-authored) resolves.
+    std::fs::metadata(&canonical)
+        .and_then(|m| m.modified())
+        .is_ok_and(|mtime| mtime >= run_start)
 }
 
 /// First token that isn't a `VAR=value` environment prefix.
@@ -2560,5 +2672,264 @@ mod tests {
             before,
             "a masked check did not verify anything, so the counter must stand"
         );
+    }
+
+    // ── dirge-1elu.2: decline green from agent-authored scripts ────────────
+    // A model can write its own validator, run it, watch it exit 0, and
+    // satisfy the gate without ever running the project's tests. A script
+    // authored THIS RUN proves nothing (generator and validator can share
+    // the same wrong assumptions), so the green is declined — except a
+    // self-authored script reporting FAILURE, which is still trustworthy
+    // in that direction.
+
+    static SCRIPT_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// A unique temp script path (per test) so parallel tests never share
+    /// a file. The basename carries a marker word so the command registers
+    /// as verification via the script-name path.
+    fn script_path(marker: &str) -> std::path::PathBuf {
+        let n = SCRIPT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::env::temp_dir().join(format!("dirge-elu2-{}-{n}-{marker}.sh", std::process::id()))
+    }
+
+    /// Pin a file's mtime to before this gate's run start, so the
+    /// modified-files registry is the ONLY source that can answer
+    /// "authored".
+    fn predate(file: &std::path::Path) {
+        std::fs::File::open(file)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600))
+            .unwrap();
+    }
+
+    /// The bug, reproduced: the agent writes `check.sh` THIS run (in the
+    /// modified-files registry) and runs it; exit 0 must NOT read as green.
+    #[test]
+    fn agent_authored_script_does_not_latch_green() {
+        let script = script_path("check");
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+        predate(&script); // only the registry can answer "authored"
+        crate::agent::tools::modified::mark_modified(&script);
+
+        let g = VerifierGate::new();
+        g.record_outcome("edit", &json!({"path": "src/a.rs"}), &ok_result(), false);
+        g.record_outcome(
+            "bash",
+            &json!({"command": script.to_string_lossy().to_string()}),
+            &ok_result(),
+            false,
+        );
+        assert_eq!(
+            g.status(GateMode::Off),
+            VerificationStatus::Unverified,
+            "a script authored this run proves nothing — must not read as green"
+        );
+        let _ = std::fs::remove_file(&script);
+    }
+
+    /// The bash-authored path: the file is only detectable by mtime — a
+    /// `cat > check.sh` heredoc the registry never sees.
+    #[test]
+    fn bash_authored_script_does_not_latch_green() {
+        let script = script_path("validate");
+        let g = VerifierGate::new(); // gate FIRST: mtime must be >= run start
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+        assert!(
+            crate::agent::tools::modified::MODIFIED_FILES
+                .lock()
+                .is_ok_and(|s| !s.contains(&script))
+        );
+
+        g.record_outcome("edit", &json!({"path": "src/a.rs"}), &ok_result(), false);
+        g.record_outcome(
+            "bash",
+            &json!({"command": script.to_string_lossy().to_string()}),
+            &ok_result(),
+            false,
+        );
+        assert_eq!(
+            g.status(GateMode::Off),
+            VerificationStatus::Unverified,
+            "a script created by bash this run must not read as green"
+        );
+        let _ = std::fs::remove_file(&script);
+    }
+
+    /// Over-detection guard: a legitimate repo script that PREDATES the
+    /// run (old mtime, not in the registry) still counts.
+    #[test]
+    fn pre_existing_repo_script_still_latches_green() {
+        let script = script_path("run-tests");
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+        predate(&script);
+        let g = VerifierGate::new(); // gate AFTER: the script predates the run
+
+        g.record_outcome("edit", &json!({"path": "src/a.rs"}), &ok_result(), false);
+        g.record_outcome(
+            "bash",
+            &json!({"command": script.to_string_lossy().to_string()}),
+            &ok_result(),
+            false,
+        );
+        assert_eq!(
+            g.status(GateMode::Off),
+            VerificationStatus::VerifiedGreen,
+            "a repo script that predates the run must still count"
+        );
+        let _ = std::fs::remove_file(&script);
+    }
+
+    /// Wrapper, not proxy: a self-authored script whose command line ALSO
+    /// carries a real word marker stays recognized regardless of who wrote
+    /// it.
+    #[test]
+    fn self_authored_script_with_real_marker_still_counts() {
+        let script = script_path("check");
+        std::fs::write(&script, "#!/bin/sh\ncargo test\nexit 0\n").unwrap();
+        predate(&script);
+        crate::agent::tools::modified::mark_modified(&script);
+
+        let g = VerifierGate::new();
+        g.record_outcome("edit", &json!({"path": "src/a.rs"}), &ok_result(), false);
+        let command = format!("{} && cargo test", script.to_string_lossy());
+        g.record_outcome("bash", &json!({"command": command}), &ok_result(), false);
+        assert_eq!(
+            g.status(GateMode::Off),
+            VerificationStatus::VerifiedGreen,
+            "a real word marker is present — wrapper, not proxy"
+        );
+        let _ = std::fs::remove_file(&script);
+    }
+
+    /// The asymmetry: a self-authored script reporting FAILURE is still
+    /// trustworthy in that direction — record the red.
+    #[test]
+    fn agent_authored_script_failure_is_still_red() {
+        let script = script_path("check");
+        std::fs::write(&script, "#!/bin/sh\nexit 1\n").unwrap();
+        crate::agent::tools::modified::mark_modified(&script);
+
+        let g = VerifierGate::new();
+        g.record_outcome("edit", &json!({"path": "src/a.rs"}), &ok_result(), false);
+        g.record_outcome(
+            "bash",
+            &json!({"command": script.to_string_lossy().to_string()}),
+            &ok_result(),
+            true,
+        );
+        assert_eq!(
+            g.status(GateMode::Off),
+            VerificationStatus::VerifiedRed,
+            "a self-authored script reporting failure is trustworthy"
+        );
+        let _ = std::fs::remove_file(&script);
+    }
+
+    /// Unknown provenance: the path doesn't exist on disk and is not in the
+    /// registry — behave exactly as today.
+    #[test]
+    fn script_with_unknown_provenance_behaves_as_today() {
+        let script = script_path("check"); // never written to disk
+        let g = VerifierGate::new();
+        g.record_outcome("edit", &json!({"path": "src/a.rs"}), &ok_result(), false);
+        g.record_outcome(
+            "bash",
+            &json!({"command": script.to_string_lossy().to_string()}),
+            &ok_result(),
+            false,
+        );
+        assert_eq!(
+            g.status(GateMode::Off),
+            VerificationStatus::VerifiedGreen,
+            "can't tell who wrote it — degrade toward today's behaviour"
+        );
+    }
+
+    /// The same-call heredoc+exec shape: `cat > check.sh <<'EOF'` writes the
+    /// script and a later line of the SAME bash call runs it. The newline
+    /// split lands the exec word in its own segment, so it must be caught
+    /// like any other script-name run — the mtime witness (gate first) does
+    /// the detecting.
+    #[test]
+    fn heredoc_then_execute_in_one_bash_call_is_caught() {
+        let script = script_path("check");
+        let g = VerifierGate::new(); // gate FIRST: mtime is the only witness
+        let command = format!(
+            "cat > {} <<'EOF'\nexit 0\nEOF\n{}",
+            script.to_string_lossy(),
+            script.to_string_lossy()
+        );
+        // The tool call wrote the file; the registry never sees it.
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+        g.record_outcome("edit", &json!({"path": "src/a.rs"}), &ok_result(), false);
+        g.record_outcome("bash", &json!({"command": command}), &ok_result(), false);
+        assert_eq!(
+            g.status(GateMode::Off),
+            VerificationStatus::Unverified,
+            "heredoc-write + same-call execute must not read as green"
+        );
+        let _ = std::fs::remove_file(&script);
+    }
+
+    /// A RELATIVE script word (`../check.sh`) resolves against the run's
+    /// cwd — the same cwd bash inherits — so the registry entry, recorded
+    /// under the same relative spelling, must match. Pins the
+    /// canonicalize-against-run-cwd behaviour.
+    #[test]
+    fn relative_script_path_resolves_against_the_run_cwd() {
+        let rel = std::path::Path::new("..").join(format!(
+            "dirge-elu2-{}-{}.sh",
+            std::process::id(),
+            SCRIPT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::write(&rel, "#!/bin/sh\nexit 0\n").unwrap();
+        predate(&rel); // only the registry can answer "authored"
+        crate::agent::tools::modified::mark_modified(&rel);
+
+        let g = VerifierGate::new();
+        g.record_outcome("edit", &json!({"path": "src/a.rs"}), &ok_result(), false);
+        g.record_outcome(
+            "bash",
+            &json!({"command": rel.to_string_lossy().to_string()}),
+            &ok_result(),
+            false,
+        );
+        assert_eq!(
+            g.status(GateMode::Off),
+            VerificationStatus::Unverified,
+            "a relative-path script authored this run must not read as green"
+        );
+        let _ = std::fs::remove_file(&rel);
+    }
+
+    /// The accepted over-detection trade: a pre-existing script whose mtime
+    /// is refreshed DURING the run (touch, chmod, a build regenerating it)
+    /// is indistinguishable from one bash created this run, so its green is
+    /// declined too. Fail-safe direction — a missed decline would let a
+    /// proxy validator through, which is the worse failure.
+    #[test]
+    fn touched_during_run_script_is_treated_as_authored() {
+        let script = script_path("run-tests");
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+        let g = VerifierGate::new(); // run starts
+        predate(&script); // the script predates the run…
+        // …but something touches it mid-run (touch / build regen).
+        std::fs::File::open(&script)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now())
+            .unwrap();
+        g.record_outcome("edit", &json!({"path": "src/a.rs"}), &ok_result(), false);
+        g.record_outcome(
+            "bash",
+            &json!({"command": script.to_string_lossy().to_string()}),
+            &ok_result(),
+            false,
+        );
+        assert_eq!(
+            g.status(GateMode::Off),
+            VerificationStatus::Unverified,
+            "mtime at-or-after run start reads as authored this run"
+        );
+        let _ = std::fs::remove_file(&script);
     }
 }
