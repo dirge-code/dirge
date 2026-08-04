@@ -74,7 +74,18 @@ fn current_repo_is_dirty() -> Result<bool, String> {
         .map_err(|e| format!("failed to resolve current directory: {e}"))?
         .canonicalize()
         .map_err(|e| format!("failed to canonicalize repository: {e}"))?;
-    crate::extras::git_worktree::repo_is_dirty(&repo)
+    #[cfg(feature = "git-worktree")]
+    {
+        crate::extras::git_worktree::repo_is_dirty(&repo)
+    }
+    #[cfg(not(feature = "git-worktree"))]
+    {
+        // No worktree isolation in this build, so no dirty-check machinery is
+        // compiled in and there is no worktree to clobber. The caller treats
+        // `Ok(false)` exactly like `Err(_)` — "no uncommitted work to lose".
+        let _ = repo;
+        Ok(false)
+    }
 }
 
 #[cfg(feature = "git-worktree")]
@@ -1141,6 +1152,7 @@ impl TaskTool {
                         .unwrap_or(SUBAGENT_DEFAULT_PREAMBLE)
                         .to_string()
                 };
+                #[cfg_attr(not(feature = "git-worktree"), allow(unused_variables))]
                 let runner = if let Some((info, main_git_dir, base_commit)) =
                     rooted_worktree_for_task.as_ref()
                 {
