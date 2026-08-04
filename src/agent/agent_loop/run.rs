@@ -168,6 +168,7 @@ const HARNESS_TAGS: &[&str] = &[
     super::progress::STALL_TAG,
     super::progress::BUDGET_TAG,
     super::safe_state::SAFE_STATE_TAG,
+    super::publish_guard::PUBLISH_GUARD_TAG,
 ];
 
 /// The harness tag `text` carries, if any.
@@ -2109,6 +2110,13 @@ pub async fn run_loop(
     // checkpoint threshold.
     let mut safe_state = super::safe_state::SafeStateEngine::new();
 
+    // dirge-1elu.1: publish-state guard. Off (the default) is byte-identical
+    // to the loop without the guard — inspect() short-circuits before any
+    // work. Arms at the fresh-green instant from the SAME fingerprint the
+    // safe-state rung stamps; persists across turns so verified work from an
+    // earlier turn stays protected.
+    let mut publish_guard = super::publish_guard::PublishGuard::new();
+
     // dirge-5mtx.5: every finalization gate's re-fire state, in one place. Each
     // field is labelled cost-ceiling or re-fire-guard on `GateStates` itself —
     // that distinction is what decides which are safe to relax.
@@ -2569,7 +2577,7 @@ pub async fn run_loop(
             let mut storm_give_up_tools: Option<Vec<String>> = None;
             if !tool_calls.is_empty() {
                 let original_count = tool_calls.len();
-                let (surviving_calls, storm_report) = guards.inspect_calls(&tool_calls);
+                let (mut surviving_calls, storm_report) = guards.inspect_calls(&tool_calls);
                 for _ in 0..storm_report.storms_broken {
                     tally.record_storm_suppression();
                 }
@@ -2643,6 +2651,80 @@ pub async fn run_loop(
                     storm_give_up_tools = Some(tool_calls.iter().map(|c| c.name.clone()).collect());
                 }
 
+                // dirge-1elu.1: publish-state guard — pre-dispatch, after the
+                // storm breaker. `blocking` drops the call (an error result
+                // naming the protected paths is backfilled below); `advisory`
+                // lets the call run but injects a tagged, model-visible
+                // warning, bounded at 2 per run then silent. Off passes
+                // everything through untouched.
+                let mut blocked: Vec<(
+                    super::tools::ToolCall,
+                    super::publish_guard::PublishVerdict,
+                )> = Vec::new();
+                let mut warned: Vec<(
+                    super::tools::ToolCall,
+                    super::publish_guard::PublishVerdict,
+                )> = Vec::new();
+                if config.publish_guard_mode != super::types::GateMode::Off {
+                    for call in &surviving_calls {
+                        match publish_guard.inspect(config.publish_guard_mode, call) {
+                            super::publish_guard::PublishVerdict::Pass => {}
+                            v @ super::publish_guard::PublishVerdict::Hit {
+                                block: true, ..
+                            } => {
+                                blocked.push((call.clone(), v));
+                            }
+                            v @ super::publish_guard::PublishVerdict::Hit {
+                                block: false, ..
+                            } => {
+                                warned.push((call.clone(), v));
+                            }
+                        }
+                    }
+                    if !blocked.is_empty() {
+                        let blocked_ids: std::collections::HashSet<&str> =
+                            blocked.iter().map(|(c, _)| c.id.as_str()).collect();
+                        surviving_calls.retain(|c| !blocked_ids.contains(c.id.as_str()));
+                    }
+                    // Advisory warnings are model-visible User messages tagged
+                    // like the other harness injections, so emit_harness_notices
+                    // mirrors them to a SystemNotice for headless consumers.
+                    if !warned.is_empty() {
+                        let mut body = format!(
+                            "{} Advisory: a command in this batch would discard verified-green work. \
+                             It is being allowed to run (advisory mode) — make a scratch copy under \
+                             /tmp if you meant to clean up:\n",
+                            super::publish_guard::PUBLISH_GUARD_TAG
+                        );
+                        for (call, verdict) in &warned {
+                            if let super::publish_guard::PublishVerdict::Hit {
+                                protected,
+                                reason,
+                                ..
+                            } = verdict
+                            {
+                                let command = call
+                                    .arguments
+                                    .get("command")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+                                let paths = protected
+                                    .iter()
+                                    .map(|p| p.display().to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                body.push_str(&format!(
+                                    "- `{command}` ({reason}) discards: {paths}\n"
+                                ));
+                            }
+                        }
+                        let msg = LoopMessage::User(super::message::UserMessage::text(body));
+                        emit_harness_notices(emit, std::slice::from_ref(&msg)).await;
+                        current_context.messages.push(loop_message_to_value(&msg));
+                        new_messages.push(msg);
+                    }
+                }
+
                 // Dispatch surviving calls through the unified dispatch.
                 // `execute_tool_calls` takes pre-extracted tool calls.
                 if !surviving_calls.is_empty() {
@@ -2691,6 +2773,45 @@ pub async fn run_loop(
                         tally.record_failure_streak(guards.failure_streak() as u32);
                         current_context.messages.push(tool_result_to_value(result));
                         new_messages.push(LoopMessage::ToolResult(result.clone()));
+                    }
+                }
+
+                // dirge-1elu.1: publish-blocked calls return an error result,
+                // so history stays well-formed and the model sees WHY the call
+                // was suppressed and what to do instead. Because these ids are
+                // already covered, the dirge-tc4r backfill below synthesizes
+                // nothing for them.
+                for (call, verdict) in &blocked {
+                    if let super::publish_guard::PublishVerdict::Hit {
+                        protected, reason, ..
+                    } = verdict
+                    {
+                        let command = call
+                            .arguments
+                            .get("command")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let paths = protected
+                            .iter()
+                            .map(|p| p.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let text = format!(
+                            "{} The command `{command}` ({reason}) would discard verified-green work \
+                             ({paths}) and was blocked. Make a scratch copy under /tmp if you meant to \
+                             clean up — the verified work is not recoverable once discarded.",
+                            super::publish_guard::PUBLISH_GUARD_TAG
+                        );
+                        let tr = ToolResultMessage {
+                            tool_call_id: call.id.clone(),
+                            tool_name: call.name.clone(),
+                            content: vec![ContentBlock::Text { text }],
+                            details: Value::Null,
+                            is_error: true,
+                        };
+                        current_context.messages.push(tool_result_to_value(&tr));
+                        new_messages.push(LoopMessage::ToolResult(tr.clone()));
+                        tool_results.push(tr);
                     }
                 }
 
@@ -2769,17 +2890,25 @@ pub async fn run_loop(
             // supersedes. Every input it reads — the guards, the verifier, the
             // reflexion log — is already current at this point: tool results
             // were recorded above.
+            // dirge-1elu.1: the publish-state guard and the safe-state rung
+            // arm from ONE fingerprint, taken at the fresh-green instant — a
+            // single git sample is the source of truth for "what this run
+            // changed at green". A later fresh-green replaces the protected
+            // set; going stale (an edit after green) never clears it.
+            let fresh_green = config.verifier.as_ref().is_some_and(|v| v.is_fresh_green());
+            if fresh_green
+                && (config.publish_guard_mode != super::types::GateMode::Off
+                    || config.safe_state_abort_mode == super::types::SafeStateMode::Auto)
+            {
+                let repo = safe_state_repo(&config);
+                let fp = repo.as_deref().and_then(super::worktree_probe::fingerprint);
+                publish_guard.arm(fp.clone(), repo);
+                safe_state.set_green_fingerprint(fp);
+            }
+
             let safe_state_msg = if config.safe_state_abort_mode != super::types::SafeStateMode::Off
             {
                 let excerpts = guards.recent_excerpts();
-                let fresh_green = config.verifier.as_ref().is_some_and(|v| v.is_fresh_green());
-                if fresh_green && config.safe_state_abort_mode == super::types::SafeStateMode::Auto
-                {
-                    let fp = safe_state_repo(&config)
-                        .as_deref()
-                        .and_then(super::worktree_probe::fingerprint);
-                    safe_state.set_green_fingerprint(fp);
-                }
                 let green_fp = safe_state.green_fingerprint().cloned();
                 let repo = safe_state_repo(&config);
                 safe_state.decide(

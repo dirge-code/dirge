@@ -565,6 +565,24 @@ fn masks_failure(command: &str) -> bool {
                 }
                 return true;
             }
+            b'\n' => {
+                // A newline between commands is an exact synonym for `;`
+                // (dirge-1elu.3): the exit status belongs to the LAST
+                // command, so an earlier failure is discarded. Only masks
+                // when something follows — a trailing newline does not.
+                //
+                // A backslash immediately before the newline is a line
+                // continuation, not a separator — `cargo test && \<newline>
+                // echo done` short-circuits and its status is honest.
+                if i > 0 && bytes[i - 1] == b'\\' {
+                    i += 1;
+                    continue;
+                }
+                if command[i + 1..].trim().is_empty() {
+                    return false;
+                }
+                return true;
+            }
             b'&' => {
                 // `&&` is fine (short-circuits); a lone `&` backgrounds.
                 if bytes.get(i + 1) == Some(&b'&') {
@@ -2406,6 +2424,7 @@ mod tests {
             "cargo test; echo done",
             "cargo test &",
             "cargo clippy 2>&1 | head -20",
+            "cargo test\necho done",
         ] {
             assert!(masks_failure(cmd), "should be detected as masking: {cmd}");
         }
@@ -2423,6 +2442,8 @@ mod tests {
             "cargo test 2>&1",
             "RUSTFLAGS=\"-D warnings\" cargo clippy --all-targets",
             "cargo test;",
+            "cargo test\n",
+            "cargo test && \\\necho done",
         ] {
             assert!(!masks_failure(cmd), "must not be flagged: {cmd}");
         }
@@ -2448,6 +2469,24 @@ mod tests {
         }
     }
 
+    /// The bug, end to end (dirge-1elu.3): a newline-chained validation
+    /// block whose exit status belongs to a trailing `echo` must NOT latch
+    /// green — every assertion may have failed while the status is honestly
+    /// 0. Same treatment as the `;` shape: success is not recorded.
+    #[test]
+    fn newline_chained_validation_block_does_not_latch_green() {
+        let cmd = "diff expected.txt actual.txt\ncmp -s a.bin b.bin\ntest -f out/report.json\necho \"all checks passed\"";
+        assert!(masks_failure(cmd), "the block's status is the echo's");
+        let g = VerifierGate::new();
+        g.record_outcome("edit", &json!({"path":"src/a.rs"}), &ok_result(), false);
+        g.record_outcome("bash", &json!({"command": cmd}), &ok_result(), false);
+        assert_eq!(
+            g.status(GateMode::Off),
+            VerificationStatus::Unverified,
+            "a masked success proves nothing and must not read as green"
+        );
+    }
+
     /// A masked command that still reports FAILURE is trustworthy in that
     /// direction — something in the chain genuinely failed — so the red is
     /// recorded. Declining it would let a real failure go unreported.
@@ -2460,6 +2499,23 @@ mod tests {
             &json!({"command": "cargo test | tail -2"}),
             &failed_result(),
             false,
+        );
+        assert_eq!(g.status(GateMode::Off), VerificationStatus::VerifiedRed);
+    }
+
+    /// A masked multi-line command that still reports FAILURE is
+    /// trustworthy in that direction — something in the chain genuinely
+    /// failed — so the red is recorded (dirge-1elu.3, same asymmetry as the
+    /// `;` shape).
+    #[test]
+    fn masked_newline_failure_is_still_recorded_as_red() {
+        let g = VerifierGate::new();
+        g.record_outcome("edit", &json!({"path":"src/a.rs"}), &ok_result(), false);
+        g.record_outcome(
+            "bash",
+            &json!({"command":"cargo test\necho done"}),
+            &ok_result(),
+            true,
         );
         assert_eq!(g.status(GateMode::Off), VerificationStatus::VerifiedRed);
     }

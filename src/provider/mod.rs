@@ -146,6 +146,10 @@ pub struct AnyAgent {
     /// forwarded to `LoopConfig.safe_state_abort_mode`. Defaults to `Off`
     /// (dirge-uw2l.4; the rung is opt-in and off is byte-identical).
     safe_state_abort_mode: crate::agent::agent_loop::types::SafeStateMode,
+    /// Set by `build_agent` from `Config::resolve_publish_guard_mode`;
+    /// forwarded to `LoopConfig.publish_guard_mode`. Defaults to `Off`
+    /// (dirge-1elu.1; the guard is opt-in and off is byte-identical).
+    publish_guard_mode: crate::agent::agent_loop::types::GateMode,
     /// Active session id forwarded to `LoopConfig.session_id` for the
     /// open-issues gate and session-scoped tools. `None` in sub-runners.
     session_id: Option<String>,
@@ -351,6 +355,7 @@ impl AnyAgent {
             verification_tiers_mode: crate::agent::agent_loop::types::GateMode::Off,
             verification_command: None,
             safe_state_abort_mode: crate::agent::agent_loop::types::SafeStateMode::Off,
+            publish_guard_mode: crate::agent::agent_loop::types::GateMode::Off,
             session_id: None,
             goal_fn: None,
             goal: None,
@@ -576,6 +581,15 @@ impl AnyAgent {
     /// `verification_command`).
     pub fn with_verification_command(mut self, command: Option<String>) -> Self {
         self.verification_command = command;
+        self
+    }
+
+    /// dirge-1elu.1: set the publish-state guard mode.
+    pub fn with_publish_guard_mode(
+        mut self,
+        mode: crate::agent::agent_loop::types::GateMode,
+    ) -> Self {
+        self.publish_guard_mode = mode;
         self
     }
 

@@ -277,6 +277,7 @@ impl AnyAgent {
         cfg.open_issues_gate_mode = self.open_issues_gate_mode;
         cfg.verification_tiers_mode = self.verification_tiers_mode;
         cfg.safe_state_abort_mode = self.safe_state_abort_mode;
+        cfg.publish_guard_mode = self.publish_guard_mode;
         cfg.session_id = self.session_id.clone();
         cfg.goal_fn = self.goal_fn.clone();
         // dirge-5mtx.3: classify judge. No consumer in run.rs yet —

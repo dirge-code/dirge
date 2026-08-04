@@ -578,6 +578,14 @@ pub struct LoopConfig {
     /// writes. Set by `build_agent` from `Config::resolve_safe_state_abort_mode`.
     pub safe_state_abort_mode: SafeStateMode,
 
+    /// How the publish-state guard engages (dirge-1elu.1). `Off` *(default)*
+    /// is byte-identical to the loop without the guard. `Advisory` injects a
+    /// model-visible warning (bounded at 2 per run) when a command would
+    /// discard verified-green work; `Blocking` suppresses the call pre-dispatch
+    /// and returns an error naming the protected paths. Set by `build_agent`
+    /// from `Config::resolve_publish_guard_mode`.
+    pub publish_guard_mode: GateMode,
+
     /// Active session id for the open-issues gate and tools that need
     /// session-scoping. `None` in review/curator sub-runners and most
     /// tests — the gate is inert without it.
@@ -766,6 +774,7 @@ impl std::fmt::Debug for LoopConfig {
             .field("open_issues_gate_mode", &self.open_issues_gate_mode)
             .field("verification_tiers_mode", &self.verification_tiers_mode)
             .field("safe_state_abort_mode", &self.safe_state_abort_mode)
+            .field("publish_guard_mode", &self.publish_guard_mode)
             .field("progress", &self.progress.is_some())
             .field("session_id", &self.session_id)
             .field("goal_fn", &self.goal_fn.as_ref().map(|_| "<judge>"))
@@ -819,6 +828,7 @@ impl Clone for LoopConfig {
             open_issues_gate_mode: self.open_issues_gate_mode,
             verification_tiers_mode: self.verification_tiers_mode,
             safe_state_abort_mode: self.safe_state_abort_mode,
+            publish_guard_mode: self.publish_guard_mode,
             progress: self.progress.clone(),
             session_id: self.session_id.clone(),
             goal_fn: self.goal_fn.clone(),
@@ -881,6 +891,7 @@ impl LoopConfig {
             open_issues_gate_mode: GateMode::Off,
             verification_tiers_mode: GateMode::Off,
             safe_state_abort_mode: SafeStateMode::Off,
+            publish_guard_mode: GateMode::Off,
             progress: None,
             session_id: None,
             goal_fn: None,

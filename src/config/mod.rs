@@ -985,6 +985,15 @@ pub struct Config {
     /// rather than silently doing something other than what its name says.
     /// See [`resolve_safe_state_abort_mode`](Self::resolve_safe_state_abort_mode).
     pub safe_state_abort: Option<String>,
+    /// How the publish-state guard engages (dirge-1elu.1): `off` / `advisory`
+    /// / `blocking` (case-insensitive, trimmed). `off` *(default)* is
+    /// byte-identical to the loop without the guard. `advisory` injects a
+    /// model-visible warning (bounded at 2 per run) when a command would
+    /// discard verified-green work but lets the call run; `blocking` suppresses
+    /// the call pre-dispatch and returns an error naming the protected paths —
+    /// with no override token (the paper's overrideable iteration-5 guard
+    /// leaked). See [`resolve_publish_guard_mode`](Self::resolve_publish_guard_mode).
+    pub publish_guard: Option<String>,
     /// How the ingestion-time injection scanner handles untrusted tool
     /// results (read, MCP, websearch). One of `off` / `advisory` / `block`
     /// (case-insensitive, trimmed). `advisory` *(default)* fences positive
@@ -1373,6 +1382,33 @@ impl Config {
                  (valid: off | advisory | auto)"
             );
             SafeStateMode::Off
+        })
+    }
+
+    /// Resolve the publish-state guard's engagement mode from
+    /// [`publish_guard`](Self::publish_guard): `off`/`advisory`/`blocking`,
+    /// parsed case-insensitively and trimmed. `None` and an empty value
+    /// resolve to `Off` (opt-in — the guard intercepts commands, which is
+    /// intrusive). An unrecognized non-empty value also resolves to `Off`
+    /// but logs a warning, so a typo never silently arms a destructive
+    /// interlock (dirge-1elu.1).
+    pub fn resolve_publish_guard_mode(&self) -> crate::agent::agent_loop::types::GateMode {
+        use crate::agent::agent_loop::types::GateMode;
+        let Some(raw) = self.publish_guard.as_deref() else {
+            return GateMode::Off;
+        };
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return GateMode::Off;
+        }
+        GateMode::from_wire(trimmed).unwrap_or_else(|| {
+            tracing::warn!(
+                target: "dirge::config",
+                value = trimmed,
+                "unrecognized `publish_guard` value; falling back to `off` \
+                 (valid: off | advisory | blocking)"
+            );
+            GateMode::Off
         })
     }
 
@@ -2231,6 +2267,37 @@ mod tests {
         // Absent is still Off — enabling a destructive path is never implicit.
         let cfg: Config = serde_json::from_str(r#"{}"#).unwrap();
         assert_eq!(cfg.resolve_safe_state_abort_mode(), SafeStateMode::Off);
+    }
+
+    #[test]
+    fn resolve_publish_guard_mode_each_string_and_default() {
+        use crate::agent::agent_loop::types::GateMode;
+
+        let mk = |raw: &str| {
+            Config::deserialize(serde_json::json!({ "publish_guard": raw }))
+                .unwrap()
+                .resolve_publish_guard_mode()
+        };
+        assert_eq!(mk("off"), GateMode::Off);
+        assert_eq!(mk("OFF"), GateMode::Off);
+        assert_eq!(mk("  Blocking  "), GateMode::Blocking);
+        assert_eq!(mk("advisory"), GateMode::Advisory);
+
+        // Absent / empty → default Off (opt-in — the guard intercepts
+        // commands, so it stays dark until asked for).
+        let cfg: Config = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(cfg.resolve_publish_guard_mode(), GateMode::Off);
+        let cfg: Config = serde_json::from_str(r#"{"publish_guard":"   "}"#).unwrap();
+        assert_eq!(cfg.resolve_publish_guard_mode(), GateMode::Off);
+    }
+
+    #[test]
+    fn resolve_publish_guard_mode_unknown_defaults_off() {
+        use crate::agent::agent_loop::types::GateMode;
+
+        // A typo must never silently arm a destructive interlock.
+        let cfg: Config = serde_json::from_str(r#"{"publish_guard":"nuclear"}"#).unwrap();
+        assert_eq!(cfg.resolve_publish_guard_mode(), GateMode::Off);
     }
 
     #[test]

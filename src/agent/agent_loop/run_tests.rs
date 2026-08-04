@@ -144,6 +144,7 @@ fn build_config() -> LoopConfig {
         open_issues_gate_mode: crate::agent::agent_loop::types::GateMode::Off,
         verification_tiers_mode: crate::agent::agent_loop::types::GateMode::Off,
         safe_state_abort_mode: crate::agent::agent_loop::types::SafeStateMode::Off,
+        publish_guard_mode: crate::agent::agent_loop::types::GateMode::Off,
         session_id: None,
         goal_fn: None,
         goal: None,
@@ -1564,6 +1565,233 @@ async fn test_full_loop_with_tool_then_final_text() {
     let kinds: Vec<_> = drain(&mut rx).await.iter().map(|e| e.kind()).collect();
     assert!(kinds.contains(&"tool_execution_start"));
     assert!(kinds.contains(&"tool_execution_end"));
+}
+
+/// Recording stand-in for the real `bash` tool: same name and `command` arg
+/// shape, but just records the command and returns success. The loop's
+/// verifier plumbing (tools.rs:632) keys on the `bash` name + `command` arg,
+/// so a recorded pass latches fresh-green exactly as a real pass would —
+/// which is what lets a loop-level publish-guard test arm through the real
+/// green path.
+#[derive(Debug)]
+struct RecBashTool {
+    executed: std::sync::Arc<Mutex<Vec<String>>>,
+}
+
+impl RecBashTool {
+    fn new() -> Self {
+        Self {
+            executed: std::sync::Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+}
+
+impl LoopTool for RecBashTool {
+    fn name(&self) -> &str {
+        "bash"
+    }
+
+    fn description(&self) -> &str {
+        "record-only bash"
+    }
+
+    fn label(&self) -> &str {
+        "bash"
+    }
+
+    fn parameters(&self) -> &Value {
+        static EMPTY: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+        EMPTY.get_or_init(
+            || serde_json::json!({"type":"object","properties":{"command":{"type":"string"}}}),
+        )
+    }
+
+    fn execute<'a>(
+        &'a self,
+        _id: &'a str,
+        args: Value,
+        _signal: AbortSignal,
+        _on_update: LoopToolUpdate,
+    ) -> Pin<Box<dyn Future<Output = Result<super::super::LoopToolResult, String>> + Send + 'a>>
+    {
+        let executed = self.executed.clone();
+        Box::pin(async move {
+            let command = args
+                .get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            executed.lock().unwrap().push(command);
+            Ok(super::super::LoopToolResult {
+                content: vec![serde_json::json!({"type":"text","text":"ok"})],
+                details: args,
+                terminate: None,
+            })
+        })
+    }
+}
+
+/// A throwaway git work tree whose only untracked file is `out.json` — the
+/// shape the fingerprint sees at green: every file differing from HEAD,
+/// including bash-mutated / untracked output.
+fn temp_git_worktree() -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "dirge-pubg-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let _ = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&dir)
+        .output();
+    std::fs::write(dir.join("out.json"), "verified content").unwrap();
+    dir
+}
+
+fn flat_text(messages: &[LoopMessage]) -> String {
+    let mut out = String::new();
+    for m in messages {
+        match m {
+            LoopMessage::User(u) => out.push_str(&u.text_joined()),
+            LoopMessage::Assistant(a) => {
+                for b in &a.content {
+                    if let ContentBlock::Text { text } = b {
+                        out.push_str(text);
+                    }
+                }
+            }
+            LoopMessage::ToolResult(t) => {
+                for b in &t.content {
+                    if let ContentBlock::Text { text } = b {
+                        out.push_str(text);
+                    }
+                }
+            }
+            _ => {}
+        }
+        out.push('\n');
+    }
+    out
+}
+
+#[tokio::test]
+async fn publish_guard_blocks_destructive_bash_after_real_green() {
+    let rec_bash = std::sync::Arc::new(RecBashTool::new());
+    let repo = temp_git_worktree();
+    let mut ctx = empty_context();
+    ctx.tools.push(rec_bash.clone());
+    let mut cfg = build_config();
+    cfg.publish_guard_mode = crate::agent::agent_loop::types::GateMode::Blocking;
+    cfg.verifier = Some(crate::agent::agent_loop::verifier::VerifierGate::new());
+    cfg.code_review_repo = Some(repo.clone());
+
+    let factory = canned_factory(vec![
+        tool_use_response(
+            "call-1",
+            "bash",
+            serde_json::json!({"command": "make check"}),
+        ),
+        tool_use_response(
+            "call-2",
+            "bash",
+            serde_json::json!({"command": "rm out.json"}),
+        ),
+        text_response("done"),
+    ]);
+
+    let (tx, mut _rx) = mpsc::channel::<LoopEvent>(128);
+    let messages = run_agent_loop(
+        vec![user("verify and clean up")],
+        ctx,
+        cfg,
+        AbortSignal::new(),
+        &tx,
+        &factory,
+        None, // summarize_fn — test default
+        None, // memory_provider — test default
+    )
+    .await;
+    drop(tx);
+
+    // The green-making `make check` ran; the destructive `rm` never did —
+    // it was suppressed pre-dispatch, which is the whole point of the guard.
+    let executed = rec_bash.executed.lock().unwrap().clone();
+    assert_eq!(
+        executed,
+        vec!["make check".to_string()],
+        "rm must not dispatch"
+    );
+
+    // The model sees an error result explaining the block, tagged like the
+    // other harness injections.
+    let text = flat_text(&messages);
+    assert!(
+        text.contains("[publish-guard]"),
+        "blocked result must carry the harness tag: {text}"
+    );
+    assert!(
+        text.contains("rm out.json") && text.contains("out.json"),
+        "blocked result must name the command and the protected path: {text}"
+    );
+    assert!(
+        text.contains("verified-green") || text.contains("verified"),
+        "blocked result must say why: {text}"
+    );
+
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+#[tokio::test]
+async fn publish_guard_off_is_byte_identical_default() {
+    let rec_bash = std::sync::Arc::new(RecBashTool::new());
+    let repo = temp_git_worktree();
+    let mut ctx = empty_context();
+    ctx.tools.push(rec_bash.clone());
+    let mut cfg = build_config();
+    cfg.publish_guard_mode = crate::agent::agent_loop::types::GateMode::Off;
+    cfg.verifier = Some(crate::agent::agent_loop::verifier::VerifierGate::new());
+    cfg.code_review_repo = Some(repo.clone());
+
+    let factory = canned_factory(vec![
+        tool_use_response(
+            "call-1",
+            "bash",
+            serde_json::json!({"command": "make check"}),
+        ),
+        tool_use_response(
+            "call-2",
+            "bash",
+            serde_json::json!({"command": "rm out.json"}),
+        ),
+        text_response("done"),
+    ]);
+
+    let (tx, mut _rx) = mpsc::channel::<LoopEvent>(128);
+    let messages = run_agent_loop(
+        vec![user("verify and clean up")],
+        ctx,
+        cfg,
+        AbortSignal::new(),
+        &tx,
+        &factory,
+        None, // summarize_fn — test default
+        None, // memory_provider — test default
+    )
+    .await;
+    drop(tx);
+
+    // Off mode is a pure pass-through: both commands executed.
+    let executed = rec_bash.executed.lock().unwrap().clone();
+    assert_eq!(
+        executed,
+        vec!["make check".to_string(), "rm out.json".to_string()]
+    );
+    // No guard message anywhere.
+    assert!(!flat_text(&messages).contains("[publish-guard]"));
+
+    let _ = std::fs::remove_dir_all(&repo);
 }
 
 /// Port of pi test "should use prepareNextTurn snapshot before
