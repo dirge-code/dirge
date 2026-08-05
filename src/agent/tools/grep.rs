@@ -1,7 +1,6 @@
 use ignore::WalkBuilder;
 use regex::Regex;
-use rig::completion::ToolDefinition;
-use rig::tool::Tool;
+use rig::tool::PortableTool;
 
 use crate::agent::agent_loop::tool_input_repair::with_contract_hint;
 use crate::agent::tools::cache::ToolCache;
@@ -76,48 +75,48 @@ impl GrepTool {
     }
 }
 
-impl Tool for GrepTool {
+impl PortableTool for GrepTool {
     const NAME: &'static str = "grep";
 
     type Error = ToolError;
     type Args = GrepArgs;
     type Output = String;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: "grep".to_string(),
-            description: with_contract_hint(
-                "grep",
-                "Search FILE CONTENTS for a regex pattern (Rust regex syntax) and return matching lines as file:line. Use this to find where text or code appears across the project. NOT for matching FILENAMES — use `glob` (path patterns) or `find_files` (filename regex); NOT for locating a symbol's definition — use `find_definition`. Respects .gitignore; skips binary files, node_modules, and target.",
-            ),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "pattern": {
-                        "type": "string",
-                        "description": "Regex pattern to search for (supports Rust regex syntax)"
-                    },
-                    "path": {
-                        "type": "string",
-                        "description": "Directory to search in (defaults to current working directory)"
-                    },
-                    "include": {
-                        "type": "string",
-                        "description": "Optional file glob pattern to filter (e.g. '*.rs', '*.{ts,tsx}')"
-                    },
-                    "context_lines": {
-                        "type": "integer",
-                        "description": "Number of context lines to show before and after each match (like grep -C)"
-                    },
-                    "include_hidden": {
-                        "type": "boolean",
-                        "description": "Include dotfiles (.env, .gitignore, etc.) in the search. Default false to avoid surfacing secrets and config files."
-                    },
-                    "reason": { "type": "string", "description": "Why you're searching: the specific question this answers and how it serves the current task. Be targeted." }
+    fn description(&self) -> String {
+        with_contract_hint(
+            "grep",
+            "Search FILE CONTENTS for a regex pattern (Rust regex syntax) and return matching lines as file:line. Use this to find where text or code appears across the project. NOT for matching FILENAMES — use `glob` (path patterns) or `find_files` (filename regex); NOT for locating a symbol's definition — use `find_definition`. Respects .gitignore; skips binary files, node_modules, and target.",
+        )
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "description": "Regex pattern to search for (supports Rust regex syntax)"
                 },
-                "required": ["pattern", "reason"]
-            }),
-        }
+                "path": {
+                    "type": "string",
+                    "description": "Directory to search in (defaults to current working directory)"
+                },
+                "include": {
+                    "type": "string",
+                    "description": "Optional file glob pattern to filter (e.g. '*.rs', '*.{ts,tsx}')"
+                },
+                "context_lines": {
+                    "type": "integer",
+                    "description": "Number of context lines to show before and after each match (like grep -C)"
+                },
+                "include_hidden": {
+                    "type": "boolean",
+                    "description": "Include dotfiles (.env, .gitignore, etc.) in the search. Default false to avoid surfacing secrets and config files."
+                },
+                "reason": { "type": "string", "description": "Why you're searching: the specific question this answers and how it serves the current task. Be targeted." }
+            },
+            "required": ["pattern", "reason"]
+        })
     }
 
     async fn call(&self, args: GrepArgs) -> Result<String, ToolError> {

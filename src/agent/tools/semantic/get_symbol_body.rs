@@ -1,8 +1,7 @@
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
-use rig::completion::ToolDefinition;
-use rig::tool::Tool;
+use rig::tool::PortableTool;
 use serde::Deserialize;
 
 use crate::agent::tools::{AskSender, PermCheck, ToolError, check_perm_path};
@@ -34,32 +33,32 @@ pub struct Args {
     name: String,
 }
 
-impl Tool for GetSymbolBodyTool {
+impl PortableTool for GetSymbolBodyTool {
     const NAME: &'static str = "get_symbol_body";
 
     type Error = ToolError;
     type Args = Args;
     type Output = String;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: "get_symbol_body".to_string(),
-            description: "Get the full source code of a named symbol (function, class, method, etc.) from a file. Uses tree-sitter to precisely extract by byte range.".to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Path to the file containing the symbol"
-                    },
-                    "name": {
-                        "type": "string",
-                        "description": "Name of the symbol to retrieve"
-                    }
+    fn description(&self) -> String {
+        "Get the full source code of a named symbol (function, class, method, etc.) from a file. Uses tree-sitter to precisely extract by byte range.".to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Path to the file containing the symbol"
                 },
-                "required": ["path", "name"]
-            }),
-        }
+                "name": {
+                    "type": "string",
+                    "description": "Name of the symbol to retrieve"
+                }
+            },
+            "required": ["path", "name"]
+        })
     }
 
     async fn call(&self, args: Args) -> Result<String, ToolError> {

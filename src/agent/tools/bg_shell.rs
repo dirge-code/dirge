@@ -18,8 +18,7 @@
 #[allow(unused_imports)]
 use crate::sync_util::LockExt;
 use indexmap::IndexMap;
-use rig::completion::ToolDefinition;
-use rig::tool::Tool;
+use rig::tool::PortableTool;
 use serde::Deserialize;
 use std::sync::{Arc, Mutex};
 use tokio::task::JoinHandle;
@@ -329,24 +328,24 @@ impl BashOutputTool {
     }
 }
 
-impl Tool for BashOutputTool {
+impl PortableTool for BashOutputTool {
     const NAME: &'static str = "bash_output";
     type Error = ToolError;
     type Args = BashOutputArgs;
     type Output = String;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: "bash_output".to_string(),
-            description: "Read new output from a background shell (one started with bash(background=true)). Returns the output produced since your last call plus the shell's status (running / exited(code) / killed / failed). Poll this to follow a long-running command; call kill_shell to stop it.".to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "id": { "type": "string", "description": "The background shell id returned by bash(background=true)." }
-                },
-                "required": ["id"]
-            }),
-        }
+    fn description(&self) -> String {
+        "Read new output from a background shell (one started with bash(background=true)). Returns the output produced since your last call plus the shell's status (running / exited(code) / killed / failed). Poll this to follow a long-running command; call kill_shell to stop it.".to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "id": { "type": "string", "description": "The background shell id returned by bash(background=true)." }
+            },
+            "required": ["id"]
+        })
     }
 
     async fn call(&self, args: BashOutputArgs) -> Result<String, ToolError> {
@@ -389,24 +388,24 @@ impl KillShellTool {
     }
 }
 
-impl Tool for KillShellTool {
+impl PortableTool for KillShellTool {
     const NAME: &'static str = "kill_shell";
     type Error = ToolError;
     type Args = KillShellArgs;
     type Output = String;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: "kill_shell".to_string(),
-            description: "Stop a running background shell (one started with bash(background=true)) by id. Kills the whole process group. No-op if it already exited.".to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "id": { "type": "string", "description": "The background shell id to kill." }
-                },
-                "required": ["id"]
-            }),
-        }
+    fn description(&self) -> String {
+        "Stop a running background shell (one started with bash(background=true)) by id. Kills the whole process group. No-op if it already exited.".to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "id": { "type": "string", "description": "The background shell id to kill." }
+            },
+            "required": ["id"]
+        })
     }
 
     async fn call(&self, args: KillShellArgs) -> Result<String, ToolError> {

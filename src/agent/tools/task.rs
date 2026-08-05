@@ -9,8 +9,7 @@
 
 #[allow(unused_imports)]
 use crate::sync_util::LockExt;
-use rig::completion::ToolDefinition;
-use rig::tool::Tool;
+use rig::tool::PortableTool;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -1400,14 +1399,8 @@ fn normalize_retry_of(retry_of: Option<String>) -> Option<String> {
         .filter(|id| !id.is_empty())
 }
 
-impl Tool for TaskTool {
-    const NAME: &'static str = "task";
-
-    type Error = ToolError;
-    type Args = Args;
-    type Output = String;
-
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
+impl TaskTool {
+    fn definition_parts(&self) -> (String, serde_json::Value) {
         let mut description = "Spawn a subagent to handle a specific subtask. The subagent runs as a one-shot query (no tools) and returns its result inline. Use for research, analysis, or planning subtasks that don't require file access. Set background=true to run asynchronously — completion is delivered to you automatically as a <system-reminder> at the start of your next turn. Do NOT poll task_status in a loop or sleep waiting; continue with other work."
             .to_string();
 
@@ -1482,12 +1475,23 @@ impl Tool for TaskTool {
                 }
             }
         }
+        (description, properties)
+    }
+}
 
-        ToolDefinition {
-            name: "task".to_string(),
-            description,
-            parameters: properties,
-        }
+impl PortableTool for TaskTool {
+    const NAME: &'static str = "task";
+
+    type Error = ToolError;
+    type Args = Args;
+    type Output = String;
+
+    fn description(&self) -> String {
+        self.definition_parts().0
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        self.definition_parts().1
     }
 
     async fn call(&self, args: Args) -> Result<String, ToolError> {
@@ -2021,7 +2025,7 @@ mod tests {
     #[tokio::test]
     async fn definition_steers_agent_away_from_polling() {
         let tool = mock_tool();
-        let def = tool.definition(String::new()).await;
+        let def = rig::tool::tool_definition(&tool);
         let desc = def.description.to_lowercase();
         assert!(
             desc.contains("system-reminder") || desc.contains("automatically"),
@@ -2588,7 +2592,7 @@ mod tests {
         assert!(subagent_route("ghost").is_none());
 
         let tool = mock_tool();
-        let def = tool.definition(String::new()).await;
+        let def = rig::tool::tool_definition(&tool);
         assert!(
             def.description.contains("Available profiles: reviewer"),
             "definition must list installed profiles: {}",
@@ -2606,7 +2610,7 @@ mod tests {
     #[tokio::test]
     async fn definition_advertises_background_field() {
         let tool = mock_tool();
-        let def = tool.definition(String::new()).await;
+        let def = rig::tool::tool_definition(&tool);
         let props = def
             .parameters
             .get("properties")

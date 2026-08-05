@@ -659,7 +659,7 @@ impl AnyAgent {
         // one arm runs, so the moves are exclusive.
         crate::provider::stream_dispatch::dispatch_stream_fn! {
             match &self.inner;
-            AnyAgentInner(a) => (*a.model).clone(),
+            AnyAgentInner(a) => a.clone(),
             tools = tools.clone(),
             timeout = Some(chunk_timeout),
             provider = provider,

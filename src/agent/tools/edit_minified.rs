@@ -11,8 +11,7 @@
 #[cfg(feature = "lsp")]
 use std::sync::Arc;
 
-use rig::completion::ToolDefinition;
-use rig::tool::Tool;
+use rig::tool::PortableTool;
 
 use crate::agent::agent_loop::tool_input_repair::with_contract_hint;
 use crate::agent::tools::cache::ToolCache;
@@ -54,31 +53,31 @@ impl EditMinifiedTool {
     }
 }
 
-impl Tool for EditMinifiedTool {
+impl PortableTool for EditMinifiedTool {
     const NAME: &'static str = "edit_minified";
 
     type Error = ToolError;
     type Args = EditArgs;
     type Output = String;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: "edit_minified".to_string(),
-            description: with_contract_hint(
-                "edit_minified",
-                "Edit a file by replacing text matched against its MINIFIED form (as shown by read_minified). `old_text` must be the minified text — copy it from a prior read_minified of the same file — and must be unique and align to whole tokens. The change is mapped back to the original source and applied in place, preserving the file's formatting; the result is syntax-checked before writing. For normal (non-minified) edits use `edit`.",
-            ),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "The absolute path to the file to edit (must be absolute, not relative)" },
-                    "old_text": { "type": "string", "description": "Exact text to find in the file's MINIFIED form (from read_minified). Must be unique and align to whole tokens." },
-                    "new_text": { "type": "string", "description": "Replacement text (written into the original source verbatim)" },
-                    "reason": { "type": "string", "description": "Why you're making this edit and how it serves the task." }
-                },
-                "required": ["path", "old_text", "new_text"]
-            }),
-        }
+    fn description(&self) -> String {
+        with_contract_hint(
+            "edit_minified",
+            "Edit a file by replacing text matched against its MINIFIED form (as shown by read_minified). `old_text` must be the minified text — copy it from a prior read_minified of the same file — and must be unique and align to whole tokens. The change is mapped back to the original source and applied in place, preserving the file's formatting; the result is syntax-checked before writing. For normal (non-minified) edits use `edit`.",
+        )
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "The absolute path to the file to edit (must be absolute, not relative)" },
+                "old_text": { "type": "string", "description": "Exact text to find in the file's MINIFIED form (from read_minified). Must be unique and align to whole tokens." },
+                "new_text": { "type": "string", "description": "Replacement text (written into the original source verbatim)" },
+                "reason": { "type": "string", "description": "Why you're making this edit and how it serves the task." }
+            },
+            "required": ["path", "old_text", "new_text"]
+        })
     }
 
     async fn call(&self, args: EditArgs) -> Result<String, ToolError> {

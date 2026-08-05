@@ -12,8 +12,7 @@
 #[cfg(feature = "lsp")]
 use std::sync::Arc;
 
-use rig::completion::ToolDefinition;
-use rig::tool::Tool;
+use rig::tool::PortableTool;
 
 use crate::agent::agent_loop::tool_input_repair::with_contract_hint;
 use crate::agent::tools::cache::ToolCache;
@@ -69,31 +68,31 @@ impl ReadMinifiedTool {
     }
 }
 
-impl Tool for ReadMinifiedTool {
+impl PortableTool for ReadMinifiedTool {
     const NAME: &'static str = "read_minified";
 
     type Error = ToolError;
     type Args = ReadArgs;
     type Output = String;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: "read_minified".to_string(),
-            description: with_contract_hint(
-                "read_minified",
-                "Read a source file with comments stripped (and, for brace languages like Rust/Go/Java, redundant whitespace collapsed) via tree-sitter, for token efficiency. Works across the supported source languages (Rust, Go, Java, C, C++, TypeScript, Python, Ruby, Bash, Clojure, Elixir); non-source files, ranged reads (offset/limit), or unparseable files transparently fall back to a normal read. Use plain `read` when you need exact line numbers.",
-            ),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "The absolute path to the file to read (must be absolute, not relative)" },
-                    "offset": { "type": "integer", "description": "Line number to start from (1-indexed). Ranged reads skip minification and read normally." },
-                    "limit": { "type": "integer", "description": "Maximum number of lines to read. Ranged reads skip minification." },
-                    "reason": { "type": "string", "description": "Why you're reading this file: what you expect to learn and how it serves the current task. Be specific and targeted." }
-                },
-                "required": ["path", "reason"]
-            }),
-        }
+    fn description(&self) -> String {
+        with_contract_hint(
+            "read_minified",
+            "Read a source file with comments stripped (and, for brace languages like Rust/Go/Java, redundant whitespace collapsed) via tree-sitter, for token efficiency. Works across the supported source languages (Rust, Go, Java, C, C++, TypeScript, Python, Ruby, Bash, Clojure, Elixir); non-source files, ranged reads (offset/limit), or unparseable files transparently fall back to a normal read. Use plain `read` when you need exact line numbers.",
+        )
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "The absolute path to the file to read (must be absolute, not relative)" },
+                "offset": { "type": "integer", "description": "Line number to start from (1-indexed). Ranged reads skip minification and read normally." },
+                "limit": { "type": "integer", "description": "Maximum number of lines to read. Ranged reads skip minification." },
+                "reason": { "type": "string", "description": "Why you're reading this file: what you expect to learn and how it serves the current task. Be specific and targeted." }
+            },
+            "required": ["path", "reason"]
+        })
     }
 
     async fn call(&self, args: ReadArgs) -> Result<String, ToolError> {

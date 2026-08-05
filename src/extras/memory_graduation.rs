@@ -155,7 +155,12 @@ pub(crate) fn recurrence_clusters(
                 use sha2::{Digest, Sha256};
                 let mut hasher = Sha256::new();
                 hasher.update(hash_input.as_bytes());
-                format!("{:x}", hasher.finalize())
+                // sha2 0.11 no longer implements `LowerHex` on the digest output.
+                hasher
+                    .finalize()
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
             };
 
             member_uids.sort();

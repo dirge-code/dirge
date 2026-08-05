@@ -1,7 +1,6 @@
 use ignore::WalkBuilder;
 use regex::Regex;
-use rig::completion::ToolDefinition;
-use rig::tool::Tool;
+use rig::tool::PortableTool;
 
 use crate::agent::agent_loop::tool_input_repair::with_contract_hint;
 use crate::agent::tools::cache::ToolCache;
@@ -47,40 +46,40 @@ impl FindFilesTool {
     }
 }
 
-impl Tool for FindFilesTool {
+impl PortableTool for FindFilesTool {
     const NAME: &'static str = "find_files";
 
     type Error = ToolError;
     type Args = FindFilesArgs;
     type Output = String;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: "find_files".to_string(),
-            description: with_contract_hint(
-                "find_files",
-                "Recursively find FILES whose FILENAME matches a regex pattern. Use this to locate a file by name (e.g. `^Cargo\\.toml$`, `.*_test\\.py$`). NOT for finding symbol definitions — use `find_definition` for that. NOT for content search — use `grep`. Respects .gitignore; skips node_modules and target.",
-            ),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "pattern": {
-                        "type": "string",
-                        "description": "Regex pattern to match file names against"
-                    },
-                    "path": {
-                        "type": "string",
-                        "description": "Directory to search in (defaults to current working directory)"
-                    },
-                    "include_hidden": {
-                        "type": "boolean",
-                        "description": "Include dotfiles (.env, .gitignore, etc.) in results. Default false to avoid surfacing secrets and config files."
-                    },
-                    "reason": { "type": "string", "description": "Why you're searching for these files: the specific question this answers and how it serves the current task. Be targeted." }
+    fn description(&self) -> String {
+        with_contract_hint(
+            "find_files",
+            "Recursively find FILES whose FILENAME matches a regex pattern. Use this to locate a file by name (e.g. `^Cargo\\.toml$`, `.*_test\\.py$`). NOT for finding symbol definitions — use `find_definition` for that. NOT for content search — use `grep`. Respects .gitignore; skips node_modules and target.",
+        )
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "description": "Regex pattern to match file names against"
                 },
-                "required": ["pattern", "reason"]
-            }),
-        }
+                "path": {
+                    "type": "string",
+                    "description": "Directory to search in (defaults to current working directory)"
+                },
+                "include_hidden": {
+                    "type": "boolean",
+                    "description": "Include dotfiles (.env, .gitignore, etc.) in results. Default false to avoid surfacing secrets and config files."
+                },
+                "reason": { "type": "string", "description": "Why you're searching for these files: the specific question this answers and how it serves the current task. Be targeted." }
+            },
+            "required": ["pattern", "reason"]
+        })
     }
 
     async fn call(&self, args: FindFilesArgs) -> Result<String, ToolError> {

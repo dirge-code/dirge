@@ -1,6 +1,5 @@
 use ignore::WalkBuilder;
-use rig::completion::ToolDefinition;
-use rig::tool::Tool;
+use rig::tool::PortableTool;
 use serde::Deserialize;
 use std::path::Path;
 
@@ -95,40 +94,40 @@ fn glob_to_regex(pattern: &str) -> Result<regex::Regex, String> {
     regex::Regex::new(&regex_str).map_err(|e| format!("invalid glob pattern: {}", e))
 }
 
-impl Tool for GlobTool {
+impl PortableTool for GlobTool {
     const NAME: &'static str = "glob";
 
     type Error = ToolError;
     type Args = GlobArgs;
     type Output = String;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: "glob".to_string(),
-            description: crate::agent::agent_loop::tool_input_repair::with_contract_hint(
-                "glob",
-                "Find files matching a glob pattern (e.g., '**/*.rs', 'src/**/*.tsx'). Respects .gitignore via ignore crate. Returns matching relative file paths sorted by modification time (newest first). Returns empty string when no files match. Use this for natural path pattern matching instead of regex-based find_files.",
-            ),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "pattern": {
-                        "type": "string",
-                        "description": "Glob pattern to match file paths (e.g. '**/*.rs', 'src/agent/**/*.rs')"
-                    },
-                    "path": {
-                        "type": "string",
-                        "description": "Root directory to search in (default: current working directory)"
-                    },
-                    "include_hidden": {
-                        "type": "boolean",
-                        "description": "Include dotfiles (.env, .gitignore, etc.) in results. Default false to avoid surfacing secrets and config files."
-                    },
-                    "reason": { "type": "string", "description": "Why you're globbing: the specific question this answers and how it serves the current task. Be targeted." }
+    fn description(&self) -> String {
+        crate::agent::agent_loop::tool_input_repair::with_contract_hint(
+            "glob",
+            "Find files matching a glob pattern (e.g., '**/*.rs', 'src/**/*.tsx'). Respects .gitignore via ignore crate. Returns matching relative file paths sorted by modification time (newest first). Returns empty string when no files match. Use this for natural path pattern matching instead of regex-based find_files.",
+        )
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "description": "Glob pattern to match file paths (e.g. '**/*.rs', 'src/agent/**/*.rs')"
                 },
-                "required": ["pattern", "reason"]
-            }),
-        }
+                "path": {
+                    "type": "string",
+                    "description": "Root directory to search in (default: current working directory)"
+                },
+                "include_hidden": {
+                    "type": "boolean",
+                    "description": "Include dotfiles (.env, .gitignore, etc.) in results. Default false to avoid surfacing secrets and config files."
+                },
+                "reason": { "type": "string", "description": "Why you're globbing: the specific question this answers and how it serves the current task. Be targeted." }
+            },
+            "required": ["pattern", "reason"]
+        })
     }
 
     async fn call(&self, args: GlobArgs) -> Result<String, ToolError> {
@@ -274,7 +273,7 @@ mod tests {
     #[tokio::test]
     async fn test_definition_has_correct_name() {
         let tool = GlobTool::new(None, None);
-        let def = tool.definition(String::new()).await;
+        let def = rig::tool::tool_definition(&tool);
         assert_eq!(def.name, "glob");
     }
 

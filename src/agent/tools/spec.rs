@@ -8,8 +8,7 @@
 
 use std::sync::Arc;
 
-use rig::completion::ToolDefinition;
-use rig::tool::Tool;
+use rig::tool::PortableTool;
 use serde::Deserialize;
 
 use crate::agent::tools::{AskSender, PermCheck, ToolError, check_perm};
@@ -102,17 +101,15 @@ fn json(v: &serde_json::Value) -> String {
     serde_json::to_string_pretty(v).unwrap_or_else(|_| r#"{"error":"serialization failed"}"#.into())
 }
 
-impl Tool for SpecTool {
+impl PortableTool for SpecTool {
     const NAME: &'static str = "spec";
 
     type Error = ToolError;
     type Args = Args;
     type Output = String;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: "spec".to_string(),
-            description: r#"Spec-driven workflow tracker (SQLite-backed). Align on WHAT before HOW, then track implementation. Living specs (capability → requirement → scenario) are the current truth; a CHANGE carries requirement deltas + a task checklist; ARCHIVE folds the deltas into the living specs.
+    fn description(&self) -> String {
+        r#"Spec-driven workflow tracker (SQLite-backed). Align on WHAT before HOW, then track implementation. Living specs (capability → requirement → scenario) are the current truth; a CHANGE carries requirement deltas + a task checklist; ARCHIVE folds the deltas into the living specs.
 
 Actions:
 - propose (slug, why, what): new change.
@@ -125,41 +122,43 @@ Actions:
 - set_field (slug, field=title|why|what|design, value): edit a change field.
 
 scenarios = array of {name, when_then} (when_then in WHEN/THEN form)."#
-                .to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["propose", "set_field", "add_delta", "add_task", "set_task", "archive", "status", "specs"],
-                        "description": "The action to perform."
-                    },
-                    "slug": {"type": "string", "description": "Change identifier, kebab-case (e.g. add-dark-mode)."},
-                    "title": {"type": "string", "description": "Human title for propose."},
-                    "why": {"type": "string", "description": "Why this change is needed (propose)."},
-                    "what": {"type": "string", "description": "What changes (propose)."},
-                    "field": {"type": "string", "enum": ["title", "why", "what", "design"], "description": "Field to update (set_field)."},
-                    "value": {"type": "string", "description": "New value (set_field)."},
-                    "group_no": {"type": "integer", "description": "Task group number (add_task; default 1)."},
-                    "seq": {"type": "integer", "description": "Task order within its group (add_task; auto if omitted)."},
-                    "text": {"type": "string", "description": "Task description (add_task)."},
-                    "task_id": {"type": "integer", "description": "Task id (set_task)."},
-                    "status": {"type": "string", "enum": ["pending", "in_progress", "done", "blocked"], "description": "Task status (set_task)."},
-                    "op": {"type": "string", "enum": ["added", "modified", "removed", "renamed"], "description": "Delta operation (add_delta)."},
-                    "capability": {"type": "string", "description": "Capability (kebab-case) the requirement belongs to."},
-                    "requirement": {"type": "string", "description": "Requirement name."},
-                    "scenarios": {
-                        "type": "array",
-                        "items": {"type": "object", "properties": {"name": {"type": "string"}, "when_then": {"type": "string"}}, "required": ["name", "when_then"]},
-                        "description": "Behavior examples for added/modified requirements."
-                    },
-                    "reason": {"type": "string", "description": "Why a requirement is removed (removed)."},
-                    "migration": {"type": "string", "description": "Migration path for a removed requirement (removed)."},
-                    "rename_to": {"type": "string", "description": "New requirement name (renamed)."}
+                .to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["propose", "set_field", "add_delta", "add_task", "set_task", "archive", "status", "specs"],
+                    "description": "The action to perform."
                 },
-                "required": ["action"]
-            }),
-        }
+                "slug": {"type": "string", "description": "Change identifier, kebab-case (e.g. add-dark-mode)."},
+                "title": {"type": "string", "description": "Human title for propose."},
+                "why": {"type": "string", "description": "Why this change is needed (propose)."},
+                "what": {"type": "string", "description": "What changes (propose)."},
+                "field": {"type": "string", "enum": ["title", "why", "what", "design"], "description": "Field to update (set_field)."},
+                "value": {"type": "string", "description": "New value (set_field)."},
+                "group_no": {"type": "integer", "description": "Task group number (add_task; default 1)."},
+                "seq": {"type": "integer", "description": "Task order within its group (add_task; auto if omitted)."},
+                "text": {"type": "string", "description": "Task description (add_task)."},
+                "task_id": {"type": "integer", "description": "Task id (set_task)."},
+                "status": {"type": "string", "enum": ["pending", "in_progress", "done", "blocked"], "description": "Task status (set_task)."},
+                "op": {"type": "string", "enum": ["added", "modified", "removed", "renamed"], "description": "Delta operation (add_delta)."},
+                "capability": {"type": "string", "description": "Capability (kebab-case) the requirement belongs to."},
+                "requirement": {"type": "string", "description": "Requirement name."},
+                "scenarios": {
+                    "type": "array",
+                    "items": {"type": "object", "properties": {"name": {"type": "string"}, "when_then": {"type": "string"}}, "required": ["name", "when_then"]},
+                    "description": "Behavior examples for added/modified requirements."
+                },
+                "reason": {"type": "string", "description": "Why a requirement is removed (removed)."},
+                "migration": {"type": "string", "description": "Migration path for a removed requirement (removed)."},
+                "rename_to": {"type": "string", "description": "New requirement name (renamed)."}
+            },
+            "required": ["action"]
+        })
     }
 
     async fn call(&self, args: Args) -> Result<String, ToolError> {

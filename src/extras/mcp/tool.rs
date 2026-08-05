@@ -5,11 +5,11 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::agent::agent_loop::rig_tool::{DynTool, DynToolError};
 use rig::completion::ToolDefinition;
-use rig::tool::{ToolDyn, ToolError};
 use rig::wasm_compat::WasmBoxedFuture;
 use rmcp::ServiceError;
-use rmcp::model::{CallToolRequestParams, JsonObject, RawContent};
+use rmcp::model::{CallToolRequestParams, ContentBlock, JsonObject};
 use tokio::sync::Mutex;
 
 use crate::agent::agent_loop::types::InjectionScanMode;
@@ -156,12 +156,12 @@ fn mcp_args_detail(args: &str) -> Option<String> {
 /// `PermissionChecker::check` plus the explicit `any_prompt_denied`
 /// probe below), so plan-mode `deny_tools: [edit]` does block an
 /// MCP-exported `edit`. Built-in tool *rule tables* don't alias.
-impl ToolDyn for McpTool {
+impl DynTool for McpTool {
     fn name(&self) -> String {
         self.definition.name.to_string()
     }
 
-    fn definition(&self, _prompt: String) -> WasmBoxedFuture<'_, ToolDefinition> {
+    fn definition(&self) -> WasmBoxedFuture<'_, ToolDefinition> {
         let name = self.definition.name.to_string();
         let description = self
             .definition
@@ -187,7 +187,7 @@ impl ToolDyn for McpTool {
         })
     }
 
-    fn call(&self, args: String) -> WasmBoxedFuture<'_, Result<String, ToolError>> {
+    fn call(&self, args: String) -> WasmBoxedFuture<'_, Result<String, DynToolError>> {
         let server_name = self.server_name.clone();
         let tool_name = self.definition.name.to_string();
         let connection = Arc::clone(&self.connection);
@@ -214,10 +214,12 @@ impl ToolDyn for McpTool {
                     guard.any_prompt_denied(&[tool_name.as_str(), qualified.as_str(), "mcp_tool"])
                 };
                 if denied {
-                    return Err(ToolError::ToolCallError(Box::new(McpToolError(format!(
-                        "MCP tool {}::{} is denied by the active prompt's `deny_tools` frontmatter. Switch with `/prompt <other>` to use it.",
-                        server_name, tool_name,
-                    )))));
+                    return Err(DynToolError::ToolCallError(Box::new(McpToolError(
+                        format!(
+                            "MCP tool {}::{} is denied by the active prompt's `deny_tools` frontmatter. Switch with `/prompt <other>` to use it.",
+                            server_name, tool_name,
+                        ),
+                    ))));
                 }
             }
             let perm_key = format!("mcp_tool:{server_name}:{tool_name}");
@@ -233,7 +235,7 @@ impl ToolDyn for McpTool {
                 mcp_args_detail(&args).as_deref(),
             )
             .await
-            .map_err(|e| ToolError::ToolCallError(Box::new(McpToolError(e.to_string()))))?;
+            .map_err(|e| DynToolError::ToolCallError(Box::new(McpToolError(e.to_string()))))?;
 
             // Malformed JSON used to silently default to `None` via
             // `unwrap_or_default()` — the MCP server got an empty
@@ -252,10 +254,12 @@ impl ToolDyn for McpTool {
                 match serde_json::from_str::<JsonObject>(trimmed) {
                     Ok(obj) => Some(obj),
                     Err(e) => {
-                        return Err(ToolError::ToolCallError(Box::new(McpToolError(format!(
-                            "MCP tool {}::{}: malformed JSON arguments ({e}). Got: {trimmed:.200}",
-                            server_name, tool_name,
-                        )))));
+                        return Err(DynToolError::ToolCallError(Box::new(McpToolError(
+                            format!(
+                                "MCP tool {}::{}: malformed JSON arguments ({e}). Got: {trimmed:.200}",
+                                server_name, tool_name,
+                            ),
+                        ))));
                     }
                 }
             };
@@ -282,10 +286,12 @@ impl ToolDyn for McpTool {
                 && let Some(args_obj) = arguments.as_ref()
                 && let Some(p) = first_external_path(perm, args_obj, allow_external)
             {
-                return Err(ToolError::ToolCallError(Box::new(McpToolError(format!(
-                    "MCP tool {server_name}::{tool_name} refused: path {p:?} is outside the working directory. \
+                return Err(DynToolError::ToolCallError(Box::new(McpToolError(
+                    format!(
+                        "MCP tool {server_name}::{tool_name} refused: path {p:?} is outside the working directory. \
                      Set `allow_external_paths: true` on the `{server_name}` server config to permit external paths for this server."
-                )))));
+                    ),
+                ))));
             }
 
             let params = arguments
@@ -319,7 +325,7 @@ impl ToolDyn for McpTool {
             {
                 Ok(r) => r,
                 Err(e) => {
-                    return Err(ToolError::ToolCallError(Box::new(McpToolError(e))));
+                    return Err(DynToolError::ToolCallError(Box::new(McpToolError(e))));
                 }
             };
 
@@ -327,8 +333,8 @@ impl ToolDyn for McpTool {
                 let error_msg = result
                     .content
                     .iter()
-                    .filter_map(|c| match &c.raw {
-                        RawContent::Text(t) => Some(t.text.clone()),
+                    .filter_map(|c| match c {
+                        ContentBlock::Text(t) => Some(t.text.clone()),
                         _ => None,
                     })
                     .collect::<Vec<_>>()
@@ -338,7 +344,7 @@ impl ToolDyn for McpTool {
                 } else {
                     error_msg
                 };
-                return Err(ToolError::ToolCallError(Box::new(McpToolError(msg))));
+                return Err(DynToolError::ToolCallError(Box::new(McpToolError(msg))));
             }
 
             // Cap aggregate MCP result at 256 KiB before it
@@ -355,14 +361,16 @@ impl ToolDyn for McpTool {
                 if truncated {
                     break;
                 }
-                let chunk: String = match item.raw {
-                    RawContent::Text(t) => t.text,
-                    RawContent::Image(img) => {
+                let chunk: String = match item {
+                    ContentBlock::Text(t) => t.text,
+                    ContentBlock::Image(img) => {
                         format!("data:{};base64,{}", img.mime_type, img.data)
                     }
-                    RawContent::Resource(r) => match r.resource {
+                    ContentBlock::Resource(r) => match r.resource {
                         rmcp::model::ResourceContents::TextResourceContents { text, .. } => text,
                         rmcp::model::ResourceContents::BlobResourceContents { blob, .. } => blob,
+                        // `ResourceContents` is #[non_exhaustive] as of rmcp 3.
+                        _ => continue,
                     },
                     _ => continue,
                 };

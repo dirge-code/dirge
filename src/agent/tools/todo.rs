@@ -24,8 +24,7 @@ use std::path::{Path, PathBuf};
 
 #[allow(unused_imports)]
 use crate::sync_util::LockExt;
-use rig::completion::ToolDefinition;
-use rig::tool::Tool;
+use rig::tool::PortableTool;
 use serde::{Deserialize, Serialize};
 
 use crate::agent::tools::{AskSender, PermCheck, ToolError, check_perm};
@@ -165,37 +164,37 @@ impl WriteTodoList {
     }
 }
 
-impl Tool for WriteTodoList {
+impl PortableTool for WriteTodoList {
     const NAME: &'static str = "write_todo_list";
 
     type Error = ToolError;
     type Args = TodoWriteArgs;
     type Output = String;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: "write_todo_list".to_string(),
-            description: "Lay out or update a structured plan for a COMPLEX, MULTI-STEP task — work that takes several distinct steps, not several tool calls for one step.\n\nDo NOT use this for single-step work, for questions, or as a step toward changing a file. Writing a plan is not doing the work: to create or change a file, call `write` or `edit`. \"Add a hello-world script\" is one edit — just make it.\n\nEach item is a tracked issue on this session's board (shared with the `issue` tool). Listing an item creates it or updates a matching one by title (case/whitespace-insensitive); statuses are pending|in_progress|completed|cancelled|blocked. Keep exactly ONE item in_progress. Omitted items are NOT auto-closed — restate one as completed/cancelled to close it. Use `issue` for single-item or cross-session edits, `task` to delegate independent work to a background subagent.".to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "todos": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "content": { "type": "string", "description": "Task description (matched by title on later calls)" },
-                                "status": { "type": "string", "description": "pending, in_progress, blocked, completed, or cancelled" },
-                                "priority": { "type": "string", "description": "high, normal, or low" }
-                            },
-                            "required": ["content", "status", "priority"]
+    fn description(&self) -> String {
+        "Lay out or update a structured plan for a COMPLEX, MULTI-STEP task — work that takes several distinct steps, not several tool calls for one step.\n\nDo NOT use this for single-step work, for questions, or as a step toward changing a file. Writing a plan is not doing the work: to create or change a file, call `write` or `edit`. \"Add a hello-world script\" is one edit — just make it.\n\nEach item is a tracked issue on this session's board (shared with the `issue` tool). Listing an item creates it or updates a matching one by title (case/whitespace-insensitive); statuses are pending|in_progress|completed|cancelled|blocked. Keep exactly ONE item in_progress. Omitted items are NOT auto-closed — restate one as completed/cancelled to close it. Use `issue` for single-item or cross-session edits, `task` to delegate independent work to a background subagent.".to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "todos": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "content": { "type": "string", "description": "Task description (matched by title on later calls)" },
+                            "status": { "type": "string", "description": "pending, in_progress, blocked, completed, or cancelled" },
+                            "priority": { "type": "string", "description": "high, normal, or low" }
                         },
-                        "description": "Full list of tasks to track"
-                    }
-                },
-                "required": ["todos"]
-            }),
-        }
+                        "required": ["content", "status", "priority"]
+                    },
+                    "description": "Full list of tasks to track"
+                }
+            },
+            "required": ["todos"]
+        })
     }
 
     async fn call(&self, args: TodoWriteArgs) -> Result<String, ToolError> {
@@ -269,7 +268,6 @@ impl Tool for WriteTodoList {
 #[cfg(test)]
 mod description_tests {
     use super::*;
-    use rig::tool::Tool;
 
     /// dirge-5xvn (GH #734): the description has to carry its own
     /// when-NOT-to-use guidance. The board semantics used to fill the first
@@ -280,7 +278,7 @@ mod description_tests {
     #[tokio::test]
     async fn description_says_when_not_to_use_and_names_the_write_tool() {
         let tool = WriteTodoList::new(PathBuf::from("/tmp/none.db"), None, None, None);
-        let desc = tool.definition(String::new()).await.description;
+        let desc = rig::tool::tool_definition(&tool).description;
         let lower = desc.to_lowercase();
 
         assert!(

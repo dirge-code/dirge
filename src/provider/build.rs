@@ -160,7 +160,14 @@ pub async fn build_agent(
             // [dirge-tfip]. The ACTIVE model name + provider are passed
             // explicitly so model-family steering tracks /model and /agent
             // swaps instead of the launch-time CLI model (dirge-5db6).
-            let (agent, cache, memory_provider) =
+            // `AnyAgentInner` stores the model itself now, not a rig
+            // `Agent` (rig 0.41 made `Agent::model` private). Keep a
+            // clone for the stream dispatcher before `$m` is consumed.
+            let model_for_inner = $m.clone();
+            // `_agent` is the rig `Agent`. Nothing reads it any more —
+            // dirge's own loop drives requests — but building it is what
+            // assembles the preamble, so it stays until that is untangled.
+            let (_agent, cache, memory_provider, agent_preamble) =
                 builder::build_agent_inner($m, cli, cfg, context, &provider_name, &model_name)
                     .await;
 
@@ -197,13 +204,13 @@ pub async fn build_agent(
                 )
                 .await;
 
-            // Phase 4.5h-6: extract the rig Agent's preamble so
-            // the new path can pass it as Context.system_prompt.
-            // rig's Agent has `preamble: Option<String>` public.
+            // Phase 4.5h-6: the new path passes the rig Agent's
+            // preamble as Context.system_prompt. rig 0.41 made that
+            // field private, so `build_agent_inner` hands it back.
             // Phase-3: when dynamic-tool-search is on, append a
             // one-liner nudge so the model knows to call
             // `tool_search` before reaching for unknown tools.
-            let mut preamble = agent.preamble.clone().unwrap_or_default();
+            let mut preamble = agent_preamble;
             if dyn_search.is_some() {
                 if !preamble.is_empty() {
                     preamble.push_str("\n\n");
@@ -218,7 +225,7 @@ pub async fn build_agent(
             }
 
             let mut agent = AnyAgent::new(
-                AnyAgentInner::$variant(agent),
+                AnyAgentInner::$variant(model_for_inner),
                 cache,
                 chunk_timeout,
                 loop_tools,

@@ -1474,7 +1474,7 @@ fn target_expands_outside_cwd_predicate() {
 async fn bash_description_has_exactly_one_contract_line() {
     use crate::sandbox::{Sandbox, SandboxMode};
     let tool = BashTool::new(None, None, Sandbox::new(SandboxMode::Off));
-    let def = tool.definition("".to_string()).await;
+    let def = rig::tool::tool_definition(&tool);
     let count = def.description.matches("CONTRACT:").count();
     assert_eq!(
         count, 1,

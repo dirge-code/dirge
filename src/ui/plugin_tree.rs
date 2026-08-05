@@ -543,11 +543,10 @@ mod tests {
             .build()
             .expect("openai client");
         let model = client.completion_model("gpt-4o");
-        let inner = rig::agent::AgentBuilder::new(model).build();
         let provider = Arc::new(RecordingProvider::default());
         let provider_dyn: Arc<dyn MemoryProvider> = provider.clone();
         let agent = AnyAgent::new(
-            AnyAgentInner::OpenAI(inner),
+            AnyAgentInner::OpenAI(model),
             ToolCache::new(),
             std::time::Duration::from_secs(300),
             Vec::new(),

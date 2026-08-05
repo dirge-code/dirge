@@ -1,8 +1,7 @@
 #[cfg(feature = "lsp")]
 use std::sync::Arc;
 
-use rig::completion::ToolDefinition;
-use rig::tool::Tool;
+use rig::tool::PortableTool;
 
 use crate::agent::agent_loop::tool_input_repair::with_contract_hint;
 use crate::agent::tools::cache::ToolCache;
@@ -108,31 +107,31 @@ impl EditTool {
     }
 }
 
-impl Tool for EditTool {
+impl PortableTool for EditTool {
     const NAME: &'static str = "edit";
 
     type Error = ToolError;
     type Args = EditArgs;
     type Output = String;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: "edit".to_string(),
-            description: with_contract_hint(
-                "edit",
-                "Edit a file by replacing exact text. If old_text appears once, replaces it. If it appears multiple times and replace_all is false, returns all match locations with line numbers. Use replaceAll: true to replace every occurrence. Handles both LF and CRLF line endings.",
-            ),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "The absolute path to the file to edit (must be absolute, not relative)" },
-                    "old_text": { "type": "string", "description": "Exact text to find and replace" },
-                    "new_text": { "type": "string", "description": "New text to replace with" },
-                    "replace_all": { "type": "boolean", "description": "Replace all occurrences instead of just the first" }
-                },
-                "required": ["path", "old_text", "new_text"]
-            }),
-        }
+    fn description(&self) -> String {
+        with_contract_hint(
+            "edit",
+            "Edit a file by replacing exact text. If old_text appears once, replaces it. If it appears multiple times and replace_all is false, returns all match locations with line numbers. Use replaceAll: true to replace every occurrence. Handles both LF and CRLF line endings.",
+        )
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "The absolute path to the file to edit (must be absolute, not relative)" },
+                "old_text": { "type": "string", "description": "Exact text to find and replace" },
+                "new_text": { "type": "string", "description": "New text to replace with" },
+                "replace_all": { "type": "boolean", "description": "Replace all occurrences instead of just the first" }
+            },
+            "required": ["path", "old_text", "new_text"]
+        })
     }
 
     async fn call(&self, args: EditArgs) -> Result<String, ToolError> {

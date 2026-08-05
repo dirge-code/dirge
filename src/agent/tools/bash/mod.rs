@@ -1,5 +1,4 @@
-use rig::completion::ToolDefinition;
-use rig::tool::Tool;
+use rig::tool::PortableTool;
 
 pub(crate) mod check;
 pub(crate) mod exec;
@@ -87,31 +86,31 @@ impl BashTool {
     }
 }
 
-impl Tool for BashTool {
+impl PortableTool for BashTool {
     const NAME: &'static str = "bash";
 
     type Error = ToolError;
     type Args = BashArgs;
     type Output = String;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: "bash".to_string(),
-            description: with_contract_hint(
+    fn description(&self) -> String {
+        with_contract_hint(
                 "bash",
                 &("Execute a bash command in the current working directory. Returns stdout and stderr.".to_owned()
                 + cfg!(feature = "experimental-ui-computer-use").then_some("\n\nDesktop automation: prefix commands with `computer:` to control the desktop GUI. Actions: `computer:open_url <url>` (opens in browser), `computer:screenshot` (captures screen), `computer:type <text>`, `computer:key <keys>`, `computer:click <button>`, `computer:move <x> <y>`. Each action prompts for user confirmation.").unwrap_or("")),
-            ),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "command": { "type": "string", "description": "Bash command to execute" },
-                    "timeout": { "type": "integer", "description": "Timeout in seconds (optional; default 120, or 600 when background)" },
-                    "background": { "type": "boolean", "description": "Run detached and unbounded: returns immediately with a shell id (does NOT block the turn). Use for long-running commands — dev servers, watch builds, tails. Read its accumulated output with the bash_output tool (pass the id; poll it to follow progress) and stop it with kill_shell (pass the id). Output is NOT auto-delivered. If `timeout` is set, the shell is auto-killed after that many seconds; otherwise it runs until it exits or you kill it." }
-                },
-                "required": ["command"]
-            }),
-        }
+            )
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "command": { "type": "string", "description": "Bash command to execute" },
+                "timeout": { "type": "integer", "description": "Timeout in seconds (optional; default 120, or 600 when background)" },
+                "background": { "type": "boolean", "description": "Run detached and unbounded: returns immediately with a shell id (does NOT block the turn). Use for long-running commands — dev servers, watch builds, tails. Read its accumulated output with the bash_output tool (pass the id; poll it to follow progress) and stop it with kill_shell (pass the id). Output is NOT auto-delivered. If `timeout` is set, the shell is auto-killed after that many seconds; otherwise it runs until it exits or you kill it." }
+            },
+            "required": ["command"]
+        })
     }
 
     async fn call(&self, args: BashArgs) -> Result<String, ToolError> {

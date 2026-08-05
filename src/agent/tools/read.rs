@@ -1,8 +1,7 @@
 #[cfg(feature = "lsp")]
 use std::sync::Arc;
 
-use rig::completion::ToolDefinition;
-use rig::tool::Tool;
+use rig::tool::PortableTool;
 
 use crate::agent::agent_loop::tool_input_repair::with_contract_hint;
 use crate::agent::agent_loop::types::InjectionScanMode;
@@ -153,52 +152,52 @@ impl ReadTool {
     }
 }
 
-impl Tool for ReadTool {
+impl PortableTool for ReadTool {
     const NAME: &'static str = "read";
 
     type Error = ToolError;
     type Args = ReadArgs;
     type Output = String;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: "read".to_string(),
-            description: with_contract_hint(
-                "read",
-                "Read the contents of a file. Supports text files. Defaults to first 2000 lines. Use offset/limit for large files.",
-            ),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "The absolute path to the file to read (must be absolute, not relative)",
-                        "dirge-hints": {"semantic": "absolute_path"}
-                    },
-                    "offset": { "type": "integer", "description": "Line number to start from (1-indexed)" },
-                    "limit": { "type": "integer", "description": "Maximum number of lines to read" },
-                    "line_hashes": { "type": "boolean", "description": "Prefix each line with its 3-char content hash (e.g. `42 a3f: ...`) for hash-anchored editing with edit_lines. Pass the start/end line numbers and these hashes to edit_lines to replace a range without retyping the old text." },
-                    "reason": { "type": "string", "description": "Why you're reading this file: what you expect to learn and how it serves the current task. Be specific and targeted — don't read files for general orientation." }
+    fn description(&self) -> String {
+        with_contract_hint(
+            "read",
+            "Read the contents of a file. Supports text files. Defaults to first 2000 lines. Use offset/limit for large files.",
+        )
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "The absolute path to the file to read (must be absolute, not relative)",
+                    "dirge-hints": {"semantic": "absolute_path"}
                 },
-                "required": ["path", "reason"],
-                // Phase-2: when `limit` is given but `offset` is
-                // not (or vice versa), the harness auto-fills the
-                // missing one with `offset = 0` and prepends a
-                // Note: to the tool result so the model knows the
-                // default was applied. Replaces the hardcoded note
-                // in `read::call`'s body — that path can be
-                // removed once every relational pairing migrates
-                // here.
-                "dirge-hints": {
-                    "relational": [
-                        {
-                            "requires": ["offset", "limit"],
-                            "defaults": {"offset": 0}
-                        }
-                    ]
-                }
-            }),
-        }
+                "offset": { "type": "integer", "description": "Line number to start from (1-indexed)" },
+                "limit": { "type": "integer", "description": "Maximum number of lines to read" },
+                "line_hashes": { "type": "boolean", "description": "Prefix each line with its 3-char content hash (e.g. `42 a3f: ...`) for hash-anchored editing with edit_lines. Pass the start/end line numbers and these hashes to edit_lines to replace a range without retyping the old text." },
+                "reason": { "type": "string", "description": "Why you're reading this file: what you expect to learn and how it serves the current task. Be specific and targeted — don't read files for general orientation." }
+            },
+            "required": ["path", "reason"],
+            // Phase-2: when `limit` is given but `offset` is
+            // not (or vice versa), the harness auto-fills the
+            // missing one with `offset = 0` and prepends a
+            // Note: to the tool result so the model knows the
+            // default was applied. Replaces the hardcoded note
+            // in `read::call`'s body — that path can be
+            // removed once every relational pairing migrates
+            // here.
+            "dirge-hints": {
+                "relational": [
+                    {
+                        "requires": ["offset", "limit"],
+                        "defaults": {"offset": 0}
+                    }
+                ]
+            }
+        })
     }
 
     async fn call(&self, args: ReadArgs) -> Result<String, ToolError> {

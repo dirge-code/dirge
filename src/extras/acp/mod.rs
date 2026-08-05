@@ -2,7 +2,7 @@ pub mod config;
 
 use std::sync::Arc;
 
-use agent_client_protocol::schema::*;
+use agent_client_protocol::schema::v1::*;
 use agent_client_protocol::{Agent, Client, ConnectionTo, Dispatch, Responder, Stdio};
 use agent_client_protocol::{on_receive_notification, on_receive_request};
 
@@ -229,12 +229,19 @@ pub async fn serve(cli: Cli, cfg: Config, context: ContextFiles) -> anyhow::Resu
             on_receive_notification!(),
         )
         .on_receive_dispatch(
-            |dispatch: Dispatch<AgentRequest, AgentNotification>, cx: ConnectionTo<Client>| {
+            |dispatch: Dispatch<AgentRequest, AgentNotification>, _cx: ConnectionTo<Client>| {
                 async move {
-                    dispatch.respond_with_error(
-                        agent_client_protocol::util::internal_error("Unhandled ACP message"),
-                        cx,
-                    )
+                    // acp 2.0 moved `respond_with_error` off `Dispatch` and onto
+                    // the `Responder` that only the request variant carries. A
+                    // notification or a stray response has no reply channel, so
+                    // there is nothing to answer — dropping it matches what the
+                    // old blanket call did for those arms.
+                    match dispatch {
+                        Dispatch::Request(_, responder) => responder.respond_with_error(
+                            agent_client_protocol::util::internal_error("Unhandled ACP message"),
+                        ),
+                        _ => Ok(()),
+                    }
                 }
             },
             agent_client_protocol::on_receive_dispatch!(),

@@ -1,5 +1,4 @@
-use rig::completion::ToolDefinition;
-use rig::tool::Tool;
+use rig::tool::PortableTool;
 use serde::Deserialize;
 use std::path::Path;
 
@@ -197,62 +196,62 @@ async fn apply_rename(path: &str, new_path: &str) -> Result<String, String> {
     Ok(format!("renamed {} -> {}", path, new_path))
 }
 
-impl Tool for ApplyPatchTool {
+impl PortableTool for ApplyPatchTool {
     const NAME: &'static str = "apply_patch";
 
     type Error = ToolError;
     type Args = ApplyPatchArgs;
     type Output = String;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: "apply_patch".to_string(),
-            description: crate::agent::agent_loop::tool_input_repair::with_contract_hint(
-                "apply_patch",
-                "Apply multiple file operations in a single call. Supports create, update (by exact text match), delete, and rename. Operations execute in order and stop on first failure — prior operations that succeeded remain applied.",
-            ),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "operations": {
-                        "type": "array",
-                        "description": "Ordered list of file operations to execute",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "action": {
-                                    "type": "string",
-                                    "enum": ["create", "update", "delete", "rename"],
-                                    "description": "The type of operation"
-                                },
-                                "path": {
-                                    "type": "string",
-                                    "description": "Target file path"
-                                },
-                                "content": {
-                                    "type": "string",
-                                    "description": "File content (required for create)"
-                                },
-                                "old_text": {
-                                    "type": "string",
-                                    "description": "Exact text to find and replace (required for update)"
-                                },
-                                "new_text": {
-                                    "type": "string",
-                                    "description": "Replacement text (required for update)"
-                                },
-                                "new_path": {
-                                    "type": "string",
-                                    "description": "New file path (required for rename)"
-                                }
+    fn description(&self) -> String {
+        crate::agent::agent_loop::tool_input_repair::with_contract_hint(
+            "apply_patch",
+            "Apply multiple file operations in a single call. Supports create, update (by exact text match), delete, and rename. Operations execute in order and stop on first failure — prior operations that succeeded remain applied.",
+        )
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "operations": {
+                    "type": "array",
+                    "description": "Ordered list of file operations to execute",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "action": {
+                                "type": "string",
+                                "enum": ["create", "update", "delete", "rename"],
+                                "description": "The type of operation"
                             },
-                            "required": ["action", "path"]
-                        }
+                            "path": {
+                                "type": "string",
+                                "description": "Target file path"
+                            },
+                            "content": {
+                                "type": "string",
+                                "description": "File content (required for create)"
+                            },
+                            "old_text": {
+                                "type": "string",
+                                "description": "Exact text to find and replace (required for update)"
+                            },
+                            "new_text": {
+                                "type": "string",
+                                "description": "Replacement text (required for update)"
+                            },
+                            "new_path": {
+                                "type": "string",
+                                "description": "New file path (required for rename)"
+                            }
+                        },
+                        "required": ["action", "path"]
                     }
-                },
-                "required": ["operations"]
-            }),
-        }
+                }
+            },
+            "required": ["operations"]
+        })
     }
 
     async fn call(&self, args: ApplyPatchArgs) -> Result<String, ToolError> {
@@ -597,7 +596,7 @@ mod tests {
     #[tokio::test]
     async fn test_definition_has_correct_name() {
         let tool = ApplyPatchTool::new(None, None);
-        let def = tool.definition(String::new()).await;
+        let def = rig::tool::tool_definition(&tool);
         assert_eq!(def.name, "apply_patch");
     }
 

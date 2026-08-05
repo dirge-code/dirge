@@ -1,8 +1,7 @@
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
-use rig::completion::ToolDefinition;
-use rig::tool::Tool;
+use rig::tool::PortableTool;
 use serde::Deserialize;
 
 use crate::agent::tools::{AskSender, PermCheck, ToolError, check_perm};
@@ -33,28 +32,28 @@ pub struct Args {
     name: String,
 }
 
-impl Tool for FindDefinitionTool {
+impl PortableTool for FindDefinitionTool {
     const NAME: &'static str = "find_definition";
 
     type Error = ToolError;
     type Args = Args;
     type Output = String;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: "find_definition".to_string(),
-            description: "Find where a SYMBOL (function, class, type, etc.) is DEFINED across the project. Uses tree-sitter for precise structural matching. NOT for finding files by name — use `find_files` for that. NOT for content search — use `grep`.".to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "name": {
-                        "type": "string",
-                        "description": "Name of the symbol to find"
-                    }
-                },
-                "required": ["name"]
-            }),
-        }
+    fn description(&self) -> String {
+        "Find where a SYMBOL (function, class, type, etc.) is DEFINED across the project. Uses tree-sitter for precise structural matching. NOT for finding files by name — use `find_files` for that. NOT for content search — use `grep`.".to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Name of the symbol to find"
+                }
+            },
+            "required": ["name"]
+        })
     }
 
     async fn call(&self, args: Args) -> Result<String, ToolError> {

@@ -1,8 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use ignore::WalkBuilder;
-use rig::completion::ToolDefinition;
-use rig::tool::Tool;
+use rig::tool::PortableTool;
 use serde::Deserialize;
 
 use crate::agent::tools::cache::ToolCache;
@@ -71,36 +70,36 @@ impl RepoOverviewTool {
     }
 }
 
-impl Tool for RepoOverviewTool {
+impl PortableTool for RepoOverviewTool {
     const NAME: &'static str = "repo_overview";
 
     type Error = ToolError;
     type Args = RepoOverviewArgs;
     type Output = String;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: "repo_overview".to_string(),
-            description: "Structural map of a codebase: directory tree with per-directory file counts and optionally per-file line counts. Use this BEFORE diving into specific files when you need a sense of project layout — much cheaper than reading every file. Honors .gitignore and skips common noise dirs (node_modules, target, .git, __pycache__).".to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Root path to summarize (relative to cwd or absolute). Defaults to '.' (cwd).",
-                    },
-                    "max_depth": {
-                        "type": "integer",
-                        "description": "Subdirectory depth cap (default 3, hard max 6).",
-                    },
-                    "include_line_counts": {
-                        "type": "boolean",
-                        "description": "Include per-file line count. Default false (cheaper).",
-                    },
+    fn description(&self) -> String {
+        "Structural map of a codebase: directory tree with per-directory file counts and optionally per-file line counts. Use this BEFORE diving into specific files when you need a sense of project layout — much cheaper than reading every file. Honors .gitignore and skips common noise dirs (node_modules, target, .git, __pycache__).".to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Root path to summarize (relative to cwd or absolute). Defaults to '.' (cwd).",
                 },
-                "required": [],
-            }),
-        }
+                "max_depth": {
+                    "type": "integer",
+                    "description": "Subdirectory depth cap (default 3, hard max 6).",
+                },
+                "include_line_counts": {
+                    "type": "boolean",
+                    "description": "Include per-file line count. Default false (cheaper).",
+                },
+            },
+            "required": [],
+        })
     }
 
     async fn call(&self, args: RepoOverviewArgs) -> Result<String, ToolError> {

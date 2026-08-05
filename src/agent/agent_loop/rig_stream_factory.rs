@@ -595,7 +595,7 @@ fn value_to_rig_message_for_provider(
         }
         "assistant" => {
             let blocks = value.get("content").and_then(|c| c.as_array())?;
-            let include_reasoning = !provider_requires_openai_reasoning_ids(provider_name);
+            let include_reasoning = !provider_rejects_reasoning_echo(provider_name);
             let synthesize_call_id = provider_requires_openai_call_ids(provider_name);
             let assistant_contents: Vec<AssistantContent> = blocks
                 .iter()
@@ -675,7 +675,20 @@ fn value_to_rig_message(value: &Value) -> Option<Message> {
     value_to_rig_message_for_provider(value, None, None)
 }
 
-fn provider_requires_openai_reasoning_ids(provider_name: Option<&str>) -> bool {
+/// Providers that must NOT receive an echoed-back assistant reasoning block.
+///
+/// Only `openai` qualifies: its Responses API wants reasoning items keyed by
+/// the encrypted ids it issued, which dirge does not retain, so a bare block is
+/// rejected and there is no field to rename it to.
+///
+/// Every other backend keeps its reasoning. Dropping it would lose the model's
+/// own chain of thought from the next turn's context, so a backend that spells
+/// the field differently is handled by renaming at the wire boundary instead —
+/// see `CompressingHttpClient::rewrite_provider_quirks`, which moves
+/// `reasoning_content` to `reasoning` for Cerebras. DeepSeek requires the echo
+/// on tool-call turns, and llama.cpp/LocalAI chat templates read
+/// `message.reasoning_content` back out of the assistant turn.
+fn provider_rejects_reasoning_echo(provider_name: Option<&str>) -> bool {
     matches!(provider_name, Some(provider) if provider.eq_ignore_ascii_case("openai"))
 }
 
@@ -1124,6 +1137,49 @@ mod tests {
                 _ => panic!("expected Reasoning"),
             },
             _ => panic!("expected Assistant"),
+        }
+    }
+
+    /// GH #745 fallout. Cerebras streams reasoning as `delta.reasoning` — the
+    /// same non-standard field LocalAI uses. rig 0.39 discarded it, so dirge
+    /// never had a thinking block to replay; rig 0.40+ keeps it, and replaying
+    /// it as `reasoning_content` makes Cerebras 400 with
+    /// `property 'messages.N.assistant.reasoning_content' is unsupported`.
+    ///
+    /// The block must still be BUILT here — dropping it would lose the model's
+    /// reasoning from the next turn's context. The field is renamed at the wire
+    /// boundary instead (`CompressingHttpClient::rewrite_provider_quirks`).
+    /// `h7_cerebras_tool_dispatch_completes_round_trip` covers the live round
+    /// trip; this pins the half that needs no API key.
+    #[test]
+    fn reasoning_echo_is_preserved_for_every_backend_but_openai() {
+        let v = serde_json::json!({
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "text": "let me think"},
+                {"type": "text", "text": "the answer"},
+            ],
+        });
+        for provider in ["cerebras", "deepseek", "custom", "ollama", "glm"] {
+            let msg = value_to_rig_message_for_provider(&v, Some(provider), None)
+                .unwrap_or_else(|| panic!("{provider} must keep the reasoning block"));
+            match msg {
+                Message::Assistant { content, .. } => {
+                    assert!(
+                        content
+                            .iter()
+                            .any(|c| matches!(c, AssistantContent::Reasoning(_))),
+                        "{provider} must retain reasoning",
+                    );
+                    assert!(
+                        content
+                            .iter()
+                            .any(|c| matches!(c, AssistantContent::Text(_))),
+                        "{provider} must retain the assistant's text",
+                    );
+                }
+                _ => panic!("expected Assistant"),
+            }
         }
     }
 

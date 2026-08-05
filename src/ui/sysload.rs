@@ -60,9 +60,9 @@ pub fn spawn_poller(interval: Duration) -> SharedSysLoad {
         // computed across the window between two refresh_cpu_all
         // calls. Prime with one refresh + sleep before the loop.
         let mut sys = System::new_with_specifics(
-            RefreshKind::new()
-                .with_cpu(CpuRefreshKind::new().with_cpu_usage())
-                .with_memory(MemoryRefreshKind::new().with_ram()),
+            RefreshKind::nothing()
+                .with_cpu(CpuRefreshKind::nothing().with_cpu_usage())
+                .with_memory(MemoryRefreshKind::nothing().with_ram()),
         );
         sys.refresh_cpu_all();
         sys.refresh_memory();

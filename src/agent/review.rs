@@ -763,11 +763,10 @@ mod tests {
             .build()
             .expect("openai client");
         let model = client.completion_model("gpt-4o");
-        let inner_agent = rig::agent::AgentBuilder::new(model).build();
         let provider = Arc::new(RecordingEndProvider::default());
         let provider_dyn: Arc<dyn MemoryProvider> = provider.clone();
         let agent = AnyAgent::new(
-            AnyAgentInner::OpenAI(inner_agent),
+            AnyAgentInner::OpenAI(model),
             ToolCache::new(),
             std::time::Duration::from_secs(300),
             Vec::new(),
@@ -871,11 +870,10 @@ mod tests {
             .build()
             .unwrap();
         let model = client.completion_model("gpt-4o");
-        let inner_agent = rig::agent::AgentBuilder::new(model).build();
         let provider = Arc::new(RecordingSwitchProvider::default());
         let provider_dyn: Arc<dyn MemoryProvider> = provider.clone();
         let agent = AnyAgent::new(
-            AnyAgentInner::OpenAI(inner_agent),
+            AnyAgentInner::OpenAI(model),
             ToolCache::new(),
             std::time::Duration::from_secs(300),
             Vec::new(),
@@ -905,9 +903,8 @@ mod tests {
             .build()
             .unwrap();
         let model = client.completion_model("gpt-4o");
-        let inner_agent = rig::agent::AgentBuilder::new(model).build();
         let agent = AnyAgent::new(
-            AnyAgentInner::OpenAI(inner_agent),
+            AnyAgentInner::OpenAI(model),
             ToolCache::new(),
             std::time::Duration::from_secs(300),
             Vec::new(),
@@ -929,9 +926,8 @@ mod tests {
             .build()
             .unwrap();
         let model = client.completion_model("gpt-4o");
-        let inner_agent = rig::agent::AgentBuilder::new(model).build();
         let agent = AnyAgent::new(
-            AnyAgentInner::OpenAI(inner_agent),
+            AnyAgentInner::OpenAI(model),
             ToolCache::new(),
             std::time::Duration::from_secs(300),
             Vec::new(),

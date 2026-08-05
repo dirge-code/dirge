@@ -194,13 +194,13 @@ libc = "0.2"
 #   - Linux: needs a D-Bus backend. `z` = zbus, a pure-Rust client, so we avoid
 #     a system libdbus build/link dependency.
 [target.'cfg(target_os = "macos")'.dependencies]
-notify-rust = { version = "4", default-features = false }
+notify-rust = { version = "4.18", default-features = false }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-notify-rust = { version = "4", default-features = false }
+notify-rust = { version = "4.18", default-features = false }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-notify-rust = { version = "4", default-features = false, features = ["z"] }
+notify-rust = { version = "4.18", default-features = false, features = ["z"] }
 
 [dependencies]
 # CVE-2026 audit (2026-05-27): rig's default features pull a
@@ -216,24 +216,31 @@ notify-rust = { version = "4", default-features = false, features = ["z"] }
 #   default → rig-lancedb → lance → tantivy → lru 0.12.5
 #     ← RUSTSEC-2026-0002 (unsound)
 #
-# Dirge only uses rig's MCP transport (`rmcp` feature) and the core
-# provider/agent/completion APIs. By disabling default features we
-# drop ~370 transitive crates (881→508 deps) and eliminate all 6
-# cargo-audit findings.
+# Dirge uses the core provider/completion APIs plus the classic agent
+# runtime. By disabling default features we drop ~370 transitive crates
+# (881→508 deps) and eliminate all 6 cargo-audit findings.
+#
+# `agent` is required: 0.41 split the classic runtime into `rig-agent`,
+# and without it `rig::agent::AgentBuilder` and the `rig::tool` traits
+# vanish. `rmcp` is inherited from before the split and is a candidate
+# for removal — nothing here references rig's MCP bridge, and dropping
+# it would also drop the duplicate `rmcp 2.2.0` that rig-agent pulls in
+# alongside our own `rmcp 1.7`.
+#
 # Pinned to an exact version, not a caret. rig ships breaking API
 # changes in patch/minor releases (0.37.0 -> 0.37.1 added a required
 # `Text.additional_params` field), and `cargo install dirge-agent`
 # resolves without our Cargo.lock, so a caret would let a published
 # dirge drift onto an incompatible rig and fail to build (GH #616).
 # Bump this deliberately when adopting a new rig.
-rig = { version = "=0.39.0", default-features = false, features = ["rmcp"] }
+rig = { version = "=0.41.0", default-features = false, features = ["agent"] }
 # Explicit dep to pin feature flags. Without this, rig (our only
 # dep on rig-core) enables `derive` and `reqwest` via its own
 # feature resolution, but we want `rustls` explicitly declared so
 # future readers understand the TLS backend choice is deliberate.
 # cargo-machete reports this as unused — the package.metadata
 # block at the top of this file suppresses that false positive.
-rig-core = { version = "=0.39.0", default-features = false, features = ["reqwest", "derive"] }
+rig-core = { version = "=0.41.0", default-features = false, features = ["reqwest", "derive"] }
 # Macros for emitting `Stream<Item = …>` from async generator-style
 # code blocks. Used by `agent_loop::rig_stream` to wrap rig's
 # `StreamingCompletionResponse` into our pi-style `StreamEvent`
@@ -246,7 +253,7 @@ async-stream = "0.3"
 # undercounts emoji (e.g. ✅ takes 2 cells in most terminals); markdown
 # tables misaligned the right border when cells contained them.
 unicode-width = "0.2"
-rmcp = { version = "1.7", optional = true, default-features = false, features = [
+rmcp = { version = "3.1", optional = true, default-features = false, features = [
     "client",
     "transport-child-process",
     "transport-streamable-http-client-reqwest",
@@ -292,16 +299,16 @@ rustls = { version = "0.23", default-features = false, features = ["ring"] }
 # sub-panel. `default-features = false` + only the modules we use
 # keeps the dep small (no disks / networks / processes — just CPU
 # + memory polling).
-sysinfo = { version = "0.32", default-features = false, features = ["system"] }
+sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 dirs = "6"
-compact_str = { version = "0.9", features = ["serde"] }
+compact_str = { version = "0.10", features = ["serde"] }
 smallvec = "1"
 regex = "1"
 ignore = "0.4.27"
 pulldown-cmark = "0.13"
 include_dir = "0.7"
-http = "1"
-agent-client-protocol = { version = "0.12.0", optional = true }
+http = "1.5"
+agent-client-protocol = { version = "2.0.0", optional = true }
 tree-sitter = { version = "0.25", optional = true }
 tree-sitter-typescript = { version = "0.23", optional = true }
 tree-sitter-python = { version = "0.25", optional = true }
@@ -314,7 +321,7 @@ tree-sitter-java = { version = "0.23", optional = true }
 tree-sitter-c = { version = "0.24", optional = true }
 tree-sitter-cpp = { version = "0.23", optional = true }
 streaming-iterator = { version = "0.1", optional = true }
-jsonschema = { version = "0.46", default-features = false, features = ["resolve-http", "resolve-file", "tls-ring"] }
+jsonschema = { version = "0.49", default-features = false, features = ["resolve-http", "resolve-file", "tls-ring"] }
 janetrs = { version = "0.8", optional = true }
 html2text = "0.17"
 indexmap = "2"
@@ -326,7 +333,7 @@ lsp-types = { version = "0.97", optional = true }
 tree-sitter-elixir = { version = "0.3.5", optional = true }
 tree-sitter-sequel = { version = "0.3", optional = true }
 tree-sitter-dafny = { version = "0.1", optional = true }
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 # DAP (Debug Adapter Protocol) — optional feature for driving
 # debuggers (lldb-dap, dlv, debugpy, node) to fix crashes instead
 # of sprinkling print statements. Types are hand-rolled in
@@ -349,10 +356,10 @@ russh = { version = "0.62.5", default-features = false, features = ["ring"], opt
 # sha2 + hex: OCI layer digest verification for the microVM sandbox.
 # Every blob downloaded from the registry is SHA-256 hashed and compared
 # against the manifest's declared digest before extraction.
-sha2 = "0.10"
+sha2 = "0.11"
 hex = { version = "0.4", optional = true }
 # base64: decode OpenSSH-format public keys for host-key verification.
-base64 = "0.22"
+base64 = "0.23"
 # YAML parser for skill frontmatter (replaces hand-rolled parser in
 # `src/extras/skills/format.rs`). `yaml-rust2` is the maintained fork
 # of the abandoned `yaml-rust` crate, fully YAML 1.2 compliant.

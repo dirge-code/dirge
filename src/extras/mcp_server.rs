@@ -25,7 +25,7 @@ use rmcp::handler::server::ServerHandler;
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolResult, Content, Implementation, InitializeResult, ServerCapabilities, ServerInfo,
+    CallToolResult, ContentBlock, Implementation, InitializeResult, ServerCapabilities, ServerInfo,
 };
 use rmcp::transport::stdio;
 use rmcp::{schemars, tool, tool_handler, tool_router};
@@ -589,11 +589,11 @@ fn load_or_create_pointer(project_dir: &Path) -> anyhow::Result<(String, Option<
 
 fn tool_json(value: &serde_json::Value) -> CallToolResult {
     let body = serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string());
-    CallToolResult::success(vec![Content::text(body)])
+    CallToolResult::success(vec![ContentBlock::text(body)])
 }
 
 fn tool_err(msg: String) -> CallToolResult {
-    CallToolResult::error(vec![Content::text(msg)])
+    CallToolResult::error(vec![ContentBlock::text(msg)])
 }
 
 /// Entry point for `dirge mcp`. Runs the MCP server over stdio until the

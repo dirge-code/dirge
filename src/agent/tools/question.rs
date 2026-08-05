@@ -1,5 +1,4 @@
-use rig::completion::ToolDefinition;
-use rig::tool::Tool;
+use rig::tool::PortableTool;
 use serde::Deserialize;
 use tokio::sync::{mpsc, oneshot};
 
@@ -75,24 +74,15 @@ impl QuestionTool {
     }
 }
 
-impl Tool for QuestionTool {
+impl PortableTool for QuestionTool {
     const NAME: &'static str = "question";
 
     type Error = ToolError;
     type Args = QuestionArgs;
     type Output = String;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        // Description mirrors opencode's question.txt structure —
-        // the explicit \"when to use\" list + \"usage notes\" gets
-        // the model to actually reach for this tool instead of
-        // either guessing or asking in plain prose. The
-        // \"(Recommended)\" convention helps the model communicate
-        // its preferred answer without taking choice away from
-        // the user.
-        ToolDefinition {
-            name: "question".to_string(),
-            description: "Ask the user structured questions during execution. Use this when you need to:\n\
+    fn description(&self) -> String {
+        "Ask the user structured questions during execution. Use this when you need to:\n\
                 1. Gather user preferences or requirements\n\
                 2. Clarify ambiguous instructions before proceeding\n\
                 3. Get decisions on implementation choices as you work\n\
@@ -106,52 +96,54 @@ impl Tool for QuestionTool {
                 - If you recommend a specific option, make it the first option and add \" (Recommended)\" at the end of the label.\n\
                 - Use `header` to group related questions under a short section title.\n\
                 - Prefer asking over guessing when the user's request is genuinely ambiguous — but don't over-ask for clearly-decidable details."
-                .to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "questions": {
-                        "type": "array",
-                        "description": "List of questions to ask the user",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "question": {
-                                    "type": "string",
-                                    "description": "The question text"
-                                },
-                                "header": {
-                                    "type": "string",
-                                    "description": "Optional section heading displayed above the question"
-                                },
-                                "options": {
-                                    "type": "array",
-                                    "description": "Answer choices for the user",
-                                    "items": {
-                                        "type": "object",
-                                        "properties": {
-                                            "label": {"type": "string", "description": "Short display label for the option"},
-                                            "description": {"type": "string", "description": "Explanation of what this choice means"}
-                                        },
-                                        "required": ["label", "description"]
-                                    }
-                                },
-                                "multi_select": {
-                                    "type": "boolean",
-                                    "description": "Allow selecting multiple options (default: false)"
-                                },
-                                "custom": {
-                                    "type": "boolean",
-                                    "description": "Whether to show a 'Type your own answer' option (default: true)"
+                .to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "questions": {
+                    "type": "array",
+                    "description": "List of questions to ask the user",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "question": {
+                                "type": "string",
+                                "description": "The question text"
+                            },
+                            "header": {
+                                "type": "string",
+                                "description": "Optional section heading displayed above the question"
+                            },
+                            "options": {
+                                "type": "array",
+                                "description": "Answer choices for the user",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "label": {"type": "string", "description": "Short display label for the option"},
+                                        "description": {"type": "string", "description": "Explanation of what this choice means"}
+                                    },
+                                    "required": ["label", "description"]
                                 }
                             },
-                            "required": ["question", "options"]
-                        }
+                            "multi_select": {
+                                "type": "boolean",
+                                "description": "Allow selecting multiple options (default: false)"
+                            },
+                            "custom": {
+                                "type": "boolean",
+                                "description": "Whether to show a 'Type your own answer' option (default: true)"
+                            }
+                        },
+                        "required": ["question", "options"]
                     }
-                },
-                "required": ["questions"]
-            }),
-        }
+                }
+            },
+            "required": ["questions"]
+        })
     }
 
     async fn call(&self, args: QuestionArgs) -> Result<String, ToolError> {
@@ -227,7 +219,7 @@ mod tests {
     async fn test_definition_has_correct_name() {
         let (tx, _rx) = mpsc::channel(1);
         let tool = QuestionTool::new(tx);
-        let def = tool.definition(String::new()).await;
+        let def = rig::tool::tool_definition(&tool);
         assert_eq!(def.name, "question");
     }
 

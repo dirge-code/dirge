@@ -4,8 +4,7 @@ use std::sync::Arc;
 #[cfg(feature = "lsp")]
 use std::time::{Duration, Instant};
 
-use rig::completion::ToolDefinition;
-use rig::tool::Tool;
+use rig::tool::PortableTool;
 
 use crate::agent::agent_loop::tool_input_repair::with_contract_hint;
 use crate::agent::tools::cache::ToolCache;
@@ -69,29 +68,29 @@ impl WriteTool {
     }
 }
 
-impl Tool for WriteTool {
+impl PortableTool for WriteTool {
     const NAME: &'static str = "write";
 
     type Error = ToolError;
     type Args = WriteArgs;
     type Output = String;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: "write".to_string(),
-            description: with_contract_hint(
-                "write",
-                "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories.",
-            ),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "The absolute path to the file to write (must be absolute, not relative)" },
-                    "content": { "type": "string", "description": "Content to write to the file" }
-                },
-                "required": ["path", "content"]
-            }),
-        }
+    fn description(&self) -> String {
+        with_contract_hint(
+            "write",
+            "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories.",
+        )
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type":"string","description":"The absolute path to the file to write (must be absolute, not relative)"},
+                "content": {"type":"string","description":"Content to write to the file"}
+            },
+            "required": ["path","content"]
+        })
     }
 
     async fn call(&self, args: WriteArgs) -> Result<String, ToolError> {
