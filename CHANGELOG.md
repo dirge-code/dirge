@@ -7,8 +7,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Changed
-- Dependency sweep. `rmcp` was on two versions at once — our own 1.7 plus a 2.2
-  that `rig`'s unused `rmcp` feature dragged in, and a third from
+- Dependency sweep. `rmcp` was on three versions at once — our own 1.7, a 2.2
+  that `rig`'s unused `rmcp` feature dragged in, and a 1.8 from
   `agent-client-protocol`. Nothing here ever touched rig's MCP bridge, so that
   feature is gone; `agent-client-protocol` moves 0.12 → 2.0 (its types live under
   `schema::v1` now, and `respond_with_error` moved from `Dispatch` to the
