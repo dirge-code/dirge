@@ -47,6 +47,11 @@ pub(crate) struct CompressingHttpClient<Inner> {
     enabled: bool,
     provider: crate::llmtrim::ir::ProviderKind,
     config: std::sync::Arc<crate::llmtrim::config::DenseConfig>,
+    /// The concrete backend, as opposed to `provider`, which is only the wire
+    /// *shape* (every OpenAI-compatible backend collapses to `OpenAi` there).
+    /// Needed to apply per-backend body quirks that survive rig's serializer —
+    /// see [`Self::rewrite_provider_quirks`]. `None` on the default/test path.
+    backend: Option<super::resolve::ProviderKind>,
 }
 
 impl<Inner: Default> Default for CompressingHttpClient<Inner> {
@@ -56,6 +61,7 @@ impl<Inner: Default> Default for CompressingHttpClient<Inner> {
             enabled: true,
             provider: crate::llmtrim::ir::ProviderKind::OpenAi,
             config: std::sync::Arc::new(crate::compression::dirge_default_config()),
+            backend: None,
         }
     }
 }
@@ -83,7 +89,14 @@ impl<Inner> CompressingHttpClient<Inner> {
             enabled,
             provider,
             config,
+            backend: None,
         }
+    }
+
+    /// Record the concrete backend so per-backend body quirks can be applied.
+    pub fn with_backend(mut self, backend: super::resolve::ProviderKind) -> Self {
+        self.backend = Some(backend);
+        self
     }
 }
 
@@ -118,6 +131,56 @@ impl<Inner> CompressingHttpClient<Inner> {
         body
     }
 
+    /// Per-backend fixups applied to the serialized body, after rig has built
+    /// it and after compression. Fail-open: anything unparseable or unexpected
+    /// passes through untouched.
+    ///
+    /// Cerebras rejects the assistant `reasoning_content` that rig emits for a
+    /// replayed thinking block —
+    /// `property 'messages.N.assistant.reasoning_content' is unsupported` — but
+    /// accepts the same payload under `reasoning`. Renaming rather than
+    /// dropping keeps the model's own reasoning in context across turns; this
+    /// is what the `@ai-sdk/cerebras` provider does for opencode.
+    fn rewrite_provider_quirks(&self, body: Bytes) -> Bytes {
+        if self.backend != Some(super::resolve::ProviderKind::Cerebras) {
+            return body;
+        }
+        let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&body) else {
+            return body;
+        };
+        let Some(messages) = value.get_mut("messages").and_then(|m| m.as_array_mut()) else {
+            return body;
+        };
+        let mut renamed = false;
+        for message in messages {
+            let Some(object) = message.as_object_mut() else {
+                continue;
+            };
+            if object.get("role").and_then(serde_json::Value::as_str) != Some("assistant") {
+                continue;
+            }
+            // Only move it when the target is free; a body that already carries
+            // `reasoning` is left exactly as-is rather than silently clobbered.
+            // Test `contains_key` BEFORE removing: removing first and bailing on
+            // the check would drop the field on this message while a later
+            // message still triggered the re-serialize, losing it silently.
+            if object.contains_key("reasoning") {
+                continue;
+            }
+            if let Some(reasoning) = object.remove("reasoning_content") {
+                object.insert("reasoning".to_string(), reasoning);
+                renamed = true;
+            }
+        }
+        if !renamed {
+            return body;
+        }
+        match serde_json::to_vec(&value) {
+            Ok(bytes) => Bytes::from(bytes),
+            Err(_) => body,
+        }
+    }
+
     fn normalized_request<T>(&self, req: Request<T>) -> http_client::Result<Request<Bytes>>
     where
         T: Into<Bytes>,
@@ -125,6 +188,7 @@ impl<Inner> CompressingHttpClient<Inner> {
         let (parts, body) = req.into_parts();
         let body: Bytes = body.into();
         let body = self.maybe_compress(body);
+        let body = self.rewrite_provider_quirks(body);
         let mut builder = Request::builder()
             .method(parts.method)
             .uri(parts.uri)
@@ -390,7 +454,111 @@ where
 
 #[cfg(test)]
 mod tests {
+    use super::CompressingHttpClient;
     use super::log_safe_uri;
+    use crate::provider::resolve::ProviderKind;
+    use bytes::Bytes;
+
+    fn cerebras_client() -> CompressingHttpClient<()> {
+        CompressingHttpClient::<()>::default().with_backend(ProviderKind::Cerebras)
+    }
+
+    fn rewrite(client: &CompressingHttpClient<()>, body: serde_json::Value) -> serde_json::Value {
+        let out = client.rewrite_provider_quirks(Bytes::from(body.to_string()));
+        serde_json::from_slice(&out).expect("rewritten body stays valid json")
+    }
+
+    /// Cerebras rejects `reasoning_content` on an assistant message but accepts
+    /// the same payload under `reasoning`. Rename rather than drop, so the
+    /// model's own reasoning survives into the next turn (GH #745 follow-on).
+    #[test]
+    fn cerebras_renames_assistant_reasoning_content() {
+        let out = rewrite(
+            &cerebras_client(),
+            serde_json::json!({"messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "answer", "reasoning_content": "thinking"},
+            ]}),
+        );
+        let assistant = &out["messages"][1];
+        assert_eq!(assistant["reasoning"], "thinking");
+        assert!(
+            assistant.get("reasoning_content").is_none(),
+            "the rejected field must be gone, not duplicated",
+        );
+        assert_eq!(assistant["content"], "answer");
+        assert_eq!(out["messages"][0]["content"], "hi", "user turns untouched");
+    }
+
+    /// Only assistant turns carry the field, and only Cerebras needs the move.
+    #[test]
+    fn rename_is_scoped_to_cerebras_assistant_turns() {
+        let body = serde_json::json!({"messages": [
+            {"role": "user", "content": "hi", "reasoning_content": "not mine"},
+            {"role": "assistant", "content": "a", "reasoning_content": "thinking"},
+        ]});
+        // A non-Cerebras backend keeps `reasoning_content` — llama.cpp/LocalAI
+        // chat templates read it back out of the assistant turn.
+        let other = rewrite(
+            &CompressingHttpClient::<()>::default().with_backend(ProviderKind::Custom),
+            body.clone(),
+        );
+        assert_eq!(other["messages"][1]["reasoning_content"], "thinking");
+        assert!(other["messages"][1].get("reasoning").is_none());
+
+        // On Cerebras a non-assistant turn is still left alone.
+        let cerebras = rewrite(&cerebras_client(), body);
+        assert_eq!(cerebras["messages"][0]["reasoning_content"], "not mine");
+    }
+
+    /// A body that already carries `reasoning` must not be clobbered, and a
+    /// body with nothing to move must come back byte-identical.
+    #[test]
+    fn rename_never_clobbers_or_rewrites_needlessly() {
+        let out = rewrite(
+            &cerebras_client(),
+            serde_json::json!({"messages": [
+                {"role": "assistant", "reasoning": "kept", "reasoning_content": "dropped"},
+            ]}),
+        );
+        assert_eq!(out["messages"][0]["reasoning"], "kept");
+
+        let untouched = serde_json::json!({"messages": [{"role": "assistant", "content": "a"}]});
+        let bytes = Bytes::from(untouched.to_string());
+        assert_eq!(
+            cerebras_client().rewrite_provider_quirks(bytes.clone()),
+            bytes,
+        );
+    }
+
+    /// A message that is skipped (already has `reasoning`) must keep its
+    /// `reasoning_content` even when a LATER message does trigger the rewrite.
+    /// Removing before the skip check dropped it silently — the re-serialize
+    /// fired for the later message and carried the deletion with it.
+    #[test]
+    fn skipped_message_keeps_its_field_when_a_later_one_is_renamed() {
+        let out = rewrite(
+            &cerebras_client(),
+            serde_json::json!({"messages": [
+                {"role": "assistant", "reasoning": "kept", "reasoning_content": "must survive"},
+                {"role": "assistant", "reasoning_content": "moved"},
+            ]}),
+        );
+        assert_eq!(out["messages"][0]["reasoning"], "kept");
+        assert_eq!(
+            out["messages"][0]["reasoning_content"], "must survive",
+            "the skipped message must not lose its field",
+        );
+        assert_eq!(out["messages"][1]["reasoning"], "moved");
+        assert!(out["messages"][1].get("reasoning_content").is_none());
+    }
+
+    /// Fail-open: a body that is not JSON at all passes straight through.
+    #[test]
+    fn rename_passes_through_non_json_bodies() {
+        let raw = Bytes::from_static(b"not json at all");
+        assert_eq!(cerebras_client().rewrite_provider_quirks(raw.clone()), raw);
+    }
 
     #[test]
     fn log_safe_uri_strips_the_query_string() {

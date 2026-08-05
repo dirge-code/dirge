@@ -1,8 +1,7 @@
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
-use rig::completion::ToolDefinition;
-use rig::tool::Tool;
+use rig::tool::PortableTool;
 use serde::Deserialize;
 
 use crate::agent::tools::{AskSender, PermCheck, ToolError, check_perm_path};
@@ -34,32 +33,32 @@ pub struct Args {
     name: String,
 }
 
-impl Tool for FindCalleesTool {
+impl PortableTool for FindCalleesTool {
     const NAME: &'static str = "find_callees";
 
     type Error = ToolError;
     type Args = Args;
     type Output = String;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: "find_callees".to_string(),
-            description: "Find all functions/methods called by a given symbol (its callees). Uses tree-sitter to extract call expressions from the symbol body. Supports TypeScript, Python, and more.".to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Path to the file containing the symbol"
-                    },
-                    "name": {
-                        "type": "string",
-                        "description": "Name of the function/method to analyze"
-                    }
+    fn description(&self) -> String {
+        "Find all functions/methods called by a given symbol (its callees). Uses tree-sitter to extract call expressions from the symbol body. Supports TypeScript, Python, and more.".to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Path to the file containing the symbol"
                 },
-                "required": ["path", "name"]
-            }),
-        }
+                "name": {
+                    "type": "string",
+                    "description": "Name of the function/method to analyze"
+                }
+            },
+            "required": ["path", "name"]
+        })
     }
 
     async fn call(&self, args: Args) -> Result<String, ToolError> {

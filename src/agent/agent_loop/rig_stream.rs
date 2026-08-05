@@ -505,6 +505,14 @@ where
                         });
                     }
                 }
+                // rig 0.40 started surfacing provider output items it does
+                // not model (reasoning_details and friends) instead of
+                // dropping them. Dirge builds its own content blocks, so
+                // there is nothing to render — but the chunk still counted
+                // as forward motion for the stall detector above, which is
+                // the behaviour we want. Ignore the payload rather than
+                // guessing at a block type for it.
+                Ok(StreamedAssistantContent::Unknown(_)) => {}
                 Err(err) => {
                     let error_msg = err.to_string();
                     use crate::agent::recovery::classify_error;

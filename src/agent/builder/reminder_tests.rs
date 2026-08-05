@@ -536,10 +536,10 @@ async fn build_agent_inner_emits_assembled_preamble() {
     let client = openai::Client::new("test-key").expect("openai client builds");
     let model = client.completion_model("gpt-4o");
 
-    let (agent, _cache, _provider) =
+    let (_agent, _cache, _provider, agent_preamble) =
         build_agent_inner(model, &cli, &cfg, &context, "openai", "gpt-4o").await;
 
-    let preamble = agent.preamble.unwrap_or_default();
+    let preamble = agent_preamble;
 
     // SKILLS_GUIDANCE markers (dirge-xxun).
     assert!(
@@ -677,14 +677,14 @@ async fn preamble_lists_global_tier_skills() {
     let prev_home = std::env::var_os("HOME");
     // SAFETY: guarded by HOME_LOCK; restored before the lock drops.
     unsafe { std::env::set_var("HOME", &home) };
-    let (agent, _cache, _provider) =
+    let (_agent, _cache, _provider, agent_preamble) =
         build_agent_inner(model, &cli, &cfg, &context, "openai", "gpt-4o").await;
     match prev_home {
         Some(h) => unsafe { std::env::set_var("HOME", h) },
         None => unsafe { std::env::remove_var("HOME") },
     }
 
-    let preamble = agent.preamble.unwrap_or_default();
+    let preamble = agent_preamble;
     assert!(
         preamble.contains("global-preamble-skill"),
         "preamble must advertise a skill from the global ~/.dirge/skills tier; got:\n{preamble}"
@@ -726,25 +726,20 @@ async fn steering_fragment_tracks_active_model_not_cli() {
     // though the openai client/model and the CLI default are not DeepSeek.
     let ctx = empty_ctx();
     let model = client.completion_model("gpt-4o");
-    let (agent, _c, _p) =
+    let (_agent, _c, _p, agent_preamble) =
         build_agent_inner(model, &cli, &cfg, &ctx, "deepseek", "deepseek-v4-pro").await;
     assert!(
-        agent
-            .preamble
-            .unwrap_or_default()
-            .contains("Plan-Execute-Verify"),
+        agent_preamble.contains("Plan-Execute-Verify"),
         "DeepSeek-chat active model must inject the steering fragment"
     );
 
     // Active model = a non-DeepSeek model → fragment absent.
     let ctx = empty_ctx();
     let model = client.completion_model("gpt-4o");
-    let (agent, _c, _p) = build_agent_inner(model, &cli, &cfg, &ctx, "openai", "gpt-4o").await;
+    let (_agent, _c, _p, agent_preamble) =
+        build_agent_inner(model, &cli, &cfg, &ctx, "openai", "gpt-4o").await;
     assert!(
-        !agent
-            .preamble
-            .unwrap_or_default()
-            .contains("Plan-Execute-Verify"),
+        !agent_preamble.contains("Plan-Execute-Verify"),
         "non-DeepSeek active model must NOT inject the steering fragment"
     );
 }

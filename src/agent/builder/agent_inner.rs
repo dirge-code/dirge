@@ -48,6 +48,9 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
     // caller (provider::build_agent) can attach it to AnyAgent for
     // session-lifecycle hook dispatch. `None` when load failed.
     Option<Arc<dyn crate::extras::memory_provider::MemoryProvider>>,
+    // rig 0.41 made `Agent::preamble` private, so hand the assembled
+    // system prompt back instead of reading it off the built agent.
+    String,
 ) {
     // The `plan_file`-keyed gate on edit/write/apply_patch was
     // removed: prompt-level tool restrictions now live in the
@@ -316,7 +319,7 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
     // `--no-tools`, collects MCP/semantic tools, and applies plugin hooks).
     // Attaching them here too only duplicated every tool construction and
     // double-collected MCP tools at startup [dirge-tfip].
-    (builder.build(), ToolCache::new(), memory_store)
+    (builder.build(), ToolCache::new(), memory_store, preamble)
 }
 
 /// Wall-clock bound for the blocking SQLite loads in `build_agent_inner`

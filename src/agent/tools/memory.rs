@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
-use rig::completion::ToolDefinition;
-use rig::tool::Tool;
+use rig::tool::PortableTool;
 use serde::Deserialize;
 
 use crate::agent::tools::{AskSender, PermCheck, ToolError, check_perm};
@@ -106,14 +105,8 @@ fn default_kind() -> Option<String> {
     None
 }
 
-impl Tool for MemoryTool {
-    const NAME: &'static str = "memory";
-
-    type Error = ToolError;
-    type Args = Args;
-    type Output = String;
-
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
+impl MemoryTool {
+    fn definition_parts(&self) -> (String, serde_json::Value) {
         // dirge-ygm3: `mark`/`supersede` are background-review-only. They live
         // in the action enum (parameters), not the prose description, so gating
         // them changes only the schema's allowed values — never the
@@ -134,9 +127,8 @@ impl Tool for MemoryTool {
                  rather than was reworded.",
             );
         }
-        ToolDefinition {
-            name: "memory".to_string(),
-            description: r#"Persistent long-term memory for project facts and pitfalls.
+        (
+            r#"Persistent long-term memory for project facts and pitfalls.
 
 SAVE WHEN: the user corrects you or says "remember this"; you discover build/test commands, conventions, architecture patterns, or library quirks; something was tried and failed (pitfall).
 
@@ -155,7 +147,7 @@ ACTIONS:
 
 old_text matches a unique substring or the exact "urn:ump:…" id from view/index."#
                 .to_string(),
-            parameters: {
+            {
                 let mut params = serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -217,7 +209,23 @@ old_text matches a unique substring or the exact "urn:ump:…" id from view/inde
                 }
                 params
             },
-        }
+        )
+    }
+}
+
+impl PortableTool for MemoryTool {
+    const NAME: &'static str = "memory";
+
+    type Error = ToolError;
+    type Args = Args;
+    type Output = String;
+
+    fn description(&self) -> String {
+        self.definition_parts().0
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        self.definition_parts().1
     }
 
     async fn call(&self, args: Args) -> Result<String, ToolError> {
@@ -464,8 +472,8 @@ mod tests {
         }
     }
 
-    fn action_enum(tool: &MemoryTool, rt: &tokio::runtime::Runtime) -> Vec<String> {
-        let def = rt.block_on(tool.definition(String::new()));
+    fn action_enum(tool: &MemoryTool) -> Vec<String> {
+        let def = rig::tool::portable_tool_definition(tool);
         def.parameters["properties"]["action"]["enum"]
             .as_array()
             .unwrap()
@@ -480,8 +488,7 @@ mod tests {
     fn default_tool_hides_review_actions_from_schema() {
         let (store, _d) = temp_store();
         let tool = MemoryTool::new(store, None, None);
-        let rt = make_runtime();
-        let actions = action_enum(&tool, &rt);
+        let actions = action_enum(&tool);
         assert!(
             !actions.iter().any(|a| a == "mark" || a == "supersede"),
             "main agent schema must omit mark/supersede: {actions:?}",
@@ -499,8 +506,7 @@ mod tests {
     fn review_tool_exposes_review_actions() {
         let (store, _d) = temp_store();
         let tool = MemoryTool::new(store, None, None).with_review_actions(true);
-        let rt = make_runtime();
-        let actions = action_enum(&tool, &rt);
+        let actions = action_enum(&tool);
         assert!(
             actions.iter().any(|a| a == "mark"),
             "mark present: {actions:?}"
@@ -827,8 +833,7 @@ mod tests {
     fn test_definition_includes_both_targets() {
         let (store, _dir) = temp_store();
         let tool = MemoryTool::new(store, None, None);
-        let rt = make_runtime();
-        let def = rt.block_on(tool.definition(String::new()));
+        let def = rig::tool::portable_tool_definition(&tool);
         assert!(def.description.contains("memory"));
         assert!(def.description.contains("pitfalls"));
     }

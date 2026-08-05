@@ -1,7 +1,6 @@
 use std::path::PathBuf;
 
-use rig::completion::ToolDefinition;
-use rig::tool::Tool;
+use rig::tool::PortableTool;
 use serde::Deserialize;
 
 use crate::agent::tools::{AskSender, PermCheck, ToolError, check_perm};
@@ -74,17 +73,15 @@ fn default_window() -> usize {
     5
 }
 
-impl Tool for SessionSearchTool {
+impl PortableTool for SessionSearchTool {
     const NAME: &'static str = "session_search";
 
     type Error = ToolError;
     type Args = SearchArgs;
     type Output = String;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: "session_search".to_string(),
-            description: r#"Search past sessions on this project. Three calling modes (inferred from args):
+    fn description(&self) -> String {
+        r#"Search past sessions on this project. Three calling modes (inferred from args):
 
 1. DISCOVERY: pass `query` — FTS5 full-text search. Returns top sessions with snippets, message windows around matches, and bookends (first/last messages). Deduped by session lineage. Zero LLM cost — pure DB queries.
 
@@ -93,30 +90,32 @@ impl Tool for SessionSearchTool {
 3. BROWSE: no args — returns recent sessions chronologically (titles, previews, timestamps).
 
 FTS5 syntax: AND (default), OR, NOT, "quoted phrases", * prefix wildcards."#
-                .to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "FTS5 query for DISCOVERY mode. Omit for BROWSE or SCROLL."
-                    },
-                    "session_id": {
-                        "type": "string",
-                        "description": "Session id for SCROLL mode."
-                    },
-                    "around_message_id": {
-                        "type": "integer",
-                        "description": "Message id anchor for SCROLL mode."
-                    },
-                    "window": {
-                        "type": "integer",
-                        "description": "Window size for SCROLL (default 5, max 20)."
-                    }
+                .to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "FTS5 query for DISCOVERY mode. Omit for BROWSE or SCROLL."
                 },
-                "required": []
-            }),
-        }
+                "session_id": {
+                    "type": "string",
+                    "description": "Session id for SCROLL mode."
+                },
+                "around_message_id": {
+                    "type": "integer",
+                    "description": "Message id anchor for SCROLL mode."
+                },
+                "window": {
+                    "type": "integer",
+                    "description": "Window size for SCROLL (default 5, max 20)."
+                }
+            },
+            "required": []
+        })
     }
 
     async fn call(&self, args: SearchArgs) -> Result<String, ToolError> {
@@ -264,8 +263,7 @@ mod tests {
     fn test_definition_includes_modes() {
         let db_path = temp_db_path();
         let tool = SessionSearchTool::new(db_path, None, None, None);
-        let rt = make_runtime();
-        let def = rt.block_on(tool.definition(String::new()));
+        let def = rig::tool::portable_tool_definition(&tool);
         assert!(def.description.contains("DISCOVERY"));
         assert!(def.description.contains("SCROLL"));
         assert!(def.description.contains("BROWSE"));

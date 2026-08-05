@@ -4,6 +4,52 @@ All notable changes to dirge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- Dependency sweep. `rmcp` was on two versions at once — our own 1.7 plus a 2.2
+  that `rig`'s unused `rmcp` feature dragged in, and a third from
+  `agent-client-protocol`. Nothing here ever touched rig's MCP bridge, so that
+  feature is gone; `agent-client-protocol` moves 0.12 → 2.0 (its types live under
+  `schema::v1` now, and `respond_with_error` moved from `Dispatch` to the
+  `Responder` that only the request variant carries); and `rmcp` goes to 3.1,
+  where `Annotated<RawContent>` is flattened to `ContentBlock`. One rmcp, latest.
+
+  Also current: `rusqlite` 0.31 → 0.40 (no `ToSql for usize`), `sysinfo`
+  0.32 → 0.39 (`RefreshKind::new` → `nothing`), `sha2` 0.10 → 0.11 (digest output
+  dropped `LowerHex`, so the two hex helpers encode explicitly), `jsonschema`
+  0.46 → 0.49, `base64` 0.23, `compact_str` 0.10, `http` 1.5, `notify-rust` 4.18.
+  `tree-sitter` stays at 0.25 — 0.26 does not resolve against the grammar crates.
+
+### Fixed
+- Reasoning is shown again for providers that stream it as `delta.reasoning`
+  rather than `delta.reasoning_content` (GH #745, reported against LocalAI).
+  rig 0.39 only deserialized `reasoning_content`, so serde dropped the field and
+  the panel stayed empty while text and tool calls — carried in the same delta —
+  worked fine. rig 0.40 added the fallback upstream; this bumps rig to 0.41.
+
+  The bump is not small. 0.41 splits the classic runtime into `rig-agent` behind
+  an `agent` feature, replaces `Tool::definition` with `description`/`parameters`
+  across all 37 tools, drops `ToolDyn` in favour of a concrete struct, and makes
+  `Agent::preamble` and `Agent::model` private. Dirge's tools move to the
+  context-free `PortableTool` contract, which is the honest fit — the agent loop
+  has driven its own dispatch since 4.5h-6 and never used rig's `ToolContext`.
+  The erased-tool seam is now dirge's own `DynTool`; it has broken on two
+  consecutive rig releases and does not need to be rig's. `AnyAgentInner` holds
+  the completion model directly instead of a rig `Agent` it only ever read the
+  model back out of.
+
+- Cerebras no longer 400s on the turn after a reasoning turn. It streams
+  reasoning as `delta.reasoning` — the same field LocalAI uses — so the fix
+  above meant dirge started capturing it and replaying it as `reasoning_content`,
+  which Cerebras rejects outright. The field is renamed to `reasoning` at the
+  wire boundary rather than dropped, so the model keeps its own chain of thought
+  in context on the next turn. Backends that want `reasoning_content` are
+  untouched: DeepSeek needs it on tool-call turns, and llama.cpp/LocalAI chat
+  templates read `message.reasoning_content` back out of the assistant turn.
+  Only the OpenAI Responses API still has the block dropped, because it keys
+  reasoning to encrypted ids dirge does not retain.
+
 ## [0.21.6] - 2026-08-04
 
 ### Added

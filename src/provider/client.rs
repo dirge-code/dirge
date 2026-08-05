@@ -1014,6 +1014,9 @@ fn compressing<Inner>(
         )),
         resolve_compression_enabled(),
     )
+    // `wire_kind` collapses every OpenAI-compatible backend to one shape, so
+    // keep the concrete kind too for per-backend body quirks.
+    .with_backend(kind)
 }
 
 /// Which of the three request shapes a provider's bodies take. Everything that isn't

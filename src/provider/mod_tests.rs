@@ -275,9 +275,8 @@ fn build_openai_any_agent() -> AnyAgent {
         .build()
         .expect("openai CompletionsClient::new should work");
     let model = client.completion_model("gpt-4o");
-    let agent = rig::agent::AgentBuilder::new(model).build();
     AnyAgent::new(
-        AnyAgentInner::OpenAI(agent),
+        AnyAgentInner::OpenAI(model),
         ToolCache::new(),
         std::time::Duration::from_secs(300),
         Vec::new(),    // loop_tools — empty for test fixture

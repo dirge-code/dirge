@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
-use rig::completion::ToolDefinition;
-use rig::tool::Tool;
+use rig::tool::PortableTool;
 use serde::Deserialize;
 
 use crate::agent::tools::{AskSender, PermCheck, ToolError, check_perm};
@@ -58,14 +57,8 @@ pub struct SkillArgs {
     force: Option<bool>,
 }
 
-impl Tool for SkillTool {
-    const NAME: &'static str = "skill";
-
-    type Error = ToolError;
-    type Args = SkillArgs;
-    type Output = String;
-
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
+impl SkillTool {
+    fn definition_parts(&self) -> (String, serde_json::Value) {
         // The available-skills catalog (name + description) is already injected
         // into the system preamble, so it is NOT duplicated here — doing so
         // bloated the tool schema on every request and pushed the description
@@ -81,11 +74,9 @@ impl Tool for SkillTool {
              only for a major overhaul. The available skills are listed in your system context — \
              `load` one by name to read its full content. Skills live in .dirge/skills/<name>/SKILL.md.",
         );
-
-        ToolDefinition {
-            name: "skill".to_string(),
+        (
             description,
-            parameters: serde_json::json!({
+            serde_json::json!({
                 "type": "object",
                 "properties": {
                     "action": {
@@ -116,7 +107,23 @@ impl Tool for SkillTool {
                 },
                 "required": ["action"]
             }),
-        }
+        )
+    }
+}
+
+impl PortableTool for SkillTool {
+    const NAME: &'static str = "skill";
+
+    type Error = ToolError;
+    type Args = SkillArgs;
+    type Output = String;
+
+    fn description(&self) -> String {
+        self.definition_parts().0
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        self.definition_parts().1
     }
 
     async fn call(&self, args: SkillArgs) -> Result<String, ToolError> {
@@ -838,8 +845,7 @@ mod tests {
         let skills = make_skills();
         let (mgr, _dir) = temp_skills_dir();
         let tool = SkillTool::new(skills, mgr, None, None, None);
-        let rt = make_runtime();
-        let def = rt.block_on(tool.definition(String::new()));
+        let def = rig::tool::portable_tool_definition(&tool);
         for action in ["load", "create", "edit", "patch", "delete", "list"] {
             assert!(
                 def.description.contains(action),

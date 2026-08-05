@@ -1,8 +1,7 @@
 use std::path::Path;
 
 use ignore::WalkBuilder;
-use rig::completion::ToolDefinition;
-use rig::tool::Tool;
+use rig::tool::PortableTool;
 
 use crate::agent::agent_loop::tool_input_repair::with_contract_hint;
 use crate::agent::tools::cache::ToolCache;
@@ -68,35 +67,35 @@ impl ListDirTool {
     }
 }
 
-impl Tool for ListDirTool {
+impl PortableTool for ListDirTool {
     const NAME: &'static str = "list_dir";
 
     type Error = ToolError;
     type Args = ListDirArgs;
     type Output = String;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: "list_dir".to_string(),
-            description: with_contract_hint(
-                "list_dir",
-                "List the immediate files and directories in ONE directory (non-recursive). Shows type, size, and subdirectory entry counts; sorted directories-first then alphabetically. Respects .gitignore. Use `repo_overview` for a whole-project tree, `glob`/`find_files` to locate files by pattern, and `grep` to search contents.",
-            ),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Directory path (defaults to current working directory)"
-                    },
-                    "include_hidden": {
-                        "type": "boolean",
-                        "description": "Include dotfiles (.env, .gitignore, etc.) in the listing. Default false to avoid surfacing secrets and config files."
-                    }
+    fn description(&self) -> String {
+        with_contract_hint(
+            "list_dir",
+            "List the immediate files and directories in ONE directory (non-recursive). Shows type, size, and subdirectory entry counts; sorted directories-first then alphabetically. Respects .gitignore. Use `repo_overview` for a whole-project tree, `glob`/`find_files` to locate files by pattern, and `grep` to search contents.",
+        )
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Directory path (defaults to current working directory)"
                 },
-                "required": []
-            }),
-        }
+                "include_hidden": {
+                    "type": "boolean",
+                    "description": "Include dotfiles (.env, .gitignore, etc.) in the listing. Default false to avoid surfacing secrets and config files."
+                }
+            },
+            "required": []
+        })
     }
 
     async fn call(&self, args: ListDirArgs) -> Result<String, ToolError> {

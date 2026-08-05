@@ -1876,14 +1876,17 @@ impl SessionDb {
             .map_err(|e| format!("Failed to prepare anchored view: {e}"))?;
 
         let messages: Vec<AnchorMessage> = stmt
-            .query_map(params![session_id, before + 1 + after, offset], |row| {
-                Ok(AnchorMessage {
-                    id: row.get(0)?,
-                    role: row.get(1)?,
-                    content: row.get(2)?,
-                    timestamp: row.get(3)?,
-                })
-            })
+            .query_map(
+                params![session_id, (before + 1 + after) as i64, offset],
+                |row| {
+                    Ok(AnchorMessage {
+                        id: row.get(0)?,
+                        role: row.get(1)?,
+                        content: row.get(2)?,
+                        timestamp: row.get(3)?,
+                    })
+                },
+            )
             .map_err(|e| format!("Failed to query anchored view: {e}"))?
             .filter_map(|r| r.ok())
             .collect();

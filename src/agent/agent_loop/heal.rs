@@ -8,11 +8,19 @@
 //! 1. Shrink oversized tool results (char cap, not token cap)
 //! 2. Fix unpaired tool calls (drops assistant.tool_calls with no
 //!    matching tool responses + stray tool messages)
-//! 3. Stamp missing `reasoning_content` on thinking-mode sessions
 //!
 //! The rationale: oversized tool results would 400 the next call
 //! before the user types. Unpaired tool calls would similarly
 //! fail API validation.
+//!
+//! Reasonix's third repair — stamping an empty `reasoning_content` onto
+//! assistant turns that lack one — is deliberately NOT ported, and the
+//! claim that it was has been removed from this list. opencode carries an
+//! equivalent for DeepSeek, but only because its own transform lifts
+//! reasoning out of the message content, so it has to put an empty one
+//! back. Dirge replays the reasoning block as-is (see
+//! `rig_stream_factory::provider_rejects_reasoning_echo`), so there is
+//! nothing to restore; the DeepSeek and GLM live smoke tests cover it.
 
 use serde_json::Value;
 

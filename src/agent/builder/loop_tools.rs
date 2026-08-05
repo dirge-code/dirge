@@ -264,7 +264,7 @@ pub async fn build_rooted_writer_tools(
 
     async fn wrap<T>(inner: T, mode: Option<ToolExecutionMode>) -> Arc<dyn LoopTool>
     where
-        T: rig::tool::ToolDyn + 'static,
+        T: crate::agent::agent_loop::rig_tool::DynTool + 'static,
     {
         let adapter = RigToolAdapter::new(Box::new(inner)).await;
         Arc::new(match mode {
@@ -505,7 +505,7 @@ pub async fn build_loop_tools(
     // is async (RigToolAdapter::new resolves it eagerly).
     async fn wrap<T>(inner: T, mode: Option<ToolExecutionMode>) -> Arc<dyn LoopTool>
     where
-        T: rig::tool::ToolDyn + 'static,
+        T: crate::agent::agent_loop::rig_tool::DynTool + 'static,
     {
         let adapter = RigToolAdapter::new(Box::new(inner)).await;
         let adapter = match mode {

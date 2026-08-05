@@ -1,5 +1,4 @@
-use rig::completion::ToolDefinition;
-use rig::tool::Tool;
+use rig::tool::PortableTool;
 use serde::Deserialize;
 
 use crate::agent::tools::{AskSender, PermCheck, ToolError, check_perm};
@@ -472,37 +471,37 @@ async fn fetch_url(client: &reqwest::Client, url: &str) -> Result<String, String
     Ok(html_to_markdown(&body))
 }
 
-impl Tool for WebFetchTool {
+impl PortableTool for WebFetchTool {
     const NAME: &'static str = "webfetch";
 
     type Error = ToolError;
     type Args = WebFetchArgs;
     type Output = String;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: "webfetch".to_string(),
-            description: crate::agent::agent_loop::tool_input_repair::with_contract_hint(
-                "webfetch",
-                "Fetch the content of one or more URLs and return it as markdown. Schemeless URLs get https:// prepended. Private/loopback/link-local addresses (127.0.0.0/8, 10.x, 172.16.x, 192.168.x, 169.254.x cloud metadata, ::1, fc00::/7, fe80::/10) and bare 'localhost' are refused by default; set DIRGE_WEBFETCH_ALLOW_PRIVATE=1 to permit them for local-dev workflows. Use for reading documentation pages, API references, or any web content.",
-            ),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "urls": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "URLs to fetch (may be comma-separated)"
-                    },
-                    "max_chars": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "description": "Maximum characters to return per URL (default: 3000)"
-                    }
+    fn description(&self) -> String {
+        crate::agent::agent_loop::tool_input_repair::with_contract_hint(
+            "webfetch",
+            "Fetch the content of one or more URLs and return it as markdown. Schemeless URLs get https:// prepended. Private/loopback/link-local addresses (127.0.0.0/8, 10.x, 172.16.x, 192.168.x, 169.254.x cloud metadata, ::1, fc00::/7, fe80::/10) and bare 'localhost' are refused by default; set DIRGE_WEBFETCH_ALLOW_PRIVATE=1 to permit them for local-dev workflows. Use for reading documentation pages, API references, or any web content.",
+        )
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "urls": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "URLs to fetch (may be comma-separated)"
                 },
-                "required": ["urls"]
-            }),
-        }
+                "max_chars": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Maximum characters to return per URL (default: 3000)"
+                }
+            },
+            "required": ["urls"]
+        })
     }
 
     async fn call(&self, args: WebFetchArgs) -> Result<String, ToolError> {
@@ -676,7 +675,7 @@ mod tests {
     #[tokio::test]
     async fn test_definition_has_correct_name() {
         let tool = WebFetchTool::new(None, None);
-        let def = tool.definition(String::new()).await;
+        let def = rig::tool::tool_definition(&tool);
         assert_eq!(def.name, "webfetch");
     }
 

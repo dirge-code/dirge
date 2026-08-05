@@ -13,8 +13,7 @@ use crate::sync_util::LockExt;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rig::completion::ToolDefinition;
-use rig::tool::Tool;
+use rig::tool::PortableTool;
 use serde::Deserialize;
 use serde_json::json;
 
@@ -237,56 +236,56 @@ fn resolve_attach_adapter(
     }
 }
 
-impl Tool for DebugTool {
+impl PortableTool for DebugTool {
     const NAME: &'static str = "debug";
 
     type Error = ToolError;
     type Args = DebugArgs;
     type Output = String;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: "debug".to_string(),
-            description: DESCRIPTION.to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "description": "Debug action to perform",
-                        "enum": [
-                            "launch", "attach", "set_breakpoints", "remove_breakpoints",
-                            "continue", "step_over", "step_in", "step_out",
-                            "pause", "evaluate", "stack_trace", "threads",
-                            "scopes", "variables", "terminate", "sessions",
-                            "run_to_cursor", "restart_frame",
-                            "backtrace_diagnostics", "error_analysis"
-                        ]
-                    },
-                    "program": { "type": "string", "description": "Path to the program to debug (launch)" },
-                    "args": { "type": "array", "items": { "type": "string" }, "description": "Command line arguments for the program (launch)" },
-                    "adapter": { "type": "string", "description": "Debug adapter name (auto-detected if omitted)" },
-                    "cwd": { "type": "string", "description": "Working directory for the debug session" },
-                    "file": { "type": "string", "description": "Source file path (set_breakpoints, remove_breakpoints)" },
-                    "line": { "type": "integer", "description": "Line number (set_breakpoints)" },
-                    "condition": { "type": "string", "description": "Conditional breakpoint expression" },
-                    "expression": { "type": "string", "description": "Expression to evaluate" },
-                    "frame_id": { "type": "integer", "description": "Stack frame ID (scopes, evaluate)" },
-                    "pid": { "type": "integer", "description": "Process ID to attach to" },
-                    "port": { "type": "integer", "description": "Port for remote attach" },
-                    "host": { "type": "string", "description": "Host for remote attach" },
-                    "levels": { "type": "integer", "description": "Number of stack frames to fetch" },
-                    "variable_ref": { "type": "integer", "description": "Variable reference ID from a scope" },
-                    "timeout": { "type": "integer", "description": "Timeout in seconds (default 30, min 5, max 300)" },
-                    "thread_id": { "type": "integer", "description": "Thread ID (continue, step, pause, stack_trace)" },
-                    "stop_on_entry": { "type": "boolean", "description": "Stop at program entry (launch)" },
-                    "context": { "type": "string", "description": "Evaluation context: watch, repl, hover" },
-                    "restart": { "type": "boolean", "description": "Restart after disconnect (terminate)" },
-                    "env": { "type": "object", "description": "Environment variables as key-value pairs (launch)", "additionalProperties": { "type": "string" } }
+    fn description(&self) -> String {
+        DESCRIPTION.to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "description": "Debug action to perform",
+                    "enum": [
+                        "launch", "attach", "set_breakpoints", "remove_breakpoints",
+                        "continue", "step_over", "step_in", "step_out",
+                        "pause", "evaluate", "stack_trace", "threads",
+                        "scopes", "variables", "terminate", "sessions",
+                        "run_to_cursor", "restart_frame",
+                        "backtrace_diagnostics", "error_analysis"
+                    ]
                 },
-                "required": ["action"]
-            }),
-        }
+                "program": { "type": "string", "description": "Path to the program to debug (launch)" },
+                "args": { "type": "array", "items": { "type": "string" }, "description": "Command line arguments for the program (launch)" },
+                "adapter": { "type": "string", "description": "Debug adapter name (auto-detected if omitted)" },
+                "cwd": { "type": "string", "description": "Working directory for the debug session" },
+                "file": { "type": "string", "description": "Source file path (set_breakpoints, remove_breakpoints)" },
+                "line": { "type": "integer", "description": "Line number (set_breakpoints)" },
+                "condition": { "type": "string", "description": "Conditional breakpoint expression" },
+                "expression": { "type": "string", "description": "Expression to evaluate" },
+                "frame_id": { "type": "integer", "description": "Stack frame ID (scopes, evaluate)" },
+                "pid": { "type": "integer", "description": "Process ID to attach to" },
+                "port": { "type": "integer", "description": "Port for remote attach" },
+                "host": { "type": "string", "description": "Host for remote attach" },
+                "levels": { "type": "integer", "description": "Number of stack frames to fetch" },
+                "variable_ref": { "type": "integer", "description": "Variable reference ID from a scope" },
+                "timeout": { "type": "integer", "description": "Timeout in seconds (default 30, min 5, max 300)" },
+                "thread_id": { "type": "integer", "description": "Thread ID (continue, step, pause, stack_trace)" },
+                "stop_on_entry": { "type": "boolean", "description": "Stop at program entry (launch)" },
+                "context": { "type": "string", "description": "Evaluation context: watch, repl, hover" },
+                "restart": { "type": "boolean", "description": "Restart after disconnect (terminate)" },
+                "env": { "type": "object", "description": "Environment variables as key-value pairs (launch)", "additionalProperties": { "type": "string" } }
+            },
+            "required": ["action"]
+        })
     }
 
     async fn call(&self, args: DebugArgs) -> Result<String, ToolError> {
@@ -994,7 +993,7 @@ mod tests {
     #[tokio::test]
     async fn definition_has_all_actions() {
         let tool = DebugTool::new(None, None);
-        let def = tool.definition(String::new()).await;
+        let def = rig::tool::tool_definition(&tool);
         let params: Value = def.parameters;
 
         // Every action in the enum list must be in the schema.
@@ -1037,7 +1036,7 @@ mod tests {
     #[tokio::test]
     async fn definition_name_matches() {
         let tool = DebugTool::new(None, None);
-        let def = tool.definition(String::new()).await;
+        let def = rig::tool::tool_definition(&tool);
         assert_eq!(def.name, "debug");
     }
 

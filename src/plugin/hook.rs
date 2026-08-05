@@ -1,11 +1,11 @@
 //! Plugin-driven interception of rig tool calls.
 //!
-//! [`HookedToolDyn`] wraps any `Box<dyn rig::tool::ToolDyn>` and runs the
+//! [`HookedToolDyn`] wraps any `Box<dyn DynTool>` and runs the
 //! `on-tool-start` Janet hook before delegating to the inner tool, and the
 //! `on-tool-end` hook after. Plugins can:
 //!
 //! - **block** the call entirely by calling `(harness/block "reason")` in
-//!   `on-tool-start` — the wrapper returns a `ToolError` with that reason
+//!   `on-tool-start` — the wrapper returns a `DynToolError` with that reason
 //!   instead of invoking the inner tool.
 //! - **mutate input** by calling `(harness/mutate-input json-string)` in
 //!   `on-tool-start` — the wrapper invokes the inner tool with `json-string`
@@ -22,7 +22,7 @@
 use crate::sync_util::LockExt;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use rig::tool::{ToolDyn, ToolError};
+use crate::agent::agent_loop::rig_tool::{DynTool, DynToolError};
 
 use super::{PluginManager, escape_janet_string};
 
@@ -42,12 +42,12 @@ pub fn global() -> Option<Arc<Mutex<PluginManager>>> {
     PLUGIN_MANAGER.get().cloned()
 }
 
-/// Wraps an inner `Box<dyn ToolDyn>` and surfaces plugin tool-hooks.
+/// Wraps an inner `Box<dyn DynTool>` and surfaces plugin tool-hooks.
 /// Cheap to construct; the actual hook dispatch happens lazily inside
 /// `call()` so non-plugin builds (where `pm` is always `None`) pay only
 /// one Option check per tool invocation.
 pub struct HookedToolDyn {
-    inner: Box<dyn ToolDyn>,
+    inner: Box<dyn DynTool>,
     pm: Option<Arc<Mutex<PluginManager>>>,
 }
 
@@ -61,7 +61,7 @@ impl HookedToolDyn {
     /// `hookify` that wrapped each tool here is gone. The live loop hooks
     /// plugins via `agent_loop::plugin_hooks` instead [dirge-tfip].
     #[allow(dead_code)]
-    pub fn wrap_global(inner: Box<dyn ToolDyn>) -> Box<dyn ToolDyn> {
+    pub fn wrap_global(inner: Box<dyn DynTool>) -> Box<dyn DynTool> {
         let pm = global();
         if pm.is_none() {
             // Avoid an extra dispatch box for the no-plugin case so
@@ -74,30 +74,30 @@ impl HookedToolDyn {
     /// Wrap with an explicit manager, bypassing the global. Used by tests
     /// and by callers that hold their own PluginManager.
     #[allow(dead_code)] // retained for future callers; tests stopped using it
-    pub fn with_manager(inner: Box<dyn ToolDyn>, pm: Option<Arc<Mutex<PluginManager>>>) -> Self {
+    pub fn with_manager(inner: Box<dyn DynTool>, pm: Option<Arc<Mutex<PluginManager>>>) -> Self {
         HookedToolDyn { inner, pm }
     }
 }
 
-impl ToolDyn for HookedToolDyn {
+impl DynTool for HookedToolDyn {
     fn name(&self) -> String {
         self.inner.name()
     }
 
-    fn definition<'a>(
-        &'a self,
-        prompt: String,
+    fn definition(
+        &self,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = rig::completion::ToolDefinition> + Send + 'a>,
+        Box<dyn std::future::Future<Output = rig::completion::ToolDefinition> + Send + '_>,
     > {
-        self.inner.definition(prompt)
+        self.inner.definition()
     }
 
     fn call<'a>(
         &'a self,
         args: String,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, ToolError>> + Send + 'a>>
-    {
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<String, DynToolError>> + Send + 'a>,
+    > {
         Box::pin(async move {
             let name = self.inner.name();
 
@@ -122,12 +122,14 @@ impl ToolDyn for HookedToolDyn {
             };
 
             if let Some(reason) = block {
-                return Err(ToolError::ToolCallError(Box::<
+                return Err(DynToolError::ToolCallError(Box::<
                     dyn std::error::Error + Send + Sync,
-                >::from(format!(
+                >::from(
+                    format!(
                     "blocked by plugin: {}",
                     reason
-                ))));
+                )
+                )));
             }
 
             let final_args = mutated.unwrap_or(args);
@@ -179,15 +181,14 @@ mod tests {
     /// Lets us assert that mutation actually changed what reached the tool.
     struct Echo;
 
-    impl ToolDyn for Echo {
+    impl DynTool for Echo {
         fn name(&self) -> String {
             "echo".to_string()
         }
 
-        fn definition<'a>(
-            &'a self,
-            _prompt: String,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolDefinition> + Send + 'a>>
+        fn definition(
+            &self,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolDefinition> + Send + '_>>
         {
             Box::pin(async move {
                 ToolDefinition {
@@ -202,7 +203,7 @@ mod tests {
             &'a self,
             args: String,
         ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<String, ToolError>> + Send + 'a>,
+            Box<dyn std::future::Future<Output = Result<String, DynToolError>> + Send + 'a>,
         > {
             Box::pin(async move { Ok(args) })
         }
@@ -215,7 +216,7 @@ mod tests {
     async fn wrap_and_call(
         pm_arc: Arc<Mutex<PluginManager>>,
         args: &str,
-    ) -> Result<String, ToolError> {
+    ) -> Result<String, DynToolError> {
         let wrapper = HookedToolDyn::with_manager(Box::new(Echo), Some(pm_arc));
         wrapper.call(args.to_string()).await
     }
@@ -330,14 +331,13 @@ mod tests {
         /// `on-tool-end` after this, allowing the hook to substitute
         /// a replacement output.
         struct AlwaysFail;
-        impl ToolDyn for AlwaysFail {
+        impl DynTool for AlwaysFail {
             fn name(&self) -> String {
                 "always_fail".to_string()
             }
-            fn definition<'a>(
-                &'a self,
-                _prompt: String,
-            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolDefinition> + Send + 'a>>
+            fn definition(
+                &self,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolDefinition> + Send + '_>>
             {
                 Box::pin(async move {
                     ToolDefinition {
@@ -351,13 +351,13 @@ mod tests {
                 &'a self,
                 _args: String,
             ) -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = Result<String, ToolError>> + Send + 'a>,
+                Box<dyn std::future::Future<Output = Result<String, DynToolError>> + Send + 'a>,
             > {
                 Box::pin(async move {
-                    Err(ToolError::ToolCallError(Box::<
+                    Err(DynToolError::ToolCallError(Box::<
                         dyn std::error::Error + Send + Sync,
                     >::from(
-                        "deliberate failure".to_string()
+                        "deliberate failure".to_string(),
                     )))
                 })
             }

@@ -11,8 +11,7 @@
 
 use std::path::PathBuf;
 
-use rig::completion::ToolDefinition;
-use rig::tool::Tool;
+use rig::tool::PortableTool;
 use serde::Deserialize;
 
 use crate::agent::tools::{AskSender, PermCheck, ToolError, check_perm};
@@ -51,64 +50,64 @@ pub struct GraphArgs {
     compress: Option<bool>,
 }
 
-impl Tool for GraphTool {
+impl PortableTool for GraphTool {
     const NAME: &'static str = "search_graph";
 
     type Error = ToolError;
     type Args = GraphArgs;
     type Output = String;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: "search_graph".to_string(),
-            description: concat!(
-                "Search the entity/relation graph for files, errors, commits, ",
-                "and their relationships. Use when reasoning about code structure ",
-                "across turns.\n\n",
-                "Two actions:\n",
-                "- `search_graph`: FTS5 search over entities by name and kind\n",
-                "- `traverse_graph`: recursive CTE traversal from an entity ID, ",
-                "returning typed relation paths\n\n",
-                "Entities are facts extracted from tool output: files, errors, ",
-                "commits, and other structured items with typed relationships ",
-                "between them.",
-            )
-            .to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "description": "search_graph (FTS5 search) or traverse_graph (CTE traversal from entity)"
-                    },
-                    "query": {
-                        "type": "string",
-                        "description": "FTS5 search query for search_graph (e.g. 'E0308', 'src/main.rs')"
-                    },
-                    "kind": {
-                        "type": "string",
-                        "description": "Optional entity kind filter for search_graph (e.g. 'file', 'error', 'commit')"
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Max results for search_graph (default 10)"
-                    },
-                    "entity_id": {
-                        "type": "integer",
-                        "description": "Entity ID seed for traverse_graph"
-                    },
-                    "depth": {
-                        "type": "integer",
-                        "description": "Max traversal depth for traverse_graph (default 2)"
-                    },
-                    "compress": {
-                        "type": "boolean",
-                        "description": "Compress traversal output into kind-grouped summary (default false)"
-                    }
+    fn description(&self) -> String {
+        concat!(
+            "Search the entity/relation graph for files, errors, commits, ",
+            "and their relationships. Use when reasoning about code structure ",
+            "across turns.\n\n",
+            "Two actions:\n",
+            "- `search_graph`: FTS5 search over entities by name and kind\n",
+            "- `traverse_graph`: recursive CTE traversal from an entity ID, ",
+            "returning typed relation paths\n\n",
+            "Entities are facts extracted from tool output: files, errors, ",
+            "commits, and other structured items with typed relationships ",
+            "between them.",
+        )
+        .to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "description": "search_graph (FTS5 search) or traverse_graph (CTE traversal from entity)"
                 },
-                "required": ["action"]
-            }),
-        }
+                "query": {
+                    "type": "string",
+                    "description": "FTS5 search query for search_graph (e.g. 'E0308', 'src/main.rs')"
+                },
+                "kind": {
+                    "type": "string",
+                    "description": "Optional entity kind filter for search_graph (e.g. 'file', 'error', 'commit')"
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max results for search_graph (default 10)"
+                },
+                "entity_id": {
+                    "type": "integer",
+                    "description": "Entity ID seed for traverse_graph"
+                },
+                "depth": {
+                    "type": "integer",
+                    "description": "Max traversal depth for traverse_graph (default 2)"
+                },
+                "compress": {
+                    "type": "boolean",
+                    "description": "Compress traversal output into kind-grouped summary (default false)"
+                }
+            },
+            "required": ["action"]
+        })
     }
 
     async fn call(&self, args: GraphArgs) -> Result<String, ToolError> {
@@ -250,7 +249,7 @@ mod tests {
     fn test_definition_includes_actions() {
         let tool = GraphTool::new(temp_db(), None, None, None);
         let rt = make_runtime();
-        let def = rt.block_on(tool.definition(String::new()));
+        let def = rt.block_on(rig::tool::tool_definition(&tool));
         assert!(def.description.contains("search_graph"));
         assert!(def.description.contains("traverse_graph"));
         assert!(def.description.contains("entity/relation"));

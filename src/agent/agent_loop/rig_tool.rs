@@ -31,7 +31,9 @@
 
 use std::pin::Pin;
 
-use rig::tool::{ToolDyn, ToolError};
+use rig::completion::ToolDefinition;
+use rig::tool::{IntoToolOutput, PortableTool};
+use rig::wasm_compat::WasmBoxedFuture;
 use serde_json::Value;
 
 use super::result::LoopToolResult;
@@ -41,6 +43,72 @@ use super::tool::{AbortSignal, LoopTool, LoopToolUpdate};
 use super::types::ToolExecutionMode;
 #[cfg(test)]
 use std::sync::Arc;
+
+/// Object-safe erased tool surface, replacing the removed
+/// `rig::tool::ToolDyn` (rig 0.41 made `ErasedTool` private and
+/// exposed only the concrete `DynamicTool`). dirge drives its own
+/// agent loop — no rig `ToolContext`/`ToolSet` — so it erases typed
+/// tools through this trait instead: any `PortableTool` implements
+/// it for free (the same blanket rig 0.39 provided for `ToolDyn`),
+/// and hand-rolled tools (MCP, hook-decorated) implement it
+/// directly.
+pub trait DynTool: Send + Sync {
+    fn name(&self) -> String;
+    fn definition(&self) -> WasmBoxedFuture<'_, ToolDefinition>;
+    fn call(&self, args: String) -> WasmBoxedFuture<'_, Result<String, DynToolError>>;
+}
+
+/// Error surface for an erased tool call, mirroring rig 0.39's
+/// `ToolError` (removed in rig 0.41).
+#[derive(Debug, thiserror::Error)]
+pub enum DynToolError {
+    #[error("{0}")]
+    ToolCallError(Box<dyn std::error::Error + Send + Sync>),
+    #[error("{0}")]
+    JsonError(#[from] serde_json::Error),
+}
+
+impl<T> DynTool for T
+where
+    T: PortableTool + Send + Sync + 'static,
+{
+    fn name(&self) -> String {
+        T::NAME.to_string()
+    }
+
+    fn definition(&self) -> WasmBoxedFuture<'_, ToolDefinition> {
+        Box::pin(async move {
+            ToolDefinition {
+                name: T::NAME.to_string(),
+                description: self.description(),
+                parameters: self.parameters(),
+            }
+        })
+    }
+
+    fn call(&self, args: String) -> WasmBoxedFuture<'_, Result<String, DynToolError>> {
+        Box::pin(async move {
+            // Replicates rig 0.39's blanket `ToolDyn::call`: a bare
+            // `null` args payload falls back to `{}` so tools whose
+            // args are all optional still deserialize.
+            let parsed = match serde_json::from_str::<T::Args>(&args) {
+                Ok(args) => args,
+                Err(err) if args.trim() == "null" => serde_json::from_str("{}").map_err(|_| err)?,
+                Err(err) => return Err(err.into()),
+            };
+            let output = <T as PortableTool>::call(self, parsed)
+                .await
+                .map_err(|e| DynToolError::ToolCallError(Box::new(e)))?;
+            // Replicates 0.39's output shaping: a plain string comes
+            // out unquoted; anything else renders as its JSON text.
+            // `ToolOutput::render` applies exactly that rule.
+            let tool_output = output
+                .into_tool_output()
+                .map_err(|e| DynToolError::ToolCallError(Box::new(e)))?;
+            Ok(tool_output.render())
+        })
+    }
+}
 
 /// Wraps a `Box<dyn rig::ToolDyn>` and exposes it as a `LoopTool`.
 ///
@@ -54,7 +122,7 @@ use std::sync::Arc;
 /// construction time (Reasonix tools.ts:36-38). The LLM sees flat
 /// dot-notation keys; `prepare_arguments` re-nests them at dispatch.
 pub struct RigToolAdapter {
-    inner: Box<dyn ToolDyn>,
+    inner: Box<dyn DynTool>,
     name: String,
     description: String,
     parameters: Value,
@@ -89,8 +157,8 @@ impl RigToolAdapter {
     /// leaves), flattens it and stores the flat variant so
     /// `prepare_arguments` can re-nest at dispatch (Reasonix
     /// tools.ts:36-38).
-    pub async fn new(inner: Box<dyn ToolDyn>) -> Self {
-        let def = inner.definition(String::new()).await;
+    pub async fn new(inner: Box<dyn DynTool>) -> Self {
+        let def = inner.definition().await;
         let flat_parameters = match analyze_schema(&def.parameters) {
             FlattenDecision {
                 should_flatten: true,
@@ -121,7 +189,7 @@ impl RigToolAdapter {
     /// Production callers should use `new`.
     #[cfg(test)]
     fn from_parts(
-        inner: Box<dyn ToolDyn>,
+        inner: Box<dyn DynTool>,
         name: String,
         description: String,
         parameters: Value,
@@ -221,7 +289,7 @@ impl LoopTool for RigToolAdapter {
 /// repair layer; this function handles runtime tool errors. If a
 /// schema error leaks through (defense-in-depth), wrap it in a
 /// model-readable retry hint rather than leaking raw serde diagnostics.
-fn format_tool_error(err: ToolError) -> String {
+fn format_tool_error(err: DynToolError) -> String {
     let raw = err.to_string();
     if raw.contains("missing field") || raw.contains("expected") || raw.contains("invalid type") {
         format!(
@@ -238,7 +306,7 @@ fn format_tool_error(err: ToolError) -> String {
 mod tests {
     use super::*;
     use rig::completion::ToolDefinition;
-    use rig::tool::Tool;
+    use rig::tool::PortableTool;
     use serde::{Deserialize, Serialize};
 
     /// Mock rig tool that echoes its input back. Mirrors the
@@ -258,24 +326,24 @@ mod tests {
         Generic(String),
     }
 
-    impl Tool for EchoTool {
+    impl PortableTool for EchoTool {
         const NAME: &'static str = "echo";
         type Error = EchoError;
         type Args = EchoArgs;
         type Output = String;
 
-        async fn definition(&self, _prompt: String) -> ToolDefinition {
-            ToolDefinition {
-                name: "echo".to_string(),
-                description: "Echo the input back".to_string(),
-                parameters: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "value": {"type": "string"}
-                    },
-                    "required": ["value"]
-                }),
-            }
+        fn description(&self) -> String {
+            "Echo the input back".to_string()
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "value": {"type": "string"}
+                },
+                "required": ["value"]
+            })
         }
 
         async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
@@ -287,18 +355,18 @@ mod tests {
     #[derive(Debug, Clone)]
     struct FailingTool;
 
-    impl Tool for FailingTool {
+    impl PortableTool for FailingTool {
         const NAME: &'static str = "failing";
         type Error = EchoError;
         type Args = EchoArgs;
         type Output = String;
 
-        async fn definition(&self, _prompt: String) -> ToolDefinition {
-            ToolDefinition {
-                name: "failing".to_string(),
-                description: "Always fails".to_string(),
-                parameters: serde_json::json!({"type": "object"}),
-            }
+        fn description(&self) -> String {
+            "Always fails".to_string()
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
         }
 
         async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
@@ -444,8 +512,8 @@ mod tests {
     /// returned by each path must match.
     #[tokio::test]
     async fn adapter_matches_rig_path_for_real_dirge_tool() {
+        use super::DynTool;
         use crate::agent::tools::ReadTool;
-        use rig::tool::ToolDyn;
 
         // Set up a temp file with known content. Reuses the
         // same TestDir pattern as fs_atomic tests for cleanup.
@@ -465,7 +533,7 @@ mod tests {
         // both traits are in scope.
         let tool_a = ReadTool::new(None, None);
         let rig_args = serde_json::json!({"path": path_str}).to_string();
-        let rig_output = <ReadTool as ToolDyn>::call(&tool_a, rig_args)
+        let rig_output = <ReadTool as DynTool>::call(&tool_a, rig_args)
             .await
             .expect("rig direct call should succeed");
 

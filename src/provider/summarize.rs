@@ -213,7 +213,7 @@ where
 
             let mut stream = agent
                 .stream_chat(prompt, Vec::<rig::completion::Message>::new())
-                .multi_turn(1)
+                .max_turns(1)
                 .await;
 
             let mut response = String::new();
@@ -224,7 +224,7 @@ where
                         rig::streaming::StreamedAssistantContent::Text(text),
                     )) => response.push_str(&text.text),
                     Ok(rig::agent::MultiTurnStreamItem::FinalResponse(res)) => {
-                        return Ok(res.response().to_string());
+                        return Ok(res.output.clone());
                     }
                     Err(e) => return Err(e.to_string()),
                     _ => {}

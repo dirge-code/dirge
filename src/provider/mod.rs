@@ -47,7 +47,6 @@ pub fn current_agent() -> Option<std::sync::Arc<AnyAgent>> {
 
 #[allow(unused_imports)]
 use crate::sync_util::LockExt;
-use rig::agent::Agent;
 use rig::providers::{anthropic, chatgpt, gemini, ollama, openai, openrouter};
 
 use crate::agent::tools::ToolCache;
@@ -69,8 +68,8 @@ pub struct AnyAgent {
     /// clone-cheap (Arc bump).
     loop_tools: Vec<std::sync::Arc<dyn crate::agent::agent_loop::LoopTool>>,
     /// Phase 4.5h-6: system prompt for the new loop path.
-    /// Extracted from the rig Agent's preamble field at build
-    /// time (every variant exposes `Agent.preamble: Option<String>`).
+    /// Returned by `build_agent_inner`, which assembles it. It used to be
+    /// read back off the rig `Agent`, but rig 0.41 made that field private.
     preamble: String,
     /// Model identifier — the same string the user passed via
     /// `--model` or pulled from config. Carried so `spawn_runner`
@@ -240,93 +239,74 @@ pub struct AnyAgent {
 }
 
 #[derive(Clone)]
+/// The per-provider completion model behind an [`AnyAgent`].
+///
+/// This holds the MODEL, not a rig `Agent`. Dirge drives its own agent
+/// loop (`agent_loop`) and only ever needed the rig `Agent` here to read
+/// the model back out of it; rig 0.41 made `Agent::model` private, and
+/// the wrapper was carrying no other weight — request shaping, tool
+/// dispatch and reasoning params are all applied by dirge's own loop.
 pub(crate) enum AnyAgentInner {
     OpenRouter(
-        Agent<
-            openrouter::completion::CompletionModel<
-                compressing_http::CompressingHttpClient<reqwest::Client>,
-            >,
+        openrouter::completion::CompletionModel<
+            compressing_http::CompressingHttpClient<reqwest::Client>,
         >,
     ),
     OpenAI(
-        Agent<
-            openai::completion::CompletionModel<
-                compressing_http::CompressingHttpClient<reqwest::Client>,
-            >,
+        openai::completion::CompletionModel<
+            compressing_http::CompressingHttpClient<reqwest::Client>,
         >,
     ),
     ChatGptOpenAI(
-        Agent<
-            openai::responses_api::ResponsesCompletionModel<
-                compressing_http::CompressingHttpClient<codex_http::CodexHttpClient>,
-            >,
+        openai::responses_api::ResponsesCompletionModel<
+            compressing_http::CompressingHttpClient<codex_http::CodexHttpClient>,
         >,
     ),
-    OpenAICodex(Agent<chatgpt::ResponsesCompletionModel>),
+    OpenAICodex(chatgpt::ResponsesCompletionModel),
     Anthropic(
-        Agent<
-            anthropic::completion::CompletionModel<
-                compressing_http::CompressingHttpClient<reqwest::Client>,
-            >,
+        anthropic::completion::CompletionModel<
+            compressing_http::CompressingHttpClient<reqwest::Client>,
         >,
     ),
     AnthropicOauth(
-        Agent<
-            anthropic::completion::CompletionModel<
-                compressing_http::CompressingHttpClient<anthropic_http::AnthropicHttpClient>,
-            >,
+        anthropic::completion::CompletionModel<
+            compressing_http::CompressingHttpClient<anthropic_http::AnthropicHttpClient>,
         >,
     ),
     Gemini(
-        Agent<
-            gemini::completion::CompletionModel<
-                compressing_http::CompressingHttpClient<reqwest::Client>,
-            >,
+        gemini::completion::CompletionModel<
+            compressing_http::CompressingHttpClient<reqwest::Client>,
         >,
     ),
     DeepSeek(
-        Agent<
-            openai::completion::CompletionModel<
-                compressing_http::CompressingHttpClient<reqwest::Client>,
-            >,
+        openai::completion::CompletionModel<
+            compressing_http::CompressingHttpClient<reqwest::Client>,
         >,
     ),
     Glm(
-        Agent<
-            openai::completion::CompletionModel<
-                compressing_http::CompressingHttpClient<reqwest::Client>,
-            >,
+        openai::completion::CompletionModel<
+            compressing_http::CompressingHttpClient<reqwest::Client>,
         >,
     ),
     Cerebras(
-        Agent<
-            openai::completion::CompletionModel<
-                compressing_http::CompressingHttpClient<reqwest::Client>,
-            >,
+        openai::completion::CompletionModel<
+            compressing_http::CompressingHttpClient<reqwest::Client>,
         >,
     ),
     OpenCode(
-        Agent<
-            openai::completion::CompletionModel<
-                compressing_http::CompressingHttpClient<reqwest::Client>,
-            >,
+        openai::completion::CompletionModel<
+            compressing_http::CompressingHttpClient<reqwest::Client>,
         >,
     ),
     Kimi(
-        Agent<
-            openai::completion::CompletionModel<
-                compressing_http::CompressingHttpClient<kimi_http::KimiHttpClient>,
-            >,
+        openai::completion::CompletionModel<
+            compressing_http::CompressingHttpClient<kimi_http::KimiHttpClient>,
         >,
     ),
-    Ollama(
-        Agent<ollama::CompletionModel<compressing_http::CompressingHttpClient<reqwest::Client>>>,
-    ),
+    Ollama(ollama::CompletionModel<compressing_http::CompressingHttpClient<reqwest::Client>>),
     Custom(
-        Agent<
-            openai::completion::CompletionModel<
-                compressing_http::CompressingHttpClient<reqwest::Client>,
-            >,
+        openai::completion::CompletionModel<
+            compressing_http::CompressingHttpClient<reqwest::Client>,
         >,
     ),
 }

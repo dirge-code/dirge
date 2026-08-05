@@ -18,8 +18,7 @@
 #[cfg(feature = "lsp")]
 use std::sync::Arc;
 
-use rig::completion::ToolDefinition;
-use rig::tool::Tool;
+use rig::tool::PortableTool;
 
 use crate::agent::agent_loop::tool_input_repair::with_contract_hint;
 use crate::agent::tools::cache::ToolCache;
@@ -163,37 +162,37 @@ pub(crate) fn apply_line_edit(
     Ok(output)
 }
 
-impl Tool for EditLinesTool {
+impl PortableTool for EditLinesTool {
     const NAME: &'static str = "edit_lines";
 
     type Error = ToolError;
     type Args = EditLinesArgs;
     type Output = String;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: "edit_lines".to_string(),
-            description: with_contract_hint(
-                "edit_lines",
-                "Replace a range of lines by line number, guarded by per-line content hashes. \
+    fn description(&self) -> String {
+        with_contract_hint(
+            "edit_lines",
+            "Replace a range of lines by line number, guarded by per-line content hashes. \
                  First read the file with line_hashes=true to get `N hhh: ...` lines, then call \
                  edit_lines with start_line/end_line (1-indexed, inclusive), expected_hashes (one \
                  per line in the range, in order), and new_text (the replacement block; empty \
                  deletes the range). Cheaper than `edit` for large blocks — you don't retype the \
                  old text. The edit is rejected if any line changed since you read it.",
-            ),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "The absolute path to the file to edit (must be absolute, not relative)", "dirge-hints": {"semantic": "absolute_path"} },
-                    "start_line": { "type": "integer", "description": "First line to replace (1-indexed, inclusive)" },
-                    "end_line": { "type": "integer", "description": "Last line to replace (1-indexed, inclusive)" },
-                    "expected_hashes": { "type": "array", "items": {"type": "string"}, "description": "The 3-char content hash for each line in [start_line, end_line], in order, exactly as shown by read(line_hashes=true)" },
-                    "new_text": { "type": "string", "description": "Replacement text for the range. Empty string deletes the lines." }
-                },
-                "required": ["path", "start_line", "end_line", "expected_hashes", "new_text"]
-            }),
-        }
+        )
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "The absolute path to the file to edit (must be absolute, not relative)", "dirge-hints": {"semantic": "absolute_path"} },
+                "start_line": { "type": "integer", "description": "First line to replace (1-indexed, inclusive)" },
+                "end_line": { "type": "integer", "description": "Last line to replace (1-indexed, inclusive)" },
+                "expected_hashes": { "type": "array", "items": {"type": "string"}, "description": "The 3-char content hash for each line in [start_line, end_line], in order, exactly as shown by read(line_hashes=true)" },
+                "new_text": { "type": "string", "description": "Replacement text for the range. Empty string deletes the lines." }
+            },
+            "required": ["path", "start_line", "end_line", "expected_hashes", "new_text"]
+        })
     }
 
     async fn call(&self, args: EditLinesArgs) -> Result<String, ToolError> {

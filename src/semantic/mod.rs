@@ -81,7 +81,7 @@ impl SemanticManager {
         &self,
         permission: Option<PermCheck>,
         ask_tx: Option<AskSender>,
-    ) -> Vec<Box<dyn rig::tool::ToolDyn>> {
+    ) -> Vec<Box<dyn crate::agent::agent_loop::rig_tool::DynTool>> {
         let idx = self.index.clone();
         vec![
             Box::new(semantic::ListSymbolsTool::new(

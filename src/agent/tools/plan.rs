@@ -11,8 +11,7 @@
 
 #[allow(unused_imports)]
 use crate::sync_util::LockExt;
-use rig::completion::ToolDefinition;
-use rig::tool::Tool;
+use rig::tool::PortableTool;
 use serde::Deserialize;
 use tokio::sync::{mpsc, oneshot};
 
@@ -86,24 +85,24 @@ impl PlanEnterTool {
 #[derive(Deserialize)]
 pub struct PlanEnterArgs {}
 
-impl Tool for PlanEnterTool {
+impl PortableTool for PlanEnterTool {
     const NAME: &'static str = "plan_enter";
 
     type Error = ToolError;
     type Args = PlanEnterArgs;
     type Output = String;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: "plan_enter".to_string(),
-            description: "Suggest switching to plan mode for complex tasks. The user will be asked to confirm. In plan mode, the agent uses a planning prompt that focuses on analysis and creating a detailed implementation plan rather than writing code."
-                .to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {},
-                "required": []
-            }),
-        }
+    fn description(&self) -> String {
+        "Suggest switching to plan mode for complex tasks. The user will be asked to confirm. In plan mode, the agent uses a planning prompt that focuses on analysis and creating a detailed implementation plan rather than writing code."
+                .to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "required": []
+        })
     }
 
     async fn call(&self, _args: PlanEnterArgs) -> Result<String, ToolError> {
@@ -165,24 +164,24 @@ impl PlanExitTool {
 #[derive(Deserialize)]
 pub struct PlanExitArgs {}
 
-impl Tool for PlanExitTool {
+impl PortableTool for PlanExitTool {
     const NAME: &'static str = "plan_exit";
 
     type Error = ToolError;
     type Args = PlanExitArgs;
     type Output = String;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: "plan_exit".to_string(),
-            description: "Suggest switching from plan mode to implementation mode. The user will be asked to confirm. The agent will switch to the code prompt for writing and executing code."
-                .to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {},
-                "required": []
-            }),
-        }
+    fn description(&self) -> String {
+        "Suggest switching from plan mode to implementation mode. The user will be asked to confirm. The agent will switch to the code prompt for writing and executing code."
+                .to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "required": []
+        })
     }
 
     async fn call(&self, _args: PlanExitArgs) -> Result<String, ToolError> {
@@ -281,10 +280,10 @@ mod tests {
         let (tx1, _rx) = mpsc::channel(1);
         let (tx2, _rx) = mpsc::channel(1);
 
-        let enter = PlanEnterTool::new(tx1).definition(String::new()).await;
+        let enter = rig::tool::tool_definition(&PlanEnterTool::new(tx1));
         assert_eq!(enter.name, "plan_enter");
 
-        let exit = PlanExitTool::new(tx2).definition(String::new()).await;
+        let exit = rig::tool::tool_definition(&PlanExitTool::new(tx2));
         assert_eq!(exit.name, "plan_exit");
     }
 
@@ -300,7 +299,7 @@ mod tests {
         // The impl block for PlanExitTool. We don't want fs::write or PLAN.md
         // string literals anywhere in the call() path.
         let impl_start = src
-            .find("impl Tool for PlanExitTool")
+            .find("impl PortableTool for PlanExitTool")
             .expect("PlanExitTool impl present");
         let impl_end = src[impl_start..]
             .find("\n}\n")

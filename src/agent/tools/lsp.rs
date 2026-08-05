@@ -7,8 +7,7 @@
 
 use std::sync::Arc;
 
-use rig::completion::ToolDefinition;
-use rig::tool::Tool;
+use rig::tool::PortableTool;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -76,59 +75,59 @@ pub struct LspArgs {
     pub query: Option<String>,
 }
 
-impl Tool for LspTool {
+impl PortableTool for LspTool {
     const NAME: &'static str = "lsp";
 
     type Error = ToolError;
     type Args = LspArgs;
     type Output = String;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: "lsp".to_string(),
-            description: DESCRIPTION.to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "operation": {
-                        "type": "string",
-                        "enum": [
-                            "definition",
-                            "references",
-                            "hover",
-                            "documentSymbol",
-                            "workspaceSymbol",
-                            "implementation",
-                            "prepareCallHierarchy",
-                            "incomingCalls",
-                            "outgoingCalls"
-                        ],
-                        "description": "Which LSP capability to invoke."
-                    },
-                    "file_path": {
-                        "type": "string",
-                        "description": "Absolute file path (must be absolute, not relative). Required for every operation.",
-                        "dirge-hints": {"semantic": "absolute_path"}
-                    },
-                    "line": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "description": "1-based line number (as shown in editors). Required for position-based operations."
-                    },
-                    "character": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "description": "1-based character offset. Required for position-based operations."
-                    },
-                    "query": {
-                        "type": "string",
-                        "description": "Search string for workspaceSymbol — REQUIRED when operation is 'workspaceSymbol' (pass empty string to list all symbols). Ignored for other operations."
-                    },
-                    "reason": { "type": "string", "description": "Why you're querying: the specific code-structure question this answers and how it serves the current task. Be targeted." }
+    fn description(&self) -> String {
+        DESCRIPTION.to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "operation": {
+                    "type": "string",
+                    "enum": [
+                        "definition",
+                        "references",
+                        "hover",
+                        "documentSymbol",
+                        "workspaceSymbol",
+                        "implementation",
+                        "prepareCallHierarchy",
+                        "incomingCalls",
+                        "outgoingCalls"
+                    ],
+                    "description": "Which LSP capability to invoke."
                 },
-                "required": ["operation", "file_path", "reason"]
-            }),
-        }
+                "file_path": {
+                    "type": "string",
+                    "description": "Absolute file path (must be absolute, not relative). Required for every operation.",
+                    "dirge-hints": {"semantic": "absolute_path"}
+                },
+                "line": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "1-based line number (as shown in editors). Required for position-based operations."
+                },
+                "character": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "1-based character offset. Required for position-based operations."
+                },
+                "query": {
+                    "type": "string",
+                    "description": "Search string for workspaceSymbol — REQUIRED when operation is 'workspaceSymbol' (pass empty string to list all symbols). Ignored for other operations."
+                },
+                "reason": { "type": "string", "description": "Why you're querying: the specific code-structure question this answers and how it serves the current task. Be targeted." }
+            },
+            "required": ["operation", "file_path", "reason"]
+        })
     }
 
     async fn call(&self, args: LspArgs) -> Result<String, ToolError> {
@@ -338,7 +337,7 @@ mod tests {
     async fn definition_has_correct_name() {
         let (tree, _) = cargo_tree("def-name");
         let tool = make_tool(Value::Null, tree.clone());
-        let def = tool.definition(String::new()).await;
+        let def = rig::tool::tool_definition(&tool);
         assert_eq!(def.name, "lsp");
         let _ = std::fs::remove_dir_all(&tree);
     }

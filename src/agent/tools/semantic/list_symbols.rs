@@ -1,8 +1,7 @@
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
-use rig::completion::ToolDefinition;
-use rig::tool::Tool;
+use rig::tool::PortableTool;
 use serde::Deserialize;
 
 use crate::agent::tools::{AskSender, PermCheck, ToolError, check_perm_path};
@@ -35,31 +34,31 @@ pub struct Args {
     kind: Option<String>,
 }
 
-impl Tool for ListSymbolsTool {
+impl PortableTool for ListSymbolsTool {
     const NAME: &'static str = "list_symbols";
 
     type Error = ToolError;
     type Args = Args;
     type Output = String;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: "list_symbols".to_string(),
-            description: "List symbols (functions, classes, methods, etc.) in a file or across the project. Parses code with tree-sitter for accurate results. Use this instead of grep when looking for code structure.".to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "File path to list symbols from. Omit to list across all indexed files."
-                    },
-                    "kind": {
-                        "type": "string",
-                        "description": "Filter by symbol kind: function, class, method, interface, type, or variable"
-                    }
+    fn description(&self) -> String {
+        "List symbols (functions, classes, methods, etc.) in a file or across the project. Parses code with tree-sitter for accurate results. Use this instead of grep when looking for code structure.".to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "File path to list symbols from. Omit to list across all indexed files."
+                },
+                "kind": {
+                    "type": "string",
+                    "description": "Filter by symbol kind: function, class, method, interface, type, or variable"
                 }
-            }),
-        }
+            }
+        })
     }
 
     async fn call(&self, args: Args) -> Result<String, ToolError> {

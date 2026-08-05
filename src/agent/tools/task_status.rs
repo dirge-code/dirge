@@ -5,8 +5,7 @@
 //! See the canonical map of the four work-tracking concepts in
 //! [`crate::agent::plan`].
 
-use rig::completion::ToolDefinition;
-use rig::tool::Tool;
+use rig::tool::PortableTool;
 use serde::Deserialize;
 use std::time::Duration;
 
@@ -46,32 +45,32 @@ pub struct TaskStatusArgs {
     pub wait: Option<bool>,
 }
 
-impl Tool for TaskStatusTool {
+impl PortableTool for TaskStatusTool {
     const NAME: &'static str = "task_status";
 
     type Error = ToolError;
     type Args = TaskStatusArgs;
     type Output = String;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: "task_status".to_string(),
-            description: "Look up the state of a background task by id. You usually do NOT need this — completion notifications arrive automatically as a <system-reminder> on your next turn. Use task_status only when you need to re-check a task's status mid-turn or look up a task whose notification you've already consumed. Returns running / completed / failed plus the result text. Set wait=true to block until the task transitions out of running (rarely useful — prefer letting the notification arrive).".to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "task_id": {
-                        "type": "string",
-                        "description": "The task ID returned by the task tool with background=true"
-                    },
-                    "wait": {
-                        "type": "boolean",
-                        "description": "Block until the task completes (default: false)"
-                    }
+    fn description(&self) -> String {
+        "Look up the state of a background task by id. You usually do NOT need this — completion notifications arrive automatically as a <system-reminder> on your next turn. Use task_status only when you need to re-check a task's status mid-turn or look up a task whose notification you've already consumed. Returns running / completed / failed plus the result text. Set wait=true to block until the task transitions out of running (rarely useful — prefer letting the notification arrive).".to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "task_id": {
+                    "type": "string",
+                    "description": "The task ID returned by the task tool with background=true"
                 },
-                "required": ["task_id"]
-            }),
-        }
+                "wait": {
+                    "type": "boolean",
+                    "description": "Block until the task completes (default: false)"
+                }
+            },
+            "required": ["task_id"]
+        })
     }
 
     async fn call(&self, args: TaskStatusArgs) -> Result<String, ToolError> {
@@ -282,7 +281,7 @@ mod tests {
     async fn test_definition_has_correct_name() {
         let store = BackgroundStore::new();
         let tool = TaskStatusTool::new(store);
-        let def = tool.definition(String::new()).await;
+        let def = rig::tool::tool_definition(&tool);
         assert_eq!(def.name, "task_status");
     }
 
@@ -294,7 +293,7 @@ mod tests {
     async fn definition_discourages_polling() {
         let store = BackgroundStore::new();
         let tool = TaskStatusTool::new(store);
-        let def = tool.definition(String::new()).await;
+        let def = rig::tool::tool_definition(&tool);
         let desc = def.description.to_lowercase();
         assert!(
             desc.contains("system-reminder") || desc.contains("automatically"),

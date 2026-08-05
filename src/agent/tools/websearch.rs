@@ -1,5 +1,4 @@
-use rig::completion::ToolDefinition;
-use rig::tool::Tool;
+use rig::tool::PortableTool;
 use serde::Deserialize;
 
 use crate::agent::agent_loop::types::InjectionScanMode;
@@ -109,36 +108,36 @@ fn format_search_results(results: &[ExaResult]) -> String {
     )
 }
 
-impl Tool for WebSearchTool {
+impl PortableTool for WebSearchTool {
     const NAME: &'static str = "websearch";
 
     type Error = ToolError;
     type Args = WebSearchArgs;
     type Output = String;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: "websearch".to_string(),
-            description: crate::agent::agent_loop::tool_input_repair::with_contract_hint(
-                "websearch",
-                "Search the web. Returns titles, URLs, and snippets. Use for looking up current documentation, API references, or up-to-date information beyond your training cutoff. Works out of the box without any API key — rotates between Exa and Parallel.ai hosted MCP endpoints (50/50 per process, pin with `DIRGE_WEBSEARCH_PROVIDER=exa|parallel`). Optional `EXA_API_KEY` / `PARALLEL_API_KEY` raise the respective rate limits. DuckDuckGo HTML scrape is the last-resort fallback if both upstream MCP endpoints fail.",
-            ),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "The search query"
-                    },
-                    "num_results": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "description": "Maximum number of results (default: 10)"
-                    }
+    fn description(&self) -> String {
+        crate::agent::agent_loop::tool_input_repair::with_contract_hint(
+            "websearch",
+            "Search the web. Returns titles, URLs, and snippets. Use for looking up current documentation, API references, or up-to-date information beyond your training cutoff. Works out of the box without any API key — rotates between Exa and Parallel.ai hosted MCP endpoints (50/50 per process, pin with `DIRGE_WEBSEARCH_PROVIDER=exa|parallel`). Optional `EXA_API_KEY` / `PARALLEL_API_KEY` raise the respective rate limits. DuckDuckGo HTML scrape is the last-resort fallback if both upstream MCP endpoints fail.",
+        )
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The search query"
                 },
-                "required": ["query"]
-            }),
-        }
+                "num_results": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Maximum number of results (default: 10)"
+                }
+            },
+            "required": ["query"]
+        })
     }
 
     async fn call(&self, args: WebSearchArgs) -> Result<String, ToolError> {
@@ -731,7 +730,7 @@ mod tests {
     #[tokio::test]
     async fn test_definition_has_correct_name() {
         let tool = WebSearchTool::new(None, None, Some("test-key".to_string()));
-        let def = tool.definition(String::new()).await;
+        let def = rig::tool::tool_definition(&tool);
         assert_eq!(def.name, "websearch");
     }
 

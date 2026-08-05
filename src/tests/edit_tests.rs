@@ -1,6 +1,6 @@
 use crate::agent::tools::edit::EditTool;
 use crate::agent::tools::{EditArgs, ToolError};
-use rig::tool::Tool;
+use rig::tool::PortableTool;
 
 struct TempFile(String);
 
