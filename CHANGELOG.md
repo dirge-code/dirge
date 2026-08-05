@@ -4,7 +4,7 @@ All notable changes to dirge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.21.7] - 2026-08-05
 
 ### Changed
 - Dependency sweep. `rmcp` was on three versions at once — our own 1.7, a 2.2
