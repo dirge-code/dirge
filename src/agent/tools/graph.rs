@@ -248,8 +248,7 @@ mod tests {
     #[test]
     fn test_definition_includes_actions() {
         let tool = GraphTool::new(temp_db(), None, None, None);
-        let rt = make_runtime();
-        let def = rt.block_on(rig::tool::tool_definition(&tool));
+        let def = rig::tool::tool_definition(&tool);
         assert!(def.description.contains("search_graph"));
         assert!(def.description.contains("traverse_graph"));
         assert!(def.description.contains("entity/relation"));
