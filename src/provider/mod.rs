@@ -150,8 +150,10 @@ pub struct AnyAgent {
     /// (dirge-1elu.1; the guard is opt-in and off is byte-identical).
     publish_guard_mode: crate::agent::agent_loop::types::GateMode,
     /// Set by `build_agent` from `Config::resolve_claim_gate_mode`;
-    /// forwarded to `LoopConfig.claim_gate_mode`. Defaults to `Off`
-    /// (dirge-d0e5.2; the gate is opt-in and off is byte-identical).
+    /// forwarded to `LoopConfig.claim_gate_mode`. This struct's own
+    /// unconfigured value is `Off`, but `build_agent` always overwrites it
+    /// from resolved config, which defaults to `Advisory` (dirge-lavc) —
+    /// so a real session runs with the gate armed at one nudge per run.
     claim_gate_mode: crate::agent::agent_loop::types::GateMode,
     /// Active session id forwarded to `LoopConfig.session_id` for the
     /// open-issues gate and session-scoped tools. `None` in sub-runners.

@@ -20,7 +20,7 @@ reason this page exists as its own document rather than a paragraph in
 | Exploration-prologue bound | `progress_prologue_cap` | `24` |
 | Capability tier | — | observed always; only `Struggling` changes behaviour |
 | Publish-state guard | `publish_guard` | `off` |
-| Claim/evidence gate | `claim_gate` | `off` |
+| Claim/evidence gate | `claim_gate` | `advisory` |
 | Agent-authored validator check | — | always on |
 
 ## The pattern
@@ -323,7 +323,12 @@ and `off` are the escape hatches, and they belong to the user, not the model.
 
 ## Claim/evidence gate (`claim_gate`)
 
-**Config:** `claim_gate`: `off` (default) | `advisory` | `blocking`
+**Config:** `claim_gate`: `off` | `advisory` (default) | `blocking`
+
+The default was `off` when the gate shipped and flipped to `advisory` in
+dirge-lavc. In `advisory` the ceiling is one nudge per run, so the cost of
+having it on is a single message; `blocking` (up to three re-entries) stays
+opt-in. Set `off` to restore byte-identical pre-gate behaviour.
 
 Fires when the final answer asserts something the run's evidence does not support:
 

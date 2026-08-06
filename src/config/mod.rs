@@ -995,12 +995,14 @@ pub struct Config {
     /// leaked). See [`resolve_publish_guard_mode`](Self::resolve_publish_guard_mode).
     pub publish_guard: Option<String>,
     /// How the deterministic claim/evidence gate engages (dirge-d0e5.2):
-    /// `off` / `advisory` / `blocking` (case-insensitive, trimmed). `off`
-    /// *(default)* is byte-identical to the loop without the gate. Either
-    /// non-`off` mode delivers the same one-shot model-visible nudge when
-    /// the final answer claims a verification result or a change the run's
-    /// evidence does not support. See
-    /// [`resolve_claim_gate_mode`](Self::resolve_claim_gate_mode).
+    /// `off` / `advisory` / `blocking` (case-insensitive, trimmed).
+    /// `advisory` *(default since dirge-lavc)* delivers ONE model-visible
+    /// nudge per run when the final answer claims a verification result or
+    /// a change the run's evidence does not support; `blocking` re-enters up
+    /// to three times and stays opt-in. `off` is byte-identical to the loop
+    /// without the gate. See
+    /// [`resolve_claim_gate_mode`](Self::resolve_claim_gate_mode) for why
+    /// the default flipped.
     pub claim_gate: Option<String>,
     /// How the ingestion-time injection scanner handles untrusted tool
     /// results (read, MCP, websearch). One of `off` / `advisory` / `block`
@@ -1423,17 +1425,32 @@ impl Config {
     /// Resolve the claim gate's engagement mode from
     /// [`claim_gate`](Self::claim_gate): `off`/`advisory`/`blocking`,
     /// parsed case-insensitively and trimmed. `None` and an empty value
-    /// resolve to `Off` (opt-in — the gate nags the model, so it must be
-    /// switched on explicitly; dirge-d0e5.2). An unrecognized non-empty
-    /// value also resolves to `Off` but logs a warning.
+    /// resolve to `Advisory`. An unrecognized non-empty value resolves to
+    /// `Off` but logs a warning.
+    ///
+    /// This default was `Off` when the gate shipped (dirge-d0e5.2), on the
+    /// reasoning that it nags the model so it should be switched on
+    /// explicitly. Flipped deliberately (dirge-lavc): in `advisory` the
+    /// per-run ceiling is ONE message ([`claim_nudge_cap`]), so "nags"
+    /// describes `blocking` (cap 3) far better than it describes this mode.
+    /// Against that one-shot cost sits an observed delegated run that
+    /// finalized with a broken test build while reporting "Compiles", and
+    /// wrote a sourcing claim into a doc comment for pages it never
+    /// fetched — with every claim-checking layer switched off, so nothing
+    /// fired. A one-message-per-run backstop is worth that.
+    ///
+    /// `blocking` stays opt-in: re-entering up to three times is a real
+    /// cost to impose on a run by default.
+    ///
+    /// [`claim_nudge_cap`]: crate::agent::agent_loop::claim_gate
     pub fn resolve_claim_gate_mode(&self) -> crate::agent::agent_loop::types::GateMode {
         use crate::agent::agent_loop::types::GateMode;
         let Some(raw) = self.claim_gate.as_deref() else {
-            return GateMode::Off;
+            return GateMode::Advisory;
         };
         let trimmed = raw.trim();
         if trimmed.is_empty() {
-            return GateMode::Off;
+            return GateMode::Advisory;
         }
         GateMode::from_wire(trimmed).unwrap_or_else(|| {
             tracing::warn!(
@@ -2310,11 +2327,22 @@ mod tests {
             let cfg = Config::deserialize(serde_json::json!({ "claim_gate": raw })).unwrap();
             assert_eq!(cfg.resolve_claim_gate_mode().as_str(), raw);
         }
-        // Absent key and an empty value both resolve to Off (opt-in).
+        // Absent key and an empty value both resolve to Advisory: the gate is
+        // on by default at its one-nudge-per-run ceiling (dirge-lavc). These
+        // two asserted `Off` before the flip — they encode the default, so
+        // they move with it rather than being deleted.
         let absent = Config::deserialize(serde_json::json!({})).unwrap();
-        assert_eq!(absent.resolve_claim_gate_mode(), GateMode::Off);
+        assert_eq!(absent.resolve_claim_gate_mode(), GateMode::Advisory);
         let empty = Config::deserialize(serde_json::json!({ "claim_gate": "" })).unwrap();
-        assert_eq!(empty.resolve_claim_gate_mode(), GateMode::Off);
+        assert_eq!(empty.resolve_claim_gate_mode(), GateMode::Advisory);
+        // An explicit "off" must still disable it — the escape hatch for
+        // anyone the nudge does not suit.
+        let off = Config::deserialize(serde_json::json!({ "claim_gate": "off" })).unwrap();
+        assert_eq!(off.resolve_claim_gate_mode(), GateMode::Off);
+        // An unrecognized value still falls back to Off, NOT to the new
+        // default — a typo must not silently arm a gate.
+        let bogus = Config::deserialize(serde_json::json!({ "claim_gate": "yes" })).unwrap();
+        assert_eq!(bogus.resolve_claim_gate_mode(), GateMode::Off);
     }
 
     #[test]
