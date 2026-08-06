@@ -34,6 +34,7 @@ pub(crate) enum RunEnd {
 /// Build the machine-readable result envelope for the headless modes.
 /// Pure so the success/error mapping is unit-testable without a live
 /// runner.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn headless_result_json(
     end: RunEnd,
     duration_ms: u64,
@@ -42,6 +43,7 @@ pub(crate) fn headless_result_json(
     session_id: &str,
     files_changed: &[String],
     evidence: &serde_json::Value,
+    cost: f64,
 ) -> serde_json::Value {
     let (subtype, is_error) = match end {
         RunEnd::Completed => ("success", false),
@@ -71,7 +73,7 @@ pub(crate) fn headless_result_json(
         // no verification command ran at all). Lets a caller check a
         // claimed test result against observed state without re-running.
         "evidence": evidence,
-        "total_cost_usd": 0.0,
+        "total_cost_usd": cost,
     })
 }
 
@@ -313,6 +315,11 @@ impl AnyAgent {
         // carries only the input-side counters.
         let mut usage = crate::agent::agent_loop::message::TokenUsage::default();
 
+        // dirge-i2st chunk 1: the bridge prices the run's usage against the
+        // model; `Done` carries the total, reported as `total_cost_usd` in
+        // the headless envelope (unknown model → bridge emits 0.0).
+        let mut run_cost = 0.0;
+
         // dirge-kuqp: per-turn buffers for incremental stream-json. The
         // bridge collapses `TurnEnd` to a bare index, so we rebuild each
         // turn's assistant/user envelopes from the streamed events and
@@ -379,10 +386,11 @@ impl AnyAgent {
                     }
                     had_output = true;
                 }
-                AgentEvent::Done { response, .. } => {
+                AgentEvent::Done { response, cost, .. } => {
                     // `Done.response` is the authoritative full text.
                     full_response = response.to_string();
                     completed = true;
+                    run_cost = cost;
                     break;
                 }
                 AgentEvent::Error(err) => {
@@ -461,6 +469,7 @@ impl AnyAgent {
                     input_tokens,
                     cached_input_tokens,
                     cache_creation_input_tokens,
+                    output_tokens,
                     ..
                 } => {
                     usage.input_tokens = usage.input_tokens.saturating_add(input_tokens);
@@ -470,6 +479,7 @@ impl AnyAgent {
                     usage.cache_creation_input_tokens = usage
                         .cache_creation_input_tokens
                         .saturating_add(cache_creation_input_tokens);
+                    usage.output_tokens = usage.output_tokens.saturating_add(output_tokens);
                 }
                 // Plugin-driven model swap after last run puts the
                 // request in the mgr; caller drains via
@@ -532,6 +542,7 @@ impl AnyAgent {
             &session_id,
             &headless_files_changed(since_epoch),
             &run_evidence(num_turns, &tool_calls, self.session_id.as_deref()),
+            run_cost,
         );
 
         match output_format {
@@ -619,6 +630,7 @@ mod tests {
             "sid",
             &[],
             &serde_json::json!({}),
+            0.0,
         );
         assert_eq!(ok["subtype"], "success");
         assert_eq!(ok["is_error"], false);
@@ -632,6 +644,7 @@ mod tests {
             "sid",
             &[],
             &serde_json::json!({}),
+            0.0,
         );
         assert_eq!(capped["subtype"], "error_max_turns");
         assert_eq!(capped["is_error"], true);
@@ -645,6 +658,7 @@ mod tests {
             "sid",
             &[],
             &serde_json::json!({}),
+            0.0,
         );
         assert_eq!(died["subtype"], "error");
         assert_eq!(died["is_error"], true);
@@ -660,6 +674,7 @@ mod tests {
             "sid",
             &[],
             &serde_json::json!({}),
+            0.0,
         );
         assert_eq!(capped["subtype"], "error_usage_cap");
         assert_eq!(capped["is_error"], true);
@@ -680,6 +695,7 @@ mod tests {
             "sid",
             &[],
             &serde_json::json!({}),
+            0.0,
         );
         assert_eq!(none["files_changed"], serde_json::json!([]));
 
@@ -692,6 +708,7 @@ mod tests {
             "sid",
             &files,
             &serde_json::json!({}),
+            0.0,
         );
         assert_eq!(
             env["files_changed"],
@@ -752,7 +769,7 @@ mod tests {
             "tool_calls": 7,
             "verification": { "observed": false, "status": null },
         });
-        let env = headless_result_json(RunEnd::Completed, 1, 3, "ok", "sid", &[], &ev);
+        let env = headless_result_json(RunEnd::Completed, 1, 3, "ok", "sid", &[], &ev, 0.0);
         assert_eq!(env["evidence"], ev);
     }
 

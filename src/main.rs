@@ -1596,6 +1596,7 @@ async fn main() -> anyhow::Result<()> {
                 usage.input_tokens,
                 usage.cached_input_tokens,
                 usage.cache_creation_input_tokens,
+                usage.output_tokens,
             );
             crate::agent::review::maybe_fire_session_end(&agent, &session);
             if let Err(e) = session::storage::save_session(&mut session) {

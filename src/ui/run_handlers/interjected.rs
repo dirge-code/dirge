@@ -79,9 +79,11 @@ pub(crate) async fn handle_interjected(
             &partial_response,
             std::mem::take(ctx.tool_calls_buf),
         );
-        // TODO(cost-tracking): same caveat as the Done
-        // branch — `tokens` is an estimate, not actual
-        // provider usage. Wire after rig usage plumbing.
+        // Abort path: no `AgentEvent::Usage` arrives for an
+        // interrupted turn, so `tokens` falls back to the estimate
+        // here (the Done path adds real provider totals instead).
+        // Kept in lockstep with `total_estimated_tokens` so an
+        // aborted turn doesn't look like a zero-token turn.
         ctx.session.total_tokens = ctx.session.total_tokens.saturating_add(tokens);
     } else {
         // No partial text but maybe pending tool

@@ -161,6 +161,7 @@ pub enum AgentEvent {
         input_tokens: u64,
         cached_input_tokens: u64,
         cache_creation_input_tokens: u64,
+        output_tokens: u64,
     },
     /// Marks the start of one turn within an agent run. A "turn" is one
     /// LLM call + any tool calls it dispatched + the tool results

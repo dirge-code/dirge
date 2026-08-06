@@ -63,8 +63,8 @@ mod tests {
     #[test]
     fn reports_ratio_and_counts() {
         let mut s = Session::new("p", "m", 0);
-        s.record_token_usage(1000, 800, 0);
-        s.record_token_usage(500, 100, 0);
+        s.record_token_usage(1000, 800, 0, 0);
+        s.record_token_usage(500, 100, 0, 0);
         let lines = report_lines(&s);
         // 900 / 1500 = 60.0%
         assert!(lines[0].contains("60.0%"), "got: {lines:?}");
@@ -76,7 +76,7 @@ mod tests {
     #[test]
     fn shows_cache_writes_line_when_nonzero() {
         let mut s = Session::new("p", "m", 0);
-        s.record_token_usage(1000, 200, 300);
+        s.record_token_usage(1000, 200, 300, 0);
         let lines = report_lines(&s);
         assert!(
             lines.iter().any(|l| l.contains("cache writes:  300")),

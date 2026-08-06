@@ -176,10 +176,13 @@ pub struct TokenUsage {
     pub output_tokens: u64,
     /// Input tokens served from a provider-managed prefix cache
     /// (DeepSeek `prompt_tokens_details.cached_tokens`, Anthropic
-    /// `cache_read_input_tokens`). These are billed at a steep
-    /// discount (DeepSeek ~1/10, Anthropic ~1/10) so the cache-hit
-    /// ratio is the headline cost lever for cheaper models. A
-    /// subset of `input_tokens`.
+    /// `cache_read_input_tokens`). The relationship to `input_tokens`
+    /// is provider-dependent: DeepSeek/OpenAI/Gemini report cached as
+    /// a SUBSET of `input_tokens`; Anthropic reports it DISJOINT
+    /// (`input_tokens` is the uncached remainder — the true prompt
+    /// total is input + cached + creation; rig_stream passes rig's
+    /// usage through verbatim). Consumers taking a ratio (e.g.
+    /// `Session::cache_hit_ratio`) must handle both conventions.
     pub cached_input_tokens: u64,
     /// Input tokens written to a provider-managed cache this
     /// request (Anthropic `cache_creation_input_tokens`; DeepSeek

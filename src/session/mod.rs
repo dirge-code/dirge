@@ -248,14 +248,13 @@ pub struct Session {
     pub compactions: Vec<Compaction>,
     pub created_at: CompactString,
     pub updated_at: CompactString,
-    // TODO(cost-tracking): `total_tokens` and `total_cost` are placeholders.
-    // Currently `total_tokens` accumulates the same heuristic estimate that
-    // already lives in `total_estimated_tokens` (`AgentEvent::Done` emits
-    // estimated_tokens because no provider integration has been wired
-    // through rig to extract actual usage). `total_cost` is never advanced
-    // past 0.0 because no per-provider pricing table exists. Both fields
-    // serialize for forward-compat so when actual provider usage lands
-    // they can be populated without a schema bump.
+    // Cost display was deliberately dropped in favor of real token
+    // counts — provider rates can't be sourced or kept fresh offline,
+    // so `total_cost` never advances and no pricing table exists. A
+    // future issue can retire the field. `total_tokens` accumulates
+    // the provider-reported run totals from `AgentEvent::Done` (the
+    // abort path still falls back to the heuristic estimate). The
+    // per-type truth lives in the `cumulative_*` counters below.
     pub total_tokens: u64,
     pub total_cost: f64,
     pub total_estimated_tokens: u64,
@@ -275,6 +274,11 @@ pub struct Session {
     /// (Anthropic only; DeepSeek reports 0).
     #[serde(default)]
     pub cumulative_cache_creation_tokens: u64,
+    /// Cumulative completion (output) tokens reported by the provider
+    /// across this session's lifetime. Defaulted on deserialize like the
+    /// other cumulative counters.
+    #[serde(default)]
+    pub cumulative_output_tokens: u64,
     pub context_window: u64,
     pub model: CompactString,
     /// dirge-ovjk follow-up: whether `model` was explicitly chosen (via
@@ -433,6 +437,7 @@ impl Session {
             updated_at: now,
             total_tokens: 0,
             total_cost: 0.0,
+            cumulative_output_tokens: 0,
             total_estimated_tokens: 0,
             cumulative_input_tokens: 0,
             cumulative_cached_input_tokens: 0,
@@ -469,7 +474,9 @@ impl Session {
         input_tokens: u64,
         cached_input_tokens: u64,
         cache_creation_input_tokens: u64,
+        output_tokens: u64,
     ) {
+        self.cumulative_output_tokens = self.cumulative_output_tokens.saturating_add(output_tokens);
         self.cumulative_input_tokens = self.cumulative_input_tokens.saturating_add(input_tokens);
         self.cumulative_cached_input_tokens = self
             .cumulative_cached_input_tokens
@@ -479,15 +486,38 @@ impl Session {
             .saturating_add(cache_creation_input_tokens);
     }
 
-    /// Cumulative prefix-cache hit ratio for this session:
-    /// cached input tokens / total input tokens, in `0.0..=1.0`.
-    /// Returns `None` when no real input usage has been recorded yet
-    /// (so callers can show "no data" rather than a misleading 0%).
+    /// Cumulative prefix-cache hit ratio for this session: cached input
+    /// tokens / total prompt tokens, in `0.0..=1.0`. Returns `None` when
+    /// no real input usage has been recorded yet (so callers can show
+    /// "no data" rather than a misleading 0%).
+    ///
+    /// Provider usage conventions differ. DeepSeek/OpenAI/Gemini report
+    /// cached tokens as a SUBSET of `input_tokens`, so the denominator
+    /// is `cumulative_input_tokens`. Anthropic reports the lanes DISJOINT
+    /// — `input_tokens` is the uncached remainder and the true prompt
+    /// total is input + cached + creation (rig_stream passes rig's usage
+    /// through verbatim). The convention is detected from the accumulated
+    /// counters: cache-creation tokens, or cached > input, can only occur
+    /// under the disjoint convention (creation is 0 for every subset
+    /// provider). Until detected, the subset denominator is assumed —
+    /// correct for all subset providers, and for a fresh Anthropic
+    /// session before its first cache write. Never exceeds 1.0 under
+    /// either convention.
     pub fn cache_hit_ratio(&self) -> Option<f64> {
-        if self.cumulative_input_tokens == 0 {
+        let cached = self.cumulative_cached_input_tokens;
+        if self.cumulative_input_tokens == 0 && cached == 0 {
             return None;
         }
-        Some(self.cumulative_cached_input_tokens as f64 / self.cumulative_input_tokens as f64)
+        let disjoint =
+            self.cumulative_cache_creation_tokens > 0 || cached > self.cumulative_input_tokens;
+        let total = if disjoint {
+            self.cumulative_input_tokens
+                .saturating_add(cached)
+                .saturating_add(self.cumulative_cache_creation_tokens)
+        } else {
+            self.cumulative_input_tokens
+        };
+        Some(cached as f64 / total as f64)
     }
 
     /// Populate `message_store` from `messages` for legacy session

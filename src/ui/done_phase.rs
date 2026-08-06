@@ -38,14 +38,12 @@ pub(crate) enum DonePhaseEvent {
     Ready(DoneChainResult),
 }
 
-/// Handle to the spawned Done-chain task plus the turn's token/cost totals
+/// Handle to the spawned Done-chain task plus the turn's token total
 /// (captured at Done receipt, applied on-loop by the completion arm).
 pub(crate) struct DonePhaseHandle {
     pub core: PhaseHandle<DonePhaseEvent>,
     #[cfg_attr(not(feature = "plugin"), allow(dead_code))]
     pub tokens: u64,
-    #[cfg_attr(not(feature = "plugin"), allow(dead_code))]
-    pub cost: f64,
 }
 
 /// Spawn the Done hook chain off-loop. The blocking Janet calls run on
@@ -56,7 +54,6 @@ pub(crate) fn spawn(
     pm: std::sync::Arc<std::sync::Mutex<crate::plugin::PluginManager>>,
     response: CompactString,
     tokens: u64,
-    cost: f64,
 ) -> DonePhaseHandle {
     let core = PhaseHandle::spawn(1, move |tx| async move {
         let fallback = response.clone();
@@ -75,7 +72,7 @@ pub(crate) fn spawn(
         });
         let _ = tx.send(DonePhaseEvent::Ready(result)).await;
     });
-    DonePhaseHandle { core, tokens, cost }
+    DonePhaseHandle { core, tokens }
 }
 
 /// Run the Done hook chain in order (the worker serializes evals, so the
@@ -177,9 +174,8 @@ mod tests {
         manager.register("prepare-next-run", "prepare-next-run");
         let pm = Arc::new(Mutex::new(manager));
 
-        let mut handle = spawn(pm, CompactString::new("original"), 100, 0.5);
+        let mut handle = spawn(pm, CompactString::new("original"), 100);
         assert_eq!(handle.tokens, 100);
-        assert_eq!(handle.cost, 0.5);
         let ev = tokio::time::timeout(Duration::from_secs(5), handle.core.rx.recv())
             .await
             .expect("done chain should complete promptly");

@@ -1080,9 +1080,9 @@ fn cache_hit_ratio_none_before_any_usage() {
 fn cache_hit_ratio_accumulates_across_turns() {
     let mut s = Session::new("p", "m", 0);
     // Turn 1: cold-ish — 1000 input, 800 cached.
-    s.record_token_usage(1000, 800, 0);
+    s.record_token_usage(1000, 800, 0, 0);
     // Turn 2: 500 input, 100 cached.
-    s.record_token_usage(500, 100, 0);
+    s.record_token_usage(500, 100, 0, 0);
     assert_eq!(s.cumulative_input_tokens, 1500);
     assert_eq!(s.cumulative_cached_input_tokens, 900);
     // 900 / 1500 = 0.6
@@ -1095,9 +1095,50 @@ fn cache_hit_ratio_accumulates_across_turns() {
 #[test]
 fn cache_creation_tracked_separately_from_ratio() {
     let mut s = Session::new("p", "m", 0);
-    s.record_token_usage(200, 0, 200);
+    s.record_token_usage(200, 0, 200, 0);
     assert_eq!(s.cumulative_cache_creation_tokens, 200);
     assert_eq!(s.cache_hit_ratio(), Some(0.0));
+}
+
+/// Anthropic reports the three lanes DISJOINT — `input_tokens` is the
+/// uncached remainder, so the true prompt total is input + cached +
+/// creation (rig_stream passes rig's usage through verbatim). A warm
+/// cache — 20000 cached reads against 500 uncached — must yield a ratio
+/// in `0.0..=1.0`: the old `cached / input` denominator produced 40.0 and
+/// `/cache` rendered 4000%.
+#[test]
+fn cache_hit_ratio_bounded_for_anthropic_disjoint_lanes() {
+    let mut s = Session::new("anthropic", "claude-sonnet-4-6", 0);
+    s.record_token_usage(500, 20_000, 1_000, 900);
+    let ratio = s.cache_hit_ratio().expect("usage recorded");
+    let expected = 20_000.0 / (500.0 + 20_000.0 + 1_000.0);
+    assert!(
+        (ratio - expected).abs() < 1e-9,
+        "ratio was {ratio}, expected {expected}"
+    );
+    assert!(ratio <= 1.0, "ratio must never exceed 1.0, was {ratio}");
+    assert_eq!(s.cumulative_output_tokens, 900);
+}
+
+/// DeepSeek-style subset reporting (cached ⊆ input, creation always 0)
+/// keeps the simple `cached / input` denominator — no double counting.
+#[test]
+fn cache_hit_ratio_subset_convention_deepseek_shaped() {
+    let mut s = Session::new("deepseek", "deepseek-v4-flash", 0);
+    s.record_token_usage(1_000_000, 900_000, 0, 200_000);
+    let ratio = s.cache_hit_ratio().expect("usage recorded");
+    assert!((ratio - 0.9).abs() < 1e-9, "ratio was {ratio}");
+}
+
+/// `total_cost` never advances — cost display was deliberately dropped
+/// (rates can't be sourced or kept fresh offline).
+#[test]
+fn total_cost_stays_zero_by_decision() {
+    let mut s = Session::new("anthropic", "claude-sonnet-4-6", 0);
+    s.record_token_usage(1_000_000, 500_000, 100_000, 1_000_000);
+    assert_eq!(s.total_cost, 0.0);
+    assert_eq!(s.cumulative_input_tokens, 1_000_000);
+    assert_eq!(s.cumulative_output_tokens, 1_000_000);
 }
 
 /// Cumulative cache fields default to 0 when absent from an older

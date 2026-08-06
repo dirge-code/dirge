@@ -123,14 +123,27 @@ impl StatusLine {
             format!("{pct}%")
         };
 
-        // TODO(cost-tracking): `session.total_cost` is always 0.0
-        // because dirge doesn't yet have a per-provider pricing
-        // table — `AgentEvent::Done` emits `cost: 0.0` unconditionally
-        // (see `src/agent/runner.rs::run_stream`). Until that's wired,
-        // the cost segment is suppressed entirely to avoid showing a
-        // misleading "$0.0000". When pricing lands, restore the
-        // conditional formatter that was here previously.
-        let cost_str = String::new();
+        // Real token usage (provider-reported), not cost: cost display was
+        // deliberately dropped — provider rates can't be sourced or kept
+        // fresh offline, so dollars would go stale. The segment appears
+        // only once the provider has reported usage, so a fresh session
+        // shows nothing rather than a misleading "tok:0/0". The cache-hit
+        // ratio rides along once cached reads exist.
+        let usage_str = if session.cumulative_input_tokens + session.cumulative_output_tokens > 0 {
+            let mut seg = format!(
+                " tok:{}/{}",
+                fmt_tokens(session.cumulative_input_tokens),
+                fmt_tokens(session.cumulative_output_tokens),
+            );
+            if session.cumulative_cached_input_tokens > 0
+                && let Some(hit) = session.cache_hit_ratio()
+            {
+                seg.push_str(&format!(" hit:{:.0}%", hit * 100.0));
+            }
+            seg
+        } else {
+            String::new()
+        };
 
         let compact_badge = if session.compactions.is_empty() {
             String::new()
@@ -185,7 +198,7 @@ impl StatusLine {
         format!(
             "{}{} | {}{} | {}/{} ({}) | {}msgs | {}{}{}{}{}{}{}{}",
             project_label,
-            cost_str,
+            usage_str,
             session.model,
             loop_badge,
             fmt_tokens(used),
@@ -321,5 +334,36 @@ mod tests {
         let line = StatusLine::render(&session, false, 0, None, None, None, None, None, None);
         let expected = format!(" session:{}", crate::text::short_id(session.id.as_str()));
         assert!(line.contains(&expected), "session id not in status: {line}");
+    }
+
+    /// The token segment renders only once the provider has reported real
+    /// usage — a fresh session shows nothing rather than a misleading
+    /// "tok:0/0" (the failure mode the cost segment used to guard
+    /// against; cost display itself was deliberately dropped).
+    #[tokio::test]
+    async fn token_segment_renders_only_after_reported_usage() {
+        let fresh = Session::new("openrouter", "unknown-model", 100_000);
+        let line = StatusLine::render(&fresh, false, 0, None, None, None, None, None, None);
+        assert!(
+            !line.contains("tok:"),
+            "no usage → no token segment: {line}"
+        );
+
+        let mut used = Session::new("anthropic", "claude-sonnet-4-6", 100_000);
+        used.record_token_usage(1_000_000, 0, 0, 500_000);
+        let line = StatusLine::render(&used, false, 0, None, None, None, None, None, None);
+        assert!(line.contains(" tok:1.0M/500k"), "in/out tokens: {line}");
+    }
+
+    /// Anthropic-shaped usage (disjoint lanes, warm cache): the rendered
+    /// hit percentage is bounded — the old `cached / input` denominator
+    /// rendered 4000%.
+    #[tokio::test]
+    async fn token_segment_hit_ratio_bounded_for_anthropic_shape() {
+        let mut used = Session::new("anthropic", "claude-sonnet-4-6", 100_000);
+        used.record_token_usage(500, 20_000, 1_000, 900);
+        let line = StatusLine::render(&used, false, 0, None, None, None, None, None, None);
+        assert!(line.contains(" hit:93%"), "bounded hit ratio: {line}");
+        assert!(!line.contains("4000"), "must not render 4000%: {line}");
     }
 }

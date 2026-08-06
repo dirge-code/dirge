@@ -452,11 +452,11 @@ fn rewind_restores_files_to_pre_prompt_state() {
 }
 
 // The token accumulator on the abort path keeps `total_tokens`
-// in sync with `total_estimated_tokens`. Both fields are
-// TODO(cost-tracking) placeholders today but the inconsistency
-// between Done/Interjected (which both update total_tokens) and
-// abort (which didn't) made the abort case look like the agent
-// produced zero tokens that turn.
+// in sync with `total_estimated_tokens`: Done/Interjected both
+// update total_tokens, and the abort path must too — otherwise
+// an aborted turn looks like the agent produced zero tokens.
+// (Done carries real provider totals; abort has no usage event
+// and falls back to the estimate.)
 #[test]
 fn capture_partial_on_abort_keeps_total_tokens_in_sync() {
     let mut session = crate::session::Session::new("openrouter", "test-model", 100_000);
