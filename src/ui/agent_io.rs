@@ -173,11 +173,11 @@ pub(crate) fn capture_partial_on_abort(
     // states on resume so the LLM never sees orphan tool_use.
     let calls = std::mem::take(tool_calls_buf);
     // Capture the message's token estimate before add_message so we
-    // can also bump `total_tokens` in lockstep with
-    // `total_estimated_tokens` — matches the Done / Interjected
-    // branches which both update total_tokens (a TODO(cost-tracking)
-    // placeholder; kept consistent so the abort case doesn't look
-    // like a zero-token turn).
+    // can also bump `total_tokens` — the abort path has no usage
+    // event to sum, so it falls back to the estimate, kept in
+    // lockstep with `total_estimated_tokens` so the abort case
+    // doesn't look like a zero-token turn (the Done path adds real
+    // provider totals instead).
     let est = session::Session::estimate_tokens(&stashed);
     session.add_message_with_tool_calls(MessageRole::Assistant, &stashed, calls);
     session.total_tokens = session.total_tokens.saturating_add(est);

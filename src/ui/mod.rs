@@ -3522,7 +3522,7 @@ pub async fn run_interactive(
                                     output.to_string(),
                                 ).await?;
                             }
-                            AgentEvent::Done { response, tokens, cost } => {
+                            AgentEvent::Done { response, tokens, .. } => {
                                 let mut ctx = make_run_ctx!();
                                 #[cfg(feature = "loop")]
                                 let loop_bits = run_handlers::done::LoopBits {
@@ -3533,7 +3533,6 @@ pub async fn run_interactive(
                                     &mut ctx,
                                     response,
                                     tokens,
-                                    cost,
                                     &mut ui.was_reasoning,
                                     &mut ui.is_running,
                                     &mut agent,
@@ -3556,6 +3555,7 @@ pub async fn run_interactive(
                                 input_tokens,
                                 cached_input_tokens,
                                 cache_creation_input_tokens,
+                                output_tokens,
                                 ..
                             } => {
                                 // Fold real provider usage into the session's
@@ -3565,6 +3565,7 @@ pub async fn run_interactive(
                                     input_tokens,
                                     cached_input_tokens,
                                     cache_creation_input_tokens,
+                                    output_tokens,
                                 );
                             }
                             #[cfg(feature = "plugin")]
@@ -3921,7 +3922,6 @@ pub async fn run_interactive(
                             continue;
                         };
                         let tokens = handle.tokens;
-                        let cost = handle.cost;
                         match ev {
                             Some(DonePhaseEvent::Ready(result)) => {
                                 for line in &result.lines {
@@ -3971,7 +3971,6 @@ pub async fn run_interactive(
                                     &mut ctx,
                                     result.response,
                                     tokens,
-                                    cost,
                                     &mut agent,
                                     &mut ui.is_running,
                                     &make_agent_build_deps!(),

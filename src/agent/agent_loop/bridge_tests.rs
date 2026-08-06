@@ -716,11 +716,40 @@ fn usage_event_translates_with_cache_counts() {
             input_tokens,
             cached_input_tokens,
             cache_creation_input_tokens,
+            output_tokens,
         } => {
             assert_eq!(*input_tokens, 1000);
             assert_eq!(*cached_input_tokens, 800);
             assert_eq!(*cache_creation_input_tokens, 0);
+            assert_eq!(*output_tokens, 50);
         }
         other => panic!("expected AgentEvent::Usage, got {other:?}"),
+    }
+}
+
+/// `AgentEvent::Done` carries the run's accumulated real provider usage
+/// (input + output) in `tokens`, and `cost` stays 0.0 — cost display was
+/// deliberately dropped in favor of token counts (chunk 1 of dirge-i2st).
+#[test]
+fn agent_end_carries_run_token_totals_and_zero_cost() {
+    use crate::agent::agent_loop::message::TokenUsage;
+    let mut bridge = EventBridge::new();
+    bridge.translate(LoopEvent::Usage {
+        usage: TokenUsage {
+            input_tokens: 2_000_000,
+            output_tokens: 1_000_000,
+            cached_input_tokens: 1_000_000,
+            cache_creation_input_tokens: 0,
+        },
+    });
+    let out = bridge.translate(LoopEvent::AgentEnd {
+        messages: Vec::new(),
+    });
+    match &out[0] {
+        AgentEvent::Done { tokens, cost, .. } => {
+            assert_eq!(*tokens, 3_000_000, "tokens = input + output");
+            assert_eq!(*cost, 0.0, "cost is retired: always 0.0");
+        }
+        other => panic!("expected Done, got {other:?}"),
     }
 }

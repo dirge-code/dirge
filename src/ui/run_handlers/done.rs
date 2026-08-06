@@ -180,7 +180,6 @@ pub(crate) async fn handle_done(
     ctx: &mut RunCtx<'_>,
     response: CompactString,
     tokens: u64,
-    cost: f64,
     was_reasoning: &mut bool,
     is_running: &mut bool,
     agent: &mut AnyAgent,
@@ -268,12 +267,7 @@ pub(crate) async fn handle_done(
         // working face rather than the idle `Done` (GH #621).
         ctx.renderer
             .set_avatar_state(avatar::AvatarState::settled(true));
-        *done_phase = Some(crate::ui::done_phase::spawn(
-            pm.clone(),
-            response,
-            tokens,
-            cost,
-        ));
+        *done_phase = Some(crate::ui::done_phase::spawn(pm.clone(), response, tokens));
         return Ok(());
     }
 
@@ -283,7 +277,6 @@ pub(crate) async fn handle_done(
         ctx,
         response,
         tokens,
-        cost,
         agent,
         is_running,
         deps,
@@ -315,7 +308,6 @@ pub(crate) async fn finish_done(
     ctx: &mut RunCtx<'_>,
     response: CompactString,
     tokens: u64,
-    cost: f64,
     agent: &mut AnyAgent,
     is_running: &mut bool,
     deps: &AgentBuildDeps<'_>,
@@ -357,15 +349,11 @@ pub(crate) async fn finish_done(
         &response,
         std::mem::take(ctx.tool_calls_buf),
     );
-    // TODO(cost-tracking): `tokens` here is the heuristic
-    // estimate (text.len()/4) and `cost` is always 0.0 —
-    // these accumulate into placeholder fields and won't
-    // reflect actual provider usage / billing until we
-    // pipe rig's `FinalResponse.usage()` through into
-    // `AgentEvent::Done`. Kept as no-op-ish additions so
-    // the wiring is in place when real values arrive.
+    // `tokens` is the run's real provider usage (input + output, from the
+    // bridge's per-run accumulation). `cost` stays 0.0 by decision — cost
+    // display was dropped (rates can't be sourced or kept fresh offline) —
+    // so `total_cost` is never advanced here.
     ctx.session.total_tokens = ctx.session.total_tokens.saturating_add(tokens);
-    ctx.session.total_cost += cost;
     // Run ended cleanly — reset the per-run tool-
     // call counter so the next user submission
     // starts at zero. Mirrored in the Interjected

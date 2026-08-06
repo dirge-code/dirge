@@ -51,7 +51,7 @@ use compact_str::CompactString;
 
 use crate::event::{AgentEvent, ToolContent};
 
-use super::message::{ContentBlock, DeltaPhase, LoopEvent, LoopMessage, StopReason};
+use super::message::{ContentBlock, DeltaPhase, LoopEvent, LoopMessage, StopReason, TokenUsage};
 
 /// Bridges `LoopEvent` stream to `AgentEvent` stream. Stateful
 /// per-run.
@@ -73,6 +73,9 @@ pub struct EventBridge {
     /// classification dirge's existing runner uses (read /
     /// find_files / list_dir → File).
     tool_name_by_id: HashMap<String, String>,
+    /// Per-run provider usage accumulation, so `AgentEnd` can report real
+    /// token totals in `Done { tokens }` (input + output).
+    run_usage: TokenUsage,
 }
 
 impl Default for EventBridge {
@@ -88,6 +91,7 @@ impl EventBridge {
             last_text_emitted: String::new(),
             last_reasoning_emitted: String::new(),
             tool_name_by_id: HashMap::new(),
+            run_usage: TokenUsage::default(),
         }
     }
 
@@ -195,9 +199,10 @@ impl EventBridge {
                 //
                 // Pi's agent_end carries newMessages; dirge's Done
                 // carries the final response string for the UI's
-                // terminal render. Tokens / cost not yet tracked
-                // through the loop — surfaced as 0. A future phase
-                // could populate from rig usage metadata.
+                // terminal render. `tokens` is the run's real provider
+                // usage (input + output, accumulated from
+                // `LoopEvent::Usage`); `cost` stays 0.0 — cost display
+                // was deliberately dropped (see session/mod.rs).
                 let last_assistant = messages.iter().rev().find_map(|m| match m {
                     LoopMessage::Assistant(a) => Some(a),
                     _ => None,
@@ -276,7 +281,10 @@ impl EventBridge {
                     .unwrap_or_default();
                 vec![AgentEvent::Done {
                     response: CompactString::from(response),
-                    tokens: 0,
+                    // Real provider totals for the run; `cost` stays 0.0
+                    // by decision — cost display was dropped (rates can't
+                    // be sourced or kept fresh offline).
+                    tokens: self.run_usage.input_tokens + self.run_usage.output_tokens,
                     cost: 0.0,
                 }]
             }
@@ -314,10 +322,27 @@ impl EventBridge {
             }
 
             LoopEvent::Usage { usage } => {
+                self.run_usage.input_tokens = self
+                    .run_usage
+                    .input_tokens
+                    .saturating_add(usage.input_tokens);
+                self.run_usage.cached_input_tokens = self
+                    .run_usage
+                    .cached_input_tokens
+                    .saturating_add(usage.cached_input_tokens);
+                self.run_usage.cache_creation_input_tokens = self
+                    .run_usage
+                    .cache_creation_input_tokens
+                    .saturating_add(usage.cache_creation_input_tokens);
+                self.run_usage.output_tokens = self
+                    .run_usage
+                    .output_tokens
+                    .saturating_add(usage.output_tokens);
                 vec![AgentEvent::Usage {
                     input_tokens: usage.input_tokens,
                     cached_input_tokens: usage.cached_input_tokens,
                     cache_creation_input_tokens: usage.cache_creation_input_tokens,
+                    output_tokens: usage.output_tokens,
                 }]
             }
 
