@@ -31,6 +31,11 @@
         }
       );
 
+      homeModules = {
+        dirge = import ./nix/home-manager.nix { inherit self; };
+        default = self.homeModules.dirge;
+      };
+
       apps = forAllSystems (
         { system, ... }:
         {
