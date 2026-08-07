@@ -1588,7 +1588,19 @@ async fn main() -> anyhow::Result<()> {
             // Persist the full assistant turn — text PLUS the tool calls/
             // results — so a resumed `--session` (e.g. an MCP delegation
             // follow-up) sees what dirge actually did, not just a text blurb.
-            session.add_message_with_tool_calls(MessageRole::Assistant, &response, turn_tool_calls);
+            // dirge-byun: skip a turn that produced neither text nor tool
+            // calls. Storing it puts an empty assistant message in the
+            // session, which every later prompt would replay as an empty text
+            // content block — rejected with `400 invalid_request_error: text
+            // content is empty` by Moonshot/Kimi and GLM, wedging the session.
+            // Same guard as the interactive path in `run_handlers/done.rs`.
+            if !response.is_empty() || !turn_tool_calls.is_empty() {
+                session.add_message_with_tool_calls(
+                    MessageRole::Assistant,
+                    &response,
+                    turn_tool_calls,
+                );
+            }
             // Fold the run's provider token usage into the session's
             // cumulative counters (headless parity with the interactive
             // UI's Usage handler) so the persisted session carries real

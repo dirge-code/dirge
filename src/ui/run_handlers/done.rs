@@ -344,11 +344,20 @@ pub(crate) async fn finish_done(
     // alongside the assistant text so the next
     // resume sees the full tool_use/tool_result
     // pairs in convert_history.
-    ctx.session.add_message_with_tool_calls(
-        MessageRole::Assistant,
-        &response,
-        std::mem::take(ctx.tool_calls_buf),
-    );
+    // dirge-byun: don't persist a turn that produced nothing at all. A
+    // reasoning-only turn (the model thinks, emits no prose, calls no tool)
+    // would otherwise be stored with empty content and replayed on every
+    // later prompt as an empty text content block — which Moonshot/Kimi and
+    // GLM reject with `400 invalid_request_error: text content is empty`,
+    // wedging the session permanently. The replay boundaries drop it anyway
+    // (`runner::convert_history`), so keeping it here only adds a session
+    // entry nothing can use. The abort path (`interjected.rs`) has always
+    // skipped empty turns for the same reason.
+    let tool_calls = std::mem::take(ctx.tool_calls_buf);
+    if !response.is_empty() || !tool_calls.is_empty() {
+        ctx.session
+            .add_message_with_tool_calls(MessageRole::Assistant, &response, tool_calls);
+    }
     // `tokens` is the run's real provider usage (input + output, from the
     // bridge's per-run accumulation). `cost` stays 0.0 by decision — cost
     // display was dropped (rates can't be sourced or kept fresh offline) —

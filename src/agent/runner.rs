@@ -164,7 +164,21 @@ pub fn convert_history(session: &Session) -> Vec<Message> {
                 // rather than skipping. Bare assistant messages
                 // (no tool_calls) keep the prior simple shape.
                 if msg.tool_calls.is_empty() {
-                    messages.push(Message::assistant(msg.content.to_string()));
+                    // dirge-byun: skip an assistant turn that produced
+                    // nothing. A reasoning-only turn (the model thinks, emits
+                    // no prose, calls no tool) persists with empty content;
+                    // replaying it as `Message::assistant("")` puts an empty
+                    // text content block on the wire, which Moonshot/Kimi and
+                    // GLM reject with `400 invalid_request_error: text content
+                    // is empty` and Anthropic 400s on too. History is rebuilt
+                    // from the session on every submit, so one such message
+                    // wedges the session for good — every later prompt fails
+                    // before it starts. The turn carries no context worth
+                    // replaying, so drop it. opencode gets this for free: the
+                    // AI SDK filters empty text parts (`message-v2.ts:262`).
+                    if !msg.content.is_empty() {
+                        messages.push(Message::assistant(msg.content.to_string()));
+                    }
                     continue;
                 }
 

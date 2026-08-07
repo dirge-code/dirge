@@ -244,6 +244,14 @@ pub fn rig_message_to_loop_messages(m: rig::completion::Message) -> Vec<LoopMess
             let mut blocks: Vec<ContentBlock> = Vec::new();
             for part in content.into_iter() {
                 match part {
+                    // dirge-byun: an empty text part is dropped rather than
+                    // carried into the loop's history. It serializes back out
+                    // as `{"type": "text", "text": ""}`, which every
+                    // OpenAI-compatible backend rejects (Moonshot/Kimi and GLM
+                    // with `text content is empty`). Dropping it here also
+                    // means an assistant turn that held nothing else yields no
+                    // loop message at all — `blocks.is_empty()` below.
+                    AssistantContent::Text(t) if t.text.is_empty() => {}
                     AssistantContent::Text(t) => blocks.push(ContentBlock::Text { text: t.text }),
                     AssistantContent::ToolCall(tc) => {
                         blocks.push(ContentBlock::ToolCall {
@@ -922,6 +930,57 @@ mod tests {
                 }
             }
             _ => panic!("expected User loop message"),
+        }
+    }
+
+    /// dirge-byun. Second line of defence behind `convert_history`: a rig
+    /// assistant message whose only content is an empty text block must not
+    /// become a `LoopMessage::Assistant` carrying `ContentBlock::Text { "" }`.
+    /// That block round-trips to `content: [{"type": "text", "text": ""}]` on
+    /// the wire, which Moonshot/Kimi and GLM reject with
+    /// `400 invalid_request_error: text content is empty`.
+    #[test]
+    fn rig_to_loop_drops_empty_assistant_text() {
+        use crate::agent::agent_loop::message::LoopMessage;
+        use rig::OneOrMany;
+        use rig::completion::message::{AssistantContent, Text, ToolCall, ToolFunction};
+
+        let empty = rig::completion::Message::assistant("");
+        assert!(
+            super::rig_message_to_loop_messages(empty).is_empty(),
+            "an assistant turn with nothing but empty text carries no context",
+        );
+
+        // ...but an empty text part next to a tool call must not take the
+        // call down with it.
+        let with_call = rig::completion::Message::Assistant {
+            id: None,
+            content: OneOrMany::many(vec![
+                AssistantContent::Text(Text {
+                    text: String::new(),
+                    additional_params: None,
+                }),
+                AssistantContent::ToolCall(ToolCall {
+                    id: "tc_1".to_string(),
+                    call_id: None,
+                    function: ToolFunction {
+                        name: "bash".to_string(),
+                        arguments: serde_json::json!({}),
+                    },
+                    signature: None,
+                    additional_params: None,
+                }),
+            ])
+            .unwrap(),
+        };
+        let out = super::rig_message_to_loop_messages(with_call);
+        assert_eq!(out.len(), 1, "the tool call keeps the message: {out:#?}");
+        match &out[0] {
+            LoopMessage::Assistant(a) => {
+                assert_eq!(a.content.len(), 1, "only the tool call survives");
+                assert!(matches!(a.content[0], ContentBlock::ToolCall { .. }));
+            }
+            other => panic!("expected Assistant loop message; got {other:?}"),
         }
     }
 

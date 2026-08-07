@@ -557,6 +557,11 @@ fn resolve_image(
     })
 }
 
+/// Stand-in body for a tool result that came back empty. Providers reject an
+/// empty text content block, and the result can't be dropped without orphaning
+/// its tool call — see the call site in `value_to_rig_message_for_provider`.
+pub(crate) const EMPTY_TOOL_RESULT_PLACEHOLDER: &str = "(no output)";
+
 fn value_to_rig_message_for_provider(
     value: &Value,
     provider_name: Option<&str>,
@@ -572,6 +577,12 @@ fn value_to_rig_message_for_provider(
             // placeholder rather than dropping the part.
             let content = value.get("content")?;
             match content {
+                // dirge-byun: an empty string would become an empty text
+                // content block, which Moonshot/Kimi and GLM reject
+                // (`text content is empty`) and Anthropic 400s on. The
+                // array shape drops its empty parts in `build_user_content`;
+                // this is the same guard for the plain-string shape.
+                Value::String(s) if s.is_empty() => None,
                 Value::String(s) => Some(Message::user(s.clone())),
                 Value::Array(parts) => build_user_content(parts, asset_dir),
                 _ => None,
@@ -591,6 +602,10 @@ fn value_to_rig_message_for_provider(
         // busting the prompt cache on every post-fold turn.
         "system" => {
             let content = value.get("content").and_then(|c| c.as_str())?;
+            // dirge-byun: same empty-text-block guard as the `user` arm.
+            if content.is_empty() {
+                return None;
+            }
             Some(Message::user(content))
         }
         "assistant" => {
@@ -644,6 +659,22 @@ fn value_to_rig_message_for_provider(
                     }
                 })
                 .unwrap_or_default();
+            // dirge-byun: a tool that succeeded silently (`mkdir -p x`,
+            // `touch y` — bash returns the merged output verbatim, and appends
+            // no exit-code note on success) leaves an empty body. That
+            // serializes to an empty text content block, which Moonshot/Kimi
+            // and GLM reject with `text content is empty` and Anthropic 400s
+            // on; because the result is replayed from history on every later
+            // turn, one silent command wedges the session for good. Unlike an
+            // empty assistant turn this can't be dropped — Anthropic and
+            // OpenAI both reject a tool call with no matching result — so it
+            // gets a body that says what happened. opencode substitutes the
+            // same placeholder (`tool/shell.ts:576`).
+            let text = if text.is_empty() {
+                EMPTY_TOOL_RESULT_PLACEHOLDER.to_string()
+            } else {
+                text
+            };
             if provider_requires_openai_call_ids(provider_name) {
                 Some(Message::tool_result_with_call_id(
                     tool_call_id,
@@ -708,6 +739,19 @@ fn value_to_assistant_content(
     match kind {
         "text" => {
             let text = obj.get("text").and_then(|t| t.as_str())?;
+            // dirge-byun: last-mile guard, mirroring the user-side skip in
+            // `build_user_content`. An empty text block serializes to
+            // `{"type": "text", "text": ""}`; Moonshot/Kimi and GLM reject the
+            // whole request with `400 invalid_request_error: text content is
+            // empty`, and Anthropic 400s on it too. The block can reach here
+            // from any turn where the model emitted only reasoning, so the
+            // upstream fixes in `convert_history` /
+            // `rig_message_to_loop_messages` are not the only entry point.
+            // Dropping the sole block of a message drops the message
+            // (`OneOrMany::many` errors on empty), which is what we want.
+            if text.is_empty() {
+                return None;
+            }
             Some(AssistantContent::text(text))
         }
         "thinking" => {
@@ -1183,6 +1227,80 @@ mod tests {
         }
     }
 
+    /// dirge-byun. A turn where the model emitted only reasoning (or nothing
+    /// at all) replays as an assistant message whose sole text block is `""`.
+    /// Every OpenAI-compatible backend serializes that as
+    /// `content: [{"type": "text", "text": ""}]` and rejects it — Moonshot/Kimi
+    /// and GLM with `400 invalid_request_error: text content is empty`,
+    /// Anthropic with its own 400. Since the offending message is replayed from
+    /// session history on EVERY subsequent prompt, the session is wedged: no
+    /// further turn can start. Drop the empty block here (mirroring the
+    /// user-side guard in `build_user_content`); a message left with nothing
+    /// usable drops out entirely.
+    #[test]
+    fn assistant_empty_text_block_is_dropped() {
+        let only_empty = serde_json::json!({
+            "role": "assistant",
+            "content": [{"type": "text", "text": ""}],
+        });
+        for provider in [None, Some("openai"), Some("moonshot"), Some("glm")] {
+            assert!(
+                value_to_rig_message_for_provider(&only_empty, provider, None).is_none(),
+                "{provider:?}: an assistant message with only an empty text block \
+                 must not reach the provider",
+            );
+        }
+
+        // The empty block must not survive alongside real content either — the
+        // provider rejects the whole request over one empty part.
+        let mixed = serde_json::json!({
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "text": "let me think"},
+                {"type": "text", "text": ""},
+            ],
+        });
+        let msg = value_to_rig_message_for_provider(&mixed, Some("moonshot"), None)
+            .expect("the reasoning block keeps the message alive");
+        match msg {
+            Message::Assistant { content, .. } => {
+                assert!(
+                    !content
+                        .iter()
+                        .any(|c| matches!(c, AssistantContent::Text(t) if t.text.is_empty())),
+                    "empty text block must be dropped",
+                );
+                assert!(
+                    content
+                        .iter()
+                        .any(|c| matches!(c, AssistantContent::Reasoning(_))),
+                    "reasoning must survive",
+                );
+            }
+            _ => panic!("expected Assistant"),
+        }
+
+        // A tool-call turn whose text was empty keeps the call — dropping the
+        // message would orphan the tool result that follows it.
+        let with_call = serde_json::json!({
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": ""},
+                {"type": "toolCall", "id": "call_1", "name": "echo", "arguments": {}},
+            ],
+        });
+        let msg = value_to_rig_message_for_provider(&with_call, Some("moonshot"), None)
+            .expect("the tool call keeps the message alive");
+        match msg {
+            Message::Assistant { content, .. } => {
+                let parts: Vec<_> = content.into_iter().collect();
+                assert_eq!(parts.len(), 1, "only the tool call survives");
+                assert!(matches!(parts[0], AssistantContent::ToolCall(_)));
+            }
+            _ => panic!("expected Assistant"),
+        }
+    }
+
     #[test]
     fn openai_assistant_thinking_only_is_skipped() {
         let v = serde_json::json!({
@@ -1317,6 +1435,177 @@ mod tests {
             },
             _ => panic!("expected User"),
         }
+    }
+
+    /// dirge-byun, second instance of the same family. A silent successful
+    /// command (`mkdir -p x`, `touch y`) makes bash return `""`, so the tool
+    /// result carries an empty text block — 26 of them across the author's
+    /// recent sessions. That serializes as an empty text content block, which
+    /// Moonshot/Kimi and GLM reject with `400 invalid_request_error: text
+    /// content is empty`, and the result is replayed from history forever
+    /// after. The result cannot simply be dropped — Anthropic and OpenAI both
+    /// reject an orphan tool call — so it gets a placeholder body instead.
+    /// opencode does the same thing (`tool/shell.ts:576`).
+    #[test]
+    fn empty_tool_result_gets_a_placeholder_body() {
+        let shapes = [
+            serde_json::json!({
+                "role": "toolResult",
+                "toolCallId": "call_1",
+                "toolName": "bash",
+                "content": [{"type": "text", "text": ""}],
+                "details": {},
+                "isError": false,
+            }),
+            serde_json::json!({
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": "",
+            }),
+            // No content key at all — `unwrap_or_default` used to make this ""
+            // too.
+            serde_json::json!({
+                "role": "toolResult",
+                "toolCallId": "call_1",
+            }),
+        ];
+        for v in &shapes {
+            let msg = value_to_rig_message_for_provider(v, Some("moonshot"), None)
+                .unwrap_or_else(|| panic!("tool result must not be dropped: {v}"));
+            match msg {
+                Message::User { content } => match content.first() {
+                    UserContent::ToolResult(tr) => {
+                        assert_eq!(tr.id, "call_1");
+                        let body = match tr.content.first() {
+                            rig::completion::message::ToolResultContent::Text(t) => t.text.clone(),
+                            other => panic!("expected text tool-result content, got {other:?}"),
+                        };
+                        assert!(
+                            !body.is_empty(),
+                            "empty tool-result body must be replaced: {v}",
+                        );
+                    }
+                    other => panic!("expected ToolResult, got {other:?}"),
+                },
+                other => panic!("expected User, got {other:?}"),
+            }
+        }
+    }
+
+    /// A `user` / `system` message whose content is an empty string must not
+    /// reach the provider either — same empty text content block, same 400.
+    /// The array-of-parts shape is already covered by
+    /// `converter_drops_empty_text_part`; this pins the plain-string arms.
+    #[test]
+    fn empty_string_user_and_system_messages_are_dropped() {
+        for role in ["user", "system"] {
+            let v = serde_json::json!({"role": role, "content": ""});
+            assert!(
+                value_to_rig_message_for_provider(&v, Some("moonshot"), None).is_none(),
+                "an empty {role} message must not reach the provider",
+            );
+        }
+    }
+
+    /// dirge-byun end to end, over the chain that actually broke: a wedged
+    /// session replays through `convert_history` →
+    /// `rig_history_to_loop_messages` → `loop_message_to_value` → here on
+    /// every single prompt (`ui/run_handlers/submit.rs` rebuilds it each
+    /// time). Nothing that reaches the provider may carry an empty text
+    /// content block: Moonshot/Kimi and GLM answer
+    /// `400 invalid_request_error: text content is empty` and the session can
+    /// never take another turn.
+    ///
+    /// The session below is the reported shape — a turn where the model
+    /// emitted only reasoning, plus a silent `mkdir` whose tool result came
+    /// back empty.
+    #[test]
+    fn wedged_session_replays_without_empty_text_blocks() {
+        use crate::session::{MessageRole, Session, ToolCallEntry, ToolCallState};
+
+        let mut s = Session::new("moonshot", "kimi", 0);
+        s.add_message(MessageRole::User, "proceed with implementation");
+        s.add_message_with_tool_calls(
+            MessageRole::Assistant,
+            "",
+            vec![ToolCallEntry {
+                id: "tc_1".to_string(),
+                name: "bash".to_string(),
+                args: serde_json::json!({"command": "mkdir -p src/gen"}),
+                state: ToolCallState::Completed {
+                    result: String::new(),
+                },
+            }],
+        );
+        // The reasoning-only turn: no prose, no tool calls.
+        s.add_message(MessageRole::Assistant, "");
+        s.add_message(MessageRole::User, "huh?");
+
+        let history = crate::agent::runner::convert_history(&s);
+        let loop_msgs =
+            crate::agent::agent_loop::integration::rig_history_to_loop_messages(history);
+        let outgoing: Vec<Message> = loop_msgs
+            .iter()
+            .map(crate::agent::agent_loop::message::loop_message_to_value)
+            .filter_map(|v| value_to_rig_message_for_provider(&v, Some("moonshot"), None))
+            .collect();
+
+        for m in &outgoing {
+            match m {
+                Message::User { content } => {
+                    for part in content.iter() {
+                        match part {
+                            UserContent::Text(t) => {
+                                assert!(!t.text.is_empty(), "empty user text block: {m:?}")
+                            }
+                            UserContent::ToolResult(tr) => {
+                                for c in tr.content.iter() {
+                                    if let rig::completion::message::ToolResultContent::Text(t) = c
+                                    {
+                                        assert!(
+                                            !t.text.is_empty(),
+                                            "empty tool-result text block: {m:?}",
+                                        );
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Message::Assistant { content, .. } => {
+                    for part in content.iter() {
+                        if let AssistantContent::Text(t) = part {
+                            assert!(!t.text.is_empty(), "empty assistant text block: {m:?}");
+                        }
+                    }
+                }
+                Message::System { .. } => {}
+            }
+        }
+
+        // The tool call must still be paired with its result — dropping the
+        // empty body instead of replacing it would orphan the call.
+        let calls = outgoing
+            .iter()
+            .filter(|m| match m {
+                Message::Assistant { content, .. } => content
+                    .iter()
+                    .any(|c| matches!(c, AssistantContent::ToolCall(_))),
+                _ => false,
+            })
+            .count();
+        let results = outgoing
+            .iter()
+            .filter(|m| match m {
+                Message::User { content } => content
+                    .iter()
+                    .any(|c| matches!(c, UserContent::ToolResult(_))),
+                _ => false,
+            })
+            .count();
+        assert_eq!(calls, 1, "the tool call survives: {outgoing:#?}");
+        assert_eq!(results, 1, "so does its result: {outgoing:#?}");
     }
 
     /// Tool role (snake_case) with tool_call_id → rig ToolResult.
