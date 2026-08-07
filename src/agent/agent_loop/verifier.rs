@@ -484,17 +484,11 @@ impl VerifierGate {
         VerificationStatus::VerifiedGreen
     }
 
-    /// Code edits since the last verification command of any tier. Feeds
-    /// the mid-run nudge; never mutates the gate (same read-only contract
-    /// as [`VerifierGate::status`]).
-    pub fn ran_verification(&self) -> bool {
-        self.inner.lock_ignore_poison().ran_verification
-    }
-
     /// Verification commands observed this run, latest-first, each with
     /// whether it failed. Empty when no build/test command ran (or when
     /// masking or a self-authored script declined the green). Feeds the
-    /// critic's evidence block (dirge-d0e5.3).
+    /// critic's evidence block (dirge-d0e5.3) and the claim gate's
+    /// kind-matched evidence check (dirge-lavc).
     pub fn observed_commands(&self) -> Vec<(String, bool)> {
         self.inner
             .lock_ignore_poison()

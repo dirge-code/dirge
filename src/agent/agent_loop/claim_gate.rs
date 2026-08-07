@@ -3,9 +3,14 @@
 //! At finalization, a model-visible one-shot nudge fires when the final
 //! answer makes a SPECIFIC claim the run's evidence does not support:
 //!
-//! - **Unsupported verification claim** — the answer asserts a test count or
-//!   named-gate result ("4954 passed", "clippy clean") while the verifier
-//!   recorded NO build/test command this run.
+//! - **Unsupported verification claim** — the answer asserts a verification
+//!   result ("5001 passed", "compiles", "clippy clean") that no observed
+//!   build/test command of the matching kind supports. The evidence check is
+//!   KIND-MATCHED (dirge-lavc): a test-count claim requires an observed TEST
+//!   command, a build/lint claim an observed BUILD/LINT command. A green
+//!   `cargo build` cannot support "N passed" — the false green this gate
+//!   exists to catch — and "compiles" is only ever judged against a build
+//!   that really ran, so a true "Compiles." stays silent.
 //! - **Unsupported change claim** — the answer asserts having
 //!   applied/fixed/changed something while zero files were mutated this run.
 //!
@@ -33,7 +38,7 @@ pub(crate) const CLAIM_GATE_TAG: &str = "[claim-check]";
 /// nagged forever. `blocking` re-enters up to three times, so a run that keeps
 /// finalizing on an unsupported claim keeps being asked — bounded, because a
 /// model that cannot satisfy the check after three tries will not on the
-/// fourth. Mirrors [`super::code_review::MAX_REVIEW_REACT`].
+/// fourth. `off` never fires.
 ///
 /// Without this the two modes were byte-identical and the config surface
 /// advertised a distinction that did not exist.
@@ -60,9 +65,11 @@ impl ClaimKind {
         match self {
             ClaimKind::Verification => {
                 "Your final message asserts a verification result (a test count like \
-                 \"N passed\" or a named gate like \"clippy clean\"), but no build/test \
-                 command ran this run, so the claim is unsupported. Either actually run \
-                 the check and report its real output, or remove the unsupported claim."
+                 \"N passed\" or a named gate like \"clippy clean\"/\"compiles\"), but no \
+                 build/test command of the matching kind ran this run — a test-count claim \
+                 needs a test command, a build/lint claim needs a build/lint command. Either \
+                 actually run the check and report its real output, or remove the unsupported \
+                 claim."
             }
             ClaimKind::Change => {
                 "Your final message says you changed or fixed something, but no files were \
@@ -76,9 +83,15 @@ impl ClaimKind {
 /// The claims [`scan_final_answer`] found in the final answer text. Evidence
 /// is applied separately by [`unsupported_claims`], so the scanner stays a
 /// pure function of the text.
+///
+/// Verification claims are split by KIND (dirge-lavc) because the kinds
+/// demand different evidence: a test-result claim ("N passed", "tests pass")
+/// can only be supported by an observed test command, a build/lint-result
+/// claim ("compiles", "clippy clean") only by an observed build/lint command.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct Claims {
-    pub verification_claim: bool,
+    pub test_claim: bool,
+    pub build_or_lint_claim: bool,
     pub change_claim: bool,
 }
 
@@ -94,22 +107,29 @@ pub(crate) fn scan_final_answer(text: &str) -> Claims {
         if sentence_attributes_to_another_actor(sentence) {
             continue;
         }
-        claims.verification_claim |= claims_verification(sentence);
+        claims.test_claim |= claims_test_result(sentence);
+        claims.build_or_lint_claim |= claims_build_or_lint_result(sentence);
         claims.change_claim |= claims_change(sentence);
     }
     claims
 }
 
-/// The deterministic conjunction: a claim with no supporting evidence from
-/// this run. `ran_verification` — did the verifier observe a build/test
-/// command this run. `files_mutated` — how many files the tracker recorded
-/// since the run's epoch.
+/// Which (if any) claim the observed evidence fails to support. Evidence is
+/// the verifier's [`crate::agent::agent_loop::verifier::VerifierGate::observed_commands`] —
+/// every build/test command observed this run, with whether it failed — and
+/// it is matched to the claim by KIND (dirge-lavc): a test-result claim needs
+/// an observed TEST command, a build/lint-result claim an observed
+/// BUILD/LINT command. The pass/fail flag is deliberately not consulted: the
+/// red/green verdict belongs to the verifier's own status machinery, and a
+/// command that ran at all is evidence its kind was attempted. This gate
+/// biases toward under-detecting.
 pub(crate) fn unsupported_claims(
     claims: &Claims,
-    ran_verification: bool,
+    observed: &[(String, bool)],
     files_mutated: usize,
 ) -> Option<ClaimKind> {
-    if claims.verification_claim && !ran_verification {
+    let (ran_test, ran_build_or_lint) = observed_kinds(observed);
+    if (claims.test_claim && !ran_test) || (claims.build_or_lint_claim && !ran_build_or_lint) {
         return Some(ClaimKind::Verification);
     }
     if claims.change_claim && files_mutated == 0 {
@@ -118,9 +138,99 @@ pub(crate) fn unsupported_claims(
     None
 }
 
-/// Drop double-quoted and backtick-quoted spans. A pasted CI log or a
-/// user-supplied transcript is someone else's output; the model quoting it is
-/// not asserting it as its own run's outcome.
+/// The kind of evidence a verification command provides. A verification TIER
+/// (verifier.rs) is a COST axis; this is a COVERAGE axis — which claims the
+/// command can support. The two are not interchangeable: `cargo build` is
+/// Slow (costly) AND build/lint kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandKind {
+    /// Runs tests: `cargo test`, `pytest`, `go test`, `npm test`.
+    Test,
+    /// Builds, checks, lints, or formats: `cargo build`, `tsc`, `eslint`.
+    BuildOrLint,
+}
+
+/// Which evidence kinds the observed commands provide, as (test, build/lint).
+/// A command provides a kind when ANY of its segments is that kind, so
+/// `cargo fmt && cargo test` counts as both. A command that is verification
+/// but whose kind is unrecognized (rare — a bare script path) provides
+/// neither, and cannot support a claim.
+fn observed_kinds(commands: &[(String, bool)]) -> (bool, bool) {
+    let mut ran_test = false;
+    let mut ran_build_or_lint = false;
+    for (command, _failed) in commands {
+        for segment in command.split(['&', '|', ';', '\n']) {
+            match segment_kind(segment) {
+                Some(CommandKind::Test) => ran_test = true,
+                Some(CommandKind::BuildOrLint) => ran_build_or_lint = true,
+                None => {}
+            }
+        }
+    }
+    (ran_test, ran_build_or_lint)
+}
+
+/// The evidence kind of a single shell segment, or `None` when it is not a
+/// recognized build/test/lint command. Mirrors the verifier's recognition
+/// vocabulary (verifier.rs) on the kind axis.
+fn segment_kind(segment: &str) -> Option<CommandKind> {
+    // Drop `VAR=value` prefixes so `RUST_LOG=debug cargo test` classifies.
+    let tokens: Vec<&str> = segment
+        .split_whitespace()
+        .filter(|t| !t.contains('='))
+        .collect();
+    let (command, args) = tokens.split_first()?;
+    let base = command.rsplit('/').next().unwrap_or(command);
+    let sub = args.iter().find(|t| !t.starts_with('-')).copied();
+    match base {
+        "cargo" => match sub {
+            Some("test") | Some("bench") | Some("nextest") => Some(CommandKind::Test),
+            Some("build") | Some("check") | Some("clippy") | Some("fmt") | Some("doc") => {
+                Some(CommandKind::BuildOrLint)
+            }
+            _ => Some(CommandKind::BuildOrLint),
+        },
+        "go" => match sub {
+            Some("test") => Some(CommandKind::Test),
+            _ => Some(CommandKind::BuildOrLint),
+        },
+        "pytest" | "tox" | "jest" | "vitest" | "mocha" | "rspec" => Some(CommandKind::Test),
+        "make" => match sub {
+            // By automake convention `make check` IS the full suite.
+            Some("test") | Some("check") => Some(CommandKind::Test),
+            _ => Some(CommandKind::BuildOrLint),
+        },
+        "npm" | "pnpm" | "yarn" => match sub {
+            Some("test") => Some(CommandKind::Test),
+            Some("run") => {
+                let script = args
+                    .iter()
+                    .find(|t| !t.starts_with('-') && **t != "run")
+                    .copied();
+                match script {
+                    Some(s) if s.contains("test") => Some(CommandKind::Test),
+                    _ => Some(CommandKind::BuildOrLint),
+                }
+            }
+            _ => Some(CommandKind::BuildOrLint),
+        },
+        "mvn" | "gradle" => match sub {
+            Some("test") => Some(CommandKind::Test),
+            _ => Some(CommandKind::BuildOrLint),
+        },
+        "dotnet" => match sub {
+            Some("test") => Some(CommandKind::Test),
+            _ => Some(CommandKind::BuildOrLint),
+        },
+        // Typecheckers and linters/formatters are build/lint by construction.
+        // The list mirrors verifier.rs's FAST_LINTERS plus common formatters.
+        "tsc" | "rustc" | "eslint" | "ruff" | "mypy" | "flake8" | "shellcheck" | "rubocop"
+        | "golangci-lint" | "prettier" | "gofmt" | "rustfmt" | "clang-format" | "black"
+        | "isort" => Some(CommandKind::BuildOrLint),
+        _ => None,
+    }
+}
+
 fn strip_quoted(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
@@ -139,9 +249,6 @@ fn strip_quoted(text: &str) -> String {
     out
 }
 
-/// Split on sentence boundaries so an attributed sentence can be dropped
-/// without silencing a real claim in the same answer ("CI reported 4954
-/// passed. I then fixed the parser.").
 fn split_sentences(text: &str) -> Vec<&str> {
     text.split(['.', '\n', ';'])
         .map(str::trim)
@@ -149,9 +256,6 @@ fn split_sentences(text: &str) -> Vec<&str> {
         .collect()
 }
 
-/// A claim scoped to another actor or to the past ("CI reported", "you
-/// said") is not the model asserting this run's outcome — the carve-out
-/// from the spec.
 fn sentence_attributes_to_another_actor(sentence: &str) -> bool {
     let lower = sentence.to_ascii_lowercase();
     const MARKERS: [&str; 9] = [
@@ -168,12 +272,12 @@ fn sentence_attributes_to_another_actor(sentence: &str) -> bool {
     MARKERS.iter().any(|m| lower.contains(m))
 }
 
-/// A concrete verification-outcome claim: a test count ("4954 passed",
-/// "12 tests passing") or a named gate ("clippy clean", "fmt clean", "all
-/// green", "exit 0").
-fn claims_verification(sentence: &str) -> bool {
+/// Does the sentence assert a TEST-RESULT claim — a test count ("5001
+/// passed") or a tests-passed phrase ("tests pass", "all green")? Such a
+/// claim requires observed TEST-command evidence (dirge-lavc); a build
+/// cannot support it.
+fn claims_test_result(sentence: &str) -> bool {
     let lower = sentence.to_ascii_lowercase();
-    // Numeric test counts: <digits> [test|tests] (passed|passing).
     let bytes = lower.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -198,24 +302,33 @@ fn claims_verification(sentence: &str) -> bool {
         }
         i += 1;
     }
-    const GATES: [&str; 10] = [
+    const TEST_GATES: &[&str] = &["all green", "all tests pass", "tests pass", "tests passing"];
+    TEST_GATES.iter().any(|g| lower.contains(g))
+}
+
+/// Does the sentence assert a BUILD/LINT-RESULT claim — a named build, lint,
+/// or format gate ("clippy clean", "compiles", "builds clean", "exit 0")?
+/// Such a claim requires observed BUILD/LINT-command evidence (dirge-lavc).
+///
+/// "compiles" and "builds clean" live here — and only here — because a green
+/// build is exactly the evidence that supports them: kind-matched, they can
+/// never fire against a build that really ran, which is why adding them to
+/// the unkinded GATES list was retracted (the observed "Compiles." was TRUE).
+fn claims_build_or_lint_result(sentence: &str) -> bool {
+    let lower = sentence.to_ascii_lowercase();
+    const BUILD_OR_LINT_GATES: &[&str] = &[
         "clippy clean",
         "clippy is clean",
         "fmt clean",
         "formatted clean",
-        "all green",
-        "all tests pass",
-        "tests pass",
-        "tests passing",
         "exit 0",
         "exit code 0",
+        "compiles",
+        "builds clean",
     ];
-    GATES.iter().any(|g| lower.contains(g))
+    BUILD_OR_LINT_GATES.iter().any(|g| lower.contains(g))
 }
 
-/// A first-person past-tense change claim ("I fixed the parser", "I've
-/// updated the config"). Present/future tense ("I will fix …") does not
-/// assert that a change was already applied, so it does not count.
 fn claims_change(sentence: &str) -> bool {
     let lower = sentence.to_ascii_lowercase();
     const VERBS: [&str; 22] = [
@@ -278,104 +391,134 @@ mod tests {
         scan_final_answer(text)
     }
 
-    fn fires(text: &str, ran_verification: bool, files_mutated: usize) -> Option<ClaimKind> {
-        unsupported_claims(&scan(text), ran_verification, files_mutated)
+    fn fires(text: &str, commands: &[&str], files_mutated: usize) -> Option<ClaimKind> {
+        let observed: Vec<(String, bool)> =
+            commands.iter().map(|c| (c.to_string(), false)).collect();
+        unsupported_claims(&scan(text), &observed, files_mutated)
     }
 
-    // Spec case 1: "4954 passed" with no verification command → fires.
     #[test]
     fn verification_claim_without_evidence_fires() {
         assert_eq!(
-            fires("All done. 4954 passed, 0 failed.", false, 3),
+            fires("All done. 4954 passed, 0 failed.", &[], 3),
             Some(ClaimKind::Verification)
         );
         assert_eq!(
-            fires("clippy clean and fmt clean.", false, 3),
+            fires("clippy clean and fmt clean.", &[], 3),
+            Some(ClaimKind::Verification)
+        );
+        assert_eq!(fires("Compiles.", &[], 3), Some(ClaimKind::Verification));
+    }
+
+    #[test]
+    fn verification_claim_with_evidence_is_silent() {
+        assert_eq!(
+            fires("All done. 4954 passed, 0 failed.", &["cargo test"], 3),
+            None
+        );
+        assert_eq!(fires("clippy clean.", &["cargo clippy"], 3), None);
+    }
+
+    #[test]
+    fn test_count_claim_with_only_build_observed_fires() {
+        // The false green this gate exists to catch (dirge-lavc): a bare
+        // `cargo build` runs zero tests, so "5001 passed" is unsupported
+        // even though the build was green.
+        assert_eq!(
+            fires("All done. 5001 passed, 0 failed.", &["cargo build"], 3),
             Some(ClaimKind::Verification)
         );
     }
 
-    // Spec case 2: same claim WITH a verification command → silent. The
-    // discriminating pair with case 1; neither means anything alone.
     #[test]
-    fn verification_claim_with_evidence_is_silent() {
-        assert_eq!(fires("All done. 4954 passed, 0 failed.", true, 3), None);
-        assert_eq!(fires("clippy clean.", true, 3), None);
+    fn compile_claim_with_green_build_observed_is_silent() {
+        // False-positive guard, the most important case (dirge-lavc): the
+        // observed incident's "Compiles." was TRUE — cargo build really had
+        // succeeded. Kind-matched, a green build supports the build claim.
+        assert_eq!(fires("Compiles.", &["cargo build"], 3), None);
+        assert_eq!(fires("It builds clean.", &["cargo build"], 3), None);
     }
 
-    // Spec case 3: "I fixed the parser" with zero files mutated → fires.
+    #[test]
+    fn test_count_claim_with_test_observed_is_silent() {
+        assert_eq!(
+            fires("All done. 5001 passed, 0 failed.", &["cargo test"], 3),
+            None
+        );
+        assert_eq!(fires("All tests pass.", &["cargo test"], 3), None);
+    }
+
+    #[test]
+    fn mismatched_kind_still_fires() {
+        // The kinds are not interchangeable: a test run proves nothing about
+        // a named lint gate, and a lint proves nothing about tests.
+        assert_eq!(
+            fires("clippy clean.", &["cargo test"], 3),
+            Some(ClaimKind::Verification)
+        );
+        assert_eq!(
+            fires("All tests pass.", &["cargo clippy"], 3),
+            Some(ClaimKind::Verification)
+        );
+    }
+
     #[test]
     fn change_claim_without_evidence_fires() {
         assert_eq!(
-            fires("I fixed the parser.", false, 0),
+            fires("I fixed the parser.", &[], 0),
             Some(ClaimKind::Change)
         );
         assert_eq!(
-            fires("I've updated the config.", false, 0),
+            fires("I've updated the config.", &[], 0),
             Some(ClaimKind::Change)
         );
     }
 
-    // Spec case 4: same claim with files mutated → silent.
     #[test]
     fn change_claim_with_evidence_is_silent() {
-        assert_eq!(fires("I fixed the parser.", false, 2), None);
+        assert_eq!(fires("I fixed the parser.", &[], 2), None);
     }
 
-    // Spec case 5: a quoted / attributed claim is someone else's output, not
-    // the model's own assertion → silent.
     #[test]
     fn attributed_claim_is_silent() {
-        assert_eq!(fires("CI reported 4954 passed.", false, 0), None);
-        assert_eq!(fires("You said the tests pass.", false, 0), None);
+        assert_eq!(fires("CI reported 4954 passed.", &[], 0), None);
+        assert_eq!(fires("You said the tests pass.", &[], 0), None);
         assert_eq!(
             fires(
                 "The log shows \"clippy clean\". I fixed the parser.",
-                false,
+                &[],
                 2
             ),
             None
         );
     }
 
-    // An attributed sentence does not silence a REAL claim in the same
-    // answer — the conjunction stays honest.
     #[test]
     fn attributed_sentence_does_not_silence_real_claim() {
         assert_eq!(
-            fires("CI reported 4954 passed. I fixed the parser.", false, 0),
+            fires("CI reported 4954 passed. I fixed the parser.", &[], 0),
             Some(ClaimKind::Change)
         );
     }
 
-    // Past tense only: "I will fix" is not an assertion that a change
-    // happened.
     #[test]
     fn future_tense_does_not_fire() {
-        assert_eq!(fires("I will fix the parser next.", false, 0), None);
+        assert_eq!(fires("I will fix the parser next.", &[], 0), None);
     }
 
-    // A plain summary with no concrete claims never fires.
     #[test]
     fn no_claims_is_silent() {
         assert_eq!(
-            fires("Here is a summary of what we discussed.", false, 0),
+            fires("Here is a summary of what we discussed.", &[], 0),
             None
         );
     }
 
-    // A quoted count ("the transcript says \"4954 passed\"") is quoting, not
-    // asserting — the carve-out strips the quotes.
     #[test]
     fn quoted_output_is_silent() {
-        assert_eq!(
-            fires("The transcript says \"4954 passed\".", false, 0),
-            None
-        );
+        assert_eq!(fires("The transcript says \"4954 passed\".", &[], 0), None);
     }
-    /// dirge-d0e5.2 follow-up: `advisory` and `blocking` must actually differ.
-    /// They were byte-identical at first — both gated on a single `MAX_CLAIM_NUDGES`
-    /// — so the config surface advertised a distinction that did not exist.
+
     #[test]
     fn advisory_and_blocking_have_different_budgets() {
         assert_eq!(claim_nudge_cap(GateMode::Off), 0, "off must never fire");
