@@ -894,6 +894,16 @@ async fn poll_finalization_follow_up(
                         .iter()
                         .filter(|m| matches!(m, super::message::LoopMessage::ToolResult(_)))
                         .count(),
+                    // dirge-lavc GAP 4: distinct tool names from the SAME
+                    // observation as the count above, so a claim to have
+                    // consulted a source is checkable against the set.
+                    tool_names: new_messages
+                        .iter()
+                        .filter_map(|m| match m {
+                            super::message::LoopMessage::ToolResult(r) => Some(r.tool_name.clone()),
+                            _ => None,
+                        })
+                        .collect(),
                 };
                 let outcome = super::critic::run_unified_review(
                     judge,
