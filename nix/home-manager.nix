@@ -12,7 +12,15 @@ in
 
     package = lib.mkOption {
       type = lib.types.package;
-      default = self.packages.${system}.default;
+      # `or` catches the whole selection path, so an unsupported system fails
+      # with an actionable message naming the option to set rather than a bare
+      # `attribute 'x86_64-darwin' missing`. The flake builds for
+      # x86_64-linux, aarch64-linux, and aarch64-darwin.
+      default =
+        self.packages.${system}.default or (throw
+          "dirge provides no package for ${system}; set programs.dirge.package explicitly.");
+      # Without this, the option docs render the whole derivation.
+      defaultText = lib.literalExpression "dirge.packages.\${system}.default";
       description = "The dirge package to use.";
     };
 
