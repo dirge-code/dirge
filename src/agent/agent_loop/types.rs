@@ -605,6 +605,15 @@ pub struct LoopConfig {
     /// room for a future hard mode. Set from `Config::resolve_claim_gate_mode`.
     pub claim_gate_mode: GateMode,
 
+    /// dirge-lavc GAP 1: artifact-scope sourcing gate's engagement mode
+    /// (`off`/`advisory`/`blocking`). `off` *(default)* is byte-identical to
+    /// the loop without the gate. The gate scans ADDED comment lines in the
+    /// run's diff for unsupported external-sourcing claims; unlike
+    /// `claim_gate_mode` it defaults to `Off` because its false-positive
+    /// surface is larger and it must be an explicit opt-in. Set from
+    /// `Config::resolve_source_gate_mode`.
+    pub source_gate_mode: GateMode,
+
     /// Active session id for the open-issues gate and tools that need
     /// session-scoping. `None` in review/curator sub-runners and most
     /// tests — the gate is inert without it.
@@ -849,6 +858,7 @@ impl Clone for LoopConfig {
             safe_state_abort_mode: self.safe_state_abort_mode,
             publish_guard_mode: self.publish_guard_mode,
             claim_gate_mode: self.claim_gate_mode,
+            source_gate_mode: self.source_gate_mode,
             progress: self.progress.clone(),
             session_id: self.session_id.clone(),
             goal_fn: self.goal_fn.clone(),
@@ -913,6 +923,7 @@ impl LoopConfig {
             safe_state_abort_mode: SafeStateMode::Off,
             publish_guard_mode: GateMode::Off,
             claim_gate_mode: GateMode::Off,
+            source_gate_mode: GateMode::Off,
             progress: None,
             session_id: None,
             goal_fn: None,

@@ -300,6 +300,10 @@ enum FollowUpSource {
     /// claimed a verification result or a change the run's evidence does not
     /// support. No LLM call.
     ClaimGate,
+    /// Deterministic artifact-scope sourcing gate (dirge-lavc GAP 1): an
+    /// added comment in the run's diff asserted consulting an external
+    /// source while no fetch/search tool ran. No LLM call. Off by default.
+    SourceGate,
     /// Unified finalization judge (dirge-8v98): completeness verdict + diff
     /// findings in one call. One-shot (Off/Advisory) or persistent up to
     /// [`super::code_review::MAX_REVIEW_REACT`] (Blocking).
@@ -324,6 +328,7 @@ impl From<FollowUpSource> for GateSource {
             FollowUpSource::ResumeAfterFailure => GateSource::ResumeAfterFailure,
             FollowUpSource::Verifier => GateSource::Verifier,
             FollowUpSource::ClaimGate => GateSource::ClaimGate,
+            FollowUpSource::SourceGate => GateSource::SourceGate,
             FollowUpSource::Critic => GateSource::Critic,
             FollowUpSource::Goal => GateSource::Goal,
             FollowUpSource::Todo => GateSource::Todo,
@@ -630,6 +635,7 @@ async fn poll_finalization_follow_up(
         open_issues_nudges,
         track_nudges,
         claim_nudges,
+        source_nudges,
         run_epoch,
     } = gates;
     let GateInputs {
@@ -776,6 +782,72 @@ async fn poll_finalization_follow_up(
             }
         }
     }
+    // 2.6 Artifact-scope sourcing gate (dirge-lavc GAP 1) — deterministic,
+    //     no LLM, and OFF by default (`source_gate` config; opt-in). The
+    //     final-answer scanners above cannot see a claim written INTO an
+    //     artifact; this gate parses the run's diff for ADDED comment lines
+    //     that assert consulting an external source ("checked Aug 2026",
+    //     "per the", "pricing page") and fires one nudge when no
+    //     fetch/search tool ran. Hard bias toward under-detecting: RFC/bug/
+    //     spec citations, repo-file references, URLs, and pre-existing WIP
+    //     (subtracted against the run-start baseline) are excluded before
+    //     the vocabulary applies. The diff capture is paid only when armed
+    //     AND the run mutated files.
+    if config.source_gate_mode != GateMode::Off
+        && *source_nudges < super::source_gate::source_nudge_cap(config.source_gate_mode)
+    {
+        let files = crate::agent::tools::modified::since(*run_epoch);
+        if !files.is_empty() {
+            let repo = config.code_review_repo.clone().unwrap_or_else(|| {
+                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+            });
+            let repo = std::fs::canonicalize(&repo).unwrap_or(repo);
+            let baseline = code_review_baseline.as_ref().map(|b| b.capped.clone());
+            let repo_for_diff = repo.clone();
+            let current = tokio::task::spawn_blocking(move || {
+                super::code_review::capture_run_diff(&repo_for_diff)
+            })
+            .await
+            .ok()
+            .flatten();
+            if let Some(current) = current {
+                let allowed: Vec<String> = files
+                    .iter()
+                    .filter_map(|p| {
+                        p.strip_prefix(&repo)
+                            .ok()
+                            .map(|r| r.to_string_lossy().replace('\\', "/"))
+                    })
+                    .collect();
+                let hits = super::source_gate::added_sourcing_comments(
+                    &current.capped,
+                    baseline.as_deref(),
+                    &allowed,
+                );
+                let tool_names: Vec<String> = new_messages
+                    .iter()
+                    .filter_map(|m| match m {
+                        LoopMessage::ToolResult(r) => Some(r.tool_name.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                if let Some(comment) = super::source_gate::unsupported_sourcing(&hits, &tool_names)
+                {
+                    *source_nudges += 1;
+                    return (
+                        vec![LoopMessage::User(super::message::UserMessage {
+                            content: vec![super::message::UserPart::text(format!(
+                                "{} A comment you added this run ({comment:?}) asserts having consulted an external source, but no fetch/search tool ran this run. Either verify the claim by actually fetching the source, or remove/rewrite the unsupported sourcing assertion.",
+                                super::source_gate::SOURCE_GATE_TAG
+                            ))],
+                        })],
+                        FollowUpSource::SourceGate,
+                    );
+                }
+            }
+        }
+    }
+
     // 3. Unified finalization judge (dirge-8v98) — ONE judge call that both
     //    judges completeness (the old F6 critic) AND reviews the run's diff for
     //    defects (the old diff-aware reviewer), returning a single consolidated

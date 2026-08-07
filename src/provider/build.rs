@@ -559,6 +559,8 @@ pub async fn build_agent(
     agent = agent.with_publish_guard_mode(cfg.resolve_publish_guard_mode());
     // dirge-d0e5.2: deterministic claim/evidence gate (off by default).
     agent = agent.with_claim_gate_mode(cfg.resolve_claim_gate_mode());
+    // dirge-lavc GAP 1: artifact-scope sourcing gate (off by default — opt-in).
+    agent = agent.with_source_gate_mode(cfg.resolve_source_gate_mode());
     agent = agent.with_safe_state_abort_mode(cfg.resolve_safe_state_abort_mode());
     agent = agent.with_session_id(session_id);
 

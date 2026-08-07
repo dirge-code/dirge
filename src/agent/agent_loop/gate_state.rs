@@ -80,6 +80,11 @@ pub struct GateStates {
     /// [dirge-d0e5.2]. No LLM call — the deterministic claim/evidence gate.
     pub claim_nudges: u8,
 
+    /// **Re-fire guard.** Bounded by `source_gate::source_nudge_cap`
+    /// [dirge-lavc GAP 1]. No LLM call — the deterministic artifact-scope
+    /// sourcing gate (added comment lines vs fetch/search tools).
+    pub source_nudges: u8,
+
     /// **Memo,** not a bound. The run-start [`crate::agent::tools::modified::epoch`]
     /// captured when this `GateStates` was constructed, so the claim gate can
     /// ask "how many files were mutated THIS run" via

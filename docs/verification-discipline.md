@@ -21,6 +21,7 @@ reason this page exists as its own document rather than a paragraph in
 | Capability tier | — | observed always; only `Struggling` changes behaviour |
 | Publish-state guard | `publish_guard` | `off` |
 | Claim/evidence gate | `claim_gate` | `advisory` |
+| Artifact sourcing gate | `source_gate` | `off` |
 | Agent-authored validator check | — | always on |
 
 ## The pattern
