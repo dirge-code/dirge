@@ -1004,6 +1004,16 @@ pub struct Config {
     /// [`resolve_claim_gate_mode`](Self::resolve_claim_gate_mode) for why
     /// the default flipped.
     pub claim_gate: Option<String>,
+    /// dirge-lavc GAP 1: artifact-scope sourcing gate. `off` *(default)* —
+    /// deliberately opt-in until it has real-world mileage. When armed
+    /// (`advisory`/`blocking`), scans ADDED comment lines in the run's diff
+    /// for assertions of having consulted an external source ("checked Aug
+    /// 2026", "per the", "pricing page") and fires one model-visible nudge
+    /// when no fetch/search tool ran this run. Unlike `claim_gate`, the
+    /// absent default is `Off`, not `Advisory`: this gate's false-positive
+    /// surface (normal comments that cite RFCs, bug IDs, repo files) is
+    /// much larger. See [`resolve_source_gate_mode`](Self::resolve_source_gate_mode).
+    pub source_gate: Option<String>,
     /// How the ingestion-time injection scanner handles untrusted tool
     /// results (read, MCP, websearch). One of `off` / `advisory` / `block`
     /// (case-insensitive, trimmed). `advisory` *(default)* fences positive
@@ -1457,6 +1467,32 @@ impl Config {
                 target: "dirge::config",
                 value = trimmed,
                 "unrecognized `claim_gate` value; falling back to `off` \
+                 (valid: off | advisory | blocking)"
+            );
+            GateMode::Off
+        })
+    }
+
+    /// Resolve the artifact-scope sourcing gate mode from
+    /// [`source_gate`](Self::source_gate): `off`/`advisory`/`blocking`,
+    /// parsed case-insensitively and trimmed. `None`, an empty value, and
+    /// an unrecognized value ALL resolve to `Off` (dirge-lavc GAP 1) — a
+    /// typo must not arm a gate, and this gate must be an explicit opt-in
+    /// until it has real-world mileage.
+    pub fn resolve_source_gate_mode(&self) -> crate::agent::agent_loop::types::GateMode {
+        use crate::agent::agent_loop::types::GateMode;
+        let Some(raw) = self.source_gate.as_deref() else {
+            return GateMode::Off;
+        };
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return GateMode::Off;
+        }
+        GateMode::from_wire(trimmed).unwrap_or_else(|| {
+            tracing::warn!(
+                target: "dirge::config",
+                value = trimmed,
+                "unrecognized `source_gate` value; falling back to `off` \
                  (valid: off | advisory | blocking)"
             );
             GateMode::Off
@@ -2343,6 +2379,26 @@ mod tests {
         // default — a typo must not silently arm a gate.
         let bogus = Config::deserialize(serde_json::json!({ "claim_gate": "yes" })).unwrap();
         assert_eq!(bogus.resolve_claim_gate_mode(), GateMode::Off);
+    }
+
+    #[test]
+    fn resolve_source_gate_mode_each_string_and_default() {
+        use crate::agent::agent_loop::types::GateMode;
+        for raw in ["off", "advisory", "blocking"] {
+            let cfg = Config::deserialize(serde_json::json!({ "source_gate": raw })).unwrap();
+            assert_eq!(cfg.resolve_source_gate_mode().as_str(), raw);
+        }
+        // Absent, empty, and unrecognized all resolve to Off: the gate is a
+        // deliberate opt-in (dirge-lavc GAP 1) — a typo must not arm it.
+        let absent = Config::deserialize(serde_json::json!({})).unwrap();
+        assert_eq!(absent.resolve_source_gate_mode(), GateMode::Off);
+        let empty = Config::deserialize(serde_json::json!({ "source_gate": "" })).unwrap();
+        assert_eq!(empty.resolve_source_gate_mode(), GateMode::Off);
+        let bogus = Config::deserialize(serde_json::json!({ "source_gate": "yes" })).unwrap();
+        assert_eq!(bogus.resolve_source_gate_mode(), GateMode::Off);
+        let blocking =
+            Config::deserialize(serde_json::json!({ "source_gate": "blocking" })).unwrap();
+        assert_eq!(blocking.resolve_source_gate_mode(), GateMode::Blocking);
     }
 
     #[test]

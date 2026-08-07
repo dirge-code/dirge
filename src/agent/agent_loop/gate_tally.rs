@@ -40,6 +40,9 @@ pub enum GateSource {
     Verifier,
     /// Deterministic claim/evidence gate (dirge-d0e5.2). No LLM call.
     ClaimGate,
+    /// Deterministic artifact-scope sourcing gate (dirge-lavc GAP 1). No
+    /// LLM call.
+    SourceGate,
     Critic,
     Goal,
     Todo,
@@ -83,11 +86,12 @@ impl GateSource {
             GateSource::ResumeAfterFailure => 2,
             GateSource::Verifier => 3,
             GateSource::ClaimGate => 4,
-            GateSource::Critic => 5,
-            GateSource::Goal => 6,
-            GateSource::Todo => 7,
-            GateSource::OpenIssues => 8,
-            GateSource::None => 9,
+            GateSource::SourceGate => 5,
+            GateSource::Critic => 6,
+            GateSource::Goal => 7,
+            GateSource::Todo => 8,
+            GateSource::OpenIssues => 9,
+            GateSource::None => 10,
         }
     }
 }
@@ -113,7 +117,11 @@ impl BoundaryNudge {
 /// discard.
 #[derive(Clone, Debug, Default)]
 pub struct GateTally {
-    gates: [u32; 10],
+    /// One slot per [`GateSource`] variant, indexed by `GateSource::index`.
+    /// Adding a variant means growing this — the index is unchecked, so a
+    /// stale length panics at runtime rather than failing to compile.
+    gates: [u32; 11],
+    /// One slot per [`BoundaryNudge`] variant, same contract as above.
     nudges: [u32; 9],
     turns: u32,
     tool_calls: u32,

@@ -155,6 +155,11 @@ pub struct AnyAgent {
     /// from resolved config, which defaults to `Advisory` (dirge-lavc) —
     /// so a real session runs with the gate armed at one nudge per run.
     claim_gate_mode: crate::agent::agent_loop::types::GateMode,
+    /// Set by `build_agent` from `Config::resolve_source_gate_mode`;
+    /// forwarded to `LoopConfig.source_gate_mode`. Defaults to `Off`
+    /// (dirge-lavc GAP 1 — the gate scans the diff for sourcing claims and
+    /// must be an explicit opt-in until it has real-world mileage).
+    source_gate_mode: crate::agent::agent_loop::types::GateMode,
     /// Active session id forwarded to `LoopConfig.session_id` for the
     /// open-issues gate and session-scoped tools. `None` in sub-runners.
     session_id: Option<String>,
@@ -343,6 +348,7 @@ impl AnyAgent {
             safe_state_abort_mode: crate::agent::agent_loop::types::SafeStateMode::Off,
             publish_guard_mode: crate::agent::agent_loop::types::GateMode::Off,
             claim_gate_mode: crate::agent::agent_loop::types::GateMode::Off,
+            source_gate_mode: crate::agent::agent_loop::types::GateMode::Off,
             session_id: None,
             goal_fn: None,
             goal: None,
@@ -583,6 +589,15 @@ impl AnyAgent {
     /// dirge-d0e5.2: set the claim gate mode.
     pub fn with_claim_gate_mode(mut self, mode: crate::agent::agent_loop::types::GateMode) -> Self {
         self.claim_gate_mode = mode;
+        self
+    }
+
+    /// dirge-lavc GAP 1: set the artifact-scope sourcing gate mode.
+    pub fn with_source_gate_mode(
+        mut self,
+        mode: crate::agent::agent_loop::types::GateMode,
+    ) -> Self {
+        self.source_gate_mode = mode;
         self
     }
 
