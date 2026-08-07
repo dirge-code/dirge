@@ -4,6 +4,30 @@ All notable changes to dirge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.21.11] - 2026-08-07
+
+### Fixed
+- A turn where the model emitted only reasoning — no prose, no tool calls —
+  wedged the session permanently. It was persisted as an assistant message with
+  empty content, and because history is rebuilt from the session on every
+  submit, from then on it went back on the wire as
+  `content: [{"type": "text", "text": ""}]`. Moonshot/Kimi and GLM answer that
+  with `400 invalid_request_error: text content is empty`, and Anthropic 400s on
+  it too, so every later prompt failed before the run even started. Reported
+  against Kimi, GPT and GLM.
+
+  A command that succeeds silently (`mkdir -p x`, `touch y`) hits the same 400
+  from the other side: bash returns the empty string, so the tool result carries
+  an empty text block. Unlike an empty assistant turn this one can't be dropped
+  — Anthropic and OpenAI both reject a tool call with no matching result — so it
+  now gets a `(no output)` body.
+
+  The guards sit at each replay boundary (`convert_history`,
+  `rig_message_to_loop_messages`, `value_to_rig_message_for_provider` — which
+  already skipped empty *user* text parts, just not assistant ones), so a
+  session that already carries an empty turn recovers on the next prompt instead
+  of staying stuck. The four persistence sites stop writing empty turns at all.
+
 ## [0.21.10] - 2026-08-07
 
 ### Fixed
