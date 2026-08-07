@@ -73,6 +73,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the full text.]` The old wording is still reachable as
   `[compression] header = "legacy"`.
 
+- `file_excerpt_cap_tokens` (default 12000) sets the per-result cap for `read`
+  excerpts. Raise it for a codebase of large files; set it to 3000 to hold
+  reads to the same cap as any other tool output. Floored at 3000, and the
+  aggressive tier still overrides it.
+
 - `[compression]` gains `trim_user_text`, `window_code`, `header` and
   `verbatim`. They exist so `scripts/loop-ab.sh` can stand up a control arm on
   the pre-fix behavior; the defaults are the fixed ones and there is no reason

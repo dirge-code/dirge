@@ -102,18 +102,51 @@ pub const AGGRESSIVE_CAP_THRESHOLD: f64 = 0.60;
 /// result can't eat ~10% of the window before a fold runs.
 pub const AGGRESSIVE_RESULT_CAP_TOKENS: u64 = 1000;
 
-/// Per-result cap for a `read` excerpt (GH #755). A file the agent is working
-/// on is not disposable output: it is the material the next edit is written
-/// against, and `edit_lines` anchors on line hashes that only exist while the
-/// rows are intact. At the generic 3000 a 1500-line JSX component is cut on the
-/// turn after it was read, so the model re-reads, gets the same cut view
-/// (the capping is deterministic), and loops — the reported failure.
+/// Default per-result cap for a `read` excerpt (GH #755). A file the agent is
+/// working on is not disposable output: it is the material the next edit is
+/// written against, and `edit_lines` anchors on line hashes that only exist
+/// while the rows are intact. At the generic 3000 a 1500-line JSX component is
+/// cut on the turn after it was read, so the model re-reads, gets the same cut
+/// view (the capping is deterministic), and loops — the reported failure.
 ///
 /// Deliberately not unbounded: 12000 tokens is roughly a 1200-line source file,
 /// generous enough for the components that prompted the report while still
 /// bounding what one result can claim. The aggressive tier overrides it — a
 /// roomier allowance is worth nothing if the request stops fitting.
-pub const FILE_EXCERPT_RESULT_CAP_TOKENS: u64 = 12_000;
+///
+/// Override with `file_excerpt_cap_tokens` in config.json. Setting it to the
+/// generic cap (3000) restores the pre-fix sizing.
+pub const DEFAULT_FILE_EXCERPT_CAP_TOKENS: u64 = 12_000;
+
+/// Floor for a configured excerpt cap. Below the generic cap the setting would
+/// make file reads *smaller* than ordinary tool output, which inverts the point
+/// of the tier; the generic cap is the sensible bottom.
+const MIN_FILE_EXCERPT_CAP_TOKENS: u64 = TURN_END_RESULT_CAP_TOKENS;
+
+/// Process-wide excerpt cap, installed once at startup from
+/// `Config::file_excerpt_cap_tokens`.
+static FILE_EXCERPT_CAP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+/// Resolve a configured excerpt cap: `None` → [`DEFAULT_FILE_EXCERPT_CAP_TOKENS`],
+/// a set value floored at [`MIN_FILE_EXCERPT_CAP_TOKENS`]. Pure, so the
+/// floor/default logic is testable without touching the process global.
+pub fn resolve_file_excerpt_cap(configured: Option<u64>) -> u64 {
+    configured
+        .map(|t| t.max(MIN_FILE_EXCERPT_CAP_TOKENS))
+        .unwrap_or(DEFAULT_FILE_EXCERPT_CAP_TOKENS)
+}
+
+/// Install the excerpt cap process-wide. Idempotent (first call wins).
+pub fn init_file_excerpt_cap(cap: Option<u64>) {
+    let _ = FILE_EXCERPT_CAP.set(resolve_file_excerpt_cap(cap));
+}
+
+/// The configured per-result cap for `read` excerpts, in tokens.
+pub fn file_excerpt_cap_tokens() -> u64 {
+    *FILE_EXCERPT_CAP
+        .get()
+        .unwrap_or(&DEFAULT_FILE_EXCERPT_CAP_TOKENS)
+}
 
 /// Pick the per-result cap for `cap_oversized_tool_results` based on how
 /// full the context already is: the tighter aggressive cap once
@@ -246,7 +279,7 @@ pub fn cap_oversized_tool_results(messages: &[Value], max_tokens: u64) -> Vec<Va
     let excerpt_tokens = if max_tokens <= AGGRESSIVE_RESULT_CAP_TOKENS {
         max_tokens
     } else {
-        max_tokens.max(FILE_EXCERPT_RESULT_CAP_TOKENS)
+        max_tokens.max(file_excerpt_cap_tokens())
     };
     let excerpt_chars = excerpt_tokens.saturating_mul(CHARS_PER_TOKEN) as usize;
     let budget_for = |text: &str| {
@@ -2090,7 +2123,7 @@ mod file_excerpt_capping {
         let got = capped_text(&src, TURN_END_RESULT_CAP_TOKENS);
         assert!(got.len() < src.len(), "still truncated");
         assert!(
-            got.len() <= (FILE_EXCERPT_RESULT_CAP_TOKENS * CHARS_PER_TOKEN) as usize,
+            got.len() <= (file_excerpt_cap_tokens() * CHARS_PER_TOKEN) as usize,
             "bounded by the excerpt cap, got {} chars",
             got.len()
         );
@@ -2141,6 +2174,29 @@ mod file_excerpt_capping {
         let once = capped_text(&excerpt(4000), TURN_END_RESULT_CAP_TOKENS);
         let twice = capped_text(&once, TURN_END_RESULT_CAP_TOKENS);
         assert_eq!(once, twice, "a second pass must be a no-op");
+    }
+
+    /// `file_excerpt_cap_tokens` in config.json. The floor exists because a cap
+    /// below the generic one would make file reads *smaller* than ordinary tool
+    /// output, inverting the point of the tier.
+    #[test]
+    fn the_excerpt_cap_is_configurable_and_floored() {
+        assert_eq!(
+            resolve_file_excerpt_cap(None),
+            DEFAULT_FILE_EXCERPT_CAP_TOKENS,
+            "unset keeps the default"
+        );
+        assert_eq!(resolve_file_excerpt_cap(Some(40_000)), 40_000, "raised");
+        assert_eq!(
+            resolve_file_excerpt_cap(Some(TURN_END_RESULT_CAP_TOKENS)),
+            TURN_END_RESULT_CAP_TOKENS,
+            "setting it to the generic cap restores the pre-fix sizing"
+        );
+        assert_eq!(
+            resolve_file_excerpt_cap(Some(1)),
+            TURN_END_RESULT_CAP_TOKENS,
+            "floored at the generic cap, never below it"
+        );
     }
 
     /// A single enormous line (minified JS, a JSON blob) has no line boundary to

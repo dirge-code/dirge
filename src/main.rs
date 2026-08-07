@@ -725,6 +725,10 @@ async fn main() -> anyhow::Result<()> {
     // Working-context budget (default 250_000). Set `context_target` in
     // config.json to lower (e.g. 100_000) or raise the cap.
     crate::agent::agent_loop::context_manager::init_context_target(cfg.context_target);
+    // Per-result cap for `read` excerpts (default 12_000). Set
+    // `file_excerpt_cap_tokens` in config.json to raise it for a codebase of
+    // large files, or to 3000 to hold reads to the generic tool-output cap.
+    crate::agent::compression::init_file_excerpt_cap(cfg.file_excerpt_cap_tokens);
     // Honor an explicit `context_window` config override in the loop's
     // window math (it previously read only the built-in model table).
     crate::agent::agent_loop::context_manager::init_context_window_override(cfg.context_window);
