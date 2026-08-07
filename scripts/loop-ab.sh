@@ -278,8 +278,19 @@ elif [ "$SCENARIO" = "edit-large" ]; then
   # a line-importance heuristic — every row is indented, so indentation cannot
   # rank anything, and no row carries an error token.
   #
-  # The dependent variables are errored_tool_calls and repair_invalid (failed
-  # edits against a view that does not match disk) and turns (re-read loops).
+  # The 60 section bodies are BYTE-IDENTICAL; only the `export function
+  # SectionN` line differs. That is load-bearing. A first version numbered
+  # every row (`className="list list-7"`), which let the model grep for the
+  # one target string and pass a unique `old_text` to `edit` — it never read
+  # the file, and the A/B came back null on every metric with 3/3 success in
+  # BOTH arms even though two of the three targets were provably absent from
+  # the control arm's view. With identical bodies, each target string occurs
+  # 60 times, so the only way to reach the right one is a line number from an
+  # accurate read. That is precisely the path GH #755 reports as broken.
+  #
+  # The dependent variables are errored_tool_calls and repair_invalid (edits
+  # against a view that does not match disk), correctness (the edit landing in
+  # the WRONG section is the characteristic failure), and turns (re-read loops).
   mkdir -p "$FIXTURE/src"
   {
     echo "import React from 'react';"
@@ -290,11 +301,11 @@ elif [ "$SCENARIO" = "edit-large" ]; then
     for i in $(seq 1 60); do
       echo "export function Section${i}({ items, onSelect }) {"
       echo "  return ("
-      echo "    <div className=\"section section-${i}\">"
-      echo "      <Header title=\"Section ${i}\" subtitle=\"rows\" />"
-      echo "      <ul className=\"list list-${i}\">"
+      echo "    <div className=\"section\">"
+      echo "      <Header title=\"Rows\" subtitle=\"details\" />"
+      echo "      <ul className=\"list\">"
       echo "        {items.map((it) => ("
-      echo "          <li key={it.id} className=\"row row-${i}\">"
+      echo "          <li key={it.id} className=\"row\">"
       echo "            <Badge tone={it.tone} label={it.label} />"
       echo "            <span className=\"value\">{it.value}</span>"
       echo "            <button type=\"button\" onClick={() => onSelect(it.id)}>"
@@ -316,31 +327,43 @@ export function Badge() {}
 export function Header() {}
 export function Spinner() {}
 JSEOF
-  FIXTURE_DESC="src/Panel.jsx — ${PANEL_LINES} lines of deeply-nested JSX, 60 near-identical sections; the task edits THREE of them"
+  FIXTURE_DESC="src/Panel.jsx — ${PANEL_LINES} lines of deeply-nested JSX, 60 byte-identical section bodies; the task edits THREE of them"
   TASK='In src/Panel.jsx, make exactly these three changes and nothing else:
 
-1. In Section7 only, change the ul className from "list list-7" to "list list-7 compact".
-2. In Section34 only, change the button text from "select" to "choose".
-3. In Section58 only, add the prop `dense` to the Badge element (so it reads `<Badge dense tone={it.tone} label={it.label} />`).
+1. Inside Section7 only, change its `<ul className="list">` to `<ul className="list compact">`.
+2. Inside Section34 only, change its button text from `select` to `choose`.
+3. Inside Section58 only, add the prop `dense` to its Badge element, so that line reads `<Badge dense tone={it.tone} label={it.label} />`.
 
-Do not change any other section, and do not reformat the file. End your answer with a line: DONE=panel'
+Every section body in this file is identical, so these exact strings each occur 60 times — only the `export function SectionN` line tells the sections apart. Change only the occurrence belonging to the named section. Do not change any other section and do not reformat the file. End your answer with a line: DONE=panel'
 
-  # Correctness is checked on disk: all three edits present, applied to the
-  # right sections only, and the file not otherwise damaged. A run that
-  # mangles the file while landing the edits scores 0 — a mangled file IS
-  # the failure under test.
+  # Correctness is checked on disk, per section: each change must land inside
+  # the NAMED section's body, exactly once in the file, with the other 59
+  # sections untouched and nothing dropped. Editing the right string in the
+  # wrong section is the characteristic failure of a trimmed read, so it has
+  # to score 0 rather than pass on a whole-file grep.
+  #
+  # `section_body` slices from the target's `export function SectionN(` line to
+  # the line before the next `export function`, so a match is attributed to the
+  # section that actually contains it.
+  section_body() { # $1 = file, $2 = section number
+    awk -v want="export function Section$2(" '
+      index($0, want) == 1 { inside = 1; next }
+      inside && /^export function Section/ { exit }
+      inside { print }
+    ' "$1"
+  }
   check_correct() {
     local out="$1" f="$FIXTURE/src/Panel.jsx" now
     [ -f "$f" ] || { echo 0; return; }
-    grep -q 'list list-7 compact' "$f" || { echo 0; return; }
-    grep -q 'choose' "$f" || { echo 0; return; }
-    grep -q '<Badge dense tone={it.tone} label={it.label} />' "$f" || { echo 0; return; }
-    # Collateral damage: exactly one section may carry each change.
-    [ "$(grep -c 'compact' "$f")" = "1" ] || { echo 0; return; }
+    # Each edit lands in its own section...
+    section_body "$f" 7  | grep -q '<ul className="list compact">' || { echo 0; return; }
+    section_body "$f" 34 | grep -q 'choose' || { echo 0; return; }
+    section_body "$f" 58 | grep -q '<Badge dense tone={it.tone} label={it.label} />' || { echo 0; return; }
+    # ...and nowhere else: exactly one occurrence of each in the whole file.
+    [ "$(grep -c 'list compact' "$f")" = "1" ] || { echo 0; return; }
     [ "$(grep -c 'choose' "$f")" = "1" ] || { echo 0; return; }
     [ "$(grep -c '<Badge dense' "$f")" = "1" ] || { echo 0; return; }
-    # The other 59 sections must be untouched, and nothing may have been
-    # dropped: the line count is unchanged and every section still closes.
+    # Nothing dropped: the line count is unchanged and all 60 sections remain.
     now="$(wc -l < "$f" | tr -d ' ')"
     [ "$now" = "$PANEL_LINES" ] || { echo 0; return; }
     [ "$(grep -c 'export function Section' "$f")" = "60" ] || { echo 0; return; }
