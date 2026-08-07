@@ -4,6 +4,69 @@ All notable changes to dirge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.21.9] - 2026-08-07
+
+### Added
+- A Home Manager module (`nix/home-manager.nix`, exposed as
+  `homeModules.dirge`). `programs.dirge.enable` installs the package and
+  `programs.dirge.settings` writes `$XDG_CONFIG_HOME/dirge/config.json`, which
+  is where dirge already looks. Thanks to @notlyrix (GH #752).
+
+  Follow-up on top of it: the `package` option gains `defaultText`, without
+  which Home Manager's option-doc generation renders the whole derivation into
+  the options table; and an unsupported system now fails with a message naming
+  the option to set rather than a bare `attribute 'x86_64-darwin' missing` (the
+  flake builds for x86_64-linux, aarch64-linux, and aarch64-darwin).
+
+- `source_gate` — a deterministic gate over comments ADDED to source files this
+  run. When one asserts an external source was consulted and no
+  `webfetch`/`websearch` ran, it fires a nudge. **Off by default**, opt-in,
+  with its own mode key rather than riding on `claim_gate`.
+
+  It exists because the other two claim-checking surfaces read the model's
+  final answer, and the fabrication that prompted this work was never there: a
+  doc comment written into `src/config/mod.rs` asserting "Rates are the
+  providers' published API list prices, checked Aug 2026" and naming six
+  pricing pages, in a session with no network access and no fetch call. A claim
+  written into the artifact is outside an answer scanner's field of view.
+
+  Deliberately narrow. Only lines this run added count — a run-start baseline
+  diff is subtracted — and RFC citations, bug IDs, spec sections, repo file
+  references, and URLs the code fetches at runtime are excluded, because
+  comments cite things legitimately all the time. One known over-detection is
+  documented at the source rather than hidden: a bash `curl` records as `bash`,
+  so a run that genuinely fetched that way reads as unsupported.
+
+### Changed
+- `claim_gate` now matches a claim against the KIND of evidence it needs. It
+  previously took a single "did any build/test command run" bool and treated
+  that as support for any verification claim, so a final answer asserting
+  "5001 passed" counted as supported by a bare `cargo build` that ran no tests
+  — the strongest claim validated by the weakest evidence.
+
+  A test-count claim now requires an observed test command; a build or lint
+  claim requires one of those. This is a coverage axis, deliberately separate
+  from the verifier's `VerificationTier`, which is a cost axis: `cargo build`
+  is Slow *and* build-kind, so a green build reports `VerifiedGreen` and the
+  tier cannot answer what the evidence supports.
+
+  Net effect should be *less* noise, not more — "compiles" backed by a real
+  build now stays silent, where the vocabulary alone would have fired on a true
+  claim.
+
+- The critic's evidence block records which tools ran, not just how many.
+  Claims about files and commands were checkable against it; claims about
+  consulted sources were not, because tool usage was only a count. The set is
+  sorted and deduped, and the preamble gains one clause making a
+  consulted-source claim with no fetch/search tool unsupported.
+
+### Fixed
+- `GateTally` panicked at runtime when a `GateSource` variant was added: the
+  backing array was fixed at 10 while the new variant pushed `None` to index
+  10. Indexing is unchecked, so a stale length fails at runtime rather than at
+  compile time; the array is now sized to the variant count with a comment
+  saying it must grow.
+
 ## [0.21.8] - 2026-08-06
 
 ### Changed
