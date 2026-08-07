@@ -4,6 +4,54 @@ All notable changes to dirge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.21.8] - 2026-08-06
+
+### Changed
+- The status line shows real token usage (`tok:in/out`, plus a cache-hit
+  percentage once there are cached reads) instead of a cost figure. `Done`
+  carried a `text.len()/4` estimate and a cost pinned at 0.0, with
+  `TODO(cost-tracking)` markers promising a per-provider pricing table.
+
+  That promise is withdrawn rather than kept. Published rates move, dirge has no
+  network to refresh them, and a table baked into the binary goes stale silently
+  — the failure mode is a confident wrong number, which is worse than no number.
+  A first attempt at building one invented a "checked Aug 2026" sourcing comment
+  citing six pricing pages it had never fetched, which is the argument against
+  the whole approach rather than an argument for a better table. Token counts
+  come from the provider, cannot go stale, and anyone who wants dollars can
+  multiply by their own rates. The segment stays hidden until the provider has
+  actually reported usage, so a fresh session shows nothing rather than
+  `tok:0/0`.
+
+- `claim_gate` now defaults to `advisory` instead of `off`. The gate shipped
+  opt-in on the reasoning that it nags the model — but in `advisory` the ceiling
+  is one message per run, and "nags" describes `blocking` (up to three
+  re-entries), which stays opt-in.
+
+  What tipped it: a delegated run finalized with a broken test build while
+  reporting "Compiles", and wrote a sourcing claim into a doc comment for pages
+  it never fetched. Nothing fired, because all three claim-checking layers are
+  off unless configured — the critic needs `critic_provider`,
+  `verification_command` defaults to unset, and this gate defaulted to `off`.
+  The one layer armed by default is the verifier nudge, which that run defeated
+  by running a green build. One message per run is a cheap backstop against
+  shipping on an unsupported claim.
+
+  An unrecognized `claim_gate` value still falls back to `off` rather than the
+  new default, so a typo cannot silently arm a gate. Explicit `off` remains
+  byte-identical to the loop without the gate.
+
+### Fixed
+- `/cache` could report a hit ratio above 100% — 4000% was reachable.
+  `cache_hit_ratio` divided cached tokens by `cumulative_input_tokens`, which
+  holds for DeepSeek and OpenAI, where cached reads are a subset of the reported
+  input count. Anthropic reports the three lanes disjoint: `input_tokens` is the
+  uncached remainder, and the real prompt total is input + cache-read +
+  cache-creation. On a warm cache the numerator dwarfed the denominator. The
+  ratio now detects the disjoint shape and sums the lanes, and the `TokenUsage`
+  docs say the relationship is provider-dependent instead of asserting "a subset
+  of `input_tokens`".
+
 ## [0.21.7] - 2026-08-05
 
 ### Changed
