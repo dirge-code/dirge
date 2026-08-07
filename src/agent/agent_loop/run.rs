@@ -730,12 +730,14 @@ async fn poll_finalization_follow_up(
     // 2.5 Claim/evidence gate (dirge-d0e5.2) — deterministic, no LLM. Fires
     //     once when the final answer asserts a verification result or a change
     //     the run's evidence does not support: a test count / named-gate claim
-    //     ("4954 passed", "clippy clean") with NO verification command
-    //     observed this run, or a first-person "I fixed …" claim with zero
-    //     files mutated. Sits AFTER the verifier gate so the more actionable
-    //     "actually run the check" nudge wins when both would fire; the claim
-    //     gate is the backstop for a model that finalizes while still claiming
-    //     an unrun result. Off by default and byte-identical when off.
+    //     ("4954 passed", "compiles", "clippy clean") with no observed command
+    //     of the matching kind — a build cannot support "N passed" and a test
+    //     run cannot support a named lint gate (dirge-lavc) — or a first-person
+    //     "I fixed …" claim with zero files mutated. Sits AFTER the verifier
+    //     gate so the more actionable "actually run the check" nudge wins when
+    //     both would fire; the claim gate is the backstop for a model that
+    //     finalizes while still claiming an unrun result. Byte-identical when
+    //     off.
     if config.claim_gate_mode != GateMode::Off
         && *claim_nudges < super::claim_gate::claim_nudge_cap(config.claim_gate_mode)
         && let Some(LoopMessage::Assistant(last)) = new_messages.last()
@@ -751,13 +753,14 @@ async fn poll_finalization_follow_up(
                 .collect::<Vec<_>>()
                 .join("\n");
             let claims = super::claim_gate::scan_final_answer(&answer);
-            let ran_verification = config
+            let observed = config
                 .verifier
                 .as_ref()
-                .is_some_and(|v| v.ran_verification());
+                .map(|v| v.observed_commands())
+                .unwrap_or_default();
             let files_mutated = crate::agent::tools::modified::since(*run_epoch).len();
             if let Some(kind) =
-                super::claim_gate::unsupported_claims(&claims, ran_verification, files_mutated)
+                super::claim_gate::unsupported_claims(&claims, &observed, files_mutated)
             {
                 *claim_nudges += 1;
                 return (
