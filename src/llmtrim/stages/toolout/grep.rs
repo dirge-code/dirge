@@ -82,7 +82,7 @@ pub fn compress(text: &str, ctx: &Ctx, query: &HashSet<String>) -> Option<String
     if keep.iter().all(|&x| x) {
         return folded.then_some(collapsed);
     }
-    Some(rebuild(&lines, &keep))
+    Some(rebuild(&lines, &keep, ctx))
 }
 
 #[cfg(test)]
@@ -162,7 +162,7 @@ mod tests {
             "dropped matches elided by position: {out}"
         );
         assert!(
-            out.starts_with("[llmtrim: showing"),
+            out.starts_with("[llmtrim compressed this tool output:"),
             "windowed output is attributed with the recovery header: {out}"
         );
     }
@@ -192,6 +192,7 @@ mod tests {
             max_lines: 30,
             template: true,
             mode: ModeSetting::Aggressive,
+            ..test_ctx()
         };
         let out = compress(&dump, &ctx, &HashSet::new()).expect("folds");
         assert!(

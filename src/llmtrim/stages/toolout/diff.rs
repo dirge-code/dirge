@@ -137,7 +137,7 @@ pub fn compress(text: &str, ctx: &Ctx, query: &HashSet<String>) -> Option<String
 
     // Attribution rail: a windowed diff opens with the recovery header (no-op when the
     // never-inflate rail ended up keeping everything it tried to elide).
-    changed.then(|| attributed(out, text.lines().count()))
+    changed.then(|| attributed(out, text.lines().count(), ctx))
 }
 
 /// Keep slots scoring highest, always including the first and last (so structure
@@ -400,6 +400,7 @@ mod tests {
             max_lines: 30,
             template: true,
             mode: ModeSetting::Aggressive,
+            ..test_ctx()
         };
         let out = compress(&diff, &ctx, &HashSet::new()).expect("compresses");
         assert!(out.contains("-let removed = 0;"), "removal kept");

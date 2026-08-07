@@ -102,6 +102,52 @@ pub const AGGRESSIVE_CAP_THRESHOLD: f64 = 0.60;
 /// result can't eat ~10% of the window before a fold runs.
 pub const AGGRESSIVE_RESULT_CAP_TOKENS: u64 = 1000;
 
+/// Default per-result cap for a `read` excerpt (GH #755). A file the agent is
+/// working on is not disposable output: it is the material the next edit is
+/// written against, and `edit_lines` anchors on line hashes that only exist
+/// while the rows are intact. At the generic 3000 a 1500-line JSX component is
+/// cut on the turn after it was read, so the model re-reads, gets the same cut
+/// view (the capping is deterministic), and loops — the reported failure.
+///
+/// Deliberately not unbounded: 12000 tokens is roughly a 1200-line source file,
+/// generous enough for the components that prompted the report while still
+/// bounding what one result can claim. The aggressive tier overrides it — a
+/// roomier allowance is worth nothing if the request stops fitting.
+///
+/// Override with `file_excerpt_cap_tokens` in config.json. Setting it to the
+/// generic cap (3000) restores the pre-fix sizing.
+pub const DEFAULT_FILE_EXCERPT_CAP_TOKENS: u64 = 12_000;
+
+/// Floor for a configured excerpt cap. Below the generic cap the setting would
+/// make file reads *smaller* than ordinary tool output, which inverts the point
+/// of the tier; the generic cap is the sensible bottom.
+const MIN_FILE_EXCERPT_CAP_TOKENS: u64 = TURN_END_RESULT_CAP_TOKENS;
+
+/// Process-wide excerpt cap, installed once at startup from
+/// `Config::file_excerpt_cap_tokens`.
+static FILE_EXCERPT_CAP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+/// Resolve a configured excerpt cap: `None` → [`DEFAULT_FILE_EXCERPT_CAP_TOKENS`],
+/// a set value floored at [`MIN_FILE_EXCERPT_CAP_TOKENS`]. Pure, so the
+/// floor/default logic is testable without touching the process global.
+pub fn resolve_file_excerpt_cap(configured: Option<u64>) -> u64 {
+    configured
+        .map(|t| t.max(MIN_FILE_EXCERPT_CAP_TOKENS))
+        .unwrap_or(DEFAULT_FILE_EXCERPT_CAP_TOKENS)
+}
+
+/// Install the excerpt cap process-wide. Idempotent (first call wins).
+pub fn init_file_excerpt_cap(cap: Option<u64>) {
+    let _ = FILE_EXCERPT_CAP.set(resolve_file_excerpt_cap(cap));
+}
+
+/// The configured per-result cap for `read` excerpts, in tokens.
+pub fn file_excerpt_cap_tokens() -> u64 {
+    *FILE_EXCERPT_CAP
+        .get()
+        .unwrap_or(&DEFAULT_FILE_EXCERPT_CAP_TOKENS)
+}
+
 /// Pick the per-result cap for `cap_oversized_tool_results` based on how
 /// full the context already is: the tighter aggressive cap once
 /// estimated usage crosses `AGGRESSIVE_CAP_THRESHOLD`, else the normal
@@ -227,6 +273,22 @@ pub fn cap_oversized_tool_results(messages: &[Value], max_tokens: u64) -> Vec<Va
     if max_chars == 0 {
         return messages.to_vec();
     }
+    // A `read` excerpt gets the roomier allowance (GH #755) — except in the
+    // aggressive tier, where the whole point is to stop the next request
+    // overflowing and no result gets a reprieve.
+    let excerpt_tokens = if max_tokens <= AGGRESSIVE_RESULT_CAP_TOKENS {
+        max_tokens
+    } else {
+        max_tokens.max(file_excerpt_cap_tokens())
+    };
+    let excerpt_chars = excerpt_tokens.saturating_mul(CHARS_PER_TOKEN) as usize;
+    let budget_for = |text: &str| {
+        if is_file_excerpt(text) {
+            excerpt_chars
+        } else {
+            max_chars
+        }
+    };
     messages
         .iter()
         .map(|msg| {
@@ -240,11 +302,12 @@ pub fn cap_oversized_tool_results(messages: &[Value], max_tokens: u64) -> Vec<Va
             match content {
                 // Heal-on-load shape: scalar string content.
                 Value::String(s) => {
-                    if s.len() <= max_chars {
+                    let budget = budget_for(s);
+                    if s.len() <= budget {
                         return msg.clone();
                     }
                     let mut new_msg = msg.clone();
-                    new_msg["content"] = Value::String(truncate_with_head_tail(s, max_chars));
+                    new_msg["content"] = Value::String(truncate_with_head_tail(s, budget));
                     new_msg
                 }
                 // Production shape: array of content blocks
@@ -260,15 +323,24 @@ pub fn cap_oversized_tool_results(messages: &[Value], max_tokens: u64) -> Vec<Va
                         .filter_map(text_of_block)
                         .map(|t| t.len())
                         .sum();
-                    if total_text_len <= max_chars {
+                    // The message's allowance is the roomier one when any of its
+                    // text blocks is a file excerpt — a read result split across
+                    // blocks is still a read result.
+                    let msg_chars = blocks
+                        .iter()
+                        .filter_map(text_of_block)
+                        .map(budget_for)
+                        .max()
+                        .unwrap_or(max_chars);
+                    if total_text_len <= msg_chars {
                         return msg.clone();
                     }
                     // Single-block fast path: cap directly to
-                    // max_chars. (Common: tool result is one
-                    // text block.)
+                    // the message allowance. (Common: tool result
+                    // is one text block.)
                     let text_block_count =
                         blocks.iter().filter(|b| text_of_block(b).is_some()).count();
-                    let per_block_budget = match max_chars.checked_div(text_block_count) {
+                    let per_block_budget = match msg_chars.checked_div(text_block_count) {
                         Some(d) => std::cmp::max(d, MIN_PER_BLOCK_BUDGET),
                         None => return msg.clone(),
                     };
@@ -384,12 +456,52 @@ pub(crate) fn content_text(content: Option<&Value>) -> String {
     }
 }
 
+/// Does this tool result look like a `read` excerpt? Matched on the read tool's
+/// own header (`(N lines total, showing lines A-B)`, or `(≥N …)` when the count
+/// is a lower bound), which it emits on every excerpt and nothing else does.
+/// Scanned over the first few lines rather than position 0 because a
+/// relational-default note or an injection-guard wrapper can precede it.
+pub(crate) fn is_file_excerpt(s: &str) -> bool {
+    static HEADER: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+        regex::Regex::new(r"^\(\s*(?:≥)?\d+ lines total[,)]").unwrap()
+    });
+    s.lines().take(8).any(|l| HEADER.is_match(l.trim_start()))
+}
+
+/// Largest byte index `<= n` that ends a line, or `None` when the cut would
+/// land more than `slack` bytes before `n` (a single huge line — minified JS, a
+/// JSON blob — has no useful boundary and must fall back to a char cut).
+fn line_end_at_or_before(s: &str, n: usize, slack: usize) -> Option<usize> {
+    if n >= s.len() {
+        return Some(s.len());
+    }
+    let cut = s[..crate::text::char_boundary_at_or_before(s, n)].rfind('\n')?;
+    (n.saturating_sub(cut) <= slack).then_some(cut)
+}
+
+/// Smallest byte index `>= n` that starts a line, under the same slack rule.
+fn line_start_at_or_after(s: &str, n: usize, slack: usize) -> Option<usize> {
+    if n >= s.len() {
+        return Some(s.len());
+    }
+    let from = crate::text::char_boundary_at_or_after(s, n);
+    let cut = s[from..].find('\n').map(|i| from + i + 1)?;
+    (cut.saturating_sub(n) <= slack).then_some(cut)
+}
+
 /// Build a `head + marker + tail` payload sized so the
 /// total length is `<= max_chars`. Tail gets 10% of the
 /// remaining content budget (capped at 1024 chars to keep
 /// deeply-nested file dumps from eating the whole tail
 /// allotment). Port of Reasonix `truncateForModel`
 /// (`mcp/registry.ts:254-262`).
+///
+/// Both cuts snap to a line boundary when one is within reach (GH #755). A
+/// char-boundary cut leaves the head ending mid-row and the tail *starting*
+/// mid-row, and a `read` row whose `<n> <hash>: ` prefix was cut off is an
+/// anchor `edit_lines` cannot use — so a large read used to break hash-anchored
+/// editing for the rest of the session. Snapping inward only ever removes
+/// content, so the size bound still holds.
 ///
 /// Sized for idempotency: a second pass on the output is a
 /// no-op because `output.len() <= max_chars` guarantees the
@@ -398,27 +510,38 @@ fn truncate_with_head_tail(s: &str, max_chars: usize) -> String {
     // Reserve enough budget for the marker (with worst-case
     // 12-digit dropped count). The marker template stays
     // constant; the dropped-count is the only variable.
-    const MARKER_OVERHEAD: usize = 160;
+    const MARKER_OVERHEAD: usize = 220;
+    // How far a cut may move to reach a line boundary. Generous enough for a
+    // long JSX row, small enough that snapping never costs a meaningful slice.
+    const LINE_SLACK: usize = 4096;
+    let advice = if is_file_excerpt(s) {
+        // The generic advice ("narrower scope") is what a `read` caller already
+        // did, and re-reading returns this same cut view because the capping is
+        // deterministic. Name the parameters that actually move the window, and
+        // say the file itself is fine — the gap is in this transcript, not on disk.
+        "re-read with offset/limit to page through it (the file on disk is complete and unchanged)"
+    } else {
+        "call the tool with a narrower scope (filter, head, pagination) if you need more"
+    };
     if max_chars <= MARKER_OVERHEAD {
         // Cap too small for both content and a marker; emit
         // just the marker so downstream callers still see
         // "result was truncated".
-        return format!(
-            "[…truncated {} chars — call the tool with a narrower scope (filter, head, pagination) if you need more…]",
-            s.len(),
-        );
+        return format!("[…truncated {} chars — {advice}…]", s.len());
     }
     let content_budget = max_chars - MARKER_OVERHEAD;
     let tail_budget = std::cmp::min(1024, content_budget / 10);
     let head_budget = content_budget.saturating_sub(tail_budget);
-    let head_end = crate::text::char_boundary_at_or_before(s, head_budget);
-    let tail_start = crate::text::char_boundary_at_or_after(s, s.len().saturating_sub(tail_budget));
+    let head_end = line_end_at_or_before(s, head_budget, LINE_SLACK)
+        .unwrap_or_else(|| crate::text::char_boundary_at_or_before(s, head_budget));
+    let raw_tail_start = s.len().saturating_sub(tail_budget);
+    let tail_start = line_start_at_or_after(s, raw_tail_start, LINE_SLACK)
+        .unwrap_or_else(|| crate::text::char_boundary_at_or_after(s, raw_tail_start))
+        .max(head_end);
     let head = &s[..head_end];
     let tail = &s[tail_start..];
     let dropped = s.len().saturating_sub(head.len() + tail.len());
-    format!(
-        "{head}\n\n[…truncated {dropped} chars — call the tool with a narrower scope (filter, head, pagination) if you need more…]\n\n{tail}"
-    )
+    format!("{head}\n\n[…truncated {dropped} chars — {advice}…]\n\n{tail}")
 }
 
 /// Prune large tool outputs in the middle section before
@@ -1902,5 +2025,187 @@ mod tests {
         );
         // Format prefix preserved: "[0] tool: ".
         assert!(out.starts_with("[0] tool: "));
+    }
+}
+
+/// GH #755 — the turn-end per-result cap, as it applies to file reads.
+#[cfg(test)]
+mod file_excerpt_capping {
+    use super::*;
+
+    /// A `read` result: the tool's own header, then `<n> <hash>: <code>` rows.
+    /// Deeply-indented JSX, the shape the issue reports.
+    fn excerpt(lines: usize) -> String {
+        let w = lines.to_string().len().max(1);
+        let body: String = (1..=lines)
+            .map(|i| {
+                format!(
+                    "{:>w$} {:03x}:            <Button variant=\"primary\" onClick={{handle{i}}}>",
+                    i,
+                    i % 4096
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("({lines} lines total, showing lines 1-{lines})\n\n{body}")
+    }
+
+    fn tool_msg(content: &str) -> Value {
+        serde_json::json!({"role": "tool", "content": content})
+    }
+
+    fn capped_text(src: &str, max_tokens: u64) -> String {
+        let out = cap_oversized_tool_results(&[tool_msg(src)], max_tokens);
+        out[0]["content"].as_str().unwrap().to_string()
+    }
+
+    /// Every content row of a `read` result carries a `<n> <hash>: ` prefix. A
+    /// surviving row without one is a row the truncation cut through.
+    fn is_intact_row(line: &str) -> bool {
+        let Some((prefix, _)) = line.split_once(": ") else {
+            return false;
+        };
+        let mut fields = prefix.split_whitespace();
+        let Some(n) = fields.next() else {
+            return false;
+        };
+        n.chars().all(|c| c.is_ascii_digit()) && fields.next().is_some_and(|h| h.len() == 3)
+    }
+
+    /// The capper cut at a UTF-8 boundary, not a line boundary, so the head ended
+    /// mid-row and the tail *started* mid-row. `edit_lines` anchors on the
+    /// `<n> <hash>:` prefix, so a cut row is an unusable anchor — which is why
+    /// hash-editing stopped working after a big read.
+    #[test]
+    fn truncation_lands_on_line_boundaries() {
+        let src = excerpt(4000);
+        let got = capped_text(&src, 1000);
+        assert!(got.len() < src.len(), "it did truncate");
+        for line in got.lines() {
+            // Skip the read header, the blank separator and the truncation marker.
+            if line.is_empty() || line.starts_with('(') || line.starts_with("[…") {
+                continue;
+            }
+            assert!(
+                is_intact_row(line),
+                "row was cut mid-line, so its hash anchor is unusable: {line:?}"
+            );
+        }
+    }
+
+    /// A file excerpt is the agent's working material, not disposable log noise,
+    /// so it gets its own (larger) allowance. A 4000-line JSX component would
+    /// otherwise be cut to ~12 KB on the turn after it was read — the model then
+    /// re-reads, gets the same cut view, and loops.
+    #[test]
+    fn file_excerpts_get_a_larger_cap_than_generic_output() {
+        let src = excerpt(1500);
+        let noise: String = (0..40_000)
+            .map(|i| format!("processed record {i} ok"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            capped_text(&src, TURN_END_RESULT_CAP_TOKENS).len()
+                > 4 * TURN_END_RESULT_CAP_TOKENS as usize,
+            "a file excerpt survives past the generic cap"
+        );
+        assert!(
+            capped_text(&noise, TURN_END_RESULT_CAP_TOKENS).len()
+                <= (TURN_END_RESULT_CAP_TOKENS * CHARS_PER_TOKEN) as usize,
+            "generic tool output is still held to the generic cap"
+        );
+    }
+
+    /// The larger allowance is not unbounded — a file excerpt over it is still cut.
+    #[test]
+    fn file_excerpts_are_still_bounded() {
+        let src = excerpt(40_000);
+        let got = capped_text(&src, TURN_END_RESULT_CAP_TOKENS);
+        assert!(got.len() < src.len(), "still truncated");
+        assert!(
+            got.len() <= (file_excerpt_cap_tokens() * CHARS_PER_TOKEN) as usize,
+            "bounded by the excerpt cap, got {} chars",
+            got.len()
+        );
+    }
+
+    /// Overflow protection wins: once the context is full enough for the
+    /// aggressive tier, excerpts are capped as tightly as anything else. A
+    /// roomier allowance is worth nothing if the request stops fitting.
+    #[test]
+    fn the_aggressive_tier_still_applies_to_excerpts() {
+        let src = excerpt(4000);
+        let got = capped_text(&src, AGGRESSIVE_RESULT_CAP_TOKENS);
+        assert!(
+            got.len() <= (AGGRESSIVE_RESULT_CAP_TOKENS * CHARS_PER_TOKEN) as usize,
+            "aggressive cap is honored, got {} chars",
+            got.len()
+        );
+    }
+
+    /// The generic marker tells the model to "call the tool with a narrower
+    /// scope (filter, head, pagination)". For a `read` that is advice it already
+    /// followed, and re-reading returns the same cut view — the loop the issue
+    /// reports. The excerpt marker names what actually works and says the file
+    /// itself is intact.
+    #[test]
+    fn the_marker_names_a_recovery_that_works_for_a_read() {
+        let got = capped_text(&excerpt(4000), TURN_END_RESULT_CAP_TOKENS);
+        let marker = got
+            .lines()
+            .find(|l| l.starts_with("[…"))
+            .expect("a truncation marker is present");
+        assert!(marker.contains("offset"), "names offset/limit: {marker}");
+        assert!(marker.contains("limit"), "names offset/limit: {marker}");
+        assert!(
+            marker.contains("on disk"),
+            "says the file itself is complete: {marker}"
+        );
+        assert!(
+            !marker.contains("pagination"),
+            "not the generic advice: {marker}"
+        );
+    }
+
+    /// Idempotency is what keeps the cap from eating a result a little more on
+    /// every turn. It has to survive the line-boundary snap.
+    #[test]
+    fn capping_is_idempotent() {
+        let once = capped_text(&excerpt(4000), TURN_END_RESULT_CAP_TOKENS);
+        let twice = capped_text(&once, TURN_END_RESULT_CAP_TOKENS);
+        assert_eq!(once, twice, "a second pass must be a no-op");
+    }
+
+    /// `file_excerpt_cap_tokens` in config.json. The floor exists because a cap
+    /// below the generic one would make file reads *smaller* than ordinary tool
+    /// output, inverting the point of the tier.
+    #[test]
+    fn the_excerpt_cap_is_configurable_and_floored() {
+        assert_eq!(
+            resolve_file_excerpt_cap(None),
+            DEFAULT_FILE_EXCERPT_CAP_TOKENS,
+            "unset keeps the default"
+        );
+        assert_eq!(resolve_file_excerpt_cap(Some(40_000)), 40_000, "raised");
+        assert_eq!(
+            resolve_file_excerpt_cap(Some(TURN_END_RESULT_CAP_TOKENS)),
+            TURN_END_RESULT_CAP_TOKENS,
+            "setting it to the generic cap restores the pre-fix sizing"
+        );
+        assert_eq!(
+            resolve_file_excerpt_cap(Some(1)),
+            TURN_END_RESULT_CAP_TOKENS,
+            "floored at the generic cap, never below it"
+        );
+    }
+
+    /// A single enormous line (minified JS, a JSON blob) has no line boundary to
+    /// snap to; the char-boundary fallback must still produce valid UTF-8.
+    #[test]
+    fn a_single_huge_line_still_truncates() {
+        let blob = format!("{{\"data\":\"{}\"}}", "é".repeat(60_000));
+        let got = capped_text(&blob, 100);
+        assert!(got.len() < blob.len(), "truncated");
+        assert!(got.contains("truncated"), "marked");
     }
 }

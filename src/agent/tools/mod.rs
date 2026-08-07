@@ -549,6 +549,12 @@ pub(crate) fn append_repair_note(msg: &mut String, note: Option<GateNote>) {
     }
 }
 
+/// First line stamped on a tool result the model asked to receive uncompressed.
+/// `llmtrim`'s tool-output stage skips any segment starting with it — see
+/// `llmtrim::stages::toolout::VERBATIM_PREFIX`, which matches on the literal
+/// because the engine is standalone and does not depend on this crate.
+pub const VERBATIM_MARKER: &str = "[dirge: verbatim — this output is exempt from compression]";
+
 #[derive(Deserialize)]
 pub struct ReadArgs {
     pub path: String,
@@ -558,6 +564,10 @@ pub struct ReadArgs {
     /// (`  42 a3f: ...`) for hash-anchored editing via `edit_lines`.
     /// Defaults to the plain `  42: ...` numbering.
     pub line_hashes: Option<bool>,
+    /// When true, stamp the result with [`VERBATIM_MARKER`] so prompt
+    /// compression passes it through untouched. For the case where the
+    /// model needs a guarantee that what it sees is what is on disk.
+    pub verbatim: Option<bool>,
 }
 
 #[derive(Deserialize)]

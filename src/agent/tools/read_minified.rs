@@ -174,6 +174,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 line_hashes: None,
+                verbatim: None,
             })
             .await
             .unwrap();
@@ -207,6 +208,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 line_hashes: None,
+                verbatim: None,
             })
             .await
             .unwrap();

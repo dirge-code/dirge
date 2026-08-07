@@ -52,7 +52,7 @@ pub fn compress(text: &str, ctx: &Ctx, query: &HashSet<String>) -> Option<String
     if keep.iter().all(|&x| x) {
         return Some(collapsed);
     }
-    Some(rebuild(&lines, &keep))
+    Some(rebuild(&lines, &keep, ctx))
 }
 
 #[cfg(test)]

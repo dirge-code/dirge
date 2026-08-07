@@ -564,6 +564,17 @@ pub struct PluginSettings {
 pub struct Compression {
     pub enabled: Option<bool>,
     pub preset: Option<String>,
+    /// Let tool-output windowing touch the user's own messages. Absent → `false`.
+    /// Exists so `scripts/loop-ab.sh` can run a control arm on the pre-dirge-09e8
+    /// behavior; there is no reason to turn it on otherwise.
+    pub trim_user_text: Option<bool>,
+    /// Let tool-output windowing fold and window code / file excerpts. Absent →
+    /// `false`. Same A/B-control caveat as `trim_user_text`.
+    pub window_code: Option<bool>,
+    /// Elision-header wording: `"explicit"` (default) or `"legacy"`.
+    pub header: Option<String>,
+    /// Honor `read(verbatim=true)`'s compression opt-out. Absent → `true`.
+    pub verbatim: Option<bool>,
 }
 
 /// Prompt-cache policy (dirge-cbgz). `ttl` is `"5m"` or `"1h"` and sets the lifetime of
@@ -910,6 +921,17 @@ pub struct Config {
     /// routes. Floored at 16k; a value above the model's real window is a
     /// no-op (the window wins). Installed process-wide at startup.
     pub context_target: Option<u64>,
+    /// Per-result token cap for `read` excerpts (default: 12_000). Every tool
+    /// result is head+tail truncated at the turn-end cap (3000 tokens, or 1000
+    /// once context passes 60%); a file excerpt gets this roomier allowance
+    /// instead, because it is the material the next edit is written against and
+    /// `edit_lines` anchors on line hashes that only survive while the rows are
+    /// intact (GH #755). Raise it for a codebase of large files, or set it to
+    /// 3000 to hold reads to the same cap as any other tool output. Floored at
+    /// 3000; the aggressive tier still overrides it, since a roomier allowance
+    /// is worth nothing if the request stops fitting. Installed process-wide at
+    /// startup.
+    pub file_excerpt_cap_tokens: Option<u64>,
     /// Incremental background checkpoint (MiMo-style): refresh the durable
     /// session checkpoint at 20%-interval usage thresholds, in the
     /// background, without folding the live context — so a resume after a
@@ -2114,6 +2136,36 @@ mod tests {
         // An empty section is also fine; the resolver supplies the default.
         let cfg: Config = serde_json::from_str(r#"{"prompt_cache": {}}"#).unwrap();
         assert!(cfg.prompt_cache.is_some_and(|c| c.ttl.is_none()));
+    }
+
+    /// GH #755. The excerpt cap has to reach the loop from config.json, and the
+    /// `[compression]` overrides alongside it — a key that silently fails to
+    /// deserialize would leave the user with no way to change either.
+    #[test]
+    fn read_trimming_overrides_parse_from_config_json() {
+        let cfg: Config = serde_json::from_str(
+            r#"{
+                "file_excerpt_cap_tokens": 40000,
+                "compression": {
+                    "trim_user_text": true,
+                    "window_code": true,
+                    "header": "legacy",
+                    "verbatim": false
+                }
+            }"#,
+        )
+        .expect("config with the read-trimming overrides must parse");
+        assert_eq!(cfg.file_excerpt_cap_tokens, Some(40_000));
+        let c = cfg.compression.expect("compression section present");
+        assert_eq!(c.trim_user_text, Some(true));
+        assert_eq!(c.window_code, Some(true));
+        assert_eq!(c.header.as_deref(), Some("legacy"));
+        assert_eq!(c.verbatim, Some(false));
+
+        // All optional: absent keys keep the shipped defaults.
+        let cfg: Config = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(cfg.file_excerpt_cap_tokens.is_none());
+        assert!(cfg.compression.is_none());
     }
 
     /// Phased workflow is opt-in and off by default; the review-cycle

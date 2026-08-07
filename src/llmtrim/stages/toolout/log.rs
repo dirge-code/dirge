@@ -25,7 +25,7 @@ pub fn compress(text: &str, ctx: &Ctx, query: &HashSet<String>) -> Option<String
     // emit nothing but an elision marker and erase the whole thing — fall through to
     // adaptive windowing instead (head/tail + query hits survive).
     if errors >= 1 && pick_mode(ctx.mode, raw.len(), errors) == Mode::Aggressive {
-        return compress_errors_only(text);
+        return compress_errors_only(text, ctx);
     }
     let (collapsed, folded) = if ctx.template {
         // Global collapse: consecutive runs *and* non-adjacent (interleaved parallel-build)
@@ -55,13 +55,13 @@ pub fn compress(text: &str, ctx: &Ctx, query: &HashSet<String>) -> Option<String
     if keep.iter().all(|&k| k) {
         return folded.then_some(collapsed);
     }
-    Some(rebuild(&lines, &keep))
+    Some(rebuild(&lines, &keep, ctx))
 }
 
 /// Errors-only mode: keep failure lines and their stack frames plus a count
 /// summary, drop everything else to positional elision markers. Far more aggressive than
 /// adaptive windowing. `None` when every line is a failure (nothing to strip).
-fn compress_errors_only(text: &str) -> Option<String> {
+fn compress_errors_only(text: &str, ctx: &Ctx) -> Option<String> {
     let lines: Vec<&str> = text.lines().collect();
     let keep = aggressive_keep(&lines);
     if keep.iter().all(|&k| k) {
@@ -70,7 +70,7 @@ fn compress_errors_only(text: &str) -> Option<String> {
     Some(format!(
         "{}\n{}",
         summary_line(&lines),
-        rebuild(&lines, &keep)
+        rebuild(&lines, &keep, ctx)
     ))
 }
 
@@ -149,6 +149,7 @@ mod tests {
             max_lines: 30,
             template: false,
             mode: ModeSetting::Adaptive,
+            ..test_ctx()
         };
         let out = compress(&log, &ctx, &HashSet::new()).expect("compresses");
 
@@ -185,6 +186,7 @@ mod tests {
             max_lines: 40,
             template: true, // ignored in aggressive mode
             mode: ModeSetting::Aggressive,
+            ..test_ctx()
         };
         let out = compress(&log, &ctx, &HashSet::new()).expect("compresses");
 
@@ -223,6 +225,7 @@ mod tests {
             max_lines: 30,
             template: false, // distinct lines anyway; force the windowing path, not a fold
             mode: ModeSetting::Aggressive,
+            ..test_ctx()
         };
         let out = compress(&log, &ctx, &HashSet::new()).expect("windows rather than erasing");
 

@@ -7,7 +7,8 @@ use crate::agent::agent_loop::tool_input_repair::with_contract_hint;
 use crate::agent::agent_loop::types::InjectionScanMode;
 use crate::agent::tools::cache::ToolCache;
 use crate::agent::tools::{
-    AskSender, PermCheck, ReadArgs, ToolError, ToolRoot, require_and_resolve_rooted,
+    AskSender, PermCheck, ReadArgs, ToolError, ToolRoot, VERBATIM_MARKER,
+    require_and_resolve_rooted,
 };
 use crate::extras::content_guard::guard_untrusted_result;
 #[cfg(feature = "lsp")]
@@ -178,6 +179,7 @@ impl PortableTool for ReadTool {
                 "offset": { "type": "integer", "description": "Line number to start from (1-indexed)" },
                 "limit": { "type": "integer", "description": "Maximum number of lines to read" },
                 "line_hashes": { "type": "boolean", "description": "Prefix each line with its 3-char content hash (e.g. `42 a3f: ...`) for hash-anchored editing with edit_lines. Pass the start/end line numbers and these hashes to edit_lines to replace a range without retyping the old text." },
+                "verbatim": { "type": "boolean", "description": "Return the excerpt exempt from prompt compression, so what you see is byte-for-byte what is on disk. Use when a compression notice appeared in an earlier read of this file, or when you need an exact whole-file view before a delicate edit." },
                 "reason": { "type": "string", "description": "Why you're reading this file: what you expect to learn and how it serves the current task. Be specific and targeted — don't read files for general orientation." }
             },
             "required": ["path", "reason"],
@@ -266,7 +268,7 @@ impl PortableTool for ReadTool {
             // context, leaving no way to see the file). Also satisfies
             // the read-before-edit gate.
             cache.mark_read(std::path::Path::new(&resolved_path));
-            return Ok(with_note(default_note, cached));
+            return Ok(mark_verbatim(&args, with_note(default_note, cached)));
         }
 
         // F4: stream the file line-by-line via BufReader instead of
@@ -494,7 +496,19 @@ impl PortableTool for ReadTool {
             });
         }
 
-        Ok(with_note(default_note, guarded))
+        Ok(mark_verbatim(&args, with_note(default_note, guarded)))
+    }
+}
+
+/// Stamp [`VERBATIM_MARKER`] on the result when the caller asked for an
+/// uncompressed read. Applied outermost — after the note and the injection
+/// guard — because llmtrim matches it at the very start of the segment. Like
+/// the note it stays out of the cache, so the same cached body serves both a
+/// plain and a verbatim read.
+fn mark_verbatim(args: &ReadArgs, body: String) -> String {
+    match args.verbatim {
+        Some(true) => format!("{VERBATIM_MARKER}\n{body}"),
+        _ => body,
     }
 }
 
@@ -629,6 +643,7 @@ mod tests {
             offset: None,
             limit: None,
             line_hashes: None,
+            verbatim: None,
         };
 
         // First read populates the cache.
@@ -687,6 +702,7 @@ mod tests {
             offset: None,
             limit: None,
             line_hashes: None,
+            verbatim: None,
         };
 
         // First read populates the cache (miss) and fences the poison.
@@ -736,6 +752,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 line_hashes: None,
+                verbatim: None,
             })
             .await
             .unwrap_err();
@@ -764,6 +781,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 line_hashes: None,
+                verbatim: None,
             })
             .await
             .unwrap();
@@ -804,6 +822,7 @@ mod tests {
                 offset: Some(1),
                 limit: Some(5),
                 line_hashes: None,
+                verbatim: None,
             })
             .await;
         let _ = std::fs::remove_file(&path);
@@ -846,6 +865,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 line_hashes: Some(true),
+                verbatim: None,
             })
             .await
             .expect("hashed read succeeds");
@@ -867,6 +887,51 @@ mod tests {
         }
     }
 
+    /// `verbatim=true` stamps the marker as the very first line, because
+    /// llmtrim matches it at the start of the segment (dirge-09e8 arm 4).
+    /// The excerpt itself is unchanged — the flag only adds the exemption.
+    #[tokio::test]
+    async fn read_verbatim_stamps_the_exemption_marker_first() {
+        let path = temp_path("verbatim");
+        std::fs::write(&path, "alpha\nbeta\n").unwrap();
+        let tool = ReadTool::new(None, None);
+        let args = |verbatim| ReadArgs {
+            path: path.to_string_lossy().into_owned(),
+            offset: None,
+            limit: None,
+            line_hashes: None,
+            verbatim,
+        };
+        let marked = tool.call(args(Some(true))).await.expect("read succeeds");
+        let plain = tool.call(args(None)).await.expect("read succeeds");
+        let _ = std::fs::remove_file(&path);
+
+        assert!(
+            marked.starts_with(VERBATIM_MARKER),
+            "marker must lead the result: {marked:?}"
+        );
+        assert_eq!(
+            marked,
+            format!("{VERBATIM_MARKER}\n{plain}"),
+            "the flag only prepends the marker; the excerpt is untouched"
+        );
+        assert!(
+            !plain.contains(VERBATIM_MARKER),
+            "and a plain read never carries it"
+        );
+    }
+
+    /// The marker llmtrim looks for and the one the tool writes must not
+    /// drift apart — they live in different modules by design (the engine is
+    /// standalone and matches on the literal).
+    #[test]
+    fn verbatim_marker_matches_the_prefix_llmtrim_looks_for() {
+        assert!(
+            VERBATIM_MARKER.starts_with(crate::llmtrim::stages::toolout::VERBATIM_PREFIX),
+            "{VERBATIM_MARKER:?} must start with the prefix llmtrim matches"
+        );
+    }
+
     /// Without the flag, output keeps the plain `N: content` form —
     /// no hash column leaks into normal reads.
     #[tokio::test]
@@ -880,6 +945,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 line_hashes: None,
+                verbatim: None,
             })
             .await
             .expect("read succeeds");
@@ -911,6 +977,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 line_hashes: None,
+                verbatim: None,
             })
             .await
             .unwrap();
@@ -943,6 +1010,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 line_hashes: None,
+                verbatim: None,
             })
             .await
             .unwrap();
@@ -967,6 +1035,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 line_hashes: None,
+                verbatim: None,
             })
             .await
             .unwrap();
@@ -997,6 +1066,7 @@ mod tests {
                 offset: Some(100),
                 limit: Some(10),
                 line_hashes: None,
+                verbatim: None,
             })
             .await
             .unwrap();
@@ -1029,6 +1099,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 line_hashes: None,
+                verbatim: None,
             })
             .await
             .unwrap();
@@ -1051,6 +1122,7 @@ mod tests {
                 offset: Some(2),
                 limit: None,
                 line_hashes: None,
+                verbatim: None,
             })
             .await
             .unwrap();
@@ -1083,6 +1155,7 @@ mod tests {
                 offset: None,
                 limit: Some(2),
                 line_hashes: None,
+                verbatim: None,
             })
             .await
             .unwrap();
@@ -1115,6 +1188,7 @@ mod tests {
                 offset: Some(2),
                 limit: Some(2),
                 line_hashes: None,
+                verbatim: None,
             })
             .await
             .unwrap();
@@ -1146,6 +1220,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 line_hashes: None,
+                verbatim: None,
             })
             .await
             .unwrap();
@@ -1165,6 +1240,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 line_hashes: None,
+                verbatim: None,
             })
             .await
             .unwrap();
@@ -1185,6 +1261,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 line_hashes: None,
+                verbatim: None,
             })
             .await
             .unwrap();

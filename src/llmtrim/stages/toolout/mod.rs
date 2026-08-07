@@ -129,6 +129,32 @@ pub(crate) fn pick_mode(setting: ModeSetting, total: usize, signal: usize) -> Mo
     }
 }
 
+/// Wording of the elision header (dirge-09e8 arm 3).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HeaderStyle {
+    /// The shipped-through-0.21 wording. Kept so an A/B control arm reproduces it byte
+    /// for byte.
+    Legacy,
+    /// States who authored the gaps, that the underlying content is complete, and how to
+    /// get it back. Models were reading the gaps as content and concluding the file was
+    /// corrupt or an edit had failed.
+    Explicit,
+}
+
+impl HeaderStyle {
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "legacy" => Self::Legacy,
+            _ => Self::Explicit,
+        }
+    }
+}
+
+/// First line of a tool result the model asked to receive uncompressed
+/// (`read(verbatim=true)`). Kept in sync with `agent::tools::VERBATIM_MARKER`; llmtrim
+/// is a standalone engine, so it matches on the literal rather than importing it.
+pub const VERBATIM_PREFIX: &str = "[dirge: verbatim";
+
 pub struct ToolOutputStage {
     /// Upper bound on lines kept per tool-output segment (the adaptive budget ceiling).
     pub max_lines: usize,
@@ -140,14 +166,32 @@ pub struct ToolOutputStage {
     /// Adaptive/aggressive split: `Adaptive` (always window), `Aggressive` (always
     /// signal-only), or `Auto` (decide per segment by noise density).
     pub mode: ModeSetting,
+    /// Compress content that is not a tool result — the user's own messages. Off by
+    /// default: a paste is not tool output, nothing about it can be "re-run", and the
+    /// silent Drain fold was reaching the model with no marker at all.
+    pub user_text: bool,
+    /// Window code and file excerpts. Off by default: the line ranking here is a *log*
+    /// heuristic and on source it keeps a near-arbitrary few percent, destroying the
+    /// line numbers `edit_lines` anchors on.
+    pub code: bool,
+    /// Elision-header wording.
+    pub header: HeaderStyle,
+    /// Honor the [`VERBATIM_PREFIX`] opt-out on a tool result.
+    pub verbatim: bool,
 }
 
 /// Per-segment knobs handed to each kind's compressor.
+#[derive(Clone, Copy)]
 pub(crate) struct Ctx {
     pub max_lines: usize,
     pub template: bool,
     /// Adaptive/aggressive split for this run (resolved per-segment when `Auto`).
     pub mode: ModeSetting,
+    /// Elision-header wording.
+    pub header: HeaderStyle,
+    /// Is this segment a tool result? Decides whether the header may tell the model to
+    /// re-run anything.
+    pub tool_result: bool,
 }
 
 impl Transform for ToolOutputStage {
@@ -195,10 +239,12 @@ impl Transform for ToolOutputStage {
             .flat_map(lex_words)
             .collect();
 
-        let ctx = Ctx {
+        let base_ctx = Ctx {
             max_lines: self.max_lines,
             template: self.template,
             mode: self.mode,
+            header: self.header,
+            tool_result: true,
         };
 
         // Rail: repeat → passthrough. A candidate whose content already appears at an
@@ -231,15 +277,50 @@ impl Transform for ToolOutputStage {
                 continue;
             };
             if text.lines().count() < self.min_lines || repeats.contains(ptr) {
-                // Too small to window — or a repeated invocation the agent made to get
-                // the full output back (passthrough). Either way no windowing; still
-                // ship the pre-pass-cleaned form if the ANSI/CR strip changed anything
-                // (the gate reverts if it didn't actually save tokens).
+                // Too small to window, or a repeated invocation the agent made to get the
+                // full output back (passthrough). Either way no windowing; still ship the
+                // pre-pass-cleaned form if the ANSI/CR strip changed anything (the gate
+                // reverts if it didn't actually save tokens). Checked before the opt-outs
+                // below so the per-line scans never run on a segment that was going to be
+                // skipped anyway.
                 if *normalized {
                     req.set(ptr, Value::String(text.clone()));
                 }
                 continue;
             }
+            // Both halves are needed to cover every wire shape. Anthropic and Gemini put
+            // tool output in a *block* inside a `user` turn, so only the block type
+            // identifies it; OpenAI Chat Completions and Responses put it in a turn of
+            // its own, which has no block type but does resolve to `Role::Tool`. Missing
+            // either half would classify real tool output as user text and silently
+            // switch this stage off for that provider.
+            let tool_result = crate::llmtrim::provider::is_tool_result_ptr(req, ptr)
+                || provider.role_at(req, ptr) == Some(crate::llmtrim::provider::Role::Tool);
+            // Three opt-outs, all decided before any transform touches the text — a skip,
+            // not a revert, because both of the transforms below (Drain fold as well as
+            // windowing) can reach the model unmarked, and the token gate cannot tell a
+            // ruined file from a well-compressed log.
+            //
+            // 1. Not tool output. The user's own message: nothing to "re-run", and the
+            //    fold marker arrives with no header at all.
+            // 2. Code / a file excerpt. Ranked by a log heuristic it loses ~95% of its
+            //    lines and all of its line numbers.
+            // 3. Explicitly exempted by the model via `read(verbatim=true)`.
+            //
+            // Ordered cheapest-first: a pointer/role lookup, then a prefix compare, and
+            // only then the per-line code scan.
+            if (!self.user_text && !tool_result)
+                || (self.verbatim && text.trim_start().starts_with(VERBATIM_PREFIX))
+                || (!self.code && detect::is_code(text))
+            {
+                // Left strictly alone — even the ANSI/CR pre-pass is a change the model
+                // would have to reconcile against what it believes is on disk.
+                continue;
+            }
+            let ctx = Ctx {
+                tool_result,
+                ..base_ctx
+            };
             let compressed = match kind {
                 Some(OutKind::Log) => log::compress(text, &ctx, &query),
                 Some(OutKind::Grep) => grep::compress(text, &ctx, &query),
@@ -383,22 +464,39 @@ fn is_elision_marker(line: &str) -> bool {
 /// who elided and how to recover, so the agent never misattributes the gaps to the tool
 /// (or to whatever wrapper ran it). No header when nothing was actually elided (the
 /// never-inflate rail may have kept every "dropped" run).
-pub(crate) fn attributed(body: Vec<String>, total: usize) -> String {
+pub(crate) fn attributed(body: Vec<String>, total: usize, ctx: &Ctx) -> String {
     if !body.iter().any(|l| is_elision_marker(l)) {
         return body.join("\n");
     }
     let shown = body.iter().filter(|l| !is_elision_marker(l)).count();
-    format!(
-        "[llmtrim: showing {shown} of {total} lines — re-run the tool for the full output]\n{}",
-        body.join("\n")
-    )
+    let header = match (ctx.header, ctx.tool_result) {
+        (HeaderStyle::Legacy, _) => format!(
+            "[llmtrim: showing {shown} of {total} lines — re-run the tool for the full output]"
+        ),
+        // Three claims, because models get all three wrong: they attribute the gaps to
+        // the tool or to the file, they treat the visible text as the whole file (and so
+        // report unmatched braces or a failed edit), and they invent workarounds instead
+        // of asking again.
+        (HeaderStyle::Explicit, true) => format!(
+            "[llmtrim compressed this tool output: {shown} of {total} lines shown. The gaps \
+             and any [×N] markers are llmtrim's, not the file's — the underlying content is \
+             complete and unchanged. Re-run the same tool call for the full text.]"
+        ),
+        // No tool to re-run: this is the user's own message.
+        (HeaderStyle::Explicit, false) => format!(
+            "[llmtrim compressed this message: {shown} of {total} lines shown. The gaps and \
+             any [×N] markers are llmtrim's, not the author's — the original is complete \
+             and unchanged.]"
+        ),
+    };
+    format!("{header}\n{}", body.join("\n"))
 }
 
 /// Reassemble `lines` in original order, keeping those flagged in `keep`, collapsing
 /// each maximal dropped run into one [`elide`] marker (unless the marker would inflate),
 /// and opening with the [`attributed`] recovery header. Shared by the log, grep and
 /// plaintext compressors (all select at line granularity).
-pub(crate) fn rebuild(lines: &[&str], keep: &[bool]) -> String {
+pub(crate) fn rebuild(lines: &[&str], keep: &[bool], ctx: &Ctx) -> String {
     let mut out: Vec<String> = Vec::new();
     let mut i = 0;
     while i < lines.len() {
@@ -413,7 +511,7 @@ pub(crate) fn rebuild(lines: &[&str], keep: &[bool]) -> String {
             elide_into(&lines[start..i], &mut out);
         }
     }
-    attributed(out, lines.len())
+    attributed(out, lines.len(), ctx)
 }
 
 #[cfg(test)]
@@ -422,12 +520,17 @@ pub(crate) fn test_ctx() -> Ctx {
         max_lines: 30,
         template: true,
         mode: ModeSetting::Adaptive,
+        header: HeaderStyle::Explicit,
+        tool_result: true,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Mode, ModeSetting, attributed, elide, elide_into, pick_mode, rebuild};
+    use super::{
+        Ctx, HeaderStyle, Mode, ModeSetting, attributed, elide, elide_into, pick_mode, rebuild,
+        test_ctx,
+    };
 
     #[test]
     fn auto_goes_aggressive_only_when_big_and_sparse() {
@@ -475,6 +578,8 @@ mod tests {
         assert_eq!(out, vec!["[… 4 lines omitted …]".to_string()]);
     }
 
+    /// The legacy header, kept verbatim so the A/B control arm reproduces today's
+    /// behavior exactly (dirge-09e8 arm 3).
     #[test]
     fn rebuild_attributes_the_elision_and_states_recovery() {
         let lines: Vec<&str> = (0..10)
@@ -483,7 +588,11 @@ mod tests {
         let mut keep = vec![false; 10];
         keep[0] = true;
         keep[9] = true;
-        let out = rebuild(&lines, &keep);
+        let ctx = Ctx {
+            header: HeaderStyle::Legacy,
+            ..test_ctx()
+        };
+        let out = rebuild(&lines, &keep, &ctx);
         assert!(
             out.starts_with("[llmtrim: showing 2 of 10 lines — re-run the tool"),
             "self-identifying recovery header first: {out}"
@@ -494,12 +603,72 @@ mod tests {
         );
     }
 
+    /// dirge-09e8 arm 3. Models read the gaps as *file* content and conclude the file
+    /// is corrupt, an edit failed, or a brace is unmatched. The header has to deny all
+    /// three: name llmtrim as the author of the gaps, say the underlying content is
+    /// complete, and name the recovery action.
+    #[test]
+    fn explicit_header_denies_that_the_gaps_are_content() {
+        let lines: Vec<&str> = (0..10)
+            .map(|_| "payload line with real content here")
+            .collect();
+        let mut keep = vec![false; 10];
+        keep[0] = true;
+        keep[9] = true;
+        let ctx = Ctx {
+            header: HeaderStyle::Explicit,
+            tool_result: true,
+            ..test_ctx()
+        };
+        let out = rebuild(&lines, &keep, &ctx);
+        let head = out.lines().next().unwrap();
+        assert!(head.contains("llmtrim"), "names the author: {head}");
+        assert!(head.contains("2 of 10 lines"), "states the ratio: {head}");
+        assert!(
+            head.contains("not the file's"),
+            "denies the gaps are file content: {head}"
+        );
+        assert!(
+            head.contains("complete and unchanged"),
+            "asserts the underlying file is intact: {head}"
+        );
+        assert!(
+            head.to_ascii_lowercase().contains("re-run"),
+            "names the recovery action: {head}"
+        );
+    }
+
+    /// The same header on a non-tool segment must not tell the model to "re-run the
+    /// tool" — there is no tool. Only reachable in the legacy `toolout_user_text` arm,
+    /// but it has to be right there too.
+    #[test]
+    fn explicit_header_does_not_invent_a_tool_for_user_text() {
+        let lines: Vec<&str> = (0..10)
+            .map(|_| "payload line with real content here")
+            .collect();
+        let mut keep = vec![false; 10];
+        keep[0] = true;
+        keep[9] = true;
+        let ctx = Ctx {
+            header: HeaderStyle::Explicit,
+            tool_result: false,
+            ..test_ctx()
+        };
+        let out = rebuild(&lines, &keep, &ctx);
+        let head = out.lines().next().unwrap();
+        assert!(!head.contains("tool"), "no tool to re-run: {head}");
+        assert!(
+            head.contains("complete and unchanged"),
+            "still asserts the original is intact: {head}"
+        );
+    }
+
     #[test]
     fn no_header_when_nothing_was_actually_elided() {
         // The never-inflate rail can return every "dropped" line — then there is no
         // elision to attribute and the header must not appear.
         let body = vec!["--".to_string(), "ok".to_string()];
-        let out = attributed(body, 2);
+        let out = attributed(body, 2, &test_ctx());
         assert_eq!(out, "--\nok");
     }
 

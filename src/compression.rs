@@ -4,34 +4,56 @@ use anyhow::{Context as _, Result};
 /// `[compression]` config section (with env var overrides checked later at
 /// each `resolve_compression_*` call site). Initialized by
 /// [`init_from_config`] right after the runtime Config is loaded from disk.
-static COMPRESSION_CFG: std::sync::OnceLock<(bool, String)> = std::sync::OnceLock::new();
+static COMPRESSION_CFG: std::sync::OnceLock<crate::config::Compression> =
+    std::sync::OnceLock::new();
 
 /// Seed the compression config from the loaded runtime Config. Call ONCE
 /// at startup, BEFORE any provider client is built.
 ///
-/// `enabled` is `None` when no `[compression]` section exists; the default
-/// is `true`.
-/// `preset` defaults to `"dirge"` when absent or `None`.
-pub fn init_from_config(enabled: Option<bool>, preset: Option<String>) {
-    let _ = COMPRESSION_CFG.set((
-        enabled.unwrap_or(true),
-        preset.unwrap_or_else(|| "dirge".to_string()),
-    ));
+/// Every field is optional; absent ones take the defaults documented on
+/// [`crate::config::Compression`] (`enabled = true`, `preset = "dirge"`).
+pub fn init_from_config(cfg: crate::config::Compression) {
+    let _ = COMPRESSION_CFG.set(cfg);
 }
 
 /// Was compression enabled in the config file? Defaults to `true` if
 /// `init_from_config` was never called (feature compiled in but config
 /// not yet loaded — fail-safe: assume on).
 pub fn configured_enabled() -> bool {
-    COMPRESSION_CFG.get().map(|(e, _)| *e).unwrap_or(true)
+    COMPRESSION_CFG
+        .get()
+        .and_then(|c| c.enabled)
+        .unwrap_or(true)
 }
 
 /// Which preset did the config file choose? Defaults to `"dirge"`.
 pub fn configured_preset() -> String {
     COMPRESSION_CFG
         .get()
-        .map(|(_, p)| p.clone())
+        .and_then(|c| c.preset.clone())
         .unwrap_or_else(|| "dirge".to_string())
+}
+
+/// Apply the `[compression]` tool-output overrides (dirge-09e8) on top of a
+/// resolved preset. These exist so `scripts/loop-ab.sh` can stand up a control
+/// arm on the pre-fix behavior; absent keys leave the preset's own defaults —
+/// which are the fixed ones — in place.
+fn apply_toolout_overrides(c: &mut crate::llmtrim::config::DenseConfig) {
+    let Some(cfg) = COMPRESSION_CFG.get() else {
+        return;
+    };
+    if let Some(v) = cfg.trim_user_text {
+        c.toolout_user_text = v;
+    }
+    if let Some(v) = cfg.window_code {
+        c.toolout_code = v;
+    }
+    if let Some(ref v) = cfg.header {
+        c.toolout_header = v.clone();
+    }
+    if let Some(v) = cfg.verbatim {
+        c.toolout_verbatim = v;
+    }
 }
 
 /// Dirge's default compression config: "lossless + tool-output windowing, no
@@ -67,10 +89,13 @@ pub fn dirge_default_config() -> crate::llmtrim::config::DenseConfig {
 /// they are an opt-in escape hatch for aggressive trimming, not a tuning
 /// knob to casually dial.
 pub fn config_for_preset(name: &str) -> crate::llmtrim::config::DenseConfig {
-    if name == "dirge" || name == "default" {
-        return dirge_default_config();
-    }
-    crate::llmtrim::config::DenseConfig::preset(name).unwrap_or_else(dirge_default_config)
+    let mut c = if name == "dirge" || name == "default" {
+        dirge_default_config()
+    } else {
+        crate::llmtrim::config::DenseConfig::preset(name).unwrap_or_else(dirge_default_config)
+    };
+    apply_toolout_overrides(&mut c);
+    c
 }
 
 /// [`config_for_preset`] plus the caching policy that depends on which backend the request
@@ -275,6 +300,180 @@ mod tests {
         assert!(
             out.contains("Cached preamble"),
             "cached content must survive compression:\n{out}"
+        );
+    }
+
+    /// Format a file the way `agent::tools::read` does: a `(N lines total, …)` header,
+    /// a blank line, then `  <lineno>: <content>` rows.
+    fn as_read_output(src: &str) -> String {
+        let lines: Vec<&str> = src.lines().collect();
+        let total = lines.len();
+        let width = total.to_string().len().max(1);
+        let body: String = lines
+            .iter()
+            .enumerate()
+            .map(|(i, l)| format!("{:>width$}: {}", i + 1, l))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("({total} lines total, showing lines 1-{total})\n\n{body}")
+    }
+
+    /// dirge's real wire shape: Anthropic, system + first turn cached, then a fresh
+    /// tool result and a fresh user message *after* the last cache breakpoint (so
+    /// neither is protected by `frozen_pointers`).
+    fn anthropic_body(tool_result: &str, user_text: &str) -> String {
+        serde_json::json!({
+            "model": "claude-opus-4-5",
+            "system": [{"type": "text", "text": "You are dirge.",
+                        "cache_control": {"type": "ephemeral"}}],
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "start the task",
+                    "cache_control": {"type": "ephemeral"}}]},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "read", "input": {"path": "x.rs"}}]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": tool_result}]},
+                {"role": "user", "content": [{"type": "text", "text": user_text}]}
+            ],
+            "max_tokens": 100
+        })
+        .to_string()
+    }
+
+    fn compress_anthropic(body: &str) -> serde_json::Value {
+        let cfg = dirge_default_config();
+        let out = rewrite_with(body, crate::llmtrim::ir::ProviderKind::Anthropic, &cfg)
+            .expect("rewrite_with should succeed");
+        serde_json::from_str(&out).expect("output should be valid JSON")
+    }
+
+    /// dirge-09e8 arm 2. A source file read came back windowed to ~5% of itself —
+    /// `read.rs` (1202 lines) reached the model as 45 of 938 lines — because the
+    /// generic `plaintext` fallback treats code as log-shaped noise and ranks its
+    /// lines with a log heuristic. It also destroys the line numbers `edit_lines`
+    /// and `line_hash` anchor on.
+    #[test]
+    fn source_file_reads_are_never_windowed() {
+        let src = include_str!("agent/tools/read.rs");
+        let read_out = as_read_output(src);
+        let v = compress_anthropic(&anthropic_body(&read_out, "fix the bug"));
+        let got = v["messages"][2]["content"][0]["content"]
+            .as_str()
+            .expect("tool result should still be a string");
+        assert_eq!(
+            got,
+            read_out,
+            "a source-file read must reach the model byte-identical; got {} of {} lines",
+            got.lines().count(),
+            read_out.lines().count()
+        );
+    }
+
+    /// dirge-09e8 arm 1. 120 pasted lines reached the model as a single
+    /// `uniform vec{} u_color_{}; [×120: (3; 0..119)]` fold marker — no header, no
+    /// elision marker, no signal at all that anything had been removed. The user's
+    /// own message is not tool output and must never be touched.
+    #[test]
+    fn pasted_user_text_is_never_compressed() {
+        let pasted: String = (0..120)
+            .map(|i| format!("uniform vec3 u_color_{i};"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let user_text = format!("here is the shader I pasted:\n\n{pasted}");
+        let v = compress_anthropic(&anthropic_body("(no output)", &user_text));
+        let got = v["messages"][3]["content"][0]["text"]
+            .as_str()
+            .expect("user text should still be a string");
+        assert_eq!(
+            got, user_text,
+            "the user's own message must reach the model byte-identical"
+        );
+    }
+
+    /// The fix must not disable tool-output windowing wholesale — a genuine build log
+    /// is still the thing this stage exists to compress.
+    #[test]
+    fn logs_are_still_windowed_after_the_fix() {
+        let mut lines: Vec<String> = (0..200)
+            .map(|i| format!("INFO  compiling module {i} ok"))
+            .collect();
+        lines.insert(120, "ERROR failed to resolve symbol foo".to_string());
+        let log = lines.join("\n");
+        let v = compress_anthropic(&anthropic_body(&log, "what failed?"));
+        let got = v["messages"][2]["content"][0]["content"]
+            .as_str()
+            .expect("tool result should still be a string");
+        assert!(
+            got.lines().count() < log.lines().count(),
+            "a real log must still be windowed, got {} of {} lines",
+            got.lines().count(),
+            log.lines().count()
+        );
+        assert!(
+            got.contains("failed to resolve symbol foo"),
+            "the error line must survive:\n{got}"
+        );
+    }
+
+    /// dirge-09e8 arm 1. "Is this tool output?" has to be answered for every wire
+    /// shape, not just Anthropic's. OpenAI Chat Completions gives a tool result a turn
+    /// of its own (`role: "tool"`) with no block type, so a block-type-only test reads
+    /// it as user text and switches the whole stage off for OpenAI, DeepSeek, GLM,
+    /// Cerebras, Kimi, Ollama and OpenRouter at once.
+    #[test]
+    fn openai_shaped_tool_results_are_still_recognized_as_tool_output() {
+        let mut lines: Vec<String> = (0..200)
+            .map(|i| format!("INFO  compiling module {i} ok"))
+            .collect();
+        lines.insert(120, "ERROR failed to resolve symbol foo".to_string());
+        let log = lines.join("\n");
+        let body = serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [
+                {"role": "system", "content": "You are a coding agent."},
+                {"role": "assistant", "tool_calls": [{"id": "c1", "type": "function",
+                    "function": {"name": "bash", "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": "c1", "content": log},
+                {"role": "user", "content": "what failed?"}
+            ],
+            "max_tokens": 100
+        })
+        .to_string();
+        let cfg = dirge_default_config();
+        let out = rewrite_with(&body, crate::llmtrim::ir::ProviderKind::OpenAi, &cfg)
+            .expect("rewrite_with should succeed");
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let got = v["messages"][2]["content"]
+            .as_str()
+            .expect("still a string");
+        assert!(
+            got.lines().count() < log.lines().count(),
+            "an OpenAI-shaped tool result must still be windowed, got {} of {} lines",
+            got.lines().count(),
+            log.lines().count()
+        );
+    }
+
+    /// dirge-09e8 arm 4. `read(verbatim=true)` marks its result exempt, so even a
+    /// log-shaped result ships whole when the model explicitly asked for it.
+    #[test]
+    fn verbatim_marked_output_is_passed_through() {
+        let mut lines: Vec<String> = (0..200)
+            .map(|i| format!("INFO  compiling module {i} ok"))
+            .collect();
+        lines.insert(120, "ERROR failed to resolve symbol foo".to_string());
+        let marked = format!(
+            "{}\n{}",
+            crate::agent::tools::VERBATIM_MARKER,
+            lines.join("\n")
+        );
+        let v = compress_anthropic(&anthropic_body(&marked, "what failed?"));
+        let got = v["messages"][2]["content"][0]["content"]
+            .as_str()
+            .expect("tool result should still be a string");
+        assert_eq!(
+            got, marked,
+            "a verbatim-marked result must reach the model byte-identical"
         );
     }
 }

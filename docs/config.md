@@ -96,6 +96,7 @@ Accepted top-level keys:
 | `context_target` | integer | Working-context budget in tokens (default: `250000`). The compaction decision treats the effective window as `min(model_window, context_target)`, so models with a window below 250k use their own (e.g. 128k stays 128k) while larger models are capped. Set lower (e.g. `100000`) for stricter folding on cost-sensitive routes. Floored at 16k. |
 | `compaction_fold_threshold` | float | Fraction of the (budgeted) context window (0.3–0.75) at which history folds into a summary — and the durable checkpoint is written. Lower folds/checkpoints earlier, from more coherent context. Unset keeps the 0.75 default. Composes with `context_target`: the fold point is `fraction × min(model_window, context_target)`. |
 | `incremental_checkpoint`  | bool    | Refresh the durable session checkpoint in the background at 20%-of-window usage thresholds, without folding, so a resumed session recovers fresh state (adapted from [MiMo-Code](https://github.com/XiaomiMiMo/MiMo-Code)). Default `true`; set `false` to disable the background summary calls. Forced off in headless `-p`/`--loop` (nothing there persists it). |
+| `file_excerpt_cap_tokens` | integer | Per-result token cap for `read` excerpts (default: `12000`). Every tool result is head+tail truncated at the turn-end cap (3000 tokens, or 1000 once context passes 60%); a file excerpt gets this roomier allowance instead, because it is the material the next edit is written against and `edit_lines` anchors on line hashes that only survive while the rows are intact. Raise it for a codebase of large files; set it to `3000` to hold reads to the same cap as any other tool output. Floored at 3000, and the aggressive tier still overrides it. See [Large file reads](#large-file-reads). |
 | `agents`                  | object  | Optional user-defined [agent profiles](agents.md), keyed by name. Each is a `{ prompt, model, deny_tools/allow_tools, reasoning, temperature, description, subagent }` bundle activated at runtime with `/agent <name>`. Lowest-precedence source — `.dirge/agents/*.md` and `~/.config/dirge/agents/*.md` override same-named entries. Absent = no profiles (opt-in). |
 | `max_tokens`              | integer | Maximum response tokens. Default: `8192`.                                                                                                                                   |
 | `max_agent_turns`         | integer | Maximum agent turns per response. Default: `100`.                                                                                                                           |
@@ -205,6 +206,48 @@ binds; on a smaller model the fold point is `fraction × model_window` instead.
 Set `compact_enabled` to `false` to disable automatic compaction entirely.
 (The separate `context_window` / `reserve_tokens` keys feed the status line and
 the older token-reserve path; the budget above is what the fold decision uses.)
+
+### Large file reads
+
+Two separate mechanisms shrink what the model sees of a file, and they have
+different knobs.
+
+**The turn-end result cap.** Every tool result is head+tail truncated before
+each send: 3000 tokens normally, 1000 once estimated context passes 60%. The
+model that *called* the tool sees the full result on that turn; later turns see
+the truncation. A `read` excerpt is held to `file_excerpt_cap_tokens` (default
+12000) instead, because it is the material the next edit is written against and
+`edit_lines` anchors on line hashes that only survive while rows are intact.
+
+```json
+{
+  "file_excerpt_cap_tokens": 40000
+}
+```
+
+Raise it if you work in a codebase of large files and see the agent re-reading
+the same one; set it to `3000` to hold reads to the same cap as any other tool
+output. It is floored at 3000, and the aggressive (>60% context) tier still
+overrides it — a roomier allowance is worth nothing if the request stops
+fitting. Truncation always cuts on a line boundary, so surviving rows keep
+their `<n> <hash>: ` prefixes and stay usable as `edit_lines` anchors.
+
+**Prompt compression.** The `[compression]` engine windows verbose *tool
+output* (logs, diffs, grep dumps). It does not touch source files, file
+excerpts, or your own messages. Those exemptions have overrides, but they exist
+for A/B testing the change that introduced them and there is no reason to turn
+them on:
+
+| Key | Default | Effect when set |
+|-----|---------|-----------------|
+| `trim_user_text` | `false` | Let windowing touch your own messages too. |
+| `window_code` | `false` | Let windowing fold and window code and file excerpts. |
+| `header` | `"explicit"` | `"legacy"` restores the pre-0.22 elision-header wording. |
+| `verbatim` | `true` | `false` ignores `read(verbatim=true)`'s compression opt-out. |
+
+If you need a guarantee that what you are looking at is byte-for-byte what is
+on disk, call `read` with `verbatim: true` — that result is exempt from
+compression entirely.
 
 ### Hybrid memory retrieval
 
@@ -321,6 +364,55 @@ It behaves like `openai` in every other respect (default model, API-key auth,
 is sent as a bearer token; unlike `auth: chatgpt` this uses no OAuth/Codex
 login, so it works against any plain `/v1/responses` server. (`allow_insecure`
 is honored here since no OAuth bearer is involved.)
+
+### GitHub Copilot
+
+Copilot has no built-in `provider_type`; it does not need one. Its endpoint is
+OpenAI-compatible, so it is reached with the generic `openai` /
+`openai-responses` types and a `base_url` of `https://api.githubcopilot.com`.
+
+Get a token from the GitHub CLI:
+
+```bash
+gh auth login
+export GH_API_KEY="$(gh auth token)"
+```
+
+Then point one or more provider entries at Copilot. Different Copilot models
+sit behind different APIs, so the `provider_type` is per model — the Responses
+API for the ones that require it, Chat Completions for the rest:
+
+```json
+{
+  "provider": "grok45",
+  "critic_provider": "luna56",
+  "summarization_provider": "luna56",
+  "approval_provider": "luna56",
+  "providers": {
+    "grok45": {
+      "provider_type": "openai-responses",
+      "base_url": "https://api.githubcopilot.com",
+      "api_key": "${GH_API_KEY}",
+      "model": "grok-4.5",
+      "multimodal": true
+    },
+    "luna56": {
+      "provider_type": "openai",
+      "base_url": "https://api.githubcopilot.com",
+      "api_key": "${GH_API_KEY}",
+      "model": "gpt-5.6-luna",
+      "multimodal": true
+    }
+  }
+}
+```
+
+`api_key` is expanded at use time, so the token stays in the environment rather
+than in the config file. Which models you can select depends on your Copilot
+plan, and `gh auth token` returns a token tied to your `gh` login — re-export
+it after re-authenticating.
+
+Recipe contributed by @dubchord, verified against Copilot Enterprise (GH #698).
 
 ### Cerebras
 
