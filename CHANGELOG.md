@@ -4,6 +4,89 @@ All notable changes to dirge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- Prompt compression no longer windows source files or the user's own messages.
+  The tool-output stage's generic fallback fired on any content segment of 30+
+  lines that its Drain pass could fold at all, which included file reads and
+  pasted text, and then ranked lines with a *log* heuristic — errors 1.0,
+  indented 0.5, everything else 0.3. On code that ranking is noise. A read of
+  `src/agent/tools/read.rs` (1202 lines) reached the model as 45 lines; a
+  176-line file as 40. It also destroyed the line numbers `edit_lines` and
+  `line_hash` anchor on.
+
+  Pasted text was worse, because the fold path emits no marker at all: 120
+  pasted lines arrived as the single line
+  `uniform vec{} u_color_{}; [×120: (3; 0..119)]`, with no header and no
+  elision marker. That is the "llmtrim artifacts in the file" models kept
+  reporting — they were reading a fold marker and concluding the file was
+  corrupt, an edit had failed, or a brace was unmatched, then working around it.
+
+  Tool results that really are logs, diffs and grep dumps still compress as
+  before. On a mixed agent turn the honest saving is ~19%, against a reported
+  ~92% when the reads and the paste were being destroyed.
+
+- The "is this tool output?" test recognized only Anthropic/Gemini content
+  blocks. OpenAI Chat Completions gives a tool result its own `role: "tool"`
+  turn with no block type, so it now also resolves through `role_at`. Without
+  both halves the exemption above would have read every OpenAI-shaped tool
+  result as user text and switched tool-output compression off for OpenAI,
+  DeepSeek, GLM, Cerebras, Kimi, Ollama and OpenRouter.
+
+- The elision header no longer tells the model to "re-run the tool" when the
+  segment it is attached to is a user message with no tool behind it.
+
+- The turn-end per-result cap no longer guts large file reads (GH #755). This
+  is a second, independent trimming layer from the one above:
+  `cap_oversized_tool_results` head+tail truncates every tool result over 3000
+  tokens on every turn after the one that called the tool.
+
+  It cut at a UTF-8 boundary rather than a line boundary, so the head ended
+  mid-row and the tail *started* mid-row — and a `read` row whose
+  `<n> <hash>: ` prefix has been cut off is an anchor `edit_lines` cannot use.
+  That is the "unable to properly edit based on line hashes" in the report.
+  Both cuts now snap to a line boundary, with the old char-boundary cut kept as
+  the fallback for content that has no line breaks (minified JS, a JSON blob).
+
+  3000 tokens is also 12 KB, which is small for a source file. On a 1145-line
+  JSX component (32.8 KB) the model kept the first of three edit targets and
+  lost the other two. Because the capping is deterministic, re-reading returns
+  the same cut view — hence the re-read loop, and the model eventually
+  shelling out to `bash`/python to read the file. File excerpts now get
+  `FILE_EXCERPT_RESULT_CAP_TOKENS` (12000); the aggressive tier still overrides
+  it, since a roomier allowance is worth nothing if the request stops fitting.
+
+  The truncation marker told the model to "call the tool with a narrower scope
+  (filter, head, pagination)" — which for a `read` is what it already did. For
+  an excerpt it now names `offset`/`limit` and says the file on disk is
+  complete.
+
+### Added
+- `read(verbatim=true)` returns an excerpt exempt from prompt compression, for
+  when the model needs a guarantee that what it sees is what is on disk.
+
+- The elision header states who authored the gaps and that the underlying
+  content is complete: `[llmtrim compressed this tool output: N of M lines
+  shown. The gaps and any [×N] markers are llmtrim's, not the file's — the
+  underlying content is complete and unchanged. Re-run the same tool call for
+  the full text.]` The old wording is still reachable as
+  `[compression] header = "legacy"`.
+
+- `[compression]` gains `trim_user_text`, `window_code`, `header` and
+  `verbatim`. They exist so `scripts/loop-ab.sh` can stand up a control arm on
+  the pre-fix behavior; the defaults are the fixed ones and there is no reason
+  to change them otherwise.
+
+- `scripts/loop-ab.sh -s edit-large` — a scenario that reads a large,
+  deeply-nested file and makes three precise edits to it. The existing
+  scenarios all write a *new* file, so none of them exercises read-then-edit;
+  an A/A on `recon-real` returned `errored_tool_calls`, `repair_invalid` and
+  `scavenged_calls` at zero across all six runs, meaning the metrics that
+  would register a mangled read were already on the floor and no sample size
+  could separate the arms. The three targets sit at sections 7, 34 and 58 so
+  head+tail truncation drops the middle ones.
+
 ## [0.21.9] - 2026-08-07
 
 ### Added

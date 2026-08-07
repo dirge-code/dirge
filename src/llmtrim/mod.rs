@@ -99,6 +99,10 @@ fn stages_for(_provider: ProviderKind, config: &config::DenseConfig) -> Vec<Box<
             min_lines: config.toolout_min_lines,
             template: config.toolout_template,
             mode: stages::toolout::ModeSetting::parse(&config.toolout_mode),
+            user_text: config.toolout_user_text,
+            code: config.toolout_code,
+            header: stages::toolout::HeaderStyle::parse(&config.toolout_header),
+            verbatim: config.toolout_verbatim,
         }));
     }
     // Stage B (input-side, lossy): prune large context to the relevant chunks first.

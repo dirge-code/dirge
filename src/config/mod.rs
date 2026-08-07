@@ -564,6 +564,17 @@ pub struct PluginSettings {
 pub struct Compression {
     pub enabled: Option<bool>,
     pub preset: Option<String>,
+    /// Let tool-output windowing touch the user's own messages. Absent → `false`.
+    /// Exists so `scripts/loop-ab.sh` can run a control arm on the pre-dirge-09e8
+    /// behavior; there is no reason to turn it on otherwise.
+    pub trim_user_text: Option<bool>,
+    /// Let tool-output windowing fold and window code / file excerpts. Absent →
+    /// `false`. Same A/B-control caveat as `trim_user_text`.
+    pub window_code: Option<bool>,
+    /// Elision-header wording: `"explicit"` (default) or `"legacy"`.
+    pub header: Option<String>,
+    /// Honor `read(verbatim=true)`'s compression opt-out. Absent → `true`.
+    pub verbatim: Option<bool>,
 }
 
 /// Prompt-cache policy (dirge-cbgz). `ttl` is `"5m"` or `"1h"` and sets the lifetime of

@@ -50,7 +50,7 @@ set -euo pipefail
 #   -B  treatment arm overrides    (default: none)
 #   -b  dirge binary               (default target/debug/dirge)
 #   -t  max_agent_turns cap        (default 20)
-#   -s  scenario small|recon|recon-real  (default small)
+#   -s  scenario small|recon|recon-real|edit-large  (default small)
 #
 # With -A and -B both empty (or set the same) the two arms are identical —
 # an A/A calibration. RUN ONE BEFORE TRUSTING ANY A/B. On the recon-real
@@ -82,11 +82,11 @@ while getopts "n:m:A:B:b:t:s:" opt; do
     b) BINARY="$OPTARG" ;;
     t) MAXTURNS="$OPTARG" ;;
     s) SCENARIO="$OPTARG" ;;
-    *) echo "usage: $0 [-n REPEATS] [-m MODELS] [-A OVERRIDES] [-B OVERRIDES] [-b BINARY] [-t MAXTURNS] [-s small|recon|recon-real]" >&2; exit 2 ;;
+    *) echo "usage: $0 [-n REPEATS] [-m MODELS] [-A OVERRIDES] [-B OVERRIDES] [-b BINARY] [-t MAXTURNS] [-s small|recon|recon-real|edit-large]" >&2; exit 2 ;;
   esac
 done
 
-case "$SCENARIO" in small|recon|recon-real) ;; *) echo "error: -s must be small, recon, or recon-real" >&2; exit 2 ;; esac
+case "$SCENARIO" in small|recon|recon-real|edit-large) ;; *) echo "error: -s must be small, recon, recon-real, or edit-large" >&2; exit 2 ;; esac
 [ "$REPEATS" -ge 1 ] 2>/dev/null || { echo "error: -n must be a positive integer" >&2; exit 2; }
 command -v jq >/dev/null || { echo "error: jq required" >&2; exit 1; }
 [ -x "$BINARY" ] || { echo "error: dirge binary not found/executable: $BINARY (cargo build first)" >&2; exit 1; }
@@ -262,6 +262,90 @@ MDEOF
     grep -wq capability "$m" || { echo 0; return; }
     echo 1
   }
+elif [ "$SCENARIO" = "edit-large" ]; then
+  # edit-large — precise edits inside a big, deeply-nested file (GH #755).
+  #
+  # The other scenarios all WRITE A NEW FILE, so they never exercise the
+  # failure this measures. An A/A on recon-real returned errored_tool_calls,
+  # repair_invalid and scavenged_calls at zero across all six runs: the
+  # metrics that would register a mangled read were already on the floor,
+  # so that scenario cannot distinguish these arms at any sample size.
+  #
+  # The reported failure needs three things together: a file large enough to
+  # be trimmed, edits precise enough that a trimmed view is not good enough,
+  # and targets far enough apart that head+tail truncation drops at least one
+  # of them. Deeply-nested TSX is what the issue reports and is worst-case for
+  # a line-importance heuristic — every row is indented, so indentation cannot
+  # rank anything, and no row carries an error token.
+  #
+  # The dependent variables are errored_tool_calls and repair_invalid (failed
+  # edits against a view that does not match disk) and turns (re-read loops).
+  mkdir -p "$FIXTURE/src"
+  {
+    echo "import React from 'react';"
+    echo "import { Badge, Header, Spinner } from './widgets';"
+    echo ""
+    echo "export const PANEL_DEFAULT_TONE = 'neutral';"
+    echo ""
+    for i in $(seq 1 60); do
+      echo "export function Section${i}({ items, onSelect }) {"
+      echo "  return ("
+      echo "    <div className=\"section section-${i}\">"
+      echo "      <Header title=\"Section ${i}\" subtitle=\"rows\" />"
+      echo "      <ul className=\"list list-${i}\">"
+      echo "        {items.map((it) => ("
+      echo "          <li key={it.id} className=\"row row-${i}\">"
+      echo "            <Badge tone={it.tone} label={it.label} />"
+      echo "            <span className=\"value\">{it.value}</span>"
+      echo "            <button type=\"button\" onClick={() => onSelect(it.id)}>"
+      echo "              select"
+      echo "            </button>"
+      echo "          </li>"
+      echo "        ))}"
+      echo "      </ul>"
+      echo "    </div>"
+      echo "  );"
+      echo "}"
+      echo ""
+    done
+  } > "$FIXTURE/src/Panel.jsx"
+  PANEL_LINES="$(wc -l < "$FIXTURE/src/Panel.jsx" | tr -d ' ')"
+  cp "$FIXTURE/src/Panel.jsx" "$FIXTURE/src/Panel.jsx.pristine"
+  cat > "$FIXTURE/src/widgets.js" <<'JSEOF'
+export function Badge() {}
+export function Header() {}
+export function Spinner() {}
+JSEOF
+  FIXTURE_DESC="src/Panel.jsx — ${PANEL_LINES} lines of deeply-nested JSX, 60 near-identical sections; the task edits THREE of them"
+  TASK='In src/Panel.jsx, make exactly these three changes and nothing else:
+
+1. In Section7 only, change the ul className from "list list-7" to "list list-7 compact".
+2. In Section34 only, change the button text from "select" to "choose".
+3. In Section58 only, add the prop `dense` to the Badge element (so it reads `<Badge dense tone={it.tone} label={it.label} />`).
+
+Do not change any other section, and do not reformat the file. End your answer with a line: DONE=panel'
+
+  # Correctness is checked on disk: all three edits present, applied to the
+  # right sections only, and the file not otherwise damaged. A run that
+  # mangles the file while landing the edits scores 0 — a mangled file IS
+  # the failure under test.
+  check_correct() {
+    local out="$1" f="$FIXTURE/src/Panel.jsx" now
+    [ -f "$f" ] || { echo 0; return; }
+    grep -q 'list list-7 compact' "$f" || { echo 0; return; }
+    grep -q 'choose' "$f" || { echo 0; return; }
+    grep -q '<Badge dense tone={it.tone} label={it.label} />' "$f" || { echo 0; return; }
+    # Collateral damage: exactly one section may carry each change.
+    [ "$(grep -c 'compact' "$f")" = "1" ] || { echo 0; return; }
+    [ "$(grep -c 'choose' "$f")" = "1" ] || { echo 0; return; }
+    [ "$(grep -c '<Badge dense' "$f")" = "1" ] || { echo 0; return; }
+    # The other 59 sections must be untouched, and nothing may have been
+    # dropped: the line count is unchanged and every section still closes.
+    now="$(wc -l < "$f" | tr -d ' ')"
+    [ "$now" = "$PANEL_LINES" ] || { echo 0; return; }
+    [ "$(grep -c 'export function Section' "$f")" = "60" ] || { echo 0; return; }
+    echo 1
+  }
 fi
 
 # ---- Undo whatever a run wrote, so each repeat starts from the same tree.
@@ -271,6 +355,13 @@ reset_fixture() {
   if [ "$SCENARIO" = "recon" ]; then
     rm -f "$FIXTURE/src/limits.py"
     rm -rf "$FIXTURE/src/__pycache__"
+  elif [ "$SCENARIO" = "edit-large" ]; then
+    # The file under test is EDITED, not created, so it has to be restored
+    # from the pristine copy or every later repeat starts from the previous
+    # run's edits and the collateral-damage checks go green for free.
+    if [ -f "$FIXTURE/src/Panel.jsx.pristine" ]; then
+      cp -f "$FIXTURE/src/Panel.jsx.pristine" "$FIXTURE/src/Panel.jsx"
+    fi
   elif [ "$SCENARIO" = "recon-real" ]; then
     rm -f "$FIXTURE/src/agent/agent_loop/capability.rs"
     if [ -f "$FIXTURE/src/agent/agent_loop/mod.rs.pristine" ]; then

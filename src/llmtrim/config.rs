@@ -156,6 +156,24 @@ pub struct DenseConfig {
     /// Dropped lines are elided by position (`[… N lines omitted …]`); the agent re-runs
     /// the tool if it needs them.
     pub toolout_mode: String,
+    /// Stage T — also compress content that is *not* a tool result: the user's own
+    /// messages. Off; `true` restores the pre-fix behavior for an A/B control arm. A
+    /// paste is not tool output, so the recovery header's "re-run the tool" is a lie,
+    /// and the Drain fold path reaches the model with no marker at all (dirge-09e8).
+    pub toolout_user_text: bool,
+    /// Stage T — also fold and window code and file excerpts. Off; `true` restores the
+    /// pre-fix behavior. The line ranking here is a *log* heuristic (errors 1.0,
+    /// indented 0.5, else 0.3); on source it keeps a near-arbitrary few percent — a
+    /// 1202-line read reached the model as 45 lines — and destroys the line numbers
+    /// `edit_lines` / `line_hash` anchor on (dirge-09e8).
+    pub toolout_code: bool,
+    /// Stage T — elision-header wording: `"explicit"` (states that llmtrim authored the
+    /// gaps and the underlying content is complete) or `"legacy"` (the pre-fix text,
+    /// kept for the A/B control arm).
+    pub toolout_header: String,
+    /// Stage T — honor the `[dirge: verbatim …]` first-line opt-out a tool can stamp on
+    /// its result when the model explicitly asked for uncompressed output.
+    pub toolout_verbatim: bool,
     /// Stage C — skeletonize fenced code blocks (drop function bodies to stubs).
     /// Lossy; off by default.
     pub skeletonize: bool,
@@ -267,6 +285,10 @@ impl DenseConfig {
             toolout_min_lines: 20,
             toolout_template: true,
             toolout_mode: "auto".to_string(),
+            toolout_user_text: false,
+            toolout_code: false,
+            toolout_header: "explicit".to_string(),
+            toolout_verbatim: true,
             skeletonize: false,
             skeleton_keep_full_top_k: 5,
             skeleton_drop_unmatched: false,

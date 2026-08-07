@@ -52,6 +52,11 @@ pub const DEFAULT_MAX_RESULT_CHARS: usize = 40_000;
 /// so on every real resume (rig_history_to_loop_messages ->
 /// heal_loaded_messages) the shrink silently no-oped and the reported
 /// counts under-counted. It also measured bytes against a char budget.
+///
+/// GH #755: `max_chars` is a floor, not a hard ceiling. A `read` excerpt is
+/// held to `FILE_EXCERPT_RESULT_CAP_TOKENS` instead, so at the default 40 KB
+/// budget an excerpt keeps up to 48 KB across a resume. Deliberate — the file
+/// the agent is mid-edit on is the last thing to shrink.
 pub fn shrink_oversized_tool_results(messages: &[Value], max_chars: usize) -> HealResult {
     use crate::agent::compression;
     // The capper takes a token budget and multiplies it back out by
