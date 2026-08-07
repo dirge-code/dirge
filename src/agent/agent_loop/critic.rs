@@ -252,10 +252,11 @@ the latest request and the transcript.\n\
 decision, that is a CORRECT stopping point, not incompleteness — never tell it to proceed anyway, \
 pick a default, or guess. Judge only the work done up to the question.\n\
 - The `--- evidence ... ---` block in the prompt is a factual record of this run. Check the \
-assistant's claims against it: a claim that names a file it changed, a command it ran, or a result \
-it produced, where the evidence shows no such thing, is an UNSUPPORTED claim — flag it with the \
-concrete mismatch. Never invent a mismatch the evidence does not show, and never flag a claim the \
-evidence supports.\n\
+assistant's claims against it: a claim that names a file it changed, a command it ran, a result \
+it produced, or a source it consulted (a fetched page, docs, an external service), where the \
+evidence shows no such thing — e.g. claiming to have checked a web page while no fetch/search \
+tool appears in `tools invoked` — is an UNSUPPORTED claim — flag it with the concrete mismatch. \
+Never invent a mismatch the evidence does not show, and never flag a claim the evidence supports.\n\
 - Do NOT invent new requirements, scope, or \"nice to haves\". If you cannot determine correctness from \
 the spec and evidence available, ABSTAIN — say what's missing (e.g. no test covering this change, \
 unclear acceptance criteria). An abstention is safer than a false pass. If you are unsure whether \
@@ -349,6 +350,12 @@ pub struct Evidence {
     pub observed_commands: Vec<(String, bool)>,
     /// Tool-result messages in this finalization's message list.
     pub tool_calls: usize,
+    /// Distinct tool names invoked this run. Kept raw here; the renderer
+    /// sorts and dedups so the prompt block is compact and stable across
+    /// runs (dirge-lavc GAP 4). This makes a sourcing claim checkable the
+    /// same way a file claim is: "checked the X page" with no fetch/search
+    /// tool in the list is UNSUPPORTED.
+    pub tool_names: Vec<String>,
 }
 
 /// Render the evidence block for the critic prompt (dirge-d0e5.3). Empty
@@ -373,12 +380,24 @@ fn evidence_block(evidence: Option<&Evidence>) -> String {
             .collect::<Vec<_>>()
             .join("; ")
     };
+    // dirge-lavc GAP 4: sort + dedup here so the rendered set is compact
+    // and stable across runs, whatever the construction site passes.
+    let mut tool_names = e.tool_names.clone();
+    tool_names.sort();
+    tool_names.dedup();
+    let tools = if tool_names.is_empty() {
+        "(none)".to_string()
+    } else {
+        tool_names.join(", ")
+    };
     format!(
         "\n\n--- evidence of what happened this run (check the assistant's claims against this; \
-         a claim naming a file, a command, or an outcome that is absent here is UNSUPPORTED) ---\n\
+         a claim naming a file, a command, a consulted source, or an outcome that is absent here \
+         is UNSUPPORTED) ---\n\
          files mutated: {files}\n\
          verification commands observed: {commands}\n\
-         tool calls: {}\n--- end evidence ---",
+         tool calls: {}\n\
+         tools invoked: {tools}\n--- end evidence ---",
         e.tool_calls
     )
 }
@@ -740,6 +759,12 @@ mod tests {
                 ("cargo clippy".to_string(), true),
             ],
             tool_calls: 9,
+            tool_names: vec![
+                "edit".to_string(),
+                "bash".to_string(),
+                "edit".to_string(), // duplicates must collapse
+                "webfetch".to_string(),
+            ],
         };
         let p = build_unified_prompt("", "t", None, None, None, Some(&evidence));
         assert!(
@@ -755,6 +780,10 @@ mod tests {
             "tool-call count must be present"
         );
         assert!(
+            p.contains("tools invoked: bash, edit, webfetch"),
+            "tool names must render sorted and deduped — duplicates collapse"
+        );
+        assert!(
             p.contains("UNSUPPORTED"),
             "the block must say what an absent fact means"
         );
@@ -765,6 +794,10 @@ mod tests {
         assert!(
             empty.contains("(none)"),
             "empty evidence must be marked, not elided"
+        );
+        assert!(
+            empty.contains("tools invoked: (none)"),
+            "absent tools must render as (none) — absence is informative for sourcing claims"
         );
     }
 
@@ -781,6 +814,10 @@ mod tests {
         assert!(
             lower.contains("unsupported") || lower.contains("does not show"),
             "preamble must tell the critic to flag unsupported claims"
+        );
+        assert!(
+            lower.contains("source") && lower.contains("fetch/search"),
+            "preamble must make consulting a source without a fetch/search tool unsupported"
         );
     }
 
