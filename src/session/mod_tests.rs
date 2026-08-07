@@ -878,6 +878,64 @@ fn convert_history_emits_tool_use_and_tool_result_blocks() {
     }
 }
 
+/// dirge-byun. A turn that produced only reasoning persists as an
+/// Assistant message with empty content and no tool calls. Replaying it
+/// as `Message::assistant("")` puts an empty text content block on the
+/// wire, which Moonshot/Kimi and GLM reject with
+/// `400 invalid_request_error: text content is empty` (Anthropic 400s
+/// too). Since the TUI rebuilds history from the session on every
+/// submit, that one message wedges the session permanently. Skip it —
+/// an empty turn carries nothing the model needs.
+#[test]
+fn convert_history_skips_empty_assistant_message() {
+    let mut s = Session::new("p", "m", 0);
+    s.add_message(MessageRole::User, "proceed with implementation");
+    s.add_message(MessageRole::Assistant, "");
+    s.add_message(MessageRole::User, "huh?");
+
+    let history = crate::agent::runner::convert_history(&s);
+    assert_eq!(history.len(), 2, "history shape: {history:#?}");
+    for m in &history {
+        assert!(
+            !matches!(m, rig::completion::Message::Assistant { .. }),
+            "the empty assistant turn must not be replayed: {m:?}",
+        );
+    }
+}
+
+/// The same guard must not swallow a turn that had no prose but did call
+/// a tool — dropping it would orphan the tool_result that follows.
+#[test]
+fn convert_history_keeps_empty_assistant_message_with_tool_calls() {
+    let mut s = Session::new("p", "m", 0);
+    s.add_message_with_tool_calls(
+        MessageRole::Assistant,
+        "",
+        vec![ToolCallEntry {
+            id: "tc_7".to_string(),
+            name: "bash".to_string(),
+            args: serde_json::json!({"cmd": "ls"}),
+            state: ToolCallState::Completed {
+                result: "a".to_string(),
+            },
+        }],
+    );
+
+    let history = crate::agent::runner::convert_history(&s);
+    assert_eq!(history.len(), 2, "history shape: {history:#?}");
+    match &history[0] {
+        rig::completion::Message::Assistant { content, .. } => {
+            let parts: Vec<_> = content.iter().collect();
+            assert_eq!(parts.len(), 1, "no empty text part alongside the call");
+            assert!(matches!(
+                parts[0],
+                rig::completion::message::AssistantContent::ToolCall(_)
+            ));
+        }
+        other => panic!("expected Assistant message; got {other:?}"),
+    }
+}
+
 /// Interrupted tool calls must be emitted as tool_result with
 /// an "[interrupted]" marker, NOT skipped. Anthropic + OpenAI
 /// reject orphan tool_use blocks; opencode handles this

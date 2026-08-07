@@ -134,8 +134,15 @@ async fn finish_turn(
     let mut map = sessions.lock().await;
     if let Some(s) = map.get_mut(id) {
         s.session.add_message(MessageRole::User, prompt);
-        s.session
-            .add_message_with_tool_calls(MessageRole::Assistant, response, tool_calls);
+        // dirge-byun: a turn with neither text nor tool calls is not stored —
+        // it would replay as an empty text content block on every later
+        // prompt, which Moonshot/Kimi and GLM reject with
+        // `400 invalid_request_error: text content is empty`. Same guard as
+        // the interactive and headless paths.
+        if !response.is_empty() || !tool_calls.is_empty() {
+            s.session
+                .add_message_with_tool_calls(MessageRole::Assistant, response, tool_calls);
+        }
         if s.run.as_ref().is_some_and(|r| r.generation == generation) {
             s.run = None;
         }
