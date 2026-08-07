@@ -362,7 +362,9 @@ thereafter.)
 ## Supported providers
 
 OpenRouter (default), OpenAI, Anthropic, Gemini, DeepSeek, GLM (ZhipuAI),
-Cerebras, OpenCode, Ollama, and any custom OpenAI-compatible endpoint.
+Cerebras, OpenCode, Ollama, and any custom OpenAI-compatible endpoint —
+including GitHub Copilot, which needs no dedicated provider type (see
+[docs/config.md](docs/config.md#github-copilot) for the recipe).
 
 Providers are declared once in `$XDG_CONFIG_HOME/dirge/config.json` and
 referenced by alias from role-assignment keys (`provider`, `review_provider`,

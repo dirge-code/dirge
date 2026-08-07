@@ -78,6 +78,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the pre-fix behavior; the defaults are the fixed ones and there is no reason
   to change them otherwise.
 
+- Documented GitHub Copilot as a backend (GH #698). It needs no dedicated
+  provider type — the endpoint is OpenAI-compatible, so `provider_type`
+  `openai` / `openai-responses` with `base_url: https://api.githubcopilot.com`
+  and a `gh auth token` reaches it. Recipe contributed by @dubchord, verified
+  against Copilot Enterprise.
+
 - `scripts/loop-ab.sh -s edit-large` — a scenario that reads a large,
   deeply-nested file and makes three precise edits to it. The existing
   scenarios all write a *new* file, so none of them exercises read-then-edit;

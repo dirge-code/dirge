@@ -322,6 +322,55 @@ is sent as a bearer token; unlike `auth: chatgpt` this uses no OAuth/Codex
 login, so it works against any plain `/v1/responses` server. (`allow_insecure`
 is honored here since no OAuth bearer is involved.)
 
+### GitHub Copilot
+
+Copilot has no built-in `provider_type`; it does not need one. Its endpoint is
+OpenAI-compatible, so it is reached with the generic `openai` /
+`openai-responses` types and a `base_url` of `https://api.githubcopilot.com`.
+
+Get a token from the GitHub CLI:
+
+```bash
+gh auth login
+export GH_API_KEY="$(gh auth token)"
+```
+
+Then point one or more provider entries at Copilot. Different Copilot models
+sit behind different APIs, so the `provider_type` is per model — the Responses
+API for the ones that require it, Chat Completions for the rest:
+
+```json
+{
+  "provider": "grok45",
+  "critic_provider": "luna56",
+  "summarization_provider": "luna56",
+  "approval_provider": "luna56",
+  "providers": {
+    "grok45": {
+      "provider_type": "openai-responses",
+      "base_url": "https://api.githubcopilot.com",
+      "api_key": "${GH_API_KEY}",
+      "model": "grok-4.5",
+      "multimodal": true
+    },
+    "luna56": {
+      "provider_type": "openai",
+      "base_url": "https://api.githubcopilot.com",
+      "api_key": "${GH_API_KEY}",
+      "model": "gpt-5.6-luna",
+      "multimodal": true
+    }
+  }
+}
+```
+
+`api_key` is expanded at use time, so the token stays in the environment rather
+than in the config file. Which models you can select depends on your Copilot
+plan, and `gh auth token` returns a token tied to your `gh` login — re-export
+it after re-authenticating.
+
+Recipe contributed by @dubchord, verified against Copilot Enterprise (GH #698).
+
 ### Cerebras
 
 Cerebras needs no `providers` entry. Export its API key and select the built-in:
