@@ -4,7 +4,7 @@ All notable changes to dirge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.21.10] - 2026-08-07
 
 ### Fixed
 - Prompt compression no longer windows source files or the user's own messages.
@@ -53,9 +53,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   JSX component (32.8 KB) the model kept the first of three edit targets and
   lost the other two. Because the capping is deterministic, re-reading returns
   the same cut view — hence the re-read loop, and the model eventually
-  shelling out to `bash`/python to read the file. File excerpts now get
-  `FILE_EXCERPT_RESULT_CAP_TOKENS` (12000); the aggressive tier still overrides
-  it, since a roomier allowance is worth nothing if the request stops fitting.
+  shelling out to `bash`/python to read the file. File excerpts now get their
+  own cap (`file_excerpt_cap_tokens`, default 12000); the aggressive tier still
+  overrides it, since a roomier allowance is worth nothing if the request stops
+  fitting.
 
   The truncation marker told the model to "call the tool with a narrower scope
   (filter, head, pagination)" — which for a `read` is what it already did. For

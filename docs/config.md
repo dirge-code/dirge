@@ -242,7 +242,7 @@ them on:
 |-----|---------|-----------------|
 | `trim_user_text` | `false` | Let windowing touch your own messages too. |
 | `window_code` | `false` | Let windowing fold and window code and file excerpts. |
-| `header` | `"explicit"` | `"legacy"` restores the pre-0.22 elision-header wording. |
+| `header` | `"explicit"` | `"legacy"` restores the pre-0.21.10 elision-header wording. |
 | `verbatim` | `true` | `false` ignores `read(verbatim=true)`'s compression opt-out. |
 
 If you need a guarantee that what you are looking at is byte-for-byte what is
