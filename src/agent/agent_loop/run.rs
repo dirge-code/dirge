@@ -258,6 +258,18 @@ const MAX_OPEN_ISSUES_NUDGES: u8 = 2;
 /// no active todo — a gap the normal unfinished-todo nudge can't cover.
 const MAX_TRACK_NUDGES: u8 = 1;
 
+/// Judge calls the one-shot critic may ATTEMPT per run (dirge-2m68).
+///
+/// The one shot is spent by a verdict, not by an attempt: a judge that timed
+/// out or errored fails open, and letting that consume the shot deleted the
+/// completeness backstop for the rest of the run exactly when the provider was
+/// unhealthy. So a failed attempt is retried at the next finalization — and
+/// this is the ceiling that keeps a persistently broken judge from being
+/// retried at every one. Three, matching `MAX_REVIEW_REACT`: a judge that has
+/// failed three times in one run is not going to answer on the fourth, and
+/// each attempt is a real LLM call.
+const MAX_CRITIC_JUDGE_ATTEMPTS: u32 = 3;
+
 /// One-shot: fire at most once per run when code edits pile up with no
 /// verification since (dirge-uw2l.2). Bounded to a single message so the
 /// mid-run reminder can never become nagging.
@@ -304,6 +316,11 @@ enum FollowUpSource {
     /// added comment in the run's diff asserted consulting an external
     /// source while no fetch/search tool ran. No LLM call. Off by default.
     SourceGate,
+    /// Deterministic completeness gate (dirge-2m68): the final answer stated
+    /// first-person work the model still intended to do, while the run was
+    /// finalizing and nothing else had anything to say. No LLM call. The
+    /// last-resort backstop, so it sits below every other gate.
+    CompletenessGate,
     /// Unified finalization judge (dirge-8v98): completeness verdict + diff
     /// findings in one call. One-shot (Off/Advisory) or persistent up to
     /// [`super::code_review::MAX_REVIEW_REACT`] (Blocking).
@@ -329,6 +346,7 @@ impl From<FollowUpSource> for GateSource {
             FollowUpSource::Verifier => GateSource::Verifier,
             FollowUpSource::ClaimGate => GateSource::ClaimGate,
             FollowUpSource::SourceGate => GateSource::SourceGate,
+            FollowUpSource::CompletenessGate => GateSource::CompletenessGate,
             FollowUpSource::Critic => GateSource::Critic,
             FollowUpSource::Goal => GateSource::Goal,
             FollowUpSource::Todo => GateSource::Todo,
@@ -626,6 +644,7 @@ async fn poll_finalization_follow_up(
     // only — no gate logic moved.
     let GateStates {
         critic_done,
+        critic_attempts,
         code_review_reacts,
         last_reviewed_fingerprint,
         last_review_findings,
@@ -636,6 +655,7 @@ async fn poll_finalization_follow_up(
         track_nudges,
         claim_nudges,
         source_nudges,
+        completeness_nudges,
         run_epoch,
     } = gates;
     let GateInputs {
@@ -871,7 +891,9 @@ async fn poll_finalization_follow_up(
         let mode = config.code_review_mode;
         let one_shot = mode != CodeReviewMode::Blocking;
         let may_fire = if one_shot {
-            !*critic_done
+            // dirge-2m68: `critic_done` marks a verdict actually received;
+            // `critic_attempts` bounds the retries a broken judge can cost.
+            !*critic_done && *critic_attempts < MAX_CRITIC_JUDGE_ATTEMPTS
         } else {
             *code_review_reacts < super::code_review::MAX_REVIEW_REACT
         };
@@ -1006,10 +1028,26 @@ async fn poll_finalization_follow_up(
                     }
                     *last_review_findings = outcome.raised_findings;
                 }
-                // One-shot modes fire at most once (flip regardless of verdict);
-                // blocking spends its budget only when it actually re-enters.
+                // One-shot modes fire at most once; blocking spends its budget
+                // only when it actually re-enters.
+                //
+                // dirge-2m68: the shot is spent by a VERDICT, not by an attempt.
+                // This used to flip `critic_done` unconditionally, so a judge
+                // that timed out or errored — which fails open with no messages
+                // and no findings — consumed the single completeness check for
+                // the whole run. The backstop disappeared precisely when the
+                // provider was unhealthy, and nothing said so. `outcome.judged`
+                // already drew this distinction for the Blocking fingerprint
+                // (dirge-q7vw); it just was not read here.
+                //
+                // The attempt is always counted, so a judge that keeps failing
+                // is retried at most `MAX_CRITIC_JUDGE_ATTEMPTS` times per run
+                // rather than at every finalization.
                 if one_shot {
-                    *critic_done = true;
+                    *critic_attempts += 1;
+                    if outcome.judged {
+                        *critic_done = true;
+                    }
                 } else if !msgs.is_empty() {
                     *code_review_reacts += 1;
                 }
@@ -1192,6 +1230,54 @@ async fn poll_finalization_follow_up(
             ))],
             FollowUpSource::Todo,
         );
+    }
+    // 7. dirge-2m68 — deterministic completeness gate, LAST on purpose.
+    //
+    //    Every gate above is a narrow mechanical detector: unrun edits, a
+    //    failed last call, a claim the evidence contradicts, todos the model
+    //    tracked. The one gate that asks "is this task actually done?" is the
+    //    LLM critic, which is inert without `critic_provider`. So a run that
+    //    edited real files, ran a real check, claimed nothing false and
+    //    tracked no todos could stop halfway and hit nothing at all.
+    //
+    //    This fires only when the model's OWN final answer states first-person
+    //    work it still intended to do. It sits below everything else because
+    //    it is the least specific: any gate above has a more actionable thing
+    //    to say, and this is the backstop for when none of them did.
+    //
+    //    The `unfinished_count() == 0` condition is not redundant with the
+    //    todo gate above — it is what keeps the two from both firing on the
+    //    same run. With tracked todos outstanding, "finish your todos" is the
+    //    better message and the todo gate owns it.
+    if let Some(LoopMessage::Assistant(last)) = new_messages.last() {
+        let answer: String = last
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if super::completeness_gate::should_nudge_incomplete(
+            config.completeness_gate_mode,
+            *completeness_nudges,
+            crate::agent::tools::todo::unfinished_count(),
+            turn_made_file_edits(new_messages),
+            &answer,
+        ) {
+            *completeness_nudges += 1;
+            return (
+                vec![LoopMessage::User(super::message::UserMessage::text(
+                    format!(
+                        "{} {}",
+                        super::completeness_gate::COMPLETENESS_GATE_TAG,
+                        super::completeness_gate::nudge_text()
+                    ),
+                ))],
+                FollowUpSource::CompletenessGate,
+            );
+        }
     }
     (Vec::new(), FollowUpSource::None)
 }

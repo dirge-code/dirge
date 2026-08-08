@@ -231,7 +231,7 @@ fn segment_kind(segment: &str) -> Option<CommandKind> {
     }
 }
 
-fn strip_quoted(text: &str) -> String {
+pub(crate) fn strip_quoted(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {
@@ -249,14 +249,14 @@ fn strip_quoted(text: &str) -> String {
     out
 }
 
-fn split_sentences(text: &str) -> Vec<&str> {
+pub(crate) fn split_sentences(text: &str) -> Vec<&str> {
     text.split(['.', '\n', ';'])
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .collect()
 }
 
-fn sentence_attributes_to_another_actor(sentence: &str) -> bool {
+pub(crate) fn sentence_attributes_to_another_actor(sentence: &str) -> bool {
     let lower = sentence.to_ascii_lowercase();
     const MARKERS: [&str; 9] = [
         "ci reported",

@@ -1026,6 +1026,14 @@ pub struct Config {
     /// [`resolve_claim_gate_mode`](Self::resolve_claim_gate_mode) for why
     /// the default flipped.
     pub claim_gate: Option<String>,
+    /// dirge-2m68: deterministic completeness gate. `off` / `advisory`
+    /// *(default)* / `blocking`, case-insensitive and trimmed. Fires ONE
+    /// model-visible nudge per run when the final answer states
+    /// first-person work the model still intended to do while the run is
+    /// finalizing. Costs no LLM call. `off` is byte-identical to the loop
+    /// without the gate. See
+    /// [`resolve_completeness_gate_mode`](Self::resolve_completeness_gate_mode).
+    pub completeness_gate: Option<String>,
     /// dirge-lavc GAP 1: artifact-scope sourcing gate. `off` *(default)* —
     /// deliberately opt-in until it has real-world mileage. When armed
     /// (`advisory`/`blocking`), scans ADDED comment lines in the run's diff
@@ -1489,6 +1497,45 @@ impl Config {
                 target: "dirge::config",
                 value = trimmed,
                 "unrecognized `claim_gate` value; falling back to `off` \
+                 (valid: off | advisory | blocking)"
+            );
+            GateMode::Off
+        })
+    }
+
+    /// Resolve the deterministic completeness gate mode from
+    /// [`completeness_gate`](Self::completeness_gate): `off`/`advisory`/
+    /// `blocking`, parsed case-insensitively and trimmed. `None` and an empty
+    /// value both mean `advisory`; an unrecognized value warns and falls back
+    /// to `off`.
+    ///
+    /// # Why the absent default is `advisory`
+    ///
+    /// Without a `critic_provider` there is no completeness judge at all, and
+    /// every other always-on gate is a narrow mechanical detector: the
+    /// verifier wants unrun edits, the resume gate a failed last call, the
+    /// claim gate a claim the evidence contradicts, the todo gate todos the
+    /// model tracked. A run that edits real files, runs a real check, claims
+    /// nothing false and stops halfway hits none of them — the most ordinary
+    /// way for an autonomous run to end badly (dirge-2m68).
+    ///
+    /// The cost of arming it is one message on a run that would otherwise
+    /// have finished silently; the gate is deterministic, so it cannot invent
+    /// an accusation, and the ceiling is one nudge. `blocking` stays opt-in.
+    pub fn resolve_completeness_gate_mode(&self) -> crate::agent::agent_loop::types::GateMode {
+        use crate::agent::agent_loop::types::GateMode;
+        let Some(raw) = self.completeness_gate.as_deref() else {
+            return GateMode::Advisory;
+        };
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return GateMode::Advisory;
+        }
+        GateMode::from_wire(trimmed).unwrap_or_else(|| {
+            tracing::warn!(
+                target: "dirge::config",
+                value = trimmed,
+                "unrecognized `completeness_gate` value; falling back to `off` \
                  (valid: off | advisory | blocking)"
             );
             GateMode::Off
@@ -2361,6 +2408,35 @@ mod tests {
         use crate::agent::agent_loop::types::GateMode;
         let cfg: Config = serde_json::from_str(r#"{ "verification_tiers": "nuclear" }"#).unwrap();
         assert_eq!(cfg.resolve_verification_tiers_mode(), GateMode::Off);
+    }
+
+    /// dirge-2m68. The default is the load-bearing assertion: without a
+    /// `critic_provider` this is the only gate that asks whether the task is
+    /// finished, so an absent key must arm it, and `off` must still be
+    /// reachable for anyone who wants the pre-gate loop back byte-for-byte.
+    #[test]
+    fn resolve_completeness_gate_mode_each_string_and_default() {
+        use crate::agent::agent_loop::types::GateMode;
+
+        let mk = |raw: &str| {
+            Config::deserialize(serde_json::json!({ "completeness_gate": raw }))
+                .unwrap()
+                .resolve_completeness_gate_mode()
+        };
+        assert_eq!(mk("off"), GateMode::Off);
+        assert_eq!(mk("OFF"), GateMode::Off);
+        assert_eq!(mk("  Advisory  "), GateMode::Advisory);
+        assert_eq!(mk("blocking"), GateMode::Blocking);
+
+        // Absent / empty -> advisory.
+        let cfg: Config = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(cfg.resolve_completeness_gate_mode(), GateMode::Advisory);
+        let cfg: Config = serde_json::from_str(r#"{ "completeness_gate": "   " }"#).unwrap();
+        assert_eq!(cfg.resolve_completeness_gate_mode(), GateMode::Advisory);
+
+        // A typo must never arm something stronger than asked for.
+        let cfg: Config = serde_json::from_str(r#"{ "completeness_gate": "nag" }"#).unwrap();
+        assert_eq!(cfg.resolve_completeness_gate_mode(), GateMode::Off);
     }
 
     #[test]

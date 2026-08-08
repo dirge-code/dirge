@@ -605,6 +605,13 @@ pub struct LoopConfig {
     /// room for a future hard mode. Set from `Config::resolve_claim_gate_mode`.
     pub claim_gate_mode: GateMode,
 
+    /// dirge-2m68: deterministic completeness gate mode. `Advisory`
+    /// (default) fires one model-visible nudge per run when the final
+    /// answer states first-person work the model still intended to do;
+    /// `Blocking` re-enters up to three times; `Off` is byte-identical to
+    /// the pre-gate loop. Set from `Config::resolve_completeness_gate_mode`.
+    pub completeness_gate_mode: GateMode,
+
     /// dirge-lavc GAP 1: artifact-scope sourcing gate's engagement mode
     /// (`off`/`advisory`/`blocking`). `off` *(default)* is byte-identical to
     /// the loop without the gate. The gate scans ADDED comment lines in the
@@ -858,6 +865,7 @@ impl Clone for LoopConfig {
             safe_state_abort_mode: self.safe_state_abort_mode,
             publish_guard_mode: self.publish_guard_mode,
             claim_gate_mode: self.claim_gate_mode,
+            completeness_gate_mode: self.completeness_gate_mode,
             source_gate_mode: self.source_gate_mode,
             progress: self.progress.clone(),
             session_id: self.session_id.clone(),
@@ -923,6 +931,7 @@ impl LoopConfig {
             safe_state_abort_mode: SafeStateMode::Off,
             publish_guard_mode: GateMode::Off,
             claim_gate_mode: GateMode::Off,
+            completeness_gate_mode: GateMode::Off,
             source_gate_mode: GateMode::Off,
             progress: None,
             session_id: None,

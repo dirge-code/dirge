@@ -482,6 +482,11 @@ pub struct LoopSpawnConfig {
     /// Forwarded to `LoopConfig.claim_gate_mode`. Default `Off`
     /// (dirge-d0e5.2; the gate is opt-in and off is byte-identical).
     pub claim_gate_mode: crate::agent::agent_loop::types::GateMode,
+
+    /// Forwarded to `LoopConfig.completeness_gate_mode`. Default `Off`
+    /// here (this struct's own default is the inert loop); production
+    /// resolves it from config, where the default is `advisory`.
+    pub completeness_gate_mode: crate::agent::agent_loop::types::GateMode,
     /// Forwarded to `LoopConfig.source_gate_mode`. Default `Off`
     /// (dirge-lavc GAP 1; opt-in, off is byte-identical).
     pub source_gate_mode: crate::agent::agent_loop::types::GateMode,
@@ -559,6 +564,7 @@ impl LoopSpawnConfig {
             safe_state_abort_mode: crate::agent::agent_loop::types::SafeStateMode::Off,
             publish_guard_mode: crate::agent::agent_loop::types::GateMode::Off,
             claim_gate_mode: crate::agent::agent_loop::types::GateMode::Off,
+            completeness_gate_mode: crate::agent::agent_loop::types::GateMode::Off,
             source_gate_mode: crate::agent::agent_loop::types::GateMode::Off,
             session_id: None,
             goal_fn: None,
@@ -650,6 +656,7 @@ pub fn spawn_loop_runner(cfg: LoopSpawnConfig) -> LoopRunner {
         safe_state_abort_mode: cfg.safe_state_abort_mode,
         publish_guard_mode: cfg.publish_guard_mode,
         claim_gate_mode: cfg.claim_gate_mode,
+        completeness_gate_mode: cfg.completeness_gate_mode,
         source_gate_mode: cfg.source_gate_mode,
         session_id: cfg.session_id.clone(),
         goal_fn: cfg.goal_fn.clone(),
