@@ -1292,6 +1292,98 @@ int main(void) {
         assert!(!errors.is_empty());
     }
 
+    /// A model blocked by this gate reported that "the project's tree-sitter
+    /// parser does not understand doctest macro syntax and flags the whole
+    /// file as invalid", and moved on to planning a way around the guard.
+    /// That claim is checkable, and this is the check: each case below is
+    /// valid Rust of the shape named, and each must pass.
+    ///
+    /// Kept as a regression test rather than a one-off. If the gate ever does
+    /// start rejecting one of these it is a real bug and this names it; until
+    /// then, "the guard cannot parse doctests" is a refuted explanation and
+    /// the reject is about the edit.
+    #[cfg(feature = "semantic-rust")]
+    #[test]
+    fn rust_doctest_and_macro_shapes_pass_the_guard() {
+        let path = PathBuf::from("/tmp/doctest.rs");
+        let cases: &[(&str, &str)] = &[
+            (
+                "doctest with hidden lines and asserts",
+                "/// Adds.\n\
+                 ///\n\
+                 /// ```\n\
+                 /// # use mycrate::add;\n\
+                 /// assert_eq!(add(1, 2), 3);\n\
+                 /// ```\n\
+                 pub fn add(a: i32, b: i32) -> i32 { a + b }\n",
+            ),
+            (
+                "doctest fence containing unbalanced delimiters in prose",
+                "/// ```text\n\
+                 /// a stray { and a stray ( live here\n\
+                 /// ```\n\
+                 pub fn f() {}\n",
+            ),
+            (
+                "doctest fence containing a macro invocation",
+                "/// ```\n\
+                 /// my_macro!(a, b);\n\
+                 /// ```\n\
+                 pub fn g() {}\n",
+            ),
+            (
+                "macro_rules! with repetition",
+                "macro_rules! cases {\n\
+                 \x20   ($($name:ident => $v:expr),* $(,)?) => {\n\
+                 \x20       $(pub const $name: i32 = $v;)*\n\
+                 \x20   };\n\
+                 }\n\
+                 cases! { A => 1, B => 2, }\n",
+            ),
+            (
+                "macro that generates doc comments",
+                "macro_rules! doc_comment {\n\
+                 \x20   ($x:expr, $($tt:tt)*) => { #[doc = $x] $($tt)* };\n\
+                 }\n\
+                 doc_comment! { \"generated\", pub fn h() {} }\n",
+            ),
+            (
+                "#[doc = include_str!(..)] attribute",
+                "#[doc = include_str!(\"../README.md\")]\npub struct S;\n",
+            ),
+            (
+                "raw string containing unbalanced delimiters",
+                "pub const S: &str = r#\"unbalanced { ( [ in a raw string\"#;\n",
+            ),
+        ];
+        let failures: Vec<&str> = cases
+            .iter()
+            .filter(|(_, src)| check_syntax(&path, src).is_err())
+            .map(|(name, _)| *name)
+            .collect();
+        assert!(
+            failures.is_empty(),
+            "the guard rejected valid Rust in these shapes: {failures:?}"
+        );
+    }
+
+    /// The other side of the test above. Without this, that one would still
+    /// pass if `check_syntax` had quietly stopped checking Rust at all — the
+    /// vacuous-guard failure mode docs/verification-discipline.md warns about.
+    #[cfg(feature = "semantic-rust")]
+    #[test]
+    fn the_doctest_guard_check_can_still_fail() {
+        let path = PathBuf::from("/tmp/doctest.rs");
+        // Same doc-comment prologue as the cases above, with a genuinely
+        // broken body: an unterminated string, which the delimiter repair
+        // cannot close.
+        let src = "/// ```\n/// assert!(true);\n/// ```\npub fn f() { let s = \"oops; }\n";
+        assert!(
+            check_syntax(&path, src).is_err(),
+            "a broken body under a doctest must still be rejected"
+        );
+    }
+
     #[test]
     fn unknown_extension_skips_silently() {
         let path = PathBuf::from("/tmp/foo.thisisntreal");
