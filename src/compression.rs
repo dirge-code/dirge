@@ -16,6 +16,21 @@ pub fn init_from_config(cfg: crate::config::Compression) {
     let _ = COMPRESSION_CFG.set(cfg);
 }
 
+/// Was `--no-compression` passed on the command line? Set once at startup
+/// from the parsed CLI, before any provider client is built.
+static CLI_DISABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Record the `--no-compression` CLI flag. Call at startup alongside
+/// [`init_from_config`].
+pub fn set_cli_disabled(disabled: bool) {
+    CLI_DISABLED.store(disabled, std::sync::atomic::Ordering::Release);
+}
+
+/// Was compression disabled by the `--no-compression` CLI flag?
+pub fn cli_disabled() -> bool {
+    CLI_DISABLED.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// Was compression enabled in the config file? Defaults to `true` if
 /// `init_from_config` was never called (feature compiled in but config
 /// not yet loaded — fail-safe: assume on).
@@ -24,6 +39,31 @@ pub fn configured_enabled() -> bool {
         .get()
         .and_then(|c| c.enabled)
         .unwrap_or(true)
+}
+
+/// Resolve whether the compression interceptor runs, from the three sources
+/// that can speak to it. Pure so the precedence is unit-testable without the
+/// process-global state the production callers read from.
+///
+/// Precedence is most-local-wins: `--no-compression` (this invocation, typed
+/// deliberately) beats `DIRGE_COMPRESSION` (this shell, possibly a stale
+/// export) beats `[compression].enabled` (this project, set once). Absent
+/// everywhere → on; compression is opt-out.
+///
+/// Only the listed disable spellings turn it off. An unrecognized
+/// `DIRGE_COMPRESSION` value leaves the engine on rather than silently
+/// disabling it over a typo.
+pub fn resolve_enabled(cli_disabled: bool, env: Option<&str>, configured: Option<bool>) -> bool {
+    if cli_disabled {
+        return false;
+    }
+    match env {
+        Some(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "off" | "false" | "no" | "disabled"
+        ),
+        None => configured.unwrap_or(true),
+    }
 }
 
 /// Which preset did the config file choose? Defaults to `"dirge"`.
@@ -210,6 +250,53 @@ mod tests {
             "dirge",
             "default preset should be 'dirge'"
         );
+    }
+
+    /// dirge-lyqb: the three-source precedence, as a pure function so it is
+    /// testable without touching the process-global OnceLock.
+    #[test]
+    fn resolve_enabled_precedence_cli_then_env_then_config() {
+        // Nothing set anywhere → on. Compression is opt-out, not opt-in.
+        assert!(resolve_enabled(false, None, None), "default is on");
+
+        // Config alone decides when neither CLI nor env speak.
+        assert!(!resolve_enabled(false, None, Some(false)), "config off");
+        assert!(resolve_enabled(false, None, Some(true)), "config on");
+
+        // Env beats config in both directions.
+        assert!(
+            !resolve_enabled(false, Some("0"), Some(true)),
+            "env disables over an enabling config"
+        );
+        assert!(
+            resolve_enabled(false, Some("1"), Some(false)),
+            "env enables over a disabling config"
+        );
+
+        // --no-compression is the user's explicit, most-local intent: it wins
+        // over a stale shell export that says otherwise.
+        assert!(
+            !resolve_enabled(true, Some("1"), Some(true)),
+            "CLI flag beats env and config"
+        );
+    }
+
+    #[test]
+    fn resolve_enabled_accepts_every_documented_disable_spelling() {
+        for word in ["0", "off", "false", "no", "disabled", "OFF", " No "] {
+            assert!(
+                !resolve_enabled(false, Some(word), None),
+                "{word:?} should disable compression"
+            );
+        }
+        // Anything else is "on" — an unrecognized value must not silently
+        // disable the engine.
+        for word in ["1", "on", "true", "yes", "dirge", ""] {
+            assert!(
+                resolve_enabled(false, Some(word), None),
+                "{word:?} should leave compression on"
+            );
+        }
     }
 
     #[test]

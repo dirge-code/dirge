@@ -84,6 +84,13 @@ Compaction runs at the turn boundary, after each assistant response. `run.rs` ca
 - **Fold = prune + summarize**: oversized tool results are capped and tool output pruned without an LLM call, then the conversation middle is summarized via the configured `summarization_provider` (or the main model if none is set). An explicit `/compress` forces the pass regardless of ratio; reactive overflow recovery uses the same route, falling back to prune-only emergency compaction when no safe summarizer is configured.
 - **Snip override**: a pre-send snip that frees ≥10% of the window suppresses a *normal* fold; aggressive and force-summary folds always proceed.
 
+What survives a fold, beyond the summary itself:
+
+- **The user's own turns, verbatim.** Summarizers paraphrase, and paraphrase is where stated constraints go soft ("use ESM not CJS" becomes "discussed module format"). The folded window's user messages are appended to the summary block unedited, newest-first under a shared budget, carried across successive folds, and any elision is declared with a pointer at `session_search`. They sit inside the `[CONTEXT COMPACTION — REFERENCE ONLY]` block so the model reads them as standing context, not as new requests.
+- **Exactly one compaction block.** A prior fold's marker is a `system` turn and the head cut snaps forward to a *user* turn, so the old marker lands in the protected head and is never folded. Each fold therefore supersedes it rather than stacking a second one — otherwise the model accumulates blocks that each declare a different `## Active Task`.
+- **A breadcrumb to the raw turns.** Folded turns are still in the session DB. The summary prefix says so and names `session_search`, and the live session is excluded from that search by exact id (not by lineage root) so the pre-fold half of the current conversation stays reachable.
+- **A validated summary, or none.** `validate_summary` requires at least two template sections with non-placeholder bodies. A stub fails, the caller keeps the pruned context, and a persistently bad summarizer trips the circuit breaker into prune-only mode — never a silent trade of real history for `## Active Task\nNone.`
+
 See [features.md](features.md) for the user-facing summary.
 
 ## Tool execution

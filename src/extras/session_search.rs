@@ -158,19 +158,23 @@ impl SessionSearch {
         let mut seen_roots = std::collections::HashSet::new();
 
         for result in &results {
+            // dirge-ldyq: exclude the LIVE session by exact id, and do it
+            // BEFORE claiming the dedup slot. Excluding by lineage root hid
+            // every pre-fold ancestor of the current conversation — but
+            // compaction rotates the id and `link_fold` shares the root, so
+            // that is precisely the history just dropped from context.
+            // Checking first also stops a live-session hit from burning its
+            // root's slot and suppressing the folded sibling behind it.
+            if self.current_session_id.as_deref() == Some(result.session_id.as_str()) {
+                continue;
+            }
+
             // Resolve lineage root.
             let root_id = self.db.resolve_parent(&result.session_id)?;
 
-            // Skip if this lineage is already represented or
-            // it's the current session.
+            // Skip if this lineage is already represented.
             if !seen_roots.insert(root_id.clone()) {
                 continue;
-            }
-            if let Some(ref current) = self.current_session_id {
-                let current_root = self.db.resolve_parent(current)?;
-                if current_root == root_id {
-                    continue;
-                }
             }
 
             // Build hit.
@@ -290,20 +294,20 @@ impl SessionSearch {
         let mut seen_roots = std::collections::HashSet::new();
 
         for s in sessions {
+            // dirge-ldyq: exclude the live session by exact id, before the
+            // dedup claim — same reasoning as `discover`. Its pre-fold
+            // ancestors are a different id in the same lineage and must
+            // stay listed.
+            if self.current_session_id.as_deref() == Some(s.id.as_str()) {
+                continue;
+            }
+
             // Resolve lineage root.
             let root_id = self.db.resolve_parent(&s.id)?;
 
             // Deduplicate by root.
             if !seen_roots.insert(root_id.clone()) {
                 continue;
-            }
-
-            // Exclude current session.
-            if let Some(ref current) = self.current_session_id {
-                let current_root = self.db.resolve_parent(current)?;
-                if current_root == root_id {
-                    continue;
-                }
             }
 
             result.push(BrowseSession {
@@ -531,6 +535,115 @@ mod tests {
         for hit in &hits {
             assert_ne!(hit.session_id, "current");
         }
+    }
+
+    /// dirge-ldyq: compaction rotates the session and `link_fold` puts the
+    /// pre-fold and post-fold ids in ONE lineage. Excluding by lineage root
+    /// therefore hid the turns compaction had just dropped out of context —
+    /// the exact moment the agent most needs to reach them. Only the LIVE
+    /// session (whose messages are still in context) may be excluded.
+    #[test]
+    fn discover_reaches_the_pre_fold_half_of_the_current_conversation() {
+        let (mut search, _dir) = temp_search();
+        seed_session(&search.db, "pre-fold", "cli");
+        seed_session(&search.db, "post-fold", "cli");
+        // What compaction's `link_fold` records.
+        search
+            .db
+            .set_parent_session("post-fold", "pre-fold")
+            .unwrap();
+
+        search
+            .db
+            .insert_message(
+                "pre-fold",
+                "user",
+                "the retry budget is quinoa_7734 attempts",
+                None,
+                None,
+                None,
+                "2025-01-15T10:01:00Z",
+            )
+            .unwrap();
+
+        search.current_session_id = Some("post-fold".to_string());
+        let hits = search.discover("quinoa_7734").unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "the folded-away turns must stay discoverable after compaction"
+        );
+        assert_eq!(hits[0].session_id, "pre-fold");
+    }
+
+    /// The live session must still be excluded — and excluding it must not
+    /// burn its lineage's dedup slot, or the pre-fold sibling gets suppressed
+    /// as collateral. Both halves match here; only the folded one may survive.
+    #[test]
+    fn discover_excludes_only_the_live_session_not_its_lineage() {
+        let (mut search, _dir) = temp_search();
+        seed_session(&search.db, "pre-fold", "cli");
+        seed_session(&search.db, "post-fold", "cli");
+        search
+            .db
+            .set_parent_session("post-fold", "pre-fold")
+            .unwrap();
+
+        search
+            .db
+            .insert_message(
+                "pre-fold",
+                "user",
+                "quinoa_7734 in the folded half",
+                None,
+                None,
+                None,
+                "2025-01-15T10:01:00Z",
+            )
+            .unwrap();
+        // Ranks above the pre-fold row on recency; pre-fix this claimed the
+        // root slot and then `continue`d, hiding the folded half too.
+        search
+            .db
+            .insert_message(
+                "post-fold",
+                "user",
+                "quinoa_7734 in the live half",
+                None,
+                None,
+                None,
+                "2025-01-15T11:01:00Z",
+            )
+            .unwrap();
+
+        search.current_session_id = Some("post-fold".to_string());
+        let hits = search.discover("quinoa_7734").unwrap();
+        assert_eq!(hits.len(), 1, "one hit from this lineage");
+        assert_eq!(
+            hits[0].session_id, "pre-fold",
+            "the folded half surfaces; the live half (already in context) does not"
+        );
+    }
+
+    /// Same fix, browse shape: a folded conversation must not vanish from the
+    /// session list just because its live tail is the current session.
+    #[test]
+    fn browse_lists_the_pre_fold_half_of_the_current_conversation() {
+        let (mut search, _dir) = temp_search();
+        seed_session(&search.db, "pre-fold", "cli");
+        seed_session(&search.db, "post-fold", "cli");
+        search
+            .db
+            .set_parent_session("post-fold", "pre-fold")
+            .unwrap();
+
+        search.current_session_id = Some("post-fold".to_string());
+        let ids: Vec<String> = search.browse().unwrap().into_iter().map(|s| s.id).collect();
+        assert_eq!(
+            ids,
+            vec!["pre-fold".to_string()],
+            "the folded half stays browsable; the live session does not"
+        );
     }
 
     #[test]

@@ -543,6 +543,7 @@ async fn main() -> anyhow::Result<()> {
     let cfg = config::load();
 
     crate::compression::init_from_config(cfg.compression.clone().unwrap_or_default());
+    crate::compression::set_cli_disabled(cli.no_compression);
     crate::prompt_cache::init_from_config(cfg.prompt_cache.as_ref().and_then(|c| c.ttl.as_deref()));
 
     // Handle subcommands that exit before the TUI starts.

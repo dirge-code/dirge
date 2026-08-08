@@ -69,7 +69,12 @@ Your current task is identified in the '## Active Task' section of the \
 summary — resume exactly from there. \
 Respond ONLY to the latest user message \
 that appears AFTER this summary. The current session state (files, \
-config, etc.) may reflect work described here — avoid repeating it:";
+config, etc.) may reflect work described here — avoid repeating it. \
+The compacted turns themselves are not lost: they are persisted and \
+searchable. If this summary is missing a detail you need — an exact \
+error string, a path, a command, something the user said — recover it \
+with `session_search` instead of re-deriving it or asking the user to \
+repeat themselves:";
 
 // Budget constants from Hermes (context_compressor.py:54-59).
 const MIN_SUMMARY_TOKENS: u64 = 2000;
@@ -795,16 +800,35 @@ Use this exact structure:\n\n\
     }
 }
 
+/// Per-turn cut in the summarizer prompt for everything the agent produced —
+/// tool output, assistant prose. Generous enough to carry an error and its
+/// surrounding lines; tight enough that one log dump can't crowd the window.
+const SUMMARY_TURN_CHARS: usize = 2000;
+
+/// dirge-7ylu: per-turn cut for the USER's own turns, which are not agent
+/// output but the specification the work is judged against. A pasted spec,
+/// stack trace, or requirements list routinely runs past
+/// [`SUMMARY_TURN_CHARS`], and cutting it means the summarizer never sees the
+/// half it is supposed to preserve. Still bounded — one absurd paste must not
+/// defeat the fold it is riding along with — just bounded far higher.
+const SUMMARY_USER_TURN_CHARS: usize = 24_000;
+
 /// Serialize turns for the summarizer prompt. Each turn gets
-/// role + content (text fields only, tool results truncated).
+/// role + content (text fields only, long turns truncated at a
+/// per-role cap).
 fn serialize_turns_for_summary(turns: &[Value]) -> String {
     let mut out = String::new();
     for (i, turn) in turns.iter().enumerate() {
         let role = turn.get("role").and_then(|v| v.as_str()).unwrap_or("?");
         let content = content_text(turn.get("content"));
+        let cap = if role == "user" {
+            SUMMARY_USER_TURN_CHARS
+        } else {
+            SUMMARY_TURN_CHARS
+        };
         out.push_str(&format!("[{i}] {role}: "));
-        if content.len() > 2000 {
-            let truncated: String = content.chars().take(2000).collect();
+        if content.chars().count() > cap {
+            let truncated: String = content.chars().take(cap).collect();
             out.push_str(&format!(
                 "{truncated}… [truncated, {} total chars]\n",
                 content.len()
@@ -817,6 +841,133 @@ fn serialize_turns_for_summary(turns: &[Value]) -> String {
     out
 }
 
+/// Header of the verbatim-user-message section. Doubles as the parse anchor
+/// when a later fold harvests the block back out of an earlier fold's marker,
+/// so the two must stay in sync — hence one constant.
+const VERBATIM_USER_HEADER: &str = "## Verbatim user messages (compacted turns, unedited)";
+
+/// Recover the verbatim user lines an earlier fold recorded in its marker
+/// block, in chronological order. Reads the `- ` bullets under
+/// [`VERBATIM_USER_HEADER`] and stops at the elision note or the next
+/// section, so prose from the block's own preamble is never mistaken for a
+/// user message. Returns empty for a marker that has no such section.
+fn prior_verbatim_lines(marker_content: &str) -> Vec<String> {
+    let Some(section) = marker_content.split(VERBATIM_USER_HEADER).nth(1) else {
+        return Vec::new();
+    };
+    section
+        .lines()
+        .take_while(|l| !l.starts_with("##"))
+        .filter_map(|l| l.strip_prefix("- "))
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Total budget for the verbatim-user-message block carried through a fold.
+/// Roughly 1.5K tokens — enough for the constraints and corrections a session
+/// accumulates, small next to the summary budget it rides beside.
+const VERBATIM_USER_BUDGET_CHARS: usize = 6000;
+
+/// Cut for any single verbatim user message, so one paste can't claim the
+/// whole budget and push out every later constraint.
+const VERBATIM_USER_MSG_CHARS: usize = 1500;
+
+/// dirge-7ylu: build the verbatim record of the user's own turns from the
+/// slice a fold is about to discard.
+///
+/// The summarizer paraphrases, and paraphrase is exactly where a user's
+/// stated constraints go soft — "use ESM not CJS" becomes "discussed module
+/// format". Those turns are the specification, so they ride through the fold
+/// in the user's own words rather than the summarizer's.
+///
+/// Newest-first eviction: when the window holds more than the budget, the
+/// OLDEST are dropped, because a later instruction supersedes an earlier one.
+/// Output stays chronological, and any elision is declared with a pointer at
+/// `session_search` — a silent drop would read as "the user never said that".
+/// Returns `None` when the folded slice held no user turns.
+///
+/// A long session folds many times, and each fold's window contains the
+/// PREVIOUS fold's marker. Verbatim lines already carried by that marker are
+/// harvested back out and carried forward, so a constraint stated before the
+/// first fold does not decay into paraphrase at the second. Everything shares
+/// one budget, so the record stays bounded no matter how many folds run.
+fn verbatim_user_block(folded: &[Value]) -> Option<String> {
+    let mut kept: Vec<String> = Vec::new();
+    let mut used = 0usize;
+    let mut elided = 0usize;
+
+    // Newest-first: `folded` in reverse, then any lines inherited from an
+    // earlier fold's marker (older than every live turn here, so they are
+    // evicted first when the budget runs out).
+    let mut candidates: Vec<String> = Vec::new();
+    let mut inherited: Vec<String> = Vec::new();
+    for msg in folded.iter().rev() {
+        let content = content_text(msg.get("content"));
+        if msg.get("role").and_then(|r| r.as_str()) == Some("system")
+            && content.contains(COMPACTION_MARKER)
+        {
+            // Oldest-last within the inherited set, matching the newest-first walk.
+            let mut prior = prior_verbatim_lines(&content);
+            prior.reverse();
+            inherited.extend(prior);
+            continue;
+        }
+        if msg.get("role").and_then(|r| r.as_str()) != Some("user") {
+            continue;
+        }
+        let text = content.trim();
+        if text.is_empty() {
+            continue;
+        }
+        candidates.push(text.to_string());
+    }
+    candidates.extend(inherited);
+
+    for text in candidates {
+        let line = if text.chars().count() > VERBATIM_USER_MSG_CHARS {
+            let head: String = text.chars().take(VERBATIM_USER_MSG_CHARS).collect();
+            format!("{head}… [truncated, {} total chars]", text.len())
+        } else {
+            text
+        };
+        // A line already carried forward must not be listed twice.
+        if kept.contains(&line) {
+            continue;
+        }
+        if used + line.len() > VERBATIM_USER_BUDGET_CHARS && !kept.is_empty() {
+            elided += 1;
+            continue;
+        }
+        used += line.len();
+        kept.push(line);
+    }
+
+    if kept.is_empty() {
+        return None;
+    }
+    // Back to chronological order for reading.
+    kept.reverse();
+
+    let mut out = format!(
+        "\n\n{VERBATIM_USER_HEADER}\n\
+         The user's own words from the turns folded above, kept verbatim because \
+         paraphrase loses constraints. These were already addressed or superseded — \
+         treat them as standing context, NOT as new requests to fulfill.\n"
+    );
+    for line in &kept {
+        out.push_str(&format!("- {line}\n"));
+    }
+    if elided > 0 {
+        out.push_str(&format!(
+            "({elided} older user message{} elided for length — recover them with `session_search`.)\n",
+            if elided == 1 { "" } else { "s" }
+        ));
+    }
+    Some(out)
+}
+
 /// Compute the summary budget from the compressed token count.
 /// Port of Hermes's _compute_summary_budget.
 pub fn summary_budget(compressed_tokens: u64) -> u64 {
@@ -824,15 +975,83 @@ pub fn summary_budget(compressed_tokens: u64) -> u64 {
     ratio_budget.clamp(MIN_SUMMARY_TOKENS, SUMMARY_TOKENS_CEILING)
 }
 
-/// Validate that a summary contains the expected sections.
-/// At minimum it should mention Active Task and have some structure.
+/// Every section name `build_summary_prompt` asks for. Used to recognize a
+/// summary structurally.
+const SUMMARY_SECTIONS: [&str; 13] = [
+    "Active Task",
+    "Goal",
+    "Constraints & Preferences",
+    "Completed Actions",
+    "Active State",
+    "In Progress",
+    "Blocked",
+    "Key Decisions",
+    "Resolved Questions",
+    "Pending User Asks",
+    "Relevant Files",
+    "Remaining Work",
+    "Critical Context",
+];
+
+/// Sections that must carry real content. One is a stub; the template asks
+/// for thirteen, so two is a floor, not a target.
+const MIN_SUMMARY_SECTIONS: usize = 2;
+
+/// True when a section body says nothing — the placeholder a model emits
+/// when it has no material (or is not really summarizing).
+fn is_placeholder(line: &str) -> bool {
+    matches!(
+        line.trim()
+            .trim_end_matches('.')
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "" | "none" | "n/a" | "na" | "-" | "—" | "unknown" | "nothing" | "todo" | "tbd"
+    )
+}
+
+/// Validate that a summary is structurally a summary and not a stub.
+///
+/// dirge-mjx8: the caller acts on `true` by DESTROYING the folded region, so
+/// a false positive costs real history permanently. The check is whether at
+/// least [`MIN_SUMMARY_SECTIONS`] of the template's `## <section>` headers
+/// carry a non-placeholder body.
+///
+/// Counting *populated* sections rather than headers or total length is what
+/// makes this both safe and permissive. `## Active Task\nNone.` is rejected
+/// however many empty headers accompany it, while a terse-but-real summary
+/// with one-line sections passes — which matters, because rejection forces
+/// prune-only folding and walks the session into an overflow. Anchoring on
+/// `## ` also means prose that merely uses the words "goal" or "remaining
+/// work" is not mistaken for a summary.
+///
+/// On `false` the caller keeps the pruned context and records a compaction
+/// failure; a persistently bad summarizer trips the circuit breaker into
+/// prune-only mode rather than silently shredding the conversation.
 pub fn validate_summary(summary: &str) -> bool {
     if summary.is_empty() {
         return false;
     }
-    // Must contain at least one of the expected section headers.
-    let required = ["Active Task", "Goal", "Completed Actions", "Remaining Work"];
-    required.iter().any(|s| summary.contains(s))
+    let mut populated = 0usize;
+    let mut in_section = false;
+    let mut has_body = false;
+    for line in summary.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("## ") {
+            // Close the section that just ended, then open the new one.
+            if in_section && has_body {
+                populated += 1;
+            }
+            in_section = SUMMARY_SECTIONS.contains(&rest.trim());
+            has_body = false;
+        } else if in_section && !is_placeholder(trimmed) {
+            has_body = true;
+        }
+    }
+    if in_section && has_body {
+        populated += 1;
+    }
+    populated >= MIN_SUMMARY_SECTIONS
 }
 
 /// Find the latest context summary marker in the message list.
@@ -846,9 +1065,16 @@ pub fn find_previous_summary(messages: &[Value]) -> Option<(usize, String)> {
         }
         let content = m.get("content").and_then(|v| v.as_str()).unwrap_or("");
         if content.starts_with(SUMMARY_PREFIX) {
-            let body = content
-                .strip_prefix(SUMMARY_PREFIX)
-                .unwrap_or("")
+            let body = content.strip_prefix(SUMMARY_PREFIX).unwrap_or("");
+            // dirge-7ylu: the summary body only. The verbatim user block is
+            // carried forward mechanically by `apply_summary`; feeding it to
+            // the summarizer too would spend budget re-reading it and invite
+            // a paraphrased duplicate of the one thing that must not be
+            // paraphrased.
+            let body = body
+                .split(VERBATIM_USER_HEADER)
+                .next()
+                .unwrap_or(body)
                 .trim()
                 .to_string();
             Some((i, body))
@@ -879,14 +1105,36 @@ pub fn apply_summary(
 
     let mut out: Vec<Value> =
         Vec::with_capacity(n.saturating_sub(compress_end - compress_start) + 1);
-    // Protected head — copy verbatim.
+    // dirge-n8uz: a prior fold's marker is a `system` turn, and the head cut
+    // snaps FORWARD to a user turn — so it lands in the protected head and
+    // survives every subsequent fold. Left alone, markers stack, and the
+    // model reads several compaction blocks each declaring a different
+    // "## Active Task". Supersede it: the new summary already subsumes the
+    // old one (`find_previous_summary` feeds it to the summarizer as
+    // PREVIOUS SUMMARY), so keeping both adds nothing but contradiction.
+    let mut superseded: Vec<Value> = Vec::new();
     for msg in messages.iter().take(compress_start) {
-        out.push(msg.clone());
+        if content_text(msg.get("content")).contains(COMPACTION_MARKER) {
+            superseded.push(msg.clone());
+        } else {
+            out.push(msg.clone());
+        }
     }
+    // dirge-7ylu: the user's own turns from the discarded middle ride through
+    // the fold verbatim, appended to the summary body. Inside the marker
+    // block rather than as real user messages: the REFERENCE-ONLY framing
+    // already tells the model not to re-answer them, and a synthetic
+    // user-role message would risk splitting a tool_use/tool_result pair.
+    //
+    // Superseded markers lead — their content predates everything in the
+    // folded window — so the newest-first budget evicts them first.
+    let mut carried = superseded;
+    carried.extend_from_slice(&messages[compress_start..compress_end]);
+    let verbatim = verbatim_user_block(&carried).unwrap_or_default();
     // Summary marker — filter-safe prefix + body.
     let summary_msg = serde_json::json!({
         "role": "system",
-        "content": format!("{}{}", SUMMARY_PREFIX, summary),
+        "content": format!("{}{}{}", SUMMARY_PREFIX, summary, verbatim),
     });
     out.push(summary_msg);
     // Protected tail — copy verbatim.
@@ -1010,9 +1258,265 @@ pub fn rotate_session_id() -> String {
 mod tests {
     use super::*;
 
-    /// `COMPACTION_MARKER` is the sentinel other subsystems (the critic) use to
-    /// detect + strip the summary block. It MUST stay the prefix of the full
-    /// `SUMMARY_PREFIX`, or those strippers silently stop working.
+    /// dirge-2klc: the folded turns are persisted to the session DB, not
+    /// destroyed. Pre-fix the prefix framed compaction as total loss, so a
+    /// model missing a detail re-derived it or asked the user to repeat
+    /// themselves. The breadcrumb has to name the retrieval path, or the
+    /// rows in the DB may as well not exist.
+    #[test]
+    fn summary_prefix_points_at_the_persisted_raw_turns() {
+        assert!(
+            SUMMARY_PREFIX.contains("session_search"),
+            "the breadcrumb must name the tool that reaches the folded turns: {SUMMARY_PREFIX}"
+        );
+        assert!(
+            SUMMARY_PREFIX.contains("not lost") || SUMMARY_PREFIX.contains("still available"),
+            "the breadcrumb must say the raw turns survived: {SUMMARY_PREFIX}"
+        );
+    }
+
+    /// dirge-7ylu: a long user message is the least disposable thing in the
+    /// window — it is the spec. Truncating every turn at 2000 chars cut it
+    /// before the summarizer ever saw it. Tool output still truncates.
+    #[test]
+    fn user_messages_reach_the_summarizer_untruncated() {
+        let spec = format!("SPEC-{}-END", "x".repeat(4000));
+        let dump = format!("LOG-{}-TAIL", "y".repeat(4000));
+        let turns = vec![
+            serde_json::json!({"role": "user", "content": spec}),
+            serde_json::json!({"role": "tool", "content": dump}),
+        ];
+        let out = serialize_turns_for_summary(&turns);
+        assert!(
+            out.contains("SPEC-") && out.contains("-END"),
+            "the whole user message must survive, head and tail"
+        );
+        assert!(
+            out.contains("LOG-") && !out.contains("-TAIL"),
+            "tool output is still capped: {}",
+            &out[out.len().saturating_sub(120)..]
+        );
+    }
+
+    /// A user message so large it would defeat the fold is still bounded —
+    /// the exemption is generous, not unlimited.
+    #[test]
+    fn absurd_user_messages_are_still_bounded() {
+        let huge = format!("HEAD-{}-TAIL", "z".repeat(200_000));
+        let turns = vec![serde_json::json!({"role": "user", "content": huge})];
+        let out = serialize_turns_for_summary(&turns);
+        assert!(out.len() < 100_000, "still bounded, got {}", out.len());
+        assert!(out.contains("HEAD-"), "keeps the head");
+    }
+
+    /// dirge-7ylu: the constraints a user states mid-session ("not CJS",
+    /// "don't touch the vendored deps") are what a small model drops after
+    /// compaction. They must survive the fold as the user's own words, not
+    /// as summarizer paraphrase.
+    #[test]
+    fn folded_user_messages_survive_verbatim_in_the_summary_block() {
+        let messages = vec![
+            serde_json::json!({"role": "system", "content": "sys"}),
+            serde_json::json!({"role": "user", "content": "start the port"}),
+            serde_json::json!({"role": "user", "content": "use ESM not CJS everywhere"}),
+            serde_json::json!({"role": "assistant", "content": "ok"}),
+            serde_json::json!({"role": "user", "content": "the timeout is 4500ms not 4000"}),
+            serde_json::json!({"role": "assistant", "content": "done"}),
+            serde_json::json!({"role": "user", "content": "now write the test"}),
+        ];
+        // Fold the middle (indices 2..5), keeping head and tail.
+        let out = apply_summary(&messages, "## Active Task\nwrite the test", 2, 5);
+        let block = out
+            .iter()
+            .find_map(|m| m.get("content").and_then(|c| c.as_str()))
+            .filter(|c| c.contains(COMPACTION_MARKER))
+            .map(str::to_string)
+            .or_else(|| {
+                out.iter()
+                    .filter_map(|m| m.get("content").and_then(|c| c.as_str()))
+                    .find(|c| c.contains(COMPACTION_MARKER))
+                    .map(str::to_string)
+            })
+            .expect("a compaction block is present");
+
+        assert!(
+            block.contains("use ESM not CJS everywhere"),
+            "folded user constraint kept verbatim: {block}"
+        );
+        assert!(
+            block.contains("the timeout is 4500ms not 4000"),
+            "folded user constraint kept verbatim: {block}"
+        );
+        // Assistant chatter from the same window is the summarizer's job,
+        // not the verbatim block's.
+        assert!(
+            !block.contains("\"ok\""),
+            "assistant turns are not copied verbatim: {block}"
+        );
+    }
+
+    /// The verbatim block is bounded and says so. A session of huge pastes
+    /// must not defeat the fold it is riding along with — and when rows are
+    /// dropped, the model is told they exist and where to find them.
+    #[test]
+    fn verbatim_block_elides_oldest_over_budget_with_a_pointer() {
+        let mut messages = vec![
+            serde_json::json!({"role": "system", "content": "sys"}),
+            serde_json::json!({"role": "user", "content": "head"}),
+        ];
+        for i in 0..40 {
+            messages.push(serde_json::json!({
+                "role": "user",
+                "content": format!("PASTE{i} {}", "q".repeat(1000)),
+            }));
+        }
+        messages.push(serde_json::json!({"role": "user", "content": "tail"}));
+        let end = messages.len() - 1;
+        let out = apply_summary(&messages, "## Active Task\nx", 2, end);
+        let block = out
+            .iter()
+            .filter_map(|m| m.get("content").and_then(|c| c.as_str()))
+            .find(|c| c.contains(COMPACTION_MARKER))
+            .expect("a compaction block is present");
+
+        assert!(
+            block.contains("PASTE39"),
+            "the newest constraints are the ones that must survive"
+        );
+        assert!(
+            !block.contains("PASTE0 "),
+            "the oldest are dropped once over budget"
+        );
+        assert!(
+            block.contains("older user message") && block.contains("session_search"),
+            "elision must be declared and point at the recovery path: {}",
+            &block[..block.len().min(600)]
+        );
+    }
+
+    /// A long session folds repeatedly. If the verbatim block were rebuilt
+    /// only from the current window, a constraint stated before fold 1 would
+    /// decay to paraphrase at fold 2 — the exact drift this exists to stop.
+    /// Prior verbatim lines are carried forward, still under one budget.
+    #[test]
+    fn verbatim_user_messages_survive_a_second_fold() {
+        let first = vec![
+            serde_json::json!({"role": "system", "content": "sys"}),
+            serde_json::json!({"role": "user", "content": "head"}),
+            serde_json::json!({"role": "user", "content": "use ESM not CJS everywhere"}),
+            serde_json::json!({"role": "assistant", "content": "ok"}),
+            serde_json::json!({"role": "user", "content": "tail"}),
+        ];
+        let after_first = apply_summary(&first, "## Active Task\nport it", 2, 4);
+
+        // Second round: the fold-1 marker is now inside the window folded away.
+        let mut second = after_first.clone();
+        second.push(serde_json::json!({"role": "user", "content": "also target node 22"}));
+        second.push(serde_json::json!({"role": "assistant", "content": "noted"}));
+        second.push(serde_json::json!({"role": "user", "content": "now ship it"}));
+        let end = second.len() - 1;
+        let after_second = apply_summary(&second, "## Active Task\nship", 1, end);
+
+        let block = after_second
+            .iter()
+            .filter_map(|m| m.get("content").and_then(|c| c.as_str()))
+            .find(|c| c.contains(COMPACTION_MARKER))
+            .expect("a compaction block is present");
+        assert!(
+            block.contains("use ESM not CJS everywhere"),
+            "the fold-1 constraint must survive fold 2 verbatim: {block}"
+        );
+        assert!(
+            block.contains("also target node 22"),
+            "the fold-2 constraint is there too: {block}"
+        );
+        assert_eq!(
+            block.matches("use ESM not CJS everywhere").count(),
+            1,
+            "carried forward once, not duplicated: {block}"
+        );
+    }
+
+    /// A fold whose window holds no user turns must not emit an empty
+    /// section header.
+    #[test]
+    fn verbatim_block_absent_when_no_user_turns_were_folded() {
+        let messages = vec![
+            serde_json::json!({"role": "system", "content": "sys"}),
+            serde_json::json!({"role": "user", "content": "head"}),
+            serde_json::json!({"role": "assistant", "content": "a"}),
+            serde_json::json!({"role": "assistant", "content": "b"}),
+            serde_json::json!({"role": "user", "content": "tail"}),
+        ];
+        let out = apply_summary(&messages, "## Active Task\nx", 2, 4);
+        let block = out
+            .iter()
+            .filter_map(|m| m.get("content").and_then(|c| c.as_str()))
+            .find(|c| c.contains(COMPACTION_MARKER))
+            .expect("a compaction block is present");
+        assert!(
+            !block.contains("Verbatim user messages"),
+            "no header without content: {block}"
+        );
+    }
+
+    /// dirge-n8uz: a fold used to STACK a new marker on top of the previous
+    /// one. The old marker snaps into the protected head (it is a `system`
+    /// turn, and the head cut snaps forward to a *user* turn), so it was
+    /// never folded away — after N folds the model read N compaction blocks,
+    /// each asserting a different "## Active Task". That is a direct
+    /// instruction conflict and a prime suspect for post-compaction drift on
+    /// small models. Exactly one marker may survive a fold.
+    #[test]
+    fn folds_replace_the_previous_marker_instead_of_stacking() {
+        let mut msgs: Vec<Value> = vec![
+            serde_json::json!({"role": "system", "content": "sys"}),
+            serde_json::json!({"role": "user", "content": "original ask"}),
+        ];
+        for i in 0..6 {
+            msgs.push(serde_json::json!({"role": "assistant", "content": format!("a{i}")}));
+            msgs.push(
+                serde_json::json!({"role": "user", "content": format!("CONSTRAINT{i} matters")}),
+            );
+        }
+        let (s1, e1) = compute_compress_window(&msgs, PROTECT_HEAD_DEFAULT, PROTECT_TAIL_DEFAULT);
+        let after1 = apply_summary(&msgs, "## Active Task\nfirst\n\n## Goal\ng", s1, e1);
+
+        let mut msgs2 = after1;
+        for i in 0..6 {
+            msgs2.push(serde_json::json!({"role": "assistant", "content": format!("b{i}")}));
+            msgs2.push(serde_json::json!({"role": "user", "content": format!("LATER{i} matters")}));
+        }
+        let (s2, e2) = compute_compress_window(&msgs2, PROTECT_HEAD_DEFAULT, PROTECT_TAIL_DEFAULT);
+        let after2 = apply_summary(&msgs2, "## Active Task\nsecond\n\n## Goal\ng", s2, e2);
+
+        let markers: Vec<&str> = after2
+            .iter()
+            .filter_map(|m| m.get("content").and_then(|c| c.as_str()))
+            .filter(|c| c.contains(COMPACTION_MARKER))
+            .collect();
+        assert_eq!(
+            markers.len(),
+            1,
+            "exactly one compaction block may survive a fold, got {}",
+            markers.len()
+        );
+        assert!(
+            markers[0].contains("second") && !markers[0].contains("\nfirst"),
+            "the surviving block is the newest one"
+        );
+        // Superseding the old marker must not drop the constraints it carried.
+        assert!(
+            markers[0].contains("CONSTRAINT0 matters"),
+            "a pre-first-fold constraint still rides through the second fold: {}",
+            markers[0]
+        );
+        assert!(
+            markers[0].contains("LATER0 matters"),
+            "second-fold constraints are there too"
+        );
+    }
+
     #[test]
     fn summary_prefix_starts_with_compaction_marker() {
         assert!(SUMMARY_PREFIX.starts_with(COMPACTION_MARKER));
@@ -1623,6 +2127,49 @@ mod tests {
         assert!(!validate_summary("just some random text with no structure"));
     }
 
+    /// dirge-mjx8: a stub summary used to validate, and `apply_summary` then
+    /// destroyed the folded region for good — trading real history for six
+    /// characters. Weak models emit exactly this. Rejection is cheap: the
+    /// caller keeps the pruned context and the circuit breaker handles a
+    /// persistent offender.
+    #[test]
+    fn stub_summaries_are_rejected() {
+        for stub in [
+            "## Active Task\nNone.",
+            "## Active Task\nNone.\n\n## Goal\nN/A",
+            "## Active Task\n",
+            "## Goal\n-",
+        ] {
+            assert!(!validate_summary(stub), "stub should be rejected: {stub:?}");
+        }
+    }
+
+    /// The section check is anchored on markdown headers, not bare
+    /// substrings. Prose that merely says "the goal" is not a summary.
+    #[test]
+    fn prose_mentioning_section_words_is_rejected() {
+        assert!(!validate_summary(
+            "The goal was to refactor the auth module and the remaining work \
+             is to write tests for the new active task handler."
+        ));
+    }
+
+    /// Rejection must stay rare. A terse but real summary from a small model
+    /// is still a summary — rejecting it would force prune-only folding and
+    /// walk the session into an overflow, which is strictly worse.
+    #[test]
+    fn terse_but_real_summaries_still_pass() {
+        assert!(validate_summary(
+            "## Active Task\nFix the failing test in foo.rs\n\n\
+             ## Completed Actions\n1. Read foo.rs\n2. Ran cargo test"
+        ));
+        // Sections outside the four legacy names count too.
+        assert!(validate_summary(
+            "## Blocked\ncargo test fails: index out of bounds at foo.rs:12\n\n\
+             ## Relevant Files\nfoo.rs — the panicking helper"
+        ));
+    }
+
     // ── build_summary_prompt ────────────────────────────
 
     #[test]
@@ -1682,6 +2229,35 @@ mod tests {
             serde_json::json!({"role": "user", "content": "hello"}),
         ];
         assert!(find_previous_summary(&msgs).is_none());
+    }
+
+    /// The verbatim block is carried forward mechanically by `apply_summary`,
+    /// so handing it to the summarizer as PREVIOUS SUMMARY only invites the
+    /// model to paraphrase it back into the body — a lossy duplicate of
+    /// content whose whole point is being unparaphrased. The single consumer
+    /// of this body is that prompt, so strip it here.
+    #[test]
+    fn previous_summary_body_excludes_the_verbatim_block() {
+        let content = format!(
+            "{}## Active Task\nfix the bug{}",
+            SUMMARY_PREFIX,
+            verbatim_user_block(&[serde_json::json!({
+                "role": "user",
+                "content": "use ESM not CJS everywhere",
+            })])
+            .expect("a block is built")
+        );
+        let msgs = vec![serde_json::json!({"role": "system", "content": content})];
+        let (_idx, body) = find_previous_summary(&msgs).expect("summary found");
+        assert!(body.contains("fix the bug"), "the summary body survives");
+        assert!(
+            !body.contains("use ESM not CJS everywhere"),
+            "the verbatim block is not fed back to the summarizer: {body}"
+        );
+        assert!(
+            !body.contains(VERBATIM_USER_HEADER),
+            "nor its header: {body}"
+        );
     }
 
     // ── apply_summary / compute_compress_window ─────────

@@ -241,10 +241,17 @@ them on:
 
 | Key | Default | Effect when set |
 |-----|---------|-----------------|
+| `enabled` | `true` | `false` disables compression entirely — request bodies go out untouched. |
+| `preset` | `"dirge"` | Named profile. `"safe"` / `"lossless"` are also output-neutral; `"agent"`, `"aggressive"`, `"auto"`, `"rag"`, `"code"` enable lossy stages **and** directives that alter the model's output. |
 | `trim_user_text` | `false` | Let windowing touch your own messages too. |
 | `window_code` | `false` | Let windowing fold and window code and file excerpts. |
 | `header` | `"explicit"` | `"legacy"` restores the pre-0.21.10 elision-header wording. |
 | `verbatim` | `true` | `false` ignores `read(verbatim=true)`'s compression opt-out. |
+
+To turn it off for one run without editing config, pass `--no-compression` or
+set `DIRGE_COMPRESSION=0` (`off`, `false`, `no`, and `disabled` also work).
+`DIRGE_COMPRESSION_PRESET` overrides `preset` the same way. Precedence is
+most-local-wins: the CLI flag beats the env var, which beats the config file.
 
 If you need a guarantee that what you are looking at is byte-for-byte what is
 on disk, call `read` with `verbatim: true` — that result is exempt from
