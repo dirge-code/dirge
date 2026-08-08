@@ -1384,6 +1384,24 @@ int main(void) {
         );
     }
 
+    /// dirge-yv0d, latent: `apply_patch` hands the gate the BOM-stripped,
+    /// LF-normalized text as its baseline while judging the re-encoded
+    /// candidate, which has the BOM back. If a leading BOM failed the
+    /// grammar, every `apply_patch` on a BOM-carrying file would reject while
+    /// its baseline read clean — defeating the dirge-ytu1 stand-down and
+    /// making the file permanently uneditable by that tool.
+    #[cfg(feature = "semantic-rust")]
+    #[test]
+    fn a_leading_bom_does_not_fail_the_rust_grammar() {
+        let path = PathBuf::from("/tmp/bom.rs");
+        let src = "\u{feff}fn main() {}\n";
+        assert!(
+            check_syntax(&path, src).is_ok(),
+            "a BOM is not a syntax error; if this fails, apply_patch's \
+             baseline/candidate asymmetry is a live bug"
+        );
+    }
+
     #[test]
     fn unknown_extension_skips_silently() {
         let path = PathBuf::from("/tmp/foo.thisisntreal");
