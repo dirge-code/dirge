@@ -31,6 +31,80 @@ pub(crate) enum RunEnd {
     UsageCapped,
 }
 
+/// How many changed files the blank-result placeholder lists before
+/// summarizing the rest. Enough to recognize the work, short enough that the
+/// envelope stays readable.
+const PLACEHOLDER_FILE_LIST_CAP: usize = 10;
+
+/// Stand-in for `result` when a run ends without writing a final answer.
+///
+/// The failure this fixes: a delegated run that hits the turn cap returns
+/// `subtype: error_max_turns` with `result: ""`. The caller gets a bare error
+/// and no way to tell finished-but-unpolished from broken-and-abandoned —
+/// and in practice a capped run has usually finished the task and run out of
+/// turns during the final fmt/clippy pass. Discarding that work is expensive
+/// and re-running it is worse.
+///
+/// Everything below is already in the envelope; nothing here is derived,
+/// inferred, or judged. The point is that `result` stops being the one field
+/// that throws its inputs away — the same shape as the gate tally dropping
+/// counts it had already recorded (dirge-l8l7.1).
+///
+/// It states explicitly that it is not a completeness claim, because the one
+/// thing that must not happen here is a caller reading a generated summary as
+/// the model's own report. Pure, so the wording is testable without a runner.
+fn blank_result_placeholder(
+    end: RunEnd,
+    num_turns: u32,
+    files_changed: &[String],
+    evidence: &serde_json::Value,
+) -> String {
+    let reason = match end {
+        RunEnd::Truncated => "it reached the agent turn cap",
+        RunEnd::Incomplete => "the runner stopped before signalling completion",
+        RunEnd::UsageCapped => "a provider usage cap stopped it, and the quota resets later",
+        // Not reachable: the caller only substitutes on a non-`Completed`
+        // end. Kept total rather than `unreachable!` so a future caller
+        // cannot turn a reporting gap into a panic.
+        RunEnd::Completed => "it produced no closing text",
+    };
+    let mut out = format!(
+        "[dirge] This run ended without writing a final answer: {reason}.\n\
+         This is NOT a judgement about whether the work is complete — a capped run has \
+         often finished the task and run out of turns during the final polish. What \
+         follows is the run's own record, not a claim about it.\n\n\
+         turns: {num_turns}\n"
+    );
+    if let Some(calls) = evidence.get("tool_calls").and_then(|v| v.as_u64()) {
+        out.push_str(&format!("tool calls: {calls}\n"));
+    }
+    match evidence.get("verification") {
+        Some(v) if v.get("observed").and_then(|o| o.as_bool()) == Some(true) => {
+            let status = v
+                .get("status")
+                .and_then(|s| s.as_str())
+                .unwrap_or("observed");
+            out.push_str(&format!("verification: {status}\n"));
+        }
+        _ => out.push_str("verification: not observed — no build or test command ran this run\n"),
+    }
+    out.push_str(&format!("files changed: {}\n", files_changed.len()));
+    for f in files_changed.iter().take(PLACEHOLDER_FILE_LIST_CAP) {
+        out.push_str(&format!("  {f}\n"));
+    }
+    if files_changed.len() > PLACEHOLDER_FILE_LIST_CAP {
+        out.push_str(&format!(
+            "  … and {} more\n",
+            files_changed.len() - PLACEHOLDER_FILE_LIST_CAP
+        ));
+    }
+    out.push_str(
+        "\nRead the diff before accepting or discarding this work. To continue it, \
+         re-run against the SAME session id rather than starting a new one.\n",
+    );
+    out
+}
+
 /// Build the machine-readable result envelope for the headless modes.
 /// Pure so the success/error mapping is unit-testable without a live
 /// runner.
@@ -45,6 +119,12 @@ pub(crate) fn headless_result_json(
     evidence: &serde_json::Value,
     cost: f64,
 ) -> serde_json::Value {
+    // A run that ended badly AND wrote nothing is the case where `result`
+    // being empty costs the caller the most. Text the model actually wrote is
+    // never replaced, and a `Completed` run is never touched.
+    let owned_placeholder = (end != RunEnd::Completed && result.trim().is_empty())
+        .then(|| blank_result_placeholder(end, num_turns, files_changed, evidence));
+    let result = owned_placeholder.as_deref().unwrap_or(result);
     let (subtype, is_error) = match end {
         RunEnd::Completed => ("success", false),
         // Matches the Claude Code stream-json convention dirge mimics.
@@ -679,6 +759,146 @@ mod tests {
         assert_eq!(capped["subtype"], "error_usage_cap");
         assert_eq!(capped["is_error"], true);
         assert_eq!(capped["result"], "partial", "partial work still delivered");
+    }
+
+    // ---- Blank `result` on a run that ended badly (dirge-8f30) ----------
+    //
+    // A delegated run that hits the turn cap returned `error_max_turns` with
+    // `result: ""` — a bare error, with no way to tell finished-but-unpolished
+    // from broken-and-abandoned, even though the same envelope already carried
+    // the turn count, the changed files and the verification status.
+
+    fn ev(tool_calls: u64, observed: bool) -> serde_json::Value {
+        serde_json::json!({
+            "turns": 40,
+            "tool_calls": tool_calls,
+            "verification": if observed {
+                serde_json::json!({"observed": true, "status": "VerifiedGreen"})
+            } else {
+                serde_json::json!({"observed": false, "status": serde_json::Value::Null})
+            },
+        })
+    }
+
+    fn capped_blank(files: &[String], evidence: serde_json::Value) -> String {
+        headless_result_json(RunEnd::Truncated, 10, 40, "", "sid", files, &evidence, 0.0)["result"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    #[test]
+    fn capped_run_with_no_text_reports_the_run_record() {
+        let files = ["src/a.rs".to_string(), "src/b.rs".to_string()];
+        let r = capped_blank(&files, ev(187, true));
+        assert!(r.contains("turn cap"), "{r}");
+        assert!(r.contains("turns: 40"), "{r}");
+        assert!(r.contains("tool calls: 187"), "{r}");
+        assert!(r.contains("files changed: 2"), "{r}");
+        assert!(r.contains("src/a.rs") && r.contains("src/b.rs"), "{r}");
+        assert!(r.contains("VerifiedGreen"), "{r}");
+    }
+
+    /// The discriminating pair. If the substitution were unconditional it
+    /// would overwrite the model's own report with a generated one, which is
+    /// a worse failure than the empty string it replaces.
+    #[test]
+    fn a_capped_run_that_wrote_text_keeps_its_own_words() {
+        let env = headless_result_json(
+            RunEnd::Truncated,
+            10,
+            40,
+            "I refactored the parser and tests pass.",
+            "sid",
+            &["src/a.rs".to_string()],
+            &ev(187, true),
+            0.0,
+        );
+        assert_eq!(env["result"], "I refactored the parser and tests pass.");
+    }
+
+    #[test]
+    fn a_completed_run_with_no_text_is_left_alone() {
+        let env = headless_result_json(
+            RunEnd::Completed,
+            10,
+            3,
+            "",
+            "sid",
+            &["src/a.rs".to_string()],
+            &ev(5, true),
+            0.0,
+        );
+        assert_eq!(
+            env["result"], "",
+            "the success envelope's shape is not this change's business"
+        );
+    }
+
+    /// The placeholder is a record, never a verdict — a caller must not be
+    /// able to read it as the model reporting success.
+    #[test]
+    fn the_placeholder_makes_no_completeness_claim() {
+        let r = capped_blank(&["src/a.rs".to_string()], ev(187, true));
+        assert!(
+            r.contains("NOT a judgement about whether the work is complete"),
+            "{r}"
+        );
+        for claim in ["task complete", "successfully", "all tests pass", "done."] {
+            assert!(
+                !r.to_lowercase().contains(claim),
+                "the placeholder must not assert {claim:?}: {r}"
+            );
+        }
+    }
+
+    /// Three different endings must not read as the same event.
+    #[test]
+    fn the_placeholder_names_which_ending_this_was() {
+        let files = ["src/a.rs".to_string()];
+        let of = |end| {
+            headless_result_json(end, 10, 40, "", "sid", &files, &ev(1, false), 0.0)["result"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        };
+        let (cap, died, quota) = (
+            of(RunEnd::Truncated),
+            of(RunEnd::Incomplete),
+            of(RunEnd::UsageCapped),
+        );
+        assert_ne!(cap, died);
+        assert_ne!(cap, quota);
+        assert_ne!(died, quota);
+        assert!(quota.contains("usage cap"), "{quota}");
+    }
+
+    /// Unobserved verification must say so rather than being omitted — an
+    /// absent line reads as "fine", which is the reading that has to be
+    /// impossible here.
+    #[test]
+    fn the_placeholder_distinguishes_unobserved_verification() {
+        let files = ["src/a.rs".to_string()];
+        let observed = capped_blank(&files, ev(1, true));
+        let unobserved = capped_blank(&files, ev(1, false));
+        assert!(
+            observed.contains("verification: VerifiedGreen"),
+            "{observed}"
+        );
+        assert!(unobserved.contains("not observed"), "{unobserved}");
+        assert_ne!(observed, unobserved);
+    }
+
+    #[test]
+    fn the_placeholder_caps_a_long_file_list_and_says_how_many_it_dropped() {
+        let files: Vec<String> = (0..25).map(|i| format!("src/f{i}.rs")).collect();
+        let r = capped_blank(&files, ev(1, false));
+        assert!(r.contains("files changed: 25"), "{r}");
+        assert!(r.contains("… and 15 more"), "{r}");
+        assert!(
+            !r.contains("src/f24.rs"),
+            "the tail must be summarized: {r}"
+        );
     }
 
     /// issue #704: the envelope carries `files_changed` verbatim (a JSON

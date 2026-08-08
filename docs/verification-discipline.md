@@ -26,10 +26,12 @@ reason this page exists as its own document rather than a paragraph in
 
 ## The pattern
 
-Nine failures, one shape:
+Eleven failures, one shape:
 
 | | What happened |
 |---|---|
+| Signal never reported | Two gates were recorded, counted, and then dropped by the emitter's hand-written field list. The unit test iterated its own copy of that list, missing the same two, so it asserted exactly what the emitter did |
+| Section unreachable | A report block sat one brace inside the "something went wrong" branch, so the summary it produced appeared only on a broken run |
 | Wrong gate | `cargo test` passed; the real gate, `cargo clippy -- -D warnings`, had six hard errors |
 | Result ignored | A test suite went red and the commit landed anyway — the commands were chained with newlines, not `&&` |
 | Status masked | `cargo clippy \| tail -2` reported zero, because that zero was `tail`'s |
@@ -50,9 +52,17 @@ and the tests instead, every time, and both were honestly green. Which is the
 point — **a single-command gate is a habit, not a design**, and no amount of
 knowing better substitutes for running the whole set.
 
-The last three came later, and they move the problem one layer out. The first
-six are about running the wrong check, or ignoring its answer. These three are
-about a check that ran, answered, and whose answer meant nothing:
+The first two rows are the newest and the most uncomfortable, because they are
+not about a check at all — they are about the *measurement layer that grades
+the checks*. dirge's implementations were sound through seven rounds of harness
+work; the numbers reporting on them were not. Four bugs, all under-reporting,
+all silent, none able to fail an existing test. Three were the same mistake
+made in an earlier round and made again, because nothing structurally prevents
+the copy that causes it. See [Keeping the reporter honest](#keeping-the-reporter-honest).
+
+The middle three move the problem one layer out. The first six are about
+running the wrong check, or ignoring its answer. These three are about a check
+that ran, answered, and whose answer meant nothing:
 
 - **Signal never fed** — the producer was never wired, and a unit test that
   calls the recorder directly cannot tell. Test the function the production
@@ -391,6 +401,33 @@ real — it passed on macOS and failed on every Linux CI job that runs tests, an
 in production it would have let a just-written proxy validator read as
 pre-existing.
 
+## A correct guard that gets routed around
+
+The pre-write syntax gate is the counter-example to everything above: it ran,
+it was right, and it was disbelieved. A model it blocked concluded that "the
+project's tree-sitter parser does not understand doctest macro syntax and flags
+the whole file as invalid", then planned to "bypass the guard by writing the
+entire file with `write`" — reconstructing a 385-line file from context.
+
+Both halves are false, and both were checkable. Seven doctest and macro shapes
+pass the grammar (a test now pins that, with a companion asserting a broken
+body under a doctest is still rejected, so it cannot go vacuous). And `write`
+goes through the same `syntax_gate` as every other file-writing tool.
+
+The reject was what left room for it. It named the error and said the file was
+not modified — consistent with an absolute, per-tool guard. From there, trying
+another tool is the obvious move, and the one it leads to has the largest blast
+radius of any edit available. Meanwhile the escape the model actually wanted
+already existed and fires automatically: a file that was failing the check
+*before* the edit is written through verbatim, so a reject always means the
+edit introduced the error.
+
+So the reject now carries both facts. This is not a prompt edit and it is not
+steering — the mechanisms were already built and already correct; the model's
+model of them was wrong, and only the tool could correct it. **A guard that
+cannot explain its own scope will be routed around rather than satisfied**, and
+the route chosen is rarely the cheap one.
+
 ## Measuring a loop-control change
 
 `scripts/loop-ab.sh` runs the same task N times per arm and compares. Three
@@ -444,3 +481,56 @@ silently gave back the hard-tier gain.
 reporting awk against a synthetic TSV — no models, no network. It exists because
 four bugs shipped in that awk at once, all silent: the report still printed, it
 just said `none` forever. None of them could fail a Rust test.
+
+## Keeping the reporter honest
+
+A second batch of four then shipped *past* that selftest, which is the more
+useful finding. They are worth naming because they are all one mistake:
+
+| | |
+|---|---|
+| Two gates recorded and never emitted | `emit`'s field list was a hand-written copy of the enum |
+| The N-arm summary printed only on a broken run | One brace, inside the missing-tally branch |
+| Events reported in awk hash order | `for (i in evs)` instead of the split index |
+| One absent arm aborted the whole report | The guard existed twenty lines away and was never applied to the primary pair |
+
+**No hand-maintained list may stand between a signal and its report.** Each of
+those is a duplicate of something that already had a single source of truth,
+drifted from it: the emitter's field names duplicate the enum, the harness's
+nudge names duplicate the emitter's field names, the report's event order
+duplicates and then discards the order the tally recorded, a loop bound
+duplicates what `split()` returned. Deriving instead of copying is what makes
+the next variant get counted the day it is added — `GateSource::ALL` and
+`BoundaryNudge::ALL` are matched exhaustively so a new gate cannot compile
+without a field name, and `sum_fields nudge_ | gate_` totals whatever the line
+carries rather than a list the script keeps.
+
+The gate set was also only half measured. `nudges_fired` was the mechanism
+check, and no `gate_*` field was scraped at all — so a finalization-gate A/B
+(`claim_gate`, `source_gate`, `publish_guard`, the verifier gate) read zero in
+both arms, and read literally by the rule above, should have been discarded as
+noise every time. `gates_fired` is now reported beside it.
+
+**A selftest must be a discrimination test.** The old one asserted "the report
+says X". Three of its seven assertions also established what would have made it
+say not-X — the co-firing/separate-firing pair — and those are the three that
+caught their bugs. The four that got through were all single-sided: a section
+that printed only when the run was broken satisfied "the section prints", and
+an ordering that fell out of awk's hash table satisfied an assertion that had
+been written down *from that same scrambled output*. Pinning observed behaviour
+as expected behaviour is how a bug becomes a contract.
+
+So every claim in that file now carries its other side — `want`/`reject` for
+one, `differs` for both — and the file is mutation-tested: reintroduce each bug
+and the selftest must go red. That pass immediately found a hole in itself, and
+it is the representative one. `gates_fired` is a row label used by *both* the
+two-arm and the N-arm block, so an unanchored `grep` for it was satisfied by
+the other section, and a wrong-column mutation survived. A check that can be
+satisfied by something other than the thing it is checking is the same failure
+as a check that cannot fail.
+
+One corollary worth stating separately, because it cost a real diagnosis: **an
+aborted report is not a failing report.** When the absent-arm guard is removed,
+awk dies, `set -e` kills the selftest, and every `reject` assertion in it passes
+vacuously on empty output. The exit code was correct and named nothing. The
+harness now catches the abort and reports it as a normal failing check.

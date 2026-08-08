@@ -460,6 +460,30 @@ pub fn require_absolute_path(path: &str, subject: &str) -> Result<(), String> {
 /// repair contract (a per-call-site copy of this was how `edit_minified`
 /// got missed). Err is the `String` message; `ToolError` callers wrap with
 /// `.map_err(ToolError::Msg)`.
+/// Two facts about this gate that a rejected model needs and cannot learn any
+/// other way, appended to every reject (dirge-yv0d).
+///
+/// Observed live: a model blocked here decided the parser was at fault, then
+/// planned to "bypass the guard by writing the entire file with `write`" —
+/// reconstructing a 385-line file from context. Both halves of that plan are
+/// wrong, and the reject was what left room for them. It named the error and
+/// said the file was not modified, which is consistent with an absolute,
+/// per-tool guard; from there, trying another tool is the obvious move, and
+/// the one it leads to has the largest blast radius of any edit available.
+///
+/// This is a deterministic error string stating what this function does, not
+/// steering. The mechanisms are already built and already correct — `write`
+/// really does come through here, and the branch above really does stand down
+/// on an already-failing file. The model just had no way to know either.
+#[cfg(feature = "semantic")]
+const GATE_REJECT_POLICY: &str = "\
+This check runs on every file-writing tool — write, edit, edit_lines, \
+edit_minified, apply_patch — so switching tools will not get past it, and \
+rewriting the whole file is not a workaround, only a larger blast radius.\n\
+A file that was already failing this check before your edit is written \
+through verbatim, so this rejection means the error came from your edit. Fix \
+the location named above and re-submit that edit.\n";
+
 pub(crate) fn syntax_gate<'a>(
     path: &std::path::Path,
     content: &'a str,
@@ -499,7 +523,14 @@ pub(crate) fn syntax_gate<'a>(
                 std::borrow::Cow::Owned(content),
                 Some(GateNote::Repaired(note)),
             )),
-            SyntaxOutcome::Rejected { message } => Err(message),
+            SyntaxOutcome::Rejected { message } => {
+                let mut message = message;
+                if !message.ends_with('\n') {
+                    message.push('\n');
+                }
+                message.push_str(GATE_REJECT_POLICY);
+                Err(message)
+            }
             SyntaxOutcome::Clean => Ok((std::borrow::Cow::Borrowed(content), None)),
         }
     }
@@ -514,6 +545,7 @@ pub(crate) fn syntax_gate<'a>(
 /// about. The distinction is load-bearing: only a REPAIR means the bytes on
 /// disk differ from the model's text, which is what the LSP-backed rollback
 /// (dirge-p1ws) verifies.
+#[derive(Debug)]
 pub(crate) enum GateNote {
     /// Delimiters were mechanically closed / trimmed.
     Repaired(String),
@@ -1159,6 +1191,95 @@ mod tests {
             syntax_gate(path, "(defn g []\n  (+ 1 2\n", || None).expect("truncation repairs");
         assert_eq!(out, "(defn g []\n  (+ 1 2\n))");
         assert!(note.expect("note").is_repair());
+    }
+
+    // ---- What a REJECT tells the model (dirge-yv0d) --------------------
+    //
+    // From a live trace: a model blocked here concluded the parser was at
+    // fault, then planned to "bypass the guard by writing the entire file
+    // with `write` (which may or may not have syntax guard)" — reconstructing
+    // a 385-line file from context. Both halves of that are wrong. `write`
+    // goes through this same function, and a file that was already failing
+    // before the edit is passed through by the branch above. Neither fact is
+    // discoverable from the reject, so the model inferred an absolute guard
+    // and went looking for a way around it.
+
+    #[cfg(feature = "semantic")]
+    fn a_rejection() -> String {
+        let path = std::path::Path::new("/tmp/gate.janet");
+        syntax_gate(path, "(def a 1))\n(def b 2)\n", || {
+            Some("(def a 1)\n(def b 2)\n".to_string())
+        })
+        .expect_err("this edit breaks a clean file and must be rejected")
+    }
+
+    #[cfg(feature = "semantic")]
+    #[test]
+    fn reject_says_every_writing_tool_goes_through_the_same_gate() {
+        let msg = a_rejection();
+        for tool in [
+            "write",
+            "edit",
+            "edit_lines",
+            "edit_minified",
+            "apply_patch",
+        ] {
+            assert!(
+                msg.contains(tool),
+                "a reject must name {tool} as covered, or switching to it looks like an escape: {msg}"
+            );
+        }
+    }
+
+    #[cfg(feature = "semantic")]
+    #[test]
+    fn reject_says_a_pre_broken_file_is_passed_through() {
+        let msg = a_rejection();
+        assert!(
+            msg.contains("before your edit") && msg.contains("verbatim"),
+            "a reject must say the gate stands down on an already-failing file, \
+             so the model reads it as 'my edit caused this' rather than 'this \
+             file is uneditable': {msg}"
+        );
+    }
+
+    /// The other side. If the policy text were appended unconditionally it
+    /// would ride along on clean writes and repairs, where it is false and
+    /// noise — and both tests above would pass just as well.
+    #[cfg(feature = "semantic")]
+    #[test]
+    fn the_gate_policy_text_rides_only_on_a_reject() {
+        let path = std::path::Path::new("/tmp/gate.janet");
+        let (_, clean) = syntax_gate(path, "(def a 1)\n", || None).expect("clean");
+        assert!(clean.is_none(), "a clean write carries no note at all");
+
+        let (_, repaired) = syntax_gate(path, "(defn g []\n  (+ 1 2\n", || None).expect("repairs");
+        let repaired = repaired.expect("repair note").text().to_string();
+        assert!(
+            !repaired.contains("apply_patch"),
+            "the repair note must not carry reject-only policy: {repaired}"
+        );
+
+        let (_, pre) = syntax_gate(path, "(def a 1))\n(def b 3)\n", || {
+            Some("(def a 1))\n(def b 2)\n".to_string())
+        })
+        .expect("stands down");
+        let pre = pre.expect("stand-down note").text().to_string();
+        assert!(
+            !pre.contains("apply_patch"),
+            "the stand-down note must not carry reject-only policy: {pre}"
+        );
+    }
+
+    #[cfg(feature = "semantic")]
+    #[test]
+    fn reject_still_leads_with_the_error_location() {
+        let msg = a_rejection();
+        let first = msg.lines().next().unwrap_or_default();
+        assert!(
+            first.contains("Syntax check failed"),
+            "the policy text is a footer, never the headline: {msg}"
+        );
     }
 
     #[cfg(feature = "semantic")]
