@@ -131,6 +131,12 @@ pub struct Cli {
     #[arg(long = "no-tools", help = "Disable all tools")]
     pub no_tools: bool,
 
+    #[arg(
+        long = "no-compression",
+        help = "Disable prompt compression (llmtrim) for this run — send request bodies untouched. Overrides DIRGE_COMPRESSION and [compression].enabled"
+    )]
+    pub no_compression: bool,
+
     #[cfg(feature = "lsp")]
     #[arg(
         long = "no-lsp",

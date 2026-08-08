@@ -973,19 +973,17 @@ fn refresh_kimi_credential(
     Ok(crate::auth::command::kimi_tokens_to_credential(tokens))
 }
 
-/// Resolve `enabled` for the compression interceptor. Config defaults to
-/// on; `DIRGE_COMPRESSION=0` or `DIRGE_COMPRESSION=off` disables at runtime.
+/// Resolve `enabled` for the compression interceptor. Defaults to on;
+/// `--no-compression`, `DIRGE_COMPRESSION=0|off`, or `[compression].enabled
+/// = false` each disable it, in that precedence order. The policy itself
+/// lives in [`crate::compression::resolve_enabled`]; this only gathers the
+/// three process-global inputs.
 fn resolve_compression_enabled() -> bool {
-    // Env var takes absolute precedence (case-insensitive boolean-disable
-    // spellings). If unset, fall back to the [compression] config section
-    // loaded at startup.
-    match std::env::var("DIRGE_COMPRESSION") {
-        Ok(v) => !matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "0" | "off" | "false" | "no" | "disabled"
-        ),
-        Err(_) => crate::compression::configured_enabled(),
-    }
+    crate::compression::resolve_enabled(
+        crate::compression::cli_disabled(),
+        std::env::var("DIRGE_COMPRESSION").ok().as_deref(),
+        Some(crate::compression::configured_enabled()),
+    )
 }
 
 /// Resolve the compression preset name. `DIRGE_COMPRESSION_PRESET` overrides

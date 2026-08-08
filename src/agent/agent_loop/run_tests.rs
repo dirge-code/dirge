@@ -1197,7 +1197,12 @@ async fn compaction_on_compact_hook_overrides_llm_summary() {
     let summarize_fn: Option<crate::agent::compression::SummarizeFn> =
         Some(std::sync::Arc::new(move |_prompt: String| {
             llm_called_c.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async move { Ok("## Active Task\nLLM-SUMMARY".to_string()) })
+            Box::pin(async move {
+                Ok(
+                    "## Active Task\nLLM-SUMMARY\n\n## Completed Actions\n1. read the file"
+                        .to_string(),
+                )
+            })
         }));
 
     // on-before observe counter + on-compact returning a custom summary.
@@ -1211,7 +1216,12 @@ async fn compaction_on_compact_hook_overrides_llm_summary() {
             })
         }),
         on_compact: std::sync::Arc::new(move |_middle| {
-            Box::pin(async move { Some("## Active Task\nPLUGIN-SUMMARY".to_string()) })
+            Box::pin(async move {
+                Some(
+                    "## Active Task\nPLUGIN-SUMMARY\n\n## Completed Actions\n1. read the file"
+                        .to_string(),
+                )
+            })
         }),
     };
 
@@ -1295,7 +1305,12 @@ async fn compaction_invalid_plugin_summary_falls_through_to_llm() {
     let summarize_fn: Option<crate::agent::compression::SummarizeFn> =
         Some(std::sync::Arc::new(move |_prompt: String| {
             llm_called_c.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async move { Ok("## Active Task\nLLM-SUMMARY".to_string()) })
+            Box::pin(async move {
+                Ok(
+                    "## Active Task\nLLM-SUMMARY\n\n## Completed Actions\n1. read the file"
+                        .to_string(),
+                )
+            })
         }));
 
     let hooks = CompactionHooks {
