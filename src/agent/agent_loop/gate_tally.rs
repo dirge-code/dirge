@@ -79,6 +79,35 @@ pub enum BoundaryMember {
 }
 
 impl GateSource {
+    /// Every variant, in [`index`](Self::index) order.
+    ///
+    /// This exists because the emitter used to carry a hand-written list of
+    /// `gate_*` fields, and `ClaimGate` / `SourceGate` were added to the
+    /// enum without being added to it — so the two gates that exist to catch
+    /// fabricated verification were themselves absent from the only surface
+    /// that reports them (dirge-l8l7.1). The unit test that should have
+    /// caught it iterated its own hand-written list with the same two
+    /// missing, so it asserted exactly what the emitter did.
+    ///
+    /// Adding a variant now fails to compile in [`index`](Self::index) and
+    /// [`field_name`](Self::field_name), and fails
+    /// `all_gate_variants_are_indexed_contiguously` and
+    /// `every_gate_variant_has_a_field_on_the_emitted_line` until it is
+    /// added here and to `emit`.
+    pub const ALL: [GateSource; 11] = [
+        GateSource::AwaitingUser,
+        GateSource::Hook,
+        GateSource::ResumeAfterFailure,
+        GateSource::Verifier,
+        GateSource::ClaimGate,
+        GateSource::SourceGate,
+        GateSource::Critic,
+        GateSource::Goal,
+        GateSource::Todo,
+        GateSource::OpenIssues,
+        GateSource::None,
+    ];
+
     fn index(self) -> usize {
         match self {
             GateSource::AwaitingUser => 0,
@@ -94,9 +123,53 @@ impl GateSource {
             GateSource::None => 10,
         }
     }
+
+    /// The field name this variant carries on the `dirge::gates` line, or
+    /// `None` for a variant that is deliberately not emitted. `None` is the
+    /// "no gate fired" sentinel — `record_gate` treats it as a no-op, so it
+    /// has no count to report.
+    ///
+    /// Exhaustive by design: a new variant must state which it is, and
+    /// `every_gate_variant_has_a_field_on_the_emitted_line` then fails until
+    /// `emit` actually carries it.
+    ///
+    /// Test-only, like [`Self::boundaries`]: `tracing`'s field names must be
+    /// literals at the macro call, so production cannot read them from here.
+    /// That is exactly why the correspondence needs asserting rather than
+    /// assuming — it is the drift that lost `ClaimGate` and `SourceGate`.
+    #[cfg(test)]
+    pub fn field_name(self) -> Option<&'static str> {
+        Some(match self {
+            GateSource::AwaitingUser => "gate_awaiting_user",
+            GateSource::Hook => "gate_hook",
+            GateSource::ResumeAfterFailure => "gate_resume_after_failure",
+            GateSource::Verifier => "gate_verifier",
+            GateSource::ClaimGate => "gate_claim_gate",
+            GateSource::SourceGate => "gate_source_gate",
+            GateSource::Critic => "gate_critic",
+            GateSource::Goal => "gate_goal",
+            GateSource::Todo => "gate_todo",
+            GateSource::OpenIssues => "gate_open_issues",
+            GateSource::None => return Option::None,
+        })
+    }
 }
 
 impl BoundaryNudge {
+    /// Every variant, in [`index`](Self::index) order. Same contract as
+    /// [`GateSource::ALL`] — see its doc for why this exists.
+    pub const ALL: [BoundaryNudge; 9] = [
+        BoundaryNudge::TrackWork,
+        BoundaryNudge::FastVerify,
+        BoundaryNudge::ProgressStall,
+        BoundaryNudge::ProgressBudget,
+        BoundaryNudge::ProgressPrologue,
+        BoundaryNudge::FileTouch,
+        BoundaryNudge::ReflectionCheckpoint,
+        BoundaryNudge::SafeState,
+        BoundaryNudge::None,
+    ];
+
     fn index(self) -> usize {
         match self {
             BoundaryNudge::TrackWork => 0,
@@ -110,6 +183,24 @@ impl BoundaryNudge {
             BoundaryNudge::None => 8,
         }
     }
+
+    /// The field name this variant carries on the `dirge::gates` line, or
+    /// `None` for the "no nudge fired" sentinel. Test-only for the same
+    /// reason — see [`GateSource::field_name`].
+    #[cfg(test)]
+    pub fn field_name(self) -> Option<&'static str> {
+        Some(match self {
+            BoundaryNudge::TrackWork => "nudge_track_work",
+            BoundaryNudge::FastVerify => "nudge_fast_verify",
+            BoundaryNudge::ProgressStall => "nudge_progress_stall",
+            BoundaryNudge::ProgressBudget => "nudge_progress_budget",
+            BoundaryNudge::ProgressPrologue => "nudge_progress_prologue",
+            BoundaryNudge::FileTouch => "nudge_file_touch",
+            BoundaryNudge::ReflectionCheckpoint => "nudge_reflection_checkpoint",
+            BoundaryNudge::SafeState => "nudge_safe_state",
+            BoundaryNudge::None => return Option::None,
+        })
+    }
 }
 
 /// Aggregated per-run counts of which gates and boundary nudges fired,
@@ -118,11 +209,10 @@ impl BoundaryNudge {
 #[derive(Clone, Debug, Default)]
 pub struct GateTally {
     /// One slot per [`GateSource`] variant, indexed by `GateSource::index`.
-    /// Adding a variant means growing this — the index is unchecked, so a
-    /// stale length panics at runtime rather than failing to compile.
-    gates: [u32; 11],
+    /// Sized off [`GateSource::ALL`] so the two cannot disagree.
+    gates: [u32; GateSource::ALL.len()],
     /// One slot per [`BoundaryNudge`] variant, same contract as above.
-    nudges: [u32; 9],
+    nudges: [u32; BoundaryNudge::ALL.len()],
     turns: u32,
     tool_calls: u32,
     errored_tool_calls: u32,
@@ -368,6 +458,15 @@ impl GateTally {
             gate_hook = self.gates[GateSource::Hook.index()],
             gate_resume_after_failure = self.gates[GateSource::ResumeAfterFailure.index()],
             gate_verifier = self.gates[GateSource::Verifier.index()],
+            // dirge-l8l7.1: these two were recorded by `record_gate` (run.rs
+            // maps them through an exhaustive `From<FollowUpSource>`) and
+            // then dropped here, so the two gates that exist to catch
+            // fabricated verification were the two whose own firing could
+            // not be observed. Field names come from `GateSource::field_name`
+            // and are asserted against `GateSource::ALL` by
+            // `every_gate_variant_has_a_field_on_the_emitted_line`.
+            gate_claim_gate = self.gates[GateSource::ClaimGate.index()],
+            gate_source_gate = self.gates[GateSource::SourceGate.index()],
             gate_critic = self.gates[GateSource::Critic.index()],
             gate_goal = self.gates[GateSource::Goal.index()],
             gate_todo = self.gates[GateSource::Todo.index()],
@@ -472,6 +571,129 @@ pub(crate) mod tests {
         tally.record_nudge(BoundaryNudge::None);
         assert_eq!(tally.nudge_count(BoundaryNudge::None), 0);
         assert_eq!(tally.nudge_count(BoundaryNudge::FileTouch), 0);
+    }
+
+    // ---- dirge-l8l7.1: the emitted line must cover every variant --------
+    //
+    // These four replace the hand-written variant lists that let `ClaimGate`
+    // and `SourceGate` be added to the enum, recorded by `record_gate`, and
+    // then dropped by `emit` — with `counts_each_gate_variant_separately`
+    // green throughout, because it iterated a list with the same two
+    // missing. A test that enumerates the thing it is checking cannot fail.
+
+    /// Field names on a rendered `dirge::gates` line, parsed exactly. The
+    /// line is space-separated `key=value`, so this splits rather than
+    /// substring-matching: `contains("gate_todo=")` would also be satisfied
+    /// by a longer field ending in that name, which is precisely the class
+    /// of bug `loop-ab.sh`'s `get_field` hit when `tool_calls` silently read
+    /// `errored_tool_calls`.
+    fn emitted_field_names(line: &str) -> std::collections::HashSet<&str> {
+        line.split_whitespace()
+            .filter_map(|tok| tok.split_once('='))
+            .map(|(k, _)| k)
+            .collect()
+    }
+
+    #[test]
+    fn all_gate_variants_are_indexed_contiguously() {
+        let mut seen = vec![false; GateSource::ALL.len()];
+        for gate in GateSource::ALL {
+            let i = gate.index();
+            assert!(
+                i < seen.len(),
+                "{gate:?} indexes {i}, past the end of ALL ({})",
+                seen.len()
+            );
+            assert!(!seen[i], "index {i} is claimed twice; {gate:?} collides");
+            seen[i] = true;
+        }
+        assert!(
+            seen.iter().all(|s| *s),
+            "GateSource::ALL is missing a variant: index(es) {:?} unclaimed",
+            seen.iter()
+                .enumerate()
+                .filter(|(_, s)| !**s)
+                .map(|(i, _)| i)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn all_nudge_variants_are_indexed_contiguously() {
+        let mut seen = vec![false; BoundaryNudge::ALL.len()];
+        for nudge in BoundaryNudge::ALL {
+            let i = nudge.index();
+            assert!(
+                i < seen.len(),
+                "{nudge:?} indexes {i}, past the end of ALL ({})",
+                seen.len()
+            );
+            assert!(!seen[i], "index {i} is claimed twice; {nudge:?} collides");
+            seen[i] = true;
+        }
+        assert!(
+            seen.iter().all(|s| *s),
+            "BoundaryNudge::ALL is missing a variant: index(es) {:?} unclaimed",
+            seen.iter()
+                .enumerate()
+                .filter(|(_, s)| !**s)
+                .map(|(i, _)| i)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn every_gate_variant_has_a_field_on_the_emitted_line() {
+        let line = capture_emit(&GateTally::new());
+        let present = emitted_field_names(&line);
+        let missing: Vec<&str> = GateSource::ALL
+            .into_iter()
+            .filter_map(GateSource::field_name)
+            .filter(|name| !present.contains(name))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "GateSource variants recorded but never emitted: {missing:?}\nline: {line}"
+        );
+    }
+
+    #[test]
+    fn every_nudge_variant_has_a_field_on_the_emitted_line() {
+        let line = capture_emit(&GateTally::new());
+        let present = emitted_field_names(&line);
+        let missing: Vec<&str> = BoundaryNudge::ALL
+            .into_iter()
+            .filter_map(BoundaryNudge::field_name)
+            .filter(|name| !present.contains(name))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "BoundaryNudge variants recorded but never emitted: {missing:?}\nline: {line}"
+        );
+    }
+
+    /// The other side of the two tests above: a name they check for must be
+    /// one the emitter could actually have got wrong. If `field_name` ever
+    /// returned something no `emit` field could match, both would be
+    /// vacuous — so pin the count and the sentinel exclusion.
+    #[test]
+    fn only_the_none_sentinels_are_exempt_from_emission() {
+        assert_eq!(GateSource::None.field_name(), Option::None);
+        assert_eq!(BoundaryNudge::None.field_name(), Option::None);
+        assert_eq!(
+            GateSource::ALL
+                .into_iter()
+                .filter_map(GateSource::field_name)
+                .count(),
+            GateSource::ALL.len() - 1
+        );
+        assert_eq!(
+            BoundaryNudge::ALL
+                .into_iter()
+                .filter_map(BoundaryNudge::field_name)
+                .count(),
+            BoundaryNudge::ALL.len() - 1
+        );
     }
 
     #[test]
