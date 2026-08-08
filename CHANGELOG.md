@@ -4,6 +4,64 @@ All notable changes to dirge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.21.12] - 2026-08-08
+
+### Fixed
+- The gate tally never emitted `gate_claim_gate` or `gate_source_gate`. Both
+  variants were recorded by `record_gate` — `run.rs` maps them through an
+  exhaustive `From<FollowUpSource>` — and then dropped by `emit`, which carried
+  a hand-written list of `gate_*` fields. So the `dirge::gates` line, the only
+  surface that reports this, could not say whether either had fired, and the
+  two gates that exist to catch fabricated verification were the two whose own
+  firing was unobservable. The unit test that should have caught it iterated
+  its own copy of that list with the same two missing, so it asserted exactly
+  what the emitter did and stayed green.
+
+  `GateSource::ALL` / `BoundaryNudge::ALL` now drive the tests, `index` is the
+  discriminant rather than a second hand-written mapping, and the count arrays
+  are sized off `ALL`. A new variant fails to compile in `field_name` and fails
+  three tests until `emit` carries it.
+
+- Four silent bugs in the A/B reporter (`scripts/loop-ab.sh`), all
+  under-reporting. The N-arm cross-model summary sat one brace inside the
+  missing-tally branch, so it printed only when a run had failed to produce a
+  gates line and was unreachable on a healthy one. Co-occurrence events came
+  out in awk hash order rather than run order (`A;B;C;D;E` reported as
+  `B, C, D, E, A`), and the selftest asserted that scrambled order as its
+  expected value. The control/treatment comparison divided by `n[arm]`
+  unguarded, so a model present under one arm and absent under the other killed
+  awk and produced no report at all — the N-arm block twenty lines below
+  already carried that guard. And no `gate_*` field was scraped at all, so
+  `nudges_fired`, the mechanism check, was structurally 0 for every
+  finalization-gate A/B.
+
+  Also: unanimous-flat was labelled `MIXED`, a `split()` was walked against a
+  hardcoded 10, an absent column rendered as `(..)` instead of announcing
+  itself, and a blank line in `results.tsv` minted an arm and a model named
+  `""` that appeared in every section. `gates_fired` is added as column 20,
+  appended so an older `results.tsv` still reports.
+
+- A delegated run that hit the turn cap returned `error_max_turns` with
+  `result: ""`, so a caller could not tell finished-but-unpolished from
+  broken-and-abandoned — while the same envelope already carried the turn
+  count, the changed files and the verification status. A run that ends
+  without writing a closing answer now gets a summary built from those fields.
+  It never replaces text the model actually wrote, never touches a successful
+  run, and states outright that it is not a completeness verdict.
+
+- The pre-write syntax gate's rejection said nothing about its own scope. A
+  model blocked by it concluded the parser was at fault and planned to write
+  the whole file with `write` instead — which goes through the same gate — and
+  the stand-down it actually wanted (a file already failing the check before
+  the edit is written through verbatim) was invisible from the reject path.
+  Rejections now carry both facts. Valid doctest and macro shapes are pinned as
+  passing, with a companion test so that check cannot go vacuous.
+
+### Changed
+- `scripts/loop-ab-selftest.sh` is a discrimination harness: every claim is
+  checked against a fixture where the answer must be different, and the file is
+  mutation-tested — reintroduce each bug and it must go red.
+
 ## [0.21.11] - 2026-08-07
 
 ### Fixed
