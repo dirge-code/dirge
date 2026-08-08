@@ -108,20 +108,17 @@ impl GateSource {
         GateSource::None,
     ];
 
+    /// Slot in [`GateTally::gates`] — the variant's own discriminant.
+    ///
+    /// This was a second hand-written mapping, which left one way to break
+    /// the tally that neither new test could see: add a variant, add it to
+    /// this match with the next index, and forget [`ALL`](Self::ALL). Both
+    /// tests iterate `ALL`, so they would have stayed green while
+    /// `record_gate` wrote past the end of a `[u32; ALL.len()]` and panicked
+    /// at runtime. Deleting the copy is the fix — the discriminant cannot
+    /// disagree with the declaration order it comes from.
     fn index(self) -> usize {
-        match self {
-            GateSource::AwaitingUser => 0,
-            GateSource::Hook => 1,
-            GateSource::ResumeAfterFailure => 2,
-            GateSource::Verifier => 3,
-            GateSource::ClaimGate => 4,
-            GateSource::SourceGate => 5,
-            GateSource::Critic => 6,
-            GateSource::Goal => 7,
-            GateSource::Todo => 8,
-            GateSource::OpenIssues => 9,
-            GateSource::None => 10,
-        }
+        self as usize
     }
 
     /// The field name this variant carries on the `dirge::gates` line, or
@@ -170,18 +167,10 @@ impl BoundaryNudge {
         BoundaryNudge::None,
     ];
 
+    /// Slot in [`GateTally::nudges`] — the discriminant. See
+    /// [`GateSource::index`] for why this is not a second mapping.
     fn index(self) -> usize {
-        match self {
-            BoundaryNudge::TrackWork => 0,
-            BoundaryNudge::FastVerify => 1,
-            BoundaryNudge::ProgressStall => 2,
-            BoundaryNudge::ProgressBudget => 3,
-            BoundaryNudge::ProgressPrologue => 4,
-            BoundaryNudge::FileTouch => 5,
-            BoundaryNudge::ReflectionCheckpoint => 6,
-            BoundaryNudge::SafeState => 7,
-            BoundaryNudge::None => 8,
-        }
+        self as usize
     }
 
     /// The field name this variant carries on the `dirge::gates` line, or
@@ -592,6 +581,28 @@ pub(crate) mod tests {
             .filter_map(|tok| tok.split_once('='))
             .map(|(k, _)| k)
             .collect()
+    }
+
+    /// The one way left to break the tally: add a variant ahead of the `None`
+    /// sentinel and not extend `ALL`. `index` is the discriminant now, so the
+    /// new variant would write past the end of a `[u32; ALL.len()]` and panic
+    /// inside `record_gate` — and every test that iterates `ALL` would stay
+    /// green, because `ALL` is what is missing it. Anchoring on the sentinel's
+    /// discriminant is what makes that visible.
+    ///
+    /// `None` must stay declared last in both enums for this to hold.
+    #[test]
+    fn all_ends_at_the_sentinel_so_a_new_variant_cannot_hide() {
+        assert_eq!(
+            GateSource::ALL.len(),
+            GateSource::None as usize + 1,
+            "a GateSource variant was added without extending ALL"
+        );
+        assert_eq!(
+            BoundaryNudge::ALL.len(),
+            BoundaryNudge::None as usize + 1,
+            "a BoundaryNudge variant was added without extending ALL"
+        );
     }
 
     #[test]

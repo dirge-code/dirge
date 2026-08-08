@@ -117,11 +117,20 @@ awk -F'\t' 'BEGIN{OFS="\t"} NR==1{$15=0} {print}' "$work/healthy.tsv" > "$work/s
 # LEGACY: the same runs as recorded before the gates column existed.
 cut -f1-19 "$work/mech.tsv" > "$work/legacy.tsv"
 
+# BLANK: mech.tsv plus a trailing empty line. Must report identically — a
+# blank line used to mint an arm named "" and a model named "".
+{ cat "$work/mech.tsv"; printf '\n'; } > "$work/blank.tsv"
+
+# TRUNCATED: mech.tsv plus a row cut off mid-write.
+{ cat "$work/mech.tsv"; printf 'control\tm1\t3\t10\n'; } > "$work/truncated.tsv"
+
 out_healthy="$(report "$work/healthy.tsv")"
 out_sick="$(report "$work/sick.tsv")"
 out_lopsided="$(report "$work/lopsided.tsv")"
 out_order="$(report "$work/order.tsv")"
 out_mech="$(report "$work/mech.tsv")"
+out_blank="$(report "$work/blank.tsv")"
+out_truncated="$(report "$work/truncated.tsv")"
 out_legacy="$(report "$work/legacy.tsv")"
 
 fails=0
@@ -149,6 +158,14 @@ differs() { # $1 = description, $2 = a, $3 = b
     fails=$((fails + 1))
   fi
 }
+same() { # $1 = description, $2 = a, $3 = b
+  if [ "$2" = "$3" ]; then
+    echo "  ok   $1"
+  else
+    echo "  FAIL $1 (the two reports differ, and must not)"
+    fails=$((fails + 1))
+  fi
+}
 eq() { # $1 = description, $2 = got, $3 = want
   if [ "$2" = "$3" ]; then
     echo "  ok   $1"
@@ -163,7 +180,7 @@ echo "loop-ab.sh reporting self-test:"
 # ---- Nothing below means anything if the report did not run. Checked first
 # and for every fixture, because an awk abort produces no rows at all and
 # every `reject` would then pass vacuously.
-for fx in healthy sick lopsided order mech legacy; do
+for fx in healthy sick lopsided order mech legacy blank truncated; do
   eval "reject \"\$out_$fx\" \"the $fx report ran to completion\" 'REPORT-ABORTED'"
 done
 
@@ -233,11 +250,33 @@ differs "the gates column is actually read, not fabricated" \
 want   "$out_healthy" "flat in every model is labelled as such" 'turns +better 0, worse 0, flat 2 of 2 models — flat in every model'
 reject "$out_healthy" "and is not called MIXED"                 'turns .*— MIXED'
 
+# ---- A row that is not a run record must not become one. A blank line used
+# to mint an arm named "" and a model named ""; before the absent-arm guard it
+# divided by zero and took the report down.
+same "a trailing blank line changes nothing" "$out_blank" "$out_mech"
+reject "$out_blank" "no arm is named after an empty field" '^  co-occurrence : '
+want   "$out_truncated" "a truncated row is reported, not absorbed" 'WARNING: 1 row\(s\) had too few fields'
+reject "$out_truncated" "and does not mint a phantom model"         '^== model:  ==$'
+reject "$out_mech"      "a clean file carries no truncation warning" 'had too few fields'
+
 # ---- dirge-l8l7.5: sum_fields has no hardcoded name list.
 eq "sum_fields totals a prefix"        "$(sum_fields nudge_ ' nudge_a=1 nudge_b=2 gate_x=5')"  3
 eq "sum_fields keeps prefixes apart"   "$(sum_fields gate_  ' nudge_a=1 nudge_b=2 gate_x=5')"  5
 eq "sum_fields counts an UNKNOWN field" "$(sum_fields nudge_ ' nudge_track_work=1 nudge_brand_new_thing=4')" 5
 eq "sum_fields reports 0, not empty"   "$(sum_fields gate_  ' nudge_a=1')"                     0
+eq "sum_fields anchors the prefix"     "$(sum_fields tool_  ' errored_tool_calls=7 tool_x=1')"  1
+# The status, not the value. loop-ab.sh runs under `set -euo pipefail`, so a
+# helper that exits non-zero on "nothing matched" does not fail a check — it
+# kills the harness mid-run, after the model calls have been paid for. The
+# value check above cannot see this: a command substitution used as an
+# ARGUMENT masks the exit status, which is exactly why it passed while the
+# first `grep | grep | awk` cut was abort-prone.
+if sum_fields gate_ ' nudge_a=1' >/dev/null 2>&1; then
+  echo "  ok   sum_fields exits 0 when nothing matches"
+else
+  echo "  FAIL sum_fields exits non-zero when nothing matches (set -e would kill a real run)"
+  fails=$((fails + 1))
+fi
 
 if [ "$fails" -ne 0 ]; then
   echo

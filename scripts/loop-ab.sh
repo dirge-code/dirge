@@ -422,11 +422,30 @@ fi
 # which is what a mechanism check needs in order to be able to report the
 # other answer. Prints 0 for no matches, so the caller never sees an empty
 # string.
+# One awk, deliberately: the first cut was `grep | grep | awk`, and under this
+# script's `set -euo pipefail` a line with NO matching field made grep exit 1,
+# which took the whole harness down mid-run — after however many model calls
+# had already been paid for. A summing helper returning "there were none" must
+# not be able to abort its caller. Nothing about that is visible from the
+# value, either: the selftest's `$(sum_fields …)` check passed throughout,
+# because a command substitution used as an argument masks the status.
+#
+# Prefix match is anchored with index()==1 against whitespace-split tokens, so
+# `tool_` cannot match inside `errored_tool_calls` — the same left-boundary
+# rule get_field needs below, for the same reason.
 sum_fields() { # $1 = key prefix, $2 = line
-  printf '%s\n' "$2" \
-    | grep -oE "[[:space:]]${1}[a-z0-9_]*=[0-9]+" \
-    | grep -oE '[0-9]+$' \
-    | awk '{ s += $1 } END { print s + 0 }'
+  printf '%s\n' "$2" | awk -v p="$1" '
+    {
+      n = split($0, toks, /[[:space:]]+/)
+      for (i = 1; i <= n; i++) {
+        if (index(toks[i], p) != 1) continue
+        eq = index(toks[i], "=")
+        if (eq == 0) continue
+        val = substr(toks[i], eq + 1)
+        if (val ~ /^[0-9]+$/) s += val
+      }
+    }
+    END { print s + 0 }'
 }
 
 get_field() { # $1 = key, $2 = line
@@ -643,6 +662,15 @@ done
 # clearly good or bad). A missing tally anywhere is surfaced, never hidden.
 awk -F'\t' '
 BEGIN { tiercols["struggling"]=1; tiercols["nominal"]=1; tiercols["strong"]=1 }
+# A run row is 19 fields (written before the gates column existed) or 20.
+# Anything shorter is not a run record — a trailing blank line, or a
+# truncated/hand-edited row — and used to be accepted, which minted an arm
+# named "" and a model named "" that then appeared in every section of the
+# report (`== model:  ==`, `co-occurrence :`). Before the absent-arm guard it
+# was worse: the phantom model had no arms, so it divided by zero and took the
+# whole report down. Skipped here, and counted, so the skip is never silent.
+NF == 0 { next }
+NF < 19 { malformed_rows++; next }
 {
   key = $1 SUBSEP $2
   if (!(key in seen)) {
@@ -920,6 +948,9 @@ END {
   }
   if (short_rows > 0) {
     printf "  NOTE: %d row(s) predate the gates_fired column (fewer than 20 fields); gates_fired reads 0 for those by default, which is an absence, not a measurement.\n", short_rows
+  }
+  if (malformed_rows > 0) {
+    printf "  WARNING: %d row(s) had too few fields to be a run record and were skipped — check %s for truncated writes.\n", malformed_rows, FILENAME
   }
 
   # dirge-1elu.6: N-arm consistency across models (only meaningful with
