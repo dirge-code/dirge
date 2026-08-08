@@ -159,11 +159,38 @@ const WORK_VERBS: [&str; 24] = [
     "verify",
 ];
 
+/// Does `needle` occur in `lower` at the START of a word?
+///
+/// A plain `contains` is wrong here and measurably so: it read `test` out of
+/// `latest`, `fix` out of `prefix`, and `port` out of `report`, `support` and
+/// `important` — so "I'll use the latest version" fired the gate. Those are
+/// precisely the honest sentences that get a gate switched off.
+///
+/// Only the LEADING boundary is required. Verbs appear in their infinitive
+/// form but the sentence may inflect them ("I'll be implementing the retry
+/// path"), and demanding a trailing boundary would drop those.
+///
+/// `claim_gate` solved the same problem for its past-tense verbs; this is that
+/// rule applied to the same class of list.
+fn contains_word_starting_with(lower: &str, needle: &str) -> bool {
+    let (hay, ndl) = (lower.as_bytes(), needle.as_bytes());
+    if ndl.is_empty() || hay.len() < ndl.len() {
+        return false;
+    }
+    (0..=hay.len() - ndl.len())
+        .any(|i| &hay[i..i + ndl.len()] == ndl && (i == 0 || !hay[i - 1].is_ascii_alphanumeric()))
+}
+
 /// Addressing the user makes it a handoff, not an abandoned intention —
 /// "I'll leave the migration to you" is a complete answer.
+///
+/// Word-anchored for the same reason as the verbs: `bayou ` contains `you `,
+/// and silencing the gate on it is the harmless direction but still wrong.
 fn addresses_the_user(lower: &str) -> bool {
     const SECOND_PERSON: [&str; 5] = ["you ", "you'", "your ", "you,", "you."];
-    SECOND_PERSON.iter().any(|m| lower.contains(m))
+    SECOND_PERSON
+        .iter()
+        .any(|m| contains_word_starting_with(lower, m))
 }
 
 fn sentence_states_remaining_work(sentence: &str) -> bool {
@@ -175,11 +202,15 @@ fn sentence_states_remaining_work(sentence: &str) -> bool {
     if addresses_the_user(&lower) {
         return false;
     }
-    let has_marker = FORWARD_MARKERS.iter().any(|m| lower.contains(m));
+    let has_marker = FORWARD_MARKERS
+        .iter()
+        .any(|m| contains_word_starting_with(&lower, m));
     if !has_marker {
         return false;
     }
-    WORK_VERBS.iter().any(|v| lower.contains(v))
+    WORK_VERBS
+        .iter()
+        .any(|v| contains_word_starting_with(&lower, v))
 }
 
 #[cfg(test)]
@@ -323,6 +354,54 @@ mod tests {
             !should_nudge_incomplete(GateMode::Blocking, 3, 0, true, STATES_WORK),
             "and stop at the ceiling"
         );
+    }
+
+    /// Found by reviewing this module rather than by a failing test, which is
+    /// the point of keeping them: a plain `contains` read `test` out of
+    /// `latest`, `fix` out of `prefix`, and `port` out of `report`, `support`
+    /// and `important`. Every one is an ordinary, complete sentence, and a gate
+    /// that fires on those gets switched off.
+    #[test]
+    fn a_verb_inside_a_longer_word_does_not_count() {
+        for answer in [
+            "I'll use the latest version of the crate.",
+            "I'll keep the prefix as-is.",
+            "I'll report the numbers in the summary.",
+            "I'll note that support for this is important.",
+            "I'll take the transport layer as given.",
+        ] {
+            assert!(
+                !states_remaining_work(answer),
+                "substring match fired on: {answer}"
+            );
+        }
+    }
+
+    /// The other side: the boundary rule must not cost real matches. Verbs are
+    /// listed as infinitives, so inflected forms have to keep counting.
+    #[test]
+    fn an_inflected_verb_still_counts() {
+        for answer in [
+            "I'll be implementing the retry path.",
+            "I'll start wiring the handlers.",
+            "I'll finish porting the last module.",
+        ] {
+            assert!(
+                states_remaining_work(answer),
+                "boundary rule dropped a real match: {answer}"
+            );
+        }
+    }
+
+    #[test]
+    fn second_person_detection_is_word_anchored() {
+        // `bayou` contains `you ` — silencing on it is the harmless direction,
+        // but it is still a wrong reason.
+        assert!(states_remaining_work("I'll implement the bayou parser."));
+        // ...while a real handoff still suppresses.
+        assert!(!states_remaining_work(
+            "I'll implement it once you confirm."
+        ));
     }
 
     #[test]
