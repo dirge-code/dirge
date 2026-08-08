@@ -43,6 +43,9 @@ pub enum GateSource {
     /// Deterministic artifact-scope sourcing gate (dirge-lavc GAP 1). No
     /// LLM call.
     SourceGate,
+    /// Deterministic completeness gate (dirge-2m68): the final answer stated
+    /// work the model still intended to do. No LLM call.
+    CompletenessGate,
     Critic,
     Goal,
     Todo,
@@ -94,13 +97,14 @@ impl GateSource {
     /// `all_gate_variants_are_indexed_contiguously` and
     /// `every_gate_variant_has_a_field_on_the_emitted_line` until it is
     /// added here and to `emit`.
-    pub const ALL: [GateSource; 11] = [
+    pub const ALL: [GateSource; 12] = [
         GateSource::AwaitingUser,
         GateSource::Hook,
         GateSource::ResumeAfterFailure,
         GateSource::Verifier,
         GateSource::ClaimGate,
         GateSource::SourceGate,
+        GateSource::CompletenessGate,
         GateSource::Critic,
         GateSource::Goal,
         GateSource::Todo,
@@ -143,6 +147,7 @@ impl GateSource {
             GateSource::Verifier => "gate_verifier",
             GateSource::ClaimGate => "gate_claim_gate",
             GateSource::SourceGate => "gate_source_gate",
+            GateSource::CompletenessGate => "gate_completeness_gate",
             GateSource::Critic => "gate_critic",
             GateSource::Goal => "gate_goal",
             GateSource::Todo => "gate_todo",
@@ -456,6 +461,7 @@ impl GateTally {
             // `every_gate_variant_has_a_field_on_the_emitted_line`.
             gate_claim_gate = self.gates[GateSource::ClaimGate.index()],
             gate_source_gate = self.gates[GateSource::SourceGate.index()],
+            gate_completeness_gate = self.gates[GateSource::CompletenessGate.index()],
             gate_critic = self.gates[GateSource::Critic.index()],
             gate_goal = self.gates[GateSource::Goal.index()],
             gate_todo = self.gates[GateSource::Todo.index()],

@@ -146,6 +146,7 @@ fn build_config() -> LoopConfig {
         safe_state_abort_mode: crate::agent::agent_loop::types::SafeStateMode::Off,
         publish_guard_mode: crate::agent::agent_loop::types::GateMode::Off,
         claim_gate_mode: crate::agent::agent_loop::types::GateMode::Off,
+        completeness_gate_mode: crate::agent::agent_loop::types::GateMode::Off,
         source_gate_mode: crate::agent::agent_loop::types::GateMode::Off,
         session_id: None,
         goal_fn: None,
@@ -5774,6 +5775,140 @@ fn counting_judge(calls: &Arc<AtomicUsize>) -> crate::agent::agent_loop::critic:
         calls.fetch_add(1, Ordering::SeqCst);
         Box::pin(async { Ok("VERDICT: INCOMPLETE\nFINDINGS:\n- High — bug".to_string()) })
     })
+}
+
+// ---- dirge-2m68(a): the one shot is spent by a VERDICT, not an attempt ----
+//
+// `critic_done` used to flip regardless of outcome, so a judge that timed out
+// or errored — which fails open with no messages — consumed the single
+// completeness check for the whole run. The backstop disappeared exactly when
+// the provider was unhealthy, and nothing said so.
+
+/// A judge that fails its first `fail_times` calls and answers after that.
+fn flaky_judge(
+    calls: &Arc<AtomicUsize>,
+    fail_times: usize,
+) -> crate::agent::agent_loop::critic::CriticFn {
+    let calls = calls.clone();
+    Arc::new(move |_p: String| {
+        let n = calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            if n < fail_times {
+                Err(anyhow::anyhow!("judge timed out"))
+            } else {
+                Ok("VERDICT: INCOMPLETE\nFINDINGS:\n- High — bug".to_string())
+            }
+        })
+    })
+}
+
+#[tokio::test]
+async fn advisory_judge_error_does_not_spend_the_one_shot() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut config = build_config();
+    config.critic_fn = Some(flaky_judge(&calls, 1));
+    config.code_review_mode = crate::agent::agent_loop::types::CodeReviewMode::Off;
+
+    let msgs_run = run_with_tool_result();
+    let mut gates = GateStates::default();
+    let (emit, _rx) = tokio::sync::mpsc::channel(8);
+
+    let (msgs1, _) = poll_finalization_follow_up(
+        &config,
+        "sys",
+        &msgs_run,
+        &mut gates,
+        GateInputs::default(),
+        &emit,
+    )
+    .await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "the judge was attempted");
+    assert!(msgs1.is_empty(), "a failed judge fails open, as before");
+    assert!(
+        !gates.critic_done,
+        "a judge that produced no verdict must NOT have spent the one shot"
+    );
+    assert_eq!(gates.critic_attempts, 1, "but the attempt is counted");
+
+    // Next finalization: the backstop is still armed, and this time it answers.
+    let (msgs2, src2) = poll_finalization_follow_up(
+        &config,
+        "sys",
+        &msgs_run,
+        &mut gates,
+        GateInputs::default(),
+        &emit,
+    )
+    .await;
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "the retry happened");
+    assert!(!msgs2.is_empty(), "and the verdict re-enters the loop");
+    assert_eq!(src2, FollowUpSource::Critic);
+    assert!(gates.critic_done, "a real verdict spends the shot");
+}
+
+/// The other side. Without this, "never spend the shot" would pass the test
+/// above just as well — and the critic would fire on every finalization.
+#[tokio::test]
+async fn advisory_judge_verdict_spends_the_one_shot() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut config = build_config();
+    config.critic_fn = Some(flaky_judge(&calls, 0)); // never fails
+    config.code_review_mode = crate::agent::agent_loop::types::CodeReviewMode::Off;
+
+    let msgs_run = run_with_tool_result();
+    let mut gates = GateStates::default();
+    let (emit, _rx) = tokio::sync::mpsc::channel(8);
+
+    for _ in 0..3 {
+        let _ = poll_finalization_follow_up(
+            &config,
+            "sys",
+            &msgs_run,
+            &mut gates,
+            GateInputs::default(),
+            &emit,
+        )
+        .await;
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "a judge that answered is asked once per run, not once per finalization"
+    );
+    assert!(gates.critic_done);
+    assert_eq!(gates.critic_attempts, 1);
+}
+
+/// A judge that never answers must not be retried at every finalization for
+/// the whole run — each attempt is a real LLM call.
+#[tokio::test]
+async fn a_persistently_failing_judge_is_bounded() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut config = build_config();
+    config.critic_fn = Some(flaky_judge(&calls, usize::MAX)); // always fails
+    config.code_review_mode = crate::agent::agent_loop::types::CodeReviewMode::Off;
+
+    let msgs_run = run_with_tool_result();
+    let mut gates = GateStates::default();
+    let (emit, _rx) = tokio::sync::mpsc::channel(8);
+
+    for _ in 0..8 {
+        let _ = poll_finalization_follow_up(
+            &config,
+            "sys",
+            &msgs_run,
+            &mut gates,
+            GateInputs::default(),
+            &emit,
+        )
+        .await;
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        MAX_CRITIC_JUDGE_ATTEMPTS as usize,
+        "retries stop at the ceiling instead of running all run"
+    );
+    assert!(!gates.critic_done, "no verdict was ever produced");
 }
 
 #[tokio::test]

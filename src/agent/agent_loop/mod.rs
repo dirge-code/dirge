@@ -26,6 +26,7 @@ pub mod bridge;
 pub mod capability;
 pub mod claim_gate;
 pub mod code_review;
+pub mod completeness_gate;
 pub mod context_depth;
 pub mod context_manager;
 pub mod critic;

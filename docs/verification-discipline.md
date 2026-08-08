@@ -22,6 +22,7 @@ reason this page exists as its own document rather than a paragraph in
 | Publish-state guard | `publish_guard` | `off` |
 | Claim/evidence gate | `claim_gate` | `advisory` |
 | Artifact sourcing gate | `source_gate` | `off` |
+| Completeness gate | `completeness_gate` | `advisory` |
 | Agent-authored validator check | — | always on |
 
 ## The pattern
@@ -371,6 +372,63 @@ model that cannot satisfy the check in three tries will not on the fourth.
 It sits **after** the verifier gate, so when both would fire the more actionable
 "go run the check" nudge wins and this stays the backstop for a model that
 finalizes while still claiming an unrun result.
+
+## Completeness gate (`completeness_gate`)
+
+**Config:** `completeness_gate`: `off` | `advisory` (default) | `blocking`
+
+Every other always-on gate wants a specific mechanical fault: the verifier
+wants code edited and never run, the resume gate a failed last tool call, the
+claim gate a claim the evidence contradicts, the todo gate todos the model
+tracked. The one gate that asks *"is this task actually done?"* is the LLM
+critic, and it is inert without a `critic_provider`.
+
+So the most ordinary way for an autonomous run to end badly had no backstop at
+all: edit real files, run a real check, claim nothing false, track no todos,
+stop halfway.
+
+The signal is **the model's own final answer saying work remains**. A run that
+writes "next I'll wire up the tests" and then stops has contradicted itself,
+and that needs no judgement call and no LLM. The original proposal was to fire
+on a short final answer; length is a weak proxy, and this page's own rule is
+that a gate firing on honest work gets switched off and then catches nothing.
+
+Narrow by construction — three conditions inside one sentence:
+
+- a first-person forward marker (`I'll`, `I still need to`), not a bare "next
+  steps", which is how a handoff is written;
+- a work verb (`implement`, `wire`, `fix`), so `I'll explain below` — fulfilled
+  in the same message — does not count;
+- no second-person address, so `I'll leave the deploy to you` and `you'll want
+  to run the migration` stay silent.
+
+Plus, at the call site: the turn actually edited files, and there are **no
+unfinished tracked todos**. That last one is not redundant with the todo gate,
+it is what stops both firing on the same run — with todos outstanding, "finish
+your todos" is the more actionable message and that gate owns it.
+
+It sits **last**, below every other gate, because it is the least specific: if
+anything above had something to say, that something is better.
+
+## The critic's one shot is spent by a verdict, not an attempt
+
+`Off`/`Advisory` run the unified judge once per run. That flag used to flip on
+any *attempt* — so a judge that timed out or errored, which fails open with no
+messages, consumed the single completeness check for the whole run. The
+backstop disappeared exactly when the provider was unhealthy, and nothing said
+so.
+
+`ReviewOutcome::judged` already drew the distinction for the `Blocking`
+fingerprint; the one-shot path just wasn't reading it. A failed attempt now
+leaves the shot unspent so a later finalization retries, bounded by
+`MAX_CRITIC_JUDGE_ATTEMPTS` so a persistently broken judge is not re-called at
+every finalization for the whole run.
+
+Worth stating as its own rule, since this is the second time it has come up
+here: **a check that could not run is not a check that passed**, and the two
+must not share a code path. It is the same shape as the `pipefail` row in the
+table above, where "I could not ask the question" and "the answer is no" came
+back on one channel.
 
 ## Agent-authored validators
 

@@ -396,6 +396,7 @@ mod tests {
             safe_state_abort_mode: crate::agent::agent_loop::types::SafeStateMode::Off,
             publish_guard_mode: crate::agent::agent_loop::types::GateMode::Off,
             claim_gate_mode: crate::agent::agent_loop::types::GateMode::Off,
+            completeness_gate_mode: crate::agent::agent_loop::types::GateMode::Off,
             source_gate_mode: crate::agent::agent_loop::types::GateMode::Off,
             session_id: None,
             goal_fn: None,

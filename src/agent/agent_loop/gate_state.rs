@@ -48,7 +48,26 @@ pub struct GateStates {
     /// **Re-fire guard.** One-shot flag for the `Off`/`Advisory` unified judge
     /// [dirge-8v98]; the persistent `Blocking` path uses
     /// [`Self::code_review_reacts`] instead.
+    ///
+    /// Set only when the judge actually returned a verdict — see
+    /// [`Self::critic_attempts`].
     pub critic_done: bool,
+
+    /// **Cost ceiling.** Judge calls attempted by the one-shot path, bounded
+    /// by `MAX_CRITIC_JUDGE_ATTEMPTS` [dirge-2m68].
+    ///
+    /// Exists because [`Self::critic_done`] used to be set regardless of
+    /// whether the judge produced a verdict. A judge that timed out or errored
+    /// fails open with no messages, so it spent the single shot and the
+    /// completeness backstop was silently gone for the rest of the run — in
+    /// exactly the runs where the provider is unhealthy and the backstop is
+    /// most wanted. `judged` (dirge-q7vw) already distinguished the two for the
+    /// `Blocking` fingerprint; the one-shot path just wasn't reading it.
+    ///
+    /// A failed attempt therefore leaves `critic_done` false so a later
+    /// finalization can retry, and this counter is what stops a persistently
+    /// broken judge from being retried at every finalization for the whole run.
+    pub critic_attempts: u32,
 
     /// **Cost ceiling.** Bounded by `code_review::MAX_REVIEW_REACT`. Each
     /// reaction is a judge LLM call over the run diff, so this is spend, not
@@ -75,6 +94,12 @@ pub struct GateStates {
 
     /// **Re-fire guard.** Bounded by `MAX_RESUME_NUDGE`.
     pub resume_nudges: u8,
+
+    /// **Re-fire guard.** Bounded by
+    /// `completeness_gate::completeness_nudge_cap` [dirge-2m68]. The gate is
+    /// deterministic and costs no LLM call, so the ceiling exists to stop
+    /// nagging, not to cap spend.
+    pub completeness_nudges: u8,
 
     /// **Re-fire guard.** Bounded by `claim_gate::MAX_CLAIM_NUDGES`
     /// [dirge-d0e5.2]. No LLM call — the deterministic claim/evidence gate.
