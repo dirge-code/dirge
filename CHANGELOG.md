@@ -4,6 +4,45 @@ All notable changes to dirge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.21.13] - 2026-08-08
+
+### Fixed
+- The one-shot completeness critic spent its single call on an ATTEMPT rather
+  than a verdict. `critic_done` flipped regardless of outcome, so a judge that
+  timed out or errored — which fails open with no messages — consumed the
+  whole run's completeness check. The backstop disappeared precisely when the
+  provider was unhealthy, and nothing reported it. `ReviewOutcome::judged`
+  already drew that distinction for the `Blocking` fingerprint; the one-shot
+  path was not reading it. A failed attempt now leaves the shot unspent so a
+  later finalization retries, bounded by `MAX_CRITIC_JUDGE_ATTEMPTS` so a
+  persistently broken judge is not re-called at every finalization.
+
+### Added
+- `completeness_gate` (`off` / `advisory` *(default)* / `blocking`): a
+  deterministic, no-LLM backstop for the case nothing else covered. Without a
+  `critic_provider` there is no completeness judge at all, and every other
+  always-on gate wants a specific mechanical fault — unrun edits, a failed last
+  tool call, a claim the evidence contradicts, todos the model tracked. A run
+  that edits real files, runs a real check, claims nothing false and stops
+  halfway hit none of them, which is the most ordinary way for an autonomous
+  run to end badly.
+
+  It fires when the final answer states first-person work the model still
+  intended to do while the run is finishing — "next I'll wire up the tests",
+  then stopping, is the model contradicting itself, which needs no judgement
+  call. Narrow by construction: the sentence needs a forward marker AND a work
+  verb AND no second-person address, so handoffs ("you'll want to run the
+  migration"), self-fulfilled intent ("I'll explain below") and quoted plans
+  stay silent. Verbs match at a word boundary, so `latest`, `prefix` and
+  `report` are not read as `test`, `fix` and `port`.
+
+  It sits below every other gate, since anything above it has something more
+  specific to say, and yields to the todo gate when tracked todos are
+  outstanding. `off` is byte-identical to the loop without it.
+
+  `GateSource::CompletenessGate` is emitted on the `dirge::gates` line, so the
+  gate is measurable from the day it ships.
+
 ## [0.21.12] - 2026-08-08
 
 ### Fixed
