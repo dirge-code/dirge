@@ -4,6 +4,56 @@ All notable changes to dirge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.21.14] - 2026-08-08
+
+### Fixed
+- `session_search` could not reach the compacted half of the conversation it
+  was running in. Discovery and browse excluded results by lineage *root*, and
+  compaction rotates the session id with `link_fold` putting both halves under
+  one root — so the turns a fold had just dropped out of context became
+  undiscoverable, permanently, at the exact moment they were most needed. The
+  rows were in the session DB the whole time with nothing able to find them.
+  The live session is now excluded by exact id, and that check runs before the
+  dedup claim so a hit on the live session can't consume its root's slot and
+  suppress the folded sibling behind it.
+- Compaction markers stacked instead of superseding. A previous fold's marker
+  is a `system` turn and the head cut snaps forward to a *user* turn, so it
+  landed in the protected head and was never folded away; every subsequent fold
+  appended another. After N folds the model was reading N compaction blocks,
+  each asserting a different `## Active Task` — an instruction conflict that
+  grows with session length, and a likely source of the post-compaction drift
+  reported on smaller models. A fold now supersedes the prior marker and
+  carries its verbatim block forward.
+- `validate_summary` accepted stubs. It passed any non-empty string containing
+  one of four substrings anywhere, so `## Active Task\nNone.` validated and
+  `apply_summary` then replaced the folded region with it — trading real
+  history for a placeholder, irreversibly. It now requires at least two of the
+  template's sections to carry non-placeholder bodies. Deliberately still
+  permissive: rejecting a terse-but-real summary forces prune-only folding and
+  walks the session into an overflow, which is the worse failure.
+
+### Changed
+- User messages survive compaction verbatim. Summarizers paraphrase, and
+  paraphrase is where a stated constraint goes soft — "use ESM not CJS"
+  becomes "discussed module format". The folded window's user turns are now
+  appended to the summary block unedited, newest-first under a shared budget,
+  carried across successive folds, with any elision declared and pointed at
+  `session_search`. They sit inside the `[CONTEXT COMPACTION — REFERENCE ONLY]`
+  block, so they read as standing context rather than as new requests. User
+  turns were also being truncated at 2000 chars before the summarizer ever saw
+  them, which cut long pasted specs in half; they now get a much higher cap
+  while tool output keeps the old one.
+- The compaction summary tells the model the folded turns still exist and names
+  `session_search`, so a missing detail can be recovered instead of re-derived
+  or asked for again. Previously the prefix framed compaction as total loss.
+
+### Added
+- `--no-compression` disables prompt compression (llmtrim) for a single run.
+  The `[compression].enabled` config key and `DIRGE_COMPRESSION` env var
+  already worked but were undocumented; both are now in `docs/config.md` along
+  with `preset`. Precedence is most-local-wins: the CLI flag beats the env var,
+  which beats the config file.
+
 ## [0.21.13] - 2026-08-08
 
 ### Fixed
