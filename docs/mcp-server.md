@@ -86,6 +86,21 @@ a caller uses to check whether work happened. It stays git-independent
 edits mid-way), but the tracker's contribution is now bounded by an epoch
 captured at the start of the call.
 
+**A `max_turns` status does not mean the work is bad.** In practice a capped
+run has usually finished the task and run out of turns during the final
+fmt/clippy polish. It used to return `summary: ""` alongside that status, so a
+caller had a bare error and no way to tell finished-but-unpolished from
+broken-and-abandoned — while the same response already carried the turn count,
+the changed files and the verification status.
+
+A run that ends without writing a closing answer now gets a summary built from
+those fields: which ending it was, turns, tool calls, verification status
+(saying so explicitly when nothing was observed), and the changed files. It
+states outright that it is **not** a completeness verdict, because a caller
+mistaking a generated summary for dirge's own report is worse than the empty
+string it replaces. Text dirge actually wrote is never replaced. Read the diff,
+and to continue the work call `delegate` again on the **same** session id.
+
 **`evidence` is what actually happened**, for checking the summary against.
 `verification_commands` lists the build/test commands the run really ran
 and how they ended. A summary claiming a test result while

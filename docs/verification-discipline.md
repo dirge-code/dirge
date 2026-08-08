@@ -401,6 +401,33 @@ real — it passed on macOS and failed on every Linux CI job that runs tests, an
 in production it would have let a just-written proxy validator read as
 pre-existing.
 
+## A correct guard that gets routed around
+
+The pre-write syntax gate is the counter-example to everything above: it ran,
+it was right, and it was disbelieved. A model it blocked concluded that "the
+project's tree-sitter parser does not understand doctest macro syntax and flags
+the whole file as invalid", then planned to "bypass the guard by writing the
+entire file with `write`" — reconstructing a 385-line file from context.
+
+Both halves are false, and both were checkable. Seven doctest and macro shapes
+pass the grammar (a test now pins that, with a companion asserting a broken
+body under a doctest is still rejected, so it cannot go vacuous). And `write`
+goes through the same `syntax_gate` as every other file-writing tool.
+
+The reject was what left room for it. It named the error and said the file was
+not modified — consistent with an absolute, per-tool guard. From there, trying
+another tool is the obvious move, and the one it leads to has the largest blast
+radius of any edit available. Meanwhile the escape the model actually wanted
+already existed and fires automatically: a file that was failing the check
+*before* the edit is written through verbatim, so a reject always means the
+edit introduced the error.
+
+So the reject now carries both facts. This is not a prompt edit and it is not
+steering — the mechanisms were already built and already correct; the model's
+model of them was wrong, and only the tool could correct it. **A guard that
+cannot explain its own scope will be routed around rather than satisfied**, and
+the route chosen is rarely the cheap one.
+
 ## Measuring a loop-control change
 
 `scripts/loop-ab.sh` runs the same task N times per arm and compares. Three
