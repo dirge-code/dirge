@@ -414,6 +414,21 @@ fi
 # the longer name, and `tail -1` then picks that one — so `tool_calls`
 # silently reported the value of `errored_tool_calls`. Every field on a
 # tracing line is space-separated, so requiring the space is safe.
+# ---- Sum every numeric field on a tracing line whose key starts with the
+# given prefix — `sum_fields nudge_ "$line"`, `sum_fields gate_ "$line"`.
+#
+# dirge-l8l7.5: the point is that there is no list to maintain. A new gate or
+# boundary nudge is counted the day `gate_tally::emit` starts emitting it,
+# which is what a mechanism check needs in order to be able to report the
+# other answer. Prints 0 for no matches, so the caller never sees an empty
+# string.
+sum_fields() { # $1 = key prefix, $2 = line
+  printf '%s\n' "$2" \
+    | grep -oE "[[:space:]]${1}[a-z0-9_]*=[0-9]+" \
+    | grep -oE '[0-9]+$' \
+    | awk '{ s += $1 } END { print s + 0 }'
+}
+
 get_field() { # $1 = key, $2 = line
   local m
   m="$(printf '%s\n' "$2" | grep -oE "[[:space:]]${1}=\"[^\"]*\"|[[:space:]]${1}=[^ ]+" | tail -1 || true)"
@@ -537,39 +552,45 @@ run_arm() { # $1 = overrides, $2 = tag, $3 = model
       boundaries="${boundaries:-none}"
       # MECHANISM CHECK. Without this an A/B cannot distinguish "the change
       # helped" from "the change never fired" — the arms differ in config but
-      # nothing confirms the code path under test was reached. Sum of every
-      # harness nudge, plus the prologue one broken out since it is what
-      # dirge-t5dh tunes.
+      # nothing confirms the code path under test was reached. The prologue
+      # nudge is broken out since it is what dirge-t5dh tunes.
+      #
+      # dirge-l8l7.5: both totals are now DERIVED FROM THE LINE by prefix,
+      # not from a hardcoded name list. Two reasons. (1) `nudges_fired` was a
+      # second copy of gate_tally's emit() field list, which is exactly how
+      # gate_claim_gate/gate_source_gate went missing one layer down
+      # (dirge-l8l7.1); a ninth nudge would have been silently excluded with
+      # nothing to notice. (2) No `gate_*` field was scraped AT ALL, so the
+      # mechanism check was structurally 0 for every finalization-gate change
+      # — claim_gate, source_gate, publish_guard, the verifier gate. Read
+      # literally per docs/verification-discipline.md, every gate A/B ever
+      # run should have been discarded as noise.
       nudge_prologue="$(get_field nudge_progress_prologue "$gates_line")"
-      nudges_total=0
-      for nk in nudge_track_work nudge_fast_verify nudge_progress_stall \
-                nudge_progress_budget nudge_file_touch \
-                nudge_reflection_checkpoint nudge_safe_state \
-                nudge_progress_prologue; do
-        nv="$(get_field "$nk" "$gates_line")"
-        nudges_total=$(( nudges_total + ${nv:-0} ))
-      done
+      nudges_total="$(sum_fields nudge_ "$gates_line")"
+      gates_total="$(sum_fields gate_ "$gates_line")"
     else
       tally_found=0
       turns=0; tool_calls_f=0; errored=0; scavenged=0; storm=0
       maxstreak=0; rep_invalid=0; rep_total=0; verification="-"
-      nudge_prologue=0; nudges_total=0; captier="-"; boundaries="none"
+      nudge_prologue=0; nudges_total=0; gates_total=0; captier="-"; boundaries="none"
     fi
 
     fw="$(first_write "$out")"
     ok="$(check_correct "$out")"
 
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    # Col 20 (gates_fired) is APPENDED so columns 1..19 keep their meaning —
+    # an older results.tsv still reports, it just has no gate column.
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
       "$2" "$3" "$i" "$turns" "$tool_calls_f" "$errored" "$scavenged" "$storm" \
       "$maxstreak" "$rep_invalid" "$rep_total" "$verification" "$fw" "$ok" "$tally_found" \
-      "$nudge_prologue" "$nudges_total" "$captier" "$boundaries" \
+      "$nudge_prologue" "$nudges_total" "$captier" "$boundaries" "$gates_total" \
       >> "$WORK/results.tsv"
 
     if [ "$tally_found" = 1 ]; then tally_str=found; else tally_str=missing; fi
-    printf '  [%s %s %s/%s] turns=%s tools=%s err=%s scav=%s storm=%s streak=%s rep_inv=%s rep_ok=%s verify=%s first_write=%s correct=%s nudges=%s prologue=%s tier=%s tally=%s\n' \
+    printf '  [%s %s %s/%s] turns=%s tools=%s err=%s scav=%s storm=%s streak=%s rep_inv=%s rep_ok=%s verify=%s first_write=%s correct=%s nudges=%s prologue=%s gates=%s tier=%s tally=%s\n' \
       "$2" "$3" "$i" "$REPEATS" "$turns" "$tool_calls_f" "$errored" "$scavenged" "$storm" \
       "$maxstreak" "$rep_invalid" "$rep_total" "$verification" "$fw" "$ok" \
-      "$nudges_total" "$nudge_prologue" "$captier" "$tally_str"
+      "$nudges_total" "$nudge_prologue" "$gates_total" "$captier" "$tally_str"
     if [ "$tally_found" = 0 ]; then
       printf '    ^ no dirge::gates line in %s (harness bug, not a zero tally)\n' "$logfile"
     fi
@@ -630,18 +651,24 @@ BEGIN { tiercols["struggling"]=1; tiercols["nominal"]=1; tiercols["strong"]=1 }
     if (!(("a" $1) in aseen)) { aseen["a" $1] = 1; alist[++na] = $1 }
   }
   n[key]++
-  # 4..11 are the numeric run metrics; 16 (prologue nudges) and 17 (all
-  # harness nudges) are the mechanism check. 12..15 are string/flag fields
-  # handled separately below.
-  for (c = 4; c <= 11; c++) {
-    sum[key,c] += $c
-    if (n[key] == 1 || $c < mn[key,c]) mn[key,c] = $c
-    if (n[key] == 1 || $c > mx[key,c]) mx[key,c] = $c
-  }
-  for (c = 16; c <= 17; c++) {
-    sum[key,c] += $c
-    if (n[key] == 1 || $c < mn[key,c]) mn[key,c] = $c
-    if (n[key] == 1 || $c > mx[key,c]) mx[key,c] = $c
+  # Numeric columns, named once: 4..11 the run metrics, 16 prologue nudges,
+  # 17 all harness nudges, 20 all finalization gates (dirge-l8l7.5). 12..15,
+  # 18 and 19 are string/flag fields handled separately below. Column 20 is
+  # absent from a results.tsv written before it existed, which reads as 0.
+  if (NF < 20) short_rows++
+  nnum = split("4 5 6 7 8 9 10 11 16 17 20", numcols, " ")
+  for (ci = 1; ci <= nnum; ci++) {
+    c = numcols[ci]
+    # `+ 0` coerces: an ABSENT column (a results.tsv written before it
+    # existed) is the empty string, and storing that verbatim rendered the
+    # range as `(..)` rather than `(0..0)` — a gap that looked like a
+    # formatting glitch instead of announcing itself. The count of short
+    # rows is reported in the summary so the zero is never mistaken for a
+    # measurement.
+    v = $c + 0
+    sum[key,c] += v
+    if (n[key] == 1 || v < mn[key,c]) mn[key,c] = v
+    if (n[key] == 1 || v > mx[key,c]) mx[key,c] = v
   }
   if ($13 ~ /^[0-9]+$/) {
     fwn[key]++
@@ -656,8 +683,14 @@ BEGIN { tiercols["struggling"]=1; tiercols["nominal"]=1; tiercols["strong"]=1 }
   # shape like `Verifier+Critic` (co-firing members joined by `+`, events
   # separated by `;` in the run). `none` / `-` means no event fired.
   if ($19 != "" && $19 != "none" && $19 != "-") {
-    split($19, evs, ";")
-    for (i in evs) {
+    # dirge-l8l7.3: iterate the split by INDEX. `for (i in evs)` walks awk
+    # hash order, which is unspecified — on BWK awk `A;B;C;D;E` came out as
+    # `B, C, D, E, A`. boundaries_encoding() emits events in run order and
+    # the tally records members in order deliberately; the report used to
+    # throw that away, and the selftest asserted the scrambled order as the
+    # expected value, so it locked the bug in and would have failed on gawk.
+    nev = split($19, evs, ";")
+    for (i = 1; i <= nev; i++) {
       s = evs[i]
       if ((key, s) in evcnt) evcnt[key, s]++
       else { evcnt[key, s] = 1; evlist[key, ++evn[key]] = s }
@@ -702,6 +735,23 @@ function ratefloor(ck, tk,    a, b) {
   b = n[tk] ? 1 / n[tk] : 1
   return (a > b) ? a : b
 }
+# dirge-l8l7.4: a model can be present under one arm and absent under the
+# other — an interrupted run, a re-run appending into an existing
+# results.tsv, a hand-assembled file. Every rate below divides by n[arm], so
+# an absent arm used to kill awk with "division by zero" at that record and
+# produce NO report at all, after a run that can take hours. The N-arm block
+# further down already carried this guard, with a comment naming the exact
+# hazard — it was simply never applied to the primary control/treatment pair
+# (and its own copy guarded the extra arm but not control). Same discipline
+# as tally=missing: report the gap, never silently zero it, and never let it
+# take the rest of the report down with it.
+function prop(num, den) { return den > 0 ? num / den : 0 }
+function havepair(a, b) { return (a in n) && n[a] > 0 && (b in n) && n[b] > 0 }
+function narm(a) { return (a in n) ? n[a] : 0 }
+function pairdir(cnum, cden, tnum, tden, lower_is_better, eps, noise) {
+  if (cden <= 0 || tden <= 0) return "n/a (arm absent)"
+  return dir3(cnum / cden, tnum / tden, lower_is_better, eps, noise)
+}
 # dirge-5mtx.7 is observation-only, so the tier is REPORTED, never scored.
 # Collecting how it distributes across models and scenarios is the whole
 # point of wiring it before deriving any threshold from it.
@@ -737,6 +787,10 @@ END {
     ck = "control" SUBSEP m
     tk = "treatment" SUBSEP m
     printf "== model: %s ==\n", m
+    # dirge-l8l7.4: say it out loud when this model has no comparable pair.
+    if (!havepair(ck, tk)) {
+      printf "  NOTE: control runs=%d, treatment runs=%d — no comparable pair for this model; rate deltas below read n/a.\n", narm(ck), narm(tk)
+    }
     printf "%-26s %-26s %-26s %s\n", "metric", "control", "treatment", "delta"
 
     row("turns", spread(ck, 4), spread(tk, 4), dir3(mean(ck, 4), mean(tk, 4), 1, 0.5, noisefloor(ck, 4)))
@@ -761,10 +815,14 @@ END {
     # is seen first.
     row("nudges_fired", spread(ck, 17), spread(tk, 17), "mechanism")
     row("  of which prologue", spread(ck, 16), spread(tk, 16), "mechanism")
-    row("success_rate", rate(ck), rate(tk), dir3(ok[ck] / n[ck], ok[tk] / n[tk], 0, 0.05, ratefloor(ck, tk)))
-    row("green_rate", sprintf("%d/%d (%.0f%%)", green[ck], n[ck], 100 * green[ck] / n[ck]),
-        sprintf("%d/%d (%.0f%%)", green[tk], n[tk], 100 * green[tk] / n[tk]),
-        dir3(green[ck] / n[ck], green[tk] / n[tk], 0, 0.05, ratefloor(ck, tk)))
+    # dirge-l8l7.5: gates are the OTHER half of the mechanism check, and were
+    # missing entirely. A finalization-gate A/B (claim_gate, source_gate,
+    # publish_guard, verifier) moves this row, never nudges_fired.
+    row("gates_fired", spread(ck, 20), spread(tk, 20), "mechanism")
+    row("success_rate", rate(ck), rate(tk), pairdir(ok[ck], narm(ck), ok[tk], narm(tk), 0, 0.05, ratefloor(ck, tk)))
+    row("green_rate", sprintf("%d/%d (%.0f%%)", green[ck], narm(ck), 100 * prop(green[ck], narm(ck))),
+        sprintf("%d/%d (%.0f%%)", green[tk], narm(tk), 100 * prop(green[tk], narm(tk))),
+        pairdir(green[ck], narm(ck), green[tk], narm(tk), 0, 0.05, ratefloor(ck, tk)))
     row("capability_tier", tierdist(ck), tierdist(tk), "observed")
     row("tally_found", sprintf("%d/%d", tallyfound[ck], n[ck]), sprintf("%d/%d", tallyfound[tk], n[tk]), "must be full")
 
@@ -818,10 +876,13 @@ END {
       row2("first_write", cval, eval2, "n/a")
       row2("nudges_fired", spread(ck, 17), spread(ek, 17), "mechanism")
       row2("  of which prologue", spread(ck, 16), spread(ek, 16), "mechanism")
-      row2("success_rate", rate(ck), rate(ek), dir3(ok[ck] / n[ck], ok[ek] / n[ek], 0, 0.05, ratefloor(ck, ek)))
-      row2("green_rate", sprintf("%d/%d (%.0f%%)", green[ck], n[ck], 100 * green[ck] / n[ck]),
-          sprintf("%d/%d (%.0f%%)", green[ek], n[ek], 100 * green[ek] / n[ek]),
-          dir3(green[ck] / n[ck], green[ek] / n[ek], 0, 0.05, ratefloor(ck, ek)))
+      row2("gates_fired", spread(ck, 20), spread(ek, 20), "mechanism")
+      # dirge-l8l7.4: the guard above covers the EXTRA arm; control can be
+      # absent for this model just as easily, and these divide by it too.
+      row2("success_rate", rate(ck), rate(ek), pairdir(ok[ck], narm(ck), ok[ek], narm(ek), 0, 0.05, ratefloor(ck, ek)))
+      row2("green_rate", sprintf("%d/%d (%.0f%%)", green[ck], narm(ck), 100 * prop(green[ck], narm(ck))),
+          sprintf("%d/%d (%.0f%%)", green[ek], narm(ek), 100 * prop(green[ek], narm(ek))),
+          pairdir(green[ck], narm(ck), green[ek], narm(ek), 0, 0.05, ratefloor(ck, ek)))
       row2("tally_found", sprintf("%d/%d", tallyfound[ck], n[ck]), sprintf("%d/%d", tallyfound[ek], n[ek]), "must be full")
       printf "\n"
     }
@@ -833,12 +894,22 @@ END {
     printf "  single model tested — the per-model deltas above are NOT evidence for a steering change.\n"
     printf "  Re-run with -m \"model1,model2,...\" before treating any direction as real.\n"
   } else {
-    split("turns tool_calls errored_tool_calls scavenged_calls storm_suppressions max_failure_streak repair_invalid first_write success_rate green_rate", names, " ")
-    for (i = 1; i <= 10; i++) {
+    # dirge-l8l7.6: iterate to what split() RETURNED, not a hardcoded 10.
+    # Adding a metric name to the string above used to drop it from the
+    # summary silently — the same hand-maintained-count class as the rest of
+    # this epic.
+    nnames = split("turns tool_calls errored_tool_calls scavenged_calls storm_suppressions max_failure_streak repair_invalid first_write success_rate green_rate", names, " ")
+    for (i = 1; i <= nnames; i++) {
       name = names[i]
       b = bm[name] + 0; w = wm[name] + 0; f = fm[name] + 0
       if (b + w + f == 0) { printf "  %-26s no usable comparison\n", name; continue }
-      held = (b == nm) ? "better in every model" : ((w == nm) ? "worse in every model" : "MIXED")
+      # dirge-l8l7.6: there was no `f == nm` arm, so a metric that came out
+      # FLAT in every model was labelled MIXED — the label for a
+      # disagreement. An A/A calibration, whose whole purpose is to produce
+      # unanimous no-effect, therefore read as an inconsistent result.
+      held = (b == nm) ? "better in every model" \
+           : ((w == nm) ? "worse in every model" \
+           : ((f == nm) ? "flat in every model" : "MIXED"))
       printf "  %-26s better %d, worse %d, flat %d of %d models — %s\n", name, b, w, f, nm, held
     }
   }
@@ -846,10 +917,24 @@ END {
   for (k in missing) total_missing += missing[k]
   if (total_missing > 0) {
     printf "  WARNING: %d run(s) produced no dirge::gates line (missing tally is a harness bug — check DIRGE_LOG/RUST_LOG).\n", total_missing
+  }
+  if (short_rows > 0) {
+    printf "  NOTE: %d row(s) predate the gates_fired column (fewer than 20 fields); gates_fired reads 0 for those by default, which is an absence, not a measurement.\n", short_rows
+  }
 
   # dirge-1elu.6: N-arm consistency across models (only meaningful with
   # several models and at least one extra arm). bm2/wm2/fm2 were filled by
   # the extra-arm blocks above.
+  #
+  # dirge-l8l7.2: this block used to sit INSIDE the `total_missing > 0`
+  # branch above — a brace mis-nesting, no other cause. So the N-arm
+  # cross-model summary, which is the entire deliverable of the N-arm mode,
+  # printed only when at least one run had FAILED to produce a gates line,
+  # and was structurally unreachable on a healthy run. Measured: an
+  # all-tallies-found fixture emitted nothing; flipping one tally to 0 made
+  # it appear. The selftest missed it because its fixture carries a missing
+  # tally on purpose (to assert `tally_found 0/1`), which parked it on the
+  # broken branch.
   if (na > 2 && nm > 1) {
     printf "== summary across models, extra arms ==\n"
     for (ai = 1; ai <= na; ai++) {
@@ -862,7 +947,6 @@ END {
         printf "    %-26s better %d, worse %d, flat %d of %d models\n", ni2, b, w, f, nm
       }
     }
-  }
   }
 }
 ' "$WORK/results.tsv"
