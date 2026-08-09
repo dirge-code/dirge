@@ -9,7 +9,9 @@
 //! Three patterns are recognized:
 //!
 //! 1. DSML invoke blocks: `<｜DSML｜invoke name="tool_name">...</>`
-//! 2. Raw JSON objects matching:
+//! 2. Tagged / fenced text channels (dirge-56vo): `<tool_call>…</tool_call>`
+//!    and ```` ```json ```` / ```` ```tool ```` fences.
+//! 3. Raw JSON objects matching:
 //!    - `{name, arguments}` (simplest form)
 //!    - `{type: "function", function: {name, arguments}}` (OpenAI-style)
 //!    - `{tool_name, tool_args}` (R1 free-form variant)
@@ -17,7 +19,28 @@
 //! Only tools whose name appears in the allowed set are returned.
 //! A max-calls cap defends against runaway extraction.
 //! Inputs over 100KB are skipped (defense against regex O(n²)).
+//!
+//! # Why the tagged pass exists (dirge-56vo)
+//!
+//! `<tool_call>…</tool_call>` is Qwen/Hermes' *native* tool channel, and it
+//! leaks into plain text whenever llama.cpp is served without `--jinja` — the
+//! most likely text-leak shape for dirge's ollama / lmstudio / llama.cpp
+//! users. Well-formed JSON inside those tags was already reachable through
+//! the raw-JSON scan below, so the tags buy two things the scan cannot:
+//!
+//!   - **Bounds.** [`iterate_json_objects`] only emits *balanced* objects, so
+//!     a call truncated at `max_tokens` produces no candidate at all. The tag
+//!     delimits the region explicitly, which is what lets
+//!     [`repair_truncated_json`] close it.
+//!   - **A repair budget that can't hurt precision.** Applying lenient repair
+//!     to every brace-run in prose would be reckless; applying it inside an
+//!     explicit tool-call tag is not.
+//!
+//! Precision throughout rests on the same gate as before: a candidate becomes
+//! a call only if it carries a `name` in `allowed_names`. Repair never invents
+//! one.
 
+use crate::agent::agent_loop::tool_input_repair::repair_truncated_json;
 use crate::agent::agent_loop::tools::ToolCall;
 
 use std::sync::LazyLock;
@@ -45,6 +68,18 @@ static RE_DSML_PARAM: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r#"<[｜|]DSML[｜|]parameter\s+name="([^"]+)"(?:\s+string="(true|false)")?\s*>([\s\S]*?)</[｜|]DSML[｜|]parameter>"#
     ).expect("DSML parameter regex must compile")
+});
+/// dirge-56vo: Qwen/Hermes `<tool_call>` channel. The closing tag is optional
+/// so a response cut off mid-call still yields a region to repair.
+static RE_TOOL_CALL_TAG: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?s)<tool_call>(.*?)(?:</tool_call>|$)")
+        .expect("tool_call tag regex must compile")
+});
+/// dirge-56vo: ```` ```json ```` / ```` ```tool ```` fences. Deliberately does
+/// NOT match a bare ```` ``` ```` fence — those are overwhelmingly code samples
+/// the model is discussing, not calls it meant to make.
+static RE_FENCED_CALL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?s)```(?:tool|json)\s*\n(.*?)(?:\n```|$)").expect("fenced call regex must compile")
 });
 
 /// Result of a scavenge pass.
@@ -102,9 +137,23 @@ pub fn scavenge_tool_calls(
         notes.push(format!("scavenged DSML call: {}", invoke.name));
     }
 
-    // Pattern B: raw JSON objects.
+    // Pattern B: tagged / fenced regions (dirge-56vo). Runs before the raw
+    // scan and removes what it consumed, so a tagged call can't also be
+    // picked up as a bare JSON object and counted twice.
     let non_dsml = strip_dsml_blocks(content);
-    for candidate in iterate_json_objects(&non_dsml) {
+    let (tagged, remainder) = extract_tagged_regions(&non_dsml);
+    for region in tagged {
+        if out.len() >= max {
+            break;
+        }
+        if let Some(call) = coerce_to_tool_call(&region, allowed_names) {
+            notes.push(format!("scavenged tagged call: {}", call.name));
+            out.push(call);
+        }
+    }
+
+    // Pattern C: raw JSON objects.
+    for candidate in iterate_json_objects(&remainder) {
         if out.len() >= max {
             break;
         }
@@ -189,6 +238,157 @@ fn parse_dsml_parameters(body: &str) -> serde_json::Value {
     serde_json::Value::Object(map)
 }
 
+/// dirge-56vo: pull `<tool_call>` / fenced regions out of `text`.
+///
+/// Returns the region bodies plus the text with those regions removed, so the
+/// caller's raw-JSON scan can run over the remainder without re-finding what
+/// was already consumed.
+fn extract_tagged_regions(text: &str) -> (Vec<String>, String) {
+    let mut regions = Vec::new();
+    let mut remainder = text.to_string();
+    for re in [&*RE_TOOL_CALL_TAG, &*RE_FENCED_CALL] {
+        for caps in re.captures_iter(&remainder.clone()) {
+            if let Some(body) = caps.get(1) {
+                let trimmed = body.as_str().trim();
+                if !trimmed.is_empty() {
+                    regions.push(trimmed.to_string());
+                }
+            }
+        }
+        remainder = re.replace_all(&remainder, "").to_string();
+    }
+    (regions, remainder)
+}
+
+/// dirge-56vo: parse `raw` as JSON, escalating through repairs.
+///
+/// Three rungs, cheapest first:
+///
+///   1. strict parse;
+///   2. re-escape literal newlines / tabs / CRs inside string literals — the
+///      single most common break in a leaked call, because the leaked calls
+///      that matter carry multi-line file content;
+///   3. drop trailing commas before a closing `}` / `]`;
+///   4. [`repair_truncated_json`], which closes unterminated strings and
+///      containers and trims a dangling comma or key at EOF.
+///
+/// Rung 3 and rung 4 are not the same fix: `repair_truncated_json` only trims
+/// at the input's end, so an *interior* `,}` survives it.
+///
+/// Returns `None` rather than a sentinel when nothing parses: a call the
+/// scavenger can't read is a call it must not invent.
+fn repair_json_lenient(raw: &str) -> Option<serde_json::Value> {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) {
+        return Some(v);
+    }
+    let escaped = escape_control_chars_in_strings(raw);
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&escaped) {
+        return Some(v);
+    }
+    let decommaed = strip_trailing_commas(&escaped);
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&decommaed) {
+        return Some(v);
+    }
+    let repaired = repair_truncated_json(&decommaed);
+    if repaired.fallback {
+        return None;
+    }
+    serde_json::from_str::<serde_json::Value>(&repaired.repaired).ok()
+}
+
+/// Drop a `,` that is followed only by whitespace and a closing `}` / `]`.
+/// String-aware, so a comma inside a string literal is left alone.
+fn strip_trailing_commas(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut in_string = false;
+    let mut escaped = false;
+    for (i, &c) in chars.iter().enumerate() {
+        if escaped {
+            out.push(c);
+            escaped = false;
+            continue;
+        }
+        if in_string {
+            if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            out.push(c);
+            continue;
+        }
+        if c == '"' {
+            in_string = true;
+            out.push(c);
+            continue;
+        }
+        if c == ',' {
+            let next = chars[i + 1..].iter().find(|n| !n.is_whitespace());
+            if matches!(next, Some('}') | Some(']')) {
+                continue; // drop it
+            }
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Escape raw newlines / tabs / CRs that appear *inside* JSON string literals.
+/// Text outside strings is untouched, so formatting whitespace between tokens
+/// still parses normally.
+fn escape_control_chars_in_strings(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_string = false;
+    let mut escaped = false;
+    for c in text.chars() {
+        if escaped {
+            out.push(c);
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' if in_string => {
+                out.push(c);
+                escaped = true;
+            }
+            '"' => {
+                in_string = !in_string;
+                out.push(c);
+            }
+            '\n' if in_string => out.push_str("\\n"),
+            '\t' if in_string => out.push_str("\\t"),
+            '\r' if in_string => out.push_str("\\r"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Argument-object keys seen in the wild, in precedence order.
+///
+/// Before dirge-56vo only `arguments` was read, so a `{name, parameters}` call
+/// coerced to an EMPTY argument object — worse than dropping it, because the
+/// result was a correctly-named call that then failed schema validation at
+/// promotion and looked like a model error rather than a parse gap.
+const ARG_KEYS: [&str; 4] = ["arguments", "parameters", "input", "args"];
+
+/// Read the argument object out of `obj`, accepting any of [`ARG_KEYS`].
+/// A value that is itself a JSON *string* is parsed one level (OpenAI encodes
+/// `arguments` that way).
+fn extract_args(obj: &serde_json::Map<String, serde_json::Value>) -> serde_json::Value {
+    for key in ARG_KEYS {
+        let Some(raw) = obj.get(key) else { continue };
+        if let Some(s) = raw.as_str() {
+            return repair_json_lenient(s).unwrap_or_else(|| serde_json::json!({}));
+        }
+        if !raw.is_null() {
+            return raw.clone();
+        }
+    }
+    serde_json::json!({})
+}
+
 /// Yield every top-level JSON object substring in text.
 /// Port of `iterateJsonObjects` (scavenge.ts:116-148).
 fn iterate_json_objects(text: &str) -> Vec<String> {
@@ -248,26 +448,18 @@ fn coerce_to_tool_call(
     candidate_json: &str,
     allowed_names: &std::collections::HashSet<String>,
 ) -> Option<ToolCall> {
-    let parsed: serde_json::Value = serde_json::from_str(candidate_json).ok()?;
+    // dirge-56vo: lenient parse. Precision still rests entirely on the
+    // allowed-name gate below — repair can fix a shape, never invent a name.
+    let parsed = repair_json_lenient(candidate_json)?;
     let obj = parsed.as_object()?;
 
-    // Pattern 1: { name, arguments }
+    // Pattern 1: { name, arguments } (or parameters / input / args)
     if let Some(name) = obj.get("name").and_then(|v| v.as_str()) {
         if allowed_names.contains(name) {
-            let args = obj
-                .get("arguments")
-                .cloned()
-                .unwrap_or(serde_json::json!({}));
-            let args_val = if args.is_string() {
-                serde_json::from_str::<serde_json::Value>(args.as_str().unwrap_or("{}"))
-                    .unwrap_or(serde_json::json!({}))
-            } else {
-                args
-            };
             return Some(ToolCall {
                 id: String::new(),
                 name: name.to_string(),
-                arguments: args_val,
+                arguments: extract_args(obj),
             });
         }
     }
@@ -277,20 +469,10 @@ fn coerce_to_tool_call(
         if let Some(func) = obj.get("function").and_then(|v| v.as_object()) {
             if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
                 if allowed_names.contains(name) {
-                    let args = func
-                        .get("arguments")
-                        .cloned()
-                        .unwrap_or(serde_json::json!({}));
-                    let args_val = if args.is_string() {
-                        serde_json::from_str::<serde_json::Value>(args.as_str().unwrap_or("{}"))
-                            .unwrap_or(serde_json::json!({}))
-                    } else {
-                        args
-                    };
                     return Some(ToolCall {
                         id: String::new(),
                         name: name.to_string(),
-                        arguments: args_val,
+                        arguments: extract_args(func),
                     });
                 }
             }
@@ -300,10 +482,11 @@ fn coerce_to_tool_call(
     // Pattern 3: { tool_name, tool_args } (R1 free-form variant)
     if let Some(name) = obj.get("tool_name").and_then(|v| v.as_str()) {
         if allowed_names.contains(name) {
-            let args = obj
-                .get("tool_args")
-                .cloned()
-                .unwrap_or(serde_json::json!({}));
+            let args = obj.get("tool_args").cloned().unwrap_or_else(|| {
+                // No `tool_args` — fall back to the generic keys rather than
+                // handing back an empty object.
+                extract_args(obj)
+            });
             return Some(ToolCall {
                 id: String::new(),
                 name: name.to_string(),
@@ -456,5 +639,95 @@ mod tests {
         let r = scavenge_tool_calls(Some(&large), &allowed(), 4);
         assert!(r.calls.is_empty());
         assert!(r.notes.iter().any(|n| n.contains("too large")));
+    }
+
+    // ---- dirge-56vo: tagged / fenced text channels + JSON repair ----
+
+    /// The Qwen/Hermes text channel. Well-formed JSON inside the tags was
+    /// already reachable through the raw-JSON scan; pin it so the explicit
+    /// tag pass can't regress it.
+    #[test]
+    fn extracts_tool_call_tag() {
+        let input = "I'll search.\n<tool_call>\n{\"name\": \"search\", \"arguments\": {\"q\": \"ts\"}}\n</tool_call>";
+        let r = scavenge_tool_calls(Some(input), &allowed(), 4);
+        assert_eq!(r.calls.len(), 1);
+        assert_eq!(r.calls[0].name, "search");
+        assert_eq!(r.calls[0].arguments["q"], "ts");
+    }
+
+    /// The case the raw-JSON scan structurally cannot reach: the object never
+    /// closes, so brace-matching never emits a candidate. The tag gives the
+    /// region explicit bounds, so the repair can close it.
+    #[test]
+    fn repairs_truncated_json_inside_tool_call_tag() {
+        let input = "<tool_call>{\"name\": \"search\", \"arguments\": {\"q\": \"ts\"</tool_call>";
+        let r = scavenge_tool_calls(Some(input), &allowed(), 4);
+        assert_eq!(r.calls.len(), 1, "truncated tagged call should be repaired");
+        assert_eq!(r.calls[0].arguments["q"], "ts");
+    }
+
+    #[test]
+    fn extracts_fenced_tool_call() {
+        let input = "Here goes:\n```json\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Oslo\"}}\n```";
+        let r = scavenge_tool_calls(Some(input), &allowed(), 4);
+        assert_eq!(r.calls.len(), 1);
+        assert_eq!(r.calls[0].name, "get_weather");
+        assert_eq!(r.calls[0].arguments["city"], "Oslo");
+    }
+
+    /// `parameters` / `input` / `args` are all in the wild. Previously these
+    /// coerced to an EMPTY argument object, which is worse than dropping the
+    /// call: it produced a well-named call that then failed schema validation.
+    #[test]
+    fn accepts_alternate_argument_keys() {
+        for key in ["parameters", "input", "args"] {
+            let input = format!("{{\"name\": \"search\", \"{key}\": {{\"q\": \"ts\"}}}}");
+            let r = scavenge_tool_calls(Some(&input), &allowed(), 4);
+            assert_eq!(r.calls.len(), 1, "{key}: expected one call");
+            assert_eq!(r.calls[0].arguments["q"], "ts", "{key}: args lost");
+        }
+    }
+
+    /// The highest-value repair in practice: a leaked `write`-shaped call
+    /// carries multi-line file content, and a literal newline inside a JSON
+    /// string is a strict-parse error.
+    #[test]
+    fn repairs_literal_newlines_in_json_strings() {
+        let input = "{\"name\": \"search\", \"arguments\": {\"q\": \"line one\nline two\"}}";
+        let r = scavenge_tool_calls(Some(input), &allowed(), 4);
+        assert_eq!(r.calls.len(), 1);
+        assert_eq!(r.calls[0].arguments["q"], "line one\nline two");
+    }
+
+    #[test]
+    fn repairs_trailing_commas() {
+        let input = "{\"name\": \"search\", \"arguments\": {\"q\": \"ts\",},}";
+        let r = scavenge_tool_calls(Some(input), &allowed(), 4);
+        assert_eq!(r.calls.len(), 1);
+        assert_eq!(r.calls[0].arguments["q"], "ts");
+    }
+
+    #[test]
+    fn tagged_call_with_unknown_tool_is_skipped() {
+        let input = "<tool_call>{\"name\": \"rm_rf_slash\", \"arguments\": {}}</tool_call>";
+        let r = scavenge_tool_calls(Some(input), &allowed(), 4);
+        assert!(r.calls.is_empty());
+    }
+
+    /// Precision guard: the repair pass must not turn ordinary prose or a
+    /// non-call JSON blob into a tool call.
+    #[test]
+    fn prose_and_non_call_json_are_not_scavenged() {
+        let input = "I considered {\"q\": \"ts\"} but decided against searching.";
+        let r = scavenge_tool_calls(Some(input), &allowed(), 4);
+        assert!(r.calls.is_empty());
+    }
+
+    /// A tagged call and the same call in the raw-JSON scan must not both land.
+    #[test]
+    fn tagged_call_is_not_double_counted() {
+        let input = "<tool_call>{\"name\": \"search\", \"arguments\": {\"q\": \"ts\"}}</tool_call>";
+        let r = scavenge_tool_calls(Some(input), &allowed(), 4);
+        assert_eq!(r.calls.len(), 1);
     }
 }
