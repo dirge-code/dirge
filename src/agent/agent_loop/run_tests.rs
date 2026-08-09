@@ -7814,3 +7814,45 @@ async fn finish_tally_hands_the_run_status_to_the_session_slot() {
 
     let _ = std::fs::remove_dir_all(&repo);
 }
+
+// ── dirge-4afz: tail-injected notes are not duplicated ──────────────
+
+/// A tail context note persists in the conversation, unlike a system-prompt
+/// section that is rebuilt each turn. Two related prompts in a row select the
+/// same exemplars, so without this the same block accumulates copies that say
+/// nothing new and are paid for until the session ends.
+#[test]
+fn identical_context_note_is_not_pushed_twice() {
+    use crate::agent::agent_loop::run::push_context_note_if_absent;
+
+    let mut ctx = empty_context();
+    assert!(push_context_note_if_absent(&mut ctx, "## Examples\nfoo".into()));
+    assert_eq!(ctx.messages.len(), 1);
+
+    assert!(
+        !push_context_note_if_absent(&mut ctx, "## Examples\nfoo".into()),
+        "a byte-identical block must be skipped"
+    );
+    assert_eq!(ctx.messages.len(), 1, "duplicate copy was appended");
+
+    // A different block still lands.
+    assert!(push_context_note_if_absent(&mut ctx, "## Examples\nbar".into()));
+    assert_eq!(ctx.messages.len(), 2);
+}
+
+/// Comparing against the live context, rather than remembering the last block
+/// pushed, is what makes re-injection correct after compaction folds the
+/// earlier copy away.
+#[test]
+fn context_note_returns_after_the_earlier_copy_is_folded_away() {
+    use crate::agent::agent_loop::run::push_context_note_if_absent;
+
+    let mut ctx = empty_context();
+    assert!(push_context_note_if_absent(&mut ctx, "## Examples\nfoo".into()));
+    ctx.messages.clear(); // stand-in for a compaction fold
+    assert!(
+        push_context_note_if_absent(&mut ctx, "## Examples\nfoo".into()),
+        "the block is genuinely gone — it must be re-injected"
+    );
+    assert_eq!(ctx.messages.len(), 1);
+}

@@ -1360,6 +1360,28 @@ const MAX_CONSECUTIVE_COMPACTION_FAILURES: u32 = 3;
 /// when the task matches fewer exemplars.
 const EXEMPLAR_TOP_K: usize = 3;
 
+/// dirge-4afz: append a tail context note, unless a byte-identical copy is
+/// already in the model-facing context. Returns whether it was pushed.
+///
+/// These blocks (few-shot exemplars, memory pre-recall) are selected from the
+/// user's prompt, so two related turns in a row routinely select the SAME
+/// block. Unlike a system-prompt section — rebuilt from scratch each turn — a
+/// tail message persists, so re-pushing an identical block adds a second copy
+/// that says nothing new and is paid for until the session ends.
+///
+/// Comparing against the live context rather than remembering the last block
+/// pushed is deliberate: if compaction has since folded the earlier copy away,
+/// the block is genuinely absent and re-injecting it is the right call.
+fn push_context_note_if_absent(context: &mut Context, block: String) -> bool {
+    let msg = LoopMessage::User(super::message::UserMessage::text(block));
+    let value = loop_message_to_value(&msg);
+    if context.messages.iter().any(|m| m == &value) {
+        return false;
+    }
+    context.messages.push(value);
+    true
+}
+
 /// Max live ACTIVE issues surfaced in the turn-start "Active work queue" section.
 /// The rest get a "+N more" hint so a large active board can't flood context.
 const ACTIVE_TOP_N: usize = 7;
@@ -1972,8 +1994,7 @@ pub async fn run_agent_loop(
     // Injected into the model-facing context ONLY — not `new_messages` —
     // so it steers this run without being persisted into session history.
     if let Some(block) = crate::agent::exemplars::block_for_task(&task_query, EXEMPLAR_TOP_K) {
-        let ex_msg = LoopMessage::User(super::message::UserMessage::text(block));
-        context.messages.push(loop_message_to_value(&ex_msg));
+        push_context_note_if_absent(&mut context, block);
     }
 
     // Pi line 105: `currentContext.messages = [...context.messages, ...prompts]`.
@@ -2013,8 +2034,7 @@ pub async fn run_agent_loop(
         match tokio::task::spawn_blocking(move || p.search(&q)).await {
             Ok(Ok(resp)) => {
                 if let Some(block) = super::context_manager::pre_recall_block(&resp, &snapshot) {
-                    let msg = LoopMessage::User(super::message::UserMessage::text(block));
-                    context.messages.push(loop_message_to_value(&msg));
+                    push_context_note_if_absent(&mut context, block);
                 }
             }
             Ok(Err(e)) => {
