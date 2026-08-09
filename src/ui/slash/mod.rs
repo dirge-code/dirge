@@ -109,6 +109,11 @@ pub(super) struct SlashCtx<'a> {
     pub user_tx: &'a tokio::sync::mpsc::UnboundedSender<crate::event::UserEvent>,
     #[cfg(feature = "loop")]
     pub loop_state: &'a mut Option<crate::extras::r#loop::LoopState>,
+    #[cfg(feature = "vigil")]
+    #[allow(dead_code)]
+    pub vigil_state: &'a mut Option<crate::extras::vigil::VigilState>,
+    #[cfg(feature = "vigil")]
+    pub vigil_ctl_tx: &'a Option<tokio::sync::mpsc::Sender<crate::extras::vigil::types::VigilCtl>>,
     #[cfg(feature = "mcp")]
     pub mcp_manager: Option<&'a McpClientManager>,
     #[cfg(feature = "semantic")]
@@ -583,6 +588,10 @@ pub async fn handle_slash(
     sandbox: &Sandbox,
     #[cfg(unix)] user_tx: &tokio::sync::mpsc::UnboundedSender<crate::event::UserEvent>,
     #[cfg(feature = "loop")] loop_state: &mut Option<crate::extras::r#loop::LoopState>,
+    #[cfg(feature = "vigil")] vigil_state: &mut Option<crate::extras::vigil::VigilState>,
+    #[cfg(feature = "vigil")] vigil_ctl_tx: &Option<
+        tokio::sync::mpsc::Sender<crate::extras::vigil::types::VigilCtl>,
+    >,
     #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
     #[cfg(feature = "semantic")] semantic_manager: Option<&SemanticManager>,
     // C8 (audit fix): every prior agent-rebuild path (/model,
@@ -616,6 +625,10 @@ pub async fn handle_slash(
         user_tx,
         #[cfg(feature = "loop")]
         loop_state,
+        #[cfg(feature = "vigil")]
+        vigil_state,
+        #[cfg(feature = "vigil")]
+        vigil_ctl_tx,
         #[cfg(feature = "mcp")]
         mcp_manager,
         #[cfg(feature = "semantic")]
@@ -671,6 +684,7 @@ pub async fn handle_slash(
         #[cfg(unix)]
         "/edit" => return Ok(SlashOutcome::DeferExternalEditor),
         "/undo" => cmd::undo::cmd_undo(&mut ctx).await?,
+        "/vigil" => cmd::vigil_cmd::cmd_vigil(&mut ctx, &parts, text).await?,
         "/retry" => cmd::retry::cmd_retry(&mut ctx).await?,
         "/allow" => cmd::allow::cmd_allow(&mut ctx, &parts, text).await?,
         "/why" => cmd::allow::why::cmd_why(&mut ctx, &parts).await?,
@@ -865,6 +879,10 @@ fn slash_commands() -> Vec<(&'static str, &'static str)> {
     // (dirge-3p8j). The gated entry made it un-completable / "unknown" in
     // no-loop builds even though the arm handled it.
     cmds.push(("/loop", "start, stop, or show a background prompt loop"));
+    // `/vigil` follows the same always-dispatched pattern as `/loop` —
+    // its handler prints a feature-gated message when built without vigil,
+    // so it stays in the canonical list unconditionally.
+    cmds.push(("/vigil", "manage vigil heartbeat/watch triggers"));
     #[cfg(feature = "dap")]
     cmds.push((
         "/debug",

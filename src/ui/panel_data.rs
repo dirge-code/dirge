@@ -86,6 +86,21 @@ pub struct LeftPanelInfo {
     pub git: Option<GitSnapshot>,
 }
 
+/// A single row in a vigil-status panel display.
+#[cfg(feature = "vigil")]
+#[derive(Debug, Clone, Default)]
+pub struct VigilStatusRow {
+    pub name: String,
+    pub trigger: String,
+    pub interval_secs: u64,
+    pub running: bool,
+    pub paused: bool,
+    /// Number of events in the most recent reap window.
+    pub last_event_count: usize,
+    /// Human-readable age of the most recent reap (e.g. "3s", "12m").
+    pub last_event_age: Option<String>,
+}
+
 /// Build a compact, glanceable label for a tool call shown in the
 /// left-panel `[ACTIVITY]` ticker — `<verb> <concise target>`. The
 /// target is the basename for path tools, the command head for `bash`,
@@ -125,6 +140,19 @@ pub fn tool_call_label(name: &str, args: &serde_json::Value) -> String {
     match target {
         Some(t) if !t.is_empty() => format!("{name} {t}"),
         _ => name.to_string(),
+    }
+}
+
+/// Human-readable short duration like "3s", "12m", "2h".
+#[cfg(feature = "vigil")]
+pub fn format_duration_short(d: chrono::TimeDelta) -> String {
+    let secs = d.num_seconds();
+    if secs < 60 {
+        format!("{}s", secs.max(0))
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{}h", secs / 3600)
     }
 }
 

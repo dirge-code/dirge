@@ -42,6 +42,12 @@ pub(crate) struct LoopBits<'a> {
     pub label: &'a mut Option<String>,
 }
 
+/// Optional vigil-feature state passed through to `handle_done`.
+#[cfg(feature = "vigil")]
+pub(crate) struct VigilBits<'a> {
+    pub state: &'a mut Option<crate::extras::vigil::VigilState>,
+}
+
 /// Outcome of [`prepare_next_model_client`]: tells the caller whether to go on
 /// and rebuild the agent, and if so whether the provider changed.
 #[cfg(feature = "plugin")]
@@ -201,8 +207,36 @@ pub(crate) async fn handle_done(
     // arm applies the model swap and runs finish_done once it resolves.
     #[cfg(feature = "plugin")] done_phase: &mut Option<crate::ui::done_phase::DonePhaseHandle>,
     #[cfg(feature = "loop")] loop_bits: LoopBits<'_>,
+    #[cfg(feature = "vigil")] vigil_bits: VigilBits<'_>,
 ) -> anyhow::Result<()> {
     *was_reasoning = false;
+    // Dispatch on-vigil-observance hook now that we have the agent's response.
+    // The vigil select! arm stored pending observance metadata in VigilState;
+    // we fire the hook here so it sees :response and :exit.
+    #[cfg(feature = "vigil")]
+    if let Some(vs) = vigil_bits.state
+        && let Some(pending) = vs.pending_observance.take()
+    {
+        #[cfg(feature = "plugin")]
+        if let Some(pm) = plugin_manager {
+            let escaped_name = pending
+                .vigil_name
+                .replace('\\', "\\\\")
+                .replace('\"', "\\\"");
+            let escaped_response = response.replace('\\', "\\\\").replace('\"', "\\\"");
+            let ctx = format!(
+                "@{{:vigil \"{}\" :count {} :response \"{}\" :exit :ok}}",
+                escaped_name, pending.event_count, escaped_response,
+            );
+            let pm = pm.clone();
+            tokio::task::spawn_blocking(move || {
+                pm.lock_ignore_poison()
+                    .dispatch_tool_hook("on-vigil-observance", &ctx)
+            })
+            .await
+            .ok();
+        }
+    }
     // A successful turn must not leave a chamber
     // half-painted. If anything slipped through
     // — show_details=false skipping the body, an
@@ -291,6 +325,8 @@ pub(crate) async fn handle_done(
         plugin_manager,
         #[cfg(feature = "loop")]
         loop_bits,
+        #[cfg(feature = "vigil")]
+        vigil_bits,
     )
     .await
 }
@@ -323,6 +359,7 @@ pub(crate) async fn finish_done(
     #[cfg_attr(not(feature = "experimental-graph-search"), allow(unused_variables))]
     plugin_manager: Option<&std::sync::Arc<std::sync::Mutex<PluginManager>>>,
     #[cfg(feature = "loop")] loop_bits: LoopBits<'_>,
+    #[cfg(feature = "vigil")] vigil_bits: VigilBits<'_>,
 ) -> anyhow::Result<()> {
     let bg_store = deps.bg_store;
 
@@ -415,6 +452,21 @@ pub(crate) async fn finish_done(
     #[cfg(not(feature = "loop"))]
     let (loop_active, loop_should_stop) = (false, false);
 
+    #[cfg(feature = "vigil")]
+    let vigil_active = vigil_bits
+        .state
+        .as_ref()
+        .map(|vs| vs.active)
+        .unwrap_or(false);
+
+    #[cfg(feature = "vigil")]
+    let action = crate::plugin::decide_post_done_action(
+        followup_for_decision,
+        loop_active,
+        loop_should_stop,
+        vigil_active,
+    );
+    #[cfg(not(feature = "vigil"))]
     let action = crate::plugin::decide_post_done_action(
         followup_for_decision,
         loop_active,
@@ -491,6 +543,12 @@ pub(crate) async fn finish_done(
             }
         }
         crate::plugin::PostDoneAction::Idle => {}
+        #[cfg(feature = "vigil")]
+        crate::plugin::PostDoneAction::VigilSleep => {
+            // Vigil mode: don't auto-follow-up or loop; just sleep.
+            // The select! loop's vigil-wake arm will observe and
+            // launch the next agent turn.
+        }
     }
 
     // Phased `/plan` reviewer loop (P3e-b). If this `Done` closed a plan-driven

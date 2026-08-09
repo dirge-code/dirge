@@ -1,0 +1,12 @@
+{
+  "name": "sanity-toll",
+  "trigger": {
+    "type": "toll",
+    "interval_secs": 10
+  },
+  "reap_interval_secs": 10,
+  "prompt": "Vigil toll fired. Rite output: {rite_output}",
+  "rite": {
+    "cmd": "echo 'toll-ok'"
+  }
+}

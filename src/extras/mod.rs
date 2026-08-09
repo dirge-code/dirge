@@ -40,3 +40,7 @@ pub mod session_search;
 pub mod skill_db;
 pub mod skills;
 pub mod spec_db;
+pub mod vigil_db;
+
+#[cfg(feature = "vigil")]
+pub mod vigil;

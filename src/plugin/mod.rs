@@ -131,15 +131,22 @@ pub enum PostDoneAction {
     LoopIter,
     LoopStop,
     Idle,
+    #[cfg(feature = "vigil")]
+    VigilSleep,
 }
 
 pub fn decide_post_done_action(
     followup: Option<String>,
     loop_active: bool,
     loop_should_stop: bool,
+    #[cfg(feature = "vigil")] vigil_active: bool,
 ) -> PostDoneAction {
     if let Some(text) = followup {
         return PostDoneAction::Followup(text);
+    }
+    #[cfg(feature = "vigil")]
+    if vigil_active {
+        return PostDoneAction::VigilSleep;
     }
     if !loop_active {
         return PostDoneAction::Idle;

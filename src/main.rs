@@ -537,6 +537,8 @@ async fn main() -> anyhow::Result<()> {
             cli::Command::Sandbox { .. } => {}
             #[cfg(feature = "mcp-server")]
             cli::Command::Mcp { .. } => {}
+            #[cfg(feature = "vigil")]
+            cli::Command::Vigil { .. } => {}
         }
     }
 
@@ -669,12 +671,13 @@ async fn main() -> anyhow::Result<()> {
                         let image_safe = image_ref.replace(['/', ':'], "_");
                         let base_dir = cache_dir.join(&image_safe).join("base");
                         if base_dir.exists() {
+                            let daemon_path = base_dir.join("usr/sbin/dropbear");
                             let sshd_path = base_dir.join("usr/sbin/sshd");
-                            if sshd_path.exists() {
+                            if daemon_path.exists() || sshd_path.exists() {
                                 println!("  Image already cached at {}", base_dir.display());
                             } else {
                                 println!(
-                                    "  Cached rootfs is stale (missing sshd) — removing and re-preparing..."
+                                    "  Cached rootfs is stale (missing daemon) — removing and re-preparing..."
                                 );
                                 std::fs::remove_dir_all(&base_dir)?;
                                 rootfs::prepare(&image_ref, &cache_dir).await?;
@@ -685,12 +688,13 @@ async fn main() -> anyhow::Result<()> {
                             println!("  Done. Cached at {}", base_dir.display());
                         }
 
-                        // Validate the prepared rootfs has sshd.
+                        // Validate the prepared rootfs has a daemon binary.
+                        let daemon_path = base_dir.join("usr/sbin/dropbear");
                         let sshd_path = base_dir.join("usr/sbin/sshd");
-                        if !sshd_path.exists() {
+                        if !daemon_path.exists() && !sshd_path.exists() {
                             anyhow::bail!(
-                                "rootfs at {} is missing /usr/sbin/sshd after preparation — \
-                                 the image may not have openssh-server installed",
+                                "rootfs at {} is missing /usr/sbin/dropbear or /usr/sbin/sshd \
+                                 after preparation — the image may not have a supported SSH daemon",
                                 base_dir.display()
                             );
                         }
@@ -703,6 +707,11 @@ async fn main() -> anyhow::Result<()> {
             #[cfg(feature = "mcp-server")]
             cli::Command::Mcp { model, sandbox } => {
                 return extras::mcp_server::serve(&cli, &cfg, model.clone(), sandbox.clone()).await;
+            }
+            #[cfg(feature = "vigil")]
+            cli::Command::Vigil { action } => {
+                handle_vigil_command(action).await?;
+                return Ok(());
             }
         }
     }
@@ -1658,10 +1667,16 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|| PathBuf::from("LOOP_PLAN.md"));
             let _use_existing = loop_mod::plan::handle_startup(&plan_file)?;
 
+            let effective_loop_max = if cli.loop_oneshot {
+                Some(1)
+            } else {
+                cli.loop_max
+            };
+
             let mut loop_state = loop_mod::LoopState::new(
                 loop_prompt,
                 plan_file,
-                cli.loop_max,
+                effective_loop_max,
                 cli.loop_run.clone(),
             );
             let session_id = Uuid::new_v4().to_string();
@@ -1927,6 +1942,115 @@ async fn main() -> anyhow::Result<()> {
         #[cfg(not(feature = "mcp"))]
         let mcp_wake_rx: Option<tokio::sync::mpsc::UnboundedReceiver<()>> = None;
 
+        // Vigil: start the vigil-keeper and wire its wake channel.
+        // The keeper owns the background reaper and trigger tasks;
+        // we hold onto the keeper (so it stays alive) but take out the
+        // wake + observance receivers to hand to `run_interactive`.
+        #[cfg(feature = "vigil")]
+        let (mut _vigil_keeper, vigil_wake_rx, vigil_observance_rx, vigil_ctl_tx, vigil_hook_rx) = {
+            if !cli.vigil_mode {
+                (None, None, None, None, None)
+            } else {
+                // Merge config vigils with --vigil-config file entries (if any).
+                let mut entries = if let Some(cfg_entries) = cfg.vigils.as_ref() {
+                    cfg_entries.clone()
+                } else {
+                    vec![]
+                };
+                if let Some(ref config_path) = cli.vigil_config {
+                    if config_path.exists() {
+                        match std::fs::read_to_string(config_path) {
+                            Ok(json_str) => {
+                                match serde_json::from_str::<Vec<crate::config::VigilEntry>>(
+                                    &json_str,
+                                ) {
+                                    Ok(file_entries) => {
+                                        for fe in file_entries {
+                                            if !entries.iter().any(|e| e.name == fe.name) {
+                                                entries.push(fe);
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        eprintln!(
+                                            "warning: --vigil-config file has invalid JSON: {e}"
+                                        );
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("warning: cannot read --vigil-config file: {e}");
+                            }
+                        }
+                    } else {
+                        eprintln!(
+                            "warning: --vigil-config file not found: {}",
+                            config_path.display()
+                        );
+                    }
+                }
+
+                let paused_names = {
+                    let paths = crate::extras::dirge_paths::ProjectPaths::new(
+                        &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+                    );
+                    let db_path = paths.session_db_path();
+                    if db_path.exists() {
+                        match crate::extras::vigil_db::VigilStore::open_at(&db_path) {
+                            Ok(store) => store
+                                .list_non_resting()
+                                .unwrap_or_default()
+                                .into_iter()
+                                .filter(|r| {
+                                    matches!(r.status, crate::extras::vigil_db::VigilStatus::Paused)
+                                })
+                                .map(|r| r.name)
+                                .collect::<std::collections::HashSet<_>>(),
+                            Err(_) => std::collections::HashSet::new(),
+                        }
+                    } else {
+                        std::collections::HashSet::new()
+                    }
+                };
+                match crate::extras::vigil::VigilKeeper::from_config_and_filesystem(
+                    entries.clone(),
+                    paused_names,
+                ) {
+                    Ok(mut keeper) => {
+                        if keeper.vigils.is_empty() {
+                            eprintln!("warning: --vigil set but no vigils configured");
+                            (None, None, None, None, None)
+                        } else {
+                            let n = keeper.vigils.len();
+                            #[cfg(feature = "plugin")]
+                            {
+                                if let Some(ref vig_tx) = keeper.vigil_plugin_tx {
+                                    crate::plugin::worker::vigil_bridge::install_vigil_tx(
+                                        vig_tx.clone(),
+                                    );
+                                }
+                                let names: Vec<String> =
+                                    keeper.vigils.iter().map(|v| v.name.clone()).collect();
+                                crate::plugin::worker::vigil_bridge::install_vigil_names(names);
+                            }
+                            eprintln!("info: vigil-keeper started with {n} vigil(s)");
+                            let wake = keeper.wake_rx.take();
+                            let obs = keeper.observance_rx.take();
+                            let ctl = keeper.ctl_tx.clone();
+                            let hook_rx = keeper.hook_rx.take();
+                            (Some(keeper), wake, obs, ctl, hook_rx)
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("warning: vigil-keeper failed to start: {e}");
+                        (None, None, None, None, None)
+                    }
+                }
+            }
+        };
+        // vigil_wake_rx and vigil_observance_rx are only passed to run_interactive
+        // when #[cfg(feature = "vigil")] — no fallback let needed.
+
         ui::run_interactive(
             client,
             agent,
@@ -1958,6 +2082,14 @@ async fn main() -> anyhow::Result<()> {
             dialog_rx,
             subagent_chat_rx,
             sysload,
+            #[cfg(feature = "vigil")]
+            vigil_wake_rx,
+            #[cfg(feature = "vigil")]
+            vigil_observance_rx,
+            #[cfg(feature = "vigil")]
+            vigil_ctl_tx,
+            #[cfg(feature = "vigil")]
+            vigil_hook_rx,
         )
         .await?;
 
@@ -2113,6 +2245,20 @@ async fn run_headless_loop(
             &summary,
         ) {
             eprintln!("[loop] warning: failed to save transcript: {}", e);
+        }
+
+        if cli.loop_persist {
+            use crate::session::{MessageRole, Session, storage};
+            let mut session = storage::load_session(session_id).unwrap_or_else(|_| {
+                let mut s = Session::new("loop", "unknown", 200_000);
+                s.id = compact_str::CompactString::new(session_id);
+                s
+            });
+            session.add_message(MessageRole::User, &iteration_prompt);
+            session.add_message(MessageRole::Assistant, &response);
+            if let Err(e) = storage::save_session(&mut session) {
+                eprintln!("[loop] warning: failed to persist session: {}", e);
+            }
         }
 
         // `prepare-next-run` hooks fired inside `run_print` may have
@@ -2335,6 +2481,168 @@ mod resolve_mode_tests {
             "unknown mode string must fall back to Standard, not panic"
         );
     }
+}
+
+/// Handle `dirge vigil add/list/remove/pause/resume/rest` subcommands.
+#[cfg(feature = "vigil")]
+async fn handle_vigil_command(action: &crate::cli::VigilAction) -> anyhow::Result<()> {
+    use crate::extras::dirge_paths::ProjectPaths;
+    use crate::extras::vigil_db::{VigilStatus, VigilStore};
+
+    let paths = ProjectPaths::new(
+        &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+    );
+
+    match action {
+        crate::cli::VigilAction::List => {
+            let vigils = config::load().vigils.unwrap_or_default();
+            println!("Vigils (from config):");
+            for v in &vigils {
+                let trigger = match &v.trigger {
+                    crate::config::VigilTrigger::Toll { interval_secs } => {
+                        format!("toll every {interval_secs}s")
+                    }
+                    crate::config::VigilTrigger::Watcher { path } => {
+                        format!("watcher on {path}")
+                    }
+                    crate::config::VigilTrigger::Harbinger {
+                        address, protocol, ..
+                    } => {
+                        let p = if protocol.is_empty() {
+                            "tcp"
+                        } else {
+                            protocol.as_str()
+                        };
+                        format!("harbinger {p}://{address}")
+                    }
+                };
+                let prompt = if v.prompt.is_empty() {
+                    "(default)".to_string()
+                } else {
+                    v.prompt.clone()
+                };
+                println!(
+                    "  {} - {trigger} - reap every {}s - prompt: {prompt}",
+                    v.name, v.reap_interval_secs
+                );
+            }
+            if vigils.is_empty() {
+                println!("  (none)");
+            }
+        }
+        crate::cli::VigilAction::Add {
+            name,
+            trigger,
+            args,
+        } => {
+            let store = VigilStore::open(&paths).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let entry = build_vigil_entry(name, trigger, args)?;
+            let json = serde_json::to_string(&entry)?;
+            store
+                .upsert(&entry.name, &json)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            println!(
+                "Added vigil '{}'. Run `dirge --vigil` to start the keeper.",
+                entry.name
+            );
+        }
+        crate::cli::VigilAction::Remove { name } => {
+            let store = VigilStore::open(&paths).map_err(|e| anyhow::anyhow!("{e}"))?;
+            match store.remove(name) {
+                Ok(()) => println!("Removed vigil '{name}'."),
+                Err(e) => eprintln!("{e}"),
+            }
+        }
+        crate::cli::VigilAction::Pause { name } => {
+            let store = VigilStore::open(&paths).map_err(|e| anyhow::anyhow!("{e}"))?;
+            match store.set_status(name, VigilStatus::Paused) {
+                Ok(()) => println!("Paused vigil '{name}'."),
+                Err(e) => eprintln!("{e}"),
+            }
+        }
+        crate::cli::VigilAction::Resume { name } => {
+            let store = VigilStore::open(&paths).map_err(|e| anyhow::anyhow!("{e}"))?;
+            match store.set_status(name, VigilStatus::Active) {
+                Ok(()) => println!("Resumed vigil '{name}'."),
+                Err(e) => eprintln!("{e}"),
+            }
+        }
+        crate::cli::VigilAction::Rest { name } => {
+            let store = VigilStore::open(&paths).map_err(|e| anyhow::anyhow!("{e}"))?;
+            match store.set_status(name, VigilStatus::Active) {
+                Ok(()) => println!("Restarted vigil '{name}'."),
+                Err(e) => eprintln!("{e}"),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Build a VigilEntry from CLI `vigil add` args.
+#[cfg(feature = "vigil")]
+fn build_vigil_entry(
+    name: &str,
+    trigger: &crate::cli::VigilAddTrigger,
+    args: &[String],
+) -> anyhow::Result<crate::config::VigilEntry> {
+    use crate::config::{VigilEntry, VigilRite, VigilTrigger};
+
+    let parsed: std::collections::HashMap<String, String> = args
+        .iter()
+        .filter_map(|a| a.split_once('='))
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+
+    let trigger = match trigger {
+        crate::cli::VigilAddTrigger::Toll => {
+            let secs = parsed
+                .get("interval_secs")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30);
+            VigilTrigger::Toll {
+                interval_secs: secs,
+            }
+        }
+        crate::cli::VigilAddTrigger::Watcher => {
+            let path = parsed
+                .get("path")
+                .cloned()
+                .unwrap_or_else(|| ".".to_string());
+            VigilTrigger::Watcher { path }
+        }
+        crate::cli::VigilAddTrigger::Harbinger => {
+            let address = parsed
+                .get("address")
+                .cloned()
+                .unwrap_or_else(|| "127.0.0.1:9000".to_string());
+            let protocol = parsed.get("protocol").cloned().unwrap_or_default();
+            VigilTrigger::Harbinger {
+                address,
+                protocol,
+                socket_mode: crate::config::SocketMode::Commands,
+                commands: std::collections::HashMap::new(),
+            }
+        }
+    };
+
+    let reap_interval_secs = parsed
+        .get("reap_interval_secs")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30);
+
+    let prompt = parsed.get("prompt").cloned().unwrap_or_default();
+
+    Ok(VigilEntry {
+        name: name.to_string(),
+        trigger,
+        reap_interval_secs,
+        prompt,
+        procession: None,
+        rite: Some(VigilRite {
+            cmd: None,
+            git_dirty: false,
+        }),
+    })
 }
 
 /// dirge-o2bw — a present-but-unparseable `permission` config block

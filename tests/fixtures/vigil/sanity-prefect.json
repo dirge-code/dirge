@@ -1,0 +1,12 @@
+{
+  "name": "prefect-remediate",
+  "trigger": {
+    "type": "toll",
+    "interval_secs": 60
+  },
+  "reap_interval_secs": 60,
+  "prompt": "Prefect flow run failed.\n\nFlow: {flow_name}\nRun ID: {run_id}\nState: {state}\n\nInvestigate the failure and remediate.",
+  "rite": {
+    "cmd": "echo 'prefect-rite-ok'"
+  }
+}

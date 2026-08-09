@@ -74,6 +74,7 @@ default = [
     'lsp',
     'acp',
     'plugin',
+    'vigil',
     'semantic-ts',
     'semantic-python',
     'semantic-bash',
@@ -125,6 +126,7 @@ no-plugin = [
 # The release workflow builds the Windows target with this set.
 windows-default = ['no-plugin']
 loop = []
+vigil = ["dep:notify"]
 # Run dirge itself as an MCP server (`dirge mcp`) so another agent (e.g.
 # Claude Code) can delegate implementation tasks to dirge and review them.
 # Pulls rmcp's server side + stdio transport + the tool macros.
@@ -336,6 +338,7 @@ lsp-types = { version = "0.97", optional = true }
 tree-sitter-elixir = { version = "0.3.5", optional = true }
 tree-sitter-sequel = { version = "0.3", optional = true }
 tree-sitter-dafny = { version = "0.1", optional = true }
+notify = { version = "7", optional = true, default-features = false, features = ["macos_kqueue"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 # DAP (Debug Adapter Protocol) — optional feature for driving
 # debuggers (lldb-dap, dlv, debugpy, node) to fix crashes instead
