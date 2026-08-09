@@ -66,8 +66,9 @@ use super::types::{ThinkingBudgets, ThinkingLevel};
 /// 2× is deliberately loose. A budget is a request, not a hard stop — models
 /// overshoot it routinely and legitimately — so the cap has to sit well clear of
 /// normal overshoot and still bite decisively on a model emitting hundreds of
-/// thousands of tokens without converging. At the default grants that puts the
-/// cap at 32k for High/Xhigh, 8k at Medium, 4k at Low.
+/// thousands of tokens without converging. With [`MIN_DERIVED_CAP`] underneath
+/// it, the default grants land at 32k for High/Xhigh and the 16k floor for
+/// everything below.
 pub const OVERRUN_FACTOR: usize = 2;
 
 /// Cap used when the turn's thinking level is unknown — no level resolved, no
@@ -75,6 +76,22 @@ pub const OVERRUN_FACTOR: usize = 2;
 /// permissive derived value, because guessing low here is what caused
 /// dirge-vzsy and a missed runaway is far cheaper than a truncated good turn.
 pub const FALLBACK_BUDGET_TOKENS: usize = 32768;
+
+/// Floor under every derived cap.
+///
+/// [`crate::provider::adapter::budget_for_level`] is only ever *sent* to the two
+/// budget-wire providers, Anthropic and Gemini. Everything else — DeepSeek
+/// (dirge's default), OpenAI, GLM, Cerebras, openrouter, ollama — takes an
+/// effort *string*, so the per-level number was never communicated and is not a
+/// budget the model agreed to. Deriving a tight cap from it there would repeat
+/// dirge-vzsy in a quieter form: an R1-class model at `reasoning_effort: medium`
+/// routinely reasons past 8k, and nothing told it not to.
+///
+/// So no derived cap sits below this. It costs nothing worth having — the
+/// runaways this guard exists for produce hundreds of thousands of tokens, not
+/// twenty — and it removes a whole class of "capped tighter than anyone was
+/// told" from the design.
+pub const MIN_DERIVED_CAP: usize = 16384;
 
 /// Same chars-per-token ratio as [`crate::agent::compression`], so the budget
 /// is expressed in the same currency as every other context number.
@@ -116,7 +133,10 @@ pub fn budget_for_turn(level: Option<ThinkingLevel>, budgets: Option<&ThinkingBu
         return FALLBACK_BUDGET_TOKENS;
     };
     let granted = crate::provider::adapter::budget_for_level(level, budgets) as usize;
-    granted.saturating_mul(OVERRUN_FACTOR)
+    if granted == 0 {
+        return 0; // Off — nothing to meter.
+    }
+    granted.saturating_mul(OVERRUN_FACTOR).max(MIN_DERIVED_CAP)
 }
 
 fn estimate_tokens(chars: usize) -> usize {
@@ -185,9 +205,13 @@ pub const COMMIT_NUDGE: &str = "Your reasoning for that turn ran past the budget
      reasoning further.";
 
 /// Turn-boundary half of the breaker. One-shot per task.
+///
+/// Holds no budget of its own: the cap belongs to the turn, and
+/// `config.reasoning` can change mid-run (the `prepare_next_turn` hook swaps
+/// the thinking level). Caching a cap at construction would let the breaker
+/// judge a turn against a level that turn was not run at.
 #[derive(Debug, Default)]
 pub struct ThinkingBreaker {
-    budget_tokens: usize,
     tripped: bool,
 }
 
@@ -202,28 +226,25 @@ pub enum BreakerAction {
 }
 
 impl ThinkingBreaker {
-    pub fn new(budget_tokens: usize) -> Self {
-        Self {
-            budget_tokens,
-            tripped: false,
-        }
+    pub fn new() -> Self {
+        Self { tripped: false }
     }
 
-    /// Judge a finished assistant message.
+    /// Judge a finished assistant message against the cap the turn ran under.
     ///
     /// Fires only when the turn *ran out of room* (`StopReason::Length`) with
     /// an over-budget reasoning trace. A model that thought hard and then
     /// answered or called a tool is left alone however long it thought — the
     /// trace length is not itself the problem, failing to convert it into an
     /// action is.
-    pub fn inspect(&mut self, msg: &AssistantMessage) -> BreakerAction {
-        if self.tripped || self.budget_tokens == 0 {
+    pub fn inspect(&mut self, msg: &AssistantMessage, budget_tokens: usize) -> BreakerAction {
+        if self.tripped || budget_tokens == 0 {
             return BreakerAction::None;
         }
         if msg.stop_reason != StopReason::Length {
             return BreakerAction::None;
         }
-        if thinking_tokens(msg) <= self.budget_tokens {
+        if thinking_tokens(msg) <= budget_tokens {
             return BreakerAction::None;
         }
         self.tripped = true;
@@ -287,6 +308,24 @@ mod tests {
         assert_eq!(budget_for_turn(Some(ThinkingLevel::Xhigh), None), 32768);
     }
 
+    /// The lower levels sit on the floor, not on 2× a number the provider was
+    /// never told. DeepSeek and OpenAI take an effort string; `budget_for_level`
+    /// never reaches them.
+    #[test]
+    fn levels_below_high_rest_on_the_floor() {
+        for level in [
+            ThinkingLevel::Minimal,
+            ThinkingLevel::Low,
+            ThinkingLevel::Medium,
+        ] {
+            assert_eq!(
+                budget_for_turn(Some(level), None),
+                MIN_DERIVED_CAP,
+                "{level:?} should not be capped below the floor"
+            );
+        }
+    }
+
     /// Custom budgets flow through — a user who raises `high` raises the cap
     /// with it rather than being cut at a stale constant.
     #[test]
@@ -341,8 +380,11 @@ mod tests {
 
     #[test]
     fn breaker_fires_on_a_truncated_over_budget_think() {
-        let mut b = ThinkingBreaker::new(FALLBACK_BUDGET_TOKENS);
-        let action = b.inspect(&msg(over_budget_chars(), StopReason::Length));
+        let mut b = ThinkingBreaker::new();
+        let action = b.inspect(
+            &msg(over_budget_chars(), StopReason::Length),
+            FALLBACK_BUDGET_TOKENS,
+        );
         assert_eq!(
             action,
             BreakerAction::ForceOff {
@@ -355,10 +397,10 @@ mod tests {
     /// action is. A model that thought hard and then acted is left alone.
     #[test]
     fn breaker_ignores_a_long_think_that_produced_a_turn() {
-        let mut b = ThinkingBreaker::new(FALLBACK_BUDGET_TOKENS);
+        let mut b = ThinkingBreaker::new();
         for stop in [StopReason::Stop, StopReason::ToolUse] {
             assert_eq!(
-                b.inspect(&msg(over_budget_chars(), stop)),
+                b.inspect(&msg(over_budget_chars(), stop), FALLBACK_BUDGET_TOKENS),
                 BreakerAction::None
             );
         }
@@ -368,9 +410,9 @@ mod tests {
     /// output, which the loop already handles.
     #[test]
     fn breaker_ignores_a_length_stop_with_little_thinking() {
-        let mut b = ThinkingBreaker::new(FALLBACK_BUDGET_TOKENS);
+        let mut b = ThinkingBreaker::new();
         assert_eq!(
-            b.inspect(&msg(200, StopReason::Length)),
+            b.inspect(&msg(200, StopReason::Length), FALLBACK_BUDGET_TOKENS),
             BreakerAction::None
         );
     }
@@ -379,10 +421,30 @@ mod tests {
     /// another nudge on top of the first.
     #[test]
     fn breaker_is_one_shot_per_task() {
-        let mut b = ThinkingBreaker::new(FALLBACK_BUDGET_TOKENS);
+        let mut b = ThinkingBreaker::new();
         let m = msg(over_budget_chars(), StopReason::Length);
-        assert_ne!(b.inspect(&m), BreakerAction::None);
-        assert_eq!(b.inspect(&m), BreakerAction::None);
+        assert_ne!(b.inspect(&m, FALLBACK_BUDGET_TOKENS), BreakerAction::None);
+        assert_eq!(b.inspect(&m, FALLBACK_BUDGET_TOKENS), BreakerAction::None);
+    }
+
+    /// The breaker holds no cap of its own, so a level swapped mid-run by
+    /// `prepare_next_turn` can't leave it judging a turn against a level that
+    /// turn never ran at.
+    #[test]
+    fn the_breaker_judges_against_the_cap_it_is_handed() {
+        let m = msg(over_budget_chars(), StopReason::Length);
+
+        // Under a cap wide enough for the trace: nothing to do.
+        let mut b = ThinkingBreaker::new();
+        assert_eq!(
+            b.inspect(&m, usize::MAX),
+            BreakerAction::None,
+            "a trace inside its cap is not a runaway"
+        );
+
+        // Same message, same breaker, a tighter cap: now it fires. The verdict
+        // follows the cap it is given, not one captured at construction.
+        assert_ne!(b.inspect(&m, 1024), BreakerAction::None);
     }
 
     #[test]
