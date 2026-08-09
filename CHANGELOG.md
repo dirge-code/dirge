@@ -4,6 +4,33 @@ All notable changes to dirge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.21.16] - 2026-08-09
+
+### Fixed
+- The per-turn reasoning cap added in 0.21.15 was a flat 8192 tokens, below the
+  16384 dirge itself grants at high effort. A high-effort turn was handed 16k of
+  thinking and then cut off at 8k by our own meter, forced to a `Length` stop,
+  and had thinking disabled for the rest of the task over it — the harness
+  truncating reasoning the same request had just asked for. Traces of 10-30k
+  tokens are ordinary for frontier reasoning models on a hard turn.
+
+  The cap is now derived: twice whatever the turn's thinking level was actually
+  granted, with a 16k floor. It means "the model blew well past its own
+  allocation" rather than an arbitrary number, and it can no longer contradict
+  the request that produced it. High and xhigh land at 32k, everything below at
+  the floor; raising the `high` budget raises the cap with it, and
+  `thinking_budget_tokens` still overrides absolutely.
+
+  The floor is there because the per-level number is only ever *sent* to the two
+  budget-wire providers, Anthropic and Gemini. DeepSeek (the default), OpenAI,
+  GLM, Cerebras, openrouter and ollama take an effort string, so for them it was
+  never a budget the model agreed to — deriving a tight cap from it would have
+  repeated the same mistake more quietly.
+- The breaker cached a cap at construction while the stream recomputed one per
+  turn, so a thinking level swapped mid-run by `prepare_next_turn` left the two
+  disagreeing — the breaker judging a turn against a level that turn never ran
+  at. It now takes the cap per inspection.
+
 ## [0.21.15] - 2026-08-09
 
 ### Added
