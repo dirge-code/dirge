@@ -2442,8 +2442,9 @@ pub async fn run_loop(
     let mut transient_recoveries: u8 = 0;
 
     // dirge-1ug5: one-shot runaway-reasoning breaker for this task.
-    let mut thinking_breaker =
-        super::thinking_budget::ThinkingBreaker::new(super::thinking_budget::budget_tokens());
+    let mut thinking_breaker = super::thinking_budget::ThinkingBreaker::new(
+        super::thinking_budget::budget_for_turn(config.reasoning, config.thinking_budgets.as_ref()),
+    );
 
     let mut verify_nudges: u8 = 0;
 
