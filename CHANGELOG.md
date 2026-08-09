@@ -4,6 +4,65 @@ All notable changes to dirge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.21.15] - 2026-08-09
+
+### Added
+- `benchmarks/` — an Aider Polyglot driver over `--print --output-format
+  stream-json`. dirge ships around fifty behavioural guards, all tuned by hand,
+  with nothing measuring whether they help and nothing noticing when one
+  regresses. The driver stages each exercise to scratch, strips the skip markers
+  Exercism ships (left in place, an agent "passes" by satisfying a single
+  assertion), restores the test files from a snapshot before scoring, and
+  retries once with the failure output. Not yet run against a real clone — the
+  C++ and Java command details are flagged unverified in the README, and they
+  surface as harness errors rather than as misses so a first run reports them
+  instead of deflating the score.
+- A per-turn reasoning cap. dirge asked the provider for a thinking budget but
+  never enforced one, and a locally-served model honours it only as far as its
+  template does. A model that deliberates without converging emits reasoning
+  steadily, so the stream-chunk timeout — which fires on silence — never trips,
+  and every other guard keys on completed turns. The stream now cuts the trace
+  off at the budget, and the run loop disables thinking for the rest of the task
+  and tells the model to commit to an implementation. 8192 tokens by default;
+  `thinking_budget_tokens` in config.json, `0` disables.
+
+### Fixed
+- `write` could silently replace a file with a fraction of its content. The
+  tree-sitter gate only catches *broken* output, so a model that regenerates a
+  500-line file from memory as a valid 120 lines passed every check, with
+  `Wrote` instead of `Created` the only trace. It was also asymmetric with
+  `edit`, which refuses to touch a file the session hasn't read. A write that
+  would leave a 30-line-or-longer file under half its lines is now refused, with
+  the `edit` call-shape to use instead.
+- Five harness guards steered the model invisibly. `HARNESS_TAGS`, which drives
+  the notice mirror headless consumers see, carried 11 of the 16 declared tags —
+  so the completeness, source, claim, prologue and code-review guards injected
+  messages a `--print` / `--loop` / MCP consumer watched the model obey with
+  nothing explaining why. A second list in the TUI carried 6, so every tag
+  outside those rendered in scrollback under `<you>`, attributing a harness
+  injection to the user who never wrote it. Both now read one registry, and a
+  test fails the build if a newly declared tag isn't in it.
+- Tool calls in `<tool_call>` tags or fenced blocks were recovered only when
+  their JSON was already well-formed and balanced. That is Qwen/Hermes' native
+  tool channel and it leaks into plain text whenever llama.cpp runs without
+  `--jinja`; a call truncated at `max_tokens` produced no candidate at all,
+  because the raw scan only emits balanced objects. `parameters` / `input` /
+  `args` are now accepted as argument keys too — only `arguments` was read, so
+  the others coerced to an empty object and then failed schema validation,
+  reading as a model error rather than a parse gap.
+- `write` accepted Windows reserved device names (`nul`, `con`, `com1`…), which
+  create an undeletable device-named file on Windows and are a near-certain
+  mistake elsewhere. Now refused for every writer including bash redirect
+  targets, above `deny_tools` and `--yolo`.
+- `/foo.md` wrote to the filesystem root. Our own schema induces it: it demands
+  an absolute path, and a model with no directory anchor complies by prefixing a
+  slash. Root plus a bare filename now resolves under the working directory, and
+  the result says where it landed.
+- Duplicate tail context notes. Exemplar and memory pre-recall blocks are
+  selected from the prompt, so two related turns select the same block; unlike a
+  system-prompt section a tail message persists, so the second copy said nothing
+  new and was paid for until the session ended.
+
 ## [0.21.14] - 2026-08-08
 
 ### Fixed
