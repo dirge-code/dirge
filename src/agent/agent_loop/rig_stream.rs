@@ -133,6 +133,18 @@ where
         // the first wait starts with the full budget.
         let mut last_chunk_at = std::time::Instant::now();
 
+        // dirge-1ug5: bound one turn's reasoning trace. The chunk timeout above
+        // only fires on SILENCE, so a model that deliberates without converging
+        // — emitting reasoning steadily and never reaching an action — is
+        // invisible to it and to every turn-boundary guard. The meter stops
+        // consuming once the trace crosses the budget; the partial assembled so
+        // far is finalized with `Length`, which is what the run loop's
+        // `ThinkingBreaker` keys on to disable thinking and push for an
+        // implementation.
+        let mut reasoning_meter = super::thinking_budget::ReasoningMeter::new(
+            super::thinking_budget::budget_tokens(),
+        );
+
         // Token usage captured from the Final(R) provider response.
         let mut token_usage: Option<super::message::TokenUsage> = None;
 
@@ -288,6 +300,7 @@ where
                     }
                 }
                 Ok(StreamedAssistantContent::ReasoningDelta { id: _, reasoning }) => {
+                    let over_budget = reasoning_meter.record(&reasoning);
                     match current_thinking_idx {
                         Some(idx) => {
                             if let Some(ContentBlock::Thinking { text }) =
@@ -310,8 +323,26 @@ where
                             };
                         }
                     }
+                    if over_budget {
+                        // Stop consuming. Falls through to the same finalization
+                        // the natural end-of-stream path uses, so the reasoning
+                        // produced so far is preserved rather than discarded.
+                        break;
+                    }
                 }
                 Ok(StreamedAssistantContent::Reasoning(r)) => {
+                    // dirge-1ug5: deliberately NOT metered. The meter exists to
+                    // cut a trace off while it is still being produced; a block
+                    // that arrives whole is already paid for, so cutting saves
+                    // nothing. Forcing `Length` here would be actively wrong —
+                    // the turn ran to completion, and the breaker would inject a
+                    // "commit to an implementation" nudge at a model that had
+                    // already answered, turning a finished run into an extra
+                    // turn. Providers that stream deltas (which is every
+                    // provider dirge meters for: DeepSeek, Anthropic extended
+                    // thinking, local llama.cpp reasoning models) go through the
+                    // arm above.
+                    //
                     // Complete reasoning block emitted in one shot.
                     // `r.content` is `Vec<ReasoningContent>` — a
                     // tagged enum with Text / Encrypted / Redacted /
@@ -546,10 +577,17 @@ where
             .content
             .iter()
             .any(|b| matches!(b, ContentBlock::ToolCall { .. }));
+        // dirge-1ug5: a trace cut off by the reasoning meter reports `Length` —
+        // it ran out of the room it was given, same as a provider max_tokens
+        // hit. Tool calls still win: if the model got as far as requesting one
+        // before the cut, the turn produced an action and the loop should
+        // dispatch it rather than treat the turn as stalled.
         let final_message = AssistantMessage {
             content: partial.content,
             stop_reason: if has_tool_calls {
                 StopReason::ToolUse
+            } else if reasoning_meter.exceeded() {
+                StopReason::Length
             } else {
                 StopReason::Stop
             },
@@ -898,6 +936,67 @@ mod tests {
             .count();
         assert_eq!(starts, 1, "expected 1 ToolCallStart; got {starts}");
         assert_eq!(ends, 1, "expected 1 ToolCallEnd; got {ends}");
+    }
+
+    /// dirge-1ug5: a model that reasons without converging emits chunks
+    /// steadily, so the chunk timeout never fires. The meter is what stops it —
+    /// the stream is cut off, the reasoning produced so far is kept, and the
+    /// message reports `Length` so the run loop's breaker can act on it.
+    #[tokio::test]
+    async fn runaway_reasoning_is_cut_off_at_the_budget() {
+        let budget = super::super::thinking_budget::budget_tokens();
+        // Two deltas, each on its own more than the whole budget: the first
+        // trips the meter, the second must never be consumed.
+        let big = "x".repeat(budget * 8);
+        let raw = raw_stream(vec![
+            Ok(StreamedAssistantContent::ReasoningDelta {
+                id: None,
+                reasoning: big.clone(),
+            }),
+            Ok(StreamedAssistantContent::ReasoningDelta {
+                id: None,
+                reasoning: "SHOULD NOT APPEAR".to_string(),
+            }),
+        ]);
+        let events = drain(wrap_streamed_assistant(raw, None, None)).await;
+        let StreamEvent::Done { message, .. } = events.last().expect("a terminal event") else {
+            panic!("stream did not finish with Done: {:?}", events.last());
+        };
+        assert_eq!(
+            message.stop_reason,
+            StopReason::Length,
+            "a budget cut must report Length so the breaker can key on it"
+        );
+        let thinking: String = message
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Thinking { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !thinking.contains("SHOULD NOT APPEAR"),
+            "consumed a delta after the budget was crossed"
+        );
+        assert!(
+            thinking.len() >= big.len(),
+            "reasoning produced before the cut must be preserved"
+        );
+    }
+
+    /// A trace within budget is untouched, and still reports `Stop`.
+    #[tokio::test]
+    async fn reasoning_within_budget_is_not_cut() {
+        let raw = raw_stream(vec![Ok(StreamedAssistantContent::ReasoningDelta {
+            id: None,
+            reasoning: "a short think".to_string(),
+        })]);
+        let events = drain(wrap_streamed_assistant(raw, None, None)).await;
+        let StreamEvent::Done { message, .. } = events.last().expect("a terminal event") else {
+            panic!("stream did not finish with Done");
+        };
+        assert_eq!(message.stop_reason, StopReason::Stop);
     }
 
     /// Reasoning deltas accumulate into a Thinking block.

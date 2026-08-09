@@ -133,28 +133,20 @@ pub fn format_time(rfc3339: &str) -> CompactString {
     }
 }
 
-/// Internal finalization nudges (critic / verifier / todo) are injected as
-/// user-role messages so the model acts on them, but they are NOT the user's
-/// input. If `content` is one of these tagged nudges, return its body with the
-/// tag stripped (to be shown under the `<critic>` handle); otherwise `None`.
+/// The body of a harness intervention, tag stripped — `None` for anything the
+/// user actually typed.
+///
+/// Harness interventions are injected as user-role messages so the model acts
+/// on them, but they are NOT the user's input and must not be rendered as if
+/// they were.
+///
 /// Single source of truth for both the live view (`run_handlers::notices`) and
-/// scrollback (`render_session`) [dirge-i75f].
-pub(crate) fn finalization_nudge_body(content: &str) -> Option<&str> {
-    use crate::agent::agent_loop::{
-        code_review::CODE_REVIEW_TAG, critic::CRITIC_TAG, run::OPEN_ISSUES_NUDGE_TAG,
-        run::RESUME_NUDGE_TAG, run::TODO_NUDGE_TAG, verifier::VERIFY_TAG,
-    };
-    let trimmed = content.trim_start();
-    [
-        CRITIC_TAG,
-        VERIFY_TAG,
-        TODO_NUDGE_TAG,
-        CODE_REVIEW_TAG,
-        RESUME_NUDGE_TAG,
-        OPEN_ISSUES_NUDGE_TAG,
-    ]
-    .into_iter()
-    .find_map(|tag| trimmed.strip_prefix(tag).map(str::trim_start))
+/// scrollback (`render_session`) [dirge-i75f]. Both callers additionally ask
+/// [`intervention::is_finalization`] which handle to render it under; keeping
+/// that split in the callers is what stopped the two from drifting again
+/// (dirge-x4se).
+pub(crate) fn harness_intervention_body(content: &str) -> Option<&str> {
+    crate::agent::agent_loop::intervention::strip_tag(content)
 }
 
 /// Resolve the `(provider, model)` pair the banner should display, preferring
@@ -244,12 +236,21 @@ pub fn render_session(
         // they're system steering, not user input — render them under the
         // `<critic>` handle/color in scrollback too, matching the live view.
         let nudge_body = if msg.role == MessageRole::User {
-            finalization_nudge_body(&msg.content)
+            harness_intervention_body(&msg.content)
         } else {
             None
         };
+        // dirge-x4se: every harness injection is system steering, not user
+        // input. The finalization family keeps the `<critic>` handle it has
+        // always had; the rest — stall, budget, safe-state, publish-guard,
+        // claim/source/completeness, thinking-budget — used to fall through to
+        // `<you>`, crediting the user with a message the harness wrote.
         let (handle, line_color) = if nudge_body.is_some() {
-            ("<critic> ", theme::critic())
+            if crate::agent::agent_loop::intervention::is_finalization(&msg.content) {
+                ("<critic> ", theme::critic())
+            } else {
+                ("<sys> ", theme::system())
+            }
         } else {
             match msg.role {
                 MessageRole::User => ("<you> ", theme::user()),
@@ -513,39 +514,39 @@ mod tests {
     /// and their tags stripped; a genuine user message is left as-is so it
     /// still renders under `<you>` [dirge-i75f].
     #[test]
-    fn finalization_nudge_body_recognizes_all_tags() {
+    fn harness_intervention_body_recognizes_every_registered_tag() {
         use crate::agent::agent_loop::{
             code_review::CODE_REVIEW_TAG, critic::CRITIC_TAG, run::OPEN_ISSUES_NUDGE_TAG,
             run::TODO_NUDGE_TAG, verifier::VERIFY_TAG,
         };
         assert_eq!(
-            finalization_nudge_body(&format!("{CRITIC_TAG} not done yet")),
+            harness_intervention_body(&format!("{CRITIC_TAG} not done yet")),
             Some("not done yet")
         );
         assert_eq!(
-            finalization_nudge_body(&format!("{CODE_REVIEW_TAG} fix the auth check")),
+            harness_intervention_body(&format!("{CODE_REVIEW_TAG} fix the auth check")),
             Some("fix the auth check")
         );
         assert_eq!(
-            finalization_nudge_body(&format!("{VERIFY_TAG} run the tests")),
+            harness_intervention_body(&format!("{VERIFY_TAG} run the tests")),
             Some("run the tests")
         );
         assert_eq!(
-            finalization_nudge_body(&format!(
+            harness_intervention_body(&format!(
                 "{TODO_NUDGE_TAG} You still have 6 unfinished todos"
             )),
             Some("You still have 6 unfinished todos")
         );
         assert_eq!(
-            finalization_nudge_body(&format!(
+            harness_intervention_body(&format!(
                 "{OPEN_ISSUES_NUDGE_TAG} 3 issue(s) you worked on this session are still open"
             )),
             Some("3 issue(s) you worked on this session are still open")
         );
         // Genuine user input is not a nudge.
-        assert_eq!(finalization_nudge_body("fix the parser bug"), None);
+        assert_eq!(harness_intervention_body("fix the parser bug"), None);
         // A bracketed-but-unknown prefix is not a nudge either.
-        assert_eq!(finalization_nudge_body("[note] just a note"), None);
+        assert_eq!(harness_intervention_body("[note] just a note"), None);
     }
 
     fn make_session() -> Session {

@@ -102,17 +102,69 @@ impl PortableTool for WriteTool {
         // Audit H12: require absolute + pin file operations to the canonical
         // path the permission check ran against, so a symlink swap can't
         // redirect the write to an unauthorized target.
+        // dirge-4afz: a root-anchored bare filename (`/notes.md`) is our own
+        // schema's fault — it demands an absolute path, and a model with no
+        // directory anchor complies by prefixing a slash. Rewrite it to cwd
+        // before the permission check so the check runs on the real target.
+        // Rooted runs are left alone: `ToolRoot::resolve` already refuses a
+        // path outside the root, which is the correct answer there.
+        let requested_path = match self.root {
+            Some(_) => args.path.clone(),
+            None => std::env::current_dir()
+                .ok()
+                .and_then(|cwd| {
+                    crate::agent::tools::write_guard::rewrite_root_bare_path(&args.path, &cwd)
+                })
+                .unwrap_or_else(|| args.path.clone()),
+        };
+        let rewrote_root_bare = requested_path != args.path;
+
         let resolved_path = require_and_resolve_rooted(
             self.root.as_ref(),
             &self.permission,
             &self.ask_tx,
             "write",
-            &args.path,
+            &requested_path,
             "the write path",
         )
         .await?;
 
         let path = Path::new(&resolved_path);
+
+        // dirge-4afz: a reserved Windows device name is refused everywhere.
+        // `ReservedDeviceNamePolicy` covers this for every writer including the
+        // shell, but the permission checker is optional (embedded / test
+        // construction passes `None`), so the tool refuses on its own too.
+        if crate::agent::tools::write_guard::is_reserved_device_name(path) {
+            return Err(ToolError::Msg(
+                crate::agent::tools::write_guard::reserved_device_message(path),
+            ));
+        }
+
+        // dirge-m8d0: read the pre-write baseline once, up front, and share it
+        // with the syntax gate below.
+        //
+        // This narrows dirge-ytu1's lazy read, which deferred it until the gate
+        // was about to reject or repair. The shrink guard needs the baseline on
+        // every overwrite of a file it can judge, so those now pay for one read
+        // of the file they are about to replace — amortized against the write
+        // itself, and against destroying content no one asked to destroy.
+        //
+        // `baseline_for_guard` declines anything over MAX_BASELINE_BYTES, so
+        // the ytu1 behaviour is preserved exactly where it mattered: a huge file
+        // is still never read just to be overwritten, and the syntax gate falls
+        // back to its own lazy read on the reject path.
+        let existing = crate::agent::tools::write_guard::baseline_for_guard(path);
+        if let Some(before) = existing.as_deref()
+            && let Some(msg) = crate::agent::tools::write_guard::shrink_verdict(
+                &resolved_path,
+                before,
+                &args.content,
+            )
+        {
+            return Err(ToolError::Msg(msg));
+        }
+
         // Phase-2 tree-sitter validation: refuse to write
         // syntactically-broken code so the model sees the error
         // in the SAME turn and self-corrects. dirge-p5fu: a purely
@@ -121,11 +173,10 @@ impl PortableTool for WriteTool {
         // the fix is reported on the result so it's never silent. No-op
         // for unknown file types or when no `semantic-<lang>` feature is
         // built. See docs/AGENTIC_LOOP_PLAN.md §2.
-        // dirge-ytu1: the baseline is read lazily — only when the gate is
-        // about to reject or repair — so a clean overwrite never pays for an
-        // extra read of the file it's about to replace.
         let (content, syntax_note) = crate::agent::tools::syntax_gate(path, &args.content, || {
-            std::fs::read_to_string(path).ok()
+            existing
+                .clone()
+                .or_else(|| std::fs::read_to_string(path).ok())
         })
         .map_err(ToolError::Msg)?;
         if let Some(parent) = path.parent() {
@@ -183,6 +234,17 @@ impl PortableTool for WriteTool {
         let verb = if was_creation { "Created" } else { "Wrote" };
         #[allow(unused_mut)]
         let mut output = format!("{} {} bytes ({} lines)", verb, bytes, line_count);
+
+        // dirge-4afz: the rewrite is silent to the filesystem but must not be
+        // silent to the model — it asked for one path and got another, and a
+        // later read of the original would come back empty.
+        if rewrote_root_bare {
+            output.push_str(&format!(
+                "\nNote: {:?} named the filesystem root with a bare filename, \
+                 which is almost never intended; wrote to {} instead.",
+                args.path, resolved_path
+            ));
+        }
 
         #[cfg(feature = "lsp")]
         {
@@ -554,5 +616,112 @@ mod tests {
                 "path {path:?}: expected absolute-path rejection; got: {msg}",
             );
         }
+    }
+
+    // ── dirge-m8d0 / dirge-4afz: content and path guards, end to end ──
+
+    fn tmp_dir(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("dirge-write-guard-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The failure the tree-sitter gate cannot see: well-formed content that
+    /// happens to be most of the file missing.
+    #[tokio::test]
+    async fn refuses_a_write_that_drops_most_of_an_existing_file() {
+        let dir = tmp_dir("shrink");
+        let path = dir.join("lib.rs");
+        std::fs::write(&path, "// line\n".repeat(400)).unwrap();
+
+        let tool = WriteTool::with_cache(None, None, ToolCache::new(), None);
+        let err = tool
+            .call(WriteArgs {
+                path: path.to_string_lossy().into_owned(),
+                content: "// line\n".repeat(50),
+            })
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("discarding 350"), "{msg}");
+        assert!(
+            msg.contains("\"name\": \"edit\""),
+            "expected the edit recipe: {msg}"
+        );
+
+        // The refusal must be a refusal — the file is untouched.
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(on_disk.lines().count(), 400, "file was modified anyway");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Creating a new file is never shrink-guarded, whatever its size.
+    #[tokio::test]
+    async fn creating_a_new_file_is_unaffected() {
+        let dir = tmp_dir("create");
+        let path = dir.join("new.rs");
+        let tool = WriteTool::with_cache(None, None, ToolCache::new(), None);
+        let out = tool
+            .call(WriteArgs {
+                path: path.to_string_lossy().into_owned(),
+                content: "fn main() {}\n".into(),
+            })
+            .await
+            .unwrap();
+        assert!(out.starts_with("Created"), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn refuses_reserved_device_names() {
+        let dir = tmp_dir("device");
+        let tool = WriteTool::with_cache(None, None, ToolCache::new(), None);
+        for name in ["nul", "COM1.txt"] {
+            let err = tool
+                .call(WriteArgs {
+                    path: dir.join(name).to_string_lossy().into_owned(),
+                    content: "x".into(),
+                })
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("reserved device name"),
+                "{name}: {err}"
+            );
+            assert!(!dir.join(name).exists(), "{name} was created anyway");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `/foo.md` lands in cwd, and the result says so — the model asked for a
+    /// different path than it got.
+    #[tokio::test]
+    async fn root_bare_path_lands_in_cwd_and_is_reported() {
+        let dir = tmp_dir("rootbare");
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+
+        let tool = WriteTool::with_cache(None, None, ToolCache::new(), None);
+        let result = tool
+            .call(WriteArgs {
+                path: "/scratch-note.md".into(),
+                content: "hi\n".into(),
+            })
+            .await;
+
+        std::env::set_current_dir(&prev).unwrap();
+        let out = result.unwrap();
+        assert!(out.contains("named the filesystem root"), "{out}");
+        assert!(
+            dir.join("scratch-note.md").exists(),
+            "not written under cwd"
+        );
+        assert!(
+            !std::path::Path::new("/scratch-note.md").exists(),
+            "wrote to the actual filesystem root"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

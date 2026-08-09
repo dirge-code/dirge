@@ -153,28 +153,11 @@ fn coverage_verified_restore(
     Some(restored.len())
 }
 
-/// Every tag the harness prefixes onto a message it injects on the model's
-/// behalf (dirge-uw2l.7). The TUI keys on these to attribute the message to
-/// the system rather than the user; [`emit_harness_notices`] uses the same
-/// list so headless consumers can see the injection too.
-const HARNESS_TAGS: &[&str] = &[
-    TODO_NUDGE_TAG,
-    OPEN_ISSUES_NUDGE_TAG,
-    RESUME_NUDGE_TAG,
-    TRACK_WORK_TAG,
-    VERIFY_TAG,
-    super::critic::CRITIC_TAG,
-    super::goal::GOAL_TAG,
-    super::progress::STALL_TAG,
-    super::progress::BUDGET_TAG,
-    super::safe_state::SAFE_STATE_TAG,
-    super::publish_guard::PUBLISH_GUARD_TAG,
-];
-
-/// The harness tag `text` carries, if any.
+/// The harness tag `text` carries, if any. Delegates to the registry in
+/// [`super::intervention`], which both this mirror and the TUI's attribution
+/// read so the two can't drift apart (dirge-x4se).
 fn harness_tag_of(text: &str) -> Option<&'static str> {
-    let t = text.trim_start();
-    HARNESS_TAGS.iter().copied().find(|tag| t.starts_with(tag))
+    super::intervention::tag_of(text)
 }
 
 /// Mirror harness-injected messages to a `SystemNotice` (dirge-uw2l.7).
@@ -189,16 +172,25 @@ fn harness_tag_of(text: &str) -> Option<&'static str> {
 ///
 /// Emitting a notice costs nothing when no tag matches (an ordinary user
 /// message or steering text mirrors nothing), so this is additive.
+///
+/// dirge-x4se: the notice leads with a short human summary of what the harness
+/// did, then the model-facing body. The body alone is an imperative addressed to
+/// the model — a human watching a headless run wants to know why the run
+/// changed course, which is a different sentence than the one the model needs.
 async fn emit_harness_notices(emit: &mpsc::Sender<LoopEvent>, msgs: &[LoopMessage]) {
     for m in msgs {
         let LoopMessage::User(u) = m else { continue };
         let text = u.text_joined();
-        if harness_tag_of(&text).is_none() {
+        let Some(tag) = harness_tag_of(&text) else {
             continue;
-        }
+        };
+        let body = super::intervention::strip_tag(&text).unwrap_or(&text);
         let _ = emit
             .send(LoopEvent::SystemNotice {
-                content: text.clone(),
+                content: format!(
+                    "harness intervention: {}\n{body}",
+                    super::intervention::summary_for_user(tag)
+                ),
             })
             .await;
     }
@@ -372,7 +364,7 @@ pub(crate) const RESUME_NUDGE_TAG: &str = "[resume]";
 
 /// Display tag prefixing the early track-work reminder, so the UI can strip
 /// it and attribute the injected message to the system rather than the user.
-const TRACK_WORK_TAG: &str = "[track]";
+pub(crate) const TRACK_WORK_TAG: &str = "[track]";
 
 /// Upper bound on consecutive resume-after-failure nudges, so a model that
 /// repeatedly stops after broken tool calls can't loop forever.
@@ -1360,6 +1352,28 @@ const MAX_CONSECUTIVE_COMPACTION_FAILURES: u32 = 3;
 /// when the task matches fewer exemplars.
 const EXEMPLAR_TOP_K: usize = 3;
 
+/// dirge-4afz: append a tail context note, unless a byte-identical copy is
+/// already in the model-facing context. Returns whether it was pushed.
+///
+/// These blocks (few-shot exemplars, memory pre-recall) are selected from the
+/// user's prompt, so two related turns in a row routinely select the SAME
+/// block. Unlike a system-prompt section — rebuilt from scratch each turn — a
+/// tail message persists, so re-pushing an identical block adds a second copy
+/// that says nothing new and is paid for until the session ends.
+///
+/// Comparing against the live context rather than remembering the last block
+/// pushed is deliberate: if compaction has since folded the earlier copy away,
+/// the block is genuinely absent and re-injecting it is the right call.
+fn push_context_note_if_absent(context: &mut Context, block: String) -> bool {
+    let msg = LoopMessage::User(super::message::UserMessage::text(block));
+    let value = loop_message_to_value(&msg);
+    if context.messages.iter().any(|m| m == &value) {
+        return false;
+    }
+    context.messages.push(value);
+    true
+}
+
 /// Max live ACTIVE issues surfaced in the turn-start "Active work queue" section.
 /// The rest get a "+N more" hint so a large active board can't flood context.
 const ACTIVE_TOP_N: usize = 7;
@@ -1972,8 +1986,7 @@ pub async fn run_agent_loop(
     // Injected into the model-facing context ONLY — not `new_messages` —
     // so it steers this run without being persisted into session history.
     if let Some(block) = crate::agent::exemplars::block_for_task(&task_query, EXEMPLAR_TOP_K) {
-        let ex_msg = LoopMessage::User(super::message::UserMessage::text(block));
-        context.messages.push(loop_message_to_value(&ex_msg));
+        push_context_note_if_absent(&mut context, block);
     }
 
     // Pi line 105: `currentContext.messages = [...context.messages, ...prompts]`.
@@ -2013,8 +2026,7 @@ pub async fn run_agent_loop(
         match tokio::task::spawn_blocking(move || p.search(&q)).await {
             Ok(Ok(resp)) => {
                 if let Some(block) = super::context_manager::pre_recall_block(&resp, &snapshot) {
-                    let msg = LoopMessage::User(super::message::UserMessage::text(block));
-                    context.messages.push(loop_message_to_value(&msg));
+                    push_context_note_if_absent(&mut context, block);
                 }
             }
             Ok(Err(e)) => {
@@ -2429,6 +2441,10 @@ pub async fn run_loop(
     // truly dead network still terminates.
     let mut transient_recoveries: u8 = 0;
 
+    // dirge-1ug5: one-shot runaway-reasoning breaker for this task.
+    let mut thinking_breaker =
+        super::thinking_budget::ThinkingBreaker::new(super::thinking_budget::budget_tokens());
+
     let mut verify_nudges: u8 = 0;
 
     // Compute the issue db path once for both the issue-board reminder and
@@ -2724,6 +2740,29 @@ pub async fn run_loop(
             // hours apart across a long autonomous run accumulate and the
             // fourth one hard-fails a perfectly healthy network.
             transient_recoveries = 0;
+
+            // dirge-1ug5: runaway-reasoning breaker. The turn ended out of room
+            // with an over-budget reasoning trace and no action to show for it —
+            // either the stream's `ReasoningMeter` cut it off, or the provider's
+            // own max_tokens did. Either way more thinking is not what the run
+            // needs: drop the level to off for the rest of this task (config is
+            // owned per run, so the next user prompt starts fresh) and hand the
+            // model one instruction to commit.
+            if let super::thinking_budget::BreakerAction::ForceOff { nudge } =
+                thinking_breaker.inspect(&assistant_msg)
+            {
+                config.reasoning = Some(super::thinking_budget::ThinkingBreaker::forced_level());
+                let msg =
+                    super::intervention::user_message(super::thinking_budget::THINKING_TAG, nudge);
+                current_context.messages.push(loop_message_to_value(&msg));
+                emit_harness_notices(emit, std::slice::from_ref(&msg)).await;
+                // The turn produced no tool calls, so the loop would otherwise
+                // fall out and end the run on a truncated think. Force one more
+                // iteration so the nudge actually drives a turn.
+                has_more_tool_calls = false;
+                recovery_pending = true;
+                continue;
+            }
 
             // Pi lines 202-216: tool calls + results.
             let mut tool_calls = extract_tool_calls_from(&assistant_msg);

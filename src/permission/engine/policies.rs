@@ -4,17 +4,19 @@
 //! be registered in [`super::Engine::new`]); the first to claim a
 //! resource sets its base effect:
 //!
-//! 1. [`PromptDenyPolicy`]   — frontmatter `deny_tools`; terminal Deny, beats Yolo.
-//! 2. [`YoloPolicy`]         — `mode == Yolo`; terminal Allow.
-//! 3. [`ConfiguredDenyPolicy`] — configured `deny` (last-match), terminal above
+//! 1. [`ReservedDeviceNamePolicy`] — writes to a DOS device name; terminal Deny,
+//!    beats even `deny_tools` (nothing can make it correct).
+//! 2. [`PromptDenyPolicy`]   — frontmatter `deny_tools`; terminal Deny, beats Yolo.
+//! 3. [`YoloPolicy`]         — `mode == Yolo`; terminal Allow.
+//! 4. [`ConfiguredDenyPolicy`] — configured `deny` (last-match), terminal above
 //!    session-allow so a session grant can't override it (dirge-ct16). Below
 //!    Yolo: Yolo's documented "all rules off" is preserved.
-//! 4. [`SessionAllowlistPolicy`] — user "allow always"; terminal Allow.
-//! 5. [`ConfiguredRulePolicy`]   — user rules, last-match-wins inside (the
+//! 5. [`SessionAllowlistPolicy`] — user "allow always"; terminal Allow.
+//! 6. [`ConfiguredRulePolicy`]   — user rules, last-match-wins inside (the
 //!    allow/ask cases; a last-match `deny` is pre-empted by `ConfiguredDeny`).
-//! 6. [`BuiltinAllowPolicy`]     — read-only ops, memory/skill, dev-null, in-cwd writes.
-//! 7. [`ExternalDirPolicy`]      — out-of-cwd paths → external_directory rule or Ask.
-//! 8. [`DefaultActionPolicy`]    — the configured default (always claims; terminal).
+//! 7. [`BuiltinAllowPolicy`]     — read-only ops, memory/skill, dev-null, in-cwd writes.
+//! 8. [`ExternalDirPolicy`]      — out-of-cwd paths → external_directory rule or Ask.
+//! 9. [`DefaultActionPolicy`]    — the configured default (always claims; terminal).
 //!
 //! Accept-mode loosening is NOT a decider — it's a post-Stage-A base
 //! coercion in `Engine::authorize` (it relaxes a base `Ask`→`Allow`,
@@ -114,6 +116,53 @@ fn is_external_path(resource: &Resource) -> bool {
 // ---------------------------------------------------------------------------
 // Stage A — deciders
 // ---------------------------------------------------------------------------
+
+/// dirge-4afz: refuse to create a Windows reserved device name (CON, PRN, AUX,
+/// NUL, COM1-9, LPT1-9 — with or without an extension).
+///
+/// Registered **first**, above `deny_tools` and Yolo, because unlike every
+/// other policy here there is no configuration under which this write is the
+/// right answer: on Windows it produces an undeletable device-named artifact,
+/// and elsewhere it is a model mistaking `nul` for `/dev/null`.
+///
+/// Living in the engine rather than in `write` is the point. This is the one
+/// guard in the write-guard family that CAN be enforced against the shell:
+/// `bash` redirect targets and mutation paths normalize to `Operation::Edit`
+/// path resources here, so `echo x > nul` is refused by the same rule that
+/// refuses `write`. (Its sibling, the shrink guard in
+/// [`crate::agent::tools::write_guard`], has no shell equivalent — a
+/// redirect's content is the command's stdout, unknowable before it runs.)
+pub struct ReservedDeviceNamePolicy;
+
+impl Decider for ReservedDeviceNamePolicy {
+    fn id(&self) -> &'static str {
+        "reserved-device-name"
+    }
+    fn applies_to(&self, op: Operation, resource: &Resource) -> bool {
+        op == Operation::Edit && matches!(resource, Resource::Path { .. })
+    }
+    fn decide(
+        &self,
+        _req: &AccessRequest,
+        _op: Operation,
+        resource: &Resource,
+        _ctx: &PolicyCtx,
+    ) -> Option<Verdict> {
+        let Resource::Path { resolved, raw, .. } = resource else {
+            return None;
+        };
+        // Check the raw path too: the resolved form can lose the offending
+        // segment when an intermediate component doesn't exist yet.
+        let hit = crate::agent::tools::write_guard::is_reserved_device_name(resolved)
+            || crate::agent::tools::write_guard::is_reserved_device_name(std::path::Path::new(raw));
+        hit.then(|| {
+            Verdict::new(
+                Effect::Deny,
+                crate::agent::tools::write_guard::reserved_device_message(resolved),
+            )
+        })
+    }
+}
 
 /// Frontmatter `deny_tools`: the active prompt forbids a tool/op. Runs
 /// first so it beats even Yolo's blanket allow. Reads `ctx.prompt_deny`

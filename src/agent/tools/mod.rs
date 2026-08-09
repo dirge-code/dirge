@@ -40,6 +40,7 @@ pub mod tool_search;
 mod webfetch;
 mod websearch;
 pub(crate) mod write;
+pub(crate) mod write_guard;
 
 #[cfg(feature = "experimental-graph-search")]
 mod graph;

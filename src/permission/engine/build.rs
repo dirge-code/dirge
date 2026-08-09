@@ -15,8 +15,8 @@ use std::path::PathBuf;
 
 use super::policies::{
     BuiltinAllowPolicy, ConfiguredDenyPolicy, ConfiguredRulePolicy, DefaultActionPolicy,
-    ExternalDirPolicy, LoopGuardPolicy, OpMatch, PromptDenyPolicy, Rule, SessionAllowlistPolicy,
-    YoloPolicy,
+    ExternalDirPolicy, LoopGuardPolicy, OpMatch, PromptDenyPolicy, ReservedDeviceNamePolicy, Rule,
+    SessionAllowlistPolicy, YoloPolicy,
 };
 use super::policy::{Decider, Modifier, PolicyCtx};
 use super::types::{Effect, Operation, Resource};
@@ -199,6 +199,10 @@ impl Engine {
             .count();
 
         let deciders: Vec<Box<dyn Decider>> = vec![
+            // dirge-4afz: above deny_tools and Yolo — no configuration makes
+            // writing a DOS device name correct, and this is the one write
+            // guard that reaches bash redirect targets too.
+            Box::new(ReservedDeviceNamePolicy),
             Box::new(PromptDenyPolicy),
             Box::new(YoloPolicy),
             // dirge-ct16: configured `deny` is terminal above session-allow
@@ -639,6 +643,49 @@ mod tests {
             "read",
             SecurityMode::Standard,
             vec![classify_path("/proj/ok.rs", "/proj")],
+        ));
+        assert_eq!(d.effect, Effect::Allow);
+    }
+
+    /// dirge-4afz: a DOS device name is refused for `write`, for `edit`, and —
+    /// the point of putting it in the engine — for a bash redirect target,
+    /// which normalizes to the same Edit path claim.
+    #[test]
+    fn reserved_device_names_are_denied_for_every_writer() {
+        let e = Engine::from_config(&PermissionConfig::default());
+        for (tool, path) in [
+            ("write", "/proj/nul"),
+            ("edit", "/proj/COM1.txt"),
+            ("bash", "/proj/aux.log"),
+        ] {
+            let d = e.authorize(&req(
+                Operation::Edit,
+                tool,
+                SecurityMode::Standard,
+                vec![classify_path(path, "/proj")],
+            ));
+            assert_eq!(d.effect, Effect::Deny, "{tool} -> {path} should be denied");
+        }
+    }
+
+    /// It sits above Yolo deliberately: no mode makes this write correct.
+    #[test]
+    fn reserved_device_name_deny_survives_yolo() {
+        let e = Engine::from_config(&PermissionConfig::default());
+        let d = e.authorize(&req(
+            Operation::Edit,
+            "write",
+            SecurityMode::Yolo,
+            vec![classify_path("/proj/nul", "/proj")],
+        ));
+        assert_eq!(d.effect, Effect::Deny);
+
+        // A neighbouring ordinary path is untouched by the new decider.
+        let d = e.authorize(&req(
+            Operation::Edit,
+            "write",
+            SecurityMode::Yolo,
+            vec![classify_path("/proj/nullable.rs", "/proj")],
         ));
         assert_eq!(d.effect, Effect::Allow);
     }
