@@ -72,14 +72,14 @@ static RE_DSML_PARAM: LazyLock<Regex> = LazyLock::new(|| {
 /// dirge-56vo: Qwen/Hermes `<tool_call>` channel. The closing tag is optional
 /// so a response cut off mid-call still yields a region to repair.
 static RE_TOOL_CALL_TAG: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?s)<tool_call>(.*?)(?:</tool_call>|$)")
-        .expect("tool_call tag regex must compile")
+    Regex::new(r"(?s)<tool_call>(.*?)(?:</tool_call>|$)").expect("tool_call tag regex must compile")
 });
 /// dirge-56vo: ```` ```json ```` / ```` ```tool ```` fences. Deliberately does
 /// NOT match a bare ```` ``` ```` fence — those are overwhelmingly code samples
 /// the model is discussing, not calls it meant to make.
 static RE_FENCED_CALL: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?s)```(?:tool|json)\s*\n(.*?)(?:\n```|$)").expect("fenced call regex must compile")
+    Regex::new(r"(?s)```(?:tool|json)\s*\n(.*?)(?:\n```|$)")
+        .expect("fenced call regex must compile")
 });
 
 /// Result of a scavenge pass.

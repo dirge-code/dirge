@@ -161,7 +161,14 @@ mod tests {
 
     #[test]
     fn ordinary_names_are_not_reserved() {
-        for name in ["console.rs", "nullable.py", "com10", "lpt", "notes.md", "aux.d/x.rs"] {
+        for name in [
+            "console.rs",
+            "nullable.py",
+            "com10",
+            "lpt",
+            "notes.md",
+            "aux.d/x.rs",
+        ] {
             assert!(
                 !is_reserved_device_name(&PathBuf::from("/tmp").join(name)),
                 "{name} should not be reserved"

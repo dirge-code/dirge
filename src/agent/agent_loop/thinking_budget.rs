@@ -69,7 +69,10 @@ pub fn init_budget(configured: Option<usize>) {
 
 /// The effective per-turn reasoning budget in tokens. 0 means disabled.
 pub fn budget_tokens() -> usize {
-    BUDGET.get().copied().unwrap_or(DEFAULT_THINKING_BUDGET_TOKENS)
+    BUDGET
+        .get()
+        .copied()
+        .unwrap_or(DEFAULT_THINKING_BUDGET_TOKENS)
 }
 
 fn estimate_tokens(chars: usize) -> usize {
@@ -123,15 +126,19 @@ pub fn thinking_tokens(msg: &AssistantMessage) -> usize {
     estimate_tokens(chars)
 }
 
+/// Harness tag on the commit nudge, so the injection is attributed to the
+/// system rather than the user. Registered in [`super::intervention`].
+pub const THINKING_TAG: &str = "[thinking-budget]";
+
 /// The one instruction the model gets after its reasoning is cut off. Leads
 /// with the consequence; names the action rather than the prohibition, because
 /// "stop deliberating" alone tends to produce more deliberation about whether
 /// to stop.
-pub const COMMIT_NUDGE: &str = "[thinking budget exceeded] Your reasoning for that turn ran past \
-     the budget and was cut off, and thinking is now disabled for the rest of this task. Commit to \
-     an implementation now: pick the most promising approach you already have and use your tools \
-     to make progress on it. If you genuinely cannot proceed, say what is blocking you in one \
-     sentence instead of reasoning further.";
+pub const COMMIT_NUDGE: &str = "Your reasoning for that turn ran past the budget and was cut \
+     off, and thinking is now disabled for the rest of this task. Commit to an implementation \
+     now: pick the most promising approach you already have and use your tools to make progress \
+     on it. If you genuinely cannot proceed, say what is blocking you in one sentence instead of \
+     reasoning further.";
 
 /// Turn-boundary half of the breaker. One-shot per task.
 #[derive(Debug, Default)]
@@ -176,7 +183,9 @@ impl ThinkingBreaker {
             return BreakerAction::None;
         }
         self.tripped = true;
-        BreakerAction::ForceOff { nudge: COMMIT_NUDGE }
+        BreakerAction::ForceOff {
+            nudge: COMMIT_NUDGE,
+        }
     }
 
     /// The level to force. Separate from `inspect` so the run loop's
@@ -224,7 +233,12 @@ mod tests {
     fn breaker_fires_on_a_truncated_over_budget_think() {
         let mut b = ThinkingBreaker::new(DEFAULT_THINKING_BUDGET_TOKENS);
         let action = b.inspect(&msg(over_budget_chars(), StopReason::Length));
-        assert_eq!(action, BreakerAction::ForceOff { nudge: COMMIT_NUDGE });
+        assert_eq!(
+            action,
+            BreakerAction::ForceOff {
+                nudge: COMMIT_NUDGE
+            }
+        );
     }
 
     /// The trace length is not the problem; failing to convert it into an
@@ -245,7 +259,10 @@ mod tests {
     #[test]
     fn breaker_ignores_a_length_stop_with_little_thinking() {
         let mut b = ThinkingBreaker::new(DEFAULT_THINKING_BUDGET_TOKENS);
-        assert_eq!(b.inspect(&msg(200, StopReason::Length)), BreakerAction::None);
+        assert_eq!(
+            b.inspect(&msg(200, StopReason::Length)),
+            BreakerAction::None
+        );
     }
 
     /// One-shot: once thinking is off, a second `Length` turn must not queue

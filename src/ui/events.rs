@@ -140,21 +140,7 @@ pub fn format_time(rfc3339: &str) -> CompactString {
 /// Single source of truth for both the live view (`run_handlers::notices`) and
 /// scrollback (`render_session`) [dirge-i75f].
 pub(crate) fn finalization_nudge_body(content: &str) -> Option<&str> {
-    use crate::agent::agent_loop::{
-        code_review::CODE_REVIEW_TAG, critic::CRITIC_TAG, run::OPEN_ISSUES_NUDGE_TAG,
-        run::RESUME_NUDGE_TAG, run::TODO_NUDGE_TAG, verifier::VERIFY_TAG,
-    };
-    let trimmed = content.trim_start();
-    [
-        CRITIC_TAG,
-        VERIFY_TAG,
-        TODO_NUDGE_TAG,
-        CODE_REVIEW_TAG,
-        RESUME_NUDGE_TAG,
-        OPEN_ISSUES_NUDGE_TAG,
-    ]
-    .into_iter()
-    .find_map(|tag| trimmed.strip_prefix(tag).map(str::trim_start))
+    crate::agent::agent_loop::intervention::strip_tag(content)
 }
 
 /// Resolve the `(provider, model)` pair the banner should display, preferring
@@ -248,8 +234,17 @@ pub fn render_session(
         } else {
             None
         };
+        // dirge-x4se: every harness injection is system steering, not user
+        // input. The finalization family keeps the `<critic>` handle it has
+        // always had; the rest — stall, budget, safe-state, publish-guard,
+        // claim/source/completeness, thinking-budget — used to fall through to
+        // `<you>`, crediting the user with a message the harness wrote.
         let (handle, line_color) = if nudge_body.is_some() {
-            ("<critic> ", theme::critic())
+            if crate::agent::agent_loop::intervention::is_finalization(&msg.content) {
+                ("<critic> ", theme::critic())
+            } else {
+                ("<sys> ", theme::system())
+            }
         } else {
             match msg.role {
                 MessageRole::User => ("<you> ", theme::user()),

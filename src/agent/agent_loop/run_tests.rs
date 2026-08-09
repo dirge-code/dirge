@@ -6928,7 +6928,7 @@ fn fast_verify_nudge_bounded_once() {
 /// added to a nudge but forgotten here.
 #[test]
 fn harness_tag_of_recognizes_every_injection_tag() {
-    for tag in HARNESS_TAGS {
+    for tag in crate::agent::agent_loop::intervention::HARNESS_TAGS {
         let text = format!("{tag} some guidance text");
         assert_eq!(
             harness_tag_of(&text),
@@ -7826,7 +7826,10 @@ fn identical_context_note_is_not_pushed_twice() {
     use crate::agent::agent_loop::run::push_context_note_if_absent;
 
     let mut ctx = empty_context();
-    assert!(push_context_note_if_absent(&mut ctx, "## Examples\nfoo".into()));
+    assert!(push_context_note_if_absent(
+        &mut ctx,
+        "## Examples\nfoo".into()
+    ));
     assert_eq!(ctx.messages.len(), 1);
 
     assert!(
@@ -7836,7 +7839,10 @@ fn identical_context_note_is_not_pushed_twice() {
     assert_eq!(ctx.messages.len(), 1, "duplicate copy was appended");
 
     // A different block still lands.
-    assert!(push_context_note_if_absent(&mut ctx, "## Examples\nbar".into()));
+    assert!(push_context_note_if_absent(
+        &mut ctx,
+        "## Examples\nbar".into()
+    ));
     assert_eq!(ctx.messages.len(), 2);
 }
 
@@ -7848,7 +7854,10 @@ fn context_note_returns_after_the_earlier_copy_is_folded_away() {
     use crate::agent::agent_loop::run::push_context_note_if_absent;
 
     let mut ctx = empty_context();
-    assert!(push_context_note_if_absent(&mut ctx, "## Examples\nfoo".into()));
+    assert!(push_context_note_if_absent(
+        &mut ctx,
+        "## Examples\nfoo".into()
+    ));
     ctx.messages.clear(); // stand-in for a compaction fold
     assert!(
         push_context_note_if_absent(&mut ctx, "## Examples\nfoo".into()),

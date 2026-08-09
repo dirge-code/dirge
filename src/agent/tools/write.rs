@@ -156,14 +156,14 @@ impl PortableTool for WriteTool {
         } else {
             None
         };
-        if let Some(before) = existing.as_deref() {
-            if let Some(msg) = crate::agent::tools::write_guard::shrink_verdict(
+        if let Some(before) = existing.as_deref()
+            && let Some(msg) = crate::agent::tools::write_guard::shrink_verdict(
                 &resolved_path,
                 before,
                 &args.content,
-            ) {
-                return Err(ToolError::Msg(msg));
-            }
+            )
+        {
+            return Err(ToolError::Msg(msg));
         }
 
         // Phase-2 tree-sitter validation: refuse to write
@@ -619,7 +619,8 @@ mod tests {
     // ── dirge-m8d0 / dirge-4afz: content and path guards, end to end ──
 
     fn tmp_dir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("dirge-write-guard-{tag}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("dirge-write-guard-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -642,7 +643,10 @@ mod tests {
             .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("discarding 350"), "{msg}");
-        assert!(msg.contains("\"name\": \"edit\""), "expected the edit recipe: {msg}");
+        assert!(
+            msg.contains("\"name\": \"edit\""),
+            "expected the edit recipe: {msg}"
+        );
 
         // The refusal must be a refusal — the file is untouched.
         let on_disk = std::fs::read_to_string(&path).unwrap();
@@ -708,7 +712,10 @@ mod tests {
         std::env::set_current_dir(&prev).unwrap();
         let out = result.unwrap();
         assert!(out.contains("named the filesystem root"), "{out}");
-        assert!(dir.join("scratch-note.md").exists(), "not written under cwd");
+        assert!(
+            dir.join("scratch-note.md").exists(),
+            "not written under cwd"
+        );
         assert!(
             !std::path::Path::new("/scratch-note.md").exists(),
             "wrote to the actual filesystem root"
