@@ -237,7 +237,7 @@ mod tests {
     fn tag_is_recognized_with_and_without_leading_space() {
         let tagged = format!("  {} do the thing", super::super::progress::STALL_TAG);
         assert_eq!(tag_of(&tagged), Some(super::super::progress::STALL_TAG));
-        assert_eq!(strip_tag(&tagged).as_deref(), Some("do the thing"));
+        assert_eq!(strip_tag(&tagged), Some("do the thing"));
     }
 
     #[test]
