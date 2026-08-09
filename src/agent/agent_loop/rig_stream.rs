@@ -331,6 +331,18 @@ where
                     }
                 }
                 Ok(StreamedAssistantContent::Reasoning(r)) => {
+                    // dirge-1ug5: deliberately NOT metered. The meter exists to
+                    // cut a trace off while it is still being produced; a block
+                    // that arrives whole is already paid for, so cutting saves
+                    // nothing. Forcing `Length` here would be actively wrong —
+                    // the turn ran to completion, and the breaker would inject a
+                    // "commit to an implementation" nudge at a model that had
+                    // already answered, turning a finished run into an extra
+                    // turn. Providers that stream deltas (which is every
+                    // provider dirge meters for: DeepSeek, Anthropic extended
+                    // thinking, local llama.cpp reasoning models) go through the
+                    // arm above.
+                    //
                     // Complete reasoning block emitted in one shot.
                     // `r.content` is `Vec<ReasoningContent>` — a
                     // tagged enum with Text / Encrypted / Redacted /

@@ -360,6 +360,17 @@ def main() -> int:
     if unknown:
         parser.error(f"unknown language(s): {', '.join(unknown)}")
 
+    # Fail before the first model call, not after it. A run is hours long and
+    # writes only to `--out`; discovering the directory doesn't exist at the end
+    # of exercise one means every result after it is lost too.
+    out_dir = args.out.resolve().parent
+    if not out_dir.is_dir():
+        parser.error(f"--out directory does not exist: {out_dir}")
+    try:
+        write_results(args.out, {"results": [], "note": "run starting"})
+    except OSError as exc:
+        parser.error(f"--out is not writable: {exc}")
+
     exercises = find_exercises(args.exercises, languages)
     if not exercises:
         parser.error(f"no exercises under {args.exercises} for {languages}")

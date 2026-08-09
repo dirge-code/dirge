@@ -327,3 +327,23 @@ def test_a_relative_dirge_bin_is_pinned_before_the_run(tmp_path, monkeypatch):
     )
     polyglot.main()
     assert seen["bin"] == str(binary), "relative binary path was not pinned"
+
+
+def test_an_unwritable_out_path_fails_before_any_model_call(tmp_path, monkeypatch):
+    """A run is hours long and writes only to --out. Finding out it's
+    unwritable after the first exercise loses everything after it too."""
+    import polyglot
+    import pytest
+
+    exercises = tmp_path / "poly"
+    _make_exercise(exercises)
+    called = []
+    monkeypatch.setattr(polyglot, "run_exercise", lambda *a: called.append(1))
+    monkeypatch.setattr(
+        "sys.argv",
+        ["polyglot.py", "--exercises", str(exercises),
+         "--out", str(tmp_path / "no" / "such" / "dir" / "out.json")],
+    )
+    with pytest.raises(SystemExit):
+        polyglot.main()
+    assert not called, "the run started despite an unwritable --out"

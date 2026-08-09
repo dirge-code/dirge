@@ -144,18 +144,17 @@ impl PortableTool for WriteTool {
         // dirge-m8d0: read the pre-write baseline once, up front, and share it
         // with the syntax gate below.
         //
-        // This supersedes dirge-ytu1's lazy read, which deferred it until the
-        // gate was about to reject or repair. The shrink guard needs the
-        // baseline on EVERY overwrite, so a clean overwrite now pays for one
-        // read of the file it is about to replace — amortized against the write
-        // itself, and against destroying content no one asked to destroy. The
-        // reject/repair path costs exactly what it did before; the read is
-        // shared, never doubled.
-        let existing = if path.exists() {
-            std::fs::read_to_string(path).ok()
-        } else {
-            None
-        };
+        // This narrows dirge-ytu1's lazy read, which deferred it until the gate
+        // was about to reject or repair. The shrink guard needs the baseline on
+        // every overwrite of a file it can judge, so those now pay for one read
+        // of the file they are about to replace — amortized against the write
+        // itself, and against destroying content no one asked to destroy.
+        //
+        // `baseline_for_guard` declines anything over MAX_BASELINE_BYTES, so
+        // the ytu1 behaviour is preserved exactly where it mattered: a huge file
+        // is still never read just to be overwritten, and the syntax gate falls
+        // back to its own lazy read on the reject path.
+        let existing = crate::agent::tools::write_guard::baseline_for_guard(path);
         if let Some(before) = existing.as_deref()
             && let Some(msg) = crate::agent::tools::write_guard::shrink_verdict(
                 &resolved_path,
@@ -174,9 +173,12 @@ impl PortableTool for WriteTool {
         // the fix is reported on the result so it's never silent. No-op
         // for unknown file types or when no `semantic-<lang>` feature is
         // built. See docs/AGENTIC_LOOP_PLAN.md §2.
-        let (content, syntax_note) =
-            crate::agent::tools::syntax_gate(path, &args.content, || existing.clone())
-                .map_err(ToolError::Msg)?;
+        let (content, syntax_note) = crate::agent::tools::syntax_gate(path, &args.content, || {
+            existing
+                .clone()
+                .or_else(|| std::fs::read_to_string(path).ok())
+        })
+        .map_err(ToolError::Msg)?;
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }

@@ -51,6 +51,31 @@ use std::path::Path;
 /// in), and the destruction a mistake causes there is small and obvious.
 pub const MIN_GUARDED_LINES: usize = 30;
 
+/// Ceiling on the pre-write baseline read.
+///
+/// The shrink guard needs the existing file's line count, which means reading
+/// it on every overwrite — where dirge-ytu1 previously deferred that read to
+/// the reject path only. Unbounded, that turns "overwrite a 900 MB log" into
+/// holding the log and its replacement in memory at once.
+///
+/// Above this size the guard declines rather than reads. That is the right
+/// trade: a multi-megabyte file is not the failure this exists for (a model
+/// regenerating a source file from memory and losing most of it), and a missed
+/// guard is far cheaper than an OOM in the middle of a run.
+pub const MAX_BASELINE_BYTES: u64 = 8 * 1024 * 1024;
+
+/// The file's current text, when it exists and is small enough to judge.
+///
+/// `None` covers all three "can't judge" cases — absent, too large, or not
+/// valid UTF-8 (a binary file, where a line count means nothing anyway).
+pub fn baseline_for_guard(path: &Path) -> Option<String> {
+    let metadata = std::fs::metadata(path).ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_BASELINE_BYTES {
+        return None;
+    }
+    std::fs::read_to_string(path).ok()
+}
+
 /// Refuse when the replacement keeps less than this fraction of the original's
 /// lines. Half is deliberately generous: this is meant to catch "regenerated
 /// from memory and lost most of it", not to police ordinary editing.
@@ -234,6 +259,31 @@ mod tests {
     }
 
     /// Truncating a large file to nothing is the extreme of the same mistake.
+    /// A file too big to hold in memory alongside its replacement is not what
+    /// this guard is for, and reading it would be worse than missing it.
+    #[test]
+    fn an_oversized_file_yields_no_baseline() {
+        let dir = std::env::temp_dir().join(format!("dirge-baseline-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let big = dir.join("big.log");
+        std::fs::write(&big, vec![b'x'; (MAX_BASELINE_BYTES + 1) as usize]).unwrap();
+        assert!(baseline_for_guard(&big).is_none());
+
+        let small = dir.join("small.rs");
+        std::fs::write(&small, "fn main() {}\n").unwrap();
+        assert_eq!(
+            baseline_for_guard(&small).as_deref(),
+            Some("fn main() {}\n")
+        );
+
+        assert!(baseline_for_guard(&dir.join("absent.rs")).is_none());
+        assert!(
+            baseline_for_guard(&dir).is_none(),
+            "a directory is not a baseline"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn emptying_a_large_file_is_refused() {
         let existing = "line\n".repeat(200);
