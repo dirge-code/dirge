@@ -17,7 +17,8 @@
 //!     prologue, code-review — injected messages that a `--print` / `--loop` /
 //!     MCP consumer saw the model obey with no indication anything had steered
 //!     it.
-//!   - `ui::events::finalization_nudge_body` carried 6. Every tag outside that
+//!   - `ui::events::harness_intervention_body` (then named for the
+//!     finalization family alone) carried 6. Every tag outside that
 //!     six rendered in scrollback under `<you>`, attributing a harness
 //!     injection to the user who never wrote it.
 //!   - The tag constants themselves, scattered across ten modules, with nothing
@@ -43,7 +44,7 @@ use super::message::{LoopMessage, UserMessage};
 /// Every tag the harness prefixes onto a message it injects on the model's
 /// behalf. The single source of truth: the headless notice mirror
 /// ([`super::run::emit_harness_notices`]) and the TUI's attribution
-/// ([`crate::ui::events::finalization_nudge_body`]) both read it, and the
+/// ([`crate::ui::events::harness_intervention_body`]) both read it, and the
 /// registry test below keeps it exhaustive.
 pub const HARNESS_TAGS: &[&str] = &[
     super::run::TODO_NUDGE_TAG,

@@ -25,11 +25,11 @@ pub(crate) fn handle_user_message(renderer: &mut Renderer, content: &str) -> std
     // re-enter as user-role messages so the model acts on them; surface them
     // under the `<critic>` handle/color rather than the user's `<you>`. The tag
     // is stripped from the display.
-    // dirge-x4se: `finalization_nudge_body` now recognizes EVERY harness tag,
+    // dirge-x4se: `harness_intervention_body` now recognizes EVERY harness tag,
     // not just the finalization family, so the split has to happen here too —
     // otherwise the live view and scrollback (ui::events::render_session)
     // disagree about who said it, which is the confusion this was fixing.
-    if let Some(body) = crate::ui::events::finalization_nudge_body(visible) {
+    if let Some(body) = crate::ui::events::harness_intervention_body(visible) {
         if crate::agent::agent_loop::intervention::is_finalization(visible) {
             write_critic_lines(renderer, body)?;
         } else {
