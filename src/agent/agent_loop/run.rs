@@ -2442,8 +2442,7 @@ pub async fn run_loop(
     let mut transient_recoveries: u8 = 0;
 
     // dirge-1ug5: one-shot runaway-reasoning breaker for this task.
-    let mut thinking_breaker =
-        super::thinking_budget::ThinkingBreaker::new(super::thinking_budget::budget_tokens());
+    let mut thinking_breaker = super::thinking_budget::ThinkingBreaker::new();
 
     let mut verify_nudges: u8 = 0;
 
@@ -2748,8 +2747,17 @@ pub async fn run_loop(
             // needs: drop the level to off for the rest of this task (config is
             // owned per run, so the next user prompt starts fresh) and hand the
             // model one instruction to commit.
+            //
+            // The cap is recomputed here rather than cached at construction:
+            // `config.reasoning` can be swapped mid-run by `prepare_next_turn`,
+            // and this has to judge the turn against the level it actually ran
+            // at — the same value the stream metered it with.
+            let turn_reasoning_cap = super::thinking_budget::budget_for_turn(
+                config.reasoning,
+                config.thinking_budgets.as_ref(),
+            );
             if let super::thinking_budget::BreakerAction::ForceOff { nudge } =
-                thinking_breaker.inspect(&assistant_msg)
+                thinking_breaker.inspect(&assistant_msg, turn_reasoning_cap)
             {
                 config.reasoning = Some(super::thinking_budget::ThinkingBreaker::forced_level());
                 let msg =

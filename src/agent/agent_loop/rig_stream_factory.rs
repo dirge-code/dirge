@@ -303,7 +303,19 @@ where
         let establish = crate::timeout::Timeouts::get().request_establish;
         match tokio::time::timeout(establish, model.stream(request)).await {
             Ok(Ok(response)) => {
-                let mut wrapped = wrap_rig_stream(response, chunk_timeout, Some(opts.signal.clone()));
+                // dirge-vzsy: the runaway cap is derived from THIS request's thinking
+                // level and budgets, so it can't cut off reasoning the same
+                // request just asked for.
+                let reasoning_budget = crate::agent::agent_loop::thinking_budget::budget_for_turn(
+                    opts.reasoning,
+                    opts.thinking_budgets.as_ref(),
+                );
+                let mut wrapped = wrap_rig_stream(
+                    response,
+                    chunk_timeout,
+                    Some(opts.signal.clone()),
+                    reasoning_budget,
+                );
                 use futures::stream::StreamExt;
                 while let Some(evt) = wrapped.next().await {
                     yield evt;

@@ -148,7 +148,13 @@ fn thinking_level_to_deepseek_effort(level: ThinkingLevel) -> Option<&'static st
 /// Defaults match the rough scale pi uses (`providers/simple-
 /// options.ts:33-...`): minimal 1024, low 2048, medium 4096,
 /// high 16384. `Off` returns 0 — caller skips the key entirely.
-fn budget_for_level(level: ThinkingLevel, budgets: Option<&ThinkingBudgets>) -> u32 {
+/// The thinking allocation a level is granted, in tokens.
+///
+/// `pub(crate)` because it is also the basis of the client-side runaway cap in
+/// [`crate::agent::agent_loop::thinking_budget`] (dirge-vzsy): that cap must be
+/// derived from what we actually grant, or the harness ends up cutting off
+/// reasoning it just finished asking for.
+pub(crate) fn budget_for_level(level: ThinkingLevel, budgets: Option<&ThinkingBudgets>) -> u32 {
     match level {
         ThinkingLevel::Off => 0,
         ThinkingLevel::Minimal => budgets.and_then(|b| b.minimal).unwrap_or(1024),

@@ -61,16 +61,24 @@ pub fn wrap_rig_stream<R>(
     rig_stream: StreamingCompletionResponse<R>,
     chunk_timeout: Option<std::time::Duration>,
     signal: Option<crate::agent::agent_loop::tool::AbortSignal>,
+    reasoning_budget_tokens: usize,
 ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send>>
 where
     R: Clone + Unpin + Send + GetTokenUsage + 'static,
 {
-    wrap_streamed_assistant(Box::pin(rig_stream), chunk_timeout, signal)
+    wrap_streamed_assistant_with_budget(
+        Box::pin(rig_stream),
+        chunk_timeout,
+        signal,
+        reasoning_budget_tokens,
+    )
 }
 
 /// Lower-level variant: wrap any `Stream<Result<StreamedAssistantContent<R>,
-/// CompletionError>>`. Used by tests to feed canned event
-/// sequences; production callers use [`wrap_rig_stream`] directly.
+/// CompletionError>>`. Test-only — it feeds canned event sequences and takes
+/// the widest reasoning cap, since a canned sequence has no thinking level to
+/// derive one from. Production goes through [`wrap_rig_stream`], which carries
+/// the turn's own cap.
 ///
 /// **Chunk timeout** (phase 4.5h-3): if `chunk_timeout` is `Some`,
 /// each `raw.next().await` is wrapped in `tokio::time::timeout`.
@@ -83,12 +91,35 @@ where
 /// `None` disables the timeout — useful for tests, debug
 /// sessions, or providers known to have long legitimate gaps
 /// where the default `300s` is still too short.
+#[cfg(test)]
 pub fn wrap_streamed_assistant<R>(
+    raw: Pin<Box<dyn Stream<Item = Result<StreamedAssistantContent<R>, CompletionError>> + Send>>,
+    chunk_timeout: Option<std::time::Duration>,
+    signal: Option<crate::agent::agent_loop::tool::AbortSignal>,
+) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send>>
+where
+    R: Clone + Unpin + Send + GetTokenUsage + 'static,
+{
+    // No level in hand here (this form is the test/canned-sequence entry
+    // point), so the cap falls back to the most permissive derived value —
+    // never a guess that could be lower than what the turn was granted.
+    let budget = super::thinking_budget::budget_for_turn(None, None);
+    wrap_streamed_assistant_with_budget(raw, chunk_timeout, signal, budget)
+}
+
+/// [`wrap_streamed_assistant`] with an explicit per-turn reasoning cap.
+///
+/// The cap belongs to the turn, not the process: it is derived from the
+/// thinking level and budgets this request was actually built with
+/// ([`super::thinking_budget::budget_for_turn`]), so it can never contradict
+/// the allocation the same request just asked the provider for (dirge-vzsy).
+pub fn wrap_streamed_assistant_with_budget<R>(
     mut raw: Pin<
         Box<dyn Stream<Item = Result<StreamedAssistantContent<R>, CompletionError>> + Send>,
     >,
     chunk_timeout: Option<std::time::Duration>,
     signal: Option<crate::agent::agent_loop::tool::AbortSignal>,
+    reasoning_budget_tokens: usize,
 ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send>>
 where
     R: Clone + Unpin + Send + GetTokenUsage + 'static,
@@ -141,9 +172,8 @@ where
         // far is finalized with `Length`, which is what the run loop's
         // `ThinkingBreaker` keys on to disable thinking and push for an
         // implementation.
-        let mut reasoning_meter = super::thinking_budget::ReasoningMeter::new(
-            super::thinking_budget::budget_tokens(),
-        );
+        let mut reasoning_meter =
+            super::thinking_budget::ReasoningMeter::new(reasoning_budget_tokens);
 
         // Token usage captured from the Final(R) provider response.
         let mut token_usage: Option<super::message::TokenUsage> = None;
@@ -944,7 +974,7 @@ mod tests {
     /// message reports `Length` so the run loop's breaker can act on it.
     #[tokio::test]
     async fn runaway_reasoning_is_cut_off_at_the_budget() {
-        let budget = super::super::thinking_budget::budget_tokens();
+        let budget = super::super::thinking_budget::budget_for_turn(None, None);
         // Two deltas, each on its own more than the whole budget: the first
         // trips the meter, the second must never be consumed.
         let big = "x".repeat(budget * 8);
