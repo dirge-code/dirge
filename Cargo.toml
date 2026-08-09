@@ -29,6 +29,9 @@ exclude = [
     ".beads/",
     ".dirge/",
     ".github/",
+    # Dev-only benchmark harness (Python). Needs a clone of the exercise repo
+    # and the six language toolchains; nothing in the crate references it.
+    "benchmarks/",
     # Marketing / authoring drafts + internal release-process docs —
     # not part of the crate's source.
     "blog.md",
