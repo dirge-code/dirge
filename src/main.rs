@@ -726,6 +726,9 @@ async fn main() -> anyhow::Result<()> {
     // Working-context budget (default 250_000). Set `context_target` in
     // config.json to lower (e.g. 100_000) or raise the cap.
     crate::agent::agent_loop::context_manager::init_context_target(cfg.context_target);
+    // dirge-1ug5: per-turn reasoning cap (default 8192 tokens, `0` disables).
+    // Read by the stream's reasoning meter and the run loop's breaker.
+    crate::agent::agent_loop::thinking_budget::init_budget(cfg.thinking_budget_tokens);
     // Per-result cap for `read` excerpts (default 12_000). Set
     // `file_excerpt_cap_tokens` in config.json to raise it for a codebase of
     // large files, or to 3000 to hold reads to the generic tool-output cap.

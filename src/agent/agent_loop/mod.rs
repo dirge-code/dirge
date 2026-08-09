@@ -66,6 +66,7 @@ pub mod storm;
 pub mod stream;
 pub mod suggest;
 pub mod tool;
+pub mod thinking_budget;
 pub mod tool_input_repair;
 pub mod tools;
 pub mod types;

@@ -2449,6 +2449,11 @@ pub async fn run_loop(
     // truly dead network still terminates.
     let mut transient_recoveries: u8 = 0;
 
+    // dirge-1ug5: one-shot runaway-reasoning breaker for this task.
+    let mut thinking_breaker = super::thinking_budget::ThinkingBreaker::new(
+        super::thinking_budget::budget_tokens(),
+    );
+
     let mut verify_nudges: u8 = 0;
 
     // Compute the issue db path once for both the issue-board reminder and
@@ -2744,6 +2749,37 @@ pub async fn run_loop(
             // hours apart across a long autonomous run accumulate and the
             // fourth one hard-fails a perfectly healthy network.
             transient_recoveries = 0;
+
+            // dirge-1ug5: runaway-reasoning breaker. The turn ended out of room
+            // with an over-budget reasoning trace and no action to show for it —
+            // either the stream's `ReasoningMeter` cut it off, or the provider's
+            // own max_tokens did. Either way more thinking is not what the run
+            // needs: drop the level to off for the rest of this task (config is
+            // owned per run, so the next user prompt starts fresh) and hand the
+            // model one instruction to commit.
+            if let super::thinking_budget::BreakerAction::ForceOff { nudge } =
+                thinking_breaker.inspect(&assistant_msg)
+            {
+                config.reasoning = Some(super::thinking_budget::ThinkingBreaker::forced_level());
+                current_context.messages.push(serde_json::json!({
+                    "role": "user",
+                    "content": nudge,
+                }));
+                let _ = emit
+                    .send(LoopEvent::SystemNotice {
+                        content: format!(
+                            "thinking budget exceeded ({} tokens) — thinking disabled for the rest of this task",
+                            super::thinking_budget::thinking_tokens(&assistant_msg)
+                        ),
+                    })
+                    .await;
+                // The turn produced no tool calls, so the loop would otherwise
+                // fall out and end the run on a truncated think. Force one more
+                // iteration so the nudge actually drives a turn.
+                has_more_tool_calls = false;
+                recovery_pending = true;
+                continue;
+            }
 
             // Pi lines 202-216: tool calls + results.
             let mut tool_calls = extract_tool_calls_from(&assistant_msg);

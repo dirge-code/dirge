@@ -823,6 +823,12 @@ pub struct Config {
     pub reserve_tokens: Option<u64>,
     pub keep_recent_tokens: Option<u64>,
     pub max_agent_turns: Option<usize>,
+    /// dirge-1ug5: cap on one turn's reasoning trace, in estimated tokens.
+    /// Enforced on our side of the stream — the provider-side thinking budget
+    /// is a request, and a locally-served model honours it only as far as its
+    /// template does. Crossing it cuts the trace off and disables thinking for
+    /// the rest of the task. Absent → 8192. Set to `0` to disable the breaker.
+    pub thinking_budget_tokens: Option<usize>,
     pub compact_enabled: Option<bool>,
     /// dirge-4nix: recurrence-weighted salience graduation for the memory
     /// curator. Detect near-duplicate entries and boost the representative's
