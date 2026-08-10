@@ -4,6 +4,12 @@
 #[cfg(feature = "sandbox-microvm")]
 use std::path::Path;
 
+// The leaf filenames and the search behind them are shared with `build.rs`
+// (dirge-btpd). Re-exported rather than moved so the existing
+// `crate::sandbox::check::LIBKRUNFW_LIB` call sites keep working.
+#[cfg(feature = "sandbox-microvm")]
+pub use super::libkrun_probe::{LIBKRUN_LIB, LIBKRUNFW_LIB};
+
 /// Severity of a single dependency check.
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -12,34 +18,6 @@ pub enum Status {
     Warn,
     Error,
 }
-
-/// Leaf filename of the libkrun shared library on this platform.
-#[cfg(feature = "sandbox-microvm")]
-pub const LIBKRUN_LIB: &str = if cfg!(target_os = "macos") {
-    "libkrun.dylib"
-} else {
-    "libkrun.so"
-};
-
-/// Leaf filename of the libkrunfw shared library on this platform.
-///
-/// On macOS this is the VERSIONED name, deliberately. libkrun carries no
-/// LC_RPATH and dlopens libkrunfw by bare name at runtime, and the name it
-/// asks for is `libkrunfw.5.dylib` — the unversioned `libkrunfw.dylib` is a
-/// symlink the loader never consults. Checking for the unversioned name would
-/// report OK on a machine where the dlopen fails.
-///
-/// dirge-jbhz: this is a const because the string was written out in four
-/// places — the check, the spawn path's existence probe, and two tests — and
-/// one of the tests had drifted to the unversioned name. Since CI has no macOS
-/// runner (dirge-u35k) that drift was invisible to the gate and only showed up
-/// as a red suite for anyone running it on a Mac.
-#[cfg(feature = "sandbox-microvm")]
-pub const LIBKRUNFW_LIB: &str = if cfg!(target_os = "macos") {
-    "libkrunfw.5.dylib"
-} else {
-    "libkrunfw.so"
-};
 
 /// One dependency check result.
 #[derive(Debug, Clone)]
@@ -153,9 +131,9 @@ pub fn check_microvm() -> Vec<CheckResult> {
             None
         } else {
             Some(if cfg!(target_os = "macos") {
-                "Install libkrun: brew tap libkrun/krun && brew trust libkrun/krun && brew install libkrun libkrunfw"
+                "Install libkrun: brew tap libkrun/krun && brew trust libkrun/krun && brew install libkrun libkrunfw (already installed elsewhere? set LIBKRUN_LIB_DIR=<dir> and rebuild)"
             } else {
-                "Install libkrun: see https://github.com/containers/libkrun"
+                "Install libkrun: see https://github.com/containers/libkrun (already installed elsewhere? set LIBKRUN_LIB_DIR=<dir> and rebuild)"
             })
         },
     });
@@ -243,20 +221,35 @@ pub fn check_microvm() -> Vec<CheckResult> {
         },
     });
 
-    // runner binary
+    // Runner binary. "Present but a stub" is a third state, not a passing one:
+    // when the build script finds no libkrun the runner still compiles, it
+    // just can't boot anything (dirge-vadg). Before that change a missing
+    // libkrun meant no runner binary at all, so existence alone was proof.
+    // dirge and the runner come out of the same build-script run, so this
+    // binary's own `krun_linked` reports on the one sitting next to it.
     let runner_ok = crate::sandbox::microvm::runner::find_runner_binary().is_ok();
+    let runner_is_stub = !cfg!(krun_linked);
     results.push(CheckResult {
         name: "dirge-microvm-runner",
-        status: if runner_ok { Status::Ok } else { Status::Error },
-        message: if runner_ok {
-            "dirge-microvm-runner binary found".into()
+        status: if runner_ok && !runner_is_stub {
+            Status::Ok
         } else {
-            "dirge-microvm-runner binary not found".into()
+            Status::Error
         },
-        fix: if runner_ok {
-            None
-        } else {
-            Some("Build with: cargo build --release --all-features")
+        message: match (runner_ok, runner_is_stub) {
+            (false, _) => "dirge-microvm-runner binary not found".into(),
+            (true, true) => {
+                "dirge-microvm-runner was built without libkrun — it is a stub and cannot boot a VM"
+                    .into()
+            }
+            (true, false) => "dirge-microvm-runner binary found".into(),
+        },
+        fix: match (runner_ok, runner_is_stub) {
+            (true, false) => None,
+            (true, true) => Some(
+                "Install libkrun, then rebuild: cargo build --release --features sandbox-microvm",
+            ),
+            (false, _) => Some("Build with: cargo build --release --all-features"),
         },
     });
 
@@ -314,62 +307,16 @@ fn which_in_path(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Is `name` installed anywhere the loader or the linker would find it?
+///
+/// Delegates to the same search `build.rs` runs, so a library the build script
+/// linked against can't be reported missing here, or the reverse. The copy
+/// this replaced had derived the pkg-config package name by stripping the
+/// `lib` prefix, asking for `krun` when the package is `libkrun`, so the
+/// pkg-config leg never once matched (dirge-vij7).
 #[cfg(feature = "sandbox-microvm")]
 fn check_shared_library(name: &str) -> bool {
-    // Try ldconfig -p (Linux only).
-    #[cfg(target_os = "linux")]
-    {
-        if let Ok(out) = std::process::Command::new("ldconfig").arg("-p").output() {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            if stdout.contains(name) {
-                return true;
-            }
-        }
-    }
-
-    // On macOS, try pkg-config and common Homebrew paths.
-    #[cfg(target_os = "macos")]
-    {
-        let libname = name.trim_start_matches("lib").trim_end_matches(".dylib");
-        if let Ok(out) = std::process::Command::new("pkg-config")
-            .args(["--exists", libname])
-            .output()
-            && out.status.success()
-        {
-            return true;
-        }
-        // Check brew --prefix
-        if let Ok(out) = std::process::Command::new("brew")
-            .args(["--prefix"])
-            .stderr(std::process::Stdio::null())
-            .output()
-        {
-            let prefix = std::str::from_utf8(&out.stdout).unwrap_or("").trim();
-            if !prefix.is_empty() && std::path::Path::new(prefix).join("lib").join(name).exists() {
-                return true;
-            }
-        }
-    }
-
-    let dirs: &[&str] = if cfg!(target_os = "macos") {
-        &["/opt/homebrew/lib", "/usr/local/lib", "/usr/lib"]
-    } else if cfg!(target_os = "linux") {
-        &[
-            "/usr/lib",
-            "/usr/lib64",
-            "/usr/local/lib",
-            "/usr/local/lib64",
-        ]
-    } else {
-        &["/usr/local/lib", "/usr/lib"]
-    };
-
-    for dir in dirs {
-        if std::path::Path::new(dir).join(name).exists() {
-            return true;
-        }
-    }
-    false
+    super::libkrun_probe::find_library_dir(name).is_some()
 }
 
 /// Check whether a cached rootfs for `image_ref` is valid (contains sshd).
@@ -518,5 +465,32 @@ mod tests {
     fn libkrunfw_check_uses_the_versioned_dlopen_name() {
         assert_eq!(LIBKRUNFW_LIB, "libkrunfw.5.dylib");
         assert_eq!(LIBKRUN_LIB, "libkrun.dylib");
+    }
+
+    /// A runner built without libkrun is a stub — it exists, and it can't boot
+    /// anything. Existence used to be proof, because a missing libkrun meant
+    /// the binary never linked; now that it does link (dirge-vadg), the check
+    /// has to tell the two apart or it reports OK on a build that can't run.
+    #[test]
+    fn stub_runner_is_not_reported_as_ok() {
+        if cfg!(krun_linked) {
+            return; // Built against a real libkrun — nothing to assert.
+        }
+        let results = check_microvm();
+        let runner = results
+            .iter()
+            .find(|r| r.name == "dirge-microvm-runner")
+            .expect("runner check should be present");
+        assert_eq!(
+            runner.status,
+            Status::Error,
+            "a stub runner must not pass: {}",
+            runner.message
+        );
+        assert!(
+            runner.message.contains("stub") || runner.message.contains("not found"),
+            "message should say why: {}",
+            runner.message
+        );
     }
 }

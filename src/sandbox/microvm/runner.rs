@@ -116,9 +116,16 @@ mod tests {
             !stderr.is_empty(),
             "runner stderr should contain crash diagnostics"
         );
-        // Should contain recognizable error text.
+        // Two shapes are legitimate. A runner linked against libkrun gets as
+        // far as parsing argv and panics on the garbage; a stub runner built
+        // without libkrun (dirge-vadg) explains that and exits without parsing
+        // anything. Either way stderr carries a diagnostic, which is what this
+        // test is about.
+        let crashed =
+            stderr.contains("rror") || stderr.contains("sage") || stderr.contains("thread");
+        let is_stub = stderr.contains("built without libkrun");
         assert!(
-            stderr.contains("rror") || stderr.contains("sage") || stderr.contains("thread"),
+            crashed || is_stub,
             "runner stderr should contain diagnostic text, got: {stderr}"
         );
     }

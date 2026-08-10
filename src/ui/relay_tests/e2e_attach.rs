@@ -286,6 +286,15 @@ mod tests {
             eprintln!("skipping: dirge-microvm-runner not found");
             return;
         }
+        // The binary existing is no longer proof it can boot: built without
+        // libkrun it is a stub that prints an explanation and exits
+        // (dirge-vadg). Without this the test gets past the prerequisites and
+        // then blocks for its full SSH timeout waiting on a VM that was never
+        // going to start.
+        if !cfg!(krun_linked) {
+            eprintln!("skipping: dirge-microvm-runner was built without libkrun");
+            return;
+        }
 
         // ── save original stdin fd and termios ─────────────────────
         let saved_stdin = unsafe { OwnedFd::from_raw_fd(libc::dup(0)) };

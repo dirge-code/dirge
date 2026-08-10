@@ -4,6 +4,52 @@ All notable changes to dirge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.21.17] - 2026-08-09
+
+### Fixed
+- Building with `--features sandbox-microvm` on a machine without libkrun
+  failed at the link step with forty lines of `Undefined symbols for
+  architecture arm64: _krun_create_ctx, _krun_set_exec, ...` — none of which
+  mention libkrun. The runner now compiles either way: without libkrun it
+  becomes a stub that says what's missing and how to install it, and `dirge
+  sandbox check` reports it as an error instead of "binary found". Starting a
+  microVM from such a build fails immediately with the same explanation instead
+  of spawning the stub and waiting out the SSH timeout.
+- The build script cached its libkrun verdict for the life of the target
+  directory. It declared `rerun-if-changed` on `dirge.entitlements`, a file it
+  never reads — the runner writes its own entitlements plist at runtime — and
+  declaring any `rerun-if-changed` switches off cargo's default "re-run when a
+  package file changed". So installing libkrun after one failed build changed
+  nothing: cargo replayed the cached "not found" and produced the identical
+  link error. Worse, the explanatory `cargo:warning` only prints on a run where
+  the script actually executes, so the second failure arrived with no
+  explanation at all, and escaping it took a `cargo clean`. The probe now
+  watches the library paths themselves. Cargo treats a watched path that
+  doesn't exist as changed on every build, so it re-probes until it finds
+  something and then settles on the real file.
+- libkrunfw no longer gates linking. Nothing in the runner references a
+  `krunfw_*` symbol — libkrun reaches libkrunfw itself, by `dlopen` on macOS
+  and `DT_NEEDED` on Linux. Requiring it before emitting `-lkrun` blocked
+  builds for no link-time reason. It is still needed to boot a VM, which is
+  what `dirge sandbox check` is for.
+- `dirge sandbox check`'s pkg-config probe never matched anything on macOS. It
+  derived the package name by stripping the `lib` prefix, asking for `krun`
+  when the metadata file is `libkrun.pc`. The build script carried a comment
+  warning about exactly that mistake and the check had drifted from it, which
+  is invisible to CI because there is no macOS runner.
+
+### Added
+- `LIBKRUN_LIB_DIR` and `LIBKRUNFW_LIB_DIR` point the build at libkrun outside
+  the standard prefixes. Changing either re-runs the probe, as does changing
+  `PKG_CONFIG_PATH`.
+
+### Changed
+- The libkrun search lives in one module that both `build.rs` and `dirge
+  sandbox check` compile, so the two can no longer disagree about whether a
+  library is installed, and the build script's half of it is now covered by
+  tests. The Linux search also looks in the Debian/Ubuntu multiarch
+  directories.
+
 ## [0.21.16] - 2026-08-09
 
 ### Fixed
