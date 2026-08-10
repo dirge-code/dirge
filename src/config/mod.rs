@@ -43,6 +43,14 @@ pub enum ProviderAuth {
 #[serde(default)]
 pub struct ProviderEntry {
     pub provider_type: Option<String>,
+    /// Optional reasoning-wire dialect override. This changes only how
+    /// `ThinkingLevel` is encoded in requests; it does not change the client,
+    /// endpoint, authentication, or model routing. This is useful for an
+    /// OpenAI-compatible gateway whose model follows another vendor's wire
+    /// contract (for example, Zen's DeepSeek route expects the `opencode`
+    /// top-level `reasoning_effort` shape while remaining keyless via
+    /// `provider_type: "custom"`).
+    pub reasoning_provider_type: Option<String>,
     pub base_url: Option<String>,
     pub model: Option<String>,
     /// Authentication source for this provider. Default is API-key
@@ -809,6 +817,10 @@ pub enum SubagentWriteIsolation {
 #[serde(default)]
 pub struct Config {
     pub provider: Option<String>,
+    /// Default reasoning effort for the main loop. An active `/agent` profile
+    /// with its own `reasoning` value overrides this. Absent means the
+    /// provider/model default is preserved.
+    pub default_reasoning: Option<String>,
     /// Default authentication source for providers that do not set
     /// `providers.<name>.auth`. `ApiKey` remains the implicit default.
     pub auth: Option<ProviderAuth>,

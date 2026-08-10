@@ -388,6 +388,11 @@ pub struct LoopSpawnConfig {
     /// receive empty string.
     pub provider_name: Option<String>,
 
+    /// Initial reasoning level for the main loop. The active agent profile
+    /// or global config resolves this before spawning; `/reasoning` can still
+    /// change it at a later turn boundary.
+    pub reasoning: Option<super::types::ThinkingLevel>,
+
     /// Model identifier forwarded to `LoopConfig.model_name` so
     /// the `tool_input_repair` telemetry records `(model, tool,
     /// repair_kind)`. `None` is acceptable — telemetry falls back
@@ -539,6 +544,7 @@ impl LoopSpawnConfig {
             initial_prompt_images: Vec::new(),
             tools: Vec::new(),
             provider_name: None,
+            reasoning: None,
             model_name: None,
             asset_dir: None,
             #[cfg(feature = "plugin")]
@@ -618,7 +624,7 @@ pub fn spawn_loop_runner(cfg: LoopSpawnConfig) -> LoopRunner {
             std::sync::Arc::new(move || store.coordinator_generation_running())
                 as crate::agent::agent_loop::hooks::ShouldDeferFinalizationFn
         }),
-        reasoning: None,
+        reasoning: cfg.reasoning,
         thinking_budgets: None,
         headers: std::collections::HashMap::new(),
         metadata: std::collections::HashMap::new(),

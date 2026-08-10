@@ -78,6 +78,13 @@ pub struct AnyAgent {
     /// triple. `String::new()` is acceptable — telemetry falls back
     /// to `"unknown"` when the field is empty.
     model_name: String,
+    /// Optional reasoning level selected by `default_reasoning` or the active
+    /// `/agent` profile. It is copied into each newly spawned loop.
+    reasoning: Option<crate::agent::agent_loop::types::ThinkingLevel>,
+    /// Optional request-wire dialect override from the configured provider
+    /// entry. This is separate from `provider_name()`: the client can remain
+    /// `custom`/keyless while its model uses another vendor's reasoning shape.
+    reasoning_provider_type: Option<String>,
     /// Phase-3: dynamic-tool-search opt-in. Resolved from
     /// `config.dynamic_tool_search` at `build_agent` time.
     /// When `true`, `spawn_runner` wires the shared
@@ -339,6 +346,8 @@ impl AnyAgent {
             loop_tools,
             preamble,
             model_name,
+            reasoning: None,
+            reasoning_provider_type: None,
             dynamic_tool_search: false,
             tool_def_filter: None,
             tool_search_registry: None,
@@ -746,6 +755,33 @@ impl AnyAgent {
             AnyAgentInner::Ollama(_) => "ollama",
             AnyAgentInner::Custom(_) => "custom",
         }
+    }
+
+    /// Provider dialect used only for reasoning request parameters. The
+    /// canonical provider identity remains available from `provider_name()`
+    /// for auth, telemetry, and model routing.
+    pub fn reasoning_provider_name(&self) -> &str {
+        self.reasoning_provider_type
+            .as_deref()
+            .unwrap_or_else(|| self.provider_name())
+    }
+
+    /// Install the resolved main-loop reasoning level.
+    pub fn with_reasoning(
+        mut self,
+        reasoning: Option<crate::agent::agent_loop::types::ThinkingLevel>,
+    ) -> Self {
+        self.reasoning = reasoning;
+        self
+    }
+
+    /// Install a request-wire dialect override without changing provider
+    /// routing or authentication.
+    pub fn with_reasoning_provider_type(mut self, provider_type: Option<String>) -> Self {
+        self.reasoning_provider_type = provider_type
+            .filter(|v| !v.trim().is_empty())
+            .map(|v| v.trim().to_ascii_lowercase());
+        self
     }
 
     /// Internal accessor for the agent's tool result cache.

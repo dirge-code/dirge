@@ -74,6 +74,23 @@ pub enum ThinkingLevel {
     Xhigh,
 }
 
+impl ThinkingLevel {
+    /// Parse the config/profile spelling used by `default_reasoning` and
+    /// `agents.<name>.reasoning`. Unknown values are rejected by the caller
+    /// rather than silently selecting a different effort level.
+    pub fn from_wire(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "off" => Some(Self::Off),
+            "minimal" => Some(Self::Minimal),
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            "xhigh" | "max" => Some(Self::Xhigh),
+            _ => None,
+        }
+    }
+}
+
 /// Per-level token budgets for thinking/reasoning. Token-based
 /// providers (Anthropic budget-mode, etc.) consume this to size
 /// the reasoning allocation per turn. Effort-based providers
@@ -1011,6 +1028,16 @@ mod tests {
             let decoded: ThinkingLevel = serde_json::from_str(wire).unwrap();
             assert_eq!(decoded, variant, "decode mismatch: {wire}");
         }
+    }
+
+    #[test]
+    fn thinking_level_from_wire_accepts_config_values() {
+        assert_eq!(ThinkingLevel::from_wire("LOW"), Some(ThinkingLevel::Low));
+        assert_eq!(
+            ThinkingLevel::from_wire(" max "),
+            Some(ThinkingLevel::Xhigh)
+        );
+        assert_eq!(ThinkingLevel::from_wire("unknown"), None);
     }
 
     /// Default for `ThinkingLevel` is `Off`. Aligns with pi's

@@ -215,6 +215,7 @@ impl AnyAgent {
         cfg.tools = self.loop_tools;
         cfg.provider_name = Some(provider_name);
         cfg.model_name = Self::model_name_opt(&self.model_name);
+        cfg.reasoning = self.reasoning;
         cfg.steering_queue = steering_queue;
         cfg.tool_def_filter = tool_def_filter;
         cfg.dynamic_tool_search = self.dynamic_tool_search;
@@ -653,7 +654,7 @@ impl AnyAgent {
         >,
     ) -> crate::agent::agent_loop::StreamFn {
         let chunk_timeout = self.chunk_timeout;
-        let provider = Some(self.provider_name().to_string());
+        let provider = Some(self.reasoning_provider_name().to_string());
         let model_name = Self::model_name_opt(&self.model_name);
         // dirge-iy20: single provider list in `stream_dispatch`. Each
         // arm clones `tools`/passes `tool_def_filter` by move — only

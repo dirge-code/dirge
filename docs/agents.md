@@ -1,7 +1,7 @@
 # Agent profiles
 
 An **agent profile** is a named, reusable persona: a bundle of *system prompt*,
-*model*, and *tool policy* you can switch to at runtime. Where a prompt
+*model*, *reasoning effort*, and *tool policy* you can switch to at runtime. Where a prompt
 (`/prompt`) only changes the system prompt + tool restrictions, an agent profile
 also routes the loop to a different **model** — so you can keep the right
 model-for-the-job one keystroke away (a cheap fast model for review, a stronger
@@ -97,7 +97,7 @@ The same shape as a JSON object, for profiles you'd rather keep in config:
 | Command | Effect |
 |---|---|
 | `/agents` (or `/agent`) | List defined profiles (active one marked `*`) **and** the built-in role routing. |
-| `/agent <name>` | Activate a profile: apply its system prompt, tool policy (at the permission layer), and model (rebuilds the agent). |
+| `/agent <name>` | Activate a profile: apply its system prompt, reasoning effort, tool policy (at the permission layer), and model (rebuilds the agent). |
 | `/agent off` | Deactivate the profile and restore the underlying state: the active `/prompt`'s prompt + denies come back, and the model is restored to whatever it was **before** the profile was activated. |
 
 The `/prompt` and `/agent` selections are **independent composing layers**, not
@@ -154,8 +154,9 @@ configured, otherwise the main model.
 Profiles are resolved into subagent routes once at startup. By default
 subagents are **tool-less** (a one-shot query — a profile's
 `deny_tools`/`allow_tools` doesn't apply, since the subagent has no tools),
-and the profile's `reasoning`/`temperature` aren't applied on the subagent
-path — only the model and system prompt are. Routing `/plan` phases to named
+and the profile's `temperature` isn't applied on the subagent path. The
+profile's `reasoning` applies to the active main loop; subagent effort remains
+provider-default until a future subagent-routing change. Routing `/plan` phases to named
 profiles, and cross-provider client switching, remain follow-ups.
 
 ### Tooled subagents (opt-in)

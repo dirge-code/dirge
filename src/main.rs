@@ -1173,6 +1173,7 @@ async fn main() -> anyhow::Result<()> {
                         name,
                         config::ProviderEntry {
                             provider_type: Some(ptype),
+                            reasoning_provider_type: None,
                             base_url: Some(base_url),
                             model: None,
                             auth: None,

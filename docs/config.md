@@ -74,6 +74,7 @@ Accepted top-level keys:
 | Key                       | Type    | Description                                                                                                                                                                 |
 | ------------------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `provider`                | string  | Active provider alias. Built-ins are `openrouter`, `openai`, `anthropic`, `gemini`/`google`, `deepseek`, `glm`/`zhipu`, `cerebras`, `opencode`, `kimi`/`kimi-code`/`moonshot`, and `ollama`; any alias declared in `providers` is also accepted. Default: `openrouter`. See [Providers and roles](#providers-and-roles). |
+| `default_reasoning`       | string  | Initial main-loop effort: `off`, `minimal`, `low`, `medium`, `high`, or `xhigh` (`max` is accepted as an alias). An active agent profile's `reasoning` overrides it. Absent preserves the provider/model default. |
 | `auth`                    | string  | Default authentication source for providers that don't set their own `providers.<name>.auth`: `api-key` (the implicit default), `chatgpt` (Codex/OpenAI login tokens), `anthropic` / `claude-code` (Anthropic Claude Code OAuth), or `kimi` (Kimi Code device OAuth). See [Providers and roles](#providers-and-roles). |
 | `providers`               | object  | Map of provider alias → entry. The active model lives in `providers.<active-provider>.model`. Each role key below points at one of these aliases. See [Providers and roles](#providers-and-roles). |
 | `review_provider`         | string  | Provider alias for the background session-review pass. Falls back to `provider`. |
@@ -331,6 +332,7 @@ Each `providers` entry accepts:
 | Field | Description |
 |-------|-------------|
 | `provider_type` | Built-in backend to use: `openrouter`, `openai`, `openai-responses`, `anthropic`, `gemini`, `deepseek`, `glm`, `cerebras`, `opencode`, `kimi`, `ollama`, or `custom`. Optional — defaults to the entry's alias when that alias matches a built-in name. `openai` speaks the Chat Completions API (`/v1/chat/completions`); `openai-responses` speaks the Responses API (`/v1/responses`) — see below. |
+| `reasoning_provider_type` | Optional reasoning-wire dialect override. It changes only the effort parameter shape; it does not change routing or authentication. For example, a keyless `provider_type: "custom"` entry targeting Zen can set this to `"opencode"` so Dirge sends top-level `reasoning_effort`. |
 | `base_url` | Endpoint base URL (for custom / self-hosted endpoints). |
 | `model` | Model name for this provider. |
 | `api_key` | Literal key or `${ENV_VAR}` interpolation. Takes precedence over `api_key_env`. |

@@ -93,6 +93,29 @@ fn create_role_client(
     create_client_with_auth(provider_name, None, providers, default_auth)
 }
 
+/// Resolve the initial thinking level for the main loop. An active profile is
+/// intentionally more specific than the global default, so `/agent off`
+/// restores the configured default on the next rebuild.
+fn configured_reasoning_level(
+    cfg: &Config,
+    context: &ContextFiles,
+) -> Option<crate::agent::agent_loop::types::ThinkingLevel> {
+    let raw = context
+        .agent_layer
+        .as_ref()
+        .and_then(|agent| agent.reasoning.as_deref())
+        .or(cfg.default_reasoning.as_deref())?;
+    let level = crate::agent::agent_loop::types::ThinkingLevel::from_wire(raw);
+    if level.is_none() {
+        tracing::warn!(
+            target = "dirge::config",
+            value = raw.trim(),
+            "unrecognized reasoning effort; ignoring it (valid: off | minimal | low | medium | high | xhigh)"
+        );
+    }
+    level
+}
+
 // Arity matches `build_agent_inner` — explicit DI signature kept
 // grep-able, refactoring into a struct is tracked separately.
 #[allow(clippy::too_many_arguments)]
@@ -119,8 +142,14 @@ pub async fn build_agent(
     // spawn_runner / run_print call on the resulting agent uses the
     // same value. Provider name comes from the resolved CLI / config
     // (already factored into resolve_provider above the call site).
-    let provider_name = cli.resolve_provider(cfg);
+    let provider_name = cli.resolve_provider(cfg).to_string();
     let chunk_timeout = cfg.resolve_stream_chunk_timeout(&provider_name);
+    let providers = cfg.providers_map();
+    let reasoning_provider_type = providers
+        .get(&provider_name)
+        .or_else(|| providers.get(&provider_name.to_ascii_lowercase()))
+        .and_then(|entry| entry.reasoning_provider_type.clone());
+    let reasoning = configured_reasoning_level(cfg, context);
     // Capture the model identifier before `match model` consumes
     // it — forwarded into `AnyAgent.model_name` so `spawn_runner`
     // can plumb it through to the `tool_input_repair` telemetry.
@@ -232,6 +261,9 @@ pub async fn build_agent(
                 preamble,
                 model_name.clone(),
             );
+            agent = agent
+                .with_reasoning(reasoning)
+                .with_reasoning_provider_type(reasoning_provider_type.clone());
             // #701: record MCP tool names so a tooled subagent's
             // `subagent_mcp` selection resolves against real MCP tools.
             agent = agent.with_mcp_tool_names(mcp_tool_names);
