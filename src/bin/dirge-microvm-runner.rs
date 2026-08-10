@@ -41,7 +41,33 @@ fn main() {
     std::process::exit(1);
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+/// Built on a supported platform, but `build.rs` found no libkrun to link
+/// against, so nothing supplies the `krun_*` symbols.
+///
+/// Compiling the real `main` in that state fails at the link step with forty
+/// lines of `Undefined symbols for architecture arm64: _krun_create_ctx, ...`
+/// that never mention libkrun, which is how this arrives for anyone building
+/// with `--features sandbox-microvm` on a machine that hasn't installed it
+/// (dirge-vadg). The build now succeeds and says so here instead.
+#[cfg(all(any(target_os = "linux", target_os = "macos"), not(krun_linked)))]
+fn main() {
+    eprintln!(
+        "dirge-microvm-runner: built without libkrun — this binary is a stub and cannot boot a VM.
+
+libkrun was not found when dirge was compiled, so the runner was built with no
+VM support. Install it and rebuild:
+
+  macOS:  brew tap libkrun/krun && brew trust libkrun/krun && brew install libkrun libkrunfw
+  Linux:  https://github.com/containers/libkrun/releases
+
+Installed somewhere non-standard? Point the build at it with LIBKRUN_LIB_DIR.
+Then rebuild with --features sandbox-microvm, and run `dirge sandbox check` to
+confirm. Until then, use --sandbox bwrap or --sandbox none."
+    );
+    std::process::exit(1);
+}
+
+#[cfg(all(any(target_os = "linux", target_os = "macos"), krun_linked))]
 fn main() {
     let config_json = std::env::args()
         .nth(1)

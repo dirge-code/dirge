@@ -14,6 +14,15 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 
 pub mod check;
+// Not feature-gated on purpose: `build.rs` includes this file too, and its
+// tests are the only coverage the build script's logic has. Gating it behind
+// `sandbox-microvm` would hide that from every default-feature CI run, which
+// is how the last drift here went unnoticed (dirge-btpd).
+// `dead_code` because the crate uses only part of the surface — the rest is
+// for the build script, which reaches this file by `include!` and so can't be
+// seen from here.
+#[allow(dead_code)]
+pub mod libkrun_probe;
 #[cfg(feature = "sandbox-microvm")]
 pub mod microvm;
 
