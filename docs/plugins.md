@@ -304,6 +304,68 @@ or unusually slow, the call returns `nil` instead of freezing the plugin.
   (harness/notify (string "definition sites: " (length defs))))
 ```
 
+### Calling dirge's tools
+
+A plugin can invoke the agent's own tools — built-ins, MCP, semantic — instead
+of reimplementing them. This is what lets a plugin build a tool *on top of*
+the existing set: batching, filtering, or running several and returning only
+the part that matters.
+
+Feature-detect with `(harness/tools?)` and fall back gracefully, exactly as
+with LSP. It is true only when the bridge is wired **and** a tool registry has
+been published (i.e. an agent exists), so a true answer means a following
+`harness/call-tool` will reach the dispatcher.
+
+| Function | Signature | Effect |
+|----------|-----------|--------|
+| `harness/tools?` | `()` | `true` when the bridge is live |
+| `harness/list-tools` | `()` | JSON array of `{name, description, parameters}` for every callable tool, or `nil` |
+| `harness/call-tool` | `(name &opt args-json)` | Runs the tool. Returns `@{:ok bool :output string}`, or `nil` when the bridge is not wired |
+
+`args-json` is a **JSON string**, not a Janet structure — the plugin
+environment has no JSON encoder, and the host re-parses it anyway. Omitting it
+means `{}`. `:ok false` carries the tool's own error text in `:output`.
+
+```janet
+(defn on-prompt [ctx]
+  (when (harness/tools?)
+    (def r (harness/call-tool "read" `{"path": "README.md"}`))
+    (when (and r (r :ok))
+      (harness/notify (string "README is " (length (r :output)) " bytes")))))
+```
+
+**Permission checks still apply, unchanged.** `check_perm*` runs inside each
+tool, so a call through the bridge is gated exactly as the model's own call
+would be: under `--restrictive` a plugin's `bash` and `write` come back
+`:ok false` with `"Permission denied by user"` and nothing runs.
+
+Read that as "no bypass", not as "extra protection". The bridge inherits
+whatever policy is in force, and headless `-p` auto-approves by default — so
+there a plugin's `bash` executes without a prompt, precisely as the model's
+would. A plugin also chooses the arguments, and plugins already sit inside
+dirge's trust boundary. The bridge grants a plugin the model's privileges,
+neither more nor less.
+
+**Two things you cannot call**, both refused with an explanatory error rather
+than attempted:
+
+- **Plugin-registered tools.** Their handlers run on the Janet worker, which
+  is blocked waiting for your call to return — attempting one would deadlock
+  until the timeout.
+- **`task`.** Subagents run isolated from plugin hooks and tool access;
+  reaching one from a plugin would smuggle a whole agent run past that
+  boundary.
+
+Hooks do **not** fire for tools invoked this way. `on-tool-start` /
+`on-tool-end` would re-enter the blocked worker, and a plugin calling a tool
+from inside `on-tool-start` would recurse. Calls are therefore silent: they do
+not appear in the transcript and do not trigger other plugins.
+
+The call blocks the Janet worker for its duration, bounded at 300 seconds.
+That is much longer than the LSP bound because tools legitimately run for
+minutes, but it is still a bound — everything else in Janet waits behind it,
+so do not call a long tool from `on-message-update`.
+
 ### Custom LLM providers
 
 | Function | Signature | Effect |

@@ -3354,3 +3354,69 @@ fn notebook_tools_are_registered_with_a_persistence_contract() {
         eval.description
     );
 }
+
+// ── Tool bridge (harness/call-tool) ──────────────────────────────────
+//
+// These run against a real Janet env with the preludes installed but no
+// responder wired, which is exactly the degraded state a plugin has to cope
+// with: the symbols must exist and answer safely rather than blow up.
+
+#[test]
+fn tool_bridge_symbols_are_defined() {
+    let mut mgr = PluginManager::try_new().unwrap();
+    for sym in ["harness/tools?", "harness/list-tools", "harness/call-tool"] {
+        let result = mgr.eval(&format!("(harness/has-symbol? \"{sym}\")"));
+        assert_eq!(result, Ok("true".to_string()), "{sym} must be defined");
+    }
+}
+
+#[test]
+fn tools_predicate_is_false_without_a_responder() {
+    let mut mgr = PluginManager::try_new().unwrap();
+    assert_eq!(mgr.eval("(harness/tools?)"), Ok("false".to_string()));
+}
+
+/// The documented contract: feature-detect, and a false predicate means the
+/// query functions return nil rather than erroring.
+#[test]
+fn list_tools_is_nil_without_a_responder() {
+    let mut mgr = PluginManager::try_new().unwrap();
+    assert_eq!(mgr.eval("(harness/list-tools)"), Ok("nil".to_string()));
+}
+
+#[test]
+fn call_tool_is_nil_without_a_responder() {
+    let mut mgr = PluginManager::try_new().unwrap();
+    assert_eq!(
+        mgr.eval("(harness/call-tool \"read\" \"{}\")"),
+        Ok("nil".to_string())
+    );
+}
+
+/// Validation happens in the Janet wrapper so a plugin gets a normal
+/// catchable error, not a silent nil that looks like "bridge down".
+#[test]
+fn call_tool_rejects_a_non_string_name() {
+    let mut mgr = PluginManager::try_new().unwrap();
+    assert!(mgr.eval("(harness/call-tool 42)").is_err());
+}
+
+#[test]
+fn call_tool_rejects_non_string_args() {
+    let mut mgr = PluginManager::try_new().unwrap();
+    assert!(
+        mgr.eval("(harness/call-tool \"read\" @{:path \"x\"})")
+            .is_err()
+    );
+}
+
+#[test]
+fn call_tool_defaults_missing_args_to_empty_object() {
+    // Reaches the C function (returning nil, no responder) rather than
+    // erroring on the missing argument.
+    let mut mgr = PluginManager::try_new().unwrap();
+    assert_eq!(
+        mgr.eval("(harness/call-tool \"read\")"),
+        Ok("nil".to_string())
+    );
+}

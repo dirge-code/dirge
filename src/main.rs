@@ -1499,6 +1499,19 @@ async fn main() -> anyhow::Result<()> {
              File tools (read, write, edit, etc.) operate on the host filesystem."
         );
     }
+    // ── Spawn the plugin tool-call drainer ───────────────────────────
+    // Plugins call (harness/call-tool "read" args-json), which reaches the
+    // worker C function; it sends a ToolCallRequest here and blocks. The
+    // responder looks the tool up in the registry published at each agent
+    // build and runs it, permission checks included (they live inside each
+    // tool, so dispatching straight to `execute` keeps the gate).
+    #[cfg(feature = "plugin")]
+    {
+        let (tool_call_tx, tool_call_rx) =
+            tokio::sync::mpsc::unbounded_channel::<plugin::tool_bridge::ToolCallRequest>();
+        plugin::tool_bridge::install_tool_call_tx(tool_call_tx);
+        plugin::tool_bridge::spawn_tool_responder(tool_call_rx);
+    }
     // ── Spawn the Computer-Use sandbox exec drainer ──────────────────
     // Computer-use plugins call (harness/computer-use-exec ...) which
     // reaches the worker C function. The C function sends a

@@ -1009,6 +1009,36 @@ const HARNESS_LSP_INIT: &str = r#"
 (defn harness/lsp-diagnostics [file] (harness/lsp "diagnostics" file))
 "#;
 
+/// Janet wrappers for the tool bridge, installed after the C functions.
+///
+/// `harness/call-tool` returns `@{:ok bool :output string}` so a plugin can
+/// distinguish a tool's error from its output, and `nil` when the bridge
+/// isn't wired at all (no responder — e.g. a build that never constructed
+/// an agent). Feature-detect with `(harness/tools?)`, exactly as with LSP.
+///
+/// Arguments are validated here rather than in the C function so a plugin
+/// gets a normal catchable Janet error instead of a silent nil.
+#[cfg(feature = "plugin")]
+const HARNESS_TOOL_INIT: &str = r#"
+(defn harness/tools? []
+  (if-let [entry (get (curenv) 'harness/__tools-live)]
+    (truthy? ((get entry :value)))
+    false))
+
+(defn harness/list-tools []
+  (when (harness/tools?)
+    (harness/__list-tools)))
+
+(defn harness/call-tool [name &opt args]
+  (when (not (string? name))
+    (error "harness/call-tool: tool name must be a string"))
+  (def payload (cond
+                 (nil? args) "{}"
+                 (string? args) args
+                 (error "harness/call-tool: args must be a JSON string")))
+  (harness/__call-tool name payload))
+"#;
+
 /// dirge-l6bf: neuter the Janet escape hatches that can terminate or
 /// destabilize the HOST process. Every hook / command / tool handler is
 /// already run inside a Janet `(try ...)` (see `mod.rs`), so an ordinary
@@ -1920,6 +1950,12 @@ fn worker_loop(
             CFunOptions::new(c"__computer-use-exec", janet_computer_use_exec_cfn)
                 .namespace(c"harness"),
         );
+        // Tool bridge: lets a plugin call dirge's own tools. Like the
+        // computer-use bridge these read a global set by main.rs, so they
+        // degrade to nil when the responder was never spawned.
+        env.add_c_fn(CFunOptions::new(c"__call-tool", janet_call_tool_cfn).namespace(c"harness"));
+        env.add_c_fn(CFunOptions::new(c"__list-tools", janet_list_tools_cfn).namespace(c"harness"));
+        env.add_c_fn(CFunOptions::new(c"__tools-live", janet_tools_live_cfn).namespace(c"harness"));
     }
     // Register DAP C functions when both features are enabled.
     #[cfg(feature = "dap")]
@@ -1950,6 +1986,10 @@ fn worker_loop(
     }
     if let Err(e) = client.run(HARNESS_LSP_INIT) {
         let _ = init_tx.send(Err(format!("harness lsp init failed: {e}")));
+        return;
+    }
+    if let Err(e) = client.run(HARNESS_TOOL_INIT) {
+        let _ = init_tx.send(Err(format!("harness tool-bridge init failed: {e}")));
         return;
     }
     // dirge-l6bf: disable host-terminating Janet functions. MUST run after
@@ -3246,6 +3286,167 @@ unsafe fn computer_use_exec_body(
         }
         None => unsafe { janet_wrap_nil() },
     }
+}
+
+/// Upper bound on a single `harness/call-tool`. Generous compared to
+/// [`LSP_QUERY_TIMEOUT`] because the callee is a real tool — `bash` alone
+/// defaults to minutes — but still bounded: the Janet worker is blocked for
+/// the whole call, so an unbounded wait would freeze every hook and every
+/// other plugin behind it.
+#[cfg(feature = "plugin")]
+const TOOL_CALL_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Send a tool call and block on the reply, polling the shutdown flag so
+/// `Worker::Drop` can unblock us. Same shape as [`send_lsp`].
+#[cfg(feature = "plugin")]
+fn send_tool_call(
+    tx: &tmpsc::UnboundedSender<super::tool_bridge::ToolCallRequest>,
+    name: String,
+    args_json: String,
+) -> Option<Result<String, String>> {
+    let (reply_tx, reply_rx) = mpsc::channel::<Result<String, String>>();
+    tx.send(super::tool_bridge::ToolCallRequest {
+        name,
+        args_json,
+        reply: reply_tx,
+    })
+    .ok()?;
+    let start = std::time::Instant::now();
+    loop {
+        match reply_rx.recv_timeout(DIALOG_POLL) {
+            Ok(r) => return Some(r),
+            Err(mpsc::RecvTimeoutError::Disconnected) => return None,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let shutting_down = SHUTDOWN.with(|cell| {
+                    cell.borrow()
+                        .as_ref()
+                        .map(|f| f.load(Ordering::SeqCst))
+                        .unwrap_or(false)
+                });
+                if shutting_down {
+                    return None;
+                }
+                if start.elapsed() >= TOOL_CALL_TIMEOUT {
+                    return Some(Err(format!(
+                        "tool call exceeded {}s and was abandoned",
+                        TOOL_CALL_TIMEOUT.as_secs()
+                    )));
+                }
+            }
+        }
+    }
+}
+
+/// C-function backing `harness/__call-tool`. Reads (name, args-json),
+/// forwards to the tokio responder and blocks on the reply. Returns a Janet
+/// table `{:ok bool :output string}`, or nil when the bridge is not wired.
+/// A table rather than a bare string because the caller has to be able to
+/// tell "the tool said no" from "the tool returned text".
+#[cfg(feature = "plugin")]
+unsafe extern "C-unwind" fn janet_call_tool_cfn(
+    argc: i32,
+    argv: *mut janetrs::lowlevel::Janet,
+) -> janetrs::lowlevel::Janet {
+    use janetrs::lowlevel::*;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        call_tool_body(argc, argv)
+    }));
+    match result {
+        Ok(j) => j,
+        Err(payload) => {
+            let msg = panic_payload_to_string(&payload);
+            tracing::error!(
+                target: "dirge::plugin",
+                cfn = "harness/call-tool",
+                panic = %msg,
+                "FFI panic in call-tool cfn — returning nil",
+            );
+            unsafe { janet_wrap_nil() }
+        }
+    }
+}
+
+#[cfg(feature = "plugin")]
+unsafe fn call_tool_body(
+    argc: i32,
+    argv: *mut janetrs::lowlevel::Janet,
+) -> janetrs::lowlevel::Janet {
+    use janetrs::lowlevel::*;
+    if argc < 2 {
+        return unsafe { janet_wrap_nil() };
+    }
+    let name = match unsafe { read_string_arg(argv, 0) } {
+        Some(s) => s,
+        None => return unsafe { janet_wrap_nil() },
+    };
+    let args_json = unsafe { read_string_arg(argv, 1) }.unwrap_or_else(|| "{}".to_string());
+
+    let answer = match super::tool_bridge::tool_call_tx() {
+        Some(tx) => send_tool_call(tx, name, args_json),
+        None => None,
+    };
+
+    let (ok, output) = match answer {
+        Some(Ok(text)) => (true, text),
+        Some(Err(err)) => (false, err),
+        None => return unsafe { janet_wrap_nil() },
+    };
+
+    let table = unsafe { janet_table(0) };
+    let ok_value = unsafe { janet_wrap_boolean(if ok { 1 } else { 0 }) };
+    let out_value = unsafe { wrap_string(&output) };
+    unsafe {
+        janet_table_put(
+            table,
+            janet_ckeywordv(c"ok".as_ptr() as *const u8, 2),
+            ok_value,
+        );
+        janet_table_put(
+            table,
+            janet_ckeywordv(c"output".as_ptr() as *const u8, 6),
+            out_value,
+        );
+    }
+    unsafe { janet_wrap_table(table) }
+}
+
+/// C-function backing `harness/__list-tools`. Returns a JSON string of the
+/// callable tools, or nil when the bridge is not wired.
+#[cfg(feature = "plugin")]
+unsafe extern "C-unwind" fn janet_list_tools_cfn(
+    _argc: i32,
+    _argv: *mut janetrs::lowlevel::Janet,
+) -> janetrs::lowlevel::Janet {
+    use janetrs::lowlevel::*;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        super::tool_bridge::list_json()
+    }));
+    match result {
+        Ok(json) => unsafe { wrap_string(&json) },
+        Err(payload) => {
+            let msg = panic_payload_to_string(&payload);
+            tracing::error!(
+                target: "dirge::plugin",
+                cfn = "harness/list-tools",
+                panic = %msg,
+                "FFI panic in list-tools cfn — returning nil",
+            );
+            unsafe { janet_wrap_nil() }
+        }
+    }
+}
+
+/// C-function backing `harness/__tools-live`. True only when the responder
+/// is wired AND a registry has been published, so `(harness/tools?)` reports
+/// runtime availability — the same contract `harness/lsp?` holds.
+#[cfg(feature = "plugin")]
+unsafe extern "C-unwind" fn janet_tools_live_cfn(
+    _argc: i32,
+    _argv: *mut janetrs::lowlevel::Janet,
+) -> janetrs::lowlevel::Janet {
+    use janetrs::lowlevel::janet_wrap_boolean;
+    let live = super::tool_bridge::is_live();
+    unsafe { janet_wrap_boolean(if live { 1 } else { 0 }) }
 }
 
 /// Wrap an `i32` as a Janet value, portably. `janet_wrap_integer` is only
