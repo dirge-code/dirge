@@ -4,6 +4,43 @@ All notable changes to dirge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.21.18] - 2026-08-12
+
+### Fixed
+- The mid-session memory refresh was busting the prompt cache on the
+  Claude-Code/OAuth path. It was appended to `messages[]` as a `system`-role
+  entry, and the OAuth shaper hoists those into the top-level `system` array
+  because a stray system turn otherwise trips Anthropic's third-party
+  classifier. But Anthropic renders `tools → system → messages` and caches on
+  a strict prefix match, so growing `system` shifts every message byte after
+  it — the whole conversation got re-billed at cache-write price, on a message
+  that had been sitting in the cheapest possible position. It is now a
+  user-role `<system-reminder>`, the same framing background-task
+  notifications already use, so there is nothing left to hoist and the cached
+  prefix survives. Compaction summaries still hoist as before.
+- `/cache` printed a nonsense fraction on Anthropic. The hit *ratio* already
+  accounted for Anthropic reporting input, cached, and creation as disjoint
+  lanes — `input_tokens` is only the uncached remainder — but the line under
+  it still divided by `input_tokens` alone, so a warm session read
+  `cache hit ratio: 93.0%` above `cached input: 20000 / 500 tokens`. Both now
+  share one denominator.
+
+### Added
+- `/cache` names the TTL in force beside the write tokens. A 1h cache write
+  costs 2× base input against 1.25× at 5m, and which one wins depends on how
+  long the gaps between turns are — so the knob driving that premium now
+  appears next to the number it is charged on, and a
+  `DIRGE_PROMPT_CACHE_TTL` comparison leaves a record of which setting
+  produced which totals. The default is unchanged at 1h.
+- A warning when a turn writes a prompt-cache entry but reads none, carrying
+  the message count. Two documented ways to lose a cache read leave no error
+  behind: the 20-block lookback window (a turn appending more than 20 content
+  blocks pushes the previous breakpoint out of range — ten parallel tool calls
+  is 21) and concurrent fan-out (an entry only becomes readable once the first
+  response starts streaming, so subagents launched together each pay the
+  write). Neither is confirmed to happen here; this reports the signature so
+  the question can be settled on evidence.
+
 ## [0.21.17] - 2026-08-09
 
 ### Fixed

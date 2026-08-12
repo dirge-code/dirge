@@ -2587,7 +2587,9 @@ pub async fn run_loop(
                     // top-level `system` array, which shifts every message byte
                     // after it and re-bills the whole conversation at cache-write
                     // price (dirge-ugah.2). See `memory_refresh_message`.
-                    current_context.messages.push(memory_refresh_message(&block));
+                    current_context
+                        .messages
+                        .push(memory_refresh_message(&block));
                 }
             }
 
