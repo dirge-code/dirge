@@ -2582,12 +2582,12 @@ pub async fn run_loop(
             {
                 let block = provider.format_for_system_prompt();
                 if !block.trim().is_empty() {
-                    current_context.messages.push(serde_json::json!({
-                        "role": "system",
-                        "content": format!(
-                            "## Updated memory (consolidated mid-session)\n{block}"
-                        ),
-                    }));
+                    // User-role `<system-reminder>`, NOT a system-role message:
+                    // the OAuth shaper hoists system-role entries into the
+                    // top-level `system` array, which shifts every message byte
+                    // after it and re-bills the whole conversation at cache-write
+                    // price (dirge-ugah.2). See `memory_refresh_message`.
+                    current_context.messages.push(memory_refresh_message(&block));
                 }
             }
 
@@ -3654,6 +3654,31 @@ fn should_advise_untracked_work(
 /// Model-visible reminder injected into the conversation when the model is
 /// editing files without an active todo. Imperative tone matching the
 /// unfinished-todo nudge — tells the model to create a todo before continuing.
+/// The mid-session memory-refresh message (dirge-ugah.2).
+///
+/// A **user**-role message wrapping a `<system-reminder>` block, not a
+/// `system`-role one. The role is load-bearing for cost: on the OAuth path
+/// `hoist_system_messages` relocates every system-role entry out of
+/// `messages[]` into the top-level `system` array, and since Anthropic
+/// renders `tools → system → messages` and caches on a strict prefix match,
+/// growing `system` shifts every message byte after it — re-billing the
+/// entire conversation at cache-write price. Appending to the tail of
+/// `messages[]` is the cheapest possible placement; hoisting moved it to the
+/// most expensive one.
+///
+/// `<system-reminder>` is the same operator-framing convention
+/// `agent::tools::background` uses, and `ui::text_output` already strips a
+/// leading one from anything user-visible.
+pub(crate) fn memory_refresh_message(block: &str) -> serde_json::Value {
+    serde_json::json!({
+        "role": "user",
+        "content": format!(
+            "<system-reminder>\n## Updated memory (consolidated mid-session)\n\
+             {block}\n</system-reminder>"
+        ),
+    })
+}
+
 fn track_work_reminder_message() -> LoopMessage {
     LoopMessage::User(super::message::UserMessage::text(format!(
         "{TRACK_WORK_TAG} You're editing files without an active todo. Before continuing, \

@@ -888,6 +888,50 @@ mod tests {
         );
     }
 
+    /// dirge-ugah.2: a mid-session memory refresh must not grow `system`.
+    ///
+    /// Anthropic renders `tools → system → messages` and caches on a strict
+    /// prefix match, so an extra system block shifts every message byte after
+    /// it and re-bills the whole conversation at cache-write price. The
+    /// refresh is a user-role `<system-reminder>`, so the hoist finds nothing
+    /// to relocate and `system` comes out byte-identical to a request without
+    /// it. The hoist itself stays — compaction summaries still need it (see
+    /// `oauth_shaper_hoists_system_messages_out_of_messages_array`).
+    #[test]
+    fn memory_refresh_leaves_the_system_array_byte_identical() {
+        let base_messages = serde_json::json!([{"role": "user", "content": "first"}]);
+        let mut refreshed = base_messages.as_array().unwrap().clone();
+        refreshed.push(crate::agent::agent_loop::run::memory_refresh_message(
+            "- fact one\n",
+        ));
+
+        let shape = |messages: &serde_json::Value| -> serde_json::Value {
+            let body = Bytes::from(
+                serde_json::json!({
+                    "model": "claude-sonnet-4-5",
+                    "stream": true,
+                    "system": [{"type": "text", "text": "Real prompt."}],
+                    "messages": messages,
+                })
+                .to_string(),
+            );
+            serde_json::from_slice(&shape_oauth_messages_payload(body)).unwrap()
+        };
+
+        let without = shape(&base_messages);
+        let with = shape(&serde_json::Value::Array(refreshed));
+
+        assert_eq!(
+            without["system"], with["system"],
+            "the memory refresh must not touch the cached system prefix"
+        );
+        assert_eq!(
+            with["messages"].as_array().unwrap().len(),
+            2,
+            "the refresh must survive in messages[], not be hoisted away"
+        );
+    }
+
     #[test]
     fn oauth_shaper_splits_assistant_text_after_tool_use() {
         let body = Bytes::from(

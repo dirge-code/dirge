@@ -973,6 +973,33 @@ async fn run_compaction_pass_ignores_stale_generation_checkpoint() {
 /// provider. Every test that flips one of those globals holds this lock.
 static DIRTY_FLAG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// dirge-ugah.2: the mid-session memory refresh must NOT be a `system`-role
+/// message.
+///
+/// On the OAuth path `hoist_system_messages` relocates every system-role
+/// entry out of `messages[]` and into the top-level `system` array. Anthropic
+/// renders `tools → system → messages` and caches on a strict prefix match,
+/// so growing `system` shifts every message byte after it — the whole
+/// conversation is re-billed at cache-write price. A user-role
+/// `<system-reminder>` carries the same operator framing (the convention
+/// `background.rs` already uses) and leaves the prefix byte-identical.
+#[test]
+fn memory_refresh_message_is_a_user_system_reminder() {
+    let m = memory_refresh_message("- fact one\n");
+    assert_eq!(m["role"], "user", "must not be system-role: {m:?}");
+    let content = m["content"].as_str().expect("text content");
+    assert!(
+        content.starts_with("<system-reminder>"),
+        "must open with the reminder tag so the UI strips it: {content}"
+    );
+    assert!(
+        content.trim_end().ends_with("</system-reminder>"),
+        "must close the reminder tag: {content}"
+    );
+    assert!(content.contains("Updated memory"), "{content}");
+    assert!(content.contains("- fact one"), "{content}");
+}
+
 /// Round 2 flag: `mark_memories_dirty` then `take_memories_dirty` returns
 /// true exactly once, then false.
 #[test]
