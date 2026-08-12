@@ -1,4 +1,5 @@
-//! /memory handler — show what is remembered, edit it, reload the snapshot.
+//! /memory handler — show what is remembered, edit it, review queued
+//! writes, reload the snapshot.
 
 use crate::ui::slash::{SlashCtx, c_agent, c_error};
 
@@ -29,12 +30,21 @@ pub(crate) async fn cmd_memory(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyhow
         "edit" => {
             cmd_memory_edit(ctx).await?;
         }
+        #[cfg(unix)]
+        "review" => {
+            cmd_memory_review(ctx).await?;
+        }
         "help" => {
             ctx.renderer
                 .write_line("/memory          — list what is remembered", c_agent())?;
             #[cfg(unix)]
             ctx.renderer
                 .write_line("/memory edit     — open the store in $EDITOR", c_agent())?;
+            #[cfg(unix)]
+            ctx.renderer.write_line(
+                "/memory review   — confirm, edit or add to memories awaiting review",
+                c_agent(),
+            )?;
             ctx.renderer.write_line(
                 "/memory reload   — refresh the frozen snapshot so recent writes appear in the prompt",
                 c_agent(),
@@ -164,6 +174,89 @@ async fn cmd_memory_edit(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     // The prompt snapshot is frozen at build time, so without this the agent
     // keeps using the memories as they were before the edit.
     if (report.updated > 0 || report.added > 0 || report.removed > 0)
+        && let Some(provider) = ctx.agent.memory_provider()
+        && let Err(e) = provider.refresh_snapshot()
+    {
+        ctx.renderer
+            .write_line(&format!("snapshot refresh failed: {e}"), c_error())?;
+    }
+    Ok(())
+}
+
+/// Open the queued memory writes in `$EDITOR` and apply the result.
+///
+/// The stores are opened here rather than taken from the agent's
+/// `MemoryProvider`: the queue is a builtin-store concept and the provider
+/// may be a hybrid wrapper around it. Opening by path also means review
+/// still works in a session whose memory tool failed to load.
+#[cfg(unix)]
+async fn cmd_memory_review(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
+    use crate::extras::memory_db::SqliteMemoryStore;
+    use crate::ui::memory_review;
+
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let paths = crate::extras::dirge_paths::ProjectPaths::new(&cwd);
+    let project = match SqliteMemoryStore::load(&paths) {
+        Ok(s) => s,
+        Err(e) => {
+            ctx.renderer
+                .write_line(&format!("cannot open memory store: {e}"), c_error())?;
+            return Ok(());
+        }
+    };
+    let global = SqliteMemoryStore::load_global().ok();
+
+    let queued = memory_review::collect(&project, global.as_ref());
+    if queued.is_empty() {
+        ctx.renderer
+            .write_line("no memories awaiting review", c_agent())?;
+        return Ok(());
+    }
+    let doc = memory_review::render(&queued);
+
+    let drained_stdin = match crate::ui::terminal::suspend_tui_for_subprocess(ctx.user_tx) {
+        Some(d) => d,
+        None => {
+            ctx.renderer
+                .write_line("no /dev/tty available — cannot open an editor", c_error())?;
+            return Ok(());
+        }
+    };
+    let edited = crate::ui::external_editor::edit_text(&doc, "memory-review");
+    crate::ui::terminal::resume_tui_after_subprocess(ctx.renderer, ctx.user_tx);
+    drop(drained_stdin);
+
+    // An aborted edit leaves the queue exactly as it was, so review can be
+    // retried. This is why `edit_text` returns None rather than an empty
+    // document on abort — confusing the two would reject everything.
+    let Some(edited) = edited else {
+        ctx.renderer
+            .write_line("review aborted — nothing changed", c_agent())?;
+        return Ok(());
+    };
+
+    let reviewed = match memory_review::parse(&edited) {
+        Ok(r) => r,
+        Err(e) => {
+            ctx.renderer
+                .write_line(&format!("could not parse the review: {e}"), c_error())?;
+            ctx.renderer
+                .write_line("nothing changed — run /memory review again", c_agent())?;
+            return Ok(());
+        }
+    };
+
+    let report = memory_review::apply(&project, global.as_ref(), &reviewed, queued.len());
+    ctx.renderer
+        .write_line(&format!("memory review: {}", report.summary()), c_agent())?;
+    for failure in &report.failures {
+        ctx.renderer
+            .write_line(&format!("  {failure}"), c_error())?;
+    }
+
+    // The prompt snapshot is frozen at build time, so accepted entries would
+    // otherwise stay invisible to the agent until a restart.
+    if report.stored > 0
         && let Some(provider) = ctx.agent.memory_provider()
         && let Err(e) = provider.refresh_snapshot()
     {

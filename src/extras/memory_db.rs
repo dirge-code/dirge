@@ -326,6 +326,21 @@ pub struct BrowseEntry {
     pub updated_at: String,
 }
 
+/// One entry awaiting human review (`status = 'pending'`).
+///
+/// Deliberately narrower than [`ActiveRow`]: nothing downstream of the
+/// review file needs salience, tier or confidence, because acceptance
+/// re-inserts through `add_entry` and lets those be derived fresh.
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingEntry {
+    pub id: i64,
+    /// `"memory"` or `"pitfalls"`.
+    pub target: String,
+    pub kind: String,
+    pub content: String,
+}
+
 /// One active row, as the matching/eviction logic sees it.
 #[derive(Clone)]
 struct ActiveRow {
@@ -1119,6 +1134,138 @@ impl SqliteMemoryStore {
         )?;
         tx.commit().map_err(|e| format!("Failed to commit: {e}"))?;
         Ok(outcome)
+    }
+
+    /// Queue an entry for human review instead of storing it.
+    ///
+    /// Written with `status = 'pending'`, which every read path already
+    /// filters out — `active_rows` and friends select `status = 'active'`,
+    /// and the FTS search joins on the same. So a pending row is invisible
+    /// to the prompt snapshot, to `view`, and to `search` with no new
+    /// filtering anywhere.
+    ///
+    /// Two deliberate differences from [`Self::add_entry`]:
+    ///
+    /// * **No compaction.** `add_entry` demotes least-salient hot rows to
+    ///   make budget room. A merely *proposed* memory must not push an
+    ///   accepted one into the breadcrumb tier before anyone has agreed to
+    ///   keep it. Budget is charged on acceptance, when the entry goes
+    ///   through the normal path.
+    /// * **No FTS row.** Nothing searches pending entries, and skipping the
+    ///   index makes discard a single `DELETE`. (The index is not 1:1 with
+    ///   the table anyway — tombstoning leaves its FTS row behind.)
+    ///
+    /// Validation is done here rather than deferred to acceptance so the
+    /// model learns immediately that an oversized or duplicate entry was
+    /// rejected, instead of the human discovering it at review time.
+    pub fn add_pending(
+        &self,
+        target: &str,
+        content: &str,
+        kind: Option<MemoryKind>,
+    ) -> Result<i64, String> {
+        scan_for_threats(content)?;
+        let trimmed = content.trim();
+        if trimmed.is_empty() {
+            return Err("Cannot add empty entry".to_string());
+        }
+        let entry = redact_for_fts(trimmed);
+
+        let char_limit = char_limit_for(target);
+        if entry.len() > char_limit {
+            return Err(format!(
+                "Entry is {} chars but the entire memory budget is {char_limit}; \
+                 split it into smaller entries.",
+                entry.len(),
+            ));
+        }
+
+        let mut conn = self.conn.lock_ignore_poison();
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("Failed to begin transaction: {e}"))?;
+
+        // Duplicate check spans active AND already-queued entries: without
+        // the second half, a review pass that runs every session would
+        // re-propose the same fact until it was accepted.
+        let active = Self::active_rows(&tx, target)?;
+        let pending = Self::pending_rows(&tx, target)?;
+        if active
+            .iter()
+            .chain(pending.iter())
+            .any(|r| r.content.trim().eq_ignore_ascii_case(entry.trim()))
+        {
+            return Err("Duplicate entry — already exists in memory".to_string());
+        }
+
+        let now = chrono::Utc::now().to_rfc3339();
+        tx.execute(
+            "INSERT INTO memories
+                (uid, target, kind, content, status, tier, salience,
+                 created_at, updated_at, use_count, confidence)
+             VALUES (?1, ?2, ?3, ?4, 'pending', 'hot', ?5, ?6, ?6, 0, ?7)",
+            params![
+                random_entry_id(),
+                target,
+                kind.unwrap_or_default().as_str(),
+                entry,
+                default_salience_for_kind(kind.unwrap_or_default()),
+                now,
+                DEFAULT_CONFIDENCE,
+            ],
+        )
+        .map_err(|e| format!("Failed to queue entry: {e}"))?;
+        let id = tx.last_insert_rowid();
+        tx.commit().map_err(|e| format!("Failed to commit: {e}"))?;
+        Ok(id)
+    }
+
+    fn pending_rows(conn: &Connection, target: &str) -> Result<Vec<ActiveRow>, String> {
+        Self::rows_where(conn, target, "status = 'pending'")
+    }
+
+    /// Every queued entry across both targets, oldest first.
+    pub fn list_pending(&self) -> Result<Vec<PendingEntry>, String> {
+        let conn = self.conn.lock_ignore_poison();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, target, kind, content FROM memories
+                 WHERE status = 'pending' ORDER BY target, id",
+            )
+            .map_err(|e| format!("Failed to read queue: {e}"))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(PendingEntry {
+                    id: row.get(0)?,
+                    target: row.get(1)?,
+                    kind: row.get(2)?,
+                    content: row.get(3)?,
+                })
+            })
+            .map_err(|e| format!("Failed to read queue: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to read queue: {e}"))?;
+        Ok(rows)
+    }
+
+    pub fn pending_count(&self) -> usize {
+        let conn = self.conn.lock_ignore_poison();
+        conn.query_row(
+            "SELECT COUNT(*) FROM memories WHERE status = 'pending'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|n| n as usize)
+        .unwrap_or(0)
+    }
+
+    /// Drop the whole queue. Called after a review has been applied — the
+    /// reviewed set is re-inserted through `add_entry`, so the queue rows
+    /// have served their purpose whether accepted, edited or rejected.
+    pub fn clear_pending(&self) -> Result<usize, String> {
+        let conn = self.conn.lock_ignore_poison();
+        conn.execute("DELETE FROM memories WHERE status = 'pending'", [])
+            .map_err(|e| format!("Failed to clear queue: {e}"))
     }
 
     /// Demote least-salient hot rows until a `cost`-char entry fits the

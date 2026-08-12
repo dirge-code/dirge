@@ -230,7 +230,7 @@ async fn memory_tool_registration_degrades_when_store_unavailable() {
 
     // Load failed → no tool, no panic.
     let mut tools: Vec<std::sync::Arc<dyn crate::agent::agent_loop::LoopTool>> = Vec::new();
-    register_memory_tool(&mut tools, None, None, None, None).await;
+    register_memory_tool(&mut tools, None, None, None, None, false).await;
     assert!(
         tools.is_empty(),
         "unavailable store must not register a memory tool"
@@ -249,7 +249,7 @@ async fn memory_tool_registration_degrades_when_store_unavailable() {
     let paths = crate::extras::dirge_paths::ProjectPaths::new(&dir);
     let store: std::sync::Arc<dyn crate::extras::memory_provider::MemoryProvider> =
         std::sync::Arc::new(crate::extras::memory_db::SqliteMemoryStore::load(&paths).unwrap());
-    register_memory_tool(&mut tools, Some(store), None, None, None).await;
+    register_memory_tool(&mut tools, Some(store), None, None, None, false).await;
     let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
     assert_eq!(names, vec!["memory"], "available store registers the tool");
     let _ = std::fs::remove_dir_all(&dir);

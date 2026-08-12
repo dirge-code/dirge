@@ -126,11 +126,14 @@ pub(crate) async fn register_memory_tool(
     global_store: Option<std::sync::Arc<dyn crate::extras::memory_provider::MemoryProvider>>,
     permission: Option<PermCheck>,
     ask_tx: Option<AskSender>,
+    confirm_writes: bool,
 ) {
     use crate::agent::agent_loop::{RigToolAdapter, types::ToolExecutionMode};
     match memory_store {
         Some(store) => {
-            let tool = tools::MemoryTool::new(store, permission, ask_tx).with_global(global_store);
+            let tool = tools::MemoryTool::new(store, permission, ask_tx)
+                .with_global(global_store)
+                .with_confirm_writes(confirm_writes);
             let adapter = RigToolAdapter::new(Box::new(tool))
                 .await
                 .with_execution_mode(ToolExecutionMode::Sequential);
@@ -156,12 +159,14 @@ pub(crate) async fn build_review_memory_tool(
     global_store: Option<std::sync::Arc<dyn crate::extras::memory_provider::MemoryProvider>>,
     permission: Option<PermCheck>,
     ask_tx: Option<AskSender>,
+    confirm_writes: bool,
 ) -> Option<std::sync::Arc<dyn crate::agent::agent_loop::LoopTool>> {
     use crate::agent::agent_loop::{RigToolAdapter, types::ToolExecutionMode};
     let store = memory_store?;
     let tool = tools::MemoryTool::new(store, permission, ask_tx)
         .with_global(global_store)
-        .with_review_actions(true);
+        .with_review_actions(true)
+        .with_confirm_writes(confirm_writes);
     let adapter = RigToolAdapter::new(Box::new(tool))
         .await
         .with_execution_mode(ToolExecutionMode::Sequential);
@@ -844,11 +849,19 @@ pub async fn build_loop_tools(
     // dirge-ygm3: build the review-enabled memory tool BEFORE `global_store` is
     // moved into the main registration. It is returned separately, never added
     // to `tools`.
+    // The gate applies to BOTH instances. The review fork is the one that
+    // writes unattended, so exempting it would miss the case this exists for.
+    let confirm_writes = cfg
+        .memory
+        .as_ref()
+        .and_then(|m| m.confirm_writes)
+        .unwrap_or(false);
     let review_memory_tool = build_review_memory_tool(
         memory_store.clone(),
         global_store.clone(),
         permission.clone(),
         ask_tx.clone(),
+        confirm_writes,
     )
     .await;
     register_memory_tool(
@@ -857,6 +870,7 @@ pub async fn build_loop_tools(
         global_store,
         permission.clone(),
         ask_tx.clone(),
+        confirm_writes,
     )
     .await;
 

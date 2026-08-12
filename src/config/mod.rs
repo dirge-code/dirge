@@ -515,6 +515,12 @@ pub struct MemoryConfig {
     /// snapshot). Surfaces relevant memory the agent wouldn't think to look
     /// up. Default off.
     pub verbatim_pre_recall: Option<bool>,
+    /// Require human confirmation before any `memory add` is stored. Entries
+    /// are queued instead, stay out of the prompt, and are accepted, edited,
+    /// rejected or added to via `/memory review`. Covers the background
+    /// review and memory curator forks as well as the agent's own writes.
+    /// Default off — it changes long-standing behavior.
+    pub confirm_writes: Option<bool>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]

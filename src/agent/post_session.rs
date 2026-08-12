@@ -178,6 +178,11 @@ pub fn spawn_post_session(
         // baked-in system-prompt block wouldn't otherwise reflect these
         // writes until a restart.
         crate::agent::agent_loop::context_manager::mark_memories_dirty();
+        // With `memory.confirm_writes` on, the review and curator passes above
+        // wrote proposals rather than memories. Say so — this is the moment
+        // the queue grows, and it grows while the user is watching the
+        // session wind down rather than driving it.
+        crate::ui::memory_review::notify_if_queued(&paths);
     });
 }
 

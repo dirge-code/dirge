@@ -52,6 +52,22 @@ pub trait MemoryProvider: Send + Sync {
     /// (types.ts:8-13); `None` defaults to `"procedural"`.
     fn add(&self, target: &str, content: &str, kind: Option<&str>) -> Result<Value, String>;
 
+    /// Queue an entry for human review instead of storing it, for
+    /// backends that support a review queue (`memory.confirm_writes`).
+    ///
+    /// Default errors rather than silently falling through to `add`: a
+    /// backend without a queue must not quietly store what the user asked
+    /// to have confirmed. The caller turns the error into a plain tool
+    /// error the model can read.
+    fn queue_for_review(
+        &self,
+        _target: &str,
+        _content: &str,
+        _kind: Option<&str>,
+    ) -> Result<Value, String> {
+        Err("This memory backend does not support review-queued writes".to_string())
+    }
+
     /// Replace an entry matched by substring. `old_text` must
     /// uniquely identify an entry; ambiguous matches error.
     /// `kind` is the UMP memory kind for the replacement entry;
@@ -224,6 +240,27 @@ impl MemoryProvider for super::memory_db::SqliteMemoryStore {
     fn add(&self, target: &str, content: &str, kind: Option<&str>) -> Result<Value, String> {
         let mkind = kind.and_then(super::memory_db::parse_kind);
         super::memory_db::SqliteMemoryStore::add(self, target, content, mkind)
+    }
+
+    fn queue_for_review(
+        &self,
+        target: &str,
+        content: &str,
+        kind: Option<&str>,
+    ) -> Result<Value, String> {
+        let mkind = kind.and_then(super::memory_db::parse_kind);
+        super::memory_db::SqliteMemoryStore::add_pending(self, target, content, mkind)?;
+        let waiting = super::memory_db::SqliteMemoryStore::pending_count(self);
+        // Say plainly that it is NOT stored. A model told only "ok" treats
+        // the fact as durable and will not mention it again — so if the
+        // human then rejects it, the knowledge is lost from both.
+        Ok(serde_json::json!({
+            "status": "queued_for_review",
+            "stored": false,
+            "awaiting_review": waiting,
+            "message": "Queued for the user to review. It is NOT in memory yet and \
+                        will only be stored if they accept it.",
+        }))
     }
 
     fn replace(
