@@ -1,0 +1,18 @@
+name: Audit dependencies
+description: >
+  Check Cargo.lock against published advisories (cargo-audit + OSV).
+
+  Shared by the CI and Release workflows rather than spelled out in each.
+  The release gate is only meaningful if it runs exactly what CI runs, and
+  two copies of a four-line job drift — which is the failure this whole
+  change exists to prevent.
+runs:
+  using: composite
+  steps:
+    - name: Audit dependencies
+      uses: pirafrank/audit-check-action@v1
+
+    - name: OSV vulnerability scan
+      uses: google/osv-scanner-action/osv-scanner-action@v2.3.8
+      with:
+        scan-args: "--lockfile=Cargo.lock --config=.osv-scanner.toml"

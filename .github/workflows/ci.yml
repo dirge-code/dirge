@@ -75,13 +75,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Audit dependencies
-        uses: pirafrank/audit-check-action@v1
-
-      - name: OSV vulnerability scan
-        uses: google/osv-scanner-action/osv-scanner-action@v2.3.8
-        with:
-          scan-args: "--lockfile=Cargo.lock --config=.osv-scanner.toml"
+      # Shared with the Release workflow's `preflight` gate — see
+      # .github/actions/audit. Keep the steps there, not here, so the gate
+      # cannot drift from what CI actually runs.
+      - uses: ./.github/actions/audit
 
   # The `validate_all_plugins_compile` Rust test (mod_tests.rs) loads every
   # plugin against the full dirge harness surface.  It runs in the
