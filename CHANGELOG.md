@@ -6,6 +6,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [0.21.18] - 2026-08-12
 
+### Security
+- Bumped `lru` to 0.18.2 for RUSTSEC-2026-0253, a panic-safety hole in
+  `LruCache::pop()`: if a key's `Drop` panics, `detach()` never runs and a
+  later eviction can dereference the freed node. It arrives transitively via
+  `ratatui-core` and is not reachable here — those cache keys have no
+  panicking `Drop` and nothing wraps them in `catch_unwind` — but the fix is a
+  semver-compatible patch, so there's no reason to carry it.
+
 ### Fixed
 - The mid-session memory refresh was busting the prompt cache on the
   Claude-Code/OAuth path. It was appended to `messages[]` as a `system`-role
