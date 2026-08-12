@@ -973,6 +973,46 @@ async fn run_compaction_pass_ignores_stale_generation_checkpoint() {
 /// provider. Every test that flips one of those globals holds this lock.
 static DIRTY_FLAG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// dirge-ugah.3: the silent-cache-miss predicate.
+///
+/// The signature of a miss is "wrote an entry, read nothing" — caching is
+/// demonstrably active (creation > 0) yet no read landed. A cold start looks
+/// identical, so a session too shallow to have written an entry yet is
+/// excluded.
+#[test]
+fn silent_cache_miss_flags_write_without_read_only_deep_in_a_session() {
+    let usage = |cached: u64, creation: u64| {
+        Some(TokenUsage {
+            input_tokens: 1_000,
+            output_tokens: 100,
+            cached_input_tokens: cached,
+            cache_creation_input_tokens: creation,
+        })
+    };
+    let deep = CACHE_MISS_MIN_MESSAGES + 1;
+
+    assert!(
+        is_silent_cache_miss(usage(0, 5_000), deep),
+        "wrote an entry, read none, deep in the session — that's the miss"
+    );
+    assert!(
+        !is_silent_cache_miss(usage(0, 5_000), CACHE_MISS_MIN_MESSAGES),
+        "a cold start also writes without reading; don't cry wolf"
+    );
+    assert!(
+        !is_silent_cache_miss(usage(20_000, 500), deep),
+        "a read landed — not a miss"
+    );
+    assert!(
+        !is_silent_cache_miss(usage(0, 0), deep),
+        "no cache activity at all (non-caching provider) is not a miss"
+    );
+    assert!(
+        !is_silent_cache_miss(None, deep),
+        "no usage reported — nothing to conclude"
+    );
+}
+
 /// dirge-ugah.2: the mid-session memory refresh must NOT be a `system`-role
 /// message.
 ///

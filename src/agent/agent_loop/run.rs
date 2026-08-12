@@ -49,8 +49,8 @@ use super::gate_state::{GateInputs, GateStates};
 use super::gate_tally::{BoundaryNudge, GateSource, GateTally};
 use super::inflight::InflightSet;
 use super::message::{
-    AssistantMessage, ContentBlock, LoopEvent, LoopMessage, StopReason, ToolResultMessage,
-    loop_message_to_value, tool_result_to_value,
+    AssistantMessage, ContentBlock, LoopEvent, LoopMessage, StopReason, TokenUsage,
+    ToolResultMessage, loop_message_to_value, tool_result_to_value,
 };
 use super::storm::StormBreaker;
 use super::stream::{StreamFn, stream_assistant_response};
@@ -2662,6 +2662,22 @@ pub async fn run_loop(
             .await;
             new_messages.push(LoopMessage::Assistant(assistant_msg.clone()));
 
+            // dirge-ugah.3: report a turn that wrote a cache entry but read
+            // none. Evidence-gathering, not a fix — see `is_silent_cache_miss`
+            // for the two mechanisms this is meant to distinguish.
+            if is_silent_cache_miss(token_usage, current_context.messages.len()) {
+                tracing::warn!(
+                    target: "dirge::cache",
+                    messages = current_context.messages.len(),
+                    cache_creation_tokens =
+                        token_usage.map_or(0, |u| u.cache_creation_input_tokens),
+                    uncached_input_tokens = token_usage.map_or(0, |u| u.input_tokens),
+                    "prompt-cache read miss: wrote a new entry, read none. Suspect the \
+                     20-block lookback window (a turn appending >20 content blocks) or \
+                     concurrent subagent fan-out",
+                );
+            }
+
             // Pi lines 196-200: error / aborted short-circuit.
             if matches!(
                 assistant_msg.stop_reason,
@@ -3654,6 +3670,40 @@ fn should_advise_untracked_work(
 /// Model-visible reminder injected into the conversation when the model is
 /// editing files without an active todo. Imperative tone matching the
 /// unfinished-todo nudge — tells the model to create a todo before continuing.
+/// How deep a conversation must be before a zero cache-read is suspicious
+/// rather than an ordinary cold start (dirge-ugah.3). A first turn writes an
+/// entry and reads nothing by definition; by this many messages the session
+/// has had at least one prior turn to write a readable prefix.
+const CACHE_MISS_MIN_MESSAGES: usize = 4;
+
+/// Whether a turn's usage is the signature of a *silent* prefix-cache miss
+/// (dirge-ugah.3): caching is demonstrably active — an entry was written —
+/// yet nothing was read back.
+///
+/// Two documented ways to lose an Anthropic cache read with no error to show
+/// for it:
+///
+/// - **The 20-block lookback window.** A breakpoint walks back at most 20
+///   content blocks to find a prior entry. A turn appending more than that —
+///   ten parallel tool calls is `assistant(text + 10 tool_use)` plus
+///   `user(10 tool_result)` = 21 blocks — pushes the previous breakpoint out
+///   of range. dirge's system prompt actively encourages parallel tool calls,
+///   and a single automatic breakpoint has no redundancy here.
+/// - **Concurrent fan-out.** An entry only becomes readable once the first
+///   response *begins streaming*, so K subagents launched together each pay
+///   the write instead of one write and K−1 reads.
+///
+/// Neither is confirmed to fire in practice, which is exactly why this
+/// reports rather than "fixes": the log is the evidence for deciding whether
+/// either needs a code change.
+fn is_silent_cache_miss(usage: Option<TokenUsage>, message_count: usize) -> bool {
+    usage.is_some_and(|u| {
+        u.cached_input_tokens == 0
+            && u.cache_creation_input_tokens > 0
+            && message_count > CACHE_MISS_MIN_MESSAGES
+    })
+}
+
 /// The mid-session memory-refresh message (dirge-ugah.2).
 ///
 /// A **user**-role message wrapping a `<system-reminder>` block, not a

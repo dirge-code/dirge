@@ -14,7 +14,7 @@ use crate::ui::theme;
 /// Render the cumulative cache report lines for a session. Pure so
 /// it can be unit-tested without a renderer. Returns one line per
 /// `Vec` entry.
-pub(crate) fn report_lines(session: &Session) -> Vec<String> {
+pub(crate) fn report_lines(session: &Session, ttl: crate::prompt_cache::CacheTtl) -> Vec<String> {
     match session.cache_hit_ratio() {
         None => vec![
             "cache: no provider usage recorded yet this session.".to_string(),
@@ -32,7 +32,13 @@ pub(crate) fn report_lines(session: &Session) -> Vec<String> {
                 format!("  cached input:  {cached} / {input} tokens"),
             ];
             if created > 0 {
-                lines.push(format!("  cache writes:  {created} tokens"));
+                // Name the TTL beside the tokens it is charged on: a 1h write
+                // costs 2x base input against 1.25x at 5m, so this is the knob
+                // driving the number on this line (dirge-ugah.4).
+                lines.push(format!(
+                    "  cache writes:  {created} tokens (ttl {})",
+                    ttl.label()
+                ));
             }
             lines
         }
@@ -40,7 +46,7 @@ pub(crate) fn report_lines(session: &Session) -> Vec<String> {
 }
 
 pub(crate) async fn cmd_cache(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
-    let lines = report_lines(ctx.session);
+    let lines = report_lines(ctx.session, crate::prompt_cache::ttl());
     for (i, line) in lines.iter().enumerate() {
         // First line in the accent/result color; continuation lines dim.
         let color = if i == 0 { c_result() } else { theme::dim() };
@@ -52,11 +58,12 @@ pub(crate) async fn cmd_cache(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::prompt_cache::CacheTtl;
 
     #[test]
     fn no_usage_reports_no_data() {
         let s = Session::new("p", "m", 0);
-        let lines = report_lines(&s);
+        let lines = report_lines(&s, CacheTtl::OneHour);
         assert!(
             lines[0].contains("no provider usage"),
             "expected no-data line, got: {lines:?}"
@@ -68,7 +75,7 @@ mod tests {
         let mut s = Session::new("p", "m", 0);
         s.record_token_usage(1000, 800, 0, 0);
         s.record_token_usage(500, 100, 0, 0);
-        let lines = report_lines(&s);
+        let lines = report_lines(&s, CacheTtl::OneHour);
         // 900 / 1500 = 60.0%
         assert!(lines[0].contains("60.0%"), "got: {lines:?}");
         assert!(lines[1].contains("900 / 1500"), "got: {lines:?}");
@@ -86,7 +93,7 @@ mod tests {
         let mut s = Session::new("anthropic", "claude-sonnet-4-6", 0);
         s.record_token_usage(500, 20_000, 1_000, 900);
         let total = 500 + 20_000 + 1_000;
-        let lines = report_lines(&s);
+        let lines = report_lines(&s, CacheTtl::OneHour);
         assert!(
             lines[1].contains(&format!("20000 / {total}")),
             "fraction must use the disjoint denominator, got: {lines:?}"
@@ -102,10 +109,36 @@ mod tests {
     fn shows_cache_writes_line_when_nonzero() {
         let mut s = Session::new("p", "m", 0);
         s.record_token_usage(1000, 200, 300, 0);
-        let lines = report_lines(&s);
+        let lines = report_lines(&s, CacheTtl::OneHour);
         assert!(
             lines.iter().any(|l| l.contains("cache writes:  300")),
             "got: {lines:?}"
+        );
+    }
+
+    /// dirge-ugah.4: the write line names the TTL in force. A 1h write costs
+    /// 2x base input against 1.25x at 5m, so without this a
+    /// `DIRGE_PROMPT_CACHE_TTL` A/B leaves no record of which arm produced
+    /// which numbers — and the 1h default stays unmeasurable.
+    #[test]
+    fn cache_writes_line_names_the_active_ttl() {
+        let mut s = Session::new("anthropic", "claude-sonnet-4-6", 0);
+        s.record_token_usage(500, 20_000, 1_000, 900);
+
+        let one_hour = report_lines(&s, CacheTtl::OneHour);
+        assert!(
+            one_hour
+                .iter()
+                .any(|l| l.contains("cache writes:") && l.contains("ttl 1h")),
+            "got: {one_hour:?}"
+        );
+
+        let five_min = report_lines(&s, CacheTtl::FiveMinutes);
+        assert!(
+            five_min
+                .iter()
+                .any(|l| l.contains("cache writes:") && l.contains("ttl 5m")),
+            "got: {five_min:?}"
         );
     }
 }
