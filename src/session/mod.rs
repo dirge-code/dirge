@@ -508,16 +508,30 @@ impl Session {
         if self.cumulative_input_tokens == 0 && cached == 0 {
             return None;
         }
+        Some(cached as f64 / self.prompt_token_total() as f64)
+    }
+
+    /// Total prompt tokens billed this session, under whichever usage
+    /// convention the provider reports (see [`Session::cache_hit_ratio`]
+    /// for why the two differ).
+    ///
+    /// This is the denominator behind the hit ratio, so anything rendering
+    /// a `cached / total` fraction must use it rather than
+    /// `cumulative_input_tokens`: under the disjoint convention that field
+    /// is only the *uncached remainder*, and the fraction then reads as
+    /// nonsense ("20000 / 500") beside a correct percentage. See
+    /// dirge-ugah.1.
+    pub fn prompt_token_total(&self) -> u64 {
+        let cached = self.cumulative_cached_input_tokens;
         let disjoint =
             self.cumulative_cache_creation_tokens > 0 || cached > self.cumulative_input_tokens;
-        let total = if disjoint {
+        if disjoint {
             self.cumulative_input_tokens
                 .saturating_add(cached)
                 .saturating_add(self.cumulative_cache_creation_tokens)
         } else {
             self.cumulative_input_tokens
-        };
-        Some(cached as f64 / total as f64)
+        }
     }
 
     /// Populate `message_store` from `messages` for legacy session

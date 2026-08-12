@@ -21,7 +21,10 @@ pub(crate) fn report_lines(session: &Session) -> Vec<String> {
             "  (the provider hasn't reported token usage, or no turn has run)".to_string(),
         ],
         Some(ratio) => {
-            let input = session.cumulative_input_tokens;
+            // The ratio's own denominator, not `cumulative_input_tokens` —
+            // under Anthropic's disjoint convention that field is only the
+            // uncached remainder (dirge-ugah.1).
+            let input = session.prompt_token_total();
             let cached = session.cumulative_cached_input_tokens;
             let created = session.cumulative_cache_creation_tokens;
             let mut lines = vec![
@@ -71,6 +74,28 @@ mod tests {
         assert!(lines[1].contains("900 / 1500"), "got: {lines:?}");
         // No cache-creation line when zero writes.
         assert_eq!(lines.len(), 2, "got: {lines:?}");
+    }
+
+    /// dirge-ugah.1: the printed fraction must share the printed
+    /// percentage's denominator. Anthropic reports the usage lanes
+    /// DISJOINT — `input_tokens` is only the uncached remainder — so the
+    /// total is input + cached + creation. Dividing by `input` alone
+    /// rendered "20000 / 500" underneath a correct "93.0%".
+    #[test]
+    fn anthropic_disjoint_fraction_shares_the_ratio_denominator() {
+        let mut s = Session::new("anthropic", "claude-sonnet-4-6", 0);
+        s.record_token_usage(500, 20_000, 1_000, 900);
+        let total = 500 + 20_000 + 1_000;
+        let lines = report_lines(&s);
+        assert!(
+            lines[1].contains(&format!("20000 / {total}")),
+            "fraction must use the disjoint denominator, got: {lines:?}"
+        );
+        let pct = 20_000.0 / total as f64 * 100.0;
+        assert!(
+            lines[0].contains(&format!("{pct:.1}%")),
+            "expected {pct:.1}%, got: {lines:?}"
+        );
     }
 
     #[test]
