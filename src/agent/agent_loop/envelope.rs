@@ -129,6 +129,13 @@ pub struct TurnEnvelope {
 /// the model-facing context only, is never emitted as a `LoopEvent`, and so
 /// never reaches the TUI attribution path those tags exist for.
 const ENVELOPE_OPEN: &str = "<turn_envelope version=\"1\">";
+
+/// Prefix identifying ANY version of a rendered envelope, for the replace-on-
+/// push path in `run::replace_context_note`. Deliberately version-free: a
+/// marker carrying `version="1"` would stop matching the moment the version
+/// bumped, and the failure would be silent accumulation of stale envelopes —
+/// the exact bug the replace path exists to prevent.
+pub const MARKER: &str = "<turn_envelope";
 const ENVELOPE_CLOSE: &str = "</turn_envelope>";
 
 /// Default budget in characters. Chars rather than tokens deliberately: the

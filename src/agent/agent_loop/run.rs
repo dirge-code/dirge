@@ -1364,6 +1364,40 @@ const EXEMPLAR_TOP_K: usize = 3;
 /// Comparing against the live context rather than remembering the last block
 /// pushed is deliberate: if compaction has since folded the earlier copy away,
 /// the block is genuinely absent and re-injecting it is the right call.
+/// Push a tail context note that REPLACES any earlier copy of itself.
+///
+/// [`push_context_note_if_absent`] appends when the block is not already
+/// present, which is right for the additive notes it was built for — another
+/// exemplar or another recalled memory is more knowledge, and an older one is
+/// still true. It is wrong for a block that states CURRENT state. After a `cd`
+/// or a `git switch` the previous turn envelope does not become merely
+/// redundant, it becomes FALSE, and leaving it in front of the new one hands
+/// the model two contradictory answers with the stale one first — strictly
+/// worse than the single stale answer the envelope exists to remove.
+///
+/// `marker` identifies prior copies (the block's opening tag). Messages that
+/// merely CONTAIN the marker as part of ordinary content are not at risk: only
+/// text-only user messages whose content STARTS with it are removed, and the
+/// marker is an XML open tag the harness itself emits.
+///
+/// Returns `false` (and leaves the context untouched) when an identical block
+/// is already the note in place — re-appending it would move it to the tail
+/// every turn and invalidate everything cached after it.
+pub(crate) fn replace_context_note(context: &mut Context, marker: &str, block: String) -> bool {
+    let msg = LoopMessage::User(super::message::UserMessage::text(block));
+    let value = loop_message_to_value(&msg);
+    if context.messages.iter().any(|m| m == &value) {
+        return false;
+    }
+    context.messages.retain(|m| {
+        !m.get("content")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|c| c.starts_with(marker))
+    });
+    context.messages.push(value);
+    true
+}
+
 fn push_context_note_if_absent(context: &mut Context, block: String) -> bool {
     let msg = LoopMessage::User(super::message::UserMessage::text(block));
     let value = loop_message_to_value(&msg);
@@ -2007,7 +2041,9 @@ pub async fn run_agent_loop(
                 "turn envelope over budget; sections dropped",
             );
         }
-        push_context_note_if_absent(&mut context, rendered.text);
+        // REPLACES rather than appends: a `cd` or `git switch` makes the
+        // previous envelope false, not merely redundant.
+        replace_context_note(&mut context, super::envelope::MARKER, rendered.text);
     }
 
     // Pi line 105: `currentContext.messages = [...context.messages, ...prompts]`.

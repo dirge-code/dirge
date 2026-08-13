@@ -8061,3 +8061,89 @@ async fn turn_envelope_is_not_persisted_into_returned_messages() {
         "the envelope was persisted into session history:\n{blob}"
     );
 }
+
+/// dirge-e31n.2 follow-up: the envelope states CURRENT state, so a second one
+/// must REPLACE the first, not sit after it.
+///
+/// `push_context_note_if_absent` is append-if-absent, which is right for the
+/// additive blocks it was built for (exemplars, recalled memory — more of them
+/// is more knowledge, and an older one is still true). It is wrong for the
+/// envelope: after a `cd` or a `git switch` the old block does not become
+/// merely redundant, it becomes FALSE, and leaving it in front of the new one
+/// hands the model two contradictory answers with the stale one first. That is
+/// strictly worse than the single stale answer R1 set out to remove.
+///
+/// Verified to discriminate: swapping `replace_context_note` for the
+/// append-only helper fails this with "the stale envelope survived".
+#[test]
+fn a_new_turn_envelope_replaces_the_previous_one() {
+    use crate::agent::agent_loop::envelope::{MARKER, SessionFacts};
+    use crate::agent::agent_loop::run::replace_context_note;
+
+    let on_a = SessionFacts {
+        cwd: Some("/repo".into()),
+        os: "linux".into(),
+        shell: None,
+        git_branch: Some("branch-a".into()),
+    };
+    let on_b = SessionFacts {
+        git_branch: Some("branch-b".into()),
+        ..on_a.clone()
+    };
+
+    let mut ctx = empty_context();
+    replace_context_note(&mut ctx, MARKER, on_a.to_envelope().expect("content").text);
+    assert_eq!(ctx.messages.len(), 1);
+
+    // A user turn lands between the two envelopes, as in a real run.
+    ctx.messages
+        .push(crate::agent::agent_loop::message::loop_message_to_value(
+            &LoopMessage::User(UserMessage::text("do the thing")),
+        ));
+
+    replace_context_note(&mut ctx, MARKER, on_b.to_envelope().expect("content").text);
+
+    let blob = ctx
+        .messages
+        .iter()
+        .map(|m| m.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !blob.contains("branch-a"),
+        "the stale envelope survived alongside the fresh one:\n{blob}"
+    );
+    assert!(blob.contains("branch-b"), "the fresh envelope is missing");
+    // The intervening user turn must NOT be collateral.
+    assert!(
+        blob.contains("do the thing"),
+        "replacing the envelope ate an unrelated message:\n{blob}"
+    );
+    assert_eq!(ctx.messages.len(), 2, "expected [user, envelope]");
+}
+
+/// The other side: an unchanged environment must not churn the context by
+/// removing and re-appending an identical block every turn — that would move
+/// it to the tail each turn and invalidate everything cached after it.
+#[test]
+fn an_unchanged_turn_envelope_is_left_alone() {
+    use crate::agent::agent_loop::envelope::{MARKER, SessionFacts};
+    use crate::agent::agent_loop::run::replace_context_note;
+
+    let facts = SessionFacts {
+        cwd: Some("/repo".into()),
+        os: "linux".into(),
+        shell: None,
+        git_branch: Some("main".into()),
+    };
+    let text = facts.to_envelope().expect("content").text;
+
+    let mut ctx = empty_context();
+    assert!(replace_context_note(&mut ctx, MARKER, text.clone()));
+    let before = ctx.messages.clone();
+    assert!(
+        !replace_context_note(&mut ctx, MARKER, text),
+        "an identical envelope must be a no-op"
+    );
+    assert_eq!(ctx.messages, before, "context churned on an unchanged turn");
+}
