@@ -58,7 +58,7 @@ set -euo pipefail
 #   -B  treatment arm overrides    (default: none)
 #   -b  dirge binary               (default target/debug/dirge)
 #   -t  max_agent_turns cap        (default 20)
-#   -s  scenario small|recon|recon-real|edit-large|denied  (default small)
+#   -s  scenario small|recon|recon-real|edit-large|denied|pinned  (default small)
 #   -C  extra arm "name:k=v,k=v" — repeatable. Reaches the N-arm reporting
 #       that already existed with no CLI route to it.
 #
@@ -124,11 +124,11 @@ while getopts "n:m:A:B:C:b:t:s:" opt; do
     t) MAXTURNS="$OPTARG" ;;
     s) SCENARIO="$OPTARG" ;;
     C) ARMS+=("$OPTARG") ;;
-    *) echo "usage: $0 [-n REPEATS] [-m MODELS] [-A OVERRIDES] [-B OVERRIDES] [-C name:OVERRIDES]... [-b BINARY] [-t MAXTURNS] [-s small|recon|recon-real|edit-large|denied]" >&2; exit 2 ;;
+    *) echo "usage: $0 [-n REPEATS] [-m MODELS] [-A OVERRIDES] [-B OVERRIDES] [-C name:OVERRIDES]... [-b BINARY] [-t MAXTURNS] [-s small|recon|recon-real|edit-large|denied|pinned]" >&2; exit 2 ;;
   esac
 done
 
-case "$SCENARIO" in small|recon|recon-real|edit-large|denied) ;; *) echo "error: -s must be small, recon, recon-real, edit-large, or denied" >&2; exit 2 ;; esac
+case "$SCENARIO" in small|recon|recon-real|edit-large|denied|pinned) ;; *) echo "error: -s must be small, recon, recon-real, edit-large, denied, or pinned" >&2; exit 2 ;; esac
 [ "$REPEATS" -ge 1 ] 2>/dev/null || { echo "error: -n must be a positive integer" >&2; exit 2; }
 command -v jq >/dev/null || { echo "error: jq required" >&2; exit 1; }
 [ -x "$BINARY" ] || { echo "error: dirge binary not found/executable: $BINARY (cargo build first)" >&2; exit 1; }
@@ -477,6 +477,53 @@ PYEOF
     cmp -s "$FIXTURE/src/config.py" "$FIXTURE/src/config.py.pristine" || { echo 0; return; }
     echo 1
   }
+elif [ "$SCENARIO" = "pinned" ]; then
+  # pinned — the lowest-variance scenario available, built for dirge-e31n.4.
+  #
+  # WHY IT EXISTS. Every other scenario measures token counts with a control
+  # spread around 2x the mean, because the variance chain is: the model chooses
+  # a different number of tool calls -> different turn count -> different token
+  # count. An A/A calibration on `small` returned input_tokens 56779..114017 on
+  # IDENTICAL config. A cache change shows up as tokens and hit rate and nothing
+  # else, so measuring one against that spread is measuring nothing.
+  #
+  # This scenario collapses the chain at its source by admitting exactly one
+  # sensible tool call. One small file, one fact inside it, one answer. There is
+  # no exploration to do and nothing to verify afterwards, so a run that behaves
+  # costs a fixed number of tokens and the arms can be compared on cost.
+  #
+  # It is deliberately a BAD scenario for steering questions — it is too easy to
+  # separate a good harness from a bad one. That is the trade: it measures cost
+  # precisely by measuring capability not at all. Do not read a steering result
+  # off it, and do not read a cost result off the others.
+  #
+  # FITNESS GATE: if an A/A on this scenario does not produce an input_tokens
+  # control spread well under the effect being claimed, it is not fit for its
+  # purpose and no cache result from it should be believed. Run
+  #   scripts/loop-ab.sh -n 6 -m <model> -s pinned
+  # with no -A/-B and read the dispersion row before trusting any epoch number.
+  mkdir -p "$FIXTURE/src"
+  {
+    for i in $(seq 1 40); do echo "setting_$i = value_$i"; done
+    echo "TARGET: quicksilver-lantern-49"
+    for i in $(seq 41 80); do echo "setting_$i = value_$i"; done
+  } > "$FIXTURE/src/config.txt"
+  cp -f "$FIXTURE/src/config.txt" "$FIXTURE/src/config.txt.pristine"
+  EXPECTED_VALUE="$(grep -oE 'quicksilver-[a-z]+-[0-9]+' "$FIXTURE/src/config.txt")"
+  FIXTURE_DESC="src/config.txt, 81 lines, one TARGET: line — single-read task"
+  TASK='src/config.txt contains exactly one line beginning with "TARGET:". Report the value after it. Do not modify any file. End your answer with a line: VALUE=<value>'
+
+  # Correct = the right value AND the file untouched. The second half is not
+  # decoration: a run that rewrote the file to make its answer true has not done
+  # the task, and without the check that failure scores as a pass.
+  check_correct() {
+    local out="$1" result got
+    result="$(jq -r 'select(.type=="result") | .result' "$out" 2>/dev/null || true)"
+    got="$(printf '%s' "$result" | grep -oE 'VALUE=[a-z0-9-]+' | tail -1 || true)"
+    [ "$got" = "VALUE=$EXPECTED_VALUE" ] || { echo 0; return; }
+    cmp -s "$FIXTURE/src/config.txt" "$FIXTURE/src/config.txt.pristine" || { echo 0; return; }
+    echo 1
+  }
 fi
 
 # ---- Undo whatever a run wrote, so each repeat starts from the same tree.
@@ -492,6 +539,10 @@ reset_fixture() {
     # run's edits and the collateral-damage checks go green for free.
     if [ -f "$FIXTURE/src/Panel.jsx.pristine" ]; then
       cp -f "$FIXTURE/src/Panel.jsx.pristine" "$FIXTURE/src/Panel.jsx"
+    fi
+  elif [ "$SCENARIO" = "pinned" ]; then
+    if [ -f "$FIXTURE/src/config.txt.pristine" ]; then
+      cp -f "$FIXTURE/src/config.txt.pristine" "$FIXTURE/src/config.txt"
     fi
   elif [ "$SCENARIO" = "denied" ]; then
     if [ -f "$FIXTURE/src/config.py.pristine" ]; then
@@ -993,6 +1044,34 @@ function prop(num, den) { return den > 0 ? num / den : 0 }
 # apostrophe ENDS it. The failure is silent in the worst way — awk still
 # parses, the report still exits 0, and the run prints per-repeat lines for
 # an hour before the comparison never appears. Caught after exactly that.
+# dirge-e31n.4: input tokens per TURN.
+#
+# Total input_tokens is approximately turns x per-turn-prompt-size, and the
+# per-turn prompt is large (~25k tokens: system prompt plus 73 tool schemas).
+# So one extra turn costs ~25k tokens and the total is dominated by turn count
+# rather than by anything about the prompt. An A/A on the `pinned` scenario --
+# built specifically to be tight -- still returned a control spread of 60484 on
+# a mean of 96812, essentially all of it explained by turns ranging 2..4.
+#
+# Which metric is right depends on what the change does. A change that alters
+# HOW MANY TURNS happen (R2, the capability projection) belongs on total tokens.
+# A change that alters WHAT A TURN COSTS (R3: cache keys, breakpoints, epoch)
+# belongs here, because dividing by turns removes the variance it does not
+# affect. Reporting only the total would have made every cache result
+# unmeasurable by construction.
+#
+# Computed from the arm MEANS rather than averaged per-row on purpose: a row
+# with zero turns (a run that died before its first turn) would otherwise divide
+# by zero and take the whole report with it.
+function tokperturn(key,    t) {
+  t = mean(key, 4)
+  return t > 0 ? sprintf("%.0f", mean(key, 21) / t) : "-"
+}
+function tokperturn_num(key,    t) {
+  t = mean(key, 4)
+  return t > 0 ? mean(key, 21) / t : 0
+}
+
 function hitrate(key,    inp) {
   inp = mean(key, 21)
   return inp > 0 ? sprintf("%.0f%%", 100 * mean(key, 22) / inp) : "-"
@@ -1088,6 +1167,8 @@ END {
     row("input_tokens", spread(ck, 21), spread(tk, 21), dir3(mean(ck, 21), mean(tk, 21), 1, 0.5, noisefloor(ck, 21)))
     row("cached_tokens", spread(ck, 22), spread(tk, 22), dir3(mean(ck, 22), mean(tk, 22), 0, 0.5, noisefloor(ck, 22)))
     row("cache_creation_tokens", spread(ck, 23), spread(tk, 23), dir3(mean(ck, 23), mean(tk, 23), 1, 0.5, noisefloor(ck, 23)))
+    row("input_tokens_per_turn", tokperturn(ck), tokperturn(tk),
+        dir3(tokperturn_num(ck), tokperturn_num(tk), 1, 0.5, 0))
     row("cache_hit_rate", hitrate(ck), hitrate(tk), "observed")
     # dirge-e31n.3: only meaningful on the `denied` scenario, where the arms
     # differ in what the prompt SAYS the model has. Lower is better: a call
@@ -1168,6 +1249,8 @@ END {
       row2("gates_fired", spread(ck, 20), spread(ek, 20), "mechanism")
       row2("input_tokens", spread(ck, 21), spread(ek, 21), dir3(mean(ck, 21), mean(ek, 21), 1, 0.5, noisefloor(ck, 21)))
       row2("cached_tokens", spread(ck, 22), spread(ek, 22), dir3(mean(ck, 22), mean(ek, 22), 0, 0.5, noisefloor(ck, 22)))
+      row2("input_tokens_per_turn", tokperturn(ck), tokperturn(ek),
+          dir3(tokperturn_num(ck), tokperturn_num(ek), 1, 0.5, 0))
       # dirge-l8l7.4: the guard above covers the EXTRA arm; control can be
       # absent for this model just as easily, and these divide by it too.
       row2("success_rate", rate(ck), rate(ek), pairdir(ok[ck], narm(ck), ok[ek], narm(ek), 0, 0.05, ratefloor(ck, ek)))

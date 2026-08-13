@@ -340,6 +340,33 @@ want "$out_lopsided" "and the other models still report"         '^== model: m1 
 # The other side: a complete pair must NOT be labelled absent.
 reject "$out_healthy" "a complete pair is not labelled absent" 'NOTE: control runs='
 
+# ---- input_tokens_per_turn (dirge-e31n.4). The steady fixture has identical
+# mean turns (9) in both arms and identical tokens (1000), so the ratio must be
+# identical too — that isolates the row from the mean-token row above.
+want "$out_steady" "tokens-per-turn divides tokens by turns" \
+  '^input_tokens_per_turn +111 +111 +flat$'
+# The turns fixture varies turns at FIXED tokens, which is exactly the case the
+# metric exists for: totals look equal while per-turn cost differs. Control
+# averages 9 turns, treatment 3 -> 111 vs 333, and MORE per turn is worse.
+row_t2() { printf '%s\t%s\t%s\t%s\t20\t0\t0\t0\t0\t0\t0\tVerifiedGreen\t3\t1\t1\t0\t2\tnominal\tnone\t0\t1000\t400\t0\t1\t0\n' "$@"; }
+{
+  row_t2 control   m1 1 9
+  row_t2 control   m1 2 9
+  row_t2 treatment m1 1 3
+  row_t2 treatment m1 2 3
+} > "$work/perturn.tsv"
+out_perturn="$(report "$work/perturn.tsv")"
+reject "$out_perturn" "the report ran to completion" 'REPORT-ABORTED'
+want "$out_perturn" "equal totals can still differ per turn" \
+  '^input_tokens_per_turn +111 +333 +worse$'
+differs "tokens-per-turn actually reads both columns" "$out_steady" "$out_perturn"
+# A zero-turn arm must not divide by zero and take the report down.
+row_t0() { printf '%s\t%s\t%s\t0\t0\t0\t0\t0\t0\t0\t0\tVerifiedGreen\t-\t0\t1\t0\t0\tnominal\tnone\t0\t0\t0\t0\t1\t0\n' "$@"; }
+{ row_t0 control m1 1; row_t0 treatment m1 1; } > "$work/zeroturn.tsv"
+out_zeroturn="$(report "$work/zeroturn.tsv")"
+reject "$out_zeroturn" "a zero-turn arm does not abort the report" 'REPORT-ABORTED'
+want   "$out_zeroturn" "and reports per-turn cost as unavailable" '^input_tokens_per_turn +- +-'
+
 # ---- Dispersion (dirge-e31n.1). The report was structurally blind to a
 # treatment whose effect is "the bad runs stop happening": dir3 gates on the
 # control spread, which is exactly what such a treatment removes.
