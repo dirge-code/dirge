@@ -131,6 +131,7 @@ fn build_config() -> LoopConfig {
         dynamic_tool_search: false,
         turn_envelope: false,
         turn_facts: false,
+        prompt_leak_detect: crate::agent::agent_loop::types::GateMode::Off,
         escalation_stream_fn: None,
         escalation_provider_name: None,
         escalation_pending: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -8515,4 +8516,197 @@ async fn unresolved_effects_are_counted_with_the_flag_off() {
             "turn_facts={turn_facts}: the mechanism gate must count either way:\n{line}"
         );
     }
+}
+
+// ── dirge-e31n.6: prompt-recitation detector ────────────────────────────
+//
+// The detector itself is unit-tested in `prompt_leak`. These cover the wiring:
+// that it is fed the real streamed text, that the mode controls what happens,
+// and that Blocking keeps the answer given BEFORE the recitation.
+
+/// A stream that emits the system prompt back, one chunk at a time, as a
+/// growing partial — the shape a real recitation arrives in.
+fn reciting_stream(preamble: &str, recite: &str) -> StreamFn {
+    let full = format!("{preamble}{recite}");
+    std::sync::Arc::new(move |_ctx, _opts| {
+        let full = full.clone();
+        let mut events: Vec<StreamEvent> = Vec::new();
+        let mut cut = 0usize;
+        let first = AssistantMessage::new(
+            vec![ContentBlock::Text {
+                text: String::new(),
+            }],
+            StopReason::Stop,
+        );
+        events.push(StreamEvent::Start {
+            partial: first.clone(),
+        });
+        while cut < full.len() {
+            cut = (cut + 40).min(full.len());
+            while !full.is_char_boundary(cut) {
+                cut += 1;
+            }
+            events.push(StreamEvent::Delta {
+                partial: AssistantMessage::new(
+                    vec![ContentBlock::Text {
+                        text: full[..cut].to_string(),
+                    }],
+                    StopReason::Stop,
+                ),
+                phase: crate::agent::agent_loop::message::DeltaPhase::TextDelta,
+            });
+        }
+        let done = AssistantMessage::new(
+            vec![ContentBlock::Text { text: full.clone() }],
+            StopReason::Stop,
+        );
+        events.push(StreamEvent::Done {
+            reason: StopReason::Stop,
+            message: done,
+            usage: None,
+        });
+        Box::pin(futures::stream::iter(events))
+    })
+}
+
+const LEAK_PROMPT: &str = "You are a coding agent operating inside a user's repository. Always read a file \
+     before you edit it, and never guess at a path you have not listed. When you change \
+     code you must run the project's tests and report the actual output rather than \
+     summarising it. Do not claim that something is verified unless you ran the check \
+     yourself in this session. If a tool call fails twice in a row, stop and diagnose \
+     the root cause instead of retrying the same call a third time. Prefer the smallest \
+     change that solves the problem, and leave the surrounding style alone.";
+
+async fn run_reciting(mode: GateMode) -> Vec<LoopMessage> {
+    let mut cfg = build_config();
+    cfg.prompt_leak_detect = mode;
+    let factory = reciting_stream("Here is the fix you asked for. ", LEAK_PROMPT);
+    let ctx = Context {
+        system_prompt: LEAK_PROMPT.to_string(),
+        messages: Vec::new(),
+        tools: Vec::new(),
+    };
+    let (tx, mut _rx) = mpsc::channel::<LoopEvent>(1024);
+    run_agent_loop(
+        vec![user("go")],
+        ctx,
+        cfg,
+        AbortSignal::new(),
+        &tx,
+        &factory,
+        None,
+        None,
+    )
+    .await
+}
+
+fn recited_text(msgs: &[LoopMessage]) -> String {
+    msgs.iter()
+        .filter_map(|m| match m {
+            LoopMessage::Assistant(a) => Some(a.text_joined()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+/// Blocking stops the recitation. The answer given BEFORE it must survive —
+/// truncating the whole turn would throw away real work to suppress a
+/// cosmetic failure.
+#[tokio::test]
+async fn blocking_truncates_a_recitation_but_keeps_the_answer() {
+    let out = recited_text(&run_reciting(GateMode::Blocking).await);
+    assert!(
+        out.contains("Here is the fix you asked for"),
+        "the real answer was discarded along with the recitation:\n{out}"
+    );
+    assert!(
+        !out.contains("leave the surrounding style alone"),
+        "the recitation ran to completion under Blocking:\n{out}"
+    );
+}
+
+/// Advisory detects and reports but changes nothing the model produced.
+/// Without this the mode is indistinguishable from Blocking.
+#[tokio::test]
+async fn advisory_records_the_leak_without_truncating() {
+    let out = recited_text(&run_reciting(GateMode::Advisory).await);
+    assert!(
+        out.contains("leave the surrounding style alone"),
+        "Advisory truncated the turn; it must only observe:\n{out}"
+    );
+}
+
+/// Off does no detection at all, and is byte-identical to Advisory's output
+/// (which also changes nothing) — the pair pins that Blocking is the only
+/// mode that alters the transcript.
+#[tokio::test]
+async fn off_is_identical_to_advisory_in_output() {
+    let off = recited_text(&run_reciting(GateMode::Off).await);
+    let advisory = recited_text(&run_reciting(GateMode::Advisory).await);
+    assert_eq!(off, advisory);
+    assert!(off.contains("leave the surrounding style alone"));
+}
+
+/// `Off` must be SILENT, not merely inert. Building the detector anyway and
+/// letting it log would leave a mode called "off" narrating every turn, and
+/// nothing else here would notice: a mutation removing the `Off` arm survived
+/// every other test, because the action is gated separately.
+#[tokio::test]
+async fn off_emits_no_detection_at_all() {
+    let line = {
+        let (cap, _guard) = crate::agent::agent_loop::gate_tally::tests::field_capture();
+        run_reciting(GateMode::Off).await;
+        cap.snapshot()
+    };
+    assert!(
+        !line.contains("reciting its system prompt"),
+        "Off still reported a detection:\n{line}"
+    );
+    // The other side: the same fixture under Advisory DOES report, so the
+    // assertion above is about the mode and not about the fixture.
+    let advisory = {
+        let (cap, _guard) = crate::agent::agent_loop::gate_tally::tests::field_capture();
+        run_reciting(GateMode::Advisory).await;
+        cap.snapshot()
+    };
+    assert!(
+        advisory.contains("reciting its system prompt"),
+        "Advisory reported nothing, so the check above is vacuous:\n{advisory}"
+    );
+}
+
+/// The detector must not fire on an ordinary answer, through the real loop —
+/// the unit tests cover the algorithm, this covers that it is fed the right
+/// text (feeding it the whole message including tool calls, say, would change
+/// what matches).
+#[tokio::test]
+async fn a_normal_answer_is_not_truncated_under_blocking() {
+    let mut cfg = build_config();
+    cfg.prompt_leak_detect = GateMode::Blocking;
+    let answer = "I looked at the parser and the failure is in the lexer: it treats a \
+                  trailing backslash as an escape even at end of input, so the last token \
+                  is never emitted. The fix is two lines in scan_string and the suite passes.";
+    let factory = reciting_stream("", answer);
+    let ctx = Context {
+        system_prompt: LEAK_PROMPT.to_string(),
+        messages: Vec::new(),
+        tools: Vec::new(),
+    };
+    let (tx, mut _rx) = mpsc::channel::<LoopEvent>(1024);
+    let msgs = run_agent_loop(
+        vec![user("go")],
+        ctx,
+        cfg,
+        AbortSignal::new(),
+        &tx,
+        &factory,
+        None,
+        None,
+    )
+    .await;
+    assert!(
+        recited_text(&msgs).contains("the suite passes"),
+        "a normal answer was truncated as a recitation"
+    );
 }

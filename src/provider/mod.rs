@@ -98,6 +98,8 @@ pub struct AnyAgent {
     /// Travels the same chain for the same reason; the config knob already
     /// ANDs it with `turn_envelope`, so this cannot be on alone.
     turn_facts: bool,
+    /// dirge-e31n.6: prompt-recitation detector mode; travels the same chain.
+    prompt_leak_detect: crate::agent::agent_loop::types::GateMode,
     /// Phase-3: per-session loaded-tool set. Allocated by
     /// `build_agent` when `dynamic_tool_search` is on, and
     /// shared with the `ToolSearchTool` instance registered in
@@ -354,6 +356,7 @@ impl AnyAgent {
             dynamic_tool_search: false,
             turn_envelope: false,
             turn_facts: false,
+            prompt_leak_detect: crate::agent::agent_loop::types::GateMode::Off,
             tool_def_filter: None,
             tool_search_registry: None,
             escalation_stream_fn: None,
@@ -743,6 +746,15 @@ impl AnyAgent {
     /// tool call whose effect could not be confirmed.
     pub fn with_turn_facts(mut self, enabled: bool) -> Self {
         self.turn_facts = enabled;
+        self
+    }
+
+    /// dirge-e31n.6: detect a model reciting its own system prompt.
+    pub fn with_prompt_leak_detect(
+        mut self,
+        mode: crate::agent::agent_loop::types::GateMode,
+    ) -> Self {
+        self.prompt_leak_detect = mode;
         self
     }
 

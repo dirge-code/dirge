@@ -1207,6 +1207,21 @@ pub struct Config {
     /// the means it sits under. See docs/verification-discipline.md.
     pub turn_facts: Option<bool>,
 
+    /// dirge-e31n.6: detect a model that stops answering and starts reciting
+    /// its own system prompt back at the user.
+    ///
+    /// `off` | `advisory` | `blocking`. **`off` by default.** `advisory`
+    /// records the detection and tells the user, letting the turn finish;
+    /// `blocking` also stops consuming the stream, so the recitation is
+    /// truncated rather than run to the output cap.
+    ///
+    /// Nobody has yet observed this in dirge — the flag exists so it can be
+    /// measured before it is trusted, which is why `advisory` (detect and
+    /// report, change nothing) is a mode rather than an afterthought. The
+    /// detector is deliberately hard to trip: see `agent_loop::prompt_leak`
+    /// for the measured margin, which is smaller than it looks.
+    pub prompt_leak_detect: Option<String>,
+
     /// Phase 4 part 2 (`docs/AGENTIC_LOOP_PLAN.md`): consecutive-turn
     /// threshold for the context-depth reminder system. `None`
     /// (default) keeps the feature OFF — long sessions get no
@@ -1736,6 +1751,24 @@ impl Config {
     /// of the tool set is rendered from the live catalog rather than a literal.
     pub fn resolve_capability_projection(&self) -> bool {
         self.capability_projection.unwrap_or(true)
+    }
+
+    /// Prompt-recitation detector (dirge-e31n.6). Default OFF. An
+    /// unrecognised value warns and falls back to off rather than to a mode
+    /// that changes behaviour.
+    pub fn resolve_prompt_leak_detect(&self) -> crate::agent::agent_loop::types::GateMode {
+        use crate::agent::agent_loop::types::GateMode;
+        match self.prompt_leak_detect.as_deref() {
+            None => GateMode::Off,
+            Some(raw) => GateMode::from_wire(raw).unwrap_or_else(|| {
+                tracing::warn!(
+                    target: "dirge::config",
+                    value = %raw,
+                    "unrecognised prompt_leak_detect; falling back to off",
+                );
+                GateMode::Off
+            }),
+        }
     }
 
     /// Unresolved-effect handoff (dirge-e31n.5). Default OFF pending

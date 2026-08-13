@@ -221,6 +221,15 @@ pub async fn stream_assistant_response(
     };
     let mut stream = active_stream_fn(llm_ctx, stream_options);
 
+    // dirge-e31n.6: watch the streamed text for the model reciting its own
+    // system prompt. Built once per turn (hashing the prompt is the expensive
+    // half) and only when armed, so an `Off` session does no work at all.
+    let mut leak_detector = match config.prompt_leak_detect {
+        super::types::GateMode::Off => None,
+        _ => super::prompt_leak::PromptLeakDetector::new(&context.system_prompt),
+    };
+    let mut leak_reported = false;
+
     // 5. Iterate events.
     let mut added_partial = false;
     // Latest partial snapshot — captured on Start/Delta so a
@@ -243,6 +252,49 @@ pub async fn stream_assistant_response(
             }
             StreamEvent::Delta { partial, phase } => {
                 last_partial = Some(partial.clone());
+                // Check BEFORE forwarding: under `Blocking` the point is to
+                // stop the recitation reaching the transcript and the screen,
+                // and a delta emitted first has already done both.
+                if let Some(det) = leak_detector.as_mut()
+                    && let Some(leak) = det.observe(&partial.text_joined())
+                    && !leak_reported
+                {
+                    leak_reported = true;
+                    tracing::warn!(
+                        target: "dirge::agent_loop::prompt_leak",
+                        run = leak.run,
+                        start_offset = leak.start_offset,
+                        mode = %config.prompt_leak_detect.as_str(),
+                        "model appears to be reciting its system prompt",
+                    );
+                    if config.prompt_leak_detect == super::types::GateMode::Blocking {
+                        // Finalize with the text BEFORE the recitation, which
+                        // is what `start_offset` is for. A bare `break` here
+                        // falls through to the stream-closed-without-Done
+                        // fallback, which synthesizes an EMPTY message — the
+                        // first cut did exactly that and threw the model's
+                        // real answer away to suppress the recitation, which
+                        // is a worse outcome than not detecting it.
+                        let full = partial.text_joined();
+                        let cut = leak.start_offset.min(full.len());
+                        // Offsets come from word-boundary segmentation so they
+                        // are already char boundaries; clamp defensively rather
+                        // than risk a panic on a slice in the stream path.
+                        let cut = (0..=cut)
+                            .rev()
+                            .find(|i| full.is_char_boundary(*i))
+                            .unwrap_or(0);
+                        let kept = AssistantMessage::new(
+                            vec![super::message::ContentBlock::Text {
+                                text: full[..cut].to_string(),
+                            }],
+                            StopReason::Stop,
+                        );
+                        finalize(context, &kept, added_partial, emit).await;
+                        final_message = Some((kept, None));
+                        break;
+                    }
+                }
                 if added_partial {
                     // Replace the last context message with the
                     // updated partial. Pi: `context.messages[

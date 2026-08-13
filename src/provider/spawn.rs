@@ -220,6 +220,7 @@ impl AnyAgent {
         cfg.dynamic_tool_search = self.dynamic_tool_search;
         cfg.turn_envelope = self.turn_envelope;
         cfg.turn_facts = self.turn_facts;
+        cfg.prompt_leak_detect = self.prompt_leak_detect;
         // Fresh-paste images ride on the active turn; the loop seeds
         // them as `UserPart::Image` parts. `asset_dir` lets the rig
         // boundary resolve every image ref (active + history) to base64.

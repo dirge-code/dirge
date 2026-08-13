@@ -284,6 +284,7 @@ pub async fn build_agent(
             }
             agent = agent.with_turn_envelope(cfg.resolve_turn_envelope());
             agent = agent.with_turn_facts(cfg.resolve_turn_facts());
+            agent = agent.with_prompt_leak_detect(cfg.resolve_prompt_leak_detect());
             if let Some(ds) = dyn_search {
                 agent.with_dynamic_tool_search(ds.filter, ds.registry)
             } else {
