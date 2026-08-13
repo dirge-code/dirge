@@ -1065,23 +1065,62 @@ fn serialize_conversation_truncates_huge_tool_results() {
     );
 }
 
-/// C6: a long full-conversation prefix is NOT truncated by the
-/// caller-side 6000-char cap any more. compress_messages no
-/// longer slices `conversation`; the full string reaches the
-/// summarizer. Regression test the unchanged-passthrough via
-/// serialize_conversation's length on a large input.
+/// C6, the half this test can actually see: `serialize_conversation` is a pure
+/// mapper with no length cap of its own.
+///
+/// It does NOT show that the full string reaches the summarizer, which is what
+/// this test's comment used to claim. At ~2000 chars the fixture is far too
+/// small to reach any downstream budget, so it passed all the way through
+/// dirge-5zca — where a fixed 128 KB cap in `oneshot_with_model` was dropping
+/// most of the conversation. That guarantee is pinned by
+/// `a_fold_sized_prompt_fits_the_summarizers_budget` below, which uses a
+/// fixture big enough to reach the cap.
 #[test]
 fn serialize_conversation_returns_full_prefix() {
     let msgs: Vec<SessionMessage> = (0..200)
         .map(|i| sm(MessageRole::Assistant, &format!("turn {i}"), vec![]))
         .collect();
     let out = summarize::serialize_conversation(&msgs);
-    // 200 turns × ~10 chars each = ~2000 chars; below the old
-    // 6000 cap but the principle still holds: the function is
-    // a pure mapper, no length cap. Confirm by checking the
-    // last turn is present.
     assert!(out.contains("turn 199"), "tail must be present: {out}");
     assert!(out.contains("turn 0"), "head must be present: {out}");
+}
+
+/// dirge-5zca: the cross-layer guarantee. `build_compaction_prompt` assembles
+/// the whole prefix and `oneshot_with_model` decides what fits — the bug lived
+/// in the seam between them, so the test has to span it too.
+///
+/// The fixture is sized at what a post-response fold actually hands over on a
+/// 128k-token model, and the first assertion exists to keep it that way: a
+/// fixture that stops reaching the old fixed cap makes the second assertion
+/// vacuous, which is exactly how the bug survived the test above.
+#[test]
+fn a_fold_sized_prompt_fits_the_summarizers_budget() {
+    use crate::provider::summarize::{ONESHOT_FALLBACK_BUDGET_BYTES, oneshot_prompt_budget_bytes};
+
+    // gpt-4o is 128_000 tokens; a fold hands over (0.75 * 128_000 - 20_000)
+    // tokens of conversation, ~304 KB at 4 bytes a token.
+    let body = "the quick brown fox jumps over the lazy dog. ".repeat(23); // ~1 KB
+    let msgs: Vec<SessionMessage> = (0..300)
+        .map(|i| sm(MessageRole::Assistant, &format!("turn {i}: {body}"), vec![]))
+        .collect();
+
+    let prompt = crate::provider::build_compaction_prompt(&msgs, None, None)
+        .expect("no delimiter in the fixture");
+
+    assert!(
+        prompt.len() > ONESHOT_FALLBACK_BUDGET_BYTES,
+        "fixture is too small to reach the budget under test ({} bytes) — the \
+         assertion below would pass without proving anything",
+        prompt.len(),
+    );
+    let budget = oneshot_prompt_budget_bytes("gpt-4o");
+    assert!(
+        prompt.len() <= budget,
+        "a fold-sized prompt ({} bytes) exceeds gpt-4o's summarizer budget \
+         ({budget} bytes) — {} bytes would be dropped silently",
+        prompt.len(),
+        prompt.len() - budget,
+    );
 }
 
 // ============================================================

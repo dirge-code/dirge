@@ -99,12 +99,18 @@ pub(crate) fn build_compaction_prompt(
     previous_summary: Option<&str>,
     instructions: Option<&str>,
 ) -> anyhow::Result<String> {
-    // C6 (audit fix): no more 6000-char truncation. A 300K-token session was
-    // previously summarized from ~1500 tokens of content — fidelity collapsed
-    // exactly when compaction was most needed. Feed the full prefix; the
-    // summarizer model has plenty of room unless the prefix itself is bigger
-    // than its window, in which case its own context-overflow path surfaces a
-    // real error rather than silently lying. Pi and opencode feed the full prefix.
+    // C6 (audit fix): no caller-side truncation here. A 300K-token session was
+    // once summarized from ~1500 tokens of content — fidelity collapsed exactly
+    // when compaction was most needed.
+    //
+    // This function assembles the WHOLE prefix; the size decision belongs to
+    // the layer that knows which model will read it, and lives in
+    // [`summarize::oneshot_prompt_budget_bytes`]. That split was a bug for as
+    // long as the budget was a fixed 128 KB (dirge-5zca): this comment used to
+    // claim an oversized prefix "surfaces a real error rather than silently
+    // lying", when in fact the middle was being dropped without a word on every
+    // model over about 70k tokens. The budget now tracks the summarizer's own
+    // window, and a truncation that still has to happen is logged.
     let conversation = summarize::serialize_conversation(messages);
 
     // `/compress <focus>` argument: free-form text after the slash command is a
