@@ -179,12 +179,33 @@ impl ToolCatalog {
     /// Deny matching goes through [`crate::permission::is_denied_by`] — the
     /// same predicate the enforcer uses — so the projection cannot describe a
     /// tool as available that the checker will refuse.
-    pub fn build(tools: &[Arc<dyn LoopTool>], deny: &[String]) -> Self {
+    /// `umbrellas` maps a set of tool names to the UMBRELLA name the
+    /// permission layer denies them under. MCP and plugin tools are never
+    /// denied by their concrete names — `prompts/plan.md` carries
+    /// `deny_tools: [..., mcp_tool, plugin_tool, ...]`, and the MCP adapter
+    /// probes `any_prompt_denied(&[concrete, qualified, "mcp_tool"])` while
+    /// the plugin adapter probes `&[concrete, "plugin_tool"]`.
+    ///
+    /// Matching only concrete names here reported every MCP tool as available
+    /// under a mode that refuses all of them — on this machine that was 39
+    /// tools announced as present when the count was actually zero. That is
+    /// the exact defect this module exists to remove, reintroduced by the
+    /// module removing it, and worse than the static list it replaced, which
+    /// at least never mentioned MCP at all.
+    pub fn build(
+        tools: &[Arc<dyn LoopTool>],
+        deny: &[String],
+        umbrellas: &[(&[String], &str)],
+    ) -> Self {
         let mut available: Vec<String> = Vec::new();
         let mut denied: Vec<String> = Vec::new();
         for t in tools {
             let name = t.name().to_string();
-            if crate::permission::is_denied_by(deny, &name) {
+            let under_denied_umbrella = umbrellas.iter().any(|(members, umbrella)| {
+                crate::permission::is_denied_by(deny, umbrella)
+                    && members.iter().any(|m| m == &name)
+            });
+            if crate::permission::is_denied_by(deny, &name) || under_denied_umbrella {
                 denied.push(name);
             } else {
                 available.push(name);
@@ -412,12 +433,25 @@ mod tests {
     }
 
     fn catalog(names: &[&'static str], deny: &[&str]) -> ToolCatalog {
+        catalog_with_umbrellas(names, deny, &[])
+    }
+
+    fn catalog_with_umbrellas(
+        names: &[&'static str],
+        deny: &[&str],
+        umbrellas: &[(&[&'static str], &'static str)],
+    ) -> ToolCatalog {
         let tools: Vec<Arc<dyn LoopTool>> = names
             .iter()
             .map(|n| Arc::new(Stub(n)) as Arc<dyn LoopTool>)
             .collect();
         let deny: Vec<String> = deny.iter().map(|s| s.to_string()).collect();
-        ToolCatalog::build(&tools, &deny)
+        let owned: Vec<(Vec<String>, &str)> = umbrellas
+            .iter()
+            .map(|(m, u)| (m.iter().map(|s| s.to_string()).collect(), *u))
+            .collect();
+        let refs: Vec<(&[String], &str)> = owned.iter().map(|(m, u)| (m.as_slice(), *u)).collect();
+        ToolCatalog::build(&tools, &deny, &refs)
     }
 
     /// A tool in two families reads to the model as two capabilities.
@@ -429,6 +463,59 @@ mod tests {
                 assert!(seen.insert(*m), "{m} appears in more than one family");
             }
         }
+    }
+
+    /// MCP and plugin tools are denied by UMBRELLA name, never by concrete
+    /// name. `prompts/plan.md` carries `deny_tools: [..., mcp_tool,
+    /// plugin_tool, ...]`, and the adapters probe
+    /// `any_prompt_denied(&[concrete, qualified, "mcp_tool"])`.
+    ///
+    /// The first version matched concrete names only, so under plan mode it
+    /// announced 39 extra tools as present when every one of them was
+    /// refused. That is the defect this module exists to remove, reintroduced
+    /// by the module removing it — and worse than the static list it replaced,
+    /// which never mentioned MCP at all.
+    #[test]
+    fn umbrella_denied_tools_are_not_announced_as_available() {
+        let mcp: &[&'static str] = &["lattice_query", "ori_add"];
+        let c = catalog_with_umbrellas(
+            &["read", "lattice_query", "ori_add"],
+            &["mcp_tool"],
+            &[(mcp, "mcp_tool")],
+        );
+        assert_eq!(
+            c.available(),
+            ["read"],
+            "MCP tools survived an umbrella deny"
+        );
+        assert_eq!(c.denied(), ["lattice_query", "ori_add"]);
+
+        let p = project(&c, DEFAULT_BUDGET_CHARS).expect("read remains");
+        assert!(
+            !p.content.contains("further tool(s)"),
+            "the projection announced extra tools that are all denied:\n{}",
+            p.content
+        );
+    }
+
+    /// The other side: without the umbrella in the deny list the same tools
+    /// ARE announced. Without this, the test above passes on a projection
+    /// that never announces anything.
+    #[test]
+    fn umbrella_tools_are_announced_when_the_umbrella_is_not_denied() {
+        let mcp: &[&'static str] = &["lattice_query", "ori_add"];
+        let c = catalog_with_umbrellas(
+            &["read", "lattice_query", "ori_add"],
+            &[],
+            &[(mcp, "mcp_tool")],
+        );
+        assert_eq!(c.available().len(), 3);
+        let p = project(&c, DEFAULT_BUDGET_CHARS).expect("has tools");
+        assert!(
+            p.content.contains("2 further tool(s)"),
+            "extra tools were not announced:\n{}",
+            p.content
+        );
     }
 
     /// The headline case, and the one dirge-cw7w hit by hand: plan mode denies
@@ -538,7 +625,7 @@ mod tests {
             .iter()
             .map(|n| Arc::new(Stub(n)) as Arc<dyn LoopTool>)
             .collect();
-        let c = ToolCatalog::build(&tools, &[]);
+        let c = ToolCatalog::build(&tools, &[], &[]);
         let p = project(&c, DEFAULT_BUDGET_CHARS).expect("has tools");
         let named = names.iter().filter(|n| p.content.contains(**n)).count();
         assert!(
@@ -606,7 +693,7 @@ mod tests {
             .iter()
             .map(|n| Arc::new(Stub(n)) as Arc<dyn LoopTool>)
             .collect();
-        let c = ToolCatalog::build(&tools, &[]);
+        let c = ToolCatalog::build(&tools, &[], &[]);
         let p = project(&c, DEFAULT_BUDGET_CHARS).expect("has tools");
         assert!(
             p.dropped.is_empty(),

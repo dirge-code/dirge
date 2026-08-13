@@ -182,7 +182,7 @@ pub async fn build_agent(
             // is on, `tool_def_filter` is `Some` and a
             // `ToolSearchTool` has been registered inside `tools`
             // with the same Arc.
-            let (loop_tools, dyn_search, review_memory_tool, mcp_tool_names) =
+            let (loop_tools, dyn_search, review_memory_tool, mcp_tool_names, plugin_tool_names) =
                 builder::build_loop_tools(
                     cache.clone(),
                     permission_for_loop,
@@ -223,6 +223,13 @@ pub async fn build_agent(
                 let catalog = crate::agent::capability_cards::ToolCatalog::build(
                     &loop_tools,
                     &context.current_prompt_deny_tools,
+                    // MCP and plugin tools are denied by UMBRELLA name, never
+                    // by concrete name — without these the projection reports
+                    // them all available under a mode that refuses them.
+                    &[
+                        (mcp_tool_names.as_slice(), "mcp_tool"),
+                        (plugin_tool_names.as_slice(), "plugin_tool"),
+                    ],
                 );
                 if let Some(projection) = crate::agent::capability_cards::project(
                     &catalog,
