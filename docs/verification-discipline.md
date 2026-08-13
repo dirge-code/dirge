@@ -514,6 +514,36 @@ The practical consequence: at n≤3 against a ~2× floor, effects justified by
 Prefer changes whose success criterion is **structural** — did the mechanism
 fire when it should, and stay silent otherwise — because those hold at n=1.
 
+**Building a scenario that forces the condition.** A mechanism check tells you
+the condition did not occur; it does not tell you how to make it occur, and that
+can be most of the work. Forcing an *unconfirmable side effect* — a command that
+changes something and then fails to report what it changed — took three attempts,
+and every failure was the model defending itself against an unbounded command:
+
+1. Pinning `timeouts.bash_secs=5` did nothing. That key is documented as the
+   default "when the call omits one", and the model passed `timeout: 60` of its
+   own. The command finished; the tool returned `exit=0`.
+2. Asking for "a timeout of 10 seconds" in the task made the model reach for the
+   *shell's* `timeout(1)` instead of the tool parameter. The command exits 124,
+   which the bash tool reports as an ordinary non-zero exit — not a tool error at
+   all, so still nothing to classify.
+3. What worked: say nothing about timeouts and pin `bash_secs` low. The two
+   bounds compose. If the model passes its own, that wins and still trips (the
+   script outlasts any sane value); if it uses a shell timeout or none, it passed
+   no tool timeout, so the configured one applies.
+
+Two things generalise. **A lever the model can overrule is not a lever** — check
+whether the knob you are pinning is a default or a bound before building a
+scenario on it. And **the scenario's difficulty is a variable you are setting**:
+a task that names the expected outcome ("it adds exactly ONE entry") makes the
+correct behaviour discoverable, and a model that would otherwise have failed may
+pass for that reason rather than because of the change under test.
+
+**Score the tree, not the answer.** For anything measuring a duplicated side
+effect, the correctness check must read the filesystem. A run that ran the script
+twice and then truthfully reported "2 lines" is the failure being measured; a
+check that only parses the model's prose scores it as a pass.
+
 **Gate co-occurrence.** Per-run totals cannot tell two gates that always fire at
 the same boundary from two that never overlap, and that distinction is where the
 ceiling lives. The ablation in [arXiv:2604.25850v4](https://arxiv.org/abs/2604.25850)
