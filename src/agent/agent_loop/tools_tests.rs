@@ -223,6 +223,7 @@ fn build_config() -> LoopConfig {
         repair_stats: std::sync::Arc::new(
             crate::agent::agent_loop::tool_input_repair::RepairStats::new(),
         ),
+        retry_stats: std::sync::Arc::new(crate::agent::agent_loop::tool_retry::RetryStats::new()),
         truncation_notes: std::sync::Arc::new(std::sync::Mutex::new(
             std::collections::HashMap::new(),
         )),
@@ -1644,4 +1645,287 @@ fn backfill_fills_all_when_none_answered() {
         back.iter().map(|r| r.tool_call_id.as_str()).collect();
     assert!(ids.contains("a") && ids.contains("b"));
     assert!(back.iter().all(|r| r.is_error));
+}
+
+// ===========================================================================
+// dirge-61sv: transient tool retry.
+//
+// The POLICY (which operations may be retried, the budget, the backoff) is
+// unit-tested in `tool_retry`. These tests cover the WIRING: that the
+// dispatcher actually consults it, that the safety gate survives the trip
+// through real dispatch, and that cancellation wins.
+//
+// The tool is named per-test, because `tool_operation` keys on the NAME —
+// `read` is an Operation::Read and `bash` is an Operation::Execute, and that
+// difference is the entire safety property.
+// ===========================================================================
+
+/// A tool that fails with `error` for its first `fail_times` calls and then
+/// succeeds. Counts every entry to `execute`, which is what the retry tests
+/// actually assert on.
+#[derive(Debug)]
+struct FlakyTool {
+    name: String,
+    error: String,
+    fail_times: usize,
+    calls: Arc<Mutex<usize>>,
+    /// Cancel the run's signal from INSIDE execute, before returning the
+    /// error. Models a cancel that lands while a tool is mid-flight — the
+    /// case where the tool's own error text, not the abort message, is what
+    /// the retry gate sees.
+    cancel_on_call: bool,
+}
+
+impl FlakyTool {
+    fn new(name: &str, error: &str, fail_times: usize) -> Self {
+        Self {
+            name: name.to_string(),
+            error: error.to_string(),
+            fail_times,
+            calls: Arc::new(Mutex::new(0)),
+            cancel_on_call: false,
+        }
+    }
+    fn cancelling(mut self) -> Self {
+        self.cancel_on_call = true;
+        self
+    }
+    fn call_count(&self) -> usize {
+        *self.calls.lock().unwrap()
+    }
+}
+
+impl LoopTool for FlakyTool {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn description(&self) -> &str {
+        "Flaky tool"
+    }
+    fn label(&self) -> &str {
+        "Flaky"
+    }
+    fn parameters(&self) -> &Value {
+        static EMPTY: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+        EMPTY.get_or_init(|| serde_json::json!({"type": "object"}))
+    }
+    fn execute<'a>(
+        &'a self,
+        _tool_call_id: &'a str,
+        _args: Value,
+        signal: AbortSignal,
+        _on_update: LoopToolUpdate,
+    ) -> Pin<Box<dyn Future<Output = Result<LoopToolResult, String>> + Send + 'a>> {
+        let calls = self.calls.clone();
+        let error = self.error.clone();
+        let fail_times = self.fail_times;
+        let cancel_on_call = self.cancel_on_call;
+        Box::pin(async move {
+            let n = {
+                let mut g = calls.lock().unwrap();
+                *g += 1;
+                *g
+            };
+            if cancel_on_call {
+                signal.cancel();
+            }
+            if n <= fail_times {
+                Err(error.clone())
+            } else {
+                Ok(LoopToolResult {
+                    content: vec![serde_json::json!({"type": "text", "text": "ok"})],
+                    details: serde_json::json!({}),
+                    terminate: None,
+                })
+            }
+        })
+    }
+}
+
+async fn dispatch_one(tool: Arc<dyn LoopTool>, name: &str, config: &LoopConfig) -> bool {
+    let context = build_context(tool);
+    let assistant_msg = AssistantMessage::new(
+        vec![ContentBlock::ToolCall {
+            id: "tool-1".to_string(),
+            name: name.to_string(),
+            arguments: serde_json::json!({}),
+        }],
+        StopReason::ToolUse,
+    );
+    let tool_calls = extract_tool_calls(&assistant_msg);
+    let (tx, _rx) = mpsc::channel::<LoopEvent>(256);
+    let batch = execute_tool_calls_sequential(
+        &context,
+        &assistant_msg,
+        &tool_calls,
+        config,
+        &AbortSignal::new(),
+        &tx,
+        &InflightSet::new(),
+    )
+    .await;
+    // `is_error` on the single result.
+    !batch.messages[0].is_error
+}
+
+/// A transient failure on a pure read is retried and recovers, and the
+/// recovery is counted.
+#[tokio::test]
+async fn transient_read_failure_is_retried_through_dispatch() {
+    let tool = Arc::new(FlakyTool::new("read", "operation timed out", 1));
+    let config = build_config();
+    let ok = dispatch_one(tool.clone(), "read", &config).await;
+    assert!(ok, "the retry should have recovered the call");
+    assert_eq!(tool.call_count(), 2, "one original call plus one retry");
+    let stats = config.retry_stats.snapshot();
+    assert_eq!(stats.attempted, 1);
+    assert_eq!(stats.recovered, 1, "a recovery must be attributed");
+}
+
+/// THE SAFETY PROPERTY, through real dispatch: a timed-out `bash` is never
+/// re-issued, because it may already have done the work.
+#[tokio::test]
+async fn timed_out_bash_is_never_retried_through_dispatch() {
+    let tool = Arc::new(FlakyTool::new("bash", "Command timed out after 120s", 1));
+    let config = build_config();
+    let ok = dispatch_one(tool.clone(), "bash", &config).await;
+    assert!(!ok, "the failure must reach the model, not be retried away");
+    assert_eq!(
+        tool.call_count(),
+        1,
+        "re-issuing a timed-out shell command can duplicate a committed effect"
+    );
+    assert_eq!(config.retry_stats.snapshot().attempted, 0);
+}
+
+/// The discriminating pair for the test above: identical error text, identical
+/// flakiness, only the tool differs. Without this, a build that retried
+/// nothing at all would pass `timed_out_bash_is_never_retried`.
+#[tokio::test]
+async fn the_bash_gate_is_about_the_tool_not_the_error_text() {
+    let text = "Command timed out after 120s";
+    let read = Arc::new(FlakyTool::new("read", text, 1));
+    let bash = Arc::new(FlakyTool::new("bash", text, 1));
+    let config = build_config();
+    dispatch_one(read.clone(), "read", &config).await;
+    dispatch_one(bash.clone(), "bash", &config).await;
+    assert_eq!(read.call_count(), 2);
+    assert_eq!(bash.call_count(), 1);
+}
+
+/// A non-transient failure is handed straight back. A file that is not there
+/// will not be there 250ms later, and the model needs to see that.
+#[tokio::test]
+async fn missing_file_is_not_retried_through_dispatch() {
+    let tool = Arc::new(FlakyTool::new("read", "No such file or directory", 1));
+    let config = build_config();
+    let ok = dispatch_one(tool.clone(), "read", &config).await;
+    assert!(!ok);
+    assert_eq!(tool.call_count(), 1);
+}
+
+/// A tool that never recovers spends its budget and stops — the call count is
+/// MAX_ATTEMPTS, not unbounded, and no recovery is claimed.
+#[tokio::test]
+async fn a_permanently_failing_read_stops_at_the_budget() {
+    let tool = Arc::new(FlakyTool::new("read", "operation timed out", usize::MAX));
+    let config = build_config();
+    let ok = dispatch_one(tool.clone(), "read", &config).await;
+    assert!(!ok);
+    assert_eq!(
+        tool.call_count(),
+        crate::agent::agent_loop::tool_retry::MAX_ATTEMPTS as usize
+    );
+    let stats = config.retry_stats.snapshot();
+    assert_eq!(
+        stats.attempted,
+        crate::agent::agent_loop::tool_retry::MAX_ATTEMPTS as u64 - 1
+    );
+    assert_eq!(stats.recovered, 0, "nothing recovered, so nothing to claim");
+}
+
+/// A call that succeeds first time is not a recovery. Counting it as one would
+/// make the stat report the feature working on every healthy run.
+#[tokio::test]
+async fn a_first_try_success_is_not_counted_as_a_recovery() {
+    let tool = Arc::new(FlakyTool::new("read", "unused", 0));
+    let config = build_config();
+    assert!(dispatch_one(tool.clone(), "read", &config).await);
+    assert_eq!(tool.call_count(), 1);
+    let stats = config.retry_stats.snapshot();
+    assert_eq!(stats.attempted, 0);
+    assert_eq!(stats.recovered, 0);
+}
+
+/// Cancellation wins over the retry budget: a signal that is already set must
+/// not be re-run, however transient the failure looks.
+#[tokio::test]
+async fn a_cancelled_call_is_not_retried() {
+    let tool = Arc::new(FlakyTool::new("read", "operation timed out", usize::MAX));
+    let context = build_context(tool.clone());
+    let assistant_msg = AssistantMessage::new(
+        vec![ContentBlock::ToolCall {
+            id: "tool-1".to_string(),
+            name: "read".to_string(),
+            arguments: serde_json::json!({}),
+        }],
+        StopReason::ToolUse,
+    );
+    let tool_calls = extract_tool_calls(&assistant_msg);
+    let (tx, _rx) = mpsc::channel::<LoopEvent>(256);
+    let config = build_config();
+    let signal = AbortSignal::new();
+    signal.cancel();
+    let _ = execute_tool_calls_sequential(
+        &context,
+        &assistant_msg,
+        &tool_calls,
+        &config,
+        &signal,
+        &tx,
+        &InflightSet::new(),
+    )
+    .await;
+    assert_eq!(
+        config.retry_stats.snapshot().attempted,
+        0,
+        "a cancelled run must not spend retry budget"
+    );
+}
+
+/// A cancel that lands WHILE the tool is running, with the tool returning
+/// transient-looking text of its own. This is the case the `is_cancelled`
+/// check in the retry loop exists for — the abort-message path is already
+/// refused by the class gate, so testing only that leaves the guard unproven.
+#[tokio::test]
+async fn a_cancel_during_execution_stops_the_retry() {
+    let tool = Arc::new(FlakyTool::new("read", "operation timed out", usize::MAX).cancelling());
+    let config = build_config();
+    let context = build_context(tool.clone());
+    let assistant_msg = AssistantMessage::new(
+        vec![ContentBlock::ToolCall {
+            id: "tool-1".to_string(),
+            name: "read".to_string(),
+            arguments: serde_json::json!({}),
+        }],
+        StopReason::ToolUse,
+    );
+    let tool_calls = extract_tool_calls(&assistant_msg);
+    let (tx, _rx) = mpsc::channel::<LoopEvent>(256);
+    let _ = execute_tool_calls_sequential(
+        &context,
+        &assistant_msg,
+        &tool_calls,
+        &config,
+        &AbortSignal::new(),
+        &tx,
+        &InflightSet::new(),
+    )
+    .await;
+    assert_eq!(
+        tool.call_count(),
+        1,
+        "a cancelled run kept retrying a transient failure"
+    );
+    assert_eq!(config.retry_stats.snapshot().attempted, 0);
 }

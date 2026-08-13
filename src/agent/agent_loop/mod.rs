@@ -71,6 +71,7 @@ pub mod thinking_budget;
 pub mod tool;
 pub mod tool_error_class;
 pub mod tool_input_repair;
+pub mod tool_retry;
 pub mod tools;
 pub mod types;
 pub mod verifier;

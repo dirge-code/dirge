@@ -180,8 +180,10 @@ pub async fn execute_tool_calls_sequential(
                 // LOOP-5: RAII guard ensures the inflight id is
                 // removed even on cancellation / panic / `?`-bail.
                 let _inflight = inflight.guard(&tool_call.id);
-                let executed =
-                    execute_prepared_tool_call(&tool, tool_call, &args, signal, emit).await;
+                let executed = execute_prepared_tool_call_with_retry(
+                    &tool, tool_call, &args, config, signal, emit,
+                )
+                .await;
                 let mut finalized = finalize_executed_tool_call(
                     context,
                     assistant_message,
@@ -229,6 +231,79 @@ pub async fn execute_tool_calls_sequential(
     ExecutedToolCallBatch {
         messages,
         terminate: should_terminate_tool_batch(&finalized_calls),
+    }
+}
+
+/// The text of a tool result, for classifying WHY it failed. Mirrors
+/// `run.rs`'s `tool_result_excerpt`, but reads the pre-conversion
+/// `LoopToolResult` shape (`content` is `Vec<Value>` of
+/// `{"type":"text","text":…}`) rather than the typed `ContentBlock`s.
+fn executed_result_text(result: &LoopToolResult) -> String {
+    result
+        .content
+        .iter()
+        .filter_map(|b| b.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Run a prepared tool call, retrying a TRANSIENT failure when re-running the
+/// tool cannot duplicate an effect (dirge-61sv).
+///
+/// The whole decision lives in [`super::tool_retry`] — see its docs for why
+/// this is gated on the tool's operation and not just on the error text. In
+/// short: a timeout does not mean the work did not happen, so only pure reads
+/// are eligible.
+///
+/// Cancellation is honoured in ONE place: the backoff races the abort signal
+/// rather than sleeping through it, so a cancelled run neither waits nor
+/// retries. An earlier cut also early-returned on `signal.is_cancelled()`
+/// right after the call — mutation testing showed that guard changes nothing,
+/// because the race already covers every path that reaches it, and it was
+/// actively slightly wrong: it discarded the recovery attribution for a retry
+/// that HAD succeeded before the run was cancelled. One encoding of a rule,
+/// not two.
+///
+/// Deliberately emits no extra `ToolExecutionStart`: the id is already live
+/// in the UI from the first attempt, and a second start for the same
+/// `tool_call_id` would render as a duplicate call rather than a retry. The
+/// retry is visible in the log and in `retry_stats` instead.
+async fn execute_prepared_tool_call_with_retry(
+    tool: &Arc<dyn LoopTool>,
+    tool_call: &ToolCall,
+    args: &Value,
+    config: &LoopConfig,
+    signal: &AbortSignal,
+    emit: &mpsc::Sender<LoopEvent>,
+) -> ExecutedOutcome {
+    let mut attempt: u32 = 1;
+    loop {
+        let outcome = execute_prepared_tool_call(tool, tool_call, args, signal, emit).await;
+        let excerpt = executed_result_text(&outcome.result);
+        if !super::tool_retry::should_retry(&tool_call.name, outcome.is_error, &excerpt, attempt) {
+            // Attribute the recovery only when a RETRY produced it — attempt
+            // 1 succeeding is just a tool working.
+            if attempt > 1 && !outcome.is_error {
+                config.retry_stats.record_recovery();
+            }
+            return outcome;
+        }
+        let wait = super::tool_retry::backoff(attempt);
+        tokio::select! {
+            biased;
+            _ = wait_for_cancel(signal.clone()) => return outcome,
+            _ = tokio::time::sleep(wait) => {}
+        }
+        config.retry_stats.record_attempt();
+        attempt += 1;
+        tracing::info!(
+            target: "dirge::agent_loop::tools",
+            tool = %tool_call.name,
+            tool_call_id = %tool_call.id,
+            attempt,
+            wait_ms = wait.as_millis() as u64,
+            "retrying transient tool failure",
+        );
     }
 }
 
@@ -911,10 +986,11 @@ pub async fn execute_tool_calls_parallel(
                 let call_id = tool_call.id.clone();
                 entries.push(Box::pin(async move {
                     let _guard = inflight_clone.guard(&call_id);
-                    let executed = execute_prepared_tool_call(
+                    let executed = execute_prepared_tool_call_with_retry(
                         &tool,
                         &tool_call_clone,
                         &args,
+                        &config_clone,
                         &signal_clone,
                         &emit_clone,
                     )

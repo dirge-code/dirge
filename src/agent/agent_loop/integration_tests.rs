@@ -73,6 +73,7 @@ fn build_config() -> LoopConfig {
         repair_stats: std::sync::Arc::new(
             crate::agent::agent_loop::tool_input_repair::RepairStats::new(),
         ),
+        retry_stats: std::sync::Arc::new(crate::agent::agent_loop::tool_retry::RetryStats::new()),
         truncation_notes: std::sync::Arc::new(std::sync::Mutex::new(
             std::collections::HashMap::new(),
         )),

@@ -30,6 +30,7 @@
 
 use crate::agent::agent_loop::tool_error_class::ErrorClass;
 use crate::agent::agent_loop::tool_input_repair::RepairStatsSnapshot;
+use crate::agent::agent_loop::tool_retry::RetryStatsSnapshot;
 
 /// Which finalization gate produced a run's follow-up. Mirrors the
 /// existing `FollowUpSource` in `run.rs`.
@@ -222,6 +223,10 @@ pub struct GateTally {
     errored_by_class: [u32; ErrorClass::ALL.len()],
     final_verification: Option<crate::agent::agent_loop::verifier::VerificationStatus>,
     repairs: Option<RepairStatsSnapshot>,
+    /// dirge-61sv: per-run transient-tool-retry counts, latched at run end
+    /// from `LoopConfig::retry_stats` — the dispatch cannot reach the tally,
+    /// exactly as with `repairs`.
+    retries: Option<RetryStatsSnapshot>,
     /// dirge-5mtx.7: the capability tier the estimator settled on for this
     /// run. OBSERVATION ONLY — nothing reads it back to change behaviour. It
     /// exists so tier distributions across models and scenarios can be
@@ -371,6 +376,12 @@ impl GateTally {
         self.repairs = snapshot;
     }
 
+    /// Latch the per-run transient-retry snapshot (dirge-61sv). Observation
+    /// only, like every other counter here.
+    pub fn set_retries(&mut self, snapshot: Option<RetryStatsSnapshot>) {
+        self.retries = snapshot;
+    }
+
     /// The model emitted tool-call-shaped TEXT instead of a native tool
     /// call, and it was scavenged into a real call.
     pub fn record_scavenged_call(&mut self) {
@@ -461,6 +472,7 @@ impl GateTally {
         // is absent (never set) emit zeros so the log line keeps a stable
         // shape a script can parse.
         let repairs = &self.repairs;
+        let retries = &self.retries;
         // Stable placeholder when unset, so the log line keeps one shape and
         // a scraper never has to cope with a missing field.
         let capability_tier = self.capability_tier.map_or("none", |t| t.as_str());
@@ -523,6 +535,12 @@ impl GateTally {
             repair_truncation_fixed = repairs.as_ref().map_or(0, |s| s.truncation_fixed),
             repair_invalid = repairs.as_ref().map_or(0, |s| s.invalid),
             repair_total_successful = repairs.as_ref().map_or(0, |s| s.total_successful()),
+            // dirge-61sv. `attempted` is the mechanism gate: zero means no
+            // transient read failure ever occurred, so any comparison of runs
+            // with and without the retry measured nothing. `recovered` is
+            // whether it earned the latency it spent.
+            tool_retries_attempted = retries.as_ref().map_or(0, |s| s.attempted),
+            tool_retries_recovered = retries.as_ref().map_or(0, |s| s.recovered),
         );
     }
 }

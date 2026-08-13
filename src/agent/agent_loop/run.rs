@@ -2371,6 +2371,7 @@ fn finish_tally(
     // verified nothing never inherits an earlier run's green.
     super::verifier::record_run_verification(config.session_id.as_deref(), verification);
     tally.set_repairs(Some(config.repair_stats.snapshot()));
+    tally.set_retries(Some(config.retry_stats.snapshot()));
     tally.emit();
 }
 

@@ -465,6 +465,11 @@ pub struct LoopConfig {
     /// null-strip), 0 invalid" at session close.
     pub repair_stats: std::sync::Arc<super::tool_input_repair::RepairStats>,
 
+    /// dirge-61sv: per-run transient-tool-retry counters. Same shape and same
+    /// reason as `repair_stats` — the dispatch has no access to the tally, so
+    /// the count rides here and is latched at run end.
+    pub retry_stats: std::sync::Arc<super::tool_retry::RetryStats>,
+
     /// dirge-7bwx review-fix #2: per-call notes from the
     /// loop-level truncation closer (`apply_truncation_repair` in
     /// `run.rs`). Keyed by tool_call_id. `prepare_tool_call`
@@ -777,6 +782,7 @@ impl std::fmt::Debug for LoopConfig {
             .field("storm_mutating_tools", &self.storm_mutating_tools)
             .field("storm_exempt_tools", &self.storm_exempt_tools)
             .field("repair_stats", &self.repair_stats)
+            .field("retry_stats", &self.retry_stats)
             .field("truncation_notes", &self.truncation_notes)
             .field(
                 "tool_def_filter",
@@ -853,6 +859,7 @@ impl Clone for LoopConfig {
             storm_mutating_tools: self.storm_mutating_tools.clone(),
             storm_exempt_tools: self.storm_exempt_tools.clone(),
             repair_stats: self.repair_stats.clone(),
+            retry_stats: self.retry_stats.clone(),
             truncation_notes: self.truncation_notes.clone(),
             tool_def_filter: self.tool_def_filter.clone(),
             dynamic_tool_search: self.dynamic_tool_search,
@@ -918,6 +925,7 @@ impl LoopConfig {
             storm_mutating_tools: None,
             storm_exempt_tools: None,
             repair_stats: std::sync::Arc::new(super::tool_input_repair::RepairStats::new()),
+            retry_stats: std::sync::Arc::new(super::tool_retry::RetryStats::new()),
             truncation_notes: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
@@ -1070,6 +1078,7 @@ mod tests {
             "storm_exempt_tools",
             "truncation_notes",
             "repair_stats",
+            "retry_stats",
         ] {
             assert!(
                 rendered.contains(field),
