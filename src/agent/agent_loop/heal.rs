@@ -94,14 +94,31 @@ pub fn shrink_oversized_tool_results(messages: &[Value], max_chars: usize) -> He
 /// 2. Loop transcript: `{"content": [{"type": "toolCall", "id": "c1", ...}, ...]}` content blocks
 ///
 /// Returns a set of IDs that need matching tool results to follow.
-fn extract_tool_call_ids(msg: &Value) -> Option<std::collections::HashSet<String>> {
-    // Legacy format: top-level tool_calls array
+/// Tool-call ids on an assistant message, each with the tool NAME when the
+/// message carries one.
+///
+/// The name is not decoration (dirge-pv03): the synthetic result this feeds
+/// tells the model what to do about a call that never returned, and the right
+/// answer depends entirely on whether re-running it can duplicate an effect.
+/// An empty name means "could not tell", which routes to the cautious message.
+fn extract_tool_call_ids(msg: &Value) -> Option<std::collections::HashMap<String, String>> {
+    // Legacy format: top-level tool_calls array. The name sits under
+    // `function.name` (OpenAI shape); `name` is accepted as a fallback.
     if let Some(calls) = msg.get("tool_calls").and_then(|c| c.as_array())
         && !calls.is_empty()
     {
-        let ids: std::collections::HashSet<String> = calls
+        let ids: std::collections::HashMap<String, String> = calls
             .iter()
-            .filter_map(|c| c.get("id").and_then(|id| id.as_str()).map(String::from))
+            .filter_map(|c| {
+                let id = c.get("id").and_then(|id| id.as_str())?;
+                let name = c
+                    .get("function")
+                    .and_then(|f| f.get("name"))
+                    .or_else(|| c.get("name"))
+                    .and_then(|n| n.as_str())
+                    .unwrap_or_default();
+                Some((id.to_string(), name.to_string()))
+            })
             .collect();
         if !ids.is_empty() {
             return Some(ids);
@@ -110,12 +127,14 @@ fn extract_tool_call_ids(msg: &Value) -> Option<std::collections::HashSet<String
 
     // Loop transcript format: content blocks with type: "toolCall"
     if let Some(blocks) = msg.get("content").and_then(|c| c.as_array()) {
-        let ids: std::collections::HashSet<String> = blocks
+        let ids: std::collections::HashMap<String, String> = blocks
             .iter()
             .filter_map(|b| {
                 let obj = b.as_object()?;
                 if obj.get("type").and_then(|t| t.as_str()) == Some("toolCall") {
-                    obj.get("id").and_then(|id| id.as_str()).map(String::from)
+                    let id = obj.get("id").and_then(|id| id.as_str())?;
+                    let name = obj.get("name").and_then(|n| n.as_str()).unwrap_or_default();
+                    Some((id.to_string(), name.to_string()))
                 } else {
                     None
                 }
@@ -127,6 +146,36 @@ fn extract_tool_call_ids(msg: &Value) -> Option<std::collections::HashSet<String
     }
 
     None
+}
+
+/// What to tell the model about a tool call whose result never arrived.
+///
+/// An interrupted call is the hardest case the side-effect taxonomy has
+/// (dirge-pv03): the result is not merely uninformative, it is ABSENT, so
+/// nothing anywhere records whether the call ran. [`super::side_effect`]
+/// answers it from the tool alone, which is all that survives here.
+///
+/// Before this, every interrupted call got "Treat as a transient failure and
+/// retry if needed" — correct for a read, and for a `bash`, a `write` or a
+/// `task` the exact advice that turns one `git push` into two. An empty or
+/// unrecognised name routes here as `Other`, which cannot mutate-or-not be
+/// proven, so it gets the cautious message.
+fn interrupted_call_note(tool_name: &str) -> &'static str {
+    use super::side_effect::{Completion, SideEffect, classify_effect};
+    match classify_effect(tool_name, Completion::CutOff) {
+        SideEffect::NoEffect => {
+            "tool result missing — the call was interrupted (cancelled, panic, or session-resume \
+             across a partial turn). This tool only reads, so nothing changed: retry it if you \
+             still need the answer."
+        }
+        SideEffect::Committed | SideEffect::Unknown => {
+            "tool result missing — the call was interrupted (cancelled, panic, or session-resume \
+             across a partial turn). It MAY HAVE ALREADY RUN: an interrupted call is not a call \
+             that did not happen, and this tool can change things. Do NOT simply re-issue it. \
+             CHECK the current state first — read the file, run the status command, look at the \
+             log — and only redo the work if it is genuinely not done."
+        }
+    }
 }
 
 /// Drop unpaired assistant.tool_calls and stray tool messages.
@@ -156,7 +205,7 @@ pub fn fix_tool_call_pairing(messages: &[Value]) -> (Vec<Value>, usize, usize) {
                         .or_else(|| nxt.get("toolCallId"))
                         .and_then(|id| id.as_str())
                         .unwrap_or("");
-                    if !needed.contains(id) {
+                    if !needed.contains_key(id) {
                         break;
                     }
                     needed.remove(id);
@@ -178,12 +227,12 @@ pub fn fix_tool_call_pairing(messages: &[Value]) -> (Vec<Value>, usize, usize) {
                     // N-result pair and doesn't 400.
                     out.push(msg.clone());
                     out.extend(candidates);
-                    for missing_id in &needed {
+                    for (missing_id, tool_name) in &needed {
                         let synthetic = serde_json::json!({
                             "role": "toolResult",
                             "tool_call_id": missing_id,
                             "toolCallId": missing_id,
-                            "content": "tool result missing — call was interrupted (cancelled, panic, or session-resume across a partial turn). Treat as a transient failure and retry if needed.",
+                            "content": interrupted_call_note(tool_name),
                             "is_error": true,
                         });
                         out.push(synthetic);
@@ -555,5 +604,119 @@ mod tests {
         assert_eq!(out[2]["tool_call_id"], "c2");
         assert_eq!(out[2]["is_error"], serde_json::Value::Bool(true));
         assert_eq!(out[3]["role"], "user");
+    }
+}
+
+#[cfg(test)]
+mod interrupted_effect_tests {
+    use super::*;
+
+    fn assistant_call(id: &str, name: &str) -> Value {
+        serde_json::json!({
+            "role": "assistant",
+            "content": [{"type": "toolCall", "id": id, "name": name, "arguments": {}}],
+        })
+    }
+
+    fn synthetic_for(id: &str, name: &str) -> String {
+        let (out, _, _) = fix_tool_call_pairing(&[assistant_call(id, name)]);
+        out.iter()
+            .find(|m| m.get("tool_call_id").and_then(Value::as_str) == Some(id))
+            .and_then(|m| m.get("content").and_then(Value::as_str))
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// dirge-pv03. THE BUG: the synthetic result for an interrupted call said
+    /// "Treat as a transient failure and retry if needed" for EVERY tool. For a
+    /// mutating one that is the duplicate-effect advice the whole side-effect
+    /// taxonomy exists to prevent — an interrupted `git push` resumed with
+    /// "retry if needed" is how one push becomes two.
+    ///
+    /// An interrupted call is the strongest possible case for it, too: the
+    /// result never arrived, so nothing anywhere records whether it ran.
+    #[test]
+    fn an_interrupted_mutating_call_is_not_told_to_retry() {
+        for tool in ["bash", "write", "edit", "apply_patch", "task"] {
+            let body = synthetic_for("c1", tool);
+            assert!(
+                !body.to_lowercase().contains("retry if needed"),
+                "{tool}: interrupted mutating call was told to retry:\n{body}"
+            );
+            assert!(
+                body.to_lowercase().contains("may have"),
+                "{tool}: must say the effect MAY have landed:\n{body}"
+            );
+            assert!(
+                body.to_lowercase().contains("check"),
+                "{tool}: must tell the model to check first:\n{body}"
+            );
+        }
+    }
+
+    /// The other side, and the one that makes the test above evidence rather
+    /// than "we removed the word retry". A pure read changed nothing however it
+    /// ended, so retrying it is correct and the advice should stay.
+    #[test]
+    fn an_interrupted_read_may_still_be_retried() {
+        for tool in ["read", "grep", "glob", "list_dir", "find_callers"] {
+            let body = synthetic_for("c1", tool);
+            assert!(
+                body.to_lowercase().contains("retry"),
+                "{tool}: a read is safe to retry and should say so:\n{body}"
+            );
+            assert!(
+                !body.to_lowercase().contains("may have"),
+                "{tool}: a read cannot have landed anything:\n{body}"
+            );
+        }
+    }
+
+    /// An unknown tool might do anything. The safe default is the cautious
+    /// message, not the retry one.
+    #[test]
+    fn an_interrupted_unknown_tool_gets_the_cautious_message() {
+        let body = synthetic_for("c1", "some_mcp_thing");
+        assert!(body.to_lowercase().contains("may have"), "{body}");
+        assert!(!body.to_lowercase().contains("retry if needed"), "{body}");
+    }
+
+    /// The legacy `tool_calls` shape carries the name under `function.name`.
+    /// Missing it would silently give every legacy-format resume the read
+    /// message, which is the unsafe direction.
+    #[test]
+    fn the_legacy_tool_calls_shape_is_classified_too() {
+        let msg = serde_json::json!({
+            "role": "assistant",
+            "tool_calls": [{"id": "c1", "type": "function",
+                            "function": {"name": "bash", "arguments": "{}"}}],
+        });
+        let (out, _, _) = fix_tool_call_pairing(&[msg]);
+        let body = out
+            .iter()
+            .find(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("c1"))
+            .and_then(|m| m.get("content").and_then(Value::as_str))
+            .unwrap_or_default();
+        assert!(
+            body.to_lowercase().contains("may have"),
+            "legacy shape fell through to the retry message:\n{body}"
+        );
+    }
+
+    /// A call whose name cannot be read at all must get the cautious message —
+    /// unknown provenance is not licence to assume it was safe.
+    #[test]
+    fn a_nameless_call_gets_the_cautious_message() {
+        let msg = serde_json::json!({
+            "role": "assistant",
+            "content": [{"type": "toolCall", "id": "c1", "arguments": {}}],
+        });
+        let (out, _, _) = fix_tool_call_pairing(&[msg]);
+        let body = out
+            .iter()
+            .find(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("c1"))
+            .and_then(|m| m.get("content").and_then(Value::as_str))
+            .unwrap_or_default();
+        assert!(body.to_lowercase().contains("may have"), "{body}");
     }
 }
