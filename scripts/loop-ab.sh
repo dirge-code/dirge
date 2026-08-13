@@ -59,6 +59,19 @@ set -euo pipefail
 #   -b  dirge binary               (default target/debug/dirge)
 #   -t  max_agent_turns cap        (default 20)
 #   -s  scenario small|recon|recon-real|edit-large|denied  (default small)
+#   -C  extra arm "name:k=v,k=v" — repeatable. Reaches the N-arm reporting
+#       that already existed with no CLI route to it.
+#
+# WHY EXTRA ARMS MATTER FOR THIS EPIC: features are expected to reinforce each
+# other, so the marginal effect of flag N measured alone understates the
+# cumulative effect of flags 1..N together. A two-arm A/B can only ever report
+# the marginal one. Run the cumulative arm alongside:
+#
+#   -B "turn_envelope=true" \
+#   -C "both:turn_envelope=true,capability_projection=true"
+#
+# and the report compares control-vs-B (marginal) and control-vs-both
+# (cumulative) in the same run, against the same control samples.
 #
 # With -A and -B both empty (or set the same) the two arms are identical —
 # an A/A calibration. RUN ONE BEFORE TRUSTING ANY A/B. On the recon-real
@@ -78,13 +91,21 @@ ARM_B=""
 BINARY="target/debug/dirge"
 MAXTURNS=20
 SCENARIO=small
+# Additional arms beyond control/treatment, as "name:overrides" strings
+# (dirge-e31n). MUST be declared even when empty: `"${ARMS[@]}"` on an UNSET
+# array under `set -u` is a hard error on bash 3.2, which is what /bin/bash
+# still is on macOS. The reference at the model loop existed with no
+# declaration anywhere, so on a stock macOS bash the harness died at the first
+# model iteration — after both arms had already run and been paid for. It
+# never fired here only because `#!/usr/bin/env bash` finds homebrew bash 5.3.
+ARMS=()
 # Extra CLI flags a scenario needs (e.g. `--prompt plan`). Word-split on
 # purpose at the call site; scenarios set it, nothing else does.
 EXTRA_ARGS=""
 
 BASE_CONFIG="${HOME}/.config/dirge/config.json"
 
-while getopts "n:m:A:B:b:t:s:" opt; do
+while getopts "n:m:A:B:C:b:t:s:" opt; do
   case "$opt" in
     n) REPEATS="$OPTARG" ;;
     m) MODELS="$OPTARG" ;;
@@ -93,7 +114,8 @@ while getopts "n:m:A:B:b:t:s:" opt; do
     b) BINARY="$OPTARG" ;;
     t) MAXTURNS="$OPTARG" ;;
     s) SCENARIO="$OPTARG" ;;
-    *) echo "usage: $0 [-n REPEATS] [-m MODELS] [-A OVERRIDES] [-B OVERRIDES] [-b BINARY] [-t MAXTURNS] [-s small|recon|recon-real|edit-large|denied]" >&2; exit 2 ;;
+    C) ARMS+=("$OPTARG") ;;
+    *) echo "usage: $0 [-n REPEATS] [-m MODELS] [-A OVERRIDES] [-B OVERRIDES] [-C name:OVERRIDES]... [-b BINARY] [-t MAXTURNS] [-s small|recon|recon-real|edit-large|denied]" >&2; exit 2 ;;
   esac
 done
 
@@ -897,6 +919,40 @@ function dir3(c, t, lower_is_better, eps, noise,    d) {
 # sample size could honestly distinguish from chance.
 function noisefloor(ck, c) { return mx[ck,c] - mn[ck,c] }
 
+# --- Dispersion (dirge-e31n.1) -------------------------------------------
+#
+# dir3 gates every direction on the CONTROL arm own spread. That correctly
+# kills a mean-shift claim smaller than the noise, but it makes this report
+# STRUCTURALLY BLIND to the opposite shape: a treatment whose whole effect is
+# that the bad runs stop happening is compared against exactly the spread it
+# removed, so it can never be labelled better however large the effect.
+#
+# Measured, not hypothetical. The R2 round-3 A/B read ~noise on every metric
+# while control ran 4..15 turns against treatment 4..5, and 102k..426k input
+# tokens against 102k..134k. A reader had to notice that in the parentheses;
+# the summary could not say it.
+#
+# Range rather than a variance estimate because n is 4..6 in practice, where a
+# proper dispersion statistic is not meaningfully better than max-min and is
+# much harder to read. The thresholds are a FACTOR OF TWO in either direction,
+# which at this n is a real difference rather than a coin flip — deliberately
+# coarser than the mean rules, because this is a weaker statistic and should
+# claim less.
+function spreadof(key, c) { return n[key] ? mx[key,c] - mn[key,c] : 0 }
+function dispdir(ck, tk, c,    cs, ts) {
+  # Needs at least two runs per arm; one run has no spread to speak of.
+  if (narm(ck) < 2 || narm(tk) < 2) return "n/a (need 2+ runs)"
+  cs = spreadof(ck, c); ts = spreadof(tk, c)
+  if (cs == 0 && ts == 0) return "flat"
+  # A control that never varied gives nothing to be steadier than, so only the
+  # noisier direction is claimable.
+  if (cs == 0) return "noisier"
+  if (ts <= cs / 2) return "steadier"
+  if (ts >= cs * 2) return "noisier"
+  return "~same"
+}
+function dispfmt(key, c) { return sprintf("%.0f", spreadof(key, c)) }
+
 # Noise floor for a PROPORTION (success rate, green rate). These are binary
 # per run, so the control arm spread is usually 0 or 1 and tells you nothing —
 # a different floor is needed. The smallest movement the sample can express is
@@ -1032,6 +1088,23 @@ END {
     row("capability_tier", tierdist(ck), tierdist(tk), "observed")
     row("tally_found", sprintf("%d/%d", tallyfound[ck], n[ck]), sprintf("%d/%d", tallyfound[tk], n[tk]), "must be full")
     row("session_found", sessdist(ck), sessdist(tk), "must be full")
+
+    # RUN-TO-RUN SPREAD. Read this before accepting a page of ~noise: a change
+    # that removes the bad runs shows up here and nowhere else above.
+    printf "\n%-26s %-26s %-26s %s\n", "dispersion (max-min)", "control", "treatment", "delta"
+    ndisp = split("4 5 6 9 21", dispcols, " ")
+    split("turns tool_calls errored_tool_calls max_failure_streak input_tokens", dispnames, " ")
+    steadier = 0; noisier = 0
+    for (di = 1; di <= ndisp; di++) {
+      dc = dispcols[di]
+      dv = dispdir(ck, tk, dc)
+      if (dv == "steadier") steadier++
+      else if (dv == "noisier") noisier++
+      printf "%-26s %-26s %-26s %s\n", dispnames[di], dispfmt(ck, dc), dispfmt(tk, dc), dv
+    }
+    if (steadier > 0 || noisier > 0) {
+      printf "  treatment is steadier on %d metric(s), noisier on %d — spread is a WEAKER signal than the means above, so read it as a hint to raise n, not as a result.\n", steadier, noisier
+    }
 
     # dirge-1elu.6: co-occurrence per arm — which gates and nudges fired
     # together at one decision point, with counts. An arm whose boundaries

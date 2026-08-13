@@ -184,6 +184,43 @@ out_legacy="$(report "$work/legacy.tsv")"
   row_denied treatment m1 2 VerifiedGreen 1 1 'Verifier+Critic' 3 0
 } > "$work/denied.tsv"
 
+# STEADY: the two arms have the SAME mean turns (9) but very different spread
+# — control 4..14, treatment 8..10. Same mean is the point: it isolates the
+# dispersion rows from the mean rows, so a dispersion verdict cannot be
+# satisfied by a mean shift leaking into it.
+row_turns() { # tag model repeat turns
+  printf '%s\t%s\t%s\t%s\t20\t0\t0\t0\t0\t0\t0\tVerifiedGreen\t3\t1\t1\t0\t2\tnominal\tnone\t0\t1000\t400\t0\t1\t0\n' "$@"
+}
+{
+  row_turns control   m1 1 4
+  row_turns control   m1 2 14
+  row_turns control   m1 3 9
+  row_turns treatment m1 1 8
+  row_turns treatment m1 2 10
+  row_turns treatment m1 3 9
+} > "$work/steady.tsv"
+
+# NOISY: the same fixture with the arms SWAPPED, so the verdict must invert.
+# Without this, "steadier" could be printed unconditionally and still pass.
+{
+  row_turns control   m1 1 8
+  row_turns control   m1 2 10
+  row_turns control   m1 3 9
+  row_turns treatment m1 1 4
+  row_turns treatment m1 2 14
+  row_turns treatment m1 3 9
+} > "$work/noisy.tsv"
+
+# SINGLE: one run per arm. There is no spread to speak of at n=1 and the
+# report must say so rather than calling a zero range "steadier".
+{
+  row_turns control   m1 1 9
+  row_turns treatment m1 1 9
+} > "$work/single.tsv"
+
+out_steady="$(report "$work/steady.tsv")"
+out_noisy="$(report "$work/noisy.tsv")"
+out_single="$(report "$work/single.tsv")"
 out_denied="$(report "$work/denied.tsv")"
 out_pretoken="$(report "$work/pretoken.tsv")"
 out_tokens="$(report "$work/tokens.tsv")"
@@ -255,7 +292,7 @@ fi
 # ---- Nothing below means anything if the report did not run. Checked first
 # and for every fixture, because an awk abort produces no rows at all and
 # every `reject` would then pass vacuously.
-for fx in healthy sick lopsided order mech legacy blank truncated pretoken tokens nosession denied; do
+for fx in healthy sick lopsided order mech legacy blank truncated pretoken tokens nosession denied steady noisy single; do
   eval "reject \"\$out_$fx\" \"the $fx report ran to completion\" 'REPORT-ABORTED'"
 done
 
@@ -302,6 +339,23 @@ want "$out_lopsided" "its rate delta reads n/a, not a number"    '^success_rate 
 want "$out_lopsided" "and the other models still report"         '^== model: m1 ==$'
 # The other side: a complete pair must NOT be labelled absent.
 reject "$out_healthy" "a complete pair is not labelled absent" 'NOTE: control runs='
+
+# ---- Dispersion (dirge-e31n.1). The report was structurally blind to a
+# treatment whose effect is "the bad runs stop happening": dir3 gates on the
+# control spread, which is exactly what such a treatment removes.
+want "$out_steady" "a dispersion section is printed" '^dispersion \(max-min\) +control +treatment +delta$'
+want "$out_steady" "a narrower treatment reads steadier"  '^turns +10 +2 +steadier$'
+want "$out_steady" "and the means are still ~noise"       '^turns +9\.0 \(4\.\.14\) +9\.0 \(8\.\.10\) +(~noise|flat)$'
+# Swapping the arms must invert the verdict. This is the assertion that makes
+# the one above evidence rather than a constant string.
+want "$out_noisy"  "a wider treatment reads noisier"      '^turns +2 +10 +noisier$'
+differs "the dispersion verdict actually reads the arms" "$out_steady" "$out_noisy"
+# n=1 has no spread; saying "steadier" off a zero range would be a fabrication.
+want   "$out_single" "n=1 refuses a dispersion verdict"   '^turns +0 +0 +n/a \(need 2\+ runs\)$'
+reject "$out_single" "and claims neither direction"       '^turns +0 +0 +(steadier|noisier)$'
+# The roll-up counts, and must not appear when nothing moved.
+want   "$out_steady" "the roll-up counts steadier metrics" 'treatment is steadier on [1-9][0-9]* metric'
+reject "$out_single" "no roll-up when no verdict was possible" 'treatment is steadier on'
 
 # ---- denied_tool_attempts (dirge-e31n.3). Fewer attempts at tools the mode
 # refuses is better, and the row must read col 25 rather than any of the
