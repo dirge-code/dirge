@@ -232,12 +232,9 @@ impl TurnEnvelope {
                     dropped.push(victim.tag());
                 }
             }
-            match assemble(&keep) {
-                Some(t) => text = t,
-                // Everything was dropped: there is no envelope left to
-                // push. Report `None` rather than an empty wrapper.
-                None => return None,
-            }
+            // Everything was dropped: there is no envelope left to push.
+            // Report `None` rather than an empty wrapper.
+            text = assemble(&keep)?;
         }
         Some(Rendered { text, dropped })
     }
