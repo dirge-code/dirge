@@ -39,9 +39,25 @@
 //!      `storm_suppressions`: the model tried a native dispatch but to a
 //!      non-existent tool, or had to be reined in from rapid-fire repeats.
 //!      Wrong, but still inside the dispatch grammar.
-//!    - **Weakest (weight 1)** — `errored_tool_calls` and `repair_successful`:
-//!      a call ran and failed (often environmental, often transient), or the
+//!    - **Weakest (weight 1)** — most errored calls and `repair_successful`: a
+//!      call ran and failed (often environmental, often transient), or the
 //!      model fumbled and then *recovered*. Friction, not stuckness.
+//!    - **One exception (weight 2)** — an errored call classified
+//!      [`ErrorClass::MissingInfo`]. See below.
+//!
+//!    Errored calls are NOT one signal. They arrive split by
+//!    [`ErrorClass`], and `MissingInfo` — the call named a file, symbol or
+//!    pattern that is not there — scores double. That class is the *wandering*
+//!    tell: the model is operating on a wrong picture of the tree, and it is
+//!    the one failure mode no other counter here can see. A wandering run
+//!    emits many DIFFERENT well-formed calls, so `storm` sees no repeat,
+//!    `scavenge` and `repair` see nothing malformed, and the streak never
+//!    reaches three because the occasional call does succeed. Every other
+//!    class stays at weight 1 on purpose: a timeout or an `EACCES` says
+//!    something about the environment, not about the model, and raising them
+//!    would lower the bar for genuine friction — the exact mistake this weight
+//!    is meant to avoid. `Unclassified` stays at 1 too, which is what keeps
+//!    unrecognised errors byte-identical to before classification existed.
 //!
 //! 3. **Hysteresis.** A single bad observation must not yank a coping run into
 //!    [`CapabilityTier::Struggling`], nor must a single clean observation
@@ -106,11 +122,37 @@
 //! Every weight, floor, threshold and ratio is a named constant below — there
 //! are no magic numbers in the body. Tuning happens in one place.
 
+use super::tool_error_class::ErrorClass;
+
 // --- weights: how damning each failure signal is (see principle 2 above) ---
 
-/// Weight for `errored_tool_calls`. Weakest: a call ran and failed, often for
-/// environmental or transient reasons.
+/// Weight for an errored call of any class but [`ErrorClass::MissingInfo`].
+/// Weakest: a call ran and failed, often for environmental or transient
+/// reasons. This is also the pre-classification weight for EVERY errored call,
+/// so a run whose errors the classifier does not recognise scores exactly as it
+/// did before this split existed.
 const W_ERRORED: u32 = 1;
+/// Weight for an errored call classified [`ErrorClass::MissingInfo`] — the
+/// model asked for something that is not there.
+///
+/// **2 is not a guess, and it is not free to move.** It is the only integer
+/// that satisfies every run whose counters are on record, and
+/// [`tests::the_missing_info_weight_is_pinned_by_the_observed_runs`] is that
+/// sweep, written so it fails if the constant moves in either direction:
+///
+/// - at **1** (i.e. no split at all) the two measured blowups — 17 and 26
+///   varied, well-formed calls at 24% and 27% error rates — score 235‰ and
+///   269‰, both under the 333‰ bar, and nothing tightens. That is the observed
+///   failure this whole change exists to catch.
+/// - at **3** the glm and qwen runs in [`CapabilityTier::Struggling`]'s table
+///   cross the bar. Both COMPLETED THE TASK. Branding a run that succeeded is
+///   the failure mode that gets a safety net switched off.
+///
+/// The bound is deliberately computed against the worst case: the grounding
+/// runs predate classification, so their class mix was never recorded, and the
+/// sweep scores their errors as if ALL of them were `MissingInfo`. If the mix
+/// was in fact softer the real headroom is larger, never smaller.
+const W_ERRORED_MISSING_INFO: u32 = 2;
 /// Weight for `repair_successful`. Weakest: the model fumbled but then
 /// recovered — friction, not stuckness.
 const W_REPAIR_SUCCESS: u32 = 1;
@@ -126,6 +168,50 @@ const W_REPAIR_INVALID: u32 = 4;
 /// Weight for `scavenged_calls`. Strongest: the model emitted tool-call-shaped
 /// TEXT instead of a real call — never inside the dispatch grammar.
 const W_SCAVENGED: u32 = 4;
+
+/// The weight one errored call carries, by what kind of failure it was.
+///
+/// Exhaustive on purpose: a new [`ErrorClass`] cannot be added without stating
+/// what it is worth here. Defaulting a new class to the weakest weight would be
+/// the safe-looking choice that silently reintroduces exactly the blindness
+/// this function exists to remove.
+const fn errored_weight(class: ErrorClass) -> u32 {
+    match class {
+        // The wandering tell — see the module docs.
+        ErrorClass::MissingInfo => W_ERRORED_MISSING_INFO,
+        // Environmental, not capability: a timeout or an EACCES says the world
+        // pushed back, and the model changing what it does cannot help.
+        ErrorClass::Transient | ErrorClass::Fatal => W_ERRORED,
+        // Already counted on the repair axis: `repair_invalid` (weight 4) and
+        // `repair_successful` (weight 1) both observe argument hygiene, so
+        // raising this would double-count the same signal.
+        ErrorClass::Misuse => W_ERRORED,
+        // The non-regression floor: an error the classifier declined to name
+        // must weigh exactly what every error weighed before the split.
+        ErrorClass::Unclassified => W_ERRORED,
+    }
+}
+
+/// The split must be a real split. If these two ever became equal the whole
+/// weighting would be a no-op and every test above would still pass — so it is
+/// asserted at COMPILE time rather than left to a test that could be deleted
+/// with the code still building.
+const _: () = assert!(
+    W_ERRORED_MISSING_INFO > W_ERRORED,
+    "missing-info must outweigh ordinary friction, or the class split changes nothing"
+);
+
+/// `errored_by_class` for `n` errored calls that all share one class.
+///
+/// Most callers — every test, and any counter snapshot built from a run that
+/// only ever saw one kind of failure — want this rather than an array literal
+/// whose positions have to be counted by hand.
+#[allow(dead_code)] // used by tests and by callers building a single-class snapshot
+pub fn errored_all(class: ErrorClass, n: u32) -> [u32; ErrorClass::ALL.len()] {
+    let mut by_class = [0; ErrorClass::ALL.len()];
+    by_class[class.index()] = n;
+    by_class
+}
 
 // --- rate basis and tier boundaries ---
 
@@ -321,8 +407,14 @@ impl CapabilityTier {
 pub struct CapabilityCounters {
     /// Total tool calls dispatched this run — the denominator for every rate.
     pub tool_calls: u32,
-    /// Calls that ran and returned an error (weight [`W_ERRORED`]).
-    pub errored_tool_calls: u32,
+    /// Calls that ran and returned an error, SPLIT BY [`ErrorClass`] and
+    /// indexed by [`ErrorClass::index`] — build it with [`errored_all`] rather
+    /// than by counting array positions.
+    ///
+    /// Split rather than totalled because the weights differ: see
+    /// [`errored_weight`]. The total is still available as
+    /// [`CapabilityCounters::errored_tool_calls`], derived from this.
+    pub errored_by_class: [u32; ErrorClass::ALL.len()],
     /// Calls whose args were too malformed to repair (weight [`W_REPAIR_INVALID`]).
     pub repair_invalid: u32,
     /// Calls that were malformed but were successfully repaired (weight
@@ -341,9 +433,26 @@ pub struct CapabilityCounters {
 
 #[allow(dead_code)] // pending dirge-5mtx.7 loop-control wiring
 impl CapabilityCounters {
+    /// Total errored calls this run — DERIVED from the per-class split, never
+    /// stored beside it, so the two cannot disagree.
+    pub fn errored_tool_calls(&self) -> u32 {
+        self.errored_by_class.iter().sum()
+    }
+
     /// Pure classification of these counters into a raw [`CapabilityTier`], with
     /// no hysteresis. See the module docs for the exact formula.
     fn raw_tier(&self) -> CapabilityTier {
+        self.raw_tier_at(W_ERRORED_MISSING_INFO)
+    }
+
+    /// [`Self::raw_tier`] with the missing-info weight supplied, so the weight
+    /// sweep can ask "what would this run classify as at weight N?" against the
+    /// SAME implementation production uses.
+    ///
+    /// A sweep that re-implemented the formula would be testing its own copy —
+    /// it would stay green while the real boundaries moved underneath it, which
+    /// is how a test written from buggy output becomes the contract.
+    fn raw_tier_at(&self, w_missing_info: u32) -> CapabilityTier {
         // Warm-up: too few calls to judge — stay Nominal (and avoid div-by-zero).
         if self.tool_calls < MIN_CALLS_FOR_ESTIMATE {
             return CapabilityTier::Nominal;
@@ -353,8 +462,20 @@ impl CapabilityCounters {
         if self.max_failure_streak >= STREAK_FORCE_STRUGGLING {
             return CapabilityTier::Struggling;
         }
+        // Errored calls carry a per-class weight; everything else is flat.
+        let errored: u64 = ErrorClass::ALL
+            .into_iter()
+            .map(|class| {
+                let weight = if class == ErrorClass::MissingInfo {
+                    w_missing_info
+                } else {
+                    errored_weight(class)
+                };
+                self.errored_by_class[class.index()] as u64 * weight as u64
+            })
+            .sum();
         // Weighted failure rate, in parts per thousand, over tool_calls.
-        let weighted = self.errored_tool_calls as u64 * W_ERRORED as u64
+        let weighted = errored
             + self.repair_successful as u64 * W_REPAIR_SUCCESS as u64
             + self.hallucinated_tool_names as u64 * W_HALLUCINATED as u64
             + self.storm_suppressions as u64 * W_STORM as u64
@@ -456,7 +577,7 @@ mod tests {
         // too little data to judge, and this avoids div-by-zero.
         let c = CapabilityCounters {
             tool_calls: MIN_CALLS_FOR_ESTIMATE - 1,
-            errored_tool_calls: 4,
+            errored_by_class: errored_all(ErrorClass::Unclassified, 4),
             repair_invalid: 4,
             max_failure_streak: 4,
             ..Default::default()
@@ -478,6 +599,209 @@ mod tests {
         assert_ne!(est.tier(), CapabilityTier::Struggling);
         est.observe(&snapshot);
         assert_eq!(est.tier(), CapabilityTier::Strong);
+    }
+
+    /// An errored call of an unrecognised class must weigh exactly what every
+    /// errored call weighed before the split existed. This is the
+    /// non-regression criterion for the whole change, so it is asserted
+    /// against the constant rather than against a hard-coded 1.
+    #[test]
+    fn every_class_but_missing_info_keeps_the_pre_split_weight() {
+        for class in ErrorClass::ALL {
+            let expected = if class == ErrorClass::MissingInfo {
+                W_ERRORED_MISSING_INFO
+            } else {
+                W_ERRORED
+            };
+            assert_eq!(
+                errored_weight(class),
+                expected,
+                "{class:?} weight drifted from the documented split"
+            );
+        }
+        // That the split is a REAL split — the two weights differing — is
+        // asserted at compile time next to the constants, not here: a runtime
+        // assertion on two consts is one clippy silences and a maintainer
+        // deletes.
+    }
+
+    /// The same run classifies differently by what its failures WERE, not just
+    /// how many there were. This is the discrimination the split buys, stated
+    /// on one pair of counter sets identical in every other respect.
+    #[test]
+    fn identical_error_counts_rank_differently_by_class() {
+        let wandering = CapabilityCounters {
+            tool_calls: 26,
+            errored_by_class: errored_all(ErrorClass::MissingInfo, 7),
+            ..Default::default()
+        };
+        let friction = CapabilityCounters {
+            tool_calls: 26,
+            errored_by_class: errored_all(ErrorClass::Transient, 7),
+            ..Default::default()
+        };
+        assert_eq!(
+            wandering.errored_tool_calls(),
+            friction.errored_tool_calls()
+        );
+        assert_eq!(
+            wandering.raw_tier(),
+            CapabilityTier::Struggling,
+            "7 of 26 calls naming things that aren't there is a run operating on a wrong map"
+        );
+        assert_ne!(
+            friction.raw_tier(),
+            CapabilityTier::Struggling,
+            "the same count of timeouts is the environment pushing back, not the model failing"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // dirge-s9ry: the missing-info weight, swept rather than guessed.
+    //
+    // Every run below is one whose counters are actually on record — the two
+    // measured blowups, and the three grounding runs in `CapabilityTier`'s
+    // table. The sweep asks each candidate weight to satisfy all five.
+    // ---------------------------------------------------------------------
+
+    /// One recorded run and what the estimator must say about it.
+    struct Recorded {
+        what: &'static str,
+        counters: CapabilityCounters,
+        must_struggle: bool,
+    }
+
+    /// The observed runs, scored at their WORST CASE: every one of these
+    /// predates classification, so the class mix was never recorded and each
+    /// run's errors are counted as if all of them were missing-info. That is
+    /// the conservative direction — it makes the upper bound on the weight as
+    /// tight as it can be, so a weight that passes here passes on the real
+    /// mix too.
+    fn recorded_runs() -> Vec<Recorded> {
+        vec![
+            // The two blowups this change exists to catch (dirge-e31n). Both
+            // hit the turn cap having produced nothing: varied, well-formed
+            // calls that storm, scavenge and repair all correctly ignored,
+            // with a streak that never reached the STREAK_FORCE_STRUGGLING
+            // override. Nothing but the class of the errors distinguishes
+            // these from ordinary friction.
+            Recorded {
+                what: "blowup A: 17 calls, 24% errored, streak 2",
+                counters: CapabilityCounters {
+                    tool_calls: 17,
+                    errored_by_class: errored_all(ErrorClass::MissingInfo, 4),
+                    max_failure_streak: 2,
+                    ..Default::default()
+                },
+                must_struggle: true,
+            },
+            Recorded {
+                what: "blowup B: 26 calls, 27% errored, streak 2",
+                counters: CapabilityCounters {
+                    tool_calls: 26,
+                    errored_by_class: errored_all(ErrorClass::MissingInfo, 7),
+                    max_failure_streak: 2,
+                    ..Default::default()
+                },
+                must_struggle: true,
+            },
+            // The grounding runs. All three COMPLETED THE TASK, and qwen is
+            // the agreed low bound of supported models — branding any of them
+            // is how a safety net gets switched off.
+            Recorded {
+                what: "deepseek-flash recon-real: 35 calls, clean",
+                counters: CapabilityCounters {
+                    tool_calls: 35,
+                    ..Default::default()
+                },
+                must_struggle: false,
+            },
+            Recorded {
+                what: "glm recon-real (good run): 20 calls, 1 errored, 1 unrepairable",
+                counters: CapabilityCounters {
+                    tool_calls: 20,
+                    errored_by_class: errored_all(ErrorClass::MissingInfo, 1),
+                    repair_invalid: 1,
+                    max_failure_streak: 1,
+                    ..Default::default()
+                },
+                must_struggle: false,
+            },
+            Recorded {
+                what: "Qwen3.6-27B-Q8 local: 20 calls, 15% errored, streak 2",
+                counters: CapabilityCounters {
+                    tool_calls: 20,
+                    errored_by_class: errored_all(ErrorClass::MissingInfo, 3),
+                    max_failure_streak: 2,
+                    ..Default::default()
+                },
+                must_struggle: false,
+            },
+        ]
+    }
+
+    /// Which recorded runs a candidate weight gets wrong.
+    fn misclassified_at(weight: u32) -> Vec<&'static str> {
+        recorded_runs()
+            .into_iter()
+            .filter(|r| {
+                let struggling = r.counters.raw_tier_at(weight) == CapabilityTier::Struggling;
+                struggling != r.must_struggle
+            })
+            .map(|r| r.what)
+            .collect()
+    }
+
+    /// The shipped weight satisfies every recorded run — and the neighbours on
+    /// both sides do not. Without the second half this would pass for any
+    /// weight in a range and pin nothing.
+    #[test]
+    fn the_missing_info_weight_is_pinned_by_the_observed_runs() {
+        assert!(
+            misclassified_at(W_ERRORED_MISSING_INFO).is_empty(),
+            "weight {W_ERRORED_MISSING_INFO} misclassifies: {:?}",
+            misclassified_at(W_ERRORED_MISSING_INFO)
+        );
+
+        // Too low — this IS the pre-split behaviour, and it is exactly the
+        // blowups it lets through.
+        let too_low = misclassified_at(W_ERRORED_MISSING_INFO - 1);
+        assert!(
+            !too_low.is_empty(),
+            "weight {} classifies everything correctly too, so {W_ERRORED_MISSING_INFO} is not pinned from below",
+            W_ERRORED_MISSING_INFO - 1
+        );
+        assert!(
+            too_low.iter().all(|w| w.starts_with("blowup")),
+            "under-weighting should miss the blowups, not brand a healthy run: {too_low:?}"
+        );
+
+        // Too high — and what it breaks is a run that finished the job.
+        let too_high = misclassified_at(W_ERRORED_MISSING_INFO + 1);
+        assert!(
+            !too_high.is_empty(),
+            "weight {} classifies everything correctly too, so {W_ERRORED_MISSING_INFO} is not pinned from above",
+            W_ERRORED_MISSING_INFO + 1
+        );
+        assert!(
+            too_high.iter().all(|w| !w.starts_with("blowup")),
+            "over-weighting should brand healthy runs, not miss blowups: {too_high:?}"
+        );
+    }
+
+    /// The sweep must be reading the shipped constant, not a copy. If
+    /// `raw_tier` stopped routing through `raw_tier_at` the sweep above would
+    /// keep passing while production used something else entirely.
+    #[test]
+    fn raw_tier_uses_the_swept_weight() {
+        for r in recorded_runs() {
+            assert_eq!(
+                r.counters.raw_tier(),
+                r.counters.raw_tier_at(W_ERRORED_MISSING_INFO),
+                "{}: raw_tier diverged from the swept implementation",
+                r.what
+            );
+        }
     }
 
     #[test]
@@ -573,13 +897,13 @@ mod tests {
         // 4 failures over 40 calls is a 10% rate -> Nominal.
         let diluted = CapabilityCounters {
             tool_calls: 40,
-            errored_tool_calls: 4,
+            errored_by_class: errored_all(ErrorClass::Unclassified, 4),
             ..Default::default()
         };
         // 4 failures over 6 calls is a ~67% rate -> Struggling.
         let concentrated = CapabilityCounters {
             tool_calls: 6,
-            errored_tool_calls: 4,
+            errored_by_class: errored_all(ErrorClass::Unclassified, 4),
             ..Default::default()
         };
         let diluted_tier = diluted.raw_tier();
@@ -693,7 +1017,7 @@ mod tests {
         // glm, recon-real: turns=36 tools=40 err=5 streak=3 rep_inv=4.
         let obs = CapabilityCounters {
             tool_calls: 40,
-            errored_tool_calls: 5,
+            errored_by_class: errored_all(ErrorClass::Unclassified, 5),
             repair_invalid: 4,
             max_failure_streak: 3,
             ..Default::default()
@@ -726,7 +1050,7 @@ mod tests {
     fn tier_tracks_the_run_not_the_model() {
         let strong_model_bad_run = CapabilityCounters {
             tool_calls: 40,
-            errored_tool_calls: 5,
+            errored_by_class: errored_all(ErrorClass::Unclassified, 5),
             repair_invalid: 4,
             max_failure_streak: 3,
             ..Default::default()
@@ -747,7 +1071,7 @@ mod tests {
     fn same_model_clean_run_ranks_above_its_own_bad_run() {
         let good = CapabilityCounters {
             tool_calls: 20,
-            errored_tool_calls: 1,
+            errored_by_class: errored_all(ErrorClass::Unclassified, 1),
             repair_invalid: 1,
             max_failure_streak: 1,
             ..Default::default()

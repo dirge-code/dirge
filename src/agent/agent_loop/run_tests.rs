@@ -7715,7 +7715,13 @@ fn tier_does_not_bypass_the_nudge_budget() {
 fn unknown_tool_name_is_counted_as_hallucinated() {
     let known = ["read", "write", "bash"];
     let mut tally = crate::agent::agent_loop::gate_tally::GateTally::new();
-    record_tool_result_signals(&mut tally, "search_files", true, &known);
+    record_tool_result_signals(
+        &mut tally,
+        "search_files",
+        true,
+        "Tool search_files not found. Did you mean `read`?",
+        &known,
+    );
     assert_eq!(tally.hallucinated_tool_names(), 1);
     // It is ALSO an errored call — the stacking is deliberate, matching how
     // repair_invalid already stacks with errored.
@@ -7723,11 +7729,57 @@ fn unknown_tool_name_is_counted_as_hallucinated() {
     assert_eq!(tally.tool_calls(), 1);
 }
 
+/// dirge-s9ry: an invented tool name must NOT also land in the double-weighted
+/// missing-info bucket. `prepare_tool_call` words the miss as "Tool X not
+/// found", which the classifier reads as MissingInfo — so an invented name
+/// would score 2 (missing-info) + 2 (hallucinated) = 4, counting one failure
+/// twice on the same axis and re-ranking it against `repair_invalid`.
+///
+/// Written with the REAL error text, because a synthetic excerpt that happened
+/// not to say "not found" would pass while production double-counted.
+#[test]
+fn an_invented_tool_name_is_not_also_counted_as_missing_info() {
+    use crate::agent::agent_loop::tool_error_class::{ErrorClass, classify};
+    let real_text = "Tool search_files not found. Did you mean `read`?";
+    // The premise: left to the classifier this text IS missing-info. If that
+    // ever stops being true this test goes vacuous, so assert it.
+    assert_eq!(
+        classify("search_files", real_text),
+        ErrorClass::MissingInfo,
+        "premise gone: the miss no longer reads as missing-info"
+    );
+
+    let known = ["read", "write", "bash"];
+    let mut tally = crate::agent::agent_loop::gate_tally::GateTally::new();
+    record_tool_result_signals(&mut tally, "search_files", true, real_text, &known);
+    let split = tally.errored_by_class();
+    assert_eq!(
+        split[ErrorClass::MissingInfo.index()],
+        0,
+        "an invented name double-dipped into the wandering bucket"
+    );
+    assert_eq!(split[ErrorClass::Misuse.index()], 1);
+    assert_eq!(tally.hallucinated_tool_names(), 1);
+}
+
+/// The other side: a REAL tool erroring with the same wording must still be
+/// missing-info. Without this the fix above could be "never classify anything
+/// as missing-info" and pass.
+#[test]
+fn a_real_tool_reporting_a_missing_path_is_still_missing_info() {
+    use crate::agent::agent_loop::tool_error_class::ErrorClass;
+    let known = ["read", "write", "bash"];
+    let mut tally = crate::agent::agent_loop::gate_tally::GateTally::new();
+    record_tool_result_signals(&mut tally, "read", true, "/src/nope.rs not found", &known);
+    assert_eq!(tally.errored_by_class()[ErrorClass::MissingInfo.index()], 1);
+    assert_eq!(tally.hallucinated_tool_names(), 0);
+}
+
 #[test]
 fn known_tool_that_errors_is_not_hallucinated() {
     let known = ["read", "write", "bash"];
     let mut tally = crate::agent::agent_loop::gate_tally::GateTally::new();
-    record_tool_result_signals(&mut tally, "bash", true, &known);
+    record_tool_result_signals(&mut tally, "bash", true, "make: *** Error 1", &known);
     assert_eq!(
         tally.hallucinated_tool_names(),
         0,
@@ -7742,9 +7794,77 @@ fn successful_call_is_never_hallucinated() {
     let mut tally = crate::agent::agent_loop::gate_tally::GateTally::new();
     // A name that isn't in the list can't actually succeed, but the guard is
     // on is_error so the classification can never fire on a working call.
-    record_tool_result_signals(&mut tally, "mystery", false, &known);
+    record_tool_result_signals(&mut tally, "mystery", false, "", &known);
     assert_eq!(tally.hallucinated_tool_names(), 0);
     assert_eq!(tally.errored_tool_calls(), 0);
+    assert_eq!(tally.tool_calls(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// dirge-s9ry: the recovery class must reach the tally, not just the failure
+// tracker's streak window. The estimator reads the tally, so a classifier
+// wired only to the checkpoint leaves the tier exactly as blind as before.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn errored_calls_land_in_their_recovery_class() {
+    use crate::agent::agent_loop::tool_error_class::ErrorClass;
+    let known = ["read", "bash", "edit"];
+    let mut tally = crate::agent::agent_loop::gate_tally::GateTally::new();
+    record_tool_result_signals(
+        &mut tally,
+        "read",
+        true,
+        "No such file or directory (os error 2)",
+        &known,
+    );
+    record_tool_result_signals(
+        &mut tally,
+        "bash",
+        true,
+        "command timed out after 120s",
+        &known,
+    );
+    record_tool_result_signals(
+        &mut tally,
+        "edit",
+        true,
+        "invalid arguments: missing required field `old_text`",
+        &known,
+    );
+    record_tool_result_signals(&mut tally, "bash", true, "make: *** [all] Error 1", &known);
+
+    let split = tally.errored_by_class();
+    assert_eq!(split[ErrorClass::MissingInfo.index()], 1);
+    assert_eq!(split[ErrorClass::Transient.index()], 1);
+    assert_eq!(split[ErrorClass::Misuse.index()], 1);
+    assert_eq!(split[ErrorClass::Unclassified.index()], 1);
+    assert_eq!(split[ErrorClass::Fatal.index()], 0);
+    assert_eq!(
+        tally.errored_tool_calls(),
+        4,
+        "the total still counts all four"
+    );
+}
+
+/// The other half: a SUCCESS must not be classified at all. Passing the
+/// excerpt through unconditionally would file every successful call under
+/// whatever its output happened to say — a `read` returning a file that
+/// mentions "not found" would score as wandering.
+#[test]
+fn successful_calls_are_never_classified() {
+    use crate::agent::agent_loop::tool_error_class::ErrorClass;
+    let known = ["read"];
+    let mut tally = crate::agent::agent_loop::gate_tally::GateTally::new();
+    record_tool_result_signals(
+        &mut tally,
+        "read",
+        false,
+        "// TODO: file not found handling",
+        &known,
+    );
+    assert_eq!(tally.errored_tool_calls(), 0);
+    assert_eq!(tally.errored_by_class()[ErrorClass::MissingInfo.index()], 0);
     assert_eq!(tally.tool_calls(), 1);
 }
 
@@ -7752,9 +7872,15 @@ fn successful_call_is_never_hallucinated() {
 fn hallucinated_names_accumulate_across_calls() {
     let known = ["read"];
     let mut tally = crate::agent::agent_loop::gate_tally::GateTally::new();
-    record_tool_result_signals(&mut tally, "view", true, &known);
-    record_tool_result_signals(&mut tally, "open_file", true, &known);
-    record_tool_result_signals(&mut tally, "read", true, &known);
+    record_tool_result_signals(&mut tally, "view", true, "Tool not found", &known);
+    record_tool_result_signals(&mut tally, "open_file", true, "Tool not found", &known);
+    record_tool_result_signals(
+        &mut tally,
+        "read",
+        true,
+        "No such file or directory",
+        &known,
+    );
     assert_eq!(tally.hallucinated_tool_names(), 2);
     assert_eq!(tally.errored_tool_calls(), 3);
     assert_eq!(tally.tool_calls(), 3);

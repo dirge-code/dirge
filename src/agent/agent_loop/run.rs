@@ -2184,10 +2184,16 @@ pub async fn run_agent_loop(
 /// Record one tool result's capability signals on the run tally [dirge-5mtx.7].
 ///
 /// Every call counts toward `tool_calls` (the denominator for every rate) and,
-/// when it failed, toward `errored_tool_calls`. A failed call whose name is in
-/// no tool the run was given is ALSO recorded as a hallucinated name — the
-/// model invented the name rather than misusing a real tool, which is a
-/// materially different capability signal.
+/// when it failed, toward the errored count FOR ITS RECOVERY CLASS
+/// (dirge-s9ry). A failed call whose name is in no tool the run was given is
+/// ALSO recorded as a hallucinated name — the model invented the name rather
+/// than misusing a real tool, which is a materially different capability
+/// signal.
+///
+/// The class comes from the same `tool_error_class::classify` the failure
+/// tracker uses on the same excerpt, so the checkpoint's account of a streak
+/// and the estimator's account of the run cannot disagree about what a failure
+/// was.
 ///
 /// `prepare_tool_call` (tools.rs) is where the miss is actually detected: it
 /// short-circuits with "Tool X not found" plus a nearest-name suggestion. But
@@ -2203,6 +2209,17 @@ pub async fn run_agent_loop(
 /// invented tool name 3, arguments too malformed to repair 5 — which is the
 /// intended ranking.
 ///
+/// KEEPING that ranking is why an invented name is classed [`ErrorClass::Misuse`]
+/// rather than run through the classifier (dirge-s9ry). `prepare_tool_call`
+/// phrases the miss as "Tool X not found", which the classifier reads — quite
+/// reasonably — as [`ErrorClass::MissingInfo`], the one class that scores
+/// double. That would have made an invented name 2 + 2 = 4, silently
+/// re-ranking it against `repair_invalid` and counting ONE failure twice on
+/// the same axis: `hallucinated_tool_names` already exists to say precisely
+/// this. `Misuse` is also the honest label — an unknown tool name is the call
+/// shape being wrong, not the tree being shaped differently than the model
+/// thought.
+///
 /// Adding this signal can only ever move a run DOWN a tier, never up, so the
 /// worst case is a run that read `Strong` reading `Nominal`, which is today's
 /// default behaviour. That is why restoring it is safe despite its effect on
@@ -2212,10 +2229,19 @@ fn record_tool_result_signals(
     tally: &mut GateTally,
     name: &str,
     is_error: bool,
+    excerpt: &str,
     known_tools: &[&str],
 ) {
-    tally.record_tool_call(is_error);
-    if is_error && !known_tools.contains(&name) {
+    use super::tool_error_class::ErrorClass;
+    let hallucinated = is_error && !known_tools.contains(&name);
+    tally.record_tool_call(is_error.then(|| {
+        if hallucinated {
+            ErrorClass::Misuse
+        } else {
+            super::tool_error_class::classify(name, excerpt)
+        }
+    }));
+    if hallucinated {
         tally.record_hallucinated_tool_name();
     }
 }
@@ -3161,6 +3187,7 @@ pub async fn run_loop(
                             &mut tally,
                             &originating.name,
                             result.is_error,
+                            &excerpt,
                             &known_tool_names,
                         );
                         tally.record_failure_streak(guards.failure_streak() as u32);
@@ -3263,7 +3290,7 @@ pub async fn run_loop(
                 let repairs = config.repair_stats.snapshot();
                 capability.observe(&super::capability::CapabilityCounters {
                     tool_calls: tally.tool_calls(),
-                    errored_tool_calls: tally.errored_tool_calls(),
+                    errored_by_class: tally.errored_by_class(),
                     repair_invalid: repairs.invalid as u32,
                     repair_successful: repairs.total_successful() as u32,
                     hallucinated_tool_names: tally.hallucinated_tool_names(),

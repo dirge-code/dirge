@@ -62,11 +62,61 @@ pub enum ErrorClass {
     Fatal,
     /// Not recognised. Behaves exactly as an errored result did before this
     /// module existed.
+    ///
+    /// Declared LAST deliberately: it is the sentinel
+    /// `all_ends_at_the_sentinel_so_a_new_class_cannot_hide` anchors on, the
+    /// same contract as [`super::gate_tally::GateSource::None`].
     #[default]
     Unclassified,
 }
 
 impl ErrorClass {
+    /// Every variant, in [`index`](Self::index) order.
+    ///
+    /// Exists so the per-class error counters cannot drift from the enum. The
+    /// tally's array is sized off this, the emitted line is asserted against
+    /// it, and [`super::capability`] weights it with an exhaustive match — so
+    /// adding a class fails to compile until it has an index, a weight and a
+    /// field, rather than being silently dropped from the surface that reports
+    /// it. That drift is what lost two gates from the `dirge::gates` line
+    /// (dirge-l8l7.1); this is the same shape, pre-empted.
+    pub const ALL: [ErrorClass; 5] = [
+        ErrorClass::Misuse,
+        ErrorClass::MissingInfo,
+        ErrorClass::Transient,
+        ErrorClass::Fatal,
+        ErrorClass::Unclassified,
+    ];
+
+    /// Slot in a per-class counter array — the variant's own discriminant, so
+    /// it cannot disagree with the declaration order [`ALL`](Self::ALL) comes
+    /// from.
+    pub fn index(self) -> usize {
+        self as usize
+    }
+
+    /// The field name this class carries on the `dirge::gates` line.
+    ///
+    /// Unlike the gate and nudge sentinels, EVERY class is emitted:
+    /// `Unclassified` is a real count (the residue the classifier declined to
+    /// name), and hiding it would make the other four unreadable — a run with
+    /// two missing-info errors reads very differently at 2 of 3 errors than at
+    /// 2 of 30.
+    ///
+    /// Test-only for the same reason as [`super::gate_tally::GateSource::field_name`]:
+    /// `tracing` needs literals at the macro call, so the correspondence has to
+    /// be asserted rather than shared.
+    #[cfg(test)]
+    pub fn field_name(self) -> &'static str {
+        match self {
+            ErrorClass::Misuse => "errored_misuse",
+            ErrorClass::MissingInfo => "errored_missing_info",
+            ErrorClass::Transient => "errored_transient",
+            ErrorClass::Fatal => "errored_fatal",
+            ErrorClass::Unclassified => "errored_unclassified",
+        }
+    }
+
     /// Short label for the checkpoint text.
     pub fn label(self) -> &'static str {
         match self {
@@ -340,6 +390,51 @@ mod tests {
     #[test]
     fn empty_streak_has_no_dominant_class() {
         assert_eq!(dominant_class(&[]), None);
+    }
+
+    /// The one way left to break the per-class counters: add a variant ahead
+    /// of `Unclassified` and not extend `ALL`. `index` is the discriminant, so
+    /// the new class would write past the end of a `[u32; ALL.len()]` and
+    /// panic at runtime — while every test that iterates `ALL` stayed green,
+    /// because `ALL` is exactly what is missing it. Anchoring on the last
+    /// variant's discriminant is what makes that visible (dirge-l8l7.1).
+    #[test]
+    fn all_ends_at_the_sentinel_so_a_new_class_cannot_hide() {
+        assert_eq!(
+            ErrorClass::ALL.len(),
+            ErrorClass::Unclassified as usize + 1,
+            "an ErrorClass variant was added without extending ALL"
+        );
+    }
+
+    #[test]
+    fn all_classes_are_indexed_contiguously() {
+        let mut seen = vec![false; ErrorClass::ALL.len()];
+        for class in ErrorClass::ALL {
+            let i = class.index();
+            assert!(i < seen.len(), "{class:?} indexes {i}, past the end of ALL");
+            assert!(!seen[i], "index {i} is claimed twice; {class:?} collides");
+            seen[i] = true;
+        }
+        assert!(
+            seen.iter().all(|s| *s),
+            "ErrorClass::ALL is missing a variant"
+        );
+    }
+
+    /// Field names must be distinct, or two classes share a counter on the
+    /// emitted line and the mix is unreadable.
+    #[test]
+    fn every_class_has_a_distinct_field_name() {
+        let names: std::collections::HashSet<&str> = ErrorClass::ALL
+            .into_iter()
+            .map(ErrorClass::field_name)
+            .collect();
+        assert_eq!(
+            names.len(),
+            ErrorClass::ALL.len(),
+            "two ErrorClass variants share a field name: {names:?}"
+        );
     }
 
     /// Every class that can be dominant must have guidance to print, or the

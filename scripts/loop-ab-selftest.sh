@@ -243,6 +243,10 @@ reject() { # $1 = output, $2 = description, $3 = pattern that must NOT match
     echo "  ok   $2"
   fi
 }
+# For checks computed in shell rather than grepped from a report — source-level
+# guards, mostly. Same accounting as want/reject.
+pass() { echo "  ok   $1"; }
+fail() { echo "  FAIL $1"; fails=$((fails + 1)); }
 differs() { # $1 = description, $2 = a, $3 = b
   if [ "$2" != "$3" ]; then
     echo "  ok   $1"
@@ -403,6 +407,126 @@ reject "$out_compact" "compactions is never given a direction" '^compactions .*(
 # A pre-compactions TSV reads 0 rather than breaking — same as every other
 # appended column.
 want "$out_mech" "a pre-compactions TSV reads zero" '^compactions +0\.0 \(0\.\.0\)'
+
+# ---- SOURCE-LEVEL: every column a row reports must be one the report
+# accumulates (dirge-s9ry). `numcols` is a hand-written list of which columns
+# are numeric, and it cannot be derived from NF because several columns are
+# strings. So it is guarded from the other end: any column index appearing in
+# a spread()/mean()/noisefloor() call must be in that list.
+#
+# This is not hypothetical. Appending errored_missing_info as col 27 and
+# adding its row reported `0.0 (..)` in both arms — a column silently never
+# accumulated, rendering as something that looks like a formatting glitch
+# rather than a missing measurement.
+{
+  cols_declared="$(sed -n 's/.*nnum = split("\([0-9 ]*\)", numcols.*/\1/p' "$ab" | tr ' ' '\n' | sort -u)"
+  if [ -z "$cols_declared" ]; then
+    fail "could not read numcols from $ab"
+  else
+    cols_read="$(grep -oE '(spread|mean|noisefloor)\((ck|tk|ek), *[0-9]+\)' "$ab" \
+                 | grep -oE '[0-9]+\)$' | tr -d ')' | sort -u)"
+    missing=""
+    for c in $cols_read; do
+      printf '%s\n' "$cols_declared" | grep -qx "$c" || missing="$missing $c"
+    done
+    if [ -n "$missing" ]; then
+      fail "report reads column(s)$missing that numcols never accumulates"
+    else
+      pass "every reported column is accumulated"
+    fi
+  fi
+}
+
+# ---- SOURCE-LEVEL: every field scraped off the gates line must reach
+# results.tsv (dirge-s9ry). The other half of the guard above — that one
+# catches a row reading a column nobody accumulated, this one catches a
+# measurement taken and then dropped on the floor.
+#
+# This is the denied_tool_attempts failure mode: a mechanism gate that reads
+# zero in every arm forever, with the whole report looking healthy, because
+# the number never made it out of run_arm. A gate you cannot see is worse
+# than no gate, since it is quietly counted as evidence.
+{
+  scraped="$(grep -oE '^ *[a-z_0-9]+="\$\((get_field|sum_fields) ' "$ab" \
+             | sed -E 's/^ *([a-z_0-9]+)=.*/\1/' | sort -u)"
+  # The printf that writes results.tsv, joined to one line. Resetting the
+  # buffer at each `printf` keeps this to the ONE statement that writes the
+  # file — buffering the whole script would make the check vacuous, since
+  # every variable appears somewhere in it.
+  emitted="$(awk '/printf .%s/ { buf = "" } { buf = buf $0 } />> "\$WORK\/results.tsv"/ { print buf; exit }' "$ab")"
+  if [ -z "$scraped" ]; then
+    fail "could not find any get_field/sum_fields assignments in $ab"
+  else
+    dropped=""
+    for v in $scraped; do
+      case "$emitted" in
+        *"\$$v"*) ;;
+        *) dropped="$dropped $v" ;;
+      esac
+    done
+    if [ -n "$dropped" ]; then
+      fail "scraped but never written to results.tsv:$dropped"
+    else
+      pass "every scraped field reaches results.tsv"
+    fi
+  fi
+}
+
+# ---- SOURCE-LEVEL: the results.tsv printf's format and argument list must
+# agree (dirge-s9ry). bash printf REUSES the format when there are more
+# arguments than conversions, so an extra column does not error — it writes a
+# SECOND ROW made of the leftovers. Too few arguments is quieter still: the
+# trailing columns come out empty and read as an absent (pre-existing) column.
+# Neither shows up as a failure anywhere downstream.
+{
+  pf="$(awk '/printf .%s/ { buf = "" } { buf = buf $0 } />> "\$WORK\/results.tsv"/ { print buf; exit }' "$ab")"
+  # -o then count LINES of output: `grep -c` counts matching lines, and the
+  # block is joined to one, so it would answer 1 however many conversions
+  # there are. That is the same shape as the sum_fields status bug — a count
+  # that cannot be wrong in the direction you are checking.
+  n_fmt="$(printf '%s' "$pf" | grep -oE "^[^']*'[^']*'" | grep -o '%s' | wc -l | tr -d ' ')"
+  n_arg="$(printf '%s' "$pf" | grep -oE '"\$[A-Za-z_0-9{}]+"' | wc -l | tr -d ' ')"
+  if [ "${n_fmt:-0}" -eq 0 ] || [ "${n_arg:-0}" -eq 0 ]; then
+    fail "could not parse the results.tsv printf (fmt=$n_fmt args=$n_arg)"
+  elif [ "$n_fmt" -ne "$n_arg" ]; then
+    fail "results.tsv printf has $n_fmt conversions but $n_arg arguments"
+  else
+    pass "results.tsv printf conversions match its arguments ($n_fmt)"
+  fi
+}
+
+# ---- errored_missing_info mechanism gate (dirge-s9ry). The capability
+# weighting only moves on errors classified MissingInfo, so this row is the
+# difference between "the weighting did nothing" and "the weighting never
+# fired". Column 27, appended, so every fixture above reads it as 0.
+#
+# The fixture makes err (col 6) and err_missing (col 27) DIFFERENT numbers on
+# purpose: they are adjacent in the report and a row reading the wrong one
+# would otherwise be invisible.
+row_mi() { # tag model repeat errored errored_missing_info
+  printf '%s\t%s\t%s\t10\t20\t%s\t0\t0\t0\t0\t0\tVerifiedGreen\t3\t1\t1\t0\t2\tnominal\tnone\t0\t1000\t400\t0\t1\t0\t0\t%s\n' "$@"
+}
+{
+  row_mi control   m1 1 8 6
+  row_mi control   m1 2 8 6
+  row_mi treatment m1 1 8 0
+  row_mi treatment m1 2 8 0
+} > "$work/missinfo.tsv"
+out_mi="$(report "$work/missinfo.tsv")"
+reject "$out_mi" "the missing-info report ran to completion" 'REPORT-ABORTED'
+want "$out_mi" "missing_info reads its own column" \
+  '^  of which missing_info +6\.0 \(6\.\.6\) +0\.0 \(0\.\.0\) +mechanism$'
+# The row above it must still read the TOTAL, not the slice — the two are
+# adjacent and both are error counts.
+want "$out_mi" "errored_tool_calls still reads the total" \
+  '^errored_tool_calls +8\.0 \(8\.\.8\) +8\.0 \(8\.\.8\)'
+# MECHANISM, not an outcome: fewer missing-info errors is not thereby better,
+# and scoring it would turn the gate into a fabricated result.
+reject "$out_mi" "missing_info is never given a direction" \
+  '^  of which missing_info .*(better|worse)$'
+# A pre-column TSV reads 0 rather than aborting, like every appended column.
+want "$out_mech" "a pre-missing-info TSV reads zero" \
+  '^  of which missing_info +0\.0 \(0\.\.0\)'
 
 # ---- input_tokens_per_turn (dirge-e31n.4). The steady fixture has identical
 # mean turns (9) in both arms and identical tokens (1000), so the ratio must be

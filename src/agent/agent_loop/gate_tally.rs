@@ -28,6 +28,7 @@
 //! It deliberately contains no rig/LLM types, so it stays unit-testable
 //! without a model.
 
+use crate::agent::agent_loop::tool_error_class::ErrorClass;
 use crate::agent::agent_loop::tool_input_repair::RepairStatsSnapshot;
 
 /// Which finalization gate produced a run's follow-up. Mirrors the
@@ -209,7 +210,16 @@ pub struct GateTally {
     nudges: [u32; BoundaryNudge::ALL.len()],
     turns: u32,
     tool_calls: u32,
-    errored_tool_calls: u32,
+    /// Errored calls split by recovery class, indexed by
+    /// [`ErrorClass::index`]. Sized off [`ErrorClass::ALL`] so the two cannot
+    /// disagree.
+    ///
+    /// There is deliberately NO separate `errored_tool_calls` field:
+    /// [`errored_tool_calls`](Self::errored_tool_calls) sums this instead. A
+    /// total kept alongside its own parts is a duplicate that drifts the
+    /// moment one call site increments one and not the other, which is the
+    /// failure this module's own history is made of (dirge-l8l7.1).
+    errored_by_class: [u32; ErrorClass::ALL.len()],
     final_verification: Option<crate::agent::agent_loop::verifier::VerificationStatus>,
     repairs: Option<RepairStatsSnapshot>,
     /// dirge-5mtx.7: the capability tier the estimator settled on for this
@@ -329,10 +339,16 @@ impl GateTally {
         self.turns += 1;
     }
 
-    pub fn record_tool_call(&mut self, is_error: bool) {
+    /// Record one dispatched tool call. `error` is `None` for a success and
+    /// `Some(class)` for a failure, so the total and the per-class split are
+    /// written from ONE input at ONE site and cannot disagree — an errored
+    /// call with no class is unrepresentable rather than merely discouraged.
+    /// A failure the classifier declined to name is
+    /// [`ErrorClass::Unclassified`], which is a class like any other.
+    pub fn record_tool_call(&mut self, error: Option<ErrorClass>) {
         self.tool_calls += 1;
-        if is_error {
-            self.errored_tool_calls += 1;
+        if let Some(class) = error {
+            self.errored_by_class[class.index()] += 1;
         }
     }
 
@@ -403,8 +419,17 @@ impl GateTally {
         self.tool_calls
     }
 
+    /// Total errored calls — DERIVED from the per-class split, never stored
+    /// beside it. See [`GateTally::errored_by_class`].
     pub fn errored_tool_calls(&self) -> u32 {
-        self.errored_tool_calls
+        self.errored_by_class.iter().sum()
+    }
+
+    /// Errored calls split by recovery class, indexed by
+    /// [`ErrorClass::index`]. Feeds [`super::capability::CapabilityCounters`],
+    /// which weights `MissingInfo` above the rest.
+    pub fn errored_by_class(&self) -> [u32; ErrorClass::ALL.len()] {
+        self.errored_by_class
     }
 
     pub fn scavenged_calls(&self) -> u32 {
@@ -446,7 +471,19 @@ impl GateTally {
             boundaries = %boundaries,
             turns = self.turns,
             tool_calls = self.tool_calls,
-            errored_tool_calls = self.errored_tool_calls,
+            errored_tool_calls = self.errored_tool_calls(),
+            // dirge-s9ry: the class split, not just the total. The total alone
+            // is what let two runs at 24% and 27% error rates read as ordinary
+            // friction — the harness could see THAT calls failed but not that
+            // every one of them named something that wasn't there. Field names
+            // come from `ErrorClass::field_name` and are asserted against
+            // `ErrorClass::ALL` by
+            // `every_error_class_has_a_field_on_the_emitted_line`.
+            errored_misuse = self.errored_by_class[ErrorClass::Misuse.index()],
+            errored_missing_info = self.errored_by_class[ErrorClass::MissingInfo.index()],
+            errored_transient = self.errored_by_class[ErrorClass::Transient.index()],
+            errored_fatal = self.errored_by_class[ErrorClass::Fatal.index()],
+            errored_unclassified = self.errored_by_class[ErrorClass::Unclassified.index()],
             final_verification = %final_verification,
             gate_awaiting_user = self.gates[GateSource::AwaitingUser.index()],
             gate_hook = self.gates[GateSource::Hook.index()],
@@ -725,11 +762,79 @@ pub(crate) mod tests {
     #[test]
     fn tool_call_errors_are_counted_separately() {
         let mut tally = GateTally::new();
-        tally.record_tool_call(false);
-        tally.record_tool_call(false);
-        tally.record_tool_call(true);
+        tally.record_tool_call(None);
+        tally.record_tool_call(None);
+        tally.record_tool_call(Some(ErrorClass::Unclassified));
         assert_eq!(tally.tool_calls(), 3);
         assert_eq!(tally.errored_tool_calls(), 1);
+    }
+
+    /// dirge-s9ry: the total is the SUM of the split, so no sequence of calls
+    /// can make the two disagree. `errored_tool_calls` used to be its own
+    /// field, which is the shape that drifts.
+    #[test]
+    fn the_errored_total_is_exactly_the_class_split() {
+        let mut tally = GateTally::new();
+        for class in ErrorClass::ALL {
+            tally.record_tool_call(Some(class));
+        }
+        tally.record_tool_call(Some(ErrorClass::MissingInfo));
+        tally.record_tool_call(None);
+
+        let split = tally.errored_by_class();
+        assert_eq!(
+            tally.errored_tool_calls(),
+            split.iter().sum::<u32>(),
+            "total and split disagree"
+        );
+        assert_eq!(tally.errored_tool_calls(), ErrorClass::ALL.len() as u32 + 1);
+        assert_eq!(split[ErrorClass::MissingInfo.index()], 2);
+        assert_eq!(split[ErrorClass::Fatal.index()], 1);
+        assert_eq!(
+            tally.tool_calls(),
+            ErrorClass::ALL.len() as u32 + 2,
+            "the success counts toward the denominator and nothing else"
+        );
+    }
+
+    /// The emitted line must carry every class, for the same reason the gate
+    /// and nudge lines must: a counter that is recorded and never reported is
+    /// a signal nobody can act on (dirge-l8l7.1).
+    #[test]
+    fn every_error_class_has_a_field_on_the_emitted_line() {
+        let line = capture_emit(&GateTally::new());
+        let present = emitted_field_names(&line);
+        let missing: Vec<&str> = ErrorClass::ALL
+            .into_iter()
+            .map(ErrorClass::field_name)
+            .filter(|name| !present.contains(name))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "ErrorClass variants recorded but never emitted: {missing:?}\nline: {line}"
+        );
+    }
+
+    /// ...and each field carries ITS OWN class's count. All five reading the
+    /// same slot would satisfy the presence test above and report nothing.
+    #[test]
+    fn each_class_field_carries_its_own_count() {
+        let mut tally = GateTally::new();
+        // Distinct counts, so a field wired to the wrong slot shows up as a
+        // wrong number rather than coincidentally matching.
+        for (i, class) in ErrorClass::ALL.into_iter().enumerate() {
+            for _ in 0..=i {
+                tally.record_tool_call(Some(class));
+            }
+        }
+        let line = capture_emit(&tally);
+        for (i, class) in ErrorClass::ALL.into_iter().enumerate() {
+            let want = format!("{}={}", class.field_name(), i + 1);
+            assert!(
+                line.split_whitespace().any(|tok| tok == want),
+                "expected `{want}` on the line: {line}"
+            );
+        }
     }
 
     #[test]

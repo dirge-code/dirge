@@ -776,9 +776,10 @@ build_config() { # $1 = cfgdir, $2 = overrides, $3 = model
 # maxstreak  repair_invalid  repair_total  verification  first_write  correct  tally
 # prologue_nudges  nudges_total  capability_tier  boundaries  gates_total
 # input_tokens  cached_tokens  cache_creation_tokens  session_found
+# denied_tool_attempts  compactions  errored_missing_info
 run_arm() { # $1 = overrides, $2 = tag, $3 = model
   local i cfgdir datadir out err logfile ok tally_str
-  local gates_line tally_found turns tool_calls_f errored scavenged storm maxstreak rep_invalid rep_total verification fw
+  local gates_line tally_found turns tool_calls_f errored err_missing scavenged storm maxstreak rep_invalid rep_total verification fw
   local sess sess_found in_tok cached_tok create_tok
   for i in $(seq 1 "$REPEATS"); do
     cfgdir="$(mktemp -d "$WORK/cfg.XXXXXX")"
@@ -805,6 +806,13 @@ run_arm() { # $1 = overrides, $2 = tag, $3 = model
       turns="$(get_field turns "$gates_line")"
       tool_calls_f="$(get_field tool_calls "$gates_line")"
       errored="$(get_field errored_tool_calls "$gates_line")"
+      # dirge-s9ry: MECHANISM GATE for the missing-info weighting. The tier
+      # only moves on errors classified MissingInfo, so an A/B that reads 0
+      # here in both arms measured nothing, however healthy the rest of the
+      # report looks. Reported beside errored_tool_calls for exactly that
+      # reason — the total was what made the two measured blowups read as
+      # ordinary friction.
+      err_missing="$(get_field errored_missing_info "$gates_line")"
       scavenged="$(get_field scavenged_calls "$gates_line")"
       storm="$(get_field storm_suppressions "$gates_line")"
       maxstreak="$(get_field max_failure_streak "$gates_line")"
@@ -838,7 +846,7 @@ run_arm() { # $1 = overrides, $2 = tag, $3 = model
       gates_total="$(sum_fields gate_ "$gates_line")"
     else
       tally_found=0
-      turns=0; tool_calls_f=0; errored=0; scavenged=0; storm=0
+      turns=0; tool_calls_f=0; errored=0; err_missing=0; scavenged=0; storm=0
       maxstreak=0; rep_invalid=0; rep_total=0; verification="-"
       nudge_prologue=0; nudges_total=0; gates_total=0; captier="-"; boundaries="none"
     fi
@@ -883,16 +891,17 @@ run_arm() { # $1 = overrides, $2 = tag, $3 = model
     # Col 20 (gates_fired) is APPENDED so columns 1..19 keep their meaning —
     # an older results.tsv still reports, it just has no gate column. Cols
     # 21..24 (tokens, cache, session_found) are appended for the same reason.
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
       "$2" "$3" "$i" "$turns" "$tool_calls_f" "$errored" "$scavenged" "$storm" \
       "$maxstreak" "$rep_invalid" "$rep_total" "$verification" "$fw" "$ok" "$tally_found" \
       "$nudge_prologue" "$nudges_total" "$captier" "$boundaries" "$gates_total" \
       "$in_tok" "$cached_tok" "$create_tok" "$sess_found" "$denied_n" "$compactions" \
+      "$err_missing" \
       >> "$WORK/results.tsv"
 
     if [ "$tally_found" = 1 ]; then tally_str=found; else tally_str=missing; fi
-    printf '  [%s %s %s/%s] turns=%s tools=%s err=%s scav=%s storm=%s streak=%s rep_inv=%s rep_ok=%s verify=%s first_write=%s correct=%s nudges=%s prologue=%s gates=%s tier=%s in_tok=%s cached=%s tally=%s\n' \
-      "$2" "$3" "$i" "$REPEATS" "$turns" "$tool_calls_f" "$errored" "$scavenged" "$storm" \
+    printf '  [%s %s %s/%s] turns=%s tools=%s err=%s err_mi=%s scav=%s storm=%s streak=%s rep_inv=%s rep_ok=%s verify=%s first_write=%s correct=%s nudges=%s prologue=%s gates=%s tier=%s in_tok=%s cached=%s tally=%s\n' \
+      "$2" "$3" "$i" "$REPEATS" "$turns" "$tool_calls_f" "$errored" "$err_missing" "$scavenged" "$storm" \
       "$maxstreak" "$rep_invalid" "$rep_total" "$verification" "$fw" "$ok" \
       "$nudges_total" "$nudge_prologue" "$gates_total" "$captier" "$in_tok" "$cached_tok" "$tally_str"
     if [ -n "${DENIED_TOOLS:-}" ]; then
@@ -990,7 +999,19 @@ NF < 19 { malformed_rows++; next }
   # was missing. Rows with NF < 19 never reach here (skipped as malformed
   # above), so this cannot fire on a truncated write.
   if (NF < 24) pretoken_rows++
-  nnum = split("4 5 6 7 8 9 10 11 16 17 20 21 22 23 25 26", numcols, " ")
+  # HAND-MAINTAINED, and it has to be: cols 12..15, 18, 19 and 24 are strings
+  # or flags handled separately, so this cannot be derived from NF. That makes
+  # it the exact shape docs/verification-discipline.md warns about — a list
+  # standing between a signal and its report — so it is guarded from the
+  # OTHER end instead: `every_reported_column_is_accumulated` in
+  # loop-ab-selftest.sh reads both this list and every `spread(...)` call in
+  # the report and fails when a row reads a column nobody accumulated.
+  #
+  # A column missing from here does NOT read as 0. It never enters mn/mx, so
+  # the range renders `(..)` where an absent-but-accumulated column renders
+  # `(0..0)` — the two are distinguishable on sight, which is what let this
+  # be caught when col 27 was appended without extending the list.
+  nnum = split("4 5 6 7 8 9 10 11 16 17 20 21 22 23 25 26 27", numcols, " ")
   for (ci = 1; ci <= nnum; ci++) {
     c = numcols[ci]
     # `+ 0` coerces: an ABSENT column (a results.tsv written before it
@@ -1226,6 +1247,10 @@ END {
     row("turns", spread(ck, 4), spread(tk, 4), dir3(mean(ck, 4), mean(tk, 4), 1, 0.5, noisefloor(ck, 4)))
     row("tool_calls", spread(ck, 5), spread(tk, 5), dir3(mean(ck, 5), mean(tk, 5), 1, 0.5, noisefloor(ck, 5)))
     row("errored_tool_calls", spread(ck, 6), spread(tk, 6), dir3(mean(ck, 6), mean(tk, 6), 1, 0.5, noisefloor(ck, 6)))
+    # dirge-s9ry: the wandering slice of the line above, and the ONLY slice the
+    # capability weighting reads. Zero in both arms means the weighting could
+    # not have fired, whatever else the report says.
+    row("  of which missing_info", spread(ck, 27), spread(tk, 27), "mechanism")
     row("scavenged_calls", spread(ck, 7), spread(tk, 7), dir3(mean(ck, 7), mean(tk, 7), 1, 0.5, noisefloor(ck, 7)))
     row("storm_suppressions", spread(ck, 8), spread(tk, 8), dir3(mean(ck, 8), mean(tk, 8), 1, 0.5, noisefloor(ck, 8)))
     row("max_failure_streak", spread(ck, 9), spread(tk, 9), dir3(mean(ck, 9), mean(tk, 9), 1, 0.5, noisefloor(ck, 9)))
@@ -1334,6 +1359,7 @@ END {
       row2("turns", spread(ck, 4), spread(ek, 4), dir3(mean(ck, 4), mean(ek, 4), 1, 0.5, noisefloor(ck, 4)))
       row2("tool_calls", spread(ck, 5), spread(ek, 5), dir3(mean(ck, 5), mean(ek, 5), 1, 0.5, noisefloor(ck, 5)))
       row2("errored_tool_calls", spread(ck, 6), spread(ek, 6), dir3(mean(ck, 6), mean(ek, 6), 1, 0.5, noisefloor(ck, 6)))
+      row2("  of which missing_info", spread(ck, 27), spread(ek, 27), "mechanism")
       row2("scavenged_calls", spread(ck, 7), spread(ek, 7), dir3(mean(ck, 7), mean(ek, 7), 1, 0.5, noisefloor(ck, 7)))
       row2("storm_suppressions", spread(ck, 8), spread(ek, 8), dir3(mean(ck, 8), mean(ek, 8), 1, 0.5, noisefloor(ck, 8)))
       row2("max_failure_streak", spread(ck, 9), spread(ek, 9), dir3(mean(ck, 9), mean(ek, 9), 1, 0.5, noisefloor(ck, 9)))
