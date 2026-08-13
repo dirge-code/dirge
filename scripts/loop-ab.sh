@@ -1167,6 +1167,26 @@ END {
           pairdir(green[ck], narm(ck), green[ek], narm(ek), 0, 0.05, ratefloor(ck, ek)))
       row2("tally_found", sprintf("%d/%d", tallyfound[ck], n[ck]), sprintf("%d/%d", tallyfound[ek], n[ek]), "must be full")
       row2("session_found", sessdist(ck), sessdist(ek), "must be full")
+      # The extra arm needs the spread rows too, and needs them MORE than the
+      # two-arm block does: extra arms are how a CUMULATIVE configuration gets
+      # measured, and the whole reason to run one is the expectation that
+      # stacked changes reinforce. Reporting the cumulative means while hiding
+      # whether the cumulative arm is steadier would leave the interesting
+      # half of that question unanswerable.
+      printf "\n%-26s %-26s %-26s %s\n", "dispersion (max-min)", "control", ak, "delta"
+      nd2 = split("4 5 6 9 21", dcol2, " ")
+      split("turns tool_calls errored_tool_calls max_failure_streak input_tokens", dnam2, " ")
+      st2 = 0; no2 = 0
+      for (dj = 1; dj <= nd2; dj++) {
+        d2 = dcol2[dj]
+        v2 = dispdir(ck, ek, d2)
+        if (v2 == "steadier") st2++
+        else if (v2 == "noisier") no2++
+        printf "%-26s %-26s %-26s %s\n", dnam2[dj], dispfmt(ck, d2), dispfmt(ek, d2), v2
+      }
+      if (st2 > 0 || no2 > 0) {
+        printf "  %s is steadier on %d metric(s), noisier on %d.\n", ak, st2, no2
+      }
       printf "\n"
     }
     printf "\n"

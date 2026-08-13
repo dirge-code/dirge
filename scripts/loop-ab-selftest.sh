@@ -355,6 +355,20 @@ want   "$out_single" "n=1 refuses a dispersion verdict"   '^turns +0 +0 +n/a \(n
 reject "$out_single" "and claims neither direction"       '^turns +0 +0 +(steadier|noisier)$'
 # The roll-up counts, and must not appear when nothing moved.
 want   "$out_steady" "the roll-up counts steadier metrics" 'treatment is steadier on [1-9][0-9]* metric'
+# The N-arm block needs the spread rows too — an extra arm is how a CUMULATIVE
+# config is measured, so hiding its dispersion hides half the question.
+#
+# NOT slice()d: the dispersion section opens with a blank line and slice()
+# stops at the first one, so anchoring there found nothing even though the
+# section printed. The header carries the ARM NAME, which is unique without
+# slicing — the two-arm block emits `control treatment`, never
+# `control allgates`. Pinning the name is also what caught the section
+# printing it BLANK (it used an awk variable that does not exist in that
+# scope); a laxer pattern would have accepted the empty column.
+want "$out_healthy" "the extra-arm block reports dispersion too" \
+  '^dispersion \(max-min\) +control +allgates +delta$'
+reject "$out_mech" "a two-arm run has no extra-arm dispersion section" \
+  '^dispersion \(max-min\) +control +allgates +delta$'
 reject "$out_single" "no roll-up when no verdict was possible" 'treatment is steadier on'
 
 # ---- denied_tool_attempts (dirge-e31n.3). Fewer attempts at tools the mode
