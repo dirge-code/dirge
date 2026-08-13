@@ -18,6 +18,14 @@ set -euo pipefail
 # plus turns-to-first-write (ordinal index of the first file-mutating
 # tool_use in the stream-json output) and task correctness.
 #
+# ...and the cost side, read from the run's own session file (dirge-e31n.1):
+# cumulative input tokens, cached input tokens, cache-creation tokens, and
+# the resulting hit rate. Those were previously only in code-mode-ab.sh,
+# which scrapes no capability signals — so a change could be measured for
+# steering OR for cost, never both at once, and a treatment that improved
+# steering by destroying the cached prefix would have read as a clean win.
+# `cached_tokens` is the one row here where HIGHER is better.
+#
 # Arms are ARBITRARY config overrides, not a hardcoded flag: `-A "k=v,..."`
 # is the control arm's jq assignment list, `-B` the treatment's. Values
 # that look like integers or true/false land as JSON numbers/booleans (a
@@ -527,10 +535,12 @@ build_config() { # $1 = cfgdir, $2 = overrides, $3 = model
 # $WORK/results.tsv as:
 # tag  model  repeat  turns  tool_calls  errored  scavenged  storm
 # maxstreak  repair_invalid  repair_total  verification  first_write  correct  tally
-# prologue_nudges  nudges_total  capability_tier  boundaries
+# prologue_nudges  nudges_total  capability_tier  boundaries  gates_total
+# input_tokens  cached_tokens  cache_creation_tokens  session_found
 run_arm() { # $1 = overrides, $2 = tag, $3 = model
   local i cfgdir datadir out err logfile ok tally_str
   local gates_line tally_found turns tool_calls_f errored scavenged storm maxstreak rep_invalid rep_total verification fw
+  local sess sess_found in_tok cached_tok create_tok
   for i in $(seq 1 "$REPEATS"); do
     cfgdir="$(mktemp -d "$WORK/cfg.XXXXXX")"
     datadir="$(mktemp -d "$WORK/data.XXXXXX")"
@@ -597,21 +607,47 @@ run_arm() { # $1 = overrides, $2 = tag, $3 = model
     fw="$(first_write "$out")"
     ok="$(check_correct "$out")"
 
+    # Token + cache accounting (dirge-e31n.1). The gate tally carries no
+    # token counts, so a cache change (prompt epoch, breakpoint placement,
+    # cache keys) was invisible to this harness and could only be measured
+    # by code-mode-ab.sh, which in turn scrapes none of the capability
+    # signals. Both halves are needed at once: an envelope that improves
+    # steering by wrecking the cached prefix is not an improvement.
+    #
+    # Same discipline as tally=missing — an absent session file is recorded
+    # as session_found=0, never as three zeros. A run that crashed before
+    # writing a session and a run that genuinely billed 0 input tokens are
+    # different facts, and only one of them is a harness bug.
+    sess="$(ls "$datadir"/sessions/*.json 2>/dev/null | head -1 || true)"
+    if [ -n "$sess" ]; then
+      sess_found=1
+      in_tok="$(jq -r '.cumulative_input_tokens // 0' "$sess" 2>/dev/null || echo 0)"
+      cached_tok="$(jq -r '.cumulative_cached_input_tokens // 0' "$sess" 2>/dev/null || echo 0)"
+      create_tok="$(jq -r '.cumulative_cache_creation_tokens // 0' "$sess" 2>/dev/null || echo 0)"
+    else
+      sess_found=0; in_tok=0; cached_tok=0; create_tok=0
+    fi
+
     # Col 20 (gates_fired) is APPENDED so columns 1..19 keep their meaning —
-    # an older results.tsv still reports, it just has no gate column.
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    # an older results.tsv still reports, it just has no gate column. Cols
+    # 21..24 (tokens, cache, session_found) are appended for the same reason.
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
       "$2" "$3" "$i" "$turns" "$tool_calls_f" "$errored" "$scavenged" "$storm" \
       "$maxstreak" "$rep_invalid" "$rep_total" "$verification" "$fw" "$ok" "$tally_found" \
       "$nudge_prologue" "$nudges_total" "$captier" "$boundaries" "$gates_total" \
+      "$in_tok" "$cached_tok" "$create_tok" "$sess_found" \
       >> "$WORK/results.tsv"
 
     if [ "$tally_found" = 1 ]; then tally_str=found; else tally_str=missing; fi
-    printf '  [%s %s %s/%s] turns=%s tools=%s err=%s scav=%s storm=%s streak=%s rep_inv=%s rep_ok=%s verify=%s first_write=%s correct=%s nudges=%s prologue=%s gates=%s tier=%s tally=%s\n' \
+    printf '  [%s %s %s/%s] turns=%s tools=%s err=%s scav=%s storm=%s streak=%s rep_inv=%s rep_ok=%s verify=%s first_write=%s correct=%s nudges=%s prologue=%s gates=%s tier=%s in_tok=%s cached=%s tally=%s\n' \
       "$2" "$3" "$i" "$REPEATS" "$turns" "$tool_calls_f" "$errored" "$scavenged" "$storm" \
       "$maxstreak" "$rep_invalid" "$rep_total" "$verification" "$fw" "$ok" \
-      "$nudges_total" "$nudge_prologue" "$gates_total" "$captier" "$tally_str"
+      "$nudges_total" "$nudge_prologue" "$gates_total" "$captier" "$in_tok" "$cached_tok" "$tally_str"
     if [ "$tally_found" = 0 ]; then
       printf '    ^ no dirge::gates line in %s (harness bug, not a zero tally)\n' "$logfile"
+    fi
+    if [ "$sess_found" = 0 ]; then
+      printf '    ^ no session file under %s/sessions (token columns are absent, not zero)\n' "$datadir"
     fi
   done
 }
@@ -684,7 +720,16 @@ NF < 19 { malformed_rows++; next }
   # 18 and 19 are string/flag fields handled separately below. Column 20 is
   # absent from a results.tsv written before it existed, which reads as 0.
   if (NF < 20) short_rows++
-  nnum = split("4 5 6 7 8 9 10 11 16 17 20", numcols, " ")
+  # dirge-e31n.1: cols 21..23 (tokens) and 24 (session_found) postdate the
+  # gates column, so a results.tsv can legitimately be 20 wide. Counted
+  # SEPARATELY from short_rows rather than folded into it — the two notes
+  # name different absences and a file can have either or both. A 19-wide
+  # file predates both columns and must say so twice; the first attempt at
+  # this guarded on `NF >= 20` and so told a legacy file only half of what
+  # was missing. Rows with NF < 19 never reach here (skipped as malformed
+  # above), so this cannot fire on a truncated write.
+  if (NF < 24) pretoken_rows++
+  nnum = split("4 5 6 7 8 9 10 11 16 17 20 21 22 23", numcols, " ")
   for (ci = 1; ci <= nnum; ci++) {
     c = numcols[ci]
     # `+ 0` coerces: an ABSENT column (a results.tsv written before it
@@ -707,6 +752,11 @@ NF < 19 { malformed_rows++; next }
   if ($13 == "-") never[key]++
   ok[key] += $14
   tallyfound[key] += $15
+  # Only counts rows that CARRY the column. On a pre-token results.tsv $24
+  # is the empty string, and adding it would report 0/N found — a harness
+  # bug that never happened. sessn[] is the denominator so the row can say
+  # "n/a (column absent)" instead of inventing a failure.
+  if ($24 != "") { sessn[key]++; sessfound[key] += $24 }
   # dirge-1elu.6: boundary co-occurrence events (col 19). Each event is a
   # shape like `Verifier+Critic` (co-firing members joined by `+`, events
   # separated by `;` in the run). `none` / `-` means no event fired.
@@ -774,6 +824,24 @@ function ratefloor(ck, tk,    a, b) {
 # as tally=missing: report the gap, never silently zero it, and never let it
 # take the rest of the report down with it.
 function prop(num, den) { return den > 0 ? num / den : 0 }
+# dirge-e31n.1: share of input tokens served from the provider prefix
+# cache. Reported, not scored — see the row() call for why. Guarded on the
+# denominator because a run that never reached the provider bills 0 input.
+# NOTE the missing apostrophe above, and in every other comment in this awk
+# program: the whole thing is one single-quoted shell string, so an
+# apostrophe ENDS it. The failure is silent in the worst way — awk still
+# parses, the report still exits 0, and the run prints per-repeat lines for
+# an hour before the comparison never appears. Caught after exactly that.
+function hitrate(key,    inp) {
+  inp = mean(key, 21)
+  return inp > 0 ? sprintf("%.0f%%", 100 * mean(key, 22) / inp) : "-"
+}
+# Distinct from tally_found: an absent COLUMN (pre-token results.tsv) is not
+# an absent SESSION. The first is an old file, the second is a harness bug,
+# and collapsing them would report every archived run as broken.
+function sessdist(key) {
+  return (key in sessn) ? sprintf("%d/%d", sessfound[key], sessn[key]) : "n/a (column absent)"
+}
 function havepair(a, b) { return (a in n) && n[a] > 0 && (b in n) && n[b] > 0 }
 function narm(a) { return (a in n) ? n[a] : 0 }
 function pairdir(cnum, cden, tnum, tden, lower_is_better, eps, noise) {
@@ -851,8 +919,18 @@ END {
     row("green_rate", sprintf("%d/%d (%.0f%%)", green[ck], narm(ck), 100 * prop(green[ck], narm(ck))),
         sprintf("%d/%d (%.0f%%)", green[tk], narm(tk), 100 * prop(green[tk], narm(tk))),
         pairdir(green[ck], narm(ck), green[tk], narm(tk), 0, 0.05, ratefloor(ck, tk)))
+    # dirge-e31n.1: cost side. Lower input tokens is better; HIGHER cached
+    # tokens is better, so it is the one metric here whose direction is
+    # inverted (lower_is_better=0). cache_hit_rate is reported rather than
+    # scored — it is a ratio of two numbers that both move, so a direction
+    # on it would double-count what the two rows above already say.
+    row("input_tokens", spread(ck, 21), spread(tk, 21), dir3(mean(ck, 21), mean(tk, 21), 1, 0.5, noisefloor(ck, 21)))
+    row("cached_tokens", spread(ck, 22), spread(tk, 22), dir3(mean(ck, 22), mean(tk, 22), 0, 0.5, noisefloor(ck, 22)))
+    row("cache_creation_tokens", spread(ck, 23), spread(tk, 23), dir3(mean(ck, 23), mean(tk, 23), 1, 0.5, noisefloor(ck, 23)))
+    row("cache_hit_rate", hitrate(ck), hitrate(tk), "observed")
     row("capability_tier", tierdist(ck), tierdist(tk), "observed")
     row("tally_found", sprintf("%d/%d", tallyfound[ck], n[ck]), sprintf("%d/%d", tallyfound[tk], n[tk]), "must be full")
+    row("session_found", sessdist(ck), sessdist(tk), "must be full")
 
     # dirge-1elu.6: co-occurrence per arm — which gates and nudges fired
     # together at one decision point, with counts. An arm whose boundaries
@@ -905,6 +983,8 @@ END {
       row2("nudges_fired", spread(ck, 17), spread(ek, 17), "mechanism")
       row2("  of which prologue", spread(ck, 16), spread(ek, 16), "mechanism")
       row2("gates_fired", spread(ck, 20), spread(ek, 20), "mechanism")
+      row2("input_tokens", spread(ck, 21), spread(ek, 21), dir3(mean(ck, 21), mean(ek, 21), 1, 0.5, noisefloor(ck, 21)))
+      row2("cached_tokens", spread(ck, 22), spread(ek, 22), dir3(mean(ck, 22), mean(ek, 22), 0, 0.5, noisefloor(ck, 22)))
       # dirge-l8l7.4: the guard above covers the EXTRA arm; control can be
       # absent for this model just as easily, and these divide by it too.
       row2("success_rate", rate(ck), rate(ek), pairdir(ok[ck], narm(ck), ok[ek], narm(ek), 0, 0.05, ratefloor(ck, ek)))
@@ -912,6 +992,7 @@ END {
           sprintf("%d/%d (%.0f%%)", green[ek], narm(ek), 100 * prop(green[ek], narm(ek))),
           pairdir(green[ck], narm(ck), green[ek], narm(ek), 0, 0.05, ratefloor(ck, ek)))
       row2("tally_found", sprintf("%d/%d", tallyfound[ck], n[ck]), sprintf("%d/%d", tallyfound[ek], n[ek]), "must be full")
+      row2("session_found", sessdist(ck), sessdist(ek), "must be full")
       printf "\n"
     }
     printf "\n"
@@ -948,6 +1029,9 @@ END {
   }
   if (short_rows > 0) {
     printf "  NOTE: %d row(s) predate the gates_fired column (fewer than 20 fields); gates_fired reads 0 for those by default, which is an absence, not a measurement.\n", short_rows
+  }
+  if (pretoken_rows > 0) {
+    printf "  NOTE: %d row(s) predate the token columns (fewer than 24 fields); input_tokens/cached_tokens read 0 for those, which is an absence, not a measurement.\n", pretoken_rows
   }
   if (malformed_rows > 0) {
     printf "  WARNING: %d row(s) had too few fields to be a run record and were skipped — check %s for truncated writes.\n", malformed_rows, FILENAME

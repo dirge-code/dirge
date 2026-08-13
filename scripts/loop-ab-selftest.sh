@@ -67,8 +67,18 @@ slice() { # $1 = output, $2 = header (literal)
 
 # tag model repeat turns tools err scav storm streak rep_inv rep_tot verify
 # first_write correct tally prologue nudges tier boundaries gates
+# input_tokens cached_tokens cache_creation_tokens session_found
 row() { # tag model repeat verify correct tally boundaries gates
-  printf '%s\t%s\t%s\t10\t20\t0\t0\t0\t0\t0\t0\t%s\t3\t%s\t%s\t0\t2\tnominal\t%s\t%s\n' "$@"
+  printf '%s\t%s\t%s\t10\t20\t0\t0\t0\t0\t0\t0\t%s\t3\t%s\t%s\t0\t2\tnominal\t%s\t%s\t1000\t400\t0\t1\n' "$@"
+}
+
+# A row carrying DIFFERENT token values, so an assertion about the token
+# columns has a known other-answer rather than matching the constant every
+# other row also writes. 2000 in / 1800 cached is 90% against the default
+# 1000 / 400 = 40%, and the two are on opposite sides of every direction
+# rule: more input is worse, more cached is better.
+row_tok() { # tag model repeat verify correct tally boundaries gates in cached create sessfound
+  printf '%s\t%s\t%s\t10\t20\t0\t0\t0\t0\t0\t0\t%s\t3\t%s\t%s\t0\t2\tnominal\t%s\t%s\t%s\t%s\t%s\t%s\n' "$@"
 }
 
 # ---- Fixtures. Each exists to be the other answer for some assertion. -----
@@ -117,6 +127,29 @@ awk -F'\t' 'BEGIN{OFS="\t"} NR==1{$15=0} {print}' "$work/healthy.tsv" > "$work/s
 # LEGACY: the same runs as recorded before the gates column existed.
 cut -f1-19 "$work/mech.tsv" > "$work/legacy.tsv"
 
+# PRETOKEN: recorded AFTER the gates column but BEFORE the token columns —
+# a legitimate 20-wide file, not a truncated one. It must report the missing
+# token columns and must NOT be accused of predating gates_fired or of being
+# a truncated write, and its session_found must read as an absent column
+# rather than 0/2 (which would call every archived run a harness bug).
+cut -f1-20 "$work/mech.tsv" > "$work/pretoken.tsv"
+
+# TOKENS: control bills more input and caches less than treatment. Both
+# token rows must therefore point the SAME way (treatment better) while
+# reading opposite columns — a swapped-column bug flips exactly one of them.
+# Spreads are wide enough that the deltas clear the noise floor.
+{
+  row_tok control   m1 1 VerifiedGreen 1 1 none              0 9000 1000 0 1
+  row_tok control   m1 2 VerifiedGreen 1 1 none              0 9100 1100 0 1
+  row_tok treatment m1 1 VerifiedGreen 1 1 'Verifier+Critic' 3 3000 2700 0 1
+  row_tok treatment m1 2 VerifiedGreen 1 1 'Verifier+Critic' 3 3100 2800 0 1
+} > "$work/tokens.tsv"
+
+# NOSESSION: identical to tokens.tsv except one run wrote no session file.
+# Only the session_found flag differs, so a report that cannot tell them
+# apart is not reading the column.
+awk -F'\t' 'BEGIN{OFS="\t"} NR==1{$24=0} {print}' "$work/tokens.tsv" > "$work/nosession.tsv"
+
 # BLANK: mech.tsv plus a trailing empty line. Must report identically — a
 # blank line used to mint an arm named "" and a model named "".
 { cat "$work/mech.tsv"; printf '\n'; } > "$work/blank.tsv"
@@ -132,6 +165,9 @@ out_mech="$(report "$work/mech.tsv")"
 out_blank="$(report "$work/blank.tsv")"
 out_truncated="$(report "$work/truncated.tsv")"
 out_legacy="$(report "$work/legacy.tsv")"
+out_pretoken="$(report "$work/pretoken.tsv")"
+out_tokens="$(report "$work/tokens.tsv")"
+out_nosession="$(report "$work/nosession.tsv")"
 
 fails=0
 want() { # $1 = output, $2 = description, $3 = grep -E pattern
@@ -177,10 +213,29 @@ eq() { # $1 = description, $2 = got, $3 = want
 
 echo "loop-ab.sh reporting self-test:"
 
+# ---- The awk program is ONE single-quoted shell string, so an apostrophe
+# anywhere inside it — including in a comment — terminates the quote. What
+# happens next is the worst available failure: awk still parses what it got,
+# the trailing words become filenames ("awk: can't open file prefix"), the
+# script still exits 0, and the run prints per-repeat lines for an hour
+# before the comparison silently never appears. Nothing above catches it,
+# because the extraction below reads the block by line range and so is happy
+# either way. This is a source check, not an output check, for that reason.
+awk_start="$(grep -n '^awk -F' "$ab" | cut -d: -f1)"
+awk_end="$(awk -v s="$awk_start" 'NR>s && /^'"'"' "\$WORK\/results.tsv"/{print NR; exit}' "$ab")"
+stray="$(awk -v s="$awk_start" -v e="$awk_end" "NR>s && NR<e && /'/ {print NR\": \"\$0}" "$ab")"
+if [ -z "$stray" ]; then
+  echo "  ok   no apostrophe inside the single-quoted awk program"
+else
+  echo "  FAIL apostrophe inside the awk program would end its quoting:"
+  printf '       %s\n' "$stray"
+  fails=$((fails + 1))
+fi
+
 # ---- Nothing below means anything if the report did not run. Checked first
 # and for every fixture, because an awk abort produces no rows at all and
 # every `reject` would then pass vacuously.
-for fx in healthy sick lopsided order mech legacy blank truncated; do
+for fx in healthy sick lopsided order mech legacy blank truncated pretoken tokens nosession; do
   eval "reject \"\$out_$fx\" \"the $fx report ran to completion\" 'REPORT-ABORTED'"
 done
 
@@ -227,6 +282,47 @@ want "$out_lopsided" "its rate delta reads n/a, not a number"    '^success_rate 
 want "$out_lopsided" "and the other models still report"         '^== model: m1 ==$'
 # The other side: a complete pair must NOT be labelled absent.
 reject "$out_healthy" "a complete pair is not labelled absent" 'NOTE: control runs='
+
+# ---- Token + cache columns (dirge-e31n.1). Asserted on tokens.tsv, where
+# control and treatment carry DIFFERENT values in both columns, so a row
+# that read the wrong column would show the other arm's number.
+want "$out_tokens" "input_tokens reads its own column" \
+  '^input_tokens +9050\.0 \(9000\.\.9100\) +3050\.0 \(3000\.\.3100\)'
+want "$out_tokens" "cached_tokens reads its own column" \
+  '^cached_tokens +1050\.0 \(1000\.\.1100\) +2750\.0 \(2700\.\.2800\)'
+# The direction rule is INVERTED between the two: less input is better,
+# more cached is better. A copy-pasted dir3 call gets one of them backwards,
+# and only checking both sides catches it.
+want "$out_tokens" "less input is better"  '^input_tokens .* better$'
+want "$out_tokens" "more cached is better" '^cached_tokens .* better$'
+# Ratio of the two, not a third column: 1050/9050 = 12%, 2750/3050 = 90%.
+want "$out_tokens" "cache_hit_rate divides cached by input" \
+  '^cache_hit_rate +12% +90% +observed$'
+want "$out_tokens" "a full-token run reports every session found" '^session_found +2/2 +2/2'
+
+# ---- An absent session is a harness bug and must read as one — the same
+# discipline as tally=missing. nosession.tsv differs from tokens.tsv in
+# exactly one field, so a report that cannot separate them is not reading it.
+want    "$out_nosession" "a missing session file is reported, not zeroed" '^session_found +1/2'
+differs "session_found actually reads the column" \
+  "$out_tokens" "$out_nosession"
+
+# ---- An absent COLUMN is not an absent session. pretoken.tsv is a
+# legitimate 20-wide file: it must be told what it is missing, and must not
+# be accused of the two OTHER shapes of incompleteness.
+want   "$out_pretoken" "a pre-token TSV says which columns are absent" \
+  'NOTE: 4 row\(s\) predate the token columns'
+want   "$out_pretoken" "and reads session_found as absent, not as 0 found" \
+  '^session_found +n/a \(column absent\) +n/a \(column absent\)'
+reject "$out_pretoken" "a pre-token TSV is not accused of predating gates" \
+  'predate the gates_fired column'
+reject "$out_pretoken" "and is not reported as a truncated write" \
+  'had too few fields'
+reject "$out_tokens"   "a full-width TSV carries no pre-token note" \
+  'predate the token columns'
+# A 19-wide legacy file predates BOTH columns and must say both, not one.
+want "$out_legacy" "a pre-gates TSV also names the missing token columns" \
+  'predate the token columns'
 
 # ---- dirge-l8l7.5: gates are half the mechanism check and were missing.
 # Asserted on the two-arm-only fixture, where gate count (3) differs from
