@@ -85,7 +85,22 @@ Respond in the same language the user writes to you.
 - Use write only for new files or complete rewrites
 - Use bash for running commands, tests, git operations
 - When the user's request is genuinely ambiguous — multiple plausible paths, unclear scope, or load-bearing decisions you can't infer from the codebase — prefer the `question` tool over guessing. Phrase each question with concrete options (and mark a recommended option \"(Recommended)\" when you have a strong preference) rather than open-ended prose. Don't over-ask: skip the tool for choices that are clearly decidable from context.
+";
 
+/// The hand-written per-tool list that used to close [`SYSTEM_PROMPT`].
+///
+/// Split out for dirge-e31n.3. It is a LITERAL: nothing reads the tool
+/// registry to build it, so it drifts from what the model actually has —
+/// `deny_tools` removes tools at the permission layer without removing them
+/// here (dirge-cw7w), MCP and plugin tools never appear in it at all, and
+/// under `dynamic_tool_search` it names tools not loaded this turn.
+///
+/// [`crate::agent::capability_cards`] renders the same information from the
+/// live catalog. Exactly one of the two is appended, chosen by the
+/// `capability_projection` config flag — appending both would state the tool
+/// set twice with two different answers, which is worse than stating it once
+/// and wrong.
+pub const STATIC_TOOL_LIST: &str = "\
 Available tools:
 - read: Read file contents (supports offset/limit for large files, max 10MB). Lines are prefixed with right-aligned numbers for reference (e.g. \"   1: content\"). When passing text from read to edit, strip the \"NNN: \" prefix — use only the actual file content.
 - write: Create or overwrite files (creates parent dirs automatically)
@@ -410,11 +425,21 @@ mod tests {
         ];
         let forbidden_actions = ["write", "delete", "create", "update"];
 
-        // Locate the `- memory:` bullet in SYSTEM_PROMPT.
-        let memory_line = SYSTEM_PROMPT
+        // Locate the `- memory:` bullet. It moved from SYSTEM_PROMPT to
+        // STATIC_TOOL_LIST in dirge-e31n.3; the guard still applies there,
+        // because that constant is still what the model reads whenever
+        // `capability_projection` is off.
+        //
+        // Under the projection this check has nothing to guard, and that is
+        // the point rather than a gap: the projection names tools but does
+        // not restate their contracts, so the model reads the action enum
+        // from the tool's own `parameters()` — the single definition, which
+        // cannot drift from itself. This bullet was always a second copy of
+        // that enum, and second copies are what this test exists to police.
+        let memory_line = STATIC_TOOL_LIST
             .lines()
             .find(|l| l.trim_start().starts_with("- memory:"))
-            .expect("SYSTEM_PROMPT should describe the memory tool");
+            .expect("STATIC_TOOL_LIST should describe the memory tool");
 
         // Split into words on whitespace and punctuation so substring
         // matches (e.g. "rewrite" containing "write") don't mask the

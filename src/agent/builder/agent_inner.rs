@@ -58,7 +58,7 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
     // at the permission-checker layer. Plan / review modes deny
     // edit/write/apply_patch/bash entirely, so the file-name gate
     // is unnecessary.
-    let mut preamble = assemble_base_preamble();
+    let mut preamble = assemble_base_preamble(cfg.resolve_capability_projection());
     append_code_mode_guidance(&mut preamble, cfg.resolve_code_mode_rubric());
     if let Some(agents) = &context.agents {
         preamble.push_str("\n\n");

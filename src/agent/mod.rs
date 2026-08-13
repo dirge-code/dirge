@@ -1,5 +1,6 @@
 pub mod agent_loop;
 pub mod builder;
+pub mod capability_cards;
 #[cfg(test)]
 mod compaction_recall;
 pub mod compression;

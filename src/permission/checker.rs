@@ -298,9 +298,10 @@ impl PermissionChecker {
     /// `check` and `check_path` share the same gate. Case-insensitive
     /// match (#7 fix): `deny_tools: [Edit]` correctly denies `edit`.
     fn is_prompt_denied(&self, tool: &str) -> bool {
-        self.prompt_deny_tools
-            .iter()
-            .any(|t| t.eq_ignore_ascii_case(tool))
+        // Delegates to the shared predicate so the capability projection
+        // (which describes the tool set to the model) cannot drift from what
+        // is actually enforced here. See `permission::is_denied_by`.
+        crate::permission::is_denied_by(&self.prompt_deny_tools, tool)
     }
 
     /// Public deny-list probe, used by code paths that route through

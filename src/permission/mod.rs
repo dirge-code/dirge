@@ -6,6 +6,23 @@ pub mod engine;
 pub mod path;
 pub mod pattern;
 
+/// Whether `tool` is denied by a `deny_tools` frontmatter list.
+///
+/// Case-insensitive: `deny_tools: [Edit]` denies `edit` (#7).
+///
+/// The single definition of that rule (dirge-e31n.3). It used to live only
+/// inside [`checker::PermissionChecker::is_prompt_denied`], which was fine
+/// while enforcement was the only consumer. It no longer is: the capability
+/// projection describes the tool set to the MODEL, and if its idea of "denied"
+/// drifts from the enforcer's, the prompt goes back to advertising tools that
+/// will be refused — which is the exact defect the projection exists to remove
+/// (see dirge-cw7w, where plan mode told the model to write a file it was
+/// denied). Two copies of a predicate that must agree is how they stop
+/// agreeing, so there is one.
+pub fn is_denied_by(deny: &[String], tool: &str) -> bool {
+    deny.iter().any(|d| d.eq_ignore_ascii_case(tool))
+}
+
 /// Push the active prompt's `deny_tools` list into the permission
 /// checker so subsequent tool calls observe the new restriction.
 /// Best-effort: a poisoned mutex falls through to `into_inner`,

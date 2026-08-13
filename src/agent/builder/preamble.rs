@@ -6,7 +6,7 @@
 use crate::agent::model_family::ModelFamily;
 use crate::agent::prompt::{
     CODE_MODE_GUIDANCE, DEEPSEEK_GUIDANCE, MEMORY_GUIDANCE, SESSION_SEARCH_GUIDANCE,
-    SKILLS_GUIDANCE, SYSTEM_PROMPT, TODO_TOOLS_PROMPT,
+    SKILLS_GUIDANCE, STATIC_TOOL_LIST, SYSTEM_PROMPT, TODO_TOOLS_PROMPT,
 };
 
 /// Append a memory provider's prompt block to the assembled preamble.
@@ -51,8 +51,15 @@ pub(crate) fn append_global_memory_to_preamble(
 /// blocks (AGENTS.md, prompts, project skills, memory) are layered on
 /// top by `build_agent_inner`. Extracted so the assembly is testable
 /// without exercising the full DI signature.
-pub(crate) fn assemble_base_preamble() -> String {
+pub(crate) fn assemble_base_preamble(capability_projection: bool) -> String {
     let mut p = SYSTEM_PROMPT.to_string();
+    // dirge-e31n.3: the hand-written tool list, appended only when the live
+    // projection is OFF. Exactly one of the two describes the tool set —
+    // both would state it twice with two different answers.
+    if !capability_projection {
+        p.push('\n');
+        p.push_str(STATIC_TOOL_LIST);
+    }
     p.push('\n');
     p.push_str(TODO_TOOLS_PROMPT);
     // dirge-xxun: skills self-improvement nudge (hermes SKILLS_GUIDANCE).

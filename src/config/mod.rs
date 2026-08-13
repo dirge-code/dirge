@@ -1146,6 +1146,21 @@ pub struct Config {
     /// the A/B says otherwise (`scripts/loop-ab.sh -B turn_envelope=true`).
     pub turn_envelope: Option<bool>,
 
+    /// dirge-e31n.3: replace the hand-written `Available tools:` list in the
+    /// system prompt with a projection rendered from the tools ACTUALLY
+    /// registered for the turn, minus what the active prompt's `deny_tools`
+    /// removes.
+    ///
+    /// The static list cannot see `deny_tools`, never mentions MCP or plugin
+    /// tools, and under `dynamic_tool_search` names tools that are not loaded
+    /// — so plan and review mode advertise `write`/`edit`/`apply_patch`/`bash`
+    /// while refusing all four (dirge-cw7w). A weak model plans against the
+    /// prompt, hits a refusal, and burns turns recovering.
+    ///
+    /// Default `false` so the preamble stays byte-for-byte identical until the
+    /// A/B says otherwise (`scripts/loop-ab.sh -B capability_projection=true`).
+    pub capability_projection: Option<bool>,
+
     /// Phase 4 part 2 (`docs/AGENTIC_LOOP_PLAN.md`): consecutive-turn
     /// threshold for the context-depth reminder system. `None`
     /// (default) keeps the feature OFF — long sessions get no
@@ -1670,6 +1685,12 @@ impl Config {
     /// A/B says the envelope is at least neutral.
     pub fn resolve_turn_envelope(&self) -> bool {
         self.turn_envelope.unwrap_or(false)
+    }
+
+    /// Capability-projection opt-in (dirge-e31n.3). Default off: the static
+    /// tool list stays in the preamble and no projection is rendered.
+    pub fn resolve_capability_projection(&self) -> bool {
+        self.capability_projection.unwrap_or(false)
     }
 
     /// Phased plan workflow opt-in (vix port). Default off — `/plan` is gated

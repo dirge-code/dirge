@@ -211,6 +211,36 @@ pub async fn build_agent(
             // one-liner nudge so the model knows to call
             // `tool_search` before reaching for unknown tools.
             let mut preamble = agent_preamble;
+            // dirge-e31n.3: describe the tools the model ACTUALLY has. This
+            // has to happen here rather than in `build_agent_inner` because
+            // the registry does not exist until `build_loop_tools` above has
+            // run — which is also why the list it replaces was hand-written
+            // in the first place, and why it drifted.
+            //
+            // `assemble_base_preamble` has already omitted the static list
+            // under the same flag, so exactly one of the two is present.
+            if cfg.resolve_capability_projection() {
+                let catalog = crate::agent::capability_cards::ToolCatalog::build(
+                    &loop_tools,
+                    &context.current_prompt_deny_tools,
+                );
+                if let Some(projection) = crate::agent::capability_cards::project(
+                    &catalog,
+                    crate::agent::capability_cards::DEFAULT_BUDGET_CHARS,
+                ) {
+                    if !projection.dropped.is_empty() {
+                        tracing::debug!(
+                            target: "dirge::context",
+                            dropped = ?projection.dropped,
+                            "capability projection over budget; families dropped",
+                        );
+                    }
+                    if !preamble.is_empty() {
+                        preamble.push_str("\n\n");
+                    }
+                    preamble.push_str(&projection.content);
+                }
+            }
             if dyn_search.is_some() {
                 if !preamble.is_empty() {
                     preamble.push_str("\n\n");

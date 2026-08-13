@@ -301,7 +301,7 @@ async fn tool_descriptions_meet_quality_bar() {
 /// every turn (not just at post-session review).
 #[test]
 fn base_preamble_includes_skills_guidance() {
-    let p = assemble_base_preamble();
+    let p = assemble_base_preamble(false);
     // Trigger fragments must be present.
     assert!(p.contains("complex task"), "missing create trigger");
     assert!(p.contains("5+ tool calls"), "missing 5+ trigger");
@@ -326,7 +326,7 @@ fn base_preamble_includes_skills_guidance() {
 /// prompt, not just in prose scattered elsewhere.
 #[test]
 fn base_preamble_includes_finishing_selfcheck() {
-    let p = assemble_base_preamble();
+    let p = assemble_base_preamble(false);
     assert!(
         p.contains("# Finishing"),
         "missing the Finishing section heading"
@@ -359,7 +359,7 @@ fn base_preamble_includes_finishing_selfcheck() {
 /// silently dropping one.
 #[test]
 fn base_preamble_carries_full_guidance_suite() {
-    let p = assemble_base_preamble();
+    let p = assemble_base_preamble(false);
     assert!(
         p.contains("# Finishing a task"),
         "F2 finishing self-check missing"
@@ -379,7 +379,7 @@ fn base_preamble_carries_full_guidance_suite() {
 /// the final reply terse (no contradiction with the Output section).
 #[test]
 fn base_preamble_includes_progress_updates() {
-    let p = assemble_base_preamble();
+    let p = assemble_base_preamble(false);
     assert!(
         p.contains("# Progress updates"),
         "missing the Progress updates section heading"
@@ -405,7 +405,7 @@ fn base_preamble_includes_progress_updates() {
 /// proceeds with a stated assumption when a question isn't warranted.
 #[test]
 fn base_preamble_includes_ask_calibration() {
-    let p = assemble_base_preamble();
+    let p = assemble_base_preamble(false);
     let lower = p.to_lowercase();
     assert!(
         p.contains("# Clarifying vs. proceeding"),
@@ -749,7 +749,7 @@ async fn steering_fragment_tracks_active_model_not_cli() {
 /// declarative-fact phrasing, and the past-session-recall nudge.
 #[test]
 fn base_preamble_includes_memory_and_search_guidance() {
-    let p = assemble_base_preamble();
+    let p = assemble_base_preamble(false);
 
     // MEMORY_GUIDANCE — must include the do/don't-save rules and the
     // declarative-vs-imperative example pair.
