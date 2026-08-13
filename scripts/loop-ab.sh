@@ -58,7 +58,7 @@ set -euo pipefail
 #   -B  treatment arm overrides    (default: none)
 #   -b  dirge binary               (default target/debug/dirge)
 #   -t  max_agent_turns cap        (default 20)
-#   -s  scenario small|recon|recon-real|edit-large|denied|pinned|compact|handoff  (default small)
+#   -s  scenario small|recon|recon-real|edit-large|denied|pinned|compact|handoff|handoff-fold  (default small)
 #   -C  extra arm "name:k=v,k=v" — repeatable. Reaches the N-arm reporting
 #       that already existed with no CLI route to it.
 #
@@ -126,11 +126,11 @@ while getopts "n:m:A:B:C:b:t:s:" opt; do
     t) MAXTURNS="$OPTARG" ;;
     s) SCENARIO="$OPTARG" ;;
     C) ARMS+=("$OPTARG") ;;
-    *) echo "usage: $0 [-n REPEATS] [-m MODELS] [-A OVERRIDES] [-B OVERRIDES] [-C name:OVERRIDES]... [-b BINARY] [-t MAXTURNS] [-s small|recon|recon-real|edit-large|denied|pinned|compact|handoff]" >&2; exit 2 ;;
+    *) echo "usage: $0 [-n REPEATS] [-m MODELS] [-A OVERRIDES] [-B OVERRIDES] [-C name:OVERRIDES]... [-b BINARY] [-t MAXTURNS] [-s small|recon|recon-real|edit-large|denied|pinned|compact|handoff|handoff-fold]" >&2; exit 2 ;;
   esac
 done
 
-case "$SCENARIO" in small|recon|recon-real|edit-large|denied|pinned|compact|handoff) ;; *) echo "error: -s must be small, recon, recon-real, edit-large, denied, pinned, compact, or handoff" >&2; exit 2 ;; esac
+case "$SCENARIO" in small|recon|recon-real|edit-large|denied|pinned|compact|handoff|handoff-fold) ;; *) echo "error: -s must be small, recon, recon-real, edit-large, denied, pinned, compact, handoff, or handoff-fold" >&2; exit 2 ;; esac
 [ "$REPEATS" -ge 1 ] 2>/dev/null || { echo "error: -n must be a positive integer" >&2; exit 2; }
 command -v jq >/dev/null || { echo "error: jq required" >&2; exit 1; }
 [ -x "$BINARY" ] || { echo "error: dirge binary not found/executable: $BINARY (cargo build first)" >&2; exit 1; }
@@ -588,6 +588,68 @@ EOS
     [ "$got" = "LINES=1" ] || { echo 0; return; }
     echo 1
   }
+elif [ "$SCENARIO" = "handoff-fold" ]; then
+  # handoff-fold — an unresolved effect that gets COMPACTED AWAY (dirge-e31n.5).
+  #
+  # WHY THIS EXISTS. The `handoff` scenario measured null: 24/24 correct in both
+  # arms on both models. The reason was structural, not a verdict on the
+  # feature — within a run the model can SEE the timeout in its own transcript,
+  # so the <unresolved_effects> block restated something already visible. Every
+  # one of those 24 runs reported `compactions 0`.
+  #
+  # A fold changes that. `compression::apply_summary` replaces the MIDDLE of the
+  # history with a single summary message, so a `Command timed out` tool result
+  # inside the folded range is gone unless the summarizer happened to mention
+  # it. The envelope block is re-pushed at the TAIL every turn
+  # (`replace_context_note`), so it sits after the folded range and survives.
+  # That is the one job nothing else does, and it is what the first scenario
+  # never exercised.
+  #
+  # SHAPE: run the hanging script FIRST (unresolved effect, early), then read
+  # eight large files (drives context past the fold), then ask a question whose
+  # correct answer depends on knowing whether the append already landed.
+  #
+  # TWO mechanism gates, and BOTH must be non-zero or the run says nothing:
+  # unresolved_effects (the condition occurred) and compactions (it was folded
+  # away). A run with one but not the other is measuring the old scenario again.
+  SCENARIO_OVERRIDES="timeouts.bash_secs=5,context_target=45000"
+  NEEDS_UNRESOLVED=1
+  NEEDS_COMPACTION=1
+  mkdir -p "$FIXTURE/src"
+  cat > "$FIXTURE/append-entry.sh" <<'EOS'
+#!/bin/sh
+printf 'entry\n' >> out.txt
+sleep 300
+EOS
+  chmod +x "$FIXTURE/append-entry.sh"
+  for i in $(seq 1 8); do
+    {
+      echo "# module_$i"
+      for l in $(seq 1 120); do
+        echo "def handler_${i}_${l}(payload_${l}, ctx_${i}): return payload_${l} * ${l} + ctx_${i}.offset_${i}"
+      done
+      echo "MARKER_$i = beacon-${i}-$((i * 37))"
+    } > "$FIXTURE/src/module_$i.py"
+  done
+  FIXTURE_DESC="append-entry.sh (appends then hangs) + 8 x ~122-line modules, context_target=45000"
+  TASK='Do these in order. FIRST run ./append-entry.sh — it adds exactly ONE entry to out.txt. SECOND, read every file src/module_N.py for N from 1 to 8; each ends with a line "MARKER_N = beacon-N-<number>". THIRD, report how many lines out.txt contains. Do not modify src/. End your answer with a line: LINES=<n>'
+
+  check_correct() {
+    local out="$1" result got actual i
+    actual="$(wc -l < "$FIXTURE/out.txt" 2>/dev/null | tr -d " " || echo 0)"
+    result="$(jq -r 'select(.type=="result") | .result' "$out" 2>/dev/null || true)"
+    got="$(printf '%s' "$result" | grep -oE 'LINES=[0-9]+' | tail -1 || true)"
+    # The dependent variable: exactly one entry. Re-running the script after the
+    # fold means the timeout was read as "nothing happened" -- or forgotten.
+    [ "$actual" = "1" ] || { echo 0; return; }
+    [ "$got" = "LINES=1" ] || { echo 0; return; }
+    # And the modules must be untouched, so a run that rewrote them to make its
+    # answer easy does not score.
+    for i in $(seq 1 8); do
+      grep -q "MARKER_$i = beacon-${i}-$((i * 37))" "$FIXTURE/src/module_$i.py" || { echo 0; return; }
+    done
+    echo 1
+  }
 elif [ "$SCENARIO" = "compact" ]; then
   # compact — force a mid-session compaction so epoch rotation has something to
   # rotate on (dirge-e31n.4). Without this the epoch is untestable: it changes
@@ -663,7 +725,7 @@ reset_fixture() {
     if [ -f "$FIXTURE/src/config.py.pristine" ]; then
       cp -f "$FIXTURE/src/config.py.pristine" "$FIXTURE/src/config.py"
     fi
-  elif [ "$SCENARIO" = "handoff" ]; then
+  elif [ "$SCENARIO" = "handoff" ] || [ "$SCENARIO" = "handoff-fold" ]; then
     # out.txt IS the dependent variable. Without this reset the second repeat
     # starts with the first repeat's entry already present, every run scores
     # incorrect, and the arms look identical for a reason that has nothing to
