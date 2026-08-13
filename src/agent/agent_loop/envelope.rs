@@ -167,7 +167,9 @@ impl TurnFact {
     fn render(&self) -> String {
         let mut s = format!("- {} {} effect={}", self.ordinal, self.tool, self.effect);
         if !self.summary.is_empty() {
-            s.push_str(&format!(" target={}", self.summary));
+            // Quoted: a command like `./deploy.sh --prod` has spaces, and an
+            // unquoted value gives the model no way to see where it ends.
+            s.push_str(&format!(" target=\"{}\"", self.summary));
         }
         s
     }
@@ -184,7 +186,11 @@ pub const MAX_TURN_FACTS: usize = 12;
 /// section rather than in the system prompt on purpose: the rule without the
 /// facts is a warning about nothing, costs cached-prefix tokens on every
 /// single turn, and trains the model to skim past it.
-const HANDOFF_RULE: &str = "An earlier turn stopped before it finished. Interruption does NOT undo work that already happened. Anything below is either already applied or unverifiable from here — CHECK the current state before redoing any of it, and do not assume a step needs repeating just because you cannot see its result.";
+const HANDOFF_RULE: &str = "The tool calls below did not report what they changed — they timed out, were \
+cut off, or failed after starting. A call that did not finish is NOT a call \
+that did not happen: whatever it had done by then, it did. So do not assume \
+any of these needs repeating just because you cannot see its result. CHECK \
+the current state first, and only then decide.";
 
 /// A per-turn envelope under construction.
 #[derive(Debug, Clone, Default)]
@@ -702,7 +708,7 @@ mod tests {
         let text = facts_env(&[(3, "bash", "unknown", "./deploy.sh")]);
         assert!(text.contains("<unresolved_effects>"), "{text}");
         assert!(
-            text.contains("- 3 bash effect=unknown target=./deploy.sh"),
+            text.contains(r#"- 3 bash effect=unknown target="./deploy.sh""#),
             "{text}"
         );
     }
@@ -713,14 +719,14 @@ mod tests {
     fn the_standing_rule_ships_with_the_facts_and_only_with_them() {
         let with = facts_env(&[(1, "write", "committed", "a.rs")]);
         assert!(
-            with.contains("Interruption does NOT undo work"),
+            with.contains("A call that did not finish is NOT a call"),
             "the rule must ship with the facts: {with}"
         );
         let mut bare = TurnEnvelope::new();
         bare.env("cwd", "/w");
         let without = bare.render().unwrap().text;
         assert!(
-            !without.contains("Interruption does NOT undo work"),
+            !without.contains("A call that did not finish is NOT a call"),
             "the rule leaked onto a turn with no facts: {without}"
         );
         assert!(!without.contains("unresolved_effects"), "{without}");

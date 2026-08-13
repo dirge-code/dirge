@@ -8382,7 +8382,7 @@ async fn a_timed_out_effect_reaches_the_model_as_a_handoff() {
         "the handoff did not say WHAT was in question:\n{blob}"
     );
     assert!(
-        blob.contains("Interruption does NOT undo work"),
+        blob.contains("A call that did not finish is NOT a call"),
         "the facts shipped without the rule that makes them actionable:\n{blob}"
     );
 }

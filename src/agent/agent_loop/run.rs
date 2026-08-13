@@ -3243,7 +3243,16 @@ pub async fn run_loop(
                         if effect == super::side_effect::SideEffect::Unknown {
                             tally.record_unresolved_effect();
                         }
-                        if config.turn_facts && effect != super::side_effect::SideEffect::NoEffect {
+                        // ONLY the unresolved ones are carried. An earlier
+                        // cut also listed `Committed` facts, and the rendered
+                        // block then contradicted itself: the rule says "these
+                        // did not report what they changed" above a list
+                        // containing entries that reported cleanly. Within a
+                        // run the model can already see those results anyway.
+                        // They become worth listing once the handoff survives
+                        // a real interrupt (dirge-pv03), where the model
+                        // cannot see its own tool results — not before.
+                        if config.turn_facts && effect == super::side_effect::SideEffect::Unknown {
                             {
                                 fact_ordinal += 1;
                                 pending_facts.push(super::envelope::TurnFact::new(
@@ -3369,14 +3378,12 @@ pub async fn run_loop(
             // effect committed cleanly has nothing to warn about, and pushing
             // the standing rule anyway would train the model to skim past it
             // on the turns where it matters.
-            // No `config.turn_facts` check here: the RECORDING site is gated,
-            // so with the flag off `pending_facts` is empty and this cannot
-            // fire. Mutation testing showed a second check changes nothing —
-            // two encodings of one rule, where changing one and trusting the
-            // other is how a flag half-works.
-            if pending_facts
-                .iter()
-                .any(|f| f.effect == super::side_effect::SideEffect::Unknown.as_str())
+            // No `config.turn_facts` check and no re-test of the effect: the
+            // RECORDING site is gated on both, so with the flag off — or with
+            // nothing unresolved — `pending_facts` is empty and this cannot
+            // fire. Mutation testing showed a second check changes nothing;
+            // two encodings of one rule is how a flag half-works.
+            if !pending_facts.is_empty()
                 && let Some(rendered) =
                     super::envelope::SessionFacts::read().to_envelope_with_facts(&pending_facts)
             {
