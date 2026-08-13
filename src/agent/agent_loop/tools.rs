@@ -616,9 +616,7 @@ async fn execute_prepared_tool_call(
             // aborted result; the loop's next signal check at
             // its turn boundary will exit cleanly.
             return ExecutedOutcome {
-                result: create_error_tool_result(
-                    "tool execution aborted by cancellation signal",
-                ),
+                result: create_error_tool_result(super::side_effect::ABORTED_SENTINEL),
                 is_error: true,
             };
         }

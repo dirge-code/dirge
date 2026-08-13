@@ -106,7 +106,20 @@ impl PortableTool for BashTool {
             "type": "object",
             "properties": {
                 "command": { "type": "string", "description": "Bash command to execute" },
-                "timeout": { "type": "integer", "description": "Timeout in seconds (optional; default 120, or 600 when background)" },
+                // dirge-e31n.5: rendered from the RESOLVED config, not a
+                // literal. This said "default 120, or 600 when background",
+                // which was wrong twice: it ignored `timeouts.bash_secs`, so a
+                // user who set 300 had the model told 120 and sizing its
+                // commands against a number that was not real; and there is no
+                // 600 background default at all — a backgrounded shell with no
+                // `timeout` runs UNBOUNDED, which the `background` description
+                // directly below states correctly. One schema, two accounts.
+                "timeout": { "type": "integer", "description": format!(
+                    "Timeout in seconds. Optional; defaults to {} for a foreground command. \
+                     When `background` is true this is an auto-kill-after-N instead, and \
+                     omitting it leaves the shell running until it exits or you kill it.",
+                    crate::timeout::Timeouts::get().bash.as_secs()
+                ) },
                 "background": { "type": "boolean", "description": "Run detached and unbounded: returns immediately with a shell id (does NOT block the turn). Use for long-running commands — dev servers, watch builds, tails. Read its accumulated output with the bash_output tool (pass the id; poll it to follow progress) and stop it with kill_shell (pass the id). Output is NOT auto-delivered. If `timeout` is set, the shell is auto-killed after that many seconds; otherwise it runs until it exits or you kill it." }
             },
             "required": ["command"]

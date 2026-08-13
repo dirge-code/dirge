@@ -94,6 +94,10 @@ pub struct AnyAgent {
     /// whether to EMIT them per turn. A flag that reached only one of the two
     /// would drop the facts entirely.
     turn_envelope: bool,
+    /// dirge-e31n.5: whether an unresolved-effect handoff rides the envelope.
+    /// Travels the same chain for the same reason; the config knob already
+    /// ANDs it with `turn_envelope`, so this cannot be on alone.
+    turn_facts: bool,
     /// Phase-3: per-session loaded-tool set. Allocated by
     /// `build_agent` when `dynamic_tool_search` is on, and
     /// shared with the `ToolSearchTool` instance registered in
@@ -349,6 +353,7 @@ impl AnyAgent {
             model_name,
             dynamic_tool_search: false,
             turn_envelope: false,
+            turn_facts: false,
             tool_def_filter: None,
             tool_search_registry: None,
             escalation_stream_fn: None,
@@ -731,6 +736,13 @@ impl AnyAgent {
     /// stale; on, once and fresh; and the two settings must not disagree.
     pub fn with_turn_envelope(mut self, enabled: bool) -> Self {
         self.turn_envelope = enabled;
+        self
+    }
+
+    /// dirge-e31n.5: carry an unresolved-effect handoff into the turn after a
+    /// tool call whose effect could not be confirmed.
+    pub fn with_turn_facts(mut self, enabled: bool) -> Self {
+        self.turn_facts = enabled;
         self
     }
 

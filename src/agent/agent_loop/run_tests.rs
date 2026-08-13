@@ -130,6 +130,7 @@ fn build_config() -> LoopConfig {
         tool_def_filter: None,
         dynamic_tool_search: false,
         turn_envelope: false,
+        turn_facts: false,
         escalation_stream_fn: None,
         escalation_provider_name: None,
         escalation_pending: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -8273,4 +8274,245 @@ fn an_unchanged_turn_envelope_is_left_alone() {
         "an identical envelope must be a no-op"
     );
     assert_eq!(ctx.messages, before, "context churned on an unchanged turn");
+}
+
+// ── dirge-e31n.5: unresolved-effect handoff ─────────────────────────────
+//
+// The taxonomy is unit-tested in `side_effect`; the rendering in `envelope`.
+// These cover the loop: that a tool whose effect could not be confirmed puts
+// a handoff in front of the MODEL on the following turn, and that a clean run
+// gets nothing.
+
+/// A `bash` that always times out — the ordinary way an effect becomes
+/// unresolved, and the one a live scenario can actually produce.
+#[derive(Debug)]
+struct TimingOutBashTool;
+
+impl LoopTool for TimingOutBashTool {
+    fn name(&self) -> &str {
+        "bash"
+    }
+    fn description(&self) -> &str {
+        "always times out"
+    }
+    fn label(&self) -> &str {
+        "bash"
+    }
+    fn parameters(&self) -> &Value {
+        static EMPTY: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+        EMPTY.get_or_init(
+            || serde_json::json!({"type":"object","properties":{"command":{"type":"string"}}}),
+        )
+    }
+    fn execute<'a>(
+        &'a self,
+        _id: &'a str,
+        _args: Value,
+        _signal: AbortSignal,
+        _on_update: LoopToolUpdate,
+    ) -> Pin<Box<dyn Future<Output = Result<super::super::LoopToolResult, String>> + Send + 'a>>
+    {
+        Box::pin(async move { Err("Command timed out after 120s".to_string()) })
+    }
+}
+
+fn context_with(tool: std::sync::Arc<dyn LoopTool>) -> Context {
+    Context {
+        system_prompt: String::new(),
+        messages: Vec::new(),
+        tools: vec![tool],
+    }
+}
+
+/// Drive one tool call then a final answer, returning everything the model saw.
+async fn run_with_tool(
+    tool: std::sync::Arc<dyn LoopTool>,
+    tool_name: &str,
+    args: Value,
+    turn_facts: bool,
+) -> String {
+    let seen: std::sync::Arc<Mutex<Vec<String>>> = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let factory = capturing_factory(
+        vec![
+            tool_use_response("c1", tool_name, args),
+            text_response("done"),
+        ],
+        seen.clone(),
+    );
+    let mut cfg = build_config();
+    cfg.turn_envelope = true;
+    cfg.turn_facts = turn_facts;
+    let (tx, mut _rx) = mpsc::channel::<LoopEvent>(256);
+    let _ = run_agent_loop(
+        vec![user("go")],
+        context_with(tool),
+        cfg,
+        AbortSignal::new(),
+        &tx,
+        &factory,
+        None,
+        None,
+    )
+    .await;
+    let g = seen.lock().unwrap();
+    g.join("\n")
+}
+
+/// A timed-out `bash` is an unresolved effect, and the turn after it must put
+/// that in front of the model together with the rule that makes it actionable.
+#[tokio::test]
+async fn a_timed_out_effect_reaches_the_model_as_a_handoff() {
+    let blob = run_with_tool(
+        std::sync::Arc::new(TimingOutBashTool),
+        "bash",
+        serde_json::json!({"command": "./slow-append.sh"}),
+        true,
+    )
+    .await;
+    assert!(
+        blob.contains("interrupted_turn_handoff"),
+        "no handoff reached the model:\n{blob}"
+    );
+    assert!(
+        blob.contains("effect=unknown"),
+        "the handoff did not mark the effect unresolved:\n{blob}"
+    );
+    assert!(
+        blob.contains("./slow-append.sh"),
+        "the handoff did not say WHAT was in question:\n{blob}"
+    );
+    assert!(
+        blob.contains("Interruption does NOT undo work"),
+        "the facts shipped without the rule that makes them actionable:\n{blob}"
+    );
+}
+
+/// The flag controls it. Without this the test above proves only that the
+/// string exists somewhere in the build.
+#[tokio::test]
+async fn no_handoff_when_turn_facts_is_off() {
+    let blob = run_with_tool(
+        std::sync::Arc::new(TimingOutBashTool),
+        "bash",
+        serde_json::json!({"command": "./slow-append.sh"}),
+        false,
+    )
+    .await;
+    assert!(
+        !blob.contains("interrupted_turn_handoff"),
+        "the handoff rendered with the flag off:\n{blob}"
+    );
+    // ...while the envelope itself still ships, so this is not just an
+    // envelope-wide off switch.
+    assert!(blob.contains("<turn_envelope"), "{blob}");
+}
+
+/// A run where everything committed cleanly has nothing to warn about. If the
+/// handoff shipped on every turn the model would learn to skim it, and it
+/// would be absent-in-effect exactly when it mattered.
+#[tokio::test]
+async fn no_handoff_when_every_effect_resolved() {
+    let blob = run_with_tool(
+        std::sync::Arc::new(RecBashTool::new()),
+        "bash",
+        serde_json::json!({"command": "true"}),
+        true,
+    )
+    .await;
+    assert!(
+        !blob.contains("interrupted_turn_handoff"),
+        "a clean run raised a handoff:\n{blob}"
+    );
+}
+
+/// A pure read that fails is NOT an unresolved effect — it changed nothing,
+/// whatever it reported. Otherwise every missing file would raise a warning
+/// about work that might have landed.
+#[tokio::test]
+async fn a_failed_read_raises_no_handoff() {
+    #[derive(Debug)]
+    struct FailingRead;
+    impl LoopTool for FailingRead {
+        fn name(&self) -> &str {
+            "read"
+        }
+        fn description(&self) -> &str {
+            "fails"
+        }
+        fn label(&self) -> &str {
+            "read"
+        }
+        fn parameters(&self) -> &Value {
+            static E: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+            E.get_or_init(|| serde_json::json!({"type":"object"}))
+        }
+        fn execute<'a>(
+            &'a self,
+            _id: &'a str,
+            _args: Value,
+            _signal: AbortSignal,
+            _on_update: LoopToolUpdate,
+        ) -> Pin<Box<dyn Future<Output = Result<super::super::LoopToolResult, String>> + Send + 'a>>
+        {
+            Box::pin(async move { Err("Command timed out after 5s".to_string()) })
+        }
+    }
+    let blob = run_with_tool(
+        std::sync::Arc::new(FailingRead),
+        "read",
+        serde_json::json!({"path": "/a/b.rs"}),
+        true,
+    )
+    .await;
+    assert!(
+        !blob.contains("interrupted_turn_handoff"),
+        "a timed-out READ raised an effect warning:\n{blob}"
+    );
+}
+
+/// dirge-e31n.5: the mechanism gate must count in BOTH arms. It answers "did
+/// this run produce an unconfirmable effect at all", which is a property of
+/// the scenario, not of the flag — and a gate that only counts where the
+/// feature is on reads zero in the control and makes every A/B look like the
+/// condition never occurred. It did: the first cut of this had the counter
+/// inside `config.turn_facts` and the control arm reported 0 while its own log
+/// showed the timeout firing.
+#[tokio::test]
+async fn unresolved_effects_are_counted_with_the_flag_off() {
+    for turn_facts in [true, false] {
+        let seen: std::sync::Arc<Mutex<Vec<String>>> = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let factory = capturing_factory(
+            vec![
+                tool_use_response("c1", "bash", serde_json::json!({"command": "./x.sh"})),
+                text_response("done"),
+            ],
+            seen,
+        );
+        let mut cfg = build_config();
+        cfg.turn_envelope = true;
+        cfg.turn_facts = turn_facts;
+        let (tx, mut _rx) = mpsc::channel::<LoopEvent>(256);
+        // Read the counter off the emitted `dirge::gates` line, which is the
+        // surface the A/B harness actually scrapes — asserting on an internal
+        // getter would leave the reported number untested.
+        let line = {
+            let (cap, _guard) = crate::agent::agent_loop::gate_tally::tests::field_capture();
+            let _ = run_agent_loop(
+                vec![user("go")],
+                context_with(std::sync::Arc::new(TimingOutBashTool)),
+                cfg,
+                AbortSignal::new(),
+                &tx,
+                &factory,
+                None,
+                None,
+            )
+            .await;
+            cap.snapshot()
+        };
+        assert!(
+            line.contains("unresolved_effects=1"),
+            "turn_facts={turn_facts}: the mechanism gate must count either way:\n{line}"
+        );
+    }
 }

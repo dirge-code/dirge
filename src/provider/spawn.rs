@@ -219,6 +219,7 @@ impl AnyAgent {
         cfg.tool_def_filter = tool_def_filter;
         cfg.dynamic_tool_search = self.dynamic_tool_search;
         cfg.turn_envelope = self.turn_envelope;
+        cfg.turn_facts = self.turn_facts;
         // Fresh-paste images ride on the active turn; the loop seeds
         // them as `UserPart::Image` parts. `asset_dir` lets the rig
         // boundary resolve every image ref (active + history) to base64.

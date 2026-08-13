@@ -516,6 +516,12 @@ pub struct LoopConfig {
     /// so exactly one of the two paths states them.
     pub turn_envelope: bool,
 
+    /// dirge-e31n.5: render an unresolved-effect handoff into the envelope on
+    /// the turn after one is recorded. Mirrors the `turn_facts` config knob,
+    /// which already ANDs it with `turn_envelope` — the handoff is a section
+    /// of that block, so it cannot render without it.
+    pub turn_facts: bool,
+
     /// Phase 4 part 1: alternate stream function used for ONE call
     /// after a repair-exhaustion or tree-sitter failure. None when
     /// escalation isn't configured.
@@ -864,6 +870,7 @@ impl Clone for LoopConfig {
             tool_def_filter: self.tool_def_filter.clone(),
             dynamic_tool_search: self.dynamic_tool_search,
             turn_envelope: false,
+            turn_facts: false,
             escalation_stream_fn: self.escalation_stream_fn.clone(),
             escalation_provider_name: self.escalation_provider_name.clone(),
             escalation_pending: self.escalation_pending.clone(),
@@ -932,6 +939,7 @@ impl LoopConfig {
             tool_def_filter: None,
             dynamic_tool_search: false,
             turn_envelope: false,
+            turn_facts: false,
             escalation_stream_fn: None,
             escalation_provider_name: None,
             escalation_pending: std::sync::Arc::new(std::sync::Mutex::new(None)),

@@ -1171,6 +1171,26 @@ pub struct Config {
     /// `Available tools:` list.
     pub capability_projection: Option<bool>,
 
+    /// dirge-e31n.5: carry an unresolved-effect handoff into the turn after a
+    /// tool call whose effect could not be confirmed.
+    ///
+    /// A tool result is success-or-error text, which answers "did the tool
+    /// report a problem" and not "did anything reach the disk". After a
+    /// timeout or a cancellation the model cannot tell a write that committed
+    /// from one that never ran, so it either re-runs a committed effect — a
+    /// second push, a doubled append — or assumes work it never did.
+    ///
+    /// When on, a turn containing an unresolved effect adds a
+    /// `<interrupted_turn_handoff>` section to the per-turn envelope listing
+    /// what may have landed, with the standing rule that interruption does not
+    /// undo work. Requires `turn_envelope`, which owns the block it rides in.
+    ///
+    /// Default `false` until measured. Unlike `turn_envelope` and
+    /// `capability_projection`, this one has no A/B behind it yet, and a
+    /// default flipped on an argument rather than a measurement is how the
+    /// other two would have shipped a regression.
+    pub turn_facts: Option<bool>,
+
     /// Phase 4 part 2 (`docs/AGENTIC_LOOP_PLAN.md`): consecutive-turn
     /// threshold for the context-depth reminder system. `None`
     /// (default) keeps the feature OFF — long sessions get no
@@ -1700,6 +1720,14 @@ impl Config {
     /// of the tool set is rendered from the live catalog rather than a literal.
     pub fn resolve_capability_projection(&self) -> bool {
         self.capability_projection.unwrap_or(true)
+    }
+
+    /// Unresolved-effect handoff (dirge-e31n.5). Default OFF pending
+    /// measurement, and gated on `turn_envelope` because the handoff renders
+    /// as a section of that block — with the envelope off there is nowhere for
+    /// it to go, and reporting it as enabled would be a lie.
+    pub fn resolve_turn_facts(&self) -> bool {
+        self.turn_facts.unwrap_or(false) && self.resolve_turn_envelope()
     }
 
     /// Phased plan workflow opt-in (vix port). Default off — `/plan` is gated

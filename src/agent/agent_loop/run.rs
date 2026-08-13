@@ -2225,6 +2225,34 @@ pub async fn run_agent_loop(
 /// default behaviour. That is why restoring it is safe despite its effect on
 /// tiering being unmeasured: the counter was always zero, so nobody has data
 /// on how often models invent tool names.
+/// A short description of WHAT a tool call acted on, for the unresolved-effect
+/// handoff (dirge-e31n.5). A list of bare tool names tells the model almost
+/// nothing — "bash" is not actionable, "bash ./deploy.sh" is.
+///
+/// Reads the argument names the built-in tools actually use, most specific
+/// first, and falls back to nothing rather than dumping the whole argument
+/// object: the summary rides into the prompt, and an arbitrary MCP tool's
+/// arguments can be large and can carry anything.
+fn fact_summary(args: &serde_json::Value) -> String {
+    const KEYS: [&str; 5] = ["command", "file_path", "path", "pattern", "query"];
+    for k in KEYS {
+        if let Some(v) = args.get(k).and_then(serde_json::Value::as_str) {
+            let v = v.trim();
+            if !v.is_empty() {
+                return crate::text::truncate_head(v, FACT_SUMMARY_CAP, |n| {
+                    format!("…(+{n} chars)")
+                })
+                .into_owned();
+            }
+        }
+    }
+    String::new()
+}
+
+/// Cap on a handoff summary. A `bash` command can be a whole heredoc; the
+/// first line's worth is what identifies it.
+const FACT_SUMMARY_CAP: usize = 120;
+
 fn record_tool_result_signals(
     tally: &mut GateTally,
     name: &str,
@@ -2449,6 +2477,10 @@ pub async fn run_loop(
     // from them — the alternative is picking another constant and calling it
     // adaptive.
     let mut capability = super::capability::CapabilityEstimator::new();
+    // dirge-e31n.5: tool calls this run whose effect is Committed or Unknown,
+    // and a monotonic ordinal so the model can read the order they happened in.
+    let mut pending_facts: Vec<super::envelope::TurnFact> = Vec::new();
+    let mut fact_ordinal: usize = 0;
 
     // Pi line 167: initial steering poll.
     // Phase 4 part 2: composes with the file-touch tracker's
@@ -3191,6 +3223,37 @@ pub async fn run_loop(
                             &excerpt,
                             &known_tool_names,
                         );
+                        // dirge-e31n.5: what this call may have LANDED. Only
+                        // effects worth carrying are kept — a `NoEffect` fact
+                        // in a handoff about what might have committed is
+                        // noise that dilutes the ones that matter.
+                        let effect = super::side_effect::classify_result(
+                            &originating.name,
+                            result.is_error,
+                            &excerpt,
+                        );
+                        // OBSERVATION, and deliberately NOT behind
+                        // `config.turn_facts`. This is the mechanism gate for
+                        // the whole feature, and a gate that only counts in
+                        // the arm the feature is on cannot answer the question
+                        // it exists for — "did this scenario even produce the
+                        // condition". The first cut had it inside the flag,
+                        // and the control arm reported 0 while its own log
+                        // showed the timeout firing.
+                        if effect == super::side_effect::SideEffect::Unknown {
+                            tally.record_unresolved_effect();
+                        }
+                        if config.turn_facts && effect != super::side_effect::SideEffect::NoEffect {
+                            {
+                                fact_ordinal += 1;
+                                pending_facts.push(super::envelope::TurnFact::new(
+                                    fact_ordinal,
+                                    &originating.name,
+                                    effect.as_str(),
+                                    fact_summary(&originating.arguments),
+                                ));
+                            }
+                        }
                         tally.record_failure_streak(guards.failure_streak() as u32);
                         current_context.messages.push(tool_result_to_value(result));
                         new_messages.push(LoopMessage::ToolResult(result.clone()));
@@ -3299,6 +3362,25 @@ pub async fn run_loop(
                     scavenged_calls: tally.scavenged_calls(),
                     max_failure_streak: tally.max_failure_streak(),
                 });
+            }
+
+            // dirge-e31n.5: re-render the envelope carrying the handoff, but
+            // ONLY once something is genuinely unresolved. A run whose every
+            // effect committed cleanly has nothing to warn about, and pushing
+            // the standing rule anyway would train the model to skim past it
+            // on the turns where it matters.
+            // No `config.turn_facts` check here: the RECORDING site is gated,
+            // so with the flag off `pending_facts` is empty and this cannot
+            // fire. Mutation testing showed a second check changes nothing —
+            // two encodings of one rule, where changing one and trusting the
+            // other is how a flag half-works.
+            if pending_facts
+                .iter()
+                .any(|f| f.effect == super::side_effect::SideEffect::Unknown.as_str())
+                && let Some(rendered) =
+                    super::envelope::SessionFacts::read().to_envelope_with_facts(&pending_facts)
+            {
+                replace_context_note(&mut current_context, super::envelope::MARKER, rendered.text);
             }
 
             // dirge-5mtx.2: ONE harness nudge per boundary, chosen by

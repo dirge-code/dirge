@@ -528,6 +528,32 @@ reject "$out_mi" "missing_info is never given a direction" \
 want "$out_mech" "a pre-missing-info TSV reads zero" \
   '^  of which missing_info +0\.0 \(0\.\.0\)'
 
+# ---- unresolved_effects mechanism gate (dirge-e31n.5). Column 28. The
+# handoff renders only on an unconfirmable effect, so this row is the
+# difference between "the taxonomy did not help" and "there was nothing to
+# help with".
+row_ue() { # tag model repeat unresolved
+  printf '%s\t%s\t%s\t10\t20\t8\t0\t0\t0\t0\t0\tVerifiedGreen\t3\t1\t1\t0\t2\tnominal\tnone\t0\t1000\t400\t0\t1\t0\t0\t6\t%s\n' "$@"
+}
+{
+  row_ue control   m1 1 4
+  row_ue control   m1 2 4
+  row_ue treatment m1 1 0
+  row_ue treatment m1 2 0
+} > "$work/unresolved.tsv"
+out_ue="$(report "$work/unresolved.tsv")"
+reject "$out_ue" "the unresolved report ran to completion" 'REPORT-ABORTED'
+want "$out_ue" "unresolved_effects reads its own column" \
+  '^unresolved_effects +4\.0 \(4\.\.4\) +0\.0 \(0\.\.0\) +mechanism$'
+# Its neighbour must keep its own value — the two are adjacent mechanism rows
+# with the fixture holding 6 and 4, so a column slip is visible.
+want "$out_ue" "missing_info still reads its own column beside it" \
+  '^  of which missing_info +6\.0 \(6\.\.6\)'
+reject "$out_ue" "unresolved_effects is never given a direction" \
+  '^unresolved_effects .*(better|worse)$'
+want "$out_mech" "a pre-unresolved TSV reads zero" \
+  '^unresolved_effects +0\.0 \(0\.\.0\)'
+
 # ---- input_tokens_per_turn (dirge-e31n.4). The steady fixture has identical
 # mean turns (9) in both arms and identical tokens (1000), so the ratio must be
 # identical too — that isolates the row from the mean-token row above.

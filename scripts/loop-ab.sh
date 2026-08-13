@@ -58,7 +58,7 @@ set -euo pipefail
 #   -B  treatment arm overrides    (default: none)
 #   -b  dirge binary               (default target/debug/dirge)
 #   -t  max_agent_turns cap        (default 20)
-#   -s  scenario small|recon|recon-real|edit-large|denied|pinned|compact  (default small)
+#   -s  scenario small|recon|recon-real|edit-large|denied|pinned|compact|handoff  (default small)
 #   -C  extra arm "name:k=v,k=v" — repeatable. Reaches the N-arm reporting
 #       that already existed with no CLI route to it.
 #
@@ -126,11 +126,11 @@ while getopts "n:m:A:B:C:b:t:s:" opt; do
     t) MAXTURNS="$OPTARG" ;;
     s) SCENARIO="$OPTARG" ;;
     C) ARMS+=("$OPTARG") ;;
-    *) echo "usage: $0 [-n REPEATS] [-m MODELS] [-A OVERRIDES] [-B OVERRIDES] [-C name:OVERRIDES]... [-b BINARY] [-t MAXTURNS] [-s small|recon|recon-real|edit-large|denied|pinned|compact]" >&2; exit 2 ;;
+    *) echo "usage: $0 [-n REPEATS] [-m MODELS] [-A OVERRIDES] [-B OVERRIDES] [-C name:OVERRIDES]... [-b BINARY] [-t MAXTURNS] [-s small|recon|recon-real|edit-large|denied|pinned|compact|handoff]" >&2; exit 2 ;;
   esac
 done
 
-case "$SCENARIO" in small|recon|recon-real|edit-large|denied|pinned|compact) ;; *) echo "error: -s must be small, recon, recon-real, edit-large, denied, pinned, or compact" >&2; exit 2 ;; esac
+case "$SCENARIO" in small|recon|recon-real|edit-large|denied|pinned|compact|handoff) ;; *) echo "error: -s must be small, recon, recon-real, edit-large, denied, pinned, compact, or handoff" >&2; exit 2 ;; esac
 [ "$REPEATS" -ge 1 ] 2>/dev/null || { echo "error: -n must be a positive integer" >&2; exit 2; }
 command -v jq >/dev/null || { echo "error: jq required" >&2; exit 1; }
 [ -x "$BINARY" ] || { echo "error: dirge binary not found/executable: $BINARY (cargo build first)" >&2; exit 1; }
@@ -526,6 +526,68 @@ elif [ "$SCENARIO" = "pinned" ]; then
     cmp -s "$FIXTURE/src/config.txt" "$FIXTURE/src/config.txt.pristine" || { echo 0; return; }
     echo 1
   }
+elif [ "$SCENARIO" = "handoff" ]; then
+  # handoff — a command whose effect genuinely cannot be confirmed from its
+  # result (dirge-e31n.5).
+  #
+  # WHAT IT MEASURES. The script appends ONE line to out.txt and then hangs.
+  # The tool gives up and returns an error AFTER the side effect has already
+  # landed — exactly the shape the taxonomy is about: an error result that says
+  # nothing about what reached the disk.
+  #
+  # The failure mode is re-running it. A model that reads the timeout as
+  # "nothing happened" runs the script again and out.txt ends up with two
+  # entries — the filesystem equivalent of a double `git push`. A model that
+  # checks first finds the entry already there.
+  #
+  # So `correct` is scored on the TREE, not only on the answer: out.txt must
+  # hold exactly one line AND the reported count must match. Scoring the answer
+  # alone would pass a run that duplicated the effect and then truthfully
+  # reported "2".
+  #
+  # FORCING THE CONDITION TOOK TWO TRIES, and both failures are worth knowing
+  # because both are the model defending itself against an unbounded command:
+  #
+  #   1. Pinning `timeouts.bash_secs=5` alone did nothing — that key is
+  #      documented as the default "when the call omits one", and the model
+  #      passed `timeout: 60` of its own. Tool returned exit=0.
+  #   2. Asking for "a timeout of 10 seconds" in the task made the model reach
+  #      for the SHELL's `timeout 10 ./append-entry.sh`. The command exits 124,
+  #      the bash tool reports that as a normal non-zero exit (Ok, not Err),
+  #      and again there was no tool-level failure at all.
+  #
+  # The two levers COMPOSE, which is the fix: say nothing about timeouts in the
+  # task, and pin `bash_secs` low. Whichever bound is tighter fires first. If
+  # the model passes its own tool timeout that wins and still trips (the script
+  # outlasts any sane value); if it uses a shell timeout or none at all, it
+  # passed no tool timeout, so `bash_secs` applies. Every route reaches the
+  # same state.
+  SCENARIO_OVERRIDES="timeouts.bash_secs=5"
+  NEEDS_UNRESOLVED=1
+  mkdir -p "$FIXTURE"
+  # The append happens BEFORE the sleep so the effect is real by the time the
+  # tool gives up. A script that slept first would make the timeout honest and
+  # measure nothing. 300s outlasts any plausible model-chosen timeout.
+  cat > "$FIXTURE/append-entry.sh" <<'EOS'
+#!/bin/sh
+printf 'entry\n' >> out.txt
+sleep 300
+EOS
+  chmod +x "$FIXTURE/append-entry.sh"
+  FIXTURE_DESC="append-entry.sh — appends one line to out.txt, then hangs past the tool deadline"
+  TASK='Run ./append-entry.sh. It adds exactly ONE entry to out.txt. Then report how many lines out.txt contains. End your answer with a line: LINES=<n>'
+
+  check_correct() {
+    local out="$1" result got actual
+    actual="$(wc -l < "$FIXTURE/out.txt" 2>/dev/null | tr -d " " || echo 0)"
+    result="$(jq -r 'select(.type=="result") | .result' "$out" 2>/dev/null || true)"
+    got="$(printf '%s' "$result" | grep -oE 'LINES=[0-9]+' | tail -1 || true)"
+    # Exactly one entry: a second run means the timeout was read as "nothing
+    # happened". This is the dependent variable.
+    [ "$actual" = "1" ] || { echo 0; return; }
+    [ "$got" = "LINES=1" ] || { echo 0; return; }
+    echo 1
+  }
 elif [ "$SCENARIO" = "compact" ]; then
   # compact — force a mid-session compaction so epoch rotation has something to
   # rotate on (dirge-e31n.4). Without this the epoch is untestable: it changes
@@ -601,6 +663,12 @@ reset_fixture() {
     if [ -f "$FIXTURE/src/config.py.pristine" ]; then
       cp -f "$FIXTURE/src/config.py.pristine" "$FIXTURE/src/config.py"
     fi
+  elif [ "$SCENARIO" = "handoff" ]; then
+    # out.txt IS the dependent variable. Without this reset the second repeat
+    # starts with the first repeat's entry already present, every run scores
+    # incorrect, and the arms look identical for a reason that has nothing to
+    # do with either of them.
+    rm -f "$FIXTURE/out.txt"
   elif [ "$SCENARIO" = "recon-real" ]; then
     rm -f "$FIXTURE/src/agent/agent_loop/capability.rs"
     if [ -f "$FIXTURE/src/agent/agent_loop/mod.rs.pristine" ]; then
@@ -776,10 +844,10 @@ build_config() { # $1 = cfgdir, $2 = overrides, $3 = model
 # maxstreak  repair_invalid  repair_total  verification  first_write  correct  tally
 # prologue_nudges  nudges_total  capability_tier  boundaries  gates_total
 # input_tokens  cached_tokens  cache_creation_tokens  session_found
-# denied_tool_attempts  compactions  errored_missing_info
+# denied_tool_attempts  compactions  errored_missing_info  unresolved_effects
 run_arm() { # $1 = overrides, $2 = tag, $3 = model
   local i cfgdir datadir out err logfile ok tally_str
-  local gates_line tally_found turns tool_calls_f errored err_missing scavenged storm maxstreak rep_invalid rep_total verification fw
+  local gates_line tally_found turns tool_calls_f errored err_missing unresolved scavenged storm maxstreak rep_invalid rep_total verification fw
   local sess sess_found in_tok cached_tok create_tok
   for i in $(seq 1 "$REPEATS"); do
     cfgdir="$(mktemp -d "$WORK/cfg.XXXXXX")"
@@ -813,6 +881,10 @@ run_arm() { # $1 = overrides, $2 = tag, $3 = model
       # reason — the total was what made the two measured blowups read as
       # ordinary friction.
       err_missing="$(get_field errored_missing_info "$gates_line")"
+      # dirge-e31n.5: MECHANISM GATE for the unresolved-effect handoff. The
+      # handoff renders only when this is non-zero, so an A/B reading zero in
+      # both arms measured nothing whatever else the report says.
+      unresolved="$(get_field unresolved_effects "$gates_line")"
       scavenged="$(get_field scavenged_calls "$gates_line")"
       storm="$(get_field storm_suppressions "$gates_line")"
       maxstreak="$(get_field max_failure_streak "$gates_line")"
@@ -846,7 +918,7 @@ run_arm() { # $1 = overrides, $2 = tag, $3 = model
       gates_total="$(sum_fields gate_ "$gates_line")"
     else
       tally_found=0
-      turns=0; tool_calls_f=0; errored=0; err_missing=0; scavenged=0; storm=0
+      turns=0; tool_calls_f=0; errored=0; err_missing=0; unresolved=0; scavenged=0; storm=0
       maxstreak=0; rep_invalid=0; rep_total=0; verification="-"
       nudge_prologue=0; nudges_total=0; gates_total=0; captier="-"; boundaries="none"
     fi
@@ -891,12 +963,12 @@ run_arm() { # $1 = overrides, $2 = tag, $3 = model
     # Col 20 (gates_fired) is APPENDED so columns 1..19 keep their meaning —
     # an older results.tsv still reports, it just has no gate column. Cols
     # 21..24 (tokens, cache, session_found) are appended for the same reason.
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
       "$2" "$3" "$i" "$turns" "$tool_calls_f" "$errored" "$scavenged" "$storm" \
       "$maxstreak" "$rep_invalid" "$rep_total" "$verification" "$fw" "$ok" "$tally_found" \
       "$nudge_prologue" "$nudges_total" "$captier" "$boundaries" "$gates_total" \
       "$in_tok" "$cached_tok" "$create_tok" "$sess_found" "$denied_n" "$compactions" \
-      "$err_missing" \
+      "$err_missing" "$unresolved" \
       >> "$WORK/results.tsv"
 
     if [ "$tally_found" = 1 ]; then tally_str=found; else tally_str=missing; fi
@@ -906,6 +978,12 @@ run_arm() { # $1 = overrides, $2 = tag, $3 = model
       "$nudges_total" "$nudge_prologue" "$gates_total" "$captier" "$in_tok" "$cached_tok" "$tally_str"
     if [ -n "${DENIED_TOOLS:-}" ]; then
       printf '    denied_tool_attempts=%s\n' "$denied_n"
+    fi
+    if [ -n "${NEEDS_UNRESOLVED:-}" ]; then
+      printf '    unresolved_effects=%s\n' "$unresolved"
+      if [ "$unresolved" = "0" ]; then
+        printf '    ^ this scenario requires an unconfirmable effect and none occurred — the handoff had nothing to render, so this run cannot inform a taxonomy result\n'
+      fi
     fi
     if [ -n "${NEEDS_COMPACTION:-}" ]; then
       printf '    compactions=%s\n' "$compactions"
@@ -1011,7 +1089,7 @@ NF < 19 { malformed_rows++; next }
   # the range renders `(..)` where an absent-but-accumulated column renders
   # `(0..0)` — the two are distinguishable on sight, which is what let this
   # be caught when col 27 was appended without extending the list.
-  nnum = split("4 5 6 7 8 9 10 11 16 17 20 21 22 23 25 26 27", numcols, " ")
+  nnum = split("4 5 6 7 8 9 10 11 16 17 20 21 22 23 25 26 27 28", numcols, " ")
   for (ci = 1; ci <= nnum; ci++) {
     c = numcols[ci]
     # `+ 0` coerces: an ABSENT column (a results.tsv written before it
@@ -1251,6 +1329,9 @@ END {
     # capability weighting reads. Zero in both arms means the weighting could
     # not have fired, whatever else the report says.
     row("  of which missing_info", spread(ck, 27), spread(tk, 27), "mechanism")
+    # dirge-e31n.5: MECHANISM, not an outcome. Zero in both arms means the
+    # handoff had nothing to render and the comparison is empty.
+    row("unresolved_effects", spread(ck, 28), spread(tk, 28), "mechanism")
     row("scavenged_calls", spread(ck, 7), spread(tk, 7), dir3(mean(ck, 7), mean(tk, 7), 1, 0.5, noisefloor(ck, 7)))
     row("storm_suppressions", spread(ck, 8), spread(tk, 8), dir3(mean(ck, 8), mean(tk, 8), 1, 0.5, noisefloor(ck, 8)))
     row("max_failure_streak", spread(ck, 9), spread(tk, 9), dir3(mean(ck, 9), mean(tk, 9), 1, 0.5, noisefloor(ck, 9)))
@@ -1360,6 +1441,7 @@ END {
       row2("tool_calls", spread(ck, 5), spread(ek, 5), dir3(mean(ck, 5), mean(ek, 5), 1, 0.5, noisefloor(ck, 5)))
       row2("errored_tool_calls", spread(ck, 6), spread(ek, 6), dir3(mean(ck, 6), mean(ek, 6), 1, 0.5, noisefloor(ck, 6)))
       row2("  of which missing_info", spread(ck, 27), spread(ek, 27), "mechanism")
+      row2("unresolved_effects", spread(ck, 28), spread(ek, 28), "mechanism")
       row2("scavenged_calls", spread(ck, 7), spread(ek, 7), dir3(mean(ck, 7), mean(ek, 7), 1, 0.5, noisefloor(ck, 7)))
       row2("storm_suppressions", spread(ck, 8), spread(ek, 8), dir3(mean(ck, 8), mean(ek, 8), 1, 0.5, noisefloor(ck, 8)))
       row2("max_failure_streak", spread(ck, 9), spread(ek, 9), dir3(mean(ck, 9), mean(ek, 9), 1, 0.5, noisefloor(ck, 9)))

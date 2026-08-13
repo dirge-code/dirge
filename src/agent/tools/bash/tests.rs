@@ -1482,3 +1482,38 @@ async fn bash_description_has_exactly_one_contract_line() {
         def.description
     );
 }
+
+/// dirge-e31n.5: the `timeout` parameter's description must report the
+/// RESOLVED default, not a literal. It said "default 120, or 600 when
+/// background" — the first ignored `timeouts.bash_secs`, so a user who
+/// configured 300 had the model planning against 120; the second described a
+/// 600s background default that has never existed (an unbounded background
+/// shell is what the `background` description itself says).
+#[test]
+fn timeout_description_reports_the_resolved_default_not_a_literal() {
+    let tool = BashTool::new(
+        None,
+        None,
+        crate::sandbox::Sandbox::new(crate::sandbox::SandboxMode::Off),
+    );
+    let schema = tool.parameters();
+    let desc = schema["properties"]["timeout"]["description"]
+        .as_str()
+        .expect("timeout description");
+    let resolved = crate::timeout::Timeouts::get().bash.as_secs();
+    assert!(
+        desc.contains(&resolved.to_string()),
+        "description does not state the resolved default {resolved}: {desc}"
+    );
+    // The fiction is gone, and its absence is asserted rather than assumed.
+    assert!(
+        !desc.contains("600 when background"),
+        "the 600s background default never existed: {desc}"
+    );
+    // ...and the real background behaviour is stated instead.
+    let lc = desc.to_lowercase();
+    assert!(
+        lc.contains("until it exits") || lc.contains("unbounded"),
+        "description does not say what an omitted background timeout does: {desc}"
+    );
+}

@@ -382,6 +382,7 @@ mod tests {
             tool_def_filter: None,
             dynamic_tool_search: false,
             turn_envelope: false,
+            turn_facts: false,
             escalation_stream_fn: None,
             escalation_provider_name: None,
             escalation_pending: std::sync::Arc::new(std::sync::Mutex::new(None)),

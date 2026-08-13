@@ -237,6 +237,11 @@ pub struct GateTally {
     storm_suppressions: u32,
     /// Peak failure streak over the run.
     max_failure_streak: u32,
+    /// dirge-e31n.5: tool calls whose effect could not be confirmed. The
+    /// MECHANISM GATE for the unresolved-effect handoff: the handoff renders
+    /// only when this is non-zero, so an A/B reading zero in both arms
+    /// measured nothing however healthy the rest of the report looks.
+    unresolved_effects: u32,
     /// dirge-1elu.6: completed boundary co-occurrence events, in run order.
     /// Each event lists the gates and nudges that fired at one decision
     /// point. OBSERVATION ONLY — no loop logic reads this back.
@@ -407,6 +412,11 @@ impl GateTally {
     pub fn record_failure_streak(&mut self, current: u32) {
         self.max_failure_streak = self.max_failure_streak.max(current);
     }
+
+    /// A tool call's effect could not be confirmed (dirge-e31n.5).
+    pub fn record_unresolved_effect(&mut self) {
+        self.unresolved_effects += 1;
+    }
 }
 
 // Read-side accessors. No consumer yet: the A/B harness (bd dirge-5mtx.1)
@@ -453,6 +463,10 @@ impl GateTally {
 
     pub fn storm_suppressions(&self) -> u32 {
         self.storm_suppressions
+    }
+
+    pub fn unresolved_effects(&self) -> u32 {
+        self.unresolved_effects
     }
 
     pub fn max_failure_streak(&self) -> u32 {
@@ -527,6 +541,7 @@ impl GateTally {
             hallucinated_tool_names = self.hallucinated_tool_names,
             storm_suppressions = self.storm_suppressions,
             max_failure_streak = self.max_failure_streak,
+            unresolved_effects = self.unresolved_effects,
             repair_null_stripped = repairs.as_ref().map_or(0, |s| s.null_stripped),
             repair_json_string_to_array = repairs.as_ref().map_or(0, |s| s.json_string_to_array),
             repair_object_to_array = repairs.as_ref().map_or(0, |s| s.object_to_array),

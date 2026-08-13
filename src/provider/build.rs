@@ -283,6 +283,7 @@ pub async fn build_agent(
                 agent = agent.with_review_memory_tool(tool);
             }
             agent = agent.with_turn_envelope(cfg.resolve_turn_envelope());
+            agent = agent.with_turn_facts(cfg.resolve_turn_facts());
             if let Some(ds) = dyn_search {
                 agent.with_dynamic_tool_search(ds.filter, ds.registry)
             } else {

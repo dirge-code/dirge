@@ -424,6 +424,10 @@ pub struct LoopSpawnConfig {
     /// for the same reason.
     pub turn_envelope: bool,
 
+    /// dirge-e31n.5: mirrors the `turn_facts` config knob. Rides the envelope,
+    /// so it is meaningless without `turn_envelope`.
+    pub turn_facts: bool,
+
     /// Phase 4 part 1: alternate stream function used for ONE
     /// call after a repair-exhaustion or tree-sitter failure.
     /// `None` when no escalation is configured.
@@ -555,6 +559,7 @@ impl LoopSpawnConfig {
             tool_def_filter: None,
             dynamic_tool_search: false,
             turn_envelope: false,
+            turn_facts: false,
             escalation_stream_fn: None,
             escalation_provider_name: None,
             escalation_max_per_session: None,
@@ -644,6 +649,7 @@ pub fn spawn_loop_runner(cfg: LoopSpawnConfig) -> LoopRunner {
         tool_def_filter: cfg.tool_def_filter.clone(),
         dynamic_tool_search: cfg.dynamic_tool_search,
         turn_envelope: cfg.turn_envelope,
+        turn_facts: cfg.turn_facts,
         escalation_stream_fn: cfg.escalation_stream_fn.clone(),
         escalation_provider_name: cfg.escalation_provider_name.clone(),
         escalation_pending: std::sync::Arc::new(std::sync::Mutex::new(None)),
