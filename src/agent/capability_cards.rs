@@ -31,9 +31,20 @@
 //! turn" is a fact the model needs, and its absence reads as an oversight it
 //! may try to work around.
 //!
-//! Tools in no family (MCP, plugins, anything new) are listed under a catch-all
-//! rather than dropped. Dropping them would recreate defect 2 in the mechanism
-//! built to fix it.
+//! Tools in no family (MCP, plugins, anything new) are ANNOUNCED BY COUNT, not
+//! enumerated. Announcing them fixes defect 2. Enumerating them made things
+//! measurably worse: the first version listed every name, which took the
+//! advertised surface from the 15 the static list carried to 63, and the A/B
+//! on DeepSeek came back turns 4.0 -> 8.5, tool_calls 3.0 -> 10.2,
+//! errored_tool_calls 0.0 (0..0) -> 3.8 (0..10), input_tokens 103k -> 230k —
+//! with `denied_tool_attempts`, the metric this exists to move, flat at zero in
+//! both arms.
+//!
+//! Accuracy and breadth are separate axes and only the first was the goal. A
+//! longer menu invites a weaker model to go shopping, and each unfamiliar tool
+//! it tries costs a turn and often an error. The extra tools are already fully
+//! described in the request tool array; repeating their names here adds no
+//! information, only encouragement.
 
 use crate::agent::agent_loop::LoopTool;
 use std::sync::Arc;
@@ -287,9 +298,28 @@ pub fn project(catalog: &ToolCatalog, budget: usize) -> Option<Projection> {
         blocks.push((fam.id, b));
     }
 
-    // Anything the table does not know about — MCP, plugins, tools added since
-    // this table was written. Listed rather than dropped: dropping them would
-    // recreate the "never described" defect inside the fix for it.
+    // Tools the family table does not know about — MCP, plugins, anything
+    // added since it was written.
+    //
+    // These are COUNTED, NOT ENUMERATED, and that is a measured decision
+    // rather than a stylistic one. The first version listed every one of them
+    // by name. On a config with several MCP servers registered that took the
+    // advertised tool surface from 15 names (the static list it replaced) to
+    // 63, and the A/B came back clearly worse on DeepSeek: turns 4.0 -> 8.5,
+    // tool_calls 3.0 -> 10.2, errored_tool_calls 0.0 (0..0) -> 3.8 (0..10),
+    // input_tokens 103k -> 230k — while `denied_tool_attempts`, the metric the
+    // projection was built to move, stayed flat at zero in both arms.
+    //
+    // The lesson is that accuracy and breadth are separate axes and only the
+    // first one was the goal. A longer menu invites a weaker model to go
+    // shopping, and every unfamiliar tool it tries is a turn plus an error.
+    // The tools are already fully described in the request's own tool array;
+    // repeating their names in the prompt adds no information the model lacks,
+    // only encouragement. `tool_search` is the discovery path when it needs
+    // one.
+    //
+    // What is preserved is the part that was actually missing: the model is
+    // TOLD these exist, so their presence in the tool array is not a surprise.
     let extras: Vec<&str> = catalog
         .available
         .iter()
@@ -300,9 +330,11 @@ pub fn project(catalog: &ToolCatalog, budget: usize) -> Option<Projection> {
         blocks.push((
             "other",
             format!(
-                "### Other tools\n{}\nConsult each tool's own description for its \
-                 contract before calling it.\n",
-                extras.join(", ")
+                "### Other tools\n{} further tool(s) are registered this turn \
+                 (integrations and plugins). Each carries its own description and \
+                 schema in this request; read those before calling one. Do not \
+                 assume a capability that is not described there.\n",
+                extras.len()
             ),
         ));
     }
@@ -455,17 +487,68 @@ mod tests {
         assert_eq!(c.denied(), ["edit"]);
     }
 
-    /// MCP and plugin tools have no family. Dropping them would recreate the
-    /// "never described" defect inside the fix for it.
+    /// MCP and plugin tools are ANNOUNCED but not enumerated.
+    ///
+    /// Both halves matter and the A/B is why. Announcing them is the win the
+    /// static list never had — it never mentioned MCP at all. Enumerating them
+    /// is what made the first version measurably worse: it took the advertised
+    /// surface from 15 names to 63 and the model went shopping (turns 4.0 ->
+    /// 8.5, errored_tool_calls 0.0 -> 3.8) without ever moving the denied-tool
+    /// metric the projection exists for.
     #[test]
-    fn unknown_tools_are_listed_not_dropped() {
-        let c = catalog(&["read", "mcp__server__do_thing"], &[]);
+    fn unknown_tools_are_counted_not_enumerated() {
+        let c = catalog(
+            &["read", "mcp__server__do_thing", "mcp__other__thing2"],
+            &[],
+        );
         let p = project(&c, DEFAULT_BUDGET_CHARS).expect("has tools");
         assert!(
-            p.content.contains("mcp__server__do_thing"),
-            "an unfamilied tool vanished:\n{}",
+            !p.content.contains("mcp__server__do_thing"),
+            "an unfamilied tool was enumerated by name:\n{}",
             p.content
         );
+        assert!(
+            p.content.contains("2 further tool(s)"),
+            "the model was not told the extra tools exist:\n{}",
+            p.content
+        );
+    }
+
+    /// The projection must not blow the advertised tool surface past what the
+    /// static list it replaces named (15). This is the regression that made
+    /// the first version worse than doing nothing, so it gets a test rather
+    /// than a comment.
+    #[test]
+    fn advertised_surface_stays_close_to_the_static_list() {
+        // A realistic registry: every familied tool plus a pile of MCP tools.
+        let mut names: Vec<&'static str> = FAMILIES
+            .iter()
+            .flat_map(|f| f.members.iter().copied())
+            .collect();
+        for extra in [
+            "mcp__a__one",
+            "mcp__a__two",
+            "mcp__b__three",
+            "mcp__b__four",
+            "mcp__c__five",
+        ] {
+            names.push(extra);
+        }
+        let tools: Vec<Arc<dyn LoopTool>> = names
+            .iter()
+            .map(|n| Arc::new(Stub(n)) as Arc<dyn LoopTool>)
+            .collect();
+        let c = ToolCatalog::build(&tools, &[]);
+        let p = project(&c, DEFAULT_BUDGET_CHARS).expect("has tools");
+        let named = names.iter().filter(|n| p.content.contains(**n)).count();
+        assert!(
+            named <= 40,
+            "the projection names {named} tools; the static list it replaces named 15, \
+             and a 4x menu is what made the first version measurably worse"
+        );
+        for mcp in ["mcp__a__one", "mcp__c__five"] {
+            assert!(!p.content.contains(mcp), "{mcp} was enumerated");
+        }
     }
 
     /// A tool that is registered nowhere must not be described. This is the
