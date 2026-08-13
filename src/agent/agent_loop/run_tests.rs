@@ -8935,3 +8935,134 @@ async fn a_mechanical_checkpoint_does_not_forbid_tools() {
          something DIFFERENT, which usually means calling something: {g:?}"
     );
 }
+
+// ── dirge-pv03: partial assistant text is fenced ────────────────────────
+//
+// stop_reason and error_message are faithful but TRANSCRIPT-ONLY — the
+// provider body carries role and content and nothing else. Without a marker in
+// the CONTENT, the next turn reads a sentence that stops mid-thought and
+// cannot tell it from a finished answer.
+
+/// A stream that emits some text and then dies, which is what a cancel or a
+/// non-retryable mid-stream failure looks like from here.
+fn truncating_stream(text: &str, error: &str) -> StreamFn {
+    let text = text.to_string();
+    let error = error.to_string();
+    std::sync::Arc::new(move |_ctx, _opts| {
+        let partial = AssistantMessage::new(
+            vec![ContentBlock::Text { text: text.clone() }],
+            StopReason::Stop,
+        );
+        Box::pin(futures::stream::iter(vec![
+            StreamEvent::Start {
+                partial: partial.clone(),
+            },
+            StreamEvent::Delta {
+                partial,
+                phase: crate::agent::agent_loop::message::DeltaPhase::TextDelta,
+            },
+            StreamEvent::Error {
+                error: error.clone(),
+            },
+        ]))
+    })
+}
+
+async fn run_truncated(text: &str, error: &str) -> Vec<LoopMessage> {
+    let (tx, mut _rx) = mpsc::channel::<LoopEvent>(256);
+    run_agent_loop(
+        vec![user("go")],
+        empty_context(),
+        build_config(),
+        AbortSignal::new(),
+        &tx,
+        &truncating_stream(text, error),
+        None,
+        None,
+    )
+    .await
+}
+
+/// The fence must be in the CONTENT. Asserting on error_message instead would
+/// pass while the model saw nothing.
+#[tokio::test]
+async fn a_cancelled_turn_fences_its_partial_text() {
+    let msgs = run_truncated(
+        "I checked the parser and the fix is to",
+        "stream aborted by cancellation signal",
+    )
+    .await;
+    let text = recited_text(&msgs);
+    assert!(
+        text.contains("I checked the parser"),
+        "the partial work was discarded:\n{text}"
+    );
+    assert!(
+        text.contains(crate::agent::agent_loop::stream::INTERRUPTED_NOTICE),
+        "the truncated text reached the model unmarked:\n{text}"
+    );
+}
+
+/// A transport failure truncates just as much as a cancel, and the model has
+/// the same problem. Both go through the terminal Error arm.
+#[tokio::test]
+async fn a_mid_stream_transport_failure_is_fenced_too() {
+    let msgs = run_truncated("Partial answer here", "error decoding response body").await;
+    assert!(
+        recited_text(&msgs).contains(crate::agent::agent_loop::stream::INTERRUPTED_NOTICE),
+        "a truncating transport error was not fenced"
+    );
+}
+
+/// The discriminating half: a turn that COMPLETED must not be fenced. Without
+/// this, "fence everything" passes.
+#[tokio::test]
+async fn a_completed_turn_is_never_fenced() {
+    let seen: std::sync::Arc<Mutex<Vec<String>>> = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let factory = capturing_factory(vec![text_response("All done, tests pass.")], seen);
+    let (tx, mut _rx) = mpsc::channel::<LoopEvent>(256);
+    let msgs = run_agent_loop(
+        vec![user("go")],
+        empty_context(),
+        build_config(),
+        AbortSignal::new(),
+        &tx,
+        &factory,
+        None,
+        None,
+    )
+    .await;
+    let text = recited_text(&msgs);
+    assert!(text.contains("All done"));
+    assert!(
+        !text.contains(crate::agent::agent_loop::stream::INTERRUPTED_NOTICE),
+        "a completed turn was marked interrupted:\n{text}"
+    );
+}
+
+/// An empty turn has nothing to qualify, and a bare marker on it is noise the
+/// model has to interpret.
+#[tokio::test]
+async fn an_empty_truncated_turn_gets_no_marker() {
+    let factory: StreamFn = std::sync::Arc::new(move |_ctx, _opts| {
+        Box::pin(futures::stream::iter(vec![StreamEvent::Error {
+            error: "stream aborted by cancellation signal".to_string(),
+        }]))
+    });
+    let (tx, mut _rx) = mpsc::channel::<LoopEvent>(256);
+    let msgs = run_agent_loop(
+        vec![user("go")],
+        empty_context(),
+        build_config(),
+        AbortSignal::new(),
+        &tx,
+        &factory,
+        None,
+        None,
+    )
+    .await;
+    assert!(
+        !recited_text(&msgs).contains(crate::agent::agent_loop::stream::INTERRUPTED_NOTICE),
+        "an empty turn was marked"
+    );
+}

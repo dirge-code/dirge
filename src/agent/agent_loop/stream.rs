@@ -41,6 +41,21 @@ use super::message::{
 use super::tool::AbortSignal;
 use super::types::{Context, LoopConfig};
 
+/// Appended to an assistant message that was cut off mid-stream (dirge-pv03),
+/// so the model reads the remains as incomplete rather than as an answer.
+///
+/// NOT named `*_TAG`. That suffix is reserved by
+/// [`super::intervention::HARNESS_TAGS`] for messages the harness injects on
+/// the model's behalf, and its registry test scans the source for the shape.
+/// This is not one of those: it is text inside the ASSISTANT's own message,
+/// never a `LoopMessage::User`, never mirrored to a `SystemNotice`, and never
+/// attributed to the user in the TUI. Same reasoning as
+/// [`super::envelope::MARKER`].
+pub const INTERRUPTED_NOTICE: &str = "[interrupted: the message above was cut off before it \
+finished — it is NOT a completed answer. Do not treat anything in it as a conclusion you \
+reached, and do not assume any work it describes was actually carried out. Re-establish the \
+state before continuing.]";
+
 /// Input passed to the stream function. Port of pi's `Context`
 /// (the one from `@earendil-works/pi-ai`, not pi's `AgentContext`)
 /// — system prompt + LLM-ready message list + tool defs.
@@ -355,6 +370,24 @@ pub async fn stream_assistant_response(
                 // and break the next turn's API call, so strip
                 // tool-call blocks and keep text/thinking.
                 content.retain(|b| !matches!(b, ContentBlock::ToolCall { .. }));
+                // dirge-pv03: fence what survived, IN THE CONTENT, so the model
+                // can see it was cut off.
+                //
+                // `stop_reason` and `error_message` are set below and are
+                // faithful, but they are TRANSCRIPT-ONLY: the provider body
+                // carries role and content and nothing else, so on the next
+                // turn the model reads a sentence that stops mid-thought and
+                // has no way to tell it from a finished answer. It then treats
+                // its own half-formed conclusion as settled, or assumes work
+                // the text was about to describe was actually done.
+                //
+                // Only when something streamed — an empty turn has nothing to
+                // qualify, and a bare marker on it would be noise.
+                if !content.is_empty() {
+                    content.push(ContentBlock::Text {
+                        text: format!("\n\n{INTERRUPTED_NOTICE}"),
+                    });
+                }
                 let finalised = AssistantMessage {
                     content,
                     stop_reason: StopReason::Error,
@@ -1107,9 +1140,14 @@ mod tests {
                 _ => None,
             })
             .collect();
+        // Still EXACT, not a `contains`: the partial must be preserved
+        // verbatim AND the only thing added is the dirge-pv03 fence. A
+        // loosened assertion here would stop noticing anything else that
+        // started appending to a truncated turn.
         assert_eq!(
-            text, "working on it",
-            "streamed partial must be preserved on a mid-stream Error"
+            text,
+            format!("working on it\n\n{INTERRUPTED_NOTICE}"),
+            "streamed partial must be preserved on a mid-stream Error, and marked incomplete"
         );
         assert_eq!(
             msg.error_message.as_deref(),
@@ -1179,6 +1217,9 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(text, "let me read the file");
+        assert_eq!(
+            text,
+            format!("let me read the file\n\n{INTERRUPTED_NOTICE}")
+        );
     }
 }
