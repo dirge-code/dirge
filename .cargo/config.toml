@@ -36,6 +36,14 @@ rustflags = ["-C", "link-arg=-fuse-ld=mold"]
 #   it off. Saves ~30-50% of incremental-link time on macOS.
 # - `incremental = true`: already the default for dev but make it
 #   explicit so a future profile-override doesn't silently disable.
+#
+# DISK: `target/debug/incremental` grows without an upper bound. Cargo prunes
+# old sessions per crate, but a workflow that recompiles the same crate many
+# times with small edits — mutation testing, bisecting — outruns that. It
+# reached 157 GB here and filled the volume mid-run, which surfaces as rustc
+# dying with SIGBUS rather than as anything mentioning disk space. It is pure
+# cache: `rm -rf target/debug/incremental` costs one slow rebuild and nothing
+# else. `scripts/mutate.sh` sets CARGO_INCREMENTAL=0 for exactly that reason.
 [profile.dev]
 split-debuginfo = "unpacked"
 incremental = true

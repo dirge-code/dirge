@@ -578,6 +578,32 @@ separate decision with its own evidence bar, and the source loop is the
 cautionary tale: it optimised an aggregate dominated by its medium tier and
 silently gave back the hard-tier gain.
 
+**Mutation testing has a harness: `scripts/mutate.sh`.** Reintroduce a bug,
+assert a named test dies. Everything in this document that turned out to be
+load-bearing was confirmed that way, and — more usefully — several guards that
+looked load-bearing had SURVIVING mutations, which is how their fixtures were
+found to be passing for the wrong reason.
+
+Three things the harness exists to stop, all learned the hard way:
+
+- **A mutation that did not apply is not a mutation that was survived.** The
+  `edit()` helper asserts its pattern was present, so a stale pattern is
+  reported as BROKEN rather than counted as a pass. From the outside those two
+  look identical, and the second is a false clean bill of health.
+- **Restore must not depend on the run finishing.** Hand-written `cp`-back is
+  fine until a command times out between the mutation and the restore, and then
+  a mutated file is sitting in the tree looking like real work. The harness
+  restores from a `trap`.
+- **Disk.** Each mutated rebuild writes a fresh incremental-compilation session.
+  `target/debug/incremental` reached 157 GB and filled the volume mid-session,
+  which surfaces as rustc dying with SIGBUS — nothing in the error mentions disk
+  space. Mutation builds are throwaway and gain almost nothing from
+  incrementality on a single large binary crate, so the harness sets
+  `CARGO_INCREMENTAL=0`.
+
+Always end with `mutate_control`: if the unmutated tree is red, every "killed"
+above it is reporting a suite that was already failing.
+
 **The harness has its own tests now.** `scripts/loop-ab-selftest.sh` runs the real
 reporting awk against a synthetic TSV — no models, no network. It exists because
 four bugs shipped in that awk at once, all silent: the report still printed, it
