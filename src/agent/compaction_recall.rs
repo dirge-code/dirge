@@ -155,12 +155,15 @@ pub(crate) async fn run_recall_eval(summarize: SummarizeFn) -> RecallReport {
     let msgs = session_with_facts(&facts);
     let (start, end) = compute_compress_window(&msgs, PROTECT_HEAD_DEFAULT, PROTECT_TAIL_DEFAULT);
     let middle = &msgs[start..end];
+    // dirge-tgb9: the fixture is dirge's own and contains no fence delimiter,
+    // so a failure here means the fixture grew one — loud is correct.
     let prompt = build_summary_prompt(
         middle,
         summary_budget(estimate_messages_tokens(middle)),
         None,
         None,
-    );
+    )
+    .expect("recall fixture must not contain the reserved fence delimiter");
     let summary = summarize(prompt).await.unwrap_or_default();
     score_recall(&summary, &facts)
 }
@@ -189,7 +192,8 @@ mod tests {
             summary_budget(estimate_messages_tokens(middle)),
             None,
             None,
-        );
+        )
+        .expect("fixture is clean");
         let report = score_recall(&prompt, &facts);
         assert!(
             report.all_survived(),
@@ -277,7 +281,8 @@ mod tests {
             summary_budget(estimate_messages_tokens(middle)),
             None,
             None,
-        );
+        )
+        .expect("fixture is clean");
         assert!(
             prompt.contains("stdlib conversion complete") && prompt.contains("no tokio remains"),
             "completion signal (original task DONE) must reach the summarizer prompt"

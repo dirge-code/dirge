@@ -152,7 +152,7 @@ pub(crate) fn build_compaction_prompt(
         anyhow::bail!("compaction aborted: input contains reserved delimiter string");
     }
 
-    Ok(prompt::COMPACTION_PROMPT
+    Ok(prompt::compaction_prompt()
         .replace("{conversation}", &conversation)
         .replace("{previous_summary}", prev_summary_value)
         .replace("{instructions}", &instructions_block))

@@ -1521,8 +1521,22 @@ fn spawn_incremental_checkpoint(
         // what was summarized, regardless of what the loop appends meanwhile.
         let boundary = messages.len();
         let budget = compression::summary_budget(compression::estimate_messages_tokens(&messages));
-        let prompt = compression::build_summary_prompt(&messages, budget, None, None);
+        // dirge-tgb9: refuses to build when the turns smuggle the fence
+        // delimiter. Nothing to fall back to here — a checkpoint is an
+        // optimisation, so skipping one just means the next fold summarizes
+        // inline.
+        let Ok(prompt) = compression::build_summary_prompt(&messages, budget, None, None) else {
+            tracing::warn!(
+                target: "dirge::agent_loop",
+                "checkpoint summary skipped: turns contain the reserved fence delimiter",
+            );
+            return;
+        };
         let result = tokio::time::timeout(CHECKPOINT_SUMMARY_TIMEOUT, sfn(prompt)).await;
+        // dirge-tgb9: strip echoed delimiters before this summary can be
+        // spliced into context — same reason as the inline path below.
+        let result =
+            result.map(|r| r.map(|s| crate::agent::prompt::strip_compaction_delimiters(&s)));
         if let Ok(Ok(summary)) = result
             && compression::validate_summary(&summary)
         {
@@ -1768,25 +1782,42 @@ async fn run_compaction_pass_with_focus(
             };
             let summary_result: Result<String, _> = match plugin_summary {
                 Some(s) => Ok(s),
-                None => {
-                    let prompt = compression::build_summary_prompt(
-                        &middle,
-                        budget,
-                        prev.as_deref(),
-                        augmented_focus.as_deref(),
-                    );
-                    // Bound the inline call: a provider that stalls without
-                    // erroring would otherwise freeze the loop indefinitely.
-                    // On timeout, keep the pruned context (Failed outcome).
-                    match tokio::time::timeout(COMPACTION_SUMMARY_TIMEOUT, sfn(prompt)).await {
-                        Ok(r) => r,
-                        Err(_) => Err(anyhow::anyhow!(
-                            "compaction summarizer timed out after {}s",
-                            COMPACTION_SUMMARY_TIMEOUT.as_secs()
-                        )),
+                None => match compression::build_summary_prompt(
+                    &middle,
+                    budget,
+                    prev.as_deref(),
+                    augmented_focus.as_deref(),
+                ) {
+                    // dirge-tgb9: the turns smuggle the reserved fence
+                    // delimiter, so the material cannot be safely fenced.
+                    // Reported as a failed summarization, which keeps the
+                    // pruned context — the same degradation as the circuit
+                    // breaker above, and far better than summarizing
+                    // attacker-shaped text into the next turn's context.
+                    Err(e) => Err(e),
+                    Ok(prompt) => {
+                        // Bound the inline call: a provider that stalls without
+                        // erroring would otherwise freeze the loop indefinitely.
+                        // On timeout, keep the pruned context (Failed outcome).
+                        match tokio::time::timeout(COMPACTION_SUMMARY_TIMEOUT, sfn(prompt)).await {
+                            Ok(r) => r,
+                            Err(_) => Err(anyhow::anyhow!(
+                                "compaction summarizer timed out after {}s",
+                                COMPACTION_SUMMARY_TIMEOUT.as_secs()
+                            )),
+                        }
                     }
-                }
+                },
             };
+            // dirge-tgb9: strip any delimiter the model echoed, exactly as the
+            // `/compact` path does (`provider::run_compaction`). This summary is
+            // spliced into the context the next turn reads, so a stray fence
+            // marker there would both confuse that turn and break the collision
+            // check on the NEXT compaction — which is the guard that keeps an
+            // attacker from closing the fence early. Covers the plugin-supplied
+            // summary above too, since both arrive here.
+            let summary_result =
+                summary_result.map(|s| crate::agent::prompt::strip_compaction_delimiters(&s));
             match summary_result {
                 Ok(summary) if compression::validate_summary(&summary) => {
                     let new_msgs =
