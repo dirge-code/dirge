@@ -1142,8 +1142,16 @@ pub struct Config {
     /// four lines. Re-evaluating them per user turn and appending at the
     /// tail costs nothing in cache churn.
     ///
-    /// Default `false` so the preamble stays byte-for-byte identical until
-    /// the A/B says otherwise (`scripts/loop-ab.sh -B turn_envelope=true`).
+    /// Default `true`. Measured on deepseek and glm at n=6 (scenario=denied):
+    /// 6/6 success on both models with no regression on any metric, and on the
+    /// model that was struggling it removed the blow-up runs entirely. On the
+    /// model that was coping it did nothing — which is the same shape
+    /// `capability.rs` is built on, help the failing run and leave the coping
+    /// run alone.
+    ///
+    /// The evidence base is ONE scenario at n=6, so this is a default worth
+    /// revisiting if a later scenario shows otherwise. Set `false` to restore
+    /// the frozen-preamble behaviour.
     pub turn_envelope: Option<bool>,
 
     /// dirge-e31n.3: replace the hand-written `Available tools:` list in the
@@ -1157,8 +1165,10 @@ pub struct Config {
     /// while refusing all four (dirge-cw7w). A weak model plans against the
     /// prompt, hits a refusal, and burns turns recovering.
     ///
-    /// Default `false` so the preamble stays byte-for-byte identical until the
-    /// A/B says otherwise (`scripts/loop-ab.sh -B capability_projection=true`).
+    /// Default `true`, on the same evidence as `turn_envelope` and with the
+    /// same caveat: safe on both models tested, materially better only on the
+    /// one that was failing. Set `false` to restore the hand-written
+    /// `Available tools:` list.
     pub capability_projection: Option<bool>,
 
     /// Phase 4 part 2 (`docs/AGENTIC_LOOP_PLAN.md`): consecutive-turn
@@ -1680,17 +1690,16 @@ impl Config {
         self.code_mode_rubric.unwrap_or(false)
     }
 
-    /// Per-turn context envelope opt-in (dirge-e31n.2). Default off, so the
-    /// frozen preamble keeps the session facts and nothing changes until the
-    /// A/B says the envelope is at least neutral.
+    /// Per-turn context envelope (dirge-e31n.2). Default ON — see the field
+    /// doc for the measurement behind that and its limits.
     pub fn resolve_turn_envelope(&self) -> bool {
-        self.turn_envelope.unwrap_or(false)
+        self.turn_envelope.unwrap_or(true)
     }
 
-    /// Capability-projection opt-in (dirge-e31n.3). Default off: the static
-    /// tool list stays in the preamble and no projection is rendered.
+    /// Capability projection (dirge-e31n.3). Default ON — the prompt's account
+    /// of the tool set is rendered from the live catalog rather than a literal.
     pub fn resolve_capability_projection(&self) -> bool {
-        self.capability_projection.unwrap_or(false)
+        self.capability_projection.unwrap_or(true)
     }
 
     /// Phased plan workflow opt-in (vix port). Default off — `/plan` is gated
@@ -2204,6 +2213,35 @@ mod tests {
     /// form used `as u8`/`as u32` casts that silently wrapped — 256
     /// CPUs became 0. Out-of-range values must now be a clean
     /// deserialization error, and valid ones still parse.
+    /// dirge-e31n: both steering flags ship ON. Pinned because the value is a
+    /// PRODUCT decision resting on a specific, narrow measurement — deepseek
+    /// and glm, n=6, one scenario — and a silent flip in either direction
+    /// changes what every user's model is told without anyone re-running that
+    /// measurement. Flipping these should be a deliberate edit that fails this
+    /// test first.
+    #[test]
+    fn steering_flags_default_on() {
+        let cfg = Config::default();
+        assert!(cfg.resolve_turn_envelope(), "turn_envelope must default on");
+        assert!(
+            cfg.resolve_capability_projection(),
+            "capability_projection must default on"
+        );
+    }
+
+    /// And both remain overridable to off — the escape hatch is the reason
+    /// defaulting them on is a safe call rather than a bet.
+    #[test]
+    fn steering_flags_can_be_disabled() {
+        let cfg = Config {
+            turn_envelope: Some(false),
+            capability_projection: Some(false),
+            ..Config::default()
+        };
+        assert!(!cfg.resolve_turn_envelope());
+        assert!(!cfg.resolve_capability_projection());
+    }
+
     #[test]
     fn sandbox_legacy_nested_rejects_out_of_range_cpus() {
         let ok: SandboxConfig =

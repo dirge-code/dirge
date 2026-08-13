@@ -517,7 +517,17 @@ async fn build_agent_inner_emits_assembled_preamble() {
     use rig::providers::openai;
 
     let cli = Cli::parse_from::<_, &str>(["dirge"]);
-    let cfg = Config::default();
+    // dirge-e31n.3: pinned OFF rather than left at the default. This test
+    // guards STATIC_TOOL_LIST against naming a memory action the schema does
+    // not have, and that constant only ships when the projection is off — with
+    // it on, the preamble does not describe memory actions at all and the
+    // model reads the enum from the tool's own `parameters()`, which cannot
+    // drift from itself. Leaving this at the default would make the assertion
+    // vacuous the moment the default flipped, which is exactly what happened.
+    let cfg = Config {
+        capability_projection: Some(false),
+        ..Config::default()
+    };
     let context = ContextFiles {
         agents: None,
         prompts: std::collections::HashMap::new(),

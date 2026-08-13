@@ -62,6 +62,15 @@ set -euo pipefail
 #   -C  extra arm "name:k=v,k=v" — repeatable. Reaches the N-arm reporting
 #       that already existed with no CLI route to it.
 #
+# WATCH THE DEFAULT. A flag that ships ON cannot be A/B'd with `-B flag=true` —
+# the control arm has it on too, so that is an A/A wearing a treatment label and
+# will read as "no effect" no matter how large the effect is. Put the DISABLE on
+# the control instead:
+#
+#   -A "turn_envelope=false" -B "turn_envelope=true"
+#
+# `turn_envelope` and `capability_projection` both default ON as of dirge-e31n.
+#
 # WHY EXTRA ARMS MATTER FOR THIS EPIC: features are expected to reinforce each
 # other, so the marginal effect of flag N measured alone understates the
 # cumulative effect of flags 1..N together. A two-arm A/B can only ever report
