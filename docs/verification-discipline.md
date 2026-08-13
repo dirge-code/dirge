@@ -595,11 +595,19 @@ Three things the harness exists to stop, all learned the hard way:
   a mutated file is sitting in the tree looking like real work. The harness
   restores from a `trap`.
 - **Disk.** Each mutated rebuild writes a fresh incremental-compilation session.
-  `target/debug/incremental` reached 157 GB and filled the volume mid-session,
-  which surfaces as rustc dying with SIGBUS — nothing in the error mentions disk
-  space. Mutation builds are throwaway and gain almost nothing from
-  incrementality on a single large binary crate, so the harness sets
-  `CARGO_INCREMENTAL=0`.
+  `target/debug/incremental` reached 157 GB here. That alone did not fill the
+  volume — it runs near 99% from ordinary use — but it was the largest single
+  reclaimable item and it is what tipped a full volume into ENOSPC mid-session.
+  Mutation builds are throwaway and gain almost nothing from incrementality on
+  a single large binary crate, so the harness sets `CARGO_INCREMENTAL=0`.
+
+  Diagnosing it has two traps worth knowing, because the symptom is rustc dying
+  with `SIGBUS` and a backtrace that mentions nothing about disk. First, `df /`
+  on macOS reports the sealed SYSTEM volume — the data lives on
+  `/System/Volumes/Data`, and the two share an APFS container, so the `Avail`
+  column is not describing the volume the `Used` column is. Second, APFS
+  snapshots pin the blocks of deleted files, so `rm -rf` returns space only as
+  they age out; `tmutil listlocalsnapshots /` shows what is holding them.
 
 Always end with `mutate_control`: if the unmutated tree is red, every "killed"
 above it is reporting a suite that was already failing.

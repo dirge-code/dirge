@@ -40,10 +40,16 @@ rustflags = ["-C", "link-arg=-fuse-ld=mold"]
 # DISK: `target/debug/incremental` grows without an upper bound. Cargo prunes
 # old sessions per crate, but a workflow that recompiles the same crate many
 # times with small edits — mutation testing, bisecting — outruns that. It
-# reached 157 GB here and filled the volume mid-run, which surfaces as rustc
-# dying with SIGBUS rather than as anything mentioning disk space. It is pure
-# cache: `rm -rf target/debug/incremental` costs one slow rebuild and nothing
-# else. `scripts/mutate.sh` sets CARGO_INCREMENTAL=0 for exactly that reason.
+# reached 157 GB. It was not the whole story — this volume runs near 99% from
+# ordinary use (Rust target dirs across ~/src exceed 110 GB) — but it was the
+# largest single reclaimable item, and it is what tipped a full volume into
+# ENOSPC mid-run. Two traps when diagnosing: `df /` reports the sealed SYSTEM
+# volume, not `/System/Volumes/Data` where the data lives; and APFS snapshots
+# pin the blocks of deleted files, so `rm -rf` returns space only as they age
+# out. The symptom is rustc dying with SIGBUS, which mentions nothing about
+# disk.
+# It is pure cache: `rm -rf target/debug/incremental` costs one slow rebuild.
+# `scripts/mutate.sh` sets CARGO_INCREMENTAL=0 for exactly that reason.
 [profile.dev]
 split-debuginfo = "unpacked"
 incremental = true
