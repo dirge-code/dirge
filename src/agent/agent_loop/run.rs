@@ -2225,34 +2225,6 @@ pub async fn run_agent_loop(
 /// default behaviour. That is why restoring it is safe despite its effect on
 /// tiering being unmeasured: the counter was always zero, so nobody has data
 /// on how often models invent tool names.
-/// A short description of WHAT a tool call acted on, for the unresolved-effect
-/// handoff (dirge-e31n.5). A list of bare tool names tells the model almost
-/// nothing — "bash" is not actionable, "bash ./deploy.sh" is.
-///
-/// Reads the argument names the built-in tools actually use, most specific
-/// first, and falls back to nothing rather than dumping the whole argument
-/// object: the summary rides into the prompt, and an arbitrary MCP tool's
-/// arguments can be large and can carry anything.
-fn fact_summary(args: &serde_json::Value) -> String {
-    const KEYS: [&str; 5] = ["command", "file_path", "path", "pattern", "query"];
-    for k in KEYS {
-        if let Some(v) = args.get(k).and_then(serde_json::Value::as_str) {
-            let v = v.trim();
-            if !v.is_empty() {
-                return crate::text::truncate_head(v, FACT_SUMMARY_CAP, |n| {
-                    format!("…(+{n} chars)")
-                })
-                .into_owned();
-            }
-        }
-    }
-    String::new()
-}
-
-/// Cap on a handoff summary. A `bash` command can be a whole heredoc; the
-/// first line's worth is what identifies it.
-const FACT_SUMMARY_CAP: usize = 120;
-
 fn record_tool_result_signals(
     tally: &mut GateTally,
     name: &str,
@@ -2479,11 +2451,9 @@ pub async fn run_loop(
     let mut capability = super::capability::CapabilityEstimator::new();
     // dirge-e31n.5: tool calls this run whose effect is Committed or Unknown,
     // and a monotonic ordinal so the model can read the order they happened in.
-    let mut pending_facts: Vec<super::envelope::TurnFact> = Vec::new();
     // dirge-e31n.6: armed by a permission checkpoint, consumed by the next
     // stream call. See that call site for why it is one-shot.
     let mut pending_tool_choice: Option<super::types::ToolChoice> = None;
-    let mut fact_ordinal: usize = 0;
 
     // Pi line 167: initial steering poll.
     // Phase 4 part 2: composes with the file-touch tracker's
@@ -3247,36 +3217,16 @@ pub async fn run_loop(
                             result.is_error,
                             &excerpt,
                         );
-                        // OBSERVATION, and deliberately NOT behind
-                        // `config.turn_facts`. This is the mechanism gate for
-                        // the whole feature, and a gate that only counts in
-                        // the arm the feature is on cannot answer the question
-                        // it exists for — "did this scenario even produce the
-                        // condition". The first cut had it inside the flag,
-                        // and the control arm reported 0 while its own log
-                        // showed the timeout firing.
+                        // OBSERVATION ONLY (dirge-e31n.5). The envelope block
+                        // this used to feed was cut on the evidence: four model
+                        // configurations across the supported range, two
+                        // scenarios, 53 runs, and the control arm never failed.
+                        // The counter stays because it costs nothing and it is
+                        // the mechanism gate that made those three rounds
+                        // legible at all -- without it a scenario that failed
+                        // to produce the condition reads as a null result.
                         if effect == super::side_effect::SideEffect::Unknown {
                             tally.record_unresolved_effect();
-                        }
-                        // ONLY the unresolved ones are carried. An earlier
-                        // cut also listed `Committed` facts, and the rendered
-                        // block then contradicted itself: the rule says "these
-                        // did not report what they changed" above a list
-                        // containing entries that reported cleanly. Within a
-                        // run the model can already see those results anyway.
-                        // They become worth listing once the handoff survives
-                        // a real interrupt (dirge-pv03), where the model
-                        // cannot see its own tool results — not before.
-                        if config.turn_facts && effect == super::side_effect::SideEffect::Unknown {
-                            {
-                                fact_ordinal += 1;
-                                pending_facts.push(super::envelope::TurnFact::new(
-                                    fact_ordinal,
-                                    &originating.name,
-                                    effect.as_str(),
-                                    fact_summary(&originating.arguments),
-                                ));
-                            }
                         }
                         tally.record_failure_streak(guards.failure_streak() as u32);
                         current_context.messages.push(tool_result_to_value(result));
@@ -3386,23 +3336,6 @@ pub async fn run_loop(
                     scavenged_calls: tally.scavenged_calls(),
                     max_failure_streak: tally.max_failure_streak(),
                 });
-            }
-
-            // dirge-e31n.5: re-render the envelope carrying the handoff, but
-            // ONLY once something is genuinely unresolved. A run whose every
-            // effect committed cleanly has nothing to warn about, and pushing
-            // the standing rule anyway would train the model to skim past it
-            // on the turns where it matters.
-            // No `config.turn_facts` check and no re-test of the effect: the
-            // RECORDING site is gated on both, so with the flag off — or with
-            // nothing unresolved — `pending_facts` is empty and this cannot
-            // fire. Mutation testing showed a second check changes nothing;
-            // two encodings of one rule is how a flag half-works.
-            if !pending_facts.is_empty()
-                && let Some(rendered) =
-                    super::envelope::SessionFacts::read().to_envelope_with_facts(&pending_facts)
-            {
-                replace_context_note(&mut current_context, super::envelope::MARKER, rendered.text);
             }
 
             // dirge-5mtx.2: ONE harness nudge per boundary, chosen by

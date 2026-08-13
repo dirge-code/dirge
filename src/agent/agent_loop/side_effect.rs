@@ -64,7 +64,11 @@ pub enum SideEffect {
 }
 
 impl SideEffect {
-    /// Stable lowercase wire name for the rendered handoff and telemetry.
+    /// Stable lowercase wire name. The envelope block that rendered these was
+    /// cut on the evidence (dirge-e31n.5); kept because the classification is
+    /// still the thing heal.rs decides an interrupted call's advice from, and
+    /// a caller wanting to log or report a class needs a name for it.
+    #[allow(dead_code)]
     pub fn as_str(self) -> &'static str {
         match self {
             SideEffect::Committed => "committed",

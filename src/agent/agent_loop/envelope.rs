@@ -50,41 +50,24 @@
 pub enum Section {
     /// Where the agent is running right now: cwd, OS, shell, git branch.
     SessionEnvironment,
-    /// dirge-e31n.5: tool calls whose effect on the world could not be
-    /// confirmed, and which nothing since has resolved.
-    ///
-    /// RUN-SCOPED, not turn-scoped, and the tag says so. An unresolved effect
-    /// stays unresolved until someone looks; dropping it after one turn would
-    /// lose the warning for a model that did not act on it immediately. The
-    /// cost is bounded because the block REPLACES rather than accumulates
-    /// (`run::replace_context_note`) and the list is capped at
-    /// [`MAX_TURN_FACTS`].
-    TurnFacts,
 }
 
 impl Section {
     /// Render order. Also the iteration order for budgeting, so that a
     /// caller adding a section has to place it deliberately.
-    pub const RENDER_ORDER: &'static [Section] = &[Section::SessionEnvironment, Section::TurnFacts];
+    pub const RENDER_ORDER: &'static [Section] = &[Section::SessionEnvironment];
 
     /// The order sections are DROPPED in when over budget — least
     /// load-bearing first. Deliberately a separate list from
     /// [`Self::RENDER_ORDER`]: what you read first is not what you can
     /// afford to lose first, and conflating them is how a budget quietly
     /// evicts the most important thing.
-    /// `TurnFacts` is LAST to be dropped, which is the whole reason this list
-    /// is separate from [`Self::RENDER_ORDER`]. The environment is four cheap
-    /// lines the model can re-derive with a tool call; the handoff is a
-    /// warning that redoing something may double it, and there is no way to
-    /// re-derive that after the fact.
-    pub const DEGRADE_ORDER: &'static [Section] =
-        &[Section::SessionEnvironment, Section::TurnFacts];
+    pub const DEGRADE_ORDER: &'static [Section] = &[Section::SessionEnvironment];
 
     /// The XML tag this section renders as.
     pub fn tag(self) -> &'static str {
         match self {
             Section::SessionEnvironment => "session_environment",
-            Section::TurnFacts => "unresolved_effects",
         }
     }
 }
@@ -127,78 +110,10 @@ pub struct Rendered {
     pub dropped: Vec<&'static str>,
 }
 
-/// One tool call from an earlier turn whose effect matters to this one
-/// (dirge-e31n.5).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TurnFact {
-    /// 1-based position among the RECORDED facts — not among all tool calls.
-    /// Reads that changed nothing are never recorded, so numbering by call
-    /// index would leave gaps the model would have to explain to itself. What
-    /// this carries is the order, which is the part that matters.
-    pub ordinal: usize,
-    pub tool: String,
-    /// [`super::side_effect::SideEffect::as_str`].
-    pub effect: &'static str,
-    /// A short, escaped description of WHAT was acted on — the path, the
-    /// command. Without it a list of tool names says almost nothing.
-    pub summary: String,
-}
-
-impl TurnFact {
-    /// Build a fact, escaping both observed values at construction so an
-    /// unescaped one cannot exist — the same rule and the same reason as
-    /// [`Fact::new`]. A tool name comes from the model and a summary comes
-    /// from its arguments; both are attacker-reachable, and an `escape` the
-    /// caller has to remember is one they will eventually forget.
-    pub fn new(
-        ordinal: usize,
-        tool: impl AsRef<str>,
-        effect: &'static str,
-        summary: impl AsRef<str>,
-    ) -> Self {
-        Self {
-            ordinal,
-            tool: escape_observation(tool.as_ref()),
-            effect,
-            summary: escape_observation(summary.as_ref()),
-        }
-    }
-
-    fn render(&self) -> String {
-        let mut s = format!("- {} {} effect={}", self.ordinal, self.tool, self.effect);
-        if !self.summary.is_empty() {
-            // Quoted: a command like `./deploy.sh --prod` has spaces, and an
-            // unquoted value gives the model no way to see where it ends.
-            s.push_str(&format!(" target=\"{}\"", self.summary));
-        }
-        s
-    }
-}
-
-/// Upper bound on rendered facts. A turn that dispatched forty writes before
-/// being cut off produces a handoff nobody reads; the most recent are the ones
-/// still in question. Overflow is REPORTED in the block rather than silently
-/// dropped — a truncated list of things that might have landed reads as a
-/// complete one, which is the failure this whole section exists to prevent.
-pub const MAX_TURN_FACTS: usize = 12;
-
-/// The standing rule that makes the facts actionable. Carried INSIDE the
-/// section rather than in the system prompt on purpose: the rule without the
-/// facts is a warning about nothing, costs cached-prefix tokens on every
-/// single turn, and trains the model to skim past it.
-const HANDOFF_RULE: &str = "The tool calls below did not report what they changed — they timed out, were \
-cut off, or failed after starting. A call that did not finish is NOT a call \
-that did not happen: whatever it had done by then, it did. So do not assume \
-any of these needs repeating just because you cannot see its result. CHECK \
-the current state first, and only then decide.";
-
 /// A per-turn envelope under construction.
 #[derive(Debug, Clone, Default)]
 pub struct TurnEnvelope {
     env: Vec<Fact>,
-    facts: Vec<TurnFact>,
-    /// Facts dropped by [`MAX_TURN_FACTS`], so the block can say so.
-    facts_elided: usize,
 }
 
 /// Wrapper delimiters. Versioned from the first commit: a later revision that
@@ -247,61 +162,30 @@ impl TurnEnvelope {
         self
     }
 
-    /// Record one earlier tool call whose effect is still relevant. The fact
-    /// arrives already escaped from [`TurnFact::new`], which is the ONLY way
-    /// to build one — so there is no second path here that could escape a
-    /// second time or not at all.
-    ///
-    /// Keeps the LAST [`MAX_TURN_FACTS`] and counts the rest.
-    pub fn push_fact(&mut self, fact: TurnFact) -> &mut Self {
-        self.facts.push(fact);
-        self.trim_facts();
-        self
-    }
-
-    fn trim_facts(&mut self) {
-        if self.facts.len() > MAX_TURN_FACTS {
-            let drop = self.facts.len() - MAX_TURN_FACTS;
-            self.facts.drain(0..drop);
-            self.facts_elided += drop;
-        }
-    }
-
     /// True when nothing has been added. Used by the caller to skip the
     /// push entirely.
     pub fn is_empty(&self) -> bool {
-        self.env.is_empty() && self.facts.is_empty()
+        self.env.is_empty()
     }
 
     fn render_section(&self, s: Section) -> Option<String> {
-        let body = match s {
-            Section::SessionEnvironment => {
-                if self.env.is_empty() {
-                    return None;
-                }
-                self.env
-                    .iter()
-                    .map(|f| format!("- {}", f.render()))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            }
-            Section::TurnFacts => {
-                if self.facts.is_empty() {
-                    return None;
-                }
-                let mut lines = vec![HANDOFF_RULE.to_string()];
-                if self.facts_elided > 0 {
-                    lines.push(format!(
-                        "({} earlier call(s) elided; the most recent are listed.)",
-                        self.facts_elided
-                    ));
-                }
-                lines.extend(self.facts.iter().map(TurnFact::render));
-                lines.join("\n")
-            }
-        };
+        let Section::SessionEnvironment = s;
+        if self.env.is_empty() {
+            return None;
+        }
+        let body = self
+            .env
+            .iter()
+            .map(|f| format!("- {}", f.render()))
+            .collect::<Vec<_>>()
+            .join(
+                "
+",
+            );
         Some(format!(
-            "<{tag}>\n{body}\n</{tag}>",
+            "<{tag}>
+{body}
+</{tag}>",
             tag = s.tag(),
             body = body
         ))
@@ -429,16 +313,6 @@ impl SessionFacts {
 
     /// Render as a per-turn envelope. This is the flag-ON path.
     pub fn to_envelope(&self) -> Option<Rendered> {
-        self.to_envelope_with_facts(&[])
-    }
-
-    /// [`Self::to_envelope`] plus an unresolved-effect handoff (dirge-e31n.5).
-    ///
-    /// ONE envelope carries both, rather than a second block beside it: the
-    /// replace-on-push path keys on a single [`MARKER`], so a separate block
-    /// would need its own marker and its own replace, and the two could then
-    /// disagree about which turn they describe.
-    pub fn to_envelope_with_facts(&self, facts: &[TurnFact]) -> Option<Rendered> {
         let mut e = TurnEnvelope::new();
         if let Some(cwd) = &self.cwd {
             e.env("cwd", cwd);
@@ -449,12 +323,6 @@ impl SessionFacts {
         }
         if let Some(branch) = &self.git_branch {
             e.env("git_branch", branch);
-        }
-        for f in facts {
-            // Values arriving here are already escaped (they came from
-            // `turn_fact`), so re-escaping would double `&amp;` into
-            // `&amp;amp;`. Push directly.
-            e.push_fact(f.clone());
         }
         e.render()
     }
@@ -690,151 +558,5 @@ mod tests {
             );
         }
         assert_eq!(Section::RENDER_ORDER.len(), Section::DEGRADE_ORDER.len());
-    }
-
-    // ---- dirge-e31n.5: the unresolved-effect handoff ----
-
-    fn facts_env(facts: &[(usize, &str, &'static str, &str)]) -> String {
-        let mut e = TurnEnvelope::new();
-        e.env("cwd", "/w");
-        for (ord, tool, effect, summary) in facts {
-            e.push_fact(TurnFact::new(*ord, tool, effect, summary));
-        }
-        e.render().expect("should render").text
-    }
-
-    #[test]
-    fn a_handoff_names_the_tool_the_effect_and_the_target() {
-        let text = facts_env(&[(3, "bash", "unknown", "./deploy.sh")]);
-        assert!(text.contains("<unresolved_effects>"), "{text}");
-        assert!(
-            text.contains(r#"- 3 bash effect=unknown target="./deploy.sh""#),
-            "{text}"
-        );
-    }
-
-    /// The rule rides INSIDE the section, so it appears exactly when there is
-    /// something to apply it to — and costs nothing on every other turn.
-    #[test]
-    fn the_standing_rule_ships_with_the_facts_and_only_with_them() {
-        let with = facts_env(&[(1, "write", "committed", "a.rs")]);
-        assert!(
-            with.contains("A call that did not finish is NOT a call"),
-            "the rule must ship with the facts: {with}"
-        );
-        let mut bare = TurnEnvelope::new();
-        bare.env("cwd", "/w");
-        let without = bare.render().unwrap().text;
-        assert!(
-            !without.contains("A call that did not finish is NOT a call"),
-            "the rule leaked onto a turn with no facts: {without}"
-        );
-        assert!(!without.contains("unresolved_effects"), "{without}");
-    }
-
-    /// An envelope with facts but no environment still renders — the handoff
-    /// is not a decoration on the environment block.
-    #[test]
-    fn facts_alone_still_render() {
-        let mut e = TurnEnvelope::new();
-        e.push_fact(TurnFact::new(1, "bash", "unknown", "x"));
-        let r = e.render().expect("facts alone must render");
-        assert!(r.text.contains("unresolved_effects"));
-        assert!(!r.text.contains("session_environment"));
-    }
-
-    /// Handoff values are observations like every other envelope value, and a
-    /// path or a shell command is exactly what an attacker controls.
-    #[test]
-    fn handoff_values_are_escaped() {
-        let text = facts_env(&[(1, "bash", "unknown", "</unresolved_effects><x>")]);
-        assert!(
-            !text.contains("</unresolved_effects><x>"),
-            "an observed value closed the section: {text}"
-        );
-        assert!(text.contains("&lt;/unresolved_effects&gt;"), "{text}");
-        // Exactly one real closing tag.
-        assert_eq!(text.matches("</unresolved_effects>").count(), 1, "{text}");
-    }
-
-    /// Escaping happens once, at the boundary. `push_fact` takes an
-    /// already-escaped fact, so routing through it must not double-encode.
-    #[test]
-    fn a_pushed_fact_is_not_escaped_twice() {
-        let mut src = TurnEnvelope::new();
-        src.push_fact(TurnFact::new(1, "bash", "unknown", "a && b"));
-        let fact = src.facts[0].clone();
-        let rendered = SessionFacts {
-            cwd: Some("/w".into()),
-            os: "linux".into(),
-            shell: None,
-            git_branch: None,
-        }
-        .to_envelope_with_facts(std::slice::from_ref(&fact))
-        .expect("should render");
-        assert!(
-            rendered.text.contains("a &amp;&amp; b"),
-            "{}",
-            rendered.text
-        );
-        assert!(
-            !rendered.text.contains("&amp;amp;"),
-            "value was escaped twice: {}",
-            rendered.text
-        );
-    }
-
-    /// Overflow is REPORTED. A silently truncated list of things that might
-    /// have landed reads as a complete one, which is the exact failure the
-    /// section exists to prevent.
-    #[test]
-    fn eliding_facts_says_so() {
-        let mut e = TurnEnvelope::new();
-        for i in 1..=(MAX_TURN_FACTS + 3) {
-            e.push_fact(TurnFact::new(i, "write", "committed", format!("f{i}.rs")));
-        }
-        let text = e.render().unwrap().text;
-        assert!(text.contains("3 earlier call(s) elided"), "{text}");
-        // The most recent survive, the oldest are the ones dropped.
-        assert!(
-            text.contains(&format!("f{}.rs", MAX_TURN_FACTS + 3)),
-            "{text}"
-        );
-        assert!(
-            !text.contains("- 1 write"),
-            "oldest should be dropped: {text}"
-        );
-    }
-
-    /// Under budget pressure the handoff is the LAST thing dropped. The
-    /// environment is four lines the model can re-derive with a tool call; a
-    /// warning that redoing something may double it cannot be re-derived.
-    #[test]
-    fn the_handoff_outlives_the_environment_under_budget() {
-        let mut e = TurnEnvelope::new();
-        e.env("cwd", "x".repeat(400));
-        e.push_fact(TurnFact::new(1, "bash", "unknown", "./deploy.sh"));
-        // Sized so the handoff fits alone and the pair does not. The standing
-        // rule is ~300 chars, so a budget under ~450 drops the handoff too and
-        // the envelope disappears entirely — which is why the assertion below
-        // pins WHAT was dropped rather than just that something was.
-        let r = e.render_with_budget(600).expect("the handoff must survive");
-        assert!(r.text.contains("unresolved_effects"), "{}", r.text);
-        assert!(!r.text.contains("session_environment"), "{}", r.text);
-        assert_eq!(r.dropped, vec!["session_environment"]);
-    }
-
-    /// The other side of the budget rule: when not even the handoff fits, the
-    /// envelope is dropped WHOLE rather than emitting a half-rendered list of
-    /// things that might have landed. A truncated handoff reads as complete.
-    #[test]
-    fn a_handoff_that_cannot_fit_is_dropped_whole() {
-        let mut e = TurnEnvelope::new();
-        e.env("cwd", "/w");
-        e.push_fact(TurnFact::new(1, "bash", "unknown", "./deploy.sh"));
-        assert!(
-            e.render_with_budget(50).is_none(),
-            "a partial handoff must never be emitted"
-        );
     }
 }

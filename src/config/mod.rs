@@ -1172,42 +1172,6 @@ pub struct Config {
     /// `Available tools:` list.
     pub capability_projection: Option<bool>,
 
-    /// dirge-e31n.5: carry an unresolved-effect handoff into the turn after a
-    /// tool call whose effect could not be confirmed.
-    ///
-    /// A tool result is success-or-error text, which answers "did the tool
-    /// report a problem" and not "did anything reach the disk". After a
-    /// timeout or a cancellation the model cannot tell a write that committed
-    /// from one that never ran, so it either re-runs a committed effect — a
-    /// second push, a doubled append — or assumes work it never did.
-    ///
-    /// When on, a turn containing an unresolved effect adds a
-    /// `<unresolved_effects>` section to the per-turn envelope listing
-    /// what may have landed, with the standing rule that interruption does not
-    /// undo work. Requires `turn_envelope`, which owns the block it rides in.
-    ///
-    /// Default `false`, and it stays false on the measurement rather than for
-    /// want of one.
-    ///
-    /// A scenario built to force the condition (`-s handoff`: a script that
-    /// appends a line and then hangs past the tool deadline, so the tool errors
-    /// AFTER the effect landed) put both tested models at 6/6 correct in BOTH
-    /// arms, n=6. Every other metric read `~noise`. The models already check
-    /// the file before deciding whether to re-run.
-    ///
-    /// The reading that matters is not "this does not work" — it is that the
-    /// WITHIN-RUN case was never where the value was. The model can see the
-    /// timeout in its own transcript, so the block mostly restates something
-    /// already visible. The case where it carries information the model
-    /// genuinely lacks is after a real interrupt, where it cannot see its own
-    /// tool results at all — and that half is dirge-pv03, not this.
-    ///
-    /// glm's run-to-run spread narrowed (turns 8 -> 4, tool calls 9 -> 4).
-    /// That is NOT being claimed as a result: one 12-turn control outlier
-    /// drives the whole range at n=6, and dispersion is a weaker signal than
-    /// the means it sits under. See docs/verification-discipline.md.
-    pub turn_facts: Option<bool>,
-
     /// dirge-e31n.6: detect a model that stops answering and starts reciting
     /// its own system prompt back at the user.
     ///
@@ -1770,14 +1734,6 @@ impl Config {
                 GateMode::Off
             }),
         }
-    }
-
-    /// Unresolved-effect handoff (dirge-e31n.5). Default OFF pending
-    /// measurement, and gated on `turn_envelope` because the handoff renders
-    /// as a section of that block — with the envelope off there is nowhere for
-    /// it to go, and reporting it as enabled would be a lie.
-    pub fn resolve_turn_facts(&self) -> bool {
-        self.turn_facts.unwrap_or(false) && self.resolve_turn_envelope()
     }
 
     /// Phased plan workflow opt-in (vix port). Default off — `/plan` is gated

@@ -545,12 +545,6 @@ pub struct LoopConfig {
     /// so exactly one of the two paths states them.
     pub turn_envelope: bool,
 
-    /// dirge-e31n.5: render an unresolved-effect handoff into the envelope on
-    /// the turn after one is recorded. Mirrors the `turn_facts` config knob,
-    /// which already ANDs it with `turn_envelope` — the handoff is a section
-    /// of that block, so it cannot render without it.
-    pub turn_facts: bool,
-
     /// dirge-e31n.6: prompt-recitation detector mode. Mirrors the
     /// `prompt_leak_detect` config knob.
     pub prompt_leak_detect: GateMode,
@@ -903,7 +897,6 @@ impl Clone for LoopConfig {
             tool_def_filter: self.tool_def_filter.clone(),
             dynamic_tool_search: self.dynamic_tool_search,
             turn_envelope: false,
-            turn_facts: false,
             prompt_leak_detect: GateMode::Off,
             escalation_stream_fn: self.escalation_stream_fn.clone(),
             escalation_provider_name: self.escalation_provider_name.clone(),
@@ -973,7 +966,6 @@ impl LoopConfig {
             tool_def_filter: None,
             dynamic_tool_search: false,
             turn_envelope: false,
-            turn_facts: false,
             prompt_leak_detect: GateMode::Off,
             escalation_stream_fn: None,
             escalation_provider_name: None,

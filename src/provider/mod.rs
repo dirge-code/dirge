@@ -94,10 +94,6 @@ pub struct AnyAgent {
     /// whether to EMIT them per turn. A flag that reached only one of the two
     /// would drop the facts entirely.
     turn_envelope: bool,
-    /// dirge-e31n.5: whether an unresolved-effect handoff rides the envelope.
-    /// Travels the same chain for the same reason; the config knob already
-    /// ANDs it with `turn_envelope`, so this cannot be on alone.
-    turn_facts: bool,
     /// dirge-e31n.6: prompt-recitation detector mode; travels the same chain.
     prompt_leak_detect: crate::agent::agent_loop::types::GateMode,
     /// Phase-3: per-session loaded-tool set. Allocated by
@@ -355,7 +351,6 @@ impl AnyAgent {
             model_name,
             dynamic_tool_search: false,
             turn_envelope: false,
-            turn_facts: false,
             prompt_leak_detect: crate::agent::agent_loop::types::GateMode::Off,
             tool_def_filter: None,
             tool_search_registry: None,
@@ -739,13 +734,6 @@ impl AnyAgent {
     /// stale; on, once and fresh; and the two settings must not disagree.
     pub fn with_turn_envelope(mut self, enabled: bool) -> Self {
         self.turn_envelope = enabled;
-        self
-    }
-
-    /// dirge-e31n.5: carry an unresolved-effect handoff into the turn after a
-    /// tool call whose effect could not be confirmed.
-    pub fn with_turn_facts(mut self, enabled: bool) -> Self {
-        self.turn_facts = enabled;
         self
     }
 

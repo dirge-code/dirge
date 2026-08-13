@@ -382,7 +382,6 @@ mod tests {
             tool_def_filter: None,
             dynamic_tool_search: false,
             turn_envelope: false,
-            turn_facts: false,
             prompt_leak_detect: crate::agent::agent_loop::types::GateMode::Off,
             escalation_stream_fn: None,
             escalation_provider_name: None,
