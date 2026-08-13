@@ -93,10 +93,6 @@ impl AssistantMessage {
         }
     }
 
-    /// Iterate just the toolCall blocks. Used by the loop's
-    /// `executeToolCalls` site (agent-loop.ts:203:
-    /// `message.content.filter((c) => c.type === "toolCall")`).
-    #[allow(dead_code)]
     /// Concatenated text of the message's `Text` blocks, in order.
     ///
     /// Thinking and tool-call blocks are excluded: the prompt-leak detector
@@ -113,6 +109,10 @@ impl AssistantMessage {
             .join("")
     }
 
+    /// Iterate just the toolCall blocks. Used by the loop's
+    /// `executeToolCalls` site (agent-loop.ts:203:
+    /// `message.content.filter((c) => c.type === "toolCall")`).
+    #[allow(dead_code)]
     pub fn tool_calls(&self) -> impl Iterator<Item = (&str, &str, &Value)> {
         self.content.iter().filter_map(|b| match b {
             ContentBlock::ToolCall {

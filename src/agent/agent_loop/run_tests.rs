@@ -8710,3 +8710,228 @@ async fn a_normal_answer_is_not_truncated_under_blocking() {
         "a normal answer was truncated as a recitation"
     );
 }
+
+// ── dirge-e31n.6: tool_choice, and its first consumer ───────────────────
+
+/// A stream fn that records the `tool_choice` of every request it is handed.
+fn tool_choice_recording_factory(
+    responses: Vec<AssistantMessage>,
+    seen: std::sync::Arc<Mutex<Vec<Option<crate::agent::agent_loop::types::ToolChoice>>>>,
+) -> StreamFn {
+    let counter = std::sync::Arc::new(AtomicUsize::new(0));
+    let responses = std::sync::Arc::new(responses);
+    std::sync::Arc::new(
+        move |_ctx, opts: crate::agent::agent_loop::stream::StreamOptions| {
+            seen.lock().unwrap().push(opts.tool_choice);
+            let n = counter.fetch_add(1, Ordering::SeqCst);
+            let msg = responses
+                .get(n)
+                .cloned()
+                .unwrap_or_else(|| text_response("end"));
+            let reason = msg.stop_reason;
+            Box::pin(futures::stream::iter(vec![StreamEvent::Done {
+                reason,
+                message: msg,
+                usage: None,
+            }]))
+        },
+    )
+}
+
+/// A tool that is always refused by the permission layer, so a run of denials
+/// builds and the permission checkpoint fires.
+#[derive(Debug)]
+struct AlwaysDeniedTool;
+
+impl LoopTool for AlwaysDeniedTool {
+    fn name(&self) -> &str {
+        "write"
+    }
+    fn description(&self) -> &str {
+        "denied"
+    }
+    fn label(&self) -> &str {
+        "write"
+    }
+    fn parameters(&self) -> &Value {
+        static E: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+        E.get_or_init(|| serde_json::json!({"type":"object"}))
+    }
+    fn execute<'a>(
+        &'a self,
+        _id: &'a str,
+        _args: Value,
+        _signal: AbortSignal,
+        _on_update: LoopToolUpdate,
+    ) -> Pin<Box<dyn Future<Output = Result<super::super::LoopToolResult, String>> + Send + 'a>>
+    {
+        Box::pin(async move { Err("Permission denied: writes outside project".to_string()) })
+    }
+}
+
+/// Ordinary turns must send NOTHING, or the feature is a permanent behaviour
+/// change wearing a per-turn label.
+#[tokio::test]
+async fn an_ordinary_turn_sends_no_tool_choice() {
+    let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let factory = tool_choice_recording_factory(vec![text_response("done")], seen.clone());
+    let (tx, mut _rx) = mpsc::channel::<LoopEvent>(256);
+    let _ = run_agent_loop(
+        vec![user("go")],
+        empty_context(),
+        build_config(),
+        AbortSignal::new(),
+        &tx,
+        &factory,
+        None,
+        None,
+    )
+    .await;
+    let g = seen.lock().unwrap();
+    assert!(!g.is_empty(), "no requests were made");
+    assert!(
+        g.iter().all(|c| c.is_none()),
+        "an ordinary turn constrained the model: {g:?}"
+    );
+}
+
+/// The permission checkpoint says no tool can clear the block. The turn that
+/// READS it must be unable to make one, or the instruction is advice the model
+/// can answer with another blocked call.
+#[tokio::test]
+async fn a_permission_checkpoint_forbids_tools_for_exactly_one_turn() {
+    use crate::agent::agent_loop::types::ToolChoice;
+    let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+    // Three denied calls build the streak; the checkpoint fires after the
+    // third, so request #4 is the one that reads it.
+    // Args must DIFFER per call: the storm breaker suppresses identical
+    // repeats, and a suppressed call never dispatches, so it produces a
+    // backfilled note rather than a denial and the streak never builds.
+    let denied = |n: u32| {
+        tool_use_response(
+            &format!("c{n}"),
+            "write",
+            serde_json::json!({"path": format!("/etc/x{n}"), "content": "y"}),
+        )
+    };
+    let factory = tool_choice_recording_factory(
+        vec![
+            denied(1),
+            denied(2),
+            denied(3),
+            // Request 4 is the constrained one. It still emits a call here so
+            // the loop RUNS A FIFTH TURN — without one there is no "turn
+            // after" and a sticky constraint would look one-shot. (A real
+            // model could not make this call; the canned stream can, which is
+            // what lets the next turn be observed at all.)
+            denied(4),
+            text_response("I am blocked and will stop."),
+        ],
+        seen.clone(),
+    );
+    let ctx = context_with(std::sync::Arc::new(AlwaysDeniedTool));
+    let (tx, mut _rx) = mpsc::channel::<LoopEvent>(1024);
+    let _ = run_agent_loop(
+        vec![user("write to /etc/x")],
+        ctx,
+        build_config(),
+        AbortSignal::new(),
+        &tx,
+        &factory,
+        None,
+        None,
+    )
+    .await;
+
+    let g = seen.lock().unwrap();
+    let forbidden: Vec<usize> = g
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| **c == Some(ToolChoice::None))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        forbidden.len(),
+        1,
+        "expected exactly one constrained turn, got {forbidden:?} of {g:?}"
+    );
+    // ONE turn only: the turn after must be free again, or a single policy
+    // block would disarm the model for the rest of the run.
+    let i = forbidden[0];
+    assert!(
+        g.get(i + 1).map(|c| c.is_none()).unwrap_or(true),
+        "the constraint leaked into the following turn: {g:?}"
+    );
+}
+
+/// The discriminating half of the test above: a MECHANICAL checkpoint — three
+/// ordinary tool errors, no denials — must NOT constrain the model. That
+/// checkpoint asks it to diagnose and try a different approach, which usually
+/// means calling something. Without this, arming on every nudge passes.
+#[tokio::test]
+async fn a_mechanical_checkpoint_does_not_forbid_tools() {
+    use crate::agent::agent_loop::types::ToolChoice;
+    #[derive(Debug)]
+    struct AlwaysErrs;
+    impl LoopTool for AlwaysErrs {
+        fn name(&self) -> &str {
+            "read"
+        }
+        fn description(&self) -> &str {
+            "errs"
+        }
+        fn label(&self) -> &str {
+            "read"
+        }
+        fn parameters(&self) -> &Value {
+            static E: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+            E.get_or_init(|| serde_json::json!({"type":"object"}))
+        }
+        fn execute<'a>(
+            &'a self,
+            _id: &'a str,
+            _args: Value,
+            _signal: AbortSignal,
+            _on_update: LoopToolUpdate,
+        ) -> Pin<Box<dyn Future<Output = Result<super::super::LoopToolResult, String>> + Send + 'a>>
+        {
+            Box::pin(async move { Err("No such file or directory".to_string()) })
+        }
+    }
+
+    let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let call = |n: u32| {
+        tool_use_response(
+            &format!("c{n}"),
+            "read",
+            serde_json::json!({"path": format!("/a/{n}.rs")}),
+        )
+    };
+    let factory = tool_choice_recording_factory(
+        vec![call(1), call(2), call(3), call(4), text_response("done")],
+        seen.clone(),
+    );
+    let (tx, mut _rx) = mpsc::channel::<LoopEvent>(1024);
+    let _ = run_agent_loop(
+        vec![user("read them")],
+        context_with(std::sync::Arc::new(AlwaysErrs)),
+        build_config(),
+        AbortSignal::new(),
+        &tx,
+        &factory,
+        None,
+        None,
+    )
+    .await;
+
+    let g = seen.lock().unwrap();
+    assert!(
+        g.len() >= 4,
+        "run was too short to reach a checkpoint: {g:?}"
+    );
+    assert!(
+        g.iter().all(|c| *c != Some(ToolChoice::None)),
+        "a mechanical checkpoint forbade tools; it asks the model to try \
+         something DIFFERENT, which usually means calling something: {g:?}"
+    );
+}

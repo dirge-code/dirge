@@ -139,6 +139,35 @@ pub struct TurnUpdate {
     pub thinking_level: Option<ThinkingLevel>,
 }
 
+/// Per-request control over whether the model may call tools (dirge-e31n.6).
+///
+/// Per REQUEST, not per session: it describes one turn, and a value that stuck
+/// would silently disarm the model for the rest of the run.
+/// There is deliberately NO `Auto` variant. `Option::<ToolChoice>::None`
+/// already means "say nothing, let the model decide", and a second spelling of
+/// the same thing is a redundant encoding that drifts — the two would have to
+/// be kept behaving identically forever, for no gain, since the wire result is
+/// the same either way. An enum rather than a bool so `Required` (force a
+/// call) can land later without touching every call site.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolChoice {
+    /// Tools are forbidden for this ONE request; the model must answer in
+    /// prose. Used where the harness has already TOLD it that calling another
+    /// tool cannot help, so the instruction is enforced rather than merely
+    /// stated.
+    None,
+}
+
+impl ToolChoice {
+    /// Wire value for OpenAI-compatible and Anthropic request bodies. Both
+    /// spell the key `tool_choice` and both read `none` the same way.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            ToolChoice::None => "none",
+        }
+    }
+}
+
 /// Tri-state gate mode reused by code-review (dirge-iyf5), open-issues
 /// (dirge-ksjl), and any future opt-in finalization gates that need an
 /// on/off/nagging toggle.
@@ -160,7 +189,7 @@ pub struct TurnUpdate {
 ///   Only FYI-for-the-human text belongs in a bare notice.
 /// - `Blocking` — await the gate and re-enter the loop on relevant
 ///   findings, bounded by a per-gate react cap.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum GateMode {
     Off,
     #[default]

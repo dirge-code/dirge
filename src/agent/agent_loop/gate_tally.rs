@@ -68,6 +68,12 @@ pub enum BoundaryNudge {
     ProgressPrologue,
     FileTouch,
     ReflectionCheckpoint,
+    /// dirge-e31n.6: a run of PERMISSION denials, which is a policy wall
+    /// rather than a mechanical failure. Split from `ReflectionCheckpoint`
+    /// because the two want opposite advice and, until now, were
+    /// indistinguishable on the emitted line — so nothing could tell a run
+    /// blocked by the user's rules from one fumbling its tool calls.
+    PermissionCheckpoint,
     SafeState,
     None,
 }
@@ -162,7 +168,7 @@ impl GateSource {
 impl BoundaryNudge {
     /// Every variant, in [`index`](Self::index) order. Same contract as
     /// [`GateSource::ALL`] — see its doc for why this exists.
-    pub const ALL: [BoundaryNudge; 9] = [
+    pub const ALL: [BoundaryNudge; 10] = [
         BoundaryNudge::TrackWork,
         BoundaryNudge::FastVerify,
         BoundaryNudge::ProgressStall,
@@ -170,6 +176,7 @@ impl BoundaryNudge {
         BoundaryNudge::ProgressPrologue,
         BoundaryNudge::FileTouch,
         BoundaryNudge::ReflectionCheckpoint,
+        BoundaryNudge::PermissionCheckpoint,
         BoundaryNudge::SafeState,
         BoundaryNudge::None,
     ];
@@ -193,6 +200,7 @@ impl BoundaryNudge {
             BoundaryNudge::ProgressPrologue => "nudge_progress_prologue",
             BoundaryNudge::FileTouch => "nudge_file_touch",
             BoundaryNudge::ReflectionCheckpoint => "nudge_reflection_checkpoint",
+            BoundaryNudge::PermissionCheckpoint => "nudge_permission_checkpoint",
             BoundaryNudge::SafeState => "nudge_safe_state",
             BoundaryNudge::None => return Option::None,
         })
@@ -536,6 +544,7 @@ impl GateTally {
             nudge_progress_prologue = self.nudges[BoundaryNudge::ProgressPrologue.index()],
             nudge_file_touch = self.nudges[BoundaryNudge::FileTouch.index()],
             nudge_reflection_checkpoint = self.nudges[BoundaryNudge::ReflectionCheckpoint.index()],
+            nudge_permission_checkpoint = self.nudges[BoundaryNudge::PermissionCheckpoint.index()],
             nudge_safe_state = self.nudges[BoundaryNudge::SafeState.index()],
             scavenged_calls = self.scavenged_calls,
             hallucinated_tool_names = self.hallucinated_tool_names,

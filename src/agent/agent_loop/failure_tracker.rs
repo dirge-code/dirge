@@ -236,7 +236,10 @@ impl FailureTracker {
     /// below keeps the base threshold: a denial streak is a policy wall, and
     /// nothing [`super::capability::CapabilityCounters`] measures says anything
     /// about how often the user's rules block a call.
-    pub fn poll_reflection(&self, tier: CapabilityTier) -> Vec<LoopMessage> {
+    pub fn poll_reflection(
+        &self,
+        tier: CapabilityTier,
+    ) -> Vec<(LoopMessage, super::gate_tally::BoundaryNudge)> {
         let threshold = self.effective_threshold(tier);
         let mut inner = self.inner.lock_ignore_poison();
         let mut out = Vec::new();
@@ -251,7 +254,10 @@ impl FailureTracker {
             if due {
                 inner.last_denial_emitted_at = inner.denials;
                 let body = format_permission_checkpoint(inner.denials, &inner.recent_denials);
-                out.push(LoopMessage::User(UserMessage::text(body)));
+                out.push((
+                    LoopMessage::User(UserMessage::text(body)),
+                    super::gate_tally::BoundaryNudge::PermissionCheckpoint,
+                ));
             }
         }
 
@@ -269,7 +275,10 @@ impl FailureTracker {
                     &inner.recent,
                     &inner.recent_classes,
                 );
-                out.push(LoopMessage::User(UserMessage::text(body)));
+                out.push((
+                    LoopMessage::User(UserMessage::text(body)),
+                    super::gate_tally::BoundaryNudge::ReflectionCheckpoint,
+                ));
             }
         }
         out
@@ -426,13 +435,13 @@ mod tests {
     /// Poll at the neutral tier — what every test predating dirge-z85a
     /// asserts, and the property `Nominal` must keep: bit-identical to the
     /// base threshold.
-    fn poll(t: &FailureTracker) -> Vec<LoopMessage> {
+    fn poll(t: &FailureTracker) -> Vec<(LoopMessage, super::super::gate_tally::BoundaryNudge)> {
         t.poll_reflection(CapabilityTier::Nominal)
     }
 
-    fn content_of(msgs: &[LoopMessage]) -> String {
+    fn content_of(msgs: &[(LoopMessage, super::super::gate_tally::BoundaryNudge)]) -> String {
         match msgs.first() {
-            Some(LoopMessage::User(u)) => u.text_joined(),
+            Some((LoopMessage::User(u), _)) => u.text_joined(),
             _ => panic!("expected one User message"),
         }
     }

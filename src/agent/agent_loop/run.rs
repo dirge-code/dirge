@@ -2320,9 +2320,9 @@ pub(crate) fn poll_boundary_nudge(
     }
     // 2. Cross-turn recovery checkpoint (rung 2) — distinct tool errors piling
     //    up, which storm's identical-repeat rule never sees.
-    if let Some(msg) = guards.poll_reflection(tier).into_iter().next() {
-        tally.record_nudge(BoundaryNudge::ReflectionCheckpoint);
-        return Some((msg, BoundaryNudge::ReflectionCheckpoint));
+    if let Some((msg, kind)) = guards.poll_reflection(tier).into_iter().next() {
+        tally.record_nudge(kind);
+        return Some((msg, kind));
     }
     // 3. Work tracking — edits with nothing on the board.
     if let Some(reminder) = build_early_track_work_reminder(
@@ -2480,6 +2480,9 @@ pub async fn run_loop(
     // dirge-e31n.5: tool calls this run whose effect is Committed or Unknown,
     // and a monotonic ordinal so the model can read the order they happened in.
     let mut pending_facts: Vec<super::envelope::TurnFact> = Vec::new();
+    // dirge-e31n.6: armed by a permission checkpoint, consumed by the next
+    // stream call. See that call site for why it is one-shot.
+    let mut pending_tool_choice: Option<super::types::ToolChoice> = None;
     let mut fact_ordinal: usize = 0;
 
     // Pi line 167: initial steering poll.
@@ -2770,12 +2773,24 @@ pub async fn run_loop(
             snip_tokens_freed = snip_tokens_freed.saturating_add(freed);
 
             // Pi lines 192-194: LLM call.
+            // dirge-e31n.6: the permission checkpoint tells the model that
+            // "retrying, rephrasing, or switching to another tool will not
+            // clear it". `take()` makes that ENFORCEABLE for exactly the turn
+            // that reads it, rather than leaving it as advice the model is
+            // free to answer with another blocked call.
+            //
+            // One turn only, by construction: the value is consumed here, so
+            // the model is never disarmed for longer than the message it is
+            // responding to. If it genuinely needs to read something to write
+            // its report, it can on the following turn.
+            let turn_tool_choice = pending_tool_choice.take();
             let (assistant_msg, token_usage) = stream_assistant_response(
                 &mut current_context,
                 &config,
                 signal.clone(),
                 emit,
                 stream_fn,
+                turn_tool_choice,
             )
             .await;
             new_messages.push(LoopMessage::Assistant(assistant_msg.clone()));
@@ -3437,7 +3452,7 @@ pub async fn run_loop(
             } else {
                 None
             };
-            if let Some((msg, _which)) = poll_boundary_nudge(
+            if let Some((msg, which)) = poll_boundary_nudge(
                 &config,
                 &guards,
                 safe_state_msg,
@@ -3448,6 +3463,13 @@ pub async fn run_loop(
                 &mut tally,
                 capability.tier(),
             ) {
+                // dirge-e31n.6: a permission checkpoint says no tool can clear
+                // the block. Forbid tools on the turn that reads it so that is
+                // a fact rather than a request. Every other nudge leaves the
+                // model free to act — several of them are ASKING it to.
+                if which == BoundaryNudge::PermissionCheckpoint {
+                    pending_tool_choice = Some(super::types::ToolChoice::None);
+                }
                 emit_harness_notices(emit, std::slice::from_ref(&msg)).await;
                 current_context.messages.push(loop_message_to_value(&msg));
                 new_messages.push(msg);

@@ -85,6 +85,10 @@ pub struct StreamOptions {
     pub thinking_budgets: Option<super::types::ThinkingBudgets>,
     pub headers: std::collections::HashMap<String, String>,
     pub metadata: std::collections::HashMap<String, serde_json::Value>,
+    /// dirge-e31n.6: per-request tool gating. `None` sends nothing and leaves
+    /// the provider default (the model decides), which is what every turn but
+    /// a deliberately-constrained one wants.
+    pub tool_choice: Option<super::types::ToolChoice>,
     pub signal: AbortSignal,
 }
 
@@ -99,6 +103,7 @@ impl StreamOptions {
             thinking_budgets: None,
             headers: std::collections::HashMap::new(),
             metadata: std::collections::HashMap::new(),
+            tool_choice: None,
             signal,
         }
     }
@@ -141,6 +146,10 @@ pub async fn stream_assistant_response(
     signal: AbortSignal,
     emit: &mpsc::Sender<LoopEvent>,
     stream_fn: &StreamFn,
+    // Forbid tools for THIS request only (dirge-e31n.6). Per-call rather than
+    // on `LoopConfig` because it describes one turn, and a sticky value would
+    // silently disarm the model for the rest of the run.
+    tool_choice: Option<super::types::ToolChoice>,
 ) -> (AssistantMessage, Option<super::message::TokenUsage>) {
     // 1. transformContext (optional, AgentMessage[] → AgentMessage[])
     let messages: Vec<serde_json::Value> = if let Some(transform) = &config.transform_context {
@@ -182,6 +191,7 @@ pub async fn stream_assistant_response(
         thinking_budgets: config.thinking_budgets.clone(),
         headers: config.headers.clone(),
         metadata: config.metadata.clone(),
+        tool_choice,
         signal,
     };
 
@@ -552,7 +562,8 @@ mod tests {
         };
         let (tx, _rx) = mpsc::channel::<LoopEvent>(8);
         let _ =
-            stream_assistant_response(&mut ctx, &config, AbortSignal::new(), &tx, &stream_fn).await;
+            stream_assistant_response(&mut ctx, &config, AbortSignal::new(), &tx, &stream_fn, None)
+                .await;
 
         let opts = observed.lock().unwrap().clone().expect("opts captured");
         assert_eq!(opts.api_key.as_deref(), Some("static-key"));
@@ -585,6 +596,7 @@ mod tests {
             signal,
             &tx,
             &canned_done_stream("Hi there!"),
+            None,
         )
         .await;
         drop(tx); // close so we can drain the channel
@@ -647,6 +659,7 @@ mod tests {
             AbortSignal::new(),
             &tx,
             &canned_done_stream("ok"),
+            None,
         )
         .await;
         assert_eq!(
@@ -695,6 +708,7 @@ mod tests {
             signal,
             &tx,
             &canned_done_stream("Response"),
+            None,
         )
         .await;
         drop(tx);
@@ -771,6 +785,7 @@ mod tests {
             signal,
             &tx,
             &canned_done_stream("Response"),
+            None,
         )
         .await;
         drop(tx);
@@ -804,7 +819,7 @@ mod tests {
             Arc::new(|_ctx, _opts| Box::pin(futures::stream::iter::<Vec<StreamEvent>>(vec![])));
 
         let (final_msg, _) =
-            stream_assistant_response(&mut ctx, &config, signal, &tx, &empty_stream).await;
+            stream_assistant_response(&mut ctx, &config, signal, &tx, &empty_stream, None).await;
         drop(tx);
         let mut events = Vec::new();
         while let Some(e) = rx.recv().await {
@@ -872,8 +887,15 @@ mod tests {
 
         let mut ctx = Context::default();
         let (tx, _rx) = mpsc::channel::<LoopEvent>(32);
-        let _ = stream_assistant_response(&mut ctx, &config, AbortSignal::new(), &tx, &default_fn)
-            .await;
+        let _ = stream_assistant_response(
+            &mut ctx,
+            &config,
+            AbortSignal::new(),
+            &tx,
+            &default_fn,
+            None,
+        )
+        .await;
 
         assert_eq!(observed.lock().unwrap().as_slice(), &["escalation"]);
     }
@@ -898,12 +920,26 @@ mod tests {
         let mut ctx = Context::default();
         let (tx, _rx) = mpsc::channel::<LoopEvent>(32);
         // First call: escalation.
-        let _ = stream_assistant_response(&mut ctx, &config, AbortSignal::new(), &tx, &default_fn)
-            .await;
+        let _ = stream_assistant_response(
+            &mut ctx,
+            &config,
+            AbortSignal::new(),
+            &tx,
+            &default_fn,
+            None,
+        )
+        .await;
         // Second call: default — the pending flag was cleared by
         // the first call's swap.
-        let _ = stream_assistant_response(&mut ctx, &config, AbortSignal::new(), &tx, &default_fn)
-            .await;
+        let _ = stream_assistant_response(
+            &mut ctx,
+            &config,
+            AbortSignal::new(),
+            &tx,
+            &default_fn,
+            None,
+        )
+        .await;
 
         assert_eq!(
             observed.lock().unwrap().as_slice(),
@@ -930,8 +966,15 @@ mod tests {
 
         let mut ctx = Context::default();
         let (tx, _rx) = mpsc::channel::<LoopEvent>(32);
-        let _ = stream_assistant_response(&mut ctx, &config, AbortSignal::new(), &tx, &default_fn)
-            .await;
+        let _ = stream_assistant_response(
+            &mut ctx,
+            &config,
+            AbortSignal::new(),
+            &tx,
+            &default_fn,
+            None,
+        )
+        .await;
 
         assert_eq!(observed.lock().unwrap().as_slice(), &["default"]);
         // The flag is cleared so a misconfigured session doesn't
@@ -992,8 +1035,15 @@ mod tests {
 
         let mut ctx = Context::default();
         let (tx, mut rx) = mpsc::channel::<LoopEvent>(64);
-        let _ = stream_assistant_response(&mut ctx, &config, AbortSignal::new(), &tx, &default_fn)
-            .await;
+        let _ = stream_assistant_response(
+            &mut ctx,
+            &config,
+            AbortSignal::new(),
+            &tx,
+            &default_fn,
+            None,
+        )
+        .await;
         drop(tx);
 
         let mut saw_escalation = false;
@@ -1044,6 +1094,7 @@ mod tests {
             AbortSignal::new(),
             &tx,
             &stream_fn,
+            None,
         )
         .await;
 
@@ -1109,6 +1160,7 @@ mod tests {
             AbortSignal::new(),
             &tx,
             &stream_fn,
+            None,
         )
         .await;
 
