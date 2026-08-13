@@ -186,10 +186,15 @@ impl ToolCatalog {
         Self { available, denied }
     }
 
+    // Read by the tests below and, for `hash`, by the prompt epoch in R3
+    // (dirge-e31n.4). Kept rather than deleted because the effective catalog
+    // is computed here and nowhere else knows it — see `hash`.
+    #[allow(dead_code)]
     pub fn available(&self) -> &[String] {
         &self.available
     }
 
+    #[allow(dead_code)]
     pub fn denied(&self) -> &[String] {
         &self.denied
     }
@@ -198,6 +203,7 @@ impl ToolCatalog {
     /// registration order cannot change it. Consumed by the prompt epoch in
     /// R3 (dirge-e31n.4) — it belongs here because this is where the effective
     /// set is computed and nowhere else knows it.
+    #[allow(dead_code)]
     pub fn hash(&self) -> String {
         use sha2::{Digest, Sha256};
         let joined = format!(

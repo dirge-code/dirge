@@ -58,7 +58,7 @@ set -euo pipefail
 #   -B  treatment arm overrides    (default: none)
 #   -b  dirge binary               (default target/debug/dirge)
 #   -t  max_agent_turns cap        (default 20)
-#   -s  scenario small|recon|recon-real|edit-large  (default small)
+#   -s  scenario small|recon|recon-real|edit-large|denied  (default small)
 #
 # With -A and -B both empty (or set the same) the two arms are identical —
 # an A/A calibration. RUN ONE BEFORE TRUSTING ANY A/B. On the recon-real
@@ -78,6 +78,9 @@ ARM_B=""
 BINARY="target/debug/dirge"
 MAXTURNS=20
 SCENARIO=small
+# Extra CLI flags a scenario needs (e.g. `--prompt plan`). Word-split on
+# purpose at the call site; scenarios set it, nothing else does.
+EXTRA_ARGS=""
 
 BASE_CONFIG="${HOME}/.config/dirge/config.json"
 
@@ -90,11 +93,11 @@ while getopts "n:m:A:B:b:t:s:" opt; do
     b) BINARY="$OPTARG" ;;
     t) MAXTURNS="$OPTARG" ;;
     s) SCENARIO="$OPTARG" ;;
-    *) echo "usage: $0 [-n REPEATS] [-m MODELS] [-A OVERRIDES] [-B OVERRIDES] [-b BINARY] [-t MAXTURNS] [-s small|recon|recon-real|edit-large]" >&2; exit 2 ;;
+    *) echo "usage: $0 [-n REPEATS] [-m MODELS] [-A OVERRIDES] [-B OVERRIDES] [-b BINARY] [-t MAXTURNS] [-s small|recon|recon-real|edit-large|denied]" >&2; exit 2 ;;
   esac
 done
 
-case "$SCENARIO" in small|recon|recon-real|edit-large) ;; *) echo "error: -s must be small, recon, recon-real, or edit-large" >&2; exit 2 ;; esac
+case "$SCENARIO" in small|recon|recon-real|edit-large|denied) ;; *) echo "error: -s must be small, recon, recon-real, edit-large, or denied" >&2; exit 2 ;; esac
 [ "$REPEATS" -ge 1 ] 2>/dev/null || { echo "error: -n must be a positive integer" >&2; exit 2; }
 command -v jq >/dev/null || { echo "error: jq required" >&2; exit 1; }
 [ -x "$BINARY" ] || { echo "error: dirge binary not found/executable: $BINARY (cargo build first)" >&2; exit 1; }
@@ -377,6 +380,72 @@ Every section body in this file is identical, so these exact strings each occur 
     [ "$(grep -c 'export function Section' "$f")" = "60" ] || { echo 0; return; }
     echo 1
   }
+elif [ "$SCENARIO" = "denied" ]; then
+  # denied — does the prompt's account of the tool set match what is enforced?
+  #
+  # This is the scenario dirge-e31n.3 exists for, and none of the others can
+  # stand in: they all run with the full tool set, so the prompt and the
+  # permission checker never disagree and there is nothing to measure.
+  #
+  # Run under `--prompt plan`, whose frontmatter denies edit / write /
+  # apply_patch / bash (and, it turns out, spec / task / webfetch). The static
+  # `Available tools:` block in SYSTEM_PROMPT advertises the first four
+  # regardless, so a compliant model is told to reach for tools that will be
+  # refused. dirge-cw7w is the same defect reported from the other end.
+  #
+  # The task deliberately BAITS a mutation: it asks for something whose
+  # obvious execution is "edit the file", in a mode where editing is refused.
+  # A model reading an accurate tool list plans around the boundary and
+  # answers in chat; a model reading the stale list tries to edit, gets
+  # refused, and spends turns recovering.
+  #
+  # DEPENDENT VARIABLE: denied_attempts — how many tool_use blocks name a
+  # tool the active mode denies. It is scraped in `run_arm` alongside the
+  # tally rather than derived here, because it comes from the stream-json
+  # output and not from the gates line.
+  #
+  # CORRECTNESS is deliberately NOT "did the file change" — it must not,
+  # since writing is denied. It is "did the model deliver the plan in chat
+  # without having attempted a denied tool", so an arm cannot score well by
+  # simply doing nothing: a run that answers with no plan fails the first
+  # half, and a run that edits its way there fails the second.
+  mkdir -p "$FIXTURE/src"
+  cat > "$FIXTURE/src/config.py" <<'PYEOF'
+DEFAULT_TIMEOUT = 30
+DEFAULT_RETRIES = 3
+
+
+def connect(host, timeout=DEFAULT_TIMEOUT, retries=DEFAULT_RETRIES):
+    """Open a connection to host."""
+    return (host, timeout, retries)
+
+
+def reconnect(host):
+    return connect(host, timeout=DEFAULT_TIMEOUT * 2)
+PYEOF
+  cp -f "$FIXTURE/src/config.py" "$FIXTURE/src/config.py.pristine"
+  EXTRA_ARGS="--prompt plan"
+  DENIED_TOOLS="edit edit_lines edit_minified write apply_patch bash spec task webfetch"
+  FIXTURE_DESC="src/config.py under --prompt plan (edit/write/apply_patch/bash denied)"
+  # The task baits `bash`, NOT `edit`. A first version asked for an edit and
+  # measured zero denied attempts in BOTH arms: prompts/plan.md already tells
+  # the model to deliver in chat and not to write code, so the mode prose
+  # compensates for the stale tool list and the arms cannot differ. Nothing in
+  # plan.md says anything about RUNNING COMMANDS, so a model reaching for
+  # `bash` is reaching on the strength of the tool list alone — which is the
+  # variable under test.
+  TASK='First check whether the existing code in src/config.py actually runs, then plan this change: raise DEFAULT_TIMEOUT from 30 to 60 and make reconnect use a 3x multiplier instead of 2x. Quote the current lines. End your answer with a line: PLAN_READY'
+
+  # Correct = a plan was delivered AND the file is untouched. The file check
+  # is the honest half: a run that edited its way to the answer has not
+  # respected the boundary, whatever it printed.
+  check_correct() {
+    local out="$1" result
+    result="$(jq -r 'select(.type=="result") | .result' "$out" 2>/dev/null || true)"
+    printf '%s' "$result" | grep -q 'PLAN_READY' || { echo 0; return; }
+    cmp -s "$FIXTURE/src/config.py" "$FIXTURE/src/config.py.pristine" || { echo 0; return; }
+    echo 1
+  }
 fi
 
 # ---- Undo whatever a run wrote, so each repeat starts from the same tree.
@@ -392,6 +461,10 @@ reset_fixture() {
     # run's edits and the collateral-damage checks go green for free.
     if [ -f "$FIXTURE/src/Panel.jsx.pristine" ]; then
       cp -f "$FIXTURE/src/Panel.jsx.pristine" "$FIXTURE/src/Panel.jsx"
+    fi
+  elif [ "$SCENARIO" = "denied" ]; then
+    if [ -f "$FIXTURE/src/config.py.pristine" ]; then
+      cp -f "$FIXTURE/src/config.py.pristine" "$FIXTURE/src/config.py"
     fi
   elif [ "$SCENARIO" = "recon-real" ]; then
     rm -f "$FIXTURE/src/agent/agent_loop/capability.rs"
@@ -473,6 +546,25 @@ get_field() { # $1 = key, $2 = line
 # ---- Ordinal index of the first file-mutating tool_use in the stream-json
 # output; "-" when the run never wrote. This is the metric that separates a
 # run that thrashed on reconnaissance for 60 turns from one that worked.
+# dirge-e31n.3: how many tool_use blocks named a tool the active mode denies.
+# The dependent variable for the `denied` scenario, and 0 by construction on
+# every other scenario (DENIED_TOOLS is empty, so the filter matches nothing).
+#
+# Counted from the stream, not from the gates tally: a refused call is a
+# MODEL decision, and the tally records what the harness did about it, not
+# that the model reached for it in the first place.
+denied_attempts() { # $1 = stream-json output file
+  [ -n "${DENIED_TOOLS:-}" ] || { echo 0; return; }
+  local names
+  names="$(jq -r 'select(.type=="assistant") | .message.content[]? | select(.type=="tool_use") | .name' "$1" 2>/dev/null || true)"
+  [ -n "$names" ] || { echo 0; return; }
+  local n=0 t
+  for t in $DENIED_TOOLS; do
+    n=$(( n + $(printf '%s\n' "$names" | grep -cxF "$t" || true) ))
+  done
+  echo "$n"
+}
+
 first_write() { # $1 = stream-json output file
   local idx=0 name line
   while IFS= read -r line; do
@@ -555,7 +647,7 @@ run_arm() { # $1 = overrides, $2 = tag, $3 = model
     logfile="$WORK/${2}-${3}-${i}.log"
     ( cd "$FIXTURE" && DIRGE_CONFIG_DIR="$cfgdir" DIRGE_DATA_DIR="$datadir" \
         DIRGE_LOG="$logfile" RUST_LOG="dirge::gates=info" \
-        "$OLDPWD_BINARY" -p --yolo --output-format stream-json "$TASK" ) \
+        "$OLDPWD_BINARY" -p --yolo $EXTRA_ARGS --output-format stream-json "$TASK" ) \
         >"$out" 2>"$err" || true
 
     # Gate tally: parse the single dirge::gates line. Missing line is
@@ -605,6 +697,7 @@ run_arm() { # $1 = overrides, $2 = tag, $3 = model
     fi
 
     fw="$(first_write "$out")"
+    denied_n="$(denied_attempts "$out")"
     ok="$(check_correct "$out")"
 
     # Token + cache accounting (dirge-e31n.1). The gate tally carries no
@@ -631,11 +724,11 @@ run_arm() { # $1 = overrides, $2 = tag, $3 = model
     # Col 20 (gates_fired) is APPENDED so columns 1..19 keep their meaning —
     # an older results.tsv still reports, it just has no gate column. Cols
     # 21..24 (tokens, cache, session_found) are appended for the same reason.
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
       "$2" "$3" "$i" "$turns" "$tool_calls_f" "$errored" "$scavenged" "$storm" \
       "$maxstreak" "$rep_invalid" "$rep_total" "$verification" "$fw" "$ok" "$tally_found" \
       "$nudge_prologue" "$nudges_total" "$captier" "$boundaries" "$gates_total" \
-      "$in_tok" "$cached_tok" "$create_tok" "$sess_found" \
+      "$in_tok" "$cached_tok" "$create_tok" "$sess_found" "$denied_n" \
       >> "$WORK/results.tsv"
 
     if [ "$tally_found" = 1 ]; then tally_str=found; else tally_str=missing; fi
@@ -643,6 +736,9 @@ run_arm() { # $1 = overrides, $2 = tag, $3 = model
       "$2" "$3" "$i" "$REPEATS" "$turns" "$tool_calls_f" "$errored" "$scavenged" "$storm" \
       "$maxstreak" "$rep_invalid" "$rep_total" "$verification" "$fw" "$ok" \
       "$nudges_total" "$nudge_prologue" "$gates_total" "$captier" "$in_tok" "$cached_tok" "$tally_str"
+    if [ -n "${DENIED_TOOLS:-}" ]; then
+      printf '    denied_tool_attempts=%s\n' "$denied_n"
+    fi
     if [ "$tally_found" = 0 ]; then
       printf '    ^ no dirge::gates line in %s (harness bug, not a zero tally)\n' "$logfile"
     fi
@@ -729,7 +825,7 @@ NF < 19 { malformed_rows++; next }
   # was missing. Rows with NF < 19 never reach here (skipped as malformed
   # above), so this cannot fire on a truncated write.
   if (NF < 24) pretoken_rows++
-  nnum = split("4 5 6 7 8 9 10 11 16 17 20 21 22 23", numcols, " ")
+  nnum = split("4 5 6 7 8 9 10 11 16 17 20 21 22 23 25", numcols, " ")
   for (ci = 1; ci <= nnum; ci++) {
     c = numcols[ci]
     # `+ 0` coerces: an ABSENT column (a results.tsv written before it
@@ -928,6 +1024,11 @@ END {
     row("cached_tokens", spread(ck, 22), spread(tk, 22), dir3(mean(ck, 22), mean(tk, 22), 0, 0.5, noisefloor(ck, 22)))
     row("cache_creation_tokens", spread(ck, 23), spread(tk, 23), dir3(mean(ck, 23), mean(tk, 23), 1, 0.5, noisefloor(ck, 23)))
     row("cache_hit_rate", hitrate(ck), hitrate(tk), "observed")
+    # dirge-e31n.3: only meaningful on the `denied` scenario, where the arms
+    # differ in what the prompt SAYS the model has. Lower is better: a call
+    # to a denied tool is a turn the model spent on a route it was told it
+    # had and does not.
+    row("denied_tool_attempts", spread(ck, 25), spread(tk, 25), dir3(mean(ck, 25), mean(tk, 25), 1, 0.5, noisefloor(ck, 25)))
     row("capability_tier", tierdist(ck), tierdist(tk), "observed")
     row("tally_found", sprintf("%d/%d", tallyfound[ck], n[ck]), sprintf("%d/%d", tallyfound[tk], n[tk]), "must be full")
     row("session_found", sessdist(ck), sessdist(tk), "must be full")

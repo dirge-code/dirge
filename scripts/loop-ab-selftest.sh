@@ -67,9 +67,9 @@ slice() { # $1 = output, $2 = header (literal)
 
 # tag model repeat turns tools err scav storm streak rep_inv rep_tot verify
 # first_write correct tally prologue nudges tier boundaries gates
-# input_tokens cached_tokens cache_creation_tokens session_found
+# input_tokens cached_tokens cache_creation_tokens session_found denied_attempts
 row() { # tag model repeat verify correct tally boundaries gates
-  printf '%s\t%s\t%s\t10\t20\t0\t0\t0\t0\t0\t0\t%s\t3\t%s\t%s\t0\t2\tnominal\t%s\t%s\t1000\t400\t0\t1\n' "$@"
+  printf '%s\t%s\t%s\t10\t20\t0\t0\t0\t0\t0\t0\t%s\t3\t%s\t%s\t0\t2\tnominal\t%s\t%s\t1000\t400\t0\t1\t0\n' "$@"
 }
 
 # A row carrying DIFFERENT token values, so an assertion about the token
@@ -78,7 +78,15 @@ row() { # tag model repeat verify correct tally boundaries gates
 # 1000 / 400 = 40%, and the two are on opposite sides of every direction
 # rule: more input is worse, more cached is better.
 row_tok() { # tag model repeat verify correct tally boundaries gates in cached create sessfound
-  printf '%s\t%s\t%s\t10\t20\t0\t0\t0\t0\t0\t0\t%s\t3\t%s\t%s\t0\t2\tnominal\t%s\t%s\t%s\t%s\t%s\t%s\n' "$@"
+  printf '%s\t%s\t%s\t10\t20\t0\t0\t0\t0\t0\t0\t%s\t3\t%s\t%s\t0\t2\tnominal\t%s\t%s\t%s\t%s\t%s\t%s\t0\n' "$@"
+}
+
+# A row carrying a non-zero denied_tool_attempts (col 25), so the row that
+# reads it has a known other-answer. The value differs from every other
+# numeric constant these fixtures use, so a wrong-column read is visible
+# rather than coincidentally equal.
+row_denied() { # tag model repeat verify correct tally boundaries gates denied
+  printf '%s\t%s\t%s\t10\t20\t0\t0\t0\t0\t0\t0\t%s\t3\t%s\t%s\t0\t2\tnominal\t%s\t%s\t1000\t400\t0\t1\t%s\n' "$@"
 }
 
 # ---- Fixtures. Each exists to be the other answer for some assertion. -----
@@ -165,6 +173,18 @@ out_mech="$(report "$work/mech.tsv")"
 out_blank="$(report "$work/blank.tsv")"
 out_truncated="$(report "$work/truncated.tsv")"
 out_legacy="$(report "$work/legacy.tsv")"
+# DENIED: the arms differ ONLY in denied_tool_attempts — control reaches for
+# tools it does not have, treatment does not. This is the shape a working
+# capability-projection A/B produces, and the fixture exists so the row is
+# checked against a case where the answer must differ.
+{
+  row_denied control   m1 1 VerifiedGreen 1 1 none              0 7
+  row_denied control   m1 2 VerifiedGreen 1 1 none              0 9
+  row_denied treatment m1 1 VerifiedGreen 1 1 'Verifier+Critic' 3 0
+  row_denied treatment m1 2 VerifiedGreen 1 1 'Verifier+Critic' 3 0
+} > "$work/denied.tsv"
+
+out_denied="$(report "$work/denied.tsv")"
 out_pretoken="$(report "$work/pretoken.tsv")"
 out_tokens="$(report "$work/tokens.tsv")"
 out_nosession="$(report "$work/nosession.tsv")"
@@ -235,7 +255,7 @@ fi
 # ---- Nothing below means anything if the report did not run. Checked first
 # and for every fixture, because an awk abort produces no rows at all and
 # every `reject` would then pass vacuously.
-for fx in healthy sick lopsided order mech legacy blank truncated pretoken tokens nosession; do
+for fx in healthy sick lopsided order mech legacy blank truncated pretoken tokens nosession denied; do
   eval "reject \"\$out_$fx\" \"the $fx report ran to completion\" 'REPORT-ABORTED'"
 done
 
@@ -282,6 +302,16 @@ want "$out_lopsided" "its rate delta reads n/a, not a number"    '^success_rate 
 want "$out_lopsided" "and the other models still report"         '^== model: m1 ==$'
 # The other side: a complete pair must NOT be labelled absent.
 reject "$out_healthy" "a complete pair is not labelled absent" 'NOTE: control runs='
+
+# ---- denied_tool_attempts (dirge-e31n.3). Fewer attempts at tools the mode
+# refuses is better, and the row must read col 25 rather than any of the
+# numerically-similar columns around it.
+want "$out_denied" "denied_tool_attempts reads its own column" \
+  '^denied_tool_attempts +8\.0 \(7\.\.9\) +0\.0 \(0\.\.0\)'
+want "$out_denied" "fewer denied attempts is better" '^denied_tool_attempts .* better$'
+# Other side: a fixture where nothing was attempted must not report a win.
+reject "$out_mech" "a run with no denied attempts reports no direction" \
+  '^denied_tool_attempts .* better$'
 
 # ---- Token + cache columns (dirge-e31n.1). Asserted on tokens.tsv, where
 # control and treatment carry DIFFERENT values in both columns, so a row
