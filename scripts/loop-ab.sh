@@ -58,7 +58,7 @@ set -euo pipefail
 #   -B  treatment arm overrides    (default: none)
 #   -b  dirge binary               (default target/debug/dirge)
 #   -t  max_agent_turns cap        (default 20)
-#   -s  scenario small|recon|recon-real|edit-large|denied|pinned  (default small)
+#   -s  scenario small|recon|recon-real|edit-large|denied|pinned|compact  (default small)
 #   -C  extra arm "name:k=v,k=v" — repeatable. Reaches the N-arm reporting
 #       that already existed with no CLI route to it.
 #
@@ -111,6 +111,8 @@ ARMS=()
 # Extra CLI flags a scenario needs (e.g. `--prompt plan`). Word-split on
 # purpose at the call site; scenarios set it, nothing else does.
 EXTRA_ARGS=""
+# Config a SCENARIO pins across every arm, same "k=v,k=v" form as -A/-B.
+SCENARIO_OVERRIDES=""
 
 BASE_CONFIG="${HOME}/.config/dirge/config.json"
 
@@ -124,11 +126,11 @@ while getopts "n:m:A:B:C:b:t:s:" opt; do
     t) MAXTURNS="$OPTARG" ;;
     s) SCENARIO="$OPTARG" ;;
     C) ARMS+=("$OPTARG") ;;
-    *) echo "usage: $0 [-n REPEATS] [-m MODELS] [-A OVERRIDES] [-B OVERRIDES] [-C name:OVERRIDES]... [-b BINARY] [-t MAXTURNS] [-s small|recon|recon-real|edit-large|denied|pinned]" >&2; exit 2 ;;
+    *) echo "usage: $0 [-n REPEATS] [-m MODELS] [-A OVERRIDES] [-B OVERRIDES] [-C name:OVERRIDES]... [-b BINARY] [-t MAXTURNS] [-s small|recon|recon-real|edit-large|denied|pinned|compact]" >&2; exit 2 ;;
   esac
 done
 
-case "$SCENARIO" in small|recon|recon-real|edit-large|denied|pinned) ;; *) echo "error: -s must be small, recon, recon-real, edit-large, denied, or pinned" >&2; exit 2 ;; esac
+case "$SCENARIO" in small|recon|recon-real|edit-large|denied|pinned|compact) ;; *) echo "error: -s must be small, recon, recon-real, edit-large, denied, pinned, or compact" >&2; exit 2 ;; esac
 [ "$REPEATS" -ge 1 ] 2>/dev/null || { echo "error: -n must be a positive integer" >&2; exit 2; }
 command -v jq >/dev/null || { echo "error: jq required" >&2; exit 1; }
 [ -x "$BINARY" ] || { echo "error: dirge binary not found/executable: $BINARY (cargo build first)" >&2; exit 1; }
@@ -524,6 +526,57 @@ elif [ "$SCENARIO" = "pinned" ]; then
     cmp -s "$FIXTURE/src/config.txt" "$FIXTURE/src/config.txt.pristine" || { echo 0; return; }
     echo 1
   }
+elif [ "$SCENARIO" = "compact" ]; then
+  # compact — force a mid-session compaction so epoch rotation has something to
+  # rotate on (dirge-e31n.4). Without this the epoch is untestable: it changes
+  # only ON a fold, and no other scenario produces one.
+  #
+  # context_target is the lever, and it is pinned as a SCENARIO override so both
+  # arms get the identical budget. An arm-level value would compare two
+  # different context budgets rather than the two configurations under test.
+  #
+  # 45000, NOT the 16000 floor. run.rs:1857 (dirge-kq3a) records why: the fold
+  # trigger reads the API prompt_tokens, which counts the system prompt and
+  # every tool schema, while the fold only rewrites current_context.messages.
+  # Once the unfoldable fixed overhead alone clears the threshold, the loop
+  # re-fires every turn forever. Measured here the per-turn prompt is ~29k
+  # tokens, so a 16k budget would sit permanently over the 0.75 fold threshold
+  # and the run would measure fold SUPPRESSION rather than compaction. 45000
+  # puts the fold at ~34k, comfortably above the fixed overhead and reachable by
+  # accumulating a few file reads.
+  SCENARIO_OVERRIDES="context_target=45000"
+  NEEDS_COMPACTION=1
+  mkdir -p "$FIXTURE/src"
+  # Eight files of distinct, incompressible content. Distinct because identical
+  # bodies let a model answer from one read; incompressible so the tool results
+  # actually consume the budget rather than being pruned away cheaply.
+  for i in $(seq 1 8); do
+    {
+      echo "# module_$i"
+      for l in $(seq 1 120); do
+        echo "def handler_${i}_${l}(payload_${l}, ctx_${i}): return payload_${l} * ${l} + ctx_${i}.offset_${i}"
+      done
+      echo "MARKER_$i = beacon-${i}-$((i * 37))"
+    } > "$FIXTURE/src/module_$i.py"
+  done
+  EXPECTED_SUM="$(seq 1 8 | awk '{s += $1 * 37} END {print s}')"
+  FIXTURE_DESC="8 x ~122-line modules, context_target=45000 (fold at ~34k)"
+  TASK='Each file src/module_N.py (N from 1 to 8) ends with a line "MARKER_N = beacon-N-<number>". Read every one of the eight files, collect the eight numbers, and report their total. Do not modify any file. End your answer with a line: SUM=<total>'
+
+  # Correct = the right total AND no file modified. Reading all eight is what
+  # drives the context past the fold threshold, and the sum is only reachable by
+  # actually doing it — a run that guessed cannot hit an 8-term total.
+  check_correct() {
+    local out="$1" result got
+    result="$(jq -r 'select(.type=="result") | .result' "$out" 2>/dev/null || true)"
+    got="$(printf '%s' "$result" | grep -oE 'SUM=[0-9]+' | tail -1 || true)"
+    [ "$got" = "SUM=$EXPECTED_SUM" ] || { echo 0; return; }
+    local i
+    for i in $(seq 1 8); do
+      grep -q "MARKER_$i = beacon-${i}-$((i * 37))" "$FIXTURE/src/module_$i.py" || { echo 0; return; }
+    done
+    echo 1
+  }
 fi
 
 # ---- Undo whatever a run wrote, so each repeat starts from the same tree.
@@ -692,17 +745,29 @@ override_program() { # $1 = "k=v,k=v" overrides
 }
 
 build_config() { # $1 = cfgdir, $2 = overrides, $3 = model
-  local prog extra=""
+  local prog extra="" scen=""
   prog="$(override_program "$2")"
+  # dirge-e31n.4: scenario-level config, applied BEFORE the arm overrides so an
+  # arm can still override it deliberately but does not have to restate it.
+  #
+  # Some config belongs to the SCENARIO rather than to an arm. `context_target`
+  # is the case that forced this: a compaction-forcing scenario has to lower it
+  # to make folds happen at all, and that value must be IDENTICAL in both arms
+  # or the comparison is between two different context budgets rather than
+  # between the two configurations under test. Leaving it to the caller to
+  # restate on every -A and -B is a footgun that fails silently -- the run
+  # completes and reports, it just answers a different question.
+  scen="$(override_program "${SCENARIO_OVERRIDES:-}")"
   extra=".max_agent_turns = ${MAXTURNS}"
   if [ "$3" != "default" ]; then
     extra="${extra} | .provider = $(jq -n --arg v "$3" '$v')"
   fi
-  if [ -z "$prog" ]; then
-    jq "$extra" "$BASE_CONFIG" > "$1/config.json"
-  else
-    jq "${prog} | ${extra}" "$BASE_CONFIG" > "$1/config.json"
-  fi
+  # Order is scenario -> arm -> harness. Later assignments win in jq, so an arm
+  # beats its scenario and max_agent_turns/provider beat everything.
+  local pipeline=""
+  [ -n "$scen" ] && pipeline="${scen} | "
+  [ -n "$prog" ] && pipeline="${pipeline}${prog} | "
+  jq "${pipeline}${extra}" "$BASE_CONFIG" > "$1/config.json"
 }
 
 # ---- Run one arm of one model: N repeats. Appends one line per repeat to
@@ -728,7 +793,7 @@ run_arm() { # $1 = overrides, $2 = tag, $3 = model
     err="$WORK/${2}-${3}-${i}.err"
     logfile="$WORK/${2}-${3}-${i}.log"
     ( cd "$FIXTURE" && DIRGE_CONFIG_DIR="$cfgdir" DIRGE_DATA_DIR="$datadir" \
-        DIRGE_LOG="$logfile" RUST_LOG="dirge::gates=info" \
+        DIRGE_LOG="$logfile" RUST_LOG="dirge::gates=info,dirge::agent_loop=info" \
         "$OLDPWD_BINARY" -p --yolo $EXTRA_ARGS --output-format stream-json "$TASK" ) \
         >"$out" 2>"$err" || true
 
@@ -780,6 +845,18 @@ run_arm() { # $1 = overrides, $2 = tag, $3 = model
 
     fw="$(first_write "$out")"
     denied_n="$(denied_attempts "$out")"
+    # dirge-e31n.4: how many times the context was actually compacted.
+    #
+    # THE MECHANISM GATE FOR R3. A prompt epoch rotates ON compaction, so a run
+    # that never compacted did not exercise the thing under test and its cache
+    # numbers are noise wearing a result's clothes. Reported per run and rolled
+    # up, the same discipline as tally=missing -- the absence is a fact about
+    # the run, never a silent zero.
+    #
+    # This is the check whose ABSENCE let denied_tool_attempts sit at zero for
+    # four rounds of R2 while every report looked healthy.
+    compactions="$(grep -ac "context compacted" "$logfile" 2>/dev/null || true)"
+    compactions="${compactions:-0}"
     ok="$(check_correct "$out")"
 
     # Token + cache accounting (dirge-e31n.1). The gate tally carries no
@@ -806,11 +883,11 @@ run_arm() { # $1 = overrides, $2 = tag, $3 = model
     # Col 20 (gates_fired) is APPENDED so columns 1..19 keep their meaning —
     # an older results.tsv still reports, it just has no gate column. Cols
     # 21..24 (tokens, cache, session_found) are appended for the same reason.
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
       "$2" "$3" "$i" "$turns" "$tool_calls_f" "$errored" "$scavenged" "$storm" \
       "$maxstreak" "$rep_invalid" "$rep_total" "$verification" "$fw" "$ok" "$tally_found" \
       "$nudge_prologue" "$nudges_total" "$captier" "$boundaries" "$gates_total" \
-      "$in_tok" "$cached_tok" "$create_tok" "$sess_found" "$denied_n" \
+      "$in_tok" "$cached_tok" "$create_tok" "$sess_found" "$denied_n" "$compactions" \
       >> "$WORK/results.tsv"
 
     if [ "$tally_found" = 1 ]; then tally_str=found; else tally_str=missing; fi
@@ -820,6 +897,12 @@ run_arm() { # $1 = overrides, $2 = tag, $3 = model
       "$nudges_total" "$nudge_prologue" "$gates_total" "$captier" "$in_tok" "$cached_tok" "$tally_str"
     if [ -n "${DENIED_TOOLS:-}" ]; then
       printf '    denied_tool_attempts=%s\n' "$denied_n"
+    fi
+    if [ -n "${NEEDS_COMPACTION:-}" ]; then
+      printf '    compactions=%s\n' "$compactions"
+      if [ "$compactions" = "0" ]; then
+        printf '    ^ this scenario requires a compaction and none happened — the epoch never rotated, so this run cannot inform a cache result\n'
+      fi
     fi
     if [ "$tally_found" = 0 ]; then
       printf '    ^ no dirge::gates line in %s (harness bug, not a zero tally)\n' "$logfile"
@@ -907,7 +990,7 @@ NF < 19 { malformed_rows++; next }
   # was missing. Rows with NF < 19 never reach here (skipped as malformed
   # above), so this cannot fire on a truncated write.
   if (NF < 24) pretoken_rows++
-  nnum = split("4 5 6 7 8 9 10 11 16 17 20 21 22 23 25", numcols, " ")
+  nnum = split("4 5 6 7 8 9 10 11 16 17 20 21 22 23 25 26", numcols, " ")
   for (ci = 1; ci <= nnum; ci++) {
     c = numcols[ci]
     # `+ 0` coerces: an ABSENT column (a results.tsv written before it
@@ -1186,6 +1269,9 @@ END {
     # to a denied tool is a turn the model spent on a route it was told it
     # had and does not.
     row("denied_tool_attempts", spread(ck, 25), spread(tk, 25), dir3(mean(ck, 25), mean(tk, 25), 1, 0.5, noisefloor(ck, 25)))
+    # MECHANISM, not an outcome — more compactions is neither better nor worse.
+    # What matters is that it is NON-ZERO on a scenario built to force one.
+    row("compactions", spread(ck, 26), spread(tk, 26), "mechanism")
     row("capability_tier", tierdist(ck), tierdist(tk), "observed")
     row("tally_found", sprintf("%d/%d", tallyfound[ck], n[ck]), sprintf("%d/%d", tallyfound[tk], n[tk]), "must be full")
     row("session_found", sessdist(ck), sessdist(tk), "must be full")

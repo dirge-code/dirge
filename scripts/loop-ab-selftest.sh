@@ -270,6 +270,47 @@ eq() { # $1 = description, $2 = got, $3 = want
 
 echo "loop-ab.sh reporting self-test:"
 
+# ---- SCENARIO_OVERRIDES ordering (dirge-e31n.4). A scenario pins config that
+# must be identical in every arm (context_target for a compaction scenario). If
+# the scenario program were dropped, or an arm could not override it, the run
+# would still COMPLETE AND REPORT -- it would just answer a different question.
+# That is the silent-degradation shape this file exists for, so it is checked
+# on the real functions rather than by reading the source.
+sed -n '/^override_program() {/,/^}/p' "$ab" > "$work/override_program.sh"
+sed -n '/^build_config() {/,/^}/p' "$ab" > "$work/build_config.sh"
+# shellcheck source=/dev/null
+. "$work/override_program.sh"
+# shellcheck source=/dev/null
+. "$work/build_config.sh"
+echo '{}' > "$work/base.json"
+BASE_CONFIG="$work/base.json"; MAXTURNS=7
+mkdir -p "$work/cfgout"
+
+SCENARIO_OVERRIDES="context_target=40000"
+build_config "$work/cfgout" "" default
+eq "a scenario override reaches the config" \
+  "$(jq -r '.context_target' "$work/cfgout/config.json")" 40000
+
+# An ARM must be able to override its scenario deliberately.
+build_config "$work/cfgout" "context_target=99000" default
+eq "an arm overrides its scenario" \
+  "$(jq -r '.context_target' "$work/cfgout/config.json")" 99000
+
+# ...and an unrelated arm override must not drop the scenario value.
+build_config "$work/cfgout" "turn_envelope=false" default
+eq "an unrelated arm keeps the scenario value" \
+  "$(jq -r '.context_target' "$work/cfgout/config.json")" 40000
+eq "and its own override still lands" \
+  "$(jq -r '.turn_envelope' "$work/cfgout/config.json")" false
+
+# With no scenario overrides at all, nothing is invented.
+SCENARIO_OVERRIDES=""
+build_config "$work/cfgout" "" default
+eq "no scenario overrides invents nothing" \
+  "$(jq -r '.context_target' "$work/cfgout/config.json")" null
+eq "and the harness knobs still apply" \
+  "$(jq -r '.max_agent_turns' "$work/cfgout/config.json")" 7
+
 # ---- The awk program is ONE single-quoted shell string, so an apostrophe
 # anywhere inside it — including in a comment — terminates the quote. What
 # happens next is the worst available failure: awk still parses what it got,
@@ -339,6 +380,29 @@ want "$out_lopsided" "its rate delta reads n/a, not a number"    '^success_rate 
 want "$out_lopsided" "and the other models still report"         '^== model: m1 ==$'
 # The other side: a complete pair must NOT be labelled absent.
 reject "$out_healthy" "a complete pair is not labelled absent" 'NOTE: control runs='
+
+# ---- compactions mechanism gate (dirge-e31n.4). A prompt epoch rotates ON
+# compaction, so a run that never compacted did not exercise it. The row is a
+# MECHANISM row: more is neither better nor worse, but zero on a scenario built
+# to force one means the run cannot inform a cache result.
+row_comp() { # tag model repeat compactions
+  printf '%s\t%s\t%s\t10\t20\t0\t0\t0\t0\t0\t0\tVerifiedGreen\t3\t1\t1\t0\t2\tnominal\tnone\t0\t1000\t400\t0\t1\t0\t%s\n' "$@"
+}
+{
+  row_comp control   m1 1 2
+  row_comp control   m1 2 2
+  row_comp treatment m1 1 0
+  row_comp treatment m1 2 0
+} > "$work/compact.tsv"
+out_compact="$(report "$work/compact.tsv")"
+reject "$out_compact" "the compaction report ran to completion" 'REPORT-ABORTED'
+want "$out_compact" "compactions reads its own column"  '^compactions +2\.0 \(2\.\.2\) +0\.0 \(0\.\.0\) +mechanism$'
+# It must NOT be scored: an arm that compacted less is not thereby better, and
+# labelling it so would turn a mechanism check into a fake result.
+reject "$out_compact" "compactions is never given a direction" '^compactions .*(better|worse)$'
+# A pre-compactions TSV reads 0 rather than breaking — same as every other
+# appended column.
+want "$out_mech" "a pre-compactions TSV reads zero" '^compactions +0\.0 \(0\.\.0\)'
 
 # ---- input_tokens_per_turn (dirge-e31n.4). The steady fixture has identical
 # mean turns (9) in both arms and identical tokens (1000), so the ratio must be
