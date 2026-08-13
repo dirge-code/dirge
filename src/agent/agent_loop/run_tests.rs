@@ -8370,7 +8370,7 @@ async fn a_timed_out_effect_reaches_the_model_as_a_handoff() {
     )
     .await;
     assert!(
-        blob.contains("interrupted_turn_handoff"),
+        blob.contains("unresolved_effects"),
         "no handoff reached the model:\n{blob}"
     );
     assert!(
@@ -8399,7 +8399,7 @@ async fn no_handoff_when_turn_facts_is_off() {
     )
     .await;
     assert!(
-        !blob.contains("interrupted_turn_handoff"),
+        !blob.contains("unresolved_effects"),
         "the handoff rendered with the flag off:\n{blob}"
     );
     // ...while the envelope itself still ships, so this is not just an
@@ -8420,7 +8420,7 @@ async fn no_handoff_when_every_effect_resolved() {
     )
     .await;
     assert!(
-        !blob.contains("interrupted_turn_handoff"),
+        !blob.contains("unresolved_effects"),
         "a clean run raised a handoff:\n{blob}"
     );
 }
@@ -8465,7 +8465,7 @@ async fn a_failed_read_raises_no_handoff() {
     )
     .await;
     assert!(
-        !blob.contains("interrupted_turn_handoff"),
+        !blob.contains("unresolved_effects"),
         "a timed-out READ raised an effect warning:\n{blob}"
     );
 }

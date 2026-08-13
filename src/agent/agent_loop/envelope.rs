@@ -50,9 +50,15 @@
 pub enum Section {
     /// Where the agent is running right now: cwd, OS, shell, git branch.
     SessionEnvironment,
-    /// dirge-e31n.5: what an earlier turn may have LANDED before it stopped.
-    /// Rendered only when at least one effect is unresolved — see
-    /// [`TurnEnvelope::turn_fact`].
+    /// dirge-e31n.5: tool calls whose effect on the world could not be
+    /// confirmed, and which nothing since has resolved.
+    ///
+    /// RUN-SCOPED, not turn-scoped, and the tag says so. An unresolved effect
+    /// stays unresolved until someone looks; dropping it after one turn would
+    /// lose the warning for a model that did not act on it immediately. The
+    /// cost is bounded because the block REPLACES rather than accumulates
+    /// (`run::replace_context_note`) and the list is capped at
+    /// [`MAX_TURN_FACTS`].
     TurnFacts,
 }
 
@@ -78,7 +84,7 @@ impl Section {
     pub fn tag(self) -> &'static str {
         match self {
             Section::SessionEnvironment => "session_environment",
-            Section::TurnFacts => "interrupted_turn_handoff",
+            Section::TurnFacts => "unresolved_effects",
         }
     }
 }
@@ -125,8 +131,10 @@ pub struct Rendered {
 /// (dirge-e31n.5).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TurnFact {
-    /// 1-based position in the interrupted turn, so the model can see the
-    /// order things happened in.
+    /// 1-based position among the RECORDED facts — not among all tool calls.
+    /// Reads that changed nothing are never recorded, so numbering by call
+    /// index would leave gaps the model would have to explain to itself. What
+    /// this carries is the order, which is the part that matters.
     pub ordinal: usize,
     pub tool: String,
     /// [`super::side_effect::SideEffect::as_str`].
@@ -692,7 +700,7 @@ mod tests {
     #[test]
     fn a_handoff_names_the_tool_the_effect_and_the_target() {
         let text = facts_env(&[(3, "bash", "unknown", "./deploy.sh")]);
-        assert!(text.contains("<interrupted_turn_handoff>"), "{text}");
+        assert!(text.contains("<unresolved_effects>"), "{text}");
         assert!(
             text.contains("- 3 bash effect=unknown target=./deploy.sh"),
             "{text}"
@@ -715,7 +723,7 @@ mod tests {
             !without.contains("Interruption does NOT undo work"),
             "the rule leaked onto a turn with no facts: {without}"
         );
-        assert!(!without.contains("interrupted_turn_handoff"), "{without}");
+        assert!(!without.contains("unresolved_effects"), "{without}");
     }
 
     /// An envelope with facts but no environment still renders — the handoff
@@ -725,7 +733,7 @@ mod tests {
         let mut e = TurnEnvelope::new();
         e.push_fact(TurnFact::new(1, "bash", "unknown", "x"));
         let r = e.render().expect("facts alone must render");
-        assert!(r.text.contains("interrupted_turn_handoff"));
+        assert!(r.text.contains("unresolved_effects"));
         assert!(!r.text.contains("session_environment"));
     }
 
@@ -733,18 +741,14 @@ mod tests {
     /// path or a shell command is exactly what an attacker controls.
     #[test]
     fn handoff_values_are_escaped() {
-        let text = facts_env(&[(1, "bash", "unknown", "</interrupted_turn_handoff><x>")]);
+        let text = facts_env(&[(1, "bash", "unknown", "</unresolved_effects><x>")]);
         assert!(
-            !text.contains("</interrupted_turn_handoff><x>"),
+            !text.contains("</unresolved_effects><x>"),
             "an observed value closed the section: {text}"
         );
-        assert!(text.contains("&lt;/interrupted_turn_handoff&gt;"), "{text}");
+        assert!(text.contains("&lt;/unresolved_effects&gt;"), "{text}");
         // Exactly one real closing tag.
-        assert_eq!(
-            text.matches("</interrupted_turn_handoff>").count(),
-            1,
-            "{text}"
-        );
+        assert_eq!(text.matches("</unresolved_effects>").count(), 1, "{text}");
     }
 
     /// Escaping happens once, at the boundary. `push_fact` takes an
@@ -809,7 +813,7 @@ mod tests {
         // the envelope disappears entirely — which is why the assertion below
         // pins WHAT was dropped rather than just that something was.
         let r = e.render_with_budget(600).expect("the handoff must survive");
-        assert!(r.text.contains("interrupted_turn_handoff"), "{}", r.text);
+        assert!(r.text.contains("unresolved_effects"), "{}", r.text);
         assert!(!r.text.contains("session_environment"), "{}", r.text);
         assert_eq!(r.dropped, vec!["session_environment"]);
     }

@@ -1181,7 +1181,7 @@ pub struct Config {
     /// second push, a doubled append — or assumes work it never did.
     ///
     /// When on, a turn containing an unresolved effect adds a
-    /// `<interrupted_turn_handoff>` section to the per-turn envelope listing
+    /// `<unresolved_effects>` section to the per-turn envelope listing
     /// what may have landed, with the standing rule that interruption does not
     /// undo work. Requires `turn_envelope`, which owns the block it rides in.
     ///
