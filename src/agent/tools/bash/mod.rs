@@ -14,6 +14,42 @@ use crate::agent::tools::{AskSender, BashArgs, PermCheck, ToolError};
 
 use crate::sandbox::{Sandbox, SandboxExecutionRoot};
 
+/// Effective deadline for a FOREGROUND `bash` command (dirge-xeis).
+///
+/// `timeouts.bash_secs` is a DEFAULT — `unwrap_or` — so before this a model
+/// passing `timeout: 600` got 600 however low the user set it. That is the
+/// documented contract and fine as far as it goes, but it left the number
+/// UNBOUNDED: nothing stopped a model asking for a day and blocking the turn
+/// for one. It also meant the knob a user reaches for to keep runs snappy
+/// bounded nothing, which is how the dirge-e31n.5 scenario failed twice to
+/// force a timeout at all.
+///
+/// So `bash_secs` stays a default and `bash_max_secs` is the ceiling. Separate
+/// knobs deliberately: raising the timeout for a genuinely long command — a
+/// full test suite — is CORRECT, and clamping every request down to the
+/// default would break it. The ceiling only has to sit above anything real.
+///
+/// FOREGROUND ONLY. A backgrounded shell with no timeout is documented as
+/// running until it exits or is killed, and that is the point of asking for
+/// one; capping a dev server at an hour would be a surprise, not a guard.
+pub(crate) fn resolve_foreground_timeout(
+    requested: Option<u64>,
+    t: &crate::timeout::Timeouts,
+) -> u64 {
+    let want = requested.unwrap_or(t.bash.as_secs());
+    let ceiling = t.bash_max.as_secs();
+    if want > ceiling {
+        tracing::info!(
+            target: "dirge::agent_loop::tools",
+            requested = want,
+            ceiling,
+            "bash timeout clamped to timeouts.bash_max_secs",
+        );
+        return ceiling;
+    }
+    want
+}
+
 pub struct BashTool {
     pub permission: Option<PermCheck>,
     pub ask_tx: Option<AskSender>,
@@ -210,9 +246,7 @@ impl PortableTool for BashTool {
         // Background requested but no store wired (headless): fall back to
         // a bounded synchronous run.
         // dirge-onlr/4xgd: single source — resolved [timeouts] config.
-        let secs = args
-            .timeout
-            .unwrap_or(crate::timeout::Timeouts::get().bash.as_secs());
+        let secs = resolve_foreground_timeout(args.timeout, &crate::timeout::Timeouts::get());
         if secs == 0 {
             return Err(ToolError::Msg("timeout must be > 0".to_string()));
         }

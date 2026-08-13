@@ -109,6 +109,20 @@ pub struct Timeouts {
     pub lsp_initialize: Duration,
     /// Default `bash` tool command timeout (when the call omits one).
     pub bash: Duration,
+    /// CEILING on a foreground `bash` timeout, including one the MODEL asked
+    /// for (dirge-xeis).
+    ///
+    /// [`Self::bash`] is only a default: `args.timeout.unwrap_or(default)`
+    /// means a model passing `timeout: 600` gets 600 however low the user set
+    /// the default, so the knob a user reaches for to keep runs snappy does
+    /// not bound anything. It also means an unbounded number: a model asking
+    /// for 86400 blocks the turn for a day.
+    ///
+    /// This is a separate knob rather than making `bash` itself a cap, because
+    /// raising the timeout for a genuinely long command — a full test suite —
+    /// is CORRECT behaviour and clamping it to the default would break it. The
+    /// ceiling only has to be high enough that nothing real hits it.
+    pub bash_max: Duration,
 }
 
 impl Timeouts {
@@ -120,6 +134,10 @@ impl Timeouts {
     pub const DEFAULT_LSP_REQUEST_SECS: u64 = 30;
     pub const DEFAULT_LSP_INITIALIZE_SECS: u64 = 45;
     pub const DEFAULT_BASH_SECS: u64 = 120;
+    /// One hour. Chosen to be above anything a real command needs while still
+    /// bounding a pathological request; lower it via `timeouts.bash_max_secs`
+    /// if you want commands held shorter than that.
+    pub const DEFAULT_BASH_MAX_SECS: u64 = 3600;
 
     /// The built-in defaults. `const` so a call site that still wants a
     /// plain `Duration` constant can read one field
@@ -133,6 +151,7 @@ impl Timeouts {
         lsp_request: Duration::from_secs(Self::DEFAULT_LSP_REQUEST_SECS),
         lsp_initialize: Duration::from_secs(Self::DEFAULT_LSP_INITIALIZE_SECS),
         bash: Duration::from_secs(Self::DEFAULT_BASH_SECS),
+        bash_max: Duration::from_secs(Self::DEFAULT_BASH_MAX_SECS),
     };
 
     /// Install the process-wide resolved timeouts. Call once at startup

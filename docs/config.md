@@ -913,7 +913,8 @@ above is the one exception with richer per-provider precedence;
 | `mcp_init_secs` | 10 | MCP server `initialize` handshake |
 | `lsp_request_secs` | 30 | Any non-`initialize` LSP request |
 | `lsp_initialize_secs` | 45 | LSP `initialize` handshake |
-| `bash_secs` | 120 | Default `bash` tool timeout when the call omits one |
+| `bash_secs` | 120 | Default `bash` tool timeout when the call omits one. A DEFAULT, not a bound — the model may pass its own `timeout` and that wins, up to `bash_max_secs` |
+| `bash_max_secs` | 3600 | Ceiling on a foreground `bash` timeout, including one the model asked for. Kept separate from `bash_secs` because raising the timeout for a genuinely long command (a full test suite) is correct and clamping every request to the default would break it; this only has to sit above anything real. Lower it to hold commands shorter. Foreground only — a backgrounded shell with no timeout still runs until it exits or is killed |
 
 ```json
 {

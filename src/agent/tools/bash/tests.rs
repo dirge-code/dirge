@@ -1517,3 +1517,81 @@ fn timeout_description_reports_the_resolved_default_not_a_literal() {
         "description does not say what an omitted background timeout does: {desc}"
     );
 }
+
+// dirge-xeis: `bash_secs` is a default the model can overrule; `bash_max_secs`
+// is the ceiling it cannot. Split deliberately — see
+// `resolve_foreground_timeout`.
+mod foreground_timeout {
+    use crate::timeout::Timeouts;
+    use std::time::Duration;
+
+    fn t(default_secs: u64, max_secs: u64) -> Timeouts {
+        Timeouts {
+            bash: Duration::from_secs(default_secs),
+            bash_max: Duration::from_secs(max_secs),
+            ..Timeouts::DEFAULT
+        }
+    }
+
+    /// THE FIX. Before this, a model asking for 600 got 600 however low the
+    /// user had set things, so the number was unbounded.
+    #[test]
+    fn a_model_request_above_the_ceiling_is_clamped() {
+        assert_eq!(
+            crate::agent::tools::bash::resolve_foreground_timeout(Some(600), &t(120, 300)),
+            300
+        );
+    }
+
+    /// The other side, and the reason the ceiling is a SEPARATE knob rather
+    /// than `bash_secs` becoming a cap: raising the timeout for a long test
+    /// suite is correct behaviour and must still work.
+    #[test]
+    fn a_model_request_under_the_ceiling_is_honoured() {
+        assert_eq!(
+            crate::agent::tools::bash::resolve_foreground_timeout(Some(600), &t(120, 3600)),
+            600,
+            "clamping a legitimate long-command request to the default would \
+             break running a real test suite"
+        );
+    }
+
+    /// An omitted timeout still takes `bash_secs`. This is the pre-existing
+    /// contract and the change must not touch it.
+    #[test]
+    fn an_omitted_timeout_still_takes_the_default() {
+        assert_eq!(
+            crate::agent::tools::bash::resolve_foreground_timeout(None, &t(120, 3600)),
+            120
+        );
+        assert_eq!(
+            crate::agent::tools::bash::resolve_foreground_timeout(None, &t(5, 3600)),
+            5
+        );
+    }
+
+    /// A default configured ABOVE the ceiling is contradictory; the ceiling
+    /// wins, because it is the one the user set to bound things.
+    #[test]
+    fn the_ceiling_beats_a_larger_default() {
+        assert_eq!(
+            crate::agent::tools::bash::resolve_foreground_timeout(None, &t(7200, 3600)),
+            3600
+        );
+    }
+
+    /// The shipped default has to be above anything real, or it becomes the
+    /// regression it exists to prevent.
+    #[test]
+    fn the_default_ceiling_clears_a_realistic_long_command() {
+        let d = Timeouts::DEFAULT;
+        assert!(
+            d.bash_max.as_secs() >= 1800,
+            "a 30-minute build must not be clamped by the default ceiling"
+        );
+        assert!(
+            d.bash_max > d.bash,
+            "the ceiling must sit above the default"
+        );
+    }
+}

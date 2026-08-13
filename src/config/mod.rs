@@ -496,6 +496,7 @@ pub struct TimeoutsConfig {
     pub lsp_request_secs: Option<u64>,
     pub lsp_initialize_secs: Option<u64>,
     pub bash_secs: Option<u64>,
+    pub bash_max_secs: Option<u64>,
 }
 
 /// Per-server LSP configuration. All fields optional — unspecified fields
@@ -1855,6 +1856,7 @@ impl Config {
             lsp_request: or_default(c.lsp_request_secs, d.lsp_request),
             lsp_initialize: or_default(c.lsp_initialize_secs, d.lsp_initialize),
             bash: or_default(c.bash_secs, d.bash),
+            bash_max: or_default(c.bash_max_secs, d.bash_max),
         }
     }
 
