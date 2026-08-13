@@ -504,6 +504,13 @@ pub struct LoopConfig {
     /// filter independently.
     pub dynamic_tool_search: bool,
 
+    /// dirge-e31n.2: emit a per-turn `<turn_envelope>` carrying the volatile
+    /// session facts (cwd, OS, shell, git branch) instead of freezing them
+    /// into the system prompt. Mirrors the `turn_envelope` config knob. When
+    /// on, `builder::agent_inner` omits those four lines from the preamble,
+    /// so exactly one of the two paths states them.
+    pub turn_envelope: bool,
+
     /// Phase 4 part 1: alternate stream function used for ONE call
     /// after a repair-exhaustion or tree-sitter failure. None when
     /// escalation isn't configured.
@@ -849,6 +856,7 @@ impl Clone for LoopConfig {
             truncation_notes: self.truncation_notes.clone(),
             tool_def_filter: self.tool_def_filter.clone(),
             dynamic_tool_search: self.dynamic_tool_search,
+            turn_envelope: false,
             escalation_stream_fn: self.escalation_stream_fn.clone(),
             escalation_provider_name: self.escalation_provider_name.clone(),
             escalation_pending: self.escalation_pending.clone(),
@@ -915,6 +923,7 @@ impl LoopConfig {
             )),
             tool_def_filter: None,
             dynamic_tool_search: false,
+            turn_envelope: false,
             escalation_stream_fn: None,
             escalation_provider_name: None,
             escalation_pending: std::sync::Arc::new(std::sync::Mutex::new(None)),

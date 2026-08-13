@@ -128,6 +128,7 @@ fn build_config() -> LoopConfig {
         )),
         tool_def_filter: None,
         dynamic_tool_search: false,
+        turn_envelope: false,
         escalation_stream_fn: None,
         escalation_provider_name: None,
         escalation_pending: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -7931,4 +7932,132 @@ fn context_note_returns_after_the_earlier_copy_is_folded_away() {
         "the block is genuinely gone — it must be re-injected"
     );
     assert_eq!(ctx.messages.len(), 1);
+}
+
+// ── dirge-e31n.2: per-turn context envelope ─────────────────────────
+
+/// Build a stream fn that answers once with `text` and captures every
+/// message batch the converter was handed, so a test can assert on what
+/// the MODEL saw rather than on what the loop returned.
+fn capturing_stream_and_seen() -> (StreamFn, std::sync::Arc<Mutex<Vec<Value>>>) {
+    use crate::agent::agent_loop::stream::LlmContext;
+    let seen: std::sync::Arc<Mutex<Vec<Value>>> = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    let factory: StreamFn = std::sync::Arc::new(move |ctx: LlmContext, _opts| {
+        sink.lock().unwrap().extend(ctx.messages.iter().cloned());
+        let msg = AssistantMessage::new(
+            vec![ContentBlock::Text {
+                text: "done".to_string(),
+            }],
+            StopReason::Stop,
+        );
+        Box::pin(futures::stream::iter(vec![StreamEvent::Done {
+            reason: StopReason::Stop,
+            message: msg,
+            usage: None,
+        }]))
+    });
+    (factory, seen)
+}
+
+/// With the flag ON the envelope must reach the MODEL. Asserted on the
+/// context the stream fn actually received, not on the loop's return value —
+/// the envelope is deliberately absent from the latter (see the next test),
+/// so returning it would be the wrong evidence.
+#[tokio::test]
+async fn turn_envelope_reaches_the_model_when_enabled() {
+    let (factory, seen) = capturing_stream_and_seen();
+    let mut cfg = build_config();
+    cfg.turn_envelope = true;
+
+    let (tx, mut _rx) = tokio::sync::mpsc::channel(64);
+    let _ = run_agent_loop(
+        vec![LoopMessage::User(UserMessage::text("start"))],
+        empty_context(),
+        cfg,
+        AbortSignal::new(),
+        &tx,
+        &factory,
+        None,
+        None,
+    )
+    .await;
+
+    let blob = serde_json::to_string(&*seen.lock().unwrap()).unwrap();
+    assert!(
+        blob.contains("<turn_envelope version=\\\"1\\\">"),
+        "the model never saw a turn envelope:\n{blob}"
+    );
+    assert!(
+        blob.contains("session_environment"),
+        "the envelope carried no session_environment section:\n{blob}"
+    );
+    // `os` is the one fact that is always readable, so it is the only one
+    // safe to assert on in any environment CI might run in.
+    assert!(
+        blob.contains(&format!("- os={}", std::env::consts::OS)),
+        "the envelope omitted the OS fact:\n{blob}"
+    );
+}
+
+/// The other side. Without this the test above proves only that the string
+/// exists somewhere, not that the flag controls it.
+#[tokio::test]
+async fn no_turn_envelope_when_disabled() {
+    let (factory, seen) = capturing_stream_and_seen();
+    let mut cfg = build_config();
+    cfg.turn_envelope = false;
+
+    let (tx, mut _rx) = tokio::sync::mpsc::channel(64);
+    let _ = run_agent_loop(
+        vec![LoopMessage::User(UserMessage::text("start"))],
+        empty_context(),
+        cfg,
+        AbortSignal::new(),
+        &tx,
+        &factory,
+        None,
+        None,
+    )
+    .await;
+
+    let blob = serde_json::to_string(&*seen.lock().unwrap()).unwrap();
+    assert!(
+        !blob.contains("turn_envelope"),
+        "the envelope leaked into a run with the flag off:\n{blob}"
+    );
+}
+
+/// The envelope is model-facing context, NOT conversation history. If it
+/// entered the returned messages it would be written to the session file and
+/// replayed on resume — a frozen snapshot of a stale environment, which is
+/// the exact failure this whole change exists to remove.
+#[tokio::test]
+async fn turn_envelope_is_not_persisted_into_returned_messages() {
+    let (factory, _seen) = capturing_stream_and_seen();
+    let mut cfg = build_config();
+    cfg.turn_envelope = true;
+
+    let (tx, mut _rx) = tokio::sync::mpsc::channel(64);
+    let messages = run_agent_loop(
+        vec![LoopMessage::User(UserMessage::text("start"))],
+        empty_context(),
+        cfg,
+        AbortSignal::new(),
+        &tx,
+        &factory,
+        None,
+        None,
+    )
+    .await;
+
+    let blob = messages
+        .iter()
+        .map(|m| crate::agent::agent_loop::message::loop_message_to_value(m).to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !blob.contains("turn_envelope"),
+        "the envelope was persisted into session history:\n{blob}"
+    );
 }

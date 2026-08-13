@@ -92,6 +92,7 @@ fn build_config() -> LoopConfig {
         truncation_notes: Arc::new(Mutex::new(std::collections::HashMap::new())),
         tool_def_filter: None,
         dynamic_tool_search: false,
+        turn_envelope: false,
         escalation_stream_fn: None,
         escalation_provider_name: None,
         escalation_pending: Arc::new(Mutex::new(None)),

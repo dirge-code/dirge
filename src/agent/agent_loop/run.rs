@@ -1989,6 +1989,27 @@ pub async fn run_agent_loop(
         push_context_note_if_absent(&mut context, block);
     }
 
+    // dirge-e31n.2: the volatile session facts, re-read at the start of every
+    // user turn instead of frozen into the preamble at agent construction.
+    // Pushed through the same tail channel as exemplars and pre-recall, so it
+    // cannot churn the cached prefix, and deduped by `push_context_note_if_absent`
+    // — an unchanged environment is pushed once and then costs nothing, while a
+    // `cd` or a branch switch produces a genuinely different block that lands on
+    // the next turn. `builder::agent_inner` omits these four lines from the
+    // preamble under the same flag, so they are stated exactly once.
+    if config.turn_envelope
+        && let Some(rendered) = super::envelope::SessionFacts::read().to_envelope()
+    {
+        if !rendered.dropped.is_empty() {
+            tracing::debug!(
+                target: "dirge::context",
+                dropped = ?rendered.dropped,
+                "turn envelope over budget; sections dropped",
+            );
+        }
+        push_context_note_if_absent(&mut context, rendered.text);
+    }
+
     // Pi line 105: `currentContext.messages = [...context.messages, ...prompts]`.
     for prompt in &prompts {
         context.messages.push(loop_message_to_value(prompt));

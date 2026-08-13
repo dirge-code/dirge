@@ -30,6 +30,7 @@ pub mod completeness_gate;
 pub mod context_depth;
 pub mod context_manager;
 pub mod critic;
+pub mod envelope;
 pub mod failure_tracker;
 pub mod gate_state;
 pub mod gate_tally;

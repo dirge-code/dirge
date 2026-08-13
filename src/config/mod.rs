@@ -1131,6 +1131,21 @@ pub struct Config {
     /// both trade a little prompt text for context-token savings.
     pub code_mode_rubric: Option<bool>,
 
+    /// dirge-e31n.2: move the volatile session facts (cwd, OS, shell, git
+    /// branch) out of the frozen system prompt and into a per-turn
+    /// `<turn_envelope>` block appended to the model-facing context.
+    ///
+    /// Those four facts are captured once, at agent construction, and never
+    /// refreshed — a `cd`, a `git switch`, or a worktree move leaves the
+    /// model reading a world that no longer exists, and the only correction
+    /// is `rebuild_agent`, which discards the whole cached prefix to update
+    /// four lines. Re-evaluating them per user turn and appending at the
+    /// tail costs nothing in cache churn.
+    ///
+    /// Default `false` so the preamble stays byte-for-byte identical until
+    /// the A/B says otherwise (`scripts/loop-ab.sh -B turn_envelope=true`).
+    pub turn_envelope: Option<bool>,
+
     /// Phase 4 part 2 (`docs/AGENTIC_LOOP_PLAN.md`): consecutive-turn
     /// threshold for the context-depth reminder system. `None`
     /// (default) keeps the feature OFF — long sessions get no
@@ -1648,6 +1663,13 @@ impl Config {
     /// A/B harness can flip it per run.
     pub fn resolve_code_mode_rubric(&self) -> bool {
         self.code_mode_rubric.unwrap_or(false)
+    }
+
+    /// Per-turn context envelope opt-in (dirge-e31n.2). Default off, so the
+    /// frozen preamble keeps the session facts and nothing changes until the
+    /// A/B says the envelope is at least neutral.
+    pub fn resolve_turn_envelope(&self) -> bool {
+        self.turn_envelope.unwrap_or(false)
     }
 
     /// Phased plan workflow opt-in (vix port). Default off — `/plan` is gated

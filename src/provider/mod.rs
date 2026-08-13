@@ -86,6 +86,14 @@ pub struct AnyAgent {
     /// `ToolSearchTool` instance in `loop_tools`. Default
     /// `false` — the untouched-by-this-feature path.
     dynamic_tool_search: bool,
+    /// dirge-e31n.2: per-turn context envelope opt-in. Resolved from
+    /// `config.turn_envelope` at `build_agent` time and forwarded to
+    /// `LoopSpawnConfig.turn_envelope` by `spawn_runner`. Must travel this
+    /// whole chain: the builder reads the config to decide whether to OMIT
+    /// the session facts from the preamble, and the loop reads it to decide
+    /// whether to EMIT them per turn. A flag that reached only one of the two
+    /// would drop the facts entirely.
+    turn_envelope: bool,
     /// Phase-3: per-session loaded-tool set. Allocated by
     /// `build_agent` when `dynamic_tool_search` is on, and
     /// shared with the `ToolSearchTool` instance registered in
@@ -340,6 +348,7 @@ impl AnyAgent {
             preamble,
             model_name,
             dynamic_tool_search: false,
+            turn_envelope: false,
             tool_def_filter: None,
             tool_search_registry: None,
             escalation_stream_fn: None,
@@ -712,6 +721,16 @@ impl AnyAgent {
         self.dynamic_tool_search = true;
         self.tool_def_filter = Some(filter);
         self.tool_search_registry = Some(registry);
+        self
+    }
+
+    /// dirge-e31n.2: emit the volatile session facts as a per-turn envelope
+    /// instead of freezing them into the preamble. The builder has already
+    /// omitted them from the system prompt under the same config flag, so
+    /// this call is what puts them back — off, they are stated once and
+    /// stale; on, once and fresh; and the two settings must not disagree.
+    pub fn with_turn_envelope(mut self, enabled: bool) -> Self {
+        self.turn_envelope = enabled;
         self
     }
 

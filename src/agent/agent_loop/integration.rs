@@ -419,6 +419,11 @@ pub struct LoopSpawnConfig {
     /// `tool_def_filter` for introspection.
     pub dynamic_tool_search: bool,
 
+    /// dirge-e31n.2: per-turn context envelope opt-in. Mirrors the
+    /// `turn_envelope` config knob; carried alongside `dynamic_tool_search`
+    /// for the same reason.
+    pub turn_envelope: bool,
+
     /// Phase 4 part 1: alternate stream function used for ONE
     /// call after a repair-exhaustion or tree-sitter failure.
     /// `None` when no escalation is configured.
@@ -549,6 +554,7 @@ impl LoopSpawnConfig {
             summarize_fn: None,
             tool_def_filter: None,
             dynamic_tool_search: false,
+            turn_envelope: false,
             escalation_stream_fn: None,
             escalation_provider_name: None,
             escalation_max_per_session: None,
@@ -636,6 +642,7 @@ pub fn spawn_loop_runner(cfg: LoopSpawnConfig) -> LoopRunner {
         )),
         tool_def_filter: cfg.tool_def_filter.clone(),
         dynamic_tool_search: cfg.dynamic_tool_search,
+        turn_envelope: cfg.turn_envelope,
         escalation_stream_fn: cfg.escalation_stream_fn.clone(),
         escalation_provider_name: cfg.escalation_provider_name.clone(),
         escalation_pending: std::sync::Arc::new(std::sync::Mutex::new(None)),

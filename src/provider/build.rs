@@ -245,6 +245,7 @@ pub async fn build_agent(
             if let Some(tool) = review_memory_tool {
                 agent = agent.with_review_memory_tool(tool);
             }
+            agent = agent.with_turn_envelope(cfg.resolve_turn_envelope());
             if let Some(ds) = dyn_search {
                 agent.with_dynamic_tool_search(ds.filter, ds.registry)
             } else {
