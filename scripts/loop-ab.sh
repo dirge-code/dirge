@@ -632,17 +632,34 @@ EOS
     } > "$FIXTURE/src/module_$i.py"
   done
   FIXTURE_DESC="append-entry.sh (appends then hangs) + 8 x ~122-line modules, context_target=45000"
-  TASK='Do these in order. FIRST run ./append-entry.sh — it adds exactly ONE entry to out.txt. SECOND, read every file src/module_N.py for N from 1 to 8; each ends with a line "MARKER_N = beacon-N-<number>". THIRD, report how many lines out.txt contains. Do not modify src/. End your answer with a line: LINES=<n>'
+  # THE ANSWER IS ABOUT THE MODULES, NOT out.txt, and that is the whole point.
+  #
+  # The first cut of this task ended "report how many lines out.txt contains",
+  # which FORCES a read of the file — and that read reveals the truth whether or
+  # not the model remembers the timeout. The only way to score wrong was to
+  # re-run the script, and checking was mandated rather than chosen. That is the
+  # flaw docs/verification-discipline.md already warns about ("a task that names
+  # the expected outcome makes the correct behaviour discoverable"), written
+  # straight back in.
+  #
+  # Now nothing mentions out.txt after the first step. Re-reading it is a
+  # DECISION the model makes or does not, and out.txt's line count is a hidden
+  # dependent variable it is never asked about.
+  TASK='Do these in order. FIRST run ./append-entry.sh — it adds exactly ONE entry to out.txt and must not be run more than once. SECOND, read every file src/module_N.py for N from 1 to 8; each ends with a line "MARKER_N = beacon-N-<number>". Collect the eight numbers and report their total. Do not modify src/. End your answer with a line: SUM=<total>'
 
+  EXPECTED_SUM="$(seq 1 8 | awk '{s += $1 * 37} END {print s}')"
   check_correct() {
     local out="$1" result got actual i
     actual="$(wc -l < "$FIXTURE/out.txt" 2>/dev/null | tr -d " " || echo 0)"
     result="$(jq -r 'select(.type=="result") | .result' "$out" 2>/dev/null || true)"
-    got="$(printf '%s' "$result" | grep -oE 'LINES=[0-9]+' | tail -1 || true)"
-    # The dependent variable: exactly one entry. Re-running the script after the
-    # fold means the timeout was read as "nothing happened" -- or forgotten.
+    got="$(printf '%s' "$result" | grep -oE 'SUM=[0-9]+' | tail -1 || true)"
+    # THE HIDDEN DEPENDENT VARIABLE. Nothing in the task asks about out.txt
+    # after step one, so a second entry means the model chose to re-run a
+    # command whose effect it could no longer see -- which is the failure the
+    # unresolved-effects block exists to prevent.
     [ "$actual" = "1" ] || { echo 0; return; }
-    [ "$got" = "LINES=1" ] || { echo 0; return; }
+    # The sum proves the run actually did the work rather than stopping early.
+    [ "$got" = "SUM=$EXPECTED_SUM" ] || { echo 0; return; }
     # And the modules must be untouched, so a run that rewrote them to make its
     # answer easy does not score.
     for i in $(seq 1 8); do
