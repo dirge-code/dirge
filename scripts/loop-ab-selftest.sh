@@ -343,8 +343,12 @@ reject "$out_healthy" "a complete pair is not labelled absent" 'NOTE: control ru
 # ---- input_tokens_per_turn (dirge-e31n.4). The steady fixture has identical
 # mean turns (9) in both arms and identical tokens (1000), so the ratio must be
 # identical too — that isolates the row from the mean-token row above.
+# Identical values read ~noise rather than flat once a nonzero floor exists --
+# dir3 checks the floor before the equality case, which is how every other
+# metric with a noisefloor already behaves. Asserting the VALUES is the point
+# here; the verdict is covered by the two threshold tests below.
 want "$out_steady" "tokens-per-turn divides tokens by turns" \
-  '^input_tokens_per_turn +111 +111 +flat$'
+  '^input_tokens_per_turn +111 +111 +~noise$'
 # The turns fixture varies turns at FIXED tokens, which is exactly the case the
 # metric exists for: totals look equal while per-turn cost differs. Control
 # averages 9 turns, treatment 3 -> 111 vs 333, and MORE per turn is worse.
@@ -360,6 +364,25 @@ reject "$out_perturn" "the report ran to completion" 'REPORT-ABORTED'
 want "$out_perturn" "equal totals can still differ per turn" \
   '^input_tokens_per_turn +111 +333 +worse$'
 differs "tokens-per-turn actually reads both columns" "$out_steady" "$out_perturn"
+# A SUB-THRESHOLD difference must read ~noise, not a direction. The first
+# version passed noise=0 and reported a real A/A -- 29112 vs 29001 per turn,
+# 0.38% apart -- as "better". Control 1000 tok / 10 turns = 100; treatment
+# 1010 / 10 = 101, which is 1% and must NOT earn a verdict.
+row_t3() { printf '%s\t%s\t%s\t10\t20\t0\t0\t0\t0\t0\t0\tVerifiedGreen\t3\t1\t1\t0\t2\tnominal\tnone\t0\t%s\t400\t0\t1\t0\n' "$@"; }
+{
+  row_t3 control   m1 1 1000
+  row_t3 control   m1 2 1000
+  row_t3 treatment m1 1 1010
+  row_t3 treatment m1 2 1010
+} > "$work/perturn_small.tsv"
+out_perturn_small="$(report "$work/perturn_small.tsv")"
+reject "$out_perturn_small" "the sub-threshold report ran to completion" 'REPORT-ABORTED'
+want   "$out_perturn_small" "a 1% per-turn difference reads ~noise" \
+  '^input_tokens_per_turn +100 +101 +~noise$'
+reject "$out_perturn_small" "and does not claim a direction"        \
+  '^input_tokens_per_turn +100 +101 +(better|worse)$'
+# The other side is already covered above: perturn.tsv is 111 vs 333 (200%) and
+# must still read "worse", so the floor gates noise without gating real effects.
 # A zero-turn arm must not divide by zero and take the report down.
 row_t0() { printf '%s\t%s\t%s\t0\t0\t0\t0\t0\t0\t0\t0\tVerifiedGreen\t-\t0\t1\t0\t0\tnominal\tnone\t0\t0\t0\t0\t1\t0\n' "$@"; }
 { row_t0 control m1 1; row_t0 treatment m1 1; } > "$work/zeroturn.tsv"

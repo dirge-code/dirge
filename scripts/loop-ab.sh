@@ -1071,6 +1071,17 @@ function tokperturn_num(key,    t) {
   t = mean(key, 4)
   return t > 0 ? mean(key, 21) / t : 0
 }
+# Noise floor for the per-turn cost, as a FRACTION of the control value rather
+# than an absolute count. It has to be relative: the value is tens of thousands
+# of tokens, so an absolute eps of 0.5 calls every rounding difference a result.
+#
+# 2% is grounded in measurement, not taste. An A/A on the `pinned` scenario at
+# n=6 -- identical config in both arms -- returned 29112 vs 29001 per turn, a
+# spread of 0.38%. The first version of this row passed noise=0 and duly
+# reported that A/A as "better", which is the precise failure this harness
+# exists to prevent. 2% leaves ~5x headroom over the observed A/A spread while
+# staying far below any cache effect worth shipping.
+function tokperturn_floor(ck) { return tokperturn_num(ck) * 0.02 }
 
 function hitrate(key,    inp) {
   inp = mean(key, 21)
@@ -1168,7 +1179,7 @@ END {
     row("cached_tokens", spread(ck, 22), spread(tk, 22), dir3(mean(ck, 22), mean(tk, 22), 0, 0.5, noisefloor(ck, 22)))
     row("cache_creation_tokens", spread(ck, 23), spread(tk, 23), dir3(mean(ck, 23), mean(tk, 23), 1, 0.5, noisefloor(ck, 23)))
     row("input_tokens_per_turn", tokperturn(ck), tokperturn(tk),
-        dir3(tokperturn_num(ck), tokperturn_num(tk), 1, 0.5, 0))
+        dir3(tokperturn_num(ck), tokperturn_num(tk), 1, 0.5, tokperturn_floor(ck)))
     row("cache_hit_rate", hitrate(ck), hitrate(tk), "observed")
     # dirge-e31n.3: only meaningful on the `denied` scenario, where the arms
     # differ in what the prompt SAYS the model has. Lower is better: a call
@@ -1250,7 +1261,7 @@ END {
       row2("input_tokens", spread(ck, 21), spread(ek, 21), dir3(mean(ck, 21), mean(ek, 21), 1, 0.5, noisefloor(ck, 21)))
       row2("cached_tokens", spread(ck, 22), spread(ek, 22), dir3(mean(ck, 22), mean(ek, 22), 0, 0.5, noisefloor(ck, 22)))
       row2("input_tokens_per_turn", tokperturn(ck), tokperturn(ek),
-          dir3(tokperturn_num(ck), tokperturn_num(ek), 1, 0.5, 0))
+          dir3(tokperturn_num(ck), tokperturn_num(ek), 1, 0.5, tokperturn_floor(ck)))
       # dirge-l8l7.4: the guard above covers the EXTRA arm; control can be
       # absent for this model just as easily, and these divide by it too.
       row2("success_rate", rate(ck), rate(ek), pairdir(ok[ck], narm(ck), ok[ek], narm(ek), 0, 0.05, ratefloor(ck, ek)))
