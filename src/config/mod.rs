@@ -1185,10 +1185,26 @@ pub struct Config {
     /// what may have landed, with the standing rule that interruption does not
     /// undo work. Requires `turn_envelope`, which owns the block it rides in.
     ///
-    /// Default `false` until measured. Unlike `turn_envelope` and
-    /// `capability_projection`, this one has no A/B behind it yet, and a
-    /// default flipped on an argument rather than a measurement is how the
-    /// other two would have shipped a regression.
+    /// Default `false`, and it stays false on the measurement rather than for
+    /// want of one.
+    ///
+    /// A scenario built to force the condition (`-s handoff`: a script that
+    /// appends a line and then hangs past the tool deadline, so the tool errors
+    /// AFTER the effect landed) put both tested models at 6/6 correct in BOTH
+    /// arms, n=6. Every other metric read `~noise`. The models already check
+    /// the file before deciding whether to re-run.
+    ///
+    /// The reading that matters is not "this does not work" — it is that the
+    /// WITHIN-RUN case was never where the value was. The model can see the
+    /// timeout in its own transcript, so the block mostly restates something
+    /// already visible. The case where it carries information the model
+    /// genuinely lacks is after a real interrupt, where it cannot see its own
+    /// tool results at all — and that half is dirge-pv03, not this.
+    ///
+    /// glm's run-to-run spread narrowed (turns 8 -> 4, tool calls 9 -> 4).
+    /// That is NOT being claimed as a result: one 12-turn control outlier
+    /// drives the whole range at n=6, and dispersion is a weaker signal than
+    /// the means it sits under. See docs/verification-discipline.md.
     pub turn_facts: Option<bool>,
 
     /// Phase 4 part 2 (`docs/AGENTIC_LOOP_PLAN.md`): consecutive-turn
