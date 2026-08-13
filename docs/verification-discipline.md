@@ -527,12 +527,25 @@ and every failure was the model defending itself against an unbounded command:
    *shell's* `timeout(1)` instead of the tool parameter. The command exits 124,
    which the bash tool reports as an ordinary non-zero exit — not a tool error at
    all, so still nothing to classify.
-3. What worked: say nothing about timeouts and pin `bash_secs` low. The two
-   bounds compose. If the model passes its own, that wins and still trips (the
-   script outlasts any sane value); if it uses a shell timeout or none, it passed
-   no tool timeout, so the configured one applies.
+3. What worked *mostly*: say nothing about timeouts and pin `bash_secs` low. The
+   two bounds compose. If the model passes its own, that wins and still trips
+   (the script outlasts any sane value); if it uses a shell timeout or none, it
+   passed no tool timeout, so the configured one applies.
 
-Two things generalise. **A lever the model can overrule is not a lever** — check
+Even then it is not airtight. Two of six control runs on one model reached for
+`background: true`, which returns a shell id immediately — no deadline, no error,
+nothing to classify. The mechanism check flagged both as uninformative, which is
+the point: the effective `n` was 4, not 6, and the report says so rather than
+averaging two empty runs into the result.
+
+Three routes around one unbounded command, found by running it: the tool's own
+`timeout` parameter, the shell's `timeout(1)`, and `background: true`. The
+general lesson is not the list — it is that **the condition you are trying to
+force may simply be rare**, because the model is actively avoiding it. That is
+worth knowing before concluding a feature does not help: it may be that the
+situation it helps with almost never arises in the scenario you built.
+
+Two more things generalise. **A lever the model can overrule is not a lever** — check
 whether the knob you are pinning is a default or a bound before building a
 scenario on it. And **the scenario's difficulty is a variable you are setting**:
 a task that names the expected outcome ("it adds exactly ONE entry") makes the
