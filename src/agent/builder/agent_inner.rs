@@ -182,8 +182,25 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
                 append_memory_to_preamble(&mut preamble, &provider);
                 Some(provider)
             }
-            Err(_) => None,
+            // #769: this used to be `Err(_) => None` — the memory tier
+            // simply vanished, and the user was never told. That is the
+            // wrong trade for a store holding what they asked dirge to
+            // remember, and it got worse once a damaged database started
+            // failing at open rather than at some later write: silence
+            // where there had at least been an error. Degrading to no
+            // memory is still right; doing it quietly is not.
+            Err(e) => {
+                eprintln!("warning: project memory is unavailable — {e}");
+                None
+            }
         };
+    // Databases that opened but without WAL. Not a failure, so it is not
+    // reported as one — but it is where SQLite files get corrupted, and
+    // it was previously recorded into a slot the next successful open
+    // wiped. Drained, so a `/model` rebuild does not repeat it.
+    for note in crate::extras::session_db::take_degraded_opens() {
+        eprintln!("warning: {note}");
+    }
     // Global (cross-project) memory tier — inject its snapshot too, under a
     // distinct header, so durable user preferences reach the prompt
     // regardless of which project this is. Best-effort: a load failure just

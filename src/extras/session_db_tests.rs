@@ -825,11 +825,11 @@ fn end_session_is_idempotent() {
 
 #[test]
 fn open_failure_returns_descriptive_error() {
-    // dirge-w4i7: assert on the returned Err, NOT the process-global
-    // last_init_error(). open() clears that global on every successful
-    // open, so a parallel test opening a DB races this assertion down to
-    // None and the test flakes. The returned error carries the same
-    // message and is per-call, so it's race-free.
+    // dirge-w4i7: assert on the returned Err, which is per-call and
+    // therefore race-free. This used to warn against reading a
+    // process-global `last_init_error()` that every successful open
+    // cleared — #769 deleted it, since nothing ever read it and the
+    // returned error says the same thing.
     //
     // Attempt to open a path that doesn't exist as a directory (the parent
     // dir creation is done by open(), but a file where a directory should
@@ -1696,4 +1696,136 @@ fn fts5_external_content_delete_all_clears_phantom_postings() {
     assert_eq!(matches("hello"), 0, "index is fully reset");
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// #769: a damaged database must be refused at OPEN, with the file named
+/// and a way out. Before this it opened cleanly and failed later at
+/// whatever write touched the bad page — a message naming neither the
+/// database nor a recovery step, repeated for every session afterwards.
+#[test]
+fn a_damaged_database_is_refused_at_open_with_the_path_and_the_steps() {
+    let _gate = DIAGNOSTICS_TEST_GATE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let n = DB_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!("dirge-damaged-open-{}-{}", std::process::id(), n));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("state.db");
+    // Build a real database, then scribble over its b-tree.
+    {
+        let db = SessionDb::open(&path).expect("a fresh database opens");
+        db.conn
+            .execute_batch("CREATE TABLE scratch (a TEXT); CREATE INDEX scratch_a ON scratch (a);")
+            .unwrap();
+        let mut stmt = db
+            .conn
+            .prepare("INSERT INTO scratch (a) VALUES (?1)")
+            .unwrap();
+        for i in 0..500 {
+            stmt.execute([format!(
+                "row {i} padded out so the file spans several pages"
+            )])
+            .unwrap();
+        }
+    }
+    let mut bytes = std::fs::read(&path).unwrap();
+    assert!(bytes.len() > 8192, "need more than one page to damage");
+    for b in bytes.iter_mut().skip(4096).take(2048) {
+        *b = 0x5a;
+    }
+    std::fs::write(&path, &bytes).unwrap();
+
+    let err = match SessionDb::open(&path) {
+        Ok(_) => panic!("a damaged database must be refused"),
+        Err(e) => e,
+    };
+    assert!(err.contains("damaged"), "{err}");
+    assert!(
+        err.contains(path.to_str().unwrap()),
+        "the message must name the file: {err}"
+    );
+    assert!(err.contains(".recover"), "{err}");
+    // The caller gets the whole thing back — that is what
+    // `agent_inner` prints instead of dropping the memory tier in
+    // silence, so the message the user sees IS this one.
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The discrimination half: an ordinary database opens, and opening it
+/// does not invent a complaint. Without this, a `quick_check` wired to
+/// reject everything would look identical.
+#[test]
+fn an_intact_database_opens_and_records_nothing() {
+    let _gate = DIAGNOSTICS_TEST_GATE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let (_db, path) = temp_db();
+    assert!(path.exists());
+    assert!(
+        take_degraded_opens().is_empty(),
+        "a healthy local open has nothing to report"
+    );
+}
+
+/// #769: the WAL-fallback notice used to be written into the slot a
+/// successful open CLEARS — recorded and then wiped by the same open, so
+/// nothing could ever read it. It lives in its own list now, and a
+/// successful open must not erase it.
+#[test]
+fn a_degraded_open_notice_survives_a_later_successful_open() {
+    let _gate = DIAGNOSTICS_TEST_GATE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let _drain = take_degraded_opens();
+    note_degraded_open("something.db is on a filesystem without WAL support".to_string());
+    // A normal open, of the kind that used to wipe it.
+    let (_db, _path) = temp_db();
+    let notes = take_degraded_opens();
+    assert_eq!(
+        notes.len(),
+        1,
+        "the notice must outlive the next open: {notes:?}"
+    );
+    assert!(notes[0].contains("without WAL support"));
+    // Draining leaves none behind, so a rebuild does not repeat it.
+    assert!(take_degraded_opens().is_empty());
+}
+
+/// A process opens more than one database — the per-project `state.db`
+/// and the global memory store — and they can sit on different
+/// filesystems. Each must be reported: keeping only the most recent
+/// notice is how the original bug worked, just one layer down.
+#[test]
+fn two_databases_in_trouble_are_both_reported() {
+    let _gate = DIAGNOSTICS_TEST_GATE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let _drain = take_degraded_opens();
+    note_degraded_open("project/state.db is on a filesystem without WAL support".to_string());
+    note_degraded_open("global/memory.db is on a filesystem without WAL support".to_string());
+    let notes = take_degraded_opens();
+    assert_eq!(notes.len(), 2, "both databases must be named: {notes:?}");
+    assert!(
+        notes.iter().any(|n| n.contains("project/state.db")),
+        "{notes:?}"
+    );
+    assert!(
+        notes.iter().any(|n| n.contains("global/memory.db")),
+        "{notes:?}"
+    );
+}
+
+/// One line per database, not per open — an agent rebuild reopens the
+/// same files and must not stack duplicates.
+#[test]
+fn a_degraded_open_is_noted_once_however_often_it_reopens() {
+    let _gate = DIAGNOSTICS_TEST_GATE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let _drain = take_degraded_opens();
+    for _ in 0..3 {
+        note_degraded_open("same.db is on a filesystem without WAL support".to_string());
+    }
+    assert_eq!(take_degraded_opens().len(), 1);
 }
