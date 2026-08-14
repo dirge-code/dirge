@@ -722,7 +722,11 @@ fn summarize_tool_result(tool_name: &str, content: &str) -> String {
                 // is bytes, so any multibyte result — CJK, emoji, an accented
                 // path — claimed a truncation that had not happened: 40 CJK
                 // characters are 120 bytes, well under the 80-char take.
-                if content.chars().count() > 80 { "…" } else { "" }
+                if content.chars().count() > 80 {
+                    "…"
+                } else {
+                    ""
+                }
             )
         }
     }
