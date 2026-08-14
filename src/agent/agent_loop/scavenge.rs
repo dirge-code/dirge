@@ -61,14 +61,6 @@ const MAX_SCAVENGE_INPUT: usize = 100 * 1024;
 const MAX_UNKNOWN_NAMES: usize = 16;
 
 // Module-level compiled regexes to avoid per-call recompilation.
-static RE_DSML_FUNC: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"<[｜|]DSML[｜|]function_calls>[\s\S]*?</?[｜|]DSML[｜|]function_calls>")
-        .expect("DSML function_calls regex must compile")
-});
-static RE_DSML_INVOKE_STRIP: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"<[｜|]DSML[｜|]invoke\s+[^>]*>[\s\S]*?</[｜|]DSML[｜|]invoke>")
-        .expect("DSML invoke strip regex must compile")
-});
 static RE_DSML_INVOKE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"<[｜|]DSML[｜|]invoke\s+name="([^"]+)">([\s\S]*?)</[｜|]DSML[｜|]invoke>"#)
         .expect("DSML invoke regex must compile")
@@ -78,19 +70,6 @@ static RE_DSML_PARAM: LazyLock<Regex> = LazyLock::new(|| {
         r#"<[｜|]DSML[｜|]parameter\s+name="([^"]+)"(?:\s+string="(true|false)")?\s*>([\s\S]*?)</[｜|]DSML[｜|]parameter>"#
     ).expect("DSML parameter regex must compile")
 });
-/// dirge-56vo: Qwen/Hermes `<tool_call>` channel. The closing tag is optional
-/// so a response cut off mid-call still yields a region to repair.
-static RE_TOOL_CALL_TAG: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?s)<tool_call>(.*?)(?:</tool_call>|$)").expect("tool_call tag regex must compile")
-});
-/// dirge-56vo: ```` ```json ```` / ```` ```tool ```` fences. Deliberately does
-/// NOT match a bare ```` ``` ```` fence — those are overwhelmingly code samples
-/// the model is discussing, not calls it meant to make.
-static RE_FENCED_CALL: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?s)```(?:tool|json)\s*\n(.*?)(?:\n```|$)")
-        .expect("fenced call regex must compile")
-});
-
 /// Result of a scavenge pass.
 #[derive(Debug, Clone, Default)]
 pub struct ScavengeResult {
@@ -168,15 +147,30 @@ pub fn scavenge_tool_calls(
     }
 
     // Pattern B: tagged / fenced regions (dirge-56vo). Runs before the raw
-    // scan and removes what it consumed, so a tagged call can't also be
-    // picked up as a bare JSON object and counted twice.
-    let non_dsml = strip_dsml_blocks(content);
-    let (tagged, remainder) = extract_tagged_regions(&non_dsml);
+    // scan, and every region — DSML included — is cut out of what the raw
+    // scan sees, so a call inside explicit syntax can't also be picked up as
+    // a bare JSON object and counted twice.
+    //
+    // The regions come from [`super::call_syntax`], which is also what the
+    // display filter reads. One definition of where a call starts and ends,
+    // so a call that runs cannot also be printed to the user (dirge-n00z).
+    let found = super::call_syntax::regions(content);
+    let remainder = super::call_syntax::without(content, &found);
+    let tagged = found.iter().filter(|r| {
+        matches!(
+            r.kind,
+            super::call_syntax::RegionKind::Tagged | super::call_syntax::RegionKind::Fenced
+        )
+    });
     for region in tagged {
         if out.len() >= max {
             break;
         }
-        match coerce_to_tool_call(&region, allowed_names) {
+        let region = content[region.body.clone()].trim();
+        if region.is_empty() {
+            continue;
+        }
+        match coerce_to_tool_call(region, allowed_names) {
             Some(call) => {
                 notes.push(format!("scavenged tagged call: {}", call.name));
                 out.push(call);
@@ -186,7 +180,7 @@ pub fn scavenge_tool_calls(
             // the miss is worth recording even though there is nothing to
             // dispatch (dirge-e31n.8).
             None if unknown_names.len() < MAX_UNKNOWN_NAMES => {
-                unknown_names.extend(candidate_name(&region))
+                unknown_names.extend(candidate_name(region))
             }
             None => {}
         }
@@ -232,21 +226,14 @@ fn candidate_name(candidate_json: &str) -> Option<String> {
 
 // ---- internal helpers ----
 
-struct DsmlInvoke {
-    name: String,
+pub struct DsmlInvoke {
+    pub name: String,
     args: serde_json::Value,
-}
-
-/// Strip DSML blocks so the raw-JSON scanner doesn't re-scavenge
-/// parameter payloads. Port of `stripDsmlBlocks` (scavenge.ts:73-78).
-fn strip_dsml_blocks(text: &str) -> String {
-    let out = RE_DSML_FUNC.replace_all(text, "");
-    RE_DSML_INVOKE_STRIP.replace_all(&out, "").to_string()
 }
 
 /// Yield every DSML invoke block found in text.
 /// Port of `iterateDsmlInvokes` (scavenge.ts:80-90).
-fn iterate_dsml_invokes(text: &str) -> Vec<DsmlInvoke> {
+pub fn iterate_dsml_invokes(text: &str) -> Vec<DsmlInvoke> {
     let mut out = Vec::new();
     for caps in RE_DSML_INVOKE.captures_iter(text) {
         let name = match caps.get(1) {
@@ -300,28 +287,6 @@ fn parse_dsml_parameters(body: &str) -> serde_json::Value {
         map.insert(key, serde_json::Value::String(raw));
     }
     serde_json::Value::Object(map)
-}
-
-/// dirge-56vo: pull `<tool_call>` / fenced regions out of `text`.
-///
-/// Returns the region bodies plus the text with those regions removed, so the
-/// caller's raw-JSON scan can run over the remainder without re-finding what
-/// was already consumed.
-fn extract_tagged_regions(text: &str) -> (Vec<String>, String) {
-    let mut regions = Vec::new();
-    let mut remainder = text.to_string();
-    for re in [&*RE_TOOL_CALL_TAG, &*RE_FENCED_CALL] {
-        for caps in re.captures_iter(&remainder.clone()) {
-            if let Some(body) = caps.get(1) {
-                let trimmed = body.as_str().trim();
-                if !trimmed.is_empty() {
-                    regions.push(trimmed.to_string());
-                }
-            }
-        }
-        remainder = re.replace_all(&remainder, "").to_string();
-    }
-    (regions, remainder)
 }
 
 /// dirge-56vo: parse `raw` as JSON, escalating through repairs.
@@ -513,7 +478,7 @@ fn iterate_json_objects(text: &str) -> Vec<String> {
 /// guessed name are handled by the same code and counted in the same place.
 /// This gate only decides what gets that far — before dirge-e31n.8 a synonym
 /// was dropped here and the call was simply gone.
-fn is_dispatchable(name: &str, allowed: &std::collections::HashSet<String>) -> bool {
+pub fn is_dispatchable(name: &str, allowed: &std::collections::HashSet<String>) -> bool {
     allowed.contains(name)
         || crate::agent::agent_loop::tool_aliases::resolve(name, allowed.iter()).is_some()
 }
@@ -521,7 +486,7 @@ fn is_dispatchable(name: &str, allowed: &std::collections::HashSet<String>) -> b
 /// Try to coerce a JSON string into a ToolCall.
 /// Port of `coerceToToolCall` (scavenge.ts:150-201).
 #[allow(clippy::collapsible_if)]
-fn coerce_to_tool_call(
+pub fn coerce_to_tool_call(
     candidate_json: &str,
     allowed_names: &std::collections::HashSet<String>,
 ) -> Option<ToolCall> {

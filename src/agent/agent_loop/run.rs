@@ -2502,6 +2502,13 @@ pub async fn run_loop(
     // runaway run. `max_turns = None` means unlimited (legacy).
     let mut turns_taken: usize = 0;
 
+    // dirge-n00z: call ids for calls lifted out of the model's TEXT, which
+    // arrive with none. Monotonic for the whole run and never reset, because
+    // an id has to stay unique across the transcript, not just the turn —
+    // results are matched back to calls by id, and two empty ones matched
+    // each other.
+    let mut scavenged_call_seq: usize = 0;
+
     // F4: in-session reflexion memory. Accumulates the approaches the
     // model looped on and abandoned this run, so the repeat-loop guard
     // can remind it of every dead end (not just the latest repeat).
@@ -2790,7 +2797,7 @@ pub async fn run_loop(
             // responding to. If it genuinely needs to read something to write
             // its report, it can on the following turn.
             let turn_tool_choice = pending_tool_choice.take();
-            let (assistant_msg, token_usage) = stream_assistant_response(
+            let (mut assistant_msg, token_usage) = stream_assistant_response(
                 &mut current_context,
                 &config,
                 signal.clone(),
@@ -2799,6 +2806,12 @@ pub async fn run_loop(
                 turn_tool_choice,
             )
             .await;
+            // Where this turn's assistant message sits in each transcript, so
+            // a call scavenged out of its text can be recorded ON it further
+            // down (dirge-n00z). Both are appended to below, so neither index
+            // may be re-derived as "the last one" by then.
+            let assistant_in_new = new_messages.len();
+            let assistant_in_context = current_context.messages.len().saturating_sub(1);
             new_messages.push(LoopMessage::Assistant(assistant_msg.clone()));
 
             // dirge-ugah.3: report a turn that wrote a cache entry but read
@@ -2929,6 +2942,9 @@ pub async fn run_loop(
 
             // Pi lines 202-216: tool calls + results.
             let mut tool_calls = extract_tool_calls_from(&assistant_msg);
+            // Ids of the calls lifted out of this turn's TEXT, so the
+            // assistant message can be made to say it made them (dirge-n00z).
+            let mut promoted_ids: Vec<String> = Vec::new();
 
             // Scavenge: scan reasoning AND regular text content for
             // tool calls the model forgot to emit in `tool_calls`.
@@ -2980,6 +2996,28 @@ pub async fn run_loop(
                     for sc in &scavenge_result.calls {
                         let sig = format!("{}::{}", sc.name, canonical_json(&sc.arguments));
                         if !seen_signatures.contains(&sig) {
+                            // dirge-n00z: a text-channel call arrives with no
+                            // id. Mint one now, before anything downstream
+                            // keys on it — results, storm signatures and the
+                            // publish guard all match calls by id, and two
+                            // empty ids matched each other.
+                            let sc = {
+                                let mut c = sc.clone();
+                                scavenged_call_seq += 1;
+                                c.id = format!("scav-{scavenged_call_seq}");
+                                c
+                            };
+                            // Every branch below that pushes the call also
+                            // records its id, and the one that drops it does
+                            // neither — a dropped call must not show up on the
+                            // assistant message as one that ran.
+                            let promote =
+                                |call: super::tools::ToolCall,
+                                 calls: &mut Vec<super::tools::ToolCall>,
+                                 ids: &mut Vec<String>| {
+                                    ids.push(call.id.clone());
+                                    calls.push(call);
+                                };
                             // dirge-knt8: validate scavenged calls against the
                             // tool's schema BEFORE promotion. Scavenged calls
                             // come from hallucinated text in the model's answer,
@@ -2997,7 +3035,7 @@ pub async fn run_loop(
                                     Ok(None) => {
                                         // Valid — push as-is.
                                         tally.record_scavenged_call();
-                                        tool_calls.push(sc.clone());
+                                        promote(sc, &mut tool_calls, &mut promoted_ids);
                                     }
                                     Ok(Some(rr)) => {
                                         // Repaired — push with repaired args.
@@ -3005,9 +3043,13 @@ pub async fn run_loop(
                                         // `config.repair_stats`; the tally
                                         // latches that snapshot at run end.
                                         tally.record_scavenged_call();
-                                        let mut repaired_call = sc.clone();
+                                        let mut repaired_call = sc;
                                         repaired_call.arguments = rr.repaired;
-                                        tool_calls.push(repaired_call);
+                                        promote(
+                                            repaired_call,
+                                            &mut tool_calls,
+                                            &mut promoted_ids,
+                                        );
                                     }
                                     Err(_) => {
                                         // Invalid scavenged call — drop silently.
@@ -3019,8 +3061,8 @@ pub async fn run_loop(
                                 // Defensive: tool not found — unreachable, since
                                 // allowed_names is built from this same tool set.
                                 // Preserve prior behavior and push the call as-is.
-                                tool_calls.push(sc.clone());
                                 tally.record_scavenged_call();
+                                promote(sc, &mut tool_calls, &mut promoted_ids);
                             }
                         }
                     }
@@ -3047,6 +3089,27 @@ pub async fn run_loop(
                     path = "aliased",
                     "resolved a tool name the model wrote differently",
                 );
+            }
+
+            // dirge-n00z: record the lifted calls ON the assistant message.
+            // After alias resolution, so the block carries the name that
+            // actually ran; before storm and dispatch, so every id here is
+            // one `backfill_missing_tool_results` will guarantee a result for.
+            if !promoted_ids.is_empty() {
+                let lifted: Vec<super::tools::ToolCall> = tool_calls
+                    .iter()
+                    .filter(|c| promoted_ids.iter().any(|id| id == &c.id))
+                    .cloned()
+                    .collect();
+                assistant_msg =
+                    super::call_syntax::absorb_text_calls(&assistant_msg, &lifted, &allowed_names);
+                let rewritten = LoopMessage::Assistant(assistant_msg.clone());
+                if let Some(slot) = current_context.messages.get_mut(assistant_in_context) {
+                    *slot = loop_message_to_value(&rewritten);
+                }
+                if let Some(slot) = new_messages.get_mut(assistant_in_new) {
+                    *slot = rewritten;
+                }
             }
 
             // dirge-7bwx: truncation repair runs BEFORE storm

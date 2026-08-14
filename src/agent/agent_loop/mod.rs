@@ -23,6 +23,7 @@
 
 pub mod activity;
 pub mod bridge;
+pub mod call_syntax;
 pub mod capability;
 pub mod claim_gate;
 pub mod code_review;

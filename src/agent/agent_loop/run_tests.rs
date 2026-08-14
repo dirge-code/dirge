@@ -8942,3 +8942,346 @@ async fn an_empty_truncated_turn_gets_no_marker() {
         "an empty turn was marked"
     );
 }
+
+// ---- dirge-n00z: a call lifted out of TEXT is recorded as a call ----
+
+/// Pull the assistant message and the tool results out of a finished run.
+fn assistant_and_results(
+    messages: &[LoopMessage],
+) -> (
+    AssistantMessage,
+    Vec<crate::agent::agent_loop::message::ToolResultMessage>,
+) {
+    let assistant = messages
+        .iter()
+        .find_map(|m| match m {
+            LoopMessage::Assistant(a) => Some(a.clone()),
+            _ => None,
+        })
+        .expect("run produced no assistant message");
+    let results = messages
+        .iter()
+        .filter_map(|m| match m {
+            LoopMessage::ToolResult(t) => Some(t.clone()),
+            _ => None,
+        })
+        .collect();
+    (assistant, results)
+}
+
+fn tool_call_blocks(msg: &AssistantMessage) -> Vec<(String, String)> {
+    msg.content
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::ToolCall { id, name, .. } => Some((id.clone(), name.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+fn text_of(msg: &AssistantMessage) -> String {
+    msg.content
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The transcript has to say the model made the call it made. A `role: "tool"`
+/// message with no matching `tool_use` is a hard 400 on OpenAI and Anthropic;
+/// it stayed latent only because text-channel calls come from servers lenient
+/// enough to have leaked them in the first place.
+#[tokio::test]
+async fn a_call_lifted_from_text_is_paired_with_its_result() {
+    let tool = std::sync::Arc::new(TypedPathTool::new());
+    let mut ctx = empty_context();
+    ctx.tools.push(tool.clone());
+
+    let dsml = r#"reading it <|DSML|invoke name="typed_path_tool"><|DSML|parameter name="path" string="true">/tmp/x</|DSML|parameter></|DSML|invoke> now"#;
+    let factory = canned_factory(vec![
+        AssistantMessage::new(
+            vec![ContentBlock::Text {
+                text: dsml.to_string(),
+            }],
+            StopReason::ToolUse,
+        ),
+        text_response("done"),
+    ]);
+
+    let (tx, _rx) = mpsc::channel::<LoopEvent>(128);
+    let messages = run_agent_loop(
+        vec![user("test")],
+        ctx,
+        build_config(),
+        AbortSignal::new(),
+        &tx,
+        &factory,
+        None,
+        None,
+    )
+    .await;
+    drop(tx);
+
+    let (assistant, results) = assistant_and_results(&messages);
+    let calls = tool_call_blocks(&assistant);
+    assert_eq!(calls.len(), 1, "lifted call missing from the message");
+    assert_eq!(calls[0].1, "typed_path_tool");
+    assert!(!calls[0].0.is_empty(), "a call with no id cannot be paired");
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0].tool_call_id, calls[0].0,
+        "the result names a call the assistant message does not make",
+    );
+    let text = text_of(&assistant);
+    assert!(
+        !text.contains("DSML"),
+        "the syntax is still in the model's words: {text}",
+    );
+    assert!(text.contains("reading it"), "prose was eaten: {text}");
+}
+
+/// Two lifted calls in one turn must be distinguishable. They used to share
+/// an empty id, so result-to-call matching, the storm signature and the
+/// publish guard's id filter all resolved to whichever came first.
+#[tokio::test]
+async fn two_calls_lifted_from_one_turn_get_distinct_ids() {
+    let tool = std::sync::Arc::new(TypedPathTool::new());
+    let mut ctx = empty_context();
+    ctx.tools.push(tool.clone());
+
+    let two = concat!(
+        r#"<|DSML|invoke name="typed_path_tool"><|DSML|parameter name="path" string="true">/tmp/a</|DSML|parameter></|DSML|invoke>"#,
+        r#"<|DSML|invoke name="typed_path_tool"><|DSML|parameter name="path" string="true">/tmp/b</|DSML|parameter></|DSML|invoke>"#,
+    );
+    let factory = canned_factory(vec![
+        AssistantMessage::new(
+            vec![ContentBlock::Text {
+                text: two.to_string(),
+            }],
+            StopReason::ToolUse,
+        ),
+        text_response("done"),
+    ]);
+
+    let (tx, _rx) = mpsc::channel::<LoopEvent>(128);
+    let messages = run_agent_loop(
+        vec![user("test")],
+        ctx,
+        build_config(),
+        AbortSignal::new(),
+        &tx,
+        &factory,
+        None,
+        None,
+    )
+    .await;
+    drop(tx);
+
+    let (assistant, results) = assistant_and_results(&messages);
+    let calls = tool_call_blocks(&assistant);
+    assert_eq!(calls.len(), 2, "expected both calls on the message");
+    assert_ne!(calls[0].0, calls[1].0, "two calls sharing one id");
+    let result_ids: std::collections::HashSet<&str> =
+        results.iter().map(|r| r.tool_call_id.as_str()).collect();
+    for (id, _) in &calls {
+        assert!(result_ids.contains(id.as_str()), "call {id} has no result");
+    }
+}
+
+/// The other direction, and the one that would be worse: a call dropped for
+/// failing its schema (dirge-knt8) never dispatches, so recording it on the
+/// message would orphan a `tool_use` — the same 400 from the other side.
+#[tokio::test]
+async fn a_dropped_call_is_not_recorded_on_the_message() {
+    let tool = std::sync::Arc::new(TypedPathTool::new());
+    let mut ctx = empty_context();
+    ctx.tools.push(tool.clone());
+
+    let bad = r#"<|DSML|invoke name="typed_path_tool"><|DSML|parameter name="wrong" string="true">x</|DSML|parameter></|DSML|invoke>"#;
+    let factory = canned_factory(vec![
+        AssistantMessage::new(
+            vec![ContentBlock::Text {
+                text: bad.to_string(),
+            }],
+            StopReason::ToolUse,
+        ),
+        text_response("done"),
+    ]);
+
+    let (tx, _rx) = mpsc::channel::<LoopEvent>(128);
+    let messages = run_agent_loop(
+        vec![user("test")],
+        ctx,
+        build_config(),
+        AbortSignal::new(),
+        &tx,
+        &factory,
+        None,
+        None,
+    )
+    .await;
+    drop(tx);
+
+    let (assistant, results) = assistant_and_results(&messages);
+    assert!(
+        tool_call_blocks(&assistant).is_empty(),
+        "a dropped call was recorded as one that ran",
+    );
+    assert!(results.is_empty(), "a dropped call produced a result");
+}
+
+/// A turn that makes one call natively and one in text. Only the text one is
+/// new to the message — the native call is already a block on it, and
+/// recording it a second time would send the provider two `tool_use` entries
+/// with the same id.
+#[tokio::test]
+async fn a_native_call_is_not_recorded_twice_alongside_a_lifted_one() {
+    let tool = std::sync::Arc::new(TypedPathTool::new());
+    let mut ctx = empty_context();
+    ctx.tools.push(tool.clone());
+
+    let lifted = r#"<|DSML|invoke name="typed_path_tool"><|DSML|parameter name="path" string="true">/tmp/b</|DSML|parameter></|DSML|invoke>"#;
+    let factory = canned_factory(vec![
+        AssistantMessage::new(
+            vec![
+                ContentBlock::ToolCall {
+                    id: "native_1".to_string(),
+                    name: "typed_path_tool".to_string(),
+                    arguments: serde_json::json!({"path": "/tmp/a"}),
+                },
+                ContentBlock::Text {
+                    text: lifted.to_string(),
+                },
+            ],
+            StopReason::ToolUse,
+        ),
+        text_response("done"),
+    ]);
+
+    let (tx, _rx) = mpsc::channel::<LoopEvent>(128);
+    let messages = run_agent_loop(
+        vec![user("test")],
+        ctx,
+        build_config(),
+        AbortSignal::new(),
+        &tx,
+        &factory,
+        None,
+        None,
+    )
+    .await;
+    drop(tx);
+
+    let (assistant, results) = assistant_and_results(&messages);
+    let calls = tool_call_blocks(&assistant);
+    assert_eq!(
+        calls.len(),
+        2,
+        "expected exactly one block per call: {calls:?}"
+    );
+    let ids: std::collections::HashSet<&str> = calls.iter().map(|(i, _)| i.as_str()).collect();
+    assert_eq!(ids.len(), 2, "a call is recorded twice: {calls:?}");
+    assert!(ids.contains("native_1"), "the native call went missing");
+    assert_eq!(results.len(), 2, "every call needs its own result");
+}
+
+/// The transcript the loop RETURNS and the context it SENDS are two different
+/// stores, and the one that reaches the provider is the second. This asserts
+/// on what the next turn's request actually contains: a `toolResult` whose id
+/// is made by a `toolCall` in the message before it.
+///
+/// A `role: "tool"` with no preceding `tool_calls` is a hard 400 on OpenAI and
+/// Anthropic; the loop returning a well-formed copy would not have saved it.
+#[tokio::test]
+async fn the_next_turn_sees_the_lifted_call_that_produced_its_result() {
+    use crate::agent::agent_loop::stream::{LlmContext, StreamFn};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let tool = std::sync::Arc::new(TypedPathTool::new());
+    let mut ctx = empty_context();
+    ctx.tools.push(tool.clone());
+
+    let lifted = r#"<|DSML|invoke name="typed_path_tool"><|DSML|parameter name="path" string="true">/tmp/x</|DSML|parameter></|DSML|invoke>"#;
+    let second_call_messages: std::sync::Arc<Mutex<Vec<serde_json::Value>>> =
+        std::sync::Arc::new(Mutex::new(Vec::new()));
+    let observed = second_call_messages.clone();
+    let counter = std::sync::Arc::new(AtomicUsize::new(0));
+    let leaked = lifted.to_string();
+
+    let factory: StreamFn = std::sync::Arc::new(move |c: LlmContext, _opts| {
+        let n = counter.fetch_add(1, Ordering::SeqCst);
+        if n > 0 {
+            *observed.lock().unwrap() = c.messages.clone();
+        }
+        let msg = if n == 0 {
+            AssistantMessage::new(
+                vec![ContentBlock::Text {
+                    text: leaked.clone(),
+                }],
+                StopReason::ToolUse,
+            )
+        } else {
+            text_response("done")
+        };
+        let reason = msg.stop_reason;
+        Box::pin(futures::stream::iter(vec![
+            crate::agent::agent_loop::message::StreamEvent::Done {
+                reason,
+                message: msg,
+                usage: None,
+            },
+        ]))
+    });
+
+    let (tx, _rx) = mpsc::channel::<LoopEvent>(128);
+    let _ = run_agent_loop(
+        vec![user("test")],
+        ctx,
+        build_config(),
+        AbortSignal::new(),
+        &tx,
+        &factory,
+        None,
+        None,
+    )
+    .await;
+    drop(tx);
+
+    let sent = second_call_messages.lock().unwrap().clone();
+    let result_id = sent
+        .iter()
+        .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("toolResult"))
+        .and_then(|m| m.get("toolCallId").and_then(|i| i.as_str()))
+        .map(str::to_string)
+        .expect("no tool result reached the next turn");
+    assert!(!result_id.is_empty(), "the result answers no id at all");
+
+    let announced: Vec<String> = sent
+        .iter()
+        .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"))
+        .filter_map(|m| m.get("content").and_then(|c| c.as_array()))
+        .flatten()
+        .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("toolCall"))
+        .filter_map(|b| b.get("id").and_then(|i| i.as_str()).map(str::to_string))
+        .collect();
+    assert!(
+        announced.contains(&result_id),
+        "the request carries a tool result for {result_id}, which no assistant \
+         message makes: {announced:?}",
+    );
+
+    let prose: String = sent
+        .iter()
+        .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"))
+        .filter_map(|m| m.get("content").and_then(|c| c.as_array()))
+        .flatten()
+        .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+        .collect();
+    assert!(
+        !prose.contains("DSML"),
+        "the model is shown its own leaked syntax as prose: {prose}",
+    );
+}

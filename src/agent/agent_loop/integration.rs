@@ -755,6 +755,11 @@ pub fn spawn_loop_runner(cfg: LoopSpawnConfig) -> LoopRunner {
         messages: cfg.history.iter().map(loop_message_to_value).collect(),
         tools: cfg.tools,
     };
+    // The run's tool set, for the bridge's answer-vs-call filter (dirge-n00z).
+    // Captured here because `context` moves into the loop task below, and the
+    // loop never adds or removes tools mid-run, so one snapshot holds.
+    let bridge_tools: std::collections::HashSet<String> =
+        context.tools.iter().map(|t| t.name().to_string()).collect();
     // Seed the active-turn user message from `initial_prompt`, appending
     // a `UserPart::Image` per fresh-paste image (the resume path carries
     // its images through history as `dirge-asset:` sentinels instead).
@@ -835,7 +840,7 @@ pub fn spawn_loop_runner(cfg: LoopSpawnConfig) -> LoopRunner {
         };
 
         let pump_future = async {
-            let mut bridge = EventBridge::new();
+            let mut bridge = EventBridge::new(bridge_tools);
             while let Some(loop_evt) = loop_rx.recv().await {
                 for agent_evt in bridge.translate(loop_evt) {
                     // If the receiver dropped (UI exited),

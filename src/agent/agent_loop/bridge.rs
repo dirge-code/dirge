@@ -53,6 +53,17 @@ use crate::event::{AgentEvent, ToolContent};
 
 use super::message::{ContentBlock, DeltaPhase, LoopEvent, LoopMessage, StopReason, TokenUsage};
 
+/// One `Token` event, or none at all when the filter withheld everything the
+/// chunk contained. An empty `Token` is not the same as no token: consumers
+/// treat it as "the model said something" and light up their spinners.
+fn token_or_nothing(text: String) -> Vec<AgentEvent> {
+    if text.is_empty() {
+        Vec::new()
+    } else {
+        vec![AgentEvent::Token(CompactString::from(text))]
+    }
+}
+
 /// Bridges `LoopEvent` stream to `AgentEvent` stream. Stateful
 /// per-run.
 pub struct EventBridge {
@@ -76,22 +87,29 @@ pub struct EventBridge {
     /// Per-run provider usage accumulation, so `AgentEnd` can report real
     /// token totals in `Done { tokens }` (input + output).
     run_usage: TokenUsage,
-}
-
-impl Default for EventBridge {
-    fn default() -> Self {
-        Self::new()
-    }
+    /// Withholds tool calls the model wrote into its ANSWER instead of the
+    /// tool channel (dirge-n00z). Every consumer of `AgentEvent` — the TUI,
+    /// `-p`, ACP, subagents — reads the text through this bridge, so this is
+    /// the one place that has to know, and the loop's transcript keeps the
+    /// model's words verbatim either way.
+    text_filter: super::call_syntax::DisplayFilter,
 }
 
 impl EventBridge {
-    pub fn new() -> Self {
+    /// `allowed_tools` is the run's tool set. It gates the filter above:
+    /// syntax naming a tool that will actually run is withheld, and syntax
+    /// naming nothing is left alone. An empty set therefore withholds
+    /// nothing, which is what the bridge's own tests want — but it means
+    /// production must pass the real set, so the parameter is required
+    /// rather than defaulted.
+    pub fn new(allowed_tools: std::collections::HashSet<String>) -> Self {
         Self {
             turn_index: 0,
             last_text_emitted: String::new(),
             last_reasoning_emitted: String::new(),
             tool_name_by_id: HashMap::new(),
             run_usage: TokenUsage::default(),
+            text_filter: super::call_syntax::DisplayFilter::new(allowed_tools),
         }
     }
 
@@ -279,6 +297,11 @@ impl EventBridge {
                         _ => None,
                     })
                     .unwrap_or_default();
+                // `-p` treats this as the authoritative full text and
+                // overwrites whatever it echoed while streaming, so filtering
+                // the Token stream alone would leave the syntax in the final
+                // answer and in `--output-format json` (dirge-n00z).
+                let response = self.text_filter.strip(&response);
                 vec![AgentEvent::Done {
                     response: CompactString::from(response),
                     // Real provider totals for the run; `cost` stays 0.0
@@ -303,6 +326,7 @@ impl EventBridge {
                 // turn's streaming text is silently dropped.
                 self.last_text_emitted.clear();
                 self.last_reasoning_emitted.clear();
+                self.text_filter.reset();
                 vec![evt]
             }
 
@@ -367,7 +391,15 @@ impl EventBridge {
             }
 
             LoopEvent::MessageEnd { message } => {
-                let _ = message;
+                // The message is complete, so anything the filter is still
+                // holding is decided now: a region with no closing tag is a
+                // truncated call, not one still arriving. Flushing HERE and
+                // not at the turn boundary matters — tool results are
+                // emitted between the two, and text released after them
+                // would read as a comment on output it was written before.
+                if matches!(message, LoopMessage::Assistant(_)) {
+                    return token_or_nothing(self.text_filter.flush());
+                }
                 Vec::new()
             }
 
@@ -389,16 +421,20 @@ impl EventBridge {
                             && concat.starts_with(&self.last_text_emitted)
                         {
                             let new_chunk = &concat[self.last_text_emitted.len()..];
-                            let chunk = CompactString::from(new_chunk);
+                            let chunk = self.text_filter.push(new_chunk);
                             self.last_text_emitted = concat;
-                            vec![AgentEvent::Token(chunk)]
+                            token_or_nothing(chunk)
                         } else if concat != self.last_text_emitted {
                             // Defensive: provider re-emitted text
                             // out of order. Emit the FULL concat
-                            // as a single Token and resync.
-                            let chunk = CompactString::from(concat.as_str());
+                            // as a single Token and resync — the
+                            // filter resyncs with it, since what it
+                            // was holding belonged to text that is
+                            // being replaced wholesale.
+                            self.text_filter.reset();
+                            let chunk = self.text_filter.push(&concat);
                             self.last_text_emitted = concat;
-                            vec![AgentEvent::Token(chunk)]
+                            token_or_nothing(chunk)
                         } else {
                             // No new text in this update.
                             Vec::new()

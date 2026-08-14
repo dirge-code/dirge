@@ -14,6 +14,10 @@ A name reaches dispatch by one of two routes, and they fail differently.
 | native `tool_calls` with an unknown name | `Tool X not found`, plus a nearest-name hint; costs a turn | resolved if the name is placeable, else unchanged |
 | a call written as TEXT, lifted by the scavenger | dropped on the allowed-name gate — no result, no error, no counter | resolved if placeable, else counted as `dropped_unknown_names` |
 
+A call written as text is now also recorded as a call rather than left as prose
+— see [Text-channel calls](text-channel-calls.md), which covers what the user
+sees and what the transcript says.
+
 The second is the quiet one. The scavenger's gate rejected the name, the call
 never existed, and the turn then ended with no tool call at all — so the loop
 read the model's raw call syntax as its final answer. Verified end to end
@@ -31,9 +35,8 @@ The last row is the failure with nothing to see: zero calls, and what the user
 gets back is the call syntax. Before this work the `text / shell` row behaved
 the same way.
 
-(The raw syntax appearing in the answer at all is a separate, pre-existing
-defect — the text is streamed before the scavenger ever runs, so it cannot be
-fixed here. Filed as `dirge-n00z`.)
+(The raw syntax appearing in the answer at all was a separate defect, fixed
+since — `dirge-n00z`, written up in [Text-channel calls](text-channel-calls.md).)
 
 ## How often does a name miss?
 
