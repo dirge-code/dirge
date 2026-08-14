@@ -718,7 +718,11 @@ fn summarize_tool_result(tool_name: &str, content: &str) -> String {
             let preview: String = content.chars().take(80).collect();
             format!(
                 "[{tool_name}] {preview}{} ({clen} chars)",
-                if content.len() > 80 { "…" } else { "" }
+                // Compare in the same unit the preview was taken in. `len()`
+                // is bytes, so any multibyte result — CJK, emoji, an accented
+                // path — claimed a truncation that had not happened: 40 CJK
+                // characters are 120 bytes, well under the 80-char take.
+                if content.chars().count() > 80 { "…" } else { "" }
             )
         }
     }
