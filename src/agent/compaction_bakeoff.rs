@@ -86,7 +86,7 @@ pub(crate) fn bakeoff_summarizer() -> Option<(SummarizeFn, String)> {
 mod tests {
     use super::*;
     use crate::agent::compaction_recall::{
-        hard_facts, run_coverage_probe_with, run_hard_recall_eval_with,
+        hard_facts, run_coverage_probe_with, run_hard_recall_eval_with, run_tool_call_probe_with,
     };
 
     fn schema_label(s: SummarySchema) -> &'static str {
@@ -126,8 +126,22 @@ mod tests {
             SummarySchema::Slots,
         ] {
             let mut declared = 0usize;
+            let mut errors = 0usize;
             for i in 0..n {
-                let (says_partial, summary) = run_coverage_probe_with(sfn.clone(), arm).await;
+                let (says_partial, summary) = match run_coverage_probe_with(sfn.clone(), arm).await
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        errors += 1;
+                        eprintln!(
+                            "[coverage] {} run {}/{}: SUMMARIZER FAILED — {e}",
+                            schema_label(arm),
+                            i + 1,
+                            n
+                        );
+                        continue;
+                    }
+                };
                 if says_partial {
                     declared += 1;
                 }
@@ -149,10 +163,67 @@ mod tests {
                 }
             }
             eprintln!(
-                "[coverage] === {:<9} declared the gap in {}/{} runs",
+                "[coverage] === {:<9} declared the gap in {}/{} runs ({} failed)",
                 schema_label(arm),
                 declared,
-                n
+                n - errors,
+                errors,
+            );
+        }
+    }
+
+    /// dirge-czg9: do facts that exist only in tool-call arguments survive a
+    /// fold? Reports two numbers — what dirge's serializer handed the
+    /// summarizer, and what came back — because a change that lifts the first
+    /// without the second is prompt bloat, not fidelity.
+    #[tokio::test]
+    async fn compaction_tool_call_probe() {
+        let Some((sfn, who)) = bakeoff_summarizer() else {
+            eprintln!("[toolcall] skipped (set DIRGE_BAKEOFF=1 and DIRGE_BAKEOFF_MODEL)");
+            return;
+        };
+        let n = repeats();
+        let total = crate::agent::compaction_recall::tool_call_facts().len();
+        eprintln!("[toolcall] model={who} repeats={n} facts={total}");
+        for arm in [SummarySchema::Sections] {
+            let (mut prompt_sum, mut summary_sum) = (0usize, 0usize);
+            let mut errors = 0usize;
+            for i in 0..n {
+                let (in_prompt, in_summary, _) =
+                    match run_tool_call_probe_with(sfn.clone(), arm).await {
+                        Ok(v) => v,
+                        Err(e) => {
+                            errors += 1;
+                            eprintln!(
+                                "[toolcall] {} run {}/{}: SUMMARIZER FAILED — {e}",
+                                schema_label(arm),
+                                i + 1,
+                                n
+                            );
+                            continue;
+                        }
+                    };
+                prompt_sum += in_prompt.survived;
+                summary_sum += in_summary.survived;
+                eprintln!(
+                    "[toolcall] {} run {}/{}: reached prompt {}/{}, kept in summary {}/{}",
+                    schema_label(arm),
+                    i + 1,
+                    n,
+                    in_prompt.survived,
+                    total,
+                    in_summary.survived,
+                    total,
+                );
+            }
+            eprintln!(
+                "[toolcall] === {:<9} prompt {:.1}/{}  summary {:.1}/{}  ({} failed)",
+                schema_label(arm),
+                prompt_sum as f64 / (n - errors).max(1) as f64,
+                total,
+                summary_sum as f64 / (n - errors).max(1) as f64,
+                total,
+                errors,
             );
         }
     }
@@ -175,8 +246,24 @@ mod tests {
             SummarySchema::Slots,
         ] {
             let mut scores = Vec::new();
+            let mut errors = 0usize;
             for i in 0..n {
-                let (report, summary) = run_hard_recall_eval_with(sfn.clone(), arm).await;
+                let (report, summary) = match run_hard_recall_eval_with(sfn.clone(), arm).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        // A failed CALL is not a lossy SUMMARY. Scoring it as
+                        // 0/20 once made one arm read 17.4 against another's
+                        // 19.9 for no reason but a transient provider error.
+                        errors += 1;
+                        eprintln!(
+                            "[bakeoff] {} run {}/{}: SUMMARIZER FAILED — {e}",
+                            schema_label(arm),
+                            i + 1,
+                            n
+                        );
+                        continue;
+                    }
+                };
                 // Print the NEEDLE, not just its kind. The first run had the
                 // sections arm dropping "error message" four times out of
                 // five, which reads like signal — but one of the three error
@@ -208,6 +295,12 @@ mod tests {
                     eprintln!("[bakeoff]   summary -> {path}");
                 }
                 scores.push(report.survived);
+            }
+            if errors > 0 {
+                eprintln!(
+                    "[bakeoff] {} — {errors} run(s) excluded: the summarizer failed",
+                    schema_label(arm)
+                );
             }
             rows.push((arm, scores));
         }

@@ -295,6 +295,108 @@ pub(crate) fn noisy_session(facts: &[PlantedFact]) -> Vec<Value> {
     msgs
 }
 
+/// Facts that exist ONLY inside tool-call arguments (dirge-czg9).
+///
+/// Every other fixture here plants its facts in message text, which is the one
+/// thing both compaction paths serialize. These are the opposite case: what the
+/// agent DID, recorded nowhere but the call it made. The prose around a call
+/// routinely does not restate it ("done", "that worked"), so if the serializer
+/// drops the call, the fact is gone before the summarizer is consulted.
+pub(crate) fn tool_call_facts() -> Vec<PlantedFact> {
+    vec![
+        PlantedFact {
+            kind: "write target",
+            needle: "crates/ingest/src/backfill/resume.rs",
+        },
+        PlantedFact {
+            kind: "bash command",
+            needle: "psql -f migrations/0043_backfill_offset.sql",
+        },
+        PlantedFact {
+            kind: "grep pattern",
+            needle: "resume_from_offset_unchecked",
+        },
+        PlantedFact {
+            kind: "edit target",
+            needle: "config/production/ingest-shard-a4e1.toml",
+        },
+        PlantedFact {
+            kind: "command flag",
+            needle: "--max-lag-seconds=90",
+        },
+        PlantedFact {
+            kind: "moved path",
+            needle: "scripts/replay_from_checkpoint.py",
+        },
+    ]
+}
+
+/// A session whose load-bearing detail lives in tool-call arguments.
+///
+/// The assistant's prose is deliberately uninformative — "done", "that
+/// worked" — because that is the realistic case and the one that makes the
+/// serializer load-bearing. A fixture whose prose restated every call would
+/// measure nothing.
+pub(crate) fn tool_call_session(facts: &[PlantedFact]) -> Vec<Value> {
+    let mut msgs: Vec<Value> = vec![
+        json!({"role": "system", "content": "you are dirge, a coding agent"}),
+        json!({"role": "user", "content": "get the ingest backfill unstuck"}),
+    ];
+    for i in 0..6 {
+        msgs.push(json!({"role": "assistant", "content": format!("checking the workers (pass {i})\n{}", noise(i, 16))}));
+        msgs.push(json!({"role": "user", "content": format!("go on {i}")}));
+    }
+
+    let calls: Vec<(&str, Value)> = vec![
+        (
+            "write",
+            json!({"path": facts[0].needle, "content": "pub fn resume() {}\n"}),
+        ),
+        ("bash", json!({"command": facts[1].needle})),
+        (
+            "grep",
+            json!({"pattern": facts[2].needle, "path": "crates/ingest"}),
+        ),
+        (
+            "edit",
+            json!({"path": facts[3].needle, "old_text": "lag=30", "new_text": "lag=90"}),
+        ),
+        (
+            "bash",
+            json!({"command": format!("./ingestctl backfill {}", facts[4].needle)}),
+        ),
+        (
+            "bash",
+            json!({"command": format!("git mv old_replay.py {}", facts[5].needle)}),
+        ),
+    ];
+
+    for (i, (name, args)) in calls.into_iter().enumerate() {
+        msgs.push(json!({
+            "role": "assistant",
+            "content": [
+                // Uninformative on purpose: the call is the only record.
+                {"type": "text", "text": "ok, doing that now"},
+                {"type": "toolCall", "id": format!("call_{i}"), "name": name, "arguments": args},
+            ],
+        }));
+        msgs.push(json!({
+            "role": "toolResult",
+            "content": format!("done\n{}", noise(i + 200, 4)),
+        }));
+        msgs.push(json!({"role": "user", "content": format!("good, next ({i})")}));
+        msgs.push(json!({"role": "assistant", "content": format!("continuing ({i})\n{}", noise(i + 300, 16))}));
+        msgs.push(json!({"role": "user", "content": format!("carry on ({i})")}));
+    }
+
+    for i in 0..6 {
+        msgs.push(json!({"role": "assistant", "content": format!("wrapping up (pass {i})\n{}", noise(i + 400, 16))}));
+        msgs.push(json!({"role": "user", "content": format!("keep going {i}")}));
+    }
+    msgs.push(json!({"role": "user", "content": "summarise what you changed"}));
+    msgs
+}
+
 /// How many planted facts survived in `text`.
 pub(crate) struct RecallReport {
     pub total: usize,
@@ -439,7 +541,7 @@ pub(crate) async fn run_recall_eval(summarize: SummarizeFn) -> RecallReport {
 pub(crate) async fn run_hard_recall_eval_with(
     summarize: SummarizeFn,
     schema: super::compression::SummarySchema,
-) -> (RecallReport, String) {
+) -> anyhow::Result<(RecallReport, String)> {
     let facts = hard_facts();
     let msgs = noisy_session(&facts);
     let (start, end) = compute_compress_window(&msgs, PROTECT_HEAD_DEFAULT, PROTECT_TAIL_DEFAULT);
@@ -452,9 +554,45 @@ pub(crate) async fn run_hard_recall_eval_with(
         schema,
     )
     .expect("recall fixture must not contain the reserved fence delimiter");
-    let summary = summarize(prompt).await.unwrap_or_default();
+    // NOT `unwrap_or_default()`. A provider error would become an empty
+    // string, score 0/20, and be reported as a maximally-lossy SUMMARY —
+    // indistinguishable from a real fidelity failure and dragging the arm's
+    // mean with it. Observed: one arm read 17.4/20 against another's 19.9
+    // purely because a single call had failed. A call that could not run is
+    // not a result (docs/verification-discipline.md).
+    let summary = summarize(prompt).await?;
     let report = score_recall(&summary, &facts);
-    (report, summary)
+    Ok((report, summary))
+}
+
+/// Tool-call probe (dirge-czg9): how many facts that live only in tool-call
+/// arguments survive a fold, and how many reached the summarizer at all.
+///
+/// Returns `(in_prompt, in_summary, summary)`. The two numbers answer different
+/// questions and both are needed. `in_prompt` is what dirge's own serializer
+/// chose to hand over — entirely dirge's doing, no model involved. `in_summary`
+/// is what the model then kept. A change that lifts the first and not the
+/// second is prompt bloat, not fidelity.
+pub(crate) async fn run_tool_call_probe_with(
+    summarize: SummarizeFn,
+    schema: super::compression::SummarySchema,
+) -> anyhow::Result<(RecallReport, RecallReport, String)> {
+    let facts = tool_call_facts();
+    let msgs = tool_call_session(&facts);
+    let (start, end) = compute_compress_window(&msgs, PROTECT_HEAD_DEFAULT, PROTECT_TAIL_DEFAULT);
+    let middle = &msgs[start..end];
+    let prompt = super::compression::build_summary_prompt_with(
+        middle,
+        summary_budget(estimate_messages_tokens(middle)),
+        None,
+        None,
+        schema,
+    )
+    .expect("fixture is clean");
+    let in_prompt = score_recall(&prompt, &facts);
+    let summary = summarize(prompt).await?;
+    let in_summary = score_recall(&summary, &facts);
+    Ok((in_prompt, in_summary, summary))
 }
 
 /// Coverage probe (dirge-5zca + dirge-e31n.7): run the hard fixture with the
@@ -469,7 +607,7 @@ pub(crate) async fn run_hard_recall_eval_with(
 pub(crate) async fn run_coverage_probe_with(
     summarize: SummarizeFn,
     schema: super::compression::SummarySchema,
-) -> (bool, String) {
+) -> anyhow::Result<(bool, String)> {
     let facts = hard_facts();
     let msgs = noisy_session(&facts);
     let (start, end) = compute_compress_window(&msgs, PROTECT_HEAD_DEFAULT, PROTECT_TAIL_DEFAULT);
@@ -489,9 +627,9 @@ pub(crate) async fn run_coverage_probe_with(
         clipped.contains("truncated by summarizer-prompt budget"),
         "the probe must actually clip the prompt"
     );
-    let summary = summarize(clipped).await.unwrap_or_default();
+    let summary = summarize(clipped).await?;
     let declared = declares_incomplete_coverage(&summary);
-    (declared, summary)
+    Ok((declared, summary))
 }
 
 #[cfg(test)]

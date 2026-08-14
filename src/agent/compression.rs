@@ -1033,8 +1033,57 @@ fn serialize_turns_for_summary(turns: &[Value]) -> String {
             out.push_str(&content);
             out.push('\n');
         }
+        // dirge-czg9: what the agent DID. Without this the summarizer saw only
+        // the prose around a call, which routinely does not restate it ("done",
+        // "that worked") — so a fold recorded outcomes with no record of what
+        // produced them. Measured before the change: 0 of 6 facts living only
+        // in tool-call arguments reached the summarizer at all.
+        for (name, args) in tool_calls_of(turn.get("content")) {
+            out.push_str(&format!("    [Tool: {name}({args})]\n"));
+        }
     }
     out
+}
+
+/// Per-call cut for a tool call's ARGUMENTS in the summarizer prompt.
+///
+/// Smaller than the `/compact` path's 2048 (`serialize_conversation`'s
+/// `PER_TOOL_CAP`) on purpose. What a summary needs from a call is which tool
+/// and which target — the path, the command, the pattern — not the payload; a
+/// `write`'s `content` argument is an entire file. And this path serializes a
+/// whole fold window, which can carry hundreds of calls, against a prompt
+/// budget that now binds against the model's real context window (dirge-5zca).
+/// 512 holds a path plus a command line plus small scalars and truncates a file
+/// body.
+const SUMMARY_TOOL_ARGS_CHARS: usize = 512;
+
+/// `(tool name, arguments as JSON)` for each `toolCall` block, arguments cut at
+/// [`SUMMARY_TOOL_ARGS_CHARS`].
+fn tool_calls_of(content: Option<&Value>) -> Vec<(String, String)> {
+    let Some(Value::Array(blocks)) = content else {
+        return Vec::new();
+    };
+    blocks
+        .iter()
+        .filter_map(|b| {
+            let obj = b.as_object()?;
+            if obj.get("type").and_then(|t| t.as_str())? != "toolCall" {
+                return None;
+            }
+            let name = obj.get("name").and_then(|n| n.as_str()).unwrap_or("?");
+            let args = obj
+                .get("arguments")
+                .map(|a| a.to_string())
+                .unwrap_or_default();
+            let args = if args.chars().count() > SUMMARY_TOOL_ARGS_CHARS {
+                let head: String = args.chars().take(SUMMARY_TOOL_ARGS_CHARS).collect();
+                format!("{head}… [truncated, {} total chars]", args.len())
+            } else {
+                args
+            };
+            Some((name.to_string(), args))
+        })
+        .collect()
 }
 
 /// Header of the verbatim-user-message section. Doubles as the parse anchor
@@ -2365,6 +2414,69 @@ mod tests {
             "## Blocked\ncargo test fails: index out of bounds at foo.rs:12\n\n\
              ## Relevant Files\nfoo.rs — the panicking helper"
         ));
+    }
+
+    /// dirge-czg9: the in-loop summarizer must be told what the agent DID.
+    ///
+    /// `serialize_turns_for_summary` rendered `[i] role: <content_text>`, and
+    /// `content_text` keeps only `type: "text"` blocks — so a toolCall block
+    /// contributed nothing. The `/compact` path's serializer has always
+    /// emitted `[Tool: name(args)]`, so the two compaction paths disagreed
+    /// about whether the summarizer sees the work at all.
+    ///
+    /// It matters because the prose around a call routinely does not restate
+    /// it ("done", "that worked"), and the summary becomes the session's
+    /// record for every later turn. The tool RESULT survives either way — it
+    /// is a separate message — so without this the summarizer sees an outcome
+    /// with no idea what produced it.
+    #[test]
+    fn the_summarizer_sees_what_the_agent_called() {
+        let turns = vec![serde_json::json!({
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "done"},
+                {
+                    "type": "toolCall",
+                    "id": "c1",
+                    "name": "write",
+                    "arguments": {"path": "crates/ingest/src/backfill.rs", "content": "fn main() {}"},
+                },
+            ],
+        })];
+        let out = serialize_turns_for_summary(&turns);
+        assert!(
+            out.contains("write"),
+            "the tool NAME must reach the summarizer: {out}"
+        );
+        assert!(
+            out.contains("crates/ingest/src/backfill.rs"),
+            "the call's TARGET must reach the summarizer: {out}"
+        );
+    }
+
+    /// The payload is a different question from the target. A `write`'s
+    /// `content` argument is an entire file, and the summarizer needs to know
+    /// which file was written, not to carry the file. Capping it is what keeps
+    /// this from inflating every fold's prompt — which now matters directly,
+    /// since dirge-5zca made the prompt budget bind against the model's window.
+    #[test]
+    fn a_huge_tool_argument_is_capped() {
+        let turns = vec![serde_json::json!({
+            "role": "assistant",
+            "content": [{
+                "type": "toolCall",
+                "id": "c1",
+                "name": "write",
+                "arguments": {"path": "big.rs", "content": "x".repeat(50_000)},
+            }],
+        })];
+        let out = serialize_turns_for_summary(&turns);
+        assert!(out.contains("big.rs"), "the target survives the cap: {out}");
+        assert!(
+            out.len() < 4_000,
+            "a 50 KB argument reached the summarizer prompt almost whole ({} chars)",
+            out.len()
+        );
     }
 
     /// dirge-tmex: the two token estimators must keep using the same method.
