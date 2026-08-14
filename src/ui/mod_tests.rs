@@ -736,6 +736,121 @@ fn mutating_commands_are_not_safe_during_agent() {
     assert!(!is_safe_during_agent("/allow bash rm *"));
 }
 
+/// Every slash command that changes the process working directory must be
+/// rejected while an agent is running.
+///
+/// R1 of the UI/agent runtime split (dirge-pge7). Process CWD is a process
+/// singleton — it cannot be given a lock — and ~20 sites on the agent side
+/// read it. Once the agent stops sharing the UI's thread, a `/cd` landing
+/// mid-run would let a tool resolve a path against a directory that changed
+/// underneath it. Nothing would crash; a file would just be read or written
+/// somewhere else.
+///
+/// What makes that impossible today is not a design, it is the accident that
+/// no CWD-mutating command appears in `is_safe_during_agent`'s allowlist.
+/// That is a hand-maintained list with nothing tying it to the mutation
+/// sites, which is the exact shape of drift this codebase keeps paying for.
+/// Pin it here, and pin the site list in the test below.
+#[test]
+fn no_cwd_mutating_command_is_safe_during_an_agent_run() {
+    for form in [
+        "/cd",              // bare — goes home, still mutates
+        "/cd /tmp",
+        "/cd ~/src",
+        "/worktree",
+        "/worktree new feature-x",
+        "/worktree exit",
+        "/worktree merge",
+    ] {
+        assert!(
+            !is_safe_during_agent(form),
+            "{form:?} changes the process working directory, so it must not be \
+             allowed to run while an agent is executing tools against it"
+        );
+    }
+
+    // The discrimination half: the gate must not be rejecting everything,
+    // or the assertions above pass while testing nothing.
+    assert!(is_safe_during_agent("/help"));
+    assert!(is_safe_during_agent("/mode"));
+}
+
+/// The set of UI files that mutate the process CWD is fixed and known.
+///
+/// Companion to the test above, which can only check the commands it names.
+/// This one fails when a *new* site starts changing directories, so whoever
+/// adds it has to decide, deliberately, whether it is reachable while an
+/// agent is running — rather than finding out from a misplaced write months
+/// later.
+///
+/// The known three, and why each is safe today:
+///
+/// - `cd` — `/cd`, gated out of `is_safe_during_agent`.
+/// - `worktree` — `/worktree`, likewise gated.
+/// - `mod` — two deferred worktree outcomes (exit, post-merge). Both run
+///   under `is_running`, which is the same flag that would have to be free
+///   for an agent run to start, so they are mutually exclusive with one by
+///   construction.
+#[test]
+fn the_set_of_cwd_mutating_ui_files_has_not_grown() {
+    /// A source line that actually calls the function, as opposed to a
+    /// comment naming it. Without this the scan trips over prose — `/spec`
+    /// carries a comment about the bug where it read the process cwd instead
+    /// of `session.working_dir` (dirge-s5oh), which is a fix, not a mutation.
+    fn calls_it(src: &str) -> bool {
+        src.lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .any(|line| line.contains("set_current_dir"))
+    }
+
+    fn scan(dir: &std::path::Path, found: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir).expect("ui dir must be readable").flatten() {
+            let path = entry.path();
+            let stem = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+            if path.is_dir() {
+                scan(&path, found);
+            } else if path.extension().is_some_and(|e| e == "rs")
+                // Test files name the function in their own assertions; scanning
+                // them would make this test match itself and pass forever.
+                && !stem.ends_with("_tests")
+                && std::fs::read_to_string(&path).map(|s| calls_it(&s)).unwrap_or(false)
+            {
+                found.push(stem);
+            }
+        }
+    }
+
+    let ui_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui");
+    let mut found = Vec::new();
+    scan(&ui_dir, &mut found);
+    found.sort();
+    found.dedup();
+
+    assert_eq!(
+        found,
+        vec!["cd".to_string(), "mod".to_string(), "worktree".to_string()],
+        "the set of UI files changing the process working directory changed. \
+         Each must be unreachable while an agent runs — see \
+         `no_cwd_mutating_command_is_safe_during_an_agent_run` — or the agent \
+         can observe the directory move mid-run."
+    );
+}
+
+/// The scan above must be able to see a real call, or it passes vacuously
+/// forever after a path typo or a filter that is too aggressive.
+#[test]
+fn the_cwd_scan_can_actually_see_a_call() {
+    let cd = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui/slash/cmd/cd.rs");
+    let src = std::fs::read_to_string(&cd).expect("/cd source must be readable");
+    assert!(
+        src.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .any(|l| l.contains("set_current_dir")),
+        "/cd no longer calls set_current_dir on a non-comment line; the scan \
+         in the previous test is now measuring nothing"
+    );
+}
+
 #[test]
 fn memory_skill_list_safe_during_agent() {
     assert!(is_safe_during_agent("/memory list"));
