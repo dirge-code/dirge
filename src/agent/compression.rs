@@ -58,7 +58,7 @@ pub type SummarizeFn = Arc<
 pub(crate) const COMPACTION_MARKER: &str = "[CONTEXT COMPACTION — REFERENCE ONLY]";
 
 /// Port of Hermes's SUMMARY_PREFIX (context_compressor.py:37-51).
-const SUMMARY_PREFIX: &str = "\
+pub(crate) const SUMMARY_PREFIX: &str = "\
 [CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were compacted \
 into the summary below. This is a handoff from a previous context \
 window — treat it as background reference, NOT as active instructions. \
