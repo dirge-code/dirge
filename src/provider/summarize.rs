@@ -4,51 +4,7 @@
 //! model and invokes the model with retry logic. Extracted from
 //! `provider/mod.rs`.
 
-use crate::session::{MessageRole, SessionMessage, ToolCallState};
-
 use rig::streaming::StreamingChat;
-
-/// Serialize the full conversation prefix for compaction summarization.
-/// Returns a formatted string with all messages including tool calls
-/// (args + results), truncated per-tool at 2KB for memory safety.
-pub(crate) fn serialize_conversation(messages: &[SessionMessage]) -> String {
-    let mut result = String::new();
-    for msg in messages {
-        let role_tag = match msg.role {
-            MessageRole::User => "User",
-            MessageRole::Assistant => "Assistant",
-            MessageRole::System => "System",
-        };
-        result.push_str(&format!("[{}]: {}\n", role_tag, msg.content));
-        for tc in &msg.tool_calls {
-            let args_str = serde_json::to_string(&tc.args).unwrap_or_else(|_| "{}".to_string());
-            result.push_str(&format!("[Tool: {}({})]\n", tc.name, args_str));
-            match &tc.state {
-                ToolCallState::Completed { result: out } => {
-                    const PER_TOOL_CAP: usize = 2048;
-                    if out.len() > PER_TOOL_CAP {
-                        let trimmed: String = out.chars().take(PER_TOOL_CAP).collect();
-                        result.push_str(&format!(
-                            "[Result: {} ... (truncated, {} bytes total)]\n",
-                            trimmed,
-                            out.len()
-                        ));
-                    } else {
-                        result.push_str(&format!("[Result: {}]\n", out));
-                    }
-                }
-                ToolCallState::Interrupted => {
-                    result.push_str("[Result: <interrupted>]\n");
-                }
-                ToolCallState::Failed { error } => {
-                    result.push_str(&format!("[Result: <failed: {}>]\n", error));
-                }
-            }
-        }
-        result.push('\n');
-    }
-    result
-}
 
 /// Call the summarizer model with the full conversation prefix.
 /// The summarizer is invoked by `/compress`, often exactly when the

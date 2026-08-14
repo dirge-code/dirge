@@ -518,6 +518,19 @@ pub(crate) async fn install_compaction(
         return Ok(CompressOutcome::NoOp);
     }
 
+    // dirge-dlpl: carry the user's own words through, as the automatic fold
+    // has since dirge-7ylu. Their reasoning applies at least as strongly here:
+    // user turns are the specification the work is judged against, and a
+    // paraphrase loses the constraints. `/compact` went without only because
+    // the block was written against the loop's message type — the shared
+    // material makes it one call from either side.
+    let dropped =
+        crate::agent::compaction_material::from_session_messages(&session.messages[..cut_idx]);
+    let summary = match crate::agent::compression::verbatim_user_block(&dropped) {
+        Some(block) => format!("{summary}{block}"),
+        None => summary,
+    };
+
     // `compress_reporting` returns the count of non-active-path
     // tree nodes (sibling branches) pruned. We notify the user
     // about that loss explicitly — without the notification a

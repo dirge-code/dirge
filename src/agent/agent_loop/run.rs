@@ -1525,7 +1525,12 @@ fn spawn_incremental_checkpoint(
         // delimiter. Nothing to fall back to here — a checkpoint is an
         // optimisation, so skipping one just means the next fold summarizes
         // inline.
-        let Ok(prompt) = compression::build_summary_prompt(&messages, budget, None, None) else {
+        let Ok(prompt) = compression::build_summary_prompt(
+            &crate::agent::compaction_material::from_loop_messages(&messages),
+            budget,
+            None,
+            None,
+        ) else {
             tracing::warn!(
                 target: "dirge::agent_loop",
                 "checkpoint summary skipped: turns contain the reserved fence delimiter",
@@ -1783,7 +1788,7 @@ async fn run_compaction_pass_with_focus(
             let summary_result: Result<String, _> = match plugin_summary {
                 Some(s) => Ok(s),
                 None => match compression::build_summary_prompt(
-                    &middle,
+                    &crate::agent::compaction_material::from_loop_messages(&middle),
                     budget,
                     prev.as_deref(),
                     augmented_focus.as_deref(),

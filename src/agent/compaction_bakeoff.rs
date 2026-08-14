@@ -240,6 +240,10 @@ mod tests {
         eprintln!("[bakeoff] model={who} repeats={n} facts={total_facts}");
 
         let mut rows: Vec<(SummarySchema, Vec<usize>)> = Vec::new();
+        // dirge-dlpl: `Sections` (14) against `CompactSections` (6) is the live
+        // question — unification left one prompt, and which template it should
+        // be is a measurement, not the one that happened to survive the
+        // refactor.
         for arm in [
             SummarySchema::SectionsWithoutCoverage,
             SummarySchema::Sections,

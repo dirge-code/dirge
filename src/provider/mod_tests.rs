@@ -965,9 +965,16 @@ fn oauth_compaction_disabled_error_is_detected_through_context_wrapping() {
 
 // --- C6/C7: compaction prefix is full + includes tool calls -----
 
-use super::summarize;
 use crate::session::{MessageRole, SessionMessage, ToolCallEntry, ToolCallState};
 use compact_str::CompactString;
+
+/// Serialize a session's messages the way compaction does: convert to the
+/// shared material, then run THE serializer.
+fn serialize_session(msgs: &[SessionMessage]) -> String {
+    crate::agent::compression::serialize_turns(
+        &crate::agent::compaction_material::from_session_messages(msgs),
+    )
+}
 
 fn sm(role: MessageRole, content: &str, tool_calls: Vec<ToolCallEntry>) -> SessionMessage {
     SessionMessage {
@@ -981,10 +988,15 @@ fn sm(role: MessageRole, content: &str, tool_calls: Vec<ToolCallEntry>) -> Sessi
     }
 }
 
-/// C7: assistant tool calls land in the serialized form with
-/// args + result. Previously they were dropped entirely so the
-/// summarizer saw only `[Assistant]: <text>` with no record
-/// that bash/read/edit ever ran.
+/// C7: assistant tool calls land in the serialized form with args + result.
+/// Previously they were dropped entirely so the summarizer saw only
+/// `[Assistant]: <text>` with no record that bash/read/edit ever ran.
+///
+/// dirge-dlpl: exercised through the SHARED serializer now
+/// (`compaction_material::from_session_messages` + `compression::serialize_turns`)
+/// rather than a `/compact`-only one. The contract is the same and it is the
+/// contract that mattered — the second implementation is what lost it on the
+/// other path (dirge-czg9).
 #[test]
 fn serialize_conversation_includes_tool_calls() {
     let msgs = vec![
@@ -1002,8 +1014,11 @@ fn serialize_conversation_includes_tool_calls() {
             }],
         ),
     ];
-    let out = summarize::serialize_conversation(&msgs);
-    assert!(out.contains("[User]"), "missing role tag: {out}");
+    let out = serialize_session(&msgs);
+    // dirge-dlpl: one format now. `/compact` used to render `[User]: text` and
+    // the fold `[0] user: text`; the shared serializer emits the indexed form
+    // for both, so a summary does not depend on which path compacted it.
+    assert!(out.contains("[0] user: "), "missing role tag: {out}");
     assert!(
         out.contains("[Tool: find_files("),
         "missing tool call line: {out}"
@@ -1037,14 +1052,13 @@ fn serialize_conversation_marks_interrupted_and_failed() {
             },
         ],
     )];
-    let out = summarize::serialize_conversation(&msgs);
+    let out = serialize_session(&msgs);
     assert!(out.contains("<interrupted>"), "got: {out}");
     assert!(out.contains("<failed: no such file>"), "got: {out}");
 }
 
-/// C7 bound: a single tool result over the per-tool cap (2KB)
-/// truncates with a marker, preserving structure of the rest
-/// of the conversation.
+/// C7 bound: a tool result far over the per-turn cap truncates with a marker,
+/// preserving the structure of the rest of the conversation.
 #[test]
 fn serialize_conversation_truncates_huge_tool_results() {
     let big: String = "x".repeat(5000);
@@ -1058,9 +1072,9 @@ fn serialize_conversation_truncates_huge_tool_results() {
             state: ToolCallState::Completed { result: big },
         }],
     )];
-    let out = summarize::serialize_conversation(&msgs);
+    let out = serialize_session(&msgs);
     assert!(
-        out.contains("(truncated, 5000 bytes total)"),
+        out.contains("truncated, 5000 total chars"),
         "expected truncation marker; got: {out}"
     );
 }
@@ -1080,7 +1094,7 @@ fn serialize_conversation_returns_full_prefix() {
     let msgs: Vec<SessionMessage> = (0..200)
         .map(|i| sm(MessageRole::Assistant, &format!("turn {i}"), vec![]))
         .collect();
-    let out = summarize::serialize_conversation(&msgs);
+    let out = serialize_session(&msgs);
     assert!(out.contains("turn 199"), "tail must be present: {out}");
     assert!(out.contains("turn 0"), "head must be present: {out}");
 }
@@ -1315,8 +1329,11 @@ fn compaction_rejects_input_containing_delimiter() {
         "compaction must reject input containing the reserved delimiter"
     );
     let err = result.unwrap_err().to_string();
+    // dirge-dlpl: this is the SHARED check's wording now — `/compact` no longer
+    // carries its own copy of the delimiter scan, which is the arrangement that
+    // let the in-loop path go without one entirely (dirge-tgb9).
     assert!(
-        err.contains("reserved delimiter"),
+        err.contains("reserved") && err.contains("delimiter"),
         "error should mention the reserved-delimiter reason, got: {err}"
     );
 }

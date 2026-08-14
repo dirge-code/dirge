@@ -518,7 +518,7 @@ pub(crate) async fn run_recall_eval(summarize: SummarizeFn) -> RecallReport {
     // dirge-tgb9: the fixture is dirge's own and contains no fence delimiter,
     // so a failure here means the fixture grew one — loud is correct.
     let prompt = build_summary_prompt(
-        middle,
+        &crate::agent::compaction_material::from_loop_messages(middle),
         summary_budget(estimate_messages_tokens(middle)),
         None,
         None,
@@ -547,7 +547,7 @@ pub(crate) async fn run_hard_recall_eval_with(
     let (start, end) = compute_compress_window(&msgs, PROTECT_HEAD_DEFAULT, PROTECT_TAIL_DEFAULT);
     let middle = &msgs[start..end];
     let prompt = super::compression::build_summary_prompt_with(
-        middle,
+        &crate::agent::compaction_material::from_loop_messages(middle),
         summary_budget(estimate_messages_tokens(middle)),
         None,
         None,
@@ -582,7 +582,7 @@ pub(crate) async fn run_tool_call_probe_with(
     let (start, end) = compute_compress_window(&msgs, PROTECT_HEAD_DEFAULT, PROTECT_TAIL_DEFAULT);
     let middle = &msgs[start..end];
     let prompt = super::compression::build_summary_prompt_with(
-        middle,
+        &crate::agent::compaction_material::from_loop_messages(middle),
         summary_budget(estimate_messages_tokens(middle)),
         None,
         None,
@@ -613,7 +613,7 @@ pub(crate) async fn run_coverage_probe_with(
     let (start, end) = compute_compress_window(&msgs, PROTECT_HEAD_DEFAULT, PROTECT_TAIL_DEFAULT);
     let middle = &msgs[start..end];
     let prompt = super::compression::build_summary_prompt_with(
-        middle,
+        &crate::agent::compaction_material::from_loop_messages(middle),
         summary_budget(estimate_messages_tokens(middle)),
         None,
         None,
@@ -652,7 +652,7 @@ mod tests {
 
         let middle = &msgs[start..end];
         let prompt = build_summary_prompt(
-            middle,
+            &crate::agent::compaction_material::from_loop_messages(middle),
             summary_budget(estimate_messages_tokens(middle)),
             None,
             None,
@@ -681,7 +681,7 @@ mod tests {
 
         let middle = &msgs[start..end];
         let prompt = build_summary_prompt(
-            middle,
+            &crate::agent::compaction_material::from_loop_messages(middle),
             summary_budget(estimate_messages_tokens(middle)),
             None,
             None,
@@ -803,7 +803,7 @@ mod tests {
 
         let middle = &msgs[start..end];
         let prompt = build_summary_prompt(
-            middle,
+            &crate::agent::compaction_material::from_loop_messages(middle),
             summary_budget(estimate_messages_tokens(middle)),
             None,
             None,
