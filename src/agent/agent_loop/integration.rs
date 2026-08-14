@@ -787,6 +787,14 @@ pub fn spawn_loop_runner(cfg: LoopSpawnConfig) -> LoopRunner {
     let memory_provider = cfg.memory_provider.clone();
 
     let task = tokio::spawn(async move {
+        // Every run's event stream ends with a terminal event, even
+        // when the run does not get to say so itself. Declared FIRST so
+        // it drops LAST — after both senders below — and its own clone
+        // is what holds the channel open long enough to speak.
+        // See `run_end` for what this is guarding against.
+        let settled = super::run_end::RunSettled::default();
+        let _epitaph = super::run_end::RunEpitaph::new(event_tx.clone(), settled.clone());
+
         // Inner channel for LoopEvents emitted by run_agent_loop.
         // Capacity matches the outer event channel — assumes each
         // LoopEvent expands to <= a small constant of AgentEvents
@@ -843,12 +851,17 @@ pub fn spawn_loop_runner(cfg: LoopSpawnConfig) -> LoopRunner {
             let mut bridge = EventBridge::new(bridge_tools);
             while let Some(loop_evt) = loop_rx.recv().await {
                 for agent_evt in bridge.translate(loop_evt) {
+                    let ends_the_run = super::run_end::is_terminal(&agent_evt);
                     // If the receiver dropped (UI exited),
                     // stop pumping — loop_future continues
                     // naturally because its emit channel
                     // uses `let _ = .send`.
                     if event_tx_inner.send(agent_evt).await.is_err() {
                         return;
+                    }
+                    // Only a DELIVERED terminal event settles the run.
+                    if ends_the_run {
+                        settled.mark();
                     }
                 }
             }
@@ -1123,6 +1136,123 @@ mod tests {
             .expect("Done must be emitted");
         assert_eq!(done, "Hello world");
         let _ = runner.task.await;
+    }
+
+    /// The discrimination half of the epitaph: a run that reported its
+    /// own ending must not have a second one appended. A `settled` flag
+    /// that never gets set would put a spurious error on the end of
+    /// every successful run — and the consumers act on the LAST
+    /// terminal event they see.
+    #[tokio::test]
+    async fn a_run_that_finished_ends_with_exactly_one_terminal_event() {
+        let cfg = LoopSpawnConfig::minimal(canned_factory(vec![text_response("Hello")]), "hi");
+        let runner = spawn_loop_runner(cfg);
+        let events = drain(runner.event_rx).await;
+        let terminal: Vec<&str> = events
+            .iter()
+            .filter(|e| super::super::run_end::is_terminal(e))
+            .map(agent_event_kind)
+            .collect();
+        assert_eq!(terminal, vec!["Done"], "in {:?}", {
+            let kinds: Vec<&str> = events.iter().map(agent_event_kind).collect();
+            kinds
+        });
+        let _ = runner.task.await;
+    }
+
+    /// A tool that blows up mid-dispatch — the shape of the reported
+    /// hang, and the one a crash-on-the-first-call test cannot see.
+    #[derive(Debug)]
+    struct BoomTool;
+
+    impl LoopTool for BoomTool {
+        fn name(&self) -> &str {
+            "boom"
+        }
+        fn description(&self) -> &str {
+            "Boom"
+        }
+        fn label(&self) -> &str {
+            "Boom"
+        }
+        fn parameters(&self) -> &Value {
+            static EMPTY: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+            EMPTY.get_or_init(|| serde_json::json!({"type": "object"}))
+        }
+        fn execute<'a>(
+            &'a self,
+            _id: &'a str,
+            _args: Value,
+            _signal: AbortSignal,
+            _on_update: LoopToolUpdate,
+        ) -> Pin<Box<dyn Future<Output = Result<LoopToolResult, String>> + Send + 'a>> {
+            Box::pin(async move {
+                // Yield first so the translation pump gets a turn and
+                // this run's earlier events actually reach the consumer
+                // before the crash — that is the case under test.
+                tokio::task::yield_now().await;
+                panic!("the tool exploded")
+            })
+        }
+    }
+
+    /// dirge-r5l1, the mid-run half: a crash AFTER the run has already
+    /// emitted events. Settling on any event rather than on a terminal
+    /// one looks fine right up until this case — the turn's first
+    /// `TurnStart` would count as "the run reported itself", and the
+    /// crash that followed would go back to closing the channel in
+    /// silence. Which is the reported hang: it happened during a tool.
+    #[tokio::test]
+    async fn a_run_that_crashes_after_streaming_still_ends_its_stream() {
+        let mut cfg = LoopSpawnConfig::minimal(
+            canned_factory(vec![
+                tool_response("call-1", "boom", serde_json::json!({})),
+                text_response("unreachable"),
+            ]),
+            "go",
+        );
+        cfg.tools.push(Arc::new(BoomTool));
+        cfg.tool_execution = ToolExecutionMode::Sequential;
+
+        let runner = spawn_loop_runner(cfg);
+        let events = drain(runner.event_rx).await;
+        assert!(runner.task.await.is_err(), "the run must actually crash");
+
+        let kinds: Vec<&str> = events.iter().map(agent_event_kind).collect();
+        assert!(
+            kinds.contains(&"ToolCall"),
+            "the run has to get far enough to emit something first: {kinds:?}"
+        );
+        let last = events.last().expect("a crashed run still says something");
+        assert!(
+            super::super::run_end::is_terminal(last),
+            "the stream ended with {:?} after {kinds:?}",
+            agent_event_kind(last)
+        );
+    }
+
+    /// dirge-r5l1: a panic inside the run unwinds out of the task and
+    /// `tokio` keeps it in the `JoinHandle`. Before the epitaph, the
+    /// event channel just closed: the TUI's select arm disabled itself
+    /// and the run stayed "running" forever, `--print` returned the
+    /// partial answer as if it were the whole one. The stream has to
+    /// end with a terminal event no matter how the task went down.
+    #[tokio::test]
+    async fn a_crashed_run_still_ends_its_event_stream() {
+        let panicking: StreamFn = Arc::new(|_ctx, _opts| panic!("the provider exploded"));
+        let cfg = LoopSpawnConfig::minimal(panicking, "hi");
+        let runner = spawn_loop_runner(cfg);
+        let events = drain(runner.event_rx).await;
+        assert!(
+            runner.task.await.is_err(),
+            "the run must actually have crashed for this to be testing anything"
+        );
+        let last = events.last().expect("a crashed run still says something");
+        assert!(
+            super::super::run_end::is_terminal(last),
+            "the stream ended with {:?}, which leaves every consumer waiting",
+            agent_event_kind(last)
+        );
     }
 
     /// Multi-turn run with a tool call: assistant emits toolCall

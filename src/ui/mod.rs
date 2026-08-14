@@ -3786,6 +3786,56 @@ pub async fn run_interactive(
                         }
                         renderer.request_repaint();
                     }
+                    // dirge-l31h: the run's task ended and never said so.
+                    //
+                    // Placed AFTER the event arm on purpose. `biased` polls
+                    // in order, so every buffered event — including the
+                    // terminal one the run's epitaph sends as it goes down —
+                    // is delivered first; a handled terminal event takes
+                    // `agent_abort`, which disables this arm. It therefore
+                    // fires only for an ending nothing else accounted for,
+                    // and the `is_running` guard keeps it off the paths that
+                    // deliberately keep a run alive past `Done` (the plugin
+                    // hook chain, `/plan` review).
+                    //
+                    // Without it the UI's run state depended on the run
+                    // CHOOSING to report itself: a task that died mid-run
+                    // left `is_running` true with no arm left to clear it,
+                    // which is a hang the user cannot tell from thinking.
+                    exit = async {
+                        match &mut ui.agent_abort {
+                            // `JoinHandle` is a future; a ready one always
+                            // wins its poll, so the handle this arm takes
+                            // below is never polled twice.
+                            Some(h) => run_handlers::ended::classify(h.await),
+                            None => std::future::pending().await,
+                        }
+                    }, if ui.is_running => {
+                        ui.agent_abort = None;
+                        tracing::warn!(
+                            target: "dirge::ui",
+                            exit = ?exit,
+                            "agent task ended without a terminal event",
+                        );
+                        let message = run_handlers::ended::describe(&exit);
+                        let mut ctx = make_run_ctx!();
+                        run_handlers::handle_error(
+                            &mut ctx,
+                            compact_str::CompactString::from(message),
+                            &mut ui.was_reasoning,
+                            &mut ui.is_running,
+                            &mut ui.last_token_render,
+                            &mut ui.agent_rx,
+                            &mut ui.agent_abort,
+                            &mut ui.agent_interject,
+                            &mut ui.agent_cancel,
+                            &ui.interjection_queue,
+                            #[cfg(feature = "plugin")]
+                            plugin_manager,
+                        )
+                        .await?;
+                        renderer.request_repaint();
+                    }
                     // Phased `/plan` explore→plan task events. Drained here so the forks
                     // run off the event loop (dirge-vuzz): progress lines paint as they
                     // arrive, `Ready` launches the implement run, `Aborted`/channel-close

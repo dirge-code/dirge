@@ -6,6 +6,9 @@ Prompted by a report of the TUI hanging mid-session, possibly around a
 [What would identify it](#what-would-identify-it) — but each is reachable from
 the code as it stands, and the first two are structural.
 
+**§1 and §1b are fixed** (`dirge-r5l1`, `dirge-u9xv`); §2, §3 and §4 are not.
+The description of each is kept as it was, followed by what changed.
+
 ## The fact that shapes all of this
 
 ```rust
@@ -45,6 +48,34 @@ Tools are awaited inline in the agent task
 any tool takes the whole run down this path**: an `unwrap`, a slice index that
 isn't a char boundary, an arithmetic overflow in a debug build.
 
+### Fixed
+
+The UI's run state hung off the *events a run chose to emit*, so a run that
+emitted none left nothing that could change its mind. That is now two
+guarantees, one at each end:
+
+`agent_loop/run_end.rs` makes the terminal event a property of the run's
+**lifetime**. `RunEpitaph` holds a sender for as long as the spawned task
+exists and sends `AgentEvent::Error` on its way down if nothing terminal went
+out; unwinding runs drop glue, so it fires on the panic path, which is the one
+that needed it. The panic text comes from the record the hook left behind
+(below), so the error names the panic and its source location rather than
+sending the reader to the log. Every consumer benefits — `--print` and ACP
+drain the same channel.
+
+`ui/run_handlers/ended.rs` is the backstop underneath it, for endings the task
+cannot narrate from inside itself: a `try_send` against a full channel, an
+abort from something that isn't the UI. The loop grew a `select!` arm that
+awaits the run's `JoinHandle`, placed after the event arm so `biased` delivers
+every buffered event — including the epitaph's — first, and guarded on
+`is_running` so it stays off the paths that deliberately keep a run alive past
+`Done`. A handled terminal event takes `agent_abort`, which disables the arm;
+so exactly one of the two reports, never both.
+
+Measured against the binary with a panic injected into tool dispatch: the TUI
+prints `error: the agent run crashed: <panic> (at <file:line>)`, closes the
+tool chamber and returns the prompt; `--print` exits 1 with the same message.
+
 ### …and it resets the terminal on the way out
 
 `install_panic_hook` (`src/ui/terminal.rs:134`) skips the terminal reset when
@@ -71,6 +102,29 @@ the user finally kills it.
 
 The guard is checking thread identity when the question is whether the process
 is about to die. Those were the same thing under a multi-threaded runtime.
+
+#### Fixed
+
+The hook stopped predicting. It now only writes the panic down
+(`panic_report`) and chains to the previous hook, whose backtrace still lands
+in the log. Two parties read the record afterwards, and each knows something
+the hook could not:
+
+- whoever caught the panic and carried on — the run's epitaph, which reports it
+  in band as the run's error, and *claims* the record by taking it;
+- `TerminalGuard::drop`, which runs exactly when the process really is tearing
+  down. It resets the terminal as it always did and then prints an unclaimed
+  record on the restored screen.
+
+So a caught panic no longer touches a live terminal, and a fatal one still gets
+its notice — and the decision is made where the answer is known rather than
+guessed where it isn't. `PANIC_HOOK_FIRED`, `UI_THREAD_ID` and
+`thread_owns_terminal` are gone with the prediction; the skip-branch they fed in
+`Drop` went too, so the teardown has one path again.
+
+A side effect worth naming: a panic that some `catch_unwind` swallowed and
+nobody reported now prints one line at exit instead of being visible only in a
+log the user probably wasn't capturing.
 
 ## 2. Blocking work stops the whole program
 
@@ -145,3 +199,7 @@ things separate the cases:
 
 Whether the terminal looked reset (colors gone, prompt misplaced, keys
 echoing) also separates §1 from the rest on sight.
+
+On a build carrying the §1 fix the first row cannot hang any more — it surfaces
+as `error: the agent run crashed: …` and the prompt comes back — so a hang on a
+current build is §2, §3 or §4, and the same table still tells them apart.

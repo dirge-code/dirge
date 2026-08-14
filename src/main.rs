@@ -24,6 +24,9 @@ mod jsonrpc_framing;
 mod llmtrim;
 #[cfg(feature = "lsp")]
 mod lsp;
+/// What a panic hook writes down so whoever survives the panic — or the
+/// terminal teardown, when nobody did — can report it.
+mod panic_report;
 mod permission;
 mod plugin;
 mod prompt_cache;
@@ -434,6 +437,14 @@ fn should_adopt_session_provider(
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
+    // Write down every panic before anything can produce one. The hook
+    // only records — whoever survives the panic claims the record and
+    // reports it (the agent run's crash error), and if nobody did,
+    // `TerminalGuard::drop` prints it on the way out. Installed here
+    // rather than in the TUI guard so `--print`, `--loop` and ACP get
+    // the same account of a crash.
+    panic_report::install();
+
     // Install ring crypto provider for rustls (reqwest uses rustls-no-provider).
     // Must happen before any reqwest::Client::new() call.
     let _ = rustls::crypto::ring::default_provider().install_default();
