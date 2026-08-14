@@ -885,11 +885,15 @@ pub fn loop_tool_to_rig_definition(tool: &dyn LoopTool) -> ToolDefinition {
 ///   - None: generic `reasoning_level` key for debugging /
 ///     ad-hoc consumers.
 ///
-/// **Headers and metadata** are passed through under
-/// conventional keys (`headers`, `metadata`) regardless of
-/// provider — rig's openai-shaped clients merge `metadata`
-/// into the request body; headers are honored where the
-/// provider impl reads them.
+/// **Metadata** is passed through under the conventional `metadata` key
+/// regardless of provider — rig's openai-shaped clients merge it into the
+/// request body.
+///
+/// **Headers are not.** They used to be, under a `headers` key, on the belief
+/// that "headers are honored where the provider impl reads them". No provider
+/// reads them: rig flattens `additional_params` into the request BODY, so the
+/// only thing that key ever did was ship `Authorization: Bearer <key>` to the
+/// endpoint as body content (dirge-vpma.25).
 pub fn build_provider_additional_params(
     provider_name: Option<&str>,
     opts: &super::stream::StreamOptions,
@@ -919,13 +923,27 @@ pub fn build_provider_additional_params(
         additional.extend(m);
     }
 
-    // ----- headers (provider-agnostic) -----
-    let headers = merged_request_headers(provider_name, opts);
-    if !headers.is_empty()
-        && let Ok(v) = serde_json::to_value(&headers)
-    {
-        additional.insert("headers".to_string(), v);
-    }
+    // ----- headers -----
+    //
+    // dirge-vpma.25: these used to be serialized into `additional_params` under
+    // a "headers" key. That could never work and was actively unsafe. rig
+    // serde-FLATTENS additional_params into the JSON request BODY, and no
+    // provider extracts a body-level "headers" field and promotes it to an HTTP
+    // header — so a request built this way (a) did not authenticate and (b)
+    // shipped `Authorization: Bearer <key>` inside the body, to an endpoint
+    // that may log it.
+    //
+    // Nothing in production set these (integration.rs passes `api_key: None`
+    // and an empty `headers` map on every spawn), so removing the injection
+    // changes no live behaviour. It is deliberately NOT replaced with a
+    // real-header implementation here: per-request headers belong at the HTTP
+    // client layer alongside the transports that already own auth, not in the
+    // completion-request builder.
+    //
+    // Warn rather than drop silently. A knob that quietly does nothing is how
+    // this survived — anyone who sets one should learn immediately that it has
+    // no consumer, instead of discovering it from an auth failure.
+    warn_unapplied_request_overrides(opts);
 
     // ----- metadata (provider-agnostic) -----
     if !opts.metadata.is_empty() {
@@ -947,22 +965,37 @@ pub fn build_provider_additional_params(
     }
 }
 
-fn merged_request_headers(
-    _provider_name: Option<&str>,
-    opts: &super::stream::StreamOptions,
-) -> std::collections::HashMap<String, String> {
-    let mut headers = opts.headers.clone();
-    if let Some(key) = opts
+/// Say so, once per process, when a request-override knob is set but has no
+/// consumer (dirge-vpma.25).
+///
+/// `StreamOptions::headers` and `::api_key` are resolved from `LoopConfig` —
+/// including through the `get_api_key` hook — and then reach nothing. They
+/// used to be flattened into the request body, which did not authenticate and
+/// leaked the bearer; that path is gone and no replacement exists yet.
+///
+/// Never logs the value of either. The whole point of the bug was a secret
+/// going somewhere it should not.
+fn warn_unapplied_request_overrides(opts: &super::stream::StreamOptions) {
+    use std::sync::Once;
+    static WARNED: Once = Once::new();
+    let has_key = opts
         .api_key
         .as_deref()
         .map(str::trim)
-        .filter(|key| !key.is_empty())
-    {
-        headers
-            .entry("Authorization".to_string())
-            .or_insert_with(|| format!("Bearer {key}"));
+        .is_some_and(|key| !key.is_empty());
+    if !has_key && opts.headers.is_empty() {
+        return;
     }
-    headers
+    WARNED.call_once(|| {
+        tracing::warn!(
+            target: "dirge::provider",
+            api_key_set = has_key,
+            header_names = %opts.headers.keys().cloned().collect::<Vec<_>>().join(", "),
+            "per-request api_key/headers are set but nothing applies them; they \
+             reach no HTTP header and are NOT sent. Configure credentials \
+             through the provider entry instead",
+        );
+    });
 }
 
 #[cfg(test)]
@@ -2079,42 +2112,64 @@ mod tests {
         assert_eq!(v["thinking_config"]["thinking_budget"], 16384);
     }
 
-    /// Headers and metadata pass through under conventional
-    /// keys regardless of provider.
+    /// Metadata passes through under its conventional key regardless of
+    /// provider. Headers do NOT — see below.
     #[test]
-    fn headers_and_metadata_pass_through_for_all_providers() {
+    fn metadata_passes_through_for_all_providers() {
         let mut opts = StreamOptions::from_signal(AbortSignal::new());
-        opts.headers
-            .insert("X-Tenant".to_string(), "acme".to_string());
         opts.metadata
             .insert("user_id".to_string(), serde_json::json!("u-42"));
         for provider in ["anthropic", "openai", "gemini", "ollama", "unknown"] {
             let v = build_provider_additional_params(Some(provider), &opts).unwrap();
-            assert_eq!(v["headers"]["X-Tenant"], "acme", "provider {provider}");
             assert_eq!(v["metadata"]["user_id"], "u-42", "provider {provider}");
         }
     }
 
+    /// dirge-vpma.25. These three assertions replace tests that asserted the
+    /// OPPOSITE — that `api_key` produced `headers.Authorization = "Bearer …"`
+    /// in the params, that an explicit header won over it, and that headers
+    /// passed through for every provider.
+    ///
+    /// Those tests were written down from the implementation's output, so the
+    /// bug became the contract. What they were pinning is a credential being
+    /// serialized into the JSON request BODY (`additional_params` is
+    /// serde-flattened into it), where it authenticates nothing — no provider
+    /// promotes a body field to an HTTP header — and can be logged by the
+    /// endpoint.
     #[test]
-    fn stream_options_api_key_adds_authorization_header() {
+    fn request_header_knobs_contribute_nothing_to_the_body() {
         let mut opts = StreamOptions::from_signal(AbortSignal::new());
         opts.api_key = Some("dynamic-token".to_string());
-
-        let v = build_provider_additional_params(Some("openai"), &opts).unwrap();
-        assert_eq!(v["headers"]["Authorization"], "Bearer dynamic-token");
-    }
-
-    #[test]
-    fn explicit_authorization_header_wins_over_stream_api_key() {
-        let mut opts = StreamOptions::from_signal(AbortSignal::new());
-        opts.api_key = Some("dynamic-token".to_string());
+        opts.headers
+            .insert("X-Tenant".to_string(), "acme".to_string());
         opts.headers.insert(
             "Authorization".to_string(),
             "Bearer explicit-token".to_string(),
         );
 
-        let v = build_provider_additional_params(Some("openai"), &opts).unwrap();
-        assert_eq!(v["headers"]["Authorization"], "Bearer explicit-token");
+        // Nothing else is set, so the whole params object must be absent.
+        assert!(
+            build_provider_additional_params(Some("openai"), &opts).is_none(),
+            "api_key/headers must contribute nothing to the request body"
+        );
+
+        // And they must not ride along beside something that IS legitimate.
+        opts.metadata
+            .insert("user_id".to_string(), serde_json::json!("u-42"));
+        let v = build_provider_additional_params(Some("openai"), &opts).expect("metadata present");
+        let body = serde_json::to_string(&v).expect("serializable");
+        assert!(body.contains("u-42"), "metadata should still pass: {body}");
+        for leaked in [
+            "dynamic-token",
+            "explicit-token",
+            "Authorization",
+            "X-Tenant",
+        ] {
+            assert!(
+                !body.contains(leaked),
+                "{leaked} reached the request body: {body}"
+            );
+        }
     }
 
     #[test]
@@ -2450,6 +2505,52 @@ mod tool_choice_tests {
             params.get("tool_choice").and_then(|v| v.as_str()),
             Some("none")
         );
+    }
+
+    /// dirge-vpma.25: a credential must never reach the request body.
+    ///
+    /// `additional_params` is serde-flattened into the JSON body, so anything
+    /// put there is sent as body content. The old `headers` key meant that
+    /// setting `api_key` shipped `Authorization: Bearer <key>` to the endpoint
+    /// as data — where it can be logged — while still failing to authenticate,
+    /// because no provider promotes a body field to an HTTP header.
+    #[test]
+    fn a_credential_never_reaches_the_request_body() {
+        let mut o = opts(None);
+        o.api_key = Some("sk-super-secret".to_string());
+        o.headers
+            .insert("X-Custom".to_string(), "value".to_string());
+
+        let params = build_provider_additional_params(Some("openai"), &o);
+
+        // Nothing at all is the expected shape here: `headers` was the only
+        // thing these two knobs contributed.
+        let body = params
+            .map(|p| serde_json::to_string(&p).expect("serializable"))
+            .unwrap_or_default();
+        assert!(
+            !body.contains("sk-super-secret"),
+            "the api key reached the request body: {body}"
+        );
+        assert!(
+            !body.contains("Authorization"),
+            "an Authorization header was serialized into the request body: {body}"
+        );
+        assert!(
+            !body.contains("X-Custom"),
+            "request headers were serialized into the request body: {body}"
+        );
+    }
+
+    /// The discrimination half: the builder still emits what it is supposed
+    /// to. Without this, the assertions above would pass just as well against
+    /// a builder that had been broken into returning nothing at all.
+    #[test]
+    fn the_builder_still_emits_real_params() {
+        let params =
+            build_provider_additional_params(Some("openai"), &opts(Some(ToolChoice::None)))
+                .expect("tool_choice must still be emitted");
+        assert!(params.get("tool_choice").is_some());
     }
 
     /// An unconstrained turn must send NOTHING — not `"auto"`. Some

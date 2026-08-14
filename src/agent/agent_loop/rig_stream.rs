@@ -598,6 +598,49 @@ where
             }
         }
 
+        // dirge-vpma.23: drop tool calls that never got a name.
+        //
+        // A delta-built call starts from a placeholder with an empty name and
+        // fills in as fragments arrive. If the stream ends mid-assembly — the
+        // provider cut off, or rig's chat-completions path silently discarded
+        // a call whose name never came — the block survives here with `name:
+        // ""`. It then counts as a tool call below, flips the turn to
+        // `ToolUse`, and the loop dispatches a tool named "", burning a turn
+        // on an error that describes nothing.
+        //
+        // Keyed on the NAME rather than on `open_tool_calls` membership,
+        // deliberately: some providers emit only deltas and never a complete
+        // ToolCall event, so their calls stay "open" for the whole stream and
+        // dropping by openness would discard perfectly good work. A call with
+        // no name cannot dispatch under any provider, which makes it the one
+        // safe discriminator.
+        let mut partial = partial;
+        let dropped: Vec<String> = partial
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolCall { name, id, .. } if name.trim().is_empty() => {
+                    Some(id.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        if !dropped.is_empty() {
+            // Counted, not just discarded: a filter whose reject path is
+            // silent is one nobody can audit.
+            tracing::warn!(
+                target: "dirge::agent_loop",
+                count = dropped.len(),
+                call_ids = %dropped.join(", "),
+                "dropping {} incomplete tool call(s) at stream end — the name never arrived, \
+                 so they could not have dispatched",
+                dropped.len(),
+            );
+            partial
+                .content
+                .retain(|b| !matches!(b, ContentBlock::ToolCall { name, .. } if name.trim().is_empty()));
+        }
+
         // Stream ended normally — finalize with the assembled
         // partial. `stop_reason` is `ToolUse` iff any toolCall
         // block is present (pi's stopReason inference for raw
@@ -845,6 +888,89 @@ mod tests {
                 }
             }
             _ => panic!("expected Done"),
+        }
+    }
+
+    /// dirge-vpma.23: a call whose NAME never arrived must not survive to the
+    /// final message.
+    ///
+    /// A delta-built call starts from a placeholder with an empty name. If the
+    /// stream ends mid-assembly — the provider cut off, or rig's
+    /// chat-completions path discarded a call whose name never came — the
+    /// block used to survive with `name: ""`, count as a tool call, flip the
+    /// turn to `ToolUse`, and make the loop dispatch a tool named "". That
+    /// burns a turn on an error describing nothing.
+    #[tokio::test]
+    async fn a_tool_call_whose_name_never_arrived_is_dropped() {
+        let raw = raw_stream(vec![
+            // Arguments only — no `Name` delta ever comes.
+            Ok(StreamedAssistantContent::ToolCallDelta {
+                id: "call_x".to_string(),
+                internal_call_id: "internal_x".to_string(),
+                content: ToolCallDeltaContent::Delta("{\"pa".to_string()),
+            }),
+            Ok(StreamedAssistantContent::ToolCallDelta {
+                id: "call_x".to_string(),
+                internal_call_id: "internal_x".to_string(),
+                content: ToolCallDeltaContent::Delta("th\":\"/tmp/x\"}".to_string()),
+            }),
+        ]);
+        let events = drain(wrap_streamed_assistant(raw, None, None)).await;
+        match events.last().expect("a final event") {
+            StreamEvent::Done {
+                message, reason, ..
+            } => {
+                assert!(
+                    !message
+                        .content
+                        .iter()
+                        .any(|b| matches!(b, ContentBlock::ToolCall { .. })),
+                    "a nameless tool call survived into the final message: {:?}",
+                    message.content
+                );
+                assert_ne!(
+                    *reason,
+                    StopReason::ToolUse,
+                    "the turn must not report ToolUse when there is no dispatchable call"
+                );
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
+    }
+
+    /// The discrimination half: a call that DID get its name still survives.
+    /// Without this, the test above would pass against a change that dropped
+    /// every delta-built call — which would break every provider that streams
+    /// tool calls as deltas and never sends a complete event.
+    #[tokio::test]
+    async fn a_named_delta_built_call_still_survives() {
+        let raw = raw_stream(vec![
+            Ok(StreamedAssistantContent::ToolCallDelta {
+                id: "call_y".to_string(),
+                internal_call_id: "internal_y".to_string(),
+                content: ToolCallDeltaContent::Name("write".to_string()),
+            }),
+            Ok(StreamedAssistantContent::ToolCallDelta {
+                id: "call_y".to_string(),
+                internal_call_id: "internal_y".to_string(),
+                content: ToolCallDeltaContent::Delta("{}".to_string()),
+            }),
+        ]);
+        let events = drain(wrap_streamed_assistant(raw, None, None)).await;
+        match events.last().expect("a final event") {
+            StreamEvent::Done {
+                message, reason, ..
+            } => {
+                assert!(
+                    message.content.iter().any(
+                        |b| matches!(b, ContentBlock::ToolCall { name, .. } if name == "write")
+                    ),
+                    "a named delta-built call was dropped: {:?}",
+                    message.content
+                );
+                assert_eq!(*reason, StopReason::ToolUse);
+            }
+            other => panic!("expected Done, got {other:?}"),
         }
     }
 

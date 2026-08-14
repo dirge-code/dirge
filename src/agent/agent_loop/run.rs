@@ -2605,6 +2605,12 @@ pub async fn run_loop(
         // the nudge rides in context.messages, so the flag alone drives
         // the next turn when no tool calls or steering are pending.
         let mut recovery_pending = false;
+        // dirge-vpma.22: set by the `ExitWithSummary` post-usage tier, which
+        // is the last line of defence when context is critically over the
+        // threshold. It has to survive to the bottom of the iteration rather
+        // than breaking on the spot, so the checkpoint-schedule reset and the
+        // per-iteration snip-credit cleanup below it still run.
+        let mut force_turn_end = false;
         while has_more_tool_calls || !pending_messages.is_empty() || recovery_pending {
             recovery_pending = false;
             // Circuit-breaker bookkeeping is at-most-once per iteration:
@@ -3646,6 +3652,17 @@ pub async fn run_loop(
                             ratio = %decision.ratio,
                             "context-manager: forcing summary and ending turn",
                         );
+                        // dirge-vpma.22: and actually end it. This arm logged
+                        // "ending turn" and then fell through to
+                        // prepareNextTurn/steering with `has_more_tool_calls`
+                        // untouched, so the turn continued. That is the exact
+                        // case this tier exists to prevent: when the summarizer
+                        // fails or the circuit breaker is already open at >80%
+                        // context, the loop went round again against a context
+                        // still over the threshold and the next request could
+                        // overflow or 400. Honoured below, after the
+                        // checkpoint-schedule reset.
+                        force_turn_end = true;
                         // When context is critically over the threshold,
                         // prune aggressively then run the structured-summary
                         // pass if a summarizer is wired.
@@ -3705,6 +3722,16 @@ pub async fn run_loop(
                 // decision; clear it so a later iteration's fold isn't
                 // suppressed by a stale snip (IMPROVEMENTS_PLAN #4).
                 snip_tokens_freed = 0;
+            }
+
+            // dirge-vpma.22: the critical-context tier asked for the turn to
+            // end. Clearing `has_more_tool_calls` would not be enough on its
+            // own — the loop condition also admits pending messages and a
+            // pending recovery — so break outright, which leaves the flag
+            // unread. Anything queued is picked up by the next turn, against
+            // a context that has just been folded.
+            if force_turn_end {
+                break;
             }
 
             // Pi lines 220-239: prepareNextTurn.
