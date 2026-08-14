@@ -189,6 +189,30 @@ fn effective_auth(
 /// `env` is injected so precedence is unit-testable without touching the
 /// process environment. OpenAI-OAuth / ChatGPT base URLs force the Codex
 /// endpoint in the caller and never come through here.
+/// The resolved endpoint for a kind whose client cannot be built without one.
+///
+/// dirge-vpma.27: DeepSeek, GLM, Cerebras, OpenCode and Kimi used to restate
+/// their default endpoint here as an `unwrap_or` fallback, duplicating
+/// [`resolve_provider_base_url`]'s table. Four of the five were already
+/// unreachable, so they were free to drift from the value actually in use; and
+/// the shape invited the reverse failure too — if the resolver ever stopped
+/// answering for one of these kinds, the stale copy would silently become the
+/// live endpoint with nothing to notice.
+///
+/// So: one table, and no second guess. A missing endpoint is a bug in the
+/// resolver, and it fails the build with the provider named rather than
+/// defaulting to whatever `rig`'s builder assumes (for the OpenAI-compatible
+/// clients, that is api.openai.com — the wrong host holding the wrong key).
+fn require_base_url(kind: ProviderKind, base_url: Option<&str>) -> anyhow::Result<&str> {
+    base_url.ok_or_else(|| {
+        anyhow::anyhow!(
+            "no base URL resolved for provider {kind:?}. Every built-in provider has a default \
+             endpoint in `resolve_provider_base_url`; set `providers.<name>.base_url` in \
+             config.json to work around this."
+        )
+    })
+}
+
 fn resolve_provider_base_url(
     kind: ProviderKind,
     config_url: Option<String>,
@@ -207,6 +231,7 @@ fn resolve_provider_base_url(
             Some("https://open.bigmodel.cn/api/coding/paas/v4"),
         ),
         ProviderKind::Cerebras => (None, Some("https://api.cerebras.ai/v1")),
+        ProviderKind::OpenCode => (None, Some("https://opencode.ai/zen/v1")),
         ProviderKind::Kimi => (
             Some("KIMI_CODE_BASE_URL"),
             Some(crate::auth::kimi_device::KIMI_CODE_BASE_URL),
@@ -536,7 +561,7 @@ where
             let b = openai::CompletionsClient::builder()
                 .http_client(compressing(reqwest::Client::new(), ProviderKind::DeepSeek))
                 .api_key(&key)
-                .base_url(base_url.as_deref().unwrap_or("https://api.deepseek.com/v1"))
+                .base_url(require_base_url(info.kind, base_url.as_deref())?)
                 .http_headers(headers);
             Ok(AnyClient::DeepSeek(b.build()?))
         }
@@ -544,11 +569,7 @@ where
             let b = openai::CompletionsClient::builder()
                 .http_client(compressing(reqwest::Client::new(), ProviderKind::Glm))
                 .api_key(&key)
-                .base_url(
-                    base_url
-                        .as_deref()
-                        .unwrap_or("https://open.bigmodel.cn/api/coding/paas/v4"),
-                )
+                .base_url(require_base_url(info.kind, base_url.as_deref())?)
                 .http_headers(headers);
             Ok(AnyClient::Glm(b.build()?))
         }
@@ -556,14 +577,14 @@ where
             let b = openai::CompletionsClient::builder()
                 .http_client(compressing(reqwest::Client::new(), ProviderKind::Cerebras))
                 .api_key(&key)
-                .base_url(base_url.as_deref().unwrap_or("https://api.cerebras.ai/v1"));
+                .base_url(require_base_url(info.kind, base_url.as_deref())?);
             Ok(AnyClient::Cerebras(b.build()?))
         }
         ProviderKind::OpenCode => {
             let b = openai::CompletionsClient::builder()
                 .http_client(compressing(reqwest::Client::new(), ProviderKind::OpenCode))
                 .api_key(&key)
-                .base_url(base_url.as_deref().unwrap_or("https://opencode.ai/zen/v1"))
+                .base_url(require_base_url(info.kind, base_url.as_deref())?)
                 .http_headers(headers);
             Ok(AnyClient::OpenCode(b.build()?))
         }
@@ -594,11 +615,7 @@ where
             let mut b = openai::CompletionsClient::builder()
                 .http_client(compressing(http, ProviderKind::Kimi))
                 .api_key(&key)
-                .base_url(
-                    base_url
-                        .as_deref()
-                        .unwrap_or(crate::auth::kimi_device::KIMI_CODE_BASE_URL),
-                );
+                .base_url(require_base_url(info.kind, base_url.as_deref())?);
             b = b.http_headers(headers);
             Ok(AnyClient::Kimi(b.build()?))
         }
@@ -1142,6 +1159,54 @@ mod tests {
                 .unwrap()
                 .as_deref(),
             Some("https://open.bigmodel.cn/api/coding/paas/v4")
+        );
+    }
+
+    /// dirge-vpma.27: every kind whose client cannot be built without an
+    /// endpoint must get one from the resolver.
+    ///
+    /// These arms used to restate their default as an `unwrap_or` at client
+    /// construction. Four of the five copies were unreachable — the resolver
+    /// already answered `Some` — so they were free to drift from the live
+    /// value, and if the resolver ever stopped answering, the stale literal
+    /// would quietly become the endpoint. The copies are gone and
+    /// `require_base_url` now refuses to build rather than guess, which is only
+    /// safe while this holds.
+    #[test]
+    fn every_kind_that_needs_an_endpoint_gets_one() {
+        for (kind, want) in [
+            (ProviderKind::DeepSeek, "https://api.deepseek.com/v1"),
+            (
+                ProviderKind::Glm,
+                "https://open.bigmodel.cn/api/coding/paas/v4",
+            ),
+            (ProviderKind::Cerebras, "https://api.cerebras.ai/v1"),
+            (ProviderKind::OpenCode, "https://opencode.ai/zen/v1"),
+            (
+                ProviderKind::Kimi,
+                crate::auth::kimi_device::KIMI_CODE_BASE_URL,
+            ),
+        ] {
+            assert_eq!(
+                resolve_provider_base_url(kind, None, no_env)
+                    .unwrap()
+                    .as_deref(),
+                Some(want),
+                "{kind:?} has no default endpoint"
+            );
+        }
+    }
+
+    /// The failure the deleted fallbacks used to mask: no endpoint is a build
+    /// error naming the provider, not a silent guess at someone else's API.
+    #[test]
+    fn a_missing_endpoint_is_refused_not_guessed() {
+        let err = require_base_url(ProviderKind::DeepSeek, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("DeepSeek"), "must name the provider: {msg}");
+        assert!(
+            require_base_url(ProviderKind::DeepSeek, Some("https://x/v1")).is_ok(),
+            "a resolved endpoint must pass through"
         );
     }
 
