@@ -19,11 +19,23 @@
 //! Flipping the flavor is one line and makes every `await` in the loop an
 //! interleaving point against process-global state that the single thread has
 //! been serialising all along — the `TODO_LIST` mirror, the snapshot store,
-//! the modified-files map, the rate-limit gate. Worse, two of those globals
-//! are not merely racy but unsound to touch concurrently: the process CWD,
-//! which `/cd` and `/worktree` mutate while tools read it, and `set_var`,
-//! which is `unsafe` in Rust 2024 precisely because a concurrent reader is
-//! undefined behaviour.
+//! the modified-files map, the rate-limit gate, the verifier, the plugin
+//! manager. None of that has been audited for concurrent access because until
+//! now it could not happen.
+//!
+//! The process CWD deserves its own mention because it is the one piece of
+//! shared state that cannot be given a lock — it is a process singleton, and
+//! roughly twenty agent-side sites read it. What makes it safe is that no
+//! command which changes it can run while an agent is running: `/cd` and
+//! `/worktree` are both kept out of `is_safe_during_agent`. That invariant is
+//! load-bearing for this whole design and is pinned by
+//! `no_cwd_mutating_command_is_safe_during_an_agent_run`.
+//!
+//! (An earlier draft of this note also listed `env::set_var` as a hazard.
+//! It is not: every call in the tree is inside a `#[cfg(test)] mod`, so
+//! nothing mutates the environment at runtime for a concurrent reader to
+//! race. Rust 2024 makes the function `unsafe`, so a production site cannot
+//! appear by accident either.)
 //!
 //! Splitting at this boundary instead keeps the agent loop internally
 //! single-threaded, so all of that keeps the serialisation it has today and
@@ -34,8 +46,20 @@
 //! plus `ask_tx` for the permission round trip. Nothing else crosses.
 
 use std::future::Future;
+use std::sync::OnceLock;
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle as TokioJoinHandle;
+
+/// The agent runtime's handle, created on first use.
+///
+/// Holds only the `Handle`; the `Runtime` itself is moved onto the driver
+/// thread and never dropped, which is also what keeps `Runtime::drop` — which
+/// panics when called from async context — from ever running.
+static AGENT: OnceLock<Handle> = OnceLock::new();
+
+/// Name of the thread the agent runtime is driven on, so it is identifiable
+/// in a debugger, a profile, or a panic message.
+const AGENT_THREAD: &str = "dirge-agent";
 
 /// The runtime that owns agent work — the loop, tool dispatch, and anything
 /// they block on.
@@ -44,21 +68,45 @@ use tokio::task::JoinHandle as TokioJoinHandle;
 /// is that agent work is *not* on the caller's runtime, and reading the
 /// current handle silently reintroduces the coupling this module exists to
 /// remove.
-// Wired at R3, when the loop's spawn sites move onto it; until then only the
-// guarantee test below exercises this.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn agent_handle() -> Handle {
-    // Pre-split: agent work still shares the caller's runtime. Replacing this
-    // body with a dedicated runtime is the change; the guarantee it must buy
-    // is pinned by `blocking_agent_work_does_not_stall_the_ui_runtime`.
-    Handle::current()
+    AGENT
+        .get_or_init(|| {
+            // CURRENT_THREAD, deliberately, and this is the whole safety
+            // argument for the split. The agent loop reaches process-global
+            // state that the single thread has been serialising all along —
+            // the `TODO_LIST` mirror, the snapshot store, the modified-files
+            // map, the rate-limit gate, the verifier, the plugin manager.
+            // Giving the agent one thread of its own preserves every one of
+            // those orderings; giving it a thread POOL would reintroduce
+            // exactly the races that made flipping the main runtime's flavor
+            // the wrong move. Blocking work in a tool still blocks other
+            // agent tasks — background review, subagents, the checkpointer —
+            // which is unchanged from today and is the point.
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .thread_name(AGENT_THREAD)
+                .build()
+                .expect("the agent runtime is required for dirge to run at all");
+            let handle = rt.handle().clone();
+            std::thread::Builder::new()
+                .name(AGENT_THREAD.to_string())
+                .spawn(move || {
+                    // A current_thread runtime only advances while something
+                    // drives it, so this thread's job is to drive it for the
+                    // life of the process. Tasks arrive via `Handle::spawn`
+                    // from the UI thread.
+                    rt.block_on(std::future::pending::<()>());
+                })
+                .expect("the agent runtime thread is required for dirge to run at all");
+            handle
+        })
+        .clone()
 }
 
 /// Spawn agent work on the agent runtime.
 ///
 /// The returned handle behaves exactly like [`tokio::spawn`]'s, including
 /// `abort()` — the UI's Ctrl+C path depends on that.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn spawn_agent<F>(future: F) -> TokioJoinHandle<F::Output>
 where
     F: Future + Send + 'static,
