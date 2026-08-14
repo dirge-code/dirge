@@ -4,6 +4,103 @@ All notable changes to dirge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.21.19] - 2026-08-14
+
+### Fixed
+- A panic anywhere in a run hung the TUI permanently. `panic = "abort"` is not
+  set, so a panic unwinds out of the agent task, tokio catches it, and the
+  event channel closes — and the UI's select arm reads a closed channel as
+  "nothing more to poll" and silently disables itself. `is_running` is cleared
+  only by events that can no longer arrive, so the run sat at "running" with
+  nothing left that could change its mind: no error, no timeout, and nothing on
+  screen to tell it apart from thinking. Tools are awaited inline in that task,
+  so any tool's `unwrap`, a slice index off a char boundary, or a debug-build
+  overflow went this way. A run's terminal event is now a property of the
+  task's lifetime rather than of the path it happened to take, so a crash
+  arrives as the error it always should have been — naming the panic and its
+  source location — and the prompt comes back. `--print` and ACP drain the same
+  channel and get it too.
+- A caught panic reset the terminal of a process that kept running. The panic
+  hook decided whether to restore the terminal by asking whether the panicking
+  thread owned it, which is true for every agent-task panic on a
+  single-threaded runtime — so a survivable panic cleared the screen, left raw
+  mode, and latched a flag that made the real teardown skip its own reset
+  later. The hook now only records what happened; whoever survives the panic
+  reports it, and the terminal teardown prints an unclaimed record after
+  restoring the screen. A panic some `catch_unwind` swallowed now gets one line
+  at exit instead of living only in a log.
+- A tool call a model wrote as text was printed to the user as the turn's
+  answer. The command ran and the reply was its source code. Two further
+  defects came out of the same gap: the call never reached the assistant
+  message, so the next request carried a `tool` result with no preceding
+  `tool_calls` (a hard 400 on OpenAI and Anthropic), and those calls carried an
+  empty id, so two in one turn were indistinguishable to result matching, the
+  storm signature and the publish guard. Such a region is now hidden exactly
+  when it dispatches — so a call that names a tool this run does not have stays
+  on screen, and a ```` ```json ```` block a model is deliberately showing you
+  never vanishes.
+- Renewing an expired provider token froze the whole program. Three transports
+  resolved their bearer synchronously on the per-request path, and the
+  refresher spawns an OS thread and joins it around a blocking HTTP exchange.
+  On a single-threaded runtime that is the only thread: nothing painted, no
+  keystroke was read, and no timer could fire — including any timeout meant to
+  bound whatever was stuck. Kimi access tokens live 15 minutes, so it recurred
+  through a long session. Resolution is off-thread now, with no thread hop at
+  all on the common path where nothing needs renewing.
+- Ctrl+C did not escape the `question` modal. It cancels in every other modal;
+  here it did nothing in the option list, and in the custom-answer field it
+  typed a literal `c` into the answer.
+- Nearest-name suggestions for an unknown tool pointed at unrelated tools —
+  `exec` → `spec`, `shell` → `skill`, `ask` → `task` — in a message with no
+  hedge, steering a model that wanted a shell toward a spec-management tool.
+  Of eleven plausible guesses, six were wrong; now one. Names that differ from
+  a real tool only in case or separators resolve directly.
+- Automatic compaction had none of the prompt-injection fencing `/compact` has
+  had all along, and it is the path that runs unattended. It also could not see
+  tool CALLS — only their results — so a fold recorded outcomes with no record
+  of what produced them; measured at 0/6 facts preserved that lived only in
+  call arguments, now 6/6. Both paths are one implementation.
+- A `/compact` summary entered the loop without the marker an automatic fold
+  writes, so the next fold could not find it and stacked a second summary
+  behind it.
+- A headless failure printed its error to stderr twice, verbatim.
+- A model-supplied `bash` timeout ignored the configured ceiling: a model
+  asking for 3600 got it however low `timeouts.bash_secs` was set. It is
+  clamped by `timeouts.bash_max_secs` (default 3600), and the schema the model
+  reads is rendered from the resolved config.
+
+### Added
+- `timeouts.tool_call_secs` (default 600) — a ceiling on one tool dispatch.
+  Every tool keeps its own tighter bound; this exists so a tool that forgets to
+  bound itself, or one on a path that skips its own client, cannot stall a run
+  silently. Tools whose own bound is legitimately larger declare it, and the
+  budget does not run while a call is waiting on you: the permission prompt,
+  the `question` tool and `/plan` approval all wait for a person from inside
+  the window being bounded, and killing a call somebody is halfway through
+  approving is worse than the stall this catches. It bounds waits, not blocked
+  threads — a tool that blocks the runtime never lets the timer be polled.
+- A per-turn `<turn_envelope>` carrying the volatile session facts (cwd, mode,
+  model, todos, modified files), rebuilt each turn and replacing the previous
+  one instead of stacking behind it. The frozen prefix keeps only what does not
+  change, so it stays cacheable.
+- The prompt's tool section is rendered from the live registry rather than a
+  literal, so prompt-level `deny_tools`, umbrella deny rules and dynamic tool
+  search can no longer make the prompt describe a capability boundary the loop
+  does not have. Both of these default on: 2 of 6 control runs blew up against
+  0 of 6 under treatment.
+- Tool failures are classified (misuse / missing-info / transient / fatal).
+  Transient failures retry with backoff on reads only, and a missing-info error
+  weighs more when estimating whether a model is coping.
+- `prompt_leak_detect`, off by default, for a model reciting its own system
+  prompt back. Advisory mode exists so it can be measured before it is trusted.
+
+### Changed
+- An interrupted mutating tool call no longer tells the model to retry it. What
+  a call landed — committed, unknown, or nothing — is classified and handed to
+  the next turn instead.
+- A truncated assistant turn is marked incomplete where the model can see it,
+  not only in the UI.
+
 ## [0.21.18] - 2026-08-12
 
 ### Security
