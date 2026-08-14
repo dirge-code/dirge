@@ -85,12 +85,15 @@ pub(crate) fn bakeoff_summarizer() -> Option<(SummarizeFn, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::compaction_recall::{hard_facts, run_hard_recall_eval_with};
+    use crate::agent::compaction_recall::{
+        hard_facts, run_coverage_probe_with, run_hard_recall_eval_with,
+    };
 
     fn schema_label(s: SummarySchema) -> &'static str {
         match s {
             SummarySchema::Sections => "sections",
             SummarySchema::Slots => "slots",
+            SummarySchema::SectionsWithoutCoverage => "no-cov",
         }
     }
 
@@ -99,6 +102,59 @@ mod tests {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(5)
+    }
+
+    /// The coverage probe (dirge-5zca): clip the assembled prompt the way the
+    /// one-shot does, and see whether the summary admits it saw partial
+    /// material.
+    ///
+    /// Separate from the recall bake-off because it asks a different question.
+    /// Recall asks how much detail survives, and both schemas came back level.
+    /// This asks whether the reader is TOLD the record is partial — and only
+    /// one schema has anywhere to say so.
+    #[tokio::test]
+    async fn compaction_coverage_probe() {
+        let Some((sfn, who)) = bakeoff_summarizer() else {
+            eprintln!("[coverage] skipped (set DIRGE_BAKEOFF=1 and DIRGE_BAKEOFF_MODEL)");
+            return;
+        };
+        let n = repeats();
+        eprintln!("[coverage] model={who} repeats={n}");
+        for arm in [
+            SummarySchema::SectionsWithoutCoverage,
+            SummarySchema::Sections,
+            SummarySchema::Slots,
+        ] {
+            let mut declared = 0usize;
+            for i in 0..n {
+                let (says_partial, summary) = run_coverage_probe_with(sfn.clone(), arm).await;
+                if says_partial {
+                    declared += 1;
+                }
+                eprintln!(
+                    "[coverage] {} run {}/{}: declares-partial={}",
+                    schema_label(arm),
+                    i + 1,
+                    n,
+                    says_partial,
+                );
+                if std::env::var("DIRGE_BAKEOFF_DUMP").is_ok() {
+                    let path = format!(
+                        "{}coverage-{}-{}.md",
+                        std::env::temp_dir().display(),
+                        schema_label(arm),
+                        i + 1
+                    );
+                    let _ = std::fs::write(&path, &summary);
+                }
+            }
+            eprintln!(
+                "[coverage] === {:<9} declared the gap in {}/{} runs",
+                schema_label(arm),
+                declared,
+                n
+            );
+        }
     }
 
     /// The bake-off. Auto-skips unless `DIRGE_BAKEOFF=1`.
@@ -113,7 +169,11 @@ mod tests {
         eprintln!("[bakeoff] model={who} repeats={n} facts={total_facts}");
 
         let mut rows: Vec<(SummarySchema, Vec<usize>)> = Vec::new();
-        for arm in [SummarySchema::Sections, SummarySchema::Slots] {
+        for arm in [
+            SummarySchema::SectionsWithoutCoverage,
+            SummarySchema::Sections,
+            SummarySchema::Slots,
+        ] {
             let mut scores = Vec::new();
             for i in 0..n {
                 let (report, summary) = run_hard_recall_eval_with(sfn.clone(), arm).await;

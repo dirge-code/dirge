@@ -688,7 +688,8 @@ fn summarize_tool_result(tool_name: &str, content: &str) -> String {
 /// worth of reasons not to ship those as flags.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SummarySchema {
-    /// Thirteen narrative markdown sections.
+    /// The shipped narrative markdown sections, including `## Source
+    /// Coverage`.
     Sections,
     /// Eleven labelled slots, every one emitted, with rules that force
     /// verbatim identifiers and mark anything inferred.
@@ -699,7 +700,23 @@ pub enum SummarySchema {
     /// config until the numbers say otherwise.
     #[cfg_attr(not(test), allow(dead_code))]
     Slots,
+    /// The shipped sections MINUS the source-coverage section — what shipped
+    /// before dirge-e31n.7. Kept so the bake-off can still reproduce the
+    /// comparison that justified adding it; not reachable from config.
+    #[cfg_attr(not(test), allow(dead_code))]
+    SectionsWithoutCoverage,
 }
+
+/// The one section that separates [`SummarySchema::SectionsWithCoverage`] from
+/// [`SummarySchema::Sections`].
+///
+/// Worded to ask for the same thing the slot version asks for, so the
+/// comparison is about WHERE the instruction sits (a whole new schema vs one
+/// more section), not about how it is phrased.
+const COVERAGE_SECTION: &str = "\n\n## Source Coverage\n\
+[What you were able to see. If the material carries a truncation marker, or\n\
+begins or ends mid-turn, say so and name what is missing. If you saw all of\n\
+it, write COMPLETE.]";
 
 /// The labelled-slot candidate template.
 ///
@@ -809,9 +826,15 @@ conversation — do not translate or switch to English.";
         None => String::new(),
     };
 
+    // dirge-e31n.7: the coverage section ships; the arm without it exists only
+    // so the bake-off can reproduce the comparison.
+    let coverage_block = match schema {
+        SummarySchema::Sections => COVERAGE_SECTION,
+        _ => "",
+    };
     let _template_sections = match schema {
         SummarySchema::Slots => slot_template(summary_budget),
-        SummarySchema::Sections => format!(
+        SummarySchema::Sections | SummarySchema::SectionsWithoutCoverage => format!(
             "## Active Task\n\
 [THE SINGLE MOST IMPORTANT FIELD. State what should happen NEXT — the\n\
 immediate piece of work in flight right now, in plain terms. This is NOT\n\
@@ -860,7 +883,7 @@ outstanding, write \"None.\"]\n\
 \n\
 ## Critical Context\n\
 [Specific values, error messages, config details that would be lost\n\
-without explicit preservation]\n\
+without explicit preservation]{coverage_block}\n\
 \n\
 Target ~{summary_budget} tokens. Be CONCRETE — include file paths,\n\
 command outputs, error messages, line numbers, and specific values.\n\
@@ -1107,7 +1130,7 @@ pub fn summary_budget(compressed_tokens: u64) -> u64 {
 
 /// Every section name `build_summary_prompt` asks for. Used to recognize a
 /// summary structurally.
-const SUMMARY_SECTIONS: [&str; 13] = [
+const SUMMARY_SECTIONS: [&str; 14] = [
     "Active Task",
     "Goal",
     "Constraints & Preferences",
@@ -1121,10 +1144,11 @@ const SUMMARY_SECTIONS: [&str; 13] = [
     "Relevant Files",
     "Remaining Work",
     "Critical Context",
+    "Source Coverage",
 ];
 
 /// Sections that must carry real content. One is a stub; the template asks
-/// for thirteen, so two is a floor, not a target.
+/// for fourteen, so two is a floor, not a target.
 const MIN_SUMMARY_SECTIONS: usize = 2;
 
 /// True when a section body says nothing — the placeholder a model emits
@@ -2298,6 +2322,47 @@ mod tests {
             "## Blocked\ncargo test fails: index out of bounds at foo.rs:12\n\n\
              ## Relevant Files\nfoo.rs — the panicking helper"
         ));
+    }
+
+    /// `SUMMARY_SECTIONS` is a hand-written copy of the template's headers,
+    /// and `validate_summary` only counts a section it names. So a section
+    /// added to the template and not to the list is invisible to validation,
+    /// and a name in the list that the template stopped asking for is a
+    /// header no model will ever emit. Both directions, because the list
+    /// documents itself as "every section name build_summary_prompt asks
+    /// for" and that sentence has to stay true.
+    ///
+    /// This is the same shape as the emit()/enum drift in
+    /// docs/verification-discipline.md: a duplicate of a source of truth,
+    /// pinned by a test rather than derived, because the template is one
+    /// format! string and splitting it to derive headers would cost more
+    /// clarity than it buys.
+    #[test]
+    fn the_section_list_matches_the_template() {
+        let turns = vec![serde_json::json!({"role": "user", "content": "hi"})];
+        let prompt = build_summary_prompt(&turns, 2000, None, None).expect("clean");
+        let headers: Vec<&str> = prompt
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("## "))
+            .map(str::trim)
+            .collect();
+
+        for h in &headers {
+            assert!(
+                SUMMARY_SECTIONS.contains(h),
+                "template asks for '## {h}' but SUMMARY_SECTIONS does not list it, \
+                 so validate_summary will never count it"
+            );
+        }
+        for name in SUMMARY_SECTIONS {
+            assert!(
+                headers.contains(&name),
+                "SUMMARY_SECTIONS lists '{name}' but the template no longer asks \
+                 for it"
+            );
+        }
+        // And the section this test was written for is actually there.
+        assert!(headers.contains(&"Source Coverage"));
     }
 
     // ── build_summary_prompt: injection defense (dirge-tgb9) ──

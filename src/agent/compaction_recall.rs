@@ -208,9 +208,16 @@ pub(crate) fn hard_facts() -> Vec<PlantedFact> {
             kind: "user constraint",
             needle: "do not touch the production shard",
         },
+        // NOT "truncate-and-replay", which is what this said first. That
+        // string contains "truncat", which is a keyword
+        // `declares_incomplete_coverage` scans for — so every coverage probe
+        // scored a declared gap the moment the summary mentioned this fact,
+        // in BOTH arms, for a reason that had nothing to do with coverage.
+        // `no_planted_fact_collides_with_the_coverage_detector` stops it
+        // coming back.
         PlantedFact {
             kind: "rejected alternative",
-            needle: "rejected the truncate-and-replay approach",
+            needle: "rejected the drop-and-replay approach",
         },
     ]
 }
@@ -349,6 +356,54 @@ pub(crate) fn score_recall(text: &str, facts: &[PlantedFact]) -> RecallReport {
     }
 }
 
+/// Does the summary tell its reader that it was built from partial material?
+///
+/// The question this answers is not cosmetic (dirge-5zca). When the assembled
+/// prompt exceeds the summarizer's input budget, `head_tail_truncate` removes
+/// the middle and leaves a marker — and a summary built from a clipped
+/// transcript reads exactly like one built from the whole thing. The next turn,
+/// and the user, have no way to know the record is partial.
+///
+/// Substring detection over a free-form claim, so it is deliberately paired
+/// with `coverage_detector_does_not_fire_on_a_confident_summary`: a detector
+/// that fires on everything would report perfect coverage-awareness and mean
+/// nothing.
+pub(crate) fn declares_incomplete_coverage(summary: &str) -> bool {
+    let s = summary.to_lowercase();
+
+    // NEGATION IS NOT OPTIONAL HERE. The most common thing a summarizer with a
+    // coverage slot writes is "COMPLETE — no truncation marker was shown",
+    // which contains "truncat". A bare substring scan reads that as a declared
+    // gap and scores a healthy run as an unhealthy one — for every run of the
+    // arm that HAS the slot, which is the arm under test. Observed verbatim in
+    // the live dumps before this was written.
+    const NEGATORS: [&str; 7] = [
+        "no ", "not ", "n't ", "without ", "none", "nothing ", "never ",
+    ];
+    let negated_at = |idx: usize| {
+        let from = idx.saturating_sub(30);
+        let window = &s[crate::text::char_boundary_at_or_after(&s, from)..idx];
+        NEGATORS.iter().any(|n| window.contains(n))
+    };
+
+    [
+        "truncat",
+        "incomplete",
+        "not complete",
+        "cut off",
+        "cut short",
+        "omitted",
+        "missing material",
+        "partial material",
+        "some material",
+    ]
+    .iter()
+    .any(|m| {
+        s.match_indices(m)
+            .any(|(idx, _)| !negated_at(idx) || *m == "not complete")
+    })
+}
+
 /// Full article-style probe: build a seeded session, run it through dirge's
 /// real compaction window + prompt builder, hand the prompt to `summarize`,
 /// and score how many facts survive in the resulting summary. The summarizer
@@ -400,6 +455,43 @@ pub(crate) async fn run_hard_recall_eval_with(
     let summary = summarize(prompt).await.unwrap_or_default();
     let report = score_recall(&summary, &facts);
     (report, summary)
+}
+
+/// Coverage probe (dirge-5zca + dirge-e31n.7): run the hard fixture with the
+/// assembled prompt CLIPPED the way `oneshot_with_model` clips it, and report
+/// whether the resulting summary admits it saw partial material.
+///
+/// The truncation is applied to the assembled prompt, not to the transcript,
+/// because that is where it happens in production — after
+/// `build_summary_prompt_with`, inside the one-shot. That also means the fence
+/// and the re-anchored output format survive (they sit in the retained head and
+/// tail), so this measures the coverage claim and not a broken prompt.
+pub(crate) async fn run_coverage_probe_with(
+    summarize: SummarizeFn,
+    schema: super::compression::SummarySchema,
+) -> (bool, String) {
+    let facts = hard_facts();
+    let msgs = noisy_session(&facts);
+    let (start, end) = compute_compress_window(&msgs, PROTECT_HEAD_DEFAULT, PROTECT_TAIL_DEFAULT);
+    let middle = &msgs[start..end];
+    let prompt = super::compression::build_summary_prompt_with(
+        middle,
+        summary_budget(estimate_messages_tokens(middle)),
+        None,
+        None,
+        schema,
+    )
+    .expect("recall fixture must not contain the reserved fence delimiter");
+
+    // Half the assembled prompt, so the cut is unmissable.
+    let clipped = crate::provider::summarize::head_tail_truncate(&prompt, prompt.len() / 2);
+    debug_assert!(
+        clipped.contains("truncated by summarizer-prompt budget"),
+        "the probe must actually clip the prompt"
+    );
+    let summary = summarize(clipped).await.unwrap_or_default();
+    let declared = declares_incomplete_coverage(&summary);
+    (declared, summary)
 }
 
 #[cfg(test)]
@@ -647,6 +739,79 @@ mod tests {
              score zero; survived {:?}",
             facts.len() - report.dropped.len()
         );
+    }
+
+    /// The coverage detector must fire on the ways a summary actually says
+    /// "I only saw part of this" — including the slot form and free prose.
+    #[test]
+    fn coverage_detector_fires_on_a_declared_gap() {
+        for s in [
+            "SOURCE_COVERAGE: INCOMPLETE — the block carries a truncation marker.",
+            "SOURCE_COVERAGE: the middle was cut off; roughly 40k bytes are missing material.",
+            "## Critical Context\nNote: part of the transcript was truncated before it reached me.",
+            "Some material appears to have been omitted from the record.",
+        ] {
+            assert!(
+                declares_incomplete_coverage(s),
+                "should have been read as a coverage gap: {s}"
+            );
+        }
+    }
+
+    /// The fixture and the detector must not share vocabulary.
+    ///
+    /// A planted fact whose text contains a coverage keyword makes every
+    /// summary that faithfully preserves it look like a declared gap — which
+    /// is what happened: "rejected the truncate-and-replay approach" contains
+    /// "truncat", so both arms scored 6/6 on the coverage probe purely for
+    /// keeping the fact. The better the summary, the more certainly it
+    /// misreported.
+    ///
+    /// This is the general guard, not a patch for that one string: any future
+    /// fact or keyword that collides fails here rather than silently inverting
+    /// a result.
+    #[test]
+    fn no_planted_fact_collides_with_the_coverage_detector() {
+        for f in hard_facts().iter().chain(seed_facts().iter()) {
+            assert!(
+                !declares_incomplete_coverage(f.needle),
+                "planted {} \"{}\" trips the coverage detector — a summary that \
+                 preserves it would be scored as declaring a gap",
+                f.kind,
+                f.needle,
+            );
+        }
+        // And the same for the surrounding fixture prose, which the model also
+        // quotes back.
+        let facts = hard_facts();
+        for m in noisy_session(&facts) {
+            let content = m.get("content").and_then(|c| c.as_str()).unwrap_or("");
+            assert!(
+                !declares_incomplete_coverage(content),
+                "fixture turn trips the coverage detector: {content:.120}"
+            );
+        }
+    }
+
+    /// The half that keeps the detector honest. A summarizer that saw
+    /// everything writes confident prose about incomplete WORK — unfinished
+    /// tasks, partial fixes, missing config — and none of that is a coverage
+    /// gap. If the detector fired on these it would report perfect
+    /// coverage-awareness while measuring nothing.
+    #[test]
+    fn coverage_detector_does_not_fire_on_a_confident_summary() {
+        for s in [
+            "SOURCE_COVERAGE: COMPLETE — no truncation marker, no turn left mid-sentence.",
+            "## Blocked\nThe backfill is unfinished; the retry path was never wired up.",
+            "## Remaining Work\nThe migration is only half applied and the index is absent.",
+            "OPEN_NEXT: finish the accept-loop fix, then re-run the ingest tests.",
+            "## Active State\nA partial batch is stuck on shard-a4e1 at offset 883421.",
+        ] {
+            assert!(
+                !declares_incomplete_coverage(s),
+                "incomplete WORK is not a coverage gap: {s}"
+            );
+        }
     }
 
     /// The scorer must actually catch a lossy (paraphrasing) summary — the
