@@ -10,6 +10,9 @@ pub(crate) mod compressing_http;
 mod dispatch;
 pub(crate) mod kimi_http;
 pub(crate) mod rate_limit_gate;
+/// The one bearer-that-renews-itself used by the Anthropic, Kimi and
+/// ChatGPT/Codex transports.
+pub(crate) mod refreshable_token;
 mod resolve;
 mod route;
 mod run;
