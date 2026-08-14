@@ -156,12 +156,21 @@ where
     let provider_name = Arc::new(provider_name);
     let model_name = Arc::new(model_name);
     let filter = Arc::new(tool_def_filter);
+    // The previous request's prefix fingerprint, so a change can be reported
+    // against it. Lives HERE — one per `StreamFn`, which is one per agent —
+    // rather than in a process global, because subagents and forked reviewers
+    // each build their own and a shared slot would report every switch between
+    // them as drift.
+    let last_prefix = Arc::new(std::sync::Mutex::new(
+        None::<super::prefix::PrefixFingerprint>,
+    ));
     Arc::new(move |ctx: LlmContext, opts: super::stream::StreamOptions| {
         let model = model.clone();
         let tools = tools.clone();
         let provider_name = provider_name.clone();
         let model_name = model_name.clone();
         let filter = filter.clone();
+        let last_prefix = last_prefix.clone();
         invoke_one_stream(
             model,
             tools,
@@ -171,6 +180,7 @@ where
             provider_name,
             model_name,
             filter,
+            last_prefix,
         )
     })
 }
@@ -196,6 +206,7 @@ fn invoke_one_stream<M>(
     tool_def_filter: Arc<
         Option<std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>>,
     >,
+    last_prefix: Arc<std::sync::Mutex<Option<super::prefix::PrefixFingerprint>>>,
 ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send>>
 where
     M: CompletionModel + Clone + Send + Sync + 'static,
@@ -248,6 +259,7 @@ where
             &system_prompt,
             &outgoing_tools,
             history_len,
+            &last_prefix,
         );
 
         // Build additional_params using a per-provider mapper
@@ -381,30 +393,57 @@ fn emit_cache_prefix_event(
     system_prompt: &str,
     tools: &[ToolDefinition],
     history_len: usize,
+    last_prefix: &std::sync::Mutex<Option<super::prefix::PrefixFingerprint>>,
 ) {
-    use std::hash::{Hash, Hasher};
-    let mut h_system = std::collections::hash_map::DefaultHasher::new();
-    system_prompt.hash(&mut h_system);
-    let system_hash = h_system.finish();
+    use crate::sync_util::LockExt;
 
-    let mut tool_names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
-    tool_names.sort_unstable();
-    let mut h_tools = std::collections::hash_map::DefaultHasher::new();
-    for n in &tool_names {
-        n.hash(&mut h_tools);
-        0u8.hash(&mut h_tools);
-    }
-    let tools_hash = h_tools.finish();
+    let now = super::prefix::PrefixFingerprint::of(system_prompt, tools);
+
+    // Take the comparison and store the new value under one lock, so two
+    // concurrent requests on the same agent cannot both read the same
+    // predecessor and report the change twice.
+    let previous = {
+        let mut guard = last_prefix.lock_ignore_poison();
+        guard.replace(now)
+    };
 
     tracing::debug!(
         target: "dirge::prompt_cache",
         provider = provider.unwrap_or("unknown"),
-        system_hash = format!("{system_hash:016x}"),
-        tools_hash = format!("{tools_hash:016x}"),
+        system_hash = format!("{:016x}", now.system_hash()),
+        tools_hash = format!("{:016x}", now.tools_hash()),
         tool_count = tools.len(),
         system_bytes = system_prompt.len(),
         history_len = history_len,
         "prompt_cache_prefix"
+    );
+
+    // The first request establishes the baseline; there is nothing to have
+    // drifted from yet.
+    let Some(previous) = previous else { return };
+    let change = now.changes_from(&previous);
+    if !change.any() {
+        return;
+    }
+
+    // A prefix change mid-session is not free: the provider caches on a
+    // strict byte prefix, so everything from the changed component onward is
+    // re-billed at write price. Some changes are deliberate (an `/agent`
+    // switch rebuilds the preamble); this says which component moved so the
+    // deliberate ones can be told from the accidental ones, and so a
+    // `dirge::cache` read-miss on the next turn has a named cause instead of
+    // a guess.
+    tracing::warn!(
+        target: "dirge::prompt_cache",
+        provider = provider.unwrap_or("unknown"),
+        changed = change.describe(),
+        system_changed = change.system,
+        tools_changed = change.tools,
+        tool_count = tools.len(),
+        history_len = history_len,
+        "cached request prefix changed mid-session: {} moved, so the cache is \
+         invalidated from there on",
+        change.describe(),
     );
 }
 
@@ -2300,26 +2339,91 @@ mod tests {
         assert_eq!(out.len(), 2);
     }
 
-    /// Phase-3 part 3: the prefix-hash helper is a pure function
-    /// of (system_prompt, tools-sorted-by-name). Same inputs →
-    /// same emitted hashes. We can't directly inspect the
-    /// emitted tracing event from here, but we can verify the
-    /// helper doesn't panic and is deterministic across runs
-    /// when invoked with identical inputs (no internal RNG).
+    /// The per-request tool filter must preserve the registry's order.
+    ///
+    /// This is the sharp end of the fingerprint work. `filter_tool_defs`
+    /// consults a `HashSet` of loaded names and the `PROMPT_DENIED_TOOLS`
+    /// global; if it ever iterated either of those instead of walking the
+    /// `tools` slice, the outgoing order would vary run to run — and since
+    /// the provider caches over the order actually sent, every session would
+    /// silently pay a full prefix rewrite. Nothing else in the suite pins
+    /// this, and the cost of getting it wrong is invisible.
     #[test]
-    fn emit_cache_prefix_event_is_deterministic() {
+    fn filtering_preserves_the_registry_order() {
+        let defs = vec![
+            mk_def("read"),
+            mk_def("write"),
+            mk_def("grep"),
+            mk_def("tool_search"),
+        ];
+        // A filter admitting several, inserted in an order deliberately
+        // unlike the registry's, so an implementation iterating the SET
+        // rather than the slice would produce the set's order instead.
+        let mut set = std::collections::HashSet::new();
+        set.insert("grep".to_string());
+        set.insert("read".to_string());
+        set.insert("write".to_string());
+        let filter = std::sync::Arc::new(std::sync::Mutex::new(set));
+
+        let first: Vec<String> = filter_tool_defs(&defs, Some(&filter))
+            .iter()
+            .map(|d| d.name.clone())
+            .collect();
+
+        // Registry order, not set order, not alphabetical.
+        assert_eq!(
+            first,
+            vec!["read", "write", "grep", "tool_search"],
+            "the outgoing list must follow the registry slice"
+        );
+
+        // And it must be stable across calls — a HashSet's iteration order
+        // is randomised per process, but also varies as it is re-hashed, so
+        // a single call could agree by luck.
+        for _ in 0..16 {
+            let again: Vec<String> = filter_tool_defs(&defs, Some(&filter))
+                .iter()
+                .map(|d| d.name.clone())
+                .collect();
+            assert_eq!(again, first, "tool order must not vary between requests");
+        }
+    }
+
+    /// The emitter is deterministic and carries its comparison state forward.
+    ///
+    /// Note the corrected contract. This test used to say "permuting tool
+    /// order must NOT change the digest (the helper sorts before hashing)" —
+    /// and never asserted it. That intent was backwards: the provider caches
+    /// over the tool list in the order it is SENT, so a permutation is a full
+    /// prefix invalidation, and sorting before hashing made the one change
+    /// that costs the most the one change the telemetry could not see.
+    #[test]
+    fn emit_cache_prefix_event_tracks_the_previous_prefix() {
         let defs = vec![mk_def("write"), mk_def("read")];
-        // Call twice; if anything stateful crept in (RNG /
-        // HashMap iteration / file IO) this would surface as
-        // either a panic, a tracing-subscriber blowup, or an
-        // observable side effect under cargo test's harness.
-        emit_cache_prefix_event(Some("anthropic"), "preamble-x", &defs, 3);
-        emit_cache_prefix_event(Some("anthropic"), "preamble-x", &defs, 3);
-        // Permuting tool order must NOT change the digest (the
-        // helper sorts before hashing). Smoke: this call must
-        // also not panic.
+        let last = std::sync::Mutex::new(None);
+
+        // First call establishes the baseline.
+        emit_cache_prefix_event(Some("anthropic"), "preamble-x", &defs, 3, &last);
+        let first = last.lock().unwrap().expect("baseline recorded");
+
+        // An identical request must fingerprint identically, or every turn
+        // would report drift and the signal would be worthless.
+        emit_cache_prefix_event(Some("anthropic"), "preamble-x", &defs, 3, &last);
+        let second = last.lock().unwrap().expect("still recorded");
+        assert_eq!(first, second, "an unchanged prefix must not read as drift");
+        assert!(!second.changes_from(&first).any());
+
+        // Permuting the tool order DOES change it.
         let permuted = vec![mk_def("read"), mk_def("write")];
-        emit_cache_prefix_event(Some("anthropic"), "preamble-x", &permuted, 3);
+        emit_cache_prefix_event(Some("anthropic"), "preamble-x", &permuted, 3, &last);
+        let third = last.lock().unwrap().expect("still recorded");
+        assert_ne!(
+            second, third,
+            "the wire carries the tools in this order; a permutation invalidates the cache"
+        );
+        let change = third.changes_from(&second);
+        assert!(change.tools, "attributed to the tools");
+        assert!(!change.system, "the preamble did not move");
     }
 }
 
