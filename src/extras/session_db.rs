@@ -32,22 +32,43 @@ pub(crate) const SCHEMA_VERSION: u32 = 16;
 #[cfg(not(feature = "experimental-graph-search"))]
 pub(crate) const SCHEMA_VERSION: u32 = 14;
 
-/// Thread-safe snapshot of the most recent `SessionDb::open()` failure.
-/// Port of Hermes's `_last_init_error` (hermes_state.py:66-67).
-/// Slash-command handlers read this to surface the underlying cause.
-static LAST_INIT_ERROR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+/// Databases that opened, but without the durability dirge expects.
+///
+/// #769: this used to share the open-failure slot, which a successful
+/// open CLEARED — so the one caveat worth hearing about was recorded and
+/// then wiped microseconds later, by the very open that recorded it. That
+/// slot is gone (nothing ever read it; every caller gets the error
+/// returned). This one is not a failure anyway: the store works, it is
+/// just standing somewhere a SQLite file can be damaged.
+///
+/// A list rather than a slot because a process opens several databases
+/// and each can answer differently, and drained rather than read so the
+/// notice is printed once instead of on every agent rebuild.
+static DEGRADED_OPENS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
-/// Return the most recent session DB init failure, if any.
-/// Port of Hermes's `get_last_init_error()` (hermes_state.py:94-100).
-#[allow(dead_code)]
-pub fn last_init_error() -> Option<String> {
-    LAST_INIT_ERROR.lock().unwrap().clone()
+fn note_degraded_open(msg: String) {
+    if let Ok(mut guard) = DEGRADED_OPENS.lock() {
+        // Bounded: one line per database, not per open. A `/model` switch
+        // rebuilds the agent and reopens the same files.
+        if !guard.contains(&msg) {
+            guard.push(msg);
+        }
+    }
 }
 
-fn set_last_init_error(msg: Option<String>) {
-    if let Ok(mut guard) = LAST_INIT_ERROR.lock() {
-        *guard = msg;
-    }
+/// Serializes the tests that read or drain the process-wide open
+/// diagnostics. `take_degraded_opens` DRAINS, so without this two tests
+/// steal each other's notices and the failure is an assertion passing for
+/// the wrong reason rather than an obvious crash.
+#[cfg(test)]
+pub(crate) static DIAGNOSTICS_TEST_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take the degraded-open notices recorded so far, leaving none behind.
+pub fn take_degraded_opens() -> Vec<String> {
+    DEGRADED_OPENS
+        .lock()
+        .map(|mut g| std::mem::take(&mut *g))
+        .unwrap_or_default()
 }
 
 /// SESS-14: scrub credential-shaped tokens from text before it lands in
@@ -197,9 +218,10 @@ impl SessionDb {
         ) {
             Ok(c) => c,
             Err(e) => {
-                let msg = format!("Failed to open session DB at {}: {e}", path.display());
-                set_last_init_error(Some(msg.clone()));
-                return Err(msg);
+                return Err(format!(
+                    "Failed to open session DB at {}: {e}",
+                    path.display()
+                ));
             }
         };
 
@@ -207,8 +229,17 @@ impl SessionDb {
         match conn.pragma_update(None, "journal_mode", "WAL") {
             Ok(_) => {}
             Err(e) => {
+                // WAL being unavailable is the signature of a filesystem
+                // that cannot do it — a network share, or a folder a sync
+                // client is rewriting underneath us. Those are also where
+                // SQLite files get corrupted (#769), so this is worth
+                // saying out loud rather than logging to a file nobody is
+                // capturing.
                 let msg = format!(
-                    "WAL mode unavailable for {} — falling back to DELETE journal: {e}",
+                    "{} is on a filesystem without WAL support — falling back to the \
+                     DELETE journal ({e}). That usually means a network share or a sync \
+                     folder (Dropbox, iCloud, OneDrive), where SQLite databases can be \
+                     corrupted. Consider moving the project onto local disk.",
                     path.display()
                 );
                 tracing::warn!(
@@ -216,23 +247,27 @@ impl SessionDb {
                     path = %path.display(),
                     "WAL mode unavailable — falling back to DELETE journal"
                 );
-                set_last_init_error(Some(msg));
+                note_degraded_open(msg);
                 conn.pragma_update(None, "journal_mode", "DELETE")
                     .map_err(|e| format!("Failed to set DELETE journal mode: {e}"))?;
             }
         }
 
         conn.execute_batch("PRAGMA foreign_keys = ON;")
-            .map_err(|e| {
-                let msg = format!("Failed to enable foreign keys: {e}");
-                set_last_init_error(Some(msg.clone()));
-                msg
-            })?;
+            .map_err(|e| format!("Failed to enable foreign keys: {e}"))?;
+
+        // #769: find damage HERE, not at whatever write happens to touch a
+        // bad page. Before this a corrupt file opened cleanly, ran for as
+        // long as nothing read the damaged part, and then failed on every
+        // memory write for the rest of that session and every session
+        // after it — with a message that named neither the file nor a way
+        // out. The check reads every page, so it costs a few tens of
+        // milliseconds on a real `state.db`; the alternative is finding
+        // out mid-session.
+        super::db_health::quick_check(&conn)?;
 
         let db = SessionDb { conn };
         db.migrate()?;
-        // Clear the error on successful open.
-        set_last_init_error(None);
         Ok(db)
     }
 

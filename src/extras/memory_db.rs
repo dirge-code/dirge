@@ -908,7 +908,7 @@ impl SqliteMemoryStore {
             "UPDATE memories SET status = 'tombstoned', updated_at = ?1 WHERE id = ?2",
             params![now, id],
         )
-        .map_err(|e| format!("Failed to tombstone entry: {e}"))?;
+        .map_err(|e| super::db_health::describe(conn, "Failed to tombstone entry", &e))?;
         Ok(())
     }
 
@@ -921,7 +921,7 @@ impl SqliteMemoryStore {
             "UPDATE memories SET tier = 'breadcrumb', updated_at = ?1 WHERE id = ?2",
             params![now, id],
         )
-        .map_err(|e| format!("Failed to demote entry: {e}"))?;
+        .map_err(|e| super::db_health::describe(conn, "Failed to demote entry", &e))?;
         Ok(())
     }
 
