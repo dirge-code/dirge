@@ -2824,9 +2824,11 @@ pub async fn run_loop(
                     cache_creation_tokens =
                         token_usage.map_or(0, |u| u.cache_creation_input_tokens),
                     uncached_input_tokens = token_usage.map_or(0, |u| u.input_tokens),
-                    "prompt-cache read miss: wrote a new entry, read none. Suspect the \
-                     20-block lookback window (a turn appending >20 content blocks) or \
-                     concurrent subagent fan-out",
+                    "prompt-cache read miss: wrote a new entry, read none. Check the \
+                     dirge::prompt_cache target first — a `cached request prefix changed` \
+                     warning just before this names the component that moved. Absent that, \
+                     suspect the 20-block lookback window (a turn appending >20 content \
+                     blocks) or concurrent subagent fan-out",
                 );
             }
 
