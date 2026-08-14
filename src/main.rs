@@ -1820,6 +1820,20 @@ async fn main() -> anyhow::Result<()> {
         )
         .await;
 
+        // dirge-wxyw: stamp which assembled system prompt this session ran
+        // under. Diagnostic only — nothing branches on it — but it is the only
+        // record of the instructions, and the version cannot stand in for it
+        // (the preamble varies within a version by mode, AGENTS.md, skills,
+        // memory and model-family steering). Logged as well as stored so it is
+        // greppable without opening the session file.
+        let digest = agent.preamble_digest();
+        tracing::info!(
+            target: "dirge::context",
+            preamble_digest = %digest,
+            "assembled system prompt",
+        );
+        session.preamble_digest = Some(CompactString::new(&digest));
+
         #[cfg(feature = "plugin")]
         if let Some(pm_arc) = plugin_manager.as_ref() {
             use crate::plugin::escape_janet_string;

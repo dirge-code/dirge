@@ -334,6 +334,15 @@ pub(crate) enum AnyAgentInner {
 }
 
 impl AnyAgent {
+    /// Fingerprint of the assembled system prompt this agent runs under
+    /// (dirge-wxyw). Stamped on the session so a later diagnosis can tell
+    /// whether two sessions ran the same instructions — the version alone
+    /// cannot, since the preamble varies within a version by prompt mode,
+    /// AGENTS.md, skills, memory and model-family steering.
+    pub fn preamble_digest(&self) -> String {
+        crate::agent::prompt::preamble_digest(&self.preamble)
+    }
+
     pub fn new(
         inner: AnyAgentInner,
         cache: ToolCache,

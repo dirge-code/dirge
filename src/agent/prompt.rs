@@ -258,6 +258,37 @@ pub fn input_contains_compaction_delimiter(inputs: &[&str]) -> bool {
         .any(|s| s.contains(COMPACTION_DELIMITER_OPEN) || s.contains(COMPACTION_DELIMITER_CLOSE))
 }
 
+/// A short, stable fingerprint of an assembled system prompt (dirge-wxyw).
+///
+/// # Why a session records this
+///
+/// Nothing else identifies the instructions a session actually ran under. The
+/// dirge version does not: the assembled preamble varies WITHIN a version by
+/// prompt mode, `AGENTS.md`, project skills, memory, the capability projection,
+/// and model-family steering — so two sessions on the same build routinely
+/// differ. When behaviour changes and the prompt is one of the suspects, this
+/// is what separates "the instructions differed" from "the model or the config
+/// differed", which is otherwise guesswork after the fact.
+///
+/// # Why SHA-256 and not `DefaultHasher`
+///
+/// The value is written into session files and compared across builds and
+/// machines. `std`'s `DefaultHasher` is explicitly not stable across Rust
+/// versions, which would make every recorded digest incomparable with every
+/// other — the one thing the field exists to do. Twelve hex characters is
+/// plenty to distinguish the handful of preambles a project produces, and short
+/// enough to read in a log line.
+///
+/// This is a fingerprint, not a version: it says whether two sessions ran the
+/// same instructions, never which is newer.
+pub fn preamble_digest(preamble: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(preamble.as_bytes());
+    let out = h.finalize();
+    out.iter().take(6).map(|b| format!("{b:02x}")).collect()
+}
+
 /// Wrap untrusted material in the delimiter pair.
 ///
 /// Callers must run [`input_contains_compaction_delimiter`] over the material
@@ -359,6 +390,34 @@ OUTPUT FORMAT (re-anchored after data): Return ONLY a markdown summary using the
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// dirge-wxyw: the digest has to answer the question it exists for —
+    /// "did these two sessions run the same instructions?" — which means
+    /// different preambles must give different values, and identical ones
+    /// the same value.
+    ///
+    /// The negative half is the one that matters: a digest that collapses
+    /// everything to one value would look perfectly healthy in a log and be
+    /// useless the moment anyone compared two sessions.
+    #[test]
+    fn the_preamble_digest_distinguishes_preambles() {
+        let base = compaction_prompt();
+        let a = preamble_digest(&base);
+        let b = preamble_digest(&format!("{base}\n\nplus a project skill"));
+        let c = preamble_digest(&base);
+
+        assert_eq!(a, c, "the same preamble must give the same digest");
+        assert_ne!(a, b, "a changed preamble must give a different digest");
+        assert_eq!(a.len(), 12, "twelve hex chars: {a}");
+        assert!(a.chars().all(|ch| ch.is_ascii_hexdigit()));
+
+        // Single-character changes must show up too — mode reminders and
+        // steering fragments differ by very little.
+        assert_ne!(
+            preamble_digest("you are an agent"),
+            preamble_digest("You are an agent")
+        );
+    }
 
     /// dirge-tgb9, the property whose absence WAS the bug: there is ONE
     /// injection-defense block and every compaction prompt carries it.

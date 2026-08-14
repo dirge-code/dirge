@@ -289,6 +289,20 @@ pub struct Session {
     /// correct answer for pre-fix sessions (they saved the unresolved default).
     #[serde(default)]
     pub model_explicit: bool,
+    /// Fingerprint of the assembled system prompt this session ran under
+    /// (dirge-wxyw), from [`crate::agent::prompt::preamble_digest`].
+    ///
+    /// Diagnostic only — nothing branches on it. It exists because nothing
+    /// else identifies the instructions a session actually ran: the version
+    /// does not, since the preamble varies within a version by prompt mode,
+    /// AGENTS.md, project skills, memory, and model-family steering. When
+    /// behaviour changes and the prompt is a suspect, this separates "the
+    /// instructions differed" from "the model or config differed".
+    ///
+    /// `None` for sessions saved before the field existed, and for any path
+    /// that builds a session without an agent.
+    #[serde(default)]
+    pub preamble_digest: Option<CompactString>,
     pub provider: CompactString,
     pub working_dir: CompactString,
     #[serde(default)]
@@ -447,6 +461,8 @@ impl Session {
             // Fresh sessions have their explicit signal stamped by the startup
             // resolver (dirge-ovjk follow-up); default false until then.
             model_explicit: false,
+            // Stamped once the agent is built (see main.rs).
+            preamble_digest: None,
             provider: CompactString::new(provider),
             working_dir: std::env::current_dir()
                 .map(|p| CompactString::new(p.to_string_lossy()))
