@@ -181,16 +181,25 @@ pub fn snip_bought_enough(freed: u64, ctx_max: u64, aggressive: bool) -> bool {
 
 /// Chars-per-token rough estimate. Port of Hermes's _CHARS_PER_TOKEN.
 ///
-/// This is the project's single token estimator (see
-/// [`estimate_messages_tokens`]); it backs the *pre-send* measurement point of
-/// the context-budget ladder, while the *post-response* decision uses the
-/// API's exact `prompt_tokens`. The two are different measurement points, not
-/// two estimators — see [`crate::agent::agent_loop::context_manager`].
+/// This backs the *pre-send* measurement point of the context-budget ladder,
+/// while the *post-response* decision uses the API's exact `prompt_tokens`.
+/// Those two are different measurement points, not two estimators — see
+/// [`crate::agent::agent_loop::context_manager`].
+///
+/// This used to claim to be "the project's single token estimator", which was
+/// not true (dirge-tmex). [`crate::session::Session::estimate_tokens`] is a
+/// second one, and it is not going away: it accounts a
+/// `SessionMessage` list for the UI meter and the `/compact` threshold, while
+/// this one accounts the loop's `Vec<Value>` for the fold ladder. Different
+/// collections, different decisions.
+///
+/// What matters is that they use the same METHOD, and they do — both are bytes
+/// over [`CHARS_PER_TOKEN`], both count a tool call's arguments. They differ
+/// only in rounding (per-message floor with a `.max(1)` there, sum-then-ceil
+/// here), which is under a token per message against an approximation whose
+/// own error is far larger. `the_two_estimators_agree_on_method` keeps that
+/// true; if it starts failing, one of them has changed what it measures.
 pub(crate) const CHARS_PER_TOKEN: u64 = 4;
-
-/// Hard floor for a compression model's context window (64K).
-#[allow(dead_code)]
-const MINIMUM_CONTEXT_LENGTH: u64 = 64_000;
 
 /// Default protected head (system prompt + first user/assistant turn)
 /// and tail (recent live exchanges) message counts. Port of Hermes
@@ -233,9 +242,12 @@ pub fn should_compress_with_threshold(
 /// dirge-el3n: handles both content shapes:
 /// - `content: "string"` (heal-on-load / OpenAI shape)
 /// - `content: [{type: "text", text: "..."}, ...]` (Anthropic /
-///   dirge's production tool-result shape). Non-text blocks
-///   contribute zero — they reach the model as opaque references
-///   (image SHA256, tool_use stubs), not raw text.
+///   dirge's production tool-result shape).
+///
+/// Per-block accounting is [`block_chars`]. This doc used to say non-text
+/// blocks contribute zero because they "reach the model as opaque references
+/// (image SHA256, tool_use stubs)" — true of an image, false of a tool call,
+/// whose arguments are serialized into the request in full (dirge-tmex).
 pub fn estimate_messages_tokens(messages: &[Value]) -> u64 {
     let total_chars: usize = messages
         .iter()
@@ -247,7 +259,38 @@ pub fn estimate_messages_tokens(messages: &[Value]) -> u64 {
 pub(crate) fn content_chars(content: Option<&Value>) -> usize {
     match content {
         Some(Value::String(s)) => s.len(),
-        Some(Value::Array(blocks)) => blocks.iter().filter_map(text_of_block).map(str::len).sum(),
+        Some(Value::Array(blocks)) => blocks.iter().map(block_chars).sum(),
+        _ => 0,
+    }
+}
+
+/// Characters a single content block contributes to the request (dirge-tmex).
+///
+/// Not the same question as [`text_of_block`], which asks "what text would the
+/// model READ". This asks "how much of the request does this block occupy",
+/// and a tool call answers differently to an image:
+///
+///   * `text` — its text, obviously.
+///   * `toolCall` — its ARGUMENTS, in full. Every byte is serialized into the
+///     request, and a `write` or `apply_patch` call carries an entire file
+///     there. Counting only the sibling text block left the pre-send estimate
+///     blind to what is routinely the largest thing in the turn, which matters
+///     because that estimate gates the turn-start fold and the tiered
+///     result cap.
+///   * anything else — zero. An image really does reach the model as an opaque
+///     reference, and inflating every turn that carries one would be the
+///     opposite error.
+fn block_chars(block: &Value) -> usize {
+    let Some(obj) = block.as_object() else {
+        return 0;
+    };
+    match obj.get("type").and_then(|t| t.as_str()) {
+        Some("text") => obj.get("text").and_then(|t| t.as_str()).map_or(0, str::len),
+        Some("toolCall") => {
+            let args = obj.get("arguments").map_or(0, |a| a.to_string().len());
+            let name = obj.get("name").and_then(|n| n.as_str()).map_or(0, str::len);
+            args + name
+        }
         _ => 0,
     }
 }
@@ -2322,6 +2365,90 @@ mod tests {
             "## Blocked\ncargo test fails: index out of bounds at foo.rs:12\n\n\
              ## Relevant Files\nfoo.rs — the panicking helper"
         ));
+    }
+
+    /// dirge-tmex: the two token estimators must keep using the same method.
+    ///
+    /// They are not being unified — they account different collections for
+    /// different decisions, and the rounding gap between them is under a token
+    /// per message against a 4-bytes-per-token approximation, which is not an
+    /// observable consequence. What would matter is one of them changing what
+    /// it MEASURES. This pins that: on the same text they agree within the
+    /// rounding, so a divergence in method shows up here rather than as two
+    /// context meters quietly disagreeing.
+    #[test]
+    fn the_two_estimators_agree_on_method() {
+        for text in [
+            "short",
+            "a somewhat longer line of prose that runs on for a while",
+            &"x".repeat(4096),
+            &"日本語のテキスト".repeat(64),
+        ] {
+            let session = crate::session::Session::estimate_tokens(text);
+            let loop_side =
+                estimate_messages_tokens(&[serde_json::json!({"role":"user","content":text})]);
+            let gap = session.abs_diff(loop_side);
+            assert!(
+                gap <= 1,
+                "estimators disagree by {gap} tokens on {} bytes (session {session}, \
+                 loop {loop_side}) — that is more than rounding, so one of them \
+                 changed what it measures",
+                text.len(),
+            );
+        }
+    }
+
+    /// dirge-tmex: the pre-send estimator must see a tool call's ARGUMENTS.
+    ///
+    /// `text_of_block` keeps only `type: "text"` blocks, and the doc for
+    /// `estimate_messages_tokens` justified that by saying non-text blocks
+    /// "reach the model as opaque references (image SHA256, tool_use stubs),
+    /// not raw text". That is true of an image and false of a tool call:
+    /// `ContentBlock::ToolCall` carries a full `arguments` value and every
+    /// byte of it is serialized into the request. A `write` or `apply_patch`
+    /// call puts an entire file in there.
+    ///
+    /// So the estimate that gates the turn-start fold and the tiered result
+    /// cap was blind to what is often the largest thing in the turn.
+    #[test]
+    fn the_estimator_counts_a_tool_calls_arguments() {
+        let file_body = "x".repeat(40_000);
+        let msgs = vec![serde_json::json!({
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "writing the file"},
+                {
+                    "type": "toolCall",
+                    "id": "call_1",
+                    "name": "write",
+                    "arguments": {"path": "src/big.rs", "content": file_body},
+                },
+            ],
+        })];
+
+        let got = estimate_messages_tokens(&msgs);
+        // 40 KB of arguments is ~10k tokens on its way to the model.
+        assert!(
+            got > 9_000,
+            "estimated {got} tokens for a turn carrying a 40 KB tool-call \
+             argument — the pre-send fold and the tiered result cap read this \
+             number, so they cannot see the largest thing in the turn"
+        );
+    }
+
+    /// The other side: a block that really IS an opaque reference must stay
+    /// uncounted, or the fix would inflate every turn carrying an image.
+    #[test]
+    fn the_estimator_still_ignores_an_opaque_block() {
+        let msgs = vec![serde_json::json!({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "look at this"},
+                {"type": "image", "sha256": "a".repeat(64), "mime": "image/png"},
+            ],
+        })];
+        // Only "look at this" (12 chars) counts.
+        assert_eq!(estimate_messages_tokens(&msgs), 3);
     }
 
     /// `SUMMARY_SECTIONS` is a hand-written copy of the template's headers,
