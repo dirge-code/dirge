@@ -6,10 +6,19 @@ Prompted by a report of the TUI hanging mid-session, possibly around a
 [What would identify it](#what-would-identify-it) — but each is reachable from
 the code as it stands, and the first two are structural.
 
-**§1, §1b and §3 are fixed** (`dirge-r5l1`, `dirge-u9xv`, `dirge-9tl3` +
-`dirge-8cbm`); §2 and §4 are not, though §2 turned out to have one specific
-instance worth naming (`dirge-bz0a`, below). The description of each is kept
-as it was, followed by what changed.
+Status, and the descriptions below are kept as first written with what
+changed appended to each:
+
+| | |
+|---|---|
+| §1 a panic in the agent task | fixed — `dirge-r5l1` |
+| §1b the panic hook resets a live terminal | fixed — `dirge-u9xv` |
+| §2 blocking work on the only thread | the instance that bites is fixed (`dirge-bz0a`); the general case stands |
+| §3 nothing bounds a tool call | fixed — `dirge-9tl3`, `dirge-8cbm` |
+| §4 an unanswered permission ask | premise mostly did not hold; the real bug under it is fixed (`dirge-x2zf`) |
+
+None of them is confirmed as the reported hang. §1 and `dirge-bz0a` are the
+two that could present exactly as one.
 
 ## The fact that shapes all of this
 
@@ -253,6 +262,40 @@ This shape has bitten before: issue #523 is the same wait in headless mode,
 fixed by adding an auto-deny drain, and ACP has its own drain for the same
 reason. The interactive path has no equivalent backstop because it assumes the
 UI always gets there eventually.
+
+### What it turned out to be
+
+The premise is weaker than it reads, and checking it before building anything
+was worth more than the fix would have been. "A modal entered and never left"
+needs a modal that cannot be left: every kind has an `Esc` path, and the
+queued ask is delivered the moment the modal closes. The run waiting on a
+person is also no longer a problem in itself — §3's watchdog does not count
+that time (`human_wait`), and there is a human on the other end by definition.
+An unbounded `reply_rx.await` is the correct thing to do while someone is
+deciding.
+
+What was real is narrower and worse: **one modal could not be left by the key
+people reach for** (`dirge-x2zf`). Ctrl+C means "I want out" everywhere else —
+`Permission` maps it to Deny, both dialogs cancel, plan approval bails. The
+`question` modal listened only for `Esc`. In the option list
+`option_select_action` took a bare `KeyCode`, so Ctrl+C fell through to
+`Ignore` and nothing happened; in the custom-answer field `KeyCode::Char(c)`
+was pushed unguarded, so Ctrl+C typed a literal `c` into the answer.
+
+It is the same shape as most of the bugs in this file: the guard exists on the
+parallel implementations and not on this one. `PlanApproval`'s text entry
+guards `Char(c)` on `!CONTROL` and carries a comment saying it does so to
+match the rest of the UI; the permission deny-note field guards it too. The
+question field is the copy that never got it.
+
+Fixed by giving the pure mapping the modifiers (it was made pure in
+`dirge-72h2` precisely so decisions like this stay testable) and guarding the
+entry field. A test now asserts every modal text field ignores control
+chords, so a fourth one cannot be added unguarded.
+
+An auto-deny deadline was deliberately NOT added. Denying a tool because
+someone took too long to read it converts a recoverable wait into a lost turn,
+and the wait is only unbounded in the sense that a person is.
 
 ## What would identify it
 

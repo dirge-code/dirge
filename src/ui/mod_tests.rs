@@ -1067,13 +1067,13 @@ use crossterm::event::KeyCode as KC;
 #[test]
 fn opt_multi_space_toggles_option() {
     // Space on an option row toggles its checkbox.
-    let a = option_select_action(KC::Char(' '), true, true, 0, 3, false);
+    let a = option_select_action(KC::Char(' '), KeyModifiers::NONE, true, true, 0, 3, false);
     assert_eq!(a, OptionAction::Toggle);
 }
 
 #[test]
 fn opt_multi_enter_on_option_confirms() {
-    let a = option_select_action(KC::Enter, true, true, 1, 3, false);
+    let a = option_select_action(KC::Enter, KeyModifiers::NONE, true, true, 1, 3, false);
     assert_eq!(a, OptionAction::Confirm);
 }
 
@@ -1082,7 +1082,7 @@ fn opt_multi_enter_on_option_confirms() {
 #[test]
 fn opt_multi_custom_row_enter_opens_editor_when_empty() {
     // No custom text yet: Enter starts typing.
-    let a = option_select_action(KC::Enter, true, true, 3, 3, false);
+    let a = option_select_action(KC::Enter, KeyModifiers::NONE, true, true, 3, 3, false);
     assert_eq!(a, OptionAction::OpenEntry);
 }
 
@@ -1090,7 +1090,7 @@ fn opt_multi_custom_row_enter_opens_editor_when_empty() {
 fn opt_multi_custom_row_enter_confirms_once_text_entered() {
     // The bug: after typing a custom answer, Enter must confirm — not
     // re-open the editor forever.
-    let a = option_select_action(KC::Enter, true, true, 3, 3, true);
+    let a = option_select_action(KC::Enter, KeyModifiers::NONE, true, true, 3, 3, true);
     assert_eq!(a, OptionAction::Confirm);
 }
 
@@ -1099,11 +1099,11 @@ fn opt_multi_custom_row_space_reopens_editor() {
     // Space on the custom row (re)opens the editor to edit the answer,
     // whether or not text already exists.
     assert_eq!(
-        option_select_action(KC::Char(' '), true, true, 3, 3, false),
+        option_select_action(KC::Char(' '), KeyModifiers::NONE, true, true, 3, 3, false),
         OptionAction::OpenEntry
     );
     assert_eq!(
-        option_select_action(KC::Char(' '), true, true, 3, 3, true),
+        option_select_action(KC::Char(' '), KeyModifiers::NONE, true, true, 3, 3, true),
         OptionAction::OpenEntry
     );
 }
@@ -1112,21 +1112,21 @@ fn opt_multi_custom_row_space_reopens_editor() {
 
 #[test]
 fn opt_single_enter_on_option_confirms() {
-    let a = option_select_action(KC::Enter, false, false, 2, 4, false);
+    let a = option_select_action(KC::Enter, KeyModifiers::NONE, false, false, 2, 4, false);
     assert_eq!(a, OptionAction::Confirm);
 }
 
 #[test]
 fn opt_single_space_on_option_confirms() {
     // Single-select has no checkboxes: Space picks the option like Enter.
-    let a = option_select_action(KC::Char(' '), false, false, 2, 4, false);
+    let a = option_select_action(KC::Char(' '), KeyModifiers::NONE, false, false, 2, 4, false);
     assert_eq!(a, OptionAction::Confirm);
 }
 
 #[test]
 fn opt_single_custom_row_enter_opens_editor() {
     // Single-select custom row always opens the editor (typing auto-submits).
-    let a = option_select_action(KC::Enter, false, true, 4, 4, false);
+    let a = option_select_action(KC::Enter, KeyModifiers::NONE, false, true, 4, 4, false);
     assert_eq!(a, OptionAction::OpenEntry);
 }
 
@@ -1135,19 +1135,19 @@ fn opt_single_custom_row_enter_opens_editor() {
 #[test]
 fn opt_arrow_and_vim_navigation() {
     assert_eq!(
-        option_select_action(KC::Up, true, true, 1, 3, false),
+        option_select_action(KC::Up, KeyModifiers::NONE, true, true, 1, 3, false),
         OptionAction::CursorUp
     );
     assert_eq!(
-        option_select_action(KC::Char('k'), true, true, 1, 3, false),
+        option_select_action(KC::Char('k'), KeyModifiers::NONE, true, true, 1, 3, false),
         OptionAction::CursorUp
     );
     assert_eq!(
-        option_select_action(KC::Down, true, true, 1, 3, false),
+        option_select_action(KC::Down, KeyModifiers::NONE, true, true, 1, 3, false),
         OptionAction::CursorDown
     );
     assert_eq!(
-        option_select_action(KC::Char('j'), true, true, 1, 3, false),
+        option_select_action(KC::Char('j'), KeyModifiers::NONE, true, true, 1, 3, false),
         OptionAction::CursorDown
     );
 }
@@ -1155,15 +1155,91 @@ fn opt_arrow_and_vim_navigation() {
 #[test]
 fn opt_esc_rejects() {
     assert_eq!(
-        option_select_action(KC::Esc, true, true, 0, 3, false),
+        option_select_action(KC::Esc, KeyModifiers::NONE, true, true, 0, 3, false),
         OptionAction::Reject
+    );
+}
+
+/// Every modal text field must ignore control chords rather than typing
+/// them (dirge-x2zf). Three fields take free text — plan-approval feedback,
+/// the question tool's custom answer, and the permission deny note — and
+/// two of them had carried the guard from the start. The third pushed the
+/// literal `c` of a Ctrl+C into the user's answer for as long as it had
+/// existed, which is how a key that cancels everywhere else came to corrupt
+/// text here.
+///
+/// A count, not a parse: crude enough to fool, strict enough to catch the
+/// mistake anyone actually makes — adding a fourth field and forgetting.
+#[test]
+fn every_modal_text_field_ignores_control_chords() {
+    let src = include_str!("mod.rs");
+    let lines: Vec<&str> = src.lines().collect();
+    let mut fields = 0;
+    for (i, line) in lines.iter().enumerate() {
+        if !line.contains(".push(c)") {
+            continue;
+        }
+        fields += 1;
+        // The guard rides on the `KeyCode::Char(c)` arm just above.
+        let window = lines[i.saturating_sub(6)..=i].join("\n");
+        assert!(
+            window.contains("KeyModifiers::CONTROL"),
+            "the text field at mod.rs:{} types control chords instead of \
+             ignoring them; guard `KeyCode::Char(c)` on `!CONTROL` as the \
+             other modal fields do",
+            i + 1,
+        );
+    }
+    assert!(
+        fields >= 3,
+        "expected the known text fields; found {fields} — has the shape changed?",
+    );
+}
+
+/// dirge-x2zf: Ctrl+C means "I want out" in every other modal — Permission
+/// denies, the dialogs cancel, plan approval bails. This one only listened
+/// for Esc, so the key a user actually reaches for did nothing.
+#[test]
+fn opt_ctrl_c_rejects_like_every_other_modal() {
+    assert_eq!(
+        option_select_action(
+            KC::Char('c'),
+            KeyModifiers::CONTROL,
+            false,
+            true,
+            0,
+            3,
+            false
+        ),
+        OptionAction::Reject,
+    );
+    assert_eq!(
+        option_select_action(KC::Char('d'), KeyModifiers::CONTROL, true, true, 3, 3, true),
+        OptionAction::Reject,
+    );
+}
+
+/// The discrimination half, and the reason the modifier is checked BEFORE
+/// the key code: a plain `c` is an ordinary keystroke in the option list
+/// (and `j`/`k` are navigation), so reading Ctrl+C off the code alone would
+/// have made the letter itself cancel the questionnaire.
+#[test]
+fn opt_a_plain_c_is_not_a_cancel() {
+    assert_eq!(
+        option_select_action(KC::Char('c'), KeyModifiers::NONE, false, true, 0, 3, false),
+        OptionAction::Ignore,
+    );
+    // And a modifier we do not act on leaves the key alone.
+    assert_eq!(
+        option_select_action(KC::Char('c'), KeyModifiers::ALT, false, true, 0, 3, false),
+        OptionAction::Ignore,
     );
 }
 
 #[test]
 fn opt_unhandled_key_is_ignored() {
     assert_eq!(
-        option_select_action(KC::Tab, true, true, 0, 3, false),
+        option_select_action(KC::Tab, KeyModifiers::NONE, true, true, 0, 3, false),
         OptionAction::Ignore
     );
 }
@@ -1171,7 +1247,7 @@ fn opt_unhandled_key_is_ignored() {
 #[test]
 fn opt_space_off_options_without_custom_is_ignored() {
     // No custom row and cursor somehow at num_options: Space does nothing.
-    let a = option_select_action(KC::Char(' '), true, false, 3, 3, false);
+    let a = option_select_action(KC::Char(' '), KeyModifiers::NONE, true, false, 3, 3, false);
     assert_eq!(a, OptionAction::Ignore);
 }
 

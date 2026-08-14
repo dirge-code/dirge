@@ -998,9 +998,26 @@ pub async fn run_interactive(
                                         entry.buf.pop();
                                         QStep::Stay
                                     }
-                                    KeyCode::Char(c) => {
+                                    // dirge-x2zf: unguarded, this pushed the
+                                    // literal 'c' of a Ctrl+C into the user's
+                                    // answer. `PlanApproval`'s entry has
+                                    // carried this guard all along; this one
+                                    // is the copy that never got it.
+                                    KeyCode::Char(c)
+                                        if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                    {
                                         entry.buf.push(c);
                                         QStep::Stay
+                                    }
+                                    // Ctrl+C bails from the answer field too,
+                                    // not just the option list.
+                                    _ if key.modifiers.contains(KeyModifiers::CONTROL)
+                                        && matches!(
+                                            key.code,
+                                            KeyCode::Char('c') | KeyCode::Char('d')
+                                        ) =>
+                                    {
+                                        QStep::Rejected
                                     }
                                     _ => QStep::Stay,
                                 }
@@ -1009,6 +1026,7 @@ pub async fn run_interactive(
                                 // this arm just applies it to the state.
                                 let action = option_select_action(
                                     key.code,
+                                    key.modifiers,
                                     multi,
                                     custom,
                                     q.cursor,
@@ -5264,6 +5282,7 @@ fn panel_refresh_due(
 /// (re)opens the editor so the answer can be edited in place.
 fn option_select_action(
     key: KeyCode,
+    mods: KeyModifiers,
     multi: bool,
     custom: bool,
     cursor: usize,
@@ -5271,6 +5290,16 @@ fn option_select_action(
     has_custom_text: bool,
 ) -> OptionAction {
     let on_custom_row = custom && cursor == num_options;
+    // dirge-x2zf: Ctrl+C / Ctrl+D mean "I want out" everywhere else in this
+    // UI — Permission maps them to Deny, the dialogs cancel, plan approval
+    // bails. This modal only listened for Esc, so the key a user reaches for
+    // did nothing at all. Checked before the code match so `Char('c')`
+    // cannot be read as an option key.
+    if mods.contains(KeyModifiers::CONTROL)
+        && matches!(key, KeyCode::Char('c') | KeyCode::Char('d'))
+    {
+        return OptionAction::Reject;
+    }
     match key {
         KeyCode::Up | KeyCode::Char('k') => OptionAction::CursorUp,
         KeyCode::Down | KeyCode::Char('j') => OptionAction::CursorDown,
