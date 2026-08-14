@@ -102,6 +102,7 @@ pub(crate) async fn handle_context_overflow(
     *agent_interject = None;
     *agent_cancel = None;
     *ctx.agent_line_started = false;
+    ctx.renderer.end_stream();
     ctx.response_buf.clear();
     *ctx.response_start_line = None;
     ctx.reasoning_buf.clear();

@@ -641,7 +641,6 @@ where
         // dropping by openness would discard perfectly good work. A call with
         // no name cannot dispatch under any provider, which makes it the one
         // safe discriminator.
-        let mut partial = partial;
         let dropped: Vec<String> = partial
             .content
             .iter()

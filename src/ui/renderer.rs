@@ -470,6 +470,7 @@ pub struct ChatSnapshot {
     source: Vec<Block>,
     streaming: bool,
     open_rows: usize,
+    stream_committed: String,
     partial: CompactString,
     partial_color: Color,
     scroll_offset: usize,
@@ -534,6 +535,11 @@ pub struct Renderer {
     /// Rows the open streamed block currently occupies at the buffer tail
     /// (only meaningful while `streaming`).
     open_rows: usize,
+    /// The part of the CURRENT logical stream already sealed into earlier
+    /// blocks, so a re-`stream` of the accumulated source renders only what is
+    /// new (dirge-fw0p). Cleared by [`Renderer::end_stream`] at the turn
+    /// boundaries that end a stream for real.
+    stream_committed: String,
     partial: CompactString,
     partial_color: Color,
     scroll_offset: usize,
@@ -719,6 +725,7 @@ impl Renderer {
             source: Vec::new(),
             streaming: false,
             open_rows: 0,
+            stream_committed: String::new(),
             partial: CompactString::new(""),
             partial_color: Color::White,
             scroll_offset: 0,
@@ -1259,6 +1266,7 @@ impl Renderer {
         slot.source = std::mem::take(&mut self.source);
         slot.streaming = self.streaming;
         slot.open_rows = self.open_rows;
+        slot.stream_committed = std::mem::take(&mut self.stream_committed);
         slot.partial = std::mem::take(&mut self.partial);
         slot.partial_color = self.partial_color;
         slot.scroll_offset = self.scroll_offset;
@@ -1278,6 +1286,7 @@ impl Renderer {
         self.source = std::mem::take(&mut slot.source);
         self.streaming = slot.streaming;
         self.open_rows = slot.open_rows;
+        self.stream_committed = std::mem::take(&mut slot.stream_committed);
         self.partial = std::mem::take(&mut slot.partial);
         self.partial_color = slot.partial_color;
         self.scroll_offset = slot.scroll_offset;
@@ -1297,6 +1306,7 @@ impl ChatSnapshot {
             source: Vec::new(),
             streaming: false,
             open_rows: 0,
+            stream_committed: String::new(),
             partial: CompactString::new(""),
             partial_color: Color::White,
             scroll_offset: 0,
@@ -2303,6 +2313,31 @@ impl Renderer {
     /// it like any other block.
     pub fn stream(&mut self, src: &str, base_color: Color, handle: bool) {
         self.commit_partial();
+        // dirge-fw0p: `src` is the WHOLE accumulated response, re-rendered on
+        // every token. That is only safe while the open block is ours to
+        // replace. Once something else wrote a line — the end-of-run
+        // repair-stats summary is the one users hit — the block is sealed, and
+        // rendering `src` again put a second copy of the entire answer on
+        // screen below the first. Render only what has not been committed yet.
+        //
+        // This holds while streaming too: once a prefix is committed, the open
+        // block carries only the remainder, so that is what a replace must
+        // rewrite. With nothing committed the strip is a no-op and `src` passes
+        // through whole, which is the ordinary path.
+        let src = match src.strip_prefix(self.stream_committed.as_str()) {
+            Some(fresh) => fresh,
+            // Not an extension of the committed text: a new stream whose reset
+            // was missed. Show it whole rather than risk swallowing an answer.
+            None => {
+                self.stream_committed.clear();
+                src
+            }
+        };
+        if src.is_empty() {
+            // Everything is already on screen. This is the ordinary case for
+            // the final commit after a notice sealed the block.
+            return;
+        }
         let block = SourceBlock::Markdown {
             src: src.to_string(),
             base_color,
@@ -2343,12 +2378,37 @@ impl Renderer {
 
     /// dirge-qy3y: seal the open streamed block (no-op when not streaming).
     /// The block stays in `source`; subsequent appends start after it.
+    ///
+    /// dirge-fw0p: the sealed text is remembered as the committed part of the
+    /// current logical stream, so a later `stream` of the same accumulated
+    /// source appends only the remainder instead of a second copy. Use
+    /// [`Self::end_stream`] when the stream is genuinely over.
     pub fn commit_stream(&mut self) {
         if self.streaming {
+            if let Some(Block {
+                src: SourceBlock::Markdown { src, .. },
+                ..
+            }) = self.source.last()
+            {
+                self.stream_committed.push_str(src);
+            }
             self.streaming = false;
             self.open_rows = 0;
             self.enforce_cap();
         }
+    }
+
+    /// dirge-fw0p: end the current logical stream — seal the open block and
+    /// forget what was committed, so the next `stream` starts fresh.
+    ///
+    /// Belongs at the turn boundaries that clear the accumulated response
+    /// buffer (Done, ToolCall, Interjected, ContextOverflow, Error). Sealing
+    /// without this leaves the next turn's text looking like a continuation,
+    /// and an answer repeating the previous one verbatim would then render as
+    /// nothing at all.
+    pub fn end_stream(&mut self) {
+        self.commit_stream();
+        self.stream_committed.clear();
     }
 
     /// dirge-qy3y: keep the scroll view anchored to the same content when a

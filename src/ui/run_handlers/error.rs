@@ -100,6 +100,7 @@ pub(crate) async fn handle_error(
     *agent_rx = None;
     *agent_interject = None;
     *ctx.agent_line_started = false;
+    ctx.renderer.end_stream();
     ctx.response_buf.clear();
     *ctx.response_start_line = None;
     ctx.reasoning_buf.clear();
