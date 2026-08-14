@@ -248,12 +248,22 @@ fn resolve_embedder(
 /// execution directory must all belong to the worktree. Search tools use their
 /// native `ToolRoot` support; this function does not duplicate their path
 /// resolution logic.
+///
+/// `allowed` is the profile's resolved subagent allow-list — the same value
+/// `spawn_subagent_runner` applies on the shared-checkout path. It is applied
+/// HERE rather than left to the caller because this function is the only thing
+/// that knows what it built: an allow-list is a cap, and a cap that the
+/// producer does not enforce is a cap the next producer will forget
+/// (dirge-fwjw — this registry previously ignored the profile entirely, so a
+/// worktree writer got the full writer tool set no matter what its profile
+/// said, while the shared-checkout path honoured it).
 pub async fn build_rooted_writer_tools(
     root: tools::ToolRoot,
     parent_permission: Option<PermCheck>,
     ask_tx: Option<AskSender>,
     sandbox: Sandbox,
     execution_root: crate::sandbox::SandboxExecutionRoot,
+    allowed: &[String],
 ) -> Vec<Arc<dyn crate::agent::agent_loop::LoopTool>> {
     use crate::agent::agent_loop::types::ToolExecutionMode;
     use crate::agent::agent_loop::{LoopTool, RigToolAdapter};
@@ -416,7 +426,22 @@ pub async fn build_rooted_writer_tools(
     writer_tools.push(wrap(tools::BashOutputTool::new(shell_store.clone()), None).await);
     writer_tools.push(wrap(tools::KillShellTool::new(shell_store), None).await);
 
-    writer_tools
+    // Apply the profile's cap. Same helper the shared-checkout fork uses, so
+    // the two dispatch paths cannot drift on what a name means.
+    let names: Vec<&str> = allowed.iter().map(String::as_str).collect();
+    let kept = crate::provider::filter_loop_tools(&writer_tools, &names);
+    if kept.is_empty() {
+        // A writer with no tools burns a worktree, a model call and a turn to
+        // accomplish nothing. Almost always a profile naming tools that this
+        // rooted registry does not build (an MCP tool, or a typo).
+        tracing::warn!(
+            target: "dirge::agents",
+            allowed = %names.join(", "),
+            built = %writer_tools.iter().map(|t| t.name().to_string()).collect::<Vec<_>>().join(", "),
+            "worktree writer profile allows no tool this registry builds — the writer will have nothing to work with",
+        );
+    }
+    kept
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1052,6 +1077,108 @@ pub async fn build_loop_tools(
         mcp_tool_names,
         plugin_tool_names,
     )
+}
+
+/// dirge-fwjw: the profile's tool cap must reach an ISOLATED worktree writer,
+/// not just the shared-checkout fork.
+///
+/// These construct the real registry rather than a stand-in, because the bug
+/// was precisely that this builder ignored the cap it was never given — a test
+/// against a mock filter would have passed throughout.
+#[cfg(test)]
+mod writer_cap_tests {
+    use super::*;
+
+    /// A scratch directory for `ToolRoot`, which canonicalizes and requires
+    /// the path to exist.
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new() -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "dirge-writer-cap-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            Scratch(dir)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    async fn writer_tool_names(allowed: &[&str]) -> Vec<String> {
+        let scratch = Scratch::new();
+        let root = tools::ToolRoot::new(&scratch.0).expect("scratch dir is a valid root");
+        let allowed: Vec<String> = allowed.iter().map(|s| s.to_string()).collect();
+        let built = build_rooted_writer_tools(
+            root,
+            None,
+            None,
+            Sandbox::new(crate::sandbox::SandboxMode::Off),
+            crate::sandbox::SandboxExecutionRoot {
+                worktree: scratch.0.clone(),
+                main_git_dir: scratch.0.join(".git"),
+            },
+            &allowed,
+        )
+        .await;
+        built.iter().map(|t| t.name().to_string()).collect()
+    }
+
+    /// The discrimination half, written first: with a permissive cap the
+    /// registry really does build the writing tools. Without this, the test
+    /// below would pass just as well against a builder that was broken and
+    /// returned nothing.
+    #[tokio::test]
+    async fn a_permissive_profile_still_gets_the_writer_tools() {
+        let names = writer_tool_names(&[
+            "read",
+            "grep",
+            "find_files",
+            "glob",
+            "list_dir",
+            "write",
+            "edit",
+            "bash",
+        ])
+        .await;
+        assert!(names.contains(&"read".to_string()), "{names:?}");
+        assert!(
+            names.contains(&"bash".to_string()),
+            "the registry must actually build bash, or the cap test below proves nothing: {names:?}"
+        );
+    }
+
+    /// The bug: a profile that caps the writer to read-only tools used to get
+    /// the whole rooted registry anyway, because this builder never saw the
+    /// allow-list. Isolating a writer therefore WIDENED what it could reach,
+    /// which is the opposite of what worktree isolation is for.
+    #[tokio::test]
+    async fn a_capped_profile_does_not_get_tools_it_denied() {
+        let names = writer_tool_names(&["read", "grep"]).await;
+        assert!(names.contains(&"read".to_string()), "{names:?}");
+        assert!(names.contains(&"grep".to_string()), "{names:?}");
+        for denied in ["bash", "write", "edit"] {
+            assert!(
+                !names.contains(&denied.to_string()),
+                "{denied} is outside the profile's cap but the writer got it anyway: {names:?}"
+            );
+        }
+    }
+
+    /// An empty cap yields an empty registry rather than silently falling back
+    /// to "everything" — a fallback would turn a misconfigured profile into
+    /// the widest possible writer, which is the failure mode worth being loud
+    /// about.
+    #[tokio::test]
+    async fn an_empty_cap_grants_nothing() {
+        assert!(writer_tool_names(&[]).await.is_empty());
+    }
 }
 
 #[cfg(all(test, any(feature = "mcp", feature = "plugin")))]

@@ -17,6 +17,11 @@ mod resolve;
 mod route;
 mod run;
 mod spawn;
+/// The one hard allow-list filter over a `LoopTool` registry. Re-exported so
+/// the rooted worktree-writer registry applies the SAME cap the shared-checkout
+/// fork does — two dispatch paths agreeing on what a tool name means is the
+/// whole point (dirge-fwjw).
+pub(crate) use spawn::filter_loop_tools;
 mod stream_dispatch;
 pub mod summarize;
 pub mod wire;
