@@ -331,6 +331,54 @@ impl Sandbox {
             .unwrap_or(false)
     }
 
+    /// The bwrap binds for the main repository's `.git` directory.
+    ///
+    /// A subagent writer runs in a `git worktree`, whose `.git` is a *file*
+    /// pointing back at `<main>/.git/worktrees/<name>`. So the main git dir
+    /// has to be reachable and writable, or the writer cannot stage, commit,
+    /// or update its own branch.
+    ///
+    /// Binding all of it read-write hands over rather more than that
+    /// (dirge-v82b). Three things under `.git` are executable configuration,
+    /// not repository data, and writing any of them runs attacker-chosen code
+    /// on the HOST the next time anyone uses the parent repo:
+    ///
+    /// - `hooks/` — the obvious one. A `post-checkout` or `pre-commit` file
+    ///   runs on the host, outside the sandbox, as the user.
+    /// - `config` — `core.fsmonitor`, `core.sshCommand`, `core.pager`,
+    ///   `alias.*`, and `diff.*.textconv` all name commands git will execute.
+    /// - `info/attributes` — can route paths through a filter driver, which
+    ///   is again a command.
+    ///
+    /// So: bind the git dir writable, then shadow those three read-only. bwrap
+    /// applies operations in order and a later bind wins on a subpath, so the
+    /// carve-outs must come after the writable bind — which is what
+    /// `the_carve_outs_come_after_the_writable_bind` pins.
+    ///
+    /// `--ro-bind-try` rather than `--ro-bind`: a fresh repository may have no
+    /// `info/attributes`, and a missing path must not fail the whole sandbox.
+    ///
+    /// Residual, deliberately not covered: `.git/modules/<name>` for
+    /// submodules carries its own `config` and `hooks`. Shadowing those
+    /// read-only would break legitimate submodule work in a writer worktree,
+    /// and a repo with submodules dispatched to an isolated writer is a much
+    /// narrower case than the one this closes. Tracked separately.
+    fn git_dir_bind_args(main_git_dir: &std::path::Path) -> Vec<std::ffi::OsString> {
+        let mut args: Vec<std::ffi::OsString> = Vec::new();
+        let mut bind = |flag: &str, path: std::path::PathBuf| {
+            args.push(flag.into());
+            args.push(path.clone().into_os_string());
+            args.push(path.into_os_string());
+        };
+        // Writable: worktree metadata, the object store, and refs.
+        bind("--bind", main_git_dir.to_path_buf());
+        // Read-only on top: everything under `.git` that names a command.
+        for executable_config in ["hooks", "config", "info/attributes"] {
+            bind("--ro-bind-try", main_git_dir.join(executable_config));
+        }
+        args
+    }
+
     fn build_command(&self, command: &str, root: Option<&SandboxExecutionRoot>) -> Command {
         let mut cmd = if self.mode == SandboxMode::Off {
             let mut c = Command::new("bash");
@@ -361,9 +409,7 @@ impl Sandbox {
             c.arg(cwd.as_os_str());
             c.arg(cwd.as_os_str());
             if let Some(root) = root {
-                c.args(["--bind"]);
-                c.arg(root.main_git_dir.as_os_str());
-                c.arg(root.main_git_dir.as_os_str());
+                c.args(Self::git_dir_bind_args(&root.main_git_dir));
                 c.args(["--chdir"]);
                 c.arg(root.worktree.as_os_str());
             }
@@ -1302,6 +1348,83 @@ mod tests {
             worktree.canonicalize().unwrap()
         );
         std::fs::remove_dir_all(worktree).unwrap();
+    }
+
+    /// Position of `needle` in the arg list, as a whole element.
+    fn arg_index(args: &[std::ffi::OsString], needle: &str) -> Option<usize> {
+        args.iter().position(|a| a == needle)
+    }
+
+    /// The writer must still be able to commit: the main git dir is bound
+    /// WRITABLE. Without this the worktree cannot stage, commit, or move its
+    /// own branch, and isolated dispatch stops working entirely.
+    ///
+    /// This is the discrimination half — written first, because a "fix" that
+    /// simply made `.git` read-only would pass every security assertion below
+    /// while breaking the feature.
+    #[test]
+    fn the_main_git_dir_stays_writable() {
+        let args = Sandbox::git_dir_bind_args(std::path::Path::new("/tmp/dirge-main/.git"));
+        let rw = arg_index(&args, "--bind").expect("the git dir must be bound read-write");
+        assert_eq!(
+            args[rw + 1],
+            std::ffi::OsString::from("/tmp/dirge-main/.git"),
+            "the writable bind must be the git dir itself"
+        );
+    }
+
+    /// dirge-v82b: a writer subagent must not be able to install a hook, edit
+    /// the parent's git config, or add a filter attribute. Each of those names
+    /// a command git will later execute ON THE HOST, outside the sandbox —
+    /// turning a contained writer into arbitrary code execution.
+    #[test]
+    fn executable_git_config_is_not_writable_by_a_writer() {
+        let args = Sandbox::git_dir_bind_args(std::path::Path::new("/tmp/dirge-main/.git"));
+        let rendered: Vec<String> = args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+
+        for path in [
+            "/tmp/dirge-main/.git/hooks",
+            "/tmp/dirge-main/.git/config",
+            "/tmp/dirge-main/.git/info/attributes",
+        ] {
+            let at = rendered
+                .iter()
+                .position(|a| a == path)
+                .unwrap_or_else(|| panic!("{path} is not bound at all: {rendered:?}"));
+            assert_eq!(
+                rendered[at - 1],
+                "--ro-bind-try",
+                "{path} must be bound READ-ONLY; it names commands git runs on the host"
+            );
+        }
+    }
+
+    /// bwrap applies mounts in order and a later bind wins on a subpath, so
+    /// the read-only carve-outs are only carve-outs if they come AFTER the
+    /// writable bind. Reversed, the writable `.git` would shadow them and the
+    /// fix would silently do nothing while every path-based assertion above
+    /// still passed.
+    #[test]
+    fn the_carve_outs_come_after_the_writable_bind() {
+        let args = Sandbox::git_dir_bind_args(std::path::Path::new("/tmp/dirge-main/.git"));
+        let rendered: Vec<String> = args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let writable = rendered
+            .iter()
+            .position(|a| a == "--bind")
+            .expect("writable bind present");
+        for path in ["/tmp/dirge-main/.git/hooks", "/tmp/dirge-main/.git/config"] {
+            let carve = rendered.iter().position(|a| a == path).expect("bound");
+            assert!(
+                carve > writable,
+                "{path} is shadowed by the writable .git bind that follows it"
+            );
+        }
     }
 
     #[test]
