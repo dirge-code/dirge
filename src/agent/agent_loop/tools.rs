@@ -605,23 +605,84 @@ async fn execute_prepared_tool_call(
     // Tools that ALSO poll `is_cancelled()` get even cleaner
     // cancellation since they bail at their next checkpoint
     // rather than relying solely on the drop.
-    let exec_future = tool.execute(&tool_call.id, args.clone(), signal.clone(), on_update);
-    let signal_check = wait_for_cancel(signal.clone());
+    //
+    // dirge-9tl3: the same race now also bounds the call in
+    // TIME. A budget races as a third arm; on expiry the tool
+    // future is dropped, so the exact cancellation machinery
+    // above — RAII guards, bash's `PgKillGuard` — covers the
+    // watchdog path identically. Arm order: cancel, then
+    // completion, then the deadline — a tool that finished must
+    // never lose to a ready timer.
+    //
+    // dirge-8cbm: a `call_budget` override may only RAISE the
+    // shared ceiling, never lower it. An override says "this tool
+    // legitimately needs LONGER" (bash with a model-supplied
+    // timeout, a subagent); a tool that wants to be cut SOONER
+    // should bound itself, where it can produce a better message
+    // than the watchdog can. Taking the max also keeps an
+    // override from shortening the window a human has to answer
+    // the permission prompt this call is sitting behind.
+    let ceiling = crate::timeout::Timeouts::get().tool_call;
+    let budget = tool.call_budget(args).map_or(ceiling, |b| b.max(ceiling));
+    let mut exec_future =
+        std::pin::pin!(tool.execute(&tool_call.id, args.clone(), signal.clone(), on_update));
+    let mut signal_check = std::pin::pin!(wait_for_cancel(signal.clone()));
 
-    let outcome = tokio::select! {
-        biased;  // Prefer the cancel branch when both are ready
-                 // — so a cancel that fires during a fast tool
-                 // doesn't get masked by the tool's completion.
-        _ = signal_check => {
-            // Signal fired before the tool finished. Return an
-            // aborted result; the loop's next signal check at
-            // its turn boundary will exit cleanly.
-            return ExecutedOutcome {
-                result: create_error_tool_result(super::side_effect::ABORTED_SENTINEL),
-                is_error: true,
-            };
+    let outcome = loop {
+        // Re-armed rather than started once, because the budget
+        // has to be able to stop counting — see the expiry arm.
+        let deadline = tokio::time::sleep(budget);
+        tokio::select! {
+            biased;  // Prefer the cancel branch when both are ready
+                     // — so a cancel that fires during a fast tool
+                     // doesn't get masked by the tool's completion.
+            _ = &mut signal_check => {
+                // Signal fired before the tool finished. Return an
+                // aborted result; the loop's next signal check at
+                // its turn boundary will exit cleanly.
+                return ExecutedOutcome {
+                    result: create_error_tool_result(super::side_effect::ABORTED_SENTINEL),
+                    is_error: true,
+                };
+            }
+            result = &mut exec_future => break result,
+            _ = deadline => {
+                // dirge-8cbm: a budget bounds WORK, not a person.
+                // The permission prompt, the `question` tool and
+                // `/plan` approval all wait for the user from
+                // inside `execute`, i.e. inside this window, and
+                // killing a call somebody is halfway through
+                // approving is worse than the stall this exists to
+                // catch. Re-arm with a full budget instead: once
+                // they answer, the tool gets its whole working
+                // window.
+                if crate::human_wait::anyone_waiting() {
+                    continue;
+                }
+                // Watchdog fired: the call was stopped by dispatch,
+                // not failed by the tool. Worded to avoid the retry
+                // classifier's "timeout" vocabulary on purpose —
+                // blindly re-running a runaway call is the wrong
+                // response to a ceiling hit.
+                tracing::warn!(
+                    target: "dirge::agent_loop::tools",
+                    tool = %tool_call.name,
+                    tool_call_id = %tool_call.id,
+                    budget_secs = budget.as_secs(),
+                    "tool call stopped by dispatch budget watchdog",
+                );
+                return ExecutedOutcome {
+                    result: create_error_tool_result(&format!(
+                        "{} call stopped: it exceeded the {}s dispatch budget \
+                         before returning. The call was cut by the watchdog, not \
+                         failed by the tool — narrow the work or split the call \
+                         rather than retrying it unchanged.",
+                        tool_call.name, budget.as_secs()
+                    )),
+                    is_error: true,
+                };
+            }
         }
-        result = exec_future => result,
     };
 
     // LOOP-11: surface the final dropped-update count if any

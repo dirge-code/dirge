@@ -50,6 +50,36 @@ pub(crate) fn resolve_foreground_timeout(
     want
 }
 
+/// Dispatch-watchdog budget for a `bash` call (dirge-9tl3).
+///
+/// Derives from bash's OWN bound — `resolve_foreground_timeout`, whose
+/// ceiling is `timeouts.bash_max` — plus a 30s grace, so bash's own timeout
+/// always fires first and the user gets bash's better-worded message, never
+/// the watchdog's. Not a new number: the watchdog must never cut a call the
+/// tool itself considers in bounds.
+///
+/// `background: true` returns to the caller immediately (the detached shell
+/// is deliberately unbounded), so it needs no special case — `None` hands
+/// the short dispatch to the shared `timeouts.tool_call` ceiling.
+///
+/// Args are a raw `serde_json::Value` and may be malformed; anything
+/// unexpected (not an object, `timeout` of the wrong type) falls back to
+/// `None` rather than panicking or silently reinterpreting the call. A
+/// MISSING `timeout` on a foreground call is fine — the default applies.
+pub(crate) fn dispatch_budget(args: &serde_json::Value) -> Option<std::time::Duration> {
+    let obj = args.as_object()?;
+    if obj.get("background") == Some(&serde_json::Value::Bool(true)) {
+        return None;
+    }
+    let requested = match obj.get("timeout") {
+        None | Some(serde_json::Value::Null) => None,
+        // Wrong type means malformed args — bail, don't guess.
+        Some(v) => Some(v.as_u64()?),
+    };
+    let own = resolve_foreground_timeout(requested, &crate::timeout::Timeouts::get());
+    Some(std::time::Duration::from_secs(own + 30))
+}
+
 pub struct BashTool {
     pub permission: Option<PermCheck>,
     pub ask_tx: Option<AskSender>,
@@ -307,3 +337,47 @@ impl PortableTool for BashTool {
 #[cfg(test)]
 #[cfg(unix)]
 mod tests;
+
+/// dirge-9tl3: ordering guarantees for the dispatch watchdog
+/// budget derived from bash's own bound.
+#[cfg(test)]
+#[cfg(unix)]
+mod budget_tests {
+    use super::*;
+
+    #[test]
+    fn foreground_bash_dispatch_budget_always_exceeds_its_own_resolved_timeout() {
+        let t = crate::timeout::Timeouts::get();
+        for requested in [None, Some(1u64), Some(t.bash.as_secs()), Some(86_400)] {
+            let args = serde_json::json!({ "timeout": requested, "background": false });
+            let budget = dispatch_budget(&args).unwrap_or_else(|| {
+                panic!("foreground call with timeout={requested:?} needs a budget")
+            });
+            let own = resolve_foreground_timeout(requested, &t);
+            assert!(
+                budget > std::time::Duration::from_secs(own),
+                "budget {budget:?} must exceed bash's own {own}s so bash's timeout always fires first"
+            );
+        }
+    }
+
+    #[test]
+    fn background_bash_has_no_budget_override() {
+        // The detached shell is deliberately unbounded and dispatch
+        // returns immediately — no special case; the shared ceiling
+        // covers the short dispatch itself.
+        assert_eq!(
+            dispatch_budget(&serde_json::json!({ "background": true })),
+            None
+        );
+    }
+
+    #[test]
+    fn malformed_bash_args_fall_back_to_no_override() {
+        assert_eq!(dispatch_budget(&serde_json::json!("nonsense")), None);
+        assert_eq!(
+            dispatch_budget(&serde_json::json!({ "timeout": "fast" })),
+            None
+        );
+    }
+}

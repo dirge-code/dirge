@@ -491,6 +491,7 @@ pub struct TimeoutsConfig {
     pub stream_chunk_secs: Option<u64>,
     pub request_establish_secs: Option<u64>,
     pub tool_call_gap_secs: Option<u64>,
+    pub tool_call_secs: Option<u64>,
     pub mcp_call_secs: Option<u64>,
     pub mcp_init_secs: Option<u64>,
     pub lsp_request_secs: Option<u64>,
@@ -1807,6 +1808,7 @@ impl Config {
             stream_chunk: or_default(c.stream_chunk_secs, d.stream_chunk),
             request_establish: or_default(c.request_establish_secs, d.request_establish),
             tool_call_gap: or_default(c.tool_call_gap_secs, d.tool_call_gap),
+            tool_call: or_default(c.tool_call_secs, d.tool_call),
             mcp_call: or_default(c.mcp_call_secs, d.mcp_call),
             mcp_init: or_default(c.mcp_init_secs, d.mcp_init),
             lsp_request: or_default(c.lsp_request_secs, d.lsp_request),
@@ -2851,6 +2853,8 @@ mod tests {
         assert_eq!(t.lsp_request, d.lsp_request);
         assert_eq!(t.mcp_init, d.mcp_init);
         assert_eq!(t.request_establish, d.request_establish);
+        // dirge-9tl3: the dispatch ceiling keeps its default when unset.
+        assert_eq!(t.tool_call, d.tool_call);
 
         // dirge-u44q: request_establish_secs is a first-class override.
         let cfg: Config =
@@ -2858,6 +2862,12 @@ mod tests {
         let t = cfg.resolve_timeouts();
         assert_eq!(t.request_establish, std::time::Duration::from_secs(90));
         assert_eq!(t.stream_chunk, d.stream_chunk);
+
+        // dirge-9tl3: tool_call_secs overrides the dispatch ceiling.
+        let cfg: Config =
+            serde_json::from_str(r#"{ "timeouts": { "tool_call_secs": 45 } }"#).unwrap();
+        let t = cfg.resolve_timeouts();
+        assert_eq!(t.tool_call, std::time::Duration::from_secs(45));
     }
 
     #[test]

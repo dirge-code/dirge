@@ -273,6 +273,26 @@ pub async fn build_rooted_writer_tools(
         })
     }
 
+    /// dirge-9tl3: like `wrap`, but attaches a per-tool dispatch budget for
+    /// tools whose own bound legitimately exceeds the shared ceiling (bash,
+    /// subagents) — so the watchdog never cuts an in-bounds call.
+    async fn wrap_bounded<T>(
+        inner: T,
+        mode: Option<ToolExecutionMode>,
+        budget: crate::agent::agent_loop::rig_tool::CallBudgetFn,
+    ) -> Arc<dyn LoopTool>
+    where
+        T: crate::agent::agent_loop::rig_tool::DynTool + 'static,
+    {
+        let adapter = RigToolAdapter::new(Box::new(inner))
+            .await
+            .with_call_budget(budget);
+        Arc::new(match mode {
+            Some(mode) => adapter.with_execution_mode(mode),
+            None => adapter,
+        })
+    }
+
     let cache = ToolCache::new();
     let shell_store = tools::bg_shell::BackgroundShellStore::new();
     let mut writer_tools: Vec<Arc<dyn LoopTool>> = Vec::new();
@@ -384,11 +404,12 @@ pub async fn build_rooted_writer_tools(
         .await,
     );
     writer_tools.push(
-        wrap(
+        wrap_bounded(
             tools::BashTool::with_cache(permission, ask_tx, sandbox, cache)
                 .with_execution_root(Some(execution_root))
                 .with_shell_store(Some(shell_store.clone())),
             Some(ToolExecutionMode::Sequential),
+            Box::new(tools::bash::dispatch_budget),
         )
         .await,
     );
@@ -521,6 +542,25 @@ pub async fn build_loop_tools(
         };
         Arc::new(adapter)
     }
+    /// dirge-9tl3: like `wrap`, but attaches a per-tool dispatch budget for
+    /// tools whose own bound legitimately exceeds the shared ceiling (bash,
+    /// subagents) — so the watchdog never cuts an in-bounds call.
+    async fn wrap_bounded<T>(
+        inner: T,
+        mode: Option<ToolExecutionMode>,
+        budget: crate::agent::agent_loop::rig_tool::CallBudgetFn,
+    ) -> Arc<dyn LoopTool>
+    where
+        T: crate::agent::agent_loop::rig_tool::DynTool + 'static,
+    {
+        let adapter = RigToolAdapter::new(Box::new(inner))
+            .await
+            .with_call_budget(budget);
+        Arc::new(match mode {
+            Some(mode) => adapter.with_execution_mode(mode),
+            None => adapter,
+        })
+    }
 
     let mut tools: Vec<Arc<dyn LoopTool>> = Vec::new();
 
@@ -617,7 +657,7 @@ pub async fn build_loop_tools(
         .await,
     );
     tools.push(
-        wrap(
+        wrap_bounded(
             tools::BashTool::with_cache(
                 permission.clone(),
                 ask_tx.clone(),
@@ -627,6 +667,7 @@ pub async fn build_loop_tools(
             .with_shell_store(Some(tools::bg_shell::global()))
             .with_shell_path_option(cfg.shell.clone()),
             Some(ToolExecutionMode::Sequential),
+            Box::new(tools::bash::dispatch_budget),
         )
         .await,
     );
@@ -854,7 +895,7 @@ pub async fn build_loop_tools(
     // store); TaskStatus is read-only.
     if let (Some(pm), Some(store)) = (parent_model, bg_store) {
         tools.push(
-            wrap(
+            wrap_bounded(
                 tools::TaskTool::new(
                     permission.clone(),
                     ask_tx.clone(),
@@ -864,6 +905,7 @@ pub async fn build_loop_tools(
                     cfg.resolve_subagent_write_isolation(),
                 ),
                 Some(ToolExecutionMode::Sequential),
+                Box::new(|_: &serde_json::Value| Some(tools::task::dispatch_budget())),
             )
             .await,
         );

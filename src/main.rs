@@ -13,6 +13,9 @@ mod event;
 mod extras;
 mod fs_atomic;
 mod hash;
+/// Marks the stretches of a tool call spent waiting on the user, so the
+/// dispatch watchdog can tell a stalled call from a careful human.
+mod human_wait;
 /// Shared request/response correlation core over `jsonrpc_framing`, used by
 /// both the LSP and DAP clients (each supplies a `Protocol` impl).
 #[cfg(any(feature = "lsp", feature = "dap"))]

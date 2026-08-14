@@ -6,8 +6,10 @@ Prompted by a report of the TUI hanging mid-session, possibly around a
 [What would identify it](#what-would-identify-it) — but each is reachable from
 the code as it stands, and the first two are structural.
 
-**§1 and §1b are fixed** (`dirge-r5l1`, `dirge-u9xv`); §2, §3 and §4 are not.
-The description of each is kept as it was, followed by what changed.
+**§1, §1b and §3 are fixed** (`dirge-r5l1`, `dirge-u9xv`, `dirge-9tl3` +
+`dirge-8cbm`); §2 and §4 are not, though §2 turned out to have one specific
+instance worth naming (`dirge-bz0a`, below). The description of each is kept
+as it was, followed by what changed.
 
 ## The fact that shapes all of this
 
@@ -144,6 +146,41 @@ synchronous on the hot path freezes input handling for its full duration:
 The dividing line is whether a path uses `spawn_blocking` (72 call sites do).
 Everything else is on the critical thread.
 
+### One instance is not diffuse at all — `dirge-bz0a`
+
+Treating this as "~280 `std::fs::` calls to sweep" hid the case that actually
+bites. Three transports — `anthropic_http.rs`, `kimi_http.rs`,
+`codex_http.rs` — resolve their bearer in a sync `RefreshableToken::bearer()`
+called from `normalized_request`, i.e. **on the per-request path**:
+
+```rust
+fn bearer(&self) -> String {
+    let mut state = self.state.lock()…;   // std::sync::Mutex, held throughout
+    if expired {
+        match (self.refresher)() { … }    // → std::thread::spawn(…).join()
+    }
+}
+```
+
+The refresher spawns an OS thread, builds a whole tokio runtime, and
+`block_on`s an HTTP exchange — while the only runtime thread waits on
+`join()`. Nothing paints, no keystroke is read, and **no timer can fire**,
+including the §3 watchdog meant to bound whatever is stuck. Bounded per
+attempt (30s) but Kimi retries three times with backoff, and Kimi access
+tokens live 15 minutes, so it recurs through a long session. All three carry
+the same comment — *"Refresh is rare (once per token lifetime) so doing it
+synchronously here is acceptable"* — which predates the single-threaded
+runtime.
+
+The fix is to hoist the bearer resolution into the async `send` and run the
+refresh through `spawn_blocking`; the `Mutex` must not be held across it
+either.
+
+For contrast, the other candidate checked and cleared: `guard_untrusted_result`
+runs ~25 regexes over an untrusted body with no size cap, on this thread. The
+`regex` crate is linear-time and websearch truncates each result to 500 chars,
+so it is sub-second on anything realistic. Not a hang.
+
 ## 3. Nothing bounds a built-in tool call
 
 `src/timeout.rs` is the source of truth and covers `stream_chunk`,
@@ -160,6 +197,40 @@ nothing underneath it.
 Dispatch does race the abort signal (`tokio::select!` on `wait_for_cancel`),
 so a stuck *async* tool is at least interruptible — provided the thread is free
 enough to notice the signal, which §2 is about.
+
+### Fixed
+
+The same race now bounds the call in time. `timeouts.tool_call` (600s) is a
+**ceiling on one dispatch**, not a per-tool default: every tool keeps its own
+tighter bound, and this exists so a tool that forgets — or a path that skips
+its own client — cannot stall a run silently. A tool whose own bound
+legitimately exceeds it declares that through `LoopTool::call_budget`; `bash`
+derives it from `resolve_foreground_timeout`, the subagent from its clamp
+ceiling, each plus a grace so the tool's own timeout fires first and produces
+the better message. Wiring is a builder on `RigToolAdapter` set where the
+concrete tool is constructed, so a new tool cannot be missed by a name table.
+On expiry the tool future is dropped, which runs the same RAII guards
+cancellation relies on — bash's `PgKillGuard` and the rest.
+
+Two rules keep it from doing harm, both of which cost a round of rework to
+find (`dirge-8cbm`):
+
+**An override may only raise the ceiling, never lower it.** An override says
+"this tool needs longer"; a tool that wants to be cut sooner should bound
+itself, where it can say why.
+
+**The budget bounds work, not a person.** The permission prompt, the
+`question` tool and `/plan` approval all wait for the user from *inside*
+`LoopTool::execute` — inside the window being bounded. As first written the
+watchdog would have cut a `bash` call after 150s because the user was still
+reading the command they were asked to approve, which is worse than the stall
+it exists to catch. `src/human_wait.rs` marks those stretches and the watchdog
+re-arms rather than firing while any are open. The count is process-wide, so
+one prompt holds off every in-flight watchdog — erring toward not cutting,
+which is the direction to err in.
+
+The known limitation is the one §2 describes: this bounds *async* stalls only.
+A tool that blocks the runtime thread never lets the timer be polled.
 
 ## 4. A permission ask nobody answers
 

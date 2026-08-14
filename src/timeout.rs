@@ -99,6 +99,23 @@ pub struct Timeouts {
     pub request_establish: Duration,
     /// Stall window while a tool call is mid-assembly in the stream.
     pub tool_call_gap: Duration,
+    /// CEILING on ONE tool dispatch (dirge-9tl3) — the watchdog in
+    /// `execute_prepared_tool_call` cuts any call that exceeds it. This is
+    /// NOT a per-tool default: websearch/bash/task and friends keep their
+    /// own, tighter bounds, and this exists so a tool that forgets to bound
+    /// itself (or a path that skips its own client) can never stall a run
+    /// silently. Deliberately generous — it should only ever fire on
+    /// something pathological.
+    ///
+    /// NOT to be confused with [`Self::tool_call_gap`]: that is the stall
+    /// window while a tool call is being ASSEMBLED in the LLM stream (args
+    /// still streaming in); this bounds the EXECUTION of an assembled call.
+    ///
+    /// Known limitation: this only bounds ASYNC stalls. dirge runs on
+    /// `#[tokio::main(flavor = "current_thread")]`, so a tool that blocks
+    /// the runtime thread synchronously never lets the timer be polled and
+    /// the watchdog cannot fire. Tracked separately.
+    pub tool_call: Duration,
     /// Total budget for one MCP tool call, including reconnect + retry.
     pub mcp_call: Duration,
     /// MCP server `initialize` handshake.
@@ -129,6 +146,7 @@ impl Timeouts {
     pub const DEFAULT_STREAM_CHUNK_SECS: u64 = 300;
     pub const DEFAULT_REQUEST_ESTABLISH_SECS: u64 = 300;
     pub const DEFAULT_TOOL_CALL_GAP_SECS: u64 = 60;
+    pub const DEFAULT_TOOL_CALL_SECS: u64 = 600;
     pub const DEFAULT_MCP_CALL_SECS: u64 = 120;
     pub const DEFAULT_MCP_INIT_SECS: u64 = 10;
     pub const DEFAULT_LSP_REQUEST_SECS: u64 = 30;
@@ -146,6 +164,7 @@ impl Timeouts {
         stream_chunk: Duration::from_secs(Self::DEFAULT_STREAM_CHUNK_SECS),
         request_establish: Duration::from_secs(Self::DEFAULT_REQUEST_ESTABLISH_SECS),
         tool_call_gap: Duration::from_secs(Self::DEFAULT_TOOL_CALL_GAP_SECS),
+        tool_call: Duration::from_secs(Self::DEFAULT_TOOL_CALL_SECS),
         mcp_call: Duration::from_secs(Self::DEFAULT_MCP_CALL_SECS),
         mcp_init: Duration::from_secs(Self::DEFAULT_MCP_INIT_SECS),
         lsp_request: Duration::from_secs(Self::DEFAULT_LSP_REQUEST_SECS),
@@ -234,6 +253,8 @@ mod tests {
         assert_eq!(t.lsp_request, Duration::from_secs(30));
         assert_eq!(t.lsp_initialize, Duration::from_secs(45));
         assert_eq!(t.bash, Duration::from_secs(120));
+        // dirge-9tl3: dispatch-level ceiling on one tool call.
+        assert_eq!(t.tool_call, Duration::from_secs(600));
         // Default impl agrees with the DEFAULT const.
         assert_eq!(Timeouts::default().mcp_call, t.mcp_call);
     }
