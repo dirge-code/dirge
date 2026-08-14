@@ -669,3 +669,62 @@ aborted report is not a failing report.** When the absent-arm guard is removed,
 awk dies, `set -e` kills the selftest, and every `reject` assertion in it passes
 vacuously on empty output. The exit code was correct and named nothing. The
 harness now catches the abort and reports it as a normal failing check.
+
+## When the scorer is the thing that is wrong
+
+The compaction-schema round (`dirge-e31n.7`) asked one question — does a
+labelled-slot summary template preserve more than the narrative sections —
+against a scorer that counted verbatim recall of twenty planted facts. The
+implementation was fine every time. The **scorer** was wrong three times, and
+each bug was on course to produce a confident, publishable, false answer.
+
+| What it reported | What was true |
+|---|---|
+| `sections` dropped the error string 4 runs of 5 | It preserved it. The model wrote `` `called Option::unwrap() on a None value` `` — the outer code span ate the inner backticks — and `contains` on a needle with backticks missed |
+| Same fact "dropped" by the other arm | It escaped the backticks instead: `` `called \`Option::unwrap()\` on a \`None\` value` `` |
+| A number "dropped" | The model wrote ``offset `883421` ``; the needle was `offset 883421` |
+| Both arms declared the truncation gap 6/6 | Neither did. One planted fact was `rejected the truncate-and-replay approach`, and the coverage detector scans for `truncat` |
+| A healthy coverage report read as a declared gap | `SOURCE_COVERAGE: COMPLETE — no truncation marker` contains `truncat`, and the detector had no negation handling |
+
+Three rules come out of it, and none of them are about compaction.
+
+**A scorer that matches strings must be tested against the strings the model
+actually writes, not the ones you planted.** Fixtures are written in the
+author's voice; a model writing markdown wraps identifiers in backticks,
+escapes them, or reflows them. Those are presentation, not content, and a
+scorer that counts them as losses measures formatting habits. Worse, it does so
+*unevenly* — the arm that writes more prose formats more — which is precisely
+the difference under test, so the artifact lands squarely on the dependent
+variable. Dump the model's actual output on the first disagreement and read it
+before believing the number.
+
+**A detector and its fixture must not share vocabulary.** The coverage detector
+scanned for `truncat`; a planted fact contained `truncate-and-replay`. Every
+summary that faithfully preserved that fact was scored as declaring a gap, so
+*the better the summary, the more certainly it misreported*. This is now a
+test — no planted needle, and no fixture turn, may trip the detector — because
+the general form is the fixable one: any future keyword or fact that collides
+fails there instead of silently inverting a result.
+
+**Negation is not a refinement.** The single most common thing a summarizer with
+a coverage slot writes is "COMPLETE — no truncation marker was shown". A bare
+substring scan reads that as a declared gap, i.e. it inverts the healthy case,
+for every run of the arm that has the feature. A keyword scanner over
+free-form model prose needs negation handling before it is run once, not after
+it produces a suspicious result.
+
+The pattern behind all three: **a one-sided assertion cannot see its own
+artifact.** Every one of these was caught by pairing — `scorer_credits_a_fact_the_model_reformatted`
+against `scorer_still_catches_a_paraphrase`,
+`coverage_detector_fires_on_a_declared_gap` against
+`coverage_detector_does_not_fire_on_a_confident_summary`. The negative half is
+where the bugs were: two of the three surfaced the moment a "must NOT fire"
+case was written down, before any model was called.
+
+One last note on reading the result. At n=8 the two schemas looked different —
+means 19.1 vs 19.8, with the sections arm carrying two lossy runs among six
+perfect ones. At n=20 they were identical (8 vs 9 facts lost of 400). The
+apparent gap was noise, and the mean was hiding the shape either way: report
+the tail (facts lost, runs losing 2+) alongside it, because for compaction the
+occasional run that drops five facts *is* the failure mode and a mean of 19
+describes neither arm.
