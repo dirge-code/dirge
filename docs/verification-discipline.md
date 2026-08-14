@@ -728,3 +728,30 @@ apparent gap was noise, and the mean was hiding the shape either way: report
 the tail (facts lost, runs losing 2+) alongside it, because for compaction the
 occasional run that drops five facts *is* the failure mode and a mean of 19
 describes neither arm.
+
+### A failed call is not a bad result
+
+One more from the same harness, found while using it rather than while writing
+it. The recall probes ended with
+
+```rust
+let summary = summarize(prompt).await.unwrap_or_default();
+```
+
+so a provider error became an empty string, scored `0/20`, and was reported as
+a **maximally lossy summary**. It is the same mistake as the aborted report
+above, inverted: there the failure vanished, here it was promoted into a data
+point.
+
+It is worse than a lost run because it is *plausible*. The arm carrying the
+failure read 17.4/20 against another's 19.9 and looked like a real fidelity
+difference — the mean moved by exactly the amount a fabricated worst-possible
+score moves it. Re-running with failures counted separately put the same arm at
+19.3 and the shipped one at 20.0.
+
+The rule: **a call that could not run must be excluded and counted, never
+scored.** Any `unwrap_or_default`, `unwrap_or(0)`, or `.ok()` on the boundary
+between your harness and something that can fail is a candidate for this, and
+the tell is that the failure mode produces a value inside the range of real
+results instead of outside it. A summary that scores zero and a request that
+404'd are indistinguishable downstream unless the harness keeps them apart.
