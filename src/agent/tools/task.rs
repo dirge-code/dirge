@@ -1214,6 +1214,12 @@ impl TaskTool {
                             worktree,
                             main_git_dir: main_git_dir.clone(),
                         },
+                        // dirge-fwjw: the profile's cap applies here too. This
+                        // path used to hand over the whole rooted registry,
+                        // while the shared-checkout fork below passed the same
+                        // list to `spawn_subagent_runner` — so isolating a
+                        // writer quietly widened what it could reach.
+                        &allowed_for_task,
                     )
                     .await;
                     agent.spawn_subagent_runner_with_tools(
