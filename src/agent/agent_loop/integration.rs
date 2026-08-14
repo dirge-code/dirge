@@ -786,7 +786,16 @@ pub fn spawn_loop_runner(cfg: LoopSpawnConfig) -> LoopRunner {
     // auto-compaction can fire on_pre_compress mid-loop.
     let memory_provider = cfg.memory_provider.clone();
 
-    let task = tokio::spawn(async move {
+    // The run goes on the AGENT runtime, not the caller's. Tools block their
+    // thread — 288 direct `std::fs::` calls, tree-sitter parses, injection
+    // scans — and while that thread was the UI's, blocking it meant no paint,
+    // no keystroke (Ctrl+C included) and no timer, so not even the dispatch
+    // watchdog could fire. See `crate::runtime`.
+    //
+    // The interject and cancel forwarders above stay on the caller's runtime
+    // deliberately: they must still be able to RECEIVE a signal while this
+    // task has its own thread blocked inside a tool.
+    let task = crate::runtime::spawn_agent(async move {
         // Every run's event stream ends with a terminal event, even
         // when the run does not get to say so itself. Declared FIRST so
         // it drops LAST — after both senders below — and its own clone

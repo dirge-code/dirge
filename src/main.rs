@@ -34,6 +34,7 @@ mod permission;
 mod plugin;
 mod prompt_cache;
 mod provider;
+mod runtime;
 mod sandbox;
 #[cfg(feature = "semantic")]
 mod semantic;
