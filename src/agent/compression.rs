@@ -1222,7 +1222,7 @@ pub fn summary_budget(compressed_tokens: u64) -> u64 {
 
 /// Every section name `build_summary_prompt` asks for. Used to recognize a
 /// summary structurally.
-const SUMMARY_SECTIONS: [&str; 14] = [
+const SUMMARY_SECTIONS: [&str; 15] = [
     "Active Task",
     "Goal",
     "Constraints & Preferences",
@@ -1237,10 +1237,15 @@ const SUMMARY_SECTIONS: [&str; 14] = [
     "Remaining Work",
     "Critical Context",
     "Source Coverage",
+    // dirge-dlpl: from the `/compact` template only. `validate_summary` is now
+    // applied to BOTH paths' summaries, so the recognised set has to be the
+    // union of what either prompt asks for — a list derived from one template
+    // would reject the other's output as unstructured.
+    "Progress",
 ];
 
-/// Sections that must carry real content. One is a stub; the template asks
-/// for fourteen, so two is a floor, not a target.
+/// Sections that must carry real content. One is a stub; the templates ask for
+/// fourteen and six, so two is a floor, not a target.
 const MIN_SUMMARY_SECTIONS: usize = 2;
 
 /// True when a section body says nothing — the placeholder a model emits
@@ -2577,31 +2582,52 @@ mod tests {
     /// format! string and splitting it to derive headers would cost more
     /// clarity than it buys.
     #[test]
-    fn the_section_list_matches_the_template() {
-        let turns = vec![serde_json::json!({"role": "user", "content": "hi"})];
-        let prompt = build_summary_prompt(&turns, 2000, None, None).expect("clean");
-        let headers: Vec<&str> = prompt
-            .lines()
-            .filter_map(|l| l.trim().strip_prefix("## "))
-            .map(str::trim)
-            .collect();
+    fn the_section_list_matches_the_templates() {
+        fn headers_of(prompt: &str) -> Vec<String> {
+            prompt
+                .lines()
+                .filter_map(|l| l.trim().strip_prefix("## "))
+                .map(|h| h.trim().to_string())
+                .collect()
+        }
 
-        for h in &headers {
+        let turns = vec![serde_json::json!({"role": "user", "content": "hi"})];
+        let in_loop = headers_of(&build_summary_prompt(&turns, 2000, None, None).expect("clean"));
+        let compact = headers_of(&crate::agent::prompt::compaction_prompt());
+
+        // dirge-dlpl: BOTH templates, because validate_summary now gates both
+        // paths. A list derived from one of them would silently reject the
+        // other's output as unstructured.
+        for h in in_loop.iter().chain(compact.iter()) {
             assert!(
-                SUMMARY_SECTIONS.contains(h),
-                "template asks for '## {h}' but SUMMARY_SECTIONS does not list it, \
-                 so validate_summary will never count it"
+                SUMMARY_SECTIONS.contains(&h.as_str()),
+                "a template asks for '## {h}' but SUMMARY_SECTIONS does not list \
+                 it, so validate_summary will never count it"
             );
         }
         for name in SUMMARY_SECTIONS {
             assert!(
-                headers.contains(&name),
-                "SUMMARY_SECTIONS lists '{name}' but the template no longer asks \
-                 for it"
+                in_loop.iter().any(|h| h == name) || compact.iter().any(|h| h == name),
+                "SUMMARY_SECTIONS lists '{name}' but neither template asks for it"
             );
         }
-        // And the section this test was written for is actually there.
-        assert!(headers.contains(&"Source Coverage"));
+        assert!(in_loop.iter().any(|h| h == "Source Coverage"));
+        assert!(compact.iter().any(|h| h == "Source Coverage"));
+    }
+
+    /// dirge-dlpl: a real `/compact` summary must pass the validation now
+    /// gating that path. Its template differs from the in-loop one, so this is
+    /// not implied by the in-loop tests — and if it failed, every `/compact`
+    /// would be refused.
+    #[test]
+    fn a_compact_shaped_summary_validates() {
+        let summary = "## Goal\nShip the backfill fix.\n\n\
+             ## Progress\n- **Done:** wrote crates/ingest/src/resume.rs\n\n\
+             ## Key Decisions\nRejected drop-and-replay; it loses the offset.\n\n\
+             ## Relevant Files\n- config/staging/ingest.toml — batch size\n\n\
+             ## Critical Context\nINGEST_BATCH_SIZE=512\n\n\
+             ## Source Coverage\nCOMPLETE";
+        assert!(validate_summary(summary));
     }
 
     // ── build_summary_prompt: injection defense (dirge-tgb9) ──

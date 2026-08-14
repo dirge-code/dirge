@@ -423,10 +423,43 @@ pub(crate) async fn rebuild_agent_parts(
     .await;
 }
 
+/// Why an about-to-be-installed `/compact` summary was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompactionRefusal {
+    /// Costs more tokens than the messages it replaces.
+    Oversized,
+    /// Not a structured summary — a refusal, an acknowledgement, a stray line.
+    Unstructured,
+}
+
+/// Should this summary be installed? (dirge-dlpl)
+///
+/// `/compact` checked only the SIZE. The in-loop fold has always also required
+/// [`validate_summary`](crate::agent::compression::validate_summary) — a
+/// summary that is not structurally a summary is rejected there and the pruned
+/// context is kept. `/compact` had no such check, so a summarizer that returned
+/// a refusal, an acknowledgement, or one stray line got it installed, and the
+/// messages it replaced were dropped from the session. Short junk passes the
+/// size check by definition: the smaller the garbage, the more certainly it was
+/// accepted.
+///
+/// Pure so it can be tested; `install_compaction` is a twenty-argument async
+/// function wired to the whole UI.
+pub(crate) fn compaction_refusal(summary: &str, net_saved: i64) -> Option<CompactionRefusal> {
+    if net_saved < 0 {
+        return Some(CompactionRefusal::Oversized);
+    }
+    if !crate::agent::compression::validate_summary(summary) {
+        return Some(CompactionRefusal::Unstructured);
+    }
+    None
+}
+
 /// dirge-tv3p: the on-UI-thread INSTALL half — given the summary from the
 /// (off-thread) summarizer, rotate the session and rebuild the agent. Cheap
-/// relative to the LLM call. Refuses to install a summary larger than the
-/// messages it replaces (audit M9).
+/// relative to the LLM call. Refuses to install a summary that is oversized
+/// (audit M9) or that is not structurally a summary at all (dirge-dlpl) — see
+/// [`compaction_refusal`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn install_compaction(
     summary: String,
@@ -471,17 +504,17 @@ pub(crate) async fn install_compaction(
     // user can adjust `keep_recent_tokens` / their compress prompt
     // and re-issue. Skipping the install also avoids polluting the
     // session-tree with a node we'd want to revert.
-    if net_saved < 0 {
-        renderer.write_line(
-            &format!(
+    if let Some(refusal) = compaction_refusal(&summary, net_saved) {
+        let msg = match refusal {
+            CompactionRefusal::Oversized => format!(
                 "compress aborted — summary ({}t) is LARGER than the {} messages it would replace ({}t); net cost +{}t. Compression rejected. Consider lowering keep_recent_tokens or refining compress instructions, then re-run /compress.",
-                summary_tokens_est,
-                cut_idx,
-                tokens_before,
-                -net_saved,
+                summary_tokens_est, cut_idx, tokens_before, -net_saved,
             ),
-            c_error(),
-        )?;
+            CompactionRefusal::Unstructured => format!(
+                "compress aborted — the summarizer returned something that is not a structured summary, so the {cut_idx} messages it would replace have been kept. Re-run /compress to try again.",
+            ),
+        };
+        renderer.write_line(&msg, c_error())?;
         return Ok(CompressOutcome::NoOp);
     }
 
@@ -1357,6 +1390,54 @@ mod tests {
             names.len(),
             total,
             "duplicate command name in slash_commands()",
+        );
+    }
+
+    /// dirge-dlpl: `/compact` used to check only the SIZE, so a summarizer
+    /// that returned a refusal or an acknowledgement had it installed as the
+    /// session record and the messages it replaced were dropped. Short junk
+    /// passes a size check by definition — the smaller the garbage, the more
+    /// certainly it was accepted, which is why the guard had to be structural.
+    #[test]
+    fn compact_refuses_a_summary_that_is_not_a_summary() {
+        use super::{CompactionRefusal, compaction_refusal};
+
+        for junk in [
+            "I'm sorry, I can't help with that.",
+            "Understood.",
+            "Here is the summary you asked for.",
+            "## Notes\nnothing much happened",
+        ] {
+            assert_eq!(
+                compaction_refusal(junk, 5_000),
+                Some(CompactionRefusal::Unstructured),
+                "installed a non-summary: {junk:?}"
+            );
+        }
+    }
+
+    /// The other half. A real summary in the shape `/compact` asks for must be
+    /// installed — a guard that refused everything would look identical in the
+    /// code and turn every /compact into a no-op.
+    #[test]
+    fn compact_installs_a_real_summary() {
+        use super::compaction_refusal;
+        let good = "## Goal\nShip the backfill fix.\n\n\
+             ## Progress\n- **Done:** wrote crates/ingest/src/resume.rs\n\n\
+             ## Key Decisions\nRejected drop-and-replay.\n\n\
+             ## Critical Context\nINGEST_BATCH_SIZE=512";
+        assert_eq!(compaction_refusal(good, 5_000), None);
+    }
+
+    /// The size guard still fires, and takes precedence: an oversized summary
+    /// is reported as oversized even though it is also well-formed.
+    #[test]
+    fn compact_still_refuses_an_oversized_summary() {
+        use super::{CompactionRefusal, compaction_refusal};
+        let good = "## Goal\nShip it.\n\n## Critical Context\nBATCH=512";
+        assert_eq!(
+            compaction_refusal(good, -1),
+            Some(CompactionRefusal::Oversized)
         );
     }
 }
