@@ -71,6 +71,7 @@ pub mod stream;
 pub mod suggest;
 pub mod thinking_budget;
 pub mod tool;
+pub mod tool_aliases;
 pub mod tool_error_class;
 pub mod tool_input_repair;
 pub mod tool_retry;

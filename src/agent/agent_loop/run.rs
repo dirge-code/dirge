@@ -2964,6 +2964,9 @@ pub async fn run_loop(
                     tally.record_dropped_unknown_name();
                     super::suggest::log_tool_name_miss(missed, &allowed_names, "scavenged");
                 }
+                for note in &scavenge_result.notes {
+                    tracing::debug!(target: "dirge::agent_loop::scavenge", "{note}");
+                }
                 if !scavenge_result.calls.is_empty() {
                     // LOOP-12: canonicalize the JSON so different key orders or
                     // numeric reprs (1 vs 1.0) for the same logical call don't
@@ -3022,6 +3025,28 @@ pub async fn run_loop(
                         }
                     }
                 }
+            }
+
+            // dirge-e31n.8: place names the model wrote for a tool dirge
+            // calls something else — `shell` for `bash`, `ask_user` for
+            // `question`, `Bash` for `bash`. ONE site, covering native and
+            // scavenged calls alike, and it rewrites the name in place so
+            // everything downstream — storm signatures, the tally, the event
+            // stream, the tool result — sees the tool that actually ran.
+            //
+            // Before storm and before truncation repair, so a guessed name
+            // and its real spelling cannot survive as two distinct calls.
+            for (guessed, real) in
+                super::tool_aliases::resolve_call_names(&mut tool_calls, &allowed_names)
+            {
+                tally.record_aliased_tool_name();
+                tracing::info!(
+                    target: "dirge::tool_miss",
+                    tool = %guessed,
+                    resolved = %real,
+                    path = "aliased",
+                    "resolved a tool name the model wrote differently",
+                );
             }
 
             // dirge-7bwx: truncation repair runs BEFORE storm

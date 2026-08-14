@@ -972,6 +972,7 @@ run_arm() { # $1 = overrides, $2 = tag, $3 = model
       # can be read as an effect while these are zero in both arms.
       halluc="$(get_field hallucinated_tool_names "$gates_line")"
       dropped="$(get_field dropped_unknown_names "$gates_line")"
+      aliased="$(get_field aliased_tool_names "$gates_line")"
       scavenged="$(get_field scavenged_calls "$gates_line")"
       storm="$(get_field storm_suppressions "$gates_line")"
       maxstreak="$(get_field max_failure_streak "$gates_line")"
@@ -1006,7 +1007,7 @@ run_arm() { # $1 = overrides, $2 = tag, $3 = model
     else
       tally_found=0
       turns=0; tool_calls_f=0; errored=0; err_missing=0; unresolved=0; scavenged=0; storm=0
-      halluc=0; dropped=0
+      halluc=0; dropped=0; aliased=0
       maxstreak=0; rep_invalid=0; rep_total=0; verification="-"
       nudge_prologue=0; nudges_total=0; gates_total=0; captier="-"; boundaries="none"
     fi
@@ -1051,12 +1052,12 @@ run_arm() { # $1 = overrides, $2 = tag, $3 = model
     # Col 20 (gates_fired) is APPENDED so columns 1..19 keep their meaning —
     # an older results.tsv still reports, it just has no gate column. Cols
     # 21..24 (tokens, cache, session_found) are appended for the same reason.
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
       "$2" "$3" "$i" "$turns" "$tool_calls_f" "$errored" "$scavenged" "$storm" \
       "$maxstreak" "$rep_invalid" "$rep_total" "$verification" "$fw" "$ok" "$tally_found" \
       "$nudge_prologue" "$nudges_total" "$captier" "$boundaries" "$gates_total" \
       "$in_tok" "$cached_tok" "$create_tok" "$sess_found" "$denied_n" "$compactions" \
-      "$err_missing" "$unresolved" "$halluc" "$dropped" \
+      "$err_missing" "$unresolved" "$halluc" "$dropped" "$aliased" \
       >> "$WORK/results.tsv"
 
     if [ "$tally_found" = 1 ]; then tally_str=found; else tally_str=missing; fi
@@ -1177,7 +1178,7 @@ NF < 19 { malformed_rows++; next }
   # the range renders `(..)` where an absent-but-accumulated column renders
   # `(0..0)` — the two are distinguishable on sight, which is what let this
   # be caught when col 27 was appended without extending the list.
-  nnum = split("4 5 6 7 8 9 10 11 16 17 20 21 22 23 25 26 27 28 29 30", numcols, " ")
+  nnum = split("4 5 6 7 8 9 10 11 16 17 20 21 22 23 25 26 27 28 29 30 31", numcols, " ")
   for (ci = 1; ci <= nnum; ci++) {
     c = numcols[ci]
     # `+ 0` coerces: an ABSENT column (a results.tsv written before it
@@ -1426,6 +1427,7 @@ END {
     # reported to the model, the second to nobody.
     row("hallucinated_tool_names", spread(ck, 29), spread(tk, 29), "mechanism")
     row("dropped_unknown_names", spread(ck, 30), spread(tk, 30), "mechanism")
+    row("aliased_tool_names", spread(ck, 31), spread(tk, 31), "mechanism")
     row("storm_suppressions", spread(ck, 8), spread(tk, 8), dir3(mean(ck, 8), mean(tk, 8), 1, 0.5, noisefloor(ck, 8)))
     row("max_failure_streak", spread(ck, 9), spread(tk, 9), dir3(mean(ck, 9), mean(tk, 9), 1, 0.5, noisefloor(ck, 9)))
     row("repair_invalid", spread(ck, 10), spread(tk, 10), dir3(mean(ck, 10), mean(tk, 10), 1, 0.5, noisefloor(ck, 10)))

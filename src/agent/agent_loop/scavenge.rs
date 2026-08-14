@@ -37,8 +37,9 @@
 //!     explicit tool-call tag is not.
 //!
 //! Precision throughout rests on the same gate as before: a candidate becomes
-//! a call only if it carries a `name` in `allowed_names`. Repair never invents
-//! one.
+//! a call only if it carries a `name` that [`is_dispatchable`] — one this run
+//! has, or one the alias table places on a tool this run has. Repair never
+//! invents a name, and the gate never widens past the tools that exist.
 
 use crate::agent::agent_loop::tool_input_repair::repair_truncated_json;
 use crate::agent::agent_loop::tools::ToolCall;
@@ -94,7 +95,13 @@ static RE_FENCED_CALL: LazyLock<Regex> = LazyLock::new(|| {
 #[derive(Debug, Clone, Default)]
 pub struct ScavengeResult {
     pub calls: Vec<ToolCall>,
-    #[allow(dead_code)]
+    /// What the pass did, one line per event — which shape each accepted call
+    /// came from, or why the pass was skipped entirely.
+    ///
+    /// These were built and dropped on the floor until dirge-e31n.8. The one
+    /// that mattered is the skip: a reasoning blob over [`MAX_SCAVENGE_INPUT`]
+    /// turns scavenging off for that turn, which on a model that emits its
+    /// calls as text means every call in it is lost, and nothing said so.
     pub notes: Vec<String>,
     /// Names from EXPLICIT call syntax that matched no tool, so the call was
     /// dropped (dirge-e31n.8).
@@ -146,7 +153,7 @@ pub fn scavenge_tool_calls(
         if out.len() >= max {
             break;
         }
-        if !allowed_names.contains(&invoke.name) {
+        if !is_dispatchable(&invoke.name, allowed_names) {
             if unknown_names.len() < MAX_UNKNOWN_NAMES {
                 unknown_names.push(invoke.name.clone());
             }
@@ -498,6 +505,19 @@ fn iterate_json_objects(text: &str) -> Vec<String> {
     out
 }
 
+/// Whether a name in scavenged text will reach a tool — either because it IS
+/// one, or because the alias table places it (dirge-e31n.8).
+///
+/// The name is NOT rewritten here. Resolution happens once, in the loop, over
+/// the final call list, so a scavenged call and a native one carrying the same
+/// guessed name are handled by the same code and counted in the same place.
+/// This gate only decides what gets that far — before dirge-e31n.8 a synonym
+/// was dropped here and the call was simply gone.
+fn is_dispatchable(name: &str, allowed: &std::collections::HashSet<String>) -> bool {
+    allowed.contains(name)
+        || crate::agent::agent_loop::tool_aliases::resolve(name, allowed.iter()).is_some()
+}
+
 /// Try to coerce a JSON string into a ToolCall.
 /// Port of `coerceToToolCall` (scavenge.ts:150-201).
 #[allow(clippy::collapsible_if)]
@@ -512,7 +532,7 @@ fn coerce_to_tool_call(
 
     // Pattern 1: { name, arguments } (or parameters / input / args)
     if let Some(name) = obj.get("name").and_then(|v| v.as_str()) {
-        if allowed_names.contains(name) {
+        if is_dispatchable(name, allowed_names) {
             return Some(ToolCall {
                 id: String::new(),
                 name: name.to_string(),
@@ -525,7 +545,7 @@ fn coerce_to_tool_call(
     if obj.get("type").and_then(|v| v.as_str()) == Some("function") {
         if let Some(func) = obj.get("function").and_then(|v| v.as_object()) {
             if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
-                if allowed_names.contains(name) {
+                if is_dispatchable(name, allowed_names) {
                     return Some(ToolCall {
                         id: String::new(),
                         name: name.to_string(),
@@ -538,7 +558,7 @@ fn coerce_to_tool_call(
 
     // Pattern 3: { tool_name, tool_args } (R1 free-form variant)
     if let Some(name) = obj.get("tool_name").and_then(|v| v.as_str()) {
-        if allowed_names.contains(name) {
+        if is_dispatchable(name, allowed_names) {
             let args = obj.get("tool_args").cloned().unwrap_or_else(|| {
                 // No `tool_args` — fall back to the generic keys rather than
                 // handing back an empty object.
@@ -863,6 +883,40 @@ mod tests {
         let r = scavenge_tool_calls(Some(input), &allowed(), 4);
         assert!(r.calls.is_empty());
         assert_eq!(r.unknown_names, vec!["execute_command".to_string()]);
+    }
+
+    /// dirge-e31n.8: a synonym in scavenged TEXT used to be dropped here and
+    /// the call was simply gone — no result, no error, and the turn ended
+    /// with the raw call syntax as the answer. It now survives the gate,
+    /// carrying the guessed name for the loop's one resolution pass to
+    /// rewrite. Both explicit shapes, since both dropped it before.
+    #[test]
+    fn an_aliasable_name_survives_the_gate() {
+        let tools: HashSet<String> = ["bash", "question"].iter().map(|s| s.to_string()).collect();
+        for input in [
+            "<|DSML|invoke name=\"shell\"><|DSML|parameter name=\"command\">ls</|DSML|parameter></|DSML|invoke>".to_string(),
+            "<tool_call>{\"name\": \"execute_command\", \"arguments\": {\"command\": \"ls\"}}</tool_call>".to_string(),
+            "```json\n{\"name\": \"ask_user\", \"arguments\": {}}\n```".to_string(),
+        ] {
+            let r = scavenge_tool_calls(Some(&input), &tools, 4);
+            assert_eq!(r.calls.len(), 1, "aliasable name dropped: {input}");
+            assert!(r.unknown_names.is_empty(), "counted as a loss: {input}");
+        }
+    }
+
+    /// And the gate does not widen past the tools that exist: an alias for a
+    /// tool this run does not have is still a miss, not a call that fails one
+    /// layer down with a worse message.
+    #[test]
+    fn an_alias_for_an_absent_tool_is_still_a_miss() {
+        let no_bash: HashSet<String> = ["read"].iter().map(|s| s.to_string()).collect();
+        let r = scavenge_tool_calls(
+            Some("<tool_call>{\"name\": \"shell\", \"arguments\": {}}</tool_call>"),
+            &no_bash,
+            4,
+        );
+        assert!(r.calls.is_empty());
+        assert_eq!(r.unknown_names, vec!["shell".to_string()]);
     }
 
     /// A turn full of invented calls is bounded: the accepted-call budget

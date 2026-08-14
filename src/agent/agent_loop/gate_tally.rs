@@ -257,6 +257,13 @@ pub struct GateTally {
     /// data on yet, and guessing a weight would bake the guess into the
     /// tier before the first measurement.
     dropped_unknown_names: u32,
+    /// dirge-e31n.8: calls whose name matched no tool but resolved to one by
+    /// alias, and so dispatched instead of failing.
+    ///
+    /// The third outcome for a name, and the mechanism gate for the alias
+    /// table: with this at zero the table did not fire, so any difference
+    /// between two arms came from somewhere else.
+    aliased_tool_names: u32,
     storm_suppressions: u32,
     /// Peak failure streak over the run.
     max_failure_streak: u32,
@@ -430,6 +437,12 @@ impl GateTally {
         self.dropped_unknown_names += 1;
     }
 
+    /// A call named a tool by a name dirge does not use, and the alias table
+    /// placed it — so it dispatched rather than costing a turn or vanishing.
+    pub fn record_aliased_tool_name(&mut self) {
+        self.aliased_tool_names += 1;
+    }
+
     /// A call was suppressed by the storm breaker as a repeat.
     pub fn record_storm_suppression(&mut self) {
         self.storm_suppressions += 1;
@@ -491,6 +504,10 @@ impl GateTally {
 
     pub fn dropped_unknown_names(&self) -> u32 {
         self.dropped_unknown_names
+    }
+
+    pub fn aliased_tool_names(&self) -> u32 {
+        self.aliased_tool_names
     }
 
     pub fn storm_suppressions(&self) -> u32 {
@@ -573,6 +590,7 @@ impl GateTally {
             scavenged_calls = self.scavenged_calls,
             hallucinated_tool_names = self.hallucinated_tool_names,
             dropped_unknown_names = self.dropped_unknown_names,
+            aliased_tool_names = self.aliased_tool_names,
             storm_suppressions = self.storm_suppressions,
             max_failure_streak = self.max_failure_streak,
             unresolved_effects = self.unresolved_effects,
