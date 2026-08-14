@@ -754,7 +754,7 @@ fn mutating_commands_are_not_safe_during_agent() {
 #[test]
 fn no_cwd_mutating_command_is_safe_during_an_agent_run() {
     for form in [
-        "/cd",              // bare — goes home, still mutates
+        "/cd", // bare — goes home, still mutates
         "/cd /tmp",
         "/cd ~/src",
         "/worktree",
@@ -804,9 +804,16 @@ fn the_set_of_cwd_mutating_ui_files_has_not_grown() {
     }
 
     fn scan(dir: &std::path::Path, found: &mut Vec<String>) {
-        for entry in std::fs::read_dir(dir).expect("ui dir must be readable").flatten() {
+        for entry in std::fs::read_dir(dir)
+            .expect("ui dir must be readable")
+            .flatten()
+        {
             let path = entry.path();
-            let stem = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+            let stem = path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
             if path.is_dir() {
                 scan(&path, found);
             } else if path.extension().is_some_and(|e| e == "rs")
