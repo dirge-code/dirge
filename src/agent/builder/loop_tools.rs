@@ -273,6 +273,26 @@ pub async fn build_rooted_writer_tools(
         })
     }
 
+    /// dirge-9tl3: like `wrap`, but attaches a per-tool dispatch budget for
+    /// tools whose own bound legitimately exceeds the shared ceiling (bash,
+    /// subagents) — so the watchdog never cuts an in-bounds call.
+    async fn wrap_bounded<T>(
+        inner: T,
+        mode: Option<ToolExecutionMode>,
+        budget: crate::agent::agent_loop::rig_tool::CallBudgetFn,
+    ) -> Arc<dyn LoopTool>
+    where
+        T: crate::agent::agent_loop::rig_tool::DynTool + 'static,
+    {
+        let adapter = RigToolAdapter::new(Box::new(inner))
+            .await
+            .with_call_budget(budget);
+        Arc::new(match mode {
+            Some(mode) => adapter.with_execution_mode(mode),
+            None => adapter,
+        })
+    }
+
     let cache = ToolCache::new();
     let shell_store = tools::bg_shell::BackgroundShellStore::new();
     let mut writer_tools: Vec<Arc<dyn LoopTool>> = Vec::new();
@@ -384,11 +404,12 @@ pub async fn build_rooted_writer_tools(
         .await,
     );
     writer_tools.push(
-        wrap(
+        wrap_bounded(
             tools::BashTool::with_cache(permission, ask_tx, sandbox, cache)
                 .with_execution_root(Some(execution_root))
                 .with_shell_store(Some(shell_store.clone())),
             Some(ToolExecutionMode::Sequential),
+            Box::new(tools::bash::dispatch_budget),
         )
         .await,
     );
@@ -426,12 +447,19 @@ pub async fn build_loop_tools(
     // `subagent_mcp` selection can be validated against real MCP tools.
     // Always empty on non-mcp builds.
     Vec<String>,
+    // dirge-e31n.3: names of the plugin-provided tools. Both this and the
+    // MCP list feed the capability projection's UMBRELLA deny check: prompt
+    // frontmatter denies these families by the umbrella names `mcp_tool` /
+    // `plugin_tool`, never by concrete tool name, so a projection matching
+    // only concrete names reports every one of them as available when the
+    // active mode refuses all of them. Always empty on non-plugin builds.
+    Vec<String>,
 ) {
     use crate::agent::agent_loop::types::ToolExecutionMode;
     use crate::agent::agent_loop::{LoopTool, RigToolAdapter};
 
     if cli.resolve_no_tools(cfg) {
-        return (Vec::new(), None, None, Vec::new());
+        return (Vec::new(), None, None, Vec::new(), Vec::new());
     }
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
@@ -513,6 +541,25 @@ pub async fn build_loop_tools(
             None => adapter,
         };
         Arc::new(adapter)
+    }
+    /// dirge-9tl3: like `wrap`, but attaches a per-tool dispatch budget for
+    /// tools whose own bound legitimately exceeds the shared ceiling (bash,
+    /// subagents) — so the watchdog never cuts an in-bounds call.
+    async fn wrap_bounded<T>(
+        inner: T,
+        mode: Option<ToolExecutionMode>,
+        budget: crate::agent::agent_loop::rig_tool::CallBudgetFn,
+    ) -> Arc<dyn LoopTool>
+    where
+        T: crate::agent::agent_loop::rig_tool::DynTool + 'static,
+    {
+        let adapter = RigToolAdapter::new(Box::new(inner))
+            .await
+            .with_call_budget(budget);
+        Arc::new(match mode {
+            Some(mode) => adapter.with_execution_mode(mode),
+            None => adapter,
+        })
     }
 
     let mut tools: Vec<Arc<dyn LoopTool>> = Vec::new();
@@ -610,7 +657,7 @@ pub async fn build_loop_tools(
         .await,
     );
     tools.push(
-        wrap(
+        wrap_bounded(
             tools::BashTool::with_cache(
                 permission.clone(),
                 ask_tx.clone(),
@@ -620,6 +667,7 @@ pub async fn build_loop_tools(
             .with_shell_store(Some(tools::bg_shell::global()))
             .with_shell_path_option(cfg.shell.clone()),
             Some(ToolExecutionMode::Sequential),
+            Box::new(tools::bash::dispatch_budget),
         )
         .await,
     );
@@ -847,7 +895,7 @@ pub async fn build_loop_tools(
     // store); TaskStatus is read-only.
     if let (Some(pm), Some(store)) = (parent_model, bg_store) {
         tools.push(
-            wrap(
+            wrap_bounded(
                 tools::TaskTool::new(
                     permission.clone(),
                     ask_tx.clone(),
@@ -857,6 +905,7 @@ pub async fn build_loop_tools(
                     cfg.resolve_subagent_write_isolation(),
                 ),
                 Some(ToolExecutionMode::Sequential),
+                Box::new(|_: &serde_json::Value| Some(tools::task::dispatch_budget())),
             )
             .await,
         );
@@ -940,6 +989,8 @@ pub async fn build_loop_tools(
     // can't shadow `read` etc. — matching pi's extension precedence
     // (extensions/runner.ts:`registerTool` rejects duplicates of the
     // core tool list).
+    #[cfg_attr(not(feature = "plugin"), allow(unused_mut))]
+    let mut plugin_tool_names: Vec<String> = Vec::new();
     #[cfg(feature = "plugin")]
     if let Some(pm_arc) = crate::plugin::hook::global() {
         let metas: Vec<crate::plugin::PluginToolMeta> = match pm_arc.lock() {
@@ -950,6 +1001,7 @@ pub async fn build_loop_tools(
             if shadows_builtin(&meta.name, "plugin") {
                 continue;
             }
+            let meta_name = meta.name.clone();
             if let Some(adapter) = crate::plugin::extension::JanetLoopTool::from_meta(
                 meta,
                 pm_arc.clone(),
@@ -957,6 +1009,7 @@ pub async fn build_loop_tools(
                 ask_tx.clone(),
             ) {
                 tools.push(Arc::new(adapter));
+                plugin_tool_names.push(meta_name);
             }
         }
     }
@@ -992,7 +1045,13 @@ pub async fn build_loop_tools(
         None
     };
 
-    (tools, tool_def_filter, review_memory_tool, mcp_tool_names)
+    (
+        tools,
+        tool_def_filter,
+        review_memory_tool,
+        mcp_tool_names,
+        plugin_tool_names,
+    )
 }
 
 #[cfg(all(test, any(feature = "mcp", feature = "plugin")))]

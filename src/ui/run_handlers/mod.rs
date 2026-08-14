@@ -31,6 +31,7 @@ use crate::semantic::SemanticManager;
 pub(super) mod context_compacted;
 pub(super) mod context_overflow;
 pub(super) mod done;
+pub(super) mod ended;
 pub(super) mod error;
 pub(super) mod interjected;
 pub(super) mod notices;

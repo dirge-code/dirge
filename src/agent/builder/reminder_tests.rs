@@ -190,7 +190,7 @@ async fn build_loop_tools_produces_core_registry() {
     let cache = ToolCache::new();
     let sandbox = Sandbox::new(SandboxMode::Off);
 
-    let (tools, _, _, _) = build_loop_tools(
+    let (tools, _, _, _, _) = build_loop_tools(
         cache,
         None, // permission
         None, // ask_tx
@@ -264,7 +264,7 @@ async fn memory_tool_registration_degrades_when_store_unavailable() {
 async fn tool_descriptions_meet_quality_bar() {
     let cli = Cli::parse_from::<_, &str>(["dirge"]);
     let cfg = Config::default();
-    let (tools, _, _, _) = build_loop_tools(
+    let (tools, _, _, _, _) = build_loop_tools(
         ToolCache::new(),
         None,
         None,
@@ -301,7 +301,7 @@ async fn tool_descriptions_meet_quality_bar() {
 /// every turn (not just at post-session review).
 #[test]
 fn base_preamble_includes_skills_guidance() {
-    let p = assemble_base_preamble();
+    let p = assemble_base_preamble(false);
     // Trigger fragments must be present.
     assert!(p.contains("complex task"), "missing create trigger");
     assert!(p.contains("5+ tool calls"), "missing 5+ trigger");
@@ -326,7 +326,7 @@ fn base_preamble_includes_skills_guidance() {
 /// prompt, not just in prose scattered elsewhere.
 #[test]
 fn base_preamble_includes_finishing_selfcheck() {
-    let p = assemble_base_preamble();
+    let p = assemble_base_preamble(false);
     assert!(
         p.contains("# Finishing"),
         "missing the Finishing section heading"
@@ -359,7 +359,7 @@ fn base_preamble_includes_finishing_selfcheck() {
 /// silently dropping one.
 #[test]
 fn base_preamble_carries_full_guidance_suite() {
-    let p = assemble_base_preamble();
+    let p = assemble_base_preamble(false);
     assert!(
         p.contains("# Finishing a task"),
         "F2 finishing self-check missing"
@@ -379,7 +379,7 @@ fn base_preamble_carries_full_guidance_suite() {
 /// the final reply terse (no contradiction with the Output section).
 #[test]
 fn base_preamble_includes_progress_updates() {
-    let p = assemble_base_preamble();
+    let p = assemble_base_preamble(false);
     assert!(
         p.contains("# Progress updates"),
         "missing the Progress updates section heading"
@@ -405,7 +405,7 @@ fn base_preamble_includes_progress_updates() {
 /// proceeds with a stated assumption when a question isn't warranted.
 #[test]
 fn base_preamble_includes_ask_calibration() {
-    let p = assemble_base_preamble();
+    let p = assemble_base_preamble(false);
     let lower = p.to_lowercase();
     assert!(
         p.contains("# Clarifying vs. proceeding"),
@@ -517,7 +517,17 @@ async fn build_agent_inner_emits_assembled_preamble() {
     use rig::providers::openai;
 
     let cli = Cli::parse_from::<_, &str>(["dirge"]);
-    let cfg = Config::default();
+    // dirge-e31n.3: pinned OFF rather than left at the default. This test
+    // guards STATIC_TOOL_LIST against naming a memory action the schema does
+    // not have, and that constant only ships when the projection is off — with
+    // it on, the preamble does not describe memory actions at all and the
+    // model reads the enum from the tool's own `parameters()`, which cannot
+    // drift from itself. Leaving this at the default would make the assertion
+    // vacuous the moment the default flipped, which is exactly what happened.
+    let cfg = Config {
+        capability_projection: Some(false),
+        ..Config::default()
+    };
     let context = ContextFiles {
         agents: None,
         prompts: std::collections::HashMap::new(),
@@ -749,7 +759,7 @@ async fn steering_fragment_tracks_active_model_not_cli() {
 /// declarative-fact phrasing, and the past-session-recall nudge.
 #[test]
 fn base_preamble_includes_memory_and_search_guidance() {
-    let p = assemble_base_preamble();
+    let p = assemble_base_preamble(false);
 
     // MEMORY_GUIDANCE — must include the do/don't-save rules and the
     // declarative-vs-imperative example pair.
@@ -813,7 +823,7 @@ async fn build_loop_tools_empty_with_no_tools() {
     let cfg = Config::default();
     let cache = ToolCache::new();
     let sandbox = Sandbox::new(SandboxMode::Off);
-    let (tools, _, _, _) = build_loop_tools(
+    let (tools, _, _, _, _) = build_loop_tools(
         cache,
         None,
         None,
@@ -848,7 +858,7 @@ async fn build_loop_tools_mutating_tools_are_sequential() {
     let cfg = Config::default();
     let cache = ToolCache::new();
     let sandbox = Sandbox::new(SandboxMode::Off);
-    let (tools, _, _, _) = build_loop_tools(
+    let (tools, _, _, _, _) = build_loop_tools(
         cache,
         None,
         None,
@@ -892,7 +902,7 @@ async fn build_loop_tools_read_only_tools_are_parallel_capable() {
     let cfg = Config::default();
     let cache = ToolCache::new();
     let sandbox = Sandbox::new(SandboxMode::Off);
-    let (tools, _, _, _) = build_loop_tools(
+    let (tools, _, _, _, _) = build_loop_tools(
         cache,
         None,
         None,

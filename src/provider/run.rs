@@ -501,7 +501,12 @@ impl AnyAgent {
                         }
                         break;
                     }
-                    eprintln!("Error: {}", err);
+                    // No `eprintln!` here: the error is returned, and both
+                    // callers report it — `main`'s `Result` termination
+                    // prints `Error: {err}` for `--print`, and the `--loop`
+                    // driver prefixes it with the iteration. Printing it
+                    // here as well put every headless failure on stderr
+                    // twice, verbatim.
                     let _ = task.await;
                     return Err(anyhow::anyhow!("{}", err));
                 }

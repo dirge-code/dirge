@@ -67,8 +67,26 @@ slice() { # $1 = output, $2 = header (literal)
 
 # tag model repeat turns tools err scav storm streak rep_inv rep_tot verify
 # first_write correct tally prologue nudges tier boundaries gates
+# input_tokens cached_tokens cache_creation_tokens session_found denied_attempts
 row() { # tag model repeat verify correct tally boundaries gates
-  printf '%s\t%s\t%s\t10\t20\t0\t0\t0\t0\t0\t0\t%s\t3\t%s\t%s\t0\t2\tnominal\t%s\t%s\n' "$@"
+  printf '%s\t%s\t%s\t10\t20\t0\t0\t0\t0\t0\t0\t%s\t3\t%s\t%s\t0\t2\tnominal\t%s\t%s\t1000\t400\t0\t1\t0\n' "$@"
+}
+
+# A row carrying DIFFERENT token values, so an assertion about the token
+# columns has a known other-answer rather than matching the constant every
+# other row also writes. 2000 in / 1800 cached is 90% against the default
+# 1000 / 400 = 40%, and the two are on opposite sides of every direction
+# rule: more input is worse, more cached is better.
+row_tok() { # tag model repeat verify correct tally boundaries gates in cached create sessfound
+  printf '%s\t%s\t%s\t10\t20\t0\t0\t0\t0\t0\t0\t%s\t3\t%s\t%s\t0\t2\tnominal\t%s\t%s\t%s\t%s\t%s\t%s\t0\n' "$@"
+}
+
+# A row carrying a non-zero denied_tool_attempts (col 25), so the row that
+# reads it has a known other-answer. The value differs from every other
+# numeric constant these fixtures use, so a wrong-column read is visible
+# rather than coincidentally equal.
+row_denied() { # tag model repeat verify correct tally boundaries gates denied
+  printf '%s\t%s\t%s\t10\t20\t0\t0\t0\t0\t0\t0\t%s\t3\t%s\t%s\t0\t2\tnominal\t%s\t%s\t1000\t400\t0\t1\t%s\n' "$@"
 }
 
 # ---- Fixtures. Each exists to be the other answer for some assertion. -----
@@ -117,6 +135,29 @@ awk -F'\t' 'BEGIN{OFS="\t"} NR==1{$15=0} {print}' "$work/healthy.tsv" > "$work/s
 # LEGACY: the same runs as recorded before the gates column existed.
 cut -f1-19 "$work/mech.tsv" > "$work/legacy.tsv"
 
+# PRETOKEN: recorded AFTER the gates column but BEFORE the token columns —
+# a legitimate 20-wide file, not a truncated one. It must report the missing
+# token columns and must NOT be accused of predating gates_fired or of being
+# a truncated write, and its session_found must read as an absent column
+# rather than 0/2 (which would call every archived run a harness bug).
+cut -f1-20 "$work/mech.tsv" > "$work/pretoken.tsv"
+
+# TOKENS: control bills more input and caches less than treatment. Both
+# token rows must therefore point the SAME way (treatment better) while
+# reading opposite columns — a swapped-column bug flips exactly one of them.
+# Spreads are wide enough that the deltas clear the noise floor.
+{
+  row_tok control   m1 1 VerifiedGreen 1 1 none              0 9000 1000 0 1
+  row_tok control   m1 2 VerifiedGreen 1 1 none              0 9100 1100 0 1
+  row_tok treatment m1 1 VerifiedGreen 1 1 'Verifier+Critic' 3 3000 2700 0 1
+  row_tok treatment m1 2 VerifiedGreen 1 1 'Verifier+Critic' 3 3100 2800 0 1
+} > "$work/tokens.tsv"
+
+# NOSESSION: identical to tokens.tsv except one run wrote no session file.
+# Only the session_found flag differs, so a report that cannot tell them
+# apart is not reading the column.
+awk -F'\t' 'BEGIN{OFS="\t"} NR==1{$24=0} {print}' "$work/tokens.tsv" > "$work/nosession.tsv"
+
 # BLANK: mech.tsv plus a trailing empty line. Must report identically — a
 # blank line used to mint an arm named "" and a model named "".
 { cat "$work/mech.tsv"; printf '\n'; } > "$work/blank.tsv"
@@ -132,6 +173,58 @@ out_mech="$(report "$work/mech.tsv")"
 out_blank="$(report "$work/blank.tsv")"
 out_truncated="$(report "$work/truncated.tsv")"
 out_legacy="$(report "$work/legacy.tsv")"
+# DENIED: the arms differ ONLY in denied_tool_attempts — control reaches for
+# tools it does not have, treatment does not. This is the shape a working
+# capability-projection A/B produces, and the fixture exists so the row is
+# checked against a case where the answer must differ.
+{
+  row_denied control   m1 1 VerifiedGreen 1 1 none              0 7
+  row_denied control   m1 2 VerifiedGreen 1 1 none              0 9
+  row_denied treatment m1 1 VerifiedGreen 1 1 'Verifier+Critic' 3 0
+  row_denied treatment m1 2 VerifiedGreen 1 1 'Verifier+Critic' 3 0
+} > "$work/denied.tsv"
+
+# STEADY: the two arms have the SAME mean turns (9) but very different spread
+# — control 4..14, treatment 8..10. Same mean is the point: it isolates the
+# dispersion rows from the mean rows, so a dispersion verdict cannot be
+# satisfied by a mean shift leaking into it.
+row_turns() { # tag model repeat turns
+  printf '%s\t%s\t%s\t%s\t20\t0\t0\t0\t0\t0\t0\tVerifiedGreen\t3\t1\t1\t0\t2\tnominal\tnone\t0\t1000\t400\t0\t1\t0\n' "$@"
+}
+{
+  row_turns control   m1 1 4
+  row_turns control   m1 2 14
+  row_turns control   m1 3 9
+  row_turns treatment m1 1 8
+  row_turns treatment m1 2 10
+  row_turns treatment m1 3 9
+} > "$work/steady.tsv"
+
+# NOISY: the same fixture with the arms SWAPPED, so the verdict must invert.
+# Without this, "steadier" could be printed unconditionally and still pass.
+{
+  row_turns control   m1 1 8
+  row_turns control   m1 2 10
+  row_turns control   m1 3 9
+  row_turns treatment m1 1 4
+  row_turns treatment m1 2 14
+  row_turns treatment m1 3 9
+} > "$work/noisy.tsv"
+
+# SINGLE: one run per arm. There is no spread to speak of at n=1 and the
+# report must say so rather than calling a zero range "steadier".
+{
+  row_turns control   m1 1 9
+  row_turns treatment m1 1 9
+} > "$work/single.tsv"
+
+out_steady="$(report "$work/steady.tsv")"
+out_noisy="$(report "$work/noisy.tsv")"
+out_single="$(report "$work/single.tsv")"
+out_denied="$(report "$work/denied.tsv")"
+out_pretoken="$(report "$work/pretoken.tsv")"
+out_tokens="$(report "$work/tokens.tsv")"
+out_nosession="$(report "$work/nosession.tsv")"
 
 fails=0
 want() { # $1 = output, $2 = description, $3 = grep -E pattern
@@ -150,6 +243,10 @@ reject() { # $1 = output, $2 = description, $3 = pattern that must NOT match
     echo "  ok   $2"
   fi
 }
+# For checks computed in shell rather than grepped from a report — source-level
+# guards, mostly. Same accounting as want/reject.
+pass() { echo "  ok   $1"; }
+fail() { echo "  FAIL $1"; fails=$((fails + 1)); }
 differs() { # $1 = description, $2 = a, $3 = b
   if [ "$2" != "$3" ]; then
     echo "  ok   $1"
@@ -177,10 +274,70 @@ eq() { # $1 = description, $2 = got, $3 = want
 
 echo "loop-ab.sh reporting self-test:"
 
+# ---- SCENARIO_OVERRIDES ordering (dirge-e31n.4). A scenario pins config that
+# must be identical in every arm (context_target for a compaction scenario). If
+# the scenario program were dropped, or an arm could not override it, the run
+# would still COMPLETE AND REPORT -- it would just answer a different question.
+# That is the silent-degradation shape this file exists for, so it is checked
+# on the real functions rather than by reading the source.
+sed -n '/^override_program() {/,/^}/p' "$ab" > "$work/override_program.sh"
+sed -n '/^build_config() {/,/^}/p' "$ab" > "$work/build_config.sh"
+# shellcheck source=/dev/null
+. "$work/override_program.sh"
+# shellcheck source=/dev/null
+. "$work/build_config.sh"
+echo '{}' > "$work/base.json"
+BASE_CONFIG="$work/base.json"; MAXTURNS=7
+mkdir -p "$work/cfgout"
+
+SCENARIO_OVERRIDES="context_target=40000"
+build_config "$work/cfgout" "" default
+eq "a scenario override reaches the config" \
+  "$(jq -r '.context_target' "$work/cfgout/config.json")" 40000
+
+# An ARM must be able to override its scenario deliberately.
+build_config "$work/cfgout" "context_target=99000" default
+eq "an arm overrides its scenario" \
+  "$(jq -r '.context_target' "$work/cfgout/config.json")" 99000
+
+# ...and an unrelated arm override must not drop the scenario value.
+build_config "$work/cfgout" "turn_envelope=false" default
+eq "an unrelated arm keeps the scenario value" \
+  "$(jq -r '.context_target' "$work/cfgout/config.json")" 40000
+eq "and its own override still lands" \
+  "$(jq -r '.turn_envelope' "$work/cfgout/config.json")" false
+
+# With no scenario overrides at all, nothing is invented.
+SCENARIO_OVERRIDES=""
+build_config "$work/cfgout" "" default
+eq "no scenario overrides invents nothing" \
+  "$(jq -r '.context_target' "$work/cfgout/config.json")" null
+eq "and the harness knobs still apply" \
+  "$(jq -r '.max_agent_turns' "$work/cfgout/config.json")" 7
+
+# ---- The awk program is ONE single-quoted shell string, so an apostrophe
+# anywhere inside it — including in a comment — terminates the quote. What
+# happens next is the worst available failure: awk still parses what it got,
+# the trailing words become filenames ("awk: can't open file prefix"), the
+# script still exits 0, and the run prints per-repeat lines for an hour
+# before the comparison silently never appears. Nothing above catches it,
+# because the extraction below reads the block by line range and so is happy
+# either way. This is a source check, not an output check, for that reason.
+awk_start="$(grep -n '^awk -F' "$ab" | cut -d: -f1)"
+awk_end="$(awk -v s="$awk_start" 'NR>s && /^'"'"' "\$WORK\/results.tsv"/{print NR; exit}' "$ab")"
+stray="$(awk -v s="$awk_start" -v e="$awk_end" "NR>s && NR<e && /'/ {print NR\": \"\$0}" "$ab")"
+if [ -z "$stray" ]; then
+  echo "  ok   no apostrophe inside the single-quoted awk program"
+else
+  echo "  FAIL apostrophe inside the awk program would end its quoting:"
+  printf '       %s\n' "$stray"
+  fails=$((fails + 1))
+fi
+
 # ---- Nothing below means anything if the report did not run. Checked first
 # and for every fixture, because an awk abort produces no rows at all and
 # every `reject` would then pass vacuously.
-for fx in healthy sick lopsided order mech legacy blank truncated; do
+for fx in healthy sick lopsided order mech legacy blank truncated pretoken tokens nosession denied steady noisy single; do
   eval "reject \"\$out_$fx\" \"the $fx report ran to completion\" 'REPORT-ABORTED'"
 done
 
@@ -227,6 +384,307 @@ want "$out_lopsided" "its rate delta reads n/a, not a number"    '^success_rate 
 want "$out_lopsided" "and the other models still report"         '^== model: m1 ==$'
 # The other side: a complete pair must NOT be labelled absent.
 reject "$out_healthy" "a complete pair is not labelled absent" 'NOTE: control runs='
+
+# ---- compactions mechanism gate (dirge-e31n.4). A prompt epoch rotates ON
+# compaction, so a run that never compacted did not exercise it. The row is a
+# MECHANISM row: more is neither better nor worse, but zero on a scenario built
+# to force one means the run cannot inform a cache result.
+row_comp() { # tag model repeat compactions
+  printf '%s\t%s\t%s\t10\t20\t0\t0\t0\t0\t0\t0\tVerifiedGreen\t3\t1\t1\t0\t2\tnominal\tnone\t0\t1000\t400\t0\t1\t0\t%s\n' "$@"
+}
+{
+  row_comp control   m1 1 2
+  row_comp control   m1 2 2
+  row_comp treatment m1 1 0
+  row_comp treatment m1 2 0
+} > "$work/compact.tsv"
+out_compact="$(report "$work/compact.tsv")"
+reject "$out_compact" "the compaction report ran to completion" 'REPORT-ABORTED'
+want "$out_compact" "compactions reads its own column"  '^compactions +2\.0 \(2\.\.2\) +0\.0 \(0\.\.0\) +mechanism$'
+# It must NOT be scored: an arm that compacted less is not thereby better, and
+# labelling it so would turn a mechanism check into a fake result.
+reject "$out_compact" "compactions is never given a direction" '^compactions .*(better|worse)$'
+# A pre-compactions TSV reads 0 rather than breaking — same as every other
+# appended column.
+want "$out_mech" "a pre-compactions TSV reads zero" '^compactions +0\.0 \(0\.\.0\)'
+
+# ---- SOURCE-LEVEL: every column a row reports must be one the report
+# accumulates (dirge-s9ry). `numcols` is a hand-written list of which columns
+# are numeric, and it cannot be derived from NF because several columns are
+# strings. So it is guarded from the other end: any column index appearing in
+# a spread()/mean()/noisefloor() call must be in that list.
+#
+# This is not hypothetical. Appending errored_missing_info as col 27 and
+# adding its row reported `0.0 (..)` in both arms — a column silently never
+# accumulated, rendering as something that looks like a formatting glitch
+# rather than a missing measurement.
+{
+  cols_declared="$(sed -n 's/.*nnum = split("\([0-9 ]*\)", numcols.*/\1/p' "$ab" | tr ' ' '\n' | sort -u)"
+  if [ -z "$cols_declared" ]; then
+    fail "could not read numcols from $ab"
+  else
+    cols_read="$(grep -oE '(spread|mean|noisefloor)\((ck|tk|ek), *[0-9]+\)' "$ab" \
+                 | grep -oE '[0-9]+\)$' | tr -d ')' | sort -u)"
+    missing=""
+    for c in $cols_read; do
+      printf '%s\n' "$cols_declared" | grep -qx "$c" || missing="$missing $c"
+    done
+    if [ -n "$missing" ]; then
+      fail "report reads column(s)$missing that numcols never accumulates"
+    else
+      pass "every reported column is accumulated"
+    fi
+  fi
+}
+
+# ---- SOURCE-LEVEL: every field scraped off the gates line must reach
+# results.tsv (dirge-s9ry). The other half of the guard above — that one
+# catches a row reading a column nobody accumulated, this one catches a
+# measurement taken and then dropped on the floor.
+#
+# This is the denied_tool_attempts failure mode: a mechanism gate that reads
+# zero in every arm forever, with the whole report looking healthy, because
+# the number never made it out of run_arm. A gate you cannot see is worse
+# than no gate, since it is quietly counted as evidence.
+{
+  scraped="$(grep -oE '^ *[a-z_0-9]+="\$\((get_field|sum_fields) ' "$ab" \
+             | sed -E 's/^ *([a-z_0-9]+)=.*/\1/' | sort -u)"
+  # The printf that writes results.tsv, joined to one line. Resetting the
+  # buffer at each `printf` keeps this to the ONE statement that writes the
+  # file — buffering the whole script would make the check vacuous, since
+  # every variable appears somewhere in it.
+  emitted="$(awk '/printf .%s/ { buf = "" } { buf = buf $0 } />> "\$WORK\/results.tsv"/ { print buf; exit }' "$ab")"
+  if [ -z "$scraped" ]; then
+    fail "could not find any get_field/sum_fields assignments in $ab"
+  else
+    dropped=""
+    for v in $scraped; do
+      case "$emitted" in
+        *"\$$v"*) ;;
+        *) dropped="$dropped $v" ;;
+      esac
+    done
+    if [ -n "$dropped" ]; then
+      fail "scraped but never written to results.tsv:$dropped"
+    else
+      pass "every scraped field reaches results.tsv"
+    fi
+  fi
+}
+
+# ---- SOURCE-LEVEL: the results.tsv printf's format and argument list must
+# agree (dirge-s9ry). bash printf REUSES the format when there are more
+# arguments than conversions, so an extra column does not error — it writes a
+# SECOND ROW made of the leftovers. Too few arguments is quieter still: the
+# trailing columns come out empty and read as an absent (pre-existing) column.
+# Neither shows up as a failure anywhere downstream.
+{
+  pf="$(awk '/printf .%s/ { buf = "" } { buf = buf $0 } />> "\$WORK\/results.tsv"/ { print buf; exit }' "$ab")"
+  # -o then count LINES of output: `grep -c` counts matching lines, and the
+  # block is joined to one, so it would answer 1 however many conversions
+  # there are. That is the same shape as the sum_fields status bug — a count
+  # that cannot be wrong in the direction you are checking.
+  n_fmt="$(printf '%s' "$pf" | grep -oE "^[^']*'[^']*'" | grep -o '%s' | wc -l | tr -d ' ')"
+  n_arg="$(printf '%s' "$pf" | grep -oE '"\$[A-Za-z_0-9{}]+"' | wc -l | tr -d ' ')"
+  if [ "${n_fmt:-0}" -eq 0 ] || [ "${n_arg:-0}" -eq 0 ]; then
+    fail "could not parse the results.tsv printf (fmt=$n_fmt args=$n_arg)"
+  elif [ "$n_fmt" -ne "$n_arg" ]; then
+    fail "results.tsv printf has $n_fmt conversions but $n_arg arguments"
+  else
+    pass "results.tsv printf conversions match its arguments ($n_fmt)"
+  fi
+}
+
+# ---- errored_missing_info mechanism gate (dirge-s9ry). The capability
+# weighting only moves on errors classified MissingInfo, so this row is the
+# difference between "the weighting did nothing" and "the weighting never
+# fired". Column 27, appended, so every fixture above reads it as 0.
+#
+# The fixture makes err (col 6) and err_missing (col 27) DIFFERENT numbers on
+# purpose: they are adjacent in the report and a row reading the wrong one
+# would otherwise be invisible.
+row_mi() { # tag model repeat errored errored_missing_info
+  printf '%s\t%s\t%s\t10\t20\t%s\t0\t0\t0\t0\t0\tVerifiedGreen\t3\t1\t1\t0\t2\tnominal\tnone\t0\t1000\t400\t0\t1\t0\t0\t%s\n' "$@"
+}
+{
+  row_mi control   m1 1 8 6
+  row_mi control   m1 2 8 6
+  row_mi treatment m1 1 8 0
+  row_mi treatment m1 2 8 0
+} > "$work/missinfo.tsv"
+out_mi="$(report "$work/missinfo.tsv")"
+reject "$out_mi" "the missing-info report ran to completion" 'REPORT-ABORTED'
+want "$out_mi" "missing_info reads its own column" \
+  '^  of which missing_info +6\.0 \(6\.\.6\) +0\.0 \(0\.\.0\) +mechanism$'
+# The row above it must still read the TOTAL, not the slice — the two are
+# adjacent and both are error counts.
+want "$out_mi" "errored_tool_calls still reads the total" \
+  '^errored_tool_calls +8\.0 \(8\.\.8\) +8\.0 \(8\.\.8\)'
+# MECHANISM, not an outcome: fewer missing-info errors is not thereby better,
+# and scoring it would turn the gate into a fabricated result.
+reject "$out_mi" "missing_info is never given a direction" \
+  '^  of which missing_info .*(better|worse)$'
+# A pre-column TSV reads 0 rather than aborting, like every appended column.
+want "$out_mech" "a pre-missing-info TSV reads zero" \
+  '^  of which missing_info +0\.0 \(0\.\.0\)'
+
+# ---- unresolved_effects mechanism gate (dirge-e31n.5). Column 28. The
+# handoff renders only on an unconfirmable effect, so this row is the
+# difference between "the taxonomy did not help" and "there was nothing to
+# help with".
+row_ue() { # tag model repeat unresolved
+  printf '%s\t%s\t%s\t10\t20\t8\t0\t0\t0\t0\t0\tVerifiedGreen\t3\t1\t1\t0\t2\tnominal\tnone\t0\t1000\t400\t0\t1\t0\t0\t6\t%s\n' "$@"
+}
+{
+  row_ue control   m1 1 4
+  row_ue control   m1 2 4
+  row_ue treatment m1 1 0
+  row_ue treatment m1 2 0
+} > "$work/unresolved.tsv"
+out_ue="$(report "$work/unresolved.tsv")"
+reject "$out_ue" "the unresolved report ran to completion" 'REPORT-ABORTED'
+want "$out_ue" "unresolved_effects reads its own column" \
+  '^unresolved_effects +4\.0 \(4\.\.4\) +0\.0 \(0\.\.0\) +mechanism$'
+# Its neighbour must keep its own value — the two are adjacent mechanism rows
+# with the fixture holding 6 and 4, so a column slip is visible.
+want "$out_ue" "missing_info still reads its own column beside it" \
+  '^  of which missing_info +6\.0 \(6\.\.6\)'
+reject "$out_ue" "unresolved_effects is never given a direction" \
+  '^unresolved_effects .*(better|worse)$'
+want "$out_mech" "a pre-unresolved TSV reads zero" \
+  '^unresolved_effects +0\.0 \(0\.\.0\)'
+
+# ---- input_tokens_per_turn (dirge-e31n.4). The steady fixture has identical
+# mean turns (9) in both arms and identical tokens (1000), so the ratio must be
+# identical too — that isolates the row from the mean-token row above.
+# Identical values read ~noise rather than flat once a nonzero floor exists --
+# dir3 checks the floor before the equality case, which is how every other
+# metric with a noisefloor already behaves. Asserting the VALUES is the point
+# here; the verdict is covered by the two threshold tests below.
+want "$out_steady" "tokens-per-turn divides tokens by turns" \
+  '^input_tokens_per_turn +111 +111 +~noise$'
+# The turns fixture varies turns at FIXED tokens, which is exactly the case the
+# metric exists for: totals look equal while per-turn cost differs. Control
+# averages 9 turns, treatment 3 -> 111 vs 333, and MORE per turn is worse.
+row_t2() { printf '%s\t%s\t%s\t%s\t20\t0\t0\t0\t0\t0\t0\tVerifiedGreen\t3\t1\t1\t0\t2\tnominal\tnone\t0\t1000\t400\t0\t1\t0\n' "$@"; }
+{
+  row_t2 control   m1 1 9
+  row_t2 control   m1 2 9
+  row_t2 treatment m1 1 3
+  row_t2 treatment m1 2 3
+} > "$work/perturn.tsv"
+out_perturn="$(report "$work/perturn.tsv")"
+reject "$out_perturn" "the report ran to completion" 'REPORT-ABORTED'
+want "$out_perturn" "equal totals can still differ per turn" \
+  '^input_tokens_per_turn +111 +333 +worse$'
+differs "tokens-per-turn actually reads both columns" "$out_steady" "$out_perturn"
+# A SUB-THRESHOLD difference must read ~noise, not a direction. The first
+# version passed noise=0 and reported a real A/A -- 29112 vs 29001 per turn,
+# 0.38% apart -- as "better". Control 1000 tok / 10 turns = 100; treatment
+# 1010 / 10 = 101, which is 1% and must NOT earn a verdict.
+row_t3() { printf '%s\t%s\t%s\t10\t20\t0\t0\t0\t0\t0\t0\tVerifiedGreen\t3\t1\t1\t0\t2\tnominal\tnone\t0\t%s\t400\t0\t1\t0\n' "$@"; }
+{
+  row_t3 control   m1 1 1000
+  row_t3 control   m1 2 1000
+  row_t3 treatment m1 1 1010
+  row_t3 treatment m1 2 1010
+} > "$work/perturn_small.tsv"
+out_perturn_small="$(report "$work/perturn_small.tsv")"
+reject "$out_perturn_small" "the sub-threshold report ran to completion" 'REPORT-ABORTED'
+want   "$out_perturn_small" "a 1% per-turn difference reads ~noise" \
+  '^input_tokens_per_turn +100 +101 +~noise$'
+reject "$out_perturn_small" "and does not claim a direction"        \
+  '^input_tokens_per_turn +100 +101 +(better|worse)$'
+# The other side is already covered above: perturn.tsv is 111 vs 333 (200%) and
+# must still read "worse", so the floor gates noise without gating real effects.
+# A zero-turn arm must not divide by zero and take the report down.
+row_t0() { printf '%s\t%s\t%s\t0\t0\t0\t0\t0\t0\t0\t0\tVerifiedGreen\t-\t0\t1\t0\t0\tnominal\tnone\t0\t0\t0\t0\t1\t0\n' "$@"; }
+{ row_t0 control m1 1; row_t0 treatment m1 1; } > "$work/zeroturn.tsv"
+out_zeroturn="$(report "$work/zeroturn.tsv")"
+reject "$out_zeroturn" "a zero-turn arm does not abort the report" 'REPORT-ABORTED'
+want   "$out_zeroturn" "and reports per-turn cost as unavailable" '^input_tokens_per_turn +- +-'
+
+# ---- Dispersion (dirge-e31n.1). The report was structurally blind to a
+# treatment whose effect is "the bad runs stop happening": dir3 gates on the
+# control spread, which is exactly what such a treatment removes.
+want "$out_steady" "a dispersion section is printed" '^dispersion \(max-min\) +control +treatment +delta$'
+want "$out_steady" "a narrower treatment reads steadier"  '^turns +10 +2 +steadier$'
+want "$out_steady" "and the means are still ~noise"       '^turns +9\.0 \(4\.\.14\) +9\.0 \(8\.\.10\) +(~noise|flat)$'
+# Swapping the arms must invert the verdict. This is the assertion that makes
+# the one above evidence rather than a constant string.
+want "$out_noisy"  "a wider treatment reads noisier"      '^turns +2 +10 +noisier$'
+differs "the dispersion verdict actually reads the arms" "$out_steady" "$out_noisy"
+# n=1 has no spread; saying "steadier" off a zero range would be a fabrication.
+want   "$out_single" "n=1 refuses a dispersion verdict"   '^turns +0 +0 +n/a \(need 2\+ runs\)$'
+reject "$out_single" "and claims neither direction"       '^turns +0 +0 +(steadier|noisier)$'
+# The roll-up counts, and must not appear when nothing moved.
+want   "$out_steady" "the roll-up counts steadier metrics" 'treatment is steadier on [1-9][0-9]* metric'
+# The N-arm block needs the spread rows too — an extra arm is how a CUMULATIVE
+# config is measured, so hiding its dispersion hides half the question.
+#
+# NOT slice()d: the dispersion section opens with a blank line and slice()
+# stops at the first one, so anchoring there found nothing even though the
+# section printed. The header carries the ARM NAME, which is unique without
+# slicing — the two-arm block emits `control treatment`, never
+# `control allgates`. Pinning the name is also what caught the section
+# printing it BLANK (it used an awk variable that does not exist in that
+# scope); a laxer pattern would have accepted the empty column.
+want "$out_healthy" "the extra-arm block reports dispersion too" \
+  '^dispersion \(max-min\) +control +allgates +delta$'
+reject "$out_mech" "a two-arm run has no extra-arm dispersion section" \
+  '^dispersion \(max-min\) +control +allgates +delta$'
+reject "$out_single" "no roll-up when no verdict was possible" 'treatment is steadier on'
+
+# ---- denied_tool_attempts (dirge-e31n.3). Fewer attempts at tools the mode
+# refuses is better, and the row must read col 25 rather than any of the
+# numerically-similar columns around it.
+want "$out_denied" "denied_tool_attempts reads its own column" \
+  '^denied_tool_attempts +8\.0 \(7\.\.9\) +0\.0 \(0\.\.0\)'
+want "$out_denied" "fewer denied attempts is better" '^denied_tool_attempts .* better$'
+# Other side: a fixture where nothing was attempted must not report a win.
+reject "$out_mech" "a run with no denied attempts reports no direction" \
+  '^denied_tool_attempts .* better$'
+
+# ---- Token + cache columns (dirge-e31n.1). Asserted on tokens.tsv, where
+# control and treatment carry DIFFERENT values in both columns, so a row
+# that read the wrong column would show the other arm's number.
+want "$out_tokens" "input_tokens reads its own column" \
+  '^input_tokens +9050\.0 \(9000\.\.9100\) +3050\.0 \(3000\.\.3100\)'
+want "$out_tokens" "cached_tokens reads its own column" \
+  '^cached_tokens +1050\.0 \(1000\.\.1100\) +2750\.0 \(2700\.\.2800\)'
+# The direction rule is INVERTED between the two: less input is better,
+# more cached is better. A copy-pasted dir3 call gets one of them backwards,
+# and only checking both sides catches it.
+want "$out_tokens" "less input is better"  '^input_tokens .* better$'
+want "$out_tokens" "more cached is better" '^cached_tokens .* better$'
+# Ratio of the two, not a third column: 1050/9050 = 12%, 2750/3050 = 90%.
+want "$out_tokens" "cache_hit_rate divides cached by input" \
+  '^cache_hit_rate +12% +90% +observed$'
+want "$out_tokens" "a full-token run reports every session found" '^session_found +2/2 +2/2'
+
+# ---- An absent session is a harness bug and must read as one — the same
+# discipline as tally=missing. nosession.tsv differs from tokens.tsv in
+# exactly one field, so a report that cannot separate them is not reading it.
+want    "$out_nosession" "a missing session file is reported, not zeroed" '^session_found +1/2'
+differs "session_found actually reads the column" \
+  "$out_tokens" "$out_nosession"
+
+# ---- An absent COLUMN is not an absent session. pretoken.tsv is a
+# legitimate 20-wide file: it must be told what it is missing, and must not
+# be accused of the two OTHER shapes of incompleteness.
+want   "$out_pretoken" "a pre-token TSV says which columns are absent" \
+  'NOTE: 4 row\(s\) predate the token columns'
+want   "$out_pretoken" "and reads session_found as absent, not as 0 found" \
+  '^session_found +n/a \(column absent\) +n/a \(column absent\)'
+reject "$out_pretoken" "a pre-token TSV is not accused of predating gates" \
+  'predate the gates_fired column'
+reject "$out_pretoken" "and is not reported as a truncated write" \
+  'had too few fields'
+reject "$out_tokens"   "a full-width TSV carries no pre-token note" \
+  'predate the token columns'
+# A 19-wide legacy file predates BOTH columns and must say both, not one.
+want "$out_legacy" "a pre-gates TSV also names the missing token columns" \
+  'predate the token columns'
 
 # ---- dirge-l8l7.5: gates are half the mechanism check and were missing.
 # Asserted on the two-arm-only fixture, where gate count (3) differs from

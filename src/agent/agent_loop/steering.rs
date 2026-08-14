@@ -373,11 +373,16 @@ mod tests {
             repair_stats: std::sync::Arc::new(
                 crate::agent::agent_loop::tool_input_repair::RepairStats::new(),
             ),
+            retry_stats: std::sync::Arc::new(
+                crate::agent::agent_loop::tool_retry::RetryStats::new(),
+            ),
             truncation_notes: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
             tool_def_filter: None,
             dynamic_tool_search: false,
+            turn_envelope: false,
+            prompt_leak_detect: crate::agent::agent_loop::types::GateMode::Off,
             escalation_stream_fn: None,
             escalation_provider_name: None,
             escalation_pending: std::sync::Arc::new(std::sync::Mutex::new(None)),

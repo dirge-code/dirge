@@ -857,6 +857,20 @@ pub fn build_provider_additional_params(
 ) -> Option<serde_json::Value> {
     let mut additional = serde_json::Map::new();
 
+    // ----- tool gating (dirge-e31n.6) -----
+    // Only `None` is sent. `Auto` is the provider default, and an explicit
+    // "auto" is NOT equivalent to omitting the key: some OpenAI-compatible
+    // backends reject `tool_choice` when the request carries no `tools` array,
+    // so sending it unconditionally would break every tool-less call (the
+    // summarizer, the critic, the goal judge) to say something the provider
+    // already assumes.
+    if let Some(super::types::ToolChoice::None) = opts.tool_choice {
+        additional.insert(
+            "tool_choice".to_string(),
+            serde_json::Value::String(super::types::ToolChoice::None.as_wire().to_string()),
+        );
+    }
+
     // ----- reasoning per provider -----
     if let Some(level) = opts.reasoning
         && let Some(serde_json::Value::Object(m)) =
@@ -2306,5 +2320,69 @@ mod tests {
         // also not panic.
         let permuted = vec![mk_def("read"), mk_def("write")];
         emit_cache_prefix_event(Some("anthropic"), "preamble-x", &permuted, 3);
+    }
+}
+
+#[cfg(test)]
+mod tool_choice_tests {
+    use super::*;
+    use crate::agent::agent_loop::stream::StreamOptions;
+    use crate::agent::agent_loop::tool::AbortSignal;
+    use crate::agent::agent_loop::types::ToolChoice;
+
+    fn opts(choice: Option<ToolChoice>) -> StreamOptions {
+        let mut o = StreamOptions::from_signal(AbortSignal::new());
+        o.tool_choice = choice;
+        o
+    }
+
+    /// `None` must reach the request body, or the whole feature is inert.
+    #[test]
+    fn forbidding_tools_reaches_the_request_body() {
+        let params =
+            build_provider_additional_params(Some("openai"), &opts(Some(ToolChoice::None)))
+                .expect("params");
+        assert_eq!(
+            params.get("tool_choice").and_then(|v| v.as_str()),
+            Some("none")
+        );
+    }
+
+    /// An unconstrained turn must send NOTHING — not `"auto"`. Some
+    /// OpenAI-compatible backends reject `tool_choice` on a request carrying no
+    /// `tools` array, and dirge makes plenty of those (summarizer, critic, goal
+    /// judge), so saying what the provider already assumes would break them.
+    /// This is also why there is no `ToolChoice::Auto` to send.
+    #[test]
+    fn an_unconstrained_turn_sends_nothing() {
+        let params = build_provider_additional_params(Some("openai"), &opts(None));
+        let has_key = params.as_ref().and_then(|p| p.get("tool_choice")).is_some();
+        assert!(
+            !has_key,
+            "an unconstrained turn put tool_choice on the wire"
+        );
+    }
+
+    /// The key is provider-independent — every backend dirge targets spells it
+    /// `tool_choice` and reads `none` the same way.
+    #[test]
+    fn every_provider_gets_the_same_key() {
+        for provider in [
+            "openai",
+            "anthropic",
+            "deepseek",
+            "glm",
+            "openrouter",
+            "custom",
+        ] {
+            let params =
+                build_provider_additional_params(Some(provider), &opts(Some(ToolChoice::None)))
+                    .unwrap_or_else(|| panic!("{provider} produced no params"));
+            assert_eq!(
+                params.get("tool_choice").and_then(|v| v.as_str()),
+                Some("none"),
+                "{provider} did not carry the tool gate"
+            );
+        }
     }
 }

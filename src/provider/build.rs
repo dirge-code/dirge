@@ -182,7 +182,7 @@ pub async fn build_agent(
             // is on, `tool_def_filter` is `Some` and a
             // `ToolSearchTool` has been registered inside `tools`
             // with the same Arc.
-            let (loop_tools, dyn_search, review_memory_tool, mcp_tool_names) =
+            let (loop_tools, dyn_search, review_memory_tool, mcp_tool_names, plugin_tool_names) =
                 builder::build_loop_tools(
                     cache.clone(),
                     permission_for_loop,
@@ -211,6 +211,43 @@ pub async fn build_agent(
             // one-liner nudge so the model knows to call
             // `tool_search` before reaching for unknown tools.
             let mut preamble = agent_preamble;
+            // dirge-e31n.3: describe the tools the model ACTUALLY has. This
+            // has to happen here rather than in `build_agent_inner` because
+            // the registry does not exist until `build_loop_tools` above has
+            // run — which is also why the list it replaces was hand-written
+            // in the first place, and why it drifted.
+            //
+            // `assemble_base_preamble` has already omitted the static list
+            // under the same flag, so exactly one of the two is present.
+            if cfg.resolve_capability_projection() {
+                let catalog = crate::agent::capability_cards::ToolCatalog::build(
+                    &loop_tools,
+                    &context.current_prompt_deny_tools,
+                    // MCP and plugin tools are denied by UMBRELLA name, never
+                    // by concrete name — without these the projection reports
+                    // them all available under a mode that refuses them.
+                    &[
+                        (mcp_tool_names.as_slice(), "mcp_tool"),
+                        (plugin_tool_names.as_slice(), "plugin_tool"),
+                    ],
+                );
+                if let Some(projection) = crate::agent::capability_cards::project(
+                    &catalog,
+                    crate::agent::capability_cards::DEFAULT_BUDGET_CHARS,
+                ) {
+                    if !projection.dropped.is_empty() {
+                        tracing::debug!(
+                            target: "dirge::context",
+                            dropped = ?projection.dropped,
+                            "capability projection over budget; families dropped",
+                        );
+                    }
+                    if !preamble.is_empty() {
+                        preamble.push_str("\n\n");
+                    }
+                    preamble.push_str(&projection.content);
+                }
+            }
             if dyn_search.is_some() {
                 if !preamble.is_empty() {
                     preamble.push_str("\n\n");
@@ -245,6 +282,8 @@ pub async fn build_agent(
             if let Some(tool) = review_memory_tool {
                 agent = agent.with_review_memory_tool(tool);
             }
+            agent = agent.with_turn_envelope(cfg.resolve_turn_envelope());
+            agent = agent.with_prompt_leak_detect(cfg.resolve_prompt_leak_detect());
             if let Some(ds) = dyn_search {
                 agent.with_dynamic_tool_search(ds.filter, ds.registry)
             } else {

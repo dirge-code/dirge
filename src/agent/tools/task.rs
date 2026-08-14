@@ -511,6 +511,11 @@ pub fn resolve_subagent_max_turns(p: &crate::context::agent_defs::SubagentToolPo
     p.max_turns.unwrap_or(SUBAGENT_DEFAULT_MAX_TURNS)
 }
 
+/// Ceiling on a per-subagent timeout. One definition so the `task` tool's
+/// dispatch budget (dirge-9tl3) derives from the same clamp the resolver
+/// enforces, instead of repeating the number.
+pub(crate) const SUBAGENT_MAX_TIMEOUT_SECS: u64 = 3600;
+
 /// Per-subagent timeout honoring profile configuration, clamped to a bounded
 /// interval so a typo cannot create either immediate failures or stuck tasks.
 pub fn resolve_subagent_timeout(
@@ -518,9 +523,8 @@ pub fn resolve_subagent_timeout(
 ) -> std::time::Duration {
     const DEFAULT_SECS: u64 = 600;
     const MIN_SECS: u64 = 30;
-    const MAX_SECS: u64 = 3600;
     let raw = p.timeout_secs.unwrap_or(DEFAULT_SECS);
-    let secs = raw.clamp(MIN_SECS, MAX_SECS);
+    let secs = raw.clamp(MIN_SECS, SUBAGENT_MAX_TIMEOUT_SECS);
     if secs != raw {
         tracing::warn!(
             timeout_secs = raw,
@@ -529,6 +533,17 @@ pub fn resolve_subagent_timeout(
         );
     }
     std::time::Duration::from_secs(secs)
+}
+
+/// Dispatch-watchdog budget for the `task` tool (dirge-9tl3).
+///
+/// Every subagent timeout is clamped to at most [`SUBAGENT_MAX_TIMEOUT_SECS`]
+/// by `resolve_subagent_timeout`, so the budget is that documented ceiling
+/// plus a 30s grace — the subagent's own timeout always fires first, with
+/// its better-worded message. Not a new number: the watchdog must never cut
+/// a call the tool itself considers in bounds.
+pub(crate) fn dispatch_budget() -> std::time::Duration {
+    std::time::Duration::from_secs(SUBAGENT_MAX_TIMEOUT_SECS + 30)
 }
 
 /// dirge-ykeu Phase 4: a pre-resolved subagent routing for one agent profile.
@@ -2946,5 +2961,24 @@ mod tests {
             }
             other => panic!("expected ToolResult; got {:?}", other),
         }
+    }
+}
+
+/// dirge-9tl3: the dispatch budget derives from the documented
+/// subagent timeout clamp, not a new number.
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    #[test]
+    fn task_dispatch_budget_exceeds_the_subagent_timeout_ceiling() {
+        // resolve_subagent_timeout clamps every profile to at most
+        // SUBAGENT_MAX_TIMEOUT_SECS, so the dispatch budget must sit
+        // above that — the watchdog never cuts an in-bounds subagent.
+        let budget = dispatch_budget();
+        assert!(budget > std::time::Duration::from_secs(SUBAGENT_MAX_TIMEOUT_SECS));
+        // ...but it derives from the clamp plus a small grace, not a
+        // freshly invented magnitude.
+        assert!(budget <= std::time::Duration::from_secs(SUBAGENT_MAX_TIMEOUT_SECS + 60));
     }
 }

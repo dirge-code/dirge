@@ -139,6 +139,35 @@ pub struct TurnUpdate {
     pub thinking_level: Option<ThinkingLevel>,
 }
 
+/// Per-request control over whether the model may call tools (dirge-e31n.6).
+///
+/// Per REQUEST, not per session: it describes one turn, and a value that stuck
+/// would silently disarm the model for the rest of the run.
+/// There is deliberately NO `Auto` variant. `Option::<ToolChoice>::None`
+/// already means "say nothing, let the model decide", and a second spelling of
+/// the same thing is a redundant encoding that drifts — the two would have to
+/// be kept behaving identically forever, for no gain, since the wire result is
+/// the same either way. An enum rather than a bool so `Required` (force a
+/// call) can land later without touching every call site.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolChoice {
+    /// Tools are forbidden for this ONE request; the model must answer in
+    /// prose. Used where the harness has already TOLD it that calling another
+    /// tool cannot help, so the instruction is enforced rather than merely
+    /// stated.
+    None,
+}
+
+impl ToolChoice {
+    /// Wire value for OpenAI-compatible and Anthropic request bodies. Both
+    /// spell the key `tool_choice` and both read `none` the same way.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            ToolChoice::None => "none",
+        }
+    }
+}
+
 /// Tri-state gate mode reused by code-review (dirge-iyf5), open-issues
 /// (dirge-ksjl), and any future opt-in finalization gates that need an
 /// on/off/nagging toggle.
@@ -160,7 +189,7 @@ pub struct TurnUpdate {
 ///   Only FYI-for-the-human text belongs in a bare notice.
 /// - `Blocking` — await the gate and re-enter the loop on relevant
 ///   findings, bounded by a per-gate react cap.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum GateMode {
     Off,
     #[default]
@@ -465,6 +494,11 @@ pub struct LoopConfig {
     /// null-strip), 0 invalid" at session close.
     pub repair_stats: std::sync::Arc<super::tool_input_repair::RepairStats>,
 
+    /// dirge-61sv: per-run transient-tool-retry counters. Same shape and same
+    /// reason as `repair_stats` — the dispatch has no access to the tally, so
+    /// the count rides here and is latched at run end.
+    pub retry_stats: std::sync::Arc<super::tool_retry::RetryStats>,
+
     /// dirge-7bwx review-fix #2: per-call notes from the
     /// loop-level truncation closer (`apply_truncation_repair` in
     /// `run.rs`). Keyed by tool_call_id. `prepare_tool_call`
@@ -503,6 +537,17 @@ pub struct LoopConfig {
     /// inspect the setting without rebuilding the request-side
     /// filter independently.
     pub dynamic_tool_search: bool,
+
+    /// dirge-e31n.2: emit a per-turn `<turn_envelope>` carrying the volatile
+    /// session facts (cwd, OS, shell, git branch) instead of freezing them
+    /// into the system prompt. Mirrors the `turn_envelope` config knob. When
+    /// on, `builder::agent_inner` omits those four lines from the preamble,
+    /// so exactly one of the two paths states them.
+    pub turn_envelope: bool,
+
+    /// dirge-e31n.6: prompt-recitation detector mode. Mirrors the
+    /// `prompt_leak_detect` config knob.
+    pub prompt_leak_detect: GateMode,
 
     /// Phase 4 part 1: alternate stream function used for ONE call
     /// after a repair-exhaustion or tree-sitter failure. None when
@@ -770,6 +815,7 @@ impl std::fmt::Debug for LoopConfig {
             .field("storm_mutating_tools", &self.storm_mutating_tools)
             .field("storm_exempt_tools", &self.storm_exempt_tools)
             .field("repair_stats", &self.repair_stats)
+            .field("retry_stats", &self.retry_stats)
             .field("truncation_notes", &self.truncation_notes)
             .field(
                 "tool_def_filter",
@@ -846,9 +892,12 @@ impl Clone for LoopConfig {
             storm_mutating_tools: self.storm_mutating_tools.clone(),
             storm_exempt_tools: self.storm_exempt_tools.clone(),
             repair_stats: self.repair_stats.clone(),
+            retry_stats: self.retry_stats.clone(),
             truncation_notes: self.truncation_notes.clone(),
             tool_def_filter: self.tool_def_filter.clone(),
             dynamic_tool_search: self.dynamic_tool_search,
+            turn_envelope: false,
+            prompt_leak_detect: GateMode::Off,
             escalation_stream_fn: self.escalation_stream_fn.clone(),
             escalation_provider_name: self.escalation_provider_name.clone(),
             escalation_pending: self.escalation_pending.clone(),
@@ -910,11 +959,14 @@ impl LoopConfig {
             storm_mutating_tools: None,
             storm_exempt_tools: None,
             repair_stats: std::sync::Arc::new(super::tool_input_repair::RepairStats::new()),
+            retry_stats: std::sync::Arc::new(super::tool_retry::RetryStats::new()),
             truncation_notes: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
             tool_def_filter: None,
             dynamic_tool_search: false,
+            turn_envelope: false,
+            prompt_leak_detect: GateMode::Off,
             escalation_stream_fn: None,
             escalation_provider_name: None,
             escalation_pending: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -1061,6 +1113,7 @@ mod tests {
             "storm_exempt_tools",
             "truncation_notes",
             "repair_stats",
+            "retry_stats",
         ] {
             assert!(
                 rendered.contains(field),

@@ -491,11 +491,13 @@ pub struct TimeoutsConfig {
     pub stream_chunk_secs: Option<u64>,
     pub request_establish_secs: Option<u64>,
     pub tool_call_gap_secs: Option<u64>,
+    pub tool_call_secs: Option<u64>,
     pub mcp_call_secs: Option<u64>,
     pub mcp_init_secs: Option<u64>,
     pub lsp_request_secs: Option<u64>,
     pub lsp_initialize_secs: Option<u64>,
     pub bash_secs: Option<u64>,
+    pub bash_max_secs: Option<u64>,
 }
 
 /// Per-server LSP configuration. All fields optional — unspecified fields
@@ -1131,6 +1133,61 @@ pub struct Config {
     /// both trade a little prompt text for context-token savings.
     pub code_mode_rubric: Option<bool>,
 
+    /// dirge-e31n.2: move the volatile session facts (cwd, OS, shell, git
+    /// branch) out of the frozen system prompt and into a per-turn
+    /// `<turn_envelope>` block appended to the model-facing context.
+    ///
+    /// Those four facts are captured once, at agent construction, and never
+    /// refreshed — a `cd`, a `git switch`, or a worktree move leaves the
+    /// model reading a world that no longer exists, and the only correction
+    /// is `rebuild_agent`, which discards the whole cached prefix to update
+    /// four lines. Re-evaluating them per user turn and appending at the
+    /// tail costs nothing in cache churn.
+    ///
+    /// Default `true`. Measured on deepseek and glm at n=6 (scenario=denied):
+    /// 6/6 success on both models with no regression on any metric, and on the
+    /// model that was struggling it removed the blow-up runs entirely. On the
+    /// model that was coping it did nothing — which is the same shape
+    /// `capability.rs` is built on, help the failing run and leave the coping
+    /// run alone.
+    ///
+    /// The evidence base is ONE scenario at n=6, so this is a default worth
+    /// revisiting if a later scenario shows otherwise. Set `false` to restore
+    /// the frozen-preamble behaviour.
+    pub turn_envelope: Option<bool>,
+
+    /// dirge-e31n.3: replace the hand-written `Available tools:` list in the
+    /// system prompt with a projection rendered from the tools ACTUALLY
+    /// registered for the turn, minus what the active prompt's `deny_tools`
+    /// removes.
+    ///
+    /// The static list cannot see `deny_tools`, never mentions MCP or plugin
+    /// tools, and under `dynamic_tool_search` names tools that are not loaded
+    /// — so plan and review mode advertise `write`/`edit`/`apply_patch`/`bash`
+    /// while refusing all four (dirge-cw7w). A weak model plans against the
+    /// prompt, hits a refusal, and burns turns recovering.
+    ///
+    /// Default `true`, on the same evidence as `turn_envelope` and with the
+    /// same caveat: safe on both models tested, materially better only on the
+    /// one that was failing. Set `false` to restore the hand-written
+    /// `Available tools:` list.
+    pub capability_projection: Option<bool>,
+
+    /// dirge-e31n.6: detect a model that stops answering and starts reciting
+    /// its own system prompt back at the user.
+    ///
+    /// `off` | `advisory` | `blocking`. **`off` by default.** `advisory`
+    /// records the detection and tells the user, letting the turn finish;
+    /// `blocking` also stops consuming the stream, so the recitation is
+    /// truncated rather than run to the output cap.
+    ///
+    /// Nobody has yet observed this in dirge — the flag exists so it can be
+    /// measured before it is trusted, which is why `advisory` (detect and
+    /// report, change nothing) is a mode rather than an afterthought. The
+    /// detector is deliberately hard to trip: see `agent_loop::prompt_leak`
+    /// for the measured margin, which is smaller than it looks.
+    pub prompt_leak_detect: Option<String>,
+
     /// Phase 4 part 2 (`docs/AGENTIC_LOOP_PLAN.md`): consecutive-turn
     /// threshold for the context-depth reminder system. `None`
     /// (default) keeps the feature OFF — long sessions get no
@@ -1650,6 +1707,36 @@ impl Config {
         self.code_mode_rubric.unwrap_or(false)
     }
 
+    /// Per-turn context envelope (dirge-e31n.2). Default ON — see the field
+    /// doc for the measurement behind that and its limits.
+    pub fn resolve_turn_envelope(&self) -> bool {
+        self.turn_envelope.unwrap_or(true)
+    }
+
+    /// Capability projection (dirge-e31n.3). Default ON — the prompt's account
+    /// of the tool set is rendered from the live catalog rather than a literal.
+    pub fn resolve_capability_projection(&self) -> bool {
+        self.capability_projection.unwrap_or(true)
+    }
+
+    /// Prompt-recitation detector (dirge-e31n.6). Default OFF. An
+    /// unrecognised value warns and falls back to off rather than to a mode
+    /// that changes behaviour.
+    pub fn resolve_prompt_leak_detect(&self) -> crate::agent::agent_loop::types::GateMode {
+        use crate::agent::agent_loop::types::GateMode;
+        match self.prompt_leak_detect.as_deref() {
+            None => GateMode::Off,
+            Some(raw) => GateMode::from_wire(raw).unwrap_or_else(|| {
+                tracing::warn!(
+                    target: "dirge::config",
+                    value = %raw,
+                    "unrecognised prompt_leak_detect; falling back to off",
+                );
+                GateMode::Off
+            }),
+        }
+    }
+
     /// Phased plan workflow opt-in (vix port). Default off — `/plan` is gated
     /// on this as a master kill-switch.
     pub fn resolve_phased_workflow_enabled(&self) -> bool {
@@ -1721,11 +1808,13 @@ impl Config {
             stream_chunk: or_default(c.stream_chunk_secs, d.stream_chunk),
             request_establish: or_default(c.request_establish_secs, d.request_establish),
             tool_call_gap: or_default(c.tool_call_gap_secs, d.tool_call_gap),
+            tool_call: or_default(c.tool_call_secs, d.tool_call),
             mcp_call: or_default(c.mcp_call_secs, d.mcp_call),
             mcp_init: or_default(c.mcp_init_secs, d.mcp_init),
             lsp_request: or_default(c.lsp_request_secs, d.lsp_request),
             lsp_initialize: or_default(c.lsp_initialize_secs, d.lsp_initialize),
             bash: or_default(c.bash_secs, d.bash),
+            bash_max: or_default(c.bash_max_secs, d.bash_max),
         }
     }
 
@@ -2161,6 +2250,35 @@ mod tests {
     /// form used `as u8`/`as u32` casts that silently wrapped — 256
     /// CPUs became 0. Out-of-range values must now be a clean
     /// deserialization error, and valid ones still parse.
+    /// dirge-e31n: both steering flags ship ON. Pinned because the value is a
+    /// PRODUCT decision resting on a specific, narrow measurement — deepseek
+    /// and glm, n=6, one scenario — and a silent flip in either direction
+    /// changes what every user's model is told without anyone re-running that
+    /// measurement. Flipping these should be a deliberate edit that fails this
+    /// test first.
+    #[test]
+    fn steering_flags_default_on() {
+        let cfg = Config::default();
+        assert!(cfg.resolve_turn_envelope(), "turn_envelope must default on");
+        assert!(
+            cfg.resolve_capability_projection(),
+            "capability_projection must default on"
+        );
+    }
+
+    /// And both remain overridable to off — the escape hatch is the reason
+    /// defaulting them on is a safe call rather than a bet.
+    #[test]
+    fn steering_flags_can_be_disabled() {
+        let cfg = Config {
+            turn_envelope: Some(false),
+            capability_projection: Some(false),
+            ..Config::default()
+        };
+        assert!(!cfg.resolve_turn_envelope());
+        assert!(!cfg.resolve_capability_projection());
+    }
+
     #[test]
     fn sandbox_legacy_nested_rejects_out_of_range_cpus() {
         let ok: SandboxConfig =
@@ -2735,6 +2853,8 @@ mod tests {
         assert_eq!(t.lsp_request, d.lsp_request);
         assert_eq!(t.mcp_init, d.mcp_init);
         assert_eq!(t.request_establish, d.request_establish);
+        // dirge-9tl3: the dispatch ceiling keeps its default when unset.
+        assert_eq!(t.tool_call, d.tool_call);
 
         // dirge-u44q: request_establish_secs is a first-class override.
         let cfg: Config =
@@ -2742,6 +2862,12 @@ mod tests {
         let t = cfg.resolve_timeouts();
         assert_eq!(t.request_establish, std::time::Duration::from_secs(90));
         assert_eq!(t.stream_chunk, d.stream_chunk);
+
+        // dirge-9tl3: tool_call_secs overrides the dispatch ceiling.
+        let cfg: Config =
+            serde_json::from_str(r#"{ "timeouts": { "tool_call_secs": 45 } }"#).unwrap();
+        let t = cfg.resolve_timeouts();
+        assert_eq!(t.tool_call, std::time::Duration::from_secs(45));
     }
 
     #[test]

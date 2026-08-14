@@ -58,7 +58,7 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
     // at the permission-checker layer. Plan / review modes deny
     // edit/write/apply_patch/bash entirely, so the file-name gate
     // is unnecessary.
-    let mut preamble = assemble_base_preamble();
+    let mut preamble = assemble_base_preamble(cfg.resolve_capability_projection());
     append_code_mode_guidance(&mut preamble, cfg.resolve_code_mode_rubric());
     if let Some(agents) = &context.agents {
         preamble.push_str("\n\n");
@@ -70,16 +70,15 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
         preamble.push_str(prompt);
     }
 
-    if let Ok(cwd) = std::env::current_dir() {
-        let cwd_str = cwd.display();
-        preamble.push_str(&format!("\n\nCurrent working directory: {}", cwd_str));
-    }
-
-    preamble.push_str(&format!("\nOS: {}", std::env::consts::OS));
-
-    if let Ok(shell) = std::env::var("SHELL") {
-        preamble.push_str(&format!("\nShell: {}", shell));
-    }
+    // dirge-e31n.2: cwd / OS / shell / git branch are the four facts in this
+    // preamble that can change WITHIN a session. Baked in here they go stale
+    // on the first `cd` or `git switch`, and the only refresh is
+    // `rebuild_agent`, which discards the whole cached prefix to update four
+    // lines. With `turn_envelope` on they move to a per-turn block appended
+    // to the model-facing context instead (see `agent_loop::envelope`), and
+    // this whole span is skipped so the fact is not stated twice with two
+    // different answers — which is worse than stating it once and stale.
+    let turn_envelope = cfg.resolve_turn_envelope();
 
     // Bounded git lookup. `git rev-parse` can hang for many seconds
     // when the repo's `.git` lives on a wedged NFS mount, the
@@ -118,8 +117,22 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
             _ => None,
         };
 
-    if let Some(branch) = git_branch {
-        preamble.push_str(&format!("\nGit branch: {}", branch));
+    // The branch is resolved above under a startup timeout and passed in
+    // rather than re-read by `SessionFacts::read` — that helper deliberately
+    // has no timeout ladder (it is for the in-turn path, where git is warm),
+    // and calling it here would drop the guard this function needs.
+    if !turn_envelope {
+        preamble.push_str(
+            &crate::agent::agent_loop::envelope::SessionFacts {
+                cwd: std::env::current_dir()
+                    .ok()
+                    .map(|p| p.display().to_string()),
+                os: std::env::consts::OS.to_string(),
+                shell: std::env::var("SHELL").ok(),
+                git_branch,
+            }
+            .to_preamble_lines(),
+        );
     }
 
     // Phase 8: inject per-project memory + skills into the system

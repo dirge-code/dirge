@@ -1085,17 +1085,17 @@ mod tests {
         );
     }
 
-    /// End-to-end: every action the SYSTEM_PROMPT names for the memory
+    /// End-to-end: every action the STATIC_TOOL_LIST names for the memory
     /// tool must succeed against a real MemoryTool with valid args.
     /// If this fails, the prompt is lying to the model. See dirge-yqmo.
     #[test]
     fn integration_prompt_actions_all_executable() {
-        use crate::agent::prompt::SYSTEM_PROMPT;
+        use crate::agent::prompt::STATIC_TOOL_LIST;
 
-        let memory_line = SYSTEM_PROMPT
+        let memory_line = STATIC_TOOL_LIST
             .lines()
             .find(|l| l.trim_start().starts_with("- memory:"))
-            .expect("SYSTEM_PROMPT should describe the memory tool");
+            .expect("STATIC_TOOL_LIST should describe the memory tool");
 
         // Extract candidate action words from the prompt.
         let known_actions = [

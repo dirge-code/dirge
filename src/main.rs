@@ -13,6 +13,9 @@ mod event;
 mod extras;
 mod fs_atomic;
 mod hash;
+/// Marks the stretches of a tool call spent waiting on the user, so the
+/// dispatch watchdog can tell a stalled call from a careful human.
+mod human_wait;
 /// Shared request/response correlation core over `jsonrpc_framing`, used by
 /// both the LSP and DAP clients (each supplies a `Protocol` impl).
 #[cfg(any(feature = "lsp", feature = "dap"))]
@@ -24,6 +27,9 @@ mod jsonrpc_framing;
 mod llmtrim;
 #[cfg(feature = "lsp")]
 mod lsp;
+/// What a panic hook writes down so whoever survives the panic — or the
+/// terminal teardown, when nobody did — can report it.
+mod panic_report;
 mod permission;
 mod plugin;
 mod prompt_cache;
@@ -434,6 +440,14 @@ fn should_adopt_session_provider(
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
+    // Write down every panic before anything can produce one. The hook
+    // only records — whoever survives the panic claims the record and
+    // reports it (the agent run's crash error), and if nobody did,
+    // `TerminalGuard::drop` prints it on the way out. Installed here
+    // rather than in the TUI guard so `--print`, `--loop` and ACP get
+    // the same account of a crash.
+    panic_report::install();
+
     // Install ring crypto provider for rustls (reqwest uses rustls-no-provider).
     // Must happen before any reqwest::Client::new() call.
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -1819,6 +1833,20 @@ async fn main() -> anyhow::Result<()> {
             Some(session.id.to_string()),
         )
         .await;
+
+        // dirge-wxyw: stamp which assembled system prompt this session ran
+        // under. Diagnostic only — nothing branches on it — but it is the only
+        // record of the instructions, and the version cannot stand in for it
+        // (the preamble varies within a version by mode, AGENTS.md, skills,
+        // memory and model-family steering). Logged as well as stored so it is
+        // greppable without opening the session file.
+        let digest = agent.preamble_digest();
+        tracing::info!(
+            target: "dirge::context",
+            preamble_digest = %digest,
+            "assembled system prompt",
+        );
+        session.preamble_digest = Some(CompactString::new(&digest));
 
         #[cfg(feature = "plugin")]
         if let Some(pm_arc) = plugin_manager.as_ref() {

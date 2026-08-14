@@ -180,8 +180,10 @@ pub async fn execute_tool_calls_sequential(
                 // LOOP-5: RAII guard ensures the inflight id is
                 // removed even on cancellation / panic / `?`-bail.
                 let _inflight = inflight.guard(&tool_call.id);
-                let executed =
-                    execute_prepared_tool_call(&tool, tool_call, &args, signal, emit).await;
+                let executed = execute_prepared_tool_call_with_retry(
+                    &tool, tool_call, &args, config, signal, emit,
+                )
+                .await;
                 let mut finalized = finalize_executed_tool_call(
                     context,
                     assistant_message,
@@ -232,6 +234,79 @@ pub async fn execute_tool_calls_sequential(
     }
 }
 
+/// The text of a tool result, for classifying WHY it failed. Mirrors
+/// `run.rs`'s `tool_result_excerpt`, but reads the pre-conversion
+/// `LoopToolResult` shape (`content` is `Vec<Value>` of
+/// `{"type":"text","text":…}`) rather than the typed `ContentBlock`s.
+fn executed_result_text(result: &LoopToolResult) -> String {
+    result
+        .content
+        .iter()
+        .filter_map(|b| b.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Run a prepared tool call, retrying a TRANSIENT failure when re-running the
+/// tool cannot duplicate an effect (dirge-61sv).
+///
+/// The whole decision lives in [`super::tool_retry`] — see its docs for why
+/// this is gated on the tool's operation and not just on the error text. In
+/// short: a timeout does not mean the work did not happen, so only pure reads
+/// are eligible.
+///
+/// Cancellation is honoured in ONE place: the backoff races the abort signal
+/// rather than sleeping through it, so a cancelled run neither waits nor
+/// retries. An earlier cut also early-returned on `signal.is_cancelled()`
+/// right after the call — mutation testing showed that guard changes nothing,
+/// because the race already covers every path that reaches it, and it was
+/// actively slightly wrong: it discarded the recovery attribution for a retry
+/// that HAD succeeded before the run was cancelled. One encoding of a rule,
+/// not two.
+///
+/// Deliberately emits no extra `ToolExecutionStart`: the id is already live
+/// in the UI from the first attempt, and a second start for the same
+/// `tool_call_id` would render as a duplicate call rather than a retry. The
+/// retry is visible in the log and in `retry_stats` instead.
+async fn execute_prepared_tool_call_with_retry(
+    tool: &Arc<dyn LoopTool>,
+    tool_call: &ToolCall,
+    args: &Value,
+    config: &LoopConfig,
+    signal: &AbortSignal,
+    emit: &mpsc::Sender<LoopEvent>,
+) -> ExecutedOutcome {
+    let mut attempt: u32 = 1;
+    loop {
+        let outcome = execute_prepared_tool_call(tool, tool_call, args, signal, emit).await;
+        let excerpt = executed_result_text(&outcome.result);
+        if !super::tool_retry::should_retry(&tool_call.name, outcome.is_error, &excerpt, attempt) {
+            // Attribute the recovery only when a RETRY produced it — attempt
+            // 1 succeeding is just a tool working.
+            if attempt > 1 && !outcome.is_error {
+                config.retry_stats.record_recovery();
+            }
+            return outcome;
+        }
+        let wait = super::tool_retry::backoff(attempt);
+        tokio::select! {
+            biased;
+            _ = wait_for_cancel(signal.clone()) => return outcome,
+            _ = tokio::time::sleep(wait) => {}
+        }
+        config.retry_stats.record_attempt();
+        attempt += 1;
+        tracing::info!(
+            target: "dirge::agent_loop::tools",
+            tool = %tool_call.name,
+            tool_call_id = %tool_call.id,
+            attempt,
+            wait_ms = wait.as_millis() as u64,
+            "retrying transient tool failure",
+        );
+    }
+}
+
 /// Lookup tool, run `prepareArguments`, validate (TODO phase 3),
 /// run `beforeToolCall`. Faithful port of pi `prepareToolCall`
 /// (agent-loop.ts:562-626).
@@ -258,6 +333,7 @@ async fn prepare_tool_call(
             // (e.g. `search_files` for `grep`, `view` for `read`). A
             // nearest-name hint turns a dead end into a one-shot fix.
             let names: Vec<&str> = context.tools.iter().map(|t| t.name()).collect();
+            super::suggest::log_tool_name_miss(&tool_call.name, &names, "dispatched");
             let mut msg = format!("Tool {} not found", tool_call.name);
             if let Some(sugg) = super::suggest::closest(&tool_call.name, &names) {
                 msg.push_str(&format!(". Did you mean `{sugg}`?"));
@@ -529,25 +605,84 @@ async fn execute_prepared_tool_call(
     // Tools that ALSO poll `is_cancelled()` get even cleaner
     // cancellation since they bail at their next checkpoint
     // rather than relying solely on the drop.
-    let exec_future = tool.execute(&tool_call.id, args.clone(), signal.clone(), on_update);
-    let signal_check = wait_for_cancel(signal.clone());
+    //
+    // dirge-9tl3: the same race now also bounds the call in
+    // TIME. A budget races as a third arm; on expiry the tool
+    // future is dropped, so the exact cancellation machinery
+    // above — RAII guards, bash's `PgKillGuard` — covers the
+    // watchdog path identically. Arm order: cancel, then
+    // completion, then the deadline — a tool that finished must
+    // never lose to a ready timer.
+    //
+    // dirge-8cbm: a `call_budget` override may only RAISE the
+    // shared ceiling, never lower it. An override says "this tool
+    // legitimately needs LONGER" (bash with a model-supplied
+    // timeout, a subagent); a tool that wants to be cut SOONER
+    // should bound itself, where it can produce a better message
+    // than the watchdog can. Taking the max also keeps an
+    // override from shortening the window a human has to answer
+    // the permission prompt this call is sitting behind.
+    let ceiling = crate::timeout::Timeouts::get().tool_call;
+    let budget = tool.call_budget(args).map_or(ceiling, |b| b.max(ceiling));
+    let mut exec_future =
+        std::pin::pin!(tool.execute(&tool_call.id, args.clone(), signal.clone(), on_update));
+    let mut signal_check = std::pin::pin!(wait_for_cancel(signal.clone()));
 
-    let outcome = tokio::select! {
-        biased;  // Prefer the cancel branch when both are ready
-                 // — so a cancel that fires during a fast tool
-                 // doesn't get masked by the tool's completion.
-        _ = signal_check => {
-            // Signal fired before the tool finished. Return an
-            // aborted result; the loop's next signal check at
-            // its turn boundary will exit cleanly.
-            return ExecutedOutcome {
-                result: create_error_tool_result(
-                    "tool execution aborted by cancellation signal",
-                ),
-                is_error: true,
-            };
+    let outcome = loop {
+        // Re-armed rather than started once, because the budget
+        // has to be able to stop counting — see the expiry arm.
+        let deadline = tokio::time::sleep(budget);
+        tokio::select! {
+            biased;  // Prefer the cancel branch when both are ready
+                     // — so a cancel that fires during a fast tool
+                     // doesn't get masked by the tool's completion.
+            _ = &mut signal_check => {
+                // Signal fired before the tool finished. Return an
+                // aborted result; the loop's next signal check at
+                // its turn boundary will exit cleanly.
+                return ExecutedOutcome {
+                    result: create_error_tool_result(super::side_effect::ABORTED_SENTINEL),
+                    is_error: true,
+                };
+            }
+            result = &mut exec_future => break result,
+            _ = deadline => {
+                // dirge-8cbm: a budget bounds WORK, not a person.
+                // The permission prompt, the `question` tool and
+                // `/plan` approval all wait for the user from
+                // inside `execute`, i.e. inside this window, and
+                // killing a call somebody is halfway through
+                // approving is worse than the stall this exists to
+                // catch. Re-arm with a full budget instead: once
+                // they answer, the tool gets its whole working
+                // window.
+                if crate::human_wait::anyone_waiting() {
+                    continue;
+                }
+                // Watchdog fired: the call was stopped by dispatch,
+                // not failed by the tool. Worded to avoid the retry
+                // classifier's "timeout" vocabulary on purpose —
+                // blindly re-running a runaway call is the wrong
+                // response to a ceiling hit.
+                tracing::warn!(
+                    target: "dirge::agent_loop::tools",
+                    tool = %tool_call.name,
+                    tool_call_id = %tool_call.id,
+                    budget_secs = budget.as_secs(),
+                    "tool call stopped by dispatch budget watchdog",
+                );
+                return ExecutedOutcome {
+                    result: create_error_tool_result(&format!(
+                        "{} call stopped: it exceeded the {}s dispatch budget \
+                         before returning. The call was cut by the watchdog, not \
+                         failed by the tool — narrow the work or split the call \
+                         rather than retrying it unchanged.",
+                        tool_call.name, budget.as_secs()
+                    )),
+                    is_error: true,
+                };
+            }
         }
-        result = exec_future => result,
     };
 
     // LOOP-11: surface the final dropped-update count if any
@@ -911,10 +1046,11 @@ pub async fn execute_tool_calls_parallel(
                 let call_id = tool_call.id.clone();
                 entries.push(Box::pin(async move {
                     let _guard = inflight_clone.guard(&call_id);
-                    let executed = execute_prepared_tool_call(
+                    let executed = execute_prepared_tool_call_with_retry(
                         &tool,
                         &tool_call_clone,
                         &args,
+                        &config_clone,
                         &signal_clone,
                         &emit_clone,
                     )

@@ -514,6 +514,49 @@ The practical consequence: at n≤3 against a ~2× floor, effects justified by
 Prefer changes whose success criterion is **structural** — did the mechanism
 fire when it should, and stay silent otherwise — because those hold at n=1.
 
+**Building a scenario that forces the condition.** A mechanism check tells you
+the condition did not occur; it does not tell you how to make it occur, and that
+can be most of the work. Forcing an *unconfirmable side effect* — a command that
+changes something and then fails to report what it changed — took three attempts,
+and every failure was the model defending itself against an unbounded command:
+
+1. Pinning `timeouts.bash_secs=5` did nothing. That key is documented as the
+   default "when the call omits one", and the model passed `timeout: 60` of its
+   own. The command finished; the tool returned `exit=0`.
+2. Asking for "a timeout of 10 seconds" in the task made the model reach for the
+   *shell's* `timeout(1)` instead of the tool parameter. The command exits 124,
+   which the bash tool reports as an ordinary non-zero exit — not a tool error at
+   all, so still nothing to classify.
+3. What worked *mostly*: say nothing about timeouts and pin `bash_secs` low. The
+   two bounds compose. If the model passes its own, that wins and still trips
+   (the script outlasts any sane value); if it uses a shell timeout or none, it
+   passed no tool timeout, so the configured one applies.
+
+Even then it is not airtight. Two of six control runs on one model reached for
+`background: true`, which returns a shell id immediately — no deadline, no error,
+nothing to classify. The mechanism check flagged both as uninformative, which is
+the point: the effective `n` was 4, not 6, and the report says so rather than
+averaging two empty runs into the result.
+
+Three routes around one unbounded command, found by running it: the tool's own
+`timeout` parameter, the shell's `timeout(1)`, and `background: true`. The
+general lesson is not the list — it is that **the condition you are trying to
+force may simply be rare**, because the model is actively avoiding it. That is
+worth knowing before concluding a feature does not help: it may be that the
+situation it helps with almost never arises in the scenario you built.
+
+Two more things generalise. **A lever the model can overrule is not a lever** — check
+whether the knob you are pinning is a default or a bound before building a
+scenario on it. And **the scenario's difficulty is a variable you are setting**:
+a task that names the expected outcome ("it adds exactly ONE entry") makes the
+correct behaviour discoverable, and a model that would otherwise have failed may
+pass for that reason rather than because of the change under test.
+
+**Score the tree, not the answer.** For anything measuring a duplicated side
+effect, the correctness check must read the filesystem. A run that ran the script
+twice and then truthfully reported "2 lines" is the failure being measured; a
+check that only parses the model's prose scores it as a pass.
+
 **Gate co-occurrence.** Per-run totals cannot tell two gates that always fire at
 the same boundary from two that never overlap, and that distinction is where the
 ceiling lives. The ablation in [arXiv:2604.25850v4](https://arxiv.org/abs/2604.25850)
@@ -534,6 +577,40 @@ Finding that two gates fire redundantly is *not* licence to remove one. That is 
 separate decision with its own evidence bar, and the source loop is the
 cautionary tale: it optimised an aggregate dominated by its medium tier and
 silently gave back the hard-tier gain.
+
+**Mutation testing has a harness: `scripts/mutate.sh`.** Reintroduce a bug,
+assert a named test dies. Everything in this document that turned out to be
+load-bearing was confirmed that way, and — more usefully — several guards that
+looked load-bearing had SURVIVING mutations, which is how their fixtures were
+found to be passing for the wrong reason.
+
+Three things the harness exists to stop, all learned the hard way:
+
+- **A mutation that did not apply is not a mutation that was survived.** The
+  `edit()` helper asserts its pattern was present, so a stale pattern is
+  reported as BROKEN rather than counted as a pass. From the outside those two
+  look identical, and the second is a false clean bill of health.
+- **Restore must not depend on the run finishing.** Hand-written `cp`-back is
+  fine until a command times out between the mutation and the restore, and then
+  a mutated file is sitting in the tree looking like real work. The harness
+  restores from a `trap`.
+- **Disk.** Each mutated rebuild writes a fresh incremental-compilation session.
+  `target/debug/incremental` reached 157 GB here. That alone did not fill the
+  volume — it runs near 99% from ordinary use — but it was the largest single
+  reclaimable item and it is what tipped a full volume into ENOSPC mid-session.
+  Mutation builds are throwaway and gain almost nothing from incrementality on
+  a single large binary crate, so the harness sets `CARGO_INCREMENTAL=0`.
+
+  Diagnosing it has two traps worth knowing, because the symptom is rustc dying
+  with `SIGBUS` and a backtrace that mentions nothing about disk. First, `df /`
+  on macOS reports the sealed SYSTEM volume — the data lives on
+  `/System/Volumes/Data`, and the two share an APFS container, so the `Avail`
+  column is not describing the volume the `Used` column is. Second, APFS
+  snapshots pin the blocks of deleted files, so `rm -rf` returns space only as
+  they age out; `tmutil listlocalsnapshots /` shows what is holding them.
+
+Always end with `mutate_control`: if the unmutated tree is red, every "killed"
+above it is reporting a suite that was already failing.
 
 **The harness has its own tests now.** `scripts/loop-ab-selftest.sh` runs the real
 reporting awk against a synthetic TSV — no models, no network. It exists because
@@ -592,3 +669,89 @@ aborted report is not a failing report.** When the absent-arm guard is removed,
 awk dies, `set -e` kills the selftest, and every `reject` assertion in it passes
 vacuously on empty output. The exit code was correct and named nothing. The
 harness now catches the abort and reports it as a normal failing check.
+
+## When the scorer is the thing that is wrong
+
+The compaction-schema round (`dirge-e31n.7`) asked one question — does a
+labelled-slot summary template preserve more than the narrative sections —
+against a scorer that counted verbatim recall of twenty planted facts. The
+implementation was fine every time. The **scorer** was wrong three times, and
+each bug was on course to produce a confident, publishable, false answer.
+
+| What it reported | What was true |
+|---|---|
+| `sections` dropped the error string 4 runs of 5 | It preserved it. The model wrote `` `called Option::unwrap() on a None value` `` — the outer code span ate the inner backticks — and `contains` on a needle with backticks missed |
+| Same fact "dropped" by the other arm | It escaped the backticks instead: `` `called \`Option::unwrap()\` on a \`None\` value` `` |
+| A number "dropped" | The model wrote ``offset `883421` ``; the needle was `offset 883421` |
+| Both arms declared the truncation gap 6/6 | Neither did. One planted fact was `rejected the truncate-and-replay approach`, and the coverage detector scans for `truncat` |
+| A healthy coverage report read as a declared gap | `SOURCE_COVERAGE: COMPLETE — no truncation marker` contains `truncat`, and the detector had no negation handling |
+
+Three rules come out of it, and none of them are about compaction.
+
+**A scorer that matches strings must be tested against the strings the model
+actually writes, not the ones you planted.** Fixtures are written in the
+author's voice; a model writing markdown wraps identifiers in backticks,
+escapes them, or reflows them. Those are presentation, not content, and a
+scorer that counts them as losses measures formatting habits. Worse, it does so
+*unevenly* — the arm that writes more prose formats more — which is precisely
+the difference under test, so the artifact lands squarely on the dependent
+variable. Dump the model's actual output on the first disagreement and read it
+before believing the number.
+
+**A detector and its fixture must not share vocabulary.** The coverage detector
+scanned for `truncat`; a planted fact contained `truncate-and-replay`. Every
+summary that faithfully preserved that fact was scored as declaring a gap, so
+*the better the summary, the more certainly it misreported*. This is now a
+test — no planted needle, and no fixture turn, may trip the detector — because
+the general form is the fixable one: any future keyword or fact that collides
+fails there instead of silently inverting a result.
+
+**Negation is not a refinement.** The single most common thing a summarizer with
+a coverage slot writes is "COMPLETE — no truncation marker was shown". A bare
+substring scan reads that as a declared gap, i.e. it inverts the healthy case,
+for every run of the arm that has the feature. A keyword scanner over
+free-form model prose needs negation handling before it is run once, not after
+it produces a suspicious result.
+
+The pattern behind all three: **a one-sided assertion cannot see its own
+artifact.** Every one of these was caught by pairing — `scorer_credits_a_fact_the_model_reformatted`
+against `scorer_still_catches_a_paraphrase`,
+`coverage_detector_fires_on_a_declared_gap` against
+`coverage_detector_does_not_fire_on_a_confident_summary`. The negative half is
+where the bugs were: two of the three surfaced the moment a "must NOT fire"
+case was written down, before any model was called.
+
+One last note on reading the result. At n=8 the two schemas looked different —
+means 19.1 vs 19.8, with the sections arm carrying two lossy runs among six
+perfect ones. At n=20 they were identical (8 vs 9 facts lost of 400). The
+apparent gap was noise, and the mean was hiding the shape either way: report
+the tail (facts lost, runs losing 2+) alongside it, because for compaction the
+occasional run that drops five facts *is* the failure mode and a mean of 19
+describes neither arm.
+
+### A failed call is not a bad result
+
+One more from the same harness, found while using it rather than while writing
+it. The recall probes ended with
+
+```rust
+let summary = summarize(prompt).await.unwrap_or_default();
+```
+
+so a provider error became an empty string, scored `0/20`, and was reported as
+a **maximally lossy summary**. It is the same mistake as the aborted report
+above, inverted: there the failure vanished, here it was promoted into a data
+point.
+
+It is worse than a lost run because it is *plausible*. The arm carrying the
+failure read 17.4/20 against another's 19.9 and looked like a real fidelity
+difference — the mean moved by exactly the amount a fabricated worst-possible
+score moves it. Re-running with failures counted separately put the same arm at
+19.3 and the shipped one at 20.0.
+
+The rule: **a call that could not run must be excluded and counted, never
+scored.** Any `unwrap_or_default`, `unwrap_or(0)`, or `.ok()` on the boundary
+between your harness and something that can fail is a candidate for this, and
+the tell is that the failure mode produces a value inside the range of real
+results instead of outside it. A summary that scores zero and a request that
+404'd are indistinguishable downstream unless the harness keeps them apart.
