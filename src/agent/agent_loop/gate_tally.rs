@@ -242,6 +242,21 @@ pub struct GateTally {
     capability_tier: Option<super::capability::CapabilityTier>,
     scavenged_calls: u32,
     hallucinated_tool_names: u32,
+    /// dirge-e31n.8: calls written in EXPLICIT call syntax inside the model's
+    /// text whose tool name matched nothing, so the scavenger dropped them.
+    ///
+    /// Sibling of `hallucinated_tool_names`, and the reason both are needed:
+    /// that one counts a miss the model was TOLD about ("Tool X not found",
+    /// with a nearest-name hint), this one counts a miss nothing reported to
+    /// anyone. Dropping silently is deliberate — dirge-knt8 established that
+    /// erroring on scavenged text re-forces a continuation turn — so the
+    /// counter is how the cost of that choice becomes visible at all.
+    ///
+    /// OBSERVATION ONLY: not fed to the capability estimator. What one of
+    /// these is worth against an errored call is exactly what there is no
+    /// data on yet, and guessing a weight would bake the guess into the
+    /// tier before the first measurement.
+    dropped_unknown_names: u32,
     storm_suppressions: u32,
     /// Peak failure streak over the run.
     max_failure_streak: u32,
@@ -401,13 +416,18 @@ impl GateTally {
         self.scavenged_calls += 1;
     }
 
-    /// A tool name had to be resolved by nearest-name match (suggest.rs).
-    /// Not wired yet: suggest.rs is called from several sites, so its
-    /// recording is scoped separately (dirge-5mtx.7). Remove this allow
-    /// when that wiring lands.
-    #[allow(dead_code)]
+    /// A dispatched call named a tool the run does not have. Recorded by
+    /// `run::record_tool_result_signals`, which re-derives the miss from the
+    /// batch's tool set — see its docs for why the classification lives
+    /// there rather than at the rejection site.
     pub fn record_hallucinated_tool_name(&mut self) {
         self.hallucinated_tool_names += 1;
+    }
+
+    /// A call written in explicit call syntax inside the model's text named a
+    /// tool the run does not have, so it was dropped without dispatch.
+    pub fn record_dropped_unknown_name(&mut self) {
+        self.dropped_unknown_names += 1;
     }
 
     /// A call was suppressed by the storm breaker as a repeat.
@@ -467,6 +487,10 @@ impl GateTally {
 
     pub fn hallucinated_tool_names(&self) -> u32 {
         self.hallucinated_tool_names
+    }
+
+    pub fn dropped_unknown_names(&self) -> u32 {
+        self.dropped_unknown_names
     }
 
     pub fn storm_suppressions(&self) -> u32 {
@@ -548,6 +572,7 @@ impl GateTally {
             nudge_safe_state = self.nudges[BoundaryNudge::SafeState.index()],
             scavenged_calls = self.scavenged_calls,
             hallucinated_tool_names = self.hallucinated_tool_names,
+            dropped_unknown_names = self.dropped_unknown_names,
             storm_suppressions = self.storm_suppressions,
             max_failure_streak = self.max_failure_streak,
             unresolved_effects = self.unresolved_effects,
@@ -892,6 +917,30 @@ pub(crate) mod tests {
 
         tally.set_verification(None);
         assert!(tally.final_verification.is_none());
+    }
+
+    /// dirge-e31n.8. Both tool-name miss counters must reach the line, and
+    /// they must reach it SEPARATELY: they measure failures that behave
+    /// nothing alike — one the model was told about, one nobody was told
+    /// about — and a report that merged them could not tell an alias table
+    /// working from a model simply retrying.
+    #[test]
+    fn both_tool_name_miss_counters_reach_the_emitted_line() {
+        let mut tally = GateTally::new();
+        tally.record_hallucinated_tool_name();
+        tally.record_dropped_unknown_name();
+        tally.record_dropped_unknown_name();
+        let line = capture_emit(&tally);
+        let present = emitted_field_names(&line);
+        for field in ["hallucinated_tool_names", "dropped_unknown_names"] {
+            assert!(present.contains(field), "{field} not emitted\nline: {line}");
+        }
+        // Distinct values, so a line that emitted one counter twice — the
+        // copy-paste this whole family of bugs is made of — fails here.
+        assert!(
+            line.contains("hallucinated_tool_names=1") && line.contains("dropped_unknown_names=2"),
+            "counters crossed or miscounted\nline: {line}"
+        );
     }
 
     #[test]

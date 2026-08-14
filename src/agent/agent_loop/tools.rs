@@ -333,6 +333,7 @@ async fn prepare_tool_call(
             // (e.g. `search_files` for `grep`, `view` for `read`). A
             // nearest-name hint turns a dead end into a one-shot fix.
             let names: Vec<&str> = context.tools.iter().map(|t| t.name()).collect();
+            super::suggest::log_tool_name_miss(&tool_call.name, &names, "dispatched");
             let mut msg = format!("Tool {} not found", tool_call.name);
             if let Some(sugg) = super::suggest::closest(&tool_call.name, &names) {
                 msg.push_str(&format!(". Did you mean `{sugg}`?"));

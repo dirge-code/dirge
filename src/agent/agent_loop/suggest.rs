@@ -77,6 +77,32 @@ where
     }
 }
 
+/// Record that a model named a tool the run does not have (dirge-e31n.8).
+///
+/// There are two ways to miss and they behave nothing alike: a native call is
+/// rejected with "Tool X not found" and the model can retry, while a call
+/// written as text is dropped silently and nobody ever hears about it. Both
+/// log here, tagged by `path`, because the question this exists to answer —
+/// *which names do models actually reach for* — cannot be answered from
+/// either half alone.
+///
+/// One line per miss on `dirge::tool_miss`, carrying the nearest real name so
+/// the log says whether the miss was a typo (something `closest` catches) or a
+/// synonym (which nothing catches today).
+pub fn log_tool_name_miss<'a, I, S>(name: &str, candidates: I, path: &'static str)
+where
+    I: IntoIterator<Item = &'a S>,
+    S: AsRef<str> + 'a + ?Sized,
+{
+    tracing::info!(
+        target: "dirge::tool_miss",
+        tool = %name,
+        nearest = closest(name, candidates).unwrap_or("-"),
+        path,
+        "model named a tool that does not exist",
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

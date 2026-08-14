@@ -2956,6 +2956,14 @@ pub async fn run_loop(
             if !scavenge_source.is_empty() {
                 let scavenge_result =
                     super::scavenge::scavenge_tool_calls(Some(&scavenge_source), &allowed_names, 4);
+                // dirge-e31n.8: a call the model wrote as TEXT naming a tool
+                // that does not exist. The scavenger drops it with no result
+                // and no error — deliberately, per dirge-knt8 — so this is
+                // the only place the loss is visible to anyone.
+                for missed in &scavenge_result.unknown_names {
+                    tally.record_dropped_unknown_name();
+                    super::suggest::log_tool_name_miss(missed, &allowed_names, "scavenged");
+                }
                 if !scavenge_result.calls.is_empty() {
                     // LOOP-12: canonicalize the JSON so different key orders or
                     // numeric reprs (1 vs 1.0) for the same logical call don't
