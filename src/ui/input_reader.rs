@@ -329,20 +329,81 @@ mod tests {
     /// terminal redirect device) ALWAYS reports POLLNVAL, even on a
     /// healthy tty — the watchdog read that as death and killed the
     /// process ~250ms after startup (exit 128+SIGHUP). A live /dev/tty
-    /// must report NOT dead. Skipped when there is no controlling
-    /// terminal (CI).
+    /// must report NOT dead.
+    ///
+    /// dirge-u35k: this used to open `/dev/tty` directly and `return` when
+    /// that failed, which is exactly what happens on a CI runner — so the
+    /// one test guarding a bug that shipped in TWO releases was a silent
+    /// no-op everywhere it mattered. It cannot be converted to the pty
+    /// helper above either: the bug is specific to `/dev/tty`, the
+    /// controlling-terminal REDIRECT device, and a pty secondary is a
+    /// different device that polls normally.
+    ///
+    /// So build the missing precondition instead. A forked child calls
+    /// `setsid` to leave the test's session, claims the pty secondary as
+    /// its controlling terminal with `TIOCSCTTY`, and only then does
+    /// `/dev/tty` resolve — to our pty. The child reports through its exit
+    /// status because that is the only channel that needs no allocation.
+    ///
+    /// The child touches nothing but raw syscalls before `_exit`, which is
+    /// the rule for a forked child in a process that may have threads.
     #[test]
-    fn live_controlling_tty_is_not_dead() {
-        let Ok(f) = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open("/dev/tty")
-        else {
-            return;
-        };
-        assert!(
-            !tty_is_dead(f.as_raw_fd()).expect("poll failed"),
-            "a live /dev/tty must not report dead (macOS POLLNVAL false positive)"
-        );
+    fn a_live_controlling_tty_is_not_dead() {
+        const DEAD: i32 = 1;
+        const NO_SETSID: i32 = 10;
+        const NO_CTTY: i32 = 11;
+        const NO_DEV_TTY: i32 = 12;
+        const PROBE_ERR: i32 = 13;
+
+        let (primary, secondary) = open_pty_pair();
+        let secondary_fd = secondary.as_raw_fd();
+
+        match unsafe { libc::fork() } {
+            -1 => panic!("fork failed: {}", std::io::Error::last_os_error()),
+            0 => unsafe {
+                // CHILD. New session, so we hold no controlling terminal…
+                if libc::setsid() < 0 {
+                    libc::_exit(NO_SETSID);
+                }
+                // …then adopt the pty secondary as one.
+                if libc::ioctl(secondary_fd, libc::TIOCSCTTY as _, 0) < 0 {
+                    libc::_exit(NO_CTTY);
+                }
+                let tty = libc::open(c"/dev/tty".as_ptr(), libc::O_RDWR);
+                if tty < 0 {
+                    libc::_exit(NO_DEV_TTY);
+                }
+                match tty_is_dead(tty) {
+                    Ok(false) => libc::_exit(0),
+                    Ok(true) => libc::_exit(DEAD),
+                    Err(_) => libc::_exit(PROBE_ERR),
+                }
+            },
+            child => {
+                let mut status: libc::c_int = 0;
+                let waited = unsafe { libc::waitpid(child, &mut status, 0) };
+                assert_eq!(waited, child, "waitpid failed");
+                assert!(
+                    libc::WIFEXITED(status),
+                    "child did not exit normally (status {status})"
+                );
+                let code = libc::WEXITSTATUS(status);
+                let explain = match code {
+                    DEAD => {
+                        "a LIVE /dev/tty reported dead — this is the macOS \
+                             POLLNVAL false positive that killed every session \
+                             ~250ms after startup in 0.19.24 and 0.19.25"
+                    }
+                    NO_SETSID => "setsid failed in the child",
+                    NO_CTTY => "could not claim the pty as a controlling terminal",
+                    NO_DEV_TTY => "/dev/tty did not open even with a controlling terminal",
+                    PROBE_ERR => "tty_is_dead returned an error",
+                    _ => "unexpected child exit",
+                };
+                assert_eq!(code, 0, "{explain} (exit {code})");
+            }
+        }
+        drop(primary);
+        drop(secondary);
     }
 }
