@@ -679,6 +679,81 @@ fn summarize_tool_result(tool_name: &str, content: &str) -> String {
     }
 }
 
+/// Which section template the summarizer is asked to fill (dirge-e31n.7).
+///
+/// [`Sections`](SummarySchema::Sections) is what ships. [`Slots`](SummarySchema::Slots)
+/// is a candidate under measurement — see `crate::agent::compaction_bakeoff`.
+/// It is not reachable from config: a schema that has not been shown to help
+/// is not a setting, it is an experiment, and this epic has three rounds'
+/// worth of reasons not to ship those as flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SummarySchema {
+    /// Thirteen narrative markdown sections.
+    Sections,
+    /// Eleven labelled slots, every one emitted, with rules that force
+    /// verbatim identifiers and mark anything inferred.
+    ///
+    /// Constructed only by the bake-off, which is why the release build sees
+    /// it as dead. That is the honest state: it is a candidate under
+    /// measurement, not a shipped alternative, and it stays unreachable from
+    /// config until the numbers say otherwise.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Slots,
+}
+
+/// The labelled-slot candidate template.
+///
+/// The hypothesis it encodes: a weak summarizer loses less against slots than
+/// against prose, because a slot named `FILES_IDS` with "quote verbatim, one
+/// per line" is a checklist, whereas "## Relevant Files — a one-line
+/// description of its role" invites a sentence that paraphrases the path away.
+///
+/// Deliberately NOT carrying the word cap the original sketch proposed. A cap
+/// changes how much can be preserved, so applying it to one arm would measure
+/// the cap and report it as the schema.
+fn slot_template(summary_budget: u64) -> String {
+    format!(
+        "Fill in EVERY slot below, in this order, each starting on its own line \
+with the slot name and a colon. A slot with nothing to report gets the single \
+word NONE — do not omit it, and do not invent content to fill it.\n\
+\n\
+RULES FOR EVERY SLOT:\n\
+- Quote identifiers VERBATIM: file paths, symbol and function names, ids, \
+commands, exact numbers, error strings, version numbers, config keys. Copy them \
+character for character. Never paraphrase, abbreviate, or tidy an identifier.\n\
+- Mark anything you concluded rather than read as `(inferred)`. Mark anything \
+stated but never confirmed as `(unverified)`. An unmarked statement means the \
+material said so plainly.\n\
+- An assistant turn that stops mid-sentence, or a tool call with no result, was \
+CUT OFF. Do not report what it was about to do as something that happened.\n\
+\n\
+TASK: what the user asked for, in their terms.\n\
+CONSTRAINTS: standing rules the user set that still bind — what must or must \
+not be done, and any stated preference about tools, style, or process.\n\
+STATE: what is true right now, at the end of the material.\n\
+DONE: what was actually completed, each item with the file, command, or output \
+that shows it.\n\
+DECISIONS: choices made, alternatives rejected, and why. A decision without its \
+reason is worth little on resume.\n\
+FILES_IDS: every file path, symbol, identifier, and exact value the next turn \
+would need. One per line, verbatim, each with a few words on its role.\n\
+COMMANDS_TESTS: commands and tests that were run, verbatim, and what each \
+reported.\n\
+OPEN_NEXT: what is unfinished, and the immediate next step.\n\
+RISKS: known problems, failures, and anything the material flagged as likely to \
+go wrong.\n\
+ACTIVE_CONTRACT: any commitment in force at the cut — something promised, a \
+gate that must pass, a step that must not be skipped.\n\
+SOURCE_COVERAGE: what you were able to see. If the material carries a \
+truncation marker, or begins or ends mid-turn, say so and name what is missing. \
+If you saw all of it, write COMPLETE.\n\
+\n\
+Target ~{summary_budget} tokens. Be CONCRETE — file paths, command output, \
+error messages, line numbers, specific values. Write only the slots. No \
+preamble, no prefix."
+    )
+}
+
 /// Build the structured summary prompt for the auxiliary model.
 /// Port of Hermes's _generate_summary prompt (context_compressor.py:960-1046).
 pub fn build_summary_prompt(
@@ -686,6 +761,24 @@ pub fn build_summary_prompt(
     summary_budget: u64,
     previous_summary: Option<&str>,
     focus_topic: Option<&str>,
+) -> anyhow::Result<String> {
+    build_summary_prompt_with(
+        turns_to_summarize,
+        summary_budget,
+        previous_summary,
+        focus_topic,
+        SummarySchema::Sections,
+    )
+}
+
+/// As [`build_summary_prompt`], with the section template selectable so the
+/// bake-off can hold everything else byte-identical across arms.
+pub fn build_summary_prompt_with(
+    turns_to_summarize: &[Value],
+    summary_budget: u64,
+    previous_summary: Option<&str>,
+    focus_topic: Option<&str>,
+    schema: SummarySchema,
 ) -> anyhow::Result<String> {
     let _summarizer_preamble = "\
 You are a summarization agent creating a context checkpoint. \
@@ -716,8 +809,10 @@ conversation — do not translate or switch to English.";
         None => String::new(),
     };
 
-    let _template_sections = format!(
-        "## Active Task\n\
+    let _template_sections = match schema {
+        SummarySchema::Slots => slot_template(summary_budget),
+        SummarySchema::Sections => format!(
+            "## Active Task\n\
 [THE SINGLE MOST IMPORTANT FIELD. State what should happen NEXT — the\n\
 immediate piece of work in flight right now, in plain terms. This is NOT\n\
 necessarily the user's original wording: the current work is often an\n\
@@ -770,7 +865,8 @@ without explicit preservation]\n\
 Target ~{summary_budget} tokens. Be CONCRETE — include file paths,\n\
 command outputs, error messages, line numbers, and specific values.\n\
 Write only the summary body. Do not include any preamble or prefix."
-    );
+        ),
+    };
 
     let serialized = serialize_turns_for_summary(turns_to_summarize);
 
