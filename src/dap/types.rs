@@ -320,6 +320,12 @@ pub struct RestartFrameArgs {
 // ContinueResponse — kept local because dap-rs misses camelCase serde
 // ---------------------------------------------------------------------------
 
+/// dirge-vpma.30: no production caller deserializes into this any more. The
+/// shared resume path takes the response as an opaque `Value` because
+/// `allThreadsContinued` was never read and the same code path also carries
+/// `next`/`stepIn`/`stepOut`, whose responses have no body at all. Kept for the
+/// client-level protocol test, which is what still pins the camelCase spelling.
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContinueResponse {
     #[serde(rename = "allThreadsContinued")]
@@ -382,8 +388,11 @@ pub struct DebugPanelData {
     pub threads: Vec<Thread>,
     pub frames: Vec<StackFrame>,
     pub variables: Vec<Variable>,
-    pub scopes: Vec<Scope>,
-    pub breakpoints: Vec<BreakpointRecord>,
+    // dirge-vpma.31: `scopes` and `breakpoints` used to sit here. `scopes` was
+    // hardcoded empty by the only producer, and `breakpoints` was populated but
+    // never read — the panel's BREAKPOINTS box derives from
+    // `SessionSummary::breakpoint_count`. Both were cloned on every UI
+    // snapshot, breakpoints deeply. Re-add them only alongside a reader.
     pub output: String,
     pub output_truncated: bool,
     pub exit_code: Option<u32>,

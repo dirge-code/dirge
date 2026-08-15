@@ -172,6 +172,20 @@ struct DapSession {
     stop_wait_in_flight: bool,
 }
 
+/// Total breakpoints across every file.
+///
+/// dirge-vpma.28: `set_source_breakpoints` stores exactly ONE record per file
+/// (it replaces the entry rather than pushing), so summing the record-vec
+/// lengths counted files, not breakpoints — five breakpoints in one file
+/// reported as 1 in the debug panel and in `format_sessions`.
+fn count_breakpoints(breakpoints: &HashMap<PathBuf, Vec<BreakpointRecord>>) -> usize {
+    breakpoints
+        .values()
+        .flatten()
+        .map(|record| record.breakpoints.len())
+        .sum()
+}
+
 impl DapSession {
     fn summary(&self) -> SessionSummary {
         SessionSummary {
@@ -179,7 +193,7 @@ impl DapSession {
             adapter_name: self.client.adapter_name.clone(),
             program: None,
             status: self.status.clone(),
-            breakpoint_count: self.breakpoints.values().map(|v| v.len()).sum(),
+            breakpoint_count: count_breakpoints(&self.breakpoints),
             function_breakpoint_count: self.function_breakpoints.len(),
             stop_reason: None,
             thread_id: None,
@@ -779,51 +793,64 @@ impl DapSessionManager {
         Ok(response.breakpoints)
     }
 
-    /// Continue execution and wait for the next stop event.
-    pub async fn continue_(
+    /// Issue a resume-style request and wait for the stop it induces, WITHOUT
+    /// holding the `active` lock while parked.
+    ///
+    /// Three phases: (1) under the lock, guard against a wait already in
+    /// flight, drop stale stops, issue `command`, mark Running and take the
+    /// event receivers; (2) lock released, in a spawned task, park for
+    /// stopped/terminated/timeout; (3) re-acquire, restore the receivers and
+    /// record the outcome.
+    ///
+    /// dirge-acgj: the wait used to run with `active` held, so a pause meant to
+    /// interrupt a free-running program blocked on the mutex for the resume's
+    /// full timeout — the one window where pause is meaningful.
+    /// dirge-vpma.30: `step` had the same defect and its own copy of the wait,
+    /// so it never got the fix. One implementation now, both callers.
+    /// dirge-8gdv: the session identity is captured under the lock so phase 3
+    /// can detect that a launch/attach replaced `active` while we were parked
+    /// and refuse to restore stale receivers into the new session.
+    ///
+    /// Returns a summary with `stop_reason`/`thread_id` filled in.
+    async fn resume_and_wait_for_stop<F>(
         &self,
+        command: &'static str,
         thread_id: u32,
-        _signal: &AbortSignal,
+        build_args: F,
         timeout: Duration,
-    ) -> Result<ContinueOutcome, ToolError> {
-        // Phase 1: under the lock, issue the continue and hand the event
-        // receivers off. dirge-acgj: the wait below used to run with `active`
-        // held, so a pause meant to interrupt a free-running program blocked
-        // on the mutex for this continue's full timeout — the one window where
-        // pause is meaningful. Take the receivers out and release the lock so
-        // concurrent requests (pause, evaluate) can reach the adapter.
-        // dirge-8gdv: capture the session identity under the lock so phase 3 can
-        // detect that a launch/attach replaced `active` while we were parked,
-        // and refuse to restore our stale receivers into the new session.
+    ) -> Result<SessionSummary, ToolError>
+    where
+        F: FnOnce(u32) -> Value,
+    {
         let (mut receivers, session_id) = {
             let mut active = self.active.lock().await;
             let session = active
                 .as_mut()
                 .ok_or_else(|| ToolError::Msg("no active debug session".into()))?;
 
-            // A previous continue is still parked on its stop-wait and owns
-            // the event stream; the session holds the dead placeholder.
-            // Proceeding would issue a real continue, park on the dead
-            // receivers (instant false "disconnected"), and clear
-            // `stop_wait_in_flight` out from under the first waiter.
+            // A previous resume is still parked on its stop-wait and owns the
+            // event stream; the session holds the dead placeholder. Proceeding
+            // would issue a real request, park on the dead receivers (instant
+            // false "disconnected"), and clear `stop_wait_in_flight` out from
+            // under the first waiter.
             if session.stop_wait_in_flight {
                 return Err(ToolError::Msg(
-                    "a continue is already waiting for the next stop; its result will reflect this request".into(),
+                    "a resume is already waiting for the next stop; its result will reflect this request".into(),
                 ));
             }
 
             // dirge-un0g: clear stops queued from a prior halt so we wait for
-            // the fresh one this continue induces, not a stale event.
+            // the fresh one this request induces, not a stale event.
             session.drain_stopped();
 
-            let args = ContinueArgs {
-                thread_id: session.resolve_thread_id(thread_id),
-                single_thread: None,
-            };
+            // dirge-vept/8q3w: substitute the last stopped thread when the
+            // caller passes the 0 sentinel — strict adapters (debugpy) reject a
+            // literal threadId 0 with "thread not found".
+            let args = build_args(session.resolve_thread_id(thread_id));
 
             session
                 .client
-                .request::<_, ContinueResponse>("continue", &args, timeout)
+                .request::<_, Value>(command, &args, timeout)
                 .await
                 .map_err(rpc_to_tool_error)?;
 
@@ -840,7 +867,7 @@ impl DapSessionManager {
         // agent tool executor drops the tool future on cancel, and a drop
         // mid-park would destroy the live receivers and leave
         // `stop_wait_in_flight` set forever — every later step/pause
-        // deflected by the guard, every continue parked on dead channels.
+        // deflected by the guard, every resume parked on dead channels.
         // Dropping the JoinHandle below merely detaches the task; it still
         // restores the receivers and clears the flag whenever the adapter
         // eventually stops, terminates, or the timeout fires.
@@ -866,17 +893,10 @@ impl DapSessionManager {
             let mut active = active.lock().await;
             let session = active
                 .as_mut()
-                .ok_or_else(|| ToolError::Msg("debug session ended during continue".into()))?;
-            // dirge-8gdv: if a launch/attach replaced the active session while
-            // we were parked, the session now in `active` is a different one.
-            // Restoring our (taken, now-stale) receivers into it would clobber
-            // the new session's live event channels and stomp its
-            // stop_wait_in_flight/status — it would then never see another
-            // event. Bail instead: drop the stale receivers and leave the
-            // replacement untouched.
+                .ok_or_else(|| ToolError::Msg("debug session ended during resume".into()))?;
             if session.id != session_id {
                 return Err(ToolError::Msg(
-                    "debug session replaced during continue".into(),
+                    "debug session replaced during resume".into(),
                 ));
             }
             session.events = receivers;
@@ -900,7 +920,7 @@ impl DapSessionManager {
                 }
                 StopOutcome::TimedOut => {
                     return Err(ToolError::Msg(format!(
-                        "timed out after {timeout:?} waiting for stop after continue"
+                        "timed out after {timeout:?} waiting for stop after {command}"
                     )));
                 }
             };
@@ -908,18 +928,48 @@ impl DapSessionManager {
             session.drain_output();
             session.drain_termination();
 
-            Ok(ContinueOutcome {
-                status: session.status.clone(),
-                output: session.output.clone(),
-                output_truncated: session.output_truncated,
-                exit_code: session.exit_code,
-                stop_reason,
-                thread_id: stop_thread_id,
-            })
+            let mut summary = session.summary();
+            summary.stop_reason = stop_reason;
+            summary.thread_id = stop_thread_id;
+            summary.output = session.output.clone();
+            summary.output_truncated = session.output_truncated;
+            summary.exit_code = session.exit_code;
+            Ok(summary)
         });
 
         park.await
-            .map_err(|e| ToolError::Msg(format!("continue stop-wait task failed: {e}")))?
+            .map_err(|e| ToolError::Msg(format!("{command} stop-wait task failed: {e}")))?
+    }
+
+    /// Continue execution and wait for the next stop event.
+    pub async fn continue_(
+        &self,
+        thread_id: u32,
+        _signal: &AbortSignal,
+        timeout: Duration,
+    ) -> Result<ContinueOutcome, ToolError> {
+        let summary = self
+            .resume_and_wait_for_stop(
+                "continue",
+                thread_id,
+                |thread_id| {
+                    serde_json::to_value(ContinueArgs {
+                        thread_id,
+                        single_thread: None,
+                    })
+                    .unwrap()
+                },
+                timeout,
+            )
+            .await?;
+        Ok(ContinueOutcome {
+            status: summary.status,
+            output: summary.output,
+            output_truncated: summary.output_truncated,
+            exit_code: summary.exit_code,
+            stop_reason: summary.stop_reason,
+            thread_id: summary.thread_id,
+        })
     }
 
     /// Step over (next).
@@ -952,63 +1002,48 @@ impl DapSessionManager {
         self.step("stepOut", thread_id, timeout).await
     }
 
+    /// dirge-vpma.30: steps park with the `active` lock RELEASED, like
+    /// `continue_`. Holding it across the stop-wait meant a step onto a
+    /// blocking line (a stdin read, a long computation) queued any concurrent
+    /// pause behind the mutex for the step's full timeout — 30s by default.
     async fn step(
         &self,
-        command: &str,
+        command: &'static str,
         thread_id: u32,
         timeout: Duration,
     ) -> Result<SessionSummary, ToolError> {
-        let mut active = self.active.lock().await;
-        let session = active
-            .as_mut()
-            .ok_or_else(|| ToolError::Msg("no active debug session".into()))?;
-
-        // dirge-un0g: clear stops queued from a prior halt so this step waits
-        // for the fresh one it induces, not a stale event.
-        session.drain_stopped();
-
-        // dirge-vept: substitute the last stopped thread when the bridge
-        // passes the 0 sentinel.
-        let thread_id = session.resolve_thread_id(thread_id);
-        let args = match command {
-            "next" => serde_json::to_value(NextArgs {
-                thread_id,
-                single_thread: None,
-                granularity: None,
-            })
-            .unwrap(),
-            "stepIn" => serde_json::to_value(StepInArgs {
-                thread_id,
-                single_thread: None,
-                granularity: None,
-                target_id: None,
-            })
-            .unwrap(),
-            "stepOut" => serde_json::to_value(StepOutArgs {
-                thread_id,
-                single_thread: None,
-                granularity: None,
-            })
-            .unwrap(),
+        match command {
+            "next" | "stepIn" | "stepOut" => {}
             _ => return Err(ToolError::Msg(format!("unknown step command: {command}"))),
-        };
-        session
-            .client
-            .request::<_, Value>(command, &args, timeout)
-            .await
-            .map_err(rpc_to_tool_error)?;
-
-        session.status = SessionStatus::Running;
-
-        let stopped = session.wait_for_stopped(timeout).await?;
-        session.status = SessionStatus::Stopped;
-        session.drain_output();
-        session.drain_termination();
-
-        let mut summary = session.summary();
-        summary.stop_reason = Some(stopped.reason.as_str().to_string());
-        summary.thread_id = stopped.thread_id.map(|id| id as u32);
-        Ok(summary)
+        }
+        self.resume_and_wait_for_stop(
+            command,
+            thread_id,
+            |thread_id| match command {
+                "next" => serde_json::to_value(NextArgs {
+                    thread_id,
+                    single_thread: None,
+                    granularity: None,
+                })
+                .unwrap(),
+                "stepIn" => serde_json::to_value(StepInArgs {
+                    thread_id,
+                    single_thread: None,
+                    granularity: None,
+                    target_id: None,
+                })
+                .unwrap(),
+                // Checked above; `stepOut` is the only remaining arm.
+                _ => serde_json::to_value(StepOutArgs {
+                    thread_id,
+                    single_thread: None,
+                    granularity: None,
+                })
+                .unwrap(),
+            },
+            timeout,
+        )
+        .await
     }
 
     /// Pause execution.
@@ -1192,17 +1227,24 @@ impl DapSessionManager {
             .as_mut()
             .ok_or_else(|| ToolError::Msg("no active debug session".into()))?;
 
-        session
+        // dirge-vpma.29: mark the session dead whatever the request does. A
+        // crashed adapter answers ConnectionClosed, and propagating that with
+        // `?` before the status was set left the session at its old status —
+        // the panel kept showing it live and every later op errored against a
+        // dead adapter until the user thought to disconnect. Same stuck-session
+        // class dirge-ibq5 fixed in `disconnect`, on the sibling path. The
+        // transport error is still returned so the caller learns it failed.
+        let result = session
             .client
             .request::<_, Value>("terminate", &TerminateArgs::default(), timeout)
             .await
-            .map_err(rpc_to_tool_error)?;
+            .map_err(rpc_to_tool_error);
 
         session.drain_output();
         session.drain_termination();
         session.status = SessionStatus::Terminated;
 
-        Ok(session.summary())
+        result.map(|_: Value| session.summary())
     }
 
     /// Disconnect from the debug adapter.
@@ -1279,8 +1321,6 @@ impl DapSessionManager {
             threads: session.cached_threads.clone(),
             frames: session.cached_frames.clone(),
             variables: session.cached_variables.clone(),
-            scopes: Vec::new(),
-            breakpoints: session.breakpoints.values().flatten().cloned().collect(),
             output: session.output.clone(),
             output_truncated: session.output_truncated,
             exit_code: session.exit_code,
@@ -1360,6 +1400,57 @@ mod tests {
             hit_condition: None,
             log_message: None,
         }
+    }
+
+    /// dirge-vpma.28: the panel and `format_sessions` report this number, so
+    /// it has to be breakpoints — not the files holding them.
+    ///
+    /// `set_source_breakpoints` stores exactly one record per file, so summing
+    /// record-vec lengths counted touched FILES: five breakpoints in one file
+    /// reported 1. The fixture uses different counts per file so a
+    /// files-vs-breakpoints mix-up cannot pass by coincidence.
+    #[test]
+    fn breakpoints_are_counted_not_the_files_holding_them() {
+        let mut map: HashMap<PathBuf, Vec<BreakpointRecord>> = HashMap::new();
+        map.insert(
+            PathBuf::from("a.rs"),
+            vec![BreakpointRecord {
+                file: "a.rs".to_string(),
+                breakpoints: vec![sbp(10, None), sbp(20, None), sbp(30, None)],
+                verified: None,
+            }],
+        );
+        map.insert(
+            PathBuf::from("b.rs"),
+            vec![BreakpointRecord {
+                file: "b.rs".to_string(),
+                breakpoints: vec![sbp(5, None)],
+                verified: None,
+            }],
+        );
+        assert_eq!(
+            count_breakpoints(&map),
+            4,
+            "3 in one file plus 1 in another is 4 breakpoints across 2 files"
+        );
+    }
+
+    /// A file whose set was cleared must not keep contributing. The clear path
+    /// removes the entry, so this pins that an empty record — if one ever gets
+    /// stored again — still counts zero.
+    #[test]
+    fn an_empty_record_contributes_nothing() {
+        let mut map: HashMap<PathBuf, Vec<BreakpointRecord>> = HashMap::new();
+        map.insert(
+            PathBuf::from("a.rs"),
+            vec![BreakpointRecord {
+                file: "a.rs".to_string(),
+                breakpoints: Vec::new(),
+                verified: None,
+            }],
+        );
+        assert_eq!(count_breakpoints(&map), 0);
+        assert_eq!(count_breakpoints(&HashMap::new()), 0);
     }
 
     // dirge-vpma.12: DAP setBreakpoints replaces a source's whole set, so an
@@ -1641,6 +1732,68 @@ mod tests {
         assert!(
             err.to_string().contains("no active debug session"),
             "active session was not cleared; got: {err}"
+        );
+    }
+
+    /// dirge-vpma.29: terminating a crashed adapter must still mark the session
+    /// Terminated.
+    ///
+    /// The RPC error was propagated with `?` before the status was set, so a
+    /// session whose adapter died stayed at its old status — the panel kept
+    /// showing it live and every later op errored against a dead adapter until
+    /// the user thought to disconnect. This is the same stuck-session class
+    /// dirge-ibq5 fixed in `disconnect`, on the sibling path.
+    ///
+    /// `terminate` deliberately keeps the session in the slot (unlike
+    /// `disconnect`), so the assertion is on the status, not on emptiness.
+    #[cfg(feature = "dap")]
+    #[tokio::test]
+    async fn terminate_marks_the_session_dead_even_when_the_adapter_is() {
+        let mgr = DapSessionManager::new();
+        let signal = AbortSignal::new();
+
+        let (client_side, server_side) = tokio::io::duplex(4096);
+        let (client_read, client_write) = tokio::io::split(client_side);
+        let (server_read, server_write) = tokio::io::split(server_side);
+        let (rpc, _read_task) = DapRpc::new(tokio::io::BufReader::new(client_read), client_write);
+        tokio::spawn(async move {
+            fake_launch_then_die(tokio::io::BufReader::new(server_read), server_write).await;
+        });
+        let client = DapClient::from_rpc(rpc, "fake-adapter");
+
+        let summary = mgr
+            .launch_with_client(
+                "fake-adapter",
+                "/tmp",
+                Some("prog"),
+                None,
+                &[],
+                Some(true),
+                None,
+                &signal,
+                client,
+                Duration::from_secs(5),
+                vec![],
+            )
+            .await
+            .expect("launch should succeed against the fake adapter");
+        assert_eq!(summary.status, SessionStatus::Stopped);
+
+        // The adapter is gone: the request fails and the caller is told so.
+        mgr.terminate(Duration::from_secs(2))
+            .await
+            .expect_err("a dead adapter cannot answer terminate");
+
+        // But the session must not still look alive.
+        let after = mgr
+            .active_summary()
+            .await
+            .expect("terminate keeps the session for inspection");
+        assert_eq!(
+            after.status,
+            SessionStatus::Terminated,
+            "a session whose terminate failed is stuck at {:?}",
+            after.status
         );
     }
 
@@ -2470,6 +2623,15 @@ mod tests {
     /// Launch handshake, then answers `continue` but withholds the stop until
     /// `release` fires — simulating a free-running program.
     fn client_with_free_running_adapter(release: tokio::sync::oneshot::Receiver<()>) -> DapClient {
+        client_with_resume_adapter("continue", release)
+    }
+
+    /// dirge-vpma.30: the same adapter, parameterised by the resume command, so
+    /// a step can be held open mid-flight exactly as `continue` is.
+    fn client_with_resume_adapter(
+        resume_command: &'static str,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) -> DapClient {
         let (client_side, server_side) = tokio::io::duplex(4096);
         let (client_read, client_write) = tokio::io::split(client_side);
         let (server_read, server_write) = tokio::io::split(server_side);
@@ -2518,13 +2680,13 @@ mod tests {
             // continue → respond, but withhold the stop until released.
             let frame = decode_frame(&mut reader).await.unwrap();
             let msg: Value = serde_json::from_slice(&frame).unwrap();
-            assert_eq!(msg["command"], "continue");
+            assert_eq!(msg["command"], resume_command);
             let seq = msg["seq"].as_u64().unwrap();
             encode_frame(
                 &mut writer,
                 &serde_json::to_vec(&serde_json::json!({
                     "type": "response", "seq": 3, "request_seq": seq, "success": true,
-                    "command": "continue", "body": { "allThreadsContinued": true }
+                    "command": resume_command, "body": { "allThreadsContinued": true }
                 }))
                 .unwrap(),
             )
@@ -2544,6 +2706,63 @@ mod tests {
             .unwrap();
         });
         DapClient::from_rpc(rpc, "fake-adapter")
+    }
+
+    /// dirge-vpma.30: a step must release the `active` lock while parked, as
+    /// `continue_` does.
+    ///
+    /// It used to hold the lock across its own copy of the stop-wait, so a step
+    /// onto a line that blocks (a stdin read, a long computation) queued every
+    /// concurrent request behind the mutex for the step's full timeout — 30s by
+    /// default. That is the same "pause cannot interrupt a running program"
+    /// window dirge-acgj closed for continue, left open on the sibling path
+    /// because the wait was written twice.
+    #[tokio::test]
+    async fn step_does_not_hold_the_active_lock_while_parked() {
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let mgr = std::sync::Arc::new(DapSessionManager::new());
+        let signal = AbortSignal::new();
+        let client = client_with_resume_adapter("next", release_rx);
+
+        mgr.launch_with_client(
+            "fake-adapter",
+            "/tmp",
+            Some("p"),
+            None,
+            &[],
+            Some(true),
+            None,
+            &signal,
+            client,
+            Duration::from_secs(5),
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        // Park a step that will not return until we release the stop.
+        let mgr2 = mgr.clone();
+        let stepping = tokio::spawn(async move {
+            let signal = AbortSignal::new();
+            mgr2.step_over(1, &signal, Duration::from_secs(5)).await
+        });
+
+        // Let the step issue its request and reach the parked stop-wait.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // The lock must be free: a concurrent request completes rather than
+        // blocking for the step's full timeout.
+        let summary = tokio::time::timeout(Duration::from_secs(1), mgr.active_summary())
+            .await
+            .expect("active_summary must not block while a step is parked")
+            .expect("a session is active");
+        assert_eq!(summary.status, SessionStatus::Running);
+
+        // Release the stop; the step completes normally and reports it.
+        release_tx.send(()).unwrap();
+        let stepped = stepping.await.unwrap().unwrap();
+        assert_eq!(stepped.stop_reason.as_deref(), Some("breakpoint"));
+        assert_eq!(stepped.status, SessionStatus::Stopped);
     }
 
     #[tokio::test]
