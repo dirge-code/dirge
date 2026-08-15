@@ -88,6 +88,17 @@ where
 /// picks it up. Matches the existing runner.rs:285-306 pattern
 /// exactly so cross-path retry behavior is identical.
 ///
+/// Whole seconds, rounded rather than truncated.
+///
+/// dirge-vpma.24: durations in user-facing timeout messages are
+/// compared against a configured whole-second knob, so truncation
+/// reads as an off-by-one against the very setting the message tells
+/// the reader to raise — a 59.999s wait against a 60s budget printed
+/// "59s".
+fn round_secs(d: std::time::Duration) -> u64 {
+    d.as_secs() + u64::from(d.subsec_millis() >= 500)
+}
+
 /// `None` disables the timeout — useful for tests, debug
 /// sessions, or providers known to have long legitimate gaps
 /// where the default `300s` is still too short.
@@ -158,11 +169,16 @@ where
         // dirge-onlr/4xgd: resolved [timeouts].tool_call_gap_secs.
         let tool_call_gap_timeout: std::time::Duration =
             crate::timeout::Timeouts::get().tool_call_gap;
-        // Wall-clock instant when the last forward-progress chunk
-        // arrived. Used to compute the remaining gap budget while
-        // a tool call is mid-assembly. Initialized to "now" so
-        // the first wait starts with the full budget.
-        let mut last_chunk_at = std::time::Instant::now();
+        // Instant when the last forward-progress chunk arrived. Used
+        // to compute the remaining gap budget while a tool call is
+        // mid-assembly. Initialized to "now" so the first wait starts
+        // with the full budget.
+        //
+        // dirge-vpma.24: this is the runtime's clock, not the OS
+        // clock, because the budget it feeds is spent by
+        // `tokio::time::timeout` below. Two clocks measuring one
+        // window can only disagree.
+        let mut last_chunk_at = tokio::time::Instant::now();
 
         // dirge-1ug5: bound one turn's reasoning trace. The chunk timeout above
         // only fires on SILENCE, so a model that deliberates without converging
@@ -249,17 +265,28 @@ where
                             // recovery::classify_error matches on
                             // it and routes to ErrorKind::Network for
                             // retry. Matches runner.rs:301-304.
+                            // dirge-vpma.24: report the SILENCE, not
+                            // the budget the last wait happened to
+                            // get. When the gap window drains between
+                            // iterations — a slow consumer, since the
+                            // generator is parked at its yield while
+                            // the clock runs — the wait is handed the
+                            // 1ms clamp below, and printing that said
+                            // "timed out after 0s ... narrows to 60s"
+                            // in one sentence. `as_secs` truncating
+                            // made even the ordinary case read 59s
+                            // for a full 60s window.
+                            let stall = round_secs(last_chunk_at.elapsed());
                             let detail = if !open_tool_calls.is_empty() {
                                 format!(
                                     "stream chunk timed out after {}s while a tool call was mid-assembly (provider stalled emitting tool-call deltas — common DeepSeek symptom; the harness narrows to {}s while assembling tool calls). Retried automatically when no text has emitted yet; otherwise the partial response is kept to avoid duplicating it. If your model legitimately pauses longer than {}s between deltas, raise `timeouts.tool_call_gap_secs` in config.json.",
-                                    t.as_secs(),
+                                    stall,
                                     tool_call_gap_timeout.as_secs(),
                                     tool_call_gap_timeout.as_secs(),
                                 )
                             } else {
                                 format!(
-                                    "stream chunk timed out after {}s (provider stalled or connection silently dropped) — bump `stream_chunk_timeout_secs` in config.json if your model has long reasoning gaps",
-                                    t.as_secs(),
+                                    "stream chunk timed out after {stall}s (provider stalled or connection silently dropped) — bump `stream_chunk_timeout_secs` in config.json if your model has long reasoning gaps",
                                 )
                             };
                             yield StreamEvent::Error { error: detail };
@@ -298,7 +325,7 @@ where
             // of kind (text, reasoning, tool-call-delta, final
             // ToolCall): any forward motion from the provider
             // is enough to reset the stall detector.
-            last_chunk_at = std::time::Instant::now();
+            last_chunk_at = tokio::time::Instant::now();
             match item {
                 Ok(StreamedAssistantContent::Text(t)) => {
                     match current_text_idx {
@@ -614,7 +641,6 @@ where
         // dropping by openness would discard perfectly good work. A call with
         // no name cannot dispatch under any provider, which makes it the one
         // safe discriminator.
-        let mut partial = partial;
         let dropped: Vec<String> = partial
             .content
             .iter()
@@ -2027,6 +2053,59 @@ mod tests {
             }
             other => panic!("expected Error, got {other:?}"),
         }
+    }
+
+    /// dirge-vpma.24: the mid-assembly timeout message must report
+    /// how long the provider was actually silent, not the residual
+    /// budget the wait was given.
+    ///
+    /// The two diverge whenever the gap window drains between
+    /// iterations rather than inside a single wait — a slow consumer
+    /// is the ordinary cause, since the generator is suspended at its
+    /// `yield` while the clock runs. The remaining budget is then
+    /// clamped to 1ms, and reporting it produced "timed out after 0s
+    /// ... the harness narrows to 60s" in one sentence: a message
+    /// that contradicts itself and understates the stall by the
+    /// entire window.
+    #[tokio::test]
+    async fn the_gap_timeout_reports_the_stall_not_the_leftover_budget() {
+        use futures::StreamExt;
+
+        tokio::time::pause();
+        let raw = tool_call_delta_then_stall();
+        let drain_task = tokio::spawn(async move {
+            let mut stream = wrap_streamed_assistant(raw, Some(Duration::from_secs(300)), None);
+            let mut events = Vec::new();
+            while let Some(event) = stream.next().await {
+                let last = matches!(event, StreamEvent::Error { .. });
+                events.push(event);
+                if last {
+                    break;
+                }
+                // Burn the whole gap window while the generator is
+                // parked at its yield. The next wait therefore starts
+                // with nothing left to spend.
+                tokio::time::sleep(Duration::from_secs(61)).await;
+            }
+            events
+        });
+        let events = drain_task.await.unwrap();
+
+        let StreamEvent::Error { error } = events.last().expect("must have events") else {
+            panic!("expected a timeout Error, got {:?}", events.last());
+        };
+        assert!(
+            error.contains("tool call was mid-assembly"),
+            "expected the mid-assembly message: {error}"
+        );
+        assert!(
+            !error.contains("timed out after 0s"),
+            "message reports the leftover budget instead of the stall: {error}"
+        );
+        assert!(
+            error.contains("timed out after 61s"),
+            "message should report the measured stall (61s): {error}"
+        );
     }
 
     /// Stalled stream + `Some(timeout)` → Error event with

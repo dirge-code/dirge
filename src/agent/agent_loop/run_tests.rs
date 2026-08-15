@@ -1682,6 +1682,86 @@ async fn drain(rx: &mut mpsc::Receiver<LoopEvent>) -> Vec<LoopEvent> {
     out
 }
 
+/// dirge-vpma.22: the post-usage ExitWithSummary tier must actually END the
+/// turn. A tool-call turn reporting usage >80% of the window used to fall
+/// through to prepareNextTurn with `has_more_tool_calls` still set, so the
+/// loop made another request against a context still over the threshold —
+/// the exact overflow/400 case the tier exists to prevent. The fix breaks
+/// out at the bottom of the iteration.
+///
+/// No summarizer is wired on purpose: the tier must end the turn even when
+/// the summarizer is absent/fails, which is the state the commit message
+/// describes as the dangerous one.
+#[tokio::test]
+async fn exit_with_summary_ends_the_turn() {
+    use crate::agent::agent_loop::message::TokenUsage;
+
+    let echo = std::sync::Arc::new(EchoTool::new());
+    let mut ctx = empty_context();
+    ctx.tools.push(echo.clone());
+
+    let calls = std::sync::Arc::new(AtomicUsize::new(0));
+    let factory: StreamFn = {
+        let calls = calls.clone();
+        std::sync::Arc::new(move |_ctx, _opts| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            // One tool call + usage at ~86% of the default 128k window:
+            // above FORCE_SUMMARY_THRESHOLD, so the post-usage decision on
+            // the first iteration is ExitWithSummary.
+            let msg = tool_use_response("call-1", "echo", serde_json::json!({"v": 1}));
+            let reason = msg.stop_reason;
+            Box::pin(futures::stream::iter(vec![StreamEvent::Done {
+                reason,
+                message: msg,
+                usage: Some(TokenUsage {
+                    input_tokens: 110_000,
+                    output_tokens: 100,
+                    cached_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                }),
+            }]))
+        })
+    };
+
+    let (tx, mut rx) = mpsc::channel::<LoopEvent>(128);
+    let messages = run_agent_loop(
+        vec![user("echo")],
+        ctx,
+        build_config(),
+        AbortSignal::new(),
+        &tx,
+        &factory,
+        None, // no summarizer
+        None, // no memory provider
+    )
+    .await;
+    drop(tx);
+    let _ = drain(&mut rx).await;
+
+    // The turn genuinely had work pending: the tool DID dispatch, so ending
+    // after it is a real decision, not an empty-loop artifact.
+    assert_eq!(
+        echo.executed.lock().unwrap().len(),
+        1,
+        "the first turn's tool call must still dispatch"
+    );
+    // And exactly one stream call was made.
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "ExitWithSummary must end the turn — saw {} stream calls; a second \
+         call goes out against a context still over the threshold",
+        calls.load(Ordering::SeqCst)
+    );
+    // The dispatched tool result made it into the returned transcript.
+    assert!(
+        messages
+            .iter()
+            .any(|m| matches!(m, LoopMessage::ToolResult(_))),
+        "the tool result should be present in the final transcript"
+    );
+}
+
 /// Port of pi test "should emit events with AgentMessage types"
 /// (agent-loop.test.ts:84). Full agent loop run — assistant
 /// response, no tools.

@@ -336,7 +336,9 @@ pub(crate) async fn finish_done(
         ctx.renderer.write("<dirge> ", c_agent())?;
     }
     // Seal any open streamed block (response above, or reasoning-only turn).
-    ctx.renderer.commit_stream();
+    // dirge-fw0p: `end_stream`, not `commit_stream` — the turn is over, so the
+    // next one must not look like a continuation of this text.
+    ctx.renderer.end_stream();
 
     ctx.renderer.write_line("", Color::White)?;
     ctx.renderer.write_line("", Color::White)?;

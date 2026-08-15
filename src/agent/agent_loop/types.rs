@@ -359,18 +359,23 @@ pub struct LoopConfig {
     pub compaction_hooks: Option<CompactionHooks>,
 
     /// Optional. Port of pi `getApiKey?` (types.ts:196).
-    /// Resolves an API key dynamically per request — useful for
-    /// short-lived OAuth tokens. `None` means "use `api_key`
-    /// fallback".
+    ///
+    /// NOT WIRED TO ANYTHING. The resolved key reaches
+    /// `StreamOptions::api_key` and stops there: it used to be flattened into
+    /// the request body, which neither authenticated nor was safe (dirge-
+    /// vpma.25), and that path is gone with no replacement. Setting it logs a
+    /// warning once per process and changes no request. Auth is owned by the
+    /// HTTP client layer — see `provider::client` and the per-provider
+    /// transports.
     ///
     /// Argument: provider name (pi: `config.model.provider`).
     /// We pass the model identifier string for now;
     /// phase 4 may substitute a richer model handle.
     pub get_api_key: Option<GetApiKeyFn>,
 
-    /// Static API key fallback. Used when `get_api_key` is None
-    /// OR when `get_api_key` returns None. Pi field
-    /// `config.apiKey` (inherited from `SimpleStreamOptions`).
+    /// Static API key fallback for [`Self::get_api_key`] — and, like it, NOT
+    /// WIRED TO ANYTHING. Pi field `config.apiKey` (inherited from
+    /// `SimpleStreamOptions`).
     pub api_key: Option<String>,
 
     /// Tool execution mode. Pi field `toolExecution?:

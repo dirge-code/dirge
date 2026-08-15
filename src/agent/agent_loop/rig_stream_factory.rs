@@ -275,8 +275,7 @@ where
         // dirge-wire: opt-in dump of the outgoing agent request (turn /
         // escalation / subagent / forked review), so secondary calls are
         // visible alongside the one-shot side-LLM dumps. No-op unless
-        // DIRGE_DUMP_REQUESTS is set. `additional` carrying reasoning params is
-        // the per-provider signal that thinking is enabled for this request.
+        // DIRGE_DUMP_REQUESTS is set.
         if crate::provider::wire::enabled() {
             let model = model_name.as_ref().as_deref().unwrap_or("default");
             let tool_names: Vec<String> = outgoing_tools.iter().map(|t| t.name.clone()).collect();
@@ -288,7 +287,10 @@ where
                 history_len,
                 messages_bytes,
                 &tool_names,
-                additional.is_some(),
+                // dirge-vpma.26: NOT `additional.is_some()` — a tool gate or a
+                // metadata map fills that too, and labelled turns with thinking
+                // off as reasoning-enabled.
+                turn_reasoning_enabled(provider, &opts),
             );
         }
 
@@ -915,11 +917,7 @@ pub fn build_provider_additional_params(
     }
 
     // ----- reasoning per provider -----
-    if let Some(level) = opts.reasoning
-        && let Some(serde_json::Value::Object(m)) =
-            crate::provider::adapter::reasoning_profile(provider_name)
-                .effort_params(level, opts.thinking_budgets.as_ref())
-    {
+    if let Some(m) = reasoning_params(provider_name, opts) {
         additional.extend(m);
     }
 
@@ -963,6 +961,35 @@ pub fn build_provider_additional_params(
     } else {
         Some(serde_json::Value::Object(additional))
     }
+}
+
+/// The reasoning params this provider wants for `opts`, or `None` when the
+/// turn asks for no reasoning — or asks for a level this provider has no wire
+/// shape for.
+///
+/// Single source of truth for "is this a reasoning turn": the params that go on
+/// the wire and the flag the wire dump reports are the same decision, so they
+/// cannot disagree (dirge-vpma.26).
+fn reasoning_params(
+    provider_name: Option<&str>,
+    opts: &super::stream::StreamOptions,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let level = opts.reasoning?;
+    match crate::provider::adapter::reasoning_profile(provider_name)
+        .effort_params(level, opts.thinking_budgets.as_ref())
+    {
+        Some(serde_json::Value::Object(m)) => Some(m),
+        _ => None,
+    }
+}
+
+/// Whether this turn puts reasoning params on the wire. See
+/// [`reasoning_params`].
+pub fn turn_reasoning_enabled(
+    provider_name: Option<&str>,
+    opts: &super::stream::StreamOptions,
+) -> bool {
+    reasoning_params(provider_name, opts).is_some()
 }
 
 /// Say so, once per process, when a request-override knob is set but has no
@@ -2551,6 +2578,45 @@ mod tool_choice_tests {
             build_provider_additional_params(Some("openai"), &opts(Some(ToolChoice::None)))
                 .expect("tool_choice must still be emitted");
         assert!(params.get("tool_choice").is_some());
+    }
+
+    /// dirge-vpma.26: the wire dump's `reasoning` flag must track whether
+    /// reasoning params were actually emitted.
+    ///
+    /// It used to be `additional.is_some()`, which is true for any occupant of
+    /// `additional_params` — a `tool_choice` gate or a metadata map with
+    /// thinking fully off. The dump exists to be read during a debugging
+    /// session, so a turn labelled reasoning-enabled that sent no reasoning
+    /// params sends the reader after the wrong thing.
+    #[test]
+    fn a_turn_carrying_only_a_tool_gate_is_not_a_reasoning_turn() {
+        let opts = opts(Some(ToolChoice::None));
+        assert!(
+            build_provider_additional_params(Some("openai"), &opts).is_some(),
+            "precondition: the gate alone fills additional_params"
+        );
+        assert!(
+            !turn_reasoning_enabled(Some("openai"), &opts),
+            "a tool gate was reported as reasoning"
+        );
+    }
+
+    /// The other half: a turn that really does ask for reasoning reports true,
+    /// so the flag is not simply hardwired off.
+    #[test]
+    fn a_thinking_turn_is_a_reasoning_turn() {
+        let mut o = opts(None);
+        o.reasoning = Some(crate::agent::agent_loop::types::ThinkingLevel::High);
+        assert!(
+            turn_reasoning_enabled(Some("deepseek"), &o),
+            "a thinking turn was not reported as reasoning"
+        );
+        let params = build_provider_additional_params(Some("deepseek"), &o)
+            .expect("reasoning params must reach the body");
+        assert!(
+            params.get("reasoning_effort").is_some(),
+            "precondition: deepseek carries a top-level effort: {params:?}"
+        );
     }
 
     /// An unconstrained turn must send NOTHING — not `"auto"`. Some

@@ -97,6 +97,7 @@ pub(crate) async fn handle_interjected(
     // other per-run state.
     *ctx.tool_calls_this_run = 0;
     *ctx.agent_line_started = false;
+    ctx.renderer.end_stream();
     ctx.response_buf.clear();
     *ctx.response_start_line = None;
     ctx.reasoning_buf.clear();

@@ -79,6 +79,7 @@ pub(crate) fn handle_user_message_after_response(
         }
     }
     *agent_line_started = false;
+    renderer.end_stream();
     response_buf.clear();
     *response_start_line = None;
     // The next turn's reasoning must anchor fresh too.

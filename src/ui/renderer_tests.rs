@@ -1765,3 +1765,133 @@ fn inactive_chat_write_survives_rebuild() {
         "inactive-chat transcript must survive a rebuild"
     );
 }
+
+/// A notice written between the last streamed text and the turn's final render
+/// must not make the answer appear twice.
+///
+/// `write_line` seals the open stream block, and `stream` only REPLACES the
+/// tail while `streaming` is set — sealed, it appends instead. `handle_done`
+/// always re-streams the accumulated response to commit it as one reflowable
+/// markdown block, so any line in between (the end-of-run repair-stats
+/// summary is the one users hit) turned that commit into a second copy of the
+/// whole answer.
+#[test]
+fn a_notice_between_stream_and_commit_does_not_duplicate_the_answer() {
+    let mut r = Renderer::new().expect("renderer");
+    let answer = "No file edits are in flight.";
+
+    r.stream(answer, Color::White, true);
+    r.write_line("  the repair-stats summary", Color::DarkGrey)
+        .expect("write");
+    // What `handle_done` does with the accumulated response buffer.
+    r.stream(answer, Color::White, true);
+    r.commit_stream();
+
+    let copies = r
+        .buffer_lines()
+        .iter()
+        .filter(|l| crate::ui::ansi::strip_ansi(l).contains(answer))
+        .count();
+    assert_eq!(
+        copies,
+        1,
+        "answer rendered {copies}x: {:?}",
+        r.buffer_lines()
+    );
+}
+
+/// The other half, and the failure the fix could introduce: once the turn is
+/// over, an answer that repeats the previous one VERBATIM must still render.
+///
+/// Suppressing a re-stream is only correct within one logical stream. If
+/// `end_stream` were not called at the turn boundary, the next turn's
+/// identical text would look like a continuation with nothing new in it — and
+/// the model repeating itself is exactly the case this bug was reported from,
+/// so it is not hypothetical.
+#[test]
+fn an_identical_answer_in_the_next_turn_still_renders() {
+    let mut r = Renderer::new().expect("renderer");
+    let answer = "No file edits are in flight.";
+
+    r.stream(answer, Color::White, true);
+    r.write_line("  the repair-stats summary", Color::DarkGrey)
+        .expect("write");
+    r.stream(answer, Color::White, true);
+    r.end_stream(); // what the Done handler does
+
+    // Next turn, same words.
+    r.stream(answer, Color::White, true);
+    r.end_stream();
+
+    let copies = r
+        .buffer_lines()
+        .iter()
+        .filter(|l| crate::ui::ansi::strip_ansi(l).contains(answer))
+        .count();
+    assert_eq!(
+        copies,
+        2,
+        "a repeated answer in a new turn was swallowed: {:?}",
+        r.buffer_lines()
+    );
+}
+
+/// Two tokens after the seal, not one — a single post-seal call cannot tell a
+/// correct implementation from one that re-expands to the full source as soon
+/// as the block is open again, because the first call is what opens it.
+#[test]
+fn streaming_resumes_after_a_notice_without_re_emitting_the_prefix() {
+    let mut r = Renderer::new().expect("renderer");
+
+    r.stream("Alpha.", Color::White, true);
+    r.write_line("  a notice", Color::DarkGrey).expect("write");
+    r.stream("Alpha. Beta.", Color::White, true);
+    r.stream("Alpha. Beta. Gamma.", Color::White, true);
+    r.end_stream();
+
+    let alphas = r
+        .buffer_lines()
+        .iter()
+        .filter(|l| crate::ui::ansi::strip_ansi(l).contains("Alpha."))
+        .count();
+    assert_eq!(
+        alphas,
+        1,
+        "the committed prefix came back on the second post-seal token: {:?}",
+        r.buffer_lines()
+    );
+    assert!(
+        r.buffer_lines()
+            .iter()
+            .any(|l| crate::ui::ansi::strip_ansi(l).contains("Gamma.")),
+        "the newest text is missing: {:?}",
+        r.buffer_lines()
+    );
+}
+
+/// Text arriving AFTER a notice sealed the block appends only the new part.
+/// `stream` is always handed the whole accumulated response, so without the
+/// committed-prefix bookkeeping the pre-notice text would be re-emitted with
+/// every later token.
+#[test]
+fn text_after_a_notice_appends_only_what_is_new() {
+    let mut r = Renderer::new().expect("renderer");
+
+    r.stream("First half.", Color::White, true);
+    r.write_line("  a notice", Color::DarkGrey).expect("write");
+    r.stream("First half. Second half.", Color::White, true);
+    r.end_stream();
+
+    let firsts = r
+        .buffer_lines()
+        .iter()
+        .filter(|l| crate::ui::ansi::strip_ansi(l).contains("First half."))
+        .count();
+    assert_eq!(firsts, 1, "first half repeated: {:?}", r.buffer_lines());
+    let seconds = r
+        .buffer_lines()
+        .iter()
+        .filter(|l| crate::ui::ansi::strip_ansi(l).contains("Second half."))
+        .count();
+    assert_eq!(seconds, 1, "second half missing: {:?}", r.buffer_lines());
+}
