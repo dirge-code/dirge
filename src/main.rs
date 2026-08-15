@@ -80,6 +80,14 @@ use crate::ui::ansi::{self, StripPolicy};
 #[derive(Default)]
 struct Channels {
     permission: Option<PermCheck>,
+    /// The resolved security mode, or `None` when tools are disabled.
+    ///
+    /// dirge-vpma.47: carried out of `build_channels` rather than recomputed.
+    /// `resolve_mode` has stderr side effects — the conflicting-flags warning
+    /// and the config-vs-CLI override warning — so calling it a second time
+    /// printed both again on every interactive launch, and left two places to
+    /// keep in step.
+    mode: Option<SecurityMode>,
     ask_tx: Option<AskSender>,
     ask_rx: Option<AskReceiver>,
     question_tx: Option<QuestionSender>,
@@ -262,6 +270,7 @@ fn build_channels(cli: &cli::Cli, cfg: &config::Config) -> Channels {
 
     Channels {
         permission: Some(perm),
+        mode: Some(mode),
         ask_tx: Some(ask_tx),
         ask_rx: Some(ask_rx),
         question_tx: Some(question_tx),
@@ -619,10 +628,17 @@ async fn main() -> anyhow::Result<()> {
                     return Ok(());
                 }
                 cli::SandboxAction::Setup { image } => {
+                    // dirge-vpma.48: say so. This used to return Ok(()) in
+                    // silence, so `dirge sandbox setup` on a build without the
+                    // feature printed nothing and exited 0 — indistinguishable
+                    // from a successful setup, while nothing had been checked,
+                    // built, or written.
                     #[cfg(not(feature = "sandbox-microvm"))]
                     {
                         let _ = &image;
-                        return Ok(());
+                        anyhow::bail!(
+                            "this dirge was built without the `sandbox-microvm` feature, so there is nothing to set up. Rebuild with `cargo build --features sandbox-microvm`, or use a release binary that ships it."
+                        );
                     }
                     #[cfg(feature = "sandbox-microvm")]
                     {
@@ -1460,6 +1476,7 @@ async fn main() -> anyhow::Result<()> {
     }
     let Channels {
         permission,
+        mode: resolved_mode,
         ask_tx,
         mut ask_rx,
         question_tx,
@@ -1706,7 +1723,9 @@ async fn main() -> anyhow::Result<()> {
                     mcp_manager.as_ref(),
                     #[cfg(feature = "semantic")]
                     semantic_manager.as_ref(),
-                    Some(session.id.to_string()),
+                    // dirge-vpma.49: through the helper, so the --no-session
+                    // policy lives in one place instead of three.
+                    session_id_for_agent(&cli, &session),
                 )
                 .await
             };
@@ -1760,7 +1779,8 @@ async fn main() -> anyhow::Result<()> {
                             mcp_manager.as_ref(),
                             #[cfg(feature = "semantic")]
                             semantic_manager.as_ref(),
-                            Some(session.id.to_string()),
+                            // dirge-vpma.49: see above.
+                            session_id_for_agent(&cli, &session),
                         )
                         .await;
                     }
@@ -1831,7 +1851,8 @@ async fn main() -> anyhow::Result<()> {
             mcp_manager.as_ref(),
             #[cfg(feature = "semantic")]
             semantic_manager.as_ref(),
-            Some(session.id.to_string()),
+            // dirge-vpma.49: see above.
+            session_id_for_agent(&cli, &session),
         )
         .await;
 
@@ -1879,10 +1900,13 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
+        // dirge-vpma.47: reuse the mode `build_channels` already resolved.
+        // Recomputing it here re-ran `resolve_mode`'s warnings, so
+        // `dirge --yolo --restrictive` printed the conflict twice.
         if !cli.resolve_no_tools(&cfg)
             && let Some(perm) = &permission
+            && let Some(mode) = resolved_mode
         {
-            let mode = resolve_mode(&cli, &cfg);
             perm.lock_ignore_poison().set_mode(mode);
         }
 
@@ -2206,6 +2230,51 @@ mod session_id_tests {
         );
     }
 
+    /// dirge-vpma.49: every `build_agent` call site must route through the
+    /// helper, not inline the session id.
+    ///
+    /// The `--no-session` policy used to live in three places: the helper (with
+    /// these tests pinning it) plus two hand-written
+    /// `Some(session.id.to_string())` arguments on the `--loop` and interactive
+    /// paths. The divergence was harmless in itself — a never-persisted id gets
+    /// excluded — but any change to the helper would silently have missed two
+    /// of the three sites. A source scan is what keeps the next call site from
+    /// being added the same way.
+    #[test]
+    fn no_build_agent_site_inlines_the_session_id() {
+        let src = include_str!("main.rs");
+        // Scan production code only. The first `#[cfg(test)]` here is a module
+        // DECLARATION (`mod tests;`, an external file), so it does not mark the
+        // start of test code — cut at the first inline `#[cfg(test)] mod X {`
+        // instead.
+        let production = src
+            .split_once("#[cfg(test)]\nmod session_id_tests {")
+            .map(|(before, _)| before)
+            .unwrap_or(src);
+        assert!(
+            production.contains("fn session_id_for_agent"),
+            "scan lost the production half — the cut marker moved",
+        );
+        // Exactly one occurrence is legitimate: the helper's own return.
+        let inlined = production.matches("Some(session.id.to_string())").count();
+        assert_eq!(
+            inlined, 1,
+            "expected the id to be built only inside session_id_for_agent, but \
+             {inlined} sites construct it — a build_agent call is inlining the \
+             policy instead of calling the helper",
+        );
+        assert!(
+            production
+                .matches("session_id_for_agent(&cli, &session)")
+                .count()
+                >= 3,
+            "expected all three agent-build sites to call the helper, found {}",
+            production
+                .matches("session_id_for_agent(&cli, &session)")
+                .count(),
+        );
+    }
+
     /// Interactive (no --print, no --no-session) also gets Some.
     #[test]
     fn interactive_yields_some() {
@@ -2263,6 +2332,41 @@ mod resolve_mode_tests {
             SecurityMode::Restrictive,
             "explicit --restrictive must override config yolo=true"
         );
+    }
+
+    /// dirge-vpma.47: the resolved mode travels with the channels, so the
+    /// interactive path never has to compute it a second time.
+    ///
+    /// `resolve_mode` writes to stderr — the conflicting-flags warning and the
+    /// config-override warning — so a second call is not free: it reprinted
+    /// both on every interactive launch. Carrying the value is also what keeps
+    /// the checker and the later `set_mode` from drifting apart.
+    #[test]
+    fn build_channels_reports_the_mode_it_resolved() {
+        let cli = cli::Cli::parse_from(["dirge", "--restrictive"]);
+        let cfg = config::Config::default();
+        let channels = build_channels(&cli, &cfg);
+        assert_eq!(
+            channels.mode,
+            Some(SecurityMode::Restrictive),
+            "the resolved mode must be carried out, not recomputed",
+        );
+        assert_eq!(
+            channels.mode,
+            Some(resolve_mode(&cli, &cfg)),
+            "the carried mode must be the one resolve_mode gives",
+        );
+    }
+
+    /// With tools disabled there is no checker and no mode — the caller's
+    /// `set_mode` is correctly skipped rather than fed a default.
+    #[test]
+    fn no_tools_carries_no_mode() {
+        let cli = cli::Cli::parse_from(["dirge", "--no-tools"]);
+        let cfg = config::Config::default();
+        let channels = build_channels(&cli, &cfg);
+        assert!(channels.permission.is_none(), "precondition: no checker");
+        assert_eq!(channels.mode, None);
     }
 
     /// A CLI flag wins over config even in the permissive direction —
