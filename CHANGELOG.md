@@ -4,22 +4,43 @@ All notable changes to dirge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.21.21] - 2026-08-15
+## [0.22.0] - 2026-08-15
+
+### Security
+- A bash command could run without ever reaching the permission checker.
+  Prefixing any denied command with `echo hi &&` and appending `2>&1 | cat` ran
+  it with no prompt. The segment splitter's `redirected_statement` handling
+  recursed only into an allowlist of node kinds and dropped everything else in
+  silence, and tree-sitter parses `a && b 2>&1 | c` as a redirected statement
+  wrapping the whole `a && b` list — so both commands vanished and the engine
+  authorized only `c`. Measured against the release binary:
+  `python3 -c "open('x','w')"` was denied, and
+  `echo hi && python3 -c "…" 2>&1 | cat` ran and wrote the file. The arm now
+  recurses into everything that is not a redirect operand, so an unfamiliar
+  grammar node over-collects rather than disappearing, and a command the
+  splitter cannot decompose at all is marked complex — the backstop that would
+  have contained this instead of letting it become a bypass. Anyone running
+  with a restrictive permission config should take this release.
+
+### Added
+- Swift support. `sourcekit-lsp` ships with the toolchain, so `.swift` files
+  get diagnostics, definitions and symbols with nothing to install;
+  `swift build`/`test`/`run`, `swiftlint` and `swift-format` are auto-allowed
+  on the same trust model as the cargo and go commands, with the subcommands
+  named individually because `swift foo.swift` and `swift repl` run arbitrary
+  code. `swift test` is also recognised by the claim gate, which previously
+  returned nothing for it while the verifier counted it — the split verdict
+  that tells a model which has just verified that it has not.
+- A tree-sitter Swift adapter, so `find_definition`, `list_symbols` and
+  `get_symbol_body` answer for Swift and the pre-write syntax gate rejects a
+  broken `.swift` edit. The gate is a hard block, so the grammar was measured
+  against async/await, actors, generics with where-clauses, property wrappers,
+  result builders, `@main`, multi-line strings and custom operators before it
+  was wired in — a grammar that reports valid code as an error leaves nothing
+  savable, which is why `.sql` is still excluded. Every adapter extension is
+  now either gated or recorded with the reason it is not.
 
 ### Fixed
-- A bash command could run without ever reaching the permission checker. The
-  segment splitter's `redirected_statement` handling recursed only into an
-  allowlist of node kinds and dropped everything else in silence, and
-  tree-sitter parses `a && b 2>&1 | c` as a redirected statement wrapping the
-  whole `a && b` list — so both commands vanished and the engine authorized
-  only `c`. Measured against the release binary:
-  `python3 -c "open('x','w')"` was denied, and the same call wrapped as
-  `echo hi && python3 -c "…" 2>&1 | cat` ran and wrote the file. Any denied
-  command ran that way. The arm now recurses into everything that is not a
-  redirect operand, so an unfamiliar grammar node over-collects rather than
-  disappearing, and a command the splitter cannot decompose at all is marked
-  complex — the backstop that would have contained this instead of letting it
-  become a bypass.
 - `python3 -m pytest` was refused wherever `pytest` was allowed, because
   nothing bridged the bare interpreter (deliberately gated — `python -c` runs
   anything) to the module it was running. It is the commonest way a model
@@ -63,24 +84,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   uses string ids and waits for the answer stalled every later request. Found
   on the wire with sourcekit-lsp, which sends `client/registerCapability` with
   a UUID and blocks on it.
-
-### Added
-- Swift support. `sourcekit-lsp` ships with the toolchain, so `.swift` files
-  get diagnostics, definitions and symbols with nothing to install;
-  `swift build`/`test`/`run`, `swiftlint` and `swift-format` are auto-allowed
-  on the same trust model as the cargo and go commands, with the subcommands
-  named individually because `swift foo.swift` and `swift repl` run arbitrary
-  code. `swift test` is also recognised by the claim gate, which previously
-  returned nothing for it while the verifier counted it — the split verdict
-  that tells a model which has just verified that it has not.
-- A tree-sitter Swift adapter, so `find_definition`, `list_symbols` and
-  `get_symbol_body` answer for Swift and the pre-write syntax gate rejects a
-  broken `.swift` edit. The gate is a hard block, so the grammar was measured
-  against async/await, actors, generics with where-clauses, property wrappers,
-  result builders, `@main`, multi-line strings and custom operators before it
-  was wired in — a grammar that reports valid code as an error leaves nothing
-  savable, which is why `.sql` is still excluded. Every adapter extension is
-  now either gated or recorded with the reason it is not.
 
 ## [0.21.20] - 2026-08-15
 
