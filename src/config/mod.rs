@@ -3766,3 +3766,106 @@ mod config_merge_tests {
         assert!(base["mcp_servers"]["exa"].as_object().is_some());
     }
 }
+
+#[cfg(test)]
+mod config_docs_coverage {
+    /// Every configurable key is described in `docs/config.md`.
+    ///
+    /// A config key nobody can find is a feature nobody has. The struct and the
+    /// docs table are two lists with nothing tying them together, and the drift
+    /// is invisible from either side — checked at 0.22.0, six top-level keys had
+    /// shipped undocumented, `compact_tool_schemas` and the per-provider
+    /// `context_window` among them, both introduced by the release that was
+    /// meant to advertise them.
+    ///
+    /// Deliberately dumb: it looks for the key NAME in the doc, so a row that
+    /// mentions a key while describing something else satisfies it. That makes
+    /// it possible to fool and it still catches the mistake anyone actually
+    /// makes — adding a key and forgetting the row.
+    const DOCS: &str = include_str!("../../docs/config.md");
+
+    /// Field names that are deliberately absent from the reference table.
+    /// Each needs a reason, so "undocumented" stays a decision rather than an
+    /// oversight.
+    const NOT_IN_THE_TABLE: &[(&str, &str)] = &[];
+
+    fn fields_of(struct_name: &str) -> Vec<String> {
+        let src = include_str!("mod.rs");
+        let start = src
+            .find(&format!("pub struct {struct_name} {{"))
+            .unwrap_or_else(|| panic!("{struct_name} not found"));
+        let mut depth = 0usize;
+        let mut end = start;
+        for (i, c) in src[start..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = start + i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        src[start..end]
+            .lines()
+            .filter_map(|l| {
+                let l = l.trim();
+                let rest = l.strip_prefix("pub ")?;
+                let name = rest.split(':').next()?.trim();
+                (!name.is_empty()
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit()))
+                .then(|| name.to_string())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_config_key_is_documented() {
+        let mut missing = Vec::new();
+        for field in fields_of("Config") {
+            if NOT_IN_THE_TABLE.iter().any(|(f, _)| *f == field) {
+                continue;
+            }
+            if !DOCS.contains(&field) {
+                missing.push(field);
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "these config keys have no mention in docs/config.md: {missing:?} — \
+             document them, or add them to NOT_IN_THE_TABLE with a reason"
+        );
+    }
+
+    /// The provider entry has its own table, and a provider key can be
+    /// "documented" only by coincidence — `context_window` exists as a
+    /// top-level key too, so a whole-document search says it is covered while
+    /// the provider table has no such row. That is exactly what happened. Scope
+    /// the search to the provider table.
+    #[test]
+    fn every_provider_key_is_in_the_provider_table() {
+        let start = DOCS
+            .find("Each `providers` entry accepts:")
+            .expect("the provider entry section exists");
+        let table = &DOCS[start..];
+        let end = table.find("\n## ").unwrap_or(table.len());
+        let table = &table[..end];
+
+        let mut missing = Vec::new();
+        for field in fields_of("ProviderEntry") {
+            if !table.contains(&format!("`{field}`")) {
+                missing.push(field);
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "these provider keys are absent from the provider-entry table in \
+             docs/config.md: {missing:?}"
+        );
+    }
+}
