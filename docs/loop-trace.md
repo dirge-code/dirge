@@ -104,7 +104,7 @@ Things worth looking at directly:
   number to check, and `context_window` in config.json is the override.
 - **An intervention firing on something the model demonstrably did** is a
   steering bug. Cross-check the guard against the `tool_start` records before
-  it — that is how the masked-exit-status case (dirge-hy4k) was found: the model
+  it — that is how the masked-exit-status case (dirge-g4lk) was found: the model
   had run pytest four times and was being told it had not run the tests.
 - **`cached` far below `input`** after the first turn means the prompt prefix is
   moving between turns and the provider cache is being rewritten.

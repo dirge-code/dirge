@@ -102,7 +102,7 @@ const VERIFY_NUDGE: &str = "[verify-before-done] You changed code this run but d
 const FAILED_NUDGE: &str = "[verify-before-done] Your last build or test command failed after you changed code. Don't report done on a red build — fix the failure. If it's pre-existing or expected, say so explicitly before finishing.";
 
 /// The nudge for a verification command that RAN but whose exit status was
-/// piped or sequenced away (dirge-hy4k).
+/// piped or sequenced away (dirge-g4lk).
 ///
 /// It says three things the generic text cannot, and each one earned its place
 /// from watching a model fail to act on the generic one: that the command was
@@ -264,7 +264,7 @@ struct Inner {
     verification_failed: bool,
     /// A nudge has already fired — never fire again (bounds the loop).
     fired: bool,
-    /// dirge-hy4k: a verification command was DECLINED because its exit status
+    /// dirge-g4lk: a verification command was DECLINED because its exit status
     /// was masked (piped, or followed by `;`), and it reported success — so
     /// the zero belongs to the last stage of the chain and proves nothing.
     ///
@@ -419,7 +419,7 @@ impl VerifierGate {
                     // trustworthy in that direction: something in the chain
                     // genuinely failed. Record the red.
                     if masks_failure(command) && !failed {
-                        // dirge-hy4k: remember that this happened. The gate's
+                        // dirge-g4lk: remember that this happened. The gate's
                         // verdict is unchanged — a masked pass is still not a
                         // green — but the nudge has to be able to say WHY, or
                         // the model is told something it can see is false.
@@ -570,7 +570,7 @@ impl VerifierGate {
             let nudge: Option<String> = if inner.verification_failed {
                 Some(FAILED_NUDGE.to_string())
             } else if !inner.ran_verification {
-                // dirge-hy4k: a command DID run and was declined for masking —
+                // dirge-g4lk: a command DID run and was declined for masking —
                 // say so, and say what to do. The generic text below claims
                 // nothing ran, which is false here and gets the whole nudge
                 // disbelieved.
@@ -1449,7 +1449,7 @@ mod tests {
             })
     }
 
-    /// dirge-hy4k: when a test run is declined because its exit status was
+    /// dirge-g4lk: when a test run is declined because its exit status was
     /// piped away, SAY THAT — do not tell the model it never ran the tests.
     ///
     /// Measured end to end: a model ran `python3 -m pytest … 2>&1 | tail -12`
