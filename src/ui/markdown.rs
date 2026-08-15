@@ -1045,6 +1045,46 @@ mod tests {
         assert_eq!(lines[1].as_str(), "字");
     }
 
+    /// dirge-8gdv.10 seam 7: mixed narrow/wide text, which p054's pure-CJK
+    /// cases do not reach.
+    ///
+    /// Stated as the invariant rather than expected rows, so it cannot be
+    /// satisfied by writing today's output down: no row may exceed the cell
+    /// budget, and the visible characters must survive in order — a wide glyph
+    /// split across a row boundary would break both at once, and renders as a
+    /// broken cell in the terminal.
+    #[test]
+    fn word_wrap_never_overflows_or_splits_a_wide_glyph() {
+        use unicode_width::UnicodeWidthStr;
+        for text in [
+            "ab字cd",
+            "字ab",
+            "a字b",
+            "hello 世界 ok",
+            "мир 世界 world",
+            "一二三四五六七八",
+            "emoji 🙂 tail",
+        ] {
+            for width in 2usize..=12 {
+                let rows = word_wrap(text, width);
+                for row in &rows {
+                    assert!(
+                        UnicodeWidthStr::width(row.as_str()) <= width,
+                        "{text:?} at width {width}: row {row:?} is \
+                         {} cells",
+                        UnicodeWidthStr::width(row.as_str()),
+                    );
+                }
+                // Every visible character survives, in order. A split glyph
+                // or a dropped one shows up here.
+                let joined: String = rows.iter().map(|r| r.as_str()).collect();
+                let want: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+                let got: String = joined.chars().filter(|c| !c.is_whitespace()).collect();
+                assert_eq!(got, want, "{text:?} at width {width}: characters changed");
+            }
+        }
+    }
+
     /// Bold (`**x**`) emits an ANSI `\x1b[1m` open inside the
     /// accumulator and `\x1b[22m` close on TagEnd::Strong.
     #[test]

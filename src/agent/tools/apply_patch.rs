@@ -467,6 +467,61 @@ mod tests {
         }
     }
 
+    /// dirge-8gdv.10 seam 7: apply_patch is the sibling of the `edit` path that
+    /// dirge-do90 fixed, and it had no CRLF coverage of its own.
+    ///
+    /// The bug there: `old_text` and the buffer are normalized to `\n` but the
+    /// replacement was spliced raw, so a model emitting `\r\n` inside
+    /// `new_text` on a CRLF file produced `\r\r\n` after the whole-buffer
+    /// re-encode. Both tools advertise CRLF handling; a guard on one of two
+    /// parallel implementations is the recurring shape in this codebase, so
+    /// pin it here too.
+    #[tokio::test]
+    async fn crlf_update_does_not_double_the_carriage_return() {
+        let tf = TestFile::new("apply-patch-crlf");
+        std::fs::write(&tf.path, "line1\r\nline2\r\nline3\r\n").unwrap();
+
+        let result = apply_update(&tf.path, "line2", "new2a\r\nnew2b").await;
+        assert!(result.is_ok(), "update should succeed; got {result:?}");
+
+        let out = std::fs::read(&tf.path).unwrap();
+        assert!(
+            !out.windows(3).any(|w| w == b"\r\r\n"),
+            "must not produce \\r\\r\\n; got {:?}",
+            String::from_utf8_lossy(&out),
+        );
+        let text = String::from_utf8_lossy(&out);
+        // Every newline is a proper CRLF — no lone \n survived either.
+        assert_eq!(
+            text.matches('\n').count(),
+            text.matches("\r\n").count(),
+            "a bare LF was left in a CRLF file: {text:?}",
+        );
+        assert!(
+            text.contains("new2a\r\nnew2b"),
+            "replacement text: {text:?}"
+        );
+    }
+
+    /// An LF file must stay LF — the re-encode restores what was there, it
+    /// does not impose CRLF. Without this the test above is satisfied by a
+    /// tool that always writes CRLF.
+    #[tokio::test]
+    async fn an_lf_file_stays_lf_through_an_update() {
+        let tf = TestFile::new("apply-patch-lf");
+        std::fs::write(&tf.path, "line1\nline2\nline3\n").unwrap();
+
+        apply_update(&tf.path, "line2", "new2a\r\nnew2b")
+            .await
+            .expect("update should succeed");
+
+        let text = String::from_utf8_lossy(&std::fs::read(&tf.path).unwrap()).into_owned();
+        assert!(
+            !text.contains('\r'),
+            "an LF file gained carriage returns: {text:?}",
+        );
+    }
+
     // dirge-tc9l: a mid-batch failure must surface as Err so the
     // consecutive-failure recovery checkpoint, repeat-loop guard, and critic
     // transcript labeling (which all key off errored tool results) actually
