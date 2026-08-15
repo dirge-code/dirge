@@ -1812,3 +1812,45 @@ fn every_module_form_tool_is_allowed_under_its_own_name() {
         );
     }
 }
+
+/// GH #778: Swift's project commands are auto-allowed like cargo's and go's —
+/// otherwise every build in a Swift repo prompts, which is the friction
+/// dirge-e1nv removed for `python -m pytest`.
+#[test]
+fn swift_project_commands_are_auto_allowed() {
+    for cmd in [
+        "swift build",
+        "swift build -c release",
+        "swift test",
+        "swift test --filter DurationTests",
+        "swift run myapp",
+        "swiftlint",
+        "swift-format --in-place Sources/",
+    ] {
+        let mut checker = fresh_checker();
+        assert!(
+            matches!(checker.check("bash", cmd), CheckResult::Allowed),
+            "{cmd:?} should be auto-allowed by the default bash rules"
+        );
+    }
+}
+
+/// The negative half: `swift` is also an interpreter and a package fetcher.
+/// Naming subcommands rather than allowing `swift **` is what keeps
+/// `swift main.swift` (arbitrary code) and `swift package resolve` (network)
+/// on the prompt path, mirroring why bare `python` is excluded.
+#[test]
+fn swift_interpreter_and_fetch_stay_gated() {
+    for cmd in [
+        "swift main.swift",
+        "swift repl",
+        "swift package resolve",
+        "swift package update",
+    ] {
+        let mut checker = fresh_checker();
+        assert!(
+            !matches!(checker.check("bash", cmd), CheckResult::Allowed),
+            "{cmd:?} must not be auto-allowed"
+        );
+    }
+}

@@ -374,6 +374,22 @@ fn base_bash_rules() -> Vec<(&'static str, Action)> {
         ("pip list **", Action::Allow),
         ("pip show **", Action::Allow),
         ("pip freeze", Action::Allow),
+        // Swift (GH #778). Project-scoped, same trust model as the cargo/go
+        // entries: `swift build`/`test`/`run` compile and run the package's own
+        // code, which is the trust you already granted by letting the agent
+        // edit it. The bare `swift` interpreter is NOT allowed — `swift foo.swift`
+        // and `swift repl` run arbitrary code, exactly the reason `python` is
+        // excluded — so each subcommand is named.
+        ("swift build **", Action::Allow),
+        ("swift test **", Action::Allow),
+        ("swift run **", Action::Allow),
+        // `swift package` covers describe/show-dependencies/resolve; resolve
+        // fetches, which is the same network-side-effect line `npm install`
+        // sits on, so it stays gated by omission.
+        ("swift package describe **", Action::Allow),
+        ("swift package show-dependencies **", Action::Allow),
+        ("swiftlint **", Action::Allow),
+        ("swift-format **", Action::Allow),
         // Go
         ("go build **", Action::Allow),
         ("go test **", Action::Allow),

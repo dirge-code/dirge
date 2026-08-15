@@ -252,6 +252,16 @@ fn segment_kind(segment: &str) -> Option<CommandKind> {
             Some("test") => Some(CommandKind::Test),
             _ => Some(CommandKind::BuildOrLint),
         },
+        // GH #778. Without this arm `swift test` fell through to `None` here
+        // while the verifier's markers matched its `test` token — the same
+        // split verdict as dirge-hwk9.3, where a model that had just been told
+        // to verify, and did, was told it had not. `swift repl` and
+        // `swift <file>.swift` are neither: they run code without checking it.
+        "swift" => match sub {
+            Some("test") => Some(CommandKind::Test),
+            Some("build") => Some(CommandKind::BuildOrLint),
+            _ => None,
+        },
         "pytest" | "unittest" | "tox" | "jest" | "vitest" | "mocha" | "rspec" => {
             Some(CommandKind::Test)
         }
@@ -286,7 +296,7 @@ fn segment_kind(segment: &str) -> Option<CommandKind> {
         // The list mirrors verifier.rs's FAST_LINTERS plus common formatters.
         "tsc" | "rustc" | "eslint" | "ruff" | "mypy" | "flake8" | "shellcheck" | "rubocop"
         | "golangci-lint" | "prettier" | "gofmt" | "rustfmt" | "clang-format" | "black"
-        | "isort" => Some(CommandKind::BuildOrLint),
+        | "isort" | "swiftlint" | "swift-format" => Some(CommandKind::BuildOrLint),
         _ => None,
     }
 }
@@ -577,6 +587,13 @@ mod tests {
             "python3 -m unittest discover",
             "cargo test",
             "make check",
+            // GH #778. `swift test` matched the verifier on its generic `test`
+            // token while `segment_kind` had no `swift` arm and returned None —
+            // the same split verdict as dirge-hwk9.3, in a language nobody had
+            // taught either recogniser about. Only TEST-kind commands belong in
+            // this list: the fixture claim is a test result, so `swift build`
+            // failing to support it is the gate working, not disagreeing.
+            "swift test",
         ] {
             assert!(
                 verifier::is_verification_command_for_test(cmd),
@@ -586,6 +603,38 @@ mod tests {
                 fires(A_TEST_CLAIM, &[cmd], 3),
                 None,
                 "...and so must the claim gate: `{cmd}`"
+            );
+        }
+    }
+
+    /// The negative half of the Swift arm, and the reason it enumerates
+    /// subcommands instead of falling through to `BuildOrLint` the way `cargo`
+    /// does: `swift` is also the interpreter. `swift foo.swift` and `swift repl`
+    /// RUN code without checking it, so neither may support a test claim — the
+    /// same distinction that keeps `python` out of the allow rules.
+    #[test]
+    fn running_swift_code_is_not_verifying_it() {
+        use super::segment_kind;
+        assert_eq!(segment_kind("swift test"), Some(CommandKind::Test));
+        assert_eq!(segment_kind("swift build"), Some(CommandKind::BuildOrLint));
+        assert_eq!(segment_kind("swiftlint"), Some(CommandKind::BuildOrLint));
+        assert_eq!(
+            segment_kind("swift-format --in-place ."),
+            Some(CommandKind::BuildOrLint)
+        );
+        // …and the verifier counts the same three, which is the agreement the
+        // test-kind list above cannot cover for build/lint commands.
+        for cmd in ["swift build", "swiftlint", "swift-format ."] {
+            assert!(
+                crate::agent::agent_loop::verifier::is_verification_command_for_test(cmd),
+                "the verifier must recognise `{cmd}`"
+            );
+        }
+        for cmd in ["swift repl", "swift main.swift", "swift package resolve"] {
+            assert_eq!(
+                segment_kind(cmd),
+                None,
+                "{cmd:?} runs or fetches; it checks nothing"
             );
         }
     }

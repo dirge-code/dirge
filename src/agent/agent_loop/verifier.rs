@@ -919,6 +919,13 @@ const WORD_MARKERS: &[&str] = &[
     "mypy",
     "shellcheck",
     "rubocop",
+    // GH #778. `swift build` / `swift test` already match on their generic
+    // `build` / `test` tokens, and `swift` itself is deliberately NOT a marker
+    // — `swift repl` and `swift foo.swift` run code without checking it. These
+    // two are separate words that would not otherwise match ("swiftlint" is not
+    // "lint").
+    "swiftlint",
+    "swift-format",
 ];
 
 /// Subcommands that do no building/testing. Their presence disqualifies
