@@ -3099,3 +3099,85 @@ fn validate_all_plugins_compile() {
 
     assert!(count >= 20, "expected at least 20 plugins, found {count}");
 }
+
+// ── dirge-8gdv.10 seam 4: hook timeout fail-open + two-plugin load ──────────
+
+// NOTE: the obvious test here — a hook running `(while true ...)`, asserting
+// the dispatch returns on the HOOK_TIMEOUT budget — is deliberately absent.
+// It hangs the suite. `eval_with_timeout` bounds the CALLER's wait, but a
+// tight Janet loop keeps the worker thread spinning forever, so every later
+// eval (including the drain this test would assert on) queues behind it and
+// never returns. That worker-lifecycle gap is dirge-ntjh, which is open and
+// deliberately deferred as permission-gate-adjacent; writing a test that
+// depends on recovery would just encode the broken behaviour. The two tests
+// below cover what the dispatch loop actually guarantees today: an erroring
+// plugin does not stop the ones after it, and two separately loaded plugins
+// both land on the hook.
+
+/// Two plugins LOADED from separate files both end up on the same hook.
+///
+/// Distinct from `dispatch_tool_hook_runs_all_when_no_block`, which registers
+/// by hand: this drives the loader's auto-discovery, the path where dirge-awwr
+/// found earlier plugins' bare hooks being re-registered under later stems.
+#[cfg(feature = "plugin")]
+#[test]
+fn two_loaded_plugins_both_register_on_the_same_hook() {
+    let first = tmpfile(
+        "seam4-a",
+        r#"(defn on-tool-start [ctx] (harness/notify "a-ran" :info))"#,
+    );
+    let second = tmpfile(
+        "seam4-b",
+        r#"(defn on-tool-start [ctx] (harness/notify "b-ran" :info))"#,
+    );
+    let mut mgr = PluginManager::try_new().unwrap();
+    super::load_plugin(&mut mgr, &first).unwrap();
+    super::load_plugin(&mut mgr, &second).unwrap();
+    let _ = std::fs::remove_file(&first);
+    let _ = std::fs::remove_file(&second);
+
+    let registered = mgr.hooks.get("on-tool-start").cloned().unwrap_or_default();
+    assert_eq!(
+        registered.len(),
+        2,
+        "both plugins must be on the hook, got {registered:?}",
+    );
+    mgr.dispatch_tool_hook("on-tool-start", "@{}").unwrap();
+    let msgs: Vec<String> = mgr
+        .drain_notifications()
+        .into_iter()
+        .map(|(_, m)| m)
+        .collect();
+    // The second file's definition shadows the first in one Janet env, so
+    // what matters here is that BOTH registrations fire a handler rather
+    // than one silently dropping out.
+    assert_eq!(msgs.len(), 2, "both registrations must run: {msgs:?}");
+}
+
+/// A throwing hook is caught, surfaced, and the next plugin still runs.
+#[cfg(feature = "plugin")]
+#[test]
+fn a_throwing_hook_does_not_prevent_the_next_plugin() {
+    let mut mgr = PluginManager::try_new().unwrap();
+    mgr.eval(r#"(defn boom [ctx] (error "kaboom"))"#).unwrap();
+    mgr.eval(r#"(defn fine [ctx] (harness/notify "still-ran" :info))"#)
+        .unwrap();
+    mgr.register("on-tool-start", "boom");
+    mgr.register("on-tool-start", "fine");
+
+    mgr.dispatch_tool_hook("on-tool-start", "@{}")
+        .expect("a throwing hook must not fail the dispatch");
+    let msgs: Vec<String> = mgr
+        .drain_notifications()
+        .into_iter()
+        .map(|(l, m)| format!("{l}:{m}"))
+        .collect();
+    assert!(
+        msgs.iter().any(|m| m.contains("still-ran")),
+        "the second plugin was skipped: {msgs:?}",
+    );
+    assert!(
+        msgs.iter().any(|m| m.contains("kaboom")),
+        "the error was swallowed instead of surfaced: {msgs:?}",
+    );
+}
