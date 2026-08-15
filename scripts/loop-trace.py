@@ -119,7 +119,10 @@ def render_line(rec):
             f"tokens ({rec.get('how')})"
         )
     elif kind == "turn_end":
-        body = f"turn end ({rec.get('stop_reason')}, {rec.get('tool_results')} results)"
+        said = rec.get("text") or ""
+        calls = rec.get("tool_calls", 0)
+        head = f"turn end ({rec.get('stop_reason')}, {calls} call(s), {rec.get('tool_results')} result(s))"
+        body = f"{head}\n          assistant: {said}" if said else head
     elif kind == "system_notice":
         body = f"\033[1mNOTICE\033[0m {rec.get('text', '')}"
     elif kind == "retry":
@@ -142,11 +145,11 @@ def summarize(records):
         out.append(f"window       {start.get('ctx_max')} tokens")
         out.append(f"tools        {len(start.get('tools') or [])}")
 
-    # Turns: count assistant messages, which is one per model call. `turn_start`
-    # is not emitted for the first turn, so counting those undercounts by one.
-    turns = sum(
-        1 for r in records if r.get("kind") == "message" and r.get("role") == "assistant"
-    )
+    # Turns: one `turn_end` per completed model turn. NOT `turn_start`, which
+    # the loop deliberately skips on the first iteration, and not assistant
+    # `message` records — those are the pre-stream placeholder and the trace no
+    # longer writes them, which silently zeroed this line until it was noticed.
+    turns = sum(1 for r in records if r.get("kind") == "turn_end")
     out.append(f"turns        {turns}")
 
     tool_ends = [r for r in records if r.get("kind") == "tool_end"]
