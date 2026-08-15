@@ -181,7 +181,48 @@ impl std::fmt::Display for SecurityMode {
     }
 }
 
-pub fn default_bash_rules() -> Vec<(&'static str, Action)> {
+/// Project tools that are ALSO reachable as `python -m <tool>` (dirge-e1nv).
+///
+/// Every name here must be allowed under its own name by [`default_bash_rules`]
+/// — the module-form rules are generated from this list, so an entry whose bare
+/// rule was later removed would be a silent widening. Pinned by
+/// `every_module_form_tool_is_allowed_under_its_own_name`.
+///
+/// `python -m <tool>` is spelled out rather than reached by stripping the
+/// interpreter prefix. Allow-matching sees commands RAW on purpose (dirge-8zem):
+/// `PATH=/tmp/evil git push` and `./env git push` run a different binary under
+/// an allowed name, so a general "strip the prefix and match" would reopen that.
+/// `-m` does not make the interpreter safe; it names a module that still has to
+/// be allowed on its own, which is why `python3 -m http.server` and
+/// `python3 -m pip install` keep prompting.
+pub const PYTHON_MODULE_TOOLS: &[&str] = &["pytest", "ruff", "black", "mypy"];
+
+/// Interpreter spellings the module form is generated for. `python3.12`-style
+/// versioned names are not included: a pattern loose enough to cover them is
+/// loose enough to cover an arbitrary `python*` on PATH.
+const PYTHON_INTERPRETERS: &[&str] = &["python", "python3"];
+
+pub fn default_bash_rules() -> Vec<(String, Action)> {
+    let mut rules: Vec<(String, Action)> = base_bash_rules()
+        .into_iter()
+        .map(|(p, a)| (p.to_string(), a))
+        .collect();
+    // dirge-e1nv: `<interp> -m <tool> **` for every tool allowed under its own
+    // name. Generated rather than written twice — eight more literals would be
+    // a second list to keep in step with the first.
+    //
+    // Appended AFTER the base list, which is last-match-wins, so this only ever
+    // adds the module spelling of a rule that is already there. A user rule
+    // still wins: `install_config_rules` pushes those after all of these.
+    for interp in PYTHON_INTERPRETERS {
+        for tool in PYTHON_MODULE_TOOLS {
+            rules.push((format!("{interp} -m {tool} **"), Action::Allow));
+        }
+    }
+    rules
+}
+
+fn base_bash_rules() -> Vec<(&'static str, Action)> {
     // Allow-list ordering / shape — three buckets:
     //   1. Read-only inspection (cat / ls / grep / etc.)
     //   2. Project-scoped dev workflow inside CWD (cargo / git

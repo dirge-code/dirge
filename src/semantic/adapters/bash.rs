@@ -32,6 +32,70 @@ mod tests {
         assert_eq!(segments, vec!["a", "b", "c"]);
     }
 
+    // ── dirge-5flx: a segment the splitter drops is a segment nobody checks ──
+    //
+    // tree-sitter-bash parses `a && b 2>&1` as
+    // `redirected_statement(body: list(a && b))`. The redirected_statement arm
+    // recursed only into children of kind command|pipeline|compound_statement|
+    // subshell and silently dropped everything else, so the whole list went
+    // missing and `a && b 2>&1 | c` reduced to `["c"]` — with complex=false, so
+    // the engine treated a command it had never seen as an ordinary `cat`.
+    //
+    // Reproduced end to end: `python3 -c "open('x','w')"` is denied, and
+    // `echo hi && python3 -c "open('x','w')" 2>&1 | cat` ran and wrote the file.
+
+    /// Every command in the list survives a redirected pipeline.
+    #[test]
+    fn a_redirect_before_a_pipe_does_not_swallow_the_list() {
+        let segments = parse_bash_segments("a && b 2>&1 | c");
+        assert_eq!(segments, vec!["a", "b", "c"]);
+    }
+
+    /// The shape that actually got through: a denied interpreter hidden
+    /// between an allowed head and an allowed tail.
+    #[test]
+    fn a_denied_command_is_still_visible_inside_a_redirected_pipeline() {
+        let segments = parse_bash_segments("echo hi && python3 -c \"open('x','w')\" 2>&1 | cat");
+        assert!(
+            segments.iter().any(|s| s.starts_with("python3 -c")),
+            "the interpreter must reach the checker; got {segments:?}"
+        );
+    }
+
+    /// Redirect operands are not commands and must not become segments —
+    /// otherwise the fix above trades a dropped command for a phantom one.
+    #[test]
+    fn redirect_targets_are_not_segments() {
+        let segments = parse_bash_segments("a && b > out.txt | c");
+        assert_eq!(segments, vec!["a", "b", "c"]);
+        let segments = parse_bash_segments("b 2>&1");
+        assert_eq!(segments, vec!["b"]);
+    }
+
+    /// The same shape without a pipe: the splitter used to return the whole
+    /// string as ONE segment, which matches no per-command rule but is still
+    /// offered to the head-matching allow deciders as a simple command.
+    #[test]
+    fn a_redirected_list_still_decomposes() {
+        let segments = parse_bash_segments("a && b 2>&1");
+        assert_eq!(segments, vec!["a", "b"]);
+    }
+
+    /// The backstop, independent of any particular grammar shape: whatever the
+    /// splitter fails to decompose is marked COMPLEX, so a matching head can
+    /// never silently allow it (dirge-g9qj's rule). This is what would have
+    /// contained the bug above instead of turning it into a bypass.
+    #[test]
+    fn an_undecomposable_command_is_marked_complex() {
+        // No `command` node anywhere — a bare assignment.
+        let (segments, complex) = parse_bash_segments_full("FOO=bar").unwrap();
+        assert_eq!(segments.len(), 1, "falls back to the whole command");
+        assert!(
+            complex,
+            "a command the splitter could not decompose must not auto-allow on its head"
+        );
+    }
+
     #[test]
     fn test_command_substitution_is_complex() {
         let (segments, complex) = parse_bash_segments_full("echo $(rm -rf /)").unwrap();
@@ -533,7 +597,18 @@ pub fn parse_bash_segments_full(command: &str) -> Result<(Vec<String>, bool), St
 
         collect_segments(root, source, &mut segments);
         if segments.is_empty() {
+            // dirge-5flx: the splitter found no command it recognized, so it
+            // does not know what this invocation runs. Falling back to the
+            // whole string is right; offering it as a SIMPLE command was not —
+            // the head-matching allow deciders would then authorize it on its
+            // first word. Marking it complex applies dirge-g9qj's rule: a claim
+            // the splitter could not decompose never auto-allows.
+            //
+            // This is the backstop that would have contained the
+            // redirected_statement bug above instead of letting it become a
+            // bypass, and it holds for the next grammar shape nobody predicted.
             segments.push(command.to_string());
+            is_complex = true;
         }
 
         Ok((segments, is_complex))
@@ -680,16 +755,30 @@ fn collect_segments(node: tree_sitter::Node, source: &[u8], out: &mut Vec<String
         // command without its redirections, matching how opencode
         // separates the two concerns.
         "redirected_statement" => {
-            // Find the inner command/pipeline; the redirect operands
-            // are leaf nodes (file_redirect, heredoc_redirect, etc.)
-            // that don't carry shell-command text.
+            // Recurse into everything that is not a redirect OPERAND.
+            //
+            // dirge-5flx: this used to be the other way round — an allowlist of
+            // command-bearing kinds, with `_ => {}` dropping the rest. A filter
+            // whose reject path is silent is a filter nobody can audit, and
+            // this one was wrong: tree-sitter-bash parses `a && b 2>&1` as
+            // `redirected_statement(body: list(a && b))`, `list` was not on the
+            // allowlist, and both commands vanished. `a && b 2>&1 | c` reduced
+            // to `["c"]` with complex=false, so the engine authorized a command
+            // it had never seen. Measured: `python3 -c "open('x','w')"` is
+            // denied, and the same call wrapped as
+            // `echo hi && python3 -c "…" 2>&1 | cat` ran and wrote the file.
+            //
+            // The operand kinds below are a closed set from the grammar and
+            // carry no shell-command text (the targets are gated separately, as
+            // Edit claims, via `collect_redirect_targets`). Everything else
+            // recurses — so a grammar node this code has never heard of
+            // over-collects rather than disappearing, which is the safe
+            // direction for a permission input.
             for i in 0..node.named_child_count() {
                 if let Some(child) = node.named_child(i) {
                     match child.kind() {
-                        "command" | "pipeline" | "compound_statement" | "subshell" => {
-                            collect_segments(child, source, out);
-                        }
-                        _ => {} // redirect operands — handled by C4
+                        "file_redirect" | "heredoc_redirect" | "herestring_redirect" => {}
+                        _ => collect_segments(child, source, out),
                     }
                 }
             }

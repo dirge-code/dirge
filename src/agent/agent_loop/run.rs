@@ -2336,6 +2336,70 @@ pub(crate) fn progress_nudge_is_suppressed(which: BoundaryNudge, masked_decline:
     which == BoundaryNudge::ProgressStall && masked_decline
 }
 
+/// Record a boundary where the arbiter had something and chose not to say it.
+///
+/// A stand-down produces no message, no tally nudge and — since dirge-hwk9.7 —
+/// no spent budget, which means it leaves no trace of any kind. That is the
+/// same blind spot the context verdict had: the interesting decision is the one
+/// with no output. Without this record a trace cannot distinguish "the stall
+/// never came up" from "the stall came up three times and was declined", and
+/// those call for opposite fixes.
+fn trace_boundary_stand_down(offer: Option<&super::progress::Checkpoint>, why: &str, extra: Value) {
+    if !super::trace::enabled() {
+        return;
+    }
+    let mut fields = serde_json::json!({
+        "decision": "stand_down",
+        "why": why,
+        "offer": offer.map(|c| match c.kind {
+            super::progress::CheckpointKind::Stall => "stall",
+            super::progress::CheckpointKind::Prologue => "prologue",
+        }),
+    });
+    if let (Some(dst), Some(src)) = (fields.as_object_mut(), extra.as_object()) {
+        for (k, v) in src {
+            dst.insert(k.clone(), v.clone());
+        }
+    }
+    super::trace::note("boundary", fields);
+}
+
+/// Whether the boundary about to be arbitrated is the one that ENDS the inner
+/// loop — the model produced an answer rather than more tool calls, so control
+/// is about to pass to [`poll_finalization_follow_up`] (dirge-hwk9.7).
+///
+/// This is the seam dirge-5mtx.2 left open. That change made the mid-turn
+/// boundary emit exactly one harness nudge, chosen by priority. It did not
+/// touch the fact that the run's LAST boundary is polled by TWO arbiters: the
+/// boundary one here, and then the finalization one, which has its own strict
+/// priority order and no knowledge that anything already spoke. Both can push a
+/// message before the same assistant turn, unranked against each other.
+///
+/// Measured, twice, on different models: `[stall]` delivered 0.1s before a
+/// successful run ended (qwen at 618.0s of 618.1s, deepseek at 55.3s of 55.4s),
+/// on the boundary after the final answer. It is not a coincidence of timing —
+/// a run in its endgame has its todos closed (cannot decrease), its files
+/// already touched (cannot increase) and its green already latched (no fresh
+/// edge), so EVERY endgame boundary is barren by the monitor's definition. The
+/// monitor is structurally guaranteed to fire there given enough turns.
+///
+/// The rule: that boundary belongs to the finalization arbiter. It is the one
+/// that knows what "finishing" means, its gates are the specific ones
+/// (`Verifier` is fast-verify's better-informed twin, `Todo` is track-work's),
+/// and the traced runs show it doing exactly the right job on that boundary
+/// while the broad nudges add noise beside it.
+///
+/// Safe-state is the exception and stays: it is an abort with a tree restore,
+/// not steering, and the finalization stack has no equivalent.
+///
+/// A user interjection arriving after this point (`poll_steering`, further
+/// down) would re-open the loop and make the prediction wrong. That is
+/// harmless now that a declined checkpoint keeps its budget — it simply
+/// re-offers at the next boundary.
+pub(crate) fn boundary_nudge_stands_down(which: BoundaryNudge, concluding: bool) -> bool {
+    concluding && which != BoundaryNudge::SafeState
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn poll_boundary_nudge(
     config: &LoopConfig,
@@ -2347,9 +2411,10 @@ pub(crate) fn poll_boundary_nudge(
     verify_nudges: &mut u8,
     tally: &mut GateTally,
     tier: super::capability::CapabilityTier,
+    concluding: bool,
 ) -> Option<(LoopMessage, BoundaryNudge)> {
     // Unconditional: the progress counters must advance every boundary.
-    let progress_signal = config.progress.as_ref().and_then(|progress| {
+    let progress_offer = config.progress.as_ref().and_then(|progress| {
         let snapshot = super::progress::ProgressSnapshot {
             todos_unfinished: crate::agent::tools::todo::unfinished_count(),
             files_touched: crate::agent::tools::modified::count(),
@@ -2367,18 +2432,58 @@ pub(crate) fn poll_boundary_nudge(
             ),
             // dirge-t5dh: the prologue bound also watches tool calls, since a
             // turn batching forty reads is one boundary but forty calls.
-            tool_calls: tally.tool_calls() as usize,
+            // dirge-hwk9.7: SUCCESSFUL calls only. Both counts come off the
+            // same tally, and the errored total is derived from the per-class
+            // split rather than stored beside it, so this cannot drift from
+            // what the capability estimator and the gates line report.
+            successful_tool_calls: tally
+                .tool_calls()
+                .saturating_sub(tally.errored_tool_calls())
+                as usize,
         };
         progress.record_turn(snapshot)
     });
 
-    // 1. Safe-state abort (EXEC rung 3) — supersedes the rung-2 checkpoint.
-    if let Some(msg) = safe_state_msg {
+    // 1. Safe-state abort (EXEC rung 3) — supersedes the rung-2 checkpoint,
+    //    and the only rung that still speaks on a concluding boundary. The
+    //    exemption is read from the policy here rather than left implicit in
+    //    this branch's position, so there is ONE statement of the rule: with it
+    //    encoded twice, a mutation of the policy changed nothing and the
+    //    exemption was untestable.
+    if let Some(msg) = safe_state_msg
+        && !boundary_nudge_stands_down(BoundaryNudge::SafeState, concluding)
+    {
         tally.record_nudge(BoundaryNudge::SafeState);
         return Some((
             LoopMessage::User(super::message::UserMessage::text(msg)),
             BoundaryNudge::SafeState,
         ));
+    }
+    // dirge-hwk9.7: everything below is steering for a model that is about to
+    // act again. On a boundary that ends the inner loop it is about to answer
+    // instead, and `poll_finalization_follow_up` owns that turn — see
+    // [`boundary_nudge_stands_down`]. Standing down here rather than inside
+    // each rung is what keeps the budgets intact: `track_nudges`,
+    // `verify_nudges` and the progress checkpoint are all spent at the point
+    // of selection, so a rung that selects and is then declined has already
+    // paid for a message nobody read.
+    if boundary_nudge_stands_down(BoundaryNudge::ProgressStall, concluding) {
+        trace_boundary_stand_down(
+            progress_offer.as_ref(),
+            "concluding",
+            serde_json::json!({
+                // What the rungs above progress would have keyed on, read-only
+                // — enough to tell from a trace whether standing down cost the
+                // model anything the finalization gates don't already cover.
+                "edits_since_verify": config
+                    .verifier
+                    .as_ref()
+                    .map_or(0, |v| v.edits_since_verify()),
+                "todos_unfinished": crate::agent::tools::todo::unfinished_count(),
+            }),
+        );
+        tally.end_boundary();
+        return None;
     }
     // 2. Cross-turn recovery checkpoint (rung 2) — distinct tool errors piling
     //    up, which storm's identical-repeat rule never sees.
@@ -2420,22 +2525,26 @@ pub(crate) fn poll_boundary_nudge(
     }
     // 6. Progress — broadest, so last. Prologue and stall are mutually
     //    exclusive inside the tracker (unarmed vs armed).
-    if let Some(msg) = progress_signal {
-        let which = if super::progress::is_prologue_checkpoint(&msg) {
-            BoundaryNudge::ProgressPrologue
-        } else {
-            BoundaryNudge::ProgressStall
+    if let Some(offer) = progress_offer {
+        let which = match offer.kind {
+            super::progress::CheckpointKind::Prologue => BoundaryNudge::ProgressPrologue,
+            super::progress::CheckpointKind::Stall => BoundaryNudge::ProgressStall,
         };
         let masked = config
             .verifier
             .as_ref()
             .is_some_and(|v| v.masked_decline_outstanding());
         if progress_nudge_is_suppressed(which, masked) {
+            trace_boundary_stand_down(Some(&offer), "masked-verification", serde_json::Value::Null);
             tally.end_boundary();
             return None;
         }
+        // Delivered — now, and only now, spend the checkpoint.
+        if let Some(progress) = config.progress.as_ref() {
+            progress.commit(offer.kind);
+        }
         tally.record_nudge(which);
-        return Some((msg, which));
+        return Some((offer.message, which));
     }
     // 7. Budget countdown. Only polled when nothing else fired, so an unused
     //    mark survives to a later boundary.
@@ -3605,6 +3714,16 @@ pub async fn run_loop(
             } else {
                 None
             };
+            // dirge-hwk9.7: exactly the inner-loop condition, evaluated one
+            // statement early. `has_more_tool_calls` and `recovery_pending` are
+            // both final by this point (set during dispatch above);
+            // `pending_messages` was drained at the top of this iteration and is
+            // only refilled by `poll_steering` further down, which is user input
+            // arriving asynchronously. So this predicts "the loop is about to
+            // exit and hand over to finalization" exactly, except when a human
+            // interjects in the gap — and a checkpoint declined for that reason
+            // keeps its budget and re-offers next boundary.
+            let concluding = !has_more_tool_calls && !recovery_pending;
             if let Some((msg, which)) = poll_boundary_nudge(
                 &config,
                 &guards,
@@ -3615,6 +3734,7 @@ pub async fn run_loop(
                 &mut verify_nudges,
                 &mut tally,
                 capability.tier(),
+                concluding,
             ) {
                 // dirge-e31n.6: a permission checkpoint says no tool can clear
                 // the block. Forbid tools on the turn that reads it so that is

@@ -50,6 +50,7 @@ One JSON object per line. Every record carries `ms` (since run start), `seq`
 | `tool_start` / `tool_end` | name, arguments, result, error flag, joined by `id` |
 | `usage` | provider-reported input / output / cached tokens for the turn |
 | `context` | the context manager's verdict, with `prompt_tokens`, `ctx_max`, `ratio` |
+| `boundary` | a turn boundary where the arbiter had something to say and stood down, with the rule that declined it (`why`) and the checkpoint left standing (`offer`) |
 | `compaction_start` / `compacted` | tokens before and after, and which kind of fold |
 | `retry`, `system_notice`, `repairs`, `escalation`, `checkpoint` | as named |
 
@@ -69,8 +70,12 @@ Interventions are attributed through `intervention::HARNESS_TAGS`, the registry
 the headless notice mirror and the TUI's attribution already share, so a guard
 added later is traced without anyone editing the trace module.
 
-Two things never become events and are recorded explicitly: the tool set at
-`run_start`, and the context manager's verdict each turn.
+Three things never become events and are recorded explicitly: the tool set at
+`run_start`, the context manager's verdict each turn, and a boundary where the
+arbiter stood down. All three are decisions with no output, which is exactly
+why they need writing down — a trace cannot otherwise distinguish "the stall
+never came up" from "the stall came up three times and was declined", and those
+call for opposite fixes.
 
 When tracing is off, `enabled()` is a relaxed atomic load and the tap returns
 before touching the event.

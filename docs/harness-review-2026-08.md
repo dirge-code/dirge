@@ -214,15 +214,125 @@ Fixing that is what made `dirge-hwk9.5` safe: boundary nudges can now emit
 `MessageStart`/`MessageEnd` like the finalization path without putting the body
 on screen a third time.
 
-## Still open
+## Phase 7 — the stall on a finishing run (dirge-hwk9.7, done)
 
-`dirge-hwk9.7` — the stall checkpoint tends to fire as a *successful* run
-concludes: qwen at 618.0s of a 618.1s run, deepseek at 55.3s of 55.4s, both
-with every test passing. The monitor is behaving to spec — re-running tests is
-not a todo closed, a new file touched, or a fresh green edge — but "name what
-is blocking you" delivered as the run ends is spent on a model that is
-finishing. Whether a boundary following a verification should count differently
-from an idle one is a decision, not a patch.
+Filed as a judgement call: the stall checkpoint fired as a *successful* run
+concluded, qwen at 618.0s of a 618.1s run and deepseek at 55.3s of 55.4s. The
+report assumed a coincidence of timing. It is not one.
+
+**A run's endgame is barren by definition.** By the time a run is finishing its
+todos are closed (so they cannot decrease), its files are touched (so they
+cannot increase) and its green is latched (so there is no fresh edge). Every
+one of the three progress signals is structurally unable to move. Any run with
+a multi-turn endgame was therefore *guaranteed* to be told it had stalled,
+given enough turns — which is why two different models produced the same
+symptom to within 0.1s of the end.
+
+The monitor's own opening paragraph says what it is for: *successful*, varied,
+useless tool calls, the one failure mode no other guard can see. It nevertheless
+scored every boundary, including two kinds that are not that — a turn with no
+tool calls (the model wrote prose; in practice its final answer) and a turn
+whose calls all failed (the failure tracker's and the storm breaker's
+territory). The second is worse than noise: the stall text asserts "the calls
+are succeeding", and a traced run shows it delivered on a boundary whose single
+call was permission-denied, after which the model spent its last words arguing
+that nothing was blocking it.
+
+Three changes, one seam:
+
+- **Only a boundary with a successful tool call is judged.** This is the
+  module's stated contract, finally encoded.
+- **The boundary that ends the inner loop belongs to the finalization arbiter.**
+  Both were polling it, unranked, so two harness messages could land before one
+  assistant turn. `dirge-5mtx.2` closed exactly this at the mid-turn boundary
+  and left the seam between the two arbiters open. Safe-state is exempt — an
+  abort with a tree restore is not steering — and the exemption is read from the
+  policy at the safe-state branch, because encoded only by ordering it was dead
+  code that no mutation could kill.
+- **`record_turn` offers, `commit` spends.** A checkpoint the arbiter declines
+  is no longer charged. That was the wart documented at `poll_boundary_nudge`,
+  and it meant the masked-verification decline silently burned one of a run's
+  two stall nudges.
+
+Rejected on the evidence: the bead's own first suggestion, that a boundary
+*following a verification* should count differently. Resetting on any
+verification run kills `green_suite_thrash_on_one_file_still_stalls` —
+edit/test/edit/test on one file is precisely the case the monitor exists for.
+
+Measured, same task and model before and after: `[stall]` at 56.9s of a 58.9s
+run → no stall, `VerifiedGreen`, with the trace showing the offer stood down
+once as `masked-verification` (budget kept) and twice as `concluding`, and
+`[verify-before-done]` doing the work alone on both terminal boundaries.
+glm-5.3 the same, 22/22.
+
+**The discrimination control matters more than the fix.** A task that writes a
+file (arming the monitor) and then searches for a symbol that does not exist
+fired `[stall]` twice — at 13.3s and 38.2s of a 241s run, both mid-run where the
+model still had turns — and stood down on the final boundary. Narrowing the
+monitor did not mute it.
+
+## The bypass the trace turned up (dirge-5flx)
+
+The barren boundary that fired the stall was barren because a `bash` call had
+been permission-denied — and chasing *that* found a permission-containment bug.
+
+`parse_bash_segments_full("a && b 2>&1 | c")` returned `(["c"], false)`. The
+`redirected_statement` arm recursed only into children whose kind was
+`command`/`pipeline`/`compound_statement`/`subshell` and dropped everything else
+through a bare `_ => {}`; tree-sitter parses that input as
+`redirected_statement(body: list(a && b))`, so both commands vanished and the
+engine authorized a command it had never seen. End to end against the release
+binary:
+
+```
+python3 -c "open('pwned_a','w')"                        -> denied
+echo hi && python3 -c "open('pwned_b','w')" 2>&1 | cat  -> ran, wrote the file
+```
+
+Any denied command runs by prefixing `echo hi &&` and appending `2>&1 | cat`.
+
+Two fixes. The arm now recurses into everything that is *not* a redirect
+operand, so an unknown grammar node over-collects rather than disappearing —
+the safe direction for a permission input. And a command the splitter could not
+decompose at all is marked **complex**, which is the backstop that would have
+contained this bug instead of letting it become a bypass.
+
+A filter whose reject path is silent is a filter nobody can audit. That
+sentence is already in this repo's memory twice, from `hallucinated_tool_names`
+and the scavenger's dropped names. This is the third, and the first where the
+thing being dropped was a permission input.
+
+## The harness demanding what it forbade (dirge-e1nv, done)
+
+`pytest **` is allowed; `python`/`python3` deliberately are not, because
+`python -c "…"` runs anything. Nothing bridged the two, so `python3 -m pytest`
+— the commonest way a model runs pytest, and the shape the verify nudge asks
+for — prompted, which headless turns into a denial. Until `dirge-5flx` the
+bypass hid it: the only form that ran was `… 2>&1 | tail`, the masked shape the
+verifier declines. Third instance of one guard punishing what another demands,
+after `dirge-hwk9.6` and `dirge-yv0d`.
+
+**The filed design was wrong, and the existing code says why.** The plan was to
+match allow rules against the exec-prefix-stripped form as well as the raw.
+`match_candidates` exposes commands raw *on purpose* (`dirge-8zem`):
+`PATH=/tmp/evil git push` and `./env git push` run a different binary under an
+allowed name, and `env_and_wrapper_prefixes_do_not_ride_an_allow_rule` pins it.
+The proposal would have reopened that hole to close this one. Reading the
+comment on the thing you are about to generalise is worth more than the
+generalisation.
+
+What shipped instead names the module form explicitly, generated from
+`PYTHON_MODULE_TOOLS` so the eight rules are not a second list to keep in step
+with the first, with a test that every entry is still allowed under its own
+name — the derivation source can go stale too. `-m` does not make the
+interpreter safe; it names a module that must still be allowed on its own, so
+`python3 -m http.server` and `python3 -m pip install` keep prompting. The deny
+side sees through the module runner as well, or the new allows would be a way
+around a deny that used to hold.
+
+Measured on the same task and stock config that had denied every verification:
+3 errored bash calls and an unverified run → 0 errored, 22/22, model correcting
+its masked command on the first nudge.
 
 ## Method notes
 

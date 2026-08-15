@@ -7436,6 +7436,7 @@ fn boundary_emits_at_most_one_nudge() {
         &mut verify,
         &mut tally,
         crate::agent::agent_loop::capability::CapabilityTier::Nominal,
+        false,
     );
     let (_msg, which) = hit.expect("something should fire");
     // Track-work outranks fast-verify and progress.
@@ -7481,6 +7482,7 @@ fn safe_state_outranks_everything_else() {
         &mut verify,
         &mut tally,
         crate::agent::agent_loop::capability::CapabilityTier::Nominal,
+        false,
     );
     let (_m, which) = hit.expect("safe-state fires");
     assert_eq!(
@@ -7492,6 +7494,134 @@ fn safe_state_outranks_everything_else() {
             .nudge_count(crate::agent::agent_loop::gate_tally::BoundaryNudge::ReflectionCheckpoint),
         0,
         "rung 3 replaces rung 2, never adds to it"
+    );
+}
+
+// ── dirge-hwk9.7: the run's last boundary has two arbiters ────────────────
+//
+// dirge-5mtx.2 made the mid-turn boundary emit ONE harness nudge. It did not
+// close the seam between the two arbiters: on the boundary after the model's
+// final answer, `poll_boundary_nudge` speaks and then
+// `poll_finalization_follow_up` speaks, unranked against each other. Measured
+// on two models, the broad one lands 0.1s before the run ends and the model
+// never reads it.
+
+/// The policy itself: on a concluding boundary every rung stands down except
+/// the safe-state abort, which is a tree restore rather than steering.
+#[test]
+fn only_safe_state_speaks_on_a_concluding_boundary() {
+    use crate::agent::agent_loop::gate_tally::BoundaryNudge as N;
+    use crate::agent::agent_loop::run::boundary_nudge_stands_down;
+    for which in N::ALL {
+        assert!(
+            !boundary_nudge_stands_down(which, false),
+            "{which:?} must be unaffected on an ordinary mid-run boundary"
+        );
+    }
+    for which in N::ALL {
+        let expected = which != N::SafeState;
+        assert_eq!(
+            boundary_nudge_stands_down(which, true),
+            expected,
+            "{which:?} on a concluding boundary"
+        );
+    }
+}
+
+/// The rule reaches the arbiter, and — the half that matters — standing down
+/// does not spend the rung's budget. A nudge charged for a message nobody read
+/// is the bug this shares with the progress checkpoint.
+#[test]
+fn a_concluding_boundary_stands_down_without_spending_the_budget() {
+    let mut cfg = build_config();
+    cfg.session_id = Some("s1".into());
+    cfg.verification_tiers_mode = GateMode::Advisory;
+    let verifier = crate::agent::agent_loop::verifier::VerifierGate::new();
+    for i in 0..5 {
+        verifier.record_outcome(
+            "edit",
+            &serde_json::json!({ "path": format!("src/f{i}.rs") }),
+            &crate::agent::agent_loop::result::LoopToolResult {
+                content: vec![serde_json::json!({"type":"text","text":"ok"})],
+                details: serde_json::json!(null),
+                terminate: None,
+            },
+            false,
+        );
+    }
+    cfg.verifier = Some(verifier);
+
+    let guards = quiet_guards();
+    let mut tally = crate::agent::agent_loop::gate_tally::GateTally::new();
+    let mut track = 0u8;
+    let mut verify = 0u8;
+
+    // Concluding: fast-verify is eligible and says nothing.
+    let hit = crate::agent::agent_loop::run::poll_boundary_nudge(
+        &cfg,
+        &guards,
+        None,
+        &[],
+        1,
+        &mut track,
+        &mut verify,
+        &mut tally,
+        crate::agent::agent_loop::capability::CapabilityTier::Nominal,
+        true,
+    );
+    assert!(
+        hit.is_none(),
+        "the finalization arbiter owns the boundary after the final answer"
+    );
+    assert_eq!(verify, 0, "a rung that stood down must not be charged");
+
+    // The very same state on an ordinary boundary still fires — so the test
+    // above is about the boundary, not about the rung being ineligible.
+    let hit = crate::agent::agent_loop::run::poll_boundary_nudge(
+        &cfg,
+        &guards,
+        None,
+        &[],
+        1,
+        &mut track,
+        &mut verify,
+        &mut tally,
+        crate::agent::agent_loop::capability::CapabilityTier::Nominal,
+        false,
+    );
+    let (_m, which) = hit.expect("mid-run, fast-verify fires");
+    assert_eq!(
+        which,
+        crate::agent::agent_loop::gate_tally::BoundaryNudge::FastVerify
+    );
+    assert_eq!(verify, 1, "and the budget is charged for a delivery");
+}
+
+/// The safe-state abort still fires on a concluding boundary: it restores a
+/// tree, which no finalization gate can do.
+#[test]
+fn safe_state_still_fires_on_a_concluding_boundary() {
+    let cfg = build_config();
+    let guards = quiet_guards();
+    let mut tally = crate::agent::agent_loop::gate_tally::GateTally::new();
+    let mut track = 0u8;
+    let mut verify = 0u8;
+    let hit = crate::agent::agent_loop::run::poll_boundary_nudge(
+        &cfg,
+        &guards,
+        Some("abort and re-plan".into()),
+        &[],
+        1,
+        &mut track,
+        &mut verify,
+        &mut tally,
+        crate::agent::agent_loop::capability::CapabilityTier::Nominal,
+        true,
+    );
+    let (_m, which) = hit.expect("rung 3 is not steering; it stays");
+    assert_eq!(
+        which,
+        crate::agent::agent_loop::gate_tally::BoundaryNudge::SafeState
     );
 }
 
@@ -7513,6 +7643,7 @@ fn quiet_boundary_emits_nothing() {
         &mut verify,
         &mut tally,
         crate::agent::agent_loop::capability::CapabilityTier::Nominal,
+        false,
     );
     assert!(hit.is_none());
     assert_eq!(track, 0);

@@ -38,6 +38,7 @@ GLYPH = {
     "checkpoint": "◇",
     "retry": "↻",
     "system_notice": "!",
+    "boundary": "⊘",
     "repairs": "⊕",
     "escalation": "↑",
 }
@@ -116,6 +117,16 @@ def render_line(rec):
             f"context {rec.get('prompt_tokens')}/{rec.get('ctx_max')} "
             f"= {ratio:.1%} {verdict}{note}"
         )
+    elif kind == "boundary":
+        extra = " ".join(
+            f"{k}={v}"
+            for k, v in rec.items()
+            if k not in ("ms", "seq", "kind", "decision", "why", "offer")
+        )
+        offer = rec.get("offer") or "nothing"
+        body = f"boundary stood down ({rec.get('why')}) — {offer} left standing"
+        if extra:
+            body += f"  [{extra}]"
     elif kind == "compacted":
         body = (
             f"compacted {rec.get('tokens_before')} → {rec.get('tokens_after')} "
@@ -181,6 +192,18 @@ def summarize(records):
             out.append(f"  {guard} ×{n} — {why}")
     else:
         out.append("interventions 0")
+
+    # The other half of the steering picture: what the arbiter had and did not
+    # send. Reporting only what fired makes an over-eager guard and a guard
+    # that never comes up look identical.
+    stood_down = [r for r in records if r.get("kind") == "boundary"]
+    if stood_down:
+        by_why = Counter(r.get("why") for r in stood_down)
+        out.append(f"stood down    {len(stood_down)}")
+        for why, n in by_why.most_common():
+            offers = Counter(r.get("offer") for r in stood_down if r.get("why") == why)
+            held = ", ".join(f"{o or 'nothing'}×{k}" for o, k in offers.most_common())
+            out.append(f"  {why} ×{n} — held: {held}")
 
     # Context health. A run that force-ends turns is a run being truncated, and
     # it is invisible in every other number here.

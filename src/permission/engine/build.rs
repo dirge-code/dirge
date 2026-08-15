@@ -165,7 +165,7 @@ impl Engine {
             rules.push(Rule {
                 op: OpMatch::One(Operation::Execute),
                 tool: Some("bash".to_string()),
-                pattern: pattern_for_tool("bash", pat),
+                pattern: pattern_for_tool("bash", &pat),
                 effect: action.into(),
                 original: format!("bash:{pat}"),
             });
