@@ -4,6 +4,125 @@ All notable changes to dirge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.21.20] - 2026-08-15
+
+### Added
+- `--trace <path>` writes a JSONL record per loop decision — turns, tool calls
+  joined to their results, provider token usage, the context manager's verdict
+  every turn including the turns it decides nothing, what the front end
+  receives, and every harness intervention attributed to the guard that sent it
+  and that guard's own account of why. `scripts/loop-trace.py` renders it as a
+  timeline plus a summary; `docs/loop-trace.md` explains how to read one. It
+  exists because the per-run tally on `dirge::gates` answers "how did this run
+  go" and cannot answer "what happened, in what order, and why" — a run where
+  the critic fired and the model then edited a file is identical on the tally
+  to one where the model edited the file and the critic fired afterwards, and
+  one of those is a bug. Everything it can get comes from the event stream the
+  loop already emits, tapped at the single point every event passes through, so
+  it is not a second set of call sites to keep in step with the first.
+- `context_window` can now be set per provider (`providers.<name>.context_window`),
+  which GitHub #772 asked for. It was a top-level key, so anyone with more than
+  one provider configured — the common case — could not correct one model's
+  window without corrupting the others'. That number is the denominator of
+  every compaction threshold, so a wrong one folds a context with room to spare
+  or fails to fold one without. Precedence runs provider, then the top-level
+  key, then the built-in model table, then 128k, and the loop's compaction math
+  and the session's context gauge now resolve it from the same call.
+- Tool schemas are trimmed to breadcrumbs on a small context window
+  (`compact_tool_schemas`: `auto`, `on`, `off`). dirge's opening request is
+  16,172 prompt tokens with the built-in tools alone and 32,621 with MCP
+  servers loaded — the second larger than a 32k window in its entirety, so such
+  a run could not take a single turn and the only symptom was every turn being
+  force-ended. Below a 48k window each tool's description is cut to its first
+  sentence and each parameter's to a clause, while names, types, enums and
+  required-ness are left exactly as they were: the model keeps everything it
+  needs to form a well-formed call and loses the prose about when to prefer one
+  tool over another. No tool is dropped — a model that cannot see a tool cannot
+  ask for it, and that failure is silent and looks like incapability. Measured
+  on one task at 32k: 16,202 tokens to 12,249, peak context 51% to 39.5%, with
+  the model still reaching for `list_symbols` unprompted.
+
+### Fixed
+- A turn the context manager cut short ended the whole run. The critical-context
+  tier breaks out of the inner loop, but the inner loop *is* the turn loop, so
+  control fell through to the finalization poll and its default is to stop. A
+  model whose context read over the threshold therefore got exactly one turn:
+  the tool calls it made were dispatched, their results were appended, and the
+  run finished before the model ever saw them — in silence, with a partial
+  answer. It only appeared to work because a critic or verifier gate sometimes
+  fired and restarted the loop, which is not a mechanism anyone designed. The
+  run now continues when the fold actually made room, and when the fold freed
+  nothing it stops with a notice naming the prompt size and the window instead
+  of stopping quietly.
+- A model the window table does not know was silently given 128k. The table
+  matches by substring, so `glm-5.3` matched nothing at all — `glm-5.2` is
+  listed at a million — and a local model, which is named by its file path,
+  matched on `qwen` and got 32000, smaller than dirge's own prompt. Every
+  context tier divides by this number, so the guess drove real folds and real
+  force-ended turns on models with room to spare, and the only visible symptom
+  was a context meter that looked full. Known families now match their point
+  releases, and a model neither lookup recognises says so once rather than
+  being guessed at in silence.
+- The context meter divided two numbers that had nothing to do with each other.
+  It showed the persisted transcript's own estimate — a chars-per-token
+  heuristic over every message, tool results at their original length — against
+  the model's advertised window, while compaction compares the provider's
+  prompt count for the actual request, whose oversized results have been
+  snipped and whose old turns are a summary, against the working budget. A
+  session was observed reading "226.9k/128.0k, 100%, compaction soon" after a
+  single compaction, which is exactly what a healthy run looks like through
+  that arithmetic. The meter now reports the two quantities the fold decision
+  is made from.
+- The verifier told a model it had not run its tests, immediately after it ran
+  them four times. A command whose exit status is piped away proves nothing —
+  the zero belongs to `tail` — so declining it is right, but the decline
+  returned without recording why and the model got the message meant for a run
+  that had checked nothing. It could see that was false, so it did not remove
+  the pipe: it re-ran the same shape twice more, then appended `; echo "exit=$?"`,
+  which reports the status of `echo`, and its final answer asserted an exit
+  status it never had. The message now quotes the command back, says the status
+  belongs to the last stage of the chain, and says what to run instead. On the
+  same task the old wording ended unverified with a green suite; the new one
+  was corrected on the first attempt, on three different models.
+- Two guards disagreed about the same command. `python3 -m pytest` classified
+  as `python3` in the claim gate and as `pytest` in the verifier, so a model
+  that had just been corrected by one, complied exactly, and reported its
+  result truthfully was told by the other that no test had run. Interpreter and
+  runner prefixes are now read through — `python -m`, `npx`, `poetry run` and
+  friends — while `python script.py` deliberately still classifies as nothing,
+  and neither recogniser previously knew `unittest` at all.
+- Reporting an exit status failed the claim gate. "exit 0" was treated as a
+  claim about a build, so a model that ran its tests cleanly and reported what
+  they returned — which is what the verifier's own nudge asks for — was told no
+  build had run. A bare exit status names no kind of command and is now
+  satisfied by any verification, while a build still cannot support a test
+  count and a test run still cannot support "clippy clean".
+- The progress monitor told a model that had passed every test it had made no
+  progress. A test run whose status was piped away never latches a green, and a
+  green is one of the three things the monitor counts as progress, so the stall
+  checkpoint fired twice at a run with a passing suite — once at 618.0 seconds
+  of a 618.1-second run. It now stands down while the verifier is holding a
+  declined command, because the verify nudge owns that situation and has the
+  message that can act on it.
+- Every harness intervention was rendered twice in the TUI. The notice that
+  mirrors an intervention carries a summary and the body, because headless
+  consumers see only it, and the interface also renders the body from the
+  message itself — so the instruction appeared on screen twice with a summary
+  above the first copy. The notice now contributes only its summary line there.
+  Headless output is unchanged.
+- Boundary nudges were missing from the message stream. Stall, budget,
+  prologue, work-tracking, file-touch, safe-state, fast-verify and reflection
+  checkpoints were pushed straight into the conversation with only a notice, so
+  anything reading the message stream saw about half the steering surface — the
+  per-run tally counted two stall checkpoints where the trace could attribute
+  one. They now emit the same events the finalization gates do.
+- The turn counter on the per-run tally read zero for any run whose turns were
+  cut short, because it was incremented past the point such a run leaves the
+  loop. It is the denominator every other count on that line is read against,
+  so the whole line was unreadable rather than merely incomplete. The fold and
+  force-summary log lines also now carry the prompt size and the window beside
+  the ratio, which previously had to be recovered by solving a division.
+
 ## [0.21.19] - 2026-08-14
 
 ### Fixed
