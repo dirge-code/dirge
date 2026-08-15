@@ -188,7 +188,8 @@ async fn emit_harness_notices(emit: &mpsc::Sender<LoopEvent>, msgs: &[LoopMessag
         let _ = emit
             .send(LoopEvent::SystemNotice {
                 content: format!(
-                    "harness intervention: {}\n{body}",
+                    "{}{}\n{body}",
+                    super::intervention::NOTICE_PREFIX,
                     super::intervention::summary_for_user(tag)
                 ),
             })
@@ -2308,6 +2309,33 @@ fn record_tool_result_signals(
     }
 }
 
+/// Whether a progress checkpoint stands down because a more specific guard
+/// owns the situation (dirge-hwk9.4).
+///
+/// A STALL checkpoint stands down while the verifier is holding a masked
+/// decline. That state — the model is checking its work through a pipe, so
+/// nothing readable came back — already has a guard with something useful to
+/// say, and this one does not: the stall text offers "getting a green check"
+/// as the way out, when a green check is exactly what just happened and could
+/// not be counted. Two answers competing over one situation is worse than the
+/// weaker one staying quiet, which is the finalization arbiter's rule applied
+/// at the boundary.
+///
+/// Measured: a run that passed all 22 tests at 345s via `pytest … | tail -28`
+/// was told twice that it had made no progress for three turns, the second
+/// time at 618.0s of a 618.1s run.
+///
+/// The PROLOGUE checkpoint is deliberately NOT suppressed: it fires on a run
+/// that has produced nothing at all, where a masked verification is not the
+/// explanation for the silence.
+///
+/// Pure so it is testable without the process-global counters the progress
+/// monitor reads (`todo::unfinished_count`, `modified::count`) — the same
+/// reason `should_advise_untracked_work` was extracted.
+pub(crate) fn progress_nudge_is_suppressed(which: BoundaryNudge, masked_decline: bool) -> bool {
+    which == BoundaryNudge::ProgressStall && masked_decline
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn poll_boundary_nudge(
     config: &LoopConfig,
@@ -2398,6 +2426,14 @@ pub(crate) fn poll_boundary_nudge(
         } else {
             BoundaryNudge::ProgressStall
         };
+        let masked = config
+            .verifier
+            .as_ref()
+            .is_some_and(|v| v.masked_decline_outstanding());
+        if progress_nudge_is_suppressed(which, masked) {
+            tally.end_boundary();
+            return None;
+        }
         tally.record_nudge(which);
         return Some((msg, which));
     }
@@ -3588,6 +3624,28 @@ pub async fn run_loop(
                     pending_tool_choice = Some(super::types::ToolChoice::None);
                 }
                 emit_harness_notices(emit, std::slice::from_ref(&msg)).await;
+                // dirge-hwk9.5: the same message events the finalization path
+                // emits. Without these, every BOUNDARY nudge — stall, budget,
+                // prologue, track-work, file-touch, safe-state, fast-verify,
+                // reflection, permission checkpoint — was absent from the
+                // LoopEvent message stream, so half the steering surface was
+                // invisible to anything reading it. Measured: the tally said
+                // `nudge_progress_stall=2` and the loop trace recorded one
+                // intervention.
+                //
+                // Safe to emit now that the TUI shows an intervention notice as
+                // its summary line only; before that, adding these would have
+                // put the body on screen a third time.
+                let _ = emit
+                    .send(LoopEvent::MessageStart {
+                        message: msg.clone(),
+                    })
+                    .await;
+                let _ = emit
+                    .send(LoopEvent::MessageEnd {
+                        message: msg.clone(),
+                    })
+                    .await;
                 current_context.messages.push(loop_message_to_value(&msg));
                 new_messages.push(msg);
             }

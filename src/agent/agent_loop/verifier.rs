@@ -543,6 +543,27 @@ impl VerifierGate {
             .collect()
     }
 
+    /// True when a verification command RAN and was declined because its exit
+    /// status was masked, and nothing readable has run since (dirge-hwk9.4).
+    ///
+    /// The state this describes is "the model is checking its work and we
+    /// cannot read the result". Two guards have something to say about it, and
+    /// only one of them is useful: the verify nudge names the pipe and says
+    /// what to run, while the progress monitor — whose progress events include
+    /// verification going green — sees no green and reports "no progress",
+    /// which is both misleading and unactionable. So the stall checkpoint
+    /// stands down while this holds, on the same principle as the finalization
+    /// arbiter: two answers competing over one situation is worse than the
+    /// weaker one staying quiet.
+    ///
+    /// Self-clearing: the first readable verification sets `ran_verification`
+    /// and the suppression lifts. A model that never stops masking has already
+    /// had the verify nudge, which is the message that can actually help it.
+    pub fn masked_decline_outstanding(&self) -> bool {
+        let inner = self.inner.lock_ignore_poison();
+        inner.masked_command.is_some() && !inner.ran_verification
+    }
+
     pub fn edits_since_verify(&self) -> u32 {
         self.inner.lock_ignore_poison().edits_since_verify
     }
@@ -1502,6 +1523,62 @@ mod tests {
             n2.contains("didn't run the tests"),
             "no command ran at all — the original wording is correct here: {n2}"
         );
+    }
+
+    /// dirge-hwk9.4: the state that stands the stall checkpoint down, and its
+    /// three boundaries.
+    ///
+    /// Self-clearing is the load-bearing part: once a readable verification
+    /// runs, the suppression must lift, or a run that pipes once is exempt from
+    /// the progress monitor for the rest of its life.
+    #[test]
+    fn a_masked_decline_is_outstanding_only_until_something_readable_runs() {
+        let g = VerifierGate::new();
+        assert!(
+            !g.masked_decline_outstanding(),
+            "a fresh gate is holding nothing"
+        );
+
+        g.record_outcome("edit", &json!({"path": "src/a.rs"}), &ok_result(), false);
+        g.record_outcome(
+            "bash",
+            &json!({"command": "pytest -v 2>&1 | tail -20"}),
+            &ok_result(),
+            false,
+        );
+        assert!(
+            g.masked_decline_outstanding(),
+            "a green we could not read is the state this describes"
+        );
+
+        g.record_outcome(
+            "bash",
+            &json!({"command": "pytest -v"}),
+            &ok_result(),
+            false,
+        );
+        assert!(
+            !g.masked_decline_outstanding(),
+            "a readable verification lifts it — otherwise one pipe exempts the \
+             run from the progress monitor forever"
+        );
+    }
+
+    /// A masked command that REPORTED FAILURE is recorded as a red rather than
+    /// declined (a masked failure is trustworthy in that direction), so it is
+    /// not an outstanding decline and must not suppress anything.
+    #[test]
+    fn a_masked_failure_is_a_red_not_an_outstanding_decline() {
+        let g = VerifierGate::new();
+        g.record_outcome("edit", &json!({"path": "src/a.rs"}), &ok_result(), false);
+        g.record_outcome(
+            "bash",
+            &json!({"command": "pytest -v 2>&1 | tail -20"}),
+            &ok_result(),
+            true, // the tool itself errored
+        );
+        assert!(!g.masked_decline_outstanding());
+        assert_eq!(g.status(GateMode::Off), VerificationStatus::VerifiedRed);
     }
 
     /// The decline itself is unchanged: a masked pass still must not count as

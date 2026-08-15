@@ -8356,6 +8356,39 @@ async fn a_force_ended_turn_is_still_counted() {
     );
 }
 
+// ── dirge-hwk9.4: the stall checkpoint stands down for a masked decline ──
+
+/// The suppression rule, both ways, plus the carve-out.
+///
+/// Measured: a run that passed all 22 tests at 345s through
+/// `pytest … | tail -28` was told twice that three turns had passed "without
+/// finishing a task item, touching a new file, or getting a green check" — the
+/// second time at 618.0s of a 618.1s run. The stall text offers a green check
+/// as the way out, which is exactly what the model had just done and what the
+/// verifier had (correctly) declined to count.
+///
+/// All three cases in one test because the bug is a MISSING distinction:
+/// asserting only that a stall is suppressed would be satisfied by suppressing
+/// every progress nudge always.
+#[test]
+fn a_masked_decline_stands_the_stall_checkpoint_down() {
+    use crate::agent::agent_loop::run::progress_nudge_is_suppressed;
+
+    assert!(
+        progress_nudge_is_suppressed(BoundaryNudge::ProgressStall, true),
+        "the verify nudge owns this state and has the actionable message"
+    );
+    assert!(
+        !progress_nudge_is_suppressed(BoundaryNudge::ProgressStall, false),
+        "with nothing masked, a barren run still gets its stall checkpoint"
+    );
+    assert!(
+        !progress_nudge_is_suppressed(BoundaryNudge::ProgressPrologue, true),
+        "the prologue fires on a run that has produced NOTHING, where a masked \
+         verification is not the explanation for the silence"
+    );
+}
+
 // ── dirge-8s2v: a force-ended turn must not silently end the run ──────
 
 /// A stream factory that always reports `input_tokens` over the window, so

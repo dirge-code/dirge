@@ -866,6 +866,11 @@ pub fn spawn_loop_runner(cfg: LoopSpawnConfig) -> LoopRunner {
                 // Free when tracing is off (an atomic load).
                 super::trace::record_event(&loop_evt);
                 for agent_evt in bridge.translate(loop_evt) {
+                    // ...and here for what the FRONT END gets, which is a
+                    // different question: the bridge drops some events and
+                    // splits others, so "did the loop decide this" and "would
+                    // the TUI show this twice" need separate answers.
+                    super::trace::record_ui_event(&agent_evt);
                     let ends_the_run = super::run_end::is_terminal(&agent_evt);
                     // If the receiver dropped (UI exited),
                     // stop pumping — loop_future continues

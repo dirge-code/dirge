@@ -369,6 +369,46 @@ pub fn record_event(evt: &LoopEvent) {
     }
 }
 
+/// Trace one `AgentEvent` — what the UI actually consumes.
+///
+/// The `LoopEvent` records above say what the LOOP did. This says what reaches
+/// the front end, which is a different question and the only one that can
+/// answer "would the TUI show this twice?". The two streams are not one-to-one:
+/// the bridge drops some events, splits others, and a single harness
+/// intervention produces BOTH a `SystemNotice` (summary plus body) and a
+/// `UserMessage` (the tagged message), each of which the TUI renders.
+///
+/// Recorded for the events that produce visible output, with the text they
+/// would render, so a duplicate shows up as two records carrying the same body.
+/// Token and reasoning deltas are excluded — they are the stream, not a
+/// decision, and the `streaming` heartbeat already covers them.
+pub fn record_ui_event(evt: &crate::event::AgentEvent) {
+    use crate::event::AgentEvent as E;
+    if !enabled() {
+        return;
+    }
+    let (what, text) = match evt {
+        E::UserMessage { content } => {
+            // Mirror the TUI's own attribution so the trace says which handle
+            // it would render under — `handle_user_message` asks exactly this.
+            let tagged = super::intervention::tag_of(content);
+            let handle = match tagged {
+                Some(t) if super::intervention::is_finalization(t) => "critic",
+                Some(_) => "sys",
+                None => "you",
+            };
+            let body = super::intervention::strip_tag(content).unwrap_or(content);
+            (handle, body.to_string())
+        }
+        E::SystemNotice { content } => ("sys-notice", content.to_string()),
+        E::Error(e) => ("error", e.to_string()),
+        // Everything else is either not rendered as its own line or is already
+        // covered by the loop-side records (tool calls, tokens, reasoning).
+        _ => return,
+    };
+    note("ui", json!({ "as": what, "text": excerpt(text.trim()) }));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -523,6 +563,52 @@ mod tests {
                 "a heartbeat must throttle the call right after it fires"
             );
         }
+    }
+
+    /// The UI-side records must say which handle the TUI would render a
+    /// message under, because that is the question "would this show twice"
+    /// turns on: a harness intervention arrives as BOTH a `SystemNotice` and a
+    /// `UserMessage`, and the TUI renders both.
+    #[test]
+    fn ui_records_name_the_handle_the_tui_would_render_under() {
+        use crate::event::AgentEvent as E;
+        let steer = format!(
+            "{} name what is blocking you",
+            super::super::progress::STALL_TAG
+        );
+        let critic = format!("{} not done yet", super::super::critic::CRITIC_TAG);
+
+        let recs = traced(|| {
+            record_ui_event(&E::UserMessage {
+                content: steer.as_str().into(),
+            });
+            record_ui_event(&E::UserMessage {
+                content: critic.as_str().into(),
+            });
+            record_ui_event(&E::UserMessage {
+                content: "fix the parser".into(),
+            });
+            record_ui_event(&E::SystemNotice {
+                content: "harness intervention: no progress".into(),
+            });
+        });
+
+        let seen: Vec<(&str, &str)> = recs
+            .iter()
+            .map(|r| (r["as"].as_str().unwrap(), r["text"].as_str().unwrap()))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                // A boundary nudge renders under <sys>, tag stripped...
+                ("sys", "name what is blocking you"),
+                // ...a finalization nudge under <critic>...
+                ("critic", "not done yet"),
+                // ...and something the user typed under <you>.
+                ("you", "fix the parser"),
+                ("sys-notice", "harness intervention: no progress"),
+            ]
+        );
     }
 
     /// A tool call and its result must be joinable, or the trace cannot say
