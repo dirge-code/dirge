@@ -1336,6 +1336,25 @@ async fn main() -> anyhow::Result<()> {
     crate::agent::agent_loop::context_manager::init_context_window_override(
         cfg.configured_context_window(&provider),
     );
+    // dirge-tva8: size the tool surface against the SAME window, passed in
+    // rather than re-derived — a tool set sized against a different number
+    // than the one compaction folds against is the drift this whole area is
+    // made of.
+    crate::agent::agent_loop::compact_schema::init(
+        crate::agent::agent_loop::context_manager::effective_ctx_max(session.context_window),
+        match cfg
+            .compact_tool_schemas
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("on" | "true" | "always") => Some(true),
+            Some("off" | "false" | "never") => Some(false),
+            // `auto`, absent, or anything unrecognized: decide from the window.
+            _ => None,
+        },
+    );
 
     // dirge-ykeu Phase 4: pre-resolve user agent profiles into subagent
     // routes (model + system prompt) and install them process-globally so the

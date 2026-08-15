@@ -836,6 +836,22 @@ pub struct Config {
     pub no_tools: Option<bool>,
     pub no_context_files: Option<bool>,
     pub context_window: Option<u64>,
+    /// Breadcrumb tool schemas for a small context window (dirge-tva8):
+    /// `auto` *(default)*, `on`, `off`.
+    ///
+    /// `auto` trims each tool's description to its first sentence when the
+    /// resolved window is at or below
+    /// [`compact_schema::SMALL_WINDOW_TOKENS`](crate::agent::agent_loop::compact_schema::SMALL_WINDOW_TOKENS).
+    /// Measured, the full tool surface is ~16k tokens with the built-ins alone
+    /// and ~32.6k with MCP servers loaded — the latter larger than a 32k window
+    /// in its entirety, so such a run could not take a single turn.
+    ///
+    /// Nothing structural is trimmed and no tool is dropped: the model keeps
+    /// everything it needs to form a well-formed call and loses the prose about
+    /// when to prefer one tool over another. `on` forces it for a large window
+    /// (worth trying if the tool surface is unusually big); `off` keeps full
+    /// descriptions on a small one.
+    pub compact_tool_schemas: Option<String>,
     pub reserve_tokens: Option<u64>,
     pub keep_recent_tokens: Option<u64>,
     pub max_agent_turns: Option<usize>,
