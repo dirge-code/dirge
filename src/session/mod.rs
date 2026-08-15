@@ -258,6 +258,21 @@ pub struct Session {
     pub total_tokens: u64,
     pub total_cost: f64,
     pub total_estimated_tokens: u64,
+    /// Prompt tokens the provider reported for the MOST RECENT request
+    /// (dirge-hwk9.2). `None` until the first response.
+    ///
+    /// This is the number the context manager divides by `effective_ctx_max`
+    /// to decide whether to fold, so it is the only honest numerator for a
+    /// context gauge. `total_estimated_tokens` is a different accounting over
+    /// a different message set — the full persisted transcript, tool results
+    /// at their original length — and a gauge built from it reported 100% and
+    /// "compaction soon" on a run whose requests were never close.
+    ///
+    /// Not persisted: it describes the last request, not the session, and a
+    /// resumed session's first gauge should come from the estimate until a
+    /// real response replaces it.
+    #[serde(skip)]
+    pub last_prompt_tokens: Option<u64>,
     /// Cumulative real input (prompt) tokens reported by the
     /// provider across this session's lifetime. Unlike
     /// `total_estimated_tokens` (a per-message heuristic), this is
@@ -453,6 +468,7 @@ impl Session {
             total_cost: 0.0,
             cumulative_output_tokens: 0,
             total_estimated_tokens: 0,
+            last_prompt_tokens: None,
             cumulative_input_tokens: 0,
             cumulative_cached_input_tokens: 0,
             cumulative_cache_creation_tokens: 0,
@@ -492,6 +508,18 @@ impl Session {
         cache_creation_input_tokens: u64,
         output_tokens: u64,
     ) {
+        // dirge-hwk9.2: the context gauge needs the LAST request's prompt
+        // size, which the cumulative counters cannot answer.
+        //
+        // `input_tokens` ALONE, deliberately: this must be the same number
+        // `context_manager::decide_after_usage` divides by, and that reads
+        // `usage.input_tokens` and nothing else. Summing the cached and
+        // creation figures would be closer to the true prompt on Anthropic
+        // (which reports cached DISJOINT from input) and would double-count on
+        // DeepSeek/OpenAI (which report it as a SUBSET) — and either way it
+        // would put the gauge back to describing a fold that does not happen,
+        // which is the bug being fixed.
+        self.last_prompt_tokens = Some(input_tokens);
         self.cumulative_output_tokens = self.cumulative_output_tokens.saturating_add(output_tokens);
         self.cumulative_input_tokens = self.cumulative_input_tokens.saturating_add(input_tokens);
         self.cumulative_cached_input_tokens = self
