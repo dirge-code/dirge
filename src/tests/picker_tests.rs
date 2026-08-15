@@ -119,7 +119,7 @@ fn test_deactivate_and_reactivate() {
     picker.deactivate();
     assert!(!picker.active);
 
-    picker.activate();
+    picker.activate(0);
     assert!(picker.active);
     assert_eq!(picker.query, "");
     assert_eq!(picker.cursor, 0);
