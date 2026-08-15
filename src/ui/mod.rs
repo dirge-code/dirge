@@ -2060,6 +2060,34 @@ pub async fn run_interactive(
                                         if let Some(ph) = ui.wt_merge_phase.take() {
                                             ph.core.task.abort();
                                         }
+                                        // dirge-vpma.21: and a `!`/`!!` shell run.
+                                        //
+                                        // Once the shell box is mounted, keys route to
+                                        // the PTY and never reach here — but during the
+                                        // ~120ms pre-mount grace window they do. This
+                                        // branch then cleared `is_running`, printed
+                                        // "interrupted" and dropped the queued messages
+                                        // while the child kept running: a prompt typed
+                                        // next submitted immediately (the busy gate now
+                                        // sees an idle session) and ran an agent turn
+                                        // alongside the live shell, and on exit a
+                                        // Visible command still fed its output to the
+                                        // agent despite the interrupt. Kill the group
+                                        // and tear the session down, exactly as the Esc
+                                        // path does.
+                                        if let Some(mut s) = ui.shell_session.take() {
+                                            if let Some(tx) = s.interrupt.take() {
+                                                let _ = tx.send(());
+                                            }
+                                            drop(s.input_tx);
+                                            if let Some(j) = s.join {
+                                                j.abort();
+                                            }
+                                            ui.shell_box_visible = false;
+                                            ui.shell_mount_deadline = None;
+                                            ui.shell_parser = None;
+                                            renderer.clear_shell_overlay();
+                                        }
                                         // Cooperative cancel first: lets the
                                         // retry loop and rig stream observe
                                         // `signal.is_cancelled()` and exit
@@ -2646,11 +2674,29 @@ pub async fn run_interactive(
                                                 Some(mut mgr) => {
                                                     let result = mgr.invoke_command(&handler, &spec);
                                                     drop(mgr);
-                                                    if let Ok(Some(msg)) = result {
-                                                        renderer.write_line(
-                                                            &format!("[plugin] {}", sanitize_output(&msg)),
-                                                            theme::dim(),
-                                                        )?;
+                                                    // dirge-vpma.20: surface the Err,
+                                                    // as the slash path does. A Janet
+                                                    // handler's own exception reaches the
+                                                    // notification queue either way, but
+                                                    // an infra-level eval error was lost
+                                                    // only here: the keypress was
+                                                    // consumed and nothing rendered or
+                                                    // logged, so the shortcut looked
+                                                    // silently dead.
+                                                    match result {
+                                                        Ok(Some(msg)) => {
+                                                            renderer.write_line(
+                                                                &format!("[plugin] {}", sanitize_output(&msg)),
+                                                                theme::dim(),
+                                                            )?;
+                                                        }
+                                                        Ok(None) => {}
+                                                        Err(e) => {
+                                                            renderer.write_line(
+                                                                &format!("[plugin] {handler} failed: {e}"),
+                                                                c_error(),
+                                                            )?;
+                                                        }
                                                     }
                                                 }
                                                 None => {
@@ -3087,7 +3133,8 @@ pub async fn run_interactive(
                                                     );
                                                     runner.install_into(&mut ui.agent_rx, &mut ui.agent_abort, &mut ui.agent_interject, &mut ui.agent_cancel, &mut ui.is_running);
                                                     begin_snapshot_turn(session);
-                                                    renderer.set_avatar_state(avatar::AvatarState::Idle);
+                                                    // dirge-vpma.18: a run is active — do not paint the resting face.
+                                                    renderer.set_avatar_state(avatar::AvatarState::settled(ui.is_running));
                                                 }
                                             }
                                             Err(e) => {
@@ -3369,7 +3416,8 @@ pub async fn run_interactive(
                                     // output + "› interrupted" were logged above; `!!`
                                     // leaves no trace at all.
                                     drain_interjections!();
-                                    renderer.set_avatar_state(avatar::AvatarState::Idle);
+                                    // dirge-vpma.18: the drain may have just spawned a runner, so the face follows the resulting state.
+                                    renderer.set_avatar_state(avatar::AvatarState::settled(ui.is_running));
                                 }
                                 renderer.request_repaint();
                             }
@@ -3899,7 +3947,6 @@ pub async fn run_interactive(
                                 begin_snapshot_turn(session);
                                 ui.last_user_prompt.clone_from(&kickoff.impl_prompt);
                                 let history = crate::agent::runner::convert_history(session);
-                                renderer.set_avatar_state(avatar::AvatarState::Idle);
                                 let runner = agent.clone().spawn_runner(
                                     crate::provider::Prompt::text(crate::agent::tools::background::prepend_pending_notifications(&kickoff.impl_prompt, bg_store.as_ref())),
                                     history,
@@ -3907,6 +3954,11 @@ pub async fn run_interactive(
                                     Some(session.assets_dir()),
                                 );
                                 runner.install_into(&mut ui.agent_rx, &mut ui.agent_abort, &mut ui.agent_interject, &mut ui.agent_cancel, &mut ui.is_running);
+                                // dirge-vpma.18: AFTER the install, and chosen from the
+                                // run state it just set. Painting Idle first showed the
+                                // resting face for the whole time-to-first-token while
+                                // the status line said busy.
+                                renderer.set_avatar_state(avatar::AvatarState::settled(ui.is_running));
                                 ui.active_plan = Some(kickoff.active);
                             }
                             Some(PlanPhaseEvent::Aborted) | None => {
@@ -4205,7 +4257,8 @@ pub async fn run_interactive(
                                 runner.install_into(&mut ui.agent_rx, &mut ui.agent_abort, &mut ui.agent_interject, &mut ui.agent_cancel, &mut ui.is_running);
                                 session.add_message_with_images(MessageRole::User, &record_text, record_images);
                                 begin_snapshot_turn(session);
-                                renderer.set_avatar_state(avatar::AvatarState::Idle);
+                                // dirge-vpma.18: a run is active — do not paint the resting face.
+                                renderer.set_avatar_state(avatar::AvatarState::settled(ui.is_running));
                             }
                             Next::Retry { prompt } => {
                                 // Reactive overflow retry: the prompt is ALREADY in the
@@ -4227,7 +4280,8 @@ pub async fn run_interactive(
                                 runner.install_into(&mut ui.agent_rx, &mut ui.agent_abort, &mut ui.agent_interject, &mut ui.agent_cancel, &mut ui.is_running);
                                 ui.last_collapsed = None;
                                 renderer.write_line("  ↳ resumed run with compacted history", theme::dim())?;
-                                renderer.set_avatar_state(avatar::AvatarState::Idle);
+                                // dirge-vpma.18: a run is active — do not paint the resting face.
+                                renderer.set_avatar_state(avatar::AvatarState::settled(ui.is_running));
                             }
                             Next::Continue => {
                                 // dirge-b899: the failed turn's partial assistant message
@@ -4249,7 +4303,9 @@ pub async fn run_interactive(
                                 begin_snapshot_turn(session);
                                 ui.last_collapsed = None;
                                 renderer.write_line("  ↳ resumed task with compacted history", theme::dim())?;
-                                renderer.set_avatar_state(avatar::AvatarState::Idle);
+                                // dirge-vpma.18: a run is active — do not paint the
+                                // resting face.
+                                renderer.set_avatar_state(avatar::AvatarState::settled(ui.is_running));
                             }
                             Next::Finish { clear_queue } => {
                                 if clear_queue {
@@ -4273,7 +4329,8 @@ pub async fn run_interactive(
                                     // next turn (else it strands; only a runner drains).
                                     drain_interjections!();
                                 }
-                                renderer.set_avatar_state(avatar::AvatarState::Idle);
+                                // dirge-vpma.18: the drain may have just spawned a runner, so the face follows the resulting state.
+                                renderer.set_avatar_state(avatar::AvatarState::settled(ui.is_running));
                             }
                         }
                         renderer.request_repaint();
@@ -4372,7 +4429,8 @@ pub async fn run_interactive(
                         // Release the busy state set at spawn; a prompt typed during the
                         // query was queued, so drain it into the next turn.
                         drain_interjections!();
-                        renderer.set_avatar_state(avatar::AvatarState::Idle);
+                        // dirge-vpma.18: the drain may have just spawned a runner, so the face follows the resulting state.
+                        renderer.set_avatar_state(avatar::AvatarState::settled(ui.is_running));
                         renderer.request_repaint();
                     }
                     // dirge-iagk: the spawned `/wt-merge` git merge completes here. On a
