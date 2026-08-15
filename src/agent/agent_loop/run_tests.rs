@@ -8199,6 +8199,305 @@ async fn finish_tally_hands_the_run_status_to_the_session_slot() {
     let _ = std::fs::remove_dir_all(&repo);
 }
 
+/// The turn counter on the `dirge::gates` line must count the turns the run
+/// actually took.
+///
+/// `turns` is the denominator every other count on that line is read against —
+/// "3 errored calls" means nothing without it, and a tier is a rate, not a
+/// total. It sits at the END of the inner loop body, so it counts only turns
+/// the loop went on to ITERATE past: the last turn of every run, and every run
+/// that finishes in one turn, is invisible. A two-turn run reads 1 and a
+/// one-turn run reads 0, which is the value a run that never called the model
+/// also reports.
+///
+/// Both halves are asserted because the interesting failure is off-by-one, not
+/// absence: a test that only demanded `> 0` would pass on a counter that
+/// undercounts every run by exactly one turn.
+#[tokio::test]
+async fn the_tally_counts_every_turn_the_run_took() {
+    use crate::agent::agent_loop::gate_tally::tests::field_capture;
+
+    async fn turns_reported(responses: Vec<AssistantMessage>) -> u32 {
+        let (cap, _guard) = field_capture();
+        let mut ctx = empty_context();
+        ctx.tools.push(std::sync::Arc::new(RecBashTool::new()));
+        let factory = canned_factory(responses);
+        let (tx, _rx) = mpsc::channel::<LoopEvent>(128);
+        let _ = run_agent_loop(
+            vec![user("task")],
+            ctx,
+            build_config(),
+            AbortSignal::new(),
+            &tx,
+            &factory,
+            None,
+            None,
+        )
+        .await;
+        drop(tx);
+        let log = cap.snapshot();
+        let line = log
+            .lines()
+            .find(|l| l.contains("dirge::gates"))
+            .unwrap_or_else(|| panic!("no dirge::gates line: {log}"));
+        line.split_whitespace()
+            .find_map(|tok| tok.strip_prefix("turns="))
+            .unwrap_or_else(|| panic!("no turns= field: {line}"))
+            .parse()
+            .unwrap_or_else(|e| panic!("turns= is not a number ({e}): {line}"))
+    }
+
+    // One assistant turn, no tool calls: the model answered and the run ended.
+    assert_eq!(
+        turns_reported(vec![text_response("done")]).await,
+        1,
+        "a run that took one turn must report one"
+    );
+
+    // Two turns: a tool call, then the answer.
+    assert_eq!(
+        turns_reported(vec![
+            tool_use_response("call-1", "bash", serde_json::json!({"command": "ls"})),
+            text_response("done"),
+        ])
+        .await,
+        2,
+        "a run that called a tool and then answered took two turns"
+    );
+}
+
+/// dirge-6gpr: a run whose turns are force-ended by the context manager must
+/// still count them.
+///
+/// `record_turn` sat at the END of the inner loop body, past the
+/// `force_turn_end` break — so every turn on the one path that ends turns
+/// early was invisible, and `turns` read 0 while the run made tool calls. A
+/// live run against a model whose window dirge under-resolves takes that path
+/// EVERY turn, which is exactly when the tally most needs to be readable.
+///
+/// Ground truth is the number of times the stream factory was called: one call
+/// is one turn, by definition, and it cannot drift from whatever the loop
+/// decides to do. Asserting equality rather than `> 0` is what makes this a
+/// discrimination — the bug produced 0 against a real count of 3, and an
+/// off-by-one would produce 2.
+#[tokio::test]
+async fn a_force_ended_turn_is_still_counted() {
+    use crate::agent::agent_loop::gate_tally::tests::field_capture;
+
+    // Reports usage far over the window, so every turn takes the
+    // ExitWithSummary path. `canned_factory` reports `usage: None`, which is
+    // why no existing test reaches this branch.
+    let calls = std::sync::Arc::new(AtomicUsize::new(0));
+    let factory: StreamFn = {
+        let calls = calls.clone();
+        std::sync::Arc::new(move |_ctx, _opts| {
+            let n = calls.fetch_add(1, Ordering::SeqCst);
+            // One tool call, then an answer: a two-turn run.
+            let msg = if n == 0 {
+                tool_use_response("call-1", "bash", serde_json::json!({"command": "ls"}))
+            } else {
+                text_response("done")
+            };
+            let reason = msg.stop_reason;
+            Box::pin(futures::stream::iter(vec![StreamEvent::Done {
+                reason,
+                message: msg,
+                usage: Some(crate::agent::agent_loop::message::TokenUsage {
+                    // "qwen" resolves to a 32k window in the model table; 40k
+                    // of prompt puts the ratio over the force-summary
+                    // threshold on every turn.
+                    input_tokens: 40_000,
+                    ..Default::default()
+                }),
+            }]))
+        })
+    };
+
+    let (cap, _guard) = field_capture();
+    let mut ctx = empty_context();
+    ctx.tools.push(std::sync::Arc::new(RecBashTool::new()));
+    let mut cfg = build_config();
+    cfg.model_name = Some("qwen".to_string());
+
+    let (tx, _rx) = mpsc::channel::<LoopEvent>(128);
+    let _ = run_agent_loop(
+        vec![user("task")],
+        ctx,
+        cfg,
+        AbortSignal::new(),
+        &tx,
+        &factory,
+        None,
+        None,
+    )
+    .await;
+    drop(tx);
+
+    let log = cap.snapshot();
+    let line = log
+        .lines()
+        .find(|l| l.contains("dirge::gates"))
+        .unwrap_or_else(|| panic!("no dirge::gates line: {log}"));
+    let reported: usize = line
+        .split_whitespace()
+        .find_map(|tok| tok.strip_prefix("turns="))
+        .unwrap_or_else(|| panic!("no turns= field: {line}"))
+        .parse()
+        .expect("turns= is a number");
+
+    let actual = calls.load(Ordering::SeqCst);
+    assert!(
+        actual > 0,
+        "the run must have called the model at least once"
+    );
+    assert_eq!(
+        reported, actual,
+        "the run took {actual} turn(s) and the tally reported {reported}"
+    );
+}
+
+// ── dirge-8s2v: a force-ended turn must not silently end the run ──────
+
+/// A stream factory that always reports `input_tokens` over the window, so
+/// every turn takes the context manager's `ExitWithSummary` path. Returns the
+/// call counter, which is ground truth for "how many turns did the model
+/// take" — `canned_factory` reports `usage: None` and so can never reach that
+/// path, which is why nothing covered it.
+fn over_budget_factory(responses: Vec<AssistantMessage>) -> (StreamFn, Arc<AtomicUsize>) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let responses = Arc::new(responses);
+    let factory: StreamFn = {
+        let calls = calls.clone();
+        Arc::new(move |_ctx, _opts| {
+            let n = calls.fetch_add(1, Ordering::SeqCst);
+            let msg = responses
+                .get(n)
+                .cloned()
+                .unwrap_or_else(|| text_response("done"));
+            let reason = msg.stop_reason;
+            Box::pin(futures::stream::iter(vec![StreamEvent::Done {
+                reason,
+                message: msg,
+                usage: Some(crate::agent::agent_loop::message::TokenUsage {
+                    // "qwen" is a 32k window in the model table.
+                    input_tokens: 40_000,
+                    ..Default::default()
+                }),
+            }]))
+        })
+    };
+    (factory, calls)
+}
+
+/// The tier ends the TURN. It must not end the RUN when the fold made room.
+///
+/// `force_turn_end` broke out of the inner loop, which IS the turn loop —
+/// control fell to the finalization poll, whose default is to stop. So a model
+/// over the threshold got exactly one turn: the tool calls it made were
+/// dispatched, their results appended, and the run ended before the model ever
+/// saw them. The user gets a half-finished answer and nothing says why.
+///
+/// The pair below asserts the other half — that a fold which freed nothing
+/// still ends the run — because a fix that simply always continues would trade
+/// this bug for an unbounded loop against a context nothing can shrink.
+#[tokio::test]
+async fn a_force_ended_turn_continues_the_run_when_the_fold_made_room() {
+    let mut ctx = padded_ctx(20);
+    ctx.tools.push(Arc::new(RecBashTool::new()));
+    let mut cfg = build_config();
+    cfg.model_name = Some("qwen".to_string());
+    // Bound the test: without a cap, a broken fix loops until the harness
+    // kills it, and a hang reads as an infrastructure problem rather than a
+    // failing assertion.
+    cfg.max_turns = Some(6);
+
+    let (factory, calls) = over_budget_factory(vec![tool_use_response(
+        "call-1",
+        "bash",
+        serde_json::json!({"command": "ls"}),
+    )]);
+    let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let summarize_fn = recording_summarizer(called.clone());
+
+    let (tx, _rx) = mpsc::channel::<LoopEvent>(256);
+    let _ = run_agent_loop(
+        vec![user("task")],
+        ctx,
+        cfg,
+        AbortSignal::new(),
+        &tx,
+        &factory,
+        summarize_fn,
+        None,
+    )
+    .await;
+    drop(tx);
+
+    assert!(
+        calls.load(Ordering::SeqCst) >= 2,
+        "the model made a tool call and the turn was force-ended; it must get \
+         another turn to see the result, but the model was called {} time(s)",
+        calls.load(Ordering::SeqCst)
+    );
+}
+
+/// ...and the other half: when the fold frees nothing, going round again meets
+/// the same wall, so the run ends — and SAYS so.
+///
+/// This is the state a small-window model is in from its first request: the
+/// system prompt and tool schemas alone exceed the window, and no fold touches
+/// either. Ending is right; ending in silence is what made this take a
+/// transcript and a division to diagnose.
+#[tokio::test]
+async fn a_force_ended_turn_ends_the_run_when_nothing_can_be_folded() {
+    // Too few messages for a compress window — `run_compaction_pass` reports
+    // `Skipped`, the same shape as a context that is all system prompt.
+    let mut ctx = empty_context();
+    ctx.tools.push(Arc::new(RecBashTool::new()));
+    let mut cfg = build_config();
+    cfg.model_name = Some("qwen".to_string());
+    cfg.max_turns = Some(6);
+
+    let (factory, calls) = over_budget_factory(vec![
+        tool_use_response("call-1", "bash", serde_json::json!({"command": "ls"})),
+        tool_use_response("call-2", "bash", serde_json::json!({"command": "ls"})),
+        tool_use_response("call-3", "bash", serde_json::json!({"command": "ls"})),
+    ]);
+
+    let (tx, mut rx) = mpsc::channel::<LoopEvent>(256);
+    let _ = run_agent_loop(
+        vec![user("task")],
+        ctx,
+        cfg,
+        AbortSignal::new(),
+        &tx,
+        &factory,
+        // No summarizer: nothing can be folded.
+        None,
+        None,
+    )
+    .await;
+    drop(tx);
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "with no room to recover, the run must stop rather than spin"
+    );
+
+    let mut notices = Vec::new();
+    while let Ok(evt) = rx.try_recv() {
+        if let LoopEvent::SystemNotice { content } = evt {
+            notices.push(content);
+        }
+    }
+    assert!(
+        notices.iter().any(|n| n.contains("context")),
+        "a run cut short because its context cannot be reduced must say so; \
+         notices were {notices:?}"
+    );
+}
+
 // ── dirge-4afz: tail-injected notes are not duplicated ──────────────
 
 /// A tail context note persists in the conversation, unlike a system-prompt

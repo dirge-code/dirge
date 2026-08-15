@@ -539,6 +539,18 @@ async fn main() -> anyhow::Result<()> {
         // No log file requested — discard tracing events.
         None => Box::new(std::io::sink()),
     };
+    // dirge-vlfb: the loop trace is its own sink, not a tracing target — it is
+    // read by a script, so it must not share a file with prose log lines whose
+    // shape nothing guarantees. `DIRGE_TRACE` is the env twin of `--trace`.
+    if let Some(path) = cli
+        .trace
+        .clone()
+        .or_else(|| std::env::var_os("DIRGE_TRACE").map(std::path::PathBuf::from))
+        && let Err(e) = agent::agent_loop::trace::enable(&path)
+    {
+        eprintln!("warning: could not write the loop trace to {path:?}: {e}");
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

@@ -154,6 +154,20 @@ pub struct Cli {
     )]
     pub verbose: bool,
 
+    /// dirge-vlfb: write a JSONL trace of the agentic loop to this path.
+    ///
+    /// Separate from `--verbose`, which turns up the volume on a log written
+    /// for humans reading a terminal. This writes ONE machine-readable record
+    /// per loop decision — the turns, the tool calls, the token usage, and
+    /// (the reason it exists) every harness intervention, attributed to the
+    /// guard that sent it. `scripts/loop-trace.py` renders it.
+    #[arg(
+        long = "trace",
+        value_name = "PATH",
+        help = "Write a JSONL trace of the agentic loop to PATH (see scripts/loop-trace.py)"
+    )]
+    pub trace: Option<std::path::PathBuf>,
+
     #[arg(
         long = "restrictive",
         short = 'R',

@@ -859,6 +859,12 @@ pub fn spawn_loop_runner(cfg: LoopSpawnConfig) -> LoopRunner {
         let pump_future = async {
             let mut bridge = EventBridge::new(bridge_tools);
             while let Some(loop_evt) = loop_rx.recv().await {
+                // The loop trace taps here because this is the one point every
+                // LoopEvent passes through on its way to every consumer — TUI,
+                // --print, ACP, MCP. Tapping the emit sites instead would be a
+                // second set of call sites to keep in step with the first.
+                // Free when tracing is off (an atomic load).
+                super::trace::record_event(&loop_evt);
                 for agent_evt in bridge.translate(loop_evt) {
                     let ends_the_run = super::run_end::is_terminal(&agent_evt);
                     // If the receiver dropped (UI exited),

@@ -2035,6 +2035,32 @@ pub async fn run_agent_loop(
     // hook during auto-compaction.
     memory_provider: Option<std::sync::Arc<dyn crate::extras::memory_provider::MemoryProvider>>,
 ) -> Vec<LoopMessage> {
+    // dirge-vlfb: the run's starting conditions. Not derivable from the event
+    // stream, and the first thing a harness review needs: the tool NAMES the
+    // model was actually offered (a feature the model cannot see is a feature
+    // that is not shipped), and the window the context manager will judge
+    // every turn against.
+    if super::trace::enabled() {
+        super::trace::note(
+            "run_start",
+            serde_json::json!({
+                "tools": context.tools.iter().map(|t| t.name().to_string()).collect::<Vec<_>>(),
+                "ctx_max": context_manager::effective_ctx_max(
+                    context_manager::context_window_override().unwrap_or_else(|| {
+                        config
+                            .model_name
+                            .as_deref()
+                            .and_then(crate::config::context_window_for_model)
+                            .unwrap_or(128_000)
+                    }),
+                ),
+                "max_turns": config.max_turns,
+                "model": config.model_name.clone(),
+                "messages": context.messages.len(),
+            }),
+        );
+    }
+
     // Pi line 103: `newMessages = [...prompts]`.
     let new_messages = prompts.clone();
 
@@ -2610,7 +2636,15 @@ pub async fn run_loop(
         // threshold. It has to survive to the bottom of the iteration rather
         // than breaking on the spot, so the checkpoint-schedule reset and the
         // per-iteration snip-credit cleanup below it still run.
-        let mut force_turn_end = false;
+        //
+        // dirge-8s2v: `Some((made_room, prompt_tokens))` — the tier ends the
+        // TURN, and whether the run may take another one depends on whether
+        // the fold it just ran actually shrank the context. It did: another
+        // turn is safe, and the model needs one to see the results of the
+        // calls it just made. It did not: going round again meets the same
+        // wall, which is what this tier exists to prevent. `prompt_tokens` is
+        // carried so the message that reports the stop can name the numbers.
+        let mut force_turn_end: Option<(bool, u64)> = None;
         while has_more_tool_calls || !pending_messages.is_empty() || recovery_pending {
             recovery_pending = false;
             // Circuit-breaker bookkeeping is at-most-once per iteration:
@@ -2819,6 +2853,16 @@ pub async fn run_loop(
             let assistant_in_new = new_messages.len();
             let assistant_in_context = current_context.messages.len().saturating_sub(1);
             new_messages.push(LoopMessage::Assistant(assistant_msg.clone()));
+
+            // dirge-6gpr: a turn has happened — the model was called and
+            // answered. Counted HERE rather than at the bottom of the
+            // iteration, where it counted only turns the loop went on to
+            // iterate past: the last turn of every run was never counted, and
+            // a run force-ended by the context manager counted none at all
+            // while making tool calls. `turns` is the denominator every other
+            // count on the tally line is read against, so a wrong one makes
+            // the whole line unreadable rather than merely incomplete.
+            tally.record_turn();
 
             // dirge-ugah.3: report a turn that wrote a cache entry but read
             // none. Evidence-gathering, not a fix — see `is_silent_cache_miss`
@@ -3573,6 +3617,24 @@ pub async fn run_loop(
                     ctx_max,
                     folded_this_turn,
                 );
+                // dirge-vlfb: the context verdict, every turn, whatever it is.
+                // The `None` arm matters as much as the others — "the context
+                // manager looked and did nothing" is the answer to most of the
+                // questions a fold-related bug raises, and it is the one
+                // outcome that logs nothing at all.
+                if super::trace::enabled() {
+                    super::trace::note(
+                        "context",
+                        serde_json::json!({
+                            "verdict": format!("{:?}", decision.kind),
+                            "prompt_tokens": decision.prompt_tokens,
+                            "ctx_max": decision.ctx_max,
+                            "ratio": decision.ratio,
+                            "aggressive": decision.aggressive,
+                            "already_folded": folded_this_turn,
+                        }),
+                    );
+                }
                 match decision.kind {
                     PostUsageDecisionKind::Fold if !folded_this_turn => {
                         folded_this_turn = true;
@@ -3597,6 +3659,11 @@ pub async fn run_loop(
                             tracing::info!(
                                 target: "dirge::agent_loop",
                                 ratio = %decision.ratio,
+                                // dirge-cprj: the ratio alone cannot say
+                                // whether the prompt is too big or the window
+                                // is too small, and those want opposite fixes.
+                                prompt_tokens = decision.prompt_tokens,
+                                ctx_max = decision.ctx_max,
                                 aggressive = decision.aggressive,
                                 tail_budget = ?decision.tail_budget,
                                 "context-manager: fold recommended ({})",
@@ -3650,6 +3717,12 @@ pub async fn run_loop(
                         tracing::warn!(
                             target: "dirge::agent_loop",
                             ratio = %decision.ratio,
+                            // dirge-cprj. This line is where a run that is
+                            // silently force-ending every turn shows up, and
+                            // without these two it cannot be told from a run
+                            // legitimately out of room.
+                            prompt_tokens = decision.prompt_tokens,
+                            ctx_max = decision.ctx_max,
                             "context-manager: forcing summary and ending turn",
                         );
                         // dirge-vpma.22: and actually end it. This arm logged
@@ -3662,7 +3735,6 @@ pub async fn run_loop(
                         // still over the threshold and the next request could
                         // overflow or 400. Honoured below, after the
                         // checkpoint-schedule reset.
-                        force_turn_end = true;
                         // When context is critically over the threshold,
                         // prune aggressively then run the structured-summary
                         // pass if a summarizer is wired.
@@ -3679,6 +3751,13 @@ pub async fn run_loop(
                             (ctx_max as f64 * context_manager::HISTORY_FOLD_THRESHOLD) as u64,
                         )
                         .await;
+                        // dirge-8s2v: `Succeeded` is the only outcome that
+                        // moved anything — `Failed` and `Skipped` both leave
+                        // the context exactly as it was.
+                        force_turn_end = Some((
+                            matches!(outcome, SummaryOutcome::Succeeded(_)),
+                            decision.prompt_tokens,
+                        ));
                         if let SummaryOutcome::Succeeded(idx) = outcome {
                             restore_working_files(&config, &mut current_context, idx, ctx_max)
                                 .await;
@@ -3727,10 +3806,50 @@ pub async fn run_loop(
             // dirge-vpma.22: the critical-context tier asked for the turn to
             // end. Clearing `has_more_tool_calls` would not be enough on its
             // own — the loop condition also admits pending messages and a
-            // pending recovery — so break outright, which leaves the flag
-            // unread. Anything queued is picked up by the next turn, against
-            // a context that has just been folded.
-            if force_turn_end {
+            // pending recovery — so leave the inner loop, which leaves the
+            // flag unread.
+            //
+            // dirge-8s2v: but leaving the inner loop is leaving the TURN loop,
+            // and control then falls to the finalization poll, whose default
+            // is to stop. As first written this ended the RUN: a model over
+            // the threshold got one turn, its tool calls ran, their results
+            // were appended, and the run finished before it ever saw them.
+            // `continue 'outer` is the difference between ending the turn and
+            // ending the run — it starts a fresh turn against the context the
+            // fold just shrank.
+            //
+            // Only when the fold made room. When it did not, another turn
+            // meets the same wall, and the honest move is to stop — but to say
+            // so, because a run that stops mid-task in silence is
+            // indistinguishable from one that decided it was finished.
+            if let Some((made_room, prompt_tokens)) = force_turn_end.take() {
+                turns_taken += 1;
+                let under_cap = config.max_turns.is_none_or(|cap| turns_taken < cap);
+                if made_room && under_cap {
+                    continue 'outer;
+                }
+                if !made_room {
+                    let notice = format!(
+                        "Run stopped: the context is over the model's window \
+                         ({} of {} tokens) and compaction could not reduce it. \
+                         The task is unfinished. This usually means the system \
+                         prompt and tool schemas alone exceed the window — \
+                         check the model's context_window in config.",
+                        prompt_tokens, ctx_max,
+                    );
+                    tracing::warn!(
+                        target: "dirge::agent_loop",
+                        prompt_tokens = prompt_tokens,
+                        ctx_max = ctx_max,
+                        "run truncated: context over window and nothing left to fold",
+                    );
+                    let _ = emit
+                        .send(LoopEvent::SystemNotice {
+                            content: notice.clone(),
+                        })
+                        .await;
+                    new_messages.push(LoopMessage::User(super::message::UserMessage::text(notice)));
+                }
                 break;
             }
 
@@ -3826,7 +3945,6 @@ pub async fn run_loop(
             // append a user-facing message into the transcript so the
             // model's history reflects the truncation, and bail.
             turns_taken += 1;
-            tally.record_turn();
             if let Some(cap) = config.max_turns
                 && turns_taken >= cap
             {
