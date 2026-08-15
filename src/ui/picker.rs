@@ -101,6 +101,14 @@ pub struct FilePicker {
     pub cursor: usize,
     pub matches: Vec<PathBuf>,
     pub selected: usize,
+    /// Byte offset of the `@` that opened the picker (dirge-vpma.45).
+    ///
+    /// Recorded once, at activation. The exit paths used to re-find it with
+    /// `buffer.rfind('@')`, but the picker's catch-all char arm feeds any
+    /// character — `@` included — into both the query and the buffer, so a
+    /// second `@` inside the query became the anchor and the splice landed in
+    /// the wrong place.
+    pub anchor: usize,
     file_cache: Arc<Mutex<Vec<PathBuf>>>,
 }
 
@@ -112,12 +120,14 @@ impl FilePicker {
             cursor: 0,
             matches: Vec::new(),
             selected: 0,
+            anchor: 0,
             file_cache: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
-    pub fn activate(&mut self) {
+    pub fn activate(&mut self, anchor: usize) {
         self.active = true;
+        self.anchor = anchor;
         self.query.clear();
         self.cursor = 0;
         self.matches.clear();
