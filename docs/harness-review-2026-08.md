@@ -98,6 +98,61 @@ fired. Nothing was wrong with that context. The gauge now reads
 `last_prompt_tokens / effective_ctx_max`, the same two numbers, with the
 estimate standing in only before the first response.
 
+## Phase 5 — a long-horizon run (done)
+
+A 22-test specification the model may not edit, with two traps a naive
+"extract all the pieces" parser passes early and fails late (`1m30` and `1m 2`
+must be rejected), forcing a restructure to whole-string validation. Steering
+features enabled: `verification_tiers`, `safe_state_abort`, `claim_gate`,
+`completeness_gate`, `source_gate` all advisory, `progress_stall_threshold: 3`.
+
+Outcome: 22/22 pass, `duration.py` the only file touched — the spec was
+respected. 9 turns, 8 tool calls, 0 errored, context peak 36%.
+
+**What worked.** `boundaries=Verifier` — one gate at one boundary, which is
+PR #739's arbiter doing its job (run 3 and run 4 both read
+`Verifier;ClaimGate`, semicolons meaning separate boundaries, never a
+collision). The progress monitor armed and fired. The per-provider window
+resolved to 65,536 from `providers.qwen-local.context_window` with no
+top-level key. The streaming heartbeat turned a silent 13-minute thinking turn
+into a visible `ThinkingDelta` series.
+
+**What it exposed** — `dirge-hwk9.4`, a three-feature cascade:
+
+1. The model went green at 345s via `pytest -v 2>&1 | tail -28`.
+2. `masks_failure` correctly declined it, so `verified_green` never latched.
+3. The progress monitor's three progress events are a todo closed, a first-time
+   file touch, or *verification going green*. None could fire.
+4. `nudge_progress_stall` fired twice — the second at 618.0s of a 618.1s run —
+   telling a model with a green suite it had made no progress for three turns.
+
+Filed, not patched. **My first attempt at a fix was wrong and is worth
+recording:** I proposed clearing `edits_since_verify` on a masked decline,
+citing the verifier's own rule that "any verification attempt clears the
+mid-run counter". Two things killed it. The stall nudge reads the *latched
+green* (`run.rs:2336`), not that counter, so the change would have fixed
+nothing; and `masked_command_does_not_clear_edits_since_verify` already asserts
+the opposite deliberately. Reverted. What remains is a design question — should
+a verification *attempt* count as progress? — and the comment at
+`run.rs:2328-2335` explains why the monitor reads the latched green in the
+first place, so it is not a free change.
+
+`dirge-hwk9.5` — boundary nudges inject at `run.rs:3591` by pushing straight
+into context, emitting only a `SystemNotice`; the finalization path emits
+`MessageStart`/`MessageEnd`. So stall, budget, prologue, track-work,
+file-touch, safe-state and reflection nudges are absent from the message
+stream: the tally read `nudge_progress_stall=2` while the trace recorded one
+intervention. Not user-visible (the notice covers the human), and making the
+paths match risks double-rendering in the TUI, so it is filed rather than
+folded in.
+
+**One message reworded on evidence.** Told to drop the `|` or `;`, one model
+produced a clean `pytest -v` (run 4) and another produced
+`pytest -v; echo "EXIT=$?"` (run 6) — which obeys the letter, tries to surface
+the status, and masks anyway. The nudge is now positional ("the build/test
+command LAST, nothing after it") and names the three idioms that have actually
+shown up.
+
 ## Still open
 
 `dirge-tva8` P0 — **dirge's own prompt does not fit a small window.** Measured,

@@ -112,13 +112,20 @@ const FAILED_NUDGE: &str = "[verify-before-done] Your last build or test command
 /// answer). The last matters most — the observed model, told only that it had
 /// not verified, re-ran the same piped command twice and then appended
 /// `; echo "exit=$?"`, which reports the status of `echo`.
+///
+/// The correction is phrased POSITIONALLY ("last, with nothing after it")
+/// rather than as a list of forbidden operators. Two runs, two outcomes: told
+/// to drop the `|` or `;`, one model produced a clean `pytest -v` and another
+/// produced `pytest -v; echo "EXIT=$?"` — which obeys the letter (it wanted to
+/// surface the status) and masks anyway. Naming the three idioms explicitly is
+/// belt and braces, since those are the three that have actually shown up.
 fn masked_nudge(command: &str) -> String {
     format!(
-        "{VERIFY_TAG} You ran `{}`, but its exit status is the last stage of \
-         the pipe or chain — not the test command's — so it doesn't show \
-         whether the tests passed. Re-run it without the `|` or `;` (let the \
-         output through, or redirect to a file and read that), and report what \
-         the test command itself returned.",
+        "{VERIFY_TAG} You ran `{}`. Its exit status is the last stage of the \
+         pipe or chain, not the test command's, so it doesn't show whether the \
+         tests passed. Re-run with the build/test command LAST and nothing \
+         after it — no `| tail`, no `; echo`, no `|| true`. Let the output \
+         through in full; it is not too long.",
         crate::text::ellipsize(command.trim(), 160),
     )
 }
