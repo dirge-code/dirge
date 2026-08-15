@@ -116,6 +116,18 @@ fn language_for_path(path: &Path) -> Option<tree_sitter::Language> {
         #[cfg(feature = "semantic-bash")]
         "sh" | "bash" => Some(tree_sitter_bash::LANGUAGE.into()),
 
+        // GH #778. Registered here only after checking what this gate actually
+        // costs if the grammar is wrong: it is a write-time HARD block, so a
+        // grammar that reports valid code as ERROR leaves the agent unable to
+        // save it — the reason `.sql` is excluded below. `tree-sitter-swift`
+        // was measured against async/await, actors, generics with `where`,
+        // property wrappers, result builders, `@main`, multi-line strings,
+        // custom operators, subscripts and enums with associated values, and
+        // reported errors on none of them. See
+        // `the_swift_grammar_accepts_modern_swift`.
+        #[cfg(feature = "semantic-swift")]
+        "swift" => Some(tree_sitter_swift::LANGUAGE.into()),
+
         // NOTE: `.sql` is deliberately NOT registered here. This gate is a
         // write-time HARD block (`syntax_gate` → tool error on parse error),
         // and the generic tree-sitter-sequel grammar reports mainstream,
@@ -1711,6 +1723,163 @@ int main(void) {
         assert!(
             repair_delimiters(&path, src).is_some(),
             "an earlier nested column-1 opener is irrelevant to an EOF close"
+        );
+    }
+}
+
+/// Adapter extensions this gate deliberately does NOT block on, with the
+/// reason (GH #778, dirge-3cfq).
+///
+/// The gate keeps its own extension→grammar table, separate from the adapter
+/// registry, and there is no way to notice a language present in one and
+/// absent from the other — that is how `.swift` shipped with a semantic
+/// adapter and no gate coverage. Silence is not a decision, so anything
+/// omitted has to be named here.
+///
+/// Omission is often the RIGHT call: this gate is a hard write block, so a
+/// grammar that reports valid code as an error leaves the agent unable to save
+/// it. The bar for adding an extension is evidence that the grammar accepts
+/// real code in that language, not merely that a grammar exists.
+#[cfg(test)]
+const GATE_EXCLUSIONS: &[(&str, &str)] = &[
+    (
+        "sql",
+        "tree-sitter-sequel reports valid CREATE PROCEDURE and all of T-SQL as \
+         ERROR; blocking those writes leaves no recourse. Indexed by SqlAdapter, \
+         which tolerates parse errors instead.",
+    ),
+    (
+        "ex",
+        "not assessed — no measurement of the Elixir grammar's false-error rate \
+         on real code, and a hard block on a guess is worse than no block.",
+    ),
+    ("exs", "see .ex"),
+    (
+        "heex",
+        "see .ex — templating dialect, likelier still to false-error.",
+    ),
+    (
+        "dfy",
+        "not assessed — same reason as .ex. Dafny files are also verified by the \
+         language server, which reports proof failures the gate could not.",
+    ),
+    (
+        "h",
+        "contested between C and C++ — the C adapter claims it for indexing, but \
+         C++ in a .h is ordinary, and tree-sitter-c reports templates and classes \
+         as errors. On a hard write block that would refuse valid headers, so .h \
+         stays indexed-but-ungated. `.hpp`/`.hh`/`.hxx` ARE gated, via the C++ \
+         grammar.",
+    ),
+];
+
+#[cfg(test)]
+mod gate_coverage {
+    use super::*;
+
+    /// Every extension a semantic adapter claims is either blocked by this gate
+    /// or listed in [`GATE_EXCLUSIONS`] with a reason. Derived from the adapter
+    /// registry, so a new language cannot be half-wired in silence.
+    #[test]
+    fn every_adapter_extension_is_gated_or_explicitly_excluded() {
+        let registry = crate::semantic::adapters::AdapterRegistry::new(
+            crate::semantic::adapters::default_adapters(),
+        );
+        for ext in registry.all_extensions() {
+            let probe = std::path::PathBuf::from(format!("probe.{ext}"));
+            if language_for_path(&probe).is_some() {
+                continue;
+            }
+            assert!(
+                GATE_EXCLUSIONS.iter().any(|(e, _)| *e == ext),
+                "{ext} has a semantic adapter but no syntax-gate grammar and no \
+                 entry in GATE_EXCLUSIONS — decide which it is and say why"
+            );
+        }
+    }
+
+    /// The exclusions list must not go stale in the other direction: an entry
+    /// for an extension no adapter claims is a note about nothing.
+    #[test]
+    fn every_exclusion_names_a_real_adapter_extension() {
+        let registry = crate::semantic::adapters::AdapterRegistry::new(
+            crate::semantic::adapters::default_adapters(),
+        );
+        let claimed = registry.all_extensions();
+        for (ext, _) in GATE_EXCLUSIONS {
+            assert!(
+                claimed.iter().any(|e| e == *ext),
+                "GATE_EXCLUSIONS lists {ext}, which no adapter claims"
+            );
+        }
+    }
+
+    /// The evidence behind registering `.swift` on a HARD block. If the grammar
+    /// ever regresses on one of these, the gate starts refusing valid Swift and
+    /// this says so before a user finds out.
+    #[cfg(feature = "semantic-swift")]
+    #[test]
+    fn the_swift_grammar_accepts_modern_swift() {
+        let cases: &[(&str, &str)] = &[
+            (
+                "async/await",
+                "func f() async throws -> Int { try await g() }",
+            ),
+            (
+                "generics with where",
+                "func f<T: Equatable>(_ a: T, b: T) -> Bool where T: Hashable { a == b }",
+            ),
+            (
+                "property wrappers",
+                "struct V { @State private var x = 0\n @Published var y: Int = 1 }",
+            ),
+            (
+                "result builder",
+                "@ViewBuilder func body() -> some View { Text(\"a\"); Text(\"b\") }",
+            ),
+            (
+                "actor",
+                "actor Counter { private var n = 0\n func inc() { n += 1 } }",
+            ),
+            (
+                "guard and optionals",
+                "func f(x: Int?) { guard let y = x else { return }\n print(y ?? 0) }",
+            ),
+            (
+                "closures",
+                "let f = { (a: Int) -> Int in a * 2 }\nlist.map { $0 + 1 }",
+            ),
+            (
+                "enum with associated values",
+                "enum E { case a(Int), b(String)\n var v: Int { switch self { case .a(let i): return i\n case .b: return 0 } } }",
+            ),
+            (
+                "constrained protocol extension",
+                "protocol P { associatedtype T }\nextension P where T == Int { func z() {} }",
+            ),
+            ("@main", "@main struct App { static func main() {} }"),
+            (
+                "string interpolation and multiline",
+                "let s = \"a \\(b) c\"\nlet m = \"\"\"\nmulti\n\"\"\"",
+            ),
+            (
+                "subscript and custom operator",
+                "struct M { subscript(i: Int) -> Int { 0 } }\ninfix operator <>: AdditionPrecedence",
+            ),
+        ];
+        let lang: tree_sitter::Language = tree_sitter_swift::LANGUAGE.into();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&lang).expect("swift grammar loads");
+        let mut rejected = Vec::new();
+        for (name, src) in cases {
+            let tree = parser.parse(src, None).expect("parses");
+            if tree.root_node().has_error() {
+                rejected.push(*name);
+            }
+        }
+        assert!(
+            rejected.is_empty(),
+            "the gate is a hard write block and the grammar rejects valid Swift: {rejected:?}"
         );
     }
 }

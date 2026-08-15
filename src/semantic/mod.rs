@@ -13,6 +13,8 @@ use crate::agent::tools::semantic;
 use crate::permission::ask::AskSender;
 use crate::permission::checker::PermCheck;
 
+// Used by src/tests/semantic_tests.rs; unused in a non-test build.
+#[allow(unused_imports)]
 pub use adapter::LanguageAdapter;
 pub use index::SymbolIndex;
 
@@ -21,57 +23,8 @@ pub struct SemanticManager {
 }
 
 impl SemanticManager {
-    // `mut` and the post-`Vec::new()` pushes are conditionally needed
-    // depending on which language adapter features are active. The
-    // `#[cfg]` gating doesn't compose with `vec![]` so we keep the
-    // `Vec::new() + push` pattern and silence both lints at the fn
-    // level (an item-level `#[allow]` on the local binding doesn't
-    // suppress clippy here in practice).
-    #[allow(unused_mut, clippy::vec_init_then_push)]
     pub fn new() -> Self {
-        let mut adapters: Vec<Box<dyn LanguageAdapter>> = Vec::new();
-
-        #[cfg(feature = "semantic-ts")]
-        adapters.push(Box::new(adapters::TypescriptAdapter));
-
-        #[cfg(feature = "semantic-python")]
-        adapters.push(Box::new(adapters::PythonAdapter));
-
-        #[cfg(feature = "semantic-clojure")]
-        adapters.push(Box::new(adapters::ClojureAdapter));
-
-        #[cfg(feature = "semantic-go")]
-        adapters.push(Box::new(adapters::GoAdapter));
-
-        #[cfg(feature = "semantic-ruby")]
-        adapters.push(Box::new(adapters::RubyAdapter));
-
-        #[cfg(feature = "semantic-rust")]
-        adapters.push(Box::new(adapters::RustAdapter));
-
-        #[cfg(feature = "semantic-java")]
-        adapters.push(Box::new(adapters::JavaAdapter));
-
-        // C registered before C++ so the C adapter wins for `.h`
-        // (shared extension). C++ users with C++ headers should use
-        // `.hpp`/`.hh`/`.hxx` to route through CppAdapter — see the
-        // comment on `CppAdapter::extensions`.
-        #[cfg(feature = "semantic-c")]
-        adapters.push(Box::new(adapters::CAdapter));
-
-        #[cfg(feature = "semantic-cpp")]
-        adapters.push(Box::new(adapters::CppAdapter));
-
-        #[cfg(feature = "semantic-elixir")]
-        adapters.push(Box::new(adapters::ElixirAdapter));
-
-        #[cfg(feature = "semantic-sql")]
-        adapters.push(Box::new(adapters::SqlAdapter));
-
-        #[cfg(feature = "semantic-dafny")]
-        adapters.push(Box::new(adapters::DafnyAdapter));
-
-        let registry = Arc::new(adapters::AdapterRegistry::new(adapters));
+        let registry = Arc::new(adapters::AdapterRegistry::new(adapters::default_adapters()));
         let index = Arc::new(RwLock::new(SymbolIndex::new(registry)));
 
         Self { index }
