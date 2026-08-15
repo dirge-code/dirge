@@ -126,6 +126,27 @@ fn result_text(content: &[Value]) -> String {
         .join(" ")
 }
 
+/// Shortest gap between two `streaming` heartbeats. Long enough that an
+/// ordinary turn contributes at most a record or two, short enough that a turn
+/// which has stopped making progress is obvious.
+const HEARTBEAT_SECS: u64 = 10;
+
+/// True when a streaming heartbeat is due, and claims the slot.
+///
+/// A CAS rather than a plain load/store so two deltas arriving together cannot
+/// both decide they are due. Seconds since the sink opened, so no wall-clock
+/// read per delta.
+fn heartbeat_due() -> bool {
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let Some(sink) = SINK.get() else { return false };
+    let now = sink.start.elapsed().as_secs();
+    let last = LAST.load(Ordering::Relaxed);
+    now.saturating_sub(last) >= HEARTBEAT_SECS
+        && LAST
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+}
+
 /// A short, single-line excerpt of `s` for a trace field.
 fn excerpt(s: &str) -> String {
     let head = crate::text::head(s, EXCERPT_BYTES);
@@ -181,10 +202,39 @@ fn describe(evt: &LoopEvent) -> Option<(&'static str, Value)> {
             LoopMessage::Assistant(_) => return None,
             _ => ("message", describe_message(message)),
         },
-        // MessageEnd repeats MessageStart's content for every message, and
-        // MessageUpdate fires per streamed delta. Both are noise in a trace
-        // whose unit is the decision, not the byte.
-        LoopEvent::MessageEnd { .. } | LoopEvent::MessageUpdate { .. } => return None,
+        // MessageEnd repeats MessageStart's content for every message.
+        LoopEvent::MessageEnd { .. } => return None,
+
+        // MessageUpdate fires per streamed delta — far too many to record, and
+        // the trace's unit is the decision, not the byte. But recording NOTHING
+        // during a turn means a trace that claims to explain a run that hung
+        // goes silent for exactly as long as the interesting part lasts: a
+        // local model was observed thinking for thirteen minutes and 2892
+        // tokens with nothing between `turn_start` and the next record, which
+        // is indistinguishable in the trace from a deadlock.
+        //
+        // So: a heartbeat, throttled to one record per HEARTBEAT_SECS, saying
+        // what the turn is doing and how much it has produced.
+        LoopEvent::MessageUpdate { message, phase } => {
+            if !heartbeat_due() {
+                return None;
+            }
+            let chars: usize = message
+                .content
+                .iter()
+                .map(|b| match b {
+                    super::message::ContentBlock::Text { text }
+                    | super::message::ContentBlock::Thinking { text } => text.len(),
+                    super::message::ContentBlock::ToolCall { arguments, .. } => {
+                        arguments.to_string().len()
+                    }
+                })
+                .sum();
+            (
+                "streaming",
+                json!({ "phase": format!("{phase:?}"), "chars": chars }),
+            )
+        }
 
         LoopEvent::ToolExecutionStart {
             tool_call_id,
@@ -423,6 +473,56 @@ mod tests {
 
         assert_eq!(recs[1]["role"], "user", "a typed message is not a steer");
         assert!(recs[1].get("guard").is_none());
+    }
+
+    /// A streaming turn must leave SOMETHING in the trace, and must not leave
+    /// one record per delta.
+    ///
+    /// A local model was observed thinking for thirteen minutes across 2892
+    /// tokens with nothing recorded between `turn_start` and the next event —
+    /// which reads exactly like a deadlock, in a file whose stated purpose is
+    /// explaining a run that hung. One record per delta is the opposite
+    /// failure: a megabyte of trace saying nothing.
+    ///
+    /// The throttle is time-based, so this asserts the shape a burst produces
+    /// (at most one record) rather than trying to make the clock move.
+    #[test]
+    fn a_burst_of_stream_deltas_leaves_at_most_one_heartbeat() {
+        let recs = traced(|| {
+            for _ in 0..500 {
+                record_event(&LoopEvent::MessageUpdate {
+                    message: assistant("thinking"),
+                    phase: crate::agent::agent_loop::message::DeltaPhase::ThinkingDelta,
+                });
+            }
+        });
+        assert!(
+            recs.len() <= 1,
+            "500 deltas must not become 500 records; got {}",
+            recs.len()
+        );
+        for r in &recs {
+            assert_eq!(r["kind"], "streaming");
+            assert!(r["chars"].is_u64(), "a heartbeat says how much: {r:?}");
+        }
+    }
+
+    /// The throttle itself: due once, then not again until the gap elapses.
+    /// Without this the test above is satisfied by a heartbeat that never
+    /// fires at all, which is the state that made a hang unreadable.
+    #[test]
+    fn the_heartbeat_fires_then_throttles() {
+        // The sink must exist for `heartbeat_due` to have a clock.
+        let _ = traced(|| {});
+        // Whether the FIRST call is due depends on how long this process has
+        // been alive, so drive it to a known state: once it fires, the next
+        // call must not.
+        if heartbeat_due() {
+            assert!(
+                !heartbeat_due(),
+                "a heartbeat must throttle the call right after it fires"
+            );
+        }
     }
 
     /// A tool call and its result must be joinable, or the trace cannot say

@@ -30,6 +30,7 @@ GLYPH = {
     "message": " ",
     "tool_start": "→",
     "tool_end": "←",
+    "streaming": "…",
     "usage": "$",
     "context": "◇",
     "compaction_start": "◆",
@@ -96,6 +97,8 @@ def render_line(rec):
         body = f"{rec.get('tool')}({rec.get('args', '')})"
     elif kind == "tool_end":
         body = f"{rec.get('tool')} {'ERROR ' if rec.get('error') else ''}→ {rec.get('output', '')}"
+    elif kind == "streaming":
+        body = f"…still streaming ({rec.get('phase')}, {rec.get('chars')} chars so far)"
     elif kind == "usage":
         body = (
             f"tokens in={rec.get('input')} out={rec.get('output')} "
