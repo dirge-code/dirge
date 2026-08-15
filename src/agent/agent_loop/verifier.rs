@@ -101,6 +101,28 @@ const VERIFY_NUDGE: &str = "[verify-before-done] You changed code this run but d
 /// Nudge when a build/test command failed after a code change.
 const FAILED_NUDGE: &str = "[verify-before-done] Your last build or test command failed after you changed code. Don't report done on a red build — fix the failure. If it's pre-existing or expected, say so explicitly before finishing.";
 
+/// The nudge for a verification command that RAN but whose exit status was
+/// piped or sequenced away (dirge-hy4k).
+///
+/// It says three things the generic text cannot, and each one earned its place
+/// from watching a model fail to act on the generic one: that the command was
+/// seen (so the model does not conclude the gate is broken and ignore it),
+/// what specifically makes it unusable (so it can be fixed rather than
+/// repeated), and what the correction looks like (so "verify again" has an
+/// answer). The last matters most — the observed model, told only that it had
+/// not verified, re-ran the same piped command twice and then appended
+/// `; echo "exit=$?"`, which reports the status of `echo`.
+fn masked_nudge(command: &str) -> String {
+    format!(
+        "{VERIFY_TAG} You ran `{}`, but its exit status is the last stage of \
+         the pipe or chain — not the test command's — so it doesn't show \
+         whether the tests passed. Re-run it without the `|` or `;` (let the \
+         output through, or redirect to a file and read that), and report what \
+         the test command itself returned.",
+        crate::text::ellipsize(command.trim(), 160),
+    )
+}
+
 /// Escalation when fast-tier checks passed but the full suite never ran
 /// (dirge-uw2l.2). Only reachable with tiers engaged; carries the same
 /// calibrated escape hatch as the legacy nudges.
@@ -242,6 +264,17 @@ struct Inner {
     verification_failed: bool,
     /// A nudge has already fired — never fire again (bounds the loop).
     fired: bool,
+    /// dirge-hy4k: a verification command was DECLINED because its exit status
+    /// was masked (piped, or followed by `;`), and it reported success — so
+    /// the zero belongs to the last stage of the chain and proves nothing.
+    ///
+    /// Recorded because the decline is otherwise indistinguishable from having
+    /// run no command at all, and the two want completely different things
+    /// said to the model. Telling a model that just ran pytest three times
+    /// that it "didn't run the tests" does not get the pipe removed; it gets
+    /// the nudge disbelieved. Holds the offending command so the message can
+    /// quote it back.
+    masked_command: Option<String>,
     /// A fast-tier command has PASSED this run. Tier flags record green
     /// *coverage*, not mere invocation: a red `cargo test` followed by a
     /// green `cargo check` must still read as fast-green-only, so the
@@ -386,6 +419,11 @@ impl VerifierGate {
                     // trustworthy in that direction: something in the chain
                     // genuinely failed. Record the red.
                     if masks_failure(command) && !failed {
+                        // dirge-hy4k: remember that this happened. The gate's
+                        // verdict is unchanged — a masked pass is still not a
+                        // green — but the nudge has to be able to say WHY, or
+                        // the model is told something it can see is false.
+                        inner.masked_command = Some(command.to_string());
                         return;
                     }
                     // dirge-1elu.2: decline a green that rests SOLELY on a
@@ -529,10 +567,17 @@ impl VerifierGate {
             return Vec::new();
         }
         if !inner.fired {
-            let nudge = if inner.verification_failed {
-                Some(FAILED_NUDGE)
+            let nudge: Option<String> = if inner.verification_failed {
+                Some(FAILED_NUDGE.to_string())
             } else if !inner.ran_verification {
-                Some(VERIFY_NUDGE)
+                // dirge-hy4k: a command DID run and was declined for masking —
+                // say so, and say what to do. The generic text below claims
+                // nothing ran, which is false here and gets the whole nudge
+                // disbelieved.
+                Some(match &inner.masked_command {
+                    Some(cmd) => masked_nudge(cmd),
+                    None => VERIFY_NUDGE.to_string(),
+                })
             } else {
                 None // ran a build/test and it passed → confident, stay silent
             };
@@ -1388,6 +1433,74 @@ mod tests {
                 LoopMessage::User(u) => u.text_joined(),
                 _ => panic!("expected user message"),
             })
+    }
+
+    /// dirge-hy4k: when a test run is declined because its exit status was
+    /// piped away, SAY THAT — do not tell the model it never ran the tests.
+    ///
+    /// Measured end to end: a model ran `python3 -m pytest … 2>&1 | tail -12`
+    /// four times, all passing. Declining them is right — the zero belongs to
+    /// `tail`. But the nudge it got was "you didn't run the tests or build to
+    /// check it", which the model could see was false, so it did not change
+    /// the command: it re-ran the same shape twice more and then added
+    /// `; echo "exit=$?"`, which masks harder while looking like compliance.
+    /// The claim gate fired on the consequence and the model's final answer
+    /// asserted "exit status 0" — a number it never had. Three of fifteen
+    /// turns, and the run still ended Unverified with a green suite.
+    ///
+    /// The three assertions are one discrimination: the message must name the
+    /// masking, must NOT claim nothing ran, and the plain no-command case must
+    /// keep saying exactly what it always said.
+    #[test]
+    fn a_masked_test_run_is_told_about_the_mask_not_that_it_never_ran() {
+        let g = VerifierGate::new();
+        g.record_outcome("edit", &json!({"path": "src/auth.rs"}), &ok_result(), false);
+        g.record_outcome(
+            "bash",
+            &json!({"command": "pytest -v 2>&1 | tail -12"}),
+            &ok_result(),
+            false,
+        );
+        let n = nudge(&g).expect("a declined verification must still nudge");
+        assert!(
+            n.contains("exit status") || n.contains("pipe"),
+            "the nudge must name why the run was not counted: {n}"
+        );
+        assert!(
+            !n.contains("didn't run the tests"),
+            "the model ran the tests; saying otherwise is what made it ignore \
+             the nudge: {n}"
+        );
+
+        // ...and a run that genuinely ran nothing still gets the original text,
+        // or this has traded one wrong message for another.
+        let g2 = VerifierGate::new();
+        g2.record_outcome("edit", &json!({"path": "src/auth.rs"}), &ok_result(), false);
+        let n2 = nudge(&g2).expect("should nudge");
+        assert!(
+            n2.contains("didn't run the tests"),
+            "no command ran at all — the original wording is correct here: {n2}"
+        );
+    }
+
+    /// The decline itself is unchanged: a masked pass still must not count as
+    /// verification, or the fix would have bought a friendlier message at the
+    /// price of the false green the guard exists to prevent.
+    #[test]
+    fn a_masked_pass_still_does_not_count_as_verified() {
+        let g = VerifierGate::new();
+        g.record_outcome("edit", &json!({"path": "src/auth.rs"}), &ok_result(), false);
+        g.record_outcome(
+            "bash",
+            &json!({"command": "pytest -v 2>&1 | tail -12"}),
+            &ok_result(),
+            false,
+        );
+        assert_eq!(
+            g.status(GateMode::Off),
+            VerificationStatus::Unverified,
+            "a piped exit status proves nothing and must not latch a green"
+        );
     }
 
     #[test]
