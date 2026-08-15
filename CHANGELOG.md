@@ -4,6 +4,84 @@ All notable changes to dirge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.21.21] - 2026-08-15
+
+### Fixed
+- A bash command could run without ever reaching the permission checker. The
+  segment splitter's `redirected_statement` handling recursed only into an
+  allowlist of node kinds and dropped everything else in silence, and
+  tree-sitter parses `a && b 2>&1 | c` as a redirected statement wrapping the
+  whole `a && b` list — so both commands vanished and the engine authorized
+  only `c`. Measured against the release binary:
+  `python3 -c "open('x','w')"` was denied, and the same call wrapped as
+  `echo hi && python3 -c "…" 2>&1 | cat` ran and wrote the file. Any denied
+  command ran that way. The arm now recurses into everything that is not a
+  redirect operand, so an unfamiliar grammar node over-collects rather than
+  disappearing, and a command the splitter cannot decompose at all is marked
+  complex — the backstop that would have contained this instead of letting it
+  become a bypass.
+- `python3 -m pytest` was refused wherever `pytest` was allowed, because
+  nothing bridged the bare interpreter (deliberately gated — `python -c` runs
+  anything) to the module it was running. It is the commonest way a model
+  invokes pytest and the exact shape the verify nudge asks for, so the harness
+  was refusing what it had just demanded. The bypass above had been hiding it:
+  the only form that ran was `… 2>&1 | tail`, which the verifier then declines
+  as masked. The module form is now named explicitly for the tools already
+  allowed under their own name; `python3 -m http.server` and
+  `python3 -m pip install` still prompt, and a deny on the tool still governs
+  its module form.
+- Interventions could stack on the run's last boundary. The mid-turn boundary
+  has emitted one harness nudge since 0.20, but the boundary that ends the
+  inner loop is polled by two arbiters — the boundary one and then the
+  finalization one — with no ranking between them, so two messages could land
+  before a single assistant turn. That boundary now belongs to finalization,
+  which is the arbiter that knows what finishing means; the safe-state abort is
+  exempt, since a tree restore is not steering.
+- The stall checkpoint fired on runs that were finishing successfully, twice
+  measured within 0.1s of the end. Not a coincidence of timing: by the time a
+  run is finishing its todos are closed, its files are touched and its
+  verification is latched green, so all three progress signals are structurally
+  unable to move and every endgame boundary is barren by definition. The
+  monitor exists for *successful, varied, useless tool calls* — its own first
+  line — but scored every boundary, including turns that called nothing (the
+  final answer) and turns whose calls all failed, which belong to the failure
+  tracker. One measured run delivered it on a boundary whose single call was
+  permission-denied, so the model spent its closing words arguing that nothing
+  was blocking it. Only a boundary with a successful tool call is judged now,
+  and a checkpoint the arbiter declines to deliver keeps its budget instead of
+  being charged for a message nobody read.
+- Objective-C and Ruby's `.rake`/`.gemspec` files opened with the language
+  server as `plaintext`, so `clangd` and `ruby-lsp` accepted them and answered
+  every query with nothing. Adding a server takes entries in three tables that
+  do not reference each other — who claims the extension, how to launch it, and
+  the `languageId` sent on open — and missing the third raises no error
+  anywhere. The check now derives from the server registry, so claiming an
+  extension requires saying what language it is.
+- A language server request carrying a non-numeric id was read as a
+  notification and dropped without a reply. Requests were identified by their
+  id's TYPE rather than by carrying both an id and a method, so a server that
+  uses string ids and waits for the answer stalled every later request. Found
+  on the wire with sourcekit-lsp, which sends `client/registerCapability` with
+  a UUID and blocks on it.
+
+### Added
+- Swift support. `sourcekit-lsp` ships with the toolchain, so `.swift` files
+  get diagnostics, definitions and symbols with nothing to install;
+  `swift build`/`test`/`run`, `swiftlint` and `swift-format` are auto-allowed
+  on the same trust model as the cargo and go commands, with the subcommands
+  named individually because `swift foo.swift` and `swift repl` run arbitrary
+  code. `swift test` is also recognised by the claim gate, which previously
+  returned nothing for it while the verifier counted it — the split verdict
+  that tells a model which has just verified that it has not.
+- A tree-sitter Swift adapter, so `find_definition`, `list_symbols` and
+  `get_symbol_body` answer for Swift and the pre-write syntax gate rejects a
+  broken `.swift` edit. The gate is a hard block, so the grammar was measured
+  against async/await, actors, generics with where-clauses, property wrappers,
+  result builders, `@main`, multi-line strings and custom operators before it
+  was wired in — a grammar that reports valid code as an error leaves nothing
+  savable, which is why `.sql` is still excluded. Every adapter extension is
+  now either gated or recorded with the reason it is not.
+
 ## [0.21.20] - 2026-08-15
 
 ### Added
