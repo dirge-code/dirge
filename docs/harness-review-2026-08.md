@@ -302,18 +302,37 @@ sentence is already in this repo's memory twice, from `hallucinated_tool_names`
 and the scavenger's dropped names. This is the third, and the first where the
 thing being dropped was a permission input.
 
-## Still open
+## The harness demanding what it forbade (dirge-e1nv, done)
 
-`dirge-e1nv` — `python3 -m pytest` is gated wherever `pytest` is allowed,
-because nothing peels the module-runner prefix (`nohup` and `timeout` have the
-same problem). It is the commonest way a model invokes pytest, and it is the
-shape the verify nudge asks for. Until `dirge-5flx` the bypass hid it: the only
-way that command ran was in its *masked* form, which the verifier declines. So
-the harness demanded what it forbade — the third instance of that pattern here,
-after `dirge-hwk9.6` and `dirge-yv0d`. The fix is to match allow rules against
-the exec-prefix-stripped form as well as the raw, which derives from the
-existing table rather than duplicating it, but it changes permission-engine
-matching semantics and deserves its own review.
+`pytest **` is allowed; `python`/`python3` deliberately are not, because
+`python -c "…"` runs anything. Nothing bridged the two, so `python3 -m pytest`
+— the commonest way a model runs pytest, and the shape the verify nudge asks
+for — prompted, which headless turns into a denial. Until `dirge-5flx` the
+bypass hid it: the only form that ran was `… 2>&1 | tail`, the masked shape the
+verifier declines. Third instance of one guard punishing what another demands,
+after `dirge-hwk9.6` and `dirge-yv0d`.
+
+**The filed design was wrong, and the existing code says why.** The plan was to
+match allow rules against the exec-prefix-stripped form as well as the raw.
+`match_candidates` exposes commands raw *on purpose* (`dirge-8zem`):
+`PATH=/tmp/evil git push` and `./env git push` run a different binary under an
+allowed name, and `env_and_wrapper_prefixes_do_not_ride_an_allow_rule` pins it.
+The proposal would have reopened that hole to close this one. Reading the
+comment on the thing you are about to generalise is worth more than the
+generalisation.
+
+What shipped instead names the module form explicitly, generated from
+`PYTHON_MODULE_TOOLS` so the eight rules are not a second list to keep in step
+with the first, with a test that every entry is still allowed under its own
+name — the derivation source can go stale too. `-m` does not make the
+interpreter safe; it names a module that must still be allowed on its own, so
+`python3 -m http.server` and `python3 -m pip install` keep prompting. The deny
+side sees through the module runner as well, or the new allows would be a way
+around a deny that used to hold.
+
+Measured on the same task and stock config that had denied every verification:
+3 errored bash calls and an unverified run → 0 errored, 22/22, model correcting
+its masked command on the first nudge.
 
 ## Method notes
 
