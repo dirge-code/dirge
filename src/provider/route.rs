@@ -185,7 +185,6 @@ pub fn apply_model_route(
 ) -> Result<Option<String>, RouteRefusal> {
     let switched_to = swap_client_for_route(cfg, client, session.provider.as_str(), &route)?;
     session.model = compact_str::CompactString::new(route.model());
-    session.context_window = cfg.resolve_context_window(route.model());
     // Only follow the client when it actually moved. A same-client rename must
     // leave `provider` alone: overwriting it (with the CLI/config default, say)
     // would make the NEXT routing decision reason from the wrong active
@@ -193,6 +192,10 @@ pub fn apply_model_route(
     if let Some(alias) = &switched_to {
         session.provider = compact_str::CompactString::new(alias);
     }
+    // GH #772: resolved AFTER the provider is updated, because a per-provider
+    // window belongs to the provider the route lands on — reading it before
+    // the swap would answer for the one being left.
+    session.context_window = cfg.resolve_context_window_for(&session.provider, route.model());
     Ok(switched_to)
 }
 

@@ -92,6 +92,9 @@ impl ClaimKind {
 pub(crate) struct Claims {
     pub test_claim: bool,
     pub build_or_lint_claim: bool,
+    /// A verification claim naming no kind of command ("exit 0"). Satisfied by
+    /// ANY observed verification — see [`claims_generic_verification`].
+    pub generic_claim: bool,
     pub change_claim: bool,
 }
 
@@ -109,6 +112,7 @@ pub(crate) fn scan_final_answer(text: &str) -> Claims {
         }
         claims.test_claim |= claims_test_result(sentence);
         claims.build_or_lint_claim |= claims_build_or_lint_result(sentence);
+        claims.generic_claim |= claims_generic_verification(sentence);
         claims.change_claim |= claims_change(sentence);
     }
     claims
@@ -129,7 +133,12 @@ pub(crate) fn unsupported_claims(
     files_mutated: usize,
 ) -> Option<ClaimKind> {
     let (ran_test, ran_build_or_lint) = observed_kinds(observed);
-    if (claims.test_claim && !ran_test) || (claims.build_or_lint_claim && !ran_build_or_lint) {
+    if (claims.test_claim && !ran_test)
+        || (claims.build_or_lint_claim && !ran_build_or_lint)
+        // dirge-hwk9.6: a kind-agnostic claim needs SOME verification, not a
+        // particular one.
+        || (claims.generic_claim && !ran_test && !ran_build_or_lint)
+    {
         return Some(ClaimKind::Verification);
     }
     if claims.change_claim && files_mutated == 0 {
@@ -173,13 +182,62 @@ fn observed_kinds(commands: &[(String, bool)]) -> (bool, bool) {
 /// The evidence kind of a single shell segment, or `None` when it is not a
 /// recognized build/test/lint command. Mirrors the verifier's recognition
 /// vocabulary (verifier.rs) on the kind axis.
+/// Peel an interpreter or package-runner prefix off a command, returning the
+/// tool that actually runs and its remaining arguments (dirge-hwk9.3).
+///
+/// Three shapes, and the distinction between the first two is the whole point:
+///
+/// - `python -m pytest …` — `-m` names a MODULE to run, so `pytest` is the
+///   tool. This is the documented way to run pytest against the current
+///   interpreter and is what the model reached for unprompted.
+/// - `python script.py`, `python -c '…'` — the interpreter is running a
+///   script, not a known tool. Left alone, so it classifies as `None` rather
+///   than becoming whatever the script is named.
+/// - `npx jest`, `poetry run pytest`, `uv run pytest` — a runner whose first
+///   non-flag argument is the tool.
+///
+/// Peeling is single-step by design: `poetry run python -m pytest` peels to
+/// `python -m pytest` and then this is not applied again. Recursing would be
+/// more thorough and would also let a long prefix chain walk to an argument
+/// that is not a command at all, which is the direction that produces a false
+/// green.
+fn strip_runner_prefix<'a>(tokens: &'a [&'a str]) -> Option<(&'a &'a str, &'a [&'a str])> {
+    let (command, args) = tokens.split_first()?;
+    let base = command.rsplit('/').next().unwrap_or(command);
+    // `python -m <module>`: the module is the tool.
+    let is_interpreter = base == "python" || base == "python3" || base.starts_with("python3.");
+    if is_interpreter
+        && let Some(pos) = args.iter().position(|t| *t == "-m")
+        && let Some(module) = args.get(pos + 1)
+    {
+        return Some((module, &args[pos + 1..]));
+    }
+    // `npx <tool>`, `poetry run <tool>`, `uv run <tool>`, `pipenv run <tool>`.
+    let runner_takes_next = match base {
+        "npx" | "bunx" | "pnpx" => true,
+        "poetry" | "uv" | "pipenv" | "rye" | "hatch" => args.first().is_some_and(|a| *a == "run"),
+        _ => false,
+    };
+    if runner_takes_next
+        && let Some(pos) = args.iter().position(|t| !t.starts_with('-') && *t != "run")
+    {
+        return Some((&args[pos], &args[pos + 1..]));
+    }
+    Some((command, args))
+}
+
 fn segment_kind(segment: &str) -> Option<CommandKind> {
     // Drop `VAR=value` prefixes so `RUST_LOG=debug cargo test` classifies.
     let tokens: Vec<&str> = segment
         .split_whitespace()
         .filter(|t| !t.contains('='))
         .collect();
-    let (command, args) = tokens.split_first()?;
+    // dirge-hwk9.3: step past an interpreter or runner prefix, so the tool that
+    // actually runs is the one classified. `python3 -m pytest` used to classify
+    // as `python3` and fall through to `None` — the verifier recognised the
+    // same command (its markers match ANY token) and the two gates then told
+    // the model opposite things about whether it had run the tests.
+    let (command, args) = strip_runner_prefix(&tokens)?;
     let base = command.rsplit('/').next().unwrap_or(command);
     let sub = args.iter().find(|t| !t.starts_with('-')).copied();
     match base {
@@ -194,7 +252,9 @@ fn segment_kind(segment: &str) -> Option<CommandKind> {
             Some("test") => Some(CommandKind::Test),
             _ => Some(CommandKind::BuildOrLint),
         },
-        "pytest" | "tox" | "jest" | "vitest" | "mocha" | "rspec" => Some(CommandKind::Test),
+        "pytest" | "unittest" | "tox" | "jest" | "vitest" | "mocha" | "rspec" => {
+            Some(CommandKind::Test)
+        }
         "make" => match sub {
             // By automake convention `make check` IS the full suite.
             Some("test") | Some("check") => Some(CommandKind::Test),
@@ -321,12 +381,27 @@ fn claims_build_or_lint_result(sentence: &str) -> bool {
         "clippy is clean",
         "fmt clean",
         "formatted clean",
-        "exit 0",
-        "exit code 0",
         "compiles",
         "builds clean",
     ];
     BUILD_OR_LINT_GATES.iter().any(|g| lower.contains(g))
+}
+
+/// A verification claim that names no KIND of command (dirge-hwk9.6).
+///
+/// "exit 0" is a claim about whatever ran, and which gate it refers to is not
+/// recoverable from the phrase. It used to sit in the build/lint list, so a
+/// model that ran its tests cleanly and reported the exit status — which is
+/// precisely what the verify nudge asks for when it declines a masked run —
+/// was told no build command had run. The harness asked for a number and then
+/// penalised the answer.
+///
+/// Kind-matching stays where it earns its keep: `cargo build` still cannot
+/// support "N passed", and a test run still cannot support "clippy clean".
+fn claims_generic_verification(sentence: &str) -> bool {
+    let lower = sentence.to_ascii_lowercase();
+    const GENERIC_GATES: &[&str] = &["exit 0", "exit code 0", "exit status 0"];
+    GENERIC_GATES.iter().any(|g| lower.contains(g))
 }
 
 fn claims_change(sentence: &str) -> bool {
@@ -395,6 +470,173 @@ mod tests {
         let observed: Vec<(String, bool)> =
             commands.iter().map(|c| (c.to_string(), false)).collect();
         unsupported_claims(&scan(text), &observed, files_mutated)
+    }
+
+    /// dirge-hwk9.3: an interpreter-prefixed test command is a test command.
+    ///
+    /// Measured live. The model ran `cd <dir> && python3 -m pytest -v`. The
+    /// verifier recognised it — its markers match on ANY token and `pytest` is
+    /// there — and the run ended `VerifiedGreen`. This gate did not:
+    /// `segment_kind` took the segment's FIRST token, got `python3`, and
+    /// returned `None`. So the model was told "no build/test command of the
+    /// matching kind ran this run" one turn after it had run one, correctly,
+    /// having just been corrected by the verifier for running it wrong.
+    ///
+    /// `python -m pytest` is the documented way to run pytest against the
+    /// current interpreter, and the same shape covers `npx`, `poetry run`,
+    /// `uv run` and `pipenv run`.
+    /// A claim string these tests can rely on being DETECTED.
+    ///
+    /// `claims_test_result` requires a run of at least two digits, so the
+    /// obvious `"4 passed"` makes no claim at all — and a test written with it
+    /// passes whatever the evidence says, which is how two of these first went
+    /// green against the very bug they were written for.
+    const A_TEST_CLAIM: &str = "All done. 4954 passed, 0 failed.";
+
+    #[test]
+    fn the_claim_used_by_these_tests_is_actually_detected() {
+        assert!(
+            scan(A_TEST_CLAIM).test_claim,
+            "the fixture must make a claim, or every test using it is vacuous"
+        );
+        assert!(
+            !scan("All done. 4 passed.").test_claim,
+            "single-digit counts are deliberately not claims — if this changes, \
+             the fixture above can be simplified"
+        );
+    }
+
+    #[test]
+    fn an_interpreter_prefixed_test_command_is_evidence() {
+        for cmd in [
+            "python3 -m pytest -v",
+            "python -m pytest",
+            "cd /tmp/proj && python3 -m pytest -v",
+            "python3 -m unittest discover",
+            "npx jest",
+            "poetry run pytest",
+            "uv run pytest -q",
+            "pipenv run pytest",
+        ] {
+            assert_eq!(
+                fires(A_TEST_CLAIM, &[cmd], 3),
+                None,
+                "`{cmd}` runs tests and must count as evidence for a test claim",
+            );
+        }
+    }
+
+    /// The build/lint half of the same shape, so the fix cannot be a special
+    /// case for pytest.
+    #[test]
+    fn an_interpreter_prefixed_lint_command_is_build_evidence() {
+        for cmd in [
+            "python3 -m mypy .",
+            "python -m ruff check",
+            "npx tsc --noEmit",
+        ] {
+            assert_eq!(
+                fires("Compiles.", &[cmd], 3),
+                None,
+                "`{cmd}` is a build/lint command",
+            );
+        }
+    }
+
+    /// The other half, or the fix is "call everything a test": a command that
+    /// merely mentions a module must not become evidence, and an interpreter
+    /// running an ordinary script is not a test run.
+    #[test]
+    fn an_interpreter_running_something_else_is_not_evidence() {
+        for cmd in [
+            "python3 -c \"import inventory; print(inventory.total_value())\"",
+            "python3 scripts/seed_db.py",
+            "npx prettier --write .", // a formatter is build/lint, never test
+        ] {
+            assert_eq!(
+                fires(A_TEST_CLAIM, &[cmd], 3),
+                Some(ClaimKind::Verification),
+                "`{cmd}` does not run tests and must not support a test claim",
+            );
+        }
+    }
+
+    /// The two recognisers must agree about what ran. They are separate by
+    /// design — the verifier scores COST, this scores COVERAGE — but a command
+    /// one of them counts as a test and the other does not counts as nothing
+    /// coherent to the model: it gets told to verify, verifies, and is told it
+    /// did not. This pins the overlap that produced the live failure.
+    #[test]
+    fn the_two_recognisers_agree_on_what_counts_as_having_run() {
+        use crate::agent::agent_loop::verifier;
+        for cmd in [
+            "python3 -m pytest -v",
+            "cd /tmp/p && python3 -m pytest -v",
+            "npx jest",
+            "poetry run pytest",
+            "python3 -m unittest discover",
+            "cargo test",
+            "make check",
+        ] {
+            assert!(
+                verifier::is_verification_command_for_test(cmd),
+                "the verifier must recognise `{cmd}`"
+            );
+            assert_eq!(
+                fires(A_TEST_CLAIM, &[cmd], 3),
+                None,
+                "...and so must the claim gate: `{cmd}`"
+            );
+        }
+    }
+
+    /// dirge-hwk9.6: "exit 0" names no KIND of command, so a test run supports
+    /// it.
+    ///
+    /// Measured on deepseek: the model ran a clean `python3 -m pytest -q`,
+    /// then wrote "Confirmed with a real exit status: `22 passed in 0.01s`,
+    /// exit 0." The claim gate fired, because "exit 0" sat in the
+    /// build/lint list and no build command had run.
+    ///
+    /// It is the verify nudge that asks for the exit status in the first
+    /// place — so the harness told the model to report a number and then
+    /// penalised it for doing so. Kind-matching exists to stop `cargo build`
+    /// supporting "N passed"; a phrase that names no kind should be satisfied
+    /// by any verification that ran.
+    #[test]
+    fn a_bare_exit_status_is_supported_by_any_verification() {
+        // The sentence deepseek actually produced. It makes TWO claims — a
+        // test count and a bare exit status — and a test run supports both.
+        let said = "Confirmed with a real exit status: 22 passed, exit 0.";
+        assert_eq!(fires(said, &["python3 -m pytest -q"], 3), None);
+
+        // The exit status ALONE names no kind, so either sort of verification
+        // supports it.
+        let bare = "The command finished with exit 0.";
+        assert_eq!(fires(bare, &["python3 -m pytest -q"], 3), None);
+        assert_eq!(fires(bare, &["cargo build"], 3), None);
+
+        // ...and with NOTHING run it still fires — the claim is unsupported,
+        // not unconditionally allowed.
+        assert_eq!(fires(bare, &[], 3), Some(ClaimKind::Verification));
+        assert_eq!(fires(said, &[], 3), Some(ClaimKind::Verification));
+    }
+
+    /// The kind-matching that DOES matter is unchanged: a build cannot support
+    /// a test-count claim. Without this the fix above could be "accept
+    /// anything", which is the false green the gate exists to catch.
+    #[test]
+    fn a_build_still_cannot_support_a_test_count() {
+        assert_eq!(
+            fires(A_TEST_CLAIM, &["cargo build"], 3),
+            Some(ClaimKind::Verification),
+            "a green build says nothing about how many tests passed"
+        );
+        assert_eq!(
+            fires("clippy clean.", &["cargo test"], 3),
+            Some(ClaimKind::Verification),
+            "...and a test run says nothing about clippy"
+        );
     }
 
     #[test]

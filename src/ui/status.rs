@@ -113,7 +113,13 @@ impl StatusLine {
         // (dirge-l4rp, dirge-cx7t).
         let ctx =
             crate::agent::agent_loop::context_manager::effective_ctx_max(session.context_window);
-        let used = session.total_estimated_tokens;
+        // dirge-hwk9.2: the provider's prompt count for the last request when
+        // there has been one — the same number the fold tiers divide by. The
+        // estimate stands in only before the first response. See
+        // `Session::last_prompt_tokens`.
+        let used = session
+            .last_prompt_tokens
+            .unwrap_or(session.total_estimated_tokens);
         let pct = (used * 100).checked_div(ctx).unwrap_or(0);
         let pct_str = if pct >= 90 {
             format!("{pct}% fold!")

@@ -95,8 +95,28 @@ pub(crate) fn build_left_panel_info(
     activity: &[String],
     git: Option<GitSnapshot>,
 ) -> LeftPanelInfo {
-    let used = session.total_estimated_tokens;
-    let window = session.context_window;
+    // dirge-hwk9.2: report the two quantities COMPACTION compares, not two
+    // others that happen to be nearby.
+    //
+    // The gauge used to divide `session.total_estimated_tokens` — a chars/4
+    // heuristic, plus per-tool-call overhead, over the whole persisted
+    // transcript — by the model's advertised window. Neither is what the
+    // context manager reads. It compares the API's `prompt_tokens` for the
+    // REQUEST (whose oversized tool results have been snipped and whose old
+    // turns have been folded into a summary) against `effective_ctx_max`
+    // (the window capped by the configured working budget). Reported live:
+    // "226.9k/128.0k, 100%, compaction soon" with exactly one compaction —
+    // consistent with a request comfortably under the fold threshold the
+    // whole time, because it was.
+    //
+    // Before the first response there is no `prompt_tokens` yet, so the
+    // estimate stands in — it is the same number the turn-start fold tier
+    // uses at that point, so the gauge still tracks the live decision.
+    let window =
+        crate::agent::agent_loop::context_manager::effective_ctx_max(session.context_window);
+    let used = session
+        .last_prompt_tokens
+        .unwrap_or(session.total_estimated_tokens);
     let pct = ((used.saturating_mul(100)).checked_div(window).unwrap_or(0)).min(100) as u16;
     LeftPanelInfo {
         context: ContextGauge {
@@ -254,6 +274,81 @@ mod tests {
             env: HashMap::new(),
             allow_external_paths: false,
         }
+    }
+
+    /// dirge-hwk9.2: the context gauge must report the numbers COMPACTION
+    /// compares, so "compaction soon" means compaction is soon.
+    ///
+    /// It divided `total_estimated_tokens` — a chars/4 heuristic plus
+    /// per-tool-call overhead, over the whole persisted transcript, tool
+    /// results at full length — by the model's advertised window. The context
+    /// manager compares the provider's `prompt_tokens` for the REQUEST, whose
+    /// oversized results have been snipped and whose old turns are a summary,
+    /// against `effective_ctx_max`. Reported live: "226.9k/128.0k, 100%,
+    /// compaction soon" with one compaction, on a run whose requests were
+    /// never close to the threshold.
+    ///
+    /// The estimate here is deliberately absurd relative to the real prompt,
+    /// because a fixture where the two agree cannot tell which one is being
+    /// read.
+    #[test]
+    fn the_context_gauge_reports_what_compaction_compares() {
+        let mut session = crate::session::Session::new("p", "m", 128_000);
+        session.total_estimated_tokens = 226_900;
+        session.record_token_usage(20_000, 15_000, 0, 500);
+
+        let info = build_left_panel_info(&session, &[], None);
+        assert_eq!(
+            info.context.used, 20_000,
+            "the gauge must read the last request's prompt tokens, not the \
+             transcript estimate"
+        );
+        assert!(
+            info.context.pct < 20,
+            "a 20k request against a 128k window is not a full context; got {}%",
+            info.context.pct
+        );
+        assert!(
+            !info.context.fold_soon,
+            "and it must not warn of a fold that is nowhere near"
+        );
+    }
+
+    /// Before the first response there is no provider count, so the estimate
+    /// stands in — otherwise the gauge would read 0% on a resumed session
+    /// carrying a large transcript, which is the same failure pointed the
+    /// other way.
+    #[test]
+    fn the_gauge_falls_back_to_the_estimate_before_the_first_response() {
+        let mut session = crate::session::Session::new("p", "m", 128_000);
+        session.total_estimated_tokens = 96_000;
+        let info = build_left_panel_info(&session, &[], None);
+        assert_eq!(info.context.used, 96_000);
+        assert!(
+            info.context.fold_soon,
+            "75% of the window with nothing else to go on is a fold warning"
+        );
+    }
+
+    /// The denominator is `effective_ctx_max`, so a configured working budget
+    /// smaller than the window is what the gauge divides by — the loop folds
+    /// against the budget, and a gauge showing the raw window would under-read
+    /// every run that sets one.
+    #[test]
+    fn the_gauge_divides_by_the_budget_the_loop_folds_against() {
+        let mut session = crate::session::Session::new("p", "m", 1_000_000);
+        session.record_token_usage(200_000, 0, 0, 10);
+        let info = build_left_panel_info(&session, &[], None);
+        // Default context_target is 250k, so a 1M window is capped to it.
+        assert_eq!(
+            info.context.window,
+            crate::agent::agent_loop::context_manager::effective_ctx_max(1_000_000)
+        );
+        assert!(
+            info.context.pct >= 75,
+            "200k of a 250k budget is a fold warning, not 20% of a 1M window; got {}%",
+            info.context.pct
+        );
     }
 
     /// GH #541: a server that fails its initial connect must still show

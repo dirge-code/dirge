@@ -79,6 +79,31 @@ pub const FINALIZATION_TAGS: &[&str] = &[
     super::run::OPEN_ISSUES_NUDGE_TAG,
 ];
 
+/// Prefix on the `SystemNotice` that mirrors an intervention to consumers
+/// which never see the tagged message (dirge-hwk9.5).
+///
+/// Shared so the producer (`run::emit_harness_notices`) and the TUI, which
+/// must recognise its own mirror to avoid rendering the body twice, cannot
+/// drift — the same reason this module exists at all.
+pub const NOTICE_PREFIX: &str = "harness intervention: ";
+
+/// The summary line of an intervention notice, without the body.
+///
+/// The notice carries `"harness intervention: {summary}\n{body}"` because
+/// headless consumers see only it — `--print` renders `SystemNotice` and
+/// ignores `UserMessage` entirely. The TUI sees BOTH, and renders the body
+/// from the message (which is also the copy `dirge-m10x` guarantees survives
+/// the next turn's stream anchor), so showing the notice in full puts the
+/// instruction on screen twice with a summary above the first copy.
+///
+/// `None` for any notice that is not an intervention mirror — the max-turns
+/// cap and friends are shown in full.
+pub fn notice_summary(content: &str) -> Option<&str> {
+    content
+        .starts_with(NOTICE_PREFIX)
+        .then(|| content.split('\n').next().unwrap_or(content))
+}
+
 /// The harness tag `text` carries, if any.
 pub fn tag_of(text: &str) -> Option<&'static str> {
     let t = text.trim_start();

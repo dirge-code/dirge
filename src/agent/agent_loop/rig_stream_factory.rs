@@ -842,6 +842,19 @@ pub fn loop_tool_to_rig_definition(tool: &dyn LoopTool) -> ToolDefinition {
         .flat_parameters()
         .cloned()
         .unwrap_or_else(|| tool.parameters().clone());
+    // dirge-tva8: on a small window, ship breadcrumb schemas — first sentence
+    // of each description, everything structural untouched. Measured, the full
+    // tool surface is 16k tokens built-in and 32.6k with MCP servers, the
+    // latter larger than a 32k window in its entirety. Decided here because
+    // this is the single point every tool becomes a provider schema, so no
+    // caller can be built that forgets. See `compact_schema`.
+    if super::compact_schema::in_force() {
+        return ToolDefinition {
+            name: tool.name().to_string(),
+            description: super::compact_schema::compact_description(tool.description()),
+            parameters: super::compact_schema::compact_parameters(&parameters),
+        };
+    }
     ToolDefinition {
         name: tool.name().to_string(),
         description: tool.description().to_string(),
