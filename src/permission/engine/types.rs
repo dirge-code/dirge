@@ -188,16 +188,64 @@ impl Resource {
     pub fn deny_match_candidates(&self) -> Vec<&str> {
         match self {
             Resource::Command { raw, .. } => {
+                let mut out = vec![raw.as_str()];
                 let stripped = strip_exec_prefix(raw);
-                if stripped.is_empty() || stripped == raw.as_str() {
-                    vec![raw]
-                } else {
-                    vec![raw, stripped]
+                if !stripped.is_empty() && stripped != raw.as_str() {
+                    out.push(stripped);
                 }
+                // dirge-e1nv: and the module form, so a deny written against a
+                // tool still governs it when run as `python -m <tool>`. The
+                // ALLOW side names that spelling explicitly
+                // (`PYTHON_MODULE_TOOLS`); without the matching deny view those
+                // rules would be a way around a deny that used to hold.
+                let module = strip_module_runner(stripped);
+                if !module.is_empty() && module != stripped {
+                    out.push(module);
+                }
+                out
             }
             _ => self.match_candidates(),
         }
     }
+}
+
+/// `python -m <module> …` → `<module> …`, as a subslice of `cmd`.
+///
+/// Returns `cmd` unchanged when it is not a module-runner invocation. The
+/// interpreter must be a bare `python`/`python3` (no path, no version suffix) —
+/// `./python3 -m pytest` runs a cwd-local binary and is not the same command,
+/// which is the distinction dirge-8zem draws for `./env`. The module must be a
+/// plain name so a path-ish operand can never be peeled into position.
+pub fn strip_module_runner(cmd: &str) -> &str {
+    let mut toks: Vec<(usize, &str)> = Vec::new();
+    let bytes = cmd.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && toks.len() < 3 {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        let start = i;
+        while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        toks.push((start, &cmd[start..i]));
+    }
+    let [(_, interp), (_, dash_m), (mod_at, module)] = toks[..] else {
+        return cmd;
+    };
+    if !matches!(interp, "python" | "python3") || dash_m != "-m" {
+        return cmd;
+    }
+    // A module name, not a path or a flag: `python -m ./x` and `python -m -c`
+    // must not peel.
+    if module.is_empty() || module.starts_with('-') || module.contains('/') || module.contains('\\')
+    {
+        return cmd;
+    }
+    &cmd[mod_at..]
 }
 
 /// The leading token of the real command, with env assignments and exec
