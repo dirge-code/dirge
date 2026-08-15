@@ -92,6 +92,9 @@ impl ClaimKind {
 pub(crate) struct Claims {
     pub test_claim: bool,
     pub build_or_lint_claim: bool,
+    /// A verification claim naming no kind of command ("exit 0"). Satisfied by
+    /// ANY observed verification — see [`claims_generic_verification`].
+    pub generic_claim: bool,
     pub change_claim: bool,
 }
 
@@ -109,6 +112,7 @@ pub(crate) fn scan_final_answer(text: &str) -> Claims {
         }
         claims.test_claim |= claims_test_result(sentence);
         claims.build_or_lint_claim |= claims_build_or_lint_result(sentence);
+        claims.generic_claim |= claims_generic_verification(sentence);
         claims.change_claim |= claims_change(sentence);
     }
     claims
@@ -129,7 +133,12 @@ pub(crate) fn unsupported_claims(
     files_mutated: usize,
 ) -> Option<ClaimKind> {
     let (ran_test, ran_build_or_lint) = observed_kinds(observed);
-    if (claims.test_claim && !ran_test) || (claims.build_or_lint_claim && !ran_build_or_lint) {
+    if (claims.test_claim && !ran_test)
+        || (claims.build_or_lint_claim && !ran_build_or_lint)
+        // dirge-hwk9.6: a kind-agnostic claim needs SOME verification, not a
+        // particular one.
+        || (claims.generic_claim && !ran_test && !ran_build_or_lint)
+    {
         return Some(ClaimKind::Verification);
     }
     if claims.change_claim && files_mutated == 0 {
@@ -372,12 +381,27 @@ fn claims_build_or_lint_result(sentence: &str) -> bool {
         "clippy is clean",
         "fmt clean",
         "formatted clean",
-        "exit 0",
-        "exit code 0",
         "compiles",
         "builds clean",
     ];
     BUILD_OR_LINT_GATES.iter().any(|g| lower.contains(g))
+}
+
+/// A verification claim that names no KIND of command (dirge-hwk9.6).
+///
+/// "exit 0" is a claim about whatever ran, and which gate it refers to is not
+/// recoverable from the phrase. It used to sit in the build/lint list, so a
+/// model that ran its tests cleanly and reported the exit status — which is
+/// precisely what the verify nudge asks for when it declines a masked run —
+/// was told no build command had run. The harness asked for a number and then
+/// penalised the answer.
+///
+/// Kind-matching stays where it earns its keep: `cargo build` still cannot
+/// support "N passed", and a test run still cannot support "clippy clean".
+fn claims_generic_verification(sentence: &str) -> bool {
+    let lower = sentence.to_ascii_lowercase();
+    const GENERIC_GATES: &[&str] = &["exit 0", "exit code 0", "exit status 0"];
+    GENERIC_GATES.iter().any(|g| lower.contains(g))
 }
 
 fn claims_change(sentence: &str) -> bool {
@@ -564,6 +588,55 @@ mod tests {
                 "...and so must the claim gate: `{cmd}`"
             );
         }
+    }
+
+    /// dirge-hwk9.6: "exit 0" names no KIND of command, so a test run supports
+    /// it.
+    ///
+    /// Measured on deepseek: the model ran a clean `python3 -m pytest -q`,
+    /// then wrote "Confirmed with a real exit status: `22 passed in 0.01s`,
+    /// exit 0." The claim gate fired, because "exit 0" sat in the
+    /// build/lint list and no build command had run.
+    ///
+    /// It is the verify nudge that asks for the exit status in the first
+    /// place — so the harness told the model to report a number and then
+    /// penalised it for doing so. Kind-matching exists to stop `cargo build`
+    /// supporting "N passed"; a phrase that names no kind should be satisfied
+    /// by any verification that ran.
+    #[test]
+    fn a_bare_exit_status_is_supported_by_any_verification() {
+        // The sentence deepseek actually produced. It makes TWO claims — a
+        // test count and a bare exit status — and a test run supports both.
+        let said = "Confirmed with a real exit status: 22 passed, exit 0.";
+        assert_eq!(fires(said, &["python3 -m pytest -q"], 3), None);
+
+        // The exit status ALONE names no kind, so either sort of verification
+        // supports it.
+        let bare = "The command finished with exit 0.";
+        assert_eq!(fires(bare, &["python3 -m pytest -q"], 3), None);
+        assert_eq!(fires(bare, &["cargo build"], 3), None);
+
+        // ...and with NOTHING run it still fires — the claim is unsupported,
+        // not unconditionally allowed.
+        assert_eq!(fires(bare, &[], 3), Some(ClaimKind::Verification));
+        assert_eq!(fires(said, &[], 3), Some(ClaimKind::Verification));
+    }
+
+    /// The kind-matching that DOES matter is unchanged: a build cannot support
+    /// a test-count claim. Without this the fix above could be "accept
+    /// anything", which is the false green the gate exists to catch.
+    #[test]
+    fn a_build_still_cannot_support_a_test_count() {
+        assert_eq!(
+            fires(A_TEST_CLAIM, &["cargo build"], 3),
+            Some(ClaimKind::Verification),
+            "a green build says nothing about how many tests passed"
+        );
+        assert_eq!(
+            fires("clippy clean.", &["cargo test"], 3),
+            Some(ClaimKind::Verification),
+            "...and a test run says nothing about clippy"
+        );
     }
 
     #[test]

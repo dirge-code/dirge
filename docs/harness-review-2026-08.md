@@ -126,7 +126,9 @@ into a visible `ThinkingDelta` series.
 4. `nudge_progress_stall` fired twice — the second at 618.0s of a 618.1s run —
    telling a model with a green suite it had made no progress for three turns.
 
-Filed, not patched. **My first attempt at a fix was wrong and is worth
+Fixed by standing the stall checkpoint down while a masked decline is
+outstanding — the verify nudge owns that state and has the actionable message.
+**My first attempt was wrong and is worth
 recording:** I proposed clearing `edits_since_verify` on a masked decline,
 citing the verifier's own rule that "any verification attempt clears the
 mid-run counter". Two things killed it. The stall nudge reads the *latched
@@ -153,21 +155,74 @@ the status, and masks anyway. The nudge is now positional ("the build/test
 command LAST, nothing after it") and names the three idioms that have actually
 shown up.
 
+## Phase 6 — three models, so the fixes aren't shaped to one (done)
+
+The same 22-test task on qwen3.8-27b (local, llama.cpp), deepseek-v4-flash and
+glm-5.3. All three passed 22/22 and touched only `duration.py`.
+
+**Every one of them piped its test output through `tail`.** That is the single
+most useful result here: masking is not a small-model quirk, it is what models
+do, and the guard that declines it therefore fires on everyone. Three of the
+four observed nudges produced a clean re-run on the first try (qwen with the
+reworded message, deepseek, glm); the fourth was qwen under the earlier
+wording, which is what motivated the rewording.
+
+The cross-model runs also found `dirge-hwk9.6`, and it was self-inflicted:
+deepseek ran a clean `pytest -q` and reported *"Confirmed with a real exit
+status: 22 passed in 0.01s, exit 0"* — and the claim gate fired, because
+`"exit 0"` sat in the build/lint list and no build had run. The verify nudge is
+what asks for the exit status in the first place, so one guard requested a
+number and another penalised the answer. `"exit 0"` is now kind-agnostic:
+satisfied by any observed verification, while a build still cannot support
+"N passed" and a test cannot support "clippy clean".
+
+Two fixes were confirmed live rather than only in tests: `glm-5.3` resolved to
+a 250k effective window (it would have been the 128k fallback before), and
+`[stall]` appeared as a properly attributed intervention in the deepseek trace,
+which is `dirge-hwk9.5` working.
+
+## The small-window path (dirge-tva8, done)
+
+Breadcrumb tool schemas below a 48k window: each tool's description trimmed to
+its first sentence, each parameter's to a clause, everything structural — names,
+types, enums, required-ness — untouched. No tool is dropped; a model that
+cannot see a tool cannot ask for it, and that failure is silent and looks like
+incapability, whereas losing the prose about *when* to prefer a tool degrades
+gracefully.
+
+Measured on the same task and model at a 32k window: **16,202 → 12,249 prompt
+tokens**, context peak 51% → 39.5%. The model still reached for `list_symbols`
+unprompted and answered correctly, which is the part that mattered — the long
+descriptions exist to improve tool *selection*, and this trades some of that
+for fitting at all.
+
+`compact_tool_schemas`: `auto` (default) / `on` / `off`. Sized against the same
+window the session gauge and compaction use, passed in rather than re-derived.
+
+## What the TUI actually renders
+
+Tracing the *front-end* event stream (not just the loop's decisions) showed
+every harness intervention rendering its body **twice** in the TUI: the notice
+carries `"harness intervention: {summary}\n{body}"` because headless sees only
+it — `--print` renders `SystemNotice` and ignores `UserMessage` entirely —
+while the TUI gets both and renders the body from the message as well. The
+notice now shows its summary line only in the TUI; the body stays on the
+message path, which is the copy `dirge-m10x` guarantees survives the next
+turn's stream anchor. Headless output is unchanged.
+
+Fixing that is what made `dirge-hwk9.5` safe: boundary nudges can now emit
+`MessageStart`/`MessageEnd` like the finalization path without putting the body
+on screen a third time.
+
 ## Still open
 
-`dirge-tva8` P0 — **dirge's own prompt does not fit a small window.** Measured,
-same task and model, two configs:
-
-| tools | first request |
-| --- | --- |
-| 34 (built-in only) | 16,172 prompt tokens |
-| 75 (plus global MCP servers) | 32,621 prompt tokens |
-
-32,621 exceeds a 32k window in its entirety: the run cannot take a single turn.
-Nothing checks the assembled prompt against the resolved window at run start,
-and nothing trims the tool surface for a small-window model. Now *visible*
-rather than silent, but not solved — and the two halves (a startup check;
-what to do about the tool surface) are separable decisions.
+`dirge-hwk9.7` — the stall checkpoint tends to fire as a *successful* run
+concludes: qwen at 618.0s of a 618.1s run, deepseek at 55.3s of 55.4s, both
+with every test passing. The monitor is behaving to spec — re-running tests is
+not a todo closed, a new file touched, or a fresh green edge — but "name what
+is blocking you" delivered as the run ends is spent on a model that is
+finishing. Whether a boundary following a verification should count differently
+from an idle one is a decision, not a patch.
 
 ## Method notes
 
