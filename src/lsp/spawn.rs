@@ -154,6 +154,21 @@ impl ProcessSpawner {
                 init_options: Value::Null,
             },
         );
+        // Swift (GH #778). `sourcekit-lsp` resolves via PATH: macOS ships a
+        // `/usr/bin/sourcekit-lsp` shim that forwards to the selected Xcode
+        // toolchain, and the Linux toolchain tarballs put the real binary on
+        // PATH. Defaulting to the bare name rather than `xcrun sourcekit-lsp`
+        // keeps one entry working on both platforms; a non-default toolchain
+        // overrides via `lsp.servers.swift.command`.
+        m.insert(
+            "swift".to_string(),
+            ProcessCommand {
+                program: PathBuf::from("sourcekit-lsp"),
+                args: vec![],
+                env: vec![],
+                init_options: Value::Null,
+            },
+        );
         // Dafny CLI's built-in language server, over stdio. `dafny` (the
         // apphost on PATH) is equivalent to `dotnet Dafny.dll`; we default
         // to it for portability. Setups with only the DLL override via

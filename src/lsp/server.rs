@@ -208,6 +208,21 @@ fn cfamily_root(file: &Path, stop_at: &Path) -> Option<PathBuf> {
     )
 }
 
+/// SwiftPM's manifest is the reliable marker. Xcode projects are DIRECTORIES
+/// (`Foo.xcodeproj`, `Foo.xcworkspace`) rather than files and their names vary,
+/// so they can't be matched by `nearest_root`'s filename list; a SwiftPM
+/// package inside an Xcode workspace still resolves via `Package.swift`, and a
+/// pure-Xcode tree falls back to the worktree boundary, which is what
+/// sourcekit-lsp wants anyway when there is no `compile_commands.json`.
+fn swift_root(file: &Path, stop_at: &Path) -> Option<PathBuf> {
+    nearest_root(
+        file,
+        stop_at,
+        &["Package.swift", "compile_commands.json"],
+        &[],
+    )
+}
+
 fn ruby_root(file: &Path, stop_at: &Path) -> Option<PathBuf> {
     nearest_root(
         file,
@@ -307,6 +322,21 @@ pub fn builtin_servers() -> Vec<ServerInfo> {
             extensions: owned(&["dfy"]),
             filenames: owned(&[]),
             root: dafny_root,
+        },
+        // Swift (GH #778): sourcekit-lsp ships with the toolchain — macOS has
+        // a `/usr/bin/sourcekit-lsp` shim that forwards to the active Xcode,
+        // and Linux toolchains put it on PATH — so anyone writing Swift already
+        // has it. Best-effort like the rest: no binary, spawn errors, and the
+        // broken-server backoff takes over.
+        //
+        // `.swift` only. sourcekit-lsp also answers for C-family files in a
+        // mixed target, but `clangd` claims those above and is the better
+        // answer for a C file; earlier entries win ties.
+        ServerInfo {
+            id: "swift",
+            extensions: owned(&["swift"]),
+            filenames: owned(&[]),
+            root: swift_root,
         },
         // CMake: cmake-language-server speaks LSP over stdio.
         // Best-effort like the others — if `cmake-language-server`
@@ -775,5 +805,43 @@ mod tests {
             .unwrap();
         let root = (server.root)(&file, &t.root).unwrap();
         assert_eq!(root, t.root_canon());
+    }
+}
+
+#[cfg(test)]
+mod swift_tests {
+    use super::*;
+
+    /// GH #778: a `.swift` file resolves to the sourcekit-lsp descriptor, and
+    /// the spawner knows how to launch it. Both halves are needed — a server
+    /// claiming the extension with no command entry can never start.
+    #[test]
+    fn swift_files_resolve_to_sourcekit_lsp() {
+        let swift = builtin_servers()
+            .into_iter()
+            .find(|s| s.id == "swift")
+            .expect("swift is a built-in server");
+        assert!(swift.extensions.iter().any(|e| e == "swift"));
+
+        let commands = crate::lsp::spawn::ProcessSpawner::default_commands();
+        let cmd = commands.get("swift").expect("swift has a launch command");
+        assert_eq!(cmd.program.to_str(), Some("sourcekit-lsp"));
+    }
+
+    /// `clangd` claims the C-family extensions and is listed first, so a mixed
+    /// Swift/ObjC target still sends `.m` to clangd. Earlier entries win ties;
+    /// this pins that Swift did not widen its claim.
+    #[test]
+    fn swift_does_not_claim_c_family_files() {
+        let swift = builtin_servers()
+            .into_iter()
+            .find(|s| s.id == "swift")
+            .expect("swift is a built-in server");
+        for ext in ["c", "h", "m", "mm", "cpp"] {
+            assert!(
+                !swift.extensions.iter().any(|e| e == ext),
+                "swift must not claim .{ext}"
+            );
+        }
     }
 }
