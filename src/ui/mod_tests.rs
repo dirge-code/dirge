@@ -1398,3 +1398,96 @@ fn panel_refresh_due_past_interval_is_true() {
     let past = now - PANEL_REFRESH_INTERVAL;
     assert!(panel_refresh_due(Some(past), now, PANEL_REFRESH_INTERVAL));
 }
+
+/// dirge-vpma.18: the resting face must never be painted where a runner was
+/// just installed.
+///
+/// `install_into` marks the run active; setting `AvatarState::Idle` right
+/// after it showed the idle face for the whole time-to-first-token while the
+/// status line said busy. Same class GH #621 fixed for the review phase, which
+/// is why `AvatarState::settled(is_running)` exists — these sites simply never
+/// adopted it. Encoded as a scan because the sites are a family (deferred
+/// prompt run, compaction Submit/Retry/Continue, plan kickoff) and the next
+/// one would otherwise be added the same way.
+#[test]
+fn no_runner_install_is_followed_by_the_idle_face() {
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui/mod.rs"),
+    )
+    .expect("ui/mod.rs must be readable");
+
+    let lines: Vec<&str> = src.lines().collect();
+    let mut offenders = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        if !line.contains("install_into(") {
+            continue;
+        }
+        // Look at the handful of statements that follow the install. A bare
+        // `Idle` there contradicts the state the install just established.
+        for probe in lines.iter().skip(i + 1).take(6) {
+            if probe.contains("AvatarState::Idle") {
+                offenders.push(i + 1);
+                break;
+            }
+            // Stop at the end of the block.
+            if probe.trim() == "}" {
+                break;
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "runner installed then the idle avatar painted at ui/mod.rs line(s) {offenders:?} \
+         — use AvatarState::settled(ui.is_running)",
+    );
+}
+
+/// The scan must be able to see a real install, or it passes vacuously the
+/// moment the call is renamed or the file moves.
+#[test]
+fn the_avatar_scan_can_actually_see_an_install() {
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui/mod.rs"),
+    )
+    .expect("ui/mod.rs must be readable");
+    assert!(
+        src.matches("install_into(").count() >= 3,
+        "the scan found no runner installs to check — did the call get renamed?",
+    );
+    assert!(
+        src.contains("AvatarState::settled(ui.is_running)"),
+        "no site uses the settled face; the scan would pass vacuously",
+    );
+}
+
+/// dirge-vpma.21: Ctrl+C must tear down a `!`/`!!` shell run, not just the
+/// agent runners.
+///
+/// Once the shell box is mounted keys route to the PTY, but during the
+/// ~120ms pre-mount grace window Ctrl+C reaches the busy-interrupt branch.
+/// That branch cleared `is_running` and dropped the queued messages while the
+/// child kept running — so the next typed prompt sailed through the busy gate
+/// and ran an agent turn alongside the live shell.
+#[test]
+fn the_interrupt_branch_tears_down_a_shell_session() {
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui/mod.rs"),
+    )
+    .expect("ui/mod.rs must be readable");
+    let branch_start = src
+        .find("dirge-vpma.21")
+        .expect("the interrupt branch must handle the shell session");
+    let branch = &src[branch_start..];
+    assert!(
+        branch.contains("ui.shell_session.take()"),
+        "the interrupt branch does not take the shell session",
+    );
+    // The kill must actually be requested, not just the handle dropped: a
+    // dropped handle leaves the child running under its own session leader.
+    let window = &branch[..branch.len().min(2000)];
+    assert!(
+        window.contains("s.interrupt.take()"),
+        "the shell child is never signalled — dropping the handle leaves the \
+         process group alive",
+    );
+}
