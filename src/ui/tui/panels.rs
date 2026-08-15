@@ -1489,8 +1489,6 @@ mod tests {
             }),
             threads: vec![],
             frames: vec![],
-            scopes: vec![],
-            breakpoints: vec![],
             variables: vec![
                 Variable {
                     name: "x".into(),
