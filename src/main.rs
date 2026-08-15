@@ -777,9 +777,11 @@ async fn main() -> anyhow::Result<()> {
     // `file_excerpt_cap_tokens` in config.json to raise it for a codebase of
     // large files, or to 3000 to hold reads to the generic tool-output cap.
     crate::agent::compression::init_file_excerpt_cap(cfg.file_excerpt_cap_tokens);
-    // Honor an explicit `context_window` config override in the loop's
-    // window math (it previously read only the built-in model table).
-    crate::agent::agent_loop::context_manager::init_context_window_override(cfg.context_window);
+    // The loop's `context_window` override is installed later, once the
+    // provider and model are final — a per-provider window (GH #772) cannot be
+    // resolved before the provider is known, and a resumed session can replace
+    // it. See the `init_context_window_override` call after
+    // `resolve_startup_model`.
     // Incremental checkpoint is persisted only by the interactive
     // session-rotation path; the headless modes have no consumer for the
     // CheckpointRefresh event, so firing it there would just burn
@@ -853,7 +855,7 @@ async fn main() -> anyhow::Result<()> {
     let mut session = session::Session::new(
         &provider,
         &model,
-        cfg.resolve_context_window(model.as_str()),
+        cfg.resolve_context_window_for(&provider, model.as_str()),
     );
     // dirge-ovjk: track whether `session` ends up loaded from disk. A fresh
     // session has its model resolved from the known explicit-vs-default
@@ -1226,6 +1228,11 @@ async fn main() -> anyhow::Result<()> {
                             // inherit the top-level default
                             // (`stream_chunk_timeout_secs` or 300s).
                             stream_chunk_timeout_secs: None,
+                            // Nor a context window — `harness/register-provider`
+                            // carries no such field, so these fall through to
+                            // the top-level key and the model table like any
+                            // provider that does not set one (GH #772).
+                            context_window: None,
                             // PROV-1: plugin-registered providers
                             // can't opt into HTTP. If a plugin
                             // declares a non-https base_url the
@@ -1315,7 +1322,20 @@ async fn main() -> anyhow::Result<()> {
     let model = CompactString::new(resolved_model);
     session.model = model.clone();
     session.model_explicit = resolved_explicit;
-    session.context_window = cfg.resolve_context_window(model.as_str());
+    session.context_window = cfg.resolve_context_window_for(&provider, model.as_str());
+    // GH #772: the loop's compaction math and the session's context gauge must
+    // read the SAME window, or the meter describes a fold that never happens.
+    // Installed here rather than at startup because this is the first point
+    // where the provider and the model are both final — a resumed session can
+    // replace either.
+    //
+    // Deliberately `configured_context_window` and not the fully-resolved
+    // value: with `None` the loop re-resolves from the model table on every
+    // run, so a mid-session `/model` switch tracks the new model. Freezing a
+    // number here would pin the first model's window to every later one.
+    crate::agent::agent_loop::context_manager::init_context_window_override(
+        cfg.configured_context_window(&provider),
+    );
 
     // dirge-ykeu Phase 4: pre-resolve user agent profiles into subagent
     // routes (model + system prompt) and install them process-globally so the

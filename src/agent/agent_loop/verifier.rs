@@ -838,6 +838,15 @@ fn exit_code_line_is_failure(line: &str) -> bool {
 /// (`npm install`, `cargo add`) is disqualified outright even though its
 /// tool name is a marker (dirge-eg37). Splitting on `&& || ; |` and
 /// newlines means one real build in a chain still counts.
+/// Test-only view of [`is_verification_command`], so the claim gate's tests can
+/// assert the two recognisers agree about what ran (dirge-hwk9.3). The live
+/// failure was exactly a disagreement: this one counted
+/// `python3 -m pytest` and the claim gate did not.
+#[cfg(test)]
+pub(crate) fn is_verification_command_for_test(command: &str) -> bool {
+    is_verification_command(command)
+}
+
 fn is_verification_command(command: &str) -> bool {
     command
         .split(['&', '|', ';', '\n'])
@@ -857,6 +866,11 @@ const WORD_MARKERS: &[&str] = &[
     "pnpm",
     "yarn",
     "pytest",
+    // dirge-hwk9.3: `python -m unittest` is the stdlib runner and was in
+    // neither recogniser, so a project using it got nagged to verify after
+    // verifying. "test" is already a marker but matches whole words only, and
+    // "unittest" is not "test".
+    "unittest",
     "tox",
     "make",
     "gradle",

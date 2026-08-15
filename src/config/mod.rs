@@ -79,6 +79,20 @@ pub struct ProviderEntry {
     /// units / semantics as the top-level `stream_chunk_timeout_secs`
     /// but takes precedence for this specific provider.
     pub stream_chunk_timeout_secs: Option<u64>,
+    /// Context window (tokens) for this provider's model, overriding both
+    /// the built-in model table and the top-level `context_window`
+    /// (GH #772).
+    ///
+    /// The top-level key applies to every provider at once, so with more
+    /// than one configured there was no way to correct one model's window
+    /// without corrupting the others'. That matters more than it sounds:
+    /// this number is the denominator of every compaction tier, so a wrong
+    /// one folds a context with room to spare, or fails to fold one without.
+    ///
+    /// Set it for a local model, whose window is whatever the server was
+    /// started with (`llama-server -c 65536`) and which the table cannot
+    /// know — a local model is named by its file path.
+    pub context_window: Option<u64>,
     /// Per-provider model options. Free-form map; known keys are
     /// honored by the request builder, unknown keys are ignored.
     /// Currently honored: `temperature` (f64, overrides cfg/CLI for
@@ -1676,6 +1690,50 @@ impl Config {
     ///
     /// `model` is the resolved model id (after CLI / config / default
     /// resolution). Passing an empty string falls through to (3).
+    /// Resolve the context window for a model reached through a named
+    /// provider (GH #772). Precedence:
+    ///   1. `providers[name].context_window`
+    ///   2. top-level `context_window`
+    ///   3. the per-model static table
+    ///   4. [`DEFAULT_CONTEXT_WINDOW`]
+    ///
+    /// An unknown or empty provider name falls through past (1), so this is
+    /// safe to call wherever the provider is not known.
+    pub fn resolve_context_window_for(&self, provider: &str, model: &str) -> u64 {
+        // Case-insensitive for the same reason every other per-provider
+        // override is: `--provider Qwen-Local` builds a client fine, and
+        // silently missing the override is the failure being fixed.
+        let lower = provider.to_ascii_lowercase();
+        if let Some(v) = self
+            .providers
+            .as_ref()
+            .and_then(|m| m.get(provider).or_else(|| m.get(&lower)))
+            .and_then(|p| p.context_window)
+        {
+            return v;
+        }
+        self.resolve_context_window(model)
+    }
+
+    /// The EXPLICITLY configured context window for `provider`, if any —
+    /// the per-provider key, else the top-level one. No table lookup and no
+    /// default.
+    ///
+    /// Separate from [`resolve_context_window_for`](Self::resolve_context_window_for)
+    /// because the loop's process-wide override must stay `None` when nothing
+    /// was configured: with `None` the loop re-resolves the window from the
+    /// model table on every run, so a mid-session `/model` switch tracks the
+    /// new model. Freezing a resolved number there would silently pin the
+    /// first model's window to every later one.
+    pub fn configured_context_window(&self, provider: &str) -> Option<u64> {
+        let lower = provider.to_ascii_lowercase();
+        self.providers
+            .as_ref()
+            .and_then(|m| m.get(provider).or_else(|| m.get(&lower)))
+            .and_then(|p| p.context_window)
+            .or(self.context_window)
+    }
+
     pub fn resolve_context_window(&self, model: &str) -> u64 {
         if let Some(v) = self.context_window {
             return v;
@@ -3247,6 +3305,109 @@ mod model_context_tests {
     fn an_empty_model_id_resolves_to_the_default_without_naming_a_model() {
         let cfg = Config::default();
         assert_eq!(cfg.resolve_context_window(""), DEFAULT_CONTEXT_WINDOW);
+    }
+
+    /// GH #772 / dirge-hwk9.1: a per-provider `context_window` beats the
+    /// top-level key, which beats the table, which beats the default.
+    ///
+    /// The top-level key applies to EVERY provider at once, so with more than
+    /// one configured — the common case — there was no way to correct one
+    /// model's window without corrupting the others'. Correcting a local
+    /// model's window this session needed a whole separate config directory
+    /// for exactly this reason.
+    ///
+    /// All four rungs are asserted from one config, because the bug this
+    /// guards against is a rung being skipped, and a test that exercises one
+    /// rung at a time cannot see that.
+    #[test]
+    fn a_per_provider_context_window_wins_over_the_top_level_key() {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "qwen-local".to_string(),
+            ProviderEntry {
+                context_window: Some(65_536),
+                ..Default::default()
+            },
+        );
+        // Configured, but says nothing about the window — must fall through
+        // rather than resolve to zero or to the other provider's value.
+        providers.insert("glm".to_string(), ProviderEntry::default());
+        let cfg = Config {
+            context_window: Some(200_000),
+            providers: Some(providers),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            cfg.resolve_context_window_for("qwen-local", "some-local.gguf"),
+            65_536,
+            "the provider's own window wins"
+        );
+        assert_eq!(
+            cfg.resolve_context_window_for("glm", "glm-5.3"),
+            200_000,
+            "a provider without one falls through to the top-level key"
+        );
+        assert_eq!(
+            cfg.resolve_context_window_for("", "glm-5.3"),
+            200_000,
+            "so does an unknown provider name"
+        );
+
+        // ...and with no top-level key the table and default still apply.
+        let cfg = Config {
+            providers: cfg.providers.clone(),
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.resolve_context_window_for("qwen-local", "some-local.gguf"),
+            65_536,
+            "the provider's window applies with no top-level key set"
+        );
+        assert_eq!(
+            cfg.resolve_context_window_for("glm", "glm-5.3"),
+            1_000_000,
+            "otherwise the model table"
+        );
+        assert_eq!(
+            cfg.resolve_context_window_for("glm", "who-knows"),
+            DEFAULT_CONTEXT_WINDOW,
+            "and finally the default"
+        );
+    }
+
+    /// Provider lookup is case-insensitive, matching every other per-provider
+    /// override — `--provider Qwen-Local` builds a client fine, and silently
+    /// missing the override is the failure mode that fix exists for.
+    #[test]
+    fn a_per_provider_window_is_found_case_insensitively() {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "qwen-local".to_string(),
+            ProviderEntry {
+                context_window: Some(65_536),
+                ..Default::default()
+            },
+        );
+        let cfg = Config {
+            providers: Some(providers),
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.resolve_context_window_for("Qwen-Local", "some-local.gguf"),
+            65_536
+        );
+    }
+
+    /// The old signature keeps working: it is the no-provider-known path, and
+    /// every existing caller reads it.
+    #[test]
+    fn the_model_only_resolver_still_honours_the_top_level_key() {
+        let cfg = Config {
+            context_window: Some(50_000),
+            ..Default::default()
+        };
+        assert_eq!(cfg.resolve_context_window("deepseek-v4-pro"), 50_000);
     }
 
     /// Match is case-insensitive — provider ids that uppercase
