@@ -459,8 +459,12 @@ const HARNESS_INIT: &str = r#"
                   (or (= level :warn) (= level "warn")) "warn"
                   (or (= level :error) (= level "error")) "error"
                   "info")]
+        # dirge-vpma.32: escape like every other tab-separated harness blob.
+        # Raw newlines truncated the message at the first one (the drain skips
+        # lines with no tab), and a payload could mint a second entry with a
+        # level of its choosing.
         (set harness-notif-list
-             (string harness-notif-list lvl "\t" msg "\n"))))))
+             (string harness-notif-list lvl "\t" (harness/-escape msg) "\n"))))))
 
 # Hook-error dedup slots. `harness-last-hook-err-msg` is the most
 # recently pushed sanitized hook-error message; `harness-last-hook-err-count`
@@ -491,6 +495,28 @@ const HARNESS_INIT: &str = r#"
 # identical messages. The catch arm in dispatch calls this rather
 # than appending directly so a buggy on-message-update hook can't
 # flood the chat with thousands of identical banners.
+#
+# dirge-vpma.33: the summary reports how many were SUPPRESSED, i.e. the count
+# minus the one already pushed and displayed. The count starts at 1 for that
+# first push, so 50 occurrences is one banner plus "(repeated 49 times)" —
+# which is what the host-side comment has always described.
+#
+# The flush is a function rather than a copy at each call site because the host
+# runs it too, at drain, to collect a run of repeats that never saw a different
+# message follow it.
+(defn harness/-flush-hook-err []
+  (when (and harness-last-hook-err-msg
+             (> harness-last-hook-err-count 1))
+    (set harness-notif-list
+         (string harness-notif-list
+                 "error\t"
+                 (harness/-escape
+                   (string harness-last-hook-err-msg
+                           " (repeated "
+                           (- harness-last-hook-err-count 1)
+                           " times)"))
+                 "\n"))))
+
 (defn harness/push-hook-err [sanitized-msg]
   (if (= sanitized-msg harness-last-hook-err-msg)
     # Same as last — increment in place; do not push.
@@ -499,17 +525,12 @@ const HARNESS_INIT: &str = r#"
     # been repeated, flush its summary now; then push the new msg
     # and reset the dedup state.
     (do
-      (when (and harness-last-hook-err-msg
-                 (> harness-last-hook-err-count 1))
-        (set harness-notif-list
-             (string harness-notif-list
-                     "error\t"
-                     harness-last-hook-err-msg
-                     " (repeated "
-                     harness-last-hook-err-count
-                     " times)\n")))
+      (harness/-flush-hook-err)
+      # dirge-vpma.32: escaped like the rest of the blob. sanitize-hook-err
+      # rewrites newlines and tabs but leaves backslashes, so an unescaped
+      # `C:\temp` would come back through the drain's unescape as a tab.
       (set harness-notif-list
-           (string harness-notif-list "error\t" sanitized-msg "\n"))
+           (string harness-notif-list "error\t" (harness/-escape sanitized-msg) "\n"))
       (set harness-last-hook-err-msg sanitized-msg)
       (set harness-last-hook-err-count 1))))
 

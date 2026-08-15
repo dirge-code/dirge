@@ -284,6 +284,32 @@ fn migrate_session(session: &mut Session) {
     }
 }
 
+/// Infix marking a `<id>.conflict-<unix_ts>.json` save-conflict sibling.
+const CONFLICT_INFIX: &str = ".conflict-";
+
+/// Does this path hold a session the scans should consider?
+///
+/// dirge-vpma.34: a save that detects a concurrent writer diverts to a
+/// `<id>.conflict-<ts>.json` sibling so neither copy is lost. That file has a
+/// `.json` extension and deserializes as a full `Session` carrying the
+/// ORIGINAL id, and every directory scan tested only the extension — so a
+/// conflict copy was indistinguishable from the real session. It could shadow
+/// the live file in the recents list and in prefix lookup, and because
+/// `delete_session` removed only `<id>.json`, deleting a session with a
+/// conflict sibling left it listed and resumable: the prefix fallback matched
+/// the sibling, and its first save re-created `<id>.json`. The deleted
+/// conversation came back.
+///
+/// One predicate for every scan — five copies of the extension test already
+/// existed, and a sixth thing to remember at each is how this happens again.
+fn is_session_file(path: &std::path::Path) -> bool {
+    path.extension().is_some_and(|e| e == "json")
+        && path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .is_some_and(|stem| !stem.contains(CONFLICT_INFIX))
+}
+
 pub fn delete_session(id: &str) -> anyhow::Result<()> {
     validate_session_id(id)?;
     let dir = session_dir();
@@ -318,7 +344,7 @@ pub fn delete_session(id: &str) -> anyhow::Result<()> {
             if let Ok(rd) = std::fs::read_dir(&dir) {
                 for entry in rd.flatten() {
                     let path = entry.path();
-                    if path.extension().is_some_and(|e| e == "json")
+                    if is_session_file(&path)
                         && let Ok(json) = std::fs::read_to_string(&path)
                         && let Ok(meta) = serde_json::from_str::<OriginMeta>(&json)
                         && effective_origin(&meta) == origin
@@ -344,6 +370,24 @@ pub fn delete_session(id: &str) -> anyhow::Result<()> {
         let path = dir.join(format!("{}.json", member));
         if path.exists() {
             std::fs::remove_file(path)?;
+        }
+        // dirge-vpma.34: and the member's save-conflict siblings. They hold
+        // the same conversation under the same id, so leaving them is leaving
+        // the data the user asked to delete — and before the scans learned to
+        // skip them, one was enough to bring the session back.
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            let prefix = format!("{member}{CONFLICT_INFIX}");
+            for entry in rd.flatten() {
+                let sibling = entry.path();
+                if sibling.extension().is_some_and(|e| e == "json")
+                    && sibling
+                        .file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .is_some_and(|stem| stem.starts_with(&prefix))
+                {
+                    let _ = std::fs::remove_file(sibling);
+                }
+            }
         }
         // Drop the member's image assets (whole dir). Best-effort: a
         // missing assets dir (pre-image sessions) is not an error.
@@ -410,7 +454,7 @@ pub fn load_session_tip(id: &str) -> anyhow::Result<Session> {
         // succeeded, so the tip scan must degrade to it, not error out.
         let Ok(entry) = entry else { continue };
         let path = entry.path();
-        if path.extension().is_some_and(|e| e == "json")
+        if is_session_file(&path)
             && let Ok(json) = std::fs::read_to_string(&path)
             && let Ok(meta) = serde_json::from_str::<TipMeta>(&json)
         {
@@ -450,7 +494,7 @@ pub fn find_sessions_by_prefix(prefix: &str) -> anyhow::Result<Vec<Session>> {
     for entry in std::fs::read_dir(&dir)? {
         let entry = entry?;
         let path = entry.path();
-        if path.extension().is_some_and(|e| e == "json")
+        if is_session_file(&path)
             && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
             && stem.starts_with(prefix)
             && let Ok(json) = std::fs::read_to_string(&path)
@@ -481,7 +525,7 @@ pub fn find_recent_sessions(limit: usize) -> anyhow::Result<Vec<Session>> {
     for entry in std::fs::read_dir(&dir)? {
         let entry = entry?;
         let path = entry.path();
-        if path.extension().is_none_or(|e| e != "json") {
+        if !is_session_file(&path) {
             continue;
         }
         let mtime = entry
@@ -557,7 +601,7 @@ pub fn recent_project_sessions(current: &Session, max_sessions: usize) -> Vec<Se
     let mut files: Vec<(std::path::PathBuf, std::time::SystemTime)> = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().is_none_or(|e| e != "json") {
+        if !is_session_file(&path) {
             continue;
         }
         let mtime = entry
@@ -1085,6 +1129,84 @@ mod tests {
         // Null bytes, newlines, spaces — anything non-id-shaped.
         assert!(validate_session_id("foo bar").is_err());
         assert!(validate_session_id("foo\nbar").is_err());
+    }
+
+    /// dirge-vpma.34: a save-conflict sibling is not a session.
+    ///
+    /// `<id>.conflict-<ts>.json` has a `.json` extension and deserializes as a
+    /// full Session with the ORIGINAL id, so scans that tested only the
+    /// extension saw it as a second copy of the conversation. `is_session_file`
+    /// is the single predicate every scan now uses.
+    #[test]
+    fn a_conflict_sibling_is_not_a_session_file() {
+        use std::path::Path;
+        assert!(is_session_file(Path::new("/s/abc123.json")));
+        assert!(
+            !is_session_file(Path::new("/s/abc123.conflict-1699999999.json")),
+            "a conflict sibling was treated as a session"
+        );
+        // Neighbouring shapes that must keep their existing answers.
+        assert!(!is_session_file(Path::new("/s/abc123.tmp.4f2a")));
+        assert!(!is_session_file(Path::new("/s/notes.txt")));
+        // A dot in an id is legal; only the conflict infix disqualifies.
+        assert!(is_session_file(Path::new("/s/abc.123.json")));
+    }
+
+    /// Deleting a session must take its conflict siblings with it.
+    ///
+    /// `delete_session` removed only `<id>.json`, so a session with a sibling
+    /// stayed listed (parsed from the sibling) and stayed resumable — the
+    /// prefix fallback matched it and the first save re-created `<id>.json`.
+    /// The scan fix hides it; this is what actually removes the data the user
+    /// asked to delete.
+    #[test]
+    fn deleting_a_session_removes_its_conflict_siblings() {
+        use crate::session::Session;
+
+        let id = format!(
+            "test-delconflict-{}",
+            std::process::id() as u64 * 1000
+                + std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .subsec_nanos() as u64
+        );
+        let mut sess = Session::new("openrouter", "test-model", 128_000);
+        sess.id = compact_str::CompactString::from(id.clone());
+        save_session(&mut sess).expect("first save");
+
+        // Force a conflict sibling: claim we loaded well before the on-disk
+        // write, so the next save diverts rather than clobbering.
+        sess.loaded_mtime = Some(std::time::SystemTime::now() - std::time::Duration::from_secs(60));
+        save_session(&mut sess).expect_err("the save must divert");
+
+        let dir = session_dir();
+        let siblings = |dir: &std::path::Path| -> usize {
+            std::fs::read_dir(dir)
+                .map(|rd| {
+                    rd.flatten()
+                        .filter(|e| {
+                            e.file_name()
+                                .to_str()
+                                .is_some_and(|n| n.starts_with(&format!("{id}.conflict-")))
+                        })
+                        .count()
+                })
+                .unwrap_or(0)
+        };
+        assert_eq!(siblings(&dir), 1, "precondition: a sibling was written");
+
+        delete_session(&id).expect("delete");
+
+        assert!(
+            !dir.join(format!("{id}.json")).exists(),
+            "real file remains"
+        );
+        assert_eq!(
+            siblings(&dir),
+            0,
+            "the conflict sibling survived the delete and still holds the conversation"
+        );
     }
 
     /// Batch2-3: when another writer's mtime is newer than ours

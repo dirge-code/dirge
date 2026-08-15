@@ -29,6 +29,10 @@ use regex::Regex;
 // actually exist.
 #[cfg(feature = "experimental-graph-search")]
 pub(crate) const SCHEMA_VERSION: u32 = 16;
+
+/// Maintenance-ledger key for the one-time FTS phantom-posting repair
+/// (dirge-vpma.50). See `ensure_message_fts_repaired`.
+const FTS_PHANTOM_REPAIR: &str = "fts_phantom_repair";
 #[cfg(not(feature = "experimental-graph-search"))]
 pub(crate) const SCHEMA_VERSION: u32 = 14;
 
@@ -303,6 +307,9 @@ impl SessionDb {
         // `ensure_skills_tables`). Must run BEFORE the early-return so
         // DBs already at SCHEMA_VERSION still gain the skills tables.
         self.ensure_skills_tables()?;
+        // The ledger the standing repairs below record themselves in. Must
+        // exist before any migration can mark itself done (dirge-vpma.50).
+        self.ensure_maintenance_table()?;
 
         let current: u32 = self
             .conn
@@ -393,6 +400,9 @@ impl SessionDb {
         // Feature-independent, idempotent, runs every open. Must follow v1
         // (which creates `sessions`). dirge-m7ja.
         self.ensure_session_origin()?;
+        // Runs after the ladder so the index it repairs is guaranteed to
+        // exist. Does real work at most once per DB (dirge-vpma.50).
+        self.ensure_message_fts_repaired()?;
 
         Ok(())
     }
@@ -638,7 +648,18 @@ impl SessionDb {
                 ",
             )
             .map_err(|e| format!("Migration v6 trigger drop failed: {e}"))?;
+        self.rebuild_message_fts("Migration v6")?;
+        // The index is clean as of now, so the standing repair below has
+        // nothing to do for this DB (dirge-vpma.50).
+        self.mark_maintenance_done(FTS_PHANTOM_REPAIR)
+    }
 
+    /// Clear both message indexes and re-insert every row's REDACTED text.
+    ///
+    /// Shared by the v6 migration and the standing phantom-posting repair
+    /// (dirge-vpma.50), which needs to do exactly what v6 does to a DB that
+    /// already ran v6's older, broken form.
+    fn rebuild_message_fts(&self, what: &str) -> Result<(), String> {
         // Backfill: clear both indexes then re-insert with redacted
         // content row-by-row so the redactor runs on each row.
         //
@@ -655,12 +676,12 @@ impl SessionDb {
                 "INSERT INTO messages_fts(messages_fts) VALUES('delete-all')",
                 [],
             )
-            .map_err(|e| format!("Migration v6 clear fts failed: {e}"))?;
+            .map_err(|e| format!("{what} clear fts failed: {e}"))?;
         // messages_fts_trigram is a STANDALONE table (no content=), so it owns
         // its indexed text — `DELETE FROM` correctly removes every posting.
         self.conn
             .execute("DELETE FROM messages_fts_trigram", [])
-            .map_err(|e| format!("Migration v6 clear trigram failed: {e}"))?;
+            .map_err(|e| format!("{what} clear trigram failed: {e}"))?;
 
         let mut stmt = self
             .conn
@@ -668,14 +689,14 @@ impl SessionDb {
                 "SELECT id, COALESCE(content, ''), COALESCE(tool_name, ''), COALESCE(tool_calls, '')
                  FROM messages",
             )
-            .map_err(|e| format!("Migration v6 select failed: {e}"))?;
+            .map_err(|e| format!("{what} select failed: {e}"))?;
 
         let mut dropped = 0usize;
         let rows: Vec<(i64, String, String, String)> = stmt
             .query_map([], |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
             })
-            .map_err(|e| format!("Migration v6 query failed: {e}"))?
+            .map_err(|e| format!("{what} query failed: {e}"))?
             .filter_map(|r| match r {
                 Ok(v) => Some(v),
                 Err(e) => {
@@ -683,7 +704,8 @@ impl SessionDb {
                     tracing::warn!(
                         target: "dirge::session_db",
                         error = %e,
-                        "migration v6 backfill skipped an undeserializable message row",
+                        what,
+                        "fts backfill skipped an undeserializable message row",
                     );
                     None
                 }
@@ -696,7 +718,8 @@ impl SessionDb {
             tracing::warn!(
                 target: "dirge::session_db",
                 dropped,
-                "migration v6 backfill skipped {dropped} message row(s) — they will not appear in FTS search",
+                what,
+                "fts backfill skipped {dropped} message row(s) — they will not appear in FTS search",
             );
         }
 
@@ -708,15 +731,93 @@ impl SessionDb {
                     "INSERT INTO messages_fts(rowid, content) VALUES (?1, ?2)",
                     params![id, redacted],
                 )
-                .map_err(|e| format!("Migration v6 fts backfill failed at row {id}: {e}"))?;
+                .map_err(|e| format!("{what} fts backfill failed at row {id}: {e}"))?;
             self.conn
                 .execute(
                     "INSERT INTO messages_fts_trigram(rowid, content) VALUES (?1, ?2)",
                     params![id, redacted],
                 )
-                .map_err(|e| format!("Migration v6 trigram backfill failed at row {id}: {e}"))?;
+                .map_err(|e| format!("{what} trigram backfill failed at row {id}: {e}"))?;
         }
         Ok(())
+    }
+
+    /// Create the maintenance ledger. Feature-independent and idempotent, so
+    /// it runs on every open ahead of the version ladder (dirge-vpma.50).
+    ///
+    /// One-shot repairs cannot be expressed as a version bump here:
+    /// `SCHEMA_VERSION` is `#[cfg]`-split (16 with experimental-graph-search,
+    /// 14 without), so a step guarded by `current < 17` would re-run on every
+    /// open of every non-graph build — which for a full index rebuild is the
+    /// difference between once and forever. This records what has been done
+    /// instead of inferring it from a number that means different things in
+    /// different builds.
+    fn ensure_maintenance_table(&self) -> Result<(), String> {
+        self.conn
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS db_maintenance (
+                     task         TEXT PRIMARY KEY,
+                     completed_at TEXT NOT NULL
+                 );",
+            )
+            .map_err(|e| format!("Failed to create db_maintenance: {e}"))
+    }
+
+    fn maintenance_done(&self, task: &str) -> bool {
+        self.conn
+            .query_row(
+                "SELECT 1 FROM db_maintenance WHERE task = ?1",
+                params![task],
+                |_| Ok(true),
+            )
+            .unwrap_or(false)
+    }
+
+    fn mark_maintenance_done(&self, task: &str) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO db_maintenance(task, completed_at) VALUES (?1, ?2)",
+                params![task, chrono::Utc::now().to_rfc3339()],
+            )
+            .map(|_| ())
+            .map_err(|e| format!("Failed to record maintenance task {task}: {e}"))
+    }
+
+    /// One-time repair for DBs that ran the ORIGINAL v6 migration
+    /// (dirge-vpma.50).
+    ///
+    /// That version cleared `messages_fts` with a plain `DELETE FROM`. It is an
+    /// external-content table, so the delete un-indexed each row using
+    /// `messages.content` as it stands now — but the indexed text had been the
+    /// composite `content || tool_name || tool_calls` the v2 triggers wrote.
+    /// Every tool_name/tool_calls token survived as a phantom posting, and a
+    /// secret in a folded bash `tool_calls` stayed permanently matchable
+    /// through `search_messages`. dirge-vpma.4 fixed the migration; a DB that
+    /// had already run it kept the postings, and nothing would ever revisit
+    /// them.
+    ///
+    /// Cheap on a clean DB: one primary-key lookup. The rebuild runs at most
+    /// once per database.
+    fn ensure_message_fts_repaired(&self) -> Result<(), String> {
+        if self.maintenance_done(FTS_PHANTOM_REPAIR) {
+            return Ok(());
+        }
+        // A partial/legacy schema (migration tests, a DB mid-build) may not
+        // have the index yet. Leave the task unmarked so a later open, once
+        // the ladder has created it, still does the repair.
+        let has_fts: bool = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='messages_fts'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        if !has_fts {
+            return Ok(());
+        }
+        self.rebuild_message_fts("FTS phantom-posting repair")?;
+        self.mark_maintenance_done(FTS_PHANTOM_REPAIR)
     }
 
     /// v5: add message detail columns.
