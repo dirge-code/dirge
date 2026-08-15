@@ -249,6 +249,11 @@ mod tests {
         // A project-scoped `.agents/skills/<name>/SKILL.md` must be picked
         // up (cwd is always a project ancestor, no .git needed).
         let dir = std::env::temp_dir().join(format!("dirge-agents-skill-{}", std::process::id()));
+        // dirge-m1ni: clear first. The name is keyed on the process id and
+        // nothing removes it, so a run whose pid the OS recycled would
+        // otherwise inherit the previous run's files — the shape that made
+        // a spec_db test fail on impossible counts.
+        let _ = std::fs::remove_dir_all(&dir);
         let skill_dir = dir.join(".agents").join("skills").join("agents-dir-skill");
         std::fs::create_dir_all(&skill_dir).unwrap();
         std::fs::write(

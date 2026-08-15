@@ -691,6 +691,11 @@ mod tests {
     #[test]
     fn precedence_project_over_global_over_config() {
         let tmp = std::env::temp_dir().join(format!("dirge-agents-test-{}", std::process::id()));
+        // dirge-m1ni: clear first. The name is keyed on the process id and
+        // nothing removes it, so a run whose pid the OS recycled would
+        // otherwise inherit the previous run's files — the shape that made
+        // a spec_db test fail on impossible counts.
+        let _ = std::fs::remove_dir_all(&tmp);
         let global = tmp.join("global");
         let project = tmp.join("project");
         std::fs::create_dir_all(&global).unwrap();

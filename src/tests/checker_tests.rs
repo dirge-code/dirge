@@ -456,3 +456,75 @@ fn explicit_granular_rules_take_effect() {
     assert_eq!(checker.check("read", "README.md"), CheckResult::Allowed);
     assert_eq!(checker.check("read", "main.rs"), CheckResult::Ask);
 }
+
+/// dirge-m1ni: a temp path keyed on the process id must be cleared before use.
+///
+/// The OS recycles pids and nothing removes these directories, so a later run
+/// can inherit a previous run's files. That is not hypothetical: `spec_db`'s
+/// fixture failed `tasks_track_real_status_and_progress` on counts that looked
+/// impossible, passing in isolation, with 1223 stale databases on the machine.
+///
+/// Scanned rather than fixed once, because the hazard is in the SHAPE — the
+/// next fixture written this way is the next flake, and it will be just as
+/// hard to read as this one was.
+#[test]
+fn pid_keyed_temp_paths_are_cleared_before_use() {
+    fn scan(dir: &std::path::Path, found: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir)
+            .expect("src must be readable")
+            .flatten()
+        {
+            let path = entry.path();
+            if path.is_dir() {
+                scan(&path, found);
+                continue;
+            }
+            if path.extension().is_none_or(|e| e != "rs") {
+                continue;
+            }
+            let Ok(src) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            for (i, line) in src.lines().enumerate() {
+                if !line.contains("std::process::id()") || !line.contains("temp_dir()") {
+                    continue;
+                }
+                // A clear must appear within a few lines either side: some
+                // fixtures compute the path first and clear just before
+                // creating it.
+                let lo = i.saturating_sub(3);
+                let hi = (i + 6).min(src.lines().count());
+                let window: Vec<&str> = src.lines().collect::<Vec<_>>()[lo..hi].to_vec();
+                let cleared = window
+                    .iter()
+                    .any(|l| l.contains("remove_dir_all") || l.contains("remove_file"));
+                // A name that also carries a clock stamp or a counter cannot
+                // collide across runs, so it needs no clear.
+                let unique = window.iter().any(|l| {
+                    l.contains("UNIX_EPOCH")
+                        || l.contains("fetch_add")
+                        || l.contains("Uuid::new_v4")
+                        || l.contains("test_run_stamp")
+                });
+                if !cleared && !unique {
+                    found.push(format!("{}:{}", path.display(), i + 1));
+                }
+            }
+        }
+    }
+
+    let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut found = Vec::new();
+    scan(&src_dir, &mut found);
+    // This file names the very identifiers it forbids, so it matches itself —
+    // the same trap the panic-hook scan hit. Drop it rather than weaken the
+    // pattern.
+    found.retain(|hit| !hit.contains("checker_tests.rs"));
+    found.sort();
+    assert!(
+        found.is_empty(),
+        "temp paths keyed on the process id with no clear and no unique stamp — \
+         a run with a recycled pid inherits the previous run's files:\n  {}",
+        found.join("\n  "),
+    );
+}

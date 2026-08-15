@@ -43,7 +43,14 @@ pub(crate) fn dirs_path() -> PathBuf {
     // (DIRGE_DATA_DIR still wins, so tests can pick their own location).
     #[cfg(test)]
     {
-        std::env::temp_dir().join(format!("dirge-test-data-{}", std::process::id()))
+        // dirge-m1ni: stamped, not cleared — every storage test in the run
+        // shares this directory, so removing it would delete a sibling
+        // test's session mid-run.
+        std::env::temp_dir().join(format!(
+            "dirge-test-data-{}-{}",
+            std::process::id(),
+            crate::text::test_run_stamp()
+        ))
     }
     #[cfg(not(test))]
     {

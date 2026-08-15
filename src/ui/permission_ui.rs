@@ -173,8 +173,19 @@ pub(crate) fn allow_always_downgrade_reason(tool: &str, input: &str) -> Option<&
     if input.trim().is_empty() {
         return Some("can't derive a useful pattern from empty input");
     }
+    // dirge-l6k4: every build answers this question, not just the ones with
+    // `semantic`. The gate used to skip the check entirely without the
+    // feature, so such a build offered "allow always" for a command carrying
+    // shell substitution — storing a rule derived from text whose inner
+    // command was never inspected. No shipped configuration hit it (every CI
+    // feature set has `semantic`), but the fallback is free: the coarse
+    // `$(`/backtick/`<(`/heredoc scan is exactly what the enforcement splitter
+    // itself uses in that build, so the two agree either way.
     #[cfg(feature = "semantic")]
-    if tool == "bash" && crate::semantic::adapters::bash::command_is_complex(input) {
+    let is_complex = crate::semantic::adapters::bash::command_is_complex(input);
+    #[cfg(not(feature = "semantic"))]
+    let is_complex = crate::agent::tools::bash::check::coarse_complex_syntax(input);
+    if tool == "bash" && is_complex {
         return Some(
             "commands with shell substitution or a subshell are never covered by a saved rule \
              (the inner command can't be inspected), so this can only be allowed once",
@@ -579,13 +590,25 @@ mod tests {
             suggest_pattern("bash", "cd /tmp/proj && python3 gen.py"),
             "python3 *"
         );
-        // Heredoc body (with its own punctuation) doesn't confuse the head pick.
-        assert_eq!(
-            suggest_pattern(
-                "bash",
-                "cd src && python3 - <<PY\nwith open('a','w') as f: f.write(x)\nPY"
-            ),
-            "python3 *"
+        // Heredoc body (with its own punctuation) doesn't confuse the head pick
+        // — where the build can see the heredoc as a heredoc.
+        //
+        // dirge-l6k4: this answer is build-dependent, and correctly so. With
+        // `semantic-bash` tree-sitter parses the redirect and the command
+        // decomposes normally. Without it the coarse scan counts `<<` as
+        // complex — and so does the ENFORCEMENT splitter in that same build,
+        // which checks the command whole. Offering `python3 *` there would
+        // save a rule that does not match how the command is actually checked
+        // (dirge-p3vf), so declining is the right answer, not a lesser one.
+        let heredoc = "cd src && python3 - <<PY\nwith open('a','w') as f: f.write(x)\nPY";
+        #[cfg(feature = "semantic-bash")]
+        assert_eq!(suggest_pattern("bash", heredoc), "python3 *");
+        #[cfg(not(feature = "semantic-bash"))]
+        assert!(
+            is_placeholder_pattern(&suggest_pattern("bash", heredoc)),
+            "without tree-sitter the heredoc is checked whole, so no pattern \
+             should be offered: {:?}",
+            suggest_pattern("bash", heredoc),
         );
         // Multiple benign prefixes are all skipped.
         // NOTE: the trailing command must be one that genuinely needs

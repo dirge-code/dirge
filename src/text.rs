@@ -10,6 +10,32 @@
 /// Largest PREFIX of `s` that fits in `max_bytes` and ends on a char
 /// boundary. Returns all of `s` when it's already within budget. Never
 /// panics.
+/// A token unique to this process RUN and stable for its lifetime.
+///
+/// dirge-m1ni: test fixtures that name a temp path after `std::process::id()`
+/// alone are not unique across runs — the OS recycles pids and nothing removes
+/// the directories, so a later run can inherit a previous run's files. That is
+/// how a `spec_db` test came to fail on counts that looked impossible while
+/// passing in isolation, with 1223 stale databases on the machine.
+///
+/// Most fixtures can simply clear the directory before use. This exists for the
+/// ones that CANNOT: a path shared by several tests in the same run (the
+/// session data dir, the per-suffix helpers) where a clear would delete a
+/// sibling test's files mid-run. Stamping the name keeps runs apart without
+/// deleting anything, and staying stable within the run is what lets two calls
+/// in one test agree on the path.
+#[cfg(test)]
+pub(crate) fn test_run_stamp() -> u128 {
+    use std::sync::OnceLock;
+    static STAMP: OnceLock<u128> = OnceLock::new();
+    *STAMP.get_or_init(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    })
+}
+
 pub(crate) fn head(s: &str, max_bytes: usize) -> &str {
     let mut end = max_bytes.min(s.len());
     while end > 0 && !s.is_char_boundary(end) {

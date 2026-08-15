@@ -264,6 +264,8 @@ mod tests {
     #[test]
     fn an_oversized_file_yields_no_baseline() {
         let dir = std::env::temp_dir().join(format!("dirge-baseline-{}", std::process::id()));
+        // dirge-m1ni: clear first — the name is keyed on a recyclable pid.
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let big = dir.join("big.log");
         std::fs::write(&big, vec![b'x'; (MAX_BASELINE_BYTES + 1) as usize]).unwrap();
