@@ -8,7 +8,10 @@ use std::sync::{Arc, Mutex};
 /// diff-safe, and inheriting the theme background. Previously the pickers wrote
 /// raw cursor-positioned escapes to `std::io::stdout()`, which `TerminalGuard`
 /// redirects to the log, so the overlay never reached the screen [dirge-92em].
-#[derive(Clone, Default)]
+// dirge-vpma.40: `PartialEq` so the renderer's bottom-bar change detection can
+// compare CONTENTS. It compared `is_some()`, which cannot see a moved selection
+// or a refiltered candidate list.
+#[derive(Clone, Default, PartialEq)]
 pub struct PickerOverlay {
     /// Header line (the `ListPicker` prompt); `None` for the file picker.
     pub title: Option<String>,

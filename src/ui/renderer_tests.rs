@@ -1895,3 +1895,200 @@ fn text_after_a_notice_appends_only_what_is_new() {
         .count();
     assert_eq!(seconds, 1, "second half missing: {:?}", r.buffer_lines());
 }
+
+/// dirge-vpma.36: a partial written mid-stream must not slide underneath the
+/// open streamed block.
+///
+/// `stream` replaces exactly `open_rows` rows at the buffer tail and expects
+/// the open block to be `source.last()`. `commit_partial` runs first, inside
+/// `stream`, and used to push its Plain block without sealing — so the next
+/// `stream` truncated the partial's rows and overwrote the Plain block,
+/// leaving a Markdown block whose row count disagreed with the buffer. The
+/// damage only shows on the next `rebuild`, which is why this is asserted
+/// against a resize rather than against the immediate output.
+#[test]
+fn a_partial_written_mid_stream_does_not_desync_source_and_buffer() {
+    let mut r = Renderer::new().expect("renderer");
+    r.stream("streamed answer", Color::White, true);
+    // A write with no trailing newline leaves a partial pending.
+    r.write("a partial", Color::White).expect("write");
+    r.stream("streamed answer continues", Color::White, true);
+    r.end_stream();
+
+    let before: Vec<String> = r.buffer_lines().iter().map(|l| l.to_string()).collect();
+    r.rebuild();
+    let after: Vec<String> = r.buffer_lines().iter().map(|l| l.to_string()).collect();
+    assert_eq!(
+        before, after,
+        "source and buffer disagree — a rebuild changed the content"
+    );
+    // Nothing got eaten on the way.
+    let joined = after.join("\n");
+    for needle in ["a partial", "streamed answer"] {
+        assert!(joined.contains(needle), "{needle} missing from {after:?}");
+    }
+}
+
+/// dirge-vpma.40: moving the picker selection is a visible change, so
+/// `set_bottom` must mark the frame dirty.
+///
+/// The dirty check compared `picker_overlay.is_some()`, which is identical
+/// before and after the selection moves — the overlay changed and the contract
+/// said nothing had. It is masked in the live path only because the picker's
+/// key handler calls `request_repaint()` itself; any caller relying on
+/// `set_bottom`'s own change detection painted a stale picker.
+#[test]
+fn moving_the_picker_selection_marks_the_frame_dirty() {
+    use crate::ui::input::InputEditor;
+
+    let mut r = Renderer::new().expect("renderer");
+    let mut editor = InputEditor::new();
+    let picker = editor.picker.insert(crate::ui::picker::FilePicker::new());
+    picker.active = true;
+    picker.matches = vec!["a.rs".into(), "b.rs".into(), "c.rs".into()];
+    picker.selected = 0;
+
+    // First call establishes the cached state.
+    r.set_bottom(&editor, "ready", false);
+    r.clear_needs_paint_for_test();
+    assert!(!r.needs_paint(), "precondition: nothing pending");
+
+    // Same everything except the highlighted row.
+    editor.picker.as_mut().unwrap().selected = 1;
+    r.set_bottom(&editor, "ready", false);
+    assert!(
+        r.needs_paint(),
+        "a moved picker selection did not mark the frame dirty"
+    );
+}
+
+/// The other half: an unchanged picker must NOT mark the frame dirty, or the
+/// change detection this whole path exists for is defeated and every event
+/// repaints.
+#[test]
+fn an_unchanged_picker_leaves_the_frame_clean() {
+    use crate::ui::input::InputEditor;
+
+    let mut r = Renderer::new().expect("renderer");
+    let mut editor = InputEditor::new();
+    let picker = editor.picker.insert(crate::ui::picker::FilePicker::new());
+    picker.active = true;
+    picker.matches = vec!["a.rs".into(), "b.rs".into()];
+    picker.selected = 1;
+
+    r.set_bottom(&editor, "ready", false);
+    r.clear_needs_paint_for_test();
+    r.set_bottom(&editor, "ready", false);
+    assert!(!r.needs_paint(), "an unchanged bottom bar forced a repaint");
+}
+
+/// dirge-vpma.38: a sink that never drains must not hold the caller.
+///
+/// The clipboard helper's stdin write was unbounded while only the child wait
+/// was capped. A helper that spawns but never reads (broken XWayland, xclip
+/// with no $DISPLAY) fills the ~64KB pipe buffer, and `write_all` then blocks
+/// the UI thread forever — the exact freeze the 2s wait exists to prevent,
+/// reached before that wait runs.
+#[test]
+fn a_sink_that_never_drains_does_not_hold_the_caller() {
+    /// Blocks forever on the first write, like a full pipe nobody reads.
+    struct Wedged;
+    impl std::io::Write for Wedged {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let started = std::time::Instant::now();
+    let finished = super::write_bounded(
+        Wedged,
+        vec![b'x'; 128 * 1024],
+        std::time::Duration::from_millis(150),
+    );
+    let waited = started.elapsed();
+
+    assert!(!finished, "a wedged sink reported success");
+    assert!(
+        waited < std::time::Duration::from_secs(2),
+        "the caller was held for {waited:?} — the write is still unbounded"
+    );
+}
+
+/// And the healthy path still writes everything before returning, so the
+/// bound is not achieved by giving up on real work.
+#[test]
+fn a_draining_sink_receives_the_whole_payload() {
+    #[derive(Clone)]
+    struct Recorder(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Recorder {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let payload = vec![b'y'; 128 * 1024];
+    let finished = super::write_bounded(
+        Recorder(seen.clone()),
+        payload.clone(),
+        std::time::Duration::from_secs(5),
+    );
+    assert!(finished, "a healthy sink timed out");
+    assert_eq!(*seen.lock().unwrap(), payload, "payload was truncated");
+}
+
+/// dirge-vpma.39: every cursor byte must land somewhere sensible.
+///
+/// The word-boundary break trims whitespace off the continuation row, and that
+/// run belonged to no row's span: this row ended before it, the next began
+/// after it. A cursor on it matched neither and kept the default (0, 0) — so
+/// arrowing right across the gap threw the caret back to the start of the
+/// input.
+///
+/// The trigger is not "two spaces": the break scans with `rfind([' ', '\t'])`,
+/// ASCII only, while `trim_start` strips all of Unicode, so an ASCII space
+/// followed by U+00A0 or U+3000 drops more than the break accounted for.
+/// ASCII-only runs never orphaned, which is why the fixtures below are the
+/// ones they are.
+///
+/// Stated as a monotonicity invariant rather than a fixed expected position:
+/// walking the cursor forward through the text must never move the caret
+/// backwards. That catches the collapse without pinning the wrap layout.
+#[test]
+fn the_cursor_never_jumps_backwards_across_a_wrapped_whitespace_run() {
+    for (label, text) in [
+        ("ascii runs", "aaa  bbb ccc"),
+        ("ascii triple", "aaa   bbb ccc"),
+        ("space then nbsp", "aaa \u{00a0}bbb ccc"),
+        ("space then tab", "aaa \tbbb ccc"),
+        ("space then ideographic", "aaa \u{3000}bbb ccc"),
+    ] {
+        for width in [4usize, 5, 6, 7] {
+            let mut prev: Option<(u16, u16)> = None;
+            for byte in 0..=text.len() {
+                if !text.is_char_boundary(byte) {
+                    continue;
+                }
+                let (_rows, row, col) = super::wrap_editor(text, byte, width);
+                if let Some(previous) = prev {
+                    assert!(
+                        (row, col) >= previous,
+                        "{label} w={width}: cursor at byte {byte} went backwards, \
+                         {previous:?} -> {:?}",
+                        (row, col),
+                    );
+                }
+                prev = Some((row, col));
+            }
+        }
+    }
+}

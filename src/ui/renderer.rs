@@ -1776,12 +1776,14 @@ impl Renderer {
         let max_offset = new_len.saturating_sub(visible);
         // When the user is scrolled up, keep the view anchored to the same
         // absolute content by shifting scroll_offset to match the size delta.
+        // dirge-vpma.37: no `else` clamp. The branch is only reached when
+        // `scroll_offset == 0`, and `0 > max_offset` is false for every usize —
+        // it was dead in both copies of this logic. Zero is already pinned to
+        // the bottom, which needs no clamping.
         if self.scroll_offset > 0 {
             let delta = new_len as isize - old_len as isize;
             let new_offset = (self.scroll_offset as isize + delta).max(0) as usize;
             self.scroll_offset = new_offset.min(max_offset);
-        } else if self.scroll_offset > max_offset {
-            self.scroll_offset = max_offset;
         }
         // #387: replacing displayed content is an explicit visible change —
         // mark dirty so the render effect repaints. Without this the modal
@@ -2014,6 +2016,23 @@ impl Renderer {
 
     fn commit_partial(&mut self) {
         if !self.partial.is_empty() {
+            // dirge-vpma.36: an open streamed block must stay the LAST region
+            // of `source`, with `open_rows` rows at the buffer tail — `stream`
+            // replaces exactly that. Appending the partial's Plain block
+            // underneath it would break both halves at once: the next `stream`
+            // would truncate the partial's rows instead of its own and
+            // overwrite the Plain block, leaving a Markdown block whose row
+            // count no longer matches the buffer. `rebuild` on the next resize
+            // then renders duplicated or missing content.
+            //
+            // Every other append path seals first (they go through
+            // `append_source_block`); this one is reached from inside `stream`
+            // itself, so it cannot seal unconditionally — that would end the
+            // stream on every token. Sealing only when there IS a partial to
+            // commit keeps the normal path untouched: nothing writes a partial
+            // mid-stream today, and if something starts to, the stream ends
+            // cleanly instead of corrupting.
+            self.commit_stream();
             let max_width = self.max_line_width();
             let c = self.partial_color;
             // dirge-qy3y: record the flushed partial as a source block so it
@@ -2417,12 +2436,14 @@ impl Renderer {
     fn anchor_after_resize_delta(&mut self, old_len: usize, new_len: usize) {
         let visible = self.visible_lines();
         let max_offset = new_len.saturating_sub(visible);
+        // dirge-vpma.37: no `else` clamp. The branch is only reached when
+        // `scroll_offset == 0`, and `0 > max_offset` is false for every usize —
+        // it was dead in both copies of this logic. Zero is already pinned to
+        // the bottom, which needs no clamping.
         if self.scroll_offset > 0 {
             let delta = new_len as isize - old_len as isize;
             let new_offset = (self.scroll_offset as isize + delta).max(0) as usize;
             self.scroll_offset = new_offset.min(max_offset);
-        } else if self.scroll_offset > max_offset {
-            self.scroll_offset = max_offset;
         }
     }
 
@@ -2804,7 +2825,14 @@ impl Renderer {
         let prev_cursor = (self.cached_input_cursor_row, self.cached_input_cursor_col);
         let prev_ghost = self.cached_input_ghost.clone();
         let prev_preview = self.cached_completion_preview.clone();
-        let prev_picker = self.picker_overlay.is_some();
+        // dirge-vpma.40: the OVERLAY, not merely whether one exists. Comparing
+        // `is_some()` could not see the selection move or the candidate list
+        // refilter, so `set_bottom`'s stated contract — mark dirty iff a
+        // visible bottom element changed — did not hold for the picker. It is
+        // masked today only because the picker key path calls
+        // `request_repaint()` itself; any caller trusting the contract paints
+        // a stale picker.
+        let prev_picker = self.picker_overlay.clone();
 
         let (display_buf, cursor_byte) = if editor.is_in_search() {
             editor.search_display()
@@ -2879,7 +2907,7 @@ impl Renderer {
             || prev_cursor != (self.cached_input_cursor_row, self.cached_input_cursor_col)
             || prev_ghost != self.cached_input_ghost
             || prev_preview != self.cached_completion_preview
-            || prev_picker != self.picker_overlay.is_some()
+            || prev_picker != self.picker_overlay
         {
             self.needs_paint = true;
         }
@@ -2924,6 +2952,13 @@ impl Renderer {
     /// next unrelated event.
     pub fn needs_paint(&self) -> bool {
         self.needs_paint
+    }
+
+    /// Clear the dirty flag without painting. Tests use it to establish a
+    /// clean baseline before asserting that a specific change sets it.
+    #[cfg(test)]
+    pub fn clear_needs_paint_for_test(&mut self) {
+        self.needs_paint = false;
     }
 
     /// #387: the single paint per event. Performs one `tui_redraw` iff the
@@ -3244,8 +3279,22 @@ pub(crate) fn wrap_editor(
 
                         let row_start = logical_start + local_byte - cur.len();
                         let row_end = row_start + prefix.len();
+                        // dirge-vpma.39: the whitespace `trim_start` dropped is
+                        // in no row's span — this row ends before it and the
+                        // continuation row begins after it — so a cursor
+                        // sitting on it matched nothing and kept the default
+                        // (0, 0), painting at the start of the input.
+                        //
+                        // More than one byte gets dropped because the two sides
+                        // disagree on what whitespace is: the break scans with
+                        // `rfind([' ', '\t'])`, ASCII only, while `trim_start`
+                        // strips all of Unicode. A space followed by U+00A0 or
+                        // U+3000 leaves the run orphaned. This row answers for
+                        // it, clamping the column to its own end — which is
+                        // where that whitespace visually collapsed.
+                        let claim_end = row_start + (cur.len() - suffix.len());
                         rows.push(prefix);
-                        if cursor_byte >= row_start && cursor_byte <= row_end {
+                        if cursor_byte >= row_start && cursor_byte <= claim_end {
                             cursor_row = rows.len() as u16 - 1;
                             cursor_col =
                                 UnicodeWidthStr::width(&full[row_start..cursor_byte.min(row_end)])
@@ -3333,6 +3382,33 @@ fn left_truncate(s: &str, max: usize) -> String {
     out
 }
 
+/// Write `payload` to `sink` on a detached thread, waiting at most `limit` for
+/// it to finish. Returns whether it finished in time.
+///
+/// dirge-vpma.38: the caller must not be the one blocked. A pipe whose reader
+/// never drains blocks `write_all` indefinitely once the buffer fills, and
+/// there is no portable write timeout on a `ChildStdin`. The thread is
+/// deliberately NOT joined on expiry — it is stuck in exactly the syscall we
+/// are escaping. It unblocks on its own when the caller kills the child, which
+/// closes the pipe and turns the write into an EPIPE; `sink` is then dropped
+/// by the thread.
+fn write_bounded<W: std::io::Write + Send + 'static>(
+    mut sink: W,
+    payload: Vec<u8>,
+    limit: std::time::Duration,
+) -> bool {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sink.write_all(&payload);
+        let _ = sink.flush();
+        // Drop `sink` before signalling so the reader sees EOF and can exit;
+        // a helper like `pbcopy` waits for it.
+        drop(sink);
+        let _ = tx.send(());
+    });
+    rx.recv_timeout(limit).is_ok()
+}
+
 pub fn copy_to_clipboard(text: &str) {
     let cmds: &[(&str, &[&str])] = &[
         ("wl-copy", &[]),
@@ -3346,10 +3422,6 @@ pub fn copy_to_clipboard(text: &str) {
             .stdin(std::process::Stdio::piped())
             .spawn()
         {
-            if let Some(mut stdin) = child.stdin.take() {
-                let _ = stdin.write_all(text.as_bytes());
-                let _ = stdin.flush();
-            }
             // Bounded wait so a wedged helper (broken XWayland,
             // frozen compositor, missing $DISPLAY for xclip) can't
             // freeze the TUI on a copy keystroke. ~2s is generous —
@@ -3360,6 +3432,16 @@ pub fn copy_to_clipboard(text: &str) {
             const CLIP_WAIT_LIMIT: std::time::Duration = std::time::Duration::from_millis(2000);
             let poll_interval = std::time::Duration::from_millis(25);
             let deadline = std::time::Instant::now() + CLIP_WAIT_LIMIT;
+            // dirge-vpma.38: the WRITE needs the bound too, and it is the half
+            // that actually wedges. A helper that spawns but never drains its
+            // stdin fills the ~64KB pipe buffer and `write_all` blocks
+            // forever — on the UI thread, for a selection larger than the
+            // buffer. That is precisely the freeze the wait below was added to
+            // prevent, reached before the wait is ever entered. One deadline
+            // covers both halves so the whole call stays inside the budget.
+            if let Some(stdin) = child.stdin.take() {
+                write_bounded(stdin, text.as_bytes().to_vec(), CLIP_WAIT_LIMIT);
+            }
             loop {
                 match child.try_wait() {
                     Ok(Some(_)) => break,
