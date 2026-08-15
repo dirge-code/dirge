@@ -416,6 +416,8 @@ fn rewind_restores_files_to_pre_prompt_state() {
     snapshots::clear();
 
     let dir = std::env::temp_dir().join(format!("dirge-rewind-it-{}", std::process::id()));
+    // dirge-m1ni: clear first — the name is keyed on a recyclable process id.
+    let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let file = dir.join("work.txt");
     std::fs::write(&file, "original").unwrap();

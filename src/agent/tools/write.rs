@@ -457,6 +457,8 @@ mod tests {
     #[tokio::test]
     async fn regression_no_manager_preserves_existing_output() {
         let dir = std::env::temp_dir().join(format!("dirge-write-no-mgr-{}", std::process::id()));
+        // dirge-m1ni: clear first — the name is keyed on a recyclable pid.
+        let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
         let path = tempfile_in(&dir, "no-mgr.txt");
 
@@ -485,6 +487,8 @@ mod tests {
     #[tokio::test]
     async fn manager_with_no_diagnostics_appends_nothing() {
         let dir = std::env::temp_dir().join(format!("dirge-write-with-mgr-{}", std::process::id()));
+        // dirge-m1ni: clear first — the name is keyed on a recyclable pid.
+        let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
         let path = tempfile_in(&dir, "with-mgr.unknown_ext");
 
@@ -514,6 +518,8 @@ mod tests {
     #[tokio::test]
     async fn auto_repairs_truncated_delimiters_on_write() {
         let dir = std::env::temp_dir().join(format!("dirge-write-repair-{}", std::process::id()));
+        // dirge-m1ni: clear first — the name is keyed on a recyclable pid.
+        let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
         let path = tempfile_in(&dir, "trunc.janet");
 
@@ -569,6 +575,8 @@ mod tests {
     #[tokio::test]
     async fn revert_restores_overwrite_and_removes_new_file() {
         let dir = std::env::temp_dir().join(format!("dirge-revert-{}", std::process::id()));
+        // dirge-m1ni: clear first — the name is keyed on a recyclable pid.
+        let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
 
         // Overwrite case: a rejected repair restores the original bytes.
@@ -621,8 +629,12 @@ mod tests {
     // ── dirge-m8d0 / dirge-4afz: content and path guards, end to end ──
 
     fn tmp_dir(tag: &str) -> std::path::PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("dirge-write-guard-{tag}-{}", std::process::id()));
+        // dirge-m1ni: stamped, not cleared — shared across parallel tests by tag.
+        let dir = std::env::temp_dir().join(format!(
+            "dirge-write-guard-{tag}-{}-{}",
+            std::process::id(),
+            crate::text::test_run_stamp()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }

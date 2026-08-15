@@ -63,7 +63,12 @@ pub(super) fn mark_bash_mutations(permission: Option<&PermCheck>, command: &str)
 
 /// dirge-7l5i: lexically resolve `.`/`..`/`.` path components without
 /// touching the filesystem (so it works for not-yet-created targets).
-#[cfg(feature = "semantic-bash")]
+// dirge-l6k4: NOT gated on `semantic-bash`. This is pure lexical path work
+// with no parser behind it; the gate was incidental to the file it lives in.
+// The verifier's agent-authored-script check needs it in every build — see
+// `resolve_script_path` — and under-detection there is the direction that
+// matters, since it latches a self-authored proxy validator as green.
+#[cfg_attr(not(feature = "semantic-bash"), allow(dead_code))]
 fn normalize_lexical(p: &std::path::Path) -> std::path::PathBuf {
     let mut out = std::path::PathBuf::new();
     for comp in p.components() {
@@ -83,7 +88,7 @@ fn normalize_lexical(p: &std::path::Path) -> std::path::PathBuf {
 /// `base` to get the effective cwd a later relative target is written
 /// against. Best-effort, quote-trimming; conservatively applies ALL `cd`s
 /// in the compound (so the effective dir is the last one).
-#[cfg(feature = "semantic-bash")]
+#[cfg_attr(not(feature = "semantic-bash"), allow(dead_code))]
 pub(crate) fn fold_cd_dirs(base: &str, segments: &[String]) -> String {
     let mut dir = std::path::PathBuf::from(base);
     for seg in segments {

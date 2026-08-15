@@ -868,6 +868,8 @@ mod read_gate_tests {
     #[tokio::test]
     async fn edit_blocked_until_file_is_read() {
         let dir = std::env::temp_dir().join(format!("dirge-edit-gate-{}", std::process::id()));
+        // dirge-m1ni: clear first — the name is keyed on a recyclable pid.
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("g.txt");
         std::fs::write(&path, "hello\nworld\n").unwrap();
@@ -908,6 +910,8 @@ mod read_gate_tests {
     #[tokio::test]
     async fn no_cache_means_no_gate() {
         let dir = std::env::temp_dir().join(format!("dirge-edit-nogate-{}", std::process::id()));
+        // dirge-m1ni: clear first — the name is keyed on a recyclable pid.
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("g.txt");
         std::fs::write(&path, "a\nb\n").unwrap();
@@ -933,6 +937,8 @@ mod read_gate_tests {
         // \r\n into \r\r\n. The tool advertises CRLF handling, so the
         // result must stay clean CRLF.
         let dir = std::env::temp_dir().join(format!("dirge-edit-crlf-{}", std::process::id()));
+        // dirge-m1ni: clear first — the name is keyed on a recyclable pid.
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("crlf.txt");
         std::fs::write(&path, "line1\r\nline2\r\nline3\r\n").unwrap();
@@ -970,6 +976,8 @@ mod read_gate_tests {
     #[tokio::test]
     async fn non_utf8_file_is_refused() {
         let dir = std::env::temp_dir().join(format!("dirge-edit-bin-{}", std::process::id()));
+        // dirge-m1ni: clear first — the name is keyed on a recyclable pid.
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("b.bin");
         std::fs::write(&path, b"alpha\n\xffbeta\n").unwrap();
@@ -995,6 +1003,8 @@ mod read_gate_tests {
     #[tokio::test]
     async fn mixed_ending_file_is_not_flipped_wholesale() {
         let dir = std::env::temp_dir().join(format!("dirge-edit-mixed-{}", std::process::id()));
+        // dirge-m1ni: clear first — the name is keyed on a recyclable pid.
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("m.txt");
         // 3 LF lines, 1 CRLF → LF dominates.

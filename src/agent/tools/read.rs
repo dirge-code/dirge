@@ -615,7 +615,14 @@ mod tests {
     }
 
     fn temp_path(suffix: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("dirge-read-test-{}-{}", std::process::id(), suffix,))
+        // dirge-m1ni: stamped, not cleared — the helper is called with several
+        // suffixes across tests that run in parallel.
+        std::env::temp_dir().join(format!(
+            "dirge-read-test-{}-{}-{}",
+            std::process::id(),
+            crate::text::test_run_stamp(),
+            suffix,
+        ))
     }
 
     /// dirge-4lzg: a content-cache HIT must return the file content,
@@ -735,6 +742,8 @@ mod tests {
     async fn missing_file_suggests_near_miss_neighbour() {
         let dir =
             std::env::temp_dir().join(format!("dirge-read-suggest-{}-{}", std::process::id(), "a"));
+        // dirge-m1ni: clear first — the name is keyed on a recyclable pid.
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("parser.rs"), "fn main() {}\n").unwrap();
 
@@ -1208,6 +1217,8 @@ mod tests {
         use crate::agent::agent_loop::types::InjectionScanMode;
 
         let dir = std::env::temp_dir().join(format!("dirge-injscan-{}", std::process::id()));
+        // dirge-m1ni: clear first — the name is keyed on a recyclable pid.
+        let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
 
         // Clean file → no fencing.

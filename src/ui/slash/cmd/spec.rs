@@ -201,6 +201,11 @@ mod tests {
             return;
         }
         let dir = std::env::temp_dir().join(format!("dirge-spec-s5oh-{}", std::process::id()));
+        // dirge-m1ni: clear first. The name is keyed on the process id and
+        // nothing removes it, so a run whose pid the OS recycled would
+        // otherwise inherit the previous run's files — the shape that made
+        // a spec_db test fail on impossible counts.
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let canon = dir.canonicalize().unwrap();
 

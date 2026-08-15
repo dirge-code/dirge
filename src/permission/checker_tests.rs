@@ -1568,6 +1568,8 @@ mod reported_permission_ux_regressions {
         // absolute probe to a sibling file in the same subtree, while
         // a path outside the working dir must NOT be coalesced.
         let proj = std::env::temp_dir().join(format!("dirge-coalesce-{}", std::process::id()));
+        // dirge-m1ni: clear first — the name is keyed on a recyclable pid.
+        let _ = std::fs::remove_dir_all(&proj);
         std::fs::create_dir_all(proj.join("sub")).unwrap();
         let mut pc = PermissionChecker::new(
             &PermissionConfig::default(),

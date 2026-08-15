@@ -656,6 +656,8 @@ async fn preamble_lists_global_tier_skills() {
     let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     let home = std::env::temp_dir().join(format!("dirge-preamble-home-{}", std::process::id()));
+    // dirge-m1ni: clear first — the name is keyed on a recyclable pid.
+    let _ = std::fs::remove_dir_all(&home);
     let skill_dir = home
         .join(".dirge")
         .join("skills")

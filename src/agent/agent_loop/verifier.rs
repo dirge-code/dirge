@@ -1235,9 +1235,13 @@ fn script_name_paths(command: &str) -> Vec<std::path::PathBuf> {
 /// leading `cd`/`pushd` segments onto the run cwd — the SAME lexical folder
 /// the permission layer uses (`fold_cd_dirs`), not a second implementation
 /// (dirge-1elu.2 follow-up). `cd sub && ./check.sh` resolves `./check.sh`
-/// against `sub/`. Without the semantic-bash feature the path resolves
-/// against the run cwd exactly as before.
-#[cfg(feature = "semantic-bash")]
+/// against `sub/`.
+///
+/// dirge-l6k4: every build, not just `semantic-bash`. `fold_cd_dirs` is pure
+/// lexical path work — its own gate was incidental to the file it lives in —
+/// and skipping the fold made a non-semantic build MISS a proxy validator the
+/// agent authored this run under a cd'd-into directory, latching it as
+/// verified green. Under-detection is the failure direction that matters here.
 fn resolve_script_path(command: &str, path: &std::path::Path) -> std::path::PathBuf {
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let segments: Vec<String> = command
@@ -1251,12 +1255,6 @@ fn resolve_script_path(command: &str, path: &std::path::Path) -> std::path::Path
     } else {
         std::path::Path::new(&effective).join(path)
     }
-}
-
-/// Non-semantic-bash builds keep today's behaviour: no cd folding.
-#[cfg(not(feature = "semantic-bash"))]
-fn resolve_script_path(_command: &str, path: &std::path::Path) -> std::path::PathBuf {
-    path.to_path_buf()
 }
 
 fn script_is_agent_authored(

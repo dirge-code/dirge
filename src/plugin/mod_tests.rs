@@ -185,6 +185,8 @@ fn test_poisoned_mutex_recovery_pattern() {
 fn test_filter_existing_dirs() {
     use std::path::PathBuf;
     let tmp = std::env::temp_dir().join(format!("dirge-plugin-test-{}", std::process::id()));
+    // dirge-m1ni: clear first — the name is keyed on a recyclable pid.
+    let _ = std::fs::remove_dir_all(&tmp);
     let _ = std::fs::create_dir_all(&tmp);
     let exists = tmp.clone();
     let missing = tmp.join("does-not-exist");
@@ -2712,6 +2714,8 @@ fn dispatch_chat_surfaces_hook_errors_via_notification_queue() {
 #[test]
 fn load_plugin_supports_directory_of_files() {
     let dir = std::env::temp_dir().join(format!("dirge-multifile-{}", std::process::id()));
+    // dirge-m1ni: clear first — the name is keyed on a recyclable pid.
+    let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("00-state.janet"), r#"(var shared-counter 0)"#).unwrap();
     std::fs::write(

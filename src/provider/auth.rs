@@ -504,6 +504,8 @@ mod tests {
     #[test]
     fn dirge_openai_oauth_wins_over_codex_auth_file() {
         let dir = std::env::temp_dir().join(format!("dirge-chatgpt-auth-{}", std::process::id()));
+        // dirge-m1ni: clear first — the name is keyed on a recyclable pid.
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("auth.json");
         std::fs::write(
@@ -646,6 +648,8 @@ mod tests {
     #[test]
     fn anthropic_reads_credentials_file_access_token() {
         let dir = std::env::temp_dir().join(format!("dirge-anthropic-auth-{}", std::process::id()));
+        // dirge-m1ni: clear first — the name is keyed on a recyclable pid.
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(".credentials.json");
         std::fs::write(

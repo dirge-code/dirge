@@ -656,6 +656,11 @@ body
     fn project_local_overrides_global_by_name() {
         use std::fs;
         let root = std::env::temp_dir().join(format!("dirge-prompt-tier-{}", std::process::id()));
+        // dirge-m1ni: clear first. The name is keyed on the process id and
+        // nothing removes it, so a run whose pid the OS recycled would
+        // otherwise inherit the previous run's files — the shape that made
+        // a spec_db test fail on impossible counts.
+        let _ = std::fs::remove_dir_all(&root);
         let global = root.join("global").join("prompts");
         let local = root.join("project").join(".dirge").join("prompts");
         fs::create_dir_all(&global).unwrap();
