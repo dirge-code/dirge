@@ -592,7 +592,11 @@ mod human_wait_tests {
                 custom: false,
             }],
         };
-        assert!(!crate::human_wait::anyone_waiting());
+        assert!(
+            !crate::human_wait::anyone_waiting(),
+            "another test is mid-prompt: {}",
+            crate::human_wait::holders()
+        );
 
         let handle = tokio::spawn(async move { tool.call(args).await });
         let req = rx.recv().await.expect("the tool must ask");

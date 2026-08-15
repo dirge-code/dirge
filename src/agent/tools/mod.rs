@@ -1536,7 +1536,11 @@ mod tests {
             Some(std::path::PathBuf::from("/tmp")),
         )));
         let (ask_tx, mut ask_rx) = tokio::sync::mpsc::channel(1);
-        assert!(!crate::human_wait::anyone_waiting());
+        assert!(
+            !crate::human_wait::anyone_waiting(),
+            "another test is mid-prompt: {}",
+            crate::human_wait::holders()
+        );
 
         let asking = tokio::spawn(async move {
             enforce(&Some(perm), &Some(ask_tx), "bash", Scope::Raw("rm -rf /")).await

@@ -21,6 +21,8 @@ mod ruby;
 mod rust;
 #[cfg(feature = "semantic-sql")]
 mod sql;
+#[cfg(feature = "semantic-swift")]
+mod swift;
 #[cfg(feature = "semantic-ts")]
 mod typescript;
 
@@ -46,12 +48,60 @@ pub use ruby::RubyAdapter;
 pub use rust::RustAdapter;
 #[cfg(feature = "semantic-sql")]
 pub use sql::SqlAdapter;
+#[cfg(feature = "semantic-swift")]
+pub use swift::SwiftAdapter;
 #[cfg(feature = "semantic-ts")]
 pub use typescript::TypescriptAdapter;
 
 use std::path::Path;
 
 use crate::semantic::adapter::LanguageAdapter;
+
+/// Every adapter compiled into this build, in registration order.
+///
+/// The order matters where two adapters claim an extension: C is registered
+/// before C++ so the C adapter wins for `.h` (C++ users with C++ headers should
+/// use `.hpp`/`.hh`/`.hxx` — see `CppAdapter::extensions`).
+///
+/// One definition, so anything that needs to know which languages this build
+/// understands — the manager, and the syntax gate's coverage check — reads the
+/// same list rather than a copy of it.
+// `mut` and the post-`Vec::new()` pushes are conditionally needed depending on
+// which adapter features are active; `#[cfg]` gating doesn't compose with
+// `vec![]`.
+#[allow(unused_mut, clippy::vec_init_then_push)]
+pub fn default_adapters() -> Vec<Box<dyn LanguageAdapter>> {
+    let mut adapters: Vec<Box<dyn LanguageAdapter>> = Vec::new();
+
+    #[cfg(feature = "semantic-ts")]
+    adapters.push(Box::new(TypescriptAdapter));
+    #[cfg(feature = "semantic-python")]
+    adapters.push(Box::new(PythonAdapter));
+    #[cfg(feature = "semantic-clojure")]
+    adapters.push(Box::new(ClojureAdapter));
+    #[cfg(feature = "semantic-go")]
+    adapters.push(Box::new(GoAdapter));
+    #[cfg(feature = "semantic-ruby")]
+    adapters.push(Box::new(RubyAdapter));
+    #[cfg(feature = "semantic-rust")]
+    adapters.push(Box::new(RustAdapter));
+    #[cfg(feature = "semantic-java")]
+    adapters.push(Box::new(JavaAdapter));
+    #[cfg(feature = "semantic-c")]
+    adapters.push(Box::new(CAdapter));
+    #[cfg(feature = "semantic-cpp")]
+    adapters.push(Box::new(CppAdapter));
+    #[cfg(feature = "semantic-elixir")]
+    adapters.push(Box::new(ElixirAdapter));
+    #[cfg(feature = "semantic-sql")]
+    adapters.push(Box::new(SqlAdapter));
+    #[cfg(feature = "semantic-dafny")]
+    adapters.push(Box::new(DafnyAdapter));
+    #[cfg(feature = "semantic-swift")]
+    adapters.push(Box::new(SwiftAdapter));
+
+    adapters
+}
 
 pub struct AdapterRegistry {
     adapters: Vec<Box<dyn LanguageAdapter>>,

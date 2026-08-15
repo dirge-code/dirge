@@ -48,9 +48,45 @@ pub struct HumanWait {
     _private: (),
 }
 
+/// Who is holding a wait, by thread name (dirge-lfux). Test builds only.
+///
+/// [`OUTSTANDING`] is process-wide, so a test asserting "nobody is waiting"
+/// asserts something about the whole binary. When that assertion fails under
+/// parallel load the count alone says nothing about WHICH test was mid-prompt,
+/// and the failure reads as an unexplained flake in the test that happened to
+/// look. Cargo names each test thread after the test, so recording the name
+/// turns the next occurrence into a one-line diagnosis instead of a hunt.
+///
+/// A `std::sync::Mutex` and not the atomic's sibling: this is diagnostic only
+/// and never read by production code.
+#[cfg(test)]
+static HOLDERS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn current_thread_name() -> String {
+    std::thread::current()
+        .name()
+        .unwrap_or("<unnamed>")
+        .to_string()
+}
+
+/// The tests currently holding a wait, for an assertion failure message.
+#[cfg(test)]
+pub(crate) fn holders() -> String {
+    match HOLDERS.lock() {
+        Ok(h) if h.is_empty() => "<none>".to_string(),
+        Ok(h) => h.join(", "),
+        Err(_) => "<poisoned>".to_string(),
+    }
+}
+
 impl HumanWait {
     pub fn begin() -> Self {
         OUTSTANDING.fetch_add(1, Ordering::SeqCst);
+        #[cfg(test)]
+        if let Ok(mut h) = HOLDERS.lock() {
+            h.push(current_thread_name());
+        }
         HumanWait { _private: () }
     }
 }
@@ -58,6 +94,14 @@ impl HumanWait {
 impl Drop for HumanWait {
     fn drop(&mut self) {
         OUTSTANDING.fetch_sub(1, Ordering::SeqCst);
+        #[cfg(test)]
+        if let Ok(mut h) = HOLDERS.lock() {
+            // Remove ONE entry for this thread, not all of them — waits nest.
+            let name = current_thread_name();
+            if let Some(i) = h.iter().rposition(|x| *x == name) {
+                h.remove(i);
+            }
+        }
     }
 }
 
@@ -83,7 +127,11 @@ mod tests {
     #[tokio::test]
     async fn nobody_is_waiting_by_default() {
         let _gate = TEST_GATE.lock().await;
-        assert!(!anyone_waiting());
+        assert!(
+            !anyone_waiting(),
+            "someone else is mid-prompt: {}",
+            holders()
+        );
     }
 
     #[tokio::test]
@@ -93,7 +141,11 @@ mod tests {
             let _waiting = HumanWait::begin();
             assert!(anyone_waiting());
         }
-        assert!(!anyone_waiting());
+        assert!(
+            !anyone_waiting(),
+            "someone else is mid-prompt: {}",
+            holders()
+        );
     }
 
     /// Parallel tool dispatch can have several prompts open at once, so
@@ -106,7 +158,11 @@ mod tests {
         drop(second);
         assert!(anyone_waiting(), "one prompt is still open");
         drop(first);
-        assert!(!anyone_waiting());
+        assert!(
+            !anyone_waiting(),
+            "someone else is mid-prompt: {}",
+            holders()
+        );
     }
 
     /// A cancelled wait releases too — the guard is dropped whether the
@@ -126,7 +182,11 @@ mod tests {
             _ = waiting => unreachable!("nobody answers"),
             _ = std::future::ready(()) => {}
         }
-        assert!(!anyone_waiting());
+        assert!(
+            !anyone_waiting(),
+            "someone else is mid-prompt: {}",
+            holders()
+        );
     }
 
     /// Every place a tool parks on an answer has to be marked, and the
