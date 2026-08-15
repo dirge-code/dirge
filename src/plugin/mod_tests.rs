@@ -747,6 +747,55 @@ fn test_notify_default_level_is_info() {
     assert_eq!(pending[0].0, "info");
 }
 
+/// dirge-vpma.32: a multiline notification must arrive whole.
+///
+/// `harness/notify` wrote `level\tmsg\n` without escaping, unlike every other
+/// tab-separated harness blob. The drain splits on newlines and skips lines
+/// with no tab, so everything after the first newline was silently lost —
+/// "build failed:\nsee log" showed only "build failed:".
+#[cfg(feature = "plugin")]
+#[test]
+fn test_notify_keeps_a_multiline_message_whole() {
+    let mut mgr = PluginManager::try_new().unwrap();
+    mgr.eval("(harness/notify \"build failed:\\nsee log\" :error)")
+        .unwrap();
+    let pending = mgr.drain_notifications();
+    assert_eq!(
+        pending,
+        vec![("error".to_string(), "build failed:\nsee log".to_string())],
+        "the tail after the newline was dropped"
+    );
+}
+
+/// The other half, and the reason this is not cosmetic: an unescaped newline
+/// let a message forge a SECOND entry with a level of its choosing. A plugin
+/// reporting an :info could stamp an "error" into the host's notification
+/// stream, or a tool result echoed into a notify could.
+#[cfg(feature = "plugin")]
+#[test]
+fn test_notify_cannot_forge_a_second_entry_with_a_spoofed_level() {
+    let mut mgr = PluginManager::try_new().unwrap();
+    mgr.eval("(harness/notify \"benign\\nerror\\tdisk is on fire\" :info)")
+        .unwrap();
+    let pending = mgr.drain_notifications();
+    assert_eq!(pending.len(), 1, "payload minted an entry: {pending:?}");
+    assert_eq!(pending[0].0, "info", "payload chose its own level");
+    assert_eq!(pending[0].1, "benign\nerror\tdisk is on fire");
+}
+
+/// A tab inside a message must not split it into level and body either.
+#[cfg(feature = "plugin")]
+#[test]
+fn test_notify_keeps_an_embedded_tab() {
+    let mut mgr = PluginManager::try_new().unwrap();
+    mgr.eval("(harness/notify \"col1\\tcol2\" :warn)").unwrap();
+    let pending = mgr.drain_notifications();
+    assert_eq!(
+        pending,
+        vec![("warn".to_string(), "col1\tcol2".to_string())]
+    );
+}
+
 /// Non-string msg silently drops instead of crashing the plugin.
 #[cfg(feature = "plugin")]
 #[test]
@@ -2536,10 +2585,60 @@ fn dispatch_dedupes_consecutive_identical_hook_errors() {
         combined.contains("always the same"),
         "msg dropped: {combined}",
     );
-    // The repeat-count summary must mention the number.
+    // dirge-vpma.33: 50 occurrences is ONE displayed banner plus 49
+    // coalesced, so the summary reads 49. This assertion used to demand "50",
+    // which was written down from the buggy output and made the off-by-one the
+    // contract — the Rust-side comment on the flush has always said 49.
     assert!(
-        combined.contains("repeated") && combined.contains("50"),
-        "expected repeat-count summary mentioning 50; got: {combined}",
+        combined.contains("(repeated 49 times)"),
+        "expected the 49 that were actually coalesced; got: {combined}",
+    );
+}
+
+/// dirge-vpma.33 in the small: the first occurrence is pushed and displayed,
+/// so the summary counts the ones that were NOT shown.
+///
+/// Three identical errors is one banner plus two suppressed. Three is chosen
+/// over two so an off-by-one cannot coincide with the total.
+#[test]
+fn hook_error_repeat_count_excludes_the_one_already_shown() {
+    let mut mgr = PluginManager::try_new().unwrap();
+    for _ in 0..3 {
+        mgr.eval(r#"(harness/push-hook-err "boom")"#).unwrap();
+    }
+    let pending = mgr.drain_notifications();
+    assert_eq!(
+        pending,
+        vec![
+            ("error".to_string(), "boom".to_string()),
+            ("error".to_string(), "boom (repeated 2 times)".to_string()),
+        ],
+        "3 occurrences = 1 shown + 2 coalesced"
+    );
+}
+
+/// A single occurrence must not produce a summary at all.
+#[test]
+fn a_lone_hook_error_gets_no_repeat_summary() {
+    let mut mgr = PluginManager::try_new().unwrap();
+    mgr.eval(r#"(harness/push-hook-err "once")"#).unwrap();
+    let pending = mgr.drain_notifications();
+    assert_eq!(pending, vec![("error".to_string(), "once".to_string())]);
+}
+
+/// dirge-vpma.32: hook errors share the notif blob, so they need the same
+/// escaping. A Windows path or a Rust debug string carries backslashes, and
+/// `sanitize-hook-err` only rewrites newlines and tabs — unescaping on drain
+/// without escaping on write would turn `C:\temp` into a tab.
+#[test]
+fn a_hook_error_keeps_its_backslashes() {
+    let mut mgr = PluginManager::try_new().unwrap();
+    mgr.eval(r#"(harness/push-hook-err "cannot open C:\temp\build")"#)
+        .unwrap();
+    let pending = mgr.drain_notifications();
+    assert_eq!(
+        pending,
+        vec![("error".to_string(), r"cannot open C:	empuild".to_string())]
     );
 }
 

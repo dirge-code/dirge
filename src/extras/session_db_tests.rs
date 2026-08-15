@@ -1829,3 +1829,123 @@ fn a_degraded_open_is_noted_once_however_often_it_reopens() {
     }
     assert_eq!(take_degraded_opens().len(), 1);
 }
+
+/// dirge-vpma.50: a DB that already ran the ORIGINAL v6 migration still
+/// carries phantom FTS postings, and nothing would ever revisit them.
+///
+/// The old v6 cleared `messages_fts` with a plain `DELETE FROM`. It is an
+/// external-content table, so that un-indexed each row against
+/// `messages.content` as it stands now — while the indexed text had been the
+/// composite `content || tool_name || tool_calls` the v2 triggers wrote. Every
+/// tool_calls token survived as a posting matchable through `search_messages`,
+/// including secrets in a folded bash call. vpma.4 fixed the migration for DBs
+/// that had not run it yet; this is the repair for the ones that had.
+///
+/// The phantom is planted as an EXTRA posting on a real message's rowid, which
+/// is the shape the old migration left: the row is still there, its index
+/// entry still carries text the current indexing would never produce.
+#[test]
+fn a_phantom_fts_posting_from_the_old_migration_is_repaired_on_open() {
+    let (db, dir) = temp_db();
+    let path = dir.join("state.db");
+    db.insert_session("s1", "cli", "gpt-5", "openai", "2026-01-01T10:00:00Z")
+        .unwrap();
+    let id = db
+        .insert_message(
+            "s1",
+            "user",
+            "an ordinary message",
+            None,
+            None,
+            None,
+            "2026-01-01T10:01:00Z",
+        )
+        .unwrap();
+
+    db.conn
+        .execute(
+            "INSERT INTO messages_fts(rowid, content) VALUES (?1, 'phantomsecrettoken')",
+            rusqlite::params![id],
+        )
+        .unwrap();
+    // Clear the ledger so this DB looks exactly like one that ran the old v6.
+    db.conn
+        .execute(
+            "DELETE FROM db_maintenance WHERE task = 'fts_phantom_repair'",
+            [],
+        )
+        .unwrap();
+    assert!(
+        !db.search_messages("phantomsecrettoken", None)
+            .unwrap()
+            .is_empty(),
+        "precondition: the planted posting must actually be matchable, or \
+         this test proves nothing",
+    );
+    drop(db);
+
+    // Reopening runs the repair.
+    let db = SessionDb::open(&path).unwrap();
+    assert!(
+        db.search_messages("phantomsecrettoken", None)
+            .unwrap()
+            .is_empty(),
+        "the phantom posting survived the repair",
+    );
+    // And the real content is still searchable — the repair rebuilds the
+    // index, it does not just empty it.
+    assert!(
+        !db.search_messages("ordinary", None).unwrap().is_empty(),
+        "the repair dropped legitimate postings",
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The repair must be one-shot. A full index rebuild on every open of every
+/// non-graph build is exactly what the feature-split `SCHEMA_VERSION` would
+/// have caused had this been a version-guarded migration, which is why the
+/// work is gated on a recorded marker rather than a version number.
+#[test]
+fn the_fts_repair_records_itself_and_does_not_run_again() {
+    let (db, dir) = temp_db();
+    let path = dir.join("state.db");
+    assert!(
+        db.maintenance_done(FTS_PHANTOM_REPAIR),
+        "a fresh DB is built clean and must be MARKED, not rebuilt on a later open",
+    );
+    db.insert_session("s1", "cli", "gpt-5", "openai", "2026-01-01T10:00:00Z")
+        .unwrap();
+    let id = db
+        .insert_message(
+            "s1",
+            "user",
+            "an ordinary message",
+            None,
+            None,
+            None,
+            "2026-01-01T10:01:00Z",
+        )
+        .unwrap();
+    drop(db);
+
+    // Plant a posting WITHOUT clearing the ledger. An already-repaired DB must
+    // leave it alone — that is what proves the marker, not luck, gates the
+    // rebuild.
+    let db = SessionDb::open(&path).unwrap();
+    db.conn
+        .execute(
+            "INSERT INTO messages_fts(rowid, content) VALUES (?1, 'untouchedtoken')",
+            rusqlite::params![id],
+        )
+        .unwrap();
+    drop(db);
+
+    let db = SessionDb::open(&path).unwrap();
+    assert!(
+        !db.search_messages("untouchedtoken", None)
+            .unwrap()
+            .is_empty(),
+        "the repair re-ran on an already-repaired DB",
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

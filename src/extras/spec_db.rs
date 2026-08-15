@@ -721,7 +721,25 @@ mod tests {
     fn store() -> (SpecStore, std::path::PathBuf) {
         static N: AtomicUsize = AtomicUsize::new(0);
         let n = N.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!("dirge-specdb-{}-{}", std::process::id(), n));
+        // The name has to be unique across RUNS, not just within one. Keyed on
+        // `pid-counter` alone it was not: the counter restarts at 0 every run
+        // and the OS recycles pids, so a later run could reopen a previous
+        // run's `state.db` — already carrying change "c" and its tasks — and
+        // fail on counts that look impossible. Nothing deletes these
+        // directories either (the returned PathBuf is not a drop guard), so
+        // thousands accumulate and the odds of a collision only grow. Stamp
+        // with the clock and clear the directory first, as the session-db and
+        // memory-db fixtures already do.
+        let dir = std::env::temp_dir().join(format!(
+            "dirge-specdb-{}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            n
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("state.db");
         let s = SpecStore::open_at(&path).unwrap();
