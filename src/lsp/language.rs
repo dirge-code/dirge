@@ -54,6 +54,7 @@ const LANGUAGES: &[(&str, &str)] = &[
     ("h", "c"),
     ("cpp", "cpp"),
     ("cxx", "cpp"),
+    ("ixx", "cpp"),
     ("cc", "cpp"),
     ("hpp", "cpp"),
     ("hxx", "cpp"),

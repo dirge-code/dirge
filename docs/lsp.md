@@ -25,7 +25,7 @@ discovering it later via `cargo check`.
 | `clojure-lsp` | `clojure-lsp` | `.clj`, `.cljs`, `.cljc`, `.edn`, `.bb` |
 | `gopls` | `gopls` | `.go` |
 | `jdtls` | `jdtls` | `.java` |
-| `clangd` | `clangd` | `.c`, `.cc`, `.cpp`, `.cxx`, `.h`, `.hh`, `.hpp`, `.hxx`, `.m`, `.mm` |
+| `clangd` | `clangd` | `.c`, `.cc`, `.cpp`, `.cxx`, `.ixx`, `.h`, `.hh`, `.hpp`, `.hxx`, `.m`, `.mm` |
 | `ruby-lsp` | `ruby-lsp` | `.rb`, `.rake`, `.gemspec` |
 | `bash-language-server` | `bash-language-server start` | `.sh`, `.bash` |
 | `cmake` | `cmake-language-server` | `.cmake` (+ `CMakeLists.txt` by name) |

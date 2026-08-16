@@ -298,7 +298,9 @@ pub fn builtin_servers() -> Vec<ServerInfo> {
         },
         ServerInfo {
             id: "clangd",
-            extensions: owned(&["c", "cc", "cpp", "cxx", "h", "hh", "hpp", "hxx", "m", "mm"]),
+            extensions: owned(&[
+                "c", "cc", "cpp", "cxx", "ixx", "h", "hh", "hpp", "hxx", "m", "mm",
+            ]),
             filenames: owned(&[]),
             root: cfamily_root,
         },

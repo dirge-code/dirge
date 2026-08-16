@@ -14,8 +14,14 @@ tree-sitter:
 
 Supports TypeScript/TSX, Python, Clojure (`.clj`/`.cljs`/`.cljc`/`.edn`/`.bb`),
 Go, Ruby (`.rb`/`.rake`/`.gemspec`), Rust, Java, C (`.c`/`.h`), and C++
-(`.cpp`/`.cc`/`.cxx`/`.hpp`/`.hh`/`.hxx`). Index is built lazily on first use and
-cached by file mtime.
+(`.cpp`/`.cc`/`.cxx`/`.ixx`/`.hpp`/`.hh`/`.hxx`). Index is built lazily on first
+use and cached by file mtime.
+
+`.ixx` is indexed on a best-effort basis: tree-sitter-cpp has no grammar for
+C++20 modules, so `export module M;` and `import std;` parse as errors and the
+declarations after them may be missed. For the same reason `.ixx` is left off
+the write-time syntax gate — see `GATE_EXCLUSIONS` in
+`src/semantic/syntax_validator.rs`.
 
 ## Export detection per language
 

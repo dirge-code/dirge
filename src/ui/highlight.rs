@@ -84,7 +84,7 @@ fn normalize_lang(lang: &str) -> &str {
         "rs" | "rust" => "rust",
         "java" => "java",
         "c" | "h" => "c",
-        "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" | "c++" => "cpp",
+        "cpp" | "cc" | "cxx" | "ixx" | "hpp" | "hh" | "hxx" | "c++" => "cpp",
         "json" | "jsonc" => "json",
         "yaml" | "yml" => "yaml",
         "toml" => "toml",
