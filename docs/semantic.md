@@ -14,7 +14,7 @@ tree-sitter:
 
 Supports TypeScript/TSX, Python, Clojure (`.clj`/`.cljs`/`.cljc`/`.edn`/`.bb`),
 Go, Ruby (`.rb`/`.rake`/`.gemspec`), Rust, Java, C (`.c`/`.h`), and C++
-(`.cpp`/`.cc`/`.cxx`/`.hpp`/`.hh`/`.hxx`). Index is built lazily on first use and
+(`.cpp`/`.cc`/`.cxx`/`.ixx`/`.hpp`/`.hh`/`.hxx`). Index is built lazily on first use and
 cached by file mtime.
 
 ## Export detection per language
