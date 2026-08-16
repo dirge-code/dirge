@@ -1771,6 +1771,15 @@ const GATE_EXCLUSIONS: &[(&str, &str)] = &[
          stays indexed-but-ungated. `.hpp`/`.hh`/`.hxx` ARE gated, via the C++ \
          grammar.",
     ),
+    (
+        "ixx",
+        "C++20 module interface unit, and tree-sitter-cpp 0.23 has no module \
+         grammar at all — `export module M;` and `import std;` parse as ERROR. \
+         Gating it would hard-block writes to every valid .ixx. Indexed by \
+         CppAdapter, which only warns on parse errors. See \
+         `the_cpp_grammar_does_not_understand_modules`; when the grammar gains \
+         module support that test fails and .ixx can move onto the gate.",
+    ),
 ];
 
 #[cfg(test)]
@@ -1880,6 +1889,28 @@ mod gate_coverage {
         assert!(
             rejected.is_empty(),
             "the gate is a hard write block and the grammar rejects valid Swift: {rejected:?}"
+        );
+    }
+
+    /// The evidence behind keeping `.ixx` OFF the gate. A module interface unit
+    /// is ordinary C++ except for the two declarations that make it one, and
+    /// tree-sitter-cpp 0.23 knows neither — so the gate would refuse every valid
+    /// `.ixx`. If a grammar bump makes this pass, drop the `ixx` entry from
+    /// [`GATE_EXCLUSIONS`] and let the gate have it.
+    #[cfg(feature = "semantic-cpp")]
+    #[test]
+    fn the_cpp_grammar_does_not_understand_modules() {
+        let lang: tree_sitter::Language = tree_sitter_cpp::LANGUAGE.into();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&lang).expect("cpp grammar loads");
+        let module_unit = "export module math;\n\
+                           import std;\n\
+                           export int add(int a, int b) { return a + b; }\n";
+        let tree = parser.parse(module_unit, None).expect("parses");
+        assert!(
+            tree.root_node().has_error(),
+            "tree-sitter-cpp now parses module declarations — .ixx no longer \
+             needs a GATE_EXCLUSIONS entry"
         );
     }
 }

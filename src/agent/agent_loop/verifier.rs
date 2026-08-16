@@ -1440,8 +1440,8 @@ fn code_paths_touched(args: &serde_json::Value) -> u32 {
 /// so a doc-only edit never triggers the verify nudge.
 const CODE_EXTS: &[&str] = &[
     "rs", "py", "ts", "tsx", "js", "jsx", "mjs", "cjs", "go", "rb", "java", "kt", "kts", "c", "h",
-    "cc", "cpp", "hpp", "cxx", "cs", "swift", "php", "scala", "clj", "cljs", "cljc", "ex", "exs",
-    "sh", "bash", "lua", "pl", "hs", "ml", "sql", "vue", "svelte",
+    "cc", "cpp", "hpp", "cxx", "ixx", "cs", "swift", "php", "scala", "clj", "cljs", "cljc", "ex",
+    "exs", "sh", "bash", "lua", "pl", "hs", "ml", "sql", "vue", "svelte",
 ];
 
 fn is_code_path(path: &str) -> bool {
