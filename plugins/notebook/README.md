@@ -35,6 +35,14 @@ Each cell resets the buffer, evaluates, and returns what was printed
 alongside the value. Compile errors and stack traces are captured the same
 way, so a broken cell reports instead of scribbling on the terminal.
 
+**Subprocess output is contained too.** A child process writes to real
+file descriptors, so the `:out`/`:err` redirect — a Janet-level thing —
+does not reach it, and an unredirected `(os/execute …)` used to land
+straight on the TUI. `os/execute` and `os/spawn` now fill in only the
+streams the caller did not specify, and `os/execute` folds what the child
+printed into the cell's captured output. Flags are passed through
+untouched, so nothing gains PATH lookup it did not ask for.
+
 **Sessions.** Cells evaluate into a per-session env created off the kernel
 root, so two agents using the same variable name do not collide. `session`
 defaults to `"main"`. `notebook/shared` is a table visible from every

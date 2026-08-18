@@ -1020,6 +1020,75 @@ const HARNESS_SANDBOX: &str = r#"
   (def sym (symbol name))
   (when (get (curenv) sym)
     (put (curenv) sym @{:value (dirge-disabled-fn name)})))
+
+# --- subprocess output containment (dirge-v49u) --------------------
+#
+# A child process writes to dirge's REAL file descriptors. The
+# `(setdyn :out @"")` redirect is a Janet-level abstraction and does not
+# touch fds, so an unredirected `(os/execute …)` lands straight on the
+# raw-mode TUI — the same staircase/ghost-cell corruption as dirge-c8lh,
+# by a different route, and not fixed by it.
+#
+# Plugin authors could be expected to redirect. The model driving the
+# notebook cannot: `(os/execute ["ls"] :p)` is the obvious thing to write
+# and there is nothing in the language to warn it.
+#
+# So: fill in only the streams the caller did NOT specify. A caller
+# managing its own redirection is left alone, and one that redirects only
+# `:out` still gets its `:err` contained.
+(def- dirge-real-execute os/execute)
+(def- dirge-real-spawn os/spawn)
+
+# Cap on subprocess output folded into the capture buffer.
+(def- dirge-subprocess-cap 65536)
+
+# Returns [env temp-file-or-nil]. `file/temp` is tmpfile(), so the file
+# unlinks itself on close and there is nothing to clean up.
+(defn- dirge-contain-streams [env]
+  # `merge` (not `table/clone`) because callers pass struct literals like
+  # {:out f}, which are immutable and cannot be cloned as tables.
+  (def e (merge @{} (or env {})))
+  (var f nil)
+  (unless (and (get e :out) (get e :err)) (set f (file/temp)))
+  (unless (get e :out) (put e :out f))
+  (unless (get e :err) (put e :err f))
+  [e f])
+
+(defn- dirge-drain-streams [f]
+  (when f
+    (file/seek f :set 0)
+    (def content (file/read f :all))
+    (file/close f)
+    (def sink (dyn :out))
+    (when (and content (buffer? sink) (pos? (length content)))
+      (if (> (length content) dirge-subprocess-cap)
+        (do
+          (buffer/push-string sink (string/slice content 0 dirge-subprocess-cap))
+          (buffer/push-string sink "\n...[subprocess output truncated]\n"))
+        (buffer/push-string sink content)))))
+
+# NOTE: flags are passed through EXACTLY as given. Do not "helpfully"
+# default them to :p — that adds PATH lookup to a call that never asked
+# for it, which can resolve a name that stock Janet would have refused.
+# Janet requires a keyword here, hence (keyword "") for the no-flag case.
+(defn- dirge-execute [args &opt flags env]
+  (def [e f] (dirge-contain-streams env))
+  # `defer`, not a plain sequence: the :x flag raises on a non-zero exit,
+  # and what the child printed BEFORE failing is exactly what someone
+  # needs to see. Draining only on success would lose every failure.
+  (defer (dirge-drain-streams f)
+    (dirge-real-execute args (or flags (keyword "")) e)))
+
+# os/spawn is asynchronous, so nothing here knows when the child is done
+# and there is no correct moment to drain. Unrequested output is absorbed
+# by the temp file rather than leaked; a caller that wants it asks for
+# :pipe, which this leaves untouched.
+(defn- dirge-spawn [args &opt flags env]
+  (def [e _f] (dirge-contain-streams env))
+  (dirge-real-spawn args (or flags (keyword "")) e))
+
+(put (curenv) 'os/execute @{:value dirge-execute})
+(put (curenv) 'os/spawn @{:value dirge-spawn})
 "#;
 
 /// Janet installed on the **notebook** VM only (dirge-9xjg.2, dirge-9xjg.5).
@@ -3637,6 +3706,121 @@ mod tests {
                  Clear in place with harness/-capture-reset instead."
             );
         }
+    }
+
+    /// dirge-v49u: a child process writes to the REAL fds, so the
+    /// `:out`/`:err` redirect — a Janet-level abstraction — does not
+    /// contain it. Unredirected subprocess output used to land straight on
+    /// the raw-mode TUI.
+    ///
+    /// Asserting the output is CAPTURED is what proves it is not leaking:
+    /// a test cannot observe the process's real stdout, but the bytes have
+    /// to be in exactly one of the two places.
+    #[test]
+    fn subprocess_output_is_captured_not_written_to_the_terminal() {
+        // Notebook VM: sessions live there, and it is the VM agent-authored
+        // code actually reaches. The containment itself is installed by
+        // HARNESS_SANDBOX, which both VMs run.
+        let mut w = Worker::try_spawn_notebook().expect("spawn notebook");
+        let cell = w
+            .eval_cell(
+                r#"(os/execute ["/bin/sh" "-c" "printf 'child-stdout\n'; printf 'child-stderr\n' >&2"] :p)"#,
+                Some("subprocess-basic"),
+                4096,
+                Duration::from_secs(10),
+            )
+            .unwrap();
+        assert!(cell.ok, "{cell:?}");
+        assert_eq!(cell.value, "0", "exit code not preserved: {cell:?}");
+        assert!(
+            cell.output.contains("child-stdout"),
+            "subprocess stdout escaped capture: {cell:?}"
+        );
+        assert!(
+            cell.output.contains("child-stderr"),
+            "subprocess stderr escaped capture: {cell:?}"
+        );
+    }
+
+    /// The `:x` flag raises on a non-zero exit. What the child printed
+    /// before failing is exactly what someone needs to read, so the drain
+    /// has to survive the raise.
+    #[test]
+    fn subprocess_output_is_captured_even_when_the_command_fails() {
+        let mut w = Worker::try_spawn_notebook().expect("spawn notebook");
+        // Through the SESSION path, which is how the agent reaches it.
+        // `ok` there comes from `fiber/status`, which is accurate even for
+        // errors raised on the event-loop path — unlike janetrs' errflags,
+        // see dirge-2jtd.
+        let cell = w
+            .eval_cell(
+                r#"(os/execute ["/bin/sh" "-c" "printf 'printed-before-failing\n'; exit 9"] :px)"#,
+                Some("subprocess-fail"),
+                4096,
+                Duration::from_secs(10),
+            )
+            .unwrap();
+        assert!(!cell.ok, "a :x non-zero exit should raise: {cell:?}");
+        assert!(
+            cell.output.contains("printed-before-failing"),
+            "output lost when the command failed: {cell:?}"
+        );
+    }
+
+    /// A caller that manages its own redirection must be left alone —
+    /// containment fills gaps, it does not seize the streams.
+    #[test]
+    fn caller_supplied_redirection_is_left_alone() {
+        let (mut w, _d, _l) = Worker::try_spawn().expect("spawn");
+        let out = w
+            .eval(
+                r#"(let [f (file/temp)]
+                     (os/execute ["/bin/sh" "-c" "printf 'to-my-own-file'"] :p {:out f :err f})
+                     (file/seek f :set 0)
+                     (def s (string (file/read f :all)))
+                     (file/close f)
+                     s)"#,
+            )
+            .unwrap();
+        assert_eq!(out, "to-my-own-file");
+    }
+
+    /// Only UNSPECIFIED streams are filled. plugins/k8s passes
+    /// `{:out :pipe}` and leaves `:err` alone; its pipe must survive while
+    /// its stderr still gets contained.
+    #[test]
+    fn only_unspecified_streams_are_filled() {
+        let (mut w, _d, _l) = Worker::try_spawn().expect("spawn");
+        let out = w
+            .eval(
+                r#"(let [p (os/spawn ["/bin/sh" "-c" "printf 'piped'; printf 'noise' >&2"] :p {:out :pipe})]
+                     (def s (string (ev/read (p :out) 64)))
+                     (os/proc-wait p)
+                     s)"#,
+            )
+            .unwrap();
+        assert_eq!(out, "piped", "caller's :out pipe was overridden");
+    }
+
+    /// Flags are passed through exactly. Injecting `:p` would add PATH
+    /// lookup to a call that never asked for it, resolving a bare name
+    /// that stock Janet refuses — a containment fix must not widen what
+    /// can be executed.
+    #[test]
+    fn containment_does_not_inject_path_lookup() {
+        let mut w = Worker::try_spawn_notebook().expect("spawn notebook");
+        let cell = w
+            .eval_cell(
+                r#"(try (os/execute ["sh" "-c" "printf 'resolved-via-path'"]) ([e] :refused))"#,
+                Some("subprocess-path"),
+                4096,
+                Duration::from_secs(10),
+            )
+            .unwrap();
+        assert!(
+            !cell.output.contains("resolved-via-path"),
+            "a bare name resolved without :p — PATH lookup was injected: {cell:?}"
+        );
     }
 
     #[test]
