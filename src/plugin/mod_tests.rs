@@ -3181,3 +3181,176 @@ fn a_throwing_hook_does_not_prevent_the_next_plugin() {
         "the error was swallowed instead of surfaced: {msgs:?}",
     );
 }
+
+// --- notebook plugin, end to end (dirge-9xjg.4) -----------------------
+
+/// Load the real `plugins/notebook` directory into a fresh manager.
+#[cfg(feature = "plugin")]
+fn load_notebook_plugin() -> PluginManager {
+    let mut mgr = PluginManager::try_new().expect("plugin manager");
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins/notebook");
+    let loaded = super::load_plugin(&mut mgr, &dir).expect("load plugins/notebook");
+    assert!(
+        loaded.files.len() >= 3,
+        "expected the whole directory to load, got {:?}",
+        loaded.files
+    );
+    mgr
+}
+
+/// The headline behaviour, through the REAL path the model uses: two
+/// separate tool calls, and the second sees what the first defined.
+///
+/// Everything below it is unit-tested in isolation; this is the one test
+/// that proves the pieces are actually connected — plugin -> bridge cfn ->
+/// notebook VM -> session env -> capture -> back.
+#[test]
+#[cfg(feature = "plugin")]
+fn notebook_tool_state_persists_across_tool_calls() {
+    let mut mgr = load_notebook_plugin();
+    let session = "e2e-persist";
+    let _ = mgr.invoke_plugin_tool(
+        "notebook-reset-handler",
+        &format!(r#"{{"session":"{session}"}}"#),
+        "tc-reset",
+    );
+
+    let first = mgr
+        .invoke_plugin_tool(
+            "notebook-eval-handler",
+            &format!(r#"{{"code":"(def carried 41)","session":"{session}"}}"#),
+            "tc-1",
+        )
+        .expect("first cell");
+    assert!(first.contains("=> 41"), "unexpected: {first}");
+
+    let second = mgr
+        .invoke_plugin_tool(
+            "notebook-eval-handler",
+            &format!(r#"{{"code":"(+ carried 1)","session":"{session}"}}"#),
+            "tc-2",
+        )
+        .expect("second cell");
+    assert!(
+        second.contains("=> 42"),
+        "state did not survive between tool calls: {second}"
+    );
+}
+
+/// Printed output has to come back, or the notebook cannot be used the
+/// way the skill prompt tells the model to use it.
+#[test]
+#[cfg(feature = "plugin")]
+fn notebook_tool_returns_printed_output() {
+    let mut mgr = load_notebook_plugin();
+    let out = mgr
+        .invoke_plugin_tool(
+            "notebook-eval-handler",
+            r#"{"code":"(print \"intermediate\") :final","session":"e2e-print"}"#,
+            "tc-print",
+        )
+        .unwrap();
+    assert!(out.contains("intermediate"), "print output lost: {out}");
+    assert!(out.contains("=> :final"), "value lost: {out}");
+}
+
+/// Unbalanced delimiters are the commonest way an LLM-written cell fails,
+/// so they are repaired before eval and the repair is reported (silently
+/// changing the code the model wrote would be worse than the error).
+#[test]
+#[cfg(feature = "plugin")]
+fn notebook_tool_repairs_unbalanced_delimiters() {
+    let mut mgr = load_notebook_plugin();
+    let out = mgr
+        .invoke_plugin_tool(
+            "notebook-eval-handler",
+            r#"{"code":"(+ 1 2","session":"e2e-repair"}"#,
+            "tc-repair",
+        )
+        .unwrap();
+    assert!(
+        out.contains("=> 3"),
+        "repair did not produce valid code: {out}"
+    );
+    assert!(
+        out.contains("repaired unbalanced delimiters"),
+        "repair not reported: {out}"
+    );
+}
+
+/// A cell that raises must come back as a readable result, not as a tool
+/// error and not as a lost turn.
+#[test]
+#[cfg(feature = "plugin")]
+fn notebook_tool_reports_a_raising_cell_readably() {
+    let mut mgr = load_notebook_plugin();
+    let out = mgr
+        .invoke_plugin_tool(
+            "notebook-eval-handler",
+            r#"{"code":"(error \"cell blew up\")","session":"e2e-err"}"#,
+            "tc-err",
+        )
+        .expect("a raising cell is a result, not a host failure");
+    assert!(out.contains("ERROR:"), "{out}");
+    assert!(out.contains("cell blew up"), "{out}");
+}
+
+/// The agent's own recovery path. Without it a poisoned binding needs an
+/// operator, which the model cannot ask for mid-run.
+#[test]
+#[cfg(feature = "plugin")]
+fn notebook_tool_session_reset_clears_state() {
+    let mut mgr = load_notebook_plugin();
+    let session = "e2e-reset";
+    mgr.invoke_plugin_tool(
+        "notebook-eval-handler",
+        &format!(r#"{{"code":"(def poisoned :bad)","session":"{session}"}}"#),
+        "tc-a",
+    )
+    .unwrap();
+    let reset = mgr
+        .invoke_plugin_tool(
+            "notebook-reset-handler",
+            &format!(r#"{{"session":"{session}"}}"#),
+            "tc-b",
+        )
+        .unwrap();
+    assert!(reset.contains("cleared"), "{reset}");
+
+    let after = mgr
+        .invoke_plugin_tool(
+            "notebook-eval-handler",
+            &format!(r#"{{"code":"poisoned","session":"{session}"}}"#),
+            "tc-c",
+        )
+        .unwrap();
+    assert!(
+        after.contains("ERROR:"),
+        "state survived the reset: {after}"
+    );
+}
+
+/// The tools have to reach the model with the persistence contract in
+/// their description — the whole behavioural shift depends on the model
+/// reading it, so an empty or generic description is a silent failure.
+#[test]
+#[cfg(feature = "plugin")]
+fn notebook_tools_are_registered_with_a_persistence_contract() {
+    let mut mgr = load_notebook_plugin();
+    let tools = mgr.list_plugin_tools();
+    let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+    assert!(names.contains(&"notebook_eval"), "got {names:?}");
+    assert!(names.contains(&"notebook_reset"), "got {names:?}");
+
+    let eval = tools.iter().find(|t| t.name == "notebook_eval").unwrap();
+    assert!(
+        eval.description.contains("PERSISTENT") && eval.description.contains("survives"),
+        "description does not state that state persists: {}",
+        eval.description
+    );
+    assert!(
+        eval.description.contains("session"),
+        "description does not explain session scoping: {}",
+        eval.description
+    );
+}

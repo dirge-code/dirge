@@ -21,7 +21,10 @@ pub use worker::{DialogReply, DialogRequest, LspRequest};
 #[cfg(feature = "plugin")]
 pub mod extension;
 pub mod hook;
+pub mod interrupt;
 pub mod loader;
+#[cfg(feature = "plugin")]
+pub mod notebook;
 pub mod worker;
 
 /// Per-process sentinel the Rust host prepends to a plugin error string
