@@ -631,6 +631,13 @@ async fn build_agent_inner_emits_assembled_preamble() {
     }
 }
 
+/// Serializes every test that overrides `$HOME`. `dirs::home_dir()` reads
+/// `$HOME` live, so two such tests running in parallel observe each other's
+/// temporary value. This MUST be one lock shared by all of them: a per-test
+/// `static` inside each fn compiles and passes when the tests are run alone,
+/// then fails only under the full suite, which is the worst way to find out.
+static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// dirge-rq65 follow-up — the system-prompt skill catalog must list
 /// skills from the SAME source as the loadable `skill` tool
 /// (`skill::discover_skills`, which spans the global tiers under
@@ -650,9 +657,7 @@ async fn preamble_lists_global_tier_skills() {
     use crate::context::ContextFiles;
     use rig::client::CompletionClient;
     use rig::providers::openai;
-    use std::sync::Mutex;
 
-    static HOME_LOCK: Mutex<()> = Mutex::new(());
     let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     let home = std::env::temp_dir().join(format!("dirge-preamble-home-{}", std::process::id()));
@@ -700,6 +705,86 @@ async fn preamble_lists_global_tier_skills() {
     assert!(
         preamble.contains("global-preamble-skill"),
         "preamble must advertise a skill from the global ~/.dirge/skills tier; got:\n{preamble}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// dirge-a34y — `no_skills` must suppress the preamble skill catalog the
+/// way `no_context_files` suppresses AGENTS.md.
+///
+/// The motivating failure is a measurement one. `scripts/loop-ab.sh` gives
+/// each A/B run its own `DIRGE_CONFIG_DIR`/`DIRGE_DATA_DIR`, but
+/// `skill::discover_skills` reads neither — it spans `$HOME/.claude|
+/// .opencode|.agents|.dirge/skills` plus every project ancestor. So every
+/// arm of every A/B silently carried whatever skills happened to be
+/// installed on the machine, inside the cached prefix, uncontrolled and
+/// unreported. Swapping `$HOME` for the run is NOT an option: OAuth
+/// credentials live under `~/.codex/auth.json` and
+/// `~/.claude/.credentials.json`, so that would trade a context confound
+/// for an auth failure.
+///
+/// This is the POSITIVE half's mirror: `preamble_lists_global_tier_skills`
+/// above proves the global tier reaches the preamble, and this proves the
+/// flag takes it back out. Both are needed — a suppression test whose
+/// fixture never had the skill in the first place passes for free.
+// Serialization: `dirs::home_dir()` reads `$HOME` live, so the guard
+// below is intentionally held across this test's `.await`s.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn no_skills_suppresses_the_preamble_catalog() {
+    use crate::context::ContextFiles;
+    use rig::client::CompletionClient;
+    use rig::providers::openai;
+
+    let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let home = std::env::temp_dir().join(format!("dirge-noskills-home-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    let skill_dir = home
+        .join(".dirge")
+        .join("skills")
+        .join("leaky-global-skill");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: leaky-global-skill\ndescription: must not reach the preamble\n---\nBody.\n",
+    )
+    .unwrap();
+
+    let cli = Cli::parse_from::<_, &str>(["dirge"]);
+    let cfg = Config {
+        no_skills: Some(true),
+        ..Config::default()
+    };
+    let context = ContextFiles {
+        agents: None,
+        prompts: std::collections::HashMap::new(),
+        agent_defs: Default::default(),
+        current_agent: None,
+        current_prompt: None,
+        current_prompt_name: None,
+        current_prompt_deny_tools: Vec::new(),
+        prompt_layer: None,
+        agent_layer: None,
+        route_before_agent: None,
+    };
+    let client = openai::Client::new("test-key").expect("openai client builds");
+    let model = client.completion_model("gpt-4o");
+
+    let prev_home = std::env::var_os("HOME");
+    // SAFETY: guarded by HOME_LOCK; restored before the lock drops.
+    unsafe { std::env::set_var("HOME", &home) };
+    let (_agent, _cache, _provider, preamble) =
+        build_agent_inner(model, &cli, &cfg, &context, "openai", "gpt-4o").await;
+    match prev_home {
+        Some(h) => unsafe { std::env::set_var("HOME", h) },
+        None => unsafe { std::env::remove_var("HOME") },
+    }
+
+    assert!(
+        !preamble.contains("leaky-global-skill"),
+        "no_skills must keep the global tier out of the preamble; got:\n{preamble}"
     );
 
     let _ = std::fs::remove_dir_all(&home);

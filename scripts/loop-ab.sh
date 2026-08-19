@@ -920,8 +920,19 @@ build_config() { # $1 = cfgdir, $2 = overrides, $3 = model
   fi
   # Order is scenario -> arm -> harness. Later assignments win in jq, so an arm
   # beats its scenario and max_agent_turns/provider beat everything.
-  local pipeline=""
-  [ -n "$scen" ] && pipeline="${scen} | "
+  # dirge-a34y: skill discovery reads $HOME and every project ancestor, and
+  # consults NEITHER DIRGE_CONFIG_DIR nor DIRGE_DATA_DIR -- so isolating those
+  # two still left every arm carrying whatever skills the machine happened to
+  # have, inside the cached prefix, uncontrolled and unreported. Overriding
+  # $HOME would isolate it and break OAuth (~/.codex/auth.json,
+  # ~/.claude/.credentials.json), trading a context confound for an auth
+  # failure. `no_skills` is the safe lever.
+  #
+  # Applied FIRST, so scenario and arm overrides both still beat it: an arm
+  # that wants to study the skill dimension can set no_skills=false and get
+  # the machine's skills back deliberately.
+  local pipeline=".no_skills = true | "
+  [ -n "$scen" ] && pipeline="${pipeline}${scen} | "
   [ -n "$prog" ] && pipeline="${pipeline}${prog} | "
   jq "${pipeline}${extra}" "$BASE_CONFIG" > "$1/config.json"
 }
@@ -1125,6 +1136,23 @@ fi
 
 echo "== loop-control A/B =="
 echo "binary=$OLDPWD_BINARY models=${MODELS:-<config default>} repeats=$REPEATS max_turns=$MAXTURNS scenario=$SCENARIO"
+# dirge-a34y: name what discovery WOULD have pulled in. Reporting it matters as
+# much as suppressing it -- a confound that is only absent from the config is
+# invisible in the artefact, and the next reader cannot tell isolation from
+# oversight.
+leaked=""
+for d in "$HOME/.claude/skills" "$HOME/.opencode/skills" "$HOME/.agents/skills" "$HOME/.dirge/skills"; do
+  [ -d "$d" ] || continue
+  for sk in "$d"/*/; do
+    [ -f "${sk}SKILL.md" ] || continue
+    leaked="${leaked}$(basename "$sk") "
+  done
+done
+if [ -n "$leaked" ]; then
+  echo "skills: DISABLED via no_skills; excluded from every arm: ${leaked%% }"
+else
+  echo "skills: DISABLED via no_skills; none found on this machine anyway"
+fi
 echo "control overrides:   ${ARM_A:-<none — no-op arm>}"
 echo "treatment overrides: ${ARM_B:-<none — no-op arm>}"
 echo "fixture: $FIXTURE_DESC"
