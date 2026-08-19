@@ -4345,6 +4345,134 @@ async fn compaction_circuit_breaker_skips_summarizer_after_max_failures() {
     );
 }
 
+/// dirge-69oe.4 — a loaded skill's OPERATING PROTOCOL does not survive a
+/// compaction. Only a head excerpt does, and nothing re-anchors the rest.
+///
+/// WHY IT MATTERS. Skills are delivered as an ordinary tool result
+/// (`skill.rs` pushes `skill.content` verbatim) and then just ride in
+/// history. `compression.rs` has no notion of skill content: it preserves
+/// verbatim user messages, files/ids, commands/tests and a coverage block,
+/// and subjects everything else to the ordinary pruner. A skill that tells
+/// the model HOW to operate therefore governs the run up to the first fold
+/// and is gutted after it, while the run carries on and still reports
+/// success.
+///
+/// TWO DISTINCT MECHANISMS, NEITHER OF WHICH PRESERVES A SKILL — worth
+/// stating because they look different and the first draft of this test
+/// confused them:
+///   - TRUNCATION (what this test exercises): an oversized tool result is
+///     replaced by a head excerpt plus a `… (N chars)` marker. Whatever sits
+///     at the TOP of SKILL.md survives; everything below it is gone. For
+///     J-Space that means the premise line can persist while the refresh
+///     schedule, seam definitions and module routing — the parts that say
+///     what to actually do — do not.
+///   - WHOLE-MESSAGE PRUNE: under enough pressure the message is dropped
+///     outright. Observed live 2026-08-19 with `first_kept=15`,
+///     `how=PruneOnly`: the entire ~4.7k-token J-Space body went, and the
+///     task still completed correctly.
+///
+/// So the assertion below deliberately targets a line DEEP in the body
+/// rather than the first one. Asserting on the head line would pass or fail
+/// depending on which mechanism happened to fire, which is how the first
+/// draft of this test reported the opposite of the live observation.
+///
+/// THIS TEST ASSERTS THE CURRENT GAP, NOT THE DESIRED END STATE. If someone
+/// implements skill re-anchoring or pins skill bodies across folds, it
+/// SHOULD fail — that is the signal to update it deliberately.
+#[tokio::test]
+async fn a_loaded_skill_body_does_not_survive_compaction() {
+    // Two markers from the real J-Space skill: one at the very top of
+    // SKILL.md, one from its refresh table far below.
+    const HEAD_LINE: &str = "You do not only produce words";
+    const DEEP_LINE: &str = "The premise and the invariants | Every third seam";
+
+    let mut ctx = empty_context();
+    ctx.messages
+        .push(serde_json::json!({"role":"system","content":"agent"}));
+    ctx.messages
+        .push(serde_json::json!({"role":"user","content":"task"}));
+    // The skill body, exactly how `skill.rs` delivers it: a tool result, early
+    // in the conversation, with the operating protocol far below the opening.
+    ctx.messages.push(serde_json::json!({
+        "role": "tool",
+        "tool_name": "skill",
+        "content": format!(
+            "# j-space\n\n{HEAD_LINE}; you also think them before saying them.\n\n{}\n{DEEP_LINE}\n",
+            "filler body line\n".repeat(400)
+        ),
+    }));
+    for i in 0..20 {
+        let role = if i % 2 == 0 { "assistant" } else { "user" };
+        ctx.messages.push(serde_json::json!({
+            "role": role, "content": format!("turn {i} with filler content")
+        }));
+    }
+    ctx.messages
+        .push(serde_json::json!({"role":"user","content":"latest"}));
+
+    // MUST-PASS PRECONDITIONS. Without these the assertion below passes for
+    // free on a fixture that never carried the protocol — which is exactly how
+    // the first live attempt at this measurement nearly produced a confident
+    // result about a skill that had failed to load.
+    let before = serde_json::to_string(&ctx.messages).unwrap();
+    assert!(
+        before.contains(HEAD_LINE),
+        "precondition: skill head must be in context before the fold"
+    );
+    assert!(
+        before.contains(DEEP_LINE),
+        "precondition: skill protocol must be in context before the fold"
+    );
+
+    let (tx, mut rx) = mpsc::channel::<LoopEvent>(8);
+    super::run_compaction_pass(
+        &mut ctx,
+        &None,
+        5,
+        0,
+        &None,
+        None,
+        &tx,
+        &empty_checkpoint_slot(),
+        &mut 0,
+        u64::MAX,
+    )
+    .await;
+    drop(tx);
+
+    // MECHANISM GATE: a fold must actually have happened, or this measured
+    // nothing however healthy the assertion looks.
+    let mut compacted = false;
+    while let Some(ev) = rx.recv().await {
+        if matches!(ev, LoopEvent::ContextCompacted { .. }) {
+            compacted = true;
+        }
+    }
+    assert!(
+        compacted,
+        "mechanism gate: no compaction happened, so this test measured nothing"
+    );
+
+    let after = serde_json::to_string(&ctx.messages).unwrap();
+    // DISCRIMINATION: this fixture must exercise TRUNCATION, not a whole-message
+    // drop. Without this the test would still pass if the pruner started
+    // deleting the message outright -- same green, different mechanism, and the
+    // doc comment above would quietly become wrong. Head present + protocol
+    // absent is what pins the behaviour actually being described.
+    assert!(
+        after.contains(HEAD_LINE),
+        "this fixture is meant to exercise truncation (head kept, tail cut). The \
+         head is gone too, so the message was dropped whole and this test is no \
+         longer measuring what its doc comment claims. Context after:\n{after}"
+    );
+    assert!(
+        !after.contains(DEEP_LINE),
+        "KNOWN GAP (dirge-69oe.4): the skill's operating protocol survived the \
+         fold. If skill preservation is now intentional, update this test and \
+         the issue rather than deleting the assertion. Context after:\n{after}"
+    );
+}
+
 // IMPROVEMENTS_PLAN #5: the ContextCompacted event reports whether the
 // pass was prune-only, prune+summary, or prune+failed-summary.
 #[tokio::test]
