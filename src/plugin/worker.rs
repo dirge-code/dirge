@@ -18,6 +18,15 @@ use std::cell::RefCell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
+
+/// dirge-2jtd: marks a value that is really an ev-path error.
+///
+/// Long and unlikely on purpose. A plugin that deliberately returned this exact
+/// prefix would be misreported as failing — accepted, because the alternative
+/// (a second round trip to read a status variable on every eval) taxes hook
+/// dispatch, which is on the hot path.
+const EV_ERROR_SENTINEL: &str = "__dirge_ev_error_9f3a__";
+
 #[cfg_attr(not(feature = "plugin"), allow(unused_imports))]
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -2006,10 +2015,50 @@ fn run_command_loop(
                 // compile errors and stack traces land in them too
                 // (dirge-c8lh) that growth would be faster, not slower.
                 let _ = client.run("(harness/-capture-reset)");
+                // dirge-2jtd: run the code inside a fiber and re-raise its
+                // error, instead of handing the raw string to janet_dobytes.
+                //
+                // janet_dobytes sets errflags only from the janet_continue it
+                // performs itself. A fiber that yields JANET_SIGNAL_EVENT is
+                // driven to completion by janet_loop, which prints a stack
+                // trace and moves on WITHOUT touching errflags — so the error
+                // VALUE came back as `ret` and janetrs mapped clear flags to
+                // Ok. Every ev-backed builtin takes that path (os/execute,
+                // os/spawn, ev/*, net/*), so a plugin hook that failed on one
+                // reported success with its error text as the return value.
+                //
+                // `resume` drives the fiber to completion across the event
+                // loop, so `fiber/status` is accurate for both paths; the
+                // re-raise then happens in the outer fiber, where errflags do
+                // get set. Same shape notebook/-eval already uses, which is
+                // where the accurate half was verified.
+                // The fiber MUST carry the caller's environment. A bare
+                // `fiber/new` gets a fresh one, so every `def` lands somewhere
+                // the next eval cannot see — and plugins define their hooks in
+                // one eval and are dispatched in another, so that breaks them
+                // in a way that reads as "the plugin didn't load".
+                //
+                // The verdict comes back IN THE VALUE rather than as a raised
+                // error. Re-raising was tried first and does not work: when the
+                // inner fiber yields to the event loop the OUTER fiber yields
+                // too, so the re-raise happens inside janet_loop and errflags
+                // stay clear — the very mechanism being worked around. Reading
+                // a status variable afterwards would work but costs a second
+                // round trip on every eval, and hook dispatch is on the hot
+                // path. A sentinel prefix keeps it at one.
+                let wrapped = format!(
+                    r#"(let [env (fiber/getenv (fiber/current)) f (fiber/new (fn [] (eval-string "{}")) :e)] (fiber/setenv f env) (let [r (resume f)] (if (= (fiber/status f) :error) (string "{}" (describe r)) r)))"#,
+                    super::escape_janet_string(&code),
+                    EV_ERROR_SENTINEL,
+                );
                 let r = client
-                    .run(&code)
+                    .run(&wrapped)
                     .map(|v| v.to_string())
-                    .map_err(|e| format!("Janet error: {e}"));
+                    .map_err(|e| format!("Janet error: {e}"))
+                    .and_then(|v| match v.strip_prefix(EV_ERROR_SENTINEL) {
+                        Some(msg) => Err(format!("Janet error: {}", msg.trim())),
+                        None => Ok(v),
+                    });
                 if r.is_err() {
                     // A failed plugin eval used to announce itself by
                     // corrupting the screen; now it is captured, so route
