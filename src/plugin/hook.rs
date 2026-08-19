@@ -228,6 +228,75 @@ mod tests {
         assert_eq!(result, r#"{"x":1}"#);
     }
 
+    /// dirge-2jtd — a Janet error raised AFTER the fiber yields to the event
+    /// loop must reach Rust as `Err`, not as `Ok` carrying the error text.
+    ///
+    /// `janet_dobytes` sets errflags only from the `janet_continue` it performs
+    /// itself. A fiber that yields `JANET_SIGNAL_EVENT` is finished by
+    /// `janet_loop`, which prints a stack trace and moves on WITHOUT touching
+    /// errflags, so `ret = fiber->last_value` hands the error value back as a
+    /// result. janetrs maps clear errflags to `Ok`. Any ev-backed builtin takes
+    /// this path — `os/execute`, `os/spawn`, `ev/*`, `net/*` — which is why it
+    /// went unnoticed: pure `(error "boom")` is flagged correctly.
+    ///
+    /// Blast radius is `PluginManager::eval`, which every hook, slash command
+    /// and tool handler goes through: a plugin whose handler fails on an ev
+    /// call reports success and its error text is silently consumed as the
+    /// return value.
+    #[test]
+    fn ev_path_error_reaches_rust_as_err() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        // Fails only after yielding to the event loop. `:px` raises on a
+        // non-zero exit, and os/execute is ev-backed.
+        let r = mgr.eval(r#"(os/execute ["/bin/sh" "-c" "exit 9"] :px)"#);
+        assert!(
+            r.is_err(),
+            "an ev-path failure must be Err; got Ok({:?})",
+            r.ok()
+        );
+    }
+
+    /// The must-not-fire half. A pure error was ALREADY reported correctly, so
+    /// a fix that only made everything fail would pass the test above while
+    /// breaking every working plugin. Both directions have to hold.
+    #[test]
+    fn pure_success_and_pure_error_keep_their_verdicts() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        assert!(
+            mgr.eval(r#"(error "boom")"#).is_err(),
+            "a pure error must stay Err"
+        );
+        assert!(mgr.eval("(+ 1 2)").is_ok(), "ordinary code must stay Ok");
+        // Multi-form input still yields the LAST form's value. The fix wraps
+        // the code, and a wrapper that changed this would silently alter what
+        // every slash command and tool handler returns.
+        assert_eq!(mgr.eval("(def a 1) (def b 2) (+ a b)").unwrap().trim(), "3");
+    }
+
+    /// THE ADVERSARIAL ONE. The fix runs the code inside a fiber, and a fiber
+    /// with the wrong environment would put every `def` somewhere later evals
+    /// cannot see. Plugins define their hooks in one eval and are dispatched in
+    /// another, so that failure would not surface until a hook was actually
+    /// called — and it would look like "the plugin didn't load" rather than
+    /// like an environment bug.
+    #[test]
+    fn definitions_survive_across_evals() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(r#"(defn my-helper [x] (* x 3))"#).unwrap();
+        let got = mgr
+            .eval("(my-helper 7)")
+            .expect("helper must still be bound");
+        assert_eq!(got.trim(), "21", "def from an earlier eval must persist");
+        // And the harness slots plugins actually use still work end to end.
+        mgr.eval(r#"(defn blocker [ctx] (harness/block "nope"))"#)
+            .unwrap();
+        mgr.register("on-tool-start", "blocker");
+        let out = mgr
+            .dispatch_tool_hook("on-tool-start", "@{:tool \"x\" :args \"{}\"}")
+            .expect("dispatch must succeed");
+        assert_eq!(out.block.as_deref(), Some("nope"));
+    }
+
     #[tokio::test]
     async fn block_returns_tool_error_with_reason() {
         let pm_arc = pm();
