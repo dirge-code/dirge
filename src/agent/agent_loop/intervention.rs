@@ -51,6 +51,7 @@ pub const HARNESS_TAGS: &[&str] = &[
     super::run::OPEN_ISSUES_NUDGE_TAG,
     super::run::RESUME_NUDGE_TAG,
     super::run::TRACK_WORK_TAG,
+    super::run::SKILL_ANCHOR_TAG,
     super::verifier::VERIFY_TAG,
     super::critic::CRITIC_TAG,
     super::goal::GOAL_TAG,
@@ -167,6 +168,9 @@ pub fn summary_for_user(tag: &str) -> &'static str {
         t if t == super::goal::GOAL_TAG => "restated the goal the run started from",
         t if t == super::run::TODO_NUDGE_TAG => "asked the model to close out its todo list",
         t if t == super::run::TRACK_WORK_TAG => "asked the model to track this work",
+        t if t == super::run::SKILL_ANCHOR_TAG => {
+            "restated a loaded skill's anchor so it stays in force"
+        }
         t if t == super::run::OPEN_ISSUES_NUDGE_TAG => "surfaced open issues before finishing",
         t if t == super::run::RESUME_NUDGE_TAG => "asked the model to resume the interrupted task",
         t if t == super::code_review::CODE_REVIEW_TAG => "code review found something to fix",

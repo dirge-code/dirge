@@ -125,6 +125,15 @@ pub struct GateStates {
     /// **Re-fire guard.** Bounded by `MAX_TRACK_NUDGES`; the
     /// file-edits-without-todos advisory is one-shot per run [dirge-track].
     pub track_nudges: u8,
+
+    /// dirge-69oe.4: anchors of skills loaded this run, `(name, section)`.
+    /// Accumulated as skill results go past, because the boundary poll only
+    /// ever sees the turn's new messages.
+    pub skill_anchors: Vec<(String, String)>,
+
+    /// Turn index of the last anchor restatement, so the interval measures
+    /// from the last fire rather than from run start.
+    pub skill_anchor_restated_at: usize,
 }
 
 /// Read-only inputs the finalization gates consult but do not own.

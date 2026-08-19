@@ -478,6 +478,8 @@ pub struct LoopSpawnConfig {
     /// Forwarded to `LoopConfig.verification_tiers_mode`. Default `Off`
     /// (opt-in; `Off` is byte-identical to the untiered gate).
     pub verification_tiers_mode: crate::agent::agent_loop::types::GateMode,
+    /// dirge-69oe.4: forwarded to `LoopConfig.skill_anchor_interval`. 0 is off.
+    pub skill_anchor_interval: u32,
     /// Forwarded to `LoopConfig.safe_state_abort_mode`. Default `Off`
     /// (opt-in; off is byte-identical to the loop without the rung).
     pub safe_state_abort_mode: crate::agent::agent_loop::types::SafeStateMode,
@@ -571,6 +573,7 @@ impl LoopSpawnConfig {
             code_review_mode: crate::agent::agent_loop::types::CodeReviewMode::default(),
             open_issues_gate_mode: crate::agent::agent_loop::types::GateMode::Off,
             verification_tiers_mode: crate::agent::agent_loop::types::GateMode::Off,
+            skill_anchor_interval: 0,
             safe_state_abort_mode: crate::agent::agent_loop::types::SafeStateMode::Off,
             publish_guard_mode: crate::agent::agent_loop::types::GateMode::Off,
             claim_gate_mode: crate::agent::agent_loop::types::GateMode::Off,
@@ -666,6 +669,7 @@ pub fn spawn_loop_runner(cfg: LoopSpawnConfig) -> LoopRunner {
         code_review_repo: None,
         open_issues_gate_mode: cfg.open_issues_gate_mode,
         verification_tiers_mode: cfg.verification_tiers_mode,
+        skill_anchor_interval: cfg.skill_anchor_interval,
         safe_state_abort_mode: cfg.safe_state_abort_mode,
         publish_guard_mode: cfg.publish_guard_mode,
         claim_gate_mode: cfg.claim_gate_mode,

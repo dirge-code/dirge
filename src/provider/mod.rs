@@ -154,6 +154,8 @@ pub struct AnyAgent {
     /// forwarded to `LoopConfig.verification_tiers_mode`. Defaults to `Off`
     /// (dirge-uw2l.2).
     verification_tiers_mode: crate::agent::agent_loop::types::GateMode,
+    /// dirge-69oe.4: forwarded to `LoopConfig.skill_anchor_interval`.
+    skill_anchor_interval: u32,
     /// dirge-w2de: the project's real gate command (`verification_command`
     /// config). Forwarded to `LoopConfig.verifier` at spawn so the gate
     /// only reports a full green after THIS command passed. `None` keeps
@@ -378,6 +380,7 @@ impl AnyAgent {
             code_review_mode: crate::agent::agent_loop::types::CodeReviewMode::default(),
             open_issues_gate_mode: crate::agent::agent_loop::types::GateMode::Off,
             verification_tiers_mode: crate::agent::agent_loop::types::GateMode::Off,
+            skill_anchor_interval: 0,
             verification_command: None,
             safe_state_abort_mode: crate::agent::agent_loop::types::SafeStateMode::Off,
             publish_guard_mode: crate::agent::agent_loop::types::GateMode::Off,
@@ -602,6 +605,13 @@ impl AnyAgent {
         mode: crate::agent::agent_loop::types::GateMode,
     ) -> Self {
         self.verification_tiers_mode = mode;
+        self
+    }
+
+    /// dirge-69oe.4: how often to restate loaded skills' anchors, in turn
+    /// boundaries. 0 is off.
+    pub fn with_skill_anchor_interval(mut self, interval: u32) -> Self {
+        self.skill_anchor_interval = interval;
         self
     }
 

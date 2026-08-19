@@ -366,6 +366,8 @@ pub(crate) const RESUME_NUDGE_TAG: &str = "[resume]";
 /// Display tag prefixing the early track-work reminder, so the UI can strip
 /// it and attribute the injected message to the system rather than the user.
 pub(crate) const TRACK_WORK_TAG: &str = "[track]";
+/// dirge-69oe.4: marks a restated skill anchor.
+pub(crate) const SKILL_ANCHOR_TAG: &str = "[skill-anchor]";
 
 /// Upper bound on consecutive resume-after-failure nudges, so a model that
 /// repeatedly stops after broken tool calls can't loop forever.
@@ -650,6 +652,9 @@ async fn poll_finalization_follow_up(
         source_nudges,
         completeness_nudges,
         run_epoch,
+        // Boundary-poll state; the finalization gates below do not read it.
+        skill_anchors: _,
+        skill_anchor_restated_at: _,
     } = gates;
     let GateInputs {
         code_review_baseline,
@@ -1922,6 +1927,10 @@ async fn run_compaction_pass_with_focus(
             tokens_after: after_summary,
             summary: applied_summary,
             first_kept_index: applied_first_kept,
+            // Read from the context the fold actually produced, not from what
+            // it intended to keep — an intent field would go green even when
+            // the keeping failed.
+            skill_anchors_kept: compression::anchors_present_in(&current_context.messages),
             compaction_kind,
             // The summarizer model name isn't threaded through the opaque
             // SummarizeFn closure yet (follow-up).
@@ -2409,6 +2418,8 @@ pub(crate) fn poll_boundary_nudge(
     turns_taken: usize,
     track_nudges: &mut u8,
     verify_nudges: &mut u8,
+    skill_anchors: &mut Vec<(String, String)>,
+    skill_anchor_restated_at: &mut usize,
     tally: &mut GateTally,
     tier: super::capability::CapabilityTier,
     concluding: bool,
@@ -2501,6 +2512,28 @@ pub(crate) fn poll_boundary_nudge(
         *track_nudges += 1;
         tally.record_nudge(BoundaryNudge::TrackWork);
         return Some((reminder, BoundaryNudge::TrackWork));
+    }
+    // 3b. Skill anchors — a loaded skill asked to be restated on an interval.
+    //     After work-tracking on purpose: this is fidelity to a skill's own
+    //     stated cadence, not a correctness signal, so it must never pre-empt a
+    //     nudge that is telling the model something is wrong.
+    for (name, section) in collect_skill_anchors(new_messages) {
+        if !skill_anchors.iter().any(|(n, _)| n == &name) {
+            skill_anchors.push((name, section));
+        }
+    }
+    if should_restate_skill_anchors(
+        config.skill_anchor_interval,
+        skill_anchors.len(),
+        turns_taken,
+        *skill_anchor_restated_at,
+    ) {
+        *skill_anchor_restated_at = turns_taken;
+        tally.record_nudge(BoundaryNudge::SkillAnchor);
+        return Some((
+            skill_anchor_reminder_message(skill_anchors),
+            BoundaryNudge::SkillAnchor,
+        ));
     }
     // 4. Fast verify — edits piling up with nothing run since.
     if let Some(reminder) = build_fast_verify_reminder(
@@ -3732,6 +3765,8 @@ pub async fn run_loop(
                 turns_taken,
                 &mut gates.track_nudges,
                 &mut verify_nudges,
+                &mut gates.skill_anchors,
+                &mut gates.skill_anchor_restated_at,
                 &mut tally,
                 capability.tier(),
                 concluding,
@@ -4315,6 +4350,85 @@ pub(crate) fn memory_refresh_message(block: &str) -> serde_json::Value {
              {block}\n</system-reminder>"
         ),
     })
+}
+
+/// dirge-69oe.4 — anchors of skills loaded so far this turn.
+///
+/// The loop sees only the turn's new messages, so an anchor has to be noticed
+/// as the skill result goes past. Keyed on the MARKER rather than on
+/// `tool_name == "skill"`, which keeps this consistent with what the fold does
+/// and means a skill that declared no `anchor:` contributes nothing — restating
+/// a head excerpt on a timer would be noise, not fidelity.
+pub(crate) fn collect_skill_anchors(new_messages: &[LoopMessage]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for msg in new_messages {
+        let LoopMessage::ToolResult(tr) = msg else {
+            continue;
+        };
+        // ToolResultMessage carries raw content blocks with no text helper of
+        // its own; join the text ones the same way the assistant-side helper
+        // does and ignore the rest.
+        let text: String = tr
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                super::message::ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        let Some(heading) = crate::skill::anchor_marker_heading(&text) else {
+            continue;
+        };
+        let Some(section) = crate::skill::extract_section(&text, heading) else {
+            continue;
+        };
+        let name = text
+            .lines()
+            .next()
+            .map(|l| l.trim_start_matches('#').trim())
+            .filter(|n| !n.is_empty())
+            .unwrap_or("skill")
+            .to_string();
+        out.push((name, section));
+    }
+    out
+}
+
+/// Whether the loaded skills' anchors are due for restatement.
+///
+/// `interval == 0` is off, and is the default: a skill that only needed to
+/// survive a fold should not also pay a timer, and every fire costs tokens at
+/// the end of the conversation where they compete with the task.
+///
+/// J-Space asks for its premise "every third seam" and its own verifier calls
+/// the verbatim recurrence the mechanism rather than an optimisation — so this
+/// exists for fidelity to a skill that asks for it, which is why the rate is
+/// the operator's to set rather than a number baked in here.
+pub(crate) fn should_restate_skill_anchors(
+    interval: u32,
+    anchors_len: usize,
+    turns_taken: usize,
+    last_restated_at: usize,
+) -> bool {
+    if interval == 0 || anchors_len == 0 {
+        return false;
+    }
+    turns_taken.saturating_sub(last_restated_at) >= interval as usize
+}
+
+/// The restatement itself. Tagged like every other boundary nudge so the model
+/// can tell harness text from the user's.
+fn skill_anchor_reminder_message(anchors: &[(String, String)]) -> LoopMessage {
+    let body = anchors
+        .iter()
+        .map(|(name, section)| format!("[{name}]\n{section}"))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    LoopMessage::User(super::message::UserMessage::text(format!(
+        "{SKILL_ANCHOR_TAG} These skills are still in force. Their anchors, restated \
+         because they thin out with distance rather than with change:\n\n{body}"
+    )))
 }
 
 fn track_work_reminder_message() -> LoopMessage {

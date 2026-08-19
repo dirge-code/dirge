@@ -838,6 +838,18 @@ pub struct Config {
     /// Suppress on-disk skill discovery entirely: no preamble catalog and
     /// nothing loadable through the `skill` tool.
     ///
+    /// dirge-69oe.4: restate loaded skills' declared `anchor:` sections every
+    /// N turn boundaries. `0` (the default) is off.
+    ///
+    /// Preserving an anchor through a fold, which happens whenever a skill
+    /// declares one, keeps it from being lost. This is the other half: some
+    /// skills state that their anchor has to RECUR — J-Space asks for its
+    /// premise every third seam and its own verifier calls the verbatim
+    /// recurrence the mechanism rather than an optimisation. A skill that only
+    /// needed to survive a fold should not also pay a timer, so the rate is the
+    /// operator's to set and nothing fires unless it is.
+    pub skill_anchor_interval: Option<u32>,
+
     /// dirge-a34y. `skill::discover_skills` spans the global tiers under
     /// `$HOME` plus every project ancestor, and consults neither
     /// `DIRGE_CONFIG_DIR` nor `DIRGE_DATA_DIR`. An A/B harness that
@@ -1498,6 +1510,11 @@ impl Config {
     /// tiering can only ever ADD messages, so it stays dark by default).
     /// An unrecognized non-empty value also resolves to `Off` but logs a
     /// warning, so a typo never silently arms the gate.
+    /// dirge-69oe.4: `skill_anchor_interval`, clamped to 0 when absent (off).
+    pub fn resolve_skill_anchor_interval(&self) -> u32 {
+        self.skill_anchor_interval.unwrap_or(0)
+    }
+
     pub fn resolve_verification_tiers_mode(&self) -> crate::agent::agent_loop::types::GateMode {
         use crate::agent::agent_loop::types::GateMode;
         let Some(raw) = self.verification_tiers.as_deref() else {

@@ -283,6 +283,7 @@ fn describe(evt: &LoopEvent) -> Option<(&'static str, Value)> {
             tokens_after,
             compaction_kind,
             first_kept_index,
+            skill_anchors_kept,
             ..
         } => (
             "compacted",
@@ -292,6 +293,10 @@ fn describe(evt: &LoopEvent) -> Option<(&'static str, Value)> {
                 "tokens_after": tokens_after,
                 "first_kept": first_kept_index,
                 "how": format!("{compaction_kind:?}"),
+                // dirge-69oe.4: the one artefact that shows whether a loaded
+                // skill still governs after a fold. Empty is the interesting
+                // reading, not a missing field.
+                "skill_anchors_kept": skill_anchors_kept,
             }),
         ),
         LoopEvent::CheckpointRefresh { summary } => {

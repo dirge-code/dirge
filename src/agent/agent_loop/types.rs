@@ -630,6 +630,10 @@ pub struct LoopConfig {
     /// byte-identical to the untiered gate. Set by `build_agent` from
     /// `Config::resolve_verification_tiers_mode`.
     pub verification_tiers_mode: GateMode,
+
+    /// dirge-69oe.4: restate loaded skills' anchors every N boundaries.
+    /// `0` is off and is the default.
+    pub skill_anchor_interval: u32,
     /// How the safe-state abort rung engages (dirge-uw2l.4). `Off` *(default)*
     /// is byte-identical to the loop without the rung. `Advisory` adds a third
     /// failure-ladder rung that replaces a boundary's recovery checkpoint with
@@ -916,6 +920,7 @@ impl Clone for LoopConfig {
             code_review_repo: self.code_review_repo.clone(),
             open_issues_gate_mode: self.open_issues_gate_mode,
             verification_tiers_mode: self.verification_tiers_mode,
+            skill_anchor_interval: self.skill_anchor_interval,
             safe_state_abort_mode: self.safe_state_abort_mode,
             publish_guard_mode: self.publish_guard_mode,
             claim_gate_mode: self.claim_gate_mode,
@@ -985,6 +990,7 @@ impl LoopConfig {
             code_review_repo: None,
             open_issues_gate_mode: GateMode::Off,
             verification_tiers_mode: GateMode::Off,
+            skill_anchor_interval: 0,
             safe_state_abort_mode: SafeStateMode::Off,
             publish_guard_mode: GateMode::Off,
             claim_gate_mode: GateMode::Off,

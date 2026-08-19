@@ -146,6 +146,7 @@ fn build_config() -> LoopConfig {
         code_review_repo: None,
         open_issues_gate_mode: crate::agent::agent_loop::types::GateMode::Off,
         verification_tiers_mode: crate::agent::agent_loop::types::GateMode::Off,
+        skill_anchor_interval: 0,
         safe_state_abort_mode: crate::agent::agent_loop::types::SafeStateMode::Off,
         publish_guard_mode: crate::agent::agent_loop::types::GateMode::Off,
         claim_gate_mode: crate::agent::agent_loop::types::GateMode::Off,
@@ -4479,6 +4480,216 @@ async fn a_loaded_skill_body_does_not_survive_compaction() {
     );
 }
 
+/// dirge-69oe.4 (recurrence) — end to end through the boundary poll: the
+/// anchor is collected off a skill result, then restated once the interval
+/// elapses, and NOTHING happens when the interval is 0.
+///
+/// The off-by-default half matters as much as the firing half. Every
+/// restatement costs tokens at the end of the conversation where they compete
+/// with the task, so a skill that only needed to survive a fold must not also
+/// pay a timer nobody asked for.
+#[test]
+fn skill_anchor_nudge_fires_on_interval_and_never_when_off() {
+    fn skill_result() -> Vec<LoopMessage> {
+        let body = format!(
+            "# j-space\n{o}## Premise{c}\n\n## Premise\nhold this\n\n## Next\nnot this\n",
+            o = crate::skill::SKILL_ANCHOR_OPEN,
+            c = crate::skill::SKILL_ANCHOR_CLOSE,
+        );
+        vec![LoopMessage::ToolResult(
+            super::super::message::ToolResultMessage {
+                tool_call_id: "1".into(),
+                tool_name: "skill".into(),
+                content: vec![super::super::message::ContentBlock::Text { text: body }],
+                details: serde_json::Value::Null,
+                is_error: false,
+            },
+        )]
+    }
+
+    // OFF (interval 0): the anchor is still collected, but nothing fires even
+    // many turns later.
+    let mut cfg = build_config();
+    cfg.skill_anchor_interval = 0;
+    let guards = quiet_guards();
+    let mut tally = crate::agent::agent_loop::gate_tally::GateTally::new();
+    let (mut track, mut verify) = (0u8, 0u8);
+    let mut anchors: Vec<(String, String)> = Vec::new();
+    let mut restated_at = 0usize;
+    let hit = crate::agent::agent_loop::run::poll_boundary_nudge(
+        &cfg,
+        &guards,
+        None,
+        &skill_result(),
+        50,
+        &mut track,
+        &mut verify,
+        &mut anchors,
+        &mut restated_at,
+        &mut tally,
+        crate::agent::agent_loop::capability::CapabilityTier::Nominal,
+        false,
+    );
+    assert!(
+        !matches!(
+            hit,
+            Some((
+                _,
+                crate::agent::agent_loop::gate_tally::BoundaryNudge::SkillAnchor
+            ))
+        ),
+        "interval 0 must never restate, however overdue"
+    );
+    assert_eq!(anchors.len(), 1, "the anchor is still collected when off");
+
+    // ON: due at the interval.
+    let mut cfg = build_config();
+    cfg.skill_anchor_interval = 3;
+    let mut tally = crate::agent::agent_loop::gate_tally::GateTally::new();
+    let (mut track, mut verify) = (0u8, 0u8);
+    let mut anchors: Vec<(String, String)> = Vec::new();
+    let mut restated_at = 0usize;
+    let hit = crate::agent::agent_loop::run::poll_boundary_nudge(
+        &cfg,
+        &guards,
+        None,
+        &skill_result(),
+        3,
+        &mut track,
+        &mut verify,
+        &mut anchors,
+        &mut restated_at,
+        &mut tally,
+        crate::agent::agent_loop::capability::CapabilityTier::Nominal,
+        false,
+    );
+    let (msg, which) = hit.expect("the anchor should be restated at the interval");
+    assert_eq!(
+        which,
+        crate::agent::agent_loop::gate_tally::BoundaryNudge::SkillAnchor
+    );
+    let text = match &msg {
+        LoopMessage::User(u) => u.text_joined(),
+        other => panic!("expected a user message, got {other:?}"),
+    };
+    assert!(text.contains("hold this"), "must carry the anchor: {text}");
+    assert!(
+        !text.contains("not this"),
+        "must carry the anchor section only: {text}"
+    );
+    assert_eq!(restated_at, 3, "the interval restarts from this fire");
+
+    // And it does not fire again on the very next boundary.
+    let hit = crate::agent::agent_loop::run::poll_boundary_nudge(
+        &cfg,
+        &guards,
+        None,
+        &[],
+        4,
+        &mut track,
+        &mut verify,
+        &mut anchors,
+        &mut restated_at,
+        &mut tally,
+        crate::agent::agent_loop::capability::CapabilityTier::Nominal,
+        false,
+    );
+    assert!(
+        !matches!(
+            hit,
+            Some((
+                _,
+                crate::agent::agent_loop::gate_tally::BoundaryNudge::SkillAnchor
+            ))
+        ),
+        "must wait a full interval before restating again"
+    );
+}
+
+/// dirge-69oe.4 (recurrence) — collecting anchors off the wire.
+///
+/// The loop only ever sees the turn's new messages, so an anchor has to be
+/// noticed as the skill result goes past and remembered. Keyed on the marker
+/// rather than on `tool_name == "skill"` so it stays consistent with what the
+/// fold does, and so a skill with no `anchor:` contributes nothing to restate.
+#[test]
+fn skill_anchors_are_collected_from_tool_results() {
+    use super::collect_skill_anchors;
+    let body = format!(
+        "# j-space\n{o}## Refresh{c}\n\n## Intro\nnot this\n\n## Refresh\nrestate me\n\n## After\nnor this\n",
+        o = crate::skill::SKILL_ANCHOR_OPEN,
+        c = crate::skill::SKILL_ANCHOR_CLOSE,
+    );
+    let msgs = vec![
+        LoopMessage::ToolResult(super::super::message::ToolResultMessage {
+            tool_call_id: "1".into(),
+            tool_name: "skill".into(),
+            content: vec![super::super::message::ContentBlock::Text { text: body }],
+            details: serde_json::Value::Null,
+            is_error: false,
+        }),
+        // An ordinary tool result must contribute nothing.
+        LoopMessage::ToolResult(super::super::message::ToolResultMessage {
+            tool_call_id: "2".into(),
+            tool_name: "read".into(),
+            content: vec![super::super::message::ContentBlock::Text {
+                text: "some file".into(),
+            }],
+            details: serde_json::Value::Null,
+            is_error: false,
+        }),
+    ];
+    let got = collect_skill_anchors(&msgs);
+    assert_eq!(got.len(), 1, "exactly one anchored skill: {got:?}");
+    assert_eq!(got[0].0, "j-space");
+    assert!(got[0].1.contains("restate me"), "got: {:?}", got[0].1);
+    assert!(
+        !got[0].1.contains("not this"),
+        "must be the named section only"
+    );
+    assert!(
+        !got[0].1.contains("nor this"),
+        "must stop at the next heading"
+    );
+
+    // A skill body with no anchor declared yields nothing to restate — the
+    // must-not-fire half. Restating a head excerpt on a timer would be noise.
+    let unanchored = format!(
+        "# plain\n{o}{c}\n\nbody",
+        o = crate::skill::SKILL_ANCHOR_OPEN,
+        c = crate::skill::SKILL_ANCHOR_CLOSE,
+    );
+    let msgs = vec![LoopMessage::ToolResult(
+        super::super::message::ToolResultMessage {
+            tool_call_id: "3".into(),
+            tool_name: "skill".into(),
+            content: vec![super::super::message::ContentBlock::Text { text: unanchored }],
+            details: serde_json::Value::Null,
+            is_error: false,
+        },
+    )];
+    assert!(collect_skill_anchors(&msgs).is_empty());
+}
+
+/// The interval decision, isolated from the loop so both halves are cheap to
+/// state. Off by default: restating costs tokens on every fire, and a skill
+/// that only needed to survive a fold should not also pay a timer.
+#[test]
+fn skill_anchor_restatement_respects_interval_and_off_switch() {
+    use super::should_restate_skill_anchors;
+    // Off (0) never fires, however overdue it looks.
+    assert!(!should_restate_skill_anchors(0, 1, 99, 0));
+    // Nothing to restate never fires.
+    assert!(!should_restate_skill_anchors(3, 0, 99, 0));
+    // Not yet due.
+    assert!(!should_restate_skill_anchors(3, 1, 2, 0));
+    // Due exactly at the interval, and after it.
+    assert!(should_restate_skill_anchors(3, 1, 3, 0));
+    assert!(should_restate_skill_anchors(3, 1, 10, 6));
+    // Just restated — the counter resets, so it must not fire again next turn.
+    assert!(!should_restate_skill_anchors(3, 1, 7, 6));
+}
+
 /// dirge-69oe.4 — the other half: a skill that DECLARES an `anchor:` keeps
 /// that section across the fold, while the rest of its body still goes.
 ///
@@ -7653,6 +7864,8 @@ fn boundary_emits_at_most_one_nudge() {
         1,
         &mut track,
         &mut verify,
+        &mut Vec::new(),
+        &mut 0usize,
         &mut tally,
         crate::agent::agent_loop::capability::CapabilityTier::Nominal,
         false,
@@ -7699,6 +7912,8 @@ fn safe_state_outranks_everything_else() {
         1,
         &mut track,
         &mut verify,
+        &mut Vec::new(),
+        &mut 0usize,
         &mut tally,
         crate::agent::agent_loop::capability::CapabilityTier::Nominal,
         false,
@@ -7784,6 +7999,8 @@ fn a_concluding_boundary_stands_down_without_spending_the_budget() {
         1,
         &mut track,
         &mut verify,
+        &mut Vec::new(),
+        &mut 0usize,
         &mut tally,
         crate::agent::agent_loop::capability::CapabilityTier::Nominal,
         true,
@@ -7804,6 +8021,8 @@ fn a_concluding_boundary_stands_down_without_spending_the_budget() {
         1,
         &mut track,
         &mut verify,
+        &mut Vec::new(),
+        &mut 0usize,
         &mut tally,
         crate::agent::agent_loop::capability::CapabilityTier::Nominal,
         false,
@@ -7833,6 +8052,8 @@ fn safe_state_still_fires_on_a_concluding_boundary() {
         1,
         &mut track,
         &mut verify,
+        &mut Vec::new(),
+        &mut 0usize,
         &mut tally,
         crate::agent::agent_loop::capability::CapabilityTier::Nominal,
         true,
@@ -7860,6 +8081,8 @@ fn quiet_boundary_emits_nothing() {
         1,
         &mut track,
         &mut verify,
+        &mut Vec::new(),
+        &mut 0usize,
         &mut tally,
         crate::agent::agent_loop::capability::CapabilityTier::Nominal,
         false,

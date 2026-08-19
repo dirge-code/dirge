@@ -658,6 +658,9 @@ pub enum LoopEvent {
         /// Summary model name, if known (`None` today — the summarizer
         /// closure doesn't expose it; threading it is a follow-up).
         summary_model: Option<String>,
+        /// dirge-69oe.4: skill anchors observed in the context AFTER the
+        /// fold. Empty when none survived, which is the case worth seeing.
+        skill_anchors_kept: Vec<String>,
     },
 
     /// Incremental checkpoint: a background summary was generated at a
