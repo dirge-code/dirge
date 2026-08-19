@@ -25,6 +25,11 @@ use std::sync::mpsc;
 /// prefix would be misreported as failing — accepted, because the alternative
 /// (a second round trip to read a status variable on every eval) taxes hook
 /// dispatch, which is on the hot path.
+///
+/// Its only use is in the `Cmd::Eval` handler, which is plugin-gated, so
+/// feature sets without `plugin` (windows-default among them) see it as dead —
+/// same treatment as the rest of this module.
+#[cfg_attr(not(feature = "plugin"), allow(dead_code))]
 const EV_ERROR_SENTINEL: &str = "__dirge_ev_error_9f3a__";
 
 #[cfg_attr(not(feature = "plugin"), allow(unused_imports))]
