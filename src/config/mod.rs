@@ -835,6 +835,20 @@ pub struct Config {
     pub temperature: Option<f64>,
     pub no_tools: Option<bool>,
     pub no_context_files: Option<bool>,
+    /// Suppress on-disk skill discovery entirely: no preamble catalog and
+    /// nothing loadable through the `skill` tool.
+    ///
+    /// dirge-a34y. `skill::discover_skills` spans the global tiers under
+    /// `$HOME` plus every project ancestor, and consults neither
+    /// `DIRGE_CONFIG_DIR` nor `DIRGE_DATA_DIR`. An A/B harness that
+    /// isolates those two therefore still inherits whatever skills the
+    /// machine happens to carry, in the cached prefix of every request.
+    /// Overriding `$HOME` would isolate it but break OAuth, whose
+    /// credentials live at `~/.codex/auth.json` and
+    /// `~/.claude/.credentials.json` — a context confound traded for an
+    /// auth failure. This flag is the safe lever, and it doubles as an
+    /// A/B arm for the skill dimension of first-turn composition.
+    pub no_skills: Option<bool>,
     pub context_window: Option<u64>,
     /// Breadcrumb tool schemas for a small context window (dirge-tva8):
     /// `auto` *(default)*, `on`, `off`.

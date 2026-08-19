@@ -210,6 +210,12 @@ pub struct Cli {
     )]
     pub no_context_files: bool,
 
+    #[arg(
+        long = "no-skills",
+        help = "Disable on-disk skill discovery (preamble catalog and the skill tool)"
+    )]
+    pub no_skills: bool,
+
     #[cfg(feature = "loop")]
     #[arg(
         long = "loop",
@@ -488,6 +494,12 @@ impl Cli {
 
     pub fn resolve_no_context_files(&self, cfg: &config::Config) -> bool {
         self.no_context_files || cfg.no_context_files.unwrap_or(false)
+    }
+
+    /// dirge-a34y: `--no-skills` / `no_skills`. See the config field for why
+    /// this exists rather than overriding `$HOME`.
+    pub fn resolve_no_skills(&self, cfg: &config::Config) -> bool {
+        self.no_skills || cfg.no_skills.unwrap_or(false)
     }
 
     pub fn resolve_no_tools(&self, cfg: &config::Config) -> bool {

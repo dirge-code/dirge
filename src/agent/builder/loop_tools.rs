@@ -493,11 +493,18 @@ pub async fn build_loop_tools(
     let skill_store = crate::extras::skill_db::SkillStore::load(&paths)
         .ok()
         .map(Arc::new);
-    let skills: Arc<[Skill]> = Arc::from(
-        tokio::task::spawn_blocking(move || skill::discover_skills(&cwd))
-            .await
-            .unwrap_or_default(),
-    );
+    // dirge-a34y: keep the loadable set in lockstep with the preamble
+    // catalog. If discovery is off, the `skill` tool must not be able to
+    // load what the preamble does not advertise.
+    let skills: Arc<[Skill]> = if cli.resolve_no_skills(cfg) {
+        Arc::from(Vec::new())
+    } else {
+        Arc::from(
+            tokio::task::spawn_blocking(move || skill::discover_skills(&cwd))
+                .await
+                .unwrap_or_default(),
+        )
+    };
     // Register discovered on-disk skills so they're tracked + searchable
     // in the salience store (dirge-a47a). Insert-time only seeds
     // provenance; agent-created skills already carry source='learned'
@@ -799,19 +806,30 @@ pub async fn build_loop_tools(
 
     // SkillTool runs arbitrary skill bodies — Sequential to be
     // safe (a skill body could do anything).
-    tools.push(
-        wrap(
-            tools::SkillTool::new(
-                Arc::clone(&skills),
-                skill_mgr,
-                skill_store.clone(),
-                permission.clone(),
-                ask_tx.clone(),
-            ),
-            Some(ToolExecutionMode::Sequential),
-        )
-        .await,
-    );
+    //
+    // dirge-a34y: under `no_skills` the tool is not registered at all. Gating
+    // only the discovered set is NOT enough and was caught live: `load` reads
+    // that set, but `list` reads `SkillManager` (the project `.dirge/skills/`
+    // directly), so a suppressed skill still showed up in `list` and then
+    // failed to `load` — the model is told a skill exists and then that it
+    // does not. Dropping the tool removes the inconsistency instead of
+    // papering over it, and also closes `create`, which would otherwise let a
+    // run author new skills while discovery is supposed to be off.
+    if !cli.resolve_no_skills(cfg) {
+        tools.push(
+            wrap(
+                tools::SkillTool::new(
+                    Arc::clone(&skills),
+                    skill_mgr,
+                    skill_store.clone(),
+                    permission.clone(),
+                    ask_tx.clone(),
+                ),
+                Some(ToolExecutionMode::Sequential),
+            )
+            .await,
+        );
+    }
 
     // Writes to the memory store — Sequential. dirge-yof4: a load
     // failure degrades to a session without the memory tool instead

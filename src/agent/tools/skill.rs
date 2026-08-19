@@ -157,6 +157,18 @@ impl PortableTool for SkillTool {
                     store.record_use(name);
                 }
                 let mut output = format!("# {}\n", skill.name);
+                // dirge-69oe.4: name the anchor section so a later compaction
+                // can carry it through. The body below stays byte-for-byte
+                // verbatim -- the marker is additive, and a skill without an
+                // `anchor:` gets nothing extra at all.
+                // The marker is emitted for EVERY load, not only for skills
+                // that declare an `anchor:`. The fold sees no tool name, so an
+                // unmarked body is indistinguishable from any other tool
+                // result and could not get even the head fallback.
+                output.push_str(crate::skill::SKILL_ANCHOR_OPEN);
+                output.push_str(skill.anchor.as_deref().unwrap_or(""));
+                output.push_str(crate::skill::SKILL_ANCHOR_CLOSE);
+                output.push('\n');
                 if !skill.description.is_empty() {
                     output.push_str(&format!("\n{}\n\n", skill.description));
                 }
@@ -359,6 +371,7 @@ mod tests {
             name: "test-skill".into(),
             description: "A test skill".into(),
             content: "Do the thing.".into(),
+            anchor: None,
             location: PathBuf::from("/tmp"),
         }])
     }

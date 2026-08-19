@@ -245,9 +245,17 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
     // preamble, so the model never knows to load it.
     // Skills carry name + description; full content loads on demand.
     // Bumps view counters for each listed skill (best-effort).
-    let mut skills = crate::skill::discover_skills(
-        &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
-    );
+    // dirge-a34y: `no_skills` suppresses discovery outright, so the catalog
+    // below and the `skill` tool's loadable set go empty together. Gated here
+    // rather than inside `discover_skills` so the walk is skipped, not just
+    // its result discarded.
+    let mut skills = if cli.resolve_no_skills(cfg) {
+        Vec::new()
+    } else {
+        crate::skill::discover_skills(
+            &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+        )
+    };
     if !skills.is_empty() {
         // dirge-a47a: register each discovered skill, then order the
         // listing by effective salience (most useful first) so the
