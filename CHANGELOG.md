@@ -4,6 +4,29 @@ All notable changes to dirge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.24.0] - 2026-08-19
+
+### Added
+- Skills that declare an `anchor:` can have it restated on an interval, not just
+  preserved across a compaction. Some skills state that their anchor has to
+  *recur* rather than merely survive — J-Space asks for its premise every third
+  seam and its own verifier calls the verbatim recurrence the mechanism rather
+  than an optimisation. `skill_anchor_interval` (default `0`, off) sets how
+  often, in turn boundaries. The rate is yours rather than any one skill's baked
+  in, and a skill that only needed to survive a fold pays no timer. Note the
+  interval is a floor, not a schedule: the boundary chain returns one nudge and
+  correctness nudges outrank this one, so the effective rate is lower whenever
+  the run is also being steered.
+
+### Fixed
+- `dirge --trace` now records `skill_anchors_kept` on each compaction — which
+  loaded skills still have their anchor in the context the fold produced. There
+  was previously no artifact that could answer whether a loaded skill still
+  governed after a compaction: the trace carried no message text and the session
+  file holds the persisted summary rather than the loop's working context. It
+  reads the context that was actually produced rather than what the fold
+  intended to keep, so it cannot report success when the keeping failed.
+
 ## [0.23.0] - 2026-08-19
 
 ### Added
@@ -4045,7 +4068,8 @@ agent in Rust with:
   LSP integration, and a Janet plugin system.
 - Session save/load/resume with LLM-summarization compaction.
 
-[Unreleased]: https://github.com/dirge-code/dirge/compare/v0.23.0...HEAD
+[Unreleased]: https://github.com/dirge-code/dirge/compare/v0.24.0...HEAD
+[0.24.0]: https://github.com/dirge-code/dirge/compare/v0.23.0...v0.24.0
 [0.23.0]: https://github.com/dirge-code/dirge/compare/v0.22.0...v0.23.0
 [0.21.3]: https://github.com/dirge-code/dirge/compare/v0.21.2...v0.21.3
 [0.16.0]: https://github.com/dirge-code/dirge/compare/v0.15.0...v0.16.0
