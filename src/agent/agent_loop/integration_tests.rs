@@ -96,6 +96,7 @@ fn build_config() -> LoopConfig {
         code_review_repo: None,
         open_issues_gate_mode: crate::agent::agent_loop::types::GateMode::Off,
         verification_tiers_mode: crate::agent::agent_loop::types::GateMode::Off,
+        skill_anchor_interval: 0,
         safe_state_abort_mode: crate::agent::agent_loop::types::SafeStateMode::Off,
         publish_guard_mode: crate::agent::agent_loop::types::GateMode::Off,
         claim_gate_mode: crate::agent::agent_loop::types::GateMode::Off,

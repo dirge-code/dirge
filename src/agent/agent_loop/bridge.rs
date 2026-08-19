@@ -136,6 +136,8 @@ impl EventBridge {
                 first_kept_index,
                 compaction_kind,
                 ref summary_model,
+                // dirge-69oe.4: trace-only; the UI does not surface it.
+                skill_anchors_kept: _,
             } => {
                 tracing::info!(
                     target: "dirge::agent_loop",

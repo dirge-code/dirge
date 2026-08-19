@@ -59,6 +59,9 @@ pub enum GateSource {
 /// today these are bare pushes in `run.rs` with no enum at all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BoundaryNudge {
+    /// dirge-69oe.4: a loaded skill's declared anchor, restated on the
+    /// interval the operator set. Off unless `skill_anchor_interval` > 0.
+    SkillAnchor,
     TrackWork,
     FastVerify,
     ProgressStall,
@@ -168,7 +171,8 @@ impl GateSource {
 impl BoundaryNudge {
     /// Every variant, in [`index`](Self::index) order. Same contract as
     /// [`GateSource::ALL`] — see its doc for why this exists.
-    pub const ALL: [BoundaryNudge; 10] = [
+    pub const ALL: [BoundaryNudge; 11] = [
+        BoundaryNudge::SkillAnchor,
         BoundaryNudge::TrackWork,
         BoundaryNudge::FastVerify,
         BoundaryNudge::ProgressStall,
@@ -193,6 +197,7 @@ impl BoundaryNudge {
     #[cfg(test)]
     pub fn field_name(self) -> Option<&'static str> {
         Some(match self {
+            BoundaryNudge::SkillAnchor => "nudge_skill_anchor",
             BoundaryNudge::TrackWork => "nudge_track_work",
             BoundaryNudge::FastVerify => "nudge_fast_verify",
             BoundaryNudge::ProgressStall => "nudge_progress_stall",
@@ -578,6 +583,7 @@ impl GateTally {
             gate_goal = self.gates[GateSource::Goal.index()],
             gate_todo = self.gates[GateSource::Todo.index()],
             gate_open_issues = self.gates[GateSource::OpenIssues.index()],
+            nudge_skill_anchor = self.nudges[BoundaryNudge::SkillAnchor.index()],
             nudge_track_work = self.nudges[BoundaryNudge::TrackWork.index()],
             nudge_fast_verify = self.nudges[BoundaryNudge::FastVerify.index()],
             nudge_progress_stall = self.nudges[BoundaryNudge::ProgressStall.index()],

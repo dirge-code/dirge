@@ -1243,6 +1243,64 @@ fn prior_skill_anchors(marker_content: &str) -> Vec<String> {
 ///
 /// Newest-first eviction under a shared budget, matching `verbatim_user_block`:
 /// the most recently loaded skill is the one most likely to still be governing.
+/// dirge-69oe.4 — which skill anchors are ACTUALLY present in the context,
+/// read after a fold has been applied.
+///
+/// Deliberately an observation, not a record of intent. The interesting claim
+/// is "the anchor survived", and a field populated from what the fold MEANT to
+/// keep would go green even if the keeping failed. Scanning the post-fold
+/// messages answers the real question, and is the only artefact that does:
+/// the trace carries no message text and the session file holds the persisted
+/// summary rather than the loop's working context.
+///
+/// Counts both shapes a surviving anchor can take — the marker, when the body
+/// is still whole, and the prune path's digest line.
+pub(crate) fn anchors_present_in(messages: &[serde_json::Value]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for m in messages {
+        let text = match m.get("content") {
+            Some(serde_json::Value::String(s)) => s.clone(),
+            Some(serde_json::Value::Array(blocks)) => blocks
+                .iter()
+                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join(""),
+            _ => continue,
+        };
+        for line in text.lines() {
+            let name = if let Some(rest) = line.strip_prefix("[skill] ") {
+                // Prune-path digest: "[skill] <name> — body compacted…".
+                rest.split(" — ").next().map(|n| n.trim().to_string())
+            } else if line.starts_with('[') && text.contains(SKILL_ANCHOR_HEADER) {
+                // Fold-marker block: "[<name>] <anchor…>".
+                line.trim_start_matches('[')
+                    .split(']')
+                    .next()
+                    .map(|n| n.trim().to_string())
+            } else {
+                None
+            };
+            if let Some(n) = name
+                && !n.is_empty()
+                && !out.contains(&n)
+            {
+                out.push(n);
+            }
+        }
+        if crate::skill::is_skill_body(&text)
+            && let Some(n) = text
+                .lines()
+                .next()
+                .map(|l| l.trim_start_matches('#').trim().to_string())
+            && !n.is_empty()
+            && !out.contains(&n)
+        {
+            out.push(n);
+        }
+    }
+    out
+}
+
 pub(crate) fn skill_anchor_block(folded: &[Turn]) -> Option<String> {
     let mut kept: Vec<String> = Vec::new();
     let mut used = 0usize;

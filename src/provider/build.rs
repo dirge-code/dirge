@@ -587,6 +587,7 @@ pub async fn build_agent(
     // config. Default is Off (opt-in; nagging is intrusive).
     agent = agent.with_open_issues_gate_mode(cfg.resolve_open_issues_gate_mode());
     agent = agent.with_verification_tiers_mode(cfg.resolve_verification_tiers_mode());
+    agent = agent.with_skill_anchor_interval(cfg.resolve_skill_anchor_interval());
     // dirge-w2de: project gate command — the real CI gate. None (absent
     // config key) keeps the verifier byte-identical.
     agent = agent.with_verification_command(cfg.verification_command.clone());

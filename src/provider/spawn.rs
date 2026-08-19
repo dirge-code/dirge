@@ -278,6 +278,7 @@ impl AnyAgent {
         cfg.code_review_mode = self.code_review_mode;
         cfg.open_issues_gate_mode = self.open_issues_gate_mode;
         cfg.verification_tiers_mode = self.verification_tiers_mode;
+        cfg.skill_anchor_interval = self.skill_anchor_interval;
         cfg.safe_state_abort_mode = self.safe_state_abort_mode;
         cfg.publish_guard_mode = self.publish_guard_mode;
         cfg.claim_gate_mode = self.claim_gate_mode;
