@@ -139,7 +139,16 @@ command -v jq >/dev/null || { echo "error: jq required" >&2; exit 1; }
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/loop-ab.XXXXXX")"
 FIXTURE="$WORK/fixture"
 mkdir -p "$FIXTURE"
-trap 'rm -rf "$WORK"' EXIT
+# LOOP_AB_KEEP=1 preserves $WORK after the run. The per-run traces, stream-json
+# and gate logs all live there, and the default cleanup destroys them the moment
+# the report prints -- so any question the summary table does not already answer
+# ("which guard fired on turn 7 of treatment run 2") was unanswerable without
+# re-running and re-paying. Off by default: these dirs are large.
+if [ "${LOOP_AB_KEEP:-0}" = "1" ]; then
+  trap 'echo; echo "artifacts kept: $WORK"' EXIT
+else
+  trap 'rm -rf "$WORK"' EXIT
+fi
 
 # ---- Scenarios. Ground truth is computed from the fixture itself, never
 # hardcoded, so the correctness gate always matches what was planted.
@@ -925,7 +934,7 @@ build_config() { # $1 = cfgdir, $2 = overrides, $3 = model
 # input_tokens  cached_tokens  cache_creation_tokens  session_found
 # denied_tool_attempts  compactions  errored_missing_info  unresolved_effects
 run_arm() { # $1 = overrides, $2 = tag, $3 = model
-  local i cfgdir datadir out err logfile ok tally_str
+  local i cfgdir datadir out err logfile tracefile ok tally_str
   local gates_line tally_found turns tool_calls_f errored err_missing unresolved scavenged storm maxstreak rep_invalid rep_total verification fw
   local sess sess_found in_tok cached_tok create_tok
   for i in $(seq 1 "$REPEATS"); do
@@ -940,8 +949,14 @@ run_arm() { # $1 = overrides, $2 = tag, $3 = model
     out="$WORK/${2}-${3}-${i}.jsonl"
     err="$WORK/${2}-${3}-${i}.err"
     logfile="$WORK/${2}-${3}-${i}.log"
+    # Per-run loop trace (dirge-vlfb). The gates tally is one aggregate line per
+    # run; the trace is the per-step record behind it, and it is the only way to
+    # answer "which guard fired at which turn" after the fact. One file per run,
+    # so arms and repeats never share a path. Costs nothing when unread.
+    tracefile="$WORK/${2}-${3}-${i}.trace.jsonl"
     ( cd "$FIXTURE" && DIRGE_CONFIG_DIR="$cfgdir" DIRGE_DATA_DIR="$datadir" \
         DIRGE_LOG="$logfile" RUST_LOG="dirge::gates=info,dirge::agent_loop=info" \
+        DIRGE_TRACE="$tracefile" \
         "$OLDPWD_BINARY" -p --yolo $EXTRA_ARGS --output-format stream-json "$TASK" ) \
         >"$out" 2>"$err" || true
 
