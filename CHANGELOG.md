@@ -4,6 +4,49 @@ All notable changes to dirge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.23.0] - 2026-08-19
+
+### Added
+- A persistent Janet notebook kernel the agent evaluates code against. State
+  survives between tool calls, so the model builds context up incrementally
+  instead of re-deriving it or writing throwaway scripts to disk. The kernel is
+  a second Janet VM with a fresh root env and none of the host bridges, so a
+  runaway cell cannot stall the permission gate and agent-authored code cannot
+  shadow a `harness/` function the gate later calls. Runaway cells are
+  interrupted rather than abandoned.
+- `no_skills` (config) / `--no-skills` (CLI) disables on-disk skill discovery —
+  both the preamble catalog and the `skill` tool. Discovery spans
+  `~/.claude`, `~/.opencode`, `~/.agents` and `~/.dirge` `/skills` plus every
+  project ancestor, and honours neither `DIRGE_CONFIG_DIR` nor `DIRGE_DATA_DIR`,
+  so an A/B harness that isolated those still inherited whatever skills the
+  machine happened to carry, in the cached prefix of every request.
+  `scripts/loop-ab.sh` now sets it and reports what it excluded.
+- Skills may declare an `anchor:` in their frontmatter, naming the one section
+  that must survive a compaction. A skill body is an ordinary tool result, so
+  the first fold digests or prunes it — fine for a skill that only had to be
+  read, not for one that governs how the model works for the rest of the run,
+  which stopped governing while the run carried on looking healthy. The anchor
+  is honoured only if the heading resolves in the body, so a typo degrades to
+  no-anchor rather than to a guarantee that keeps nothing. On a ~4,700-token
+  skill this carries ~280 tokens through the fold.
+- `ixx` is recognized as a C++ extension.
+
+### Fixed
+- A Janet runtime error raised after the fiber yielded to the event loop was
+  reported to Rust as success, with the error text sitting where a value should
+  be. Every ev-backed builtin takes that path — `os/execute`, `os/spawn`,
+  `ev/*`, `net/*` — so a plugin hook, slash command or tool handler that failed
+  on one reported success and its error text was consumed as the return value.
+  Pure `(error ...)` was always flagged correctly, which is why it went
+  unnoticed. This is a diagnostics fix, not a permission fix: the tool-hook path
+  already proceeds when a hook errors.
+- Janet subprocess output could corrupt the TUI.
+- HTTP 402 is now classified as a usage cap. A spent balance is the same wall as
+  a usage cap reached by a different route, but the classifier keyed on throttle
+  vocabulary and a billing 402 shares no wording with it, so a spent balance was
+  reported as a generic provider error and the one message that would say "top
+  up" never appeared.
+
 ## [0.22.0] - 2026-08-15
 
 ### Security
@@ -4002,7 +4045,8 @@ agent in Rust with:
   LSP integration, and a Janet plugin system.
 - Session save/load/resume with LLM-summarization compaction.
 
-[Unreleased]: https://github.com/dirge-code/dirge/compare/v0.21.3...HEAD
+[Unreleased]: https://github.com/dirge-code/dirge/compare/v0.23.0...HEAD
+[0.23.0]: https://github.com/dirge-code/dirge/compare/v0.22.0...v0.23.0
 [0.21.3]: https://github.com/dirge-code/dirge/compare/v0.21.2...v0.21.3
 [0.16.0]: https://github.com/dirge-code/dirge/compare/v0.15.0...v0.16.0
 [0.4.1]: https://github.com/dirge-code/dirge/compare/v0.4.0...v0.4.1
