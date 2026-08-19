@@ -4376,9 +4376,15 @@ async fn compaction_circuit_breaker_skips_summarizer_after_max_failures() {
 /// depending on which mechanism happened to fire, which is how the first
 /// draft of this test reported the opposite of the live observation.
 ///
-/// THIS TEST ASSERTS THE CURRENT GAP, NOT THE DESIRED END STATE. If someone
-/// implements skill re-anchoring or pins skill bodies across folds, it
-/// SHOULD fail — that is the signal to update it deliberately.
+/// SCOPE, as of dirge-69oe.4's fix: this now describes the FALLBACK case —
+/// a skill that declares no `anchor:` in its frontmatter. Those still lose
+/// everything past a bounded head excerpt, which is the deliberate design:
+/// carrying whole bodies through every fold would cost more than the summary
+/// they ride beside. The declared-anchor path is covered by
+/// `a_declared_skill_anchor_survives_compaction`, and the two must be read
+/// together — this one alone would be satisfied by a harness that cannot
+/// preserve anything, and that one alone by a harness that preserves
+/// everything.
 #[tokio::test]
 async fn a_loaded_skill_body_does_not_survive_compaction() {
     // Two markers from the real J-Space skill: one at the very top of
@@ -4470,6 +4476,91 @@ async fn a_loaded_skill_body_does_not_survive_compaction() {
         "KNOWN GAP (dirge-69oe.4): the skill's operating protocol survived the \
          fold. If skill preservation is now intentional, update this test and \
          the issue rather than deleting the assertion. Context after:\n{after}"
+    );
+}
+
+/// dirge-69oe.4 — the other half: a skill that DECLARES an `anchor:` keeps
+/// that section across the fold, while the rest of its body still goes.
+///
+/// This is the fix for the gap pinned by
+/// `a_loaded_skill_body_does_not_survive_compaction` above. Both must hold
+/// together: without the negative test this could pass by preserving
+/// everything (which would cost a fold's worth of tokens on every skill), and
+/// without this one the negative test is satisfied by a harness that simply
+/// cannot preserve anything.
+#[tokio::test]
+async fn a_declared_skill_anchor_survives_compaction() {
+    const ANCHOR_LINE: &str = "The premise and the invariants | Every third seam";
+    const DROPPED_LINE: &str = "a routing detail nobody needs restated";
+
+    let mut ctx = empty_context();
+    ctx.messages
+        .push(serde_json::json!({"role":"system","content":"agent"}));
+    ctx.messages
+        .push(serde_json::json!({"role":"user","content":"task"}));
+    // Exactly what the skill tool emits for a skill whose frontmatter carries
+    // `anchor: "## Refresh"` — marker line, then the verbatim body.
+    let body = format!(
+        "# j-space\n{open}## Refresh{close}\n\n## Intro\n{dropped}\n\n## Refresh\n{anchor}\n\n## Routing\n{dropped}\n{filler}",
+        open = crate::skill::SKILL_ANCHOR_OPEN,
+        close = crate::skill::SKILL_ANCHOR_CLOSE,
+        dropped = DROPPED_LINE,
+        anchor = ANCHOR_LINE,
+        filler = "filler body line\n".repeat(400),
+    );
+    ctx.messages.push(serde_json::json!({
+        "role": "tool", "tool_name": "skill", "content": body,
+    }));
+    for i in 0..20 {
+        let role = if i % 2 == 0 { "assistant" } else { "user" };
+        ctx.messages.push(serde_json::json!({
+            "role": role, "content": format!("turn {i} with filler content")
+        }));
+    }
+    ctx.messages
+        .push(serde_json::json!({"role":"user","content":"latest"}));
+
+    let before = serde_json::to_string(&ctx.messages).unwrap();
+    assert!(before.contains(ANCHOR_LINE), "precondition: anchor present");
+    assert!(
+        before.contains(DROPPED_LINE),
+        "precondition: filler present"
+    );
+
+    let (tx, mut rx) = mpsc::channel::<LoopEvent>(8);
+    super::run_compaction_pass(
+        &mut ctx,
+        &None,
+        5,
+        0,
+        &None,
+        None,
+        &tx,
+        &empty_checkpoint_slot(),
+        &mut 0,
+        u64::MAX,
+    )
+    .await;
+    drop(tx);
+    let mut compacted = false;
+    while let Some(ev) = rx.recv().await {
+        if matches!(ev, LoopEvent::ContextCompacted { .. }) {
+            compacted = true;
+        }
+    }
+    assert!(compacted, "mechanism gate: no compaction happened");
+
+    let after = serde_json::to_string(&ctx.messages).unwrap();
+    assert!(
+        after.contains(ANCHOR_LINE),
+        "the declared anchor must ride through the fold; context after:\n{after}"
+    );
+    // MUST-NOT-FIRE: only the anchor rides through, not the body around it.
+    // Preserving everything would satisfy the assertion above while costing a
+    // full skill body on every fold — the outcome this design exists to avoid.
+    assert!(
+        !after.contains(DROPPED_LINE),
+        "only the anchor section may survive, not the whole body; after:\n{after}"
     );
 }
 

@@ -714,6 +714,41 @@ fn summarize_tool_result(tool_name: &str, content: &str) -> String {
         "task" | "task_status" => {
             format!("[{tool_name}] {clen} chars result")
         }
+        // dirge-69oe.4: a skill body is not a result to be summarised, it is
+        // an instruction that is still in force. The generic arm below would
+        // reduce it to an 80-char preview -- which, for a skill whose first
+        // lines are a title and a description, preserves nothing that governs
+        // anything. Keep the section the skill DECLARED as required instead.
+        //
+        // This is the prune path. The summary path carries anchors in the fold
+        // marker (`skill_anchor_block`); both are needed, because a run with no
+        // summarizer wired folds prune-only and never builds a marker at all --
+        // which is exactly the configuration this gap was first observed in.
+        "skill" => {
+            let name = content
+                .lines()
+                .next()
+                .map(|l| l.trim_start_matches('#').trim())
+                .filter(|n| !n.is_empty())
+                .unwrap_or("skill");
+            match crate::skill::anchor_marker_heading(content)
+                .and_then(|h| crate::skill::extract_section(content, h))
+            {
+                Some(anchor) => {
+                    let clipped: String = anchor.chars().take(SKILL_ANCHOR_ONE_CHARS).collect();
+                    format!("[skill] {name} — body compacted; declared anchor kept:\n{clipped}")
+                }
+                // No anchor declared, or its heading did not resolve. Fall back
+                // to a bounded head excerpt: better than 80 chars, and visibly
+                // worse than declaring one.
+                None => {
+                    let head: String = content.chars().take(SKILL_ANCHOR_ONE_CHARS).collect();
+                    format!(
+                        "[skill] {name} — body compacted ({clen} chars), no anchor declared:\n{head}"
+                    )
+                }
+            }
+        }
         _ => {
             let preview: String = content.chars().take(80).collect();
             format!(
@@ -1152,6 +1187,136 @@ const VERBATIM_USER_MSG_CHARS: usize = 1500;
 /// why only the automatic fold had it — `/compact` works on `SessionMessage`
 /// and simply went without, paraphrasing away the very thing dirge-7ylu added
 /// this to protect.
+/// Header of the skill-anchor section. Doubles as the parse anchor when a
+/// later fold harvests anchors out of an earlier fold's marker.
+const SKILL_ANCHOR_HEADER: &str = "## Skill anchors carried through this fold";
+
+/// Total budget for the anchor block. Deliberately smaller than the verbatim
+/// budget: a skill anchor is meant to be the short part a skill needs restated,
+/// and a skill that declares half its body as the anchor should be truncated
+/// rather than allowed to crowd out the summary it rides beside.
+const SKILL_ANCHOR_BUDGET_CHARS: usize = 3000;
+
+/// Cut for any single anchor, including the head fallback used when a skill
+/// declares no `anchor:`.
+const SKILL_ANCHOR_ONE_CHARS: usize = 1200;
+
+/// Recover anchors an earlier fold recorded, so a skill loaded before the FIRST
+/// fold still has its anchor after the third. Mirrors `prior_verbatim_lines`.
+fn prior_skill_anchors(marker_content: &str) -> Vec<String> {
+    let Some(section) = marker_content.split(SKILL_ANCHOR_HEADER).nth(1) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut cur: Vec<&str> = Vec::new();
+    for line in section.lines() {
+        if line.starts_with("## ") && !line.starts_with(SKILL_ANCHOR_HEADER) {
+            break;
+        }
+        if line.starts_with("[") && !cur.is_empty() {
+            out.push(cur.join("\n").trim().to_string());
+            cur.clear();
+        }
+        if line.starts_with("[") || !cur.is_empty() {
+            cur.push(line);
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur.join("\n").trim().to_string());
+    }
+    out.retain(|s| !s.is_empty());
+    out
+}
+
+/// dirge-69oe.4: carry loaded skills' anchor sections through a fold.
+///
+/// A skill body is an ordinary tool result. It is truncated to a head excerpt
+/// or pruned outright like anything else, so a skill that governs HOW the model
+/// works stops governing at the first compaction while the run carries on
+/// looking healthy — the failure this exists to stop.
+///
+/// Only the declared `anchor:` section rides through, not the body: the point
+/// is the short part a skill needs restated, and carrying whole bodies would
+/// cost more per fold than the summary they accompany. A skill that declares no
+/// anchor gets a bounded head excerpt, which is better than nothing and worse
+/// than declaring one.
+///
+/// Newest-first eviction under a shared budget, matching `verbatim_user_block`:
+/// the most recently loaded skill is the one most likely to still be governing.
+pub(crate) fn skill_anchor_block(folded: &[Turn]) -> Option<String> {
+    let mut kept: Vec<String> = Vec::new();
+    let mut used = 0usize;
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut candidates: Vec<String> = Vec::new();
+    let mut inherited: Vec<String> = Vec::new();
+
+    for msg in folded.iter().rev() {
+        if msg.role == TurnRole::System && msg.text.contains(COMPACTION_MARKER) {
+            let mut prior = prior_skill_anchors(&msg.text);
+            prior.reverse();
+            inherited.extend(prior);
+            continue;
+        }
+        if msg.role != TurnRole::ToolResult || !crate::skill::is_skill_body(&msg.text) {
+            continue;
+        }
+        // The skill tool writes `# <name>` as the first line.
+        let name = msg
+            .text
+            .lines()
+            .next()
+            .map(|l| l.trim_start_matches('#').trim())
+            .filter(|n| !n.is_empty())
+            .unwrap_or("skill")
+            .to_string();
+        let section = match crate::skill::anchor_marker_heading(&msg.text)
+            .and_then(|h| crate::skill::extract_section(&msg.text, h))
+        {
+            Some(s) => s,
+            // No `anchor:` declared, or the heading did not resolve in the body
+            // that actually shipped. Fall back to a bounded head excerpt.
+            None => msg.text.chars().take(SKILL_ANCHOR_ONE_CHARS).collect(),
+        };
+        let section = section.trim();
+        if section.is_empty() {
+            continue;
+        }
+        let clipped: String = if section.chars().count() > SKILL_ANCHOR_ONE_CHARS {
+            let head: String = section.chars().take(SKILL_ANCHOR_ONE_CHARS).collect();
+            format!("{head}… (anchor truncated)")
+        } else {
+            section.to_string()
+        };
+        candidates.push(format!("[{name}] {clipped}"));
+    }
+    candidates.extend(inherited);
+
+    for entry in candidates {
+        // One anchor per skill. A skill re-loaded mid-run would otherwise ride
+        // through twice and spend the budget on a duplicate.
+        let key = entry.split(']').next().unwrap_or(&entry).to_string();
+        if !seen.insert(key) {
+            continue;
+        }
+        if used + entry.len() > SKILL_ANCHOR_BUDGET_CHARS && !kept.is_empty() {
+            break;
+        }
+        used += entry.len();
+        kept.push(entry);
+    }
+
+    if kept.is_empty() {
+        return None;
+    }
+    kept.reverse();
+    Some(format!(
+        "\n\n{SKILL_ANCHOR_HEADER}\n\
+         These skills were loaded before this fold and still apply. Their bodies \
+         were compacted away; these are the sections they declared as required.\n\n{}\n",
+        kept.join("\n\n")
+    ))
+}
+
 pub(crate) fn verbatim_user_block(folded: &[Turn]) -> Option<String> {
     let mut kept: Vec<String> = Vec::new();
     let mut used = 0usize;
@@ -1387,12 +1552,14 @@ pub fn apply_summary(
     // folded window — so the newest-first budget evicts them first.
     let mut carried = superseded;
     carried.extend_from_slice(&messages[compress_start..compress_end]);
-    let verbatim = verbatim_user_block(&super::compaction_material::from_loop_messages(&carried))
-        .unwrap_or_default();
+    let material = super::compaction_material::from_loop_messages(&carried);
+    let verbatim = verbatim_user_block(&material).unwrap_or_default();
+    // dirge-69oe.4: skills that declared an anchor keep it across the fold.
+    let anchors = skill_anchor_block(&material).unwrap_or_default();
     // Summary marker — filter-safe prefix + body.
     let summary_msg = serde_json::json!({
         "role": "system",
-        "content": format!("{}{}{}", SUMMARY_PREFIX, summary, verbatim),
+        "content": format!("{}{}{}{}", SUMMARY_PREFIX, summary, anchors, verbatim),
     });
     out.push(summary_msg);
     // Protected tail — copy verbatim.
