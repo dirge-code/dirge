@@ -10,6 +10,14 @@ mod libkrun_probe {
 }
 
 fn main() {
+    // The Mojo grammar is vendored (`grammars/tree-sitter-mojo`) rather than
+    // pulled as a crate: it isn't published to crates.io under any name, and a
+    // git dependency makes `cargo publish` refuse the whole package — which
+    // would break the release job. Compiled here so the grammar stays inside
+    // this crate. See that directory's README for provenance.
+    #[cfg(feature = "semantic-mojo")]
+    build_mojo_grammar();
+
     // Without the feature the runner isn't built at all (it declares
     // `required-features`), so there is nothing to link and nothing to probe.
     #[cfg(feature = "sandbox-microvm")]
@@ -30,4 +38,30 @@ fn main() {
     // `rerun-if-changed` on it. That did nothing except switch off cargo's
     // default "re-run when any package file changed" heuristic, which pinned
     // the libkrun verdict for the life of the target directory (dirge-zsi8).
+}
+
+#[cfg(feature = "semantic-mojo")]
+fn build_mojo_grammar() {
+    let src_dir = std::path::Path::new("grammars/tree-sitter-mojo/src");
+
+    let mut c_config = cc::Build::new();
+    c_config
+        .std("c11")
+        .include(src_dir)
+        // Upstream's own binding sets this; the generated parser has
+        // unused-value warnings that are not worth patching out of a
+        // regenerated file.
+        .flag_if_supported("-Wno-unused-value");
+
+    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        c_config.flag("-utf-8");
+    }
+
+    for f in ["parser.c", "scanner.c"] {
+        let path = src_dir.join(f);
+        c_config.file(&path);
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+
+    c_config.compile("tree-sitter-mojo");
 }

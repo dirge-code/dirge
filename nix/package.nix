@@ -30,14 +30,6 @@ rustPlatform.buildRustPackage {
   src = source;
 
   cargoLock.lockFile = ../Cargo.lock;
-  # tree-sitter-mojo isn't on crates.io, so Cargo.lock carries it as a git
-  # dependency and importCargoLock needs its fetch hash pinned here. The
-  # hash was NAR-serialized offline (no Nix on the dev box); if it's ever
-  # wrong the build error names the correct one — update it from there.
-  cargoLock.outputHashes = {
-    "tree-sitter-mojo-0.25.0" = "sha256-nw5dCRuVis8iWQ32qDhNPEqtN7konXaV/H2Om7+OjNU=";
-  };
-
   nativeBuildInputs = [
     cmake
     # evil-janet generates bindings during the build; bindgenHook also

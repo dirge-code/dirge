@@ -1983,7 +1983,7 @@ mod gate_coverage {
                 "__extension List[T]:\n    fn total_len(self) -> Int:\n        return len(self)\n",
             ),
         ];
-        let lang: tree_sitter::Language = tree_sitter_mojo::LANGUAGE.into();
+        let lang: tree_sitter::Language = crate::semantic::mojo_grammar::LANGUAGE.into();
         let mut parser = tree_sitter::Parser::new();
         parser.set_language(&lang).expect("mojo grammar loads");
         let mut rejected = Vec::new();
@@ -2024,7 +2024,7 @@ mod gate_coverage {
                 "def f():\n    (var list) = [a + b for a, b in [(1, 2), (3, 4)]]\n",
             ),
         ];
-        let lang: tree_sitter::Language = tree_sitter_mojo::LANGUAGE.into();
+        let lang: tree_sitter::Language = crate::semantic::mojo_grammar::LANGUAGE.into();
         let mut parser = tree_sitter::Parser::new();
         parser.set_language(&lang).expect("mojo grammar loads");
         for (name, src) in cases {

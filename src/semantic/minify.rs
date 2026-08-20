@@ -87,7 +87,7 @@ pub fn language_for_ext(ext: &str) -> Option<tree_sitter::Language> {
         #[cfg(feature = "semantic-python")]
         "py" => Some(tree_sitter_python::LANGUAGE.into()),
         #[cfg(feature = "semantic-mojo")]
-        "mojo" | "🔥" => Some(tree_sitter_mojo::LANGUAGE.into()),
+        "mojo" | "🔥" => Some(crate::semantic::mojo_grammar::LANGUAGE.into()),
         #[cfg(feature = "semantic-ruby")]
         "rb" | "rake" | "gemspec" => Some(tree_sitter_ruby::LANGUAGE.into()),
         #[cfg(feature = "semantic-elixir")]

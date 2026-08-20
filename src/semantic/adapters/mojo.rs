@@ -6,7 +6,8 @@ use crate::semantic::adapter::LanguageAdapter;
 use crate::semantic::common::node_text;
 use crate::semantic::types::{ByteRange, ExtractedFile, Import, ImportKind, Symbol, SymbolKind};
 
-/// Mojo. The grammar (lsh/tree-sitter-mojo) is a fork of tree-sitter-python,
+/// Mojo. The grammar (lsh/tree-sitter-mojo, vendored at
+/// `grammars/tree-sitter-mojo`) is a fork of tree-sitter-python,
 /// so the shape of this adapter follows `PythonAdapter` closely; the
 /// differences are the Mojo-only definition kinds:
 ///
@@ -266,7 +267,7 @@ impl LanguageAdapter for MojoAdapter {
     }
 
     fn extract(&self, file_path: &Path, source: &str) -> Result<ExtractedFile, String> {
-        let lang = tree_sitter_mojo::LANGUAGE.into();
+        let lang = crate::semantic::mojo_grammar::LANGUAGE.into();
         let mut parser = Parser::new();
         parser
             .set_language(&lang)
@@ -311,7 +312,7 @@ impl LanguageAdapter for MojoAdapter {
         _file_path: &Path,
         range: ByteRange,
     ) -> Result<Vec<String>, String> {
-        let lang: tree_sitter::Language = tree_sitter_mojo::LANGUAGE.into();
+        let lang: tree_sitter::Language = crate::semantic::mojo_grammar::LANGUAGE.into();
         // Same two alternatives as Python (B3-7): direct identifier calls AND
         // attribute-access (method) calls, so `obj.method()` isn't dropped.
         let query_str = r#"

@@ -15,8 +15,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   write-time syntax gate deliberately does NOT use the grammar — measured
   against 800 real files from the modular repo it false-errors on ~10%, so
   Mojo writes get the delimiter-balance scan instead (see `GATE_EXCLUSIONS`).
-  The grammar is pinned to a fork of `lsh/tree-sitter-mojo` carrying a
-  one-line build fix until upstream PR #12 merges.
+  The grammar is vendored at `grammars/tree-sitter-mojo` and compiled by
+  `build.rs`: it isn't published to crates.io, and a git dependency would make
+  `cargo publish` reject the whole package.
 
 ## [0.24.0] - 2026-08-19
 
