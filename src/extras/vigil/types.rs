@@ -107,8 +107,15 @@ pub enum VigilCtl {
 /// Result of a rite gate check.
 #[derive(Debug)]
 pub enum RiteResult {
-    Pass { output: Option<String> },
-    Fail { reason: String },
+    Pass {
+        output: Option<String>,
+        /// Exit code of the rite command. `None` when the rite had no `cmd`
+        /// (e.g. a `git_dirty`-only gate).
+        exit_code: Option<i32>,
+    },
+    Fail {
+        reason: String,
+    },
 }
 
 /// Runtime representation of a vigil definition (deserialized from config

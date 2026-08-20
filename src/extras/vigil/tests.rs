@@ -230,25 +230,28 @@ async fn harbinger_template_emits_raw_payload() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn harbinger_commands_resolves_registered_tool() {
+async fn harbinger_commands_executes_resolved_command() {
+    let out_path = std::env::temp_dir().join(format!("dirge-vigil-cmd-{}.txt", std::process::id()));
+    let _ = std::fs::remove_file(&out_path);
+
     let mut commands = HashMap::new();
-    let mut ping_args = serde_json::Map::new();
-    ping_args.insert(
+    let mut cmd_args = serde_json::Map::new();
+    cmd_args.insert(
         "command".to_string(),
-        serde_json::Value::String("echo {message}".to_string()),
+        serde_json::Value::String(format!("echo {{message}} > {}", out_path.display())),
     );
     commands.insert(
-        "ping".to_string(),
+        "write".to_string(),
         VigilCommand {
             tool: "bash".to_string(),
-            args: ping_args,
+            args: cmd_args,
         },
     );
 
     let mut keeper = spawn_keeper(vec![VigilEntry {
-        name: "harb-cmd".to_string(),
+        name: "harb-exec".to_string(),
         trigger: VigilTrigger::Harbinger {
-            address: "127.0.0.1:19191".to_string(),
+            address: "127.0.0.1:19192".to_string(),
             protocol: "tcp".to_string(),
             socket_mode: SocketMode::Commands,
             commands,
@@ -259,15 +262,24 @@ async fn harbinger_commands_resolves_registered_tool() {
         ..Default::default()
     }]);
 
-    send_line(19191, r#"{"command":"ping","args":{"message":"hello"}}"#);
+    send_line(19192, r#"{"command":"write","args":{"message":"hello"}}"#);
 
-    let obs = recv_observance_from(&mut keeper, "harb-cmd", Duration::from_secs(8))
-        .await
-        .expect("harbinger commands observance");
+    // Commands mode emits no observance — poll for the command's side effect.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    loop {
+        match std::fs::read_to_string(&out_path) {
+            Ok(content) => {
+                assert_eq!(content.trim(), "hello");
+                break;
+            }
+            Err(_) if tokio::time::Instant::now() >= deadline => {
+                panic!("commands-mode dispatch did not execute within 8s");
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+        }
+    }
 
-    assert_eq!(obs.vigil_name, "harb-cmd");
-    assert_eq!(obs.context["_resolved_tool"], "bash");
-    assert_eq!(obs.context["_resolved_args"]["command"], "echo hello");
+    let _ = std::fs::remove_file(&out_path);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -389,6 +401,23 @@ async fn rite_empty_stdout_yields_empty_rite_output() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn rite_success_exposes_exit_code_in_prompt() {
+    let mut keeper = spawn_keeper(vec![toll_entry(
+        "rite-exit",
+        1,
+        1,
+        "exit:{rite_exit_code}",
+        ok_rite(),
+    )]);
+
+    let obs = recv_observance_from(&mut keeper, "rite-exit", Duration::from_secs(8))
+        .await
+        .expect("rite-exit observance");
+
+    assert_eq!(obs.prompt, "exit:0");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn watcher_fires_on_file_modify() {
     let dir = std::env::temp_dir().join(format!("dirge-vigil-watchmod-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -487,6 +516,54 @@ async fn in_flight_observance_skips_overlapping_reap() {
             .is_none(),
         "second reap must be skipped while observance is in flight"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn vigil_refires_after_inflight_flag_clears() {
+    let mut keeper = spawn_keeper(vec![toll_entry("refire", 1, 1, "x", None)]);
+
+    let first = recv_observance_from(&mut keeper, "refire", Duration::from_secs(8))
+        .await
+        .expect("first observance");
+
+    // Simulate the UI post-turn handler releasing the in-flight flag.
+    first
+        .running
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+
+    let second = recv_observance_from(&mut keeper, "refire", Duration::from_secs(8))
+        .await
+        .expect("second observance after release");
+    assert_eq!(second.vigil_name, "refire");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn two_vigils_reap_independently() {
+    let mut keeper = spawn_keeper(vec![
+        toll_entry("v-a", 1, 1, "a", None),
+        toll_entry("v-b", 1, 1, "b", None),
+    ]);
+
+    let rx = keeper.observance_rx.as_mut().expect("observance receiver");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    let mut seen = std::collections::HashSet::new();
+
+    while seen.len() < 2 {
+        let now = tokio::time::Instant::now();
+        assert!(
+            now < deadline,
+            "timed out waiting for both vigils; seen={seen:?}"
+        );
+        match tokio::time::timeout(deadline - now, rx.recv()).await {
+            Ok(Some(obs)) => {
+                seen.insert(obs.vigil_name.clone());
+            }
+            Ok(None) | Err(_) => break,
+        }
+    }
+
+    assert!(seen.contains("v-a"), "seen={seen:?}");
+    assert!(seen.contains("v-b"), "seen={seen:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

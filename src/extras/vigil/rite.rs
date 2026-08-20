@@ -14,6 +14,9 @@ pub async fn evaluate_rite(rite: &VigilRite) -> RiteResult {
 }
 
 async fn evaluate_rite_in(rite: &VigilRite, dir: &std::path::Path) -> RiteResult {
+    let mut exit_code: Option<i32> = None;
+    let mut output: Option<String> = None;
+
     if let Some(ref cmd) = rite.cmd
         && !cmd.is_empty()
     {
@@ -23,21 +26,20 @@ async fn evaluate_rite_in(rite: &VigilRite, dir: &std::path::Path) -> RiteResult
             .output()
             .await
         {
-            Ok(output) if output.status.success() => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
+            Ok(cmd_output) if cmd_output.status.success() => {
+                exit_code = cmd_output.status.code();
+                let stdout = String::from_utf8_lossy(&cmd_output.stdout);
                 let trimmed = stdout.trim().to_string();
                 if !trimmed.is_empty() {
-                    return RiteResult::Pass {
-                        output: Some(trimmed),
-                    };
+                    output = Some(trimmed);
                 }
             }
-            Ok(output) => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
+            Ok(cmd_output) => {
+                let stderr = String::from_utf8_lossy(&cmd_output.stderr);
                 return RiteResult::Fail {
                     reason: format!(
                         "rite cmd '{cmd}' exited {}: {}",
-                        output.status,
+                        cmd_output.status,
                         stderr.trim()
                     ),
                 };
@@ -64,7 +66,7 @@ async fn evaluate_rite_in(rite: &VigilRite, dir: &std::path::Path) -> RiteResult
         }
     }
 
-    RiteResult::Pass { output: None }
+    RiteResult::Pass { output, exit_code }
 }
 
 async fn check_git_dirty(dir: &std::path::Path) -> Result<bool, String> {
@@ -174,6 +176,63 @@ mod tests {
         assert!(
             matches!(evaluate_rite_in(&gate, &dir).await, RiteResult::Fail { .. }),
             "dirty tree should fail the git_dirty gate"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_rite_cmd_and_git_dirty_are_anded() {
+        use std::process::Stdio;
+
+        let dir = std::env::temp_dir().join(format!("dirge-vigil-andgate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let git = |args: &[&str]| {
+            tokio::process::Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+        };
+
+        git(&["init"]).await.unwrap();
+        std::fs::write(dir.join("f.txt"), "a").unwrap();
+        git(&["-c", "user.email=t@t", "-c", "user.name=t", "add", "f.txt"])
+            .await
+            .unwrap();
+        git(&[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-m",
+            "init",
+        ])
+        .await
+        .unwrap();
+
+        let gate = VigilRite {
+            cmd: Some("echo ok".to_string()),
+            git_dirty: true,
+        };
+
+        assert!(
+            matches!(
+                evaluate_rite_in(&gate, &dir).await,
+                RiteResult::Pass { output: Some(ref out), .. } if out == "ok"
+            ),
+            "clean tree and successful cmd should pass"
+        );
+
+        std::fs::write(dir.join("f.txt"), "b").unwrap();
+        assert!(
+            matches!(evaluate_rite_in(&gate, &dir).await, RiteResult::Fail { .. }),
+            "dirty tree must fail even when the cmd succeeds"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

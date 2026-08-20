@@ -2122,11 +2122,10 @@ async fn main() -> anyhow::Result<()> {
                 .store(false, std::sync::atomic::Ordering::SeqCst);
             #[cfg(feature = "plugin")]
             if let Some(pm_arc) = plugin_manager.as_ref() {
-                let escaped_name = obs.vigil_name.replace('\\', "\\\\").replace('"', "\\\"");
-                let escaped_response = response.replace('\\', "\\\\").replace('"', "\\\"");
-                let ctx = format!(
-                    "@{{:vigil \"{}\" :count {} :response \"{}\" :exit :ok}}",
-                    escaped_name, obs.event_count, escaped_response
+                let ctx = crate::extras::vigil::observance_context(
+                    &obs.vigil_name,
+                    obs.event_count,
+                    &response,
                 );
                 let pm = pm_arc.clone();
                 tokio::task::spawn_blocking(move || {

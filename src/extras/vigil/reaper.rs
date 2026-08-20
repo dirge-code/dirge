@@ -201,7 +201,9 @@ pub async fn run_reaper(
                         let (rite_output, rite_exit_code) =
                             if let Some(Some(rite)) = rite_map.get(&vigil_name) {
                                 match evaluate_rite(rite).await {
-                                    RiteResult::Pass { output } => (output, None),
+                                    RiteResult::Pass { output, exit_code } => {
+                                        (output, exit_code)
+                                    }
                                     RiteResult::Fail { reason } => {
                                         warn!(%vigil_name, %reason, "rite gate failed, skipping observance");
                                         continue;
@@ -210,6 +212,37 @@ pub async fn run_reaper(
                             } else {
                                 (None, None)
                             };
+
+                        // Commands-mode harbinger: execute the resolved shell
+                        // command directly — no agent turn, no LLM cost. The rite
+                        // gate above still applies.
+                        if let Some(commands) = extract_resolved_commands(&events) {
+                            for command in commands {
+                                info!(%vigil_name, %command, "commands-mode dispatch");
+                                match tokio::process::Command::new("sh")
+                                    .arg("-c")
+                                    .arg(&command)
+                                    .output()
+                                    .await
+                                {
+                                    Ok(output) => {
+                                        let stdout =
+                                            String::from_utf8_lossy(&output.stdout);
+                                        let code = output.status.code().unwrap_or(-1);
+                                        info!(
+                                            %vigil_name,
+                                            exit_code = code,
+                                            stdout = %stdout.trim(),
+                                            "commands-mode dispatch finished"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        warn!(%vigil_name, %command, "commands-mode dispatch failed: {e}");
+                                    }
+                                }
+                            }
+                            continue;
+                        }
 
                         let batch = CoalescedBatch::from_events(
                             vigil_name.clone(),
@@ -354,4 +387,27 @@ fn coalesce_events(events: &[VigilEvent]) -> serde_json::Value {
         "files": files,
         "event_count": events.len(),
     })
+}
+
+/// Extract the resolved shell commands from a commands-mode harbinger batch.
+/// Returns `None` when no event carries a resolved dispatch (template mode).
+fn extract_resolved_commands(events: &[VigilEvent]) -> Option<Vec<String>> {
+    let mut commands = Vec::with_capacity(events.len());
+    let mut is_commands_batch = false;
+
+    for event in events {
+        if let Some(args) = event.context.get("_resolved_args") {
+            is_commands_batch = true;
+            match args.get("command").and_then(|c| c.as_str()) {
+                Some(command) => commands.push(command.to_string()),
+                None => warn!("commands-mode event missing resolved command"),
+            }
+        }
+    }
+
+    if is_commands_batch {
+        Some(commands)
+    } else {
+        None
+    }
 }

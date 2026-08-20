@@ -219,14 +219,10 @@ pub(crate) async fn handle_done(
     {
         #[cfg(feature = "plugin")]
         if let Some(pm) = plugin_manager {
-            let escaped_name = pending
-                .vigil_name
-                .replace('\\', "\\\\")
-                .replace('\"', "\\\"");
-            let escaped_response = response.replace('\\', "\\\\").replace('\"', "\\\"");
-            let ctx = format!(
-                "@{{:vigil \"{}\" :count {} :response \"{}\" :exit :ok}}",
-                escaped_name, pending.event_count, escaped_response,
+            let ctx = crate::extras::vigil::observance_context(
+                &pending.vigil_name,
+                pending.event_count,
+                &response,
             );
             let pm = pm.clone();
             tokio::task::spawn_blocking(move || {

@@ -53,6 +53,17 @@ pub struct PendingObservance {
     pub running: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
+/// Format the `on-vigil-observance` hook context string, escaping the vigil
+/// name and agent response for the Janet `@{...}` template.
+pub fn observance_context(vigil_name: &str, event_count: usize, response: &str) -> String {
+    let escaped_name = vigil_name.replace('\\', "\\\\").replace('"', "\\\"");
+    let escaped_response = response.replace('\\', "\\\\").replace('"', "\\\"");
+    format!(
+        "@{{:vigil \"{}\" :count {} :response \"{}\" :exit :ok}}",
+        escaped_name, event_count, escaped_response
+    )
+}
+
 /// The vigil-keeper — owns all active vigils, starts triggers, runs the reaper.
 pub struct VigilKeeper {
     pub vigils: Vec<VigilInstance>,
@@ -293,3 +304,24 @@ impl VigilKeeper {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod observance_context_tests {
+    use super::observance_context;
+
+    #[test]
+    fn formats_simple_event() {
+        assert_eq!(
+            observance_context("jenkins-remediate", 2, "done"),
+            "@{:vigil \"jenkins-remediate\" :count 2 :response \"done\" :exit :ok}"
+        );
+    }
+
+    #[test]
+    fn escapes_quotes_and_backslashes() {
+        assert_eq!(
+            observance_context("a\"b", 1, "c\\d"),
+            "@{:vigil \"a\\\"b\" :count 1 :response \"c\\\\d\" :exit :ok}"
+        );
+    }
+}
