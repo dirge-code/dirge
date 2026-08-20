@@ -23,20 +23,20 @@
   "Parse Jenkins JSON and emit failed builds into the vigil-keeper."
   (when json-str
     (try
-      (let [parsed (parse json-str)
-            jobs (if (indexed? (parsed :jobs)) (parsed :jobs) @[])]
+      (let [parsed (harness/json-decode json-str)
+            jobs (if (indexed? (get parsed "jobs")) (get parsed "jobs") @[])]
         (each job jobs
-          (when (= "FAILURE" (get-in job [:lastBuild :result]))
+          (when (= "FAILURE" (get-in job ["lastBuild" "result"]))
             (vigil/emit "jenkins-remediate"
-                        {:job (job :name)
-                         :build_number (string (get-in job [:lastBuild :number]))
-                         :url (get-in job [:lastBuild :url])
+                        {:job (get job "name")
+                         :build_number (string (get-in job ["lastBuild" "number"]))
+                         :url (get-in job ["lastBuild" "url"])
                          :status "FAILURE"}))))
       ([_] nil))))
 
-(defn poll-jenkins []
+(defn poll-jenkins [&opt _]
   "One-shot: curl Jenkins API, parse JSON, emit failures to vigil."
-  (let [json-str (sh-capture "curl -s http://localhost:8080/api/json?tree=jobs[name,lastBuild[number,result,url]]")]
+  (let [json-str (sh-capture "curl -s --globoff http://localhost:8080/api/json?tree=jobs[name,lastBuild[number,result,url]]")]
     (if json-str
       (do
         (emit-jenkins-failures json-str)

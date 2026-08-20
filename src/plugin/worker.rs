@@ -746,6 +746,13 @@ const HARNESS_INIT: &str = r#"
 (defn harness/json-extract [json-str key]
   (when (and (string? json-str) (string? key))
     (harness/__json-extract json-str key)))
+
+# (harness/json-decode json-str) -> value | nil
+# Parses a JSON string into a Janet value. Objects become tables keyed by
+# string, arrays become tuples. Returns nil on invalid JSON.
+(defn harness/json-decode [json-str]
+  (when (string? json-str)
+    (harness/__json-decode json-str)))
 "#;
 
 /// Janet-side aliases that defer the actual blocking work to the
@@ -1449,6 +1456,9 @@ fn worker_loop(
         env.add_c_fn(
             CFunOptions::new(c"__json-extract", janet_json_extract_cfn).namespace(c"harness"),
         );
+        env.add_c_fn(
+            CFunOptions::new(c"__json-decode", janet_json_decode_cfn).namespace(c"harness"),
+        );
         // Only register the LSP bridge when the lsp feature is compiled
         // in. The Janet `harness/lsp` wrappers (HARNESS_LSP_INIT) guard on
         // this symbol's existence and degrade to nil when it's absent.
@@ -1776,6 +1786,49 @@ unsafe fn json_extract_body(
             _ => unsafe { janet_wrap_nil() },
         },
         _ => unsafe { janet_wrap_nil() },
+    }
+}
+
+#[cfg(feature = "plugin")]
+unsafe extern "C-unwind" fn janet_json_decode_cfn(
+    argc: i32,
+    argv: *mut janetrs::lowlevel::Janet,
+) -> janetrs::lowlevel::Janet {
+    use janetrs::lowlevel::*;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        json_decode_body(argc, argv)
+    }));
+    match result {
+        Ok(j) => j,
+        Err(payload) => {
+            let msg = panic_payload_to_string(&payload);
+            tracing::error!(
+                target: "dirge::plugin",
+                cfn = "harness/json-decode",
+                panic = %msg,
+                "FFI panic in json-decode cfn — returning nil",
+            );
+            unsafe { janet_wrap_nil() }
+        }
+    }
+}
+
+#[cfg(feature = "plugin")]
+unsafe fn json_decode_body(
+    argc: i32,
+    argv: *mut janetrs::lowlevel::Janet,
+) -> janetrs::lowlevel::Janet {
+    use janetrs::lowlevel::*;
+    if argc < 1 {
+        return unsafe { janet_wrap_nil() };
+    }
+    let json_str = match unsafe { read_string_arg(argv, 0) } {
+        Some(s) => s,
+        None => return unsafe { janet_wrap_nil() },
+    };
+    match serde_json::from_str::<serde_json::Value>(&json_str) {
+        Ok(value) => vigil_bridge::json_to_janet(&value),
+        Err(_) => unsafe { janet_wrap_nil() },
     }
 }
 
@@ -2516,38 +2569,38 @@ pub(crate) mod vigil_bridge {
     use super::read_string_arg;
     use std::collections::HashMap;
 
-    thread_local! {
-        /// Sender to the vigil-keeper's event channel. None until the
-        /// runtime wires it in at startup during `--vigil` mode.
-        static VIGIL_TX: std::cell::RefCell<Option<tokio::sync::mpsc::Sender<String>>> =
-            const { std::cell::RefCell::new(None) };
+    // Process-global (not thread-local): install_* runs on the tokio
+    // runtime thread while the C functions read these on the Janet worker
+    // thread, so a thread_local value would never be visible where it's
+    // consumed (mirrors the SANDBOX_EXEC_TX OnceLock pattern above).
+    /// Sender to the vigil-keeper's event channel. Installed once at
+    /// keeper startup during `--vigil` mode.
+    static VIGIL_TX: std::sync::OnceLock<tokio::sync::mpsc::Sender<String>> =
+        std::sync::OnceLock::new();
 
-        /// Active vigil names, populated at keeper startup via install_vigil_names.
-        static VIGIL_NAMES: std::cell::RefCell<Vec<String>> =
-            const { std::cell::RefCell::new(Vec::new()) };
+    /// Active vigil names, populated at keeper startup via install_vigil_names.
+    static VIGIL_NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
 
-        /// Per-vigil state map (name → JSON value). Janet code can
-        /// read/write this via vigil/get and vigil/set-state.
-        static VIGIL_STATE: std::cell::RefCell<HashMap<String, serde_json::Value>> =
-            std::cell::RefCell::new(HashMap::new());
+    /// Per-vigil state map (name → JSON value). Janet code can
+    /// read/write this via vigil/get and vigil/set-state. Lazy-initialized
+    /// because `HashMap::new` is not const.
+    static VIGIL_STATE: std::sync::OnceLock<std::sync::Mutex<HashMap<String, serde_json::Value>>> =
+        std::sync::OnceLock::new();
+
+    fn vigil_state() -> &'static std::sync::Mutex<HashMap<String, serde_json::Value>> {
+        VIGIL_STATE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
     }
 
     /// Install the vigil bridge sender. Called from the tokio runtime
     /// after the vigil-keeper is created. Panics if called twice.
     pub fn install_vigil_tx(tx: tokio::sync::mpsc::Sender<String>) {
-        VIGIL_TX.with(|cell| {
-            let mut borrowed = cell.borrow_mut();
-            assert!(borrowed.is_none(), "vigil bridge already installed");
-            *borrowed = Some(tx);
-        });
+        assert!(VIGIL_TX.set(tx).is_ok(), "vigil bridge already installed");
     }
 
     /// Install vigil names into the bridge. Called at keeper startup
     /// after install_vigil_tx.
     pub fn install_vigil_names(names: Vec<String>) {
-        VIGIL_NAMES.with(|cell| {
-            *cell.borrow_mut() = names;
-        });
+        let _ = VIGIL_NAMES.set(names);
     }
 
     /// Return a Janet boolean — true if the vigil bridge has been installed.
@@ -2556,7 +2609,7 @@ pub(crate) mod vigil_bridge {
         _argv: *mut janetrs::lowlevel::Janet,
     ) -> janetrs::lowlevel::Janet {
         use janetrs::lowlevel::*;
-        let live = VIGIL_TX.with(|cell| cell.borrow().is_some());
+        let live = VIGIL_TX.get().is_some();
         unsafe { janet_wrap_boolean(if live { 1 } else { 0 }) }
     }
 
@@ -2574,11 +2627,9 @@ pub(crate) mod vigil_bridge {
             Some(s) => s,
             None => return unsafe { janet_wrap_nil() },
         };
-        VIGIL_TX.with(|cell| {
-            if let Some(ref tx) = *cell.borrow() {
-                let _ = tx.try_send(msg);
-            }
-        });
+        if let Some(tx) = VIGIL_TX.get() {
+            let _ = tx.try_send(msg);
+        }
         unsafe { janet_wrap_nil() }
     }
 
@@ -2589,18 +2640,16 @@ pub(crate) mod vigil_bridge {
         _argv: *mut janetrs::lowlevel::Janet,
     ) -> janetrs::lowlevel::Janet {
         use janetrs::lowlevel::*;
-        VIGIL_NAMES.with(|cell| {
-            let names = cell.borrow();
-            let tup = unsafe { janet_tuple_begin(names.len() as i32) };
-            for (i, name) in names.iter().enumerate() {
-                unsafe {
-                    let c_str = std::ffi::CString::new(name.as_str()).unwrap();
-                    let s = janet_wrap_string(janet_cstring(c_str.as_ptr()));
-                    *tup.offset(i as isize) = s;
-                }
+        let names = VIGIL_NAMES.get().map(|v| v.as_slice()).unwrap_or(&[]);
+        let tup = unsafe { janet_tuple_begin(names.len() as i32) };
+        for (i, name) in names.iter().enumerate() {
+            unsafe {
+                let c_str = std::ffi::CString::new(name.as_str()).unwrap();
+                let s = janet_wrap_string(janet_cstring(c_str.as_ptr()));
+                *tup.offset(i as isize) = s;
             }
-            unsafe { janet_wrap_tuple(janet_tuple_end(tup)) }
-        })
+        }
+        unsafe { janet_wrap_tuple(janet_tuple_end(tup)) }
     }
 
     /// (vigil/get name) — return a Janet table of state for the named vigil.
@@ -2617,22 +2666,19 @@ pub(crate) mod vigil_bridge {
             Some(s) => s,
             None => return unsafe { janet_wrap_nil() },
         };
-        VIGIL_STATE.with(|cell| {
-            let state = cell.borrow();
-            if let Some(value) = state.get(&name) {
-                json_to_janet(value)
+        let state = vigil_state().lock().unwrap();
+        if let Some(value) = state.get(&name) {
+            json_to_janet(value)
+        } else {
+            let known = VIGIL_NAMES.get().is_some_and(|n| n.contains(&name));
+            if known {
+                // Vigil exists but has no state yet — return empty table.
+                let tab = unsafe { janet_table(0) };
+                unsafe { janet_wrap_table(tab) }
             } else {
-                VIGIL_NAMES.with(|nc| {
-                    if nc.borrow().contains(&name) {
-                        // Vigil exists but has no state yet — return empty table.
-                        let tab = unsafe { janet_table(0) };
-                        unsafe { janet_wrap_table(tab) }
-                    } else {
-                        unsafe { janet_wrap_nil() }
-                    }
-                })
+                unsafe { janet_wrap_nil() }
             }
-        })
+        }
     }
 
     /// (vigil/set-state name key value) — set a key-value pair on a vigil's
@@ -2661,22 +2707,21 @@ pub(crate) mod vigil_bridge {
         // treat it as a raw string.
         let value: serde_json::Value =
             serde_json::from_str(&value_str).unwrap_or(serde_json::Value::String(value_str));
-        VIGIL_STATE.with(|cell| {
-            let mut state = cell.borrow_mut();
-            let entry = state
-                .entry(name.clone())
-                .or_insert(serde_json::Value::Object(serde_json::Map::new()));
-            if let serde_json::Value::Object(map) = entry {
-                map.insert(key, value);
-            }
-        });
+        let mut state = vigil_state().lock().unwrap();
+        let entry = state
+            .entry(name.clone())
+            .or_insert(serde_json::Value::Object(serde_json::Map::new()));
+        if let serde_json::Value::Object(map) = entry {
+            map.insert(key, value);
+        }
+        drop(state);
         let c_str = std::ffi::CString::new(name.as_str()).unwrap();
         unsafe { janet_wrap_string(janet_cstring(c_str.as_ptr())) }
     }
 
     /// Convert a serde_json::Value to a Janet value.
     #[allow(clippy::ptr_offset_with_cast)]
-    fn json_to_janet(value: &serde_json::Value) -> janetrs::lowlevel::Janet {
+    pub(super) fn json_to_janet(value: &serde_json::Value) -> janetrs::lowlevel::Janet {
         use janetrs::lowlevel::*;
         match value {
             serde_json::Value::Null => unsafe { janet_wrap_nil() },
@@ -3414,5 +3459,32 @@ mod tests {
         assert_eq!(context["build_number"], "42");
         assert_eq!(context["url"], "http://jenkins:8080/job/my-pipeline/42");
         assert_eq!(context["status"], "FAILURE");
+    }
+
+    /// harness/json-decode parses nested JSON into a Janet table keyed by
+    /// string (not keyword) — the poller fixtures rely on this to read
+    /// `jobs[0].lastBuild.result` from a Jenkins API response.
+    #[cfg(feature = "vigil")]
+    #[test]
+    fn json_decode_parses_nested_json_with_string_keys() {
+        let (mut worker, _dialog_rx, _lsp_rx) = Worker::try_spawn().unwrap();
+        let r = worker
+            .eval(
+                r#"(let [d (harness/json-decode "{\"jobs\":[{\"name\":\"test-pipeline\",\"lastBuild\":{\"number\":1,\"result\":\"FAILURE\"}}]}")]
+                 (let [job (get (get d "jobs") 0)]
+                   (string (get job "name") "|" (get-in job ["lastBuild" "result"]))))"#,
+            )
+            .unwrap();
+        assert!(r.contains("test-pipeline"), "got {r:?}");
+        assert!(r.contains("FAILURE"), "got {r:?}");
+    }
+
+    /// harness/json-decode returns nil (not a panic) for malformed JSON.
+    #[cfg(feature = "vigil")]
+    #[test]
+    fn json_decode_returns_nil_on_invalid_json() {
+        let (mut worker, _dialog_rx, _lsp_rx) = Worker::try_spawn().unwrap();
+        let r = worker.eval(r#"(harness/json-decode "not json")"#).unwrap();
+        assert_eq!(r, "nil");
     }
 }

@@ -23,16 +23,16 @@
   "Parse Prefect JSON and emit failed flow runs into the vigil-keeper."
   (when json-str
     (try
-      (let [parsed (parse json-str)
-            runs (if (indexed? (parsed :data)) (parsed :data) @[])]
+      (let [decoded (harness/json-decode json-str)
+            runs (if (indexed? decoded) decoded @[])]
         (each run runs
           (vigil/emit "prefect-remediate"
-                      {:run_id (run :id)
-                       :flow_name (run :name)
+                      {:run_id (get run "id")
+                       :flow_name (get run "name")
                        :state "FAILED"})))
       ([_] nil))))
 
-(defn poll-prefect []
+(defn poll-prefect [&opt _]
   "One-shot: curl Prefect API, parse JSON, emit failures to vigil."
   (let [json-str (sh-capture
                   "curl -s -X POST -H 'Content-Type: application/json' -d '{\"flow_runs\":{\"state\":{\"type\":{\"any_\":[\"FAILED\",\"CRASHED\"]}}}}' http://localhost:4200/api/flow_runs/filter")]

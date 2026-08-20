@@ -23,16 +23,16 @@
   "Parse Airflow JSON and emit failed DAG runs into the vigil-keeper."
   (when json-str
     (try
-      (let [parsed (parse json-str)
-            runs (if (indexed? (parsed :dag_runs)) (parsed :dag_runs) @[])]
+      (let [parsed (harness/json-decode json-str)
+            runs (if (indexed? (get parsed "dag_runs")) (get parsed "dag_runs") @[])]
         (each run runs
           (vigil/emit "airflow-remediate"
-                      {:dag_id (run :dag_id)
-                       :run_id (run :dag_run_id)
+                      {:dag_id (get run "dag_id")
+                       :run_id (get run "dag_run_id")
                        :state "failed"})))
       ([_] nil))))
 
-(defn poll-airflow []
+(defn poll-airflow [&opt _]
   "One-shot: curl Airflow API, parse JSON, emit failures to vigil."
   (let [json-str (sh-capture "curl -s -u admin:admin http://localhost:8081/api/v1/dags/~/dagRuns?state=failed")]
     (if json-str
