@@ -3487,4 +3487,32 @@ mod tests {
         let r = worker.eval(r#"(harness/json-decode "not json")"#).unwrap();
         assert_eq!(r, "nil");
     }
+
+    /// Regression: the vigil bridge sender installed on one thread must be
+    /// visible to `vigil_emit_cfn` running on the Janet worker thread. The
+    /// original `thread_local!` bridge wrote VIGIL_TX on the tokio runtime
+    /// thread and read it on the worker thread, so (vigil/emit ...) was a
+    /// silent no-op. This pins the cross-thread contract with a real worker.
+    #[cfg(feature = "vigil")]
+    #[test]
+    fn vigil_bridge_delivers_emit_across_threads() {
+        // Install on the TEST thread; the worker evaluates on its own thread.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(16);
+        vigil_bridge::install_vigil_tx(tx);
+
+        let (mut worker, _dialog_rx, _lsp_rx) = Worker::try_spawn().unwrap();
+        let r = worker
+            .eval(r#"(vigil/emit "test-vigil" {:job "my-pipeline"})"#)
+            .unwrap();
+        assert_eq!(r, "nil");
+
+        let msg = rx
+            .blocking_recv()
+            .expect("vigil/emit must reach the bridge tx across threads");
+        let (name, payload) = msg.split_once('\t').expect("name\tpayload");
+        assert_eq!(name, "test-vigil");
+        let context: serde_json::Value =
+            serde_json::from_str(payload).expect("payload must be valid JSON");
+        assert_eq!(context["job"], "my-pipeline");
+    }
 }
