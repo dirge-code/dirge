@@ -1441,7 +1441,7 @@ fn code_paths_touched(args: &serde_json::Value) -> u32 {
 const CODE_EXTS: &[&str] = &[
     "rs", "py", "ts", "tsx", "js", "jsx", "mjs", "cjs", "go", "rb", "java", "kt", "kts", "c", "h",
     "cc", "cpp", "hpp", "cxx", "ixx", "cs", "swift", "php", "scala", "clj", "cljs", "cljc", "ex",
-    "exs", "sh", "bash", "lua", "pl", "hs", "ml", "sql", "vue", "svelte",
+    "exs", "sh", "bash", "lua", "pl", "hs", "ml", "sql", "vue", "svelte", "mojo", "🔥",
 ];
 
 fn is_code_path(path: &str) -> bool {

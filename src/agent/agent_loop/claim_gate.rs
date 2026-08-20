@@ -262,6 +262,14 @@ fn segment_kind(segment: &str) -> Option<CommandKind> {
             Some("build") => Some(CommandKind::BuildOrLint),
             _ => None,
         },
+        // Same shape as the swift arm: `mojo test`/`build`/`format` verify or
+        // check code; `mojo run <file>` and bare `mojo <file>` execute it
+        // without checking anything, so they stay None.
+        "mojo" => match sub {
+            Some("test") => Some(CommandKind::Test),
+            Some("build") | Some("format") => Some(CommandKind::BuildOrLint),
+            _ => None,
+        },
         "pytest" | "unittest" | "tox" | "jest" | "vitest" | "mocha" | "rspec" => {
             Some(CommandKind::Test)
         }

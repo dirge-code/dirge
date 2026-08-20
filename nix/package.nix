@@ -17,6 +17,9 @@ let
       ../Cargo.toml
       ../Cargo.lock
       ../build.rs
+      # build.rs compiles the vendored Mojo grammar from here under the
+      # default `semantic-mojo` feature, so it has to be in the sandbox.
+      ../grammars
       ../src
       ../prompts
       ../plugins
@@ -30,7 +33,6 @@ rustPlatform.buildRustPackage {
   src = source;
 
   cargoLock.lockFile = ../Cargo.lock;
-
   nativeBuildInputs = [
     cmake
     # evil-janet generates bindings during the build; bindgenHook also

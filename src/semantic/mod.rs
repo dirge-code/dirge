@@ -3,6 +3,8 @@ pub mod adapters;
 pub(crate) mod common;
 mod index;
 pub mod minify;
+#[cfg(feature = "semantic-mojo")]
+pub mod mojo_grammar;
 pub mod syntax_validator;
 pub mod types;
 

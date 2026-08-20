@@ -4,6 +4,21 @@ All notable changes to dirge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- Mojo language support, end to end: `mojo-lsp-server` LSP integration
+  (diagnostics + the `lsp` tool for `.mojo`/`.🔥`, project roots resolved via
+  `mojoproject.toml`/`pixi.toml`), and a tree-sitter semantic adapter
+  (`semantic-mojo` feature, on by default) covering symbol indexing (structs,
+  traits, `__extension` methods, `comptime` aliases) and minified reads. The
+  write-time syntax gate deliberately does NOT use the grammar — measured
+  against 800 real files from the modular repo it false-errors on ~10%, so
+  Mojo writes get the delimiter-balance scan instead (see `GATE_EXCLUSIONS`).
+  The grammar is vendored at `grammars/tree-sitter-mojo` and compiled by
+  `build.rs`: it isn't published to crates.io, and a git dependency would make
+  `cargo publish` reject the whole package.
+
 ## [0.24.0] - 2026-08-19
 
 ### Added

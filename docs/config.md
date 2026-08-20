@@ -1167,7 +1167,10 @@ CLI flag: `--no-lsp` (overrides the config; same effect as `lsp: false`).
 | `clangd`             | `clangd`                                     |
 | `ruby-lsp`           | `ruby-lsp`                                   |
 | `bash-language-server` | `bash-language-server start`               |
+| `dafny`              | `dafny server --verify-on change`            |
+| `swift`              | `sourcekit-lsp`                              |
 | `cmake`              | `cmake-language-server`                      |
+| `mojo`               | `mojo-lsp-server`                            |
 
 Servers are spawned lazily on first file touch and cached per `(workspace_root, server_id)` pair. Concurrent agent tool calls for the same file deduplicate so dirge never races two `rust-analyzer` processes against one workspace.
 

@@ -1854,3 +1854,35 @@ fn swift_interpreter_and_fetch_stay_gated() {
         );
     }
 }
+
+/// Mojo's check-style commands are auto-allowed like swift's: build/test/
+/// format operate on the project's own code.
+#[test]
+fn mojo_project_commands_are_auto_allowed() {
+    for cmd in [
+        "mojo build main.mojo",
+        "mojo test",
+        "mojo test kernels/",
+        "mojo format --quiet src/",
+    ] {
+        let mut checker = fresh_checker();
+        assert!(
+            matches!(checker.check("bash", cmd), CheckResult::Allowed),
+            "{cmd:?} should be auto-allowed by the default bash rules"
+        );
+    }
+}
+
+/// The negative half, stricter than swift's: `mojo run <file>` and bare
+/// `mojo <file>` take a FILE to execute — the interpreter form, not a
+/// package target — so unlike `swift run` they stay on the prompt path.
+#[test]
+fn mojo_interpreter_forms_stay_gated() {
+    for cmd in ["mojo main.mojo", "mojo run main.mojo", "mojo repl"] {
+        let mut checker = fresh_checker();
+        assert!(
+            !matches!(checker.check("bash", cmd), CheckResult::Allowed),
+            "{cmd:?} must not be auto-allowed"
+        );
+    }
+}
