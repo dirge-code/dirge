@@ -236,6 +236,11 @@ pub(crate) async fn handle_done(
             .await
             .ok();
         }
+        // Release the in-flight flag so the vigil can fire again on its next
+        // reap window. The reaper skips a vigil while this flag is set.
+        pending
+            .running
+            .store(false, std::sync::atomic::Ordering::SeqCst);
     }
     // A successful turn must not leave a chamber
     // half-painted. If anything slipped through

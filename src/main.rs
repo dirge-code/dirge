@@ -1947,8 +1947,14 @@ async fn main() -> anyhow::Result<()> {
         // we hold onto the keeper (so it stays alive) but take out the
         // wake + observance receivers to hand to `run_interactive`.
         #[cfg(feature = "vigil")]
-        let (mut _vigil_keeper, vigil_wake_rx, vigil_observance_rx, vigil_ctl_tx, vigil_hook_rx) = {
-            if !cli.vigil_mode {
+        let (
+            mut _vigil_keeper,
+            vigil_wake_rx,
+            mut vigil_observance_rx,
+            vigil_ctl_tx,
+            vigil_hook_rx,
+        ) = {
+            if !cli.vigil_mode && !cli.vigil_once {
                 (None, None, None, None, None)
             } else {
                 // Merge config vigils with --vigil-config file entries (if any).
@@ -2048,6 +2054,65 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         };
+        // Headless vigil: wait for a single observance, run one agent turn
+        // on its prompt, dispatch on-vigil-observance, then exit. Mirrors the
+        // --loop headless driver but keyed off the vigil-keeper instead of a
+        // LOOP_PLAN iteration.
+        #[cfg(feature = "vigil")]
+        if cli.vigil_once {
+            let rx = vigil_observance_rx
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("--vigil-once requires an active vigil-keeper"))?;
+            let obs = match tokio::time::timeout(std::time::Duration::from_secs(60), rx.recv())
+                .await
+            {
+                Ok(Some(obs)) => obs,
+                Ok(None) => {
+                    anyhow::bail!("vigil: observance channel closed before an observance arrived")
+                }
+                Err(_) => anyhow::bail!("vigil: timed out after 60s waiting for an observance"),
+            };
+            let prompt = if obs.prompt.is_empty() {
+                format!("[vigil] {} - {} event(s)", obs.vigil_name, obs.event_count)
+            } else {
+                obs.prompt.clone()
+            };
+            eprintln!(
+                "info: vigil observance for '{}' ({} event(s))",
+                obs.vigil_name, obs.event_count
+            );
+            let (response, _tool_calls, _usage) = agent
+                .run_print(
+                    &prompt,
+                    cli.resolve_max_agent_turns(&cfg),
+                    cli.output_format,
+                    Vec::new(),
+                )
+                .await?;
+            // Release the in-flight flag so a future reap isn't skipped if
+            // the keeper outlives this one-shot turn.
+            obs.running
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            #[cfg(feature = "plugin")]
+            if let Some(pm_arc) = plugin_manager.as_ref() {
+                let escaped_name = obs.vigil_name.replace('\\', "\\\\").replace('"', "\\\"");
+                let escaped_response = response.replace('\\', "\\\\").replace('"', "\\\"");
+                let ctx = format!(
+                    "@{{:vigil \"{}\" :count {} :response \"{}\" :exit :ok}}",
+                    escaped_name, obs.event_count, escaped_response
+                );
+                let pm = pm_arc.clone();
+                tokio::task::spawn_blocking(move || {
+                    pm.lock_ignore_poison()
+                        .dispatch_tool_hook("on-vigil-observance", &ctx)
+                })
+                .await
+                .ok();
+            }
+            crate::agent::tools::bg_shell::global().kill_all();
+            return Ok(());
+        }
+
         // vigil_wake_rx and vigil_observance_rx are only passed to run_interactive
         // when #[cfg(feature = "vigil")] — no fallback let needed.
 

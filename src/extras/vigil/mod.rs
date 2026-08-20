@@ -50,7 +50,6 @@ pub struct VigilState {
 pub struct PendingObservance {
     pub vigil_name: String,
     pub event_count: usize,
-    #[allow(dead_code)]
     pub running: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 

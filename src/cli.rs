@@ -259,6 +259,13 @@ pub struct Cli {
     #[arg(long = "vigil-config", help = "Path to a vigil JSON config file")]
     pub vigil_config: Option<std::path::PathBuf>,
 
+    #[cfg(feature = "vigil")]
+    #[arg(
+        long = "vigil-once",
+        help = "Run vigil headlessly: wait for one observance, run one agent turn, then exit"
+    )]
+    pub vigil_once: bool,
+
     #[arg(
         long = "auto-confirm",
         value_enum,
@@ -588,6 +595,14 @@ mod tests {
             }) => {}
             other => panic!("expected auth openai command, got {other:?}"),
         }
+    }
+
+    #[cfg(feature = "vigil")]
+    #[test]
+    fn parses_vigil_once_flag() {
+        let cli = Cli::try_parse_from(["dirge", "--vigil-once"]).unwrap();
+        assert!(cli.vigil_once);
+        assert!(!cli.vigil_mode);
     }
 
     #[test]
