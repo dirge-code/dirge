@@ -390,6 +390,15 @@ fn base_bash_rules() -> Vec<(&'static str, Action)> {
         ("swift package show-dependencies **", Action::Allow),
         ("swiftlint **", Action::Allow),
         ("swift-format **", Action::Allow),
+        // Mojo. Same trust model as swift's entries: `mojo build`/`test`
+        // compile and test the project's own code. Unlike `swift run`, which
+        // runs the *package's* target, `mojo run <file>` (and bare
+        // `mojo <file>`) executes an arbitrary file — the interpreter form,
+        // excluded for the same reason `python` is — so `run` is deliberately
+        // absent. `mojo format` only rewrites source in place.
+        ("mojo build **", Action::Allow),
+        ("mojo test **", Action::Allow),
+        ("mojo format **", Action::Allow),
         // Go
         ("go build **", Action::Allow),
         ("go test **", Action::Allow),

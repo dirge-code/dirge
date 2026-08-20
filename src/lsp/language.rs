@@ -94,6 +94,12 @@ const LANGUAGES: &[(&str, &str)] = &[
     // every query came back empty. See
     // `every_served_extension_has_a_language_id`.
     ("swift", "swift"),
+    // Mojo source uses `.mojo` or the fire emoji `.🔥` — both are first-class
+    // per the Modular docs, and `language_for_path`'s `to_lowercase()` is a
+    // no-op on the emoji so the lookup works unchanged. languageId "mojo"
+    // matches what the official VS Code extension sends.
+    ("mojo", "mojo"),
+    ("🔥", "mojo"),
 ];
 
 const FILENAMES: &[(&str, &str)] = &[
@@ -155,6 +161,15 @@ mod tests {
     fn dfy_is_dafny() {
         assert_eq!(lang("src/Spec.dfy"), "dafny");
         assert_eq!(lang("Spec.DFY"), "dafny");
+    }
+
+    #[test]
+    fn mojo_extensions_including_fire_emoji() {
+        assert_eq!(lang("src/kernel.mojo"), "mojo");
+        assert_eq!(lang("Kernel.MOJO"), "mojo");
+        // The emoji extension is multi-byte and has no uppercase form; it must
+        // survive the lowercasing lookup path.
+        assert_eq!(lang("src/kernel.🔥"), "mojo");
     }
 
     #[test]

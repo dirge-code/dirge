@@ -128,6 +128,14 @@ fn language_for_path(path: &Path) -> Option<tree_sitter::Language> {
         #[cfg(feature = "semantic-swift")]
         "swift" => Some(tree_sitter_swift::LANGUAGE.into()),
 
+        // NOTE: `.mojo`/`.🔥` are deliberately NOT registered here despite
+        // the semantic-mojo adapter. Measured against 800 real files from the
+        // modular repo, the grammar false-errors on ~10% of them — see the
+        // `mojo`/`🔥` entries in GATE_EXCLUSIONS and
+        // `the_mojo_grammar_rejects_real_world_constructs`. Mojo writes still
+        // get the delimiter-balance scan via `lex_rules_for_path`, which
+        // shares Python's lexical rules.
+
         // NOTE: `.sql` is deliberately NOT registered here. This gate is a
         // write-time HARD block (`syntax_gate` → tool error on parse error),
         // and the generic tree-sitter-sequel grammar reports mainstream,
@@ -444,7 +452,11 @@ fn lex_rules_for_path(path: &Path) -> Option<&'static LexRules> {
         "c" | "h" | "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" => &RULES_C,
         "go" => &RULES_GO,
         "java" => &RULES_JAVA,
-        "py" | "pyi" => &RULES_PYTHON,
+        // Mojo's lexical grammar matches Python's here: `#` comments,
+        // the same string forms. For Mojo this is the PRIMARY write
+        // check — the tree-sitter grammar is kept off the hard gate
+        // (see the `mojo` GATE_EXCLUSIONS entry).
+        "py" | "pyi" | "mojo" | "🔥" => &RULES_PYTHON,
         // Clojure family + Fennel.
         "clj" | "cljs" | "cljc" | "cljd" | "edn" | "bb" | "fnl" => &RULES_LISP,
         // Janet + Janet Data Notation (`#` comments, backtick long-strings).
@@ -1780,6 +1792,18 @@ const GATE_EXCLUSIONS: &[(&str, &str)] = &[
          `the_cpp_grammar_does_not_understand_modules`; when the grammar gains \
          module support that test fails and .ixx can move onto the gate.",
     ),
+    (
+        "mojo",
+        "measured: tree-sitter-mojo false-errors on ~10% of 800 real files \
+         from the modular repo (`@__llvm_metadata` decorators, function-type \
+         parametrics with intersection types, `(var x) = …` patterns — all \
+         valid Mojo in production kernels and the stdlib test suite). On a \
+         hard write block that would refuse valid Mojo with no recourse. \
+         Indexed by MojoAdapter, which only warns on parse errors; writes get \
+         the Python-rules delimiter scan instead. See \
+         `the_mojo_grammar_rejects_real_world_constructs`.",
+    ),
+    ("🔥", "see .mojo"),
 ];
 
 #[cfg(test)]
@@ -1890,6 +1914,128 @@ mod gate_coverage {
             rejected.is_empty(),
             "the gate is a hard write block and the grammar rejects valid Swift: {rejected:?}"
         );
+    }
+
+    /// Half the evidence behind keeping `.mojo`/`.🔥` OFF the gate (the
+    /// GATE_EXCLUSIONS entry): the grammar handles core Mojo 1.0 — so the
+    /// MojoAdapter's *indexing* is trustworthy — but "handles the basics" is
+    /// not the gate's bar. The other half is
+    /// `the_mojo_grammar_rejects_real_world_constructs` below: measured
+    /// against 800 real files from the modular repo it false-errors on ~10%,
+    /// and a hard write block that refuses one valid file in ten leaves the
+    /// agent with no recourse. If THIS test starts failing the adapter's
+    /// index quality is degrading, which is worth knowing even off the gate.
+    #[cfg(feature = "semantic-mojo")]
+    #[test]
+    fn the_mojo_grammar_accepts_core_mojo_1_0() {
+        let cases: &[(&str, &str)] = &[
+            (
+                "fn with parametrics and raises",
+                "fn add[T: Intable](a: T, b: T) raises -> Int:\n    return Int(a) + Int(b)\n",
+            ),
+            (
+                "struct with conformances and __init__(out self)",
+                "struct Pair(Copyable, Movable):\n    var first: Int\n    var second: Int\n\n    fn __init__(out self, first: Int, second: Int):\n        self.first = first\n        self.second = second\n",
+            ),
+            (
+                "trait with default method",
+                "trait Shape:\n    fn area(self) -> Float64:\n        ...\n",
+            ),
+            (
+                "comptime parameterized alias",
+                "comptime Vec[dt: DType, width: Int] = SIMD[dt, width]\n",
+            ),
+            ("bare comptime binding", "comptime block_size = 16\n"),
+            (
+                "decorated struct",
+                "@fieldwise_init\nstruct Point(Copyable):\n    var x: Int\n    var y: Int\n",
+            ),
+            (
+                "register_passable",
+                "@register_passable(\"trivial\")\nstruct Handle:\n    var id: Int\n",
+            ),
+            (
+                "generic fn with where clause",
+                "fn clamp[T: Comparable](x: T, lo: T, hi: T) -> T where conforms_to(T, Comparable):\n    return x\n",
+            ),
+            (
+                "mut and var argument conventions",
+                "fn bump(mut x: Int, var s: String) -> String:\n    x += 1\n    return s^\n",
+            ),
+            (
+                "ref return and origins",
+                "fn first[T: Copyable](ref xs: List[T]) -> ref [xs] T:\n    return xs[0]\n",
+            ),
+            (
+                "comptime if statement",
+                "fn pick[cond: Bool]() -> Int:\n    comptime if cond:\n        return 1\n    else:\n        return 2\n",
+            ),
+            (
+                "for loop and python-style def",
+                "def total(xs: List[Int]) -> Int:\n    var acc = 0\n    for x in xs:\n        acc += x\n    return acc\n",
+            ),
+            (
+                "imports",
+                "from collections import Dict\nimport math\nfrom python import Python as py\n",
+            ),
+            (
+                "extension",
+                "__extension List[T]:\n    fn total_len(self) -> Int:\n        return len(self)\n",
+            ),
+        ];
+        let lang: tree_sitter::Language = tree_sitter_mojo::LANGUAGE.into();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&lang).expect("mojo grammar loads");
+        let mut rejected = Vec::new();
+        for (name, src) in cases {
+            let tree = parser.parse(src, None).expect("parses");
+            if tree.root_node().has_error() {
+                rejected.push(*name);
+            }
+        }
+        assert!(
+            rejected.is_empty(),
+            "the Mojo grammar regressed on core Mojo 1.0 — MojoAdapter index \
+             quality is degrading: {rejected:?}"
+        );
+    }
+
+    /// The evidence behind keeping `.mojo`/`.🔥` OFF the gate, boiled down to
+    /// the constructs the grammar actually failed on in the modular repo
+    /// (each valid Mojo, in production kernels / the stdlib test suite). When
+    /// the grammar learns one of these this test fails — that is the signal
+    /// to re-measure the false-error rate on a real Mojo codebase and, if it
+    /// has fallen to ~zero, drop the `mojo`/`🔥` GATE_EXCLUSIONS entries and
+    /// register the grammar in `language_for_path`.
+    #[cfg(feature = "semantic-mojo")]
+    #[test]
+    fn the_mojo_grammar_rejects_real_world_constructs() {
+        let cases: &[(&str, &str)] = &[
+            (
+                "llvm_metadata decorator with backtick identifier",
+                "@__llvm_metadata(`rocdl.waves_per_eu`=SIMDLength(2))\nfn kernel():\n    pass\n",
+            ),
+            (
+                "function-type parameter with intersection type",
+                "fn apply[TileFn: ImplicitlyCopyable & (def[ws: Int, _r: Int](IndexList[_r]) -> None)]():\n    pass\n",
+            ),
+            (
+                "parenthesized var binding pattern",
+                "def f():\n    (var list) = [a + b for a, b in [(1, 2), (3, 4)]]\n",
+            ),
+        ];
+        let lang: tree_sitter::Language = tree_sitter_mojo::LANGUAGE.into();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&lang).expect("mojo grammar loads");
+        for (name, src) in cases {
+            let tree = parser.parse(src, None).expect("parses");
+            assert!(
+                tree.root_node().has_error(),
+                "tree-sitter-mojo now parses `{name}` — re-measure its \
+                 false-error rate on a real Mojo codebase; if it's ~zero, \
+                 move .mojo/.🔥 off GATE_EXCLUSIONS and onto the gate"
+            );
+        }
     }
 
     /// The evidence behind keeping `.ixx` OFF the gate. A module interface unit

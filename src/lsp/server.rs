@@ -247,6 +247,14 @@ fn dafny_root(file: &Path, stop_at: &Path) -> Option<PathBuf> {
     nearest_root(file, stop_at, &["dfyconfig.toml"], &[])
 }
 
+fn mojo_root(file: &Path, stop_at: &Path) -> Option<PathBuf> {
+    // `mojoproject.toml` (magic) and `pixi.toml` (pixi) are the Mojo
+    // project markers. mojo-lsp-server itself has no hard root
+    // requirement — it resolves imports relative to include paths — so
+    // the worktree-boundary fallback for a loose `.mojo` file is fine.
+    nearest_root(file, stop_at, &["mojoproject.toml", "pixi.toml"], &[])
+}
+
 /// All built-in LSP server descriptors. Order is significant only for tie-
 /// breaking when an extension is claimed by more than one server — earlier
 /// entries are tried first.
@@ -351,6 +359,18 @@ pub fn builtin_servers() -> Vec<ServerInfo> {
             extensions: owned(&["cmake"]),
             filenames: owned(&["cmakelists.txt"]),
             root: cfamily_root,
+        },
+        // Mojo: `mojo-lsp-server` ships with the Modular toolchain (magic /
+        // pixi installs put it on PATH). Best-effort like the rest — no
+        // binary, spawn errors, broken-server backoff takes over. Claims
+        // both spellings of the extension; `.🔥` is first-class per the
+        // Modular docs and `get_clients`' `eq_ignore_ascii_case` is a
+        // byte-compare no-op on the emoji, so it matches unchanged.
+        ServerInfo {
+            id: "mojo",
+            extensions: owned(&["mojo", "🔥"]),
+            filenames: owned(&[]),
+            root: mojo_root,
         },
     ]
 }

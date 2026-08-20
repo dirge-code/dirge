@@ -13,6 +13,8 @@ mod elixir;
 mod go;
 #[cfg(feature = "semantic-java")]
 mod java;
+#[cfg(feature = "semantic-mojo")]
+mod mojo;
 #[cfg(feature = "semantic-python")]
 mod python;
 #[cfg(feature = "semantic-ruby")]
@@ -40,6 +42,8 @@ pub use elixir::ElixirAdapter;
 pub use go::GoAdapter;
 #[cfg(feature = "semantic-java")]
 pub use java::JavaAdapter;
+#[cfg(feature = "semantic-mojo")]
+pub use mojo::MojoAdapter;
 #[cfg(feature = "semantic-python")]
 pub use python::PythonAdapter;
 #[cfg(feature = "semantic-ruby")]
@@ -99,6 +103,8 @@ pub fn default_adapters() -> Vec<Box<dyn LanguageAdapter>> {
     adapters.push(Box::new(DafnyAdapter));
     #[cfg(feature = "semantic-swift")]
     adapters.push(Box::new(SwiftAdapter));
+    #[cfg(feature = "semantic-mojo")]
+    adapters.push(Box::new(MojoAdapter));
 
     adapters
 }

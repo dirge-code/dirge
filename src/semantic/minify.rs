@@ -86,6 +86,8 @@ pub fn language_for_ext(ext: &str) -> Option<tree_sitter::Language> {
         "clj" | "cljs" | "cljc" | "edn" | "bb" => Some(tree_sitter_clojure::LANGUAGE.into()),
         #[cfg(feature = "semantic-python")]
         "py" => Some(tree_sitter_python::LANGUAGE.into()),
+        #[cfg(feature = "semantic-mojo")]
+        "mojo" | "🔥" => Some(tree_sitter_mojo::LANGUAGE.into()),
         #[cfg(feature = "semantic-ruby")]
         "rb" | "rake" | "gemspec" => Some(tree_sitter_ruby::LANGUAGE.into()),
         #[cfg(feature = "semantic-elixir")]
@@ -190,8 +192,10 @@ fn annotate(ext: &str, tokens: &mut [Token], source: &[u8]) {
         // Newline/whitespace-significant languages: preserve the source
         // whitespace (keeps ASI/indentation/preprocessor structure intact),
         // collapse only blank lines, strip comments. Provably non-corrupting.
-        "sh" | "bash" | "py" | "rb" | "rake" | "gemspec" | "ts" | "tsx" | "c" | "h" | "cpp"
-        | "cc" | "cxx" | "hpp" | "hh" | "ex" | "exs" => annotate_gap_preserve(tokens, source),
+        "sh" | "bash" | "py" | "mojo" | "🔥" | "rb" | "rake" | "gemspec" | "ts" | "tsx" | "c"
+        | "h" | "cpp" | "cc" | "cxx" | "hpp" | "hh" | "ex" | "exs" => {
+            annotate_gap_preserve(tokens, source)
+        }
         _ => {}
     }
 }

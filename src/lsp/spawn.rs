@@ -198,6 +198,18 @@ impl ProcessSpawner {
                 init_options: Value::Null,
             },
         );
+        // Mojo's language server ships with the Modular toolchain and
+        // speaks LSP over stdio with no args. Extra include dirs (`-I`)
+        // can be added via config `lsp.servers.mojo.command`.
+        m.insert(
+            "mojo".to_string(),
+            ProcessCommand {
+                program: PathBuf::from("mojo-lsp-server"),
+                args: vec![],
+                env: vec![],
+                init_options: Value::Null,
+            },
+        );
         m
     }
 }
