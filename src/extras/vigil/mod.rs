@@ -291,3 +291,6 @@ impl VigilKeeper {
         info!("vigil-keeper shutdown complete");
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -10,6 +10,10 @@ use super::types::RiteResult;
 /// - `cmd`: runs a shell command; 0 exit = pass.
 /// - `git_dirty`: fails if the git working tree is dirty.
 pub async fn evaluate_rite(rite: &VigilRite) -> RiteResult {
+    evaluate_rite_in(rite, std::path::Path::new(".")).await
+}
+
+async fn evaluate_rite_in(rite: &VigilRite, dir: &std::path::Path) -> RiteResult {
     if let Some(ref cmd) = rite.cmd
         && !cmd.is_empty()
     {
@@ -47,7 +51,7 @@ pub async fn evaluate_rite(rite: &VigilRite) -> RiteResult {
     }
 
     if rite.git_dirty {
-        match check_git_dirty().await {
+        match check_git_dirty(dir).await {
             Ok(true) => {
                 return RiteResult::Fail {
                     reason: "git working tree is dirty".to_string(),
@@ -63,8 +67,10 @@ pub async fn evaluate_rite(rite: &VigilRite) -> RiteResult {
     RiteResult::Pass { output: None }
 }
 
-async fn check_git_dirty() -> Result<bool, String> {
+async fn check_git_dirty(dir: &std::path::Path) -> Result<bool, String> {
     let output = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
         .args(["status", "--porcelain"])
         .output()
         .await
@@ -109,5 +115,67 @@ mod tests {
             "expected Fail but got {:?}",
             result
         );
+    }
+
+    #[tokio::test]
+    async fn test_git_dirty_detects_clean_and_dirty_tree() {
+        use std::process::Stdio;
+
+        let dir = std::env::temp_dir().join(format!("dirge-vigil-gitdirty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let git = |args: &[&str]| {
+            tokio::process::Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+        };
+
+        git(&["init"]).await.unwrap();
+        std::fs::write(dir.join("f.txt"), "a").unwrap();
+        git(&["-c", "user.email=t@t", "-c", "user.name=t", "add", "f.txt"])
+            .await
+            .unwrap();
+        git(&[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-m",
+            "init",
+        ])
+        .await
+        .unwrap();
+
+        let gate = VigilRite {
+            git_dirty: true,
+            ..Default::default()
+        };
+
+        assert!(
+            !check_git_dirty(&dir).await.unwrap(),
+            "fresh commit should be clean"
+        );
+        assert!(
+            matches!(evaluate_rite_in(&gate, &dir).await, RiteResult::Pass { .. }),
+            "clean tree should pass the git_dirty gate"
+        );
+
+        std::fs::write(dir.join("f.txt"), "b").unwrap();
+        assert!(
+            check_git_dirty(&dir).await.unwrap(),
+            "modified file should be dirty"
+        );
+        assert!(
+            matches!(evaluate_rite_in(&gate, &dir).await, RiteResult::Fail { .. }),
+            "dirty tree should fail the git_dirty gate"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

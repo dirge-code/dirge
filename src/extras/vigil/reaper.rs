@@ -41,8 +41,8 @@ pub async fn run_reaper(
     hook_tx: mpsc::Sender<super::types::HookDispatchRequest>,
     initial_paused: std::collections::HashSet<String>,
 ) {
-    let mut reap_tasks: FuturesUnordered<tokio::task::JoinHandle<(String, Vec<VigilEvent>)>> =
-        FuturesUnordered::new();
+    type ReapTask = tokio::task::JoinHandle<(String, Vec<VigilEvent>, mpsc::Receiver<VigilEvent>)>;
+    let mut reap_tasks: FuturesUnordered<ReapTask> = FuturesUnordered::new();
 
     // Lookup maps for metadata accessed in the reap-results arm.
     let running: HashMap<String, Arc<AtomicBool>> = vigils
@@ -72,11 +72,16 @@ pub async fn run_reaper(
         .map(|v| (v.name.clone(), v.reap_interval_secs))
         .collect();
 
-    for mut input in vigils {
-        let name = input.name.clone();
-        let interval = input.reap_interval_secs;
+    let mut rxs: HashMap<String, mpsc::Receiver<VigilEvent>> = vigils
+        .into_iter()
+        .map(|input| (input.name.clone(), input.rx))
+        .collect();
+
+    for (name, &interval) in &reap_interval_map {
+        let rx = rxs.remove(name).expect("receiver for every reap input");
+        let name = name.clone();
         reap_tasks.push(tokio::spawn(async move {
-            reap_interval(name, interval, &mut input.rx).await
+            reap_interval(name, interval, rx).await
         }));
     }
 
@@ -86,7 +91,11 @@ pub async fn run_reaper(
 
     loop {
         tokio::select! {
-            Some(ctl) = ctl_rx.recv() => {
+            maybe_ctl = ctl_rx.recv() => {
+                let ctl = match maybe_ctl {
+                    Some(ctl) => ctl,
+                    None => break, // ctl channel closed — keeper dropped
+                };
                 match ctl {
                     super::types::VigilCtl::Shutdown => {
                         info!("reaper shutting down");
@@ -133,7 +142,18 @@ pub async fn run_reaper(
             }
             Some(result) = reap_tasks.next() => {
                 match result {
-                    Ok((vigil_name, events)) => {
+                    Ok((vigil_name, events, rx)) => {
+                        // Re-spawn this vigil's reap task so it keeps reaping on
+                        // its cadence instead of stopping after the first window.
+                        let interval = reap_interval_map
+                            .get(&vigil_name)
+                            .copied()
+                            .unwrap_or(0);
+                        let next_name = vigil_name.clone();
+                        reap_tasks.push(tokio::spawn(async move {
+                            reap_interval(next_name, interval, rx).await
+                        }));
+
                         if events.is_empty() {
                             continue;
                         }
@@ -288,8 +308,8 @@ pub async fn run_reaper(
 async fn reap_interval(
     name: String,
     interval_secs: u64,
-    rx: &mut mpsc::Receiver<VigilEvent>,
-) -> (String, Vec<VigilEvent>) {
+    mut rx: mpsc::Receiver<VigilEvent>,
+) -> (String, Vec<VigilEvent>, mpsc::Receiver<VigilEvent>) {
     let mut events: Vec<VigilEvent> = Vec::new();
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(interval_secs);
 
@@ -307,7 +327,7 @@ async fn reap_interval(
         }
     }
 
-    (name, events)
+    (name, events, rx)
 }
 
 fn coalesce_events(events: &[VigilEvent]) -> serde_json::Value {
