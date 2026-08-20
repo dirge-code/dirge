@@ -29,7 +29,13 @@ impl MojoAdapter {
 
     /// Methods inside a struct/class/trait/extension body. `container` is the
     /// enclosing type's name, recorded as `parent_class`.
-    fn walk_type_body(&self, node: Node, source: &[u8], symbols: &mut Vec<Symbol>, container: &str) {
+    fn walk_type_body(
+        &self,
+        node: Node,
+        source: &[u8],
+        symbols: &mut Vec<Symbol>,
+        container: &str,
+    ) {
         for i in 0..node.named_child_count() {
             if let Some(child) = node.named_child(i) {
                 match child.kind() {
@@ -421,7 +427,11 @@ def main():
             "{:?}",
             f.imports
         );
-        assert!(f.imports.iter().any(|i| i.names.iter().any(|n| n == "math")));
+        assert!(
+            f.imports
+                .iter()
+                .any(|i| i.names.iter().any(|n| n == "math"))
+        );
     }
 
     #[test]
