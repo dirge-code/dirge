@@ -266,6 +266,13 @@ pub struct Cli {
     )]
     pub vigil_once: bool,
 
+    #[cfg(feature = "vigil")]
+    #[arg(
+        long = "vigil-once-command",
+        help = "Invoke this registered plugin command (e.g. poll-jenkins) after the vigil bridge is live, before waiting for an observance"
+    )]
+    pub vigil_once_command: Option<String>,
+
     #[arg(
         long = "auto-confirm",
         value_enum,
@@ -603,6 +610,13 @@ mod tests {
         let cli = Cli::try_parse_from(["dirge", "--vigil-once"]).unwrap();
         assert!(cli.vigil_once);
         assert!(!cli.vigil_mode);
+    }
+
+    #[cfg(feature = "vigil")]
+    #[test]
+    fn parses_vigil_once_command_flag() {
+        let cli = Cli::try_parse_from(["dirge", "--vigil-once-command", "poll-jenkins"]).unwrap();
+        assert_eq!(cli.vigil_once_command.as_deref(), Some("poll-jenkins"));
     }
 
     #[test]

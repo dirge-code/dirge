@@ -2063,14 +2063,41 @@ async fn main() -> anyhow::Result<()> {
             let rx = vigil_observance_rx
                 .as_mut()
                 .ok_or_else(|| anyhow::anyhow!("--vigil-once requires an active vigil-keeper"))?;
-            let obs = match tokio::time::timeout(std::time::Duration::from_secs(60), rx.recv())
+            // Run the named poll command now that the vigil bridge is live so
+            // its (vigil/emit ...) lands in the keeper's queue before we wait.
+            #[cfg(feature = "plugin")]
+            if let Some(cmd) = cli.vigil_once_command.as_deref()
+                && let Some(pm_arc) = plugin_manager.as_ref()
+            {
+                let cmd = cmd.to_string();
+                let pm = pm_arc.clone();
+                match tokio::task::spawn_blocking(move || {
+                    let mut mgr = pm.lock_ignore_poison();
+                    let handler = mgr
+                        .list_commands()
+                        .into_iter()
+                        .find(|(name, _)| name == &cmd)
+                        .map(|(_, handler)| handler)
+                        .unwrap_or_else(|| cmd.clone());
+                    mgr.invoke_command(&handler, "")
+                })
+                .await
+                {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => eprintln!("warning: vigil poll command failed: {e}"),
+                    Err(e) => eprintln!("warning: vigil poll command panicked: {e}"),
+                }
+            }
+            // Reap fires at the vigil's reap_interval boundary (up to 60s in
+            // the fixtures); allow several windows before declaring a timeout.
+            let obs = match tokio::time::timeout(std::time::Duration::from_secs(180), rx.recv())
                 .await
             {
                 Ok(Some(obs)) => obs,
                 Ok(None) => {
                     anyhow::bail!("vigil: observance channel closed before an observance arrived")
                 }
-                Err(_) => anyhow::bail!("vigil: timed out after 60s waiting for an observance"),
+                Err(_) => anyhow::bail!("vigil: timed out after 180s waiting for an observance"),
             };
             let prompt = if obs.prompt.is_empty() {
                 format!("[vigil] {} - {} event(s)", obs.vigil_name, obs.event_count)
