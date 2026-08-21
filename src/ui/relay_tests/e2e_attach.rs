@@ -76,7 +76,8 @@ mod tests {
             .expect("clone secondary for HUP trigger");
         let mut secondary_for_injector = fake_secondary;
         let injector = std::thread::spawn(move || {
-            for i in 0u64.. {
+            let mut i = 0u64;
+            loop {
                 if !injector_running2.load(Ordering::Relaxed) {
                     break;
                 }
@@ -89,6 +90,7 @@ mod tests {
                     injector_bytes2.fetch_add(1, Ordering::Relaxed);
                 }
                 std::thread::sleep(interval);
+                i += 1;
             }
         });
 
@@ -341,7 +343,8 @@ mod tests {
         let secondary_for_hup = fake_secondary.try_clone().expect("clone secondary for HUP");
         let mut secondary_for_injector = fake_secondary;
         let injector = std::thread::spawn(move || {
-            for i in 0u64.. {
+            let mut i = 0u64;
+            loop {
                 if !injector_running2.load(Ordering::Relaxed) {
                     break;
                 }
@@ -352,6 +355,7 @@ mod tests {
                     injector_bytes2.fetch_add(1, Ordering::Relaxed);
                 }
                 std::thread::sleep(interval);
+                i += 1;
             }
         });
 

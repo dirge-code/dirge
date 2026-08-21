@@ -147,6 +147,7 @@ Accepted top-level keys:
 | `mcp_servers`             | object  | MCP server map when compiled with the `mcp` feature. When omitted, defaults to a single Exa Web Search server; see below.                                                   |
 | `acp_servers`             | object  | ACP server config map when compiled with the `acp` feature. See the ACP section below.                                                                                       |
 | `editor_open_command`     | string  | Opt-in editor follow-along: a command template with `{path}` and `{line}` placeholders (e.g. `"zed {path}:{line}"`, `"code --goto {path}:{line}"`). When set, dirge opens files it reads or edits in this external GUI editor, detached and non-blocking — the editor "follows along" like Zed's AI panel. `None` (unset) disables the feature entirely. |
+| `vigils`                  | array   | Vigil definitions consulted only when `--vigil` is active (compiled with the `vigil` feature). Each entry: `name`, a `trigger` (`toll` timer with `interval_secs`, `watcher` on a `path`, or `harbinger` TCP socket with `address` and `socket_mode`), an optional `reap_interval_secs` (default 30), an optional `prompt` for the observance turn, and optional `procession` (Janet) and `rite` gate. |
 
 ### Desktop Notifications
 
