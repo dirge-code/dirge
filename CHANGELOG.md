@@ -4,6 +4,475 @@ All notable changes to dirge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- Mojo language support, end to end: `mojo-lsp-server` LSP integration
+  (diagnostics + the `lsp` tool for `.mojo`/`.🔥`, project roots resolved via
+  `mojoproject.toml`/`pixi.toml`), and a tree-sitter semantic adapter
+  (`semantic-mojo` feature, on by default) covering symbol indexing (structs,
+  traits, `__extension` methods, `comptime` aliases) and minified reads. The
+  write-time syntax gate deliberately does NOT use the grammar — measured
+  against 800 real files from the modular repo it false-errors on ~10%, so
+  Mojo writes get the delimiter-balance scan instead (see `GATE_EXCLUSIONS`).
+  The grammar is vendored at `grammars/tree-sitter-mojo` and compiled by
+  `build.rs`: it isn't published to crates.io, and a git dependency would make
+  `cargo publish` reject the whole package.
+
+## [0.24.0] - 2026-08-19
+
+### Added
+- Skills that declare an `anchor:` can have it restated on an interval, not just
+  preserved across a compaction. Some skills state that their anchor has to
+  *recur* rather than merely survive — J-Space asks for its premise every third
+  seam and its own verifier calls the verbatim recurrence the mechanism rather
+  than an optimisation. `skill_anchor_interval` (default `0`, off) sets how
+  often, in turn boundaries. The rate is yours rather than any one skill's baked
+  in, and a skill that only needed to survive a fold pays no timer. Note the
+  interval is a floor, not a schedule: the boundary chain returns one nudge and
+  correctness nudges outrank this one, so the effective rate is lower whenever
+  the run is also being steered.
+
+### Fixed
+- `dirge --trace` now records `skill_anchors_kept` on each compaction — which
+  loaded skills still have their anchor in the context the fold produced. There
+  was previously no artifact that could answer whether a loaded skill still
+  governed after a compaction: the trace carried no message text and the session
+  file holds the persisted summary rather than the loop's working context. It
+  reads the context that was actually produced rather than what the fold
+  intended to keep, so it cannot report success when the keeping failed.
+
+## [0.23.0] - 2026-08-19
+
+### Added
+- A persistent Janet notebook kernel the agent evaluates code against. State
+  survives between tool calls, so the model builds context up incrementally
+  instead of re-deriving it or writing throwaway scripts to disk. The kernel is
+  a second Janet VM with a fresh root env and none of the host bridges, so a
+  runaway cell cannot stall the permission gate and agent-authored code cannot
+  shadow a `harness/` function the gate later calls. Runaway cells are
+  interrupted rather than abandoned.
+- `no_skills` (config) / `--no-skills` (CLI) disables on-disk skill discovery —
+  both the preamble catalog and the `skill` tool. Discovery spans
+  `~/.claude`, `~/.opencode`, `~/.agents` and `~/.dirge` `/skills` plus every
+  project ancestor, and honours neither `DIRGE_CONFIG_DIR` nor `DIRGE_DATA_DIR`,
+  so an A/B harness that isolated those still inherited whatever skills the
+  machine happened to carry, in the cached prefix of every request.
+  `scripts/loop-ab.sh` now sets it and reports what it excluded.
+- Skills may declare an `anchor:` in their frontmatter, naming the one section
+  that must survive a compaction. A skill body is an ordinary tool result, so
+  the first fold digests or prunes it — fine for a skill that only had to be
+  read, not for one that governs how the model works for the rest of the run,
+  which stopped governing while the run carried on looking healthy. The anchor
+  is honoured only if the heading resolves in the body, so a typo degrades to
+  no-anchor rather than to a guarantee that keeps nothing. On a ~4,700-token
+  skill this carries ~280 tokens through the fold.
+- `ixx` is recognized as a C++ extension.
+
+### Fixed
+- A Janet runtime error raised after the fiber yielded to the event loop was
+  reported to Rust as success, with the error text sitting where a value should
+  be. Every ev-backed builtin takes that path — `os/execute`, `os/spawn`,
+  `ev/*`, `net/*` — so a plugin hook, slash command or tool handler that failed
+  on one reported success and its error text was consumed as the return value.
+  Pure `(error ...)` was always flagged correctly, which is why it went
+  unnoticed. This is a diagnostics fix, not a permission fix: the tool-hook path
+  already proceeds when a hook errors.
+- Janet subprocess output could corrupt the TUI.
+- HTTP 402 is now classified as a usage cap. A spent balance is the same wall as
+  a usage cap reached by a different route, but the classifier keyed on throttle
+  vocabulary and a billing 402 shares no wording with it, so a spent balance was
+  reported as a generic provider error and the one message that would say "top
+  up" never appeared.
+
+## [0.22.0] - 2026-08-15
+
+### Security
+- A bash command could run without ever reaching the permission checker.
+  Prefixing any denied command with `echo hi &&` and appending `2>&1 | cat` ran
+  it with no prompt. The segment splitter's `redirected_statement` handling
+  recursed only into an allowlist of node kinds and dropped everything else in
+  silence, and tree-sitter parses `a && b 2>&1 | c` as a redirected statement
+  wrapping the whole `a && b` list — so both commands vanished and the engine
+  authorized only `c`. Measured against the release binary:
+  `python3 -c "open('x','w')"` was denied, and
+  `echo hi && python3 -c "…" 2>&1 | cat` ran and wrote the file. The arm now
+  recurses into everything that is not a redirect operand, so an unfamiliar
+  grammar node over-collects rather than disappearing, and a command the
+  splitter cannot decompose at all is marked complex — the backstop that would
+  have contained this instead of letting it become a bypass. Anyone running
+  with a restrictive permission config should take this release.
+
+### Added
+- Swift support. `sourcekit-lsp` ships with the toolchain, so `.swift` files
+  get diagnostics, definitions and symbols with nothing to install;
+  `swift build`/`test`/`run`, `swiftlint` and `swift-format` are auto-allowed
+  on the same trust model as the cargo and go commands, with the subcommands
+  named individually because `swift foo.swift` and `swift repl` run arbitrary
+  code. `swift test` is also recognised by the claim gate, which previously
+  returned nothing for it while the verifier counted it — the split verdict
+  that tells a model which has just verified that it has not.
+- A tree-sitter Swift adapter, so `find_definition`, `list_symbols` and
+  `get_symbol_body` answer for Swift and the pre-write syntax gate rejects a
+  broken `.swift` edit. The gate is a hard block, so the grammar was measured
+  against async/await, actors, generics with where-clauses, property wrappers,
+  result builders, `@main`, multi-line strings and custom operators before it
+  was wired in — a grammar that reports valid code as an error leaves nothing
+  savable, which is why `.sql` is still excluded. Every adapter extension is
+  now either gated or recorded with the reason it is not.
+
+### Fixed
+- `python3 -m pytest` was refused wherever `pytest` was allowed, because
+  nothing bridged the bare interpreter (deliberately gated — `python -c` runs
+  anything) to the module it was running. It is the commonest way a model
+  invokes pytest and the exact shape the verify nudge asks for, so the harness
+  was refusing what it had just demanded. The bypass above had been hiding it:
+  the only form that ran was `… 2>&1 | tail`, which the verifier then declines
+  as masked. The module form is now named explicitly for the tools already
+  allowed under their own name; `python3 -m http.server` and
+  `python3 -m pip install` still prompt, and a deny on the tool still governs
+  its module form.
+- Interventions could stack on the run's last boundary. The mid-turn boundary
+  has emitted one harness nudge since 0.20, but the boundary that ends the
+  inner loop is polled by two arbiters — the boundary one and then the
+  finalization one — with no ranking between them, so two messages could land
+  before a single assistant turn. That boundary now belongs to finalization,
+  which is the arbiter that knows what finishing means; the safe-state abort is
+  exempt, since a tree restore is not steering.
+- The stall checkpoint fired on runs that were finishing successfully, twice
+  measured within 0.1s of the end. Not a coincidence of timing: by the time a
+  run is finishing its todos are closed, its files are touched and its
+  verification is latched green, so all three progress signals are structurally
+  unable to move and every endgame boundary is barren by definition. The
+  monitor exists for *successful, varied, useless tool calls* — its own first
+  line — but scored every boundary, including turns that called nothing (the
+  final answer) and turns whose calls all failed, which belong to the failure
+  tracker. One measured run delivered it on a boundary whose single call was
+  permission-denied, so the model spent its closing words arguing that nothing
+  was blocking it. Only a boundary with a successful tool call is judged now,
+  and a checkpoint the arbiter declines to deliver keeps its budget instead of
+  being charged for a message nobody read.
+- Objective-C and Ruby's `.rake`/`.gemspec` files opened with the language
+  server as `plaintext`, so `clangd` and `ruby-lsp` accepted them and answered
+  every query with nothing. Adding a server takes entries in three tables that
+  do not reference each other — who claims the extension, how to launch it, and
+  the `languageId` sent on open — and missing the third raises no error
+  anywhere. The check now derives from the server registry, so claiming an
+  extension requires saying what language it is.
+- A language server request carrying a non-numeric id was read as a
+  notification and dropped without a reply. Requests were identified by their
+  id's TYPE rather than by carrying both an id and a method, so a server that
+  uses string ids and waits for the answer stalled every later request. Found
+  on the wire with sourcekit-lsp, which sends `client/registerCapability` with
+  a UUID and blocks on it.
+
+## [0.21.20] - 2026-08-15
+
+### Added
+- `--trace <path>` writes a JSONL record per loop decision — turns, tool calls
+  joined to their results, provider token usage, the context manager's verdict
+  every turn including the turns it decides nothing, what the front end
+  receives, and every harness intervention attributed to the guard that sent it
+  and that guard's own account of why. `scripts/loop-trace.py` renders it as a
+  timeline plus a summary; `docs/loop-trace.md` explains how to read one. It
+  exists because the per-run tally on `dirge::gates` answers "how did this run
+  go" and cannot answer "what happened, in what order, and why" — a run where
+  the critic fired and the model then edited a file is identical on the tally
+  to one where the model edited the file and the critic fired afterwards, and
+  one of those is a bug. Everything it can get comes from the event stream the
+  loop already emits, tapped at the single point every event passes through, so
+  it is not a second set of call sites to keep in step with the first.
+- `context_window` can now be set per provider (`providers.<name>.context_window`),
+  which GitHub #772 asked for. It was a top-level key, so anyone with more than
+  one provider configured — the common case — could not correct one model's
+  window without corrupting the others'. That number is the denominator of
+  every compaction threshold, so a wrong one folds a context with room to spare
+  or fails to fold one without. Precedence runs provider, then the top-level
+  key, then the built-in model table, then 128k, and the loop's compaction math
+  and the session's context gauge now resolve it from the same call.
+- Tool schemas are trimmed to breadcrumbs on a small context window
+  (`compact_tool_schemas`: `auto`, `on`, `off`). dirge's opening request is
+  16,172 prompt tokens with the built-in tools alone and 32,621 with MCP
+  servers loaded — the second larger than a 32k window in its entirety, so such
+  a run could not take a single turn and the only symptom was every turn being
+  force-ended. Below a 48k window each tool's description is cut to its first
+  sentence and each parameter's to a clause, while names, types, enums and
+  required-ness are left exactly as they were: the model keeps everything it
+  needs to form a well-formed call and loses the prose about when to prefer one
+  tool over another. No tool is dropped — a model that cannot see a tool cannot
+  ask for it, and that failure is silent and looks like incapability. Measured
+  on one task at 32k: 16,202 tokens to 12,249, peak context 51% to 39.5%, with
+  the model still reaching for `list_symbols` unprompted.
+
+### Fixed
+- A turn the context manager cut short ended the whole run. The critical-context
+  tier breaks out of the inner loop, but the inner loop *is* the turn loop, so
+  control fell through to the finalization poll and its default is to stop. A
+  model whose context read over the threshold therefore got exactly one turn:
+  the tool calls it made were dispatched, their results were appended, and the
+  run finished before the model ever saw them — in silence, with a partial
+  answer. It only appeared to work because a critic or verifier gate sometimes
+  fired and restarted the loop, which is not a mechanism anyone designed. The
+  run now continues when the fold actually made room, and when the fold freed
+  nothing it stops with a notice naming the prompt size and the window instead
+  of stopping quietly.
+- A model the window table does not know was silently given 128k. The table
+  matches by substring, so `glm-5.3` matched nothing at all — `glm-5.2` is
+  listed at a million — and a local model, which is named by its file path,
+  matched on `qwen` and got 32000, smaller than dirge's own prompt. Every
+  context tier divides by this number, so the guess drove real folds and real
+  force-ended turns on models with room to spare, and the only visible symptom
+  was a context meter that looked full. Known families now match their point
+  releases, and a model neither lookup recognises says so once rather than
+  being guessed at in silence.
+- The context meter divided two numbers that had nothing to do with each other.
+  It showed the persisted transcript's own estimate — a chars-per-token
+  heuristic over every message, tool results at their original length — against
+  the model's advertised window, while compaction compares the provider's
+  prompt count for the actual request, whose oversized results have been
+  snipped and whose old turns are a summary, against the working budget. A
+  session was observed reading "226.9k/128.0k, 100%, compaction soon" after a
+  single compaction, which is exactly what a healthy run looks like through
+  that arithmetic. The meter now reports the two quantities the fold decision
+  is made from.
+- The verifier told a model it had not run its tests, immediately after it ran
+  them four times. A command whose exit status is piped away proves nothing —
+  the zero belongs to `tail` — so declining it is right, but the decline
+  returned without recording why and the model got the message meant for a run
+  that had checked nothing. It could see that was false, so it did not remove
+  the pipe: it re-ran the same shape twice more, then appended `; echo "exit=$?"`,
+  which reports the status of `echo`, and its final answer asserted an exit
+  status it never had. The message now quotes the command back, says the status
+  belongs to the last stage of the chain, and says what to run instead. On the
+  same task the old wording ended unverified with a green suite; the new one
+  was corrected on the first attempt, on three different models.
+- Two guards disagreed about the same command. `python3 -m pytest` classified
+  as `python3` in the claim gate and as `pytest` in the verifier, so a model
+  that had just been corrected by one, complied exactly, and reported its
+  result truthfully was told by the other that no test had run. Interpreter and
+  runner prefixes are now read through — `python -m`, `npx`, `poetry run` and
+  friends — while `python script.py` deliberately still classifies as nothing,
+  and neither recogniser previously knew `unittest` at all.
+- Reporting an exit status failed the claim gate. "exit 0" was treated as a
+  claim about a build, so a model that ran its tests cleanly and reported what
+  they returned — which is what the verifier's own nudge asks for — was told no
+  build had run. A bare exit status names no kind of command and is now
+  satisfied by any verification, while a build still cannot support a test
+  count and a test run still cannot support "clippy clean".
+- The progress monitor told a model that had passed every test it had made no
+  progress. A test run whose status was piped away never latches a green, and a
+  green is one of the three things the monitor counts as progress, so the stall
+  checkpoint fired twice at a run with a passing suite — once at 618.0 seconds
+  of a 618.1-second run. It now stands down while the verifier is holding a
+  declined command, because the verify nudge owns that situation and has the
+  message that can act on it.
+- Every harness intervention was rendered twice in the TUI. The notice that
+  mirrors an intervention carries a summary and the body, because headless
+  consumers see only it, and the interface also renders the body from the
+  message itself — so the instruction appeared on screen twice with a summary
+  above the first copy. The notice now contributes only its summary line there.
+  Headless output is unchanged.
+- Boundary nudges were missing from the message stream. Stall, budget,
+  prologue, work-tracking, file-touch, safe-state, fast-verify and reflection
+  checkpoints were pushed straight into the conversation with only a notice, so
+  anything reading the message stream saw about half the steering surface — the
+  per-run tally counted two stall checkpoints where the trace could attribute
+  one. They now emit the same events the finalization gates do.
+- The turn counter on the per-run tally read zero for any run whose turns were
+  cut short, because it was incremented past the point such a run leaves the
+  loop. It is the denominator every other count on that line is read against,
+  so the whole line was unreadable rather than merely incomplete. The fold and
+  force-summary log lines also now carry the prompt size and the window beside
+  the ratio, which previously had to be recovered by solving a division.
+
+## [0.21.19] - 2026-08-14
+
+### Fixed
+- A panic anywhere in a run hung the TUI permanently. `panic = "abort"` is not
+  set, so a panic unwinds out of the agent task, tokio catches it, and the
+  event channel closes — and the UI's select arm reads a closed channel as
+  "nothing more to poll" and silently disables itself. `is_running` is cleared
+  only by events that can no longer arrive, so the run sat at "running" with
+  nothing left that could change its mind: no error, no timeout, and nothing on
+  screen to tell it apart from thinking. Tools are awaited inline in that task,
+  so any tool's `unwrap`, a slice index off a char boundary, or a debug-build
+  overflow went this way. A run's terminal event is now a property of the
+  task's lifetime rather than of the path it happened to take, so a crash
+  arrives as the error it always should have been — naming the panic and its
+  source location — and the prompt comes back. `--print` and ACP drain the same
+  channel and get it too.
+- A caught panic reset the terminal of a process that kept running. The panic
+  hook decided whether to restore the terminal by asking whether the panicking
+  thread owned it, which is true for every agent-task panic on a
+  single-threaded runtime — so a survivable panic cleared the screen, left raw
+  mode, and latched a flag that made the real teardown skip its own reset
+  later. The hook now only records what happened; whoever survives the panic
+  reports it, and the terminal teardown prints an unclaimed record after
+  restoring the screen. A panic some `catch_unwind` swallowed now gets one line
+  at exit instead of living only in a log.
+- A tool call a model wrote as text was printed to the user as the turn's
+  answer. The command ran and the reply was its source code. Two further
+  defects came out of the same gap: the call never reached the assistant
+  message, so the next request carried a `tool` result with no preceding
+  `tool_calls` (a hard 400 on OpenAI and Anthropic), and those calls carried an
+  empty id, so two in one turn were indistinguishable to result matching, the
+  storm signature and the publish guard. Such a region is now hidden exactly
+  when it dispatches — so a call that names a tool this run does not have stays
+  on screen, and a ```` ```json ```` block a model is deliberately showing you
+  never vanishes.
+- Renewing an expired provider token froze the whole program. Three transports
+  resolved their bearer synchronously on the per-request path, and the
+  refresher spawns an OS thread and joins it around a blocking HTTP exchange.
+  On a single-threaded runtime that is the only thread: nothing painted, no
+  keystroke was read, and no timer could fire — including any timeout meant to
+  bound whatever was stuck. Kimi access tokens live 15 minutes, so it recurred
+  through a long session. Resolution is off-thread now, with no thread hop at
+  all on the common path where nothing needs renewing.
+- Ctrl+C did not escape the `question` modal. It cancels in every other modal;
+  here it did nothing in the option list, and in the custom-answer field it
+  typed a literal `c` into the answer.
+- Nearest-name suggestions for an unknown tool pointed at unrelated tools —
+  `exec` → `spec`, `shell` → `skill`, `ask` → `task` — in a message with no
+  hedge, steering a model that wanted a shell toward a spec-management tool.
+  Of eleven plausible guesses, six were wrong; now one. Names that differ from
+  a real tool only in case or separators resolve directly.
+- Automatic compaction had none of the prompt-injection fencing `/compact` has
+  had all along, and it is the path that runs unattended. It also could not see
+  tool CALLS — only their results — so a fold recorded outcomes with no record
+  of what produced them; measured at 0/6 facts preserved that lived only in
+  call arguments, now 6/6. Both paths are one implementation.
+- A `/compact` summary entered the loop without the marker an automatic fold
+  writes, so the next fold could not find it and stacked a second summary
+  behind it.
+- A headless failure printed its error to stderr twice, verbatim.
+- A model-supplied `bash` timeout ignored the configured ceiling: a model
+  asking for 3600 got it however low `timeouts.bash_secs` was set. It is
+  clamped by `timeouts.bash_max_secs` (default 3600), and the schema the model
+  reads is rendered from the resolved config.
+
+### Added
+- `timeouts.tool_call_secs` (default 600) — a ceiling on one tool dispatch.
+  Every tool keeps its own tighter bound; this exists so a tool that forgets to
+  bound itself, or one on a path that skips its own client, cannot stall a run
+  silently. Tools whose own bound is legitimately larger declare it, and the
+  budget does not run while a call is waiting on you: the permission prompt,
+  the `question` tool and `/plan` approval all wait for a person from inside
+  the window being bounded, and killing a call somebody is halfway through
+  approving is worse than the stall this catches. It bounds waits, not blocked
+  threads — a tool that blocks the runtime never lets the timer be polled.
+- A per-turn `<turn_envelope>` carrying the volatile session facts (cwd, mode,
+  model, todos, modified files), rebuilt each turn and replacing the previous
+  one instead of stacking behind it. The frozen prefix keeps only what does not
+  change, so it stays cacheable.
+- The prompt's tool section is rendered from the live registry rather than a
+  literal, so prompt-level `deny_tools`, umbrella deny rules and dynamic tool
+  search can no longer make the prompt describe a capability boundary the loop
+  does not have. Both of these default on: 2 of 6 control runs blew up against
+  0 of 6 under treatment.
+- Tool failures are classified (misuse / missing-info / transient / fatal).
+  Transient failures retry with backoff on reads only, and a missing-info error
+  weighs more when estimating whether a model is coping.
+- `prompt_leak_detect`, off by default, for a model reciting its own system
+  prompt back. Advisory mode exists so it can be measured before it is trusted.
+
+### Changed
+- An interrupted mutating tool call no longer tells the model to retry it. What
+  a call landed — committed, unknown, or nothing — is classified and handed to
+  the next turn instead.
+- A truncated assistant turn is marked incomplete where the model can see it,
+  not only in the UI.
+
+## [0.21.18] - 2026-08-12
+
+### Security
+- Bumped `lru` to 0.18.2 for RUSTSEC-2026-0253, a panic-safety hole in
+  `LruCache::pop()`: if a key's `Drop` panics, `detach()` never runs and a
+  later eviction can dereference the freed node. It arrives transitively via
+  `ratatui-core` and is not reachable here — those cache keys have no
+  panicking `Drop` and nothing wraps them in `catch_unwind` — but the fix is a
+  semver-compatible patch, so there's no reason to carry it.
+
+### Fixed
+- The mid-session memory refresh was busting the prompt cache on the
+  Claude-Code/OAuth path. It was appended to `messages[]` as a `system`-role
+  entry, and the OAuth shaper hoists those into the top-level `system` array
+  because a stray system turn otherwise trips Anthropic's third-party
+  classifier. But Anthropic renders `tools → system → messages` and caches on
+  a strict prefix match, so growing `system` shifts every message byte after
+  it — the whole conversation got re-billed at cache-write price, on a message
+  that had been sitting in the cheapest possible position. It is now a
+  user-role `<system-reminder>`, the same framing background-task
+  notifications already use, so there is nothing left to hoist and the cached
+  prefix survives. Compaction summaries still hoist as before.
+- `/cache` printed a nonsense fraction on Anthropic. The hit *ratio* already
+  accounted for Anthropic reporting input, cached, and creation as disjoint
+  lanes — `input_tokens` is only the uncached remainder — but the line under
+  it still divided by `input_tokens` alone, so a warm session read
+  `cache hit ratio: 93.0%` above `cached input: 20000 / 500 tokens`. Both now
+  share one denominator.
+
+### Added
+- `/cache` names the TTL in force beside the write tokens. A 1h cache write
+  costs 2× base input against 1.25× at 5m, and which one wins depends on how
+  long the gaps between turns are — so the knob driving that premium now
+  appears next to the number it is charged on, and a
+  `DIRGE_PROMPT_CACHE_TTL` comparison leaves a record of which setting
+  produced which totals. The default is unchanged at 1h.
+- A warning when a turn writes a prompt-cache entry but reads none, carrying
+  the message count. Two documented ways to lose a cache read leave no error
+  behind: the 20-block lookback window (a turn appending more than 20 content
+  blocks pushes the previous breakpoint out of range — ten parallel tool calls
+  is 21) and concurrent fan-out (an entry only becomes readable once the first
+  response starts streaming, so subagents launched together each pay the
+  write). Neither is confirmed to happen here; this reports the signature so
+  the question can be settled on evidence.
+
+## [0.21.17] - 2026-08-09
+
+### Fixed
+- Building with `--features sandbox-microvm` on a machine without libkrun
+  failed at the link step with forty lines of `Undefined symbols for
+  architecture arm64: _krun_create_ctx, _krun_set_exec, ...` — none of which
+  mention libkrun. The runner now compiles either way: without libkrun it
+  becomes a stub that says what's missing and how to install it, and `dirge
+  sandbox check` reports it as an error instead of "binary found". Starting a
+  microVM from such a build fails immediately with the same explanation instead
+  of spawning the stub and waiting out the SSH timeout.
+- The build script cached its libkrun verdict for the life of the target
+  directory. It declared `rerun-if-changed` on `dirge.entitlements`, a file it
+  never reads — the runner writes its own entitlements plist at runtime — and
+  declaring any `rerun-if-changed` switches off cargo's default "re-run when a
+  package file changed". So installing libkrun after one failed build changed
+  nothing: cargo replayed the cached "not found" and produced the identical
+  link error. Worse, the explanatory `cargo:warning` only prints on a run where
+  the script actually executes, so the second failure arrived with no
+  explanation at all, and escaping it took a `cargo clean`. The probe now
+  watches the library paths themselves. Cargo treats a watched path that
+  doesn't exist as changed on every build, so it re-probes until it finds
+  something and then settles on the real file.
+- libkrunfw no longer gates linking. Nothing in the runner references a
+  `krunfw_*` symbol — libkrun reaches libkrunfw itself, by `dlopen` on macOS
+  and `DT_NEEDED` on Linux. Requiring it before emitting `-lkrun` blocked
+  builds for no link-time reason. It is still needed to boot a VM, which is
+  what `dirge sandbox check` is for.
+- `dirge sandbox check`'s pkg-config probe never matched anything on macOS. It
+  derived the package name by stripping the `lib` prefix, asking for `krun`
+  when the metadata file is `libkrun.pc`. The build script carried a comment
+  warning about exactly that mistake and the check had drifted from it, which
+  is invisible to CI because there is no macOS runner.
+
+### Added
+- `LIBKRUN_LIB_DIR` and `LIBKRUNFW_LIB_DIR` point the build at libkrun outside
+  the standard prefixes. Changing either re-runs the probe, as does changing
+  `PKG_CONFIG_PATH`.
+
+### Changed
+- The libkrun search lives in one module that both `build.rs` and `dirge
+  sandbox check` compile, so the two can no longer disagree about whether a
+  library is installed, and the build script's half of it is now covered by
+  tests. The Linux search also looks in the Debian/Ubuntu multiarch
+  directories.
+
 ## [0.21.16] - 2026-08-09
 
 ### Fixed
@@ -3614,7 +4083,9 @@ agent in Rust with:
   LSP integration, and a Janet plugin system.
 - Session save/load/resume with LLM-summarization compaction.
 
-[Unreleased]: https://github.com/dirge-code/dirge/compare/v0.21.3...HEAD
+[Unreleased]: https://github.com/dirge-code/dirge/compare/v0.24.0...HEAD
+[0.24.0]: https://github.com/dirge-code/dirge/compare/v0.23.0...v0.24.0
+[0.23.0]: https://github.com/dirge-code/dirge/compare/v0.22.0...v0.23.0
 [0.21.3]: https://github.com/dirge-code/dirge/compare/v0.21.2...v0.21.3
 [0.16.0]: https://github.com/dirge-code/dirge/compare/v0.15.0...v0.16.0
 [0.4.1]: https://github.com/dirge-code/dirge/compare/v0.4.0...v0.4.1

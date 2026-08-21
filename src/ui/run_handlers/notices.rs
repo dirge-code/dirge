@@ -79,6 +79,7 @@ pub(crate) fn handle_user_message_after_response(
         }
     }
     *agent_line_started = false;
+    renderer.end_stream();
     response_buf.clear();
     *response_start_line = None;
     // The next turn's reasoning must anchor fresh too.
@@ -93,7 +94,17 @@ pub(crate) fn handle_user_message_after_response(
 /// (e.g. the max-agent-turns cap), rendered in the warning color so it
 /// reads as runtime output rather than something the user typed.
 pub(crate) fn handle_system_notice(renderer: &mut Renderer, content: &str) -> std::io::Result<()> {
-    write_system_lines(renderer, content)?;
+    // dirge-hwk9.5: an intervention mirror shows its SUMMARY here and nothing
+    // more. The notice carries `"harness intervention: {summary}\n{body}"`
+    // because headless consumers see only it — `--print` renders SystemNotice
+    // and ignores UserMessage entirely — but the TUI gets both, and renders
+    // the body from the message. Showing the notice in full put the
+    // instruction on screen twice.
+    //
+    // The body is deliberately left to the message path: that is the copy
+    // `dirge-m10x` guarantees survives the next turn's stream anchor.
+    let shown = crate::agent::agent_loop::intervention::notice_summary(content).unwrap_or(content);
+    write_system_lines(renderer, shown)?;
     renderer.write_line("", Color::White)
 }
 
@@ -168,6 +179,47 @@ mod tests {
         r.buffer_lines()
             .iter()
             .any(|l| crate::ui::ansi::strip_ansi(l).contains(needle))
+    }
+
+    /// dirge-hwk9.5: one harness intervention must produce ONE rendered body.
+    ///
+    /// Every intervention reaches the front end twice: `emit_harness_notices`
+    /// sends a `SystemNotice` whose content is
+    /// `"harness intervention: {summary}\n{body}"`, and the tagged message
+    /// itself arrives as a `UserMessage`, which `handle_user_message` renders
+    /// as `{body}` under `<sys>` or `<critic>`. Both handlers write lines, so
+    /// the body lands on screen twice with a summary line above the first copy.
+    ///
+    /// This drives the two handlers in the order the UI receives them and
+    /// counts the body, which is the only way to see it — each handler is
+    /// correct in isolation.
+    #[test]
+    fn one_intervention_renders_its_body_once() {
+        let body = "verify the build before finishing";
+        let mut r = Renderer::new().unwrap();
+
+        // The order the UI event loop sees them in.
+        handle_system_notice(
+            &mut r,
+            &format!("harness intervention: the critic pushed back on the answer\n{body}"),
+        )
+        .unwrap();
+        handle_user_message(&mut r, &format!("{CRITIC_TAG} {body}")).unwrap();
+
+        let copies = r
+            .buffer_lines()
+            .iter()
+            .filter(|l| crate::ui::ansi::strip_ansi(l).contains(body))
+            .count();
+        assert_eq!(
+            copies, 1,
+            "the intervention body must appear once; the summary line is what \
+             the notice adds, not a second copy of the instruction"
+        );
+        assert!(
+            has_line_containing(&r, "harness intervention:"),
+            "the human-facing summary must still be shown"
+        );
     }
 
     /// dirge-m10x: a critic nudge re-enters as a user-role message while the

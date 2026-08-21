@@ -11,8 +11,36 @@ permissions:
   contents: write
 
 jobs:
+  # Gate the whole release on a dependency audit of the TAGGED commit.
+  #
+  # CI owns the audit job, but CI is triggered by the push to `main` while
+  # this workflow is triggered independently by the tag. Pushing the commit
+  # and the tag back-to-back starts the release before CI can report, so a
+  # lockfile advisory published since the last green run ships regardless.
+  # Cutting v0.21.18 hit exactly that: RUSTSEC-2026-0253 landed between the
+  # last green run and the tag, and `sbom` had already created a PUBLIC
+  # release with three targets' binaries by the time CI came back red.
+  # Recovery meant deleting a published release and re-pushing the tag.
+  #
+  # This runs ahead of `sbom` specifically because `sbom` is what creates the
+  # release object — nothing is public until the audit passes.
+  #
+  # Scoped to the audit and NOT the rest of CI on purpose: the audit is the
+  # one check whose verdict changes without the commit changing, since a
+  # newly published advisory flips it red on identical code. fmt / clippy /
+  # tests are deterministic per commit, so a SHA that was green stays green;
+  # re-running them here would add ~7 min to every release and catch nothing.
+  preflight:
+    name: Audit dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/audit
+
   sbom:
     name: Generate SBOM
+    # Nothing public exists until the audit clears — see `preflight`.
+    needs: preflight
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

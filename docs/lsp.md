@@ -25,10 +25,13 @@ discovering it later via `cargo check`.
 | `clojure-lsp` | `clojure-lsp` | `.clj`, `.cljs`, `.cljc`, `.edn`, `.bb` |
 | `gopls` | `gopls` | `.go` |
 | `jdtls` | `jdtls` | `.java` |
-| `clangd` | `clangd` | `.c`, `.cc`, `.cpp`, `.cxx`, `.h`, `.hh`, `.hpp`, `.hxx`, `.m`, `.mm` |
+| `clangd` | `clangd` | `.c`, `.cc`, `.cpp`, `.cxx`, `.ixx`, `.h`, `.hh`, `.hpp`, `.hxx`, `.m`, `.mm` |
 | `ruby-lsp` | `ruby-lsp` | `.rb`, `.rake`, `.gemspec` |
 | `bash-language-server` | `bash-language-server start` | `.sh`, `.bash` |
+| `dafny` | `dafny server --verify-on change` | `.dfy` |
+| `swift` | `sourcekit-lsp` | `.swift` |
 | `cmake` | `cmake-language-server` | `.cmake` (+ `CMakeLists.txt` by name) |
+| `mojo` | `mojo-lsp-server` | `.mojo`, `.🔥` |
 
 Missing binaries trip the broken-server backoff (1s → 2s → … capped at 10 min)
 rather than failing dirge — the rest of the session keeps working. Override the
@@ -45,7 +48,9 @@ pyright looks for `pyproject.toml`/`setup.py`/etc.; clojure-lsp looks for
 `compile_commands.json`/`CMakeLists.txt`/`Makefile`/`meson.build`; ruby-lsp
 follows `Gemfile`/`Rakefile`; bash-language-server uses the file's parent. Cmake
 uses the same root markers as clangd (`compile_commands.json`, `CMakeLists.txt`,
-`Makefile`, `meson.build`).
+`Makefile`, `meson.build`). Dafny looks for `dfyconfig.toml`; swift for
+`Package.swift`/`compile_commands.json`; mojo for
+`mojoproject.toml`/`pixi.toml`.
 
 Disable: `--no-lsp` flag or `{ "lsp": false }` in the config. Per-server
 overrides (custom command, env, init options) live in the config — see

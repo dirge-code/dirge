@@ -24,6 +24,8 @@ pub mod entity_search;
 
 pub mod content_guard;
 pub mod curator_clock;
+/// What to say when a SQLite file is not readable (issue #769).
+pub mod db_health;
 pub mod dirge_paths;
 pub mod fts;
 pub mod issue_db;

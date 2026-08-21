@@ -89,67 +89,38 @@ impl AnyClient {
     }
 }
 
-/// dirge-tv3p: build the compaction summarizer prompt from the to-be-discarded
-/// messages. Pure + synchronous (serialize the conversation, assemble the
-/// prompt, run the prompt-injection delimiter check) so the UI thread can do it
-/// before handing the slow LLM call to a background task. Returns `Err` when the
-/// untrusted inputs smuggle the reserved delimiter (caller skips compaction).
+/// dirge-tv3p: build the compaction summarizer prompt for the `/compact` path.
+///
+/// dirge-dlpl: an ADAPTER now, not an implementation. It converts the session's
+/// messages to [`compaction_material::Turn`] and hands them to
+/// [`compression::build_summary_prompt_with`] — the same builder the automatic
+/// in-loop fold uses, so the two paths share the serializer, the caps, the
+/// prompt-injection fencing, the section template and the delimiter check
+/// instead of each carrying their own.
+///
+/// They did each carry their own, and every difference turned out to be a
+/// defect: the fencing reached only this path (dirge-tgb9, P1), tool calls
+/// reached only the other (dirge-czg9), and the source-coverage section had to
+/// be added to each separately.
+///
+/// Pure + synchronous so the UI thread can build it before handing the slow LLM
+/// call to a background task. Returns `Err` when the untrusted material smuggles
+/// the reserved delimiter (caller skips compaction).
 pub(crate) fn build_compaction_prompt(
     messages: &[SessionMessage],
     previous_summary: Option<&str>,
     instructions: Option<&str>,
 ) -> anyhow::Result<String> {
-    // C6 (audit fix): no more 6000-char truncation. A 300K-token session was
-    // previously summarized from ~1500 tokens of content — fidelity collapsed
-    // exactly when compaction was most needed. Feed the full prefix; the
-    // summarizer model has plenty of room unless the prefix itself is bigger
-    // than its window, in which case its own context-overflow path surfaces a
-    // real error rather than silently lying. Pi and opencode feed the full prefix.
-    let conversation = summarize::serialize_conversation(messages);
-
-    // `/compress <focus>` argument: free-form text after the slash command is a
-    // Hermes-style FOCUS TOPIC — the summarizer allocates ~60-70% of its budget
-    // to topic-related information. Maps context_compressor.py:1050-1054.
-    let instructions_block = match instructions {
-        Some(text) if !text.trim().is_empty() => format!(
-            "FOCUS TOPIC: \"{}\"\n\
-             The user has requested that this compaction PRIORITISE preserving \
-             all information related to the focus topic above. For content \
-             related to \"{}\", include full detail — exact values, file paths, \
-             command outputs, error messages, and decisions. For content NOT \
-             related to the focus topic, summarise more aggressively. The \
-             focus topic sections should receive roughly 60-70% of the \
-             summary token budget. Even for the focus topic, NEVER preserve \
-             API keys, tokens, passwords, or credentials — use [REDACTED].",
-            text.trim(),
-            text.trim(),
-        ),
-        _ => "(none)".to_string(),
-    };
-
-    // dirge-u13u: prompt-injection defense. Before fencing the untrusted inputs
-    // with our distinctive delimiter pair, scan them for the delimiter itself —
-    // a smuggled delimiter (via a prior tool output, fetched URL, paste) could
-    // close our fence and inject instructions outside it. Bail rather than risk
-    // it; the warning stays operator-side (tracing). The caller treats this
-    // `Err` as "skip compaction for this turn".
-    let prev_summary_value = previous_summary.unwrap_or("(none)");
-    if prompt::input_contains_compaction_delimiter(&[
-        &conversation,
-        prev_summary_value,
-        &instructions_block,
-    ]) {
-        tracing::warn!(
-            "compaction input contains the untrusted-material delimiter — \
-             skipping compaction this turn to avoid prompt-injection risk"
-        );
-        anyhow::bail!("compaction aborted: input contains reserved delimiter string");
-    }
-
-    Ok(prompt::COMPACTION_PROMPT
-        .replace("{conversation}", &conversation)
-        .replace("{previous_summary}", prev_summary_value)
-        .replace("{instructions}", &instructions_block))
+    // C6 (audit fix): no caller-side truncation here. A 300K-token session was
+    // once summarized from ~1500 tokens of content — fidelity collapsed exactly
+    // when compaction was most needed. The size decision belongs to the layer
+    // that knows which model will read it, and lives in
+    // [`summarize::oneshot_prompt_budget_bytes`].
+    let turns = crate::agent::compaction_material::from_session_messages(messages);
+    let budget = crate::agent::compression::summary_budget(
+        crate::agent::compression::estimate_turn_tokens(&turns),
+    );
+    crate::agent::compression::build_summary_prompt(&turns, budget, previous_summary, instructions)
 }
 
 /// dirge-tv3p: run the compaction summarizer LLM over a prebuilt prompt and

@@ -377,7 +377,7 @@ impl LanguageAdapter for CppAdapter {
         // `SemanticManager` so C wins for `.h`. If a project is
         // primarily C++ users can flip the file extension to
         // `.hpp` / `.hh` / `.hxx` to route through here.
-        &[".cpp", ".cc", ".cxx", ".hpp", ".hh", ".hxx"]
+        &[".cpp", ".cc", ".cxx", ".ixx", ".hpp", ".hh", ".hxx"]
     }
 
     fn extract(&self, file_path: &Path, source: &str) -> Result<ExtractedFile, String> {

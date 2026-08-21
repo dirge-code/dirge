@@ -165,7 +165,7 @@ impl Engine {
             rules.push(Rule {
                 op: OpMatch::One(Operation::Execute),
                 tool: Some("bash".to_string()),
-                pattern: pattern_for_tool("bash", pat),
+                pattern: pattern_for_tool("bash", &pat),
                 effect: action.into(),
                 original: format!("bash:{pat}"),
             });
@@ -314,6 +314,8 @@ mod tests {
     #[test]
     fn classify_path_real_cwd_in_project_is_in_cwd() {
         let cwd = std::env::temp_dir().join(format!("dirge-classify-real-{}", std::process::id()));
+        // dirge-m1ni: clear first — the name is keyed on a recyclable pid.
+        let _ = std::fs::remove_dir_all(&cwd);
         std::fs::create_dir_all(cwd.join("sub")).unwrap();
         let file = cwd.join("sub").join("a.dfy");
         std::fs::write(&file, "// x\n").unwrap();
@@ -328,6 +330,8 @@ mod tests {
         // A path outside the cwd subtree stays external.
         let outside_dir =
             std::env::temp_dir().join(format!("dirge-classify-out-{}", std::process::id()));
+        // dirge-m1ni: clear first — the name is keyed on a recyclable pid.
+        let _ = std::fs::remove_dir_all(&outside_dir);
         std::fs::create_dir_all(&outside_dir).unwrap();
         let outside = outside_dir.join("b.dfy");
         std::fs::write(&outside, "// y\n").unwrap();

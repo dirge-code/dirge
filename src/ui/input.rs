@@ -648,7 +648,7 @@ impl InputEditor {
         let normalized: String = text.replace("\r\n", "\n").replace('\r', "\n");
         // Strip PASTE_MARK so it can never appear in paste content and confuse
         // the marker parser.
-        let cleaned: String = normalized.chars().filter(|&c| c != PASTE_MARK).collect();
+        let mut cleaned: String = normalized.chars().filter(|&c| c != PASTE_MARK).collect();
         if cleaned.is_empty() {
             return;
         }
@@ -657,22 +657,33 @@ impl InputEditor {
         // The terminal is for text, not binary blobs — truncate with a
         // visible warning so the user knows.
         const MAX_PASTE_BYTES: usize = 1_048_576; // 1 MB
-        if cleaned.len() > MAX_PASTE_BYTES {
+        // dirge-vpma.43: truncate, then fall through to the SAME collapse path
+        // everything else takes. This used to insert the kept megabyte raw and
+        // return, skipping the placeholder collapse that even a 4-line paste
+        // gets — so the largest pastes in the program were the ones left
+        // rendering in full on every frame, which is the bloat the cap exists
+        // to prevent.
+        let truncation_notice = if cleaned.len() > MAX_PASTE_BYTES {
             // dirge-n9c7: cut at the last char boundary at or below the BYTE
             // cap. The old `chars().take(MAX_PASTE_BYTES)` counted characters,
             // so a non-ASCII paste kept up to ~4x the limit and the notice
             // (charging `.len()`, bytes) mislabeled it as chars.
             let cut = crate::text::char_boundary_at_or_before(&cleaned, MAX_PASTE_BYTES);
-            self.insert_str(&cleaned[..cut]);
-            // Append a truncation notice so it's clear the paste was cut.
-            self.insert_str(&format!(
-                "\n\n[paste truncated: {} bytes → 1 MB limit]",
-                cleaned.len()
-            ));
-            return;
-        }
+            let original_len = cleaned.len();
+            cleaned.truncate(cut);
+            Some(format!(
+                "\n\n[paste truncated: {original_len} bytes → 1 MB limit]"
+            ))
+        } else {
+            None
+        };
+        // dirge-vpma.43: collapse on SIZE as well as line count. The trigger
+        // was lines only, so a single-line megabyte — a minified bundle, one
+        // long log record — stayed in the buffer verbatim no matter how big,
+        // because it contained no newlines to count.
+        const PASTE_COLLAPSE_BYTES: usize = 4096;
         let line_count = cleaned.matches('\n').count() + 1;
-        if line_count < PASTE_COLLAPSE_LINES {
+        if line_count < PASTE_COLLAPSE_LINES && cleaned.len() < PASTE_COLLAPSE_BYTES {
             self.insert_str(&cleaned);
             return;
         }
@@ -700,6 +711,9 @@ impl InputEditor {
             }
             self.history_pos = None;
             self.reset_kill_accumulation();
+            if let Some(notice) = truncation_notice {
+                self.insert_str(&notice);
+            }
             return;
         }
         let idx = self.pastes.len();
@@ -707,6 +721,10 @@ impl InputEditor {
             .push(Some(PasteSlot::Text(CompactString::from(cleaned))));
         let marker = format!("{}{}{}", PASTE_MARK, idx, PASTE_MARK);
         self.insert_str(&marker);
+        // Visible text after the placeholder, so a cut paste says so on screen.
+        if let Some(notice) = truncation_notice {
+            self.insert_str(&notice);
+        }
     }
 
     fn insert_str(&mut self, s: &str) {
@@ -864,8 +882,12 @@ impl InputEditor {
     }
 
     pub fn start_picker(&mut self) {
+        // dirge-vpma.45: the caller inserts the `@` at the current cursor
+        // immediately after this, so that offset is the anchor the exit paths
+        // splice against.
+        let anchor = self.cursor;
         let picker = self.picker.get_or_insert_with(FilePicker::new);
-        picker.activate();
+        picker.activate(anchor);
     }
 
     fn reset_kill_accumulation(&mut self) {
@@ -934,7 +956,11 @@ impl InputEditor {
                     // — corrupted any buffer containing multi-byte
                     // text before the `@`. Use byte-level slicing
                     // throughout.
-                    if let Some(at) = self.buffer.rfind('@') {
+                    // dirge-vpma.45: the RECORDED anchor, not `rfind('@')` —
+                    // an `@` typed inside the query would otherwise become the
+                    // anchor and the splice would land past it.
+                    let at = picker.anchor;
+                    if at <= self.buffer.len() && self.buffer.is_char_boundary(at) {
                         let before = &self.buffer[..at];
                         let after = self.buffer.get(at + 1..).unwrap_or("");
                         let new_buf = format!("{}{}", before, after);
@@ -959,7 +985,11 @@ impl InputEditor {
                     true
                 } else {
                     // Same byte-vs-char fix as the Esc branch above.
-                    if let Some(at) = self.buffer.rfind('@') {
+                    // dirge-vpma.45: the RECORDED anchor, not `rfind('@')` —
+                    // an `@` typed inside the query would otherwise become the
+                    // anchor and the splice would land past it.
+                    let at = picker.anchor;
+                    if at <= self.buffer.len() && self.buffer.is_char_boundary(at) {
                         let before = &self.buffer[..at];
                         let after = self.buffer.get(at + 1..).unwrap_or("");
                         let new_buf = format!("{}{}", before, after);
@@ -996,7 +1026,9 @@ impl InputEditor {
                     // and `self.cursor` are all byte offsets. Previous
                     // version mixed byte indices with `chars()` iters
                     // and corrupted the buffer on multi-byte input.
-                    if let Some(at) = self.buffer.rfind('@') {
+                    // dirge-vpma.45: the recorded anchor (see start_picker).
+                    let at = picker.anchor;
+                    if at <= self.buffer.len() && self.buffer.is_char_boundary(at) {
                         let before = &self.buffer[..at];
                         let after_byte = at + 1 + picker.query.len();
                         let after = self.buffer.get(after_byte..).unwrap_or("");
@@ -1017,7 +1049,9 @@ impl InputEditor {
                 // offsets with char counts and corrupted the buffer
                 // for any input containing multi-byte UTF-8 chars
                 // before the `@` (accented letters, emoji, CJK, …).
-                if let Some(at) = self.buffer.rfind('@') {
+                // dirge-vpma.45: the recorded anchor (see start_picker).
+                let at = picker.anchor;
+                if at <= self.buffer.len() && self.buffer.is_char_boundary(at) {
                     let before = &self.buffer[..at];
                     let after_byte = at + 1 + picker.query.len();
                     let after = self.buffer.get(after_byte..).unwrap_or("");
@@ -1296,11 +1330,17 @@ impl InputEditor {
                 }
                 None
             }
+            // dirge-vpma.46: `remove_range`, not a bare `replace_range` —
+            // deleting over a paste placeholder must free its slot. The raw
+            // form dropped the marker from the buffer while its (up to ~1MB)
+            // body stayed resident in `pastes`, and unlike a kill the text is
+            // not in the kill-ring either, so nothing could reach it again.
+            // Backspace/Delete have always gone through `remove_range` for
+            // exactly this reason.
             InputAction::DeleteWordBack => {
                 if self.cursor > 0 {
                     let start = prev_word_pos(&self.buffer, self.cursor);
-                    self.buffer.replace_range(start..self.cursor, "");
-                    self.cursor = start;
+                    self.remove_range(start, self.cursor);
                 }
                 self.reset_kill_accumulation();
                 None
@@ -1308,7 +1348,8 @@ impl InputEditor {
             InputAction::DeleteWordForward => {
                 if self.cursor < self.buffer.len() {
                     let end = next_word_pos(&self.buffer, self.cursor);
-                    self.buffer.replace_range(self.cursor..end, "");
+                    let at = self.cursor;
+                    self.remove_range(at, end);
                 }
                 self.reset_kill_accumulation();
                 None
@@ -1324,6 +1365,12 @@ impl InputEditor {
                         len,
                     });
                     self.cursor += len;
+                    // dirge-vpma.44: a yank edits the buffer, so it leaves
+                    // history navigation. Without this, Up after yanking into
+                    // a recalled entry saw `history_pos` still set, kept
+                    // walking history, and discarded the edit — while the same
+                    // flow with a typed character keeps it.
+                    self.history_pos = None;
                 }
                 self.last_action_was_kill = false;
                 None
@@ -1355,6 +1402,8 @@ impl InputEditor {
                                 cursor: state.cursor,
                                 len: text.len(),
                             });
+                            // Same reason as Yank above (dirge-vpma.44).
+                            self.history_pos = None;
                         }
                     }
                 }
@@ -2082,7 +2131,11 @@ mod tests {
         let big = "中".repeat(400_000);
         assert!(big.len() > CAP);
         e.handle_paste(&big);
-        let buf = e.buffer.as_str();
+        // dirge-vpma.43: the kept text now collapses into a placeholder like
+        // any other large paste, so the cut is checked against the EXPANDED
+        // body. The subject of this test is unchanged — where the cut lands.
+        let buf = e.expanded();
+        let buf = buf.as_str();
         let notice_at = buf.find("\n\n[paste truncated").expect("truncation notice");
         let content = &buf[..notice_at];
         assert!(
@@ -2289,6 +2342,186 @@ mod tests {
 
     /// History navigation must preserve the user's in-progress draft.
     /// Up stashes it; Down past the newest entry restores it.
+    /// dirge-vpma.44: a yank edits the buffer, so it must leave history
+    /// navigation — every other buffer-mutating path does.
+    ///
+    /// Recall an entry with Up, yank into it, then press Up again.
+    /// `history_pos` was still set, so LineUp kept WALKING history — the
+    /// yanked text was overwritten and gone. With the reset, Up instead
+    /// starts a fresh traversal that stashes the edit as the draft, so Down
+    /// brings it back. That is exactly what the same flow with a typed
+    /// character already did, which is what makes this a bug and not a design.
+    #[test]
+    fn yanking_into_a_recalled_history_entry_keeps_the_edit() {
+        let mut e = InputEditor::new();
+        e.history.push("older".into());
+        e.history.push("recalled".into());
+        e.kill_ring.insert(0, " plus yank".into());
+
+        e.history_up();
+        assert_eq!(e.buffer.as_str(), "recalled", "precondition");
+        e.cursor = e.buffer.len();
+        e.handle_key(ev(KeyCode::Char('y'), KeyModifiers::CONTROL));
+        assert_eq!(
+            e.buffer.as_str(),
+            "recalled plus yank",
+            "precondition: yanked",
+        );
+
+        e.handle_key(ev(KeyCode::Up, KeyModifiers::NONE));
+        e.handle_key(ev(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(
+            e.buffer.as_str(),
+            "recalled plus yank",
+            "the yanked edit was discarded instead of stashed as the draft",
+        );
+    }
+
+    /// The control: with no yank, Up still walks history. Otherwise the fix
+    /// above could be "history navigation is broken" and look the same.
+    #[test]
+    fn up_still_walks_history_when_nothing_was_yanked() {
+        let mut e = InputEditor::new();
+        e.history.push("older".into());
+        e.history.push("recalled".into());
+
+        e.handle_key(ev(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(e.buffer.as_str(), "recalled");
+        e.handle_key(ev(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(
+            e.buffer.as_str(),
+            "older",
+            "history navigation stopped working"
+        );
+    }
+
+    /// dirge-vpma.46: deleting a word over a paste placeholder must free the
+    /// slot.
+    ///
+    /// The word deletes used a bare `replace_range`, which drops the marker
+    /// from the buffer while its body — up to ~1MB — stays resident in
+    /// `pastes`. Unlike a kill it is not in the kill-ring either, so the
+    /// retained body is unreachable. Backspace/Delete have always used
+    /// `remove_range` for this reason.
+    #[test]
+    fn deleting_a_word_over_a_paste_placeholder_frees_its_body() {
+        let mut e = InputEditor::new();
+        let body = "line\n".repeat(PASTE_COLLAPSE_LINES + 2);
+        e.handle_paste(&body);
+        assert!(
+            e.pastes.iter().any(|p| p.is_some()),
+            "precondition: the paste collapsed into a slot",
+        );
+        e.cursor = e.buffer.len();
+
+        e.handle_key(ev(KeyCode::Backspace, KeyModifiers::ALT));
+
+        assert!(
+            !e.buffer.contains(PASTE_MARK),
+            "precondition: the placeholder was deleted: {:?}",
+            e.buffer,
+        );
+        assert!(
+            e.pastes.iter().all(|p| p.is_none()),
+            "the deleted placeholder's body is still resident and unreachable",
+        );
+    }
+
+    /// dirge-vpma.43: an oversized paste must collapse like any other.
+    ///
+    /// The truncation path inserted the kept megabyte raw and returned,
+    /// skipping the placeholder collapse a 4-line paste gets — so the biggest
+    /// pastes were the ones rendered in full every frame, which is the bloat
+    /// the cap exists to prevent.
+    #[test]
+    fn an_oversized_paste_collapses_instead_of_landing_raw() {
+        let mut e = InputEditor::new();
+        let huge = "x".repeat(2 * 1_048_576);
+        e.handle_paste(&huge);
+
+        assert!(
+            e.buffer.contains(PASTE_MARK),
+            "the truncated paste did not collapse into a placeholder",
+        );
+        assert!(
+            e.buffer.len() < 4096,
+            "the buffer still holds {} bytes of raw paste",
+            e.buffer.len(),
+        );
+        // The user is still told it was cut.
+        assert!(
+            e.buffer.contains("truncated"),
+            "no truncation notice: {:?}",
+            e.buffer,
+        );
+        // And the kept text is still there behind the placeholder.
+        assert!(
+            e.expanded().len() > 1_000_000,
+            "the body was lost, not collapsed",
+        );
+    }
+
+    /// A single-line megabyte has no newlines to count, so a line-only
+    /// threshold left it in the buffer verbatim — the same bloat from the
+    /// paste least able to afford it.
+    #[test]
+    fn a_single_line_megabyte_collapses_too() {
+        let mut e = InputEditor::new();
+        e.handle_paste(&"y".repeat(500_000));
+        assert!(
+            e.buffer.contains(PASTE_MARK),
+            "a single-line 500KB paste stayed raw in the buffer",
+        );
+    }
+
+    /// The control for both: a small paste must still land as plain text, or
+    /// the collapse threshold has simply been turned into "always".
+    #[test]
+    fn a_small_paste_still_lands_as_text() {
+        let mut e = InputEditor::new();
+        e.handle_paste("just two\nlines");
+        assert!(!e.buffer.contains(PASTE_MARK), "a short paste collapsed");
+        assert_eq!(e.buffer.as_str(), "just two\nlines");
+    }
+
+    /// dirge-vpma.45: an `@` typed inside the picker query must not become the
+    /// splice anchor.
+    ///
+    /// The exit paths re-found the anchor with `rfind('@')`, but the picker's
+    /// catch-all char arm feeds `@` into both the query and the buffer. Typing
+    /// `@foo@bar` then Esc made the SECOND `@` the anchor, so the slice
+    /// overshot and `@foo` was left behind as stray text.
+    #[test]
+    fn an_at_sign_inside_the_picker_query_is_not_the_anchor() {
+        let mut e = InputEditor::new();
+        e.insert_str("see ");
+        e.handle_key(ev(KeyCode::Char('@'), KeyModifiers::NONE));
+        assert!(
+            e.picker.as_ref().is_some_and(|p| p.active),
+            "precondition: the picker opened",
+        );
+        // The event loop routes keys to the picker while it is active
+        // (ui/mod.rs), so drive it the same way.
+        for c in "foo@bar".chars() {
+            assert!(
+                e.handle_picker_key(ev(KeyCode::Char(c), KeyModifiers::NONE)),
+                "picker must consume '{c}'",
+            );
+        }
+        assert_eq!(
+            e.buffer.as_str(),
+            "see @foo@bar",
+            "precondition: the second '@' really is in the buffer",
+        );
+        e.handle_picker_key(ev(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert_eq!(
+            e.buffer.as_str(),
+            "see ",
+            "the query was spliced against the wrong anchor, leaving debris",
+        );
+    }
+
     #[test]
     fn history_up_stashes_in_progress_draft() {
         let mut e = InputEditor::new();

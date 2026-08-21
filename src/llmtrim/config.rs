@@ -1533,6 +1533,8 @@ mod tests {
     #[test]
     fn write_then_read_sub_mapping_round_trips() {
         let dir = std::env::temp_dir().join(format!("llmtrim-sub-test-{}", std::process::id()));
+        // dirge-m1ni: clear first — the name is keyed on a recyclable pid.
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.toml");
         std::fs::write(&path, "preset = \"auto\"\n").unwrap();
@@ -1562,6 +1564,8 @@ mod tests {
     #[test]
     fn sub_off_on_cycle_preserves_provider_and_mapping() {
         let dir = std::env::temp_dir().join(format!("llmtrim-sub-onoff-{}", std::process::id()));
+        // dirge-m1ni: clear first — the name is keyed on a recyclable pid.
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.toml");
 
@@ -1679,6 +1683,8 @@ mod tests {
     #[test]
     fn granular_sub_editors_preserve_active_mode_and_entries() {
         let dir = std::env::temp_dir().join(format!("llmtrim-sub-edit-{}", std::process::id()));
+        // dirge-m1ni: clear first — the name is keyed on a recyclable pid.
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.toml");
         // Seed a full mapping + fallback mode.
@@ -1784,6 +1790,8 @@ mod tests {
 
         // Writer round-trips and preserves the mapping; writing `none` clears it.
         let dir = std::env::temp_dir().join(format!("llmtrim-effort-{}", std::process::id()));
+        // dirge-m1ni: clear first — the name is keyed on a recyclable pid.
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.toml");
         let mut tiers = std::collections::BTreeMap::new();
@@ -2045,6 +2053,8 @@ mod tests {
     #[test]
     fn compact_writer_preserves_existing_config() {
         let dir = std::env::temp_dir().join(format!("llmtrim-compact-test-{}", std::process::id()));
+        // dirge-m1ni: clear first — the name is keyed on a recyclable pid.
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.toml");
         std::fs::write(

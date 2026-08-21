@@ -73,11 +73,14 @@ fn build_config() -> LoopConfig {
         repair_stats: std::sync::Arc::new(
             crate::agent::agent_loop::tool_input_repair::RepairStats::new(),
         ),
+        retry_stats: std::sync::Arc::new(crate::agent::agent_loop::tool_retry::RetryStats::new()),
         truncation_notes: std::sync::Arc::new(std::sync::Mutex::new(
             std::collections::HashMap::new(),
         )),
         tool_def_filter: None,
         dynamic_tool_search: false,
+        turn_envelope: false,
+        prompt_leak_detect: crate::agent::agent_loop::types::GateMode::Off,
         escalation_stream_fn: None,
         escalation_provider_name: None,
         escalation_pending: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -93,6 +96,7 @@ fn build_config() -> LoopConfig {
         code_review_repo: None,
         open_issues_gate_mode: crate::agent::agent_loop::types::GateMode::Off,
         verification_tiers_mode: crate::agent::agent_loop::types::GateMode::Off,
+        skill_anchor_interval: 0,
         safe_state_abort_mode: crate::agent::agent_loop::types::SafeStateMode::Off,
         publish_guard_mode: crate::agent::agent_loop::types::GateMode::Off,
         claim_gate_mode: crate::agent::agent_loop::types::GateMode::Off,

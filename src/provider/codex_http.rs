@@ -1,63 +1,20 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use bytes::Bytes;
 use rig::http_client::{
     self, HttpClientExt, LazyBody, MultipartForm, Request, Response, StreamingResponse,
 };
 
-use crate::provider::auth::RefreshedAuth;
-
 /// Re-resolves the ChatGPT/Codex OAuth bearer (and its expiry) when the frozen
 /// one expires mid-session. Boxed so tests can inject a fake; the live seam
 /// wraps `load_fresh_openai_oauth`, which refreshes-and-persists (dirge-30nl).
-pub(crate) type CodexRefreshFn = Arc<dyn Fn() -> anyhow::Result<RefreshedAuth> + Send + Sync>;
+pub(crate) use crate::provider::refreshable_token::RefreshFn as CodexRefreshFn;
+use crate::provider::refreshable_token::{self, RefreshableToken};
 
-struct TokenState {
-    bearer: String,
-    /// `None` means "never refresh" — an env/legacy-file token with no
-    /// refresh grant that Dirge doesn't manage.
-    expires_at_ms: Option<i64>,
-}
-
-/// A ChatGPT/Codex bearer that renews itself when it expires part-way through a
-/// long session. Pre-fix the bearer was baked into a static `HeaderMap` at
-/// client build, so a run that crossed token expiry died on a non-retryable
-/// 401 (dirge-30nl). Mirrors the Anthropic seam but is deliberately kept
-/// separate — this is a different transport and conflating them would widen the
-/// auth-flow blast radius.
-struct RefreshableToken {
-    state: Mutex<TokenState>,
-    refresher: CodexRefreshFn,
-}
-
-impl RefreshableToken {
-    /// Current bearer, refreshing first if it has expired. A refresh failure
-    /// keeps the stale token so the request fails exactly as it did before this
-    /// fix rather than wedging the client; the next request retries. Refresh is
-    /// rare (once per token lifetime) so doing it synchronously is acceptable.
-    fn bearer(&self) -> String {
-        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(expires_at) = state.expires_at_ms {
-            let now = chrono::Utc::now().timestamp_millis();
-            if crate::auth::file_store::epoch_ms_is_expired(expires_at, now) {
-                match (self.refresher)() {
-                    Ok(fresh) => {
-                        state.bearer = fresh.bearer_token;
-                        state.expires_at_ms = fresh.expires_at_ms;
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            target: "dirge::provider",
-                            error = %e,
-                            "ChatGPT/Codex OAuth token expired and refresh failed; sending the stale token",
-                        );
-                    }
-                }
-            }
-        }
-        state.bearer.clone()
-    }
-}
+/// ChatGPT/Codex sits at no refresh margin today — its tokens are
+/// long-lived enough to cross the expiry boundary rarely. See the field
+/// docs on `RefreshableToken::margin_ms`.
+const REFRESH_MARGIN_MS: i64 = 0;
 
 // `token` is `Option` only to satisfy the `HttpClientExt: Default` bound; a
 // default instance never rewrites the Authorization header.
@@ -87,13 +44,13 @@ impl CodexHttpClient {
     ) -> Self {
         Self {
             inner: reqwest::Client::new(),
-            token: Some(Arc::new(RefreshableToken {
-                state: Mutex::new(TokenState {
-                    bearer: bearer_token,
-                    expires_at_ms,
-                }),
+            token: Some(Arc::new(RefreshableToken::renewable(
+                bearer_token,
+                expires_at_ms,
                 refresher,
-            })),
+                REFRESH_MARGIN_MS,
+                "chatgpt-codex",
+            ))),
         }
     }
 
@@ -112,21 +69,22 @@ impl CodexHttpClient {
     // `input`, and `store: false`. Keep the fix inside Dirge by
     // normalizing the outgoing `/responses` JSON body at the
     // transport boundary instead of vendoring or forking rig-core.
-    fn normalized_request<T>(&self, req: Request<T>) -> http_client::Result<Request<Bytes>>
-    where
-        T: Into<Bytes>,
-    {
+    /// dirge-bz0a: the bearer is resolved by the CALLER, in async context,
+    /// because a mid-session renewal blocks (see `refreshable_token`). This
+    /// stays sync and pure so it can run inline once the bearer is in hand.
+    fn normalized_request(
+        req: Request<Bytes>,
+        bearer: Option<String>,
+    ) -> http_client::Result<Request<Bytes>> {
         let (mut parts, body) = req.into_parts();
-        // Overwrite the build-time bearer with a freshly resolved one; this is
-        // where a mid-session refresh fires if the token has expired
+        // Overwrite the build-time bearer with the freshly resolved one
         // (dirge-30nl). Absent a refreshable token the header is left as rig
         // set it from the static api_key.
-        if let Some(token) = &self.token
-            && let Ok(value) = http::HeaderValue::from_str(&format!("Bearer {}", token.bearer()))
+        if let Some(bearer) = bearer
+            && let Ok(value) = http::HeaderValue::from_str(&format!("Bearer {bearer}"))
         {
             parts.headers.insert(http::header::AUTHORIZATION, value);
         }
-        let body = body.into();
         let body = if is_responses_path(parts.uri.path()) {
             normalize_codex_responses_body(body)
         } else {
@@ -156,9 +114,12 @@ impl HttpClientExt for CodexHttpClient {
         U: Send + 'static,
     {
         let inner = self.inner.clone();
-        let req = self.normalized_request(req);
+        let token = self.token.clone();
+        // `T` is not `'static` and the returned future is; the body
+        // conversion is the only step that needs `T`, so it happens here.
+        let req: Request<Bytes> = req.map(Into::into);
         async move {
-            let req = req?;
+            let req = Self::normalized_request(req, refreshable_token::bearer(token).await)?;
             inner.send(req).await
         }
     }
@@ -182,9 +143,10 @@ impl HttpClientExt for CodexHttpClient {
     {
         let inner = self.inner.clone();
         let is_responses_stream = is_responses_path(req.uri().path());
-        let req = self.normalized_request(req);
+        let token = self.token.clone();
+        let req: Request<Bytes> = req.map(Into::into);
         async move {
-            let req = req?;
+            let req = Self::normalized_request(req, refreshable_token::bearer(token).await)?;
             let mut response = inner.send_streaming(req).await?;
             if is_responses_stream
                 && !response
@@ -213,8 +175,9 @@ impl super::compressing_http::StreamingWithHeaders for CodexHttpClient {
         use super::compressing_http::StreamingSend;
         let inner = self.inner.clone();
         let is_responses_stream = is_responses_path(req.uri().path());
-        let req = self.normalized_request(req);
+        let token = self.token.clone();
         async move {
+            let req = Self::normalized_request(req, refreshable_token::bearer(token).await);
             let mut send = match req {
                 Ok(req) => inner.send_streaming_with_headers(req).await,
                 Err(e) => StreamingSend {
@@ -333,8 +296,12 @@ fn extract_message_text(item: &serde_json::Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::auth::RefreshedAuth;
 
-    fn authorization(client: &CodexHttpClient, preexisting: Option<&str>) -> Option<String> {
+    /// Drive one request through the real path: resolve the client's
+    /// bearer the way `send` does (async since dirge-bz0a, so a renewal
+    /// cannot block the runtime) and normalize with it.
+    async fn authorization(client: &CodexHttpClient, preexisting: Option<&str>) -> Option<String> {
         let mut builder = Request::builder()
             .method("POST")
             .uri("https://api/responses");
@@ -342,14 +309,16 @@ mod tests {
             builder = builder.header(http::header::AUTHORIZATION, bearer);
         }
         let req = builder.body(Bytes::from("{}")).unwrap();
-        let out = client.normalized_request(req).unwrap();
+        let bearer = refreshable_token::bearer(client.token.clone()).await;
+        let out =
+            CodexHttpClient::normalized_request(req, bearer).expect("normalization must succeed");
         out.headers()
             .get(http::header::AUTHORIZATION)
             .map(|v| v.to_str().unwrap().to_string())
     }
 
-    #[test]
-    fn refreshable_client_overwrites_authorization_with_refreshed_bearer() {
+    #[tokio::test]
+    async fn refreshable_client_overwrites_authorization_with_refreshed_bearer() {
         let refresher: CodexRefreshFn = Arc::new(|| {
             Ok(RefreshedAuth {
                 bearer_token: "FRESH".to_string(),
@@ -360,48 +329,56 @@ mod tests {
         let client = CodexHttpClient::new_refreshable("STALE".to_string(), Some(0), refresher);
 
         assert_eq!(
-            authorization(&client, Some("Bearer STALE")).as_deref(),
+            authorization(&client, Some("Bearer STALE"))
+                .await
+                .as_deref(),
             Some("Bearer FRESH")
         );
     }
 
-    #[test]
-    fn refreshable_client_keeps_fresh_bearer_without_refreshing() {
+    #[tokio::test]
+    async fn refreshable_client_keeps_fresh_bearer_without_refreshing() {
         let refresher: CodexRefreshFn = Arc::new(|| panic!("must not refresh a fresh token"));
         let client =
             CodexHttpClient::new_refreshable("CURRENT".to_string(), Some(i64::MAX), refresher);
 
         assert_eq!(
-            authorization(&client, Some("Bearer CURRENT")).as_deref(),
+            authorization(&client, Some("Bearer CURRENT"))
+                .await
+                .as_deref(),
             Some("Bearer CURRENT")
         );
     }
 
-    #[test]
-    fn refresh_failure_falls_back_to_the_stale_bearer() {
+    #[tokio::test]
+    async fn refresh_failure_falls_back_to_the_stale_bearer() {
         let refresher: CodexRefreshFn = Arc::new(|| anyhow::bail!("network down"));
         let client = CodexHttpClient::new_refreshable("STALE".to_string(), Some(0), refresher);
 
         // Fail-open: the request still carries the old bearer (no regression vs
         // the frozen-header behavior) rather than dropping Authorization.
         assert_eq!(
-            authorization(&client, Some("Bearer STALE")).as_deref(),
+            authorization(&client, Some("Bearer STALE"))
+                .await
+                .as_deref(),
             Some("Bearer STALE")
         );
     }
 
-    #[test]
-    fn default_client_leaves_authorization_untouched() {
+    #[tokio::test]
+    async fn default_client_leaves_authorization_untouched() {
         let client = CodexHttpClient::default();
 
         assert_eq!(
-            authorization(&client, Some("Bearer PREEXISTING")).as_deref(),
+            authorization(&client, Some("Bearer PREEXISTING"))
+                .await
+                .as_deref(),
             Some("Bearer PREEXISTING")
         );
     }
 
-    #[test]
-    fn merges_multiple_system_messages_into_instructions() {
+    #[tokio::test]
+    async fn merges_multiple_system_messages_into_instructions() {
         // `strip_system_input_items` deletes ALL system items, so every
         // system message must be lifted into `instructions` — not just the
         // first — or the rest would be silently lost.
@@ -425,8 +402,8 @@ mod tests {
         assert_eq!(value["input"][0]["role"], "user");
     }
 
-    #[test]
-    fn injects_responses_instructions_from_system_input() {
+    #[tokio::test]
+    async fn injects_responses_instructions_from_system_input() {
         let body = Bytes::from(
             serde_json::json!({
                 "model": "gpt-5",
@@ -455,8 +432,8 @@ mod tests {
         assert_eq!(value["input"][0]["role"], "user");
     }
 
-    #[test]
-    fn preserves_existing_instructions_but_still_strips_system_input() {
+    #[tokio::test]
+    async fn preserves_existing_instructions_but_still_strips_system_input() {
         let body = Bytes::from(
             serde_json::json!({
                 "instructions": "Existing",
@@ -475,8 +452,8 @@ mod tests {
         assert!(value["input"].as_array().unwrap().is_empty());
     }
 
-    #[test]
-    fn overrides_true_store_for_codex_backend() {
+    #[tokio::test]
+    async fn overrides_true_store_for_codex_backend() {
         let body = Bytes::from(
             serde_json::json!({
                 "store": true,

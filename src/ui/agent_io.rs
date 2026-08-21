@@ -202,11 +202,22 @@ pub(crate) fn persist_turn_to_db(
     let db = match crate::extras::session_db::SessionDb::open(&paths.session_db_path()) {
         Ok(db) => db,
         Err(e) => {
-            tracing::debug!(
-                target: "dirge::ui",
-                error = %e,
-                "Session DB unavailable — turn not persisted"
-            );
+            // #769: this ran at `debug!` on EVERY turn, so a database
+            // dirge could not open meant the session silently stopped
+            // being saved — the loudest possible consequence reported at
+            // the quietest possible level, into a log nobody captures
+            // without `--verbose`. Once, at `warn!`, with the reason
+            // (which now carries the file and the recovery steps when the
+            // database is damaged). Surfacing it in the UI needs a notice
+            // path this function does not have — see dirge-n45d.
+            static REPORTED: std::sync::Once = std::sync::Once::new();
+            REPORTED.call_once(|| {
+                tracing::warn!(
+                    target: "dirge::ui",
+                    error = %e,
+                    "session DB unavailable — turns are NOT being saved for this session"
+                );
+            });
             return;
         }
     };

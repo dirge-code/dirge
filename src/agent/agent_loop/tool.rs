@@ -161,6 +161,16 @@ pub trait LoopTool: Send + Sync + std::fmt::Debug {
         None
     }
 
+    /// Per-dispatch budget for the watchdog in
+    /// `execute_prepared_tool_call` (dirge-9tl3). `None` — the default —
+    /// means "use the shared `timeouts.tool_call` ceiling". Override ONLY
+    /// when the tool's own bound legitimately exceeds that ceiling
+    /// (bash's `bash_max`, the subagent clamp), so the watchdog never
+    /// cuts a call the tool itself considers in bounds.
+    fn call_budget(&self, _args: &Value) -> Option<std::time::Duration> {
+        None
+    }
+
     /// Compatibility shim run BEFORE schema validation. Pi field
     /// `prepareArguments?(args: unknown): Static<TParameters>`
     /// (types.ts:368). Mutates raw provider arguments into a

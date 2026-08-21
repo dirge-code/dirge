@@ -11,6 +11,7 @@ binary, and getting a microVM booted.
 |-----------|-------|-------|
 | Hardware virtualization | `/dev/kvm` (load `kvm` module, user in `kvm` group) | Hypervisor.framework (built-in on Apple Silicon) |
 | VM runtime | `libkrun.so` + `libkrunfw.so` (see [libkrun releases](https://github.com/containers/libkrun/releases)) | `libkrun.dylib` + `libkrunfw.5.dylib` (`brew install libkrun libkrunfw`) |
+| Runtime library override | `LIBKRUN_LIB_DIR` / `LIBKRUNFW_LIB_DIR` if installed outside the standard prefixes | same |
 | Image building (optional) | `buildah` (`apt install buildah`) | Not needed — uses built-in OCI puller |
 | OCI layer extraction | `gzip` + `tar` | `gzip` + `tar` (pre-installed) |
 | SSH key generation | `ssh-keygen` (`apt install openssh-client`) | `ssh-keygen` (pre-installed) |
@@ -35,8 +36,8 @@ before proceeding. `WARN` items (buildah, mold) are optional.
 ### What the check covers
 
 1. Hardware virtualization — `/dev/kvm` exists and accessible (Linux) or `sysctl kern.hv_support` → 1 (macOS)
-2. `libkrun` — found via platform-appropriate paths
-3. `libkrunfw` — same
+2. `libkrun` — `LIBKRUN_LIB_DIR`, else pkg-config, Homebrew, `ldconfig`, then the standard prefixes
+3. `libkrunfw` — same, via `LIBKRUNFW_LIB_DIR`; checked under the versioned name libkrun actually `dlopen`s
 4. `gzip` — on PATH
 5. `tar` — on PATH
 6. `ssh-keygen` — on PATH
@@ -56,10 +57,22 @@ This compiles both `dirge` and `dirge-microvm-runner`. The runner binary lands
 at `target/release/dirge-microvm-runner`. dirge finds it by looking next to its
 own binary or on `$PATH`.
 
-> **Caveat:** If libkrun (`libkrun.so` on Linux, `libkrun.dylib` on macOS) is not installed, the runner
-> binary will fail to *link* (unresolved symbols). The main `dirge` binary and
-> all non-VM tests still compile fine — `build.rs` emits a warning but doesn't
-> abort. Install libkrun before building if you need the runner.
+> **Caveat:** If libkrun (`libkrun.so` on Linux, `libkrun.dylib` on macOS) is
+> not installed, the build still succeeds — `build.rs` warns, and the runner is
+> compiled as a stub that explains itself when run instead of booting a VM.
+> `dirge sandbox check` reports it as an error. Install libkrun and rebuild;
+> the build script re-probes on its own, so no `cargo clean` is needed.
+>
+> libkrunfw is *not* needed to build: nothing links against it, libkrun reaches
+> it on its own. It is needed to boot.
+
+If libkrun is installed somewhere the search doesn't cover, point at it
+directly — this also skips pkg-config and Homebrew entirely:
+
+```bash
+LIBKRUN_LIB_DIR=/path/to/lib LIBKRUNFW_LIB_DIR=/path/to/lib \
+  cargo build --release --features sandbox-microvm
+```
 
 ### Pre-built binaries
 
@@ -179,7 +192,8 @@ libkrun couldn't boot the VM. Common causes:
 
 - **Linux**: `/dev/kvm` permission denied — add your user to the `kvm` group: `sudo usermod -aG kvm $USER` (log out and back in)
 - **macOS**: runner not codesigned — rebuild with `cargo build --features sandbox-microvm`; the sandbox automatically codesigns on first use via `ensure_runner_signed()`. To force sign at build time: `codesign --force --sign - --entitlements dirge.entitlements target/release/dirge-microvm-runner`. Verify with `codesign -d --entitlements - target/release/dirge-microvm-runner | grep hypervisor`
-- libkrun library not found — install from [libkrun releases](https://github.com/containers/libkrun/releases) (Linux) or `brew install libkrun libkrunfw` (macOS)
+- libkrun library not found — install from [libkrun releases](https://github.com/containers/libkrun/releases) (Linux) or `brew install libkrun libkrunfw` (macOS), then rebuild. If it's installed somewhere else, set `LIBKRUN_LIB_DIR`
+- the runner prints "built without libkrun" — libkrun was missing when dirge was compiled, so the runner is a stub. Install it and rebuild with `--features sandbox-microvm`
 - Missing CPU virtualization — enable VT-x/AMD-V in BIOS / Apple Silicon has it always on
 
 ### SSH timeout

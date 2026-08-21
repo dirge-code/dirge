@@ -154,6 +154,20 @@ pub struct Cli {
     )]
     pub verbose: bool,
 
+    /// dirge-vlfb: write a JSONL trace of the agentic loop to this path.
+    ///
+    /// Separate from `--verbose`, which turns up the volume on a log written
+    /// for humans reading a terminal. This writes ONE machine-readable record
+    /// per loop decision — the turns, the tool calls, the token usage, and
+    /// (the reason it exists) every harness intervention, attributed to the
+    /// guard that sent it. `scripts/loop-trace.py` renders it.
+    #[arg(
+        long = "trace",
+        value_name = "PATH",
+        help = "Write a JSONL trace of the agentic loop to PATH (see scripts/loop-trace.py)"
+    )]
+    pub trace: Option<std::path::PathBuf>,
+
     #[arg(
         long = "restrictive",
         short = 'R',
@@ -195,6 +209,12 @@ pub struct Cli {
         help = "Disable AGENTS.md loading"
     )]
     pub no_context_files: bool,
+
+    #[arg(
+        long = "no-skills",
+        help = "Disable on-disk skill discovery (preamble catalog and the skill tool)"
+    )]
+    pub no_skills: bool,
 
     #[cfg(feature = "loop")]
     #[arg(
@@ -555,6 +575,12 @@ impl Cli {
 
     pub fn resolve_no_context_files(&self, cfg: &config::Config) -> bool {
         self.no_context_files || cfg.no_context_files.unwrap_or(false)
+    }
+
+    /// dirge-a34y: `--no-skills` / `no_skills`. See the config field for why
+    /// this exists rather than overriding `$HOME`.
+    pub fn resolve_no_skills(&self, cfg: &config::Config) -> bool {
+        self.no_skills || cfg.no_skills.unwrap_or(false)
     }
 
     pub fn resolve_no_tools(&self, cfg: &config::Config) -> bool {

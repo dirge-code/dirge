@@ -128,7 +128,13 @@ impl PortableTool for PlanEnterTool {
             .await
             .map_err(|_| ToolError::Msg("plan system unavailable".to_string()))?;
 
-        match reply_rx.await {
+        // dirge-8cbm: the dispatch watchdog must not count a user
+        // deciding whether to enter plan mode as a stalled call.
+        let response = {
+            let _waiting = crate::human_wait::HumanWait::begin();
+            reply_rx.await
+        };
+        match response {
             Ok(PlanSwitchResponse::Accepted) => Ok("plan mode activated".to_string()),
             Ok(PlanSwitchResponse::Rejected) => {
                 Err(ToolError::Msg("user declined plan mode".to_string()))
@@ -199,7 +205,13 @@ impl PortableTool for PlanExitTool {
             .await
             .map_err(|_| ToolError::Msg("plan system unavailable".to_string()))?;
 
-        match reply_rx.await {
+        // dirge-8cbm: same as `Enter` — reviewing a plan is thinking
+        // time, not a stalled call.
+        let response = {
+            let _waiting = crate::human_wait::HumanWait::begin();
+            reply_rx.await
+        };
+        match response {
             Ok(PlanSwitchResponse::Accepted) => Ok("switched to implementation mode".to_string()),
             Ok(PlanSwitchResponse::Rejected) => {
                 Err(ToolError::Msg("user declined mode switch".to_string()))

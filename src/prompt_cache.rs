@@ -45,6 +45,16 @@ impl CacheTtl {
         }
     }
 
+    /// Short human label for reports (`/cache`). Unlike [`Self::wire_ttl`] this
+    /// always names a lifetime — 5m is a real choice even though the wire
+    /// expresses it by omission.
+    pub fn label(self) -> &'static str {
+        match self {
+            CacheTtl::FiveMinutes => "5m",
+            CacheTtl::OneHour => "1h",
+        }
+    }
+
     /// Parse a config/env spelling. Accepts the two wire values plus the spellings a
     /// user is likely to reach for; `None` when it isn't one of them.
     pub fn parse(s: &str) -> Option<Self> {
@@ -115,6 +125,14 @@ mod tests {
     fn five_minutes_is_expressed_by_omitting_ttl() {
         assert_eq!(CacheTtl::FiveMinutes.wire_ttl(), None);
         assert_eq!(CacheTtl::OneHour.wire_ttl(), Some("1h"));
+    }
+
+    /// dirge-ugah.4: both lifetimes are nameable for reports, including the
+    /// one the wire expresses by omitting `ttl`.
+    #[test]
+    fn label_names_both_lifetimes() {
+        assert_eq!(CacheTtl::FiveMinutes.label(), "5m");
+        assert_eq!(CacheTtl::OneHour.label(), "1h");
     }
 
     #[test]

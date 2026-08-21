@@ -49,8 +49,8 @@ use super::gate_state::{GateInputs, GateStates};
 use super::gate_tally::{BoundaryNudge, GateSource, GateTally};
 use super::inflight::InflightSet;
 use super::message::{
-    AssistantMessage, ContentBlock, LoopEvent, LoopMessage, StopReason, ToolResultMessage,
-    loop_message_to_value, tool_result_to_value,
+    AssistantMessage, ContentBlock, LoopEvent, LoopMessage, StopReason, TokenUsage,
+    ToolResultMessage, loop_message_to_value, tool_result_to_value,
 };
 use super::storm::StormBreaker;
 use super::stream::{StreamFn, stream_assistant_response};
@@ -188,7 +188,8 @@ async fn emit_harness_notices(emit: &mpsc::Sender<LoopEvent>, msgs: &[LoopMessag
         let _ = emit
             .send(LoopEvent::SystemNotice {
                 content: format!(
-                    "harness intervention: {}\n{body}",
+                    "{}{}\n{body}",
+                    super::intervention::NOTICE_PREFIX,
                     super::intervention::summary_for_user(tag)
                 ),
             })
@@ -365,6 +366,8 @@ pub(crate) const RESUME_NUDGE_TAG: &str = "[resume]";
 /// Display tag prefixing the early track-work reminder, so the UI can strip
 /// it and attribute the injected message to the system rather than the user.
 pub(crate) const TRACK_WORK_TAG: &str = "[track]";
+/// dirge-69oe.4: marks a restated skill anchor.
+pub(crate) const SKILL_ANCHOR_TAG: &str = "[skill-anchor]";
 
 /// Upper bound on consecutive resume-after-failure nudges, so a model that
 /// repeatedly stops after broken tool calls can't loop forever.
@@ -649,6 +652,9 @@ async fn poll_finalization_follow_up(
         source_nudges,
         completeness_nudges,
         run_epoch,
+        // Boundary-poll state; the finalization gates below do not read it.
+        skill_anchors: _,
+        skill_anchor_restated_at: _,
     } = gates;
     let GateInputs {
         code_review_baseline,
@@ -1364,6 +1370,40 @@ const EXEMPLAR_TOP_K: usize = 3;
 /// Comparing against the live context rather than remembering the last block
 /// pushed is deliberate: if compaction has since folded the earlier copy away,
 /// the block is genuinely absent and re-injecting it is the right call.
+/// Push a tail context note that REPLACES any earlier copy of itself.
+///
+/// [`push_context_note_if_absent`] appends when the block is not already
+/// present, which is right for the additive notes it was built for — another
+/// exemplar or another recalled memory is more knowledge, and an older one is
+/// still true. It is wrong for a block that states CURRENT state. After a `cd`
+/// or a `git switch` the previous turn envelope does not become merely
+/// redundant, it becomes FALSE, and leaving it in front of the new one hands
+/// the model two contradictory answers with the stale one first — strictly
+/// worse than the single stale answer the envelope exists to remove.
+///
+/// `marker` identifies prior copies (the block's opening tag). Messages that
+/// merely CONTAIN the marker as part of ordinary content are not at risk: only
+/// text-only user messages whose content STARTS with it are removed, and the
+/// marker is an XML open tag the harness itself emits.
+///
+/// Returns `false` (and leaves the context untouched) when an identical block
+/// is already the note in place — re-appending it would move it to the tail
+/// every turn and invalidate everything cached after it.
+pub(crate) fn replace_context_note(context: &mut Context, marker: &str, block: String) -> bool {
+    let msg = LoopMessage::User(super::message::UserMessage::text(block));
+    let value = loop_message_to_value(&msg);
+    if context.messages.iter().any(|m| m == &value) {
+        return false;
+    }
+    context.messages.retain(|m| {
+        !m.get("content")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|c| c.starts_with(marker))
+    });
+    context.messages.push(value);
+    true
+}
+
 fn push_context_note_if_absent(context: &mut Context, block: String) -> bool {
     let msg = LoopMessage::User(super::message::UserMessage::text(block));
     let value = loop_message_to_value(&msg);
@@ -1487,8 +1527,27 @@ fn spawn_incremental_checkpoint(
         // what was summarized, regardless of what the loop appends meanwhile.
         let boundary = messages.len();
         let budget = compression::summary_budget(compression::estimate_messages_tokens(&messages));
-        let prompt = compression::build_summary_prompt(&messages, budget, None, None);
+        // dirge-tgb9: refuses to build when the turns smuggle the fence
+        // delimiter. Nothing to fall back to here — a checkpoint is an
+        // optimisation, so skipping one just means the next fold summarizes
+        // inline.
+        let Ok(prompt) = compression::build_summary_prompt(
+            &crate::agent::compaction_material::from_loop_messages(&messages),
+            budget,
+            None,
+            None,
+        ) else {
+            tracing::warn!(
+                target: "dirge::agent_loop",
+                "checkpoint summary skipped: turns contain the reserved fence delimiter",
+            );
+            return;
+        };
         let result = tokio::time::timeout(CHECKPOINT_SUMMARY_TIMEOUT, sfn(prompt)).await;
+        // dirge-tgb9: strip echoed delimiters before this summary can be
+        // spliced into context — same reason as the inline path below.
+        let result =
+            result.map(|r| r.map(|s| crate::agent::prompt::strip_compaction_delimiters(&s)));
         if let Ok(Ok(summary)) = result
             && compression::validate_summary(&summary)
         {
@@ -1734,25 +1793,42 @@ async fn run_compaction_pass_with_focus(
             };
             let summary_result: Result<String, _> = match plugin_summary {
                 Some(s) => Ok(s),
-                None => {
-                    let prompt = compression::build_summary_prompt(
-                        &middle,
-                        budget,
-                        prev.as_deref(),
-                        augmented_focus.as_deref(),
-                    );
-                    // Bound the inline call: a provider that stalls without
-                    // erroring would otherwise freeze the loop indefinitely.
-                    // On timeout, keep the pruned context (Failed outcome).
-                    match tokio::time::timeout(COMPACTION_SUMMARY_TIMEOUT, sfn(prompt)).await {
-                        Ok(r) => r,
-                        Err(_) => Err(anyhow::anyhow!(
-                            "compaction summarizer timed out after {}s",
-                            COMPACTION_SUMMARY_TIMEOUT.as_secs()
-                        )),
+                None => match compression::build_summary_prompt(
+                    &crate::agent::compaction_material::from_loop_messages(&middle),
+                    budget,
+                    prev.as_deref(),
+                    augmented_focus.as_deref(),
+                ) {
+                    // dirge-tgb9: the turns smuggle the reserved fence
+                    // delimiter, so the material cannot be safely fenced.
+                    // Reported as a failed summarization, which keeps the
+                    // pruned context — the same degradation as the circuit
+                    // breaker above, and far better than summarizing
+                    // attacker-shaped text into the next turn's context.
+                    Err(e) => Err(e),
+                    Ok(prompt) => {
+                        // Bound the inline call: a provider that stalls without
+                        // erroring would otherwise freeze the loop indefinitely.
+                        // On timeout, keep the pruned context (Failed outcome).
+                        match tokio::time::timeout(COMPACTION_SUMMARY_TIMEOUT, sfn(prompt)).await {
+                            Ok(r) => r,
+                            Err(_) => Err(anyhow::anyhow!(
+                                "compaction summarizer timed out after {}s",
+                                COMPACTION_SUMMARY_TIMEOUT.as_secs()
+                            )),
+                        }
                     }
-                }
+                },
             };
+            // dirge-tgb9: strip any delimiter the model echoed, exactly as the
+            // `/compact` path does (`provider::run_compaction`). This summary is
+            // spliced into the context the next turn reads, so a stray fence
+            // marker there would both confuse that turn and break the collision
+            // check on the NEXT compaction — which is the guard that keeps an
+            // attacker from closing the fence early. Covers the plugin-supplied
+            // summary above too, since both arrive here.
+            let summary_result =
+                summary_result.map(|s| crate::agent::prompt::strip_compaction_delimiters(&s));
             match summary_result {
                 Ok(summary) if compression::validate_summary(&summary) => {
                     let new_msgs =
@@ -1851,6 +1927,10 @@ async fn run_compaction_pass_with_focus(
             tokens_after: after_summary,
             summary: applied_summary,
             first_kept_index: applied_first_kept,
+            // Read from the context the fold actually produced, not from what
+            // it intended to keep — an intent field would go green even when
+            // the keeping failed.
+            skill_anchors_kept: compression::anchors_present_in(&current_context.messages),
             compaction_kind,
             // The summarizer model name isn't threaded through the opaque
             // SummarizeFn closure yet (follow-up).
@@ -1965,6 +2045,32 @@ pub async fn run_agent_loop(
     // hook during auto-compaction.
     memory_provider: Option<std::sync::Arc<dyn crate::extras::memory_provider::MemoryProvider>>,
 ) -> Vec<LoopMessage> {
+    // dirge-vlfb: the run's starting conditions. Not derivable from the event
+    // stream, and the first thing a harness review needs: the tool NAMES the
+    // model was actually offered (a feature the model cannot see is a feature
+    // that is not shipped), and the window the context manager will judge
+    // every turn against.
+    if super::trace::enabled() {
+        super::trace::note(
+            "run_start",
+            serde_json::json!({
+                "tools": context.tools.iter().map(|t| t.name().to_string()).collect::<Vec<_>>(),
+                "ctx_max": context_manager::effective_ctx_max(
+                    context_manager::context_window_override().unwrap_or_else(|| {
+                        config
+                            .model_name
+                            .as_deref()
+                            .and_then(crate::config::context_window_for_model)
+                            .unwrap_or(128_000)
+                    }),
+                ),
+                "max_turns": config.max_turns,
+                "model": config.model_name.clone(),
+                "messages": context.messages.len(),
+            }),
+        );
+    }
+
     // Pi line 103: `newMessages = [...prompts]`.
     let new_messages = prompts.clone();
 
@@ -1987,6 +2093,29 @@ pub async fn run_agent_loop(
     // so it steers this run without being persisted into session history.
     if let Some(block) = crate::agent::exemplars::block_for_task(&task_query, EXEMPLAR_TOP_K) {
         push_context_note_if_absent(&mut context, block);
+    }
+
+    // dirge-e31n.2: the volatile session facts, re-read at the start of every
+    // user turn instead of frozen into the preamble at agent construction.
+    // Pushed through the same tail channel as exemplars and pre-recall, so it
+    // cannot churn the cached prefix, and deduped by `push_context_note_if_absent`
+    // — an unchanged environment is pushed once and then costs nothing, while a
+    // `cd` or a branch switch produces a genuinely different block that lands on
+    // the next turn. `builder::agent_inner` omits these four lines from the
+    // preamble under the same flag, so they are stated exactly once.
+    if config.turn_envelope
+        && let Some(rendered) = super::envelope::SessionFacts::read().to_envelope()
+    {
+        if !rendered.dropped.is_empty() {
+            tracing::debug!(
+                target: "dirge::context",
+                dropped = ?rendered.dropped,
+                "turn envelope over budget; sections dropped",
+            );
+        }
+        // REPLACES rather than appends: a `cd` or `git switch` makes the
+        // previous envelope false, not merely redundant.
+        replace_context_note(&mut context, super::envelope::MARKER, rendered.text);
     }
 
     // Pi line 105: `currentContext.messages = [...context.messages, ...prompts]`.
@@ -2127,10 +2256,16 @@ pub async fn run_agent_loop(
 /// Record one tool result's capability signals on the run tally [dirge-5mtx.7].
 ///
 /// Every call counts toward `tool_calls` (the denominator for every rate) and,
-/// when it failed, toward `errored_tool_calls`. A failed call whose name is in
-/// no tool the run was given is ALSO recorded as a hallucinated name — the
-/// model invented the name rather than misusing a real tool, which is a
-/// materially different capability signal.
+/// when it failed, toward the errored count FOR ITS RECOVERY CLASS
+/// (dirge-s9ry). A failed call whose name is in no tool the run was given is
+/// ALSO recorded as a hallucinated name — the model invented the name rather
+/// than misusing a real tool, which is a materially different capability
+/// signal.
+///
+/// The class comes from the same `tool_error_class::classify` the failure
+/// tracker uses on the same excerpt, so the checkpoint's account of a streak
+/// and the estimator's account of the run cannot disagree about what a failure
+/// was.
 ///
 /// `prepare_tool_call` (tools.rs) is where the miss is actually detected: it
 /// short-circuits with "Tool X not found" plus a nearest-name suggestion. But
@@ -2146,6 +2281,17 @@ pub async fn run_agent_loop(
 /// invented tool name 3, arguments too malformed to repair 5 — which is the
 /// intended ranking.
 ///
+/// KEEPING that ranking is why an invented name is classed [`ErrorClass::Misuse`]
+/// rather than run through the classifier (dirge-s9ry). `prepare_tool_call`
+/// phrases the miss as "Tool X not found", which the classifier reads — quite
+/// reasonably — as [`ErrorClass::MissingInfo`], the one class that scores
+/// double. That would have made an invented name 2 + 2 = 4, silently
+/// re-ranking it against `repair_invalid` and counting ONE failure twice on
+/// the same axis: `hallucinated_tool_names` already exists to say precisely
+/// this. `Misuse` is also the honest label — an unknown tool name is the call
+/// shape being wrong, not the tree being shaped differently than the model
+/// thought.
+///
 /// Adding this signal can only ever move a run DOWN a tier, never up, so the
 /// worst case is a run that read `Strong` reading `Nominal`, which is today's
 /// default behaviour. That is why restoring it is safe despite its effect on
@@ -2155,12 +2301,112 @@ fn record_tool_result_signals(
     tally: &mut GateTally,
     name: &str,
     is_error: bool,
+    excerpt: &str,
     known_tools: &[&str],
 ) {
-    tally.record_tool_call(is_error);
-    if is_error && !known_tools.contains(&name) {
+    use super::tool_error_class::ErrorClass;
+    let hallucinated = is_error && !known_tools.contains(&name);
+    tally.record_tool_call(is_error.then(|| {
+        if hallucinated {
+            ErrorClass::Misuse
+        } else {
+            super::tool_error_class::classify(name, excerpt)
+        }
+    }));
+    if hallucinated {
         tally.record_hallucinated_tool_name();
     }
+}
+
+/// Whether a progress checkpoint stands down because a more specific guard
+/// owns the situation (dirge-hwk9.4).
+///
+/// A STALL checkpoint stands down while the verifier is holding a masked
+/// decline. That state — the model is checking its work through a pipe, so
+/// nothing readable came back — already has a guard with something useful to
+/// say, and this one does not: the stall text offers "getting a green check"
+/// as the way out, when a green check is exactly what just happened and could
+/// not be counted. Two answers competing over one situation is worse than the
+/// weaker one staying quiet, which is the finalization arbiter's rule applied
+/// at the boundary.
+///
+/// Measured: a run that passed all 22 tests at 345s via `pytest … | tail -28`
+/// was told twice that it had made no progress for three turns, the second
+/// time at 618.0s of a 618.1s run.
+///
+/// The PROLOGUE checkpoint is deliberately NOT suppressed: it fires on a run
+/// that has produced nothing at all, where a masked verification is not the
+/// explanation for the silence.
+///
+/// Pure so it is testable without the process-global counters the progress
+/// monitor reads (`todo::unfinished_count`, `modified::count`) — the same
+/// reason `should_advise_untracked_work` was extracted.
+pub(crate) fn progress_nudge_is_suppressed(which: BoundaryNudge, masked_decline: bool) -> bool {
+    which == BoundaryNudge::ProgressStall && masked_decline
+}
+
+/// Record a boundary where the arbiter had something and chose not to say it.
+///
+/// A stand-down produces no message, no tally nudge and — since dirge-hwk9.7 —
+/// no spent budget, which means it leaves no trace of any kind. That is the
+/// same blind spot the context verdict had: the interesting decision is the one
+/// with no output. Without this record a trace cannot distinguish "the stall
+/// never came up" from "the stall came up three times and was declined", and
+/// those call for opposite fixes.
+fn trace_boundary_stand_down(offer: Option<&super::progress::Checkpoint>, why: &str, extra: Value) {
+    if !super::trace::enabled() {
+        return;
+    }
+    let mut fields = serde_json::json!({
+        "decision": "stand_down",
+        "why": why,
+        "offer": offer.map(|c| match c.kind {
+            super::progress::CheckpointKind::Stall => "stall",
+            super::progress::CheckpointKind::Prologue => "prologue",
+        }),
+    });
+    if let (Some(dst), Some(src)) = (fields.as_object_mut(), extra.as_object()) {
+        for (k, v) in src {
+            dst.insert(k.clone(), v.clone());
+        }
+    }
+    super::trace::note("boundary", fields);
+}
+
+/// Whether the boundary about to be arbitrated is the one that ENDS the inner
+/// loop — the model produced an answer rather than more tool calls, so control
+/// is about to pass to [`poll_finalization_follow_up`] (dirge-hwk9.7).
+///
+/// This is the seam dirge-5mtx.2 left open. That change made the mid-turn
+/// boundary emit exactly one harness nudge, chosen by priority. It did not
+/// touch the fact that the run's LAST boundary is polled by TWO arbiters: the
+/// boundary one here, and then the finalization one, which has its own strict
+/// priority order and no knowledge that anything already spoke. Both can push a
+/// message before the same assistant turn, unranked against each other.
+///
+/// Measured, twice, on different models: `[stall]` delivered 0.1s before a
+/// successful run ended (qwen at 618.0s of 618.1s, deepseek at 55.3s of 55.4s),
+/// on the boundary after the final answer. It is not a coincidence of timing —
+/// a run in its endgame has its todos closed (cannot decrease), its files
+/// already touched (cannot increase) and its green already latched (no fresh
+/// edge), so EVERY endgame boundary is barren by the monitor's definition. The
+/// monitor is structurally guaranteed to fire there given enough turns.
+///
+/// The rule: that boundary belongs to the finalization arbiter. It is the one
+/// that knows what "finishing" means, its gates are the specific ones
+/// (`Verifier` is fast-verify's better-informed twin, `Todo` is track-work's),
+/// and the traced runs show it doing exactly the right job on that boundary
+/// while the broad nudges add noise beside it.
+///
+/// Safe-state is the exception and stays: it is an abort with a tree restore,
+/// not steering, and the finalization stack has no equivalent.
+///
+/// A user interjection arriving after this point (`poll_steering`, further
+/// down) would re-open the loop and make the prediction wrong. That is
+/// harmless now that a declined checkpoint keeps its budget — it simply
+/// re-offers at the next boundary.
+pub(crate) fn boundary_nudge_stands_down(which: BoundaryNudge, concluding: bool) -> bool {
+    concluding && which != BoundaryNudge::SafeState
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2172,11 +2418,14 @@ pub(crate) fn poll_boundary_nudge(
     turns_taken: usize,
     track_nudges: &mut u8,
     verify_nudges: &mut u8,
+    skill_anchors: &mut Vec<(String, String)>,
+    skill_anchor_restated_at: &mut usize,
     tally: &mut GateTally,
     tier: super::capability::CapabilityTier,
+    concluding: bool,
 ) -> Option<(LoopMessage, BoundaryNudge)> {
     // Unconditional: the progress counters must advance every boundary.
-    let progress_signal = config.progress.as_ref().and_then(|progress| {
+    let progress_offer = config.progress.as_ref().and_then(|progress| {
         let snapshot = super::progress::ProgressSnapshot {
             todos_unfinished: crate::agent::tools::todo::unfinished_count(),
             files_touched: crate::agent::tools::modified::count(),
@@ -2194,24 +2443,64 @@ pub(crate) fn poll_boundary_nudge(
             ),
             // dirge-t5dh: the prologue bound also watches tool calls, since a
             // turn batching forty reads is one boundary but forty calls.
-            tool_calls: tally.tool_calls() as usize,
+            // dirge-hwk9.7: SUCCESSFUL calls only. Both counts come off the
+            // same tally, and the errored total is derived from the per-class
+            // split rather than stored beside it, so this cannot drift from
+            // what the capability estimator and the gates line report.
+            successful_tool_calls: tally
+                .tool_calls()
+                .saturating_sub(tally.errored_tool_calls())
+                as usize,
         };
         progress.record_turn(snapshot)
     });
 
-    // 1. Safe-state abort (EXEC rung 3) — supersedes the rung-2 checkpoint.
-    if let Some(msg) = safe_state_msg {
+    // 1. Safe-state abort (EXEC rung 3) — supersedes the rung-2 checkpoint,
+    //    and the only rung that still speaks on a concluding boundary. The
+    //    exemption is read from the policy here rather than left implicit in
+    //    this branch's position, so there is ONE statement of the rule: with it
+    //    encoded twice, a mutation of the policy changed nothing and the
+    //    exemption was untestable.
+    if let Some(msg) = safe_state_msg
+        && !boundary_nudge_stands_down(BoundaryNudge::SafeState, concluding)
+    {
         tally.record_nudge(BoundaryNudge::SafeState);
         return Some((
             LoopMessage::User(super::message::UserMessage::text(msg)),
             BoundaryNudge::SafeState,
         ));
     }
+    // dirge-hwk9.7: everything below is steering for a model that is about to
+    // act again. On a boundary that ends the inner loop it is about to answer
+    // instead, and `poll_finalization_follow_up` owns that turn — see
+    // [`boundary_nudge_stands_down`]. Standing down here rather than inside
+    // each rung is what keeps the budgets intact: `track_nudges`,
+    // `verify_nudges` and the progress checkpoint are all spent at the point
+    // of selection, so a rung that selects and is then declined has already
+    // paid for a message nobody read.
+    if boundary_nudge_stands_down(BoundaryNudge::ProgressStall, concluding) {
+        trace_boundary_stand_down(
+            progress_offer.as_ref(),
+            "concluding",
+            serde_json::json!({
+                // What the rungs above progress would have keyed on, read-only
+                // — enough to tell from a trace whether standing down cost the
+                // model anything the finalization gates don't already cover.
+                "edits_since_verify": config
+                    .verifier
+                    .as_ref()
+                    .map_or(0, |v| v.edits_since_verify()),
+                "todos_unfinished": crate::agent::tools::todo::unfinished_count(),
+            }),
+        );
+        tally.end_boundary();
+        return None;
+    }
     // 2. Cross-turn recovery checkpoint (rung 2) — distinct tool errors piling
     //    up, which storm's identical-repeat rule never sees.
-    if let Some(msg) = guards.poll_reflection(tier).into_iter().next() {
-        tally.record_nudge(BoundaryNudge::ReflectionCheckpoint);
-        return Some((msg, BoundaryNudge::ReflectionCheckpoint));
+    if let Some((msg, kind)) = guards.poll_reflection(tier).into_iter().next() {
+        tally.record_nudge(kind);
+        return Some((msg, kind));
     }
     // 3. Work tracking — edits with nothing on the board.
     if let Some(reminder) = build_early_track_work_reminder(
@@ -2223,6 +2512,28 @@ pub(crate) fn poll_boundary_nudge(
         *track_nudges += 1;
         tally.record_nudge(BoundaryNudge::TrackWork);
         return Some((reminder, BoundaryNudge::TrackWork));
+    }
+    // 3b. Skill anchors — a loaded skill asked to be restated on an interval.
+    //     After work-tracking on purpose: this is fidelity to a skill's own
+    //     stated cadence, not a correctness signal, so it must never pre-empt a
+    //     nudge that is telling the model something is wrong.
+    for (name, section) in collect_skill_anchors(new_messages) {
+        if !skill_anchors.iter().any(|(n, _)| n == &name) {
+            skill_anchors.push((name, section));
+        }
+    }
+    if should_restate_skill_anchors(
+        config.skill_anchor_interval,
+        skill_anchors.len(),
+        turns_taken,
+        *skill_anchor_restated_at,
+    ) {
+        *skill_anchor_restated_at = turns_taken;
+        tally.record_nudge(BoundaryNudge::SkillAnchor);
+        return Some((
+            skill_anchor_reminder_message(skill_anchors),
+            BoundaryNudge::SkillAnchor,
+        ));
     }
     // 4. Fast verify — edits piling up with nothing run since.
     if let Some(reminder) = build_fast_verify_reminder(
@@ -2247,14 +2558,26 @@ pub(crate) fn poll_boundary_nudge(
     }
     // 6. Progress — broadest, so last. Prologue and stall are mutually
     //    exclusive inside the tracker (unarmed vs armed).
-    if let Some(msg) = progress_signal {
-        let which = if super::progress::is_prologue_checkpoint(&msg) {
-            BoundaryNudge::ProgressPrologue
-        } else {
-            BoundaryNudge::ProgressStall
+    if let Some(offer) = progress_offer {
+        let which = match offer.kind {
+            super::progress::CheckpointKind::Prologue => BoundaryNudge::ProgressPrologue,
+            super::progress::CheckpointKind::Stall => BoundaryNudge::ProgressStall,
         };
+        let masked = config
+            .verifier
+            .as_ref()
+            .is_some_and(|v| v.masked_decline_outstanding());
+        if progress_nudge_is_suppressed(which, masked) {
+            trace_boundary_stand_down(Some(&offer), "masked-verification", serde_json::Value::Null);
+            tally.end_boundary();
+            return None;
+        }
+        // Delivered — now, and only now, spend the checkpoint.
+        if let Some(progress) = config.progress.as_ref() {
+            progress.commit(offer.kind);
+        }
         tally.record_nudge(which);
-        return Some((msg, which));
+        return Some((offer.message, which));
     }
     // 7. Budget countdown. Only polled when nothing else fired, so an unused
     //    mark survives to a later boundary.
@@ -2288,6 +2611,7 @@ fn finish_tally(
     // verified nothing never inherits an earlier run's green.
     super::verifier::record_run_verification(config.session_id.as_deref(), verification);
     tally.set_repairs(Some(config.repair_stats.snapshot()));
+    tally.set_retries(Some(config.retry_stats.snapshot()));
     tally.emit();
 }
 
@@ -2365,6 +2689,11 @@ pub async fn run_loop(
     // from them — the alternative is picking another constant and calling it
     // adaptive.
     let mut capability = super::capability::CapabilityEstimator::new();
+    // dirge-e31n.5: tool calls this run whose effect is Committed or Unknown,
+    // and a monotonic ordinal so the model can read the order they happened in.
+    // dirge-e31n.6: armed by a permission checkpoint, consumed by the next
+    // stream call. See that call site for why it is one-shot.
+    let mut pending_tool_choice: Option<super::types::ToolChoice> = None;
 
     // Pi line 167: initial steering poll.
     // Phase 4 part 2: composes with the file-touch tracker's
@@ -2376,6 +2705,13 @@ pub async fn run_loop(
     // dirge-nqr: count assistant turns so a hard cap can stop a
     // runaway run. `max_turns = None` means unlimited (legacy).
     let mut turns_taken: usize = 0;
+
+    // dirge-n00z: call ids for calls lifted out of the model's TEXT, which
+    // arrive with none. Monotonic for the whole run and never reset, because
+    // an id has to stay unique across the transcript, not just the turn —
+    // results are matched back to calls by id, and two empty ones matched
+    // each other.
+    let mut scavenged_call_seq: usize = 0;
 
     // F4: in-session reflexion memory. Accumulates the approaches the
     // model looped on and abandoned this run, so the repeat-loop guard
@@ -2473,6 +2809,20 @@ pub async fn run_loop(
         // the nudge rides in context.messages, so the flag alone drives
         // the next turn when no tool calls or steering are pending.
         let mut recovery_pending = false;
+        // dirge-vpma.22: set by the `ExitWithSummary` post-usage tier, which
+        // is the last line of defence when context is critically over the
+        // threshold. It has to survive to the bottom of the iteration rather
+        // than breaking on the spot, so the checkpoint-schedule reset and the
+        // per-iteration snip-credit cleanup below it still run.
+        //
+        // dirge-8s2v: `Some((made_room, prompt_tokens))` — the tier ends the
+        // TURN, and whether the run may take another one depends on whether
+        // the fold it just ran actually shrank the context. It did: another
+        // turn is safe, and the model needs one to see the results of the
+        // calls it just made. It did not: going round again meets the same
+        // wall, which is what this tier exists to prevent. `prompt_tokens` is
+        // carried so the message that reports the stop can name the numbers.
+        let mut force_turn_end: Option<(bool, u64)> = None;
         while has_more_tool_calls || !pending_messages.is_empty() || recovery_pending {
             recovery_pending = false;
             // Circuit-breaker bookkeeping is at-most-once per iteration:
@@ -2582,12 +2932,14 @@ pub async fn run_loop(
             {
                 let block = provider.format_for_system_prompt();
                 if !block.trim().is_empty() {
-                    current_context.messages.push(serde_json::json!({
-                        "role": "system",
-                        "content": format!(
-                            "## Updated memory (consolidated mid-session)\n{block}"
-                        ),
-                    }));
+                    // User-role `<system-reminder>`, NOT a system-role message:
+                    // the OAuth shaper hoists system-role entries into the
+                    // top-level `system` array, which shifts every message byte
+                    // after it and re-bills the whole conversation at cache-write
+                    // price (dirge-ugah.2). See `memory_refresh_message`.
+                    current_context
+                        .messages
+                        .push(memory_refresh_message(&block));
                 }
             }
 
@@ -2652,15 +3004,61 @@ pub async fn run_loop(
             snip_tokens_freed = snip_tokens_freed.saturating_add(freed);
 
             // Pi lines 192-194: LLM call.
-            let (assistant_msg, token_usage) = stream_assistant_response(
+            // dirge-e31n.6: the permission checkpoint tells the model that
+            // "retrying, rephrasing, or switching to another tool will not
+            // clear it". `take()` makes that ENFORCEABLE for exactly the turn
+            // that reads it, rather than leaving it as advice the model is
+            // free to answer with another blocked call.
+            //
+            // One turn only, by construction: the value is consumed here, so
+            // the model is never disarmed for longer than the message it is
+            // responding to. If it genuinely needs to read something to write
+            // its report, it can on the following turn.
+            let turn_tool_choice = pending_tool_choice.take();
+            let (mut assistant_msg, token_usage) = stream_assistant_response(
                 &mut current_context,
                 &config,
                 signal.clone(),
                 emit,
                 stream_fn,
+                turn_tool_choice,
             )
             .await;
+            // Where this turn's assistant message sits in each transcript, so
+            // a call scavenged out of its text can be recorded ON it further
+            // down (dirge-n00z). Both are appended to below, so neither index
+            // may be re-derived as "the last one" by then.
+            let assistant_in_new = new_messages.len();
+            let assistant_in_context = current_context.messages.len().saturating_sub(1);
             new_messages.push(LoopMessage::Assistant(assistant_msg.clone()));
+
+            // dirge-6gpr: a turn has happened — the model was called and
+            // answered. Counted HERE rather than at the bottom of the
+            // iteration, where it counted only turns the loop went on to
+            // iterate past: the last turn of every run was never counted, and
+            // a run force-ended by the context manager counted none at all
+            // while making tool calls. `turns` is the denominator every other
+            // count on the tally line is read against, so a wrong one makes
+            // the whole line unreadable rather than merely incomplete.
+            tally.record_turn();
+
+            // dirge-ugah.3: report a turn that wrote a cache entry but read
+            // none. Evidence-gathering, not a fix — see `is_silent_cache_miss`
+            // for the two mechanisms this is meant to distinguish.
+            if is_silent_cache_miss(token_usage, current_context.messages.len()) {
+                tracing::warn!(
+                    target: "dirge::cache",
+                    messages = current_context.messages.len(),
+                    cache_creation_tokens =
+                        token_usage.map_or(0, |u| u.cache_creation_input_tokens),
+                    uncached_input_tokens = token_usage.map_or(0, |u| u.input_tokens),
+                    "prompt-cache read miss: wrote a new entry, read none. Check the \
+                     dirge::prompt_cache target first — a `cached request prefix changed` \
+                     warning just before this names the component that moved. Absent that, \
+                     suspect the 20-block lookback window (a turn appending >20 content \
+                     blocks) or concurrent subagent fan-out",
+                );
+            }
 
             // Pi lines 196-200: error / aborted short-circuit.
             if matches!(
@@ -2774,6 +3172,9 @@ pub async fn run_loop(
 
             // Pi lines 202-216: tool calls + results.
             let mut tool_calls = extract_tool_calls_from(&assistant_msg);
+            // Ids of the calls lifted out of this turn's TEXT, so the
+            // assistant message can be made to say it made them (dirge-n00z).
+            let mut promoted_ids: Vec<String> = Vec::new();
 
             // Scavenge: scan reasoning AND regular text content for
             // tool calls the model forgot to emit in `tool_calls`.
@@ -2801,6 +3202,17 @@ pub async fn run_loop(
             if !scavenge_source.is_empty() {
                 let scavenge_result =
                     super::scavenge::scavenge_tool_calls(Some(&scavenge_source), &allowed_names, 4);
+                // dirge-e31n.8: a call the model wrote as TEXT naming a tool
+                // that does not exist. The scavenger drops it with no result
+                // and no error — deliberately, per dirge-knt8 — so this is
+                // the only place the loss is visible to anyone.
+                for missed in &scavenge_result.unknown_names {
+                    tally.record_dropped_unknown_name();
+                    super::suggest::log_tool_name_miss(missed, &allowed_names, "scavenged");
+                }
+                for note in &scavenge_result.notes {
+                    tracing::debug!(target: "dirge::agent_loop::scavenge", "{note}");
+                }
                 if !scavenge_result.calls.is_empty() {
                     // LOOP-12: canonicalize the JSON so different key orders or
                     // numeric reprs (1 vs 1.0) for the same logical call don't
@@ -2814,6 +3226,28 @@ pub async fn run_loop(
                     for sc in &scavenge_result.calls {
                         let sig = format!("{}::{}", sc.name, canonical_json(&sc.arguments));
                         if !seen_signatures.contains(&sig) {
+                            // dirge-n00z: a text-channel call arrives with no
+                            // id. Mint one now, before anything downstream
+                            // keys on it — results, storm signatures and the
+                            // publish guard all match calls by id, and two
+                            // empty ids matched each other.
+                            let sc = {
+                                let mut c = sc.clone();
+                                scavenged_call_seq += 1;
+                                c.id = format!("scav-{scavenged_call_seq}");
+                                c
+                            };
+                            // Every branch below that pushes the call also
+                            // records its id, and the one that drops it does
+                            // neither — a dropped call must not show up on the
+                            // assistant message as one that ran.
+                            let promote =
+                                |call: super::tools::ToolCall,
+                                 calls: &mut Vec<super::tools::ToolCall>,
+                                 ids: &mut Vec<String>| {
+                                    ids.push(call.id.clone());
+                                    calls.push(call);
+                                };
                             // dirge-knt8: validate scavenged calls against the
                             // tool's schema BEFORE promotion. Scavenged calls
                             // come from hallucinated text in the model's answer,
@@ -2831,7 +3265,7 @@ pub async fn run_loop(
                                     Ok(None) => {
                                         // Valid — push as-is.
                                         tally.record_scavenged_call();
-                                        tool_calls.push(sc.clone());
+                                        promote(sc, &mut tool_calls, &mut promoted_ids);
                                     }
                                     Ok(Some(rr)) => {
                                         // Repaired — push with repaired args.
@@ -2839,9 +3273,13 @@ pub async fn run_loop(
                                         // `config.repair_stats`; the tally
                                         // latches that snapshot at run end.
                                         tally.record_scavenged_call();
-                                        let mut repaired_call = sc.clone();
+                                        let mut repaired_call = sc;
                                         repaired_call.arguments = rr.repaired;
-                                        tool_calls.push(repaired_call);
+                                        promote(
+                                            repaired_call,
+                                            &mut tool_calls,
+                                            &mut promoted_ids,
+                                        );
                                     }
                                     Err(_) => {
                                         // Invalid scavenged call — drop silently.
@@ -2853,11 +3291,54 @@ pub async fn run_loop(
                                 // Defensive: tool not found — unreachable, since
                                 // allowed_names is built from this same tool set.
                                 // Preserve prior behavior and push the call as-is.
-                                tool_calls.push(sc.clone());
                                 tally.record_scavenged_call();
+                                promote(sc, &mut tool_calls, &mut promoted_ids);
                             }
                         }
                     }
+                }
+            }
+
+            // dirge-e31n.8: place names the model wrote for a tool dirge
+            // calls something else — `shell` for `bash`, `ask_user` for
+            // `question`, `Bash` for `bash`. ONE site, covering native and
+            // scavenged calls alike, and it rewrites the name in place so
+            // everything downstream — storm signatures, the tally, the event
+            // stream, the tool result — sees the tool that actually ran.
+            //
+            // Before storm and before truncation repair, so a guessed name
+            // and its real spelling cannot survive as two distinct calls.
+            for (guessed, real) in
+                super::tool_aliases::resolve_call_names(&mut tool_calls, &allowed_names)
+            {
+                tally.record_aliased_tool_name();
+                tracing::info!(
+                    target: "dirge::tool_miss",
+                    tool = %guessed,
+                    resolved = %real,
+                    path = "aliased",
+                    "resolved a tool name the model wrote differently",
+                );
+            }
+
+            // dirge-n00z: record the lifted calls ON the assistant message.
+            // After alias resolution, so the block carries the name that
+            // actually ran; before storm and dispatch, so every id here is
+            // one `backfill_missing_tool_results` will guarantee a result for.
+            if !promoted_ids.is_empty() {
+                let lifted: Vec<super::tools::ToolCall> = tool_calls
+                    .iter()
+                    .filter(|c| promoted_ids.iter().any(|id| id == &c.id))
+                    .cloned()
+                    .collect();
+                assistant_msg =
+                    super::call_syntax::absorb_text_calls(&assistant_msg, &lifted, &allowed_names);
+                let rewritten = LoopMessage::Assistant(assistant_msg.clone());
+                if let Some(slot) = current_context.messages.get_mut(assistant_in_context) {
+                    *slot = loop_message_to_value(&rewritten);
+                }
+                if let Some(slot) = new_messages.get_mut(assistant_in_new) {
+                    *slot = rewritten;
                 }
             }
 
@@ -3086,8 +3567,29 @@ pub async fn run_loop(
                             &mut tally,
                             &originating.name,
                             result.is_error,
+                            &excerpt,
                             &known_tool_names,
                         );
+                        // dirge-e31n.5: what this call may have LANDED. Only
+                        // effects worth carrying are kept — a `NoEffect` fact
+                        // in a handoff about what might have committed is
+                        // noise that dilutes the ones that matter.
+                        let effect = super::side_effect::classify_result(
+                            &originating.name,
+                            result.is_error,
+                            &excerpt,
+                        );
+                        // OBSERVATION ONLY (dirge-e31n.5). The envelope block
+                        // this used to feed was cut on the evidence: four model
+                        // configurations across the supported range, two
+                        // scenarios, 53 runs, and the control arm never failed.
+                        // The counter stays because it costs nothing and it is
+                        // the mechanism gate that made those three rounds
+                        // legible at all -- without it a scenario that failed
+                        // to produce the condition reads as a null result.
+                        if effect == super::side_effect::SideEffect::Unknown {
+                            tally.record_unresolved_effect();
+                        }
                         tally.record_failure_streak(guards.failure_streak() as u32);
                         current_context.messages.push(tool_result_to_value(result));
                         new_messages.push(LoopMessage::ToolResult(result.clone()));
@@ -3188,7 +3690,7 @@ pub async fn run_loop(
                 let repairs = config.repair_stats.snapshot();
                 capability.observe(&super::capability::CapabilityCounters {
                     tool_calls: tally.tool_calls(),
-                    errored_tool_calls: tally.errored_tool_calls(),
+                    errored_by_class: tally.errored_by_class(),
                     repair_invalid: repairs.invalid as u32,
                     repair_successful: repairs.total_successful() as u32,
                     hallucinated_tool_names: tally.hallucinated_tool_names(),
@@ -3245,7 +3747,17 @@ pub async fn run_loop(
             } else {
                 None
             };
-            if let Some((msg, _which)) = poll_boundary_nudge(
+            // dirge-hwk9.7: exactly the inner-loop condition, evaluated one
+            // statement early. `has_more_tool_calls` and `recovery_pending` are
+            // both final by this point (set during dispatch above);
+            // `pending_messages` was drained at the top of this iteration and is
+            // only refilled by `poll_steering` further down, which is user input
+            // arriving asynchronously. So this predicts "the loop is about to
+            // exit and hand over to finalization" exactly, except when a human
+            // interjects in the gap — and a checkpoint declined for that reason
+            // keeps its budget and re-offers next boundary.
+            let concluding = !has_more_tool_calls && !recovery_pending;
+            if let Some((msg, which)) = poll_boundary_nudge(
                 &config,
                 &guards,
                 safe_state_msg,
@@ -3253,10 +3765,42 @@ pub async fn run_loop(
                 turns_taken,
                 &mut gates.track_nudges,
                 &mut verify_nudges,
+                &mut gates.skill_anchors,
+                &mut gates.skill_anchor_restated_at,
                 &mut tally,
                 capability.tier(),
+                concluding,
             ) {
+                // dirge-e31n.6: a permission checkpoint says no tool can clear
+                // the block. Forbid tools on the turn that reads it so that is
+                // a fact rather than a request. Every other nudge leaves the
+                // model free to act — several of them are ASKING it to.
+                if which == BoundaryNudge::PermissionCheckpoint {
+                    pending_tool_choice = Some(super::types::ToolChoice::None);
+                }
                 emit_harness_notices(emit, std::slice::from_ref(&msg)).await;
+                // dirge-hwk9.5: the same message events the finalization path
+                // emits. Without these, every BOUNDARY nudge — stall, budget,
+                // prologue, track-work, file-touch, safe-state, fast-verify,
+                // reflection, permission checkpoint — was absent from the
+                // LoopEvent message stream, so half the steering surface was
+                // invisible to anything reading it. Measured: the tally said
+                // `nudge_progress_stall=2` and the loop trace recorded one
+                // intervention.
+                //
+                // Safe to emit now that the TUI shows an intervention notice as
+                // its summary line only; before that, adding these would have
+                // put the body on screen a third time.
+                let _ = emit
+                    .send(LoopEvent::MessageStart {
+                        message: msg.clone(),
+                    })
+                    .await;
+                let _ = emit
+                    .send(LoopEvent::MessageEnd {
+                        message: msg.clone(),
+                    })
+                    .await;
                 current_context.messages.push(loop_message_to_value(&msg));
                 new_messages.push(msg);
             }
@@ -3286,6 +3830,24 @@ pub async fn run_loop(
                     ctx_max,
                     folded_this_turn,
                 );
+                // dirge-vlfb: the context verdict, every turn, whatever it is.
+                // The `None` arm matters as much as the others — "the context
+                // manager looked and did nothing" is the answer to most of the
+                // questions a fold-related bug raises, and it is the one
+                // outcome that logs nothing at all.
+                if super::trace::enabled() {
+                    super::trace::note(
+                        "context",
+                        serde_json::json!({
+                            "verdict": format!("{:?}", decision.kind),
+                            "prompt_tokens": decision.prompt_tokens,
+                            "ctx_max": decision.ctx_max,
+                            "ratio": decision.ratio,
+                            "aggressive": decision.aggressive,
+                            "already_folded": folded_this_turn,
+                        }),
+                    );
+                }
                 match decision.kind {
                     PostUsageDecisionKind::Fold if !folded_this_turn => {
                         folded_this_turn = true;
@@ -3310,6 +3872,11 @@ pub async fn run_loop(
                             tracing::info!(
                                 target: "dirge::agent_loop",
                                 ratio = %decision.ratio,
+                                // dirge-cprj: the ratio alone cannot say
+                                // whether the prompt is too big or the window
+                                // is too small, and those want opposite fixes.
+                                prompt_tokens = decision.prompt_tokens,
+                                ctx_max = decision.ctx_max,
                                 aggressive = decision.aggressive,
                                 tail_budget = ?decision.tail_budget,
                                 "context-manager: fold recommended ({})",
@@ -3363,8 +3930,24 @@ pub async fn run_loop(
                         tracing::warn!(
                             target: "dirge::agent_loop",
                             ratio = %decision.ratio,
+                            // dirge-cprj. This line is where a run that is
+                            // silently force-ending every turn shows up, and
+                            // without these two it cannot be told from a run
+                            // legitimately out of room.
+                            prompt_tokens = decision.prompt_tokens,
+                            ctx_max = decision.ctx_max,
                             "context-manager: forcing summary and ending turn",
                         );
+                        // dirge-vpma.22: and actually end it. This arm logged
+                        // "ending turn" and then fell through to
+                        // prepareNextTurn/steering with `has_more_tool_calls`
+                        // untouched, so the turn continued. That is the exact
+                        // case this tier exists to prevent: when the summarizer
+                        // fails or the circuit breaker is already open at >80%
+                        // context, the loop went round again against a context
+                        // still over the threshold and the next request could
+                        // overflow or 400. Honoured below, after the
+                        // checkpoint-schedule reset.
                         // When context is critically over the threshold,
                         // prune aggressively then run the structured-summary
                         // pass if a summarizer is wired.
@@ -3381,6 +3964,13 @@ pub async fn run_loop(
                             (ctx_max as f64 * context_manager::HISTORY_FOLD_THRESHOLD) as u64,
                         )
                         .await;
+                        // dirge-8s2v: `Succeeded` is the only outcome that
+                        // moved anything — `Failed` and `Skipped` both leave
+                        // the context exactly as it was.
+                        force_turn_end = Some((
+                            matches!(outcome, SummaryOutcome::Succeeded(_)),
+                            decision.prompt_tokens,
+                        ));
                         if let SummaryOutcome::Succeeded(idx) = outcome {
                             restore_working_files(&config, &mut current_context, idx, ctx_max)
                                 .await;
@@ -3424,6 +4014,56 @@ pub async fn run_loop(
                 // decision; clear it so a later iteration's fold isn't
                 // suppressed by a stale snip (IMPROVEMENTS_PLAN #4).
                 snip_tokens_freed = 0;
+            }
+
+            // dirge-vpma.22: the critical-context tier asked for the turn to
+            // end. Clearing `has_more_tool_calls` would not be enough on its
+            // own — the loop condition also admits pending messages and a
+            // pending recovery — so leave the inner loop, which leaves the
+            // flag unread.
+            //
+            // dirge-8s2v: but leaving the inner loop is leaving the TURN loop,
+            // and control then falls to the finalization poll, whose default
+            // is to stop. As first written this ended the RUN: a model over
+            // the threshold got one turn, its tool calls ran, their results
+            // were appended, and the run finished before it ever saw them.
+            // `continue 'outer` is the difference between ending the turn and
+            // ending the run — it starts a fresh turn against the context the
+            // fold just shrank.
+            //
+            // Only when the fold made room. When it did not, another turn
+            // meets the same wall, and the honest move is to stop — but to say
+            // so, because a run that stops mid-task in silence is
+            // indistinguishable from one that decided it was finished.
+            if let Some((made_room, prompt_tokens)) = force_turn_end.take() {
+                turns_taken += 1;
+                let under_cap = config.max_turns.is_none_or(|cap| turns_taken < cap);
+                if made_room && under_cap {
+                    continue 'outer;
+                }
+                if !made_room {
+                    let notice = format!(
+                        "Run stopped: the context is over the model's window \
+                         ({} of {} tokens) and compaction could not reduce it. \
+                         The task is unfinished. This usually means the system \
+                         prompt and tool schemas alone exceed the window — \
+                         check the model's context_window in config.",
+                        prompt_tokens, ctx_max,
+                    );
+                    tracing::warn!(
+                        target: "dirge::agent_loop",
+                        prompt_tokens = prompt_tokens,
+                        ctx_max = ctx_max,
+                        "run truncated: context over window and nothing left to fold",
+                    );
+                    let _ = emit
+                        .send(LoopEvent::SystemNotice {
+                            content: notice.clone(),
+                        })
+                        .await;
+                    new_messages.push(LoopMessage::User(super::message::UserMessage::text(notice)));
+                }
+                break;
             }
 
             // Pi lines 220-239: prepareNextTurn.
@@ -3518,7 +4158,6 @@ pub async fn run_loop(
             // append a user-facing message into the transcript so the
             // model's history reflects the truncation, and bail.
             turns_taken += 1;
-            tally.record_turn();
             if let Some(cap) = config.max_turns
                 && turns_taken >= cap
             {
@@ -3654,6 +4293,144 @@ fn should_advise_untracked_work(
 /// Model-visible reminder injected into the conversation when the model is
 /// editing files without an active todo. Imperative tone matching the
 /// unfinished-todo nudge — tells the model to create a todo before continuing.
+/// How deep a conversation must be before a zero cache-read is suspicious
+/// rather than an ordinary cold start (dirge-ugah.3). A first turn writes an
+/// entry and reads nothing by definition; by this many messages the session
+/// has had at least one prior turn to write a readable prefix.
+const CACHE_MISS_MIN_MESSAGES: usize = 4;
+
+/// Whether a turn's usage is the signature of a *silent* prefix-cache miss
+/// (dirge-ugah.3): caching is demonstrably active — an entry was written —
+/// yet nothing was read back.
+///
+/// Two documented ways to lose an Anthropic cache read with no error to show
+/// for it:
+///
+/// - **The 20-block lookback window.** A breakpoint walks back at most 20
+///   content blocks to find a prior entry. A turn appending more than that —
+///   ten parallel tool calls is `assistant(text + 10 tool_use)` plus
+///   `user(10 tool_result)` = 21 blocks — pushes the previous breakpoint out
+///   of range. dirge's system prompt actively encourages parallel tool calls,
+///   and a single automatic breakpoint has no redundancy here.
+/// - **Concurrent fan-out.** An entry only becomes readable once the first
+///   response *begins streaming*, so K subagents launched together each pay
+///   the write instead of one write and K−1 reads.
+///
+/// Neither is confirmed to fire in practice, which is exactly why this
+/// reports rather than "fixes": the log is the evidence for deciding whether
+/// either needs a code change.
+fn is_silent_cache_miss(usage: Option<TokenUsage>, message_count: usize) -> bool {
+    usage.is_some_and(|u| {
+        u.cached_input_tokens == 0
+            && u.cache_creation_input_tokens > 0
+            && message_count > CACHE_MISS_MIN_MESSAGES
+    })
+}
+
+/// The mid-session memory-refresh message (dirge-ugah.2).
+///
+/// A **user**-role message wrapping a `<system-reminder>` block, not a
+/// `system`-role one. The role is load-bearing for cost: on the OAuth path
+/// `hoist_system_messages` relocates every system-role entry out of
+/// `messages[]` into the top-level `system` array, and since Anthropic
+/// renders `tools → system → messages` and caches on a strict prefix match,
+/// growing `system` shifts every message byte after it — re-billing the
+/// entire conversation at cache-write price. Appending to the tail of
+/// `messages[]` is the cheapest possible placement; hoisting moved it to the
+/// most expensive one.
+///
+/// `<system-reminder>` is the same operator-framing convention
+/// `agent::tools::background` uses, and `ui::text_output` already strips a
+/// leading one from anything user-visible.
+pub(crate) fn memory_refresh_message(block: &str) -> serde_json::Value {
+    serde_json::json!({
+        "role": "user",
+        "content": format!(
+            "<system-reminder>\n## Updated memory (consolidated mid-session)\n\
+             {block}\n</system-reminder>"
+        ),
+    })
+}
+
+/// dirge-69oe.4 — anchors of skills loaded so far this turn.
+///
+/// The loop sees only the turn's new messages, so an anchor has to be noticed
+/// as the skill result goes past. Keyed on the MARKER rather than on
+/// `tool_name == "skill"`, which keeps this consistent with what the fold does
+/// and means a skill that declared no `anchor:` contributes nothing — restating
+/// a head excerpt on a timer would be noise, not fidelity.
+pub(crate) fn collect_skill_anchors(new_messages: &[LoopMessage]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for msg in new_messages {
+        let LoopMessage::ToolResult(tr) = msg else {
+            continue;
+        };
+        // ToolResultMessage carries raw content blocks with no text helper of
+        // its own; join the text ones the same way the assistant-side helper
+        // does and ignore the rest.
+        let text: String = tr
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                super::message::ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        let Some(heading) = crate::skill::anchor_marker_heading(&text) else {
+            continue;
+        };
+        let Some(section) = crate::skill::extract_section(&text, heading) else {
+            continue;
+        };
+        let name = text
+            .lines()
+            .next()
+            .map(|l| l.trim_start_matches('#').trim())
+            .filter(|n| !n.is_empty())
+            .unwrap_or("skill")
+            .to_string();
+        out.push((name, section));
+    }
+    out
+}
+
+/// Whether the loaded skills' anchors are due for restatement.
+///
+/// `interval == 0` is off, and is the default: a skill that only needed to
+/// survive a fold should not also pay a timer, and every fire costs tokens at
+/// the end of the conversation where they compete with the task.
+///
+/// J-Space asks for its premise "every third seam" and its own verifier calls
+/// the verbatim recurrence the mechanism rather than an optimisation — so this
+/// exists for fidelity to a skill that asks for it, which is why the rate is
+/// the operator's to set rather than a number baked in here.
+pub(crate) fn should_restate_skill_anchors(
+    interval: u32,
+    anchors_len: usize,
+    turns_taken: usize,
+    last_restated_at: usize,
+) -> bool {
+    if interval == 0 || anchors_len == 0 {
+        return false;
+    }
+    turns_taken.saturating_sub(last_restated_at) >= interval as usize
+}
+
+/// The restatement itself. Tagged like every other boundary nudge so the model
+/// can tell harness text from the user's.
+fn skill_anchor_reminder_message(anchors: &[(String, String)]) -> LoopMessage {
+    let body = anchors
+        .iter()
+        .map(|(name, section)| format!("[{name}]\n{section}"))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    LoopMessage::User(super::message::UserMessage::text(format!(
+        "{SKILL_ANCHOR_TAG} These skills are still in force. Their anchors, restated \
+         because they thin out with distance rather than with change:\n\n{body}"
+    )))
+}
+
 fn track_work_reminder_message() -> LoopMessage {
     LoopMessage::User(super::message::UserMessage::text(format!(
         "{TRACK_WORK_TAG} You're editing files without an active todo. Before continuing, \

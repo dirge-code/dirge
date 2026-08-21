@@ -1,61 +1,17 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use bytes::Bytes;
 use rig::http_client::{
     self, HttpClientExt, LazyBody, MultipartForm, Request, Response, StreamingResponse,
 };
 
-use crate::provider::auth::RefreshedAuth;
+pub(crate) use crate::provider::refreshable_token::RefreshFn;
+use crate::provider::refreshable_token::{self, RefreshableToken};
 
-/// Refreshes an expired Anthropic OAuth credential and returns the new bearer
-/// and its expiry. Boxed so tests can inject a fake; the live seam re-runs the
-/// same read/refresh/persist path the client build used (dirge-956a).
-pub(crate) type RefreshFn = Arc<dyn Fn() -> anyhow::Result<RefreshedAuth> + Send + Sync>;
-
-struct TokenState {
-    bearer: String,
-    /// `None` means "never refresh" — a static env token with no refresh
-    /// grant, or the `Default`/API-key path that doesn't send a bearer.
-    expires_at_ms: Option<i64>,
-}
-
-/// A bearer that can renew itself when it expires part-way through a long
-/// session (dirge-956a). Pre-fix the bearer was frozen at client build, so a
-/// run that crossed token expiry died on a non-retryable 401.
-pub(crate) struct RefreshableToken {
-    state: Mutex<TokenState>,
-    refresher: RefreshFn,
-}
-
-impl RefreshableToken {
-    /// Current bearer, refreshing first if it has expired. A refresh failure
-    /// keeps the stale token so the request fails exactly as it did before
-    /// this fix (no regression) rather than wedging the client; the next
-    /// request will try again. Refresh is rare (once per token lifetime) so
-    /// doing it synchronously here is acceptable.
-    fn bearer(&self) -> String {
-        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(expires_at) = state.expires_at_ms {
-            let now = chrono::Utc::now().timestamp_millis();
-            if crate::auth::file_store::epoch_ms_is_expired(expires_at, now) {
-                match (self.refresher)() {
-                    Ok(fresh) => {
-                        state.bearer = fresh.bearer_token;
-                        state.expires_at_ms = fresh.expires_at_ms;
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            target: "dirge::provider",
-                            error = %e,
-                            "Anthropic OAuth token expired and refresh failed; sending the stale token",
-                        );
-                    }
-                }
-            }
-        }
-        state.bearer.clone()
-    }
-}
+/// Anthropic sits at no refresh margin today — its tokens are long-lived
+/// enough to cross the expiry boundary rarely. See the field docs on
+/// `RefreshableToken::margin_ms`.
+const REFRESH_MARGIN_MS: i64 = 0;
 
 /// Normalizes Anthropic OAuth requests at the transport boundary: swaps
 /// `x-api-key` for `Authorization: Bearer`, adds the Claude Code identity
@@ -100,15 +56,7 @@ impl AnthropicHttpClient {
     pub(crate) fn new(bearer_token: String) -> Self {
         Self {
             inner: reqwest::Client::new(),
-            token: Some(Arc::new(RefreshableToken {
-                state: Mutex::new(TokenState {
-                    bearer: bearer_token,
-                    expires_at_ms: None,
-                }),
-                refresher: Arc::new(|| {
-                    Err(anyhow::anyhow!("no Anthropic OAuth refresher configured"))
-                }),
-            })),
+            token: Some(Arc::new(RefreshableToken::fixed(bearer_token))),
         }
     }
 
@@ -122,25 +70,24 @@ impl AnthropicHttpClient {
     ) -> Self {
         Self {
             inner: reqwest::Client::new(),
-            token: Some(Arc::new(RefreshableToken {
-                state: Mutex::new(TokenState {
-                    bearer: bearer_token,
-                    expires_at_ms,
-                }),
+            token: Some(Arc::new(RefreshableToken::renewable(
+                bearer_token,
+                expires_at_ms,
                 refresher,
-            })),
+                REFRESH_MARGIN_MS,
+                "anthropic",
+            ))),
         }
     }
 
-    fn normalized_request<T>(&self, req: Request<T>) -> http_client::Result<Request<Bytes>>
-    where
-        T: Into<Bytes>,
-    {
-        // Resolve the bearer up front — this is where a mid-session refresh
-        // fires if the token has expired (dirge-956a).
-        let bearer = self.token.as_ref().map(|t| t.bearer());
+    /// dirge-bz0a: the bearer is resolved by the CALLER, in async context,
+    /// because a mid-session renewal blocks (see `refreshable_token`). This
+    /// stays sync and pure so it can run inline once the bearer is in hand.
+    fn normalized_request(
+        req: Request<Bytes>,
+        bearer: Option<String>,
+    ) -> http_client::Result<Request<Bytes>> {
         let (mut parts, body) = req.into_parts();
-        let body: Bytes = body.into();
         parts.headers.remove("x-api-key");
         if let Some(token) = bearer.as_deref()
             && let Ok(value) = http::HeaderValue::from_str(&format!("Bearer {token}"))
@@ -211,9 +158,12 @@ impl HttpClientExt for AnthropicHttpClient {
         U: Send + 'static,
     {
         let inner = self.inner.clone();
-        let req = self.normalized_request(req);
+        let token = self.token.clone();
+        // `T` is not `'static`, and the returned future is; the body
+        // conversion is the only step that needs `T`, so it happens here.
+        let req: Request<Bytes> = req.map(Into::into);
         async move {
-            let req = req?;
+            let req = Self::normalized_request(req, refreshable_token::bearer(token).await)?;
             inner.send(req).await
         }
     }
@@ -236,9 +186,12 @@ impl HttpClientExt for AnthropicHttpClient {
         T: Into<Bytes> + Send,
     {
         let inner = self.inner.clone();
-        let req = self.normalized_request(req);
+        let token = self.token.clone();
+        // `T` is not `'static`, and the returned future is; the body
+        // conversion is the only step that needs `T`, so it happens here.
+        let req: Request<Bytes> = req.map(Into::into);
         async move {
-            let req = req?;
+            let req = Self::normalized_request(req, refreshable_token::bearer(token).await)?;
             inner.send_streaming(req).await
         }
     }
@@ -257,8 +210,10 @@ impl super::compressing_http::StreamingWithHeaders for AnthropicHttpClient {
     ) -> impl Future<Output = super::compressing_http::StreamingSend> + Send {
         use super::compressing_http::StreamingSend;
         let inner = self.inner.clone();
-        let req = self.normalized_request(req);
+        let token = self.token.clone();
+        let req: Request<Bytes> = req.map(Into::into);
         async move {
+            let req = Self::normalized_request(req, refreshable_token::bearer(token).await);
             match req {
                 Ok(req) => inner.send_streaming_with_headers(req).await,
                 // A normalization failure never reached the network, so there
@@ -655,21 +610,39 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    fn token(bearer: &str, expires_at_ms: Option<i64>, refresher: RefreshFn) -> RefreshableToken {
-        RefreshableToken {
-            state: Mutex::new(TokenState {
-                bearer: bearer.to_string(),
-                expires_at_ms,
-            }),
+    use crate::provider::auth::RefreshedAuth;
+
+    /// These pin dirge-956a — a bearer that renews itself mid-session —
+    /// against the SHARED token (dirge-bz0a folded the three per-transport
+    /// copies into one). They go through `refreshable_token::bearer`, the
+    /// real path every send now takes, rather than poking the type
+    /// directly, so they also cover the async seam that keeps a renewal
+    /// off the runtime thread.
+    fn token(
+        bearer: &str,
+        expires_at_ms: Option<i64>,
+        refresher: RefreshFn,
+    ) -> Arc<RefreshableToken> {
+        Arc::new(RefreshableToken::renewable(
+            bearer.to_string(),
+            expires_at_ms,
             refresher,
-        }
+            REFRESH_MARGIN_MS,
+            "anthropic",
+        ))
+    }
+
+    async fn bearer_of(tok: &Arc<RefreshableToken>) -> String {
+        refreshable_token::bearer(Some(tok.clone()))
+            .await
+            .expect("a token always resolves to a bearer")
     }
 
     /// dirge-956a: an expired bearer refreshes exactly once, swaps in the new
     /// token, and caches the fresh expiry so a follow-up request doesn't
     /// refresh again.
-    #[test]
-    fn expired_token_refreshes_once_and_caches_fresh_expiry() {
+    #[tokio::test]
+    async fn expired_token_refreshes_once_and_caches_fresh_expiry() {
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_c = calls.clone();
         let future = chrono::Utc::now().timestamp_millis() + 3_600_000;
@@ -684,16 +657,16 @@ mod tests {
         let past = chrono::Utc::now().timestamp_millis() - 3_600_000;
         let tok = token("sk-ant-oat-stale", Some(past), refresher);
 
-        assert_eq!(tok.bearer(), "sk-ant-oat-fresh");
+        assert_eq!(bearer_of(&tok).await, "sk-ant-oat-fresh");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         // Second call sees the cached fresh (future) expiry — no re-refresh.
-        assert_eq!(tok.bearer(), "sk-ant-oat-fresh");
+        assert_eq!(bearer_of(&tok).await, "sk-ant-oat-fresh");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     /// A token that is still valid is used as-is; the refresher never fires.
-    #[test]
-    fn valid_token_is_not_refreshed() {
+    #[tokio::test]
+    async fn valid_token_is_not_refreshed() {
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_c = calls.clone();
         let refresher: RefreshFn = Arc::new(move || {
@@ -706,24 +679,24 @@ mod tests {
         let future = chrono::Utc::now().timestamp_millis() + 3_600_000;
         let tok = token("sk-ant-oat-live", Some(future), refresher);
 
-        assert_eq!(tok.bearer(), "sk-ant-oat-live");
+        assert_eq!(bearer_of(&tok).await, "sk-ant-oat-live");
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     /// A refresh failure keeps the stale token so the request fails the same
     /// way it did pre-fix (no worse), rather than wedging the client.
-    #[test]
-    fn refresh_failure_falls_back_to_stale_token() {
+    #[tokio::test]
+    async fn refresh_failure_falls_back_to_stale_token() {
         let refresher: RefreshFn = Arc::new(|| anyhow::bail!("network down"));
         let past = chrono::Utc::now().timestamp_millis() - 1;
         let tok = token("sk-ant-oat-stale", Some(past), refresher);
 
-        assert_eq!(tok.bearer(), "sk-ant-oat-stale");
+        assert_eq!(bearer_of(&tok).await, "sk-ant-oat-stale");
     }
 
     /// A static token with no expiry (env path) never refreshes.
-    #[test]
-    fn none_expiry_never_refreshes() {
+    #[tokio::test]
+    async fn none_expiry_never_refreshes() {
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_c = calls.clone();
         let refresher: RefreshFn = Arc::new(move || {
@@ -735,7 +708,7 @@ mod tests {
         });
         let tok = token("sk-ant-oat-static", None, refresher);
 
-        assert_eq!(tok.bearer(), "sk-ant-oat-static");
+        assert_eq!(bearer_of(&tok).await, "sk-ant-oat-static");
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
@@ -888,6 +861,50 @@ mod tests {
         );
     }
 
+    /// dirge-ugah.2: a mid-session memory refresh must not grow `system`.
+    ///
+    /// Anthropic renders `tools → system → messages` and caches on a strict
+    /// prefix match, so an extra system block shifts every message byte after
+    /// it and re-bills the whole conversation at cache-write price. The
+    /// refresh is a user-role `<system-reminder>`, so the hoist finds nothing
+    /// to relocate and `system` comes out byte-identical to a request without
+    /// it. The hoist itself stays — compaction summaries still need it (see
+    /// `oauth_shaper_hoists_system_messages_out_of_messages_array`).
+    #[test]
+    fn memory_refresh_leaves_the_system_array_byte_identical() {
+        let base_messages = serde_json::json!([{"role": "user", "content": "first"}]);
+        let mut refreshed = base_messages.as_array().unwrap().clone();
+        refreshed.push(crate::agent::agent_loop::run::memory_refresh_message(
+            "- fact one\n",
+        ));
+
+        let shape = |messages: &serde_json::Value| -> serde_json::Value {
+            let body = Bytes::from(
+                serde_json::json!({
+                    "model": "claude-sonnet-4-5",
+                    "stream": true,
+                    "system": [{"type": "text", "text": "Real prompt."}],
+                    "messages": messages,
+                })
+                .to_string(),
+            );
+            serde_json::from_slice(&shape_oauth_messages_payload(body)).unwrap()
+        };
+
+        let without = shape(&base_messages);
+        let with = shape(&serde_json::Value::Array(refreshed));
+
+        assert_eq!(
+            without["system"], with["system"],
+            "the memory refresh must not touch the cached system prefix"
+        );
+        assert_eq!(
+            with["messages"].as_array().unwrap().len(),
+            2,
+            "the refresh must survive in messages[], not be hoisted away"
+        );
+    }
+
     #[test]
     fn oauth_shaper_splits_assistant_text_after_tool_use() {
         let body = Bytes::from(
@@ -934,7 +951,6 @@ mod tests {
 
     #[test]
     fn non_oauth_messages_payload_passes_through_unchanged() {
-        let client = AnthropicHttpClient::new("sk-ant-api03-test".to_string());
         let body = Bytes::from(
             r#"{"model":"claude","stream":true,"system":[{"type":"text","text":"Real prompt"}],"messages":[{"role":"user","content":"hello"}]}"#,
         );
@@ -944,7 +960,9 @@ mod tests {
             .body(body.clone())
             .unwrap();
 
-        let normalized = client.normalized_request(req).unwrap();
+        let normalized =
+            AnthropicHttpClient::normalized_request(req, Some("sk-ant-api03-test".to_string()))
+                .expect("normalization must succeed");
         assert_eq!(normalized.into_body(), body);
     }
 
@@ -999,8 +1017,60 @@ mod tests {
         );
     }
 
-    fn oauth_client() -> AnthropicHttpClient {
-        AnthropicHttpClient::new("sk-ant-oat-test".to_string())
+    /// The OAuth bearer the shaping tests normalize against. Passed
+    /// straight in: since dirge-bz0a the bearer is resolved by the caller
+    /// (asynchronously, so a renewal cannot block the runtime) and
+    /// `normalized_request` is a pure function of request + bearer.
+    const OAUTH_BEARER: &str = "sk-ant-oat-test";
+
+    fn normalize_oauth(req: Request<Bytes>) -> Request<Bytes> {
+        AnthropicHttpClient::normalized_request(req, Some(OAUTH_BEARER.to_string()))
+            .expect("normalization must succeed")
+    }
+
+    /// The one thing this transport exists to do, and the only one that
+    /// had no test: swap Anthropic's `x-api-key` for the resolved OAuth
+    /// bearer. Kimi and Codex both covered their equivalent; this was the
+    /// gap a mutation found.
+    #[test]
+    fn the_resolved_bearer_replaces_the_api_key_header() {
+        let req = Request::builder()
+            .method("POST")
+            .uri("https://api.anthropic.com/v1/messages")
+            .header("x-api-key", "sk-ant-api03-should-be-dropped")
+            .body(Bytes::from("{}"))
+            .unwrap();
+        let out = normalize_oauth(req);
+        assert_eq!(
+            out.headers()
+                .get(http::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok()),
+            Some(format!("Bearer {OAUTH_BEARER}").as_str()),
+        );
+        assert!(
+            out.headers().get("x-api-key").is_none(),
+            "the api-key header must not ride along with an OAuth bearer",
+        );
+    }
+
+    /// The discrimination half: with no bearer to insert, the request is
+    /// left as rig built it rather than getting an empty Authorization.
+    #[test]
+    fn no_bearer_leaves_the_authorization_header_alone() {
+        let req = Request::builder()
+            .method("POST")
+            .uri("https://api.anthropic.com/v1/messages")
+            .header(http::header::AUTHORIZATION, "Bearer PREEXISTING")
+            .body(Bytes::from("{}"))
+            .unwrap();
+        let out =
+            AnthropicHttpClient::normalized_request(req, None).expect("normalization must succeed");
+        assert_eq!(
+            out.headers()
+                .get(http::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok()),
+            Some("Bearer PREEXISTING"),
+        );
     }
 
     fn messages_req(body: Bytes) -> Request<Bytes> {
@@ -1022,11 +1092,10 @@ mod tests {
 
     #[test]
     fn dynamic_beta_includes_interleaved_thinking_when_extended() {
-        let client = oauth_client();
         let body = Bytes::from(
             r#"{"model":"claude-opus-4-5","messages":[],"thinking":{"type":"enabled","budget_tokens":10000}}"#,
         );
-        let normalized = client.normalized_request(messages_req(body)).unwrap();
+        let normalized = normalize_oauth(messages_req(body));
         let header = beta_header(&normalized);
         assert!(
             header.contains("interleaved-thinking-2025-05-14"),
@@ -1036,11 +1105,10 @@ mod tests {
 
     #[test]
     fn dynamic_beta_excludes_interleaved_thinking_when_adaptive() {
-        let client = oauth_client();
         let body = Bytes::from(
             r#"{"model":"claude-opus-4-7","messages":[],"thinking":{"type":"adaptive","display":"summarized"}}"#,
         );
-        let normalized = client.normalized_request(messages_req(body)).unwrap();
+        let normalized = normalize_oauth(messages_req(body));
         let header = beta_header(&normalized);
         assert!(
             !header.contains("interleaved-thinking-2025-05-14"),
@@ -1050,9 +1118,8 @@ mod tests {
 
     #[test]
     fn dynamic_beta_baseline_oauth_set_unchanged() {
-        let client = oauth_client();
         let body = Bytes::from(r#"{"model":"claude-sonnet-4-5","messages":[]}"#);
-        let normalized = client.normalized_request(messages_req(body)).unwrap();
+        let normalized = normalize_oauth(messages_req(body));
         let header = beta_header(&normalized);
         assert!(
             header.contains("claude-code-20250219"),
@@ -1077,9 +1144,8 @@ mod tests {
         // that doesn't know the value: those reject the whole request with
         // "Unexpected value(s) `prompt-caching-scope-2026-01-05` for the
         // `anthropic-beta` header" rather than ignoring it.
-        let client = oauth_client();
         let body = Bytes::from(r#"{"model":"claude-sonnet-4-5","messages":[]}"#);
-        let normalized = client.normalized_request(messages_req(body)).unwrap();
+        let normalized = normalize_oauth(messages_req(body));
         let header = beta_header(&normalized);
         assert!(
             !header.contains("prompt-caching-scope"),

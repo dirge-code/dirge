@@ -13,9 +13,22 @@ tree-sitter:
 | `find_callees` | Extract all function/method calls made within a symbol's body (tree-sitter query). |
 
 Supports TypeScript/TSX, Python, Clojure (`.clj`/`.cljs`/`.cljc`/`.edn`/`.bb`),
-Go, Ruby (`.rb`/`.rake`/`.gemspec`), Rust, Java, C (`.c`/`.h`), and C++
-(`.cpp`/`.cc`/`.cxx`/`.hpp`/`.hh`/`.hxx`). Index is built lazily on first use and
-cached by file mtime.
+Go, Ruby (`.rb`/`.rake`/`.gemspec`), Rust, Java, C (`.c`/`.h`), C++
+(`.cpp`/`.cc`/`.cxx`/`.ixx`/`.hpp`/`.hh`/`.hxx`), Elixir (`.ex`/`.exs`), SQL,
+Dafny (`.dfy`), Swift, and Mojo (`.mojo`/`.🔥`). Index is built lazily on first
+use and cached by file mtime.
+
+`.ixx` is indexed on a best-effort basis: tree-sitter-cpp has no grammar for
+C++20 modules, so `export module M;` and `import std;` parse as errors and the
+declarations after them may be missed. For the same reason `.ixx` is left off
+the write-time syntax gate — see `GATE_EXCLUSIONS` in
+`src/semantic/syntax_validator.rs`.
+
+`.mojo`/`.🔥` are likewise indexed but left off the write-time syntax gate:
+measured against 800 real files from the modular repo, tree-sitter-mojo
+false-errors on ~10% (`@__llvm_metadata` decorators, function-type parametrics,
+`(var x) = …` patterns). Mojo writes get a comment/string-aware
+delimiter-balance check instead.
 
 ## Export detection per language
 
@@ -30,6 +43,7 @@ cached by file mtime.
 | Java | `public` modifier; package-private + `private` / `protected` stay non-exported | class/interface/method (incl. constructors) /variable (fields) — nested classes recursed |
 | C | `static` storage class = non-exported; extern by default | function/class (struct/enum) /type alias (typedef; suppressed when wrapping a named struct to avoid duplicates) |
 | C++ | `public:` / `private:` / `protected:` access labels tracked through class bodies | class (class/struct) /method (incl. through templates + namespaces) /function (top-level) — namespaces recursed |
+| Mojo | leading underscore convention; `__dunder__` treated as public | function/class (struct) /interface (trait + default methods) /method (incl. `__extension` methods, attached to the extended type) /type alias (`comptime` parameterized alias) |
 
 C and C++ both claim `.h`. When extracting a `.h` file, dirge sniffs the
 first 32 KiB for C++-only markers (`class `, `namespace `, `template<`, `::`)

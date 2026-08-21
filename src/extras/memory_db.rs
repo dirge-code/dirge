@@ -908,7 +908,7 @@ impl SqliteMemoryStore {
             "UPDATE memories SET status = 'tombstoned', updated_at = ?1 WHERE id = ?2",
             params![now, id],
         )
-        .map_err(|e| format!("Failed to tombstone entry: {e}"))?;
+        .map_err(|e| super::db_health::describe(conn, "Failed to tombstone entry", &e))?;
         Ok(())
     }
 
@@ -921,7 +921,7 @@ impl SqliteMemoryStore {
             "UPDATE memories SET tier = 'breadcrumb', updated_at = ?1 WHERE id = ?2",
             params![now, id],
         )
-        .map_err(|e| format!("Failed to demote entry: {e}"))?;
+        .map_err(|e| super::db_health::describe(conn, "Failed to demote entry", &e))?;
         Ok(())
     }
 
@@ -1058,11 +1058,24 @@ impl SqliteMemoryStore {
                     params![id, redact_for_fts(&entry)],
                 )
                 .map_err(|e| format!("Failed to reindex overview: {e}"))?;
+                // dirge-vpma.35: refreshing the overview can GROW it, and this
+                // branch used to commit without compacting — only the
+                // whole-budget gate above applied. A refresh with a much larger
+                // body then left the hot tier over `char_limit_for`, rendering
+                // oversized into every system prompt until some unrelated
+                // insert happened to trigger compaction. Same grow-must-compact
+                // rule `replace_entry` follows, and like it the cost is 0
+                // because the UPDATE above already put the new size in the
+                // rows this reads. The overview itself is eviction-exempt, so
+                // this demotes around it.
+                let demoted = Self::make_room_in_hot(&tx, target, 0, false)?;
+                let archived = if demoted > 0 {
+                    Self::compact_breadcrumbs(&tx, target)?
+                } else {
+                    0
+                };
                 tx.commit().map_err(|e| format!("Failed to commit: {e}"))?;
-                return Ok(CompactionOutcome {
-                    demoted: 0,
-                    archived: 0,
-                });
+                return Ok(CompactionOutcome { demoted, archived });
             }
         }
 
@@ -2725,6 +2738,65 @@ mod tests {
         // The original overview must survive the rejected refresh.
         let view = store.view("memory").to_string();
         assert!(view.contains("a Rust CLI"), "original overview intact");
+    }
+
+    /// dirge-vpma.35: the same grow-must-compact rule on the OTHER path that
+    /// can grow a hot row.
+    ///
+    /// An overview refresh replaces the body in place. The branch checked only
+    /// the whole-budget gate and committed, so a refresh with a much larger
+    /// body left the hot tier over `char_limit_for` — rendering oversized into
+    /// every system prompt until some unrelated insert happened to compact.
+    /// Deliberately mirrors `replace_growing_a_hot_entry_compacts_to_stay_in_budget`:
+    /// two paths, one rule.
+    #[test]
+    fn refreshing_the_overview_larger_compacts_to_stay_in_budget() {
+        let (paths, _dir) = temp_project();
+        let store = SqliteMemoryStore::load(&paths).unwrap();
+
+        // A small overview, then a hot tier filled close to the 2200 budget.
+        store
+            .add_entry("memory", "overview: a Rust CLI", Some(MemoryKind::Overview))
+            .unwrap();
+        for i in 0..4 {
+            let e = format!("fact {i}: {}", "x".repeat(390));
+            store
+                .add_entry("memory", &e, Some(MemoryKind::Semantic))
+                .unwrap();
+        }
+
+        // Refresh the overview with a much larger body — under the whole
+        // budget on its own, so the only gate that could catch it is
+        // compaction.
+        let big = format!("overview: {}", "y".repeat(1500));
+        store
+            .add_entry("memory", &big, Some(MemoryKind::Overview))
+            .unwrap();
+
+        let conn = raw_conn(&paths);
+        let hot_total: i64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(LENGTH(content) + 3), 0) FROM memories \
+                 WHERE target = 'memory' AND status = 'active' AND tier = 'hot'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            hot_total <= DEFAULT_MEMORY_CHAR_LIMIT as i64,
+            "hot tier must stay within budget after a growing overview refresh, got {hot_total}"
+        );
+        // And the refreshed overview is the one that stayed — it is
+        // eviction-exempt, so compaction must demote around it.
+        let overview_hot: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories \
+                 WHERE status = 'active' AND tier = 'hot' AND content LIKE 'overview: yyy%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(overview_hot, 1, "the refreshed overview must stay hot");
     }
 
     #[test]

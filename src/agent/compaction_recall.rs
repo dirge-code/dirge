@@ -116,6 +116,287 @@ pub(crate) fn session_with_facts(facts: &[PlantedFact]) -> Vec<Value> {
     msgs
 }
 
+/// A harder seed set (dirge-e31n.7).
+///
+/// [`seed_facts`] + [`session_with_facts`] deliberately make the facts easy:
+/// six of them, each announced by its own turn as `noted (file path): X — keep
+/// this for later`. That is right for what those guard — that dirge's own
+/// window/serialization carries facts to the summarizer — but useless for
+/// comparing SCHEMAS, because any competent summarizer keeps all six and both
+/// arms score 6/6. A null result there would say nothing about the schema, only
+/// that the fixture was too easy.
+///
+/// So this set is twenty facts, none announced, each buried inside plausible
+/// tool output with surrounding noise. The summarizer has to decide what is
+/// load-bearing rather than copy a labelled list — which is the thing a schema
+/// can plausibly change.
+pub(crate) fn hard_facts() -> Vec<PlantedFact> {
+    vec![
+        PlantedFact {
+            kind: "file path",
+            needle: "crates/ingest/src/backfill/checkpoint.rs",
+        },
+        PlantedFact {
+            kind: "file path",
+            needle: "config/staging/ingest.toml",
+        },
+        PlantedFact {
+            kind: "code location",
+            needle: "resume_from_offset at line 412",
+        },
+        PlantedFact {
+            kind: "code location",
+            needle: "checkpoint.rs:88",
+        },
+        PlantedFact {
+            kind: "error message",
+            needle: "called `Option::unwrap()` on a `None` value",
+        },
+        PlantedFact {
+            kind: "error message",
+            needle: "connection pool exhausted after 30s",
+        },
+        PlantedFact {
+            kind: "error message",
+            needle: "checksum mismatch: expected 8f3a1c, got 2b90de",
+        },
+        PlantedFact {
+            kind: "config value",
+            needle: "INGEST_BATCH_SIZE=512",
+        },
+        PlantedFact {
+            kind: "config value",
+            needle: "pool.max_connections = 16",
+        },
+        PlantedFact {
+            kind: "config value",
+            needle: "retry.backoff_ms = 250",
+        },
+        PlantedFact {
+            kind: "identifier",
+            needle: "job_7fK2pQx9",
+        },
+        PlantedFact {
+            kind: "identifier",
+            needle: "shard-a4e1",
+        },
+        PlantedFact {
+            kind: "identifier",
+            needle: "migration 0042_add_offset_index",
+        },
+        PlantedFact {
+            kind: "numeric value",
+            needle: "1_048_576 rows",
+        },
+        PlantedFact {
+            kind: "numeric value",
+            needle: "offset 883421",
+        },
+        PlantedFact {
+            kind: "numeric value",
+            needle: "p99 of 4.7s",
+        },
+        PlantedFact {
+            kind: "command",
+            needle: "cargo test -p ingest --features backfill",
+        },
+        PlantedFact {
+            kind: "command",
+            needle: "psql -c 'select max(offset) from ingest_log'",
+        },
+        PlantedFact {
+            kind: "user constraint",
+            needle: "do not touch the production shard",
+        },
+        // NOT "truncate-and-replay", which is what this said first. That
+        // string contains "truncat", which is a keyword
+        // `declares_incomplete_coverage` scans for — so every coverage probe
+        // scored a declared gap the moment the summary mentioned this fact,
+        // in BOTH arms, for a reason that had nothing to do with coverage.
+        // `no_planted_fact_collides_with_the_coverage_detector` stops it
+        // coming back.
+        PlantedFact {
+            kind: "rejected alternative",
+            needle: "rejected the drop-and-replay approach",
+        },
+    ]
+}
+
+/// Plausible filler that reads like real tool output, so a fact is one line
+/// among many rather than the only content of its turn.
+fn noise(seed: usize, lines: usize) -> String {
+    (0..lines)
+        .map(|i| {
+            let n = seed * 31 + i * 7;
+            format!(
+                "  ingest::backfill::worker  batch {n} ok  \
+                 rows={} lag_ms={} shard=b{}",
+                200 + n % 97,
+                12 + n % 43,
+                n % 8
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// A realistic debugging session carrying [`hard_facts`], each embedded in a
+/// noisy tool result rather than announced.
+///
+/// Every fact-bearing turn stays well under
+/// `compression::SUMMARY_TURN_CHARS` (2000) so the per-turn truncation is not
+/// silently doing the dropping — that would measure the serializer, not the
+/// schema. `planted_hard_facts_reach_the_summarizer` pins it.
+pub(crate) fn noisy_session(facts: &[PlantedFact]) -> Vec<Value> {
+    let mut msgs: Vec<Value> = vec![
+        json!({"role": "system", "content": "you are dirge, a coding agent"}),
+        json!({"role": "user", "content": "the nightly ingest backfill is stalling — find out why"}),
+    ];
+
+    // Volume matters as much as the facts. `summary_budget` is 20% of the
+    // material once past its 2000-token floor, so the session has to be big
+    // enough that the floor is not what the summarizer is working against —
+    // otherwise the "hard" fixture is only mildly compressed and both arms keep
+    // everything. Volume comes from MORE turns, not longer ones:
+    // `serialize_turns_for_summary` truncates a non-user turn at 2000 chars.
+    for i in 0..8 {
+        msgs.push(json!({"role": "assistant", "content": format!("pulling the worker logs (pass {i})\n{}", noise(i, 18))}));
+        msgs.push(json!({"role": "user", "content": format!("keep digging {i}")}));
+    }
+
+    for (i, fact) in facts.iter().enumerate() {
+        // The fact sits in the middle of ordinary output, phrased the way that
+        // kind of detail actually shows up.
+        let body = match fact.kind {
+            "command" => format!("{}\n$ {}\n{}", noise(i, 4), fact.needle, noise(i + 50, 4)),
+            "user constraint" | "rejected alternative" => {
+                format!("{}\n{}\n{}", noise(i, 3), fact.needle, noise(i + 60, 3))
+            }
+            _ => format!("{}\n  {}\n{}", noise(i, 5), fact.needle, noise(i + 70, 5)),
+        };
+        let role = if fact.kind == "user constraint" {
+            "user"
+        } else {
+            "assistant"
+        };
+        msgs.push(json!({"role": role, "content": body}));
+        msgs.push(json!({"role": "user", "content": format!("ok, and then? ({i})")}));
+        // Filler between facts, so they are spread through the material rather
+        // than arriving as a dense run the summarizer can lift wholesale.
+        msgs.push(json!({"role": "assistant", "content": format!("continuing the sweep ({i})\n{}", noise(i + 120, 18))}));
+        msgs.push(json!({"role": "user", "content": format!("carry on ({i})")}));
+    }
+
+    for i in 0..8 {
+        msgs.push(json!({"role": "assistant", "content": format!("narrowing it down (pass {i})\n{}", noise(i + 90, 18))}));
+        msgs.push(json!({"role": "user", "content": format!("go on {i}")}));
+    }
+    msgs.push(json!({"role": "user", "content": "so what is the actual fix?"}));
+    msgs
+}
+
+/// Facts that exist ONLY inside tool-call arguments (dirge-czg9).
+///
+/// Every other fixture here plants its facts in message text, which is the one
+/// thing both compaction paths serialize. These are the opposite case: what the
+/// agent DID, recorded nowhere but the call it made. The prose around a call
+/// routinely does not restate it ("done", "that worked"), so if the serializer
+/// drops the call, the fact is gone before the summarizer is consulted.
+pub(crate) fn tool_call_facts() -> Vec<PlantedFact> {
+    vec![
+        PlantedFact {
+            kind: "write target",
+            needle: "crates/ingest/src/backfill/resume.rs",
+        },
+        PlantedFact {
+            kind: "bash command",
+            needle: "psql -f migrations/0043_backfill_offset.sql",
+        },
+        PlantedFact {
+            kind: "grep pattern",
+            needle: "resume_from_offset_unchecked",
+        },
+        PlantedFact {
+            kind: "edit target",
+            needle: "config/production/ingest-shard-a4e1.toml",
+        },
+        PlantedFact {
+            kind: "command flag",
+            needle: "--max-lag-seconds=90",
+        },
+        PlantedFact {
+            kind: "moved path",
+            needle: "scripts/replay_from_checkpoint.py",
+        },
+    ]
+}
+
+/// A session whose load-bearing detail lives in tool-call arguments.
+///
+/// The assistant's prose is deliberately uninformative — "done", "that
+/// worked" — because that is the realistic case and the one that makes the
+/// serializer load-bearing. A fixture whose prose restated every call would
+/// measure nothing.
+pub(crate) fn tool_call_session(facts: &[PlantedFact]) -> Vec<Value> {
+    let mut msgs: Vec<Value> = vec![
+        json!({"role": "system", "content": "you are dirge, a coding agent"}),
+        json!({"role": "user", "content": "get the ingest backfill unstuck"}),
+    ];
+    for i in 0..6 {
+        msgs.push(json!({"role": "assistant", "content": format!("checking the workers (pass {i})\n{}", noise(i, 16))}));
+        msgs.push(json!({"role": "user", "content": format!("go on {i}")}));
+    }
+
+    let calls: Vec<(&str, Value)> = vec![
+        (
+            "write",
+            json!({"path": facts[0].needle, "content": "pub fn resume() {}\n"}),
+        ),
+        ("bash", json!({"command": facts[1].needle})),
+        (
+            "grep",
+            json!({"pattern": facts[2].needle, "path": "crates/ingest"}),
+        ),
+        (
+            "edit",
+            json!({"path": facts[3].needle, "old_text": "lag=30", "new_text": "lag=90"}),
+        ),
+        (
+            "bash",
+            json!({"command": format!("./ingestctl backfill {}", facts[4].needle)}),
+        ),
+        (
+            "bash",
+            json!({"command": format!("git mv old_replay.py {}", facts[5].needle)}),
+        ),
+    ];
+
+    for (i, (name, args)) in calls.into_iter().enumerate() {
+        msgs.push(json!({
+            "role": "assistant",
+            "content": [
+                // Uninformative on purpose: the call is the only record.
+                {"type": "text", "text": "ok, doing that now"},
+                {"type": "toolCall", "id": format!("call_{i}"), "name": name, "arguments": args},
+            ],
+        }));
+        msgs.push(json!({
+            "role": "toolResult",
+            "content": format!("done\n{}", noise(i + 200, 4)),
+        }));
+        msgs.push(json!({"role": "user", "content": format!("good, next ({i})")}));
+        msgs.push(json!({"role": "assistant", "content": format!("continuing ({i})\n{}", noise(i + 300, 16))}));
+        msgs.push(json!({"role": "user", "content": format!("carry on ({i})")}));
+    }
+
+    for i in 0..6 {
+        msgs.push(json!({"role": "assistant", "content": format!("wrapping up (pass {i})\n{}", noise(i + 400, 16))}));
+        msgs.push(json!({"role": "user", "content": format!("keep going {i}")}));
+    }
+    msgs.push(json!({"role": "user", "content": "summarise what you changed"}));
+    msgs
+}
+
 /// How many planted facts survived in `text`.
 pub(crate) struct RecallReport {
     pub total: usize,
@@ -130,13 +411,44 @@ impl RecallReport {
     }
 }
 
-/// Score verbatim recall: a fact survives iff its exact `needle` appears in
-/// `text`. Verbatim by design — the whole point is that paraphrase loses the
-/// detail (a path or error string is only useful exact).
+/// Strip markdown presentation before matching (dirge-e31n.7).
+///
+/// A raw `contains` looked right and was not. Measured against a live model,
+/// three of the "dropped" facts in one run were present and faithful:
+///
+///   needle  `called \`Option::unwrap()\` on a \`None\` value`
+///   written `` `called Option::unwrap() on a None value` ``   (inner ticks eaten
+///           by the outer code span)
+///   written ``` `called \`Option::unwrap()\` on a \`None\` value` ``` (escaped)
+///
+///   needle  `offset 883421`
+///   written ``offset `883421` ``    (the model code-formatted the number)
+///
+/// Wrapping an identifier in backticks is the natural thing for a model
+/// writing markdown to do, so scoring it as a loss measures formatting habits
+/// and reports them as fidelity. Worse, it would do so UNEVENLY — the arm that
+/// writes more prose formats more — which is precisely the difference under
+/// test.
+///
+/// Only presentation is removed: backticks, backslashes, and runs of
+/// whitespace. Case, punctuation, and every character of the identifier itself
+/// still have to match, so a paraphrase is still a miss —
+/// `scorer_still_catches_a_paraphrase` pins that this did not turn into a
+/// scorer that credits anything.
+fn normalize_for_match(s: &str) -> String {
+    let stripped: String = s.chars().filter(|c| *c != '`' && *c != '\\').collect();
+    stripped.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Score verbatim recall: a fact survives iff its `needle` appears in `text`,
+/// compared after [`normalize_for_match`]. Verbatim by design — the whole point
+/// is that paraphrase loses the detail (a path or error string is only useful
+/// exact).
 pub(crate) fn score_recall(text: &str, facts: &[PlantedFact]) -> RecallReport {
+    let haystack = normalize_for_match(text);
     let dropped: Vec<(&'static str, &'static str)> = facts
         .iter()
-        .filter(|f| !text.contains(f.needle))
+        .filter(|f| !haystack.contains(&normalize_for_match(f.needle)))
         .map(|f| (f.kind, f.needle))
         .collect();
     RecallReport {
@@ -144,6 +456,54 @@ pub(crate) fn score_recall(text: &str, facts: &[PlantedFact]) -> RecallReport {
         survived: facts.len() - dropped.len(),
         dropped,
     }
+}
+
+/// Does the summary tell its reader that it was built from partial material?
+///
+/// The question this answers is not cosmetic (dirge-5zca). When the assembled
+/// prompt exceeds the summarizer's input budget, `head_tail_truncate` removes
+/// the middle and leaves a marker — and a summary built from a clipped
+/// transcript reads exactly like one built from the whole thing. The next turn,
+/// and the user, have no way to know the record is partial.
+///
+/// Substring detection over a free-form claim, so it is deliberately paired
+/// with `coverage_detector_does_not_fire_on_a_confident_summary`: a detector
+/// that fires on everything would report perfect coverage-awareness and mean
+/// nothing.
+pub(crate) fn declares_incomplete_coverage(summary: &str) -> bool {
+    let s = summary.to_lowercase();
+
+    // NEGATION IS NOT OPTIONAL HERE. The most common thing a summarizer with a
+    // coverage slot writes is "COMPLETE — no truncation marker was shown",
+    // which contains "truncat". A bare substring scan reads that as a declared
+    // gap and scores a healthy run as an unhealthy one — for every run of the
+    // arm that HAS the slot, which is the arm under test. Observed verbatim in
+    // the live dumps before this was written.
+    const NEGATORS: [&str; 7] = [
+        "no ", "not ", "n't ", "without ", "none", "nothing ", "never ",
+    ];
+    let negated_at = |idx: usize| {
+        let from = idx.saturating_sub(30);
+        let window = &s[crate::text::char_boundary_at_or_after(&s, from)..idx];
+        NEGATORS.iter().any(|n| window.contains(n))
+    };
+
+    [
+        "truncat",
+        "incomplete",
+        "not complete",
+        "cut off",
+        "cut short",
+        "omitted",
+        "missing material",
+        "partial material",
+        "some material",
+    ]
+    .iter()
+    .any(|m| {
+        s.match_indices(m)
+            .any(|(idx, _)| !negated_at(idx) || *m == "not complete")
+    })
 }
 
 /// Full article-style probe: build a seeded session, run it through dirge's
@@ -155,14 +515,121 @@ pub(crate) async fn run_recall_eval(summarize: SummarizeFn) -> RecallReport {
     let msgs = session_with_facts(&facts);
     let (start, end) = compute_compress_window(&msgs, PROTECT_HEAD_DEFAULT, PROTECT_TAIL_DEFAULT);
     let middle = &msgs[start..end];
+    // dirge-tgb9: the fixture is dirge's own and contains no fence delimiter,
+    // so a failure here means the fixture grew one — loud is correct.
     let prompt = build_summary_prompt(
-        middle,
+        &crate::agent::compaction_material::from_loop_messages(middle),
         summary_budget(estimate_messages_tokens(middle)),
         None,
         None,
-    );
+    )
+    .expect("recall fixture must not contain the reserved fence delimiter");
     let summary = summarize(prompt).await.unwrap_or_default();
     score_recall(&summary, &facts)
+}
+
+/// Run the hard fixture through `summarize` once, under `schema`, and score
+/// the summary.
+///
+/// Everything except the section template is identical across schemas — same
+/// transcript, same window, same budget, same scorer — so a difference in the
+/// score is attributable to the template and nothing else.
+/// Returns the report AND the summary text, so a caller can inspect what the
+/// model actually wrote. Scoring is verbatim substring matching, which cannot
+/// tell "the model dropped this fact" from "the model reformatted it" — the
+/// summary is the only way to settle that, so the harness must hand it back.
+pub(crate) async fn run_hard_recall_eval_with(
+    summarize: SummarizeFn,
+    schema: super::compression::SummarySchema,
+) -> anyhow::Result<(RecallReport, String)> {
+    let facts = hard_facts();
+    let msgs = noisy_session(&facts);
+    let (start, end) = compute_compress_window(&msgs, PROTECT_HEAD_DEFAULT, PROTECT_TAIL_DEFAULT);
+    let middle = &msgs[start..end];
+    let prompt = super::compression::build_summary_prompt_with(
+        &crate::agent::compaction_material::from_loop_messages(middle),
+        summary_budget(estimate_messages_tokens(middle)),
+        None,
+        None,
+        schema,
+    )
+    .expect("recall fixture must not contain the reserved fence delimiter");
+    // NOT `unwrap_or_default()`. A provider error would become an empty
+    // string, score 0/20, and be reported as a maximally-lossy SUMMARY —
+    // indistinguishable from a real fidelity failure and dragging the arm's
+    // mean with it. Observed: one arm read 17.4/20 against another's 19.9
+    // purely because a single call had failed. A call that could not run is
+    // not a result (docs/verification-discipline.md).
+    let summary = summarize(prompt).await?;
+    let report = score_recall(&summary, &facts);
+    Ok((report, summary))
+}
+
+/// Tool-call probe (dirge-czg9): how many facts that live only in tool-call
+/// arguments survive a fold, and how many reached the summarizer at all.
+///
+/// Returns `(in_prompt, in_summary, summary)`. The two numbers answer different
+/// questions and both are needed. `in_prompt` is what dirge's own serializer
+/// chose to hand over — entirely dirge's doing, no model involved. `in_summary`
+/// is what the model then kept. A change that lifts the first and not the
+/// second is prompt bloat, not fidelity.
+pub(crate) async fn run_tool_call_probe_with(
+    summarize: SummarizeFn,
+    schema: super::compression::SummarySchema,
+) -> anyhow::Result<(RecallReport, RecallReport, String)> {
+    let facts = tool_call_facts();
+    let msgs = tool_call_session(&facts);
+    let (start, end) = compute_compress_window(&msgs, PROTECT_HEAD_DEFAULT, PROTECT_TAIL_DEFAULT);
+    let middle = &msgs[start..end];
+    let prompt = super::compression::build_summary_prompt_with(
+        &crate::agent::compaction_material::from_loop_messages(middle),
+        summary_budget(estimate_messages_tokens(middle)),
+        None,
+        None,
+        schema,
+    )
+    .expect("fixture is clean");
+    let in_prompt = score_recall(&prompt, &facts);
+    let summary = summarize(prompt).await?;
+    let in_summary = score_recall(&summary, &facts);
+    Ok((in_prompt, in_summary, summary))
+}
+
+/// Coverage probe (dirge-5zca + dirge-e31n.7): run the hard fixture with the
+/// assembled prompt CLIPPED the way `oneshot_with_model` clips it, and report
+/// whether the resulting summary admits it saw partial material.
+///
+/// The truncation is applied to the assembled prompt, not to the transcript,
+/// because that is where it happens in production — after
+/// `build_summary_prompt_with`, inside the one-shot. That also means the fence
+/// and the re-anchored output format survive (they sit in the retained head and
+/// tail), so this measures the coverage claim and not a broken prompt.
+pub(crate) async fn run_coverage_probe_with(
+    summarize: SummarizeFn,
+    schema: super::compression::SummarySchema,
+) -> anyhow::Result<(bool, String)> {
+    let facts = hard_facts();
+    let msgs = noisy_session(&facts);
+    let (start, end) = compute_compress_window(&msgs, PROTECT_HEAD_DEFAULT, PROTECT_TAIL_DEFAULT);
+    let middle = &msgs[start..end];
+    let prompt = super::compression::build_summary_prompt_with(
+        &crate::agent::compaction_material::from_loop_messages(middle),
+        summary_budget(estimate_messages_tokens(middle)),
+        None,
+        None,
+        schema,
+    )
+    .expect("recall fixture must not contain the reserved fence delimiter");
+
+    // Half the assembled prompt, so the cut is unmissable.
+    let clipped = crate::provider::summarize::head_tail_truncate(&prompt, prompt.len() / 2);
+    debug_assert!(
+        clipped.contains("truncated by summarizer-prompt budget"),
+        "the probe must actually clip the prompt"
+    );
+    let summary = summarize(clipped).await?;
+    let declared = declares_incomplete_coverage(&summary);
+    Ok((declared, summary))
 }
 
 #[cfg(test)]
@@ -185,16 +652,79 @@ mod tests {
 
         let middle = &msgs[start..end];
         let prompt = build_summary_prompt(
-            middle,
+            &crate::agent::compaction_material::from_loop_messages(middle),
             summary_budget(estimate_messages_tokens(middle)),
             None,
             None,
-        );
+        )
+        .expect("fixture is clean");
         let report = score_recall(&prompt, &facts);
         assert!(
             report.all_survived(),
             "facts dropped before reaching the summarizer: {:?}",
             report.dropped
+        );
+    }
+
+    /// The same guard as [`planted_facts_reach_the_summarizer`], for the hard
+    /// fixture. This one matters MORE, not less: the noisy turns are long, and
+    /// `serialize_turns_for_summary` truncates a non-user turn at 2000 chars.
+    /// If a fact fell past that cut, the bake-off would be measuring the
+    /// serializer and reporting it as a schema difference.
+    #[test]
+    fn planted_hard_facts_reach_the_summarizer() {
+        let facts = hard_facts();
+        let msgs = noisy_session(&facts);
+        let (start, end) =
+            compute_compress_window(&msgs, PROTECT_HEAD_DEFAULT, PROTECT_TAIL_DEFAULT);
+        assert!(start < end, "session must produce a non-empty window");
+
+        let middle = &msgs[start..end];
+        let prompt = build_summary_prompt(
+            &crate::agent::compaction_material::from_loop_messages(middle),
+            summary_budget(estimate_messages_tokens(middle)),
+            None,
+            None,
+        )
+        .expect("fixture is clean");
+        let report = score_recall(&prompt, &facts);
+        assert!(
+            report.all_survived(),
+            "facts dropped before reaching the summarizer: {:?}",
+            report.dropped
+        );
+    }
+
+    /// The hard fixture has to actually be hard: enough material that a
+    /// summarizer must choose what to keep. If it shrinks to where everything
+    /// fits comfortably, a null bake-off result would mean nothing.
+    #[test]
+    fn the_hard_fixture_forces_the_summarizer_to_choose() {
+        let facts = hard_facts();
+        assert!(
+            facts.len() >= 20,
+            "too few facts to force a choice: {}",
+            facts.len()
+        );
+        let msgs = noisy_session(&facts);
+        let (start, end) =
+            compute_compress_window(&msgs, PROTECT_HEAD_DEFAULT, PROTECT_TAIL_DEFAULT);
+        let middle = &msgs[start..end];
+        let material = estimate_messages_tokens(middle);
+        let budget = summary_budget(material);
+        // The real condition: the budget must be set by the RATIO, not clamped
+        // up by `MIN_SUMMARY_TOKENS`. While the floor dominates, growing the
+        // fixture does not tighten the squeeze, and "budget < material" stays
+        // true while meaning nothing.
+        assert!(
+            budget > 2_000,
+            "budget is still on the 2000-token floor (material {material} tokens) — \
+             the fixture is not yet big enough for the ratio to bind"
+        );
+        assert!(
+            budget * 4 < material,
+            "budget {budget} vs material {material}: the summarizer is not being \
+             asked to drop much"
         );
     }
 
@@ -273,11 +803,12 @@ mod tests {
 
         let middle = &msgs[start..end];
         let prompt = build_summary_prompt(
-            middle,
+            &crate::agent::compaction_material::from_loop_messages(middle),
             summary_budget(estimate_messages_tokens(middle)),
             None,
             None,
-        );
+        )
+        .expect("fixture is clean");
         assert!(
             prompt.contains("stdlib conversion complete") && prompt.contains("no tokio remains"),
             "completion signal (original task DONE) must reach the summarizer prompt"
@@ -286,6 +817,139 @@ mod tests {
             prompt.contains("integration test hangs") && prompt.contains("debugging the race"),
             "follow-up signal (live work) must reach the summarizer prompt"
         );
+    }
+
+    /// Real strings a live summarizer produced, which the raw `contains`
+    /// scorer counted as losses. Every one of these preserves the fact.
+    #[test]
+    fn scorer_credits_a_fact_the_model_reformatted() {
+        let facts = hard_facts();
+
+        // Outer code span ate the inner backticks (deepseek, sections arm).
+        let a = "- `called Option::unwrap() on a None value`";
+        // Inner backticks escaped instead (deepseek, slots arm).
+        let b = r"RISKS: `called \`Option::unwrap()\` on a \`None\` value`";
+        // The model code-formatted a bare number.
+        let c = "   - offset `883421`";
+        // And a path wrapped mid-sentence.
+        let d = "see `crates/ingest/src/backfill/checkpoint.rs` for the resume path";
+
+        for (text, needle) in [
+            (a, "called `Option::unwrap()` on a `None` value"),
+            (b, "called `Option::unwrap()` on a `None` value"),
+            (c, "offset 883421"),
+            (d, "crates/ingest/src/backfill/checkpoint.rs"),
+        ] {
+            let f: Vec<&PlantedFact> = facts.iter().filter(|f| f.needle == needle).collect();
+            assert_eq!(f.len(), 1, "needle not in the fact set: {needle}");
+            let report = score_recall(
+                text,
+                &[PlantedFact {
+                    kind: f[0].kind,
+                    needle: f[0].needle,
+                }],
+            );
+            assert!(
+                report.all_survived(),
+                "reformatted-but-faithful text scored as a loss\n  text:   {text}\n  needle: {needle}"
+            );
+        }
+    }
+
+    /// The other half, and the reason the normalisation is narrow: stripping
+    /// presentation must NOT turn the scorer into one that credits anything.
+    /// A paraphrase that keeps the meaning and loses the string is still a
+    /// loss — that is the whole failure mode being measured.
+    #[test]
+    fn scorer_still_catches_a_paraphrase() {
+        let facts = hard_facts();
+        let paraphrased = "## Blocked\n\
+            The worker hit an unwrap panic on a missing value, the connection \
+            pool ran out after about half a minute, and a checksum did not \
+            match. Config was adjusted (batch size, pool ceiling, backoff) and \
+            the team ran the ingest tests plus a database query for the maximum \
+            offset. A job on one shard is stuck partway through.";
+        let report = score_recall(paraphrased, &facts);
+        assert_eq!(
+            report.survived,
+            0,
+            "a summary that keeps the meaning and drops every exact string must \
+             score zero; survived {:?}",
+            facts.len() - report.dropped.len()
+        );
+    }
+
+    /// The coverage detector must fire on the ways a summary actually says
+    /// "I only saw part of this" — including the slot form and free prose.
+    #[test]
+    fn coverage_detector_fires_on_a_declared_gap() {
+        for s in [
+            "SOURCE_COVERAGE: INCOMPLETE — the block carries a truncation marker.",
+            "SOURCE_COVERAGE: the middle was cut off; roughly 40k bytes are missing material.",
+            "## Critical Context\nNote: part of the transcript was truncated before it reached me.",
+            "Some material appears to have been omitted from the record.",
+        ] {
+            assert!(
+                declares_incomplete_coverage(s),
+                "should have been read as a coverage gap: {s}"
+            );
+        }
+    }
+
+    /// The fixture and the detector must not share vocabulary.
+    ///
+    /// A planted fact whose text contains a coverage keyword makes every
+    /// summary that faithfully preserves it look like a declared gap — which
+    /// is what happened: "rejected the truncate-and-replay approach" contains
+    /// "truncat", so both arms scored 6/6 on the coverage probe purely for
+    /// keeping the fact. The better the summary, the more certainly it
+    /// misreported.
+    ///
+    /// This is the general guard, not a patch for that one string: any future
+    /// fact or keyword that collides fails here rather than silently inverting
+    /// a result.
+    #[test]
+    fn no_planted_fact_collides_with_the_coverage_detector() {
+        for f in hard_facts().iter().chain(seed_facts().iter()) {
+            assert!(
+                !declares_incomplete_coverage(f.needle),
+                "planted {} \"{}\" trips the coverage detector — a summary that \
+                 preserves it would be scored as declaring a gap",
+                f.kind,
+                f.needle,
+            );
+        }
+        // And the same for the surrounding fixture prose, which the model also
+        // quotes back.
+        let facts = hard_facts();
+        for m in noisy_session(&facts) {
+            let content = m.get("content").and_then(|c| c.as_str()).unwrap_or("");
+            assert!(
+                !declares_incomplete_coverage(content),
+                "fixture turn trips the coverage detector: {content:.120}"
+            );
+        }
+    }
+
+    /// The half that keeps the detector honest. A summarizer that saw
+    /// everything writes confident prose about incomplete WORK — unfinished
+    /// tasks, partial fixes, missing config — and none of that is a coverage
+    /// gap. If the detector fired on these it would report perfect
+    /// coverage-awareness while measuring nothing.
+    #[test]
+    fn coverage_detector_does_not_fire_on_a_confident_summary() {
+        for s in [
+            "SOURCE_COVERAGE: COMPLETE — no truncation marker, no turn left mid-sentence.",
+            "## Blocked\nThe backfill is unfinished; the retry path was never wired up.",
+            "## Remaining Work\nThe migration is only half applied and the index is absent.",
+            "OPEN_NEXT: finish the accept-loop fix, then re-run the ingest tests.",
+            "## Active State\nA partial batch is stuck on shard-a4e1 at offset 883421.",
+        ] {
+            assert!(
+                !declares_incomplete_coverage(s),
+                "incomplete WORK is not a coverage gap: {s}"
+            );
+        }
     }
 
     /// The scorer must actually catch a lossy (paraphrasing) summary — the

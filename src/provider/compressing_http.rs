@@ -853,6 +853,19 @@ mod tests {
         super::super::rate_limit_gate::clear(host);
     }
 
+    /// Serializes the tests that stand up a loopback server.
+    ///
+    /// The rate-limit gate is a process-global keyed by `host:port`, and
+    /// `serve_once` takes whatever ephemeral port the OS hands out. Any
+    /// SUCCESSFUL response clears its endpoint's entry — so if two of
+    /// these run at once and the second happens to be handed the port the
+    /// first just released, its 200 wipes the first's latch between the
+    /// request and the assertion. Rare (it needs exact port reuse inside
+    /// a narrow window) and it did fire once in a full parallel run.
+    /// One at a time closes the window; sequential runs cannot collide
+    /// because each assertion completes before the next test starts.
+    static LOOPBACK_SERVER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     /// One-shot loopback HTTP/1.1 server: accepts a single connection, drains
     /// the request, and writes a canned response. Lets the reqwest-backed
     /// streaming path be exercised end-to-end without a real provider or a mock
@@ -911,6 +924,7 @@ mod tests {
     /// `Invalid status code {status} with message: {body}`.
     #[tokio::test]
     async fn reqwest_streaming_keeps_headers_on_429() {
+        let _serialized = LOOPBACK_SERVER.lock().await;
         let reset = (chrono::Utc::now() + chrono::Duration::hours(2)).timestamp_millis();
         let url = serve_once(
             "429 Too Many Requests",
@@ -955,6 +969,7 @@ mod tests {
     /// behaviour that carries every provider request in dirge.
     #[tokio::test]
     async fn reqwest_streaming_preserves_sse_bytes_on_2xx() {
+        let _serialized = LOOPBACK_SERVER.lock().await;
         let payload = b"data: hello\n\n";
         let url = serve_once("200 OK", &[("content-type", "text/event-stream")], payload).await;
 

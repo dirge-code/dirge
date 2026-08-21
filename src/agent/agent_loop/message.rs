@@ -93,6 +93,22 @@ impl AssistantMessage {
         }
     }
 
+    /// Concatenated text of the message's `Text` blocks, in order.
+    ///
+    /// Thinking and tool-call blocks are excluded: the prompt-leak detector
+    /// watches what the model SAYS, and reasoning is neither shown to the user
+    /// nor a recitation when it restates the instructions to itself.
+    pub fn text_joined(&self) -> String {
+        self.content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
     /// Iterate just the toolCall blocks. Used by the loop's
     /// `executeToolCalls` site (agent-loop.ts:203:
     /// `message.content.filter((c) => c.type === "toolCall")`).
@@ -642,6 +658,9 @@ pub enum LoopEvent {
         /// Summary model name, if known (`None` today — the summarizer
         /// closure doesn't expose it; threading it is a follow-up).
         summary_model: Option<String>,
+        /// dirge-69oe.4: skill anchors observed in the context AFTER the
+        /// fold. Empty when none survived, which is the case worth seeing.
+        skill_anchors_kept: Vec<String>,
     },
 
     /// Incremental checkpoint: a background summary was generated at a

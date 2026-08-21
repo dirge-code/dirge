@@ -223,11 +223,14 @@ fn build_config() -> LoopConfig {
         repair_stats: std::sync::Arc::new(
             crate::agent::agent_loop::tool_input_repair::RepairStats::new(),
         ),
+        retry_stats: std::sync::Arc::new(crate::agent::agent_loop::tool_retry::RetryStats::new()),
         truncation_notes: std::sync::Arc::new(std::sync::Mutex::new(
             std::collections::HashMap::new(),
         )),
         tool_def_filter: None,
         dynamic_tool_search: false,
+        turn_envelope: false,
+        prompt_leak_detect: crate::agent::agent_loop::types::GateMode::Off,
         escalation_stream_fn: None,
         escalation_provider_name: None,
         escalation_pending: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -243,6 +246,7 @@ fn build_config() -> LoopConfig {
         code_review_repo: None,
         open_issues_gate_mode: crate::agent::agent_loop::types::GateMode::Off,
         verification_tiers_mode: crate::agent::agent_loop::types::GateMode::Off,
+        skill_anchor_interval: 0,
         safe_state_abort_mode: crate::agent::agent_loop::types::SafeStateMode::Off,
         publish_guard_mode: crate::agent::agent_loop::types::GateMode::Off,
         claim_gate_mode: crate::agent::agent_loop::types::GateMode::Off,
@@ -1643,4 +1647,750 @@ fn backfill_fills_all_when_none_answered() {
         back.iter().map(|r| r.tool_call_id.as_str()).collect();
     assert!(ids.contains("a") && ids.contains("b"));
     assert!(back.iter().all(|r| r.is_error));
+}
+
+// ===========================================================================
+// dirge-61sv: transient tool retry.
+//
+// The POLICY (which operations may be retried, the budget, the backoff) is
+// unit-tested in `tool_retry`. These tests cover the WIRING: that the
+// dispatcher actually consults it, that the safety gate survives the trip
+// through real dispatch, and that cancellation wins.
+//
+// The tool is named per-test, because `tool_operation` keys on the NAME —
+// `read` is an Operation::Read and `bash` is an Operation::Execute, and that
+// difference is the entire safety property.
+// ===========================================================================
+
+/// A tool that fails with `error` for its first `fail_times` calls and then
+/// succeeds. Counts every entry to `execute`, which is what the retry tests
+/// actually assert on.
+#[derive(Debug)]
+struct FlakyTool {
+    name: String,
+    error: String,
+    fail_times: usize,
+    calls: Arc<Mutex<usize>>,
+    /// Cancel the run's signal from INSIDE execute, before returning the
+    /// error. Models a cancel that lands while a tool is mid-flight — the
+    /// case where the tool's own error text, not the abort message, is what
+    /// the retry gate sees.
+    cancel_on_call: bool,
+}
+
+impl FlakyTool {
+    fn new(name: &str, error: &str, fail_times: usize) -> Self {
+        Self {
+            name: name.to_string(),
+            error: error.to_string(),
+            fail_times,
+            calls: Arc::new(Mutex::new(0)),
+            cancel_on_call: false,
+        }
+    }
+    fn cancelling(mut self) -> Self {
+        self.cancel_on_call = true;
+        self
+    }
+    fn call_count(&self) -> usize {
+        *self.calls.lock().unwrap()
+    }
+}
+
+impl LoopTool for FlakyTool {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn description(&self) -> &str {
+        "Flaky tool"
+    }
+    fn label(&self) -> &str {
+        "Flaky"
+    }
+    fn parameters(&self) -> &Value {
+        static EMPTY: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+        EMPTY.get_or_init(|| serde_json::json!({"type": "object"}))
+    }
+    fn execute<'a>(
+        &'a self,
+        _tool_call_id: &'a str,
+        _args: Value,
+        signal: AbortSignal,
+        _on_update: LoopToolUpdate,
+    ) -> Pin<Box<dyn Future<Output = Result<LoopToolResult, String>> + Send + 'a>> {
+        let calls = self.calls.clone();
+        let error = self.error.clone();
+        let fail_times = self.fail_times;
+        let cancel_on_call = self.cancel_on_call;
+        Box::pin(async move {
+            let n = {
+                let mut g = calls.lock().unwrap();
+                *g += 1;
+                *g
+            };
+            if cancel_on_call {
+                signal.cancel();
+            }
+            if n <= fail_times {
+                Err(error.clone())
+            } else {
+                Ok(LoopToolResult {
+                    content: vec![serde_json::json!({"type": "text", "text": "ok"})],
+                    details: serde_json::json!({}),
+                    terminate: None,
+                })
+            }
+        })
+    }
+}
+
+async fn dispatch_one(tool: Arc<dyn LoopTool>, name: &str, config: &LoopConfig) -> bool {
+    let context = build_context(tool);
+    let assistant_msg = AssistantMessage::new(
+        vec![ContentBlock::ToolCall {
+            id: "tool-1".to_string(),
+            name: name.to_string(),
+            arguments: serde_json::json!({}),
+        }],
+        StopReason::ToolUse,
+    );
+    let tool_calls = extract_tool_calls(&assistant_msg);
+    let (tx, _rx) = mpsc::channel::<LoopEvent>(256);
+    let batch = execute_tool_calls_sequential(
+        &context,
+        &assistant_msg,
+        &tool_calls,
+        config,
+        &AbortSignal::new(),
+        &tx,
+        &InflightSet::new(),
+    )
+    .await;
+    // `is_error` on the single result.
+    !batch.messages[0].is_error
+}
+
+/// A transient failure on a pure read is retried and recovers, and the
+/// recovery is counted.
+#[tokio::test]
+async fn transient_read_failure_is_retried_through_dispatch() {
+    let tool = Arc::new(FlakyTool::new("read", "operation timed out", 1));
+    let config = build_config();
+    let ok = dispatch_one(tool.clone(), "read", &config).await;
+    assert!(ok, "the retry should have recovered the call");
+    assert_eq!(tool.call_count(), 2, "one original call plus one retry");
+    let stats = config.retry_stats.snapshot();
+    assert_eq!(stats.attempted, 1);
+    assert_eq!(stats.recovered, 1, "a recovery must be attributed");
+}
+
+/// THE SAFETY PROPERTY, through real dispatch: a timed-out `bash` is never
+/// re-issued, because it may already have done the work.
+#[tokio::test]
+async fn timed_out_bash_is_never_retried_through_dispatch() {
+    let tool = Arc::new(FlakyTool::new("bash", "Command timed out after 120s", 1));
+    let config = build_config();
+    let ok = dispatch_one(tool.clone(), "bash", &config).await;
+    assert!(!ok, "the failure must reach the model, not be retried away");
+    assert_eq!(
+        tool.call_count(),
+        1,
+        "re-issuing a timed-out shell command can duplicate a committed effect"
+    );
+    assert_eq!(config.retry_stats.snapshot().attempted, 0);
+}
+
+/// The discriminating pair for the test above: identical error text, identical
+/// flakiness, only the tool differs. Without this, a build that retried
+/// nothing at all would pass `timed_out_bash_is_never_retried`.
+#[tokio::test]
+async fn the_bash_gate_is_about_the_tool_not_the_error_text() {
+    let text = "Command timed out after 120s";
+    let read = Arc::new(FlakyTool::new("read", text, 1));
+    let bash = Arc::new(FlakyTool::new("bash", text, 1));
+    let config = build_config();
+    dispatch_one(read.clone(), "read", &config).await;
+    dispatch_one(bash.clone(), "bash", &config).await;
+    assert_eq!(read.call_count(), 2);
+    assert_eq!(bash.call_count(), 1);
+}
+
+/// A non-transient failure is handed straight back. A file that is not there
+/// will not be there 250ms later, and the model needs to see that.
+#[tokio::test]
+async fn missing_file_is_not_retried_through_dispatch() {
+    let tool = Arc::new(FlakyTool::new("read", "No such file or directory", 1));
+    let config = build_config();
+    let ok = dispatch_one(tool.clone(), "read", &config).await;
+    assert!(!ok);
+    assert_eq!(tool.call_count(), 1);
+}
+
+/// A tool that never recovers spends its budget and stops — the call count is
+/// MAX_ATTEMPTS, not unbounded, and no recovery is claimed.
+#[tokio::test]
+async fn a_permanently_failing_read_stops_at_the_budget() {
+    let tool = Arc::new(FlakyTool::new("read", "operation timed out", usize::MAX));
+    let config = build_config();
+    let ok = dispatch_one(tool.clone(), "read", &config).await;
+    assert!(!ok);
+    assert_eq!(
+        tool.call_count(),
+        crate::agent::agent_loop::tool_retry::MAX_ATTEMPTS as usize
+    );
+    let stats = config.retry_stats.snapshot();
+    assert_eq!(
+        stats.attempted,
+        crate::agent::agent_loop::tool_retry::MAX_ATTEMPTS as u64 - 1
+    );
+    assert_eq!(stats.recovered, 0, "nothing recovered, so nothing to claim");
+}
+
+/// A call that succeeds first time is not a recovery. Counting it as one would
+/// make the stat report the feature working on every healthy run.
+#[tokio::test]
+async fn a_first_try_success_is_not_counted_as_a_recovery() {
+    let tool = Arc::new(FlakyTool::new("read", "unused", 0));
+    let config = build_config();
+    assert!(dispatch_one(tool.clone(), "read", &config).await);
+    assert_eq!(tool.call_count(), 1);
+    let stats = config.retry_stats.snapshot();
+    assert_eq!(stats.attempted, 0);
+    assert_eq!(stats.recovered, 0);
+}
+
+/// Cancellation wins over the retry budget: a signal that is already set must
+/// not be re-run, however transient the failure looks.
+#[tokio::test]
+async fn a_cancelled_call_is_not_retried() {
+    let tool = Arc::new(FlakyTool::new("read", "operation timed out", usize::MAX));
+    let context = build_context(tool.clone());
+    let assistant_msg = AssistantMessage::new(
+        vec![ContentBlock::ToolCall {
+            id: "tool-1".to_string(),
+            name: "read".to_string(),
+            arguments: serde_json::json!({}),
+        }],
+        StopReason::ToolUse,
+    );
+    let tool_calls = extract_tool_calls(&assistant_msg);
+    let (tx, _rx) = mpsc::channel::<LoopEvent>(256);
+    let config = build_config();
+    let signal = AbortSignal::new();
+    signal.cancel();
+    let _ = execute_tool_calls_sequential(
+        &context,
+        &assistant_msg,
+        &tool_calls,
+        &config,
+        &signal,
+        &tx,
+        &InflightSet::new(),
+    )
+    .await;
+    assert_eq!(
+        config.retry_stats.snapshot().attempted,
+        0,
+        "a cancelled run must not spend retry budget"
+    );
+}
+
+/// A cancel that lands WHILE the tool is running, with the tool returning
+/// transient-looking text of its own. This is the case the `is_cancelled`
+/// check in the retry loop exists for — the abort-message path is already
+/// refused by the class gate, so testing only that leaves the guard unproven.
+#[tokio::test]
+async fn a_cancel_during_execution_stops_the_retry() {
+    let tool = Arc::new(FlakyTool::new("read", "operation timed out", usize::MAX).cancelling());
+    let config = build_config();
+    let context = build_context(tool.clone());
+    let assistant_msg = AssistantMessage::new(
+        vec![ContentBlock::ToolCall {
+            id: "tool-1".to_string(),
+            name: "read".to_string(),
+            arguments: serde_json::json!({}),
+        }],
+        StopReason::ToolUse,
+    );
+    let tool_calls = extract_tool_calls(&assistant_msg);
+    let (tx, _rx) = mpsc::channel::<LoopEvent>(256);
+    let _ = execute_tool_calls_sequential(
+        &context,
+        &assistant_msg,
+        &tool_calls,
+        &config,
+        &AbortSignal::new(),
+        &tx,
+        &InflightSet::new(),
+    )
+    .await;
+    assert_eq!(
+        tool.call_count(),
+        1,
+        "a cancelled run kept retrying a transient failure"
+    );
+    assert_eq!(config.retry_stats.snapshot().attempted, 0);
+}
+
+// ============================================================
+// dirge-9tl3 — dispatch-level tool-call budget
+// ============================================================
+
+/// Returns immediately with a distinctive marker. Carries an
+/// explicit TINY budget so the discrimination tests prove a
+/// finished tool never loses to a ready timer.
+struct BudgetPromptTool;
+
+impl std::fmt::Debug for BudgetPromptTool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BudgetPromptTool")
+    }
+}
+
+impl LoopTool for BudgetPromptTool {
+    fn name(&self) -> &str {
+        "prompt"
+    }
+    fn description(&self) -> &str {
+        "returns immediately"
+    }
+    fn label(&self) -> &str {
+        "Prompt"
+    }
+    fn parameters(&self) -> &Value {
+        static EMPTY: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+        EMPTY.get_or_init(|| serde_json::json!({"type": "object"}))
+    }
+    fn call_budget(&self, _args: &Value) -> Option<std::time::Duration> {
+        Some(std::time::Duration::from_millis(50))
+    }
+    fn execute<'a>(
+        &'a self,
+        _id: &'a str,
+        _args: Value,
+        _signal: AbortSignal,
+        _on_update: LoopToolUpdate,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<LoopToolResult, String>> + Send + 'a>> {
+        Box::pin(async move {
+            Ok(LoopToolResult {
+                content: vec![serde_json::json!({
+                    "type": "text",
+                    "text": "real-result",
+                })],
+                details: Value::Null,
+                terminate: None,
+            })
+        })
+    }
+}
+
+/// Never finishes and never polls the signal — the pathological
+/// case the watchdog exists for.
+struct BudgetNeverTool;
+
+impl std::fmt::Debug for BudgetNeverTool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BudgetNeverTool")
+    }
+}
+
+impl LoopTool for BudgetNeverTool {
+    fn name(&self) -> &str {
+        "never"
+    }
+    fn description(&self) -> &str {
+        "never returns"
+    }
+    fn label(&self) -> &str {
+        "Never"
+    }
+    fn parameters(&self) -> &Value {
+        static EMPTY: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+        EMPTY.get_or_init(|| serde_json::json!({"type": "object"}))
+    }
+    fn call_budget(&self, _args: &Value) -> Option<std::time::Duration> {
+        Some(std::time::Duration::from_secs(600))
+    }
+    fn execute<'a>(
+        &'a self,
+        _id: &'a str,
+        _args: Value,
+        _signal: AbortSignal, // intentionally NOT polled
+        _on_update: LoopToolUpdate,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<LoopToolResult, String>> + Send + 'a>> {
+        Box::pin(std::future::pending())
+    }
+}
+
+/// Fetch the first content block of an outcome as text.
+fn outcome_text(outcome: &super::ExecutedOutcome) -> String {
+    outcome
+        .result
+        .content
+        .first()
+        .cloned()
+        .unwrap_or(Value::Null)
+        .to_string()
+}
+
+/// The discrimination half: a tool that completes normally must
+/// NOT be cut, even when its budget is far shorter than the run.
+/// A finished tool must never lose to a timer that became ready
+/// in the same poll.
+#[tokio::test(start_paused = true)]
+async fn a_tool_that_completes_promptly_is_not_cut_by_the_budget() {
+    let tool: Arc<dyn LoopTool> = Arc::new(BudgetPromptTool);
+    let call = ToolCall {
+        id: "tc-prompt".to_string(),
+        name: "prompt".to_string(),
+        arguments: serde_json::json!({}),
+    };
+    let (tx, _rx) = mpsc::channel::<LoopEvent>(64);
+    let outcome =
+        execute_prepared_tool_call(&tool, &call, &call.arguments, &AbortSignal::new(), &tx).await;
+    assert!(!outcome.is_error, "a prompt tool must complete on its own");
+    let text = outcome_text(&outcome);
+    assert!(
+        text.contains("real-result"),
+        "the tool's own result must survive the watchdog; got {text}"
+    );
+}
+
+/// A tool that never returns IS stopped: `is_error` true, the
+/// message names the tool and the budget, and it reads as "this
+/// call was stopped" — not as a transient failure the model
+/// should blindly retry (the retry classifier keys on
+/// "timed out", so the wording must avoid it).
+#[tokio::test(start_paused = true)]
+async fn a_never_returning_tool_is_stopped_by_the_budget_and_named() {
+    // The watchdog re-arms while anything is waiting on a person, so a
+    // test that needs it to FIRE has to hold the count still (dirge-8cbm).
+    let _gate = crate::human_wait::TEST_GATE.lock().await;
+    let tool: Arc<dyn LoopTool> = Arc::new(BudgetNeverTool);
+    let call = ToolCall {
+        id: "tc-never".to_string(),
+        name: "never".to_string(),
+        arguments: serde_json::json!({}),
+    };
+    let (tx, _rx) = mpsc::channel::<LoopEvent>(64);
+    // Paused time only advances when awaited on, so without a
+    // watchdog the dispatch never finishes — this guard failing
+    // IS the red signal. It sits far above the 600s budget so the
+    // watchdog provably fires first.
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(1200),
+        execute_prepared_tool_call(&tool, &call, &call.arguments, &AbortSignal::new(), &tx),
+    )
+    .await
+    .expect("the watchdog must stop a never-returning tool");
+    assert!(outcome.is_error);
+    let text = outcome_text(&outcome);
+    assert!(
+        text.contains("never"),
+        "message must name the tool; got {text}"
+    );
+    assert!(
+        text.contains("stopped"),
+        "message must read as stopped, not as a tool failure; got {text}"
+    );
+    assert!(
+        text.contains("600"),
+        "message must carry the budget in seconds; got {text}"
+    );
+    assert!(
+        !text.to_lowercase().contains("timed out"),
+        "wording must not classify as transient/retryable; got {text}"
+    );
+}
+
+/// The stopped call surfaces as a normal tool-result message and
+/// the batch CONTINUES — the next tool in the same batch still
+/// runs, so one pathological call cannot hang the run.
+#[tokio::test(start_paused = true)]
+async fn a_budget_stopped_call_yields_a_result_and_the_batch_continues() {
+    // The watchdog re-arms while anything is waiting on a person, so a
+    // test that needs it to FIRE has to hold the count still (dirge-8cbm).
+    let _gate = crate::human_wait::TEST_GATE.lock().await;
+    let mut ctx = Context::default();
+    ctx.tools.push(Arc::new(BudgetNeverTool));
+    ctx.tools.push(Arc::new(BudgetPromptTool));
+    let calls = vec![
+        ToolCall {
+            id: "tc-1".to_string(),
+            name: "never".to_string(),
+            arguments: serde_json::json!({}),
+        },
+        ToolCall {
+            id: "tc-2".to_string(),
+            name: "prompt".to_string(),
+            arguments: serde_json::json!({}),
+        },
+    ];
+    let assistant = AssistantMessage::new(
+        calls
+            .iter()
+            .map(|c| ContentBlock::ToolCall {
+                id: c.id.clone(),
+                name: c.name.clone(),
+                arguments: c.arguments.clone(),
+            })
+            .collect(),
+        StopReason::ToolUse,
+    );
+    let cfg = build_config();
+    let (tx, _rx) = mpsc::channel::<LoopEvent>(64);
+    let batch = tokio::time::timeout(
+        std::time::Duration::from_secs(1200),
+        execute_tool_calls_sequential(
+            &ctx,
+            &assistant,
+            &calls,
+            &cfg,
+            &AbortSignal::new(),
+            &tx,
+            &InflightSet::new(),
+        ),
+    )
+    .await
+    .expect("the batch must finish once the watchdog stops the stuck tool");
+    assert_eq!(batch.messages.len(), 2, "both calls must produce messages");
+    assert!(
+        batch.messages[0].is_error,
+        "the stuck call reports an error"
+    );
+    assert!(
+        !batch.messages[1].is_error,
+        "the following call must still run"
+    );
+}
+
+/// `call_budget` defaults to `None`: an ordinary tool opts into
+/// the shared ceiling instead of carrying its own number.
+#[test]
+fn call_budget_defaults_to_none_for_an_ordinary_tool() {
+    struct OrdinaryTool;
+    impl std::fmt::Debug for OrdinaryTool {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("OrdinaryTool")
+        }
+    }
+    impl LoopTool for OrdinaryTool {
+        fn name(&self) -> &str {
+            "ordinary"
+        }
+        fn description(&self) -> &str {
+            "no budget override"
+        }
+        fn label(&self) -> &str {
+            "Ordinary"
+        }
+        fn parameters(&self) -> &Value {
+            static EMPTY: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+            EMPTY.get_or_init(|| serde_json::json!({"type": "object"}))
+        }
+        fn execute<'a>(
+            &'a self,
+            _id: &'a str,
+            _args: Value,
+            _signal: AbortSignal,
+            _on_update: LoopToolUpdate,
+        ) -> std::pin::Pin<Box<dyn Future<Output = Result<LoopToolResult, String>> + Send + 'a>>
+        {
+            Box::pin(std::future::pending())
+        }
+    }
+    assert_eq!(OrdinaryTool.call_budget(&serde_json::json!({})), None);
+}
+
+/// Cancel still wins when both cancel and expiry are pending:
+/// the select is `biased` and the cancel arm is polled first.
+#[tokio::test(start_paused = true)]
+async fn cancel_wins_over_the_budget_when_both_are_pending() {
+    let tool: Arc<dyn LoopTool> = Arc::new(BudgetNeverTool);
+    let call = ToolCall {
+        id: "tc-cancel".to_string(),
+        name: "never".to_string(),
+        arguments: serde_json::json!({}),
+    };
+    let signal = AbortSignal::new();
+    // Cancel BEFORE dispatch — with the budget timer also pending,
+    // the biased select must resolve via the cancel arm.
+    signal.cancel();
+    let (tx, _rx) = mpsc::channel::<LoopEvent>(64);
+    let outcome = execute_prepared_tool_call(&tool, &call, &call.arguments, &signal, &tx).await;
+    assert!(outcome.is_error);
+    let text = outcome_text(&outcome);
+    assert!(
+        text.contains("aborted"),
+        "cancel must outrank the budget arm; got {text}"
+    );
+}
+
+// ============================================================
+// dirge-8cbm — the budget bounds work, not a person
+// ============================================================
+
+/// Declares a budget far BELOW the shared ceiling. The override must
+/// not be able to shorten dispatch: a tool that wants to be cut sooner
+/// should bound itself, where it can produce a better message.
+struct UnderCuttingTool;
+
+impl std::fmt::Debug for UnderCuttingTool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("UnderCuttingTool")
+    }
+}
+
+impl LoopTool for UnderCuttingTool {
+    fn name(&self) -> &str {
+        "undercut"
+    }
+    fn description(&self) -> &str {
+        "asks to be cut early"
+    }
+    fn label(&self) -> &str {
+        "Undercut"
+    }
+    fn parameters(&self) -> &Value {
+        static EMPTY: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+        EMPTY.get_or_init(|| serde_json::json!({"type": "object"}))
+    }
+    fn call_budget(&self, _args: &Value) -> Option<std::time::Duration> {
+        Some(std::time::Duration::from_secs(1))
+    }
+    fn execute<'a>(
+        &'a self,
+        _id: &'a str,
+        _args: Value,
+        _signal: AbortSignal,
+        _on_update: LoopToolUpdate,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<LoopToolResult, String>> + Send + 'a>> {
+        Box::pin(std::future::pending())
+    }
+}
+
+/// Never returns, and spends the whole call marked as waiting on the
+/// user — the shape of a tool parked on its permission prompt.
+struct AwaitingHumanTool;
+
+impl std::fmt::Debug for AwaitingHumanTool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AwaitingHumanTool")
+    }
+}
+
+impl LoopTool for AwaitingHumanTool {
+    fn name(&self) -> &str {
+        "awaiting"
+    }
+    fn description(&self) -> &str {
+        "parked on a prompt"
+    }
+    fn label(&self) -> &str {
+        "Awaiting"
+    }
+    fn parameters(&self) -> &Value {
+        static EMPTY: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+        EMPTY.get_or_init(|| serde_json::json!({"type": "object"}))
+    }
+    fn execute<'a>(
+        &'a self,
+        _id: &'a str,
+        _args: Value,
+        _signal: AbortSignal,
+        _on_update: LoopToolUpdate,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<LoopToolResult, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let _waiting = crate::human_wait::HumanWait::begin();
+            std::future::pending::<()>().await;
+            unreachable!("the prompt is never answered")
+        })
+    }
+}
+
+/// dirge-8cbm: a `call_budget` override may only RAISE the ceiling. An
+/// override that asks for 1s must still get the shared ceiling, or a
+/// tool's own bound could shorten the window a human has to answer the
+/// permission prompt the call is sitting behind.
+#[tokio::test(start_paused = true)]
+async fn an_override_cannot_cut_a_call_sooner_than_the_shared_ceiling() {
+    // Without the gate a concurrent human wait would hold off the
+    // watchdog anyway and this would pass for the wrong reason.
+    let _gate = crate::human_wait::TEST_GATE.lock().await;
+    let tool: Arc<dyn LoopTool> = Arc::new(UnderCuttingTool);
+    let call = ToolCall {
+        id: "tc-undercut".to_string(),
+        name: "undercut".to_string(),
+        arguments: serde_json::json!({}),
+    };
+    let (tx, _rx) = mpsc::channel::<LoopEvent>(64);
+    let ceiling = crate::timeout::Timeouts::get().tool_call;
+    // Well inside the ceiling but far past the 1s the tool asked for:
+    // if the override could lower the budget, this would have been cut.
+    let early = tokio::time::timeout(
+        ceiling / 2,
+        execute_prepared_tool_call(&tool, &call, &call.arguments, &AbortSignal::new(), &tx),
+    )
+    .await;
+    assert!(
+        early.is_err(),
+        "the override lowered the ceiling — dispatch cut at the tool's 1s"
+    );
+}
+
+/// The case that makes the watchdog safe to ship: a call parked on a
+/// human must NOT be cut, however long they take. Cutting here kills a
+/// correct call precisely when the user is being careful.
+#[tokio::test(start_paused = true)]
+async fn a_call_waiting_on_a_person_is_never_cut() {
+    let _gate = crate::human_wait::TEST_GATE.lock().await;
+    let tool: Arc<dyn LoopTool> = Arc::new(AwaitingHumanTool);
+    let call = ToolCall {
+        id: "tc-awaiting".to_string(),
+        name: "awaiting".to_string(),
+        arguments: serde_json::json!({}),
+    };
+    let (tx, _rx) = mpsc::channel::<LoopEvent>(64);
+    let ceiling = crate::timeout::Timeouts::get().tool_call;
+    // Twenty budgets' worth of deliberation. Paused time makes this
+    // instant; the watchdog must re-arm every time rather than fire.
+    let outcome = tokio::time::timeout(
+        ceiling * 20,
+        execute_prepared_tool_call(&tool, &call, &call.arguments, &AbortSignal::new(), &tx),
+    )
+    .await;
+    assert!(
+        outcome.is_err(),
+        "the watchdog cut a call that was waiting on the user"
+    );
+    // And the marker is released when the call's future is dropped, so
+    // one abandoned prompt can't disable the watchdog for the session.
+    assert!(!crate::human_wait::anyone_waiting());
+}
+
+/// The discrimination half of the above: with nobody waiting, the same
+/// never-returning shape IS cut. Without this, `a_call_waiting_on_a_
+/// person_is_never_cut` would also pass against a watchdog that never
+/// fires at all.
+#[tokio::test(start_paused = true)]
+async fn the_same_call_is_cut_when_nobody_is_waiting() {
+    let _gate = crate::human_wait::TEST_GATE.lock().await;
+    assert!(
+        !crate::human_wait::anyone_waiting(),
+        "the gate should have given us a clean count"
+    );
+    let tool: Arc<dyn LoopTool> = Arc::new(BudgetNeverTool);
+    let call = ToolCall {
+        id: "tc-nobody".to_string(),
+        name: "never".to_string(),
+        arguments: serde_json::json!({}),
+    };
+    let (tx, _rx) = mpsc::channel::<LoopEvent>(64);
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(1200),
+        execute_prepared_tool_call(&tool, &call, &call.arguments, &AbortSignal::new(), &tx),
+    )
+    .await
+    .expect("with nobody waiting the watchdog must fire");
+    assert!(outcome.is_error);
 }

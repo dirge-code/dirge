@@ -419,6 +419,14 @@ pub struct LoopSpawnConfig {
     /// `tool_def_filter` for introspection.
     pub dynamic_tool_search: bool,
 
+    /// dirge-e31n.2: per-turn context envelope opt-in. Mirrors the
+    /// `turn_envelope` config knob; carried alongside `dynamic_tool_search`
+    /// for the same reason.
+    pub turn_envelope: bool,
+
+    /// dirge-e31n.6: mirrors the `prompt_leak_detect` config knob.
+    pub prompt_leak_detect: crate::agent::agent_loop::types::GateMode,
+
     /// Phase 4 part 1: alternate stream function used for ONE
     /// call after a repair-exhaustion or tree-sitter failure.
     /// `None` when no escalation is configured.
@@ -470,6 +478,8 @@ pub struct LoopSpawnConfig {
     /// Forwarded to `LoopConfig.verification_tiers_mode`. Default `Off`
     /// (opt-in; `Off` is byte-identical to the untiered gate).
     pub verification_tiers_mode: crate::agent::agent_loop::types::GateMode,
+    /// dirge-69oe.4: forwarded to `LoopConfig.skill_anchor_interval`. 0 is off.
+    pub skill_anchor_interval: u32,
     /// Forwarded to `LoopConfig.safe_state_abort_mode`. Default `Off`
     /// (opt-in; off is byte-identical to the loop without the rung).
     pub safe_state_abort_mode: crate::agent::agent_loop::types::SafeStateMode,
@@ -549,6 +559,8 @@ impl LoopSpawnConfig {
             summarize_fn: None,
             tool_def_filter: None,
             dynamic_tool_search: false,
+            turn_envelope: false,
+            prompt_leak_detect: crate::agent::agent_loop::types::GateMode::Off,
             escalation_stream_fn: None,
             escalation_provider_name: None,
             escalation_max_per_session: None,
@@ -561,6 +573,7 @@ impl LoopSpawnConfig {
             code_review_mode: crate::agent::agent_loop::types::CodeReviewMode::default(),
             open_issues_gate_mode: crate::agent::agent_loop::types::GateMode::Off,
             verification_tiers_mode: crate::agent::agent_loop::types::GateMode::Off,
+            skill_anchor_interval: 0,
             safe_state_abort_mode: crate::agent::agent_loop::types::SafeStateMode::Off,
             publish_guard_mode: crate::agent::agent_loop::types::GateMode::Off,
             claim_gate_mode: crate::agent::agent_loop::types::GateMode::Off,
@@ -631,11 +644,14 @@ pub fn spawn_loop_runner(cfg: LoopSpawnConfig) -> LoopRunner {
         repair_stats: std::sync::Arc::new(
             crate::agent::agent_loop::tool_input_repair::RepairStats::new(),
         ),
+        retry_stats: std::sync::Arc::new(crate::agent::agent_loop::tool_retry::RetryStats::new()),
         truncation_notes: std::sync::Arc::new(std::sync::Mutex::new(
             std::collections::HashMap::new(),
         )),
         tool_def_filter: cfg.tool_def_filter.clone(),
         dynamic_tool_search: cfg.dynamic_tool_search,
+        turn_envelope: cfg.turn_envelope,
+        prompt_leak_detect: cfg.prompt_leak_detect,
         escalation_stream_fn: cfg.escalation_stream_fn.clone(),
         escalation_provider_name: cfg.escalation_provider_name.clone(),
         escalation_pending: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -653,6 +669,7 @@ pub fn spawn_loop_runner(cfg: LoopSpawnConfig) -> LoopRunner {
         code_review_repo: None,
         open_issues_gate_mode: cfg.open_issues_gate_mode,
         verification_tiers_mode: cfg.verification_tiers_mode,
+        skill_anchor_interval: cfg.skill_anchor_interval,
         safe_state_abort_mode: cfg.safe_state_abort_mode,
         publish_guard_mode: cfg.publish_guard_mode,
         claim_gate_mode: cfg.claim_gate_mode,
@@ -742,6 +759,11 @@ pub fn spawn_loop_runner(cfg: LoopSpawnConfig) -> LoopRunner {
         messages: cfg.history.iter().map(loop_message_to_value).collect(),
         tools: cfg.tools,
     };
+    // The run's tool set, for the bridge's answer-vs-call filter (dirge-n00z).
+    // Captured here because `context` moves into the loop task below, and the
+    // loop never adds or removes tools mid-run, so one snapshot holds.
+    let bridge_tools: std::collections::HashSet<String> =
+        context.tools.iter().map(|t| t.name().to_string()).collect();
     // Seed the active-turn user message from `initial_prompt`, appending
     // a `UserPart::Image` per fresh-paste image (the resume path carries
     // its images through history as `dirge-asset:` sentinels instead).
@@ -768,7 +790,24 @@ pub fn spawn_loop_runner(cfg: LoopSpawnConfig) -> LoopRunner {
     // auto-compaction can fire on_pre_compress mid-loop.
     let memory_provider = cfg.memory_provider.clone();
 
-    let task = tokio::spawn(async move {
+    // The run goes on the AGENT runtime, not the caller's. Tools block their
+    // thread — 288 direct `std::fs::` calls, tree-sitter parses, injection
+    // scans — and while that thread was the UI's, blocking it meant no paint,
+    // no keystroke (Ctrl+C included) and no timer, so not even the dispatch
+    // watchdog could fire. See `crate::runtime`.
+    //
+    // The interject and cancel forwarders above stay on the caller's runtime
+    // deliberately: they must still be able to RECEIVE a signal while this
+    // task has its own thread blocked inside a tool.
+    let task = crate::runtime::spawn_agent(async move {
+        // Every run's event stream ends with a terminal event, even
+        // when the run does not get to say so itself. Declared FIRST so
+        // it drops LAST — after both senders below — and its own clone
+        // is what holds the channel open long enough to speak.
+        // See `run_end` for what this is guarding against.
+        let settled = super::run_end::RunSettled::default();
+        let _epitaph = super::run_end::RunEpitaph::new(event_tx.clone(), settled.clone());
+
         // Inner channel for LoopEvents emitted by run_agent_loop.
         // Capacity matches the outer event channel — assumes each
         // LoopEvent expands to <= a small constant of AgentEvents
@@ -822,15 +861,31 @@ pub fn spawn_loop_runner(cfg: LoopSpawnConfig) -> LoopRunner {
         };
 
         let pump_future = async {
-            let mut bridge = EventBridge::new();
+            let mut bridge = EventBridge::new(bridge_tools);
             while let Some(loop_evt) = loop_rx.recv().await {
+                // The loop trace taps here because this is the one point every
+                // LoopEvent passes through on its way to every consumer — TUI,
+                // --print, ACP, MCP. Tapping the emit sites instead would be a
+                // second set of call sites to keep in step with the first.
+                // Free when tracing is off (an atomic load).
+                super::trace::record_event(&loop_evt);
                 for agent_evt in bridge.translate(loop_evt) {
+                    // ...and here for what the FRONT END gets, which is a
+                    // different question: the bridge drops some events and
+                    // splits others, so "did the loop decide this" and "would
+                    // the TUI show this twice" need separate answers.
+                    super::trace::record_ui_event(&agent_evt);
+                    let ends_the_run = super::run_end::is_terminal(&agent_evt);
                     // If the receiver dropped (UI exited),
                     // stop pumping — loop_future continues
                     // naturally because its emit channel
                     // uses `let _ = .send`.
                     if event_tx_inner.send(agent_evt).await.is_err() {
                         return;
+                    }
+                    // Only a DELIVERED terminal event settles the run.
+                    if ends_the_run {
+                        settled.mark();
                     }
                 }
             }
@@ -1105,6 +1160,123 @@ mod tests {
             .expect("Done must be emitted");
         assert_eq!(done, "Hello world");
         let _ = runner.task.await;
+    }
+
+    /// The discrimination half of the epitaph: a run that reported its
+    /// own ending must not have a second one appended. A `settled` flag
+    /// that never gets set would put a spurious error on the end of
+    /// every successful run — and the consumers act on the LAST
+    /// terminal event they see.
+    #[tokio::test]
+    async fn a_run_that_finished_ends_with_exactly_one_terminal_event() {
+        let cfg = LoopSpawnConfig::minimal(canned_factory(vec![text_response("Hello")]), "hi");
+        let runner = spawn_loop_runner(cfg);
+        let events = drain(runner.event_rx).await;
+        let terminal: Vec<&str> = events
+            .iter()
+            .filter(|e| super::super::run_end::is_terminal(e))
+            .map(agent_event_kind)
+            .collect();
+        assert_eq!(terminal, vec!["Done"], "in {:?}", {
+            let kinds: Vec<&str> = events.iter().map(agent_event_kind).collect();
+            kinds
+        });
+        let _ = runner.task.await;
+    }
+
+    /// A tool that blows up mid-dispatch — the shape of the reported
+    /// hang, and the one a crash-on-the-first-call test cannot see.
+    #[derive(Debug)]
+    struct BoomTool;
+
+    impl LoopTool for BoomTool {
+        fn name(&self) -> &str {
+            "boom"
+        }
+        fn description(&self) -> &str {
+            "Boom"
+        }
+        fn label(&self) -> &str {
+            "Boom"
+        }
+        fn parameters(&self) -> &Value {
+            static EMPTY: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+            EMPTY.get_or_init(|| serde_json::json!({"type": "object"}))
+        }
+        fn execute<'a>(
+            &'a self,
+            _id: &'a str,
+            _args: Value,
+            _signal: AbortSignal,
+            _on_update: LoopToolUpdate,
+        ) -> Pin<Box<dyn Future<Output = Result<LoopToolResult, String>> + Send + 'a>> {
+            Box::pin(async move {
+                // Yield first so the translation pump gets a turn and
+                // this run's earlier events actually reach the consumer
+                // before the crash — that is the case under test.
+                tokio::task::yield_now().await;
+                panic!("the tool exploded")
+            })
+        }
+    }
+
+    /// dirge-r5l1, the mid-run half: a crash AFTER the run has already
+    /// emitted events. Settling on any event rather than on a terminal
+    /// one looks fine right up until this case — the turn's first
+    /// `TurnStart` would count as "the run reported itself", and the
+    /// crash that followed would go back to closing the channel in
+    /// silence. Which is the reported hang: it happened during a tool.
+    #[tokio::test]
+    async fn a_run_that_crashes_after_streaming_still_ends_its_stream() {
+        let mut cfg = LoopSpawnConfig::minimal(
+            canned_factory(vec![
+                tool_response("call-1", "boom", serde_json::json!({})),
+                text_response("unreachable"),
+            ]),
+            "go",
+        );
+        cfg.tools.push(Arc::new(BoomTool));
+        cfg.tool_execution = ToolExecutionMode::Sequential;
+
+        let runner = spawn_loop_runner(cfg);
+        let events = drain(runner.event_rx).await;
+        assert!(runner.task.await.is_err(), "the run must actually crash");
+
+        let kinds: Vec<&str> = events.iter().map(agent_event_kind).collect();
+        assert!(
+            kinds.contains(&"ToolCall"),
+            "the run has to get far enough to emit something first: {kinds:?}"
+        );
+        let last = events.last().expect("a crashed run still says something");
+        assert!(
+            super::super::run_end::is_terminal(last),
+            "the stream ended with {:?} after {kinds:?}",
+            agent_event_kind(last)
+        );
+    }
+
+    /// dirge-r5l1: a panic inside the run unwinds out of the task and
+    /// `tokio` keeps it in the `JoinHandle`. Before the epitaph, the
+    /// event channel just closed: the TUI's select arm disabled itself
+    /// and the run stayed "running" forever, `--print` returned the
+    /// partial answer as if it were the whole one. The stream has to
+    /// end with a terminal event no matter how the task went down.
+    #[tokio::test]
+    async fn a_crashed_run_still_ends_its_event_stream() {
+        let panicking: StreamFn = Arc::new(|_ctx, _opts| panic!("the provider exploded"));
+        let cfg = LoopSpawnConfig::minimal(panicking, "hi");
+        let runner = spawn_loop_runner(cfg);
+        let events = drain(runner.event_rx).await;
+        assert!(
+            runner.task.await.is_err(),
+            "the run must actually have crashed for this to be testing anything"
+        );
+        let last = events.last().expect("a crashed run still says something");
+        assert!(
+            super::super::run_end::is_terminal(last),
+            "the stream ended with {:?}, which leaves every consumer waiting",
+            agent_event_kind(last)
+        );
     }
 
     /// Multi-turn run with a tool call: assistant emits toolCall

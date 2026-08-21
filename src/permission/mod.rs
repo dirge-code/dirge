@@ -6,6 +6,23 @@ pub mod engine;
 pub mod path;
 pub mod pattern;
 
+/// Whether `tool` is denied by a `deny_tools` frontmatter list.
+///
+/// Case-insensitive: `deny_tools: [Edit]` denies `edit` (#7).
+///
+/// The single definition of that rule (dirge-e31n.3). It used to live only
+/// inside [`checker::PermissionChecker::is_prompt_denied`], which was fine
+/// while enforcement was the only consumer. It no longer is: the capability
+/// projection describes the tool set to the MODEL, and if its idea of "denied"
+/// drifts from the enforcer's, the prompt goes back to advertising tools that
+/// will be refused — which is the exact defect the projection exists to remove
+/// (see dirge-cw7w, where plan mode told the model to write a file it was
+/// denied). Two copies of a predicate that must agree is how they stop
+/// agreeing, so there is one.
+pub fn is_denied_by(deny: &[String], tool: &str) -> bool {
+    deny.iter().any(|d| d.eq_ignore_ascii_case(tool))
+}
+
 /// Push the active prompt's `deny_tools` list into the permission
 /// checker so subsequent tool calls observe the new restriction.
 /// Best-effort: a poisoned mutex falls through to `into_inner`,
@@ -164,7 +181,48 @@ impl std::fmt::Display for SecurityMode {
     }
 }
 
-pub fn default_bash_rules() -> Vec<(&'static str, Action)> {
+/// Project tools that are ALSO reachable as `python -m <tool>` (dirge-e1nv).
+///
+/// Every name here must be allowed under its own name by [`default_bash_rules`]
+/// — the module-form rules are generated from this list, so an entry whose bare
+/// rule was later removed would be a silent widening. Pinned by
+/// `every_module_form_tool_is_allowed_under_its_own_name`.
+///
+/// `python -m <tool>` is spelled out rather than reached by stripping the
+/// interpreter prefix. Allow-matching sees commands RAW on purpose (dirge-8zem):
+/// `PATH=/tmp/evil git push` and `./env git push` run a different binary under
+/// an allowed name, so a general "strip the prefix and match" would reopen that.
+/// `-m` does not make the interpreter safe; it names a module that still has to
+/// be allowed on its own, which is why `python3 -m http.server` and
+/// `python3 -m pip install` keep prompting.
+pub const PYTHON_MODULE_TOOLS: &[&str] = &["pytest", "ruff", "black", "mypy"];
+
+/// Interpreter spellings the module form is generated for. `python3.12`-style
+/// versioned names are not included: a pattern loose enough to cover them is
+/// loose enough to cover an arbitrary `python*` on PATH.
+const PYTHON_INTERPRETERS: &[&str] = &["python", "python3"];
+
+pub fn default_bash_rules() -> Vec<(String, Action)> {
+    let mut rules: Vec<(String, Action)> = base_bash_rules()
+        .into_iter()
+        .map(|(p, a)| (p.to_string(), a))
+        .collect();
+    // dirge-e1nv: `<interp> -m <tool> **` for every tool allowed under its own
+    // name. Generated rather than written twice — eight more literals would be
+    // a second list to keep in step with the first.
+    //
+    // Appended AFTER the base list, which is last-match-wins, so this only ever
+    // adds the module spelling of a rule that is already there. A user rule
+    // still wins: `install_config_rules` pushes those after all of these.
+    for interp in PYTHON_INTERPRETERS {
+        for tool in PYTHON_MODULE_TOOLS {
+            rules.push((format!("{interp} -m {tool} **"), Action::Allow));
+        }
+    }
+    rules
+}
+
+fn base_bash_rules() -> Vec<(&'static str, Action)> {
     // Allow-list ordering / shape — three buckets:
     //   1. Read-only inspection (cat / ls / grep / etc.)
     //   2. Project-scoped dev workflow inside CWD (cargo / git
@@ -316,6 +374,31 @@ pub fn default_bash_rules() -> Vec<(&'static str, Action)> {
         ("pip list **", Action::Allow),
         ("pip show **", Action::Allow),
         ("pip freeze", Action::Allow),
+        // Swift (GH #778). Project-scoped, same trust model as the cargo/go
+        // entries: `swift build`/`test`/`run` compile and run the package's own
+        // code, which is the trust you already granted by letting the agent
+        // edit it. The bare `swift` interpreter is NOT allowed — `swift foo.swift`
+        // and `swift repl` run arbitrary code, exactly the reason `python` is
+        // excluded — so each subcommand is named.
+        ("swift build **", Action::Allow),
+        ("swift test **", Action::Allow),
+        ("swift run **", Action::Allow),
+        // `swift package` covers describe/show-dependencies/resolve; resolve
+        // fetches, which is the same network-side-effect line `npm install`
+        // sits on, so it stays gated by omission.
+        ("swift package describe **", Action::Allow),
+        ("swift package show-dependencies **", Action::Allow),
+        ("swiftlint **", Action::Allow),
+        ("swift-format **", Action::Allow),
+        // Mojo. Same trust model as swift's entries: `mojo build`/`test`
+        // compile and test the project's own code. Unlike `swift run`, which
+        // runs the *package's* target, `mojo run <file>` (and bare
+        // `mojo <file>`) executes an arbitrary file — the interpreter form,
+        // excluded for the same reason `python` is — so `run` is deliberately
+        // absent. `mojo format` only rewrites source in place.
+        ("mojo build **", Action::Allow),
+        ("mojo test **", Action::Allow),
+        ("mojo format **", Action::Allow),
         // Go
         ("go build **", Action::Allow),
         ("go test **", Action::Allow),

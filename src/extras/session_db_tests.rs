@@ -825,11 +825,11 @@ fn end_session_is_idempotent() {
 
 #[test]
 fn open_failure_returns_descriptive_error() {
-    // dirge-w4i7: assert on the returned Err, NOT the process-global
-    // last_init_error(). open() clears that global on every successful
-    // open, so a parallel test opening a DB races this assertion down to
-    // None and the test flakes. The returned error carries the same
-    // message and is per-call, so it's race-free.
+    // dirge-w4i7: assert on the returned Err, which is per-call and
+    // therefore race-free. This used to warn against reading a
+    // process-global `last_init_error()` that every successful open
+    // cleared — #769 deleted it, since nothing ever read it and the
+    // returned error says the same thing.
     //
     // Attempt to open a path that doesn't exist as a directory (the parent
     // dir creation is done by open(), but a file where a directory should
@@ -1695,5 +1695,257 @@ fn fts5_external_content_delete_all_clears_phantom_postings() {
     );
     assert_eq!(matches("hello"), 0, "index is fully reset");
 
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// #769: a damaged database must be refused at OPEN, with the file named
+/// and a way out. Before this it opened cleanly and failed later at
+/// whatever write touched the bad page — a message naming neither the
+/// database nor a recovery step, repeated for every session afterwards.
+#[test]
+fn a_damaged_database_is_refused_at_open_with_the_path_and_the_steps() {
+    let _gate = DIAGNOSTICS_TEST_GATE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let n = DB_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!("dirge-damaged-open-{}-{}", std::process::id(), n));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("state.db");
+    // Build a real database, then scribble over its b-tree.
+    {
+        let db = SessionDb::open(&path).expect("a fresh database opens");
+        db.conn
+            .execute_batch("CREATE TABLE scratch (a TEXT); CREATE INDEX scratch_a ON scratch (a);")
+            .unwrap();
+        let mut stmt = db
+            .conn
+            .prepare("INSERT INTO scratch (a) VALUES (?1)")
+            .unwrap();
+        for i in 0..500 {
+            stmt.execute([format!(
+                "row {i} padded out so the file spans several pages"
+            )])
+            .unwrap();
+        }
+    }
+    let mut bytes = std::fs::read(&path).unwrap();
+    assert!(bytes.len() > 8192, "need more than one page to damage");
+    for b in bytes.iter_mut().skip(4096).take(2048) {
+        *b = 0x5a;
+    }
+    std::fs::write(&path, &bytes).unwrap();
+
+    let err = match SessionDb::open(&path) {
+        Ok(_) => panic!("a damaged database must be refused"),
+        Err(e) => e,
+    };
+    assert!(err.contains("damaged"), "{err}");
+    assert!(
+        err.contains(path.to_str().unwrap()),
+        "the message must name the file: {err}"
+    );
+    assert!(err.contains(".recover"), "{err}");
+    // The caller gets the whole thing back — that is what
+    // `agent_inner` prints instead of dropping the memory tier in
+    // silence, so the message the user sees IS this one.
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The discrimination half: an ordinary database opens, and opening it
+/// does not invent a complaint. Without this, a `quick_check` wired to
+/// reject everything would look identical.
+#[test]
+fn an_intact_database_opens_and_records_nothing() {
+    let _gate = DIAGNOSTICS_TEST_GATE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let (_db, path) = temp_db();
+    assert!(path.exists());
+    assert!(
+        take_degraded_opens().is_empty(),
+        "a healthy local open has nothing to report"
+    );
+}
+
+/// #769: the WAL-fallback notice used to be written into the slot a
+/// successful open CLEARS — recorded and then wiped by the same open, so
+/// nothing could ever read it. It lives in its own list now, and a
+/// successful open must not erase it.
+#[test]
+fn a_degraded_open_notice_survives_a_later_successful_open() {
+    let _gate = DIAGNOSTICS_TEST_GATE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let _drain = take_degraded_opens();
+    note_degraded_open("something.db is on a filesystem without WAL support".to_string());
+    // A normal open, of the kind that used to wipe it.
+    let (_db, _path) = temp_db();
+    let notes = take_degraded_opens();
+    assert_eq!(
+        notes.len(),
+        1,
+        "the notice must outlive the next open: {notes:?}"
+    );
+    assert!(notes[0].contains("without WAL support"));
+    // Draining leaves none behind, so a rebuild does not repeat it.
+    assert!(take_degraded_opens().is_empty());
+}
+
+/// A process opens more than one database — the per-project `state.db`
+/// and the global memory store — and they can sit on different
+/// filesystems. Each must be reported: keeping only the most recent
+/// notice is how the original bug worked, just one layer down.
+#[test]
+fn two_databases_in_trouble_are_both_reported() {
+    let _gate = DIAGNOSTICS_TEST_GATE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let _drain = take_degraded_opens();
+    note_degraded_open("project/state.db is on a filesystem without WAL support".to_string());
+    note_degraded_open("global/memory.db is on a filesystem without WAL support".to_string());
+    let notes = take_degraded_opens();
+    assert_eq!(notes.len(), 2, "both databases must be named: {notes:?}");
+    assert!(
+        notes.iter().any(|n| n.contains("project/state.db")),
+        "{notes:?}"
+    );
+    assert!(
+        notes.iter().any(|n| n.contains("global/memory.db")),
+        "{notes:?}"
+    );
+}
+
+/// One line per database, not per open — an agent rebuild reopens the
+/// same files and must not stack duplicates.
+#[test]
+fn a_degraded_open_is_noted_once_however_often_it_reopens() {
+    let _gate = DIAGNOSTICS_TEST_GATE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let _drain = take_degraded_opens();
+    for _ in 0..3 {
+        note_degraded_open("same.db is on a filesystem without WAL support".to_string());
+    }
+    assert_eq!(take_degraded_opens().len(), 1);
+}
+
+/// dirge-vpma.50: a DB that already ran the ORIGINAL v6 migration still
+/// carries phantom FTS postings, and nothing would ever revisit them.
+///
+/// The old v6 cleared `messages_fts` with a plain `DELETE FROM`. It is an
+/// external-content table, so that un-indexed each row against
+/// `messages.content` as it stands now — while the indexed text had been the
+/// composite `content || tool_name || tool_calls` the v2 triggers wrote. Every
+/// tool_calls token survived as a posting matchable through `search_messages`,
+/// including secrets in a folded bash call. vpma.4 fixed the migration for DBs
+/// that had not run it yet; this is the repair for the ones that had.
+///
+/// The phantom is planted as an EXTRA posting on a real message's rowid, which
+/// is the shape the old migration left: the row is still there, its index
+/// entry still carries text the current indexing would never produce.
+#[test]
+fn a_phantom_fts_posting_from_the_old_migration_is_repaired_on_open() {
+    let (db, dir) = temp_db();
+    let path = dir.join("state.db");
+    db.insert_session("s1", "cli", "gpt-5", "openai", "2026-01-01T10:00:00Z")
+        .unwrap();
+    let id = db
+        .insert_message(
+            "s1",
+            "user",
+            "an ordinary message",
+            None,
+            None,
+            None,
+            "2026-01-01T10:01:00Z",
+        )
+        .unwrap();
+
+    db.conn
+        .execute(
+            "INSERT INTO messages_fts(rowid, content) VALUES (?1, 'phantomsecrettoken')",
+            rusqlite::params![id],
+        )
+        .unwrap();
+    // Clear the ledger so this DB looks exactly like one that ran the old v6.
+    db.conn
+        .execute(
+            "DELETE FROM db_maintenance WHERE task = 'fts_phantom_repair'",
+            [],
+        )
+        .unwrap();
+    assert!(
+        !db.search_messages("phantomsecrettoken", None)
+            .unwrap()
+            .is_empty(),
+        "precondition: the planted posting must actually be matchable, or \
+         this test proves nothing",
+    );
+    drop(db);
+
+    // Reopening runs the repair.
+    let db = SessionDb::open(&path).unwrap();
+    assert!(
+        db.search_messages("phantomsecrettoken", None)
+            .unwrap()
+            .is_empty(),
+        "the phantom posting survived the repair",
+    );
+    // And the real content is still searchable — the repair rebuilds the
+    // index, it does not just empty it.
+    assert!(
+        !db.search_messages("ordinary", None).unwrap().is_empty(),
+        "the repair dropped legitimate postings",
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The repair must be one-shot. A full index rebuild on every open of every
+/// non-graph build is exactly what the feature-split `SCHEMA_VERSION` would
+/// have caused had this been a version-guarded migration, which is why the
+/// work is gated on a recorded marker rather than a version number.
+#[test]
+fn the_fts_repair_records_itself_and_does_not_run_again() {
+    let (db, dir) = temp_db();
+    let path = dir.join("state.db");
+    assert!(
+        db.maintenance_done(FTS_PHANTOM_REPAIR),
+        "a fresh DB is built clean and must be MARKED, not rebuilt on a later open",
+    );
+    db.insert_session("s1", "cli", "gpt-5", "openai", "2026-01-01T10:00:00Z")
+        .unwrap();
+    let id = db
+        .insert_message(
+            "s1",
+            "user",
+            "an ordinary message",
+            None,
+            None,
+            None,
+            "2026-01-01T10:01:00Z",
+        )
+        .unwrap();
+    drop(db);
+
+    // Plant a posting WITHOUT clearing the ledger. An already-repaired DB must
+    // leave it alone — that is what proves the marker, not luck, gates the
+    // rebuild.
+    let db = SessionDb::open(&path).unwrap();
+    db.conn
+        .execute(
+            "INSERT INTO messages_fts(rowid, content) VALUES (?1, 'untouchedtoken')",
+            rusqlite::params![id],
+        )
+        .unwrap();
+    drop(db);
+
+    let db = SessionDb::open(&path).unwrap();
+    assert!(
+        !db.search_messages("untouchedtoken", None)
+            .unwrap()
+            .is_empty(),
+        "the repair re-ran on an already-repaired DB",
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

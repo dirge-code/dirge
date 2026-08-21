@@ -196,6 +196,8 @@ mod tests {
     #[tokio::test]
     async fn edits_via_minified_match_preserving_formatting() {
         let dir = std::env::temp_dir().join(format!("dirge-editmin-{}", std::process::id()));
+        // dirge-m1ni: clear first — the name is keyed on a recyclable pid.
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("a.rs");
         let src = "fn main() {\n    let x = 1;\n    let y = 2;\n}\n";
@@ -244,6 +246,8 @@ mod tests {
         snapshots::clear();
 
         let dir = std::env::temp_dir().join(format!("dirge-editmin-rewind-{}", std::process::id()));
+        // dirge-m1ni: clear first — the name is keyed on a recyclable pid.
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("a.rs");
         let src = "fn main() {\n    let x = 1;\n    let y = 2;\n}\n";
@@ -290,6 +294,8 @@ mod tests {
     #[tokio::test]
     async fn blocked_until_read() {
         let dir = std::env::temp_dir().join(format!("dirge-editmin-gate-{}", std::process::id()));
+        // dirge-m1ni: clear first — the name is keyed on a recyclable pid.
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("a.rs");
         std::fs::write(&path, "fn main(){let x=1;}\n").unwrap();

@@ -44,7 +44,16 @@ mod integration {
         } else {
             std::path::Path::new("/dev/kvm").exists()
         };
-        virtualization_ok && crate::sandbox::microvm::runner::find_runner_binary().is_ok()
+        // `krun_linked` matters as much as the binary existing. A runner built
+        // without libkrun is a stub that explains itself and exits (dirge-vadg)
+        // — it is a file on disk that cannot boot anything. Before the stub,
+        // "binary found" implied "libkrun linked" because a missing libkrun
+        // meant the link failed and no binary was produced; that inference is
+        // no longer sound, and without this these tests go red for every macOS
+        // dev who hasn't installed libkrun. CI wouldn't catch it (dirge-u35k).
+        virtualization_ok
+            && cfg!(krun_linked)
+            && crate::sandbox::microvm::runner::find_runner_binary().is_ok()
     }
 
     #[test]

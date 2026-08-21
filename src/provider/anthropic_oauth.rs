@@ -290,6 +290,8 @@ mod tests {
         };
         let dir =
             std::env::temp_dir().join(format!("dirge-anthropic-oauth-{}", std::process::id()));
+        // dirge-m1ni: clear first — the name is keyed on a recyclable pid.
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(".credentials.json");
 

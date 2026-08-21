@@ -75,13 +75,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Audit dependencies
-        uses: pirafrank/audit-check-action@v1
-
-      - name: OSV vulnerability scan
-        uses: google/osv-scanner-action/osv-scanner-action@v2.3.8
-        with:
-          scan-args: "--lockfile=Cargo.lock --config=.osv-scanner.toml"
+      # Shared with the Release workflow's `preflight` gate — see
+      # .github/actions/audit. Keep the steps there, not here, so the gate
+      # cannot drift from what CI actually runs.
+      - uses: ./.github/actions/audit
 
   # The `validate_all_plugins_compile` Rust test (mod_tests.rs) loads every
   # plugin against the full dirge harness surface.  It runs in the
@@ -188,3 +185,36 @@ jobs:
 
       - name: Build
         run: cargo build --bin dirge --no-default-features --features windows-default
+
+  # macOS ships as a release target (aarch64-apple-darwin and
+  # x86_64-apple-darwin in release.yml, plus a Nix bin.nix platform) and had
+  # NO CI coverage at all — not build, not test. dirge-u35k: the dead-tty
+  # watchdog was unusable on macOS in 0.19.24 AND again in 0.19.25, exiting
+  # 129 within seconds of every TUI startup, and nothing caught it across two
+  # releases. A first-class target with zero CI is how that happens twice.
+  #
+  # Unlike the Windows job this RUNS THE SUITE. The tests assume Unix
+  # semantics, which macOS has, and the bugs worth catching here are runtime
+  # behaviour (poll/ioctl/tty semantics differ from Linux) rather than
+  # compilation. A build-only job would not have caught the watchdog bug.
+  macos:
+    name: build (macos)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Build
+        run: cargo build --bin dirge
+
+      - name: Install nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+
+      - name: Test
+        run: cargo nextest run --bin dirge

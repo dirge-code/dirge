@@ -13,6 +13,9 @@ mod event;
 mod extras;
 mod fs_atomic;
 mod hash;
+/// Marks the stretches of a tool call spent waiting on the user, so the
+/// dispatch watchdog can tell a stalled call from a careful human.
+mod human_wait;
 /// Shared request/response correlation core over `jsonrpc_framing`, used by
 /// both the LSP and DAP clients (each supplies a `Protocol` impl).
 #[cfg(any(feature = "lsp", feature = "dap"))]
@@ -24,10 +27,14 @@ mod jsonrpc_framing;
 mod llmtrim;
 #[cfg(feature = "lsp")]
 mod lsp;
+/// What a panic hook writes down so whoever survives the panic — or the
+/// terminal teardown, when nobody did — can report it.
+mod panic_report;
 mod permission;
 mod plugin;
 mod prompt_cache;
 mod provider;
+mod runtime;
 mod sandbox;
 #[cfg(feature = "semantic")]
 mod semantic;
@@ -73,6 +80,14 @@ use crate::ui::ansi::{self, StripPolicy};
 #[derive(Default)]
 struct Channels {
     permission: Option<PermCheck>,
+    /// The resolved security mode, or `None` when tools are disabled.
+    ///
+    /// dirge-vpma.47: carried out of `build_channels` rather than recomputed.
+    /// `resolve_mode` has stderr side effects — the conflicting-flags warning
+    /// and the config-vs-CLI override warning — so calling it a second time
+    /// printed both again on every interactive launch, and left two places to
+    /// keep in step.
+    mode: Option<SecurityMode>,
     ask_tx: Option<AskSender>,
     ask_rx: Option<AskReceiver>,
     question_tx: Option<QuestionSender>,
@@ -255,6 +270,7 @@ fn build_channels(cli: &cli::Cli, cfg: &config::Config) -> Channels {
 
     Channels {
         permission: Some(perm),
+        mode: Some(mode),
         ask_tx: Some(ask_tx),
         ask_rx: Some(ask_rx),
         question_tx: Some(question_tx),
@@ -434,6 +450,14 @@ fn should_adopt_session_provider(
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
+    // Write down every panic before anything can produce one. The hook
+    // only records — whoever survives the panic claims the record and
+    // reports it (the agent run's crash error), and if nobody did,
+    // `TerminalGuard::drop` prints it on the way out. Installed here
+    // rather than in the TUI guard so `--print`, `--loop` and ACP get
+    // the same account of a crash.
+    panic_report::install();
+
     // Install ring crypto provider for rustls (reqwest uses rustls-no-provider).
     // Must happen before any reqwest::Client::new() call.
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -515,6 +539,18 @@ async fn main() -> anyhow::Result<()> {
         // No log file requested — discard tracing events.
         None => Box::new(std::io::sink()),
     };
+    // dirge-vlfb: the loop trace is its own sink, not a tracing target — it is
+    // read by a script, so it must not share a file with prose log lines whose
+    // shape nothing guarantees. `DIRGE_TRACE` is the env twin of `--trace`.
+    if let Some(path) = cli
+        .trace
+        .clone()
+        .or_else(|| std::env::var_os("DIRGE_TRACE").map(std::path::PathBuf::from))
+        && let Err(e) = agent::agent_loop::trace::enable(&path)
+    {
+        eprintln!("warning: could not write the loop trace to {path:?}: {e}");
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -606,10 +642,17 @@ async fn main() -> anyhow::Result<()> {
                     return Ok(());
                 }
                 cli::SandboxAction::Setup { image } => {
+                    // dirge-vpma.48: say so. This used to return Ok(()) in
+                    // silence, so `dirge sandbox setup` on a build without the
+                    // feature printed nothing and exited 0 — indistinguishable
+                    // from a successful setup, while nothing had been checked,
+                    // built, or written.
                     #[cfg(not(feature = "sandbox-microvm"))]
                     {
                         let _ = &image;
-                        return Ok(());
+                        anyhow::bail!(
+                            "this dirge was built without the `sandbox-microvm` feature, so there is nothing to set up. Rebuild with `cargo build --features sandbox-microvm`, or use a release binary that ships it."
+                        );
                     }
                     #[cfg(feature = "sandbox-microvm")]
                     {
@@ -743,9 +786,11 @@ async fn main() -> anyhow::Result<()> {
     // `file_excerpt_cap_tokens` in config.json to raise it for a codebase of
     // large files, or to 3000 to hold reads to the generic tool-output cap.
     crate::agent::compression::init_file_excerpt_cap(cfg.file_excerpt_cap_tokens);
-    // Honor an explicit `context_window` config override in the loop's
-    // window math (it previously read only the built-in model table).
-    crate::agent::agent_loop::context_manager::init_context_window_override(cfg.context_window);
+    // The loop's `context_window` override is installed later, once the
+    // provider and model are final — a per-provider window (GH #772) cannot be
+    // resolved before the provider is known, and a resumed session can replace
+    // it. See the `init_context_window_override` call after
+    // `resolve_startup_model`.
     // Incremental checkpoint is persisted only by the interactive
     // session-rotation path; the headless modes have no consumer for the
     // CheckpointRefresh event, so firing it there would just burn
@@ -819,7 +864,7 @@ async fn main() -> anyhow::Result<()> {
     let mut session = session::Session::new(
         &provider,
         &model,
-        cfg.resolve_context_window(model.as_str()),
+        cfg.resolve_context_window_for(&provider, model.as_str()),
     );
     // dirge-ovjk: track whether `session` ends up loaded from disk. A fresh
     // session has its model resolved from the known explicit-vs-default
@@ -1192,6 +1237,11 @@ async fn main() -> anyhow::Result<()> {
                             // inherit the top-level default
                             // (`stream_chunk_timeout_secs` or 300s).
                             stream_chunk_timeout_secs: None,
+                            // Nor a context window — `harness/register-provider`
+                            // carries no such field, so these fall through to
+                            // the top-level key and the model table like any
+                            // provider that does not set one (GH #772).
+                            context_window: None,
                             // PROV-1: plugin-registered providers
                             // can't opt into HTTP. If a plugin
                             // declares a non-https base_url the
@@ -1281,7 +1331,39 @@ async fn main() -> anyhow::Result<()> {
     let model = CompactString::new(resolved_model);
     session.model = model.clone();
     session.model_explicit = resolved_explicit;
-    session.context_window = cfg.resolve_context_window(model.as_str());
+    session.context_window = cfg.resolve_context_window_for(&provider, model.as_str());
+    // GH #772: the loop's compaction math and the session's context gauge must
+    // read the SAME window, or the meter describes a fold that never happens.
+    // Installed here rather than at startup because this is the first point
+    // where the provider and the model are both final — a resumed session can
+    // replace either.
+    //
+    // Deliberately `configured_context_window` and not the fully-resolved
+    // value: with `None` the loop re-resolves from the model table on every
+    // run, so a mid-session `/model` switch tracks the new model. Freezing a
+    // number here would pin the first model's window to every later one.
+    crate::agent::agent_loop::context_manager::init_context_window_override(
+        cfg.configured_context_window(&provider),
+    );
+    // dirge-tva8: size the tool surface against the SAME window, passed in
+    // rather than re-derived — a tool set sized against a different number
+    // than the one compaction folds against is the drift this whole area is
+    // made of.
+    crate::agent::agent_loop::compact_schema::init(
+        crate::agent::agent_loop::context_manager::effective_ctx_max(session.context_window),
+        match cfg
+            .compact_tool_schemas
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("on" | "true" | "always") => Some(true),
+            Some("off" | "false" | "never") => Some(false),
+            // `auto`, absent, or anything unrecognized: decide from the window.
+            _ => None,
+        },
+    );
 
     // dirge-ykeu Phase 4: pre-resolve user agent profiles into subagent
     // routes (model + system prompt) and install them process-globally so the
@@ -1454,6 +1536,7 @@ async fn main() -> anyhow::Result<()> {
     }
     let Channels {
         permission,
+        mode: resolved_mode,
         ask_tx,
         mut ask_rx,
         question_tx,
@@ -1706,7 +1789,9 @@ async fn main() -> anyhow::Result<()> {
                     mcp_manager.as_ref(),
                     #[cfg(feature = "semantic")]
                     semantic_manager.as_ref(),
-                    Some(session.id.to_string()),
+                    // dirge-vpma.49: through the helper, so the --no-session
+                    // policy lives in one place instead of three.
+                    session_id_for_agent(&cli, &session),
                 )
                 .await
             };
@@ -1760,7 +1845,8 @@ async fn main() -> anyhow::Result<()> {
                             mcp_manager.as_ref(),
                             #[cfg(feature = "semantic")]
                             semantic_manager.as_ref(),
-                            Some(session.id.to_string()),
+                            // dirge-vpma.49: see above.
+                            session_id_for_agent(&cli, &session),
                         )
                         .await;
                     }
@@ -1831,9 +1917,24 @@ async fn main() -> anyhow::Result<()> {
             mcp_manager.as_ref(),
             #[cfg(feature = "semantic")]
             semantic_manager.as_ref(),
-            Some(session.id.to_string()),
+            // dirge-vpma.49: see above.
+            session_id_for_agent(&cli, &session),
         )
         .await;
+
+        // dirge-wxyw: stamp which assembled system prompt this session ran
+        // under. Diagnostic only — nothing branches on it — but it is the only
+        // record of the instructions, and the version cannot stand in for it
+        // (the preamble varies within a version by mode, AGENTS.md, skills,
+        // memory and model-family steering). Logged as well as stored so it is
+        // greppable without opening the session file.
+        let digest = agent.preamble_digest();
+        tracing::info!(
+            target: "dirge::context",
+            preamble_digest = %digest,
+            "assembled system prompt",
+        );
+        session.preamble_digest = Some(CompactString::new(&digest));
 
         #[cfg(feature = "plugin")]
         if let Some(pm_arc) = plugin_manager.as_ref() {
@@ -1865,10 +1966,13 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
+        // dirge-vpma.47: reuse the mode `build_channels` already resolved.
+        // Recomputing it here re-ran `resolve_mode`'s warnings, so
+        // `dirge --yolo --restrictive` printed the conflict twice.
         if !cli.resolve_no_tools(&cfg)
             && let Some(perm) = &permission
+            && let Some(mode) = resolved_mode
         {
-            let mode = resolve_mode(&cli, &cfg);
             perm.lock_ignore_poison().set_mode(mode);
         }
 
@@ -2414,6 +2518,51 @@ mod session_id_tests {
         );
     }
 
+    /// dirge-vpma.49: every `build_agent` call site must route through the
+    /// helper, not inline the session id.
+    ///
+    /// The `--no-session` policy used to live in three places: the helper (with
+    /// these tests pinning it) plus two hand-written
+    /// `Some(session.id.to_string())` arguments on the `--loop` and interactive
+    /// paths. The divergence was harmless in itself — a never-persisted id gets
+    /// excluded — but any change to the helper would silently have missed two
+    /// of the three sites. A source scan is what keeps the next call site from
+    /// being added the same way.
+    #[test]
+    fn no_build_agent_site_inlines_the_session_id() {
+        let src = include_str!("main.rs");
+        // Scan production code only. The first `#[cfg(test)]` here is a module
+        // DECLARATION (`mod tests;`, an external file), so it does not mark the
+        // start of test code — cut at the first inline `#[cfg(test)] mod X {`
+        // instead.
+        let production = src
+            .split_once("#[cfg(test)]\nmod session_id_tests {")
+            .map(|(before, _)| before)
+            .unwrap_or(src);
+        assert!(
+            production.contains("fn session_id_for_agent"),
+            "scan lost the production half — the cut marker moved",
+        );
+        // Exactly one occurrence is legitimate: the helper's own return.
+        let inlined = production.matches("Some(session.id.to_string())").count();
+        assert_eq!(
+            inlined, 1,
+            "expected the id to be built only inside session_id_for_agent, but \
+             {inlined} sites construct it — a build_agent call is inlining the \
+             policy instead of calling the helper",
+        );
+        assert!(
+            production
+                .matches("session_id_for_agent(&cli, &session)")
+                .count()
+                >= 3,
+            "expected all three agent-build sites to call the helper, found {}",
+            production
+                .matches("session_id_for_agent(&cli, &session)")
+                .count(),
+        );
+    }
+
     /// Interactive (no --print, no --no-session) also gets Some.
     #[test]
     fn interactive_yields_some() {
@@ -2471,6 +2620,41 @@ mod resolve_mode_tests {
             SecurityMode::Restrictive,
             "explicit --restrictive must override config yolo=true"
         );
+    }
+
+    /// dirge-vpma.47: the resolved mode travels with the channels, so the
+    /// interactive path never has to compute it a second time.
+    ///
+    /// `resolve_mode` writes to stderr — the conflicting-flags warning and the
+    /// config-override warning — so a second call is not free: it reprinted
+    /// both on every interactive launch. Carrying the value is also what keeps
+    /// the checker and the later `set_mode` from drifting apart.
+    #[test]
+    fn build_channels_reports_the_mode_it_resolved() {
+        let cli = cli::Cli::parse_from(["dirge", "--restrictive"]);
+        let cfg = config::Config::default();
+        let channels = build_channels(&cli, &cfg);
+        assert_eq!(
+            channels.mode,
+            Some(SecurityMode::Restrictive),
+            "the resolved mode must be carried out, not recomputed",
+        );
+        assert_eq!(
+            channels.mode,
+            Some(resolve_mode(&cli, &cfg)),
+            "the carried mode must be the one resolve_mode gives",
+        );
+    }
+
+    /// With tools disabled there is no checker and no mode — the caller's
+    /// `set_mode` is correctly skipped rather than fed a default.
+    #[test]
+    fn no_tools_carries_no_mode() {
+        let cli = cli::Cli::parse_from(["dirge", "--no-tools"]);
+        let cfg = config::Config::default();
+        let channels = build_channels(&cli, &cfg);
+        assert!(channels.permission.is_none(), "precondition: no checker");
+        assert_eq!(channels.mode, None);
     }
 
     /// A CLI flag wins over config even in the permissive direction —

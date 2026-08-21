@@ -965,9 +965,16 @@ fn oauth_compaction_disabled_error_is_detected_through_context_wrapping() {
 
 // --- C6/C7: compaction prefix is full + includes tool calls -----
 
-use super::summarize;
 use crate::session::{MessageRole, SessionMessage, ToolCallEntry, ToolCallState};
 use compact_str::CompactString;
+
+/// Serialize a session's messages the way compaction does: convert to the
+/// shared material, then run THE serializer.
+fn serialize_session(msgs: &[SessionMessage]) -> String {
+    crate::agent::compression::serialize_turns(
+        &crate::agent::compaction_material::from_session_messages(msgs),
+    )
+}
 
 fn sm(role: MessageRole, content: &str, tool_calls: Vec<ToolCallEntry>) -> SessionMessage {
     SessionMessage {
@@ -981,10 +988,15 @@ fn sm(role: MessageRole, content: &str, tool_calls: Vec<ToolCallEntry>) -> Sessi
     }
 }
 
-/// C7: assistant tool calls land in the serialized form with
-/// args + result. Previously they were dropped entirely so the
-/// summarizer saw only `[Assistant]: <text>` with no record
-/// that bash/read/edit ever ran.
+/// C7: assistant tool calls land in the serialized form with args + result.
+/// Previously they were dropped entirely so the summarizer saw only
+/// `[Assistant]: <text>` with no record that bash/read/edit ever ran.
+///
+/// dirge-dlpl: exercised through the SHARED serializer now
+/// (`compaction_material::from_session_messages` + `compression::serialize_turns`)
+/// rather than a `/compact`-only one. The contract is the same and it is the
+/// contract that mattered — the second implementation is what lost it on the
+/// other path (dirge-czg9).
 #[test]
 fn serialize_conversation_includes_tool_calls() {
     let msgs = vec![
@@ -1002,8 +1014,11 @@ fn serialize_conversation_includes_tool_calls() {
             }],
         ),
     ];
-    let out = summarize::serialize_conversation(&msgs);
-    assert!(out.contains("[User]"), "missing role tag: {out}");
+    let out = serialize_session(&msgs);
+    // dirge-dlpl: one format now. `/compact` used to render `[User]: text` and
+    // the fold `[0] user: text`; the shared serializer emits the indexed form
+    // for both, so a summary does not depend on which path compacted it.
+    assert!(out.contains("[0] user: "), "missing role tag: {out}");
     assert!(
         out.contains("[Tool: find_files("),
         "missing tool call line: {out}"
@@ -1037,14 +1052,13 @@ fn serialize_conversation_marks_interrupted_and_failed() {
             },
         ],
     )];
-    let out = summarize::serialize_conversation(&msgs);
+    let out = serialize_session(&msgs);
     assert!(out.contains("<interrupted>"), "got: {out}");
     assert!(out.contains("<failed: no such file>"), "got: {out}");
 }
 
-/// C7 bound: a single tool result over the per-tool cap (2KB)
-/// truncates with a marker, preserving structure of the rest
-/// of the conversation.
+/// C7 bound: a tool result far over the per-turn cap truncates with a marker,
+/// preserving the structure of the rest of the conversation.
 #[test]
 fn serialize_conversation_truncates_huge_tool_results() {
     let big: String = "x".repeat(5000);
@@ -1058,30 +1072,69 @@ fn serialize_conversation_truncates_huge_tool_results() {
             state: ToolCallState::Completed { result: big },
         }],
     )];
-    let out = summarize::serialize_conversation(&msgs);
+    let out = serialize_session(&msgs);
     assert!(
-        out.contains("(truncated, 5000 bytes total)"),
+        out.contains("truncated, 5000 total chars"),
         "expected truncation marker; got: {out}"
     );
 }
 
-/// C6: a long full-conversation prefix is NOT truncated by the
-/// caller-side 6000-char cap any more. compress_messages no
-/// longer slices `conversation`; the full string reaches the
-/// summarizer. Regression test the unchanged-passthrough via
-/// serialize_conversation's length on a large input.
+/// C6, the half this test can actually see: `serialize_conversation` is a pure
+/// mapper with no length cap of its own.
+///
+/// It does NOT show that the full string reaches the summarizer, which is what
+/// this test's comment used to claim. At ~2000 chars the fixture is far too
+/// small to reach any downstream budget, so it passed all the way through
+/// dirge-5zca — where a fixed 128 KB cap in `oneshot_with_model` was dropping
+/// most of the conversation. That guarantee is pinned by
+/// `a_fold_sized_prompt_fits_the_summarizers_budget` below, which uses a
+/// fixture big enough to reach the cap.
 #[test]
 fn serialize_conversation_returns_full_prefix() {
     let msgs: Vec<SessionMessage> = (0..200)
         .map(|i| sm(MessageRole::Assistant, &format!("turn {i}"), vec![]))
         .collect();
-    let out = summarize::serialize_conversation(&msgs);
-    // 200 turns × ~10 chars each = ~2000 chars; below the old
-    // 6000 cap but the principle still holds: the function is
-    // a pure mapper, no length cap. Confirm by checking the
-    // last turn is present.
+    let out = serialize_session(&msgs);
     assert!(out.contains("turn 199"), "tail must be present: {out}");
     assert!(out.contains("turn 0"), "head must be present: {out}");
+}
+
+/// dirge-5zca: the cross-layer guarantee. `build_compaction_prompt` assembles
+/// the whole prefix and `oneshot_with_model` decides what fits — the bug lived
+/// in the seam between them, so the test has to span it too.
+///
+/// The fixture is sized at what a post-response fold actually hands over on a
+/// 128k-token model, and the first assertion exists to keep it that way: a
+/// fixture that stops reaching the old fixed cap makes the second assertion
+/// vacuous, which is exactly how the bug survived the test above.
+#[test]
+fn a_fold_sized_prompt_fits_the_summarizers_budget() {
+    use crate::provider::summarize::{ONESHOT_FALLBACK_BUDGET_BYTES, oneshot_prompt_budget_bytes};
+
+    // gpt-4o is 128_000 tokens; a fold hands over (0.75 * 128_000 - 20_000)
+    // tokens of conversation, ~304 KB at 4 bytes a token.
+    let body = "the quick brown fox jumps over the lazy dog. ".repeat(23); // ~1 KB
+    let msgs: Vec<SessionMessage> = (0..300)
+        .map(|i| sm(MessageRole::Assistant, &format!("turn {i}: {body}"), vec![]))
+        .collect();
+
+    let prompt = crate::provider::build_compaction_prompt(&msgs, None, None)
+        .expect("no delimiter in the fixture");
+
+    assert!(
+        prompt.len() > ONESHOT_FALLBACK_BUDGET_BYTES,
+        "fixture is too small to reach the budget under test ({} bytes) — the \
+         assertion below would pass without proving anything",
+        prompt.len(),
+    );
+    let budget = oneshot_prompt_budget_bytes("gpt-4o");
+    assert!(
+        prompt.len() <= budget,
+        "a fold-sized prompt ({} bytes) exceeds gpt-4o's summarizer budget \
+         ({budget} bytes) — {} bytes would be dropped silently",
+        prompt.len(),
+        prompt.len() - budget,
+    );
 }
 
 // ============================================================
@@ -1276,8 +1329,11 @@ fn compaction_rejects_input_containing_delimiter() {
         "compaction must reject input containing the reserved delimiter"
     );
     let err = result.unwrap_err().to_string();
+    // dirge-dlpl: this is the SHARED check's wording now — `/compact` no longer
+    // carries its own copy of the delimiter scan, which is the arrangement that
+    // let the in-loop path go without one entirely (dirge-tgb9).
     assert!(
-        err.contains("reserved delimiter"),
+        err.contains("reserved") && err.contains("delimiter"),
         "error should mention the reserved-delimiter reason, got: {err}"
     );
 }

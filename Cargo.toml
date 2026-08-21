@@ -3,7 +3,7 @@
 # taken on crates.io. The installed BINARY is still `dirge` (see [[bin]]),
 # so users run: `cargo install dirge-agent` then the `dirge` command.
 name = "dirge-agent"
-version = "0.21.16"
+version = "0.24.0"
 edition = "2024"
 # MSRV: edition 2024 needs 1.85, but the dependency tree (time, serde_with,
 # darling, instability) requires 1.88 — pin there so older toolchains fail
@@ -88,6 +88,8 @@ default = [
     'semantic-elixir',
     'semantic-sql',
     'semantic-dafny',
+    'semantic-swift',
+    'semantic-mojo',
     'slash-completion',
     'mcp-server',
 ]
@@ -117,6 +119,8 @@ no-plugin = [
     'semantic-elixir',
     'semantic-sql',
     'semantic-dafny',
+    'semantic-swift',
+    'semantic-mojo',
     'slash-completion',
     'mcp-server',
 ]
@@ -153,6 +157,8 @@ semantic-cpp = ["semantic", "dep:tree-sitter-cpp"]
 semantic-elixir = ["semantic", "dep:tree-sitter-elixir"]
 semantic-sql = ["semantic", "dep:tree-sitter-sequel"]
 semantic-dafny = ["semantic", "dep:tree-sitter-dafny"]
+semantic-swift = ["semantic", "dep:tree-sitter-swift"]
+semantic-mojo = ["semantic", "dep:tree-sitter-language", "dep:cc"]
 plugin = ["dep:janetrs"]
 lsp = ["dep:lsp-types"]
 dap = ["dep:which", "dep:dap"]
@@ -390,6 +396,17 @@ toon-format = { version = "0.5.0", default-features = false }
 unicode-normalization = { version = "0.1.25" }
 unicode-segmentation = { version = "1.13.3" }
 whatlang = { version = "0.18.0" }
+tree-sitter-swift = { version = "0.7.3", optional = true }
+# The Mojo grammar is VENDORED at `grammars/tree-sitter-mojo` and compiled
+# by build.rs — it isn't on crates.io under any name, and cargo refuses to
+# publish a package carrying a git dependency, which would break the release
+# job. All that's needed here is the `LanguageFn` wrapper type; the parser
+# itself is linked in as a static lib. See that directory's README.
+tree-sitter-language = { version = "0.1", optional = true }
+
+[build-dependencies]
+# Compiles the vendored Mojo grammar (`grammars/tree-sitter-mojo`) in build.rs.
+cc = { version = "1.2", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }

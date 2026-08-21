@@ -10,10 +10,18 @@ pub(crate) mod compressing_http;
 mod dispatch;
 pub(crate) mod kimi_http;
 pub(crate) mod rate_limit_gate;
+/// The one bearer-that-renews-itself used by the Anthropic, Kimi and
+/// ChatGPT/Codex transports.
+pub(crate) mod refreshable_token;
 mod resolve;
 mod route;
 mod run;
 mod spawn;
+/// The one hard allow-list filter over a `LoopTool` registry. Re-exported so
+/// the rooted worktree-writer registry applies the SAME cap the shared-checkout
+/// fork does — two dispatch paths agreeing on what a tool name means is the
+/// whole point (dirge-fwjw).
+pub(crate) use spawn::filter_loop_tools;
 mod stream_dispatch;
 pub mod summarize;
 pub mod wire;
@@ -86,6 +94,16 @@ pub struct AnyAgent {
     /// `ToolSearchTool` instance in `loop_tools`. Default
     /// `false` — the untouched-by-this-feature path.
     dynamic_tool_search: bool,
+    /// dirge-e31n.2: per-turn context envelope opt-in. Resolved from
+    /// `config.turn_envelope` at `build_agent` time and forwarded to
+    /// `LoopSpawnConfig.turn_envelope` by `spawn_runner`. Must travel this
+    /// whole chain: the builder reads the config to decide whether to OMIT
+    /// the session facts from the preamble, and the loop reads it to decide
+    /// whether to EMIT them per turn. A flag that reached only one of the two
+    /// would drop the facts entirely.
+    turn_envelope: bool,
+    /// dirge-e31n.6: prompt-recitation detector mode; travels the same chain.
+    prompt_leak_detect: crate::agent::agent_loop::types::GateMode,
     /// Phase-3: per-session loaded-tool set. Allocated by
     /// `build_agent` when `dynamic_tool_search` is on, and
     /// shared with the `ToolSearchTool` instance registered in
@@ -136,6 +154,8 @@ pub struct AnyAgent {
     /// forwarded to `LoopConfig.verification_tiers_mode`. Defaults to `Off`
     /// (dirge-uw2l.2).
     verification_tiers_mode: crate::agent::agent_loop::types::GateMode,
+    /// dirge-69oe.4: forwarded to `LoopConfig.skill_anchor_interval`.
+    skill_anchor_interval: u32,
     /// dirge-w2de: the project's real gate command (`verification_command`
     /// config). Forwarded to `LoopConfig.verifier` at spawn so the gate
     /// only reports a full green after THIS command passed. `None` keeps
@@ -324,6 +344,15 @@ pub(crate) enum AnyAgentInner {
 }
 
 impl AnyAgent {
+    /// Fingerprint of the assembled system prompt this agent runs under
+    /// (dirge-wxyw). Stamped on the session so a later diagnosis can tell
+    /// whether two sessions ran the same instructions — the version alone
+    /// cannot, since the preamble varies within a version by prompt mode,
+    /// AGENTS.md, skills, memory and model-family steering.
+    pub fn preamble_digest(&self) -> String {
+        crate::agent::prompt::preamble_digest(&self.preamble)
+    }
+
     pub fn new(
         inner: AnyAgentInner,
         cache: ToolCache,
@@ -340,6 +369,8 @@ impl AnyAgent {
             preamble,
             model_name,
             dynamic_tool_search: false,
+            turn_envelope: false,
+            prompt_leak_detect: crate::agent::agent_loop::types::GateMode::Off,
             tool_def_filter: None,
             tool_search_registry: None,
             escalation_stream_fn: None,
@@ -349,6 +380,7 @@ impl AnyAgent {
             code_review_mode: crate::agent::agent_loop::types::CodeReviewMode::default(),
             open_issues_gate_mode: crate::agent::agent_loop::types::GateMode::Off,
             verification_tiers_mode: crate::agent::agent_loop::types::GateMode::Off,
+            skill_anchor_interval: 0,
             verification_command: None,
             safe_state_abort_mode: crate::agent::agent_loop::types::SafeStateMode::Off,
             publish_guard_mode: crate::agent::agent_loop::types::GateMode::Off,
@@ -576,6 +608,13 @@ impl AnyAgent {
         self
     }
 
+    /// dirge-69oe.4: how often to restate loaded skills' anchors, in turn
+    /// boundaries. 0 is off.
+    pub fn with_skill_anchor_interval(mut self, interval: u32) -> Self {
+        self.skill_anchor_interval = interval;
+        self
+    }
+
     /// dirge-w2de: set the project gate command (config
     /// `verification_command`).
     pub fn with_verification_command(mut self, command: Option<String>) -> Self {
@@ -712,6 +751,25 @@ impl AnyAgent {
         self.dynamic_tool_search = true;
         self.tool_def_filter = Some(filter);
         self.tool_search_registry = Some(registry);
+        self
+    }
+
+    /// dirge-e31n.2: emit the volatile session facts as a per-turn envelope
+    /// instead of freezing them into the preamble. The builder has already
+    /// omitted them from the system prompt under the same config flag, so
+    /// this call is what puts them back — off, they are stated once and
+    /// stale; on, once and fresh; and the two settings must not disagree.
+    pub fn with_turn_envelope(mut self, enabled: bool) -> Self {
+        self.turn_envelope = enabled;
+        self
+    }
+
+    /// dirge-e31n.6: detect a model reciting its own system prompt.
+    pub fn with_prompt_leak_detect(
+        mut self,
+        mode: crate::agent::agent_loop::types::GateMode,
+    ) -> Self {
+        self.prompt_leak_detect = mode;
         self
     }
 

@@ -1268,6 +1268,8 @@ mod tests {
         use crate::lsp::spawn::ProcessSpawner;
 
         let tree = std::env::temp_dir().join(format!("dirge-dafny-lsp-{}", std::process::id()));
+        // dirge-m1ni: clear first — the name is keyed on a recyclable pid.
+        let _ = std::fs::remove_dir_all(&tree);
         std::fs::create_dir_all(&tree).unwrap();
         let file = tree.join("Bad.dfy");
         // Type error: `r: int` assigned a bool. Surfaces as a fast

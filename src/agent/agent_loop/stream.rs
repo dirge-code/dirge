@@ -41,6 +41,21 @@ use super::message::{
 use super::tool::AbortSignal;
 use super::types::{Context, LoopConfig};
 
+/// Appended to an assistant message that was cut off mid-stream (dirge-pv03),
+/// so the model reads the remains as incomplete rather than as an answer.
+///
+/// NOT named `*_TAG`. That suffix is reserved by
+/// [`super::intervention::HARNESS_TAGS`] for messages the harness injects on
+/// the model's behalf, and its registry test scans the source for the shape.
+/// This is not one of those: it is text inside the ASSISTANT's own message,
+/// never a `LoopMessage::User`, never mirrored to a `SystemNotice`, and never
+/// attributed to the user in the TUI. Same reasoning as
+/// [`super::envelope::MARKER`].
+pub const INTERRUPTED_NOTICE: &str = "[interrupted: the message above was cut off before it \
+finished — it is NOT a completed answer. Do not treat anything in it as a conclusion you \
+reached, and do not assume any work it describes was actually carried out. Re-establish the \
+state before continuing.]";
+
 /// Input passed to the stream function. Port of pi's `Context`
 /// (the one from `@earendil-works/pi-ai`, not pi's `AgentContext`)
 /// — system prompt + LLM-ready message list + tool defs.
@@ -85,6 +100,10 @@ pub struct StreamOptions {
     pub thinking_budgets: Option<super::types::ThinkingBudgets>,
     pub headers: std::collections::HashMap<String, String>,
     pub metadata: std::collections::HashMap<String, serde_json::Value>,
+    /// dirge-e31n.6: per-request tool gating. `None` sends nothing and leaves
+    /// the provider default (the model decides), which is what every turn but
+    /// a deliberately-constrained one wants.
+    pub tool_choice: Option<super::types::ToolChoice>,
     pub signal: AbortSignal,
 }
 
@@ -99,6 +118,7 @@ impl StreamOptions {
             thinking_budgets: None,
             headers: std::collections::HashMap::new(),
             metadata: std::collections::HashMap::new(),
+            tool_choice: None,
             signal,
         }
     }
@@ -141,6 +161,10 @@ pub async fn stream_assistant_response(
     signal: AbortSignal,
     emit: &mpsc::Sender<LoopEvent>,
     stream_fn: &StreamFn,
+    // Forbid tools for THIS request only (dirge-e31n.6). Per-call rather than
+    // on `LoopConfig` because it describes one turn, and a sticky value would
+    // silently disarm the model for the rest of the run.
+    tool_choice: Option<super::types::ToolChoice>,
 ) -> (AssistantMessage, Option<super::message::TokenUsage>) {
     // 1. transformContext (optional, AgentMessage[] → AgentMessage[])
     let messages: Vec<serde_json::Value> = if let Some(transform) = &config.transform_context {
@@ -182,6 +206,7 @@ pub async fn stream_assistant_response(
         thinking_budgets: config.thinking_budgets.clone(),
         headers: config.headers.clone(),
         metadata: config.metadata.clone(),
+        tool_choice,
         signal,
     };
 
@@ -221,6 +246,15 @@ pub async fn stream_assistant_response(
     };
     let mut stream = active_stream_fn(llm_ctx, stream_options);
 
+    // dirge-e31n.6: watch the streamed text for the model reciting its own
+    // system prompt. Built once per turn (hashing the prompt is the expensive
+    // half) and only when armed, so an `Off` session does no work at all.
+    let mut leak_detector = match config.prompt_leak_detect {
+        super::types::GateMode::Off => None,
+        _ => super::prompt_leak::PromptLeakDetector::new(&context.system_prompt),
+    };
+    let mut leak_reported = false;
+
     // 5. Iterate events.
     let mut added_partial = false;
     // Latest partial snapshot — captured on Start/Delta so a
@@ -243,6 +277,49 @@ pub async fn stream_assistant_response(
             }
             StreamEvent::Delta { partial, phase } => {
                 last_partial = Some(partial.clone());
+                // Check BEFORE forwarding: under `Blocking` the point is to
+                // stop the recitation reaching the transcript and the screen,
+                // and a delta emitted first has already done both.
+                if let Some(det) = leak_detector.as_mut()
+                    && let Some(leak) = det.observe(&partial.text_joined())
+                    && !leak_reported
+                {
+                    leak_reported = true;
+                    tracing::warn!(
+                        target: "dirge::agent_loop::prompt_leak",
+                        run = leak.run,
+                        start_offset = leak.start_offset,
+                        mode = %config.prompt_leak_detect.as_str(),
+                        "model appears to be reciting its system prompt",
+                    );
+                    if config.prompt_leak_detect == super::types::GateMode::Blocking {
+                        // Finalize with the text BEFORE the recitation, which
+                        // is what `start_offset` is for. A bare `break` here
+                        // falls through to the stream-closed-without-Done
+                        // fallback, which synthesizes an EMPTY message — the
+                        // first cut did exactly that and threw the model's
+                        // real answer away to suppress the recitation, which
+                        // is a worse outcome than not detecting it.
+                        let full = partial.text_joined();
+                        let cut = leak.start_offset.min(full.len());
+                        // Offsets come from word-boundary segmentation so they
+                        // are already char boundaries; clamp defensively rather
+                        // than risk a panic on a slice in the stream path.
+                        let cut = (0..=cut)
+                            .rev()
+                            .find(|i| full.is_char_boundary(*i))
+                            .unwrap_or(0);
+                        let kept = AssistantMessage::new(
+                            vec![super::message::ContentBlock::Text {
+                                text: full[..cut].to_string(),
+                            }],
+                            StopReason::Stop,
+                        );
+                        finalize(context, &kept, added_partial, emit).await;
+                        final_message = Some((kept, None));
+                        break;
+                    }
+                }
                 if added_partial {
                     // Replace the last context message with the
                     // updated partial. Pi: `context.messages[
@@ -293,6 +370,24 @@ pub async fn stream_assistant_response(
                 // and break the next turn's API call, so strip
                 // tool-call blocks and keep text/thinking.
                 content.retain(|b| !matches!(b, ContentBlock::ToolCall { .. }));
+                // dirge-pv03: fence what survived, IN THE CONTENT, so the model
+                // can see it was cut off.
+                //
+                // `stop_reason` and `error_message` are set below and are
+                // faithful, but they are TRANSCRIPT-ONLY: the provider body
+                // carries role and content and nothing else, so on the next
+                // turn the model reads a sentence that stops mid-thought and
+                // has no way to tell it from a finished answer. It then treats
+                // its own half-formed conclusion as settled, or assumes work
+                // the text was about to describe was actually done.
+                //
+                // Only when something streamed — an empty turn has nothing to
+                // qualify, and a bare marker on it would be noise.
+                if !content.is_empty() {
+                    content.push(ContentBlock::Text {
+                        text: format!("\n\n{INTERRUPTED_NOTICE}"),
+                    });
+                }
                 let finalised = AssistantMessage {
                     content,
                     stop_reason: StopReason::Error,
@@ -500,7 +595,8 @@ mod tests {
         };
         let (tx, _rx) = mpsc::channel::<LoopEvent>(8);
         let _ =
-            stream_assistant_response(&mut ctx, &config, AbortSignal::new(), &tx, &stream_fn).await;
+            stream_assistant_response(&mut ctx, &config, AbortSignal::new(), &tx, &stream_fn, None)
+                .await;
 
         let opts = observed.lock().unwrap().clone().expect("opts captured");
         assert_eq!(opts.api_key.as_deref(), Some("static-key"));
@@ -533,6 +629,7 @@ mod tests {
             signal,
             &tx,
             &canned_done_stream("Hi there!"),
+            None,
         )
         .await;
         drop(tx); // close so we can drain the channel
@@ -595,6 +692,7 @@ mod tests {
             AbortSignal::new(),
             &tx,
             &canned_done_stream("ok"),
+            None,
         )
         .await;
         assert_eq!(
@@ -643,6 +741,7 @@ mod tests {
             signal,
             &tx,
             &canned_done_stream("Response"),
+            None,
         )
         .await;
         drop(tx);
@@ -719,6 +818,7 @@ mod tests {
             signal,
             &tx,
             &canned_done_stream("Response"),
+            None,
         )
         .await;
         drop(tx);
@@ -752,7 +852,7 @@ mod tests {
             Arc::new(|_ctx, _opts| Box::pin(futures::stream::iter::<Vec<StreamEvent>>(vec![])));
 
         let (final_msg, _) =
-            stream_assistant_response(&mut ctx, &config, signal, &tx, &empty_stream).await;
+            stream_assistant_response(&mut ctx, &config, signal, &tx, &empty_stream, None).await;
         drop(tx);
         let mut events = Vec::new();
         while let Some(e) = rx.recv().await {
@@ -820,8 +920,15 @@ mod tests {
 
         let mut ctx = Context::default();
         let (tx, _rx) = mpsc::channel::<LoopEvent>(32);
-        let _ = stream_assistant_response(&mut ctx, &config, AbortSignal::new(), &tx, &default_fn)
-            .await;
+        let _ = stream_assistant_response(
+            &mut ctx,
+            &config,
+            AbortSignal::new(),
+            &tx,
+            &default_fn,
+            None,
+        )
+        .await;
 
         assert_eq!(observed.lock().unwrap().as_slice(), &["escalation"]);
     }
@@ -846,12 +953,26 @@ mod tests {
         let mut ctx = Context::default();
         let (tx, _rx) = mpsc::channel::<LoopEvent>(32);
         // First call: escalation.
-        let _ = stream_assistant_response(&mut ctx, &config, AbortSignal::new(), &tx, &default_fn)
-            .await;
+        let _ = stream_assistant_response(
+            &mut ctx,
+            &config,
+            AbortSignal::new(),
+            &tx,
+            &default_fn,
+            None,
+        )
+        .await;
         // Second call: default — the pending flag was cleared by
         // the first call's swap.
-        let _ = stream_assistant_response(&mut ctx, &config, AbortSignal::new(), &tx, &default_fn)
-            .await;
+        let _ = stream_assistant_response(
+            &mut ctx,
+            &config,
+            AbortSignal::new(),
+            &tx,
+            &default_fn,
+            None,
+        )
+        .await;
 
         assert_eq!(
             observed.lock().unwrap().as_slice(),
@@ -878,8 +999,15 @@ mod tests {
 
         let mut ctx = Context::default();
         let (tx, _rx) = mpsc::channel::<LoopEvent>(32);
-        let _ = stream_assistant_response(&mut ctx, &config, AbortSignal::new(), &tx, &default_fn)
-            .await;
+        let _ = stream_assistant_response(
+            &mut ctx,
+            &config,
+            AbortSignal::new(),
+            &tx,
+            &default_fn,
+            None,
+        )
+        .await;
 
         assert_eq!(observed.lock().unwrap().as_slice(), &["default"]);
         // The flag is cleared so a misconfigured session doesn't
@@ -940,8 +1068,15 @@ mod tests {
 
         let mut ctx = Context::default();
         let (tx, mut rx) = mpsc::channel::<LoopEvent>(64);
-        let _ = stream_assistant_response(&mut ctx, &config, AbortSignal::new(), &tx, &default_fn)
-            .await;
+        let _ = stream_assistant_response(
+            &mut ctx,
+            &config,
+            AbortSignal::new(),
+            &tx,
+            &default_fn,
+            None,
+        )
+        .await;
         drop(tx);
 
         let mut saw_escalation = false;
@@ -992,6 +1127,7 @@ mod tests {
             AbortSignal::new(),
             &tx,
             &stream_fn,
+            None,
         )
         .await;
 
@@ -1004,9 +1140,14 @@ mod tests {
                 _ => None,
             })
             .collect();
+        // Still EXACT, not a `contains`: the partial must be preserved
+        // verbatim AND the only thing added is the dirge-pv03 fence. A
+        // loosened assertion here would stop noticing anything else that
+        // started appending to a truncated turn.
         assert_eq!(
-            text, "working on it",
-            "streamed partial must be preserved on a mid-stream Error"
+            text,
+            format!("working on it\n\n{INTERRUPTED_NOTICE}"),
+            "streamed partial must be preserved on a mid-stream Error, and marked incomplete"
         );
         assert_eq!(
             msg.error_message.as_deref(),
@@ -1057,6 +1198,7 @@ mod tests {
             AbortSignal::new(),
             &tx,
             &stream_fn,
+            None,
         )
         .await;
 
@@ -1075,6 +1217,9 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(text, "let me read the file");
+        assert_eq!(
+            text,
+            format!("let me read the file\n\n{INTERRUPTED_NOTICE}")
+        );
     }
 }

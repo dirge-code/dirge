@@ -10,68 +10,25 @@
 //!     managed service expects on every API request (see
 //!     `auth::kimi_device::kimi_device_headers`).
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use bytes::Bytes;
 use rig::http_client::{
     self, HttpClientExt, LazyBody, MultipartForm, Request, Response, StreamingResponse,
 };
 
-use crate::provider::auth::RefreshedAuth;
-
 /// Re-resolves the Kimi OAuth bearer (and its expiry) when the frozen one
 /// expires mid-session. Boxed so tests can inject a fake; the live seam
 /// wraps `load_fresh_kimi_oauth`, which refreshes-and-persists.
-pub(crate) type KimiRefreshFn = Arc<dyn Fn() -> anyhow::Result<RefreshedAuth> + Send + Sync>;
+pub(crate) use crate::provider::refreshable_token::RefreshFn as KimiRefreshFn;
+use crate::provider::refreshable_token::{self, RefreshableToken};
 
-struct TokenState {
-    bearer: String,
-    /// `None` means "never refresh" — an API-key / env token with no
-    /// refresh grant that Dirge doesn't manage.
-    expires_at_ms: Option<i64>,
-}
-
-struct RefreshableToken {
-    state: Mutex<TokenState>,
-    refresher: KimiRefreshFn,
-}
-
-impl RefreshableToken {
-    /// Current bearer, refreshing first if it has expired. A refresh failure
-    /// keeps the stale token so the request fails exactly as it would
-    /// without the seam rather than wedging the client; the next request
-    /// retries. Refresh is rare (once per token lifetime) so doing it
-    /// synchronously is acceptable.
-    fn bearer(&self) -> String {
-        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(expires_at) = state.expires_at_ms {
-            let now = chrono::Utc::now().timestamp_millis();
-            // dirge-iki5: refresh a little BEFORE the token dies. A request
-            // that passes this check with milliseconds to spare can still
-            // reach Kimi after expiry, and that 401 is non-retryable.
-            if crate::auth::file_store::epoch_ms_is_expired_within(
-                expires_at,
-                now,
-                crate::auth::store::KIMI_REFRESH_MARGIN_MS,
-            ) {
-                match (self.refresher)() {
-                    Ok(fresh) => {
-                        state.bearer = fresh.bearer_token;
-                        state.expires_at_ms = fresh.expires_at_ms;
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            target: "dirge::provider",
-                            error = %e,
-                            "Kimi OAuth token expired and refresh failed; sending the stale token",
-                        );
-                    }
-                }
-            }
-        }
-        state.bearer.clone()
-    }
-}
+/// dirge-iki5: renew shortly BEFORE the token dies. A 15-minute Kimi
+/// access token crosses the expiry boundary every 15 minutes of an active
+/// session, and a request that passes the freshness check with
+/// milliseconds to spare can still land after expiry — a non-retryable
+/// 401 that fails the whole turn.
+const REFRESH_MARGIN_MS: i64 = crate::auth::store::KIMI_REFRESH_MARGIN_MS;
 
 /// A never-called refresher for the static (non-Dirge-OAuth) path: with
 /// `expires_at_ms: None` the refresh branch can never fire, but the field
@@ -167,13 +124,13 @@ impl KimiHttpClient {
         Self {
             inner: reqwest::Client::new(),
             token: bearer_token.map(|bearer| {
-                Arc::new(RefreshableToken {
-                    state: Mutex::new(TokenState {
-                        bearer,
-                        expires_at_ms,
-                    }),
+                Arc::new(RefreshableToken::renewable(
+                    bearer,
+                    expires_at_ms,
                     refresher,
-                })
+                    REFRESH_MARGIN_MS,
+                    "kimi",
+                ))
             }),
             identity_headers: Arc::new(identity_headers),
         }
@@ -183,21 +140,24 @@ impl KimiHttpClient {
     /// bearer and inject the device identity headers. The body passes
     /// through unchanged — unlike the Codex transport there is no
     /// dialect-specific normalization to apply.
-    fn normalized_request<T>(&self, req: Request<T>) -> http_client::Result<Request<Bytes>>
-    where
-        T: Into<Bytes>,
-    {
+    /// dirge-bz0a: the bearer is resolved by the CALLER, in async context,
+    /// because a mid-session renewal blocks (see `refreshable_token`). This
+    /// stays sync and pure so it can run inline once the bearer is in hand.
+    fn normalized_request(
+        req: Request<Bytes>,
+        bearer: Option<String>,
+        identity_headers: &http::HeaderMap,
+    ) -> http_client::Result<Request<Bytes>> {
         let (mut parts, body) = req.into_parts();
-        // Overwrite the build-time bearer with a freshly resolved one; this
-        // is where a mid-session refresh fires if the token has expired.
+        // Overwrite the build-time bearer with the freshly resolved one.
         // Absent a token the header is left as rig set it from the static
         // api_key.
-        if let Some(token) = &self.token
-            && let Ok(value) = http::HeaderValue::from_str(&format!("Bearer {}", token.bearer()))
+        if let Some(bearer) = bearer
+            && let Ok(value) = http::HeaderValue::from_str(&format!("Bearer {bearer}"))
         {
             parts.headers.insert(http::header::AUTHORIZATION, value);
         }
-        for (name, value) in self.identity_headers.iter() {
+        for (name, value) in identity_headers.iter() {
             parts.headers.insert(name, value.clone());
         }
 
@@ -208,9 +168,7 @@ impl KimiHttpClient {
         if let Some(headers) = builder.headers_mut() {
             *headers = parts.headers;
         }
-        builder
-            .body(body.into())
-            .map_err(http_client::Error::Protocol)
+        builder.body(body).map_err(http_client::Error::Protocol)
     }
 }
 
@@ -242,9 +200,14 @@ impl HttpClientExt for KimiHttpClient {
         U: Send + 'static,
     {
         let inner = self.inner.clone();
-        let req = self.normalized_request(req);
+        let token = self.token.clone();
+        let identity = self.identity_headers.clone();
+        // `T` is not `'static` and the returned future is; the body
+        // conversion is the only step that needs `T`, so it happens here.
+        let req: Request<Bytes> = req.map(Into::into);
         async move {
-            let req = req?;
+            let bearer = refreshable_token::bearer(token).await;
+            let req = Self::normalized_request(req, bearer, &identity)?;
             inner.send(req).await
         }
     }
@@ -267,9 +230,14 @@ impl HttpClientExt for KimiHttpClient {
         T: Into<Bytes> + Send,
     {
         let inner = self.inner.clone();
-        let req = self.normalized_request(req);
+        let token = self.token.clone();
+        let identity = self.identity_headers.clone();
+        // `T` is not `'static` and the returned future is; the body
+        // conversion is the only step that needs `T`, so it happens here.
+        let req: Request<Bytes> = req.map(Into::into);
         async move {
-            let req = req?;
+            let bearer = refreshable_token::bearer(token).await;
+            let req = Self::normalized_request(req, bearer, &identity)?;
             inner.send_streaming(req).await
         }
     }
@@ -285,9 +253,11 @@ impl super::compressing_http::StreamingWithHeaders for KimiHttpClient {
     ) -> impl Future<Output = super::compressing_http::StreamingSend> + Send {
         use super::compressing_http::StreamingSend;
         let inner = self.inner.clone();
-        let req = self.normalized_request(req);
+        let token = self.token.clone();
+        let identity = self.identity_headers.clone();
         async move {
-            match req {
+            let bearer = refreshable_token::bearer(token).await;
+            match Self::normalized_request(req, bearer, &identity) {
                 Ok(req) => inner.send_streaming_with_headers(req).await,
                 Err(e) => StreamingSend {
                     result: Err(e),
@@ -301,6 +271,7 @@ impl super::compressing_http::StreamingWithHeaders for KimiHttpClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::auth::RefreshedAuth;
 
     fn identity_headers() -> http::HeaderMap {
         let mut map = http::HeaderMap::new();
@@ -319,6 +290,44 @@ mod tests {
         map
     }
 
+    /// dirge-iki5, and the WIRING of it rather than the mechanism: the
+    /// shared token can carry a margin, but only this transport asks for
+    /// one. A 15-minute Kimi access token crosses the expiry boundary
+    /// every 15 minutes of an active session, and a request that passes
+    /// the freshness check with milliseconds to spare still lands after
+    /// expiry — a non-retryable 401 that fails the whole turn.
+    ///
+    /// So a token that is still technically alive, but inside the
+    /// margin, must renew. Set the margin to zero and this token is used
+    /// as-is, which is the shape of the bug.
+    #[tokio::test]
+    async fn a_kimi_token_inside_the_refresh_margin_renews_before_it_dies() {
+        // Compile-time, and load-bearing: `nearly` below is derived from
+        // the margin, so at zero it would land exactly on `now`, read as
+        // expired, renew, and the assertion would pass having tested
+        // nothing. Zeroing kimi's margin must break the build, not go
+        // quiet.
+        const {
+            assert!(
+                REFRESH_MARGIN_MS > 0,
+                "kimi runs a refresh margin; without one a 15-minute token 401s every 15 minutes"
+            )
+        };
+        let refresher: KimiRefreshFn = Arc::new(|| {
+            Ok(RefreshedAuth {
+                bearer_token: "FRESH".to_string(),
+                expires_at_ms: Some(i64::MAX),
+            })
+        });
+        // Alive, but only for half the margin.
+        let nearly = chrono::Utc::now().timestamp_millis() + REFRESH_MARGIN_MS / 2;
+        let client = client("NEARLY-DEAD", Some(nearly), refresher);
+        assert_eq!(
+            authorization(&request(&client, Some("Bearer NEARLY-DEAD")).await).as_deref(),
+            Some("Bearer FRESH"),
+        );
+    }
+
     fn client(
         bearer: &str,
         expires_at_ms: Option<i64>,
@@ -332,7 +341,10 @@ mod tests {
         )
     }
 
-    fn request(client: &KimiHttpClient, preexisting: Option<&str>) -> http::HeaderMap {
+    /// Drive one request through the real path: resolve the client's
+    /// bearer the way `send` does (async since dirge-bz0a, so a renewal
+    /// cannot block the runtime) and normalize with it.
+    async fn request(client: &KimiHttpClient, preexisting: Option<&str>) -> http::HeaderMap {
         let mut builder = Request::builder()
             .method("POST")
             .uri("https://api.kimi.com/coding/v1/chat/completions");
@@ -340,7 +352,11 @@ mod tests {
             builder = builder.header(http::header::AUTHORIZATION, bearer);
         }
         let req = builder.body(Bytes::from("{}")).unwrap();
-        client.normalized_request(req).unwrap().headers().clone()
+        let bearer = refreshable_token::bearer(client.token.clone()).await;
+        KimiHttpClient::normalized_request(req, bearer, &client.identity_headers)
+            .expect("normalization must succeed")
+            .headers()
+            .clone()
     }
 
     fn authorization(headers: &http::HeaderMap) -> Option<String> {
@@ -349,8 +365,8 @@ mod tests {
             .map(|v| v.to_str().unwrap().to_string())
     }
 
-    #[test]
-    fn refreshable_client_overwrites_authorization_with_refreshed_bearer() {
+    #[tokio::test]
+    async fn refreshable_client_overwrites_authorization_with_refreshed_bearer() {
         let refresher: KimiRefreshFn = Arc::new(|| {
             Ok(RefreshedAuth {
                 bearer_token: "FRESH".to_string(),
@@ -361,49 +377,49 @@ mod tests {
         let client = client("STALE", Some(0), refresher);
 
         assert_eq!(
-            authorization(&request(&client, Some("Bearer STALE"))).as_deref(),
+            authorization(&request(&client, Some("Bearer STALE")).await).as_deref(),
             Some("Bearer FRESH")
         );
     }
 
-    #[test]
-    fn refreshable_client_keeps_fresh_bearer_without_refreshing() {
+    #[tokio::test]
+    async fn refreshable_client_keeps_fresh_bearer_without_refreshing() {
         let refresher: KimiRefreshFn = Arc::new(|| panic!("must not refresh a fresh token"));
         let client = client("CURRENT", Some(i64::MAX), refresher);
 
         assert_eq!(
-            authorization(&request(&client, Some("Bearer CURRENT"))).as_deref(),
+            authorization(&request(&client, Some("Bearer CURRENT")).await).as_deref(),
             Some("Bearer CURRENT")
         );
     }
 
-    #[test]
-    fn refresh_failure_falls_back_to_the_stale_bearer() {
+    #[tokio::test]
+    async fn refresh_failure_falls_back_to_the_stale_bearer() {
         let refresher: KimiRefreshFn = Arc::new(|| anyhow::bail!("network down"));
         let client = client("STALE", Some(0), refresher);
 
         // Fail-open: the request still carries the old bearer rather than
         // dropping Authorization.
         assert_eq!(
-            authorization(&request(&client, Some("Bearer STALE"))).as_deref(),
+            authorization(&request(&client, Some("Bearer STALE")).await).as_deref(),
             Some("Bearer STALE")
         );
     }
 
-    #[test]
-    fn static_client_bearer_is_never_refreshed() {
+    #[tokio::test]
+    async fn static_client_bearer_is_never_refreshed() {
         let client = client("API-KEY", None, never_refresh());
 
         assert_eq!(
-            authorization(&request(&client, Some("Bearer API-KEY"))).as_deref(),
+            authorization(&request(&client, Some("Bearer API-KEY")).await).as_deref(),
             Some("Bearer API-KEY")
         );
     }
 
-    #[test]
-    fn identity_headers_are_injected_on_every_request() {
+    #[tokio::test]
+    async fn identity_headers_are_injected_on_every_request() {
         let client = client("TOKEN", Some(i64::MAX), never_refresh());
-        let headers = request(&client, None);
+        let headers = request(&client, None).await;
 
         assert_eq!(headers.get("x-msh-platform").unwrap(), "kimi_code_cli");
         assert_eq!(headers.get("x-msh-device-id").unwrap(), "device-1");
@@ -413,10 +429,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn default_client_leaves_authorization_and_headers_untouched() {
+    #[tokio::test]
+    async fn default_client_leaves_authorization_and_headers_untouched() {
         let client = KimiHttpClient::default();
-        let headers = request(&client, Some("Bearer PREEXISTING"));
+        let headers = request(&client, Some("Bearer PREEXISTING")).await;
 
         assert_eq!(
             authorization(&headers).as_deref(),
@@ -425,8 +441,8 @@ mod tests {
         assert!(headers.get("x-msh-platform").is_none());
     }
 
-    #[test]
-    fn debug_redacts_bearer_token() {
+    #[tokio::test]
+    async fn debug_redacts_bearer_token() {
         let client = client("SUPER-SECRET", Some(i64::MAX), never_refresh());
         let rendered = format!("{client:?}");
 

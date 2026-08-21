@@ -30,7 +30,7 @@ fn assistant_with_thinking(s: &str) -> AssistantMessage {
 /// TurnStart is index 0). `TurnEnd` matches.
 #[test]
 fn turn_start_end_index_round_trips() {
-    let mut bridge = EventBridge::new();
+    let mut bridge = EventBridge::new(Default::default());
     let s0 = bridge.translate(LoopEvent::TurnStart);
     let e0 = bridge.translate(LoopEvent::TurnEnd {
         message: assistant_with_text("hi"),
@@ -58,7 +58,7 @@ fn turn_start_end_index_round_trips() {
 /// `AgentEnd` produces `Done` with the final assistant text.
 #[test]
 fn agent_start_no_op_agent_end_emits_done() {
-    let mut bridge = EventBridge::new();
+    let mut bridge = EventBridge::new(Default::default());
     assert!(bridge.translate(LoopEvent::AgentStart).is_empty());
 
     let messages = vec![
@@ -89,7 +89,7 @@ fn agent_start_no_op_agent_end_emits_done() {
 /// the compacted history.
 #[test]
 fn agent_end_context_length_error_emits_context_overflow() {
-    let mut bridge = EventBridge::new();
+    let mut bridge = EventBridge::new(Default::default());
     let mut a = assistant_with_text("");
     a.stop_reason = StopReason::Error;
     a.error_message = Some("prompt is too long: maximum context length exceeded".to_string());
@@ -115,7 +115,7 @@ fn agent_end_context_length_error_emits_context_overflow() {
 /// context-length signal → `AgentEvent::Error`.
 #[test]
 fn agent_end_non_context_error_emits_error() {
-    let mut bridge = EventBridge::new();
+    let mut bridge = EventBridge::new(Default::default());
     let mut a = assistant_with_text("");
     a.stop_reason = StopReason::Error;
     a.error_message = Some("401 unauthorized: invalid api key".to_string());
@@ -141,7 +141,7 @@ fn agent_end_non_context_error_emits_error() {
 /// (the user's bug report on this).
 #[test]
 fn agent_end_cancellation_emits_interjected_not_error() {
-    let mut bridge = EventBridge::new();
+    let mut bridge = EventBridge::new(Default::default());
     let mut a = assistant_with_text("partial response before interject");
     a.stop_reason = StopReason::Error;
     a.error_message = Some("stream aborted by cancellation signal".to_string());
@@ -172,7 +172,7 @@ fn agent_end_cancellation_emits_interjected_not_error() {
 /// a misleading Done.
 #[test]
 fn agent_end_error_without_message_still_emits_error() {
-    let mut bridge = EventBridge::new();
+    let mut bridge = EventBridge::new(Default::default());
     let mut a = assistant_with_text("");
     a.stop_reason = StopReason::Error;
     a.error_message = None;
@@ -188,7 +188,7 @@ fn agent_end_error_without_message_still_emits_error() {
 /// concern handled separately.
 #[test]
 fn agent_end_aborted_emits_done() {
-    let mut bridge = EventBridge::new();
+    let mut bridge = EventBridge::new(Default::default());
     let mut a = assistant_with_text("partial work");
     a.stop_reason = StopReason::Aborted;
     let messages = vec![LoopMessage::Assistant(a)];
@@ -208,7 +208,7 @@ fn agent_end_aborted_emits_done() {
 /// response.
 #[test]
 fn agent_end_no_assistant_done_empty_response() {
-    let mut bridge = EventBridge::new();
+    let mut bridge = EventBridge::new(Default::default());
     let messages = vec![LoopMessage::User(UserMessage::text("hi"))];
     let out = bridge.translate(LoopEvent::AgentEnd { messages });
     match &out[0] {
@@ -225,7 +225,7 @@ fn agent_end_no_assistant_done_empty_response() {
 /// portion.
 #[test]
 fn text_delta_emits_token_chunks() {
-    let mut bridge = EventBridge::new();
+    let mut bridge = EventBridge::new(Default::default());
     // First chunk: "Hello"
     let out = bridge.translate(LoopEvent::MessageUpdate {
         message: assistant_with_text("Hello"),
@@ -258,7 +258,7 @@ fn text_delta_emits_token_chunks() {
 /// using the same delta tracking.
 #[test]
 fn reasoning_delta_emits_reasoning_chunks() {
-    let mut bridge = EventBridge::new();
+    let mut bridge = EventBridge::new(Default::default());
     let out = bridge.translate(LoopEvent::MessageUpdate {
         message: assistant_with_thinking("Let me think"),
         phase: DeltaPhase::ThinkingStart,
@@ -281,7 +281,7 @@ fn reasoning_delta_emits_reasoning_chunks() {
 /// them independently. Verifies the per-kind delta state.
 #[test]
 fn text_and_reasoning_tracked_independently() {
-    let mut bridge = EventBridge::new();
+    let mut bridge = EventBridge::new(Default::default());
     // Reasoning arrives first.
     let _ = bridge.translate(LoopEvent::MessageUpdate {
         message: AssistantMessage::new(
@@ -321,7 +321,7 @@ fn text_and_reasoning_tracked_independently() {
 /// classification.
 #[test]
 fn tool_execution_start_emits_call_and_started() {
-    let mut bridge = EventBridge::new();
+    let mut bridge = EventBridge::new(Default::default());
     let out = bridge.translate(LoopEvent::ToolExecutionStart {
         tool_call_id: "call-1".to_string(),
         tool_name: "read".to_string(),
@@ -348,7 +348,7 @@ fn tool_execution_start_emits_call_and_started() {
 /// for tool names that surface file refs.
 #[test]
 fn tool_execution_end_classifies_file_tools_as_file() {
-    let mut bridge = EventBridge::new();
+    let mut bridge = EventBridge::new(Default::default());
     // Record the tool name first.
     let _ = bridge.translate(LoopEvent::ToolExecutionStart {
         tool_call_id: "call-1".to_string(),
@@ -383,7 +383,7 @@ fn tool_execution_end_classifies_file_tools_as_file() {
 /// for tools that aren't in the file-classification set.
 #[test]
 fn tool_execution_end_classifies_other_tools_as_text() {
-    let mut bridge = EventBridge::new();
+    let mut bridge = EventBridge::new(Default::default());
     let _ = bridge.translate(LoopEvent::ToolExecutionStart {
         tool_call_id: "call-2".to_string(),
         tool_name: "bash".to_string(),
@@ -415,7 +415,7 @@ fn tool_execution_end_classifies_other_tools_as_text() {
 /// lookup gets the full structure.
 #[test]
 fn message_start_custom_emits_custom_message_event() {
-    let mut bridge = EventBridge::new();
+    let mut bridge = EventBridge::new(Default::default());
     let payload = serde_json::json!({"type": "status", "content": "hello"});
     let events = bridge.translate(LoopEvent::MessageStart {
         message: LoopMessage::Custom(payload.clone()),
@@ -433,7 +433,7 @@ fn message_start_custom_emits_custom_message_event() {
 /// `MessageEnd` is always a no-op.
 #[test]
 fn message_start_end_behavior() {
-    let mut bridge = EventBridge::new();
+    let mut bridge = EventBridge::new(Default::default());
     let user_msg = LoopMessage::User(UserMessage::text("hi"));
     // User messages now emit UserMessage.
     let events = bridge.translate(LoopEvent::MessageStart {
@@ -477,7 +477,7 @@ fn message_start_end_behavior() {
 /// content was already streamed via the corresponding Delta).
 #[test]
 fn message_update_end_phases_are_no_ops() {
-    let mut bridge = EventBridge::new();
+    let mut bridge = EventBridge::new(Default::default());
     for phase in [
         DeltaPhase::TextEnd,
         DeltaPhase::ThinkingEnd,
@@ -502,7 +502,7 @@ fn message_update_end_phases_are_no_ops() {
 /// misroutes content for parallel reads, this test catches it.
 #[test]
 fn parallel_tool_execution_ends_preserve_distinct_content() {
-    let mut bridge = EventBridge::new();
+    let mut bridge = EventBridge::new(Default::default());
     let n = 7;
     // Phase 1: 7 Starts in source order (mirrors tools.rs:843-852).
     for i in 0..n {
@@ -552,7 +552,7 @@ fn parallel_tool_execution_ends_preserve_distinct_content() {
 /// itself does.
 #[test]
 fn empty_loop_tool_result_content_produces_empty_output() {
-    let mut bridge = EventBridge::new();
+    let mut bridge = EventBridge::new(Default::default());
     let _ = bridge.translate(LoopEvent::ToolExecutionStart {
         tool_call_id: "c1".to_string(),
         tool_name: "read".to_string(),
@@ -613,7 +613,7 @@ fn flatten_content_stringifies_unknown_blocks() {
 /// tool call → tool result → tokens → TurnEnd → AgentEnd).
 #[test]
 fn full_run_event_sequence_translates_correctly() {
-    let mut bridge = EventBridge::new();
+    let mut bridge = EventBridge::new(Default::default());
     let mut all = Vec::new();
 
     all.extend(bridge.translate(LoopEvent::AgentStart));
@@ -701,7 +701,7 @@ fn full_run_event_sequence_translates_correctly() {
 #[test]
 fn usage_event_translates_with_cache_counts() {
     use crate::agent::agent_loop::message::TokenUsage;
-    let mut bridge = EventBridge::new();
+    let mut bridge = EventBridge::new(Default::default());
     let out = bridge.translate(LoopEvent::Usage {
         usage: TokenUsage {
             input_tokens: 1000,
@@ -733,7 +733,7 @@ fn usage_event_translates_with_cache_counts() {
 #[test]
 fn agent_end_carries_run_token_totals_and_zero_cost() {
     use crate::agent::agent_loop::message::TokenUsage;
-    let mut bridge = EventBridge::new();
+    let mut bridge = EventBridge::new(Default::default());
     bridge.translate(LoopEvent::Usage {
         usage: TokenUsage {
             input_tokens: 2_000_000,
@@ -751,5 +751,127 @@ fn agent_end_carries_run_token_totals_and_zero_cost() {
             assert_eq!(*cost, 0.0, "cost is retired: always 0.0");
         }
         other => panic!("expected Done, got {other:?}"),
+    }
+}
+
+// ---- dirge-n00z: a call the model wrote as text is not the answer ----
+//
+// The negative half is first on purpose. This filter sits on the streaming
+// path of every turn, so the failure that would matter most is not "syntax
+// leaked through" — it is "an ordinary answer got eaten".
+
+/// Replay `text` through the bridge one chunk at a time, the way a provider
+/// delivers it, and return everything the user would have seen.
+fn streamed(text: &str, chunk: usize, tools: &[&str]) -> String {
+    let mut bridge = EventBridge::new(tools.iter().map(|s| s.to_string()).collect());
+    let mut seen = String::new();
+    let mut sofar = String::new();
+    bridge.translate(LoopEvent::TurnStart);
+    let mut start = 0;
+    while start < text.len() {
+        let mut end = (start + chunk).min(text.len());
+        while !text.is_char_boundary(end) {
+            end += 1;
+        }
+        sofar.push_str(&text[start..end]);
+        for evt in bridge.translate(LoopEvent::MessageUpdate {
+            message: assistant_with_text(&sofar),
+            phase: DeltaPhase::TextDelta,
+        }) {
+            if let AgentEvent::Token(t) = evt {
+                assert!(!t.is_empty(), "an empty Token is not a token");
+                seen.push_str(&t);
+            }
+        }
+        start = end;
+    }
+    for evt in bridge.translate(LoopEvent::MessageEnd {
+        message: LoopMessage::Assistant(assistant_with_text(&sofar)),
+    }) {
+        if let AgentEvent::Token(t) = evt {
+            seen.push_str(&t);
+        }
+    }
+    seen
+}
+
+/// An ordinary answer reaches the user byte for byte, at every chunking.
+#[test]
+fn an_ordinary_answer_streams_through_untouched() {
+    for text in [
+        "Done — the tests pass.",
+        "Run `bash` with:\n```sh\nls -la\n```\nThat's the shape.",
+        "The config is:\n```json\n{\"port\": 8080}\n```\n",
+    ] {
+        for chunk in [1, 4, 17, 4096] {
+            assert_eq!(
+                streamed(text, chunk, &["bash", "read"]),
+                text,
+                "{chunk}: {text}"
+            );
+        }
+    }
+}
+
+/// The bug: the model wrote its call as text, the scavenger ran it, and the
+/// syntax was shown to the user as the turn's answer anyway.
+#[test]
+fn a_call_written_as_text_is_not_shown_as_the_answer() {
+    let text =
+        "<tool_call>\n{\"name\": \"bash\", \"arguments\": {\"command\": \"ls\"}}\n</tool_call>";
+    for chunk in [1, 3, 11, 4096] {
+        assert_eq!(streamed(text, chunk, &["bash"]), "", "chunk {chunk}");
+    }
+}
+
+/// And the other half: syntax naming a tool that does not exist dispatches
+/// nothing, so hiding it would leave the user an empty turn with no account
+/// of what happened. It stays visible, exactly as before.
+#[test]
+fn a_call_naming_no_tool_is_still_shown() {
+    let text = "<tool_call>\n{\"name\": \"frobnicate\", \"arguments\": {}}\n</tool_call>";
+    assert_eq!(streamed(text, 5, &["bash"]), text);
+}
+
+/// `-p` overwrites everything it echoed with `Done.response`, so the Token
+/// stream and the final answer have to be filtered by the same rule or the
+/// syntax comes back at the end.
+#[test]
+fn the_final_answer_is_filtered_too() {
+    let mut bridge = EventBridge::new(["bash".to_string()].into_iter().collect());
+    let leaked =
+        "<tool_call>{\"name\": \"bash\", \"arguments\": {\"command\": \"ls\"}}</tool_call>ok";
+    let out = bridge.translate(LoopEvent::AgentEnd {
+        messages: vec![LoopMessage::Assistant(assistant_with_text(leaked))],
+    });
+    match out.as_slice() {
+        [AgentEvent::Done { response, .. }] => assert_eq!(response, "ok"),
+        other => panic!("expected Done, got {other:?}"),
+    }
+}
+
+/// A turn boundary clears the filter with the rest of the delta state. Without
+/// this a region left open by turn 1 would swallow the start of turn 2.
+#[test]
+fn a_turn_boundary_clears_held_text() {
+    let mut bridge = EventBridge::new(["bash".to_string()].into_iter().collect());
+    bridge.translate(LoopEvent::TurnStart);
+    let held = bridge.translate(LoopEvent::MessageUpdate {
+        message: assistant_with_text("<tool_call>{\"name\": \"bash\""),
+        phase: DeltaPhase::TextDelta,
+    });
+    assert!(held.is_empty(), "an unfinished region should be held");
+    bridge.translate(LoopEvent::TurnEnd {
+        message: assistant_with_text(""),
+        tool_results: Vec::new(),
+    });
+    bridge.translate(LoopEvent::TurnStart);
+    let next = bridge.translate(LoopEvent::MessageUpdate {
+        message: assistant_with_text("fresh answer"),
+        phase: DeltaPhase::TextDelta,
+    });
+    match next.as_slice() {
+        [AgentEvent::Token(t)] => assert_eq!(t, "fresh answer"),
+        other => panic!("turn 2 lost its text: {other:?}"),
     }
 }

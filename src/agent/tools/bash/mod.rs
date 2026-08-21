@@ -14,6 +14,72 @@ use crate::agent::tools::{AskSender, BashArgs, PermCheck, ToolError};
 
 use crate::sandbox::{Sandbox, SandboxExecutionRoot};
 
+/// Effective deadline for a FOREGROUND `bash` command (dirge-xeis).
+///
+/// `timeouts.bash_secs` is a DEFAULT — `unwrap_or` — so before this a model
+/// passing `timeout: 600` got 600 however low the user set it. That is the
+/// documented contract and fine as far as it goes, but it left the number
+/// UNBOUNDED: nothing stopped a model asking for a day and blocking the turn
+/// for one. It also meant the knob a user reaches for to keep runs snappy
+/// bounded nothing, which is how the dirge-e31n.5 scenario failed twice to
+/// force a timeout at all.
+///
+/// So `bash_secs` stays a default and `bash_max_secs` is the ceiling. Separate
+/// knobs deliberately: raising the timeout for a genuinely long command — a
+/// full test suite — is CORRECT, and clamping every request down to the
+/// default would break it. The ceiling only has to sit above anything real.
+///
+/// FOREGROUND ONLY. A backgrounded shell with no timeout is documented as
+/// running until it exits or is killed, and that is the point of asking for
+/// one; capping a dev server at an hour would be a surprise, not a guard.
+pub(crate) fn resolve_foreground_timeout(
+    requested: Option<u64>,
+    t: &crate::timeout::Timeouts,
+) -> u64 {
+    let want = requested.unwrap_or(t.bash.as_secs());
+    let ceiling = t.bash_max.as_secs();
+    if want > ceiling {
+        tracing::info!(
+            target: "dirge::agent_loop::tools",
+            requested = want,
+            ceiling,
+            "bash timeout clamped to timeouts.bash_max_secs",
+        );
+        return ceiling;
+    }
+    want
+}
+
+/// Dispatch-watchdog budget for a `bash` call (dirge-9tl3).
+///
+/// Derives from bash's OWN bound — `resolve_foreground_timeout`, whose
+/// ceiling is `timeouts.bash_max` — plus a 30s grace, so bash's own timeout
+/// always fires first and the user gets bash's better-worded message, never
+/// the watchdog's. Not a new number: the watchdog must never cut a call the
+/// tool itself considers in bounds.
+///
+/// `background: true` returns to the caller immediately (the detached shell
+/// is deliberately unbounded), so it needs no special case — `None` hands
+/// the short dispatch to the shared `timeouts.tool_call` ceiling.
+///
+/// Args are a raw `serde_json::Value` and may be malformed; anything
+/// unexpected (not an object, `timeout` of the wrong type) falls back to
+/// `None` rather than panicking or silently reinterpreting the call. A
+/// MISSING `timeout` on a foreground call is fine — the default applies.
+pub(crate) fn dispatch_budget(args: &serde_json::Value) -> Option<std::time::Duration> {
+    let obj = args.as_object()?;
+    if obj.get("background") == Some(&serde_json::Value::Bool(true)) {
+        return None;
+    }
+    let requested = match obj.get("timeout") {
+        None | Some(serde_json::Value::Null) => None,
+        // Wrong type means malformed args — bail, don't guess.
+        Some(v) => Some(v.as_u64()?),
+    };
+    let own = resolve_foreground_timeout(requested, &crate::timeout::Timeouts::get());
+    Some(std::time::Duration::from_secs(own + 30))
+}
+
 pub struct BashTool {
     pub permission: Option<PermCheck>,
     pub ask_tx: Option<AskSender>,
@@ -106,7 +172,20 @@ impl PortableTool for BashTool {
             "type": "object",
             "properties": {
                 "command": { "type": "string", "description": "Bash command to execute" },
-                "timeout": { "type": "integer", "description": "Timeout in seconds (optional; default 120, or 600 when background)" },
+                // dirge-e31n.5: rendered from the RESOLVED config, not a
+                // literal. This said "default 120, or 600 when background",
+                // which was wrong twice: it ignored `timeouts.bash_secs`, so a
+                // user who set 300 had the model told 120 and sizing its
+                // commands against a number that was not real; and there is no
+                // 600 background default at all — a backgrounded shell with no
+                // `timeout` runs UNBOUNDED, which the `background` description
+                // directly below states correctly. One schema, two accounts.
+                "timeout": { "type": "integer", "description": format!(
+                    "Timeout in seconds. Optional; defaults to {} for a foreground command. \
+                     When `background` is true this is an auto-kill-after-N instead, and \
+                     omitting it leaves the shell running until it exits or you kill it.",
+                    crate::timeout::Timeouts::get().bash.as_secs()
+                ) },
                 "background": { "type": "boolean", "description": "Run detached and unbounded: returns immediately with a shell id (does NOT block the turn). Use for long-running commands — dev servers, watch builds, tails. Read its accumulated output with the bash_output tool (pass the id; poll it to follow progress) and stop it with kill_shell (pass the id). Output is NOT auto-delivered. If `timeout` is set, the shell is auto-killed after that many seconds; otherwise it runs until it exits or you kill it." }
             },
             "required": ["command"]
@@ -197,9 +276,7 @@ impl PortableTool for BashTool {
         // Background requested but no store wired (headless): fall back to
         // a bounded synchronous run.
         // dirge-onlr/4xgd: single source — resolved [timeouts] config.
-        let secs = args
-            .timeout
-            .unwrap_or(crate::timeout::Timeouts::get().bash.as_secs());
+        let secs = resolve_foreground_timeout(args.timeout, &crate::timeout::Timeouts::get());
         if secs == 0 {
             return Err(ToolError::Msg("timeout must be > 0".to_string()));
         }
@@ -260,3 +337,47 @@ impl PortableTool for BashTool {
 #[cfg(test)]
 #[cfg(unix)]
 mod tests;
+
+/// dirge-9tl3: ordering guarantees for the dispatch watchdog
+/// budget derived from bash's own bound.
+#[cfg(test)]
+#[cfg(unix)]
+mod budget_tests {
+    use super::*;
+
+    #[test]
+    fn foreground_bash_dispatch_budget_always_exceeds_its_own_resolved_timeout() {
+        let t = crate::timeout::Timeouts::get();
+        for requested in [None, Some(1u64), Some(t.bash.as_secs()), Some(86_400)] {
+            let args = serde_json::json!({ "timeout": requested, "background": false });
+            let budget = dispatch_budget(&args).unwrap_or_else(|| {
+                panic!("foreground call with timeout={requested:?} needs a budget")
+            });
+            let own = resolve_foreground_timeout(requested, &t);
+            assert!(
+                budget > std::time::Duration::from_secs(own),
+                "budget {budget:?} must exceed bash's own {own}s so bash's timeout always fires first"
+            );
+        }
+    }
+
+    #[test]
+    fn background_bash_has_no_budget_override() {
+        // The detached shell is deliberately unbounded and dispatch
+        // returns immediately — no special case; the shared ceiling
+        // covers the short dispatch itself.
+        assert_eq!(
+            dispatch_budget(&serde_json::json!({ "background": true })),
+            None
+        );
+    }
+
+    #[test]
+    fn malformed_bash_args_fall_back_to_no_override() {
+        assert_eq!(dispatch_budget(&serde_json::json!("nonsense")), None);
+        assert_eq!(
+            dispatch_budget(&serde_json::json!({ "timeout": "fast" })),
+            None
+        );
+    }
+}

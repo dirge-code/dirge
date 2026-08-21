@@ -163,7 +163,10 @@ pub(crate) async fn apply_next_model(
     }
     // Re-resolve context window for the new model — mirrors `/model` so a
     // 128k→1M jump (or vice versa) updates the status indicator.
-    let new_ctx = ctx.cfg.resolve_context_window(new_model_compact.as_str());
+    // Against the provider we ended up on — updated just above (GH #772).
+    let new_ctx = ctx
+        .cfg
+        .resolve_context_window_for(&ctx.session.provider, new_model_compact.as_str());
     if new_ctx != ctx.session.context_window {
         ctx.session.context_window = new_ctx;
     }
@@ -374,7 +377,9 @@ pub(crate) async fn finish_done(
         ctx.renderer.write("<dirge> ", c_agent())?;
     }
     // Seal any open streamed block (response above, or reasoning-only turn).
-    ctx.renderer.commit_stream();
+    // dirge-fw0p: `end_stream`, not `commit_stream` — the turn is over, so the
+    // next one must not look like a continuation of this text.
+    ctx.renderer.end_stream();
 
     ctx.renderer.write_line("", Color::White)?;
     ctx.renderer.write_line("", Color::White)?;

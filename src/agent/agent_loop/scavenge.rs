@@ -37,8 +37,9 @@
 //!     explicit tool-call tag is not.
 //!
 //! Precision throughout rests on the same gate as before: a candidate becomes
-//! a call only if it carries a `name` in `allowed_names`. Repair never invents
-//! one.
+//! a call only if it carries a `name` that [`is_dispatchable`] — one this run
+//! has, or one the alias table places on a tool this run has. Repair never
+//! invents a name, and the gate never widens past the tools that exist.
 
 use crate::agent::agent_loop::tool_input_repair::repair_truncated_json;
 use crate::agent::agent_loop::tools::ToolCall;
@@ -51,15 +52,15 @@ use regex::Regex;
 /// Port of `MAX_SCAVENGE_INPUT` (scavenge.ts:18).
 const MAX_SCAVENGE_INPUT: usize = 100 * 1024;
 
+/// Cap on recorded [`ScavengeResult::unknown_names`] per pass.
+///
+/// The call budget bounds accepted calls but not rejected ones, and the input
+/// runs to 100 KB — a model stuck emitting invented calls could otherwise put
+/// a four-figure number of log lines on one turn. Well above any real turn, so
+/// it does not shape the measurement it exists to keep affordable.
+const MAX_UNKNOWN_NAMES: usize = 16;
+
 // Module-level compiled regexes to avoid per-call recompilation.
-static RE_DSML_FUNC: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"<[｜|]DSML[｜|]function_calls>[\s\S]*?</?[｜|]DSML[｜|]function_calls>")
-        .expect("DSML function_calls regex must compile")
-});
-static RE_DSML_INVOKE_STRIP: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"<[｜|]DSML[｜|]invoke\s+[^>]*>[\s\S]*?</[｜|]DSML[｜|]invoke>")
-        .expect("DSML invoke strip regex must compile")
-});
 static RE_DSML_INVOKE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"<[｜|]DSML[｜|]invoke\s+name="([^"]+)">([\s\S]*?)</[｜|]DSML[｜|]invoke>"#)
         .expect("DSML invoke regex must compile")
@@ -69,25 +70,34 @@ static RE_DSML_PARAM: LazyLock<Regex> = LazyLock::new(|| {
         r#"<[｜|]DSML[｜|]parameter\s+name="([^"]+)"(?:\s+string="(true|false)")?\s*>([\s\S]*?)</[｜|]DSML[｜|]parameter>"#
     ).expect("DSML parameter regex must compile")
 });
-/// dirge-56vo: Qwen/Hermes `<tool_call>` channel. The closing tag is optional
-/// so a response cut off mid-call still yields a region to repair.
-static RE_TOOL_CALL_TAG: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?s)<tool_call>(.*?)(?:</tool_call>|$)").expect("tool_call tag regex must compile")
-});
-/// dirge-56vo: ```` ```json ```` / ```` ```tool ```` fences. Deliberately does
-/// NOT match a bare ```` ``` ```` fence — those are overwhelmingly code samples
-/// the model is discussing, not calls it meant to make.
-static RE_FENCED_CALL: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?s)```(?:tool|json)\s*\n(.*?)(?:\n```|$)")
-        .expect("fenced call regex must compile")
-});
-
 /// Result of a scavenge pass.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ScavengeResult {
     pub calls: Vec<ToolCall>,
-    #[allow(dead_code)]
+    /// What the pass did, one line per event — which shape each accepted call
+    /// came from, or why the pass was skipped entirely.
+    ///
+    /// These were built and dropped on the floor until dirge-e31n.8. The one
+    /// that mattered is the skip: a reasoning blob over [`MAX_SCAVENGE_INPUT`]
+    /// turns scavenging off for that turn, which on a model that emits its
+    /// calls as text means every call in it is lost, and nothing said so.
     pub notes: Vec<String>,
+    /// Names from EXPLICIT call syntax that matched no tool, so the call was
+    /// dropped (dirge-e31n.8).
+    ///
+    /// This is the quietest failure the loop has. A native tool call naming a
+    /// missing tool at least comes back as "Tool X not found" and the model
+    /// can retry; a call the model wrote as *text* is dropped here with no
+    /// result, no error, and — until this field existed — no counter. The
+    /// turn then ends with no tool call at all, so the loop reads the raw
+    /// call syntax as the final answer.
+    ///
+    /// Only the two explicit shapes are recorded: a `DSML|invoke` tag and a
+    /// tagged/fenced region, both of which say "this is a call" in their own
+    /// syntax. A bare JSON object in prose (pattern C) is NOT, and counting
+    /// those would report a model quoting a schema as a model fumbling a
+    /// call.
+    pub unknown_names: Vec<String>,
 }
 
 /// Scan reasoning content for tool calls the model forgot to emit.
@@ -99,34 +109,33 @@ pub fn scavenge_tool_calls(
 ) -> ScavengeResult {
     let content = match reasoning_content {
         Some(c) if !c.is_empty() => c,
-        _ => {
-            return ScavengeResult {
-                calls: vec![],
-                notes: vec![],
-            };
-        }
+        _ => return ScavengeResult::default(),
     };
 
     if content.len() > MAX_SCAVENGE_INPUT {
         return ScavengeResult {
-            calls: vec![],
             notes: vec![format!(
                 "scavenge skipped: reasoning_content too large ({} chars)",
                 content.len()
             )],
+            ..ScavengeResult::default()
         };
     }
 
     let max = if max_calls == 0 { 4 } else { max_calls };
     let mut notes: Vec<String> = Vec::new();
     let mut out: Vec<ToolCall> = Vec::new();
+    let mut unknown_names: Vec<String> = Vec::new();
 
     // Pattern A: DSML invoke blocks.
     for invoke in iterate_dsml_invokes(content) {
         if out.len() >= max {
             break;
         }
-        if !allowed_names.contains(&invoke.name) {
+        if !is_dispatchable(&invoke.name, allowed_names) {
+            if unknown_names.len() < MAX_UNKNOWN_NAMES {
+                unknown_names.push(invoke.name.clone());
+            }
             continue;
         }
         out.push(ToolCall {
@@ -138,17 +147,42 @@ pub fn scavenge_tool_calls(
     }
 
     // Pattern B: tagged / fenced regions (dirge-56vo). Runs before the raw
-    // scan and removes what it consumed, so a tagged call can't also be
-    // picked up as a bare JSON object and counted twice.
-    let non_dsml = strip_dsml_blocks(content);
-    let (tagged, remainder) = extract_tagged_regions(&non_dsml);
+    // scan, and every region — DSML included — is cut out of what the raw
+    // scan sees, so a call inside explicit syntax can't also be picked up as
+    // a bare JSON object and counted twice.
+    //
+    // The regions come from [`super::call_syntax`], which is also what the
+    // display filter reads. One definition of where a call starts and ends,
+    // so a call that runs cannot also be printed to the user (dirge-n00z).
+    let found = super::call_syntax::regions(content);
+    let remainder = super::call_syntax::without(content, &found);
+    let tagged = found.iter().filter(|r| {
+        matches!(
+            r.kind,
+            super::call_syntax::RegionKind::Tagged | super::call_syntax::RegionKind::Fenced
+        )
+    });
     for region in tagged {
         if out.len() >= max {
             break;
         }
-        if let Some(call) = coerce_to_tool_call(&region, allowed_names) {
-            notes.push(format!("scavenged tagged call: {}", call.name));
-            out.push(call);
+        let region = content[region.body.clone()].trim();
+        if region.is_empty() {
+            continue;
+        }
+        match coerce_to_tool_call(region, allowed_names) {
+            Some(call) => {
+                notes.push(format!("scavenged tagged call: {}", call.name));
+                out.push(call);
+            }
+            // A `<tool_call>` tag or a ```tool fence carrying a name that
+            // matches nothing. The tag is the model saying this IS a call, so
+            // the miss is worth recording even though there is nothing to
+            // dispatch (dirge-e31n.8).
+            None if unknown_names.len() < MAX_UNKNOWN_NAMES => {
+                unknown_names.extend(candidate_name(region))
+            }
+            None => {}
         }
     }
 
@@ -163,26 +197,43 @@ pub fn scavenge_tool_calls(
         }
     }
 
-    ScavengeResult { calls: out, notes }
+    ScavengeResult {
+        calls: out,
+        notes,
+        unknown_names,
+    }
+}
+
+/// The tool name an explicit call region names, whatever it is — the same
+/// three shapes [`coerce_to_tool_call`] reads, minus the allowed-name gate.
+///
+/// Kept beside that function on purpose: it exists only to answer "was there a
+/// name here at all?" after the gate said no, and the two must read the same
+/// shapes or the miss counter would disagree with the thing that dropped the
+/// call.
+fn candidate_name(candidate_json: &str) -> Option<String> {
+    let parsed = repair_json_lenient(candidate_json)?;
+    let obj = parsed.as_object()?;
+    let direct = obj.get("name").or_else(|| obj.get("tool_name"));
+    let nested = (obj.get("type").and_then(|v| v.as_str()) == Some("function"))
+        .then(|| obj.get("function").and_then(|v| v.as_object())?.get("name"))
+        .flatten();
+    direct
+        .or(nested)
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
 }
 
 // ---- internal helpers ----
 
-struct DsmlInvoke {
-    name: String,
+pub struct DsmlInvoke {
+    pub name: String,
     args: serde_json::Value,
-}
-
-/// Strip DSML blocks so the raw-JSON scanner doesn't re-scavenge
-/// parameter payloads. Port of `stripDsmlBlocks` (scavenge.ts:73-78).
-fn strip_dsml_blocks(text: &str) -> String {
-    let out = RE_DSML_FUNC.replace_all(text, "");
-    RE_DSML_INVOKE_STRIP.replace_all(&out, "").to_string()
 }
 
 /// Yield every DSML invoke block found in text.
 /// Port of `iterateDsmlInvokes` (scavenge.ts:80-90).
-fn iterate_dsml_invokes(text: &str) -> Vec<DsmlInvoke> {
+pub fn iterate_dsml_invokes(text: &str) -> Vec<DsmlInvoke> {
     let mut out = Vec::new();
     for caps in RE_DSML_INVOKE.captures_iter(text) {
         let name = match caps.get(1) {
@@ -236,28 +287,6 @@ fn parse_dsml_parameters(body: &str) -> serde_json::Value {
         map.insert(key, serde_json::Value::String(raw));
     }
     serde_json::Value::Object(map)
-}
-
-/// dirge-56vo: pull `<tool_call>` / fenced regions out of `text`.
-///
-/// Returns the region bodies plus the text with those regions removed, so the
-/// caller's raw-JSON scan can run over the remainder without re-finding what
-/// was already consumed.
-fn extract_tagged_regions(text: &str) -> (Vec<String>, String) {
-    let mut regions = Vec::new();
-    let mut remainder = text.to_string();
-    for re in [&*RE_TOOL_CALL_TAG, &*RE_FENCED_CALL] {
-        for caps in re.captures_iter(&remainder.clone()) {
-            if let Some(body) = caps.get(1) {
-                let trimmed = body.as_str().trim();
-                if !trimmed.is_empty() {
-                    regions.push(trimmed.to_string());
-                }
-            }
-        }
-        remainder = re.replace_all(&remainder, "").to_string();
-    }
-    (regions, remainder)
 }
 
 /// dirge-56vo: parse `raw` as JSON, escalating through repairs.
@@ -441,10 +470,23 @@ fn iterate_json_objects(text: &str) -> Vec<String> {
     out
 }
 
+/// Whether a name in scavenged text will reach a tool — either because it IS
+/// one, or because the alias table places it (dirge-e31n.8).
+///
+/// The name is NOT rewritten here. Resolution happens once, in the loop, over
+/// the final call list, so a scavenged call and a native one carrying the same
+/// guessed name are handled by the same code and counted in the same place.
+/// This gate only decides what gets that far — before dirge-e31n.8 a synonym
+/// was dropped here and the call was simply gone.
+pub fn is_dispatchable(name: &str, allowed: &std::collections::HashSet<String>) -> bool {
+    allowed.contains(name)
+        || crate::agent::agent_loop::tool_aliases::resolve(name, allowed.iter()).is_some()
+}
+
 /// Try to coerce a JSON string into a ToolCall.
 /// Port of `coerceToToolCall` (scavenge.ts:150-201).
 #[allow(clippy::collapsible_if)]
-fn coerce_to_tool_call(
+pub fn coerce_to_tool_call(
     candidate_json: &str,
     allowed_names: &std::collections::HashSet<String>,
 ) -> Option<ToolCall> {
@@ -455,7 +497,7 @@ fn coerce_to_tool_call(
 
     // Pattern 1: { name, arguments } (or parameters / input / args)
     if let Some(name) = obj.get("name").and_then(|v| v.as_str()) {
-        if allowed_names.contains(name) {
+        if is_dispatchable(name, allowed_names) {
             return Some(ToolCall {
                 id: String::new(),
                 name: name.to_string(),
@@ -468,7 +510,7 @@ fn coerce_to_tool_call(
     if obj.get("type").and_then(|v| v.as_str()) == Some("function") {
         if let Some(func) = obj.get("function").and_then(|v| v.as_object()) {
             if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
-                if allowed_names.contains(name) {
+                if is_dispatchable(name, allowed_names) {
                     return Some(ToolCall {
                         id: String::new(),
                         name: name.to_string(),
@@ -481,7 +523,7 @@ fn coerce_to_tool_call(
 
     // Pattern 3: { tool_name, tool_args } (R1 free-form variant)
     if let Some(name) = obj.get("tool_name").and_then(|v| v.as_str()) {
-        if allowed_names.contains(name) {
+        if is_dispatchable(name, allowed_names) {
             let args = obj.get("tool_args").cloned().unwrap_or_else(|| {
                 // No `tool_args` — fall back to the generic keys rather than
                 // handing back an empty object.
@@ -729,5 +771,135 @@ mod tests {
         let input = "<tool_call>{\"name\": \"search\", \"arguments\": {\"q\": \"ts\"}}</tool_call>";
         let r = scavenge_tool_calls(Some(input), &allowed(), 4);
         assert_eq!(r.calls.len(), 1);
+    }
+
+    // ---- dirge-e31n.8: the names that get dropped ----
+    //
+    // The negative half is written FIRST and deliberately: a miss counter that
+    // over-fires reports every model quoting a schema as a model fumbling a
+    // call, and the resulting number is worse than no number, because it looks
+    // like evidence.
+
+    /// Ordinary prose containing JSON with a `name` key is NOT a dropped call.
+    /// This is the whole reason pattern C (bare JSON) is excluded — a model
+    /// explaining `{"name": "delete_everything"}` is discussing a schema, not
+    /// reaching for a tool.
+    #[test]
+    fn bare_json_in_prose_is_not_counted_as_a_miss() {
+        for input in [
+            "The MCP server exposes {\"name\": \"delete_everything\", \"arguments\": {}}.",
+            "I considered {\"q\": \"ts\"} but decided against searching.",
+            "no json here at all",
+        ] {
+            let r = scavenge_tool_calls(Some(input), &allowed(), 4);
+            assert!(
+                r.unknown_names.is_empty(),
+                "prose scored as a dropped call: {input}"
+            );
+        }
+    }
+
+    /// A call that DISPATCHED is not a miss. Guards the other direction: a
+    /// counter that fires on success would make every healthy run look sick.
+    #[test]
+    fn a_dispatched_call_is_not_counted_as_a_miss() {
+        let input = "<tool_call>{\"name\": \"search\", \"arguments\": {\"q\": \"ts\"}}</tool_call>";
+        let r = scavenge_tool_calls(Some(input), &allowed(), 4);
+        assert_eq!(r.calls.len(), 1);
+        assert!(r.unknown_names.is_empty());
+    }
+
+    /// The positive half, DSML: the model wrote an explicit invoke for a tool
+    /// that does not exist. Nothing dispatches and nothing errors, so without
+    /// this the loss leaves no trace anywhere.
+    #[test]
+    fn unknown_dsml_invoke_name_is_recorded() {
+        let input = "<|DSML|invoke name=\"search_files\">\
+                     <|DSML|parameter name=\"q\">ts</|DSML|parameter>\
+                     </|DSML|invoke>";
+        let r = scavenge_tool_calls(Some(input), &allowed(), 4);
+        assert!(r.calls.is_empty(), "unknown name must not dispatch");
+        assert_eq!(r.unknown_names, vec!["search_files".to_string()]);
+    }
+
+    /// The positive half, tagged region — and each name shape `coerce_to_tool_call`
+    /// reads, so the miss counter cannot go blind to a shape the dropper handles.
+    #[test]
+    fn unknown_tagged_name_is_recorded_in_every_shape() {
+        for (label, body) in [
+            ("name", "{\"name\": \"view\", \"arguments\": {}}"),
+            (
+                "openai",
+                "{\"type\": \"function\", \"function\": {\"name\": \"view\", \"arguments\": {}}}",
+            ),
+            ("tool_name", "{\"tool_name\": \"view\", \"tool_args\": {}}"),
+        ] {
+            let input = format!("<tool_call>{body}</tool_call>");
+            let r = scavenge_tool_calls(Some(&input), &allowed(), 4);
+            assert!(r.calls.is_empty(), "{label}: must not dispatch");
+            assert_eq!(r.unknown_names, vec!["view".to_string()], "{label}");
+        }
+    }
+
+    /// A fenced region counts too — same explicit-syntax rule, different tag.
+    #[test]
+    fn unknown_fenced_name_is_recorded() {
+        let input = "```json\n{\"name\": \"execute_command\", \"arguments\": {}}\n```";
+        let r = scavenge_tool_calls(Some(input), &allowed(), 4);
+        assert!(r.calls.is_empty());
+        assert_eq!(r.unknown_names, vec!["execute_command".to_string()]);
+    }
+
+    /// dirge-e31n.8: a synonym in scavenged TEXT used to be dropped here and
+    /// the call was simply gone — no result, no error, and the turn ended
+    /// with the raw call syntax as the answer. It now survives the gate,
+    /// carrying the guessed name for the loop's one resolution pass to
+    /// rewrite. Both explicit shapes, since both dropped it before.
+    #[test]
+    fn an_aliasable_name_survives_the_gate() {
+        let tools: HashSet<String> = ["bash", "question"].iter().map(|s| s.to_string()).collect();
+        for input in [
+            "<|DSML|invoke name=\"shell\"><|DSML|parameter name=\"command\">ls</|DSML|parameter></|DSML|invoke>".to_string(),
+            "<tool_call>{\"name\": \"execute_command\", \"arguments\": {\"command\": \"ls\"}}</tool_call>".to_string(),
+            "```json\n{\"name\": \"ask_user\", \"arguments\": {}}\n```".to_string(),
+        ] {
+            let r = scavenge_tool_calls(Some(&input), &tools, 4);
+            assert_eq!(r.calls.len(), 1, "aliasable name dropped: {input}");
+            assert!(r.unknown_names.is_empty(), "counted as a loss: {input}");
+        }
+    }
+
+    /// And the gate does not widen past the tools that exist: an alias for a
+    /// tool this run does not have is still a miss, not a call that fails one
+    /// layer down with a worse message.
+    #[test]
+    fn an_alias_for_an_absent_tool_is_still_a_miss() {
+        let no_bash: HashSet<String> = ["read"].iter().map(|s| s.to_string()).collect();
+        let r = scavenge_tool_calls(
+            Some("<tool_call>{\"name\": \"shell\", \"arguments\": {}}</tool_call>"),
+            &no_bash,
+            4,
+        );
+        assert!(r.calls.is_empty());
+        assert_eq!(r.unknown_names, vec!["shell".to_string()]);
+    }
+
+    /// A turn full of invented calls is bounded: the accepted-call budget
+    /// never applied to rejected ones, and the input runs to 100 KB.
+    #[test]
+    fn recorded_misses_are_capped() {
+        let input = "<tool_call>{\"name\": \"nope\", \"arguments\": {}}</tool_call>".repeat(40);
+        let r = scavenge_tool_calls(Some(&input), &allowed(), 4);
+        assert_eq!(r.unknown_names.len(), MAX_UNKNOWN_NAMES);
+    }
+
+    /// A tagged region with no name at all is malformed, not a miss — there
+    /// is no name to alias and nothing to report.
+    #[test]
+    fn tagged_region_without_a_name_is_not_a_miss() {
+        let input = "<tool_call>{\"arguments\": {\"q\": \"ts\"}}</tool_call>";
+        let r = scavenge_tool_calls(Some(input), &allowed(), 4);
+        assert!(r.calls.is_empty());
+        assert!(r.unknown_names.is_empty());
     }
 }

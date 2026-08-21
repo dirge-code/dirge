@@ -77,6 +77,11 @@ struct Inner {
     /// `(tool_name, excerpt)` for the most recent failures in the
     /// current streak, bounded to `MAX_QUOTED`.
     recent: Vec<(String, String)>,
+    /// dirge-61sv: the recovery class of each failure in `recent`, in the same
+    /// order and bounded the same way. Kept parallel rather than folded into
+    /// the tuple so the excerpt list stays the shape `recent_excerpts` already
+    /// hands to the safe-state replan.
+    recent_classes: Vec<super::tool_error_class::ErrorClass>,
     /// Escalation score at the last emitted checkpoint; 0 = none emitted
     /// for this streak. Re-arm only after another `threshold` of
     /// escalation so a stubborn streak gets periodic — not per-call —
@@ -111,6 +116,7 @@ impl FailureTracker {
                 escalation: 0,
                 timeouts: 0,
                 recent: Vec::new(),
+                recent_classes: Vec::new(),
                 last_emitted_at: 0,
                 denials: 0,
                 recent_denials: Vec::new(),
@@ -132,6 +138,7 @@ impl FailureTracker {
                 inner.escalation = 0;
                 inner.timeouts = 0;
                 inner.recent.clear();
+                inner.recent_classes.clear();
                 inner.last_emitted_at = 0;
                 inner.denials = 0;
                 inner.recent_denials.clear();
@@ -162,6 +169,18 @@ impl FailureTracker {
                 inner.escalation += 2;
                 inner.timeouts += 1;
             }
+        }
+        // dirge-61sv: remember WHAT KIND of failure this was, not just that it
+        // was one. A streak of "no such file" and a streak of schema
+        // rejections want opposite advice, and the generic checkpoint gives
+        // neither. Bounded by the same MAX_QUOTED window as the excerpts so a
+        // long streak cannot grow this without limit.
+        inner
+            .recent_classes
+            .push(super::tool_error_class::classify(tool_name, excerpt));
+        if inner.recent_classes.len() > MAX_QUOTED {
+            let drop = inner.recent_classes.len() - MAX_QUOTED;
+            inner.recent_classes.drain(0..drop);
         }
         inner
             .recent
@@ -217,7 +236,10 @@ impl FailureTracker {
     /// below keeps the base threshold: a denial streak is a policy wall, and
     /// nothing [`super::capability::CapabilityCounters`] measures says anything
     /// about how often the user's rules block a call.
-    pub fn poll_reflection(&self, tier: CapabilityTier) -> Vec<LoopMessage> {
+    pub fn poll_reflection(
+        &self,
+        tier: CapabilityTier,
+    ) -> Vec<(LoopMessage, super::gate_tally::BoundaryNudge)> {
         let threshold = self.effective_threshold(tier);
         let mut inner = self.inner.lock_ignore_poison();
         let mut out = Vec::new();
@@ -232,7 +254,10 @@ impl FailureTracker {
             if due {
                 inner.last_denial_emitted_at = inner.denials;
                 let body = format_permission_checkpoint(inner.denials, &inner.recent_denials);
-                out.push(LoopMessage::User(UserMessage::text(body)));
+                out.push((
+                    LoopMessage::User(UserMessage::text(body)),
+                    super::gate_tally::BoundaryNudge::PermissionCheckpoint,
+                ));
             }
         }
 
@@ -244,8 +269,16 @@ impl FailureTracker {
                 || inner.escalation.saturating_sub(inner.last_emitted_at) >= threshold;
             if due {
                 inner.last_emitted_at = inner.escalation;
-                let body = format_checkpoint(inner.consecutive, inner.timeouts, &inner.recent);
-                out.push(LoopMessage::User(UserMessage::text(body)));
+                let body = format_checkpoint(
+                    inner.consecutive,
+                    inner.timeouts,
+                    &inner.recent,
+                    &inner.recent_classes,
+                );
+                out.push((
+                    LoopMessage::User(UserMessage::text(body)),
+                    super::gate_tally::BoundaryNudge::ReflectionCheckpoint,
+                ));
             }
         }
         out
@@ -302,7 +335,12 @@ fn condense(s: &str) -> String {
 }
 
 /// Build the recovery-checkpoint body. Free fn so tests pin the wording.
-fn format_checkpoint(consecutive: usize, timeouts: usize, recent: &[(String, String)]) -> String {
+fn format_checkpoint(
+    consecutive: usize,
+    timeouts: usize,
+    recent: &[(String, String)],
+    classes: &[super::tool_error_class::ErrorClass],
+) -> String {
     let mut s = format!("[Recovery checkpoint] {consecutive} tool calls in a row have failed:\n");
     for (tool, excerpt) in recent {
         s.push_str(&format!("  - {tool}: {excerpt}\n"));
@@ -315,6 +353,19 @@ fn format_checkpoint(consecutive: usize, timeouts: usize, recent: &[(String, Str
             "{timeouts} of these timed out — the command ran out its time budget, it didn't \
              fail on bad input. Re-running it unchanged will hang again: narrow the work, fix \
              why it hangs, or raise the timeout deliberately — don't just retry.\n",
+        ));
+    }
+    // dirge-61sv: when the streak has a single character, say so and give the
+    // instruction that fits it. Placed BEFORE the generic list because the
+    // specific direction is the useful part; the generic questions stay as the
+    // fallback for a streak with no dominant class.
+    if let Some(class) = super::tool_error_class::dominant_class(classes)
+        && let Some(guidance) = class.guidance()
+    {
+        s.push_str(&format!(
+            "Most of these are {}. {}\n",
+            class.label(),
+            guidance
         ));
     }
     s.push_str(
@@ -384,15 +435,137 @@ mod tests {
     /// Poll at the neutral tier — what every test predating dirge-z85a
     /// asserts, and the property `Nominal` must keep: bit-identical to the
     /// base threshold.
-    fn poll(t: &FailureTracker) -> Vec<LoopMessage> {
+    fn poll(t: &FailureTracker) -> Vec<(LoopMessage, super::super::gate_tally::BoundaryNudge)> {
         t.poll_reflection(CapabilityTier::Nominal)
     }
 
-    fn content_of(msgs: &[LoopMessage]) -> String {
+    fn content_of(msgs: &[(LoopMessage, super::super::gate_tally::BoundaryNudge)]) -> String {
         match msgs.first() {
-            Some(LoopMessage::User(u)) => u.text_joined(),
+            Some((LoopMessage::User(u), _)) => u.text_joined(),
             _ => panic!("expected one User message"),
         }
+    }
+
+    /// dirge-61sv: a streak with one character must SAY so, and say the thing
+    /// that fits it. The generic checkpoint asks "wrong arguments, wrong tool,
+    /// or wrong approach?" — for a run whose calls all name files that are not
+    /// there, none of those three is the answer, and the useful instruction is
+    /// to stop calling and go look.
+    ///
+    /// This is the case measured in dirge-e31n: control runs burned 17 and 26
+    /// varied, well-formed tool calls that storm, scavenge and repair all
+    /// correctly ignored, and the only nudge they got was the generic one.
+    #[test]
+    fn checkpoint_names_a_dominant_missing_info_streak() {
+        use super::super::activity::Outcome;
+        let t = FailureTracker::new(3);
+        for path in ["/a/one.rs", "/a/two.rs", "/a/three.rs"] {
+            t.record(
+                Outcome::Error,
+                "read",
+                &format!("No such file or directory: {path}"),
+            );
+        }
+        let msgs = t.poll_reflection(CapabilityTier::Nominal);
+        let body = content_of(&msgs);
+        assert!(
+            body.contains("things that aren't there"),
+            "checkpoint did not name the dominant class:\n{body}"
+        );
+        assert!(
+            body.contains("stop calling and go look"),
+            "checkpoint named the class but gave no class-specific direction:\n{body}"
+        );
+        // The generic advice still ships — the class line supplements it.
+        assert!(body.contains("Stop and diagnose before retrying"));
+    }
+
+    /// The other side, and the one that makes the test above evidence: a
+    /// DIFFERENT dominant class must produce different direction. A checkpoint
+    /// that printed the missing-info line for every streak would pass the test
+    /// above and be useless.
+    #[test]
+    fn a_different_dominant_class_gives_different_direction() {
+        use super::super::activity::Outcome;
+        let t = FailureTracker::new(3);
+        for _ in 0..3 {
+            t.record(
+                Outcome::Error,
+                "edit",
+                "invalid arguments: missing required field `old_text`",
+            );
+        }
+        let body = content_of(&t.poll_reflection(CapabilityTier::Nominal));
+        assert!(
+            body.contains("malformed calls"),
+            "misuse streak was not named:\n{body}"
+        );
+        assert!(
+            !body.contains("things that aren't there"),
+            "a misuse streak got missing-info direction:\n{body}"
+        );
+    }
+
+    /// A mixed streak has no single character, so the checkpoint must NOT
+    /// pick one. Confident direction about a minority of the failures is
+    /// worse than the honest generic questions.
+    #[test]
+    fn a_mixed_streak_names_no_class() {
+        use super::super::activity::Outcome;
+        let t = FailureTracker::new(3);
+        t.record(Outcome::Error, "read", "No such file or directory: /a");
+        t.record(Outcome::Error, "edit", "invalid arguments: bad schema");
+        t.record(Outcome::Error, "bash", "make: *** Error 1");
+        let body = content_of(&t.poll_reflection(CapabilityTier::Nominal));
+        assert!(body.contains("Stop and diagnose before retrying"));
+        for label in [
+            "things that aren't there",
+            "malformed calls",
+            "transient failures",
+        ] {
+            assert!(
+                !body.contains(label),
+                "a mixed streak claimed a dominant class ({label}):\n{body}"
+            );
+        }
+    }
+
+    /// Unrecognised errors must behave exactly as they did before this
+    /// existed — the acceptance criterion for not regressing today's runs.
+    #[test]
+    fn unclassified_streak_is_unchanged_by_classification() {
+        use super::super::activity::Outcome;
+        let t = FailureTracker::new(3);
+        for _ in 0..3 {
+            t.record(Outcome::Error, "bash", "make: *** [target] Error 1");
+        }
+        let body = content_of(&t.poll_reflection(CapabilityTier::Nominal));
+        assert!(body.contains("Stop and diagnose before retrying"));
+        assert!(
+            !body.contains("Most of these are"),
+            "an unclassified streak claimed a class:\n{body}"
+        );
+    }
+
+    /// A success clears the class history with the rest of the streak state,
+    /// so a later unrelated streak cannot inherit the earlier one's character.
+    #[test]
+    fn success_clears_the_class_history() {
+        use super::super::activity::Outcome;
+        let t = FailureTracker::new(3);
+        for _ in 0..3 {
+            t.record(Outcome::Error, "read", "No such file or directory: /a");
+        }
+        t.record(Outcome::Ok, "read", "");
+        for _ in 0..3 {
+            t.record(Outcome::Error, "edit", "invalid arguments: bad schema");
+        }
+        let body = content_of(&t.poll_reflection(CapabilityTier::Nominal));
+        assert!(
+            !body.contains("things that aren't there"),
+            "the cleared streak's class leaked into a new one:\n{body}"
+        );
+        assert!(body.contains("malformed calls"));
     }
 
     #[test]

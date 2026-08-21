@@ -71,6 +71,7 @@ pub(crate) fn handle_token(
     if *was_reasoning {
         ctx.renderer.write_line("", Color::White)?;
         *was_reasoning = false;
+        ctx.renderer.end_stream();
         ctx.response_buf.clear();
         *ctx.response_start_line = None;
         // End-of-reasoning marker. The reasoning stays rendered in the
@@ -153,7 +154,7 @@ pub(crate) fn render_queued_steering(
         renderer.stream(response_buf, c_agent(), true);
         renderer.render_viewport()?;
     }
-    renderer.commit_stream();
+    renderer.end_stream();
     for line in text.lines() {
         let safe_line = sanitize_output(line);
         renderer.write_line(&format!("» {}", safe_line), crate::ui::theme::dim())?;

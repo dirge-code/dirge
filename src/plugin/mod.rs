@@ -21,7 +21,10 @@ pub use worker::{DialogReply, DialogRequest, LspRequest};
 #[cfg(feature = "plugin")]
 pub mod extension;
 pub mod hook;
+pub mod interrupt;
 pub mod loader;
+#[cfg(feature = "plugin")]
+pub mod notebook;
 pub mod worker;
 
 /// Per-process sentinel the Rust host prepends to a plugin error string
@@ -1189,17 +1192,13 @@ impl PluginManager {
         // count shows up in the next drain instead of being lost.
         // Resets the dedup slots regardless so a future drain
         // starts fresh.
+        // dirge-vpma.33: call the harness's own flush rather than restating it
+        // here. The two copies had already drifted — this one printed the raw
+        // count, overstating the suppressed total by the one banner that was
+        // shown.
         let _ = self.worker.eval(
             r#"(do
-                 (when (and harness-last-hook-err-msg
-                            (> harness-last-hook-err-count 1))
-                   (set harness-notif-list
-                        (string harness-notif-list
-                                "error\t"
-                                harness-last-hook-err-msg
-                                " (repeated "
-                                harness-last-hook-err-count
-                                " times)\n")))
+                 (harness/-flush-hook-err)
                  (set harness-last-hook-err-msg nil)
                  (set harness-last-hook-err-count 0))"#,
         );
@@ -1220,7 +1219,8 @@ impl PluginManager {
                 if level.is_empty() || msg.is_empty() {
                     None
                 } else {
-                    Some((level.to_string(), msg.to_string()))
+                    // dirge-vpma.32: the writer escapes, so undo it here.
+                    Some((level.to_string(), unescape_harness_field(msg)))
                 }
             })
             .collect();

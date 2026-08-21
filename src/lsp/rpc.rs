@@ -69,32 +69,49 @@ impl Protocol for LspProtocol {
     }
 
     fn classify(msg: &Value) -> Incoming<RpcError> {
-        // EXT-5: JSON-RPC spec permits string IDs; some servers (e.g.
-        // rust-analyzer's internal notifications, clangd diagnostics) use them.
-        // Numeric correlation accepts a JSON number OR a numeric string.
-        let id_value = msg.get("id").cloned();
-        let id_num = id_value.as_ref().and_then(|v| v.as_u64());
-        let id_str = id_value.as_ref().and_then(|v| v.as_str()).map(String::from);
-        let id = id_num.or_else(|| id_str.as_ref().and_then(|s| s.parse().ok()));
+        // EXT-5: the JSON-RPC spec permits string ids and some servers use
+        // them (rust-analyzer's internal notifications, clangd diagnostics).
+        //
+        // The RAW id, whatever JSON type it is. JSON-RPC allows a string id and
+        // says nothing about its shape; sourcekit-lsp uses a UUID.
+        let raw_id = msg.get("id").cloned().filter(|v| !v.is_null());
+        // A NUMERIC view of it, for correlating a response to one of our own
+        // requests. Our outgoing ids are always numbers, so anything that
+        // doesn't parse cannot be a reply to us.
+        let numeric_id = raw_id
+            .as_ref()
+            .and_then(|v| v.as_u64().or_else(|| v.as_str()?.parse().ok()));
         let method = msg.get("method").and_then(|v| v.as_str()).map(String::from);
 
-        match (id, method) {
-            (Some(id), None) => Incoming::Response {
-                id,
-                result: response_result(msg),
+        match (raw_id, method) {
+            // Server→client REQUEST: carries BOTH an id and a method. We
+            // register no client-side request capabilities, so acknowledge with
+            // a null result rather than let the server hang. The shared read
+            // loop writes `ack`.
+            //
+            // GH #778: the id is echoed VERBATIM. It used to be echoed as the
+            // numeric parse, which meant a request whose id was not a number
+            // fell through to the `(None, Some(method))` arm below and was
+            // classified as a NOTIFICATION — no handler, dropped in silence.
+            // sourcekit-lsp sends `client/registerCapability` with a UUID id
+            // and waits for the reply before servicing anything else, so every
+            // request after it hung: the server spawned, the file opened, and
+            // `documentSymbol` simply never came back. Measured on the wire.
+            (Some(id), Some(_method)) => Incoming::ReverseRequest {
+                ack: json!({ "jsonrpc": "2.0", "id": id, "result": Value::Null }),
+            },
+            (Some(_), None) => match numeric_id {
+                Some(id) => Incoming::Response {
+                    id,
+                    result: response_result(msg),
+                },
+                // A response we cannot correlate is not ours to route.
+                None => Incoming::Ignore,
             },
             (None, Some(method)) => Incoming::Notify {
                 key: method,
                 body: msg.get("params").cloned().unwrap_or(Value::Null),
             },
-            (Some(id), Some(_method)) => {
-                // Server→client request. We register no client-side request
-                // capabilities in v1, so acknowledge with a null result rather
-                // than let the server hang. The shared read loop writes `ack`.
-                Incoming::ReverseRequest {
-                    ack: json!({ "jsonrpc": "2.0", "id": id, "result": Value::Null }),
-                }
-            }
             (None, None) => Incoming::Ignore,
         }
     }
@@ -495,5 +512,87 @@ mod tests {
             .expect("read task should exit, not hang")
             .unwrap();
         assert!(task_result.is_err());
+    }
+}
+
+#[cfg(test)]
+mod reverse_request_ids {
+    use super::*;
+    use crate::jsonrpc_client::Incoming;
+
+    /// `Incoming` carries a boxed error type and isn't `Debug`; name the arm so
+    /// a failure says which one it took.
+    fn label(msg: Value) -> &'static str {
+        match <LspProtocol as Protocol>::classify(&msg) {
+            Incoming::Response { .. } => "response",
+            Incoming::Notify { .. } => "notify",
+            Incoming::ReverseRequest { .. } => "reverse-request",
+            Incoming::Ignore => "ignore",
+        }
+    }
+
+    fn ack_of(msg: Value) -> Value {
+        match <LspProtocol as Protocol>::classify(&msg) {
+            Incoming::ReverseRequest { ack } => ack,
+            _ => panic!("expected a reverse request"),
+        }
+    }
+
+    /// GH #778. A server-to-client request is identified by having BOTH an id
+    /// and a method — never by the id's TYPE. sourcekit-lsp sends
+    /// `client/registerCapability` with a UUID and blocks until it is answered,
+    /// so misreading it as a notification hangs every later request: the server
+    /// starts, the file opens, and `documentSymbol` never returns. Measured on
+    /// the wire before this was fixed.
+    #[test]
+    fn a_request_with_a_uuid_id_is_acked_not_dropped() {
+        let uuid = "085FE661-8A49-4B4A-B320-A8E2E1C0FFEE";
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "id": uuid,
+            "method": "client/registerCapability",
+            "params": {"registrations": []},
+        });
+        assert_eq!(label(msg.clone()), "reverse-request");
+        let ack = ack_of(msg);
+        assert_eq!(
+            ack["id"], uuid,
+            "the ack must echo the id VERBATIM; a numeric parse loses it"
+        );
+        assert!(ack["result"].is_null());
+    }
+
+    /// The shapes that must classify exactly as they did before.
+    #[test]
+    fn numeric_ids_and_notifications_are_unchanged() {
+        // Our own request, answered.
+        assert_eq!(
+            label(json!({"jsonrpc": "2.0", "id": 7, "result": {"ok": true}})),
+            "response"
+        );
+        // A numeric-STRING id still correlates (EXT-5).
+        assert_eq!(
+            label(json!({"jsonrpc": "2.0", "id": "7", "result": null})),
+            "response"
+        );
+        // A server request with a numeric id is still a reverse request, and
+        // its ack still carries the number.
+        let numeric_req = json!({"jsonrpc": "2.0", "id": 3, "method": "workspace/configuration"});
+        assert_eq!(label(numeric_req.clone()), "reverse-request");
+        assert_eq!(ack_of(numeric_req)["id"], 3);
+        // A notification has no id and must NOT be acked — acking it would put
+        // a bogus response on the wire.
+        assert_eq!(
+            label(
+                json!({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics",
+                         "params": {"uri": "file:///a.swift"}})
+            ),
+            "notify"
+        );
+        // A response we cannot correlate is ignored, not mistaken for a request.
+        assert_eq!(
+            label(json!({"jsonrpc": "2.0", "id": "not-a-number", "result": null})),
+            "ignore"
+        );
     }
 }

@@ -121,6 +121,10 @@ where
 /// or >2 levels of nesting, the adapter auto-flattens it at
 /// construction time (Reasonix tools.ts:36-38). The LLM sees flat
 /// dot-notation keys; `prepare_arguments` re-nests them at dispatch.
+/// Per-tool dispatch budget hook (dirge-9tl3). `None` return → the shared
+/// `timeouts.tool_call` ceiling. See `LoopTool::call_budget`.
+pub(crate) type CallBudgetFn = Box<dyn Fn(&Value) -> Option<std::time::Duration> + Send + Sync>;
+
 pub struct RigToolAdapter {
     inner: Box<dyn DynTool>,
     name: String,
@@ -130,6 +134,9 @@ pub struct RigToolAdapter {
     /// Port of Reasonix `InternalTool.flatSchema` (tools.ts:37).
     flat_parameters: Option<Value>,
     execution_mode: Option<ToolExecutionMode>,
+    /// Per-tool dispatch budget hook (dirge-9tl3). `None` → the shared
+    /// `timeouts.tool_call` ceiling. See `LoopTool::call_budget`.
+    call_budget_fn: Option<CallBudgetFn>,
 }
 
 impl std::fmt::Debug for RigToolAdapter {
@@ -173,6 +180,7 @@ impl RigToolAdapter {
             parameters: def.parameters,
             flat_parameters,
             execution_mode: None,
+            call_budget_fn: None,
         }
     }
     /// that mutate shared filesystem state or process state
@@ -181,6 +189,14 @@ impl RigToolAdapter {
     /// forces the WHOLE batch sequential.
     pub fn with_execution_mode(mut self, mode: ToolExecutionMode) -> Self {
         self.execution_mode = Some(mode);
+        self
+    }
+
+    /// Attach a per-tool dispatch budget hook (dirge-9tl3). Only for tools
+    /// whose own bound legitimately exceeds the shared ceiling (bash,
+    /// subagents) — so the watchdog never cuts an in-bounds call.
+    pub fn with_call_budget(mut self, f: CallBudgetFn) -> Self {
+        self.call_budget_fn = Some(f);
         self
     }
 
@@ -201,6 +217,7 @@ impl RigToolAdapter {
             parameters,
             flat_parameters: None,
             execution_mode: None,
+            call_budget_fn: None,
         }
     }
 }
@@ -231,6 +248,10 @@ impl LoopTool for RigToolAdapter {
 
     fn execution_mode(&self) -> Option<ToolExecutionMode> {
         self.execution_mode
+    }
+
+    fn call_budget(&self, args: &Value) -> Option<std::time::Duration> {
+        self.call_budget_fn.as_ref().and_then(|f| f(args))
     }
 
     /// Re-nests flat dot-notation args when the schema was

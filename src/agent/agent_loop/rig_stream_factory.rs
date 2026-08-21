@@ -156,12 +156,21 @@ where
     let provider_name = Arc::new(provider_name);
     let model_name = Arc::new(model_name);
     let filter = Arc::new(tool_def_filter);
+    // The previous request's prefix fingerprint, so a change can be reported
+    // against it. Lives HERE — one per `StreamFn`, which is one per agent —
+    // rather than in a process global, because subagents and forked reviewers
+    // each build their own and a shared slot would report every switch between
+    // them as drift.
+    let last_prefix = Arc::new(std::sync::Mutex::new(
+        None::<super::prefix::PrefixFingerprint>,
+    ));
     Arc::new(move |ctx: LlmContext, opts: super::stream::StreamOptions| {
         let model = model.clone();
         let tools = tools.clone();
         let provider_name = provider_name.clone();
         let model_name = model_name.clone();
         let filter = filter.clone();
+        let last_prefix = last_prefix.clone();
         invoke_one_stream(
             model,
             tools,
@@ -171,6 +180,7 @@ where
             provider_name,
             model_name,
             filter,
+            last_prefix,
         )
     })
 }
@@ -196,6 +206,7 @@ fn invoke_one_stream<M>(
     tool_def_filter: Arc<
         Option<std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>>,
     >,
+    last_prefix: Arc<std::sync::Mutex<Option<super::prefix::PrefixFingerprint>>>,
 ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send>>
 where
     M: CompletionModel + Clone + Send + Sync + 'static,
@@ -248,6 +259,7 @@ where
             &system_prompt,
             &outgoing_tools,
             history_len,
+            &last_prefix,
         );
 
         // Build additional_params using a per-provider mapper
@@ -263,8 +275,7 @@ where
         // dirge-wire: opt-in dump of the outgoing agent request (turn /
         // escalation / subagent / forked review), so secondary calls are
         // visible alongside the one-shot side-LLM dumps. No-op unless
-        // DIRGE_DUMP_REQUESTS is set. `additional` carrying reasoning params is
-        // the per-provider signal that thinking is enabled for this request.
+        // DIRGE_DUMP_REQUESTS is set.
         if crate::provider::wire::enabled() {
             let model = model_name.as_ref().as_deref().unwrap_or("default");
             let tool_names: Vec<String> = outgoing_tools.iter().map(|t| t.name.clone()).collect();
@@ -276,7 +287,10 @@ where
                 history_len,
                 messages_bytes,
                 &tool_names,
-                additional.is_some(),
+                // dirge-vpma.26: NOT `additional.is_some()` — a tool gate or a
+                // metadata map fills that too, and labelled turns with thinking
+                // off as reasoning-enabled.
+                turn_reasoning_enabled(provider, &opts),
             );
         }
 
@@ -381,30 +395,57 @@ fn emit_cache_prefix_event(
     system_prompt: &str,
     tools: &[ToolDefinition],
     history_len: usize,
+    last_prefix: &std::sync::Mutex<Option<super::prefix::PrefixFingerprint>>,
 ) {
-    use std::hash::{Hash, Hasher};
-    let mut h_system = std::collections::hash_map::DefaultHasher::new();
-    system_prompt.hash(&mut h_system);
-    let system_hash = h_system.finish();
+    use crate::sync_util::LockExt;
 
-    let mut tool_names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
-    tool_names.sort_unstable();
-    let mut h_tools = std::collections::hash_map::DefaultHasher::new();
-    for n in &tool_names {
-        n.hash(&mut h_tools);
-        0u8.hash(&mut h_tools);
-    }
-    let tools_hash = h_tools.finish();
+    let now = super::prefix::PrefixFingerprint::of(system_prompt, tools);
+
+    // Take the comparison and store the new value under one lock, so two
+    // concurrent requests on the same agent cannot both read the same
+    // predecessor and report the change twice.
+    let previous = {
+        let mut guard = last_prefix.lock_ignore_poison();
+        guard.replace(now)
+    };
 
     tracing::debug!(
         target: "dirge::prompt_cache",
         provider = provider.unwrap_or("unknown"),
-        system_hash = format!("{system_hash:016x}"),
-        tools_hash = format!("{tools_hash:016x}"),
+        system_hash = format!("{:016x}", now.system_hash()),
+        tools_hash = format!("{:016x}", now.tools_hash()),
         tool_count = tools.len(),
         system_bytes = system_prompt.len(),
         history_len = history_len,
         "prompt_cache_prefix"
+    );
+
+    // The first request establishes the baseline; there is nothing to have
+    // drifted from yet.
+    let Some(previous) = previous else { return };
+    let change = now.changes_from(&previous);
+    if !change.any() {
+        return;
+    }
+
+    // A prefix change mid-session is not free: the provider caches on a
+    // strict byte prefix, so everything from the changed component onward is
+    // re-billed at write price. Some changes are deliberate (an `/agent`
+    // switch rebuilds the preamble); this says which component moved so the
+    // deliberate ones can be told from the accidental ones, and so a
+    // `dirge::cache` read-miss on the next turn has a named cause instead of
+    // a guess.
+    tracing::warn!(
+        target: "dirge::prompt_cache",
+        provider = provider.unwrap_or("unknown"),
+        changed = change.describe(),
+        system_changed = change.system,
+        tools_changed = change.tools,
+        tool_count = tools.len(),
+        history_len = history_len,
+        "cached request prefix changed mid-session: {} moved, so the cache is \
+         invalidated from there on",
+        change.describe(),
     );
 }
 
@@ -801,6 +842,19 @@ pub fn loop_tool_to_rig_definition(tool: &dyn LoopTool) -> ToolDefinition {
         .flat_parameters()
         .cloned()
         .unwrap_or_else(|| tool.parameters().clone());
+    // dirge-tva8: on a small window, ship breadcrumb schemas — first sentence
+    // of each description, everything structural untouched. Measured, the full
+    // tool surface is 16k tokens built-in and 32.6k with MCP servers, the
+    // latter larger than a 32k window in its entirety. Decided here because
+    // this is the single point every tool becomes a provider schema, so no
+    // caller can be built that forgets. See `compact_schema`.
+    if super::compact_schema::in_force() {
+        return ToolDefinition {
+            name: tool.name().to_string(),
+            description: super::compact_schema::compact_description(tool.description()),
+            parameters: super::compact_schema::compact_parameters(&parameters),
+        };
+    }
     ToolDefinition {
         name: tool.name().to_string(),
         description: tool.description().to_string(),
@@ -846,33 +900,61 @@ pub fn loop_tool_to_rig_definition(tool: &dyn LoopTool) -> ToolDefinition {
 ///   - None: generic `reasoning_level` key for debugging /
 ///     ad-hoc consumers.
 ///
-/// **Headers and metadata** are passed through under
-/// conventional keys (`headers`, `metadata`) regardless of
-/// provider — rig's openai-shaped clients merge `metadata`
-/// into the request body; headers are honored where the
-/// provider impl reads them.
+/// **Metadata** is passed through under the conventional `metadata` key
+/// regardless of provider — rig's openai-shaped clients merge it into the
+/// request body.
+///
+/// **Headers are not.** They used to be, under a `headers` key, on the belief
+/// that "headers are honored where the provider impl reads them". No provider
+/// reads them: rig flattens `additional_params` into the request BODY, so the
+/// only thing that key ever did was ship `Authorization: Bearer <key>` to the
+/// endpoint as body content (dirge-vpma.25).
 pub fn build_provider_additional_params(
     provider_name: Option<&str>,
     opts: &super::stream::StreamOptions,
 ) -> Option<serde_json::Value> {
     let mut additional = serde_json::Map::new();
 
+    // ----- tool gating (dirge-e31n.6) -----
+    // Only `None` is sent. `Auto` is the provider default, and an explicit
+    // "auto" is NOT equivalent to omitting the key: some OpenAI-compatible
+    // backends reject `tool_choice` when the request carries no `tools` array,
+    // so sending it unconditionally would break every tool-less call (the
+    // summarizer, the critic, the goal judge) to say something the provider
+    // already assumes.
+    if let Some(super::types::ToolChoice::None) = opts.tool_choice {
+        additional.insert(
+            "tool_choice".to_string(),
+            serde_json::Value::String(super::types::ToolChoice::None.as_wire().to_string()),
+        );
+    }
+
     // ----- reasoning per provider -----
-    if let Some(level) = opts.reasoning
-        && let Some(serde_json::Value::Object(m)) =
-            crate::provider::adapter::reasoning_profile(provider_name)
-                .effort_params(level, opts.thinking_budgets.as_ref())
-    {
+    if let Some(m) = reasoning_params(provider_name, opts) {
         additional.extend(m);
     }
 
-    // ----- headers (provider-agnostic) -----
-    let headers = merged_request_headers(provider_name, opts);
-    if !headers.is_empty()
-        && let Ok(v) = serde_json::to_value(&headers)
-    {
-        additional.insert("headers".to_string(), v);
-    }
+    // ----- headers -----
+    //
+    // dirge-vpma.25: these used to be serialized into `additional_params` under
+    // a "headers" key. That could never work and was actively unsafe. rig
+    // serde-FLATTENS additional_params into the JSON request BODY, and no
+    // provider extracts a body-level "headers" field and promotes it to an HTTP
+    // header — so a request built this way (a) did not authenticate and (b)
+    // shipped `Authorization: Bearer <key>` inside the body, to an endpoint
+    // that may log it.
+    //
+    // Nothing in production set these (integration.rs passes `api_key: None`
+    // and an empty `headers` map on every spawn), so removing the injection
+    // changes no live behaviour. It is deliberately NOT replaced with a
+    // real-header implementation here: per-request headers belong at the HTTP
+    // client layer alongside the transports that already own auth, not in the
+    // completion-request builder.
+    //
+    // Warn rather than drop silently. A knob that quietly does nothing is how
+    // this survived — anyone who sets one should learn immediately that it has
+    // no consumer, instead of discovering it from an auth failure.
+    warn_unapplied_request_overrides(opts);
 
     // ----- metadata (provider-agnostic) -----
     if !opts.metadata.is_empty() {
@@ -894,22 +976,66 @@ pub fn build_provider_additional_params(
     }
 }
 
-fn merged_request_headers(
-    _provider_name: Option<&str>,
+/// The reasoning params this provider wants for `opts`, or `None` when the
+/// turn asks for no reasoning — or asks for a level this provider has no wire
+/// shape for.
+///
+/// Single source of truth for "is this a reasoning turn": the params that go on
+/// the wire and the flag the wire dump reports are the same decision, so they
+/// cannot disagree (dirge-vpma.26).
+fn reasoning_params(
+    provider_name: Option<&str>,
     opts: &super::stream::StreamOptions,
-) -> std::collections::HashMap<String, String> {
-    let mut headers = opts.headers.clone();
-    if let Some(key) = opts
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let level = opts.reasoning?;
+    match crate::provider::adapter::reasoning_profile(provider_name)
+        .effort_params(level, opts.thinking_budgets.as_ref())
+    {
+        Some(serde_json::Value::Object(m)) => Some(m),
+        _ => None,
+    }
+}
+
+/// Whether this turn puts reasoning params on the wire. See
+/// [`reasoning_params`].
+pub fn turn_reasoning_enabled(
+    provider_name: Option<&str>,
+    opts: &super::stream::StreamOptions,
+) -> bool {
+    reasoning_params(provider_name, opts).is_some()
+}
+
+/// Say so, once per process, when a request-override knob is set but has no
+/// consumer (dirge-vpma.25).
+///
+/// `StreamOptions::headers` and `::api_key` are resolved from `LoopConfig` —
+/// including through the `get_api_key` hook — and then reach nothing. They
+/// used to be flattened into the request body, which did not authenticate and
+/// leaked the bearer; that path is gone and no replacement exists yet.
+///
+/// Never logs the value of either. The whole point of the bug was a secret
+/// going somewhere it should not.
+fn warn_unapplied_request_overrides(opts: &super::stream::StreamOptions) {
+    use std::sync::Once;
+    static WARNED: Once = Once::new();
+    let has_key = opts
         .api_key
         .as_deref()
         .map(str::trim)
-        .filter(|key| !key.is_empty())
-    {
-        headers
-            .entry("Authorization".to_string())
-            .or_insert_with(|| format!("Bearer {key}"));
+        .is_some_and(|key| !key.is_empty());
+    if !has_key && opts.headers.is_empty() {
+        return;
     }
-    headers
+    WARNED.call_once(|| {
+        tracing::warn!(
+            target: "dirge::provider",
+            api_key_set = has_key,
+            header_names = %opts.headers.keys().cloned().collect::<Vec<_>>().join(", "),
+            "per-request api_key/headers are set but nothing applies them; they \
+             reach no HTTP header and are NOT sent. Configure credentials \
+             through the provider entry instead",
+        );
+    });
 }
 
 #[cfg(test)]
@@ -2026,42 +2152,64 @@ mod tests {
         assert_eq!(v["thinking_config"]["thinking_budget"], 16384);
     }
 
-    /// Headers and metadata pass through under conventional
-    /// keys regardless of provider.
+    /// Metadata passes through under its conventional key regardless of
+    /// provider. Headers do NOT — see below.
     #[test]
-    fn headers_and_metadata_pass_through_for_all_providers() {
+    fn metadata_passes_through_for_all_providers() {
         let mut opts = StreamOptions::from_signal(AbortSignal::new());
-        opts.headers
-            .insert("X-Tenant".to_string(), "acme".to_string());
         opts.metadata
             .insert("user_id".to_string(), serde_json::json!("u-42"));
         for provider in ["anthropic", "openai", "gemini", "ollama", "unknown"] {
             let v = build_provider_additional_params(Some(provider), &opts).unwrap();
-            assert_eq!(v["headers"]["X-Tenant"], "acme", "provider {provider}");
             assert_eq!(v["metadata"]["user_id"], "u-42", "provider {provider}");
         }
     }
 
+    /// dirge-vpma.25. These three assertions replace tests that asserted the
+    /// OPPOSITE — that `api_key` produced `headers.Authorization = "Bearer …"`
+    /// in the params, that an explicit header won over it, and that headers
+    /// passed through for every provider.
+    ///
+    /// Those tests were written down from the implementation's output, so the
+    /// bug became the contract. What they were pinning is a credential being
+    /// serialized into the JSON request BODY (`additional_params` is
+    /// serde-flattened into it), where it authenticates nothing — no provider
+    /// promotes a body field to an HTTP header — and can be logged by the
+    /// endpoint.
     #[test]
-    fn stream_options_api_key_adds_authorization_header() {
+    fn request_header_knobs_contribute_nothing_to_the_body() {
         let mut opts = StreamOptions::from_signal(AbortSignal::new());
         opts.api_key = Some("dynamic-token".to_string());
-
-        let v = build_provider_additional_params(Some("openai"), &opts).unwrap();
-        assert_eq!(v["headers"]["Authorization"], "Bearer dynamic-token");
-    }
-
-    #[test]
-    fn explicit_authorization_header_wins_over_stream_api_key() {
-        let mut opts = StreamOptions::from_signal(AbortSignal::new());
-        opts.api_key = Some("dynamic-token".to_string());
+        opts.headers
+            .insert("X-Tenant".to_string(), "acme".to_string());
         opts.headers.insert(
             "Authorization".to_string(),
             "Bearer explicit-token".to_string(),
         );
 
-        let v = build_provider_additional_params(Some("openai"), &opts).unwrap();
-        assert_eq!(v["headers"]["Authorization"], "Bearer explicit-token");
+        // Nothing else is set, so the whole params object must be absent.
+        assert!(
+            build_provider_additional_params(Some("openai"), &opts).is_none(),
+            "api_key/headers must contribute nothing to the request body"
+        );
+
+        // And they must not ride along beside something that IS legitimate.
+        opts.metadata
+            .insert("user_id".to_string(), serde_json::json!("u-42"));
+        let v = build_provider_additional_params(Some("openai"), &opts).expect("metadata present");
+        let body = serde_json::to_string(&v).expect("serializable");
+        assert!(body.contains("u-42"), "metadata should still pass: {body}");
+        for leaked in [
+            "dynamic-token",
+            "explicit-token",
+            "Authorization",
+            "X-Tenant",
+        ] {
+            assert!(
+                !body.contains(leaked),
+                "{leaked} reached the request body: {body}"
+            );
+        }
     }
 
     #[test]
@@ -2286,25 +2434,239 @@ mod tests {
         assert_eq!(out.len(), 2);
     }
 
-    /// Phase-3 part 3: the prefix-hash helper is a pure function
-    /// of (system_prompt, tools-sorted-by-name). Same inputs →
-    /// same emitted hashes. We can't directly inspect the
-    /// emitted tracing event from here, but we can verify the
-    /// helper doesn't panic and is deterministic across runs
-    /// when invoked with identical inputs (no internal RNG).
+    /// The per-request tool filter must preserve the registry's order.
+    ///
+    /// This is the sharp end of the fingerprint work. `filter_tool_defs`
+    /// consults a `HashSet` of loaded names and the `PROMPT_DENIED_TOOLS`
+    /// global; if it ever iterated either of those instead of walking the
+    /// `tools` slice, the outgoing order would vary run to run — and since
+    /// the provider caches over the order actually sent, every session would
+    /// silently pay a full prefix rewrite. Nothing else in the suite pins
+    /// this, and the cost of getting it wrong is invisible.
     #[test]
-    fn emit_cache_prefix_event_is_deterministic() {
+    fn filtering_preserves_the_registry_order() {
+        let defs = vec![
+            mk_def("read"),
+            mk_def("write"),
+            mk_def("grep"),
+            mk_def("tool_search"),
+        ];
+        // A filter admitting several, inserted in an order deliberately
+        // unlike the registry's, so an implementation iterating the SET
+        // rather than the slice would produce the set's order instead.
+        let mut set = std::collections::HashSet::new();
+        set.insert("grep".to_string());
+        set.insert("read".to_string());
+        set.insert("write".to_string());
+        let filter = std::sync::Arc::new(std::sync::Mutex::new(set));
+
+        let first: Vec<String> = filter_tool_defs(&defs, Some(&filter))
+            .iter()
+            .map(|d| d.name.clone())
+            .collect();
+
+        // Registry order, not set order, not alphabetical.
+        assert_eq!(
+            first,
+            vec!["read", "write", "grep", "tool_search"],
+            "the outgoing list must follow the registry slice"
+        );
+
+        // And it must be stable across calls — a HashSet's iteration order
+        // is randomised per process, but also varies as it is re-hashed, so
+        // a single call could agree by luck.
+        for _ in 0..16 {
+            let again: Vec<String> = filter_tool_defs(&defs, Some(&filter))
+                .iter()
+                .map(|d| d.name.clone())
+                .collect();
+            assert_eq!(again, first, "tool order must not vary between requests");
+        }
+    }
+
+    /// The emitter is deterministic and carries its comparison state forward.
+    ///
+    /// Note the corrected contract. This test used to say "permuting tool
+    /// order must NOT change the digest (the helper sorts before hashing)" —
+    /// and never asserted it. That intent was backwards: the provider caches
+    /// over the tool list in the order it is SENT, so a permutation is a full
+    /// prefix invalidation, and sorting before hashing made the one change
+    /// that costs the most the one change the telemetry could not see.
+    #[test]
+    fn emit_cache_prefix_event_tracks_the_previous_prefix() {
         let defs = vec![mk_def("write"), mk_def("read")];
-        // Call twice; if anything stateful crept in (RNG /
-        // HashMap iteration / file IO) this would surface as
-        // either a panic, a tracing-subscriber blowup, or an
-        // observable side effect under cargo test's harness.
-        emit_cache_prefix_event(Some("anthropic"), "preamble-x", &defs, 3);
-        emit_cache_prefix_event(Some("anthropic"), "preamble-x", &defs, 3);
-        // Permuting tool order must NOT change the digest (the
-        // helper sorts before hashing). Smoke: this call must
-        // also not panic.
+        let last = std::sync::Mutex::new(None);
+
+        // First call establishes the baseline.
+        emit_cache_prefix_event(Some("anthropic"), "preamble-x", &defs, 3, &last);
+        let first = last.lock().unwrap().expect("baseline recorded");
+
+        // An identical request must fingerprint identically, or every turn
+        // would report drift and the signal would be worthless.
+        emit_cache_prefix_event(Some("anthropic"), "preamble-x", &defs, 3, &last);
+        let second = last.lock().unwrap().expect("still recorded");
+        assert_eq!(first, second, "an unchanged prefix must not read as drift");
+        assert!(!second.changes_from(&first).any());
+
+        // Permuting the tool order DOES change it.
         let permuted = vec![mk_def("read"), mk_def("write")];
-        emit_cache_prefix_event(Some("anthropic"), "preamble-x", &permuted, 3);
+        emit_cache_prefix_event(Some("anthropic"), "preamble-x", &permuted, 3, &last);
+        let third = last.lock().unwrap().expect("still recorded");
+        assert_ne!(
+            second, third,
+            "the wire carries the tools in this order; a permutation invalidates the cache"
+        );
+        let change = third.changes_from(&second);
+        assert!(change.tools, "attributed to the tools");
+        assert!(!change.system, "the preamble did not move");
+    }
+}
+
+#[cfg(test)]
+mod tool_choice_tests {
+    use super::*;
+    use crate::agent::agent_loop::stream::StreamOptions;
+    use crate::agent::agent_loop::tool::AbortSignal;
+    use crate::agent::agent_loop::types::ToolChoice;
+
+    fn opts(choice: Option<ToolChoice>) -> StreamOptions {
+        let mut o = StreamOptions::from_signal(AbortSignal::new());
+        o.tool_choice = choice;
+        o
+    }
+
+    /// `None` must reach the request body, or the whole feature is inert.
+    #[test]
+    fn forbidding_tools_reaches_the_request_body() {
+        let params =
+            build_provider_additional_params(Some("openai"), &opts(Some(ToolChoice::None)))
+                .expect("params");
+        assert_eq!(
+            params.get("tool_choice").and_then(|v| v.as_str()),
+            Some("none")
+        );
+    }
+
+    /// dirge-vpma.25: a credential must never reach the request body.
+    ///
+    /// `additional_params` is serde-flattened into the JSON body, so anything
+    /// put there is sent as body content. The old `headers` key meant that
+    /// setting `api_key` shipped `Authorization: Bearer <key>` to the endpoint
+    /// as data — where it can be logged — while still failing to authenticate,
+    /// because no provider promotes a body field to an HTTP header.
+    #[test]
+    fn a_credential_never_reaches_the_request_body() {
+        let mut o = opts(None);
+        o.api_key = Some("sk-super-secret".to_string());
+        o.headers
+            .insert("X-Custom".to_string(), "value".to_string());
+
+        let params = build_provider_additional_params(Some("openai"), &o);
+
+        // Nothing at all is the expected shape here: `headers` was the only
+        // thing these two knobs contributed.
+        let body = params
+            .map(|p| serde_json::to_string(&p).expect("serializable"))
+            .unwrap_or_default();
+        assert!(
+            !body.contains("sk-super-secret"),
+            "the api key reached the request body: {body}"
+        );
+        assert!(
+            !body.contains("Authorization"),
+            "an Authorization header was serialized into the request body: {body}"
+        );
+        assert!(
+            !body.contains("X-Custom"),
+            "request headers were serialized into the request body: {body}"
+        );
+    }
+
+    /// The discrimination half: the builder still emits what it is supposed
+    /// to. Without this, the assertions above would pass just as well against
+    /// a builder that had been broken into returning nothing at all.
+    #[test]
+    fn the_builder_still_emits_real_params() {
+        let params =
+            build_provider_additional_params(Some("openai"), &opts(Some(ToolChoice::None)))
+                .expect("tool_choice must still be emitted");
+        assert!(params.get("tool_choice").is_some());
+    }
+
+    /// dirge-vpma.26: the wire dump's `reasoning` flag must track whether
+    /// reasoning params were actually emitted.
+    ///
+    /// It used to be `additional.is_some()`, which is true for any occupant of
+    /// `additional_params` — a `tool_choice` gate or a metadata map with
+    /// thinking fully off. The dump exists to be read during a debugging
+    /// session, so a turn labelled reasoning-enabled that sent no reasoning
+    /// params sends the reader after the wrong thing.
+    #[test]
+    fn a_turn_carrying_only_a_tool_gate_is_not_a_reasoning_turn() {
+        let opts = opts(Some(ToolChoice::None));
+        assert!(
+            build_provider_additional_params(Some("openai"), &opts).is_some(),
+            "precondition: the gate alone fills additional_params"
+        );
+        assert!(
+            !turn_reasoning_enabled(Some("openai"), &opts),
+            "a tool gate was reported as reasoning"
+        );
+    }
+
+    /// The other half: a turn that really does ask for reasoning reports true,
+    /// so the flag is not simply hardwired off.
+    #[test]
+    fn a_thinking_turn_is_a_reasoning_turn() {
+        let mut o = opts(None);
+        o.reasoning = Some(crate::agent::agent_loop::types::ThinkingLevel::High);
+        assert!(
+            turn_reasoning_enabled(Some("deepseek"), &o),
+            "a thinking turn was not reported as reasoning"
+        );
+        let params = build_provider_additional_params(Some("deepseek"), &o)
+            .expect("reasoning params must reach the body");
+        assert!(
+            params.get("reasoning_effort").is_some(),
+            "precondition: deepseek carries a top-level effort: {params:?}"
+        );
+    }
+
+    /// An unconstrained turn must send NOTHING — not `"auto"`. Some
+    /// OpenAI-compatible backends reject `tool_choice` on a request carrying no
+    /// `tools` array, and dirge makes plenty of those (summarizer, critic, goal
+    /// judge), so saying what the provider already assumes would break them.
+    /// This is also why there is no `ToolChoice::Auto` to send.
+    #[test]
+    fn an_unconstrained_turn_sends_nothing() {
+        let params = build_provider_additional_params(Some("openai"), &opts(None));
+        let has_key = params.as_ref().and_then(|p| p.get("tool_choice")).is_some();
+        assert!(
+            !has_key,
+            "an unconstrained turn put tool_choice on the wire"
+        );
+    }
+
+    /// The key is provider-independent — every backend dirge targets spells it
+    /// `tool_choice` and reads `none` the same way.
+    #[test]
+    fn every_provider_gets_the_same_key() {
+        for provider in [
+            "openai",
+            "anthropic",
+            "deepseek",
+            "glm",
+            "openrouter",
+            "custom",
+        ] {
+            let params =
+                build_provider_additional_params(Some(provider), &opts(Some(ToolChoice::None)))
+                    .unwrap_or_else(|| panic!("{provider} produced no params"));
+            assert_eq!(
+                params.get("tool_choice").and_then(|v| v.as_str()),
+                Some("none"),
+                "{provider} did not carry the tool gate"
+            );
+        }
     }
 }

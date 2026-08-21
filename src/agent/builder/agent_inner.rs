@@ -58,7 +58,7 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
     // at the permission-checker layer. Plan / review modes deny
     // edit/write/apply_patch/bash entirely, so the file-name gate
     // is unnecessary.
-    let mut preamble = assemble_base_preamble();
+    let mut preamble = assemble_base_preamble(cfg.resolve_capability_projection());
     append_code_mode_guidance(&mut preamble, cfg.resolve_code_mode_rubric());
     if let Some(agents) = &context.agents {
         preamble.push_str("\n\n");
@@ -70,16 +70,15 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
         preamble.push_str(prompt);
     }
 
-    if let Ok(cwd) = std::env::current_dir() {
-        let cwd_str = cwd.display();
-        preamble.push_str(&format!("\n\nCurrent working directory: {}", cwd_str));
-    }
-
-    preamble.push_str(&format!("\nOS: {}", std::env::consts::OS));
-
-    if let Ok(shell) = std::env::var("SHELL") {
-        preamble.push_str(&format!("\nShell: {}", shell));
-    }
+    // dirge-e31n.2: cwd / OS / shell / git branch are the four facts in this
+    // preamble that can change WITHIN a session. Baked in here they go stale
+    // on the first `cd` or `git switch`, and the only refresh is
+    // `rebuild_agent`, which discards the whole cached prefix to update four
+    // lines. With `turn_envelope` on they move to a per-turn block appended
+    // to the model-facing context instead (see `agent_loop::envelope`), and
+    // this whole span is skipped so the fact is not stated twice with two
+    // different answers — which is worse than stating it once and stale.
+    let turn_envelope = cfg.resolve_turn_envelope();
 
     // Bounded git lookup. `git rev-parse` can hang for many seconds
     // when the repo's `.git` lives on a wedged NFS mount, the
@@ -118,8 +117,22 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
             _ => None,
         };
 
-    if let Some(branch) = git_branch {
-        preamble.push_str(&format!("\nGit branch: {}", branch));
+    // The branch is resolved above under a startup timeout and passed in
+    // rather than re-read by `SessionFacts::read` — that helper deliberately
+    // has no timeout ladder (it is for the in-turn path, where git is warm),
+    // and calling it here would drop the guard this function needs.
+    if !turn_envelope {
+        preamble.push_str(
+            &crate::agent::agent_loop::envelope::SessionFacts {
+                cwd: std::env::current_dir()
+                    .ok()
+                    .map(|p| p.display().to_string()),
+                os: std::env::consts::OS.to_string(),
+                shell: std::env::var("SHELL").ok(),
+                git_branch,
+            }
+            .to_preamble_lines(),
+        );
     }
 
     // Phase 8: inject per-project memory + skills into the system
@@ -169,8 +182,25 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
                 append_memory_to_preamble(&mut preamble, &provider);
                 Some(provider)
             }
-            Err(_) => None,
+            // #769: this used to be `Err(_) => None` — the memory tier
+            // simply vanished, and the user was never told. That is the
+            // wrong trade for a store holding what they asked dirge to
+            // remember, and it got worse once a damaged database started
+            // failing at open rather than at some later write: silence
+            // where there had at least been an error. Degrading to no
+            // memory is still right; doing it quietly is not.
+            Err(e) => {
+                eprintln!("warning: project memory is unavailable — {e}");
+                None
+            }
         };
+    // Databases that opened but without WAL. Not a failure, so it is not
+    // reported as one — but it is where SQLite files get corrupted, and
+    // it was previously recorded into a slot the next successful open
+    // wiped. Drained, so a `/model` rebuild does not repeat it.
+    for note in crate::extras::session_db::take_degraded_opens() {
+        eprintln!("warning: {note}");
+    }
     // Global (cross-project) memory tier — inject its snapshot too, under a
     // distinct header, so durable user preferences reach the prompt
     // regardless of which project this is. Best-effort: a load failure just
@@ -215,9 +245,17 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
     // preamble, so the model never knows to load it.
     // Skills carry name + description; full content loads on demand.
     // Bumps view counters for each listed skill (best-effort).
-    let mut skills = crate::skill::discover_skills(
-        &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
-    );
+    // dirge-a34y: `no_skills` suppresses discovery outright, so the catalog
+    // below and the `skill` tool's loadable set go empty together. Gated here
+    // rather than inside `discover_skills` so the walk is skipped, not just
+    // its result discarded.
+    let mut skills = if cli.resolve_no_skills(cfg) {
+        Vec::new()
+    } else {
+        crate::skill::discover_skills(
+            &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+        )
+    };
     if !skills.is_empty() {
         // dirge-a47a: register each discovered skill, then order the
         // listing by effective salience (most useful first) so the

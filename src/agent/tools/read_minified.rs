@@ -78,7 +78,7 @@ impl PortableTool for ReadMinifiedTool {
     fn description(&self) -> String {
         with_contract_hint(
             "read_minified",
-            "Read a source file with comments stripped (and, for brace languages like Rust/Go/Java, redundant whitespace collapsed) via tree-sitter, for token efficiency. Works across the supported source languages (Rust, Go, Java, C, C++, TypeScript, Python, Ruby, Bash, Clojure, Elixir); non-source files, ranged reads (offset/limit), or unparseable files transparently fall back to a normal read. Use plain `read` when you need exact line numbers.",
+            "Read a source file with comments stripped (and, for brace languages like Rust/Go/Java, redundant whitespace collapsed) via tree-sitter, for token efficiency. Works across the supported source languages (Rust, Go, Java, C, C++, TypeScript, Python, Mojo, Ruby, Bash, Clojure, Elixir); non-source files, ranged reads (offset/limit), or unparseable files transparently fall back to a normal read. Use plain `read` when you need exact line numbers.",
         )
     }
 
@@ -152,6 +152,8 @@ mod tests {
     #[tokio::test]
     async fn minifies_supported_language_and_marks_read() {
         let dir = std::env::temp_dir().join(format!("dirge-readmin-{}", std::process::id()));
+        // dirge-m1ni: clear first — the name is keyed on a recyclable pid.
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("a.rs");
         std::fs::write(&path, "// header\nfn  main ( ) {\n    let  x = 1 ;\n}\n").unwrap();
@@ -189,6 +191,8 @@ mod tests {
     #[tokio::test]
     async fn unsupported_language_falls_back_to_plain_read() {
         let dir = std::env::temp_dir().join(format!("dirge-readmin-md-{}", std::process::id()));
+        // dirge-m1ni: clear first — the name is keyed on a recyclable pid.
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("notes.md");
         std::fs::write(&path, "# Title\n\nplain markdown body\n").unwrap();

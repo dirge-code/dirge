@@ -1568,6 +1568,8 @@ mod reported_permission_ux_regressions {
         // absolute probe to a sibling file in the same subtree, while
         // a path outside the working dir must NOT be coalesced.
         let proj = std::env::temp_dir().join(format!("dirge-coalesce-{}", std::process::id()));
+        // dirge-m1ni: clear first — the name is keyed on a recyclable pid.
+        let _ = std::fs::remove_dir_all(&proj);
         std::fs::create_dir_all(proj.join("sub")).unwrap();
         let mut pc = PermissionChecker::new(
             &PermissionConfig::default(),
@@ -1714,4 +1716,173 @@ fn worktree_checker_keeps_deny_list_and_root_but_not_session_grants() {
         child.allowlist_entries().is_empty(),
         "parent-relative session grants must not leak into the worktree root",
     );
+}
+
+// ── dirge-e1nv: `python -m <tool>` is the same tool ────────────────────────
+//
+// `pytest **` is allowed; the bare `python`/`python3` interpreters deliberately
+// are not (`python -c "…"` runs anything). Nothing bridged the two, so
+// `python3 -m pytest` — the commonest way a model runs pytest, and the shape
+// the verify nudge asks for — prompted, which in headless means denied. Until
+// dirge-5flx a splitter bug hid it: the only form that ran was
+// `… 2>&1 | tail`, i.e. exactly the masked shape the verifier declines.
+//
+// NOT fixed by stripping the prefix for allow-matching. `match_candidates`
+// exposes commands raw ON PURPOSE (dirge-8zem): `PATH=/tmp/evil git push` and
+// `./env git push` run a different binary under an allowed name, and
+// `env_and_wrapper_prefixes_do_not_ride_an_allow_rule` pins that. The module
+// form is named explicitly instead.
+
+#[test]
+fn python_module_form_is_allowed_wherever_the_tool_is() {
+    for cmd in [
+        "python3 -m pytest test_duration.py -q",
+        "python -m pytest",
+        "python3 -m ruff check .",
+        "python3 -m black --check .",
+        "python3 -m mypy src",
+    ] {
+        let mut checker = fresh_checker();
+        assert!(
+            matches!(checker.check("bash", cmd), CheckResult::Allowed),
+            "{cmd:?} must be allowed wherever the bare tool is"
+        );
+    }
+}
+
+/// The negative half, which is what keeps the rule narrow: `-m` does not make
+/// the interpreter safe, it only names a module that must be allowed on its own.
+#[test]
+fn other_python_module_invocations_stay_gated() {
+    for cmd in [
+        "python3 -m http.server",
+        "python3 -m pip install requests",
+        "python3 -m venv .venv",
+        "python3 -c \"import os; os.system('x')\"",
+        "python3 script.py",
+        // An env prefix still changes WHICH python runs (dirge-8zem).
+        "PATH=/tmp/evil python3 -m pytest",
+    ] {
+        let mut checker = fresh_checker();
+        assert!(
+            !matches!(checker.check("bash", cmd), CheckResult::Allowed),
+            "{cmd:?} must not be auto-allowed"
+        );
+    }
+}
+
+/// A user deny on the tool must still govern its module form — otherwise the
+/// new allow rules are a way around a deny that used to hold.
+#[test]
+fn a_deny_on_the_tool_still_governs_its_module_form() {
+    use crate::permission::OpSpec;
+    let cfg = PermissionConfig {
+        rules: vec![rule(OpSpec::Execute, "pytest **", Action::Deny)],
+        ..Default::default()
+    };
+    let mut checker = PermissionChecker::new(
+        &cfg,
+        SecurityMode::Standard,
+        Some(std::path::PathBuf::from("/tmp")),
+    );
+    assert!(
+        matches!(
+            checker.check("bash", "python3 -m pytest t.py"),
+            CheckResult::Denied(_)
+        ),
+        "a deny on the tool must see through the module runner"
+    );
+}
+
+/// The generated rules derive from tools that are allowed under their own
+/// name. Pinning that here is what stops the derivation SOURCE going stale —
+/// a module-form allow for something the bare list no longer permits would be
+/// a silent widening.
+#[test]
+fn every_module_form_tool_is_allowed_under_its_own_name() {
+    use crate::permission::{PYTHON_MODULE_TOOLS, default_bash_rules};
+    let rules = default_bash_rules();
+    for tool in PYTHON_MODULE_TOOLS {
+        let bare = rules
+            .iter()
+            .rfind(|(pat, _)| crate::permission::pattern::Pattern::new_command(pat).matches(tool));
+        assert!(
+            matches!(bare, Some((_, Action::Allow))),
+            "{tool:?} has a module-form allow but is not allowed under its own name"
+        );
+    }
+}
+
+/// GH #778: Swift's project commands are auto-allowed like cargo's and go's —
+/// otherwise every build in a Swift repo prompts, which is the friction
+/// dirge-e1nv removed for `python -m pytest`.
+#[test]
+fn swift_project_commands_are_auto_allowed() {
+    for cmd in [
+        "swift build",
+        "swift build -c release",
+        "swift test",
+        "swift test --filter DurationTests",
+        "swift run myapp",
+        "swiftlint",
+        "swift-format --in-place Sources/",
+    ] {
+        let mut checker = fresh_checker();
+        assert!(
+            matches!(checker.check("bash", cmd), CheckResult::Allowed),
+            "{cmd:?} should be auto-allowed by the default bash rules"
+        );
+    }
+}
+
+/// The negative half: `swift` is also an interpreter and a package fetcher.
+/// Naming subcommands rather than allowing `swift **` is what keeps
+/// `swift main.swift` (arbitrary code) and `swift package resolve` (network)
+/// on the prompt path, mirroring why bare `python` is excluded.
+#[test]
+fn swift_interpreter_and_fetch_stay_gated() {
+    for cmd in [
+        "swift main.swift",
+        "swift repl",
+        "swift package resolve",
+        "swift package update",
+    ] {
+        let mut checker = fresh_checker();
+        assert!(
+            !matches!(checker.check("bash", cmd), CheckResult::Allowed),
+            "{cmd:?} must not be auto-allowed"
+        );
+    }
+}
+
+/// Mojo's check-style commands are auto-allowed like swift's: build/test/
+/// format operate on the project's own code.
+#[test]
+fn mojo_project_commands_are_auto_allowed() {
+    for cmd in [
+        "mojo build main.mojo",
+        "mojo test",
+        "mojo test kernels/",
+        "mojo format --quiet src/",
+    ] {
+        let mut checker = fresh_checker();
+        assert!(
+            matches!(checker.check("bash", cmd), CheckResult::Allowed),
+            "{cmd:?} should be auto-allowed by the default bash rules"
+        );
+    }
+}
+
+/// The negative half, stricter than swift's: `mojo run <file>` and bare
+/// `mojo <file>` take a FILE to execute — the interpreter form, not a
+/// package target — so unlike `swift run` they stay on the prompt path.
+#[test]
+fn mojo_interpreter_forms_stay_gated() {
+    for cmd in ["mojo main.mojo", "mojo run main.mojo", "mojo repl"] {
+        let mut checker = fresh_checker();
+        assert!(
+            !matches!(checker.check("bash", cmd), CheckResult::Allowed),
+            "{cmd:?} must not be auto-allowed"
+        );
+    }
 }

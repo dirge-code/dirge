@@ -101,8 +101,24 @@ pub fn convert_history(session: &Session) -> Vec<Message> {
     let mut messages = Vec::new();
 
     if let Some(summary) = summary {
+        // dirge-dlpl: the SHARED marker, not a third wrapper of its own.
+        //
+        // This used to emit "[Previous conversation summary]\n…", which is a
+        // string nothing else in the codebase knows. A `/compact` summary
+        // therefore entered the loop unrecognisable: `find_previous_summary`
+        // scans for `SUMMARY_PREFIX`, so the next automatic fold did not feed
+        // it forward into the iterative-update prompt, and `apply_summary`'s
+        // superseded-marker check scans for the same string, so the old
+        // summary was never replaced and accumulated alongside every later
+        // fold's marker.
+        //
+        // Wrapping here rather than changing what `compress_reporting` writes
+        // keeps stored sessions untouched — the marker is applied at the
+        // boundary where the summary enters the loop, so old files with a bare
+        // summary get it too.
         messages.push(Message::system(format!(
-            "[Previous conversation summary]\n{}",
+            "{}{}",
+            crate::agent::compression::SUMMARY_PREFIX,
             summary
         )));
     }
@@ -607,5 +623,47 @@ mod plugin_hook_tests {
         let mut mgr = PluginManager::try_new().unwrap();
         let result = apply_response_hooks("ok", &mut mgr);
         assert_eq!(result, ResponseHookResult::default());
+    }
+
+    /// dirge-dlpl: a `/compact` summary must enter the loop carrying the same
+    /// marker an automatic fold writes.
+    ///
+    /// Without it the summary is unrecognisable downstream:
+    /// `find_previous_summary` scans for `SUMMARY_PREFIX` and would not feed it
+    /// into the next fold's iterative-update prompt, and `apply_summary`'s
+    /// superseded check scans for the same string, so the old summary would
+    /// never be replaced and would accumulate beside every later fold's marker.
+    #[test]
+    fn a_stored_summary_enters_the_loop_with_the_shared_marker() {
+        use crate::agent::compression::{COMPACTION_MARKER, find_previous_summary};
+
+        let mut session = Session::new("openai", "gpt-4o", 128_000);
+        session.add_message(MessageRole::User, "the original request");
+        session.compress_reporting("## Goal\nship it".to_string(), 1, 100);
+
+        let history = convert_history(&session);
+        let system: Vec<String> = history
+            .iter()
+            .filter_map(|m| match m {
+                Message::System { content } => Some(content.to_string()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            system.iter().any(|c| c.contains(COMPACTION_MARKER)),
+            "the stored summary reached the loop without the shared marker: {system:?}"
+        );
+
+        // And the thing the marker exists for: the fold can find it.
+        let as_values: Vec<serde_json::Value> = system
+            .iter()
+            .map(|c| serde_json::json!({"role": "system", "content": c}))
+            .collect();
+        let found = find_previous_summary(&as_values);
+        assert!(
+            found.is_some(),
+            "find_previous_summary did not recognise the stored summary"
+        );
+        assert!(found.unwrap().1.contains("ship it"));
     }
 }

@@ -248,12 +248,22 @@ fn resolve_embedder(
 /// execution directory must all belong to the worktree. Search tools use their
 /// native `ToolRoot` support; this function does not duplicate their path
 /// resolution logic.
+///
+/// `allowed` is the profile's resolved subagent allow-list — the same value
+/// `spawn_subagent_runner` applies on the shared-checkout path. It is applied
+/// HERE rather than left to the caller because this function is the only thing
+/// that knows what it built: an allow-list is a cap, and a cap that the
+/// producer does not enforce is a cap the next producer will forget
+/// (dirge-fwjw — this registry previously ignored the profile entirely, so a
+/// worktree writer got the full writer tool set no matter what its profile
+/// said, while the shared-checkout path honoured it).
 pub async fn build_rooted_writer_tools(
     root: tools::ToolRoot,
     parent_permission: Option<PermCheck>,
     ask_tx: Option<AskSender>,
     sandbox: Sandbox,
     execution_root: crate::sandbox::SandboxExecutionRoot,
+    allowed: &[String],
 ) -> Vec<Arc<dyn crate::agent::agent_loop::LoopTool>> {
     use crate::agent::agent_loop::types::ToolExecutionMode;
     use crate::agent::agent_loop::{LoopTool, RigToolAdapter};
@@ -267,6 +277,26 @@ pub async fn build_rooted_writer_tools(
         T: crate::agent::agent_loop::rig_tool::DynTool + 'static,
     {
         let adapter = RigToolAdapter::new(Box::new(inner)).await;
+        Arc::new(match mode {
+            Some(mode) => adapter.with_execution_mode(mode),
+            None => adapter,
+        })
+    }
+
+    /// dirge-9tl3: like `wrap`, but attaches a per-tool dispatch budget for
+    /// tools whose own bound legitimately exceeds the shared ceiling (bash,
+    /// subagents) — so the watchdog never cuts an in-bounds call.
+    async fn wrap_bounded<T>(
+        inner: T,
+        mode: Option<ToolExecutionMode>,
+        budget: crate::agent::agent_loop::rig_tool::CallBudgetFn,
+    ) -> Arc<dyn LoopTool>
+    where
+        T: crate::agent::agent_loop::rig_tool::DynTool + 'static,
+    {
+        let adapter = RigToolAdapter::new(Box::new(inner))
+            .await
+            .with_call_budget(budget);
         Arc::new(match mode {
             Some(mode) => adapter.with_execution_mode(mode),
             None => adapter,
@@ -384,18 +414,34 @@ pub async fn build_rooted_writer_tools(
         .await,
     );
     writer_tools.push(
-        wrap(
+        wrap_bounded(
             tools::BashTool::with_cache(permission, ask_tx, sandbox, cache)
                 .with_execution_root(Some(execution_root))
                 .with_shell_store(Some(shell_store.clone())),
             Some(ToolExecutionMode::Sequential),
+            Box::new(tools::bash::dispatch_budget),
         )
         .await,
     );
     writer_tools.push(wrap(tools::BashOutputTool::new(shell_store.clone()), None).await);
     writer_tools.push(wrap(tools::KillShellTool::new(shell_store), None).await);
 
-    writer_tools
+    // Apply the profile's cap. Same helper the shared-checkout fork uses, so
+    // the two dispatch paths cannot drift on what a name means.
+    let names: Vec<&str> = allowed.iter().map(String::as_str).collect();
+    let kept = crate::provider::filter_loop_tools(&writer_tools, &names);
+    if kept.is_empty() {
+        // A writer with no tools burns a worktree, a model call and a turn to
+        // accomplish nothing. Almost always a profile naming tools that this
+        // rooted registry does not build (an MCP tool, or a typo).
+        tracing::warn!(
+            target: "dirge::agents",
+            allowed = %names.join(", "),
+            built = %writer_tools.iter().map(|t| t.name().to_string()).collect::<Vec<_>>().join(", "),
+            "worktree writer profile allows no tool this registry builds — the writer will have nothing to work with",
+        );
+    }
+    kept
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -426,12 +472,19 @@ pub async fn build_loop_tools(
     // `subagent_mcp` selection can be validated against real MCP tools.
     // Always empty on non-mcp builds.
     Vec<String>,
+    // dirge-e31n.3: names of the plugin-provided tools. Both this and the
+    // MCP list feed the capability projection's UMBRELLA deny check: prompt
+    // frontmatter denies these families by the umbrella names `mcp_tool` /
+    // `plugin_tool`, never by concrete tool name, so a projection matching
+    // only concrete names reports every one of them as available when the
+    // active mode refuses all of them. Always empty on non-plugin builds.
+    Vec<String>,
 ) {
     use crate::agent::agent_loop::types::ToolExecutionMode;
     use crate::agent::agent_loop::{LoopTool, RigToolAdapter};
 
     if cli.resolve_no_tools(cfg) {
-        return (Vec::new(), None, None, Vec::new());
+        return (Vec::new(), None, None, Vec::new(), Vec::new());
     }
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
@@ -440,11 +493,18 @@ pub async fn build_loop_tools(
     let skill_store = crate::extras::skill_db::SkillStore::load(&paths)
         .ok()
         .map(Arc::new);
-    let skills: Arc<[Skill]> = Arc::from(
-        tokio::task::spawn_blocking(move || skill::discover_skills(&cwd))
-            .await
-            .unwrap_or_default(),
-    );
+    // dirge-a34y: keep the loadable set in lockstep with the preamble
+    // catalog. If discovery is off, the `skill` tool must not be able to
+    // load what the preamble does not advertise.
+    let skills: Arc<[Skill]> = if cli.resolve_no_skills(cfg) {
+        Arc::from(Vec::new())
+    } else {
+        Arc::from(
+            tokio::task::spawn_blocking(move || skill::discover_skills(&cwd))
+                .await
+                .unwrap_or_default(),
+        )
+    };
     // Register discovered on-disk skills so they're tracked + searchable
     // in the salience store (dirge-a47a). Insert-time only seeds
     // provenance; agent-created skills already carry source='learned'
@@ -513,6 +573,25 @@ pub async fn build_loop_tools(
             None => adapter,
         };
         Arc::new(adapter)
+    }
+    /// dirge-9tl3: like `wrap`, but attaches a per-tool dispatch budget for
+    /// tools whose own bound legitimately exceeds the shared ceiling (bash,
+    /// subagents) — so the watchdog never cuts an in-bounds call.
+    async fn wrap_bounded<T>(
+        inner: T,
+        mode: Option<ToolExecutionMode>,
+        budget: crate::agent::agent_loop::rig_tool::CallBudgetFn,
+    ) -> Arc<dyn LoopTool>
+    where
+        T: crate::agent::agent_loop::rig_tool::DynTool + 'static,
+    {
+        let adapter = RigToolAdapter::new(Box::new(inner))
+            .await
+            .with_call_budget(budget);
+        Arc::new(match mode {
+            Some(mode) => adapter.with_execution_mode(mode),
+            None => adapter,
+        })
     }
 
     let mut tools: Vec<Arc<dyn LoopTool>> = Vec::new();
@@ -610,7 +689,7 @@ pub async fn build_loop_tools(
         .await,
     );
     tools.push(
-        wrap(
+        wrap_bounded(
             tools::BashTool::with_cache(
                 permission.clone(),
                 ask_tx.clone(),
@@ -620,6 +699,7 @@ pub async fn build_loop_tools(
             .with_shell_store(Some(tools::bg_shell::global()))
             .with_shell_path_option(cfg.shell.clone()),
             Some(ToolExecutionMode::Sequential),
+            Box::new(tools::bash::dispatch_budget),
         )
         .await,
     );
@@ -726,19 +806,30 @@ pub async fn build_loop_tools(
 
     // SkillTool runs arbitrary skill bodies — Sequential to be
     // safe (a skill body could do anything).
-    tools.push(
-        wrap(
-            tools::SkillTool::new(
-                Arc::clone(&skills),
-                skill_mgr,
-                skill_store.clone(),
-                permission.clone(),
-                ask_tx.clone(),
-            ),
-            Some(ToolExecutionMode::Sequential),
-        )
-        .await,
-    );
+    //
+    // dirge-a34y: under `no_skills` the tool is not registered at all. Gating
+    // only the discovered set is NOT enough and was caught live: `load` reads
+    // that set, but `list` reads `SkillManager` (the project `.dirge/skills/`
+    // directly), so a suppressed skill still showed up in `list` and then
+    // failed to `load` — the model is told a skill exists and then that it
+    // does not. Dropping the tool removes the inconsistency instead of
+    // papering over it, and also closes `create`, which would otherwise let a
+    // run author new skills while discovery is supposed to be off.
+    if !cli.resolve_no_skills(cfg) {
+        tools.push(
+            wrap(
+                tools::SkillTool::new(
+                    Arc::clone(&skills),
+                    skill_mgr,
+                    skill_store.clone(),
+                    permission.clone(),
+                    ask_tx.clone(),
+                ),
+                Some(ToolExecutionMode::Sequential),
+            )
+            .await,
+        );
+    }
 
     // Writes to the memory store — Sequential. dirge-yof4: a load
     // failure degrades to a session without the memory tool instead
@@ -847,7 +938,7 @@ pub async fn build_loop_tools(
     // store); TaskStatus is read-only.
     if let (Some(pm), Some(store)) = (parent_model, bg_store) {
         tools.push(
-            wrap(
+            wrap_bounded(
                 tools::TaskTool::new(
                     permission.clone(),
                     ask_tx.clone(),
@@ -857,6 +948,7 @@ pub async fn build_loop_tools(
                     cfg.resolve_subagent_write_isolation(),
                 ),
                 Some(ToolExecutionMode::Sequential),
+                Box::new(|_: &serde_json::Value| Some(tools::task::dispatch_budget())),
             )
             .await,
         );
@@ -940,6 +1032,8 @@ pub async fn build_loop_tools(
     // can't shadow `read` etc. — matching pi's extension precedence
     // (extensions/runner.ts:`registerTool` rejects duplicates of the
     // core tool list).
+    #[cfg_attr(not(feature = "plugin"), allow(unused_mut))]
+    let mut plugin_tool_names: Vec<String> = Vec::new();
     #[cfg(feature = "plugin")]
     if let Some(pm_arc) = crate::plugin::hook::global() {
         let metas: Vec<crate::plugin::PluginToolMeta> = match pm_arc.lock() {
@@ -950,6 +1044,7 @@ pub async fn build_loop_tools(
             if shadows_builtin(&meta.name, "plugin") {
                 continue;
             }
+            let meta_name = meta.name.clone();
             if let Some(adapter) = crate::plugin::extension::JanetLoopTool::from_meta(
                 meta,
                 pm_arc.clone(),
@@ -957,6 +1052,7 @@ pub async fn build_loop_tools(
                 ask_tx.clone(),
             ) {
                 tools.push(Arc::new(adapter));
+                plugin_tool_names.push(meta_name);
             }
         }
     }
@@ -992,7 +1088,115 @@ pub async fn build_loop_tools(
         None
     };
 
-    (tools, tool_def_filter, review_memory_tool, mcp_tool_names)
+    (
+        tools,
+        tool_def_filter,
+        review_memory_tool,
+        mcp_tool_names,
+        plugin_tool_names,
+    )
+}
+
+/// dirge-fwjw: the profile's tool cap must reach an ISOLATED worktree writer,
+/// not just the shared-checkout fork.
+///
+/// These construct the real registry rather than a stand-in, because the bug
+/// was precisely that this builder ignored the cap it was never given — a test
+/// against a mock filter would have passed throughout.
+#[cfg(test)]
+mod writer_cap_tests {
+    use super::*;
+
+    /// A scratch directory for `ToolRoot`, which canonicalizes and requires
+    /// the path to exist.
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new() -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "dirge-writer-cap-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            Scratch(dir)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    async fn writer_tool_names(allowed: &[&str]) -> Vec<String> {
+        let scratch = Scratch::new();
+        let root = tools::ToolRoot::new(&scratch.0).expect("scratch dir is a valid root");
+        let allowed: Vec<String> = allowed.iter().map(|s| s.to_string()).collect();
+        let built = build_rooted_writer_tools(
+            root,
+            None,
+            None,
+            Sandbox::new(crate::sandbox::SandboxMode::Off),
+            crate::sandbox::SandboxExecutionRoot {
+                worktree: scratch.0.clone(),
+                main_git_dir: scratch.0.join(".git"),
+            },
+            &allowed,
+        )
+        .await;
+        built.iter().map(|t| t.name().to_string()).collect()
+    }
+
+    /// The discrimination half, written first: with a permissive cap the
+    /// registry really does build the writing tools. Without this, the test
+    /// below would pass just as well against a builder that was broken and
+    /// returned nothing.
+    #[tokio::test]
+    async fn a_permissive_profile_still_gets_the_writer_tools() {
+        let names = writer_tool_names(&[
+            "read",
+            "grep",
+            "find_files",
+            "glob",
+            "list_dir",
+            "write",
+            "edit",
+            "bash",
+        ])
+        .await;
+        assert!(names.contains(&"read".to_string()), "{names:?}");
+        assert!(
+            names.contains(&"bash".to_string()),
+            "the registry must actually build bash, or the cap test below proves nothing: {names:?}"
+        );
+    }
+
+    /// The bug: a profile that caps the writer to read-only tools used to get
+    /// the whole rooted registry anyway, because this builder never saw the
+    /// allow-list. Isolating a writer therefore WIDENED what it could reach,
+    /// which is the opposite of what worktree isolation is for.
+    #[tokio::test]
+    async fn a_capped_profile_does_not_get_tools_it_denied() {
+        let names = writer_tool_names(&["read", "grep"]).await;
+        assert!(names.contains(&"read".to_string()), "{names:?}");
+        assert!(names.contains(&"grep".to_string()), "{names:?}");
+        for denied in ["bash", "write", "edit"] {
+            assert!(
+                !names.contains(&denied.to_string()),
+                "{denied} is outside the profile's cap but the writer got it anyway: {names:?}"
+            );
+        }
+    }
+
+    /// An empty cap yields an empty registry rather than silently falling back
+    /// to "everything" — a fallback would turn a misconfigured profile into
+    /// the widest possible writer, which is the failure mode worth being loud
+    /// about.
+    #[tokio::test]
+    async fn an_empty_cap_grants_nothing() {
+        assert!(writer_tool_names(&[]).await.is_empty());
+    }
 }
 
 #[cfg(all(test, any(feature = "mcp", feature = "plugin")))]

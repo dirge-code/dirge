@@ -218,6 +218,8 @@ impl AnyAgent {
         cfg.steering_queue = steering_queue;
         cfg.tool_def_filter = tool_def_filter;
         cfg.dynamic_tool_search = self.dynamic_tool_search;
+        cfg.turn_envelope = self.turn_envelope;
+        cfg.prompt_leak_detect = self.prompt_leak_detect;
         // Fresh-paste images ride on the active turn; the loop seeds
         // them as `UserPart::Image` parts. `asset_dir` lets the rig
         // boundary resolve every image ref (active + history) to base64.
@@ -276,6 +278,7 @@ impl AnyAgent {
         cfg.code_review_mode = self.code_review_mode;
         cfg.open_issues_gate_mode = self.open_issues_gate_mode;
         cfg.verification_tiers_mode = self.verification_tiers_mode;
+        cfg.skill_anchor_interval = self.skill_anchor_interval;
         cfg.safe_state_abort_mode = self.safe_state_abort_mode;
         cfg.publish_guard_mode = self.publish_guard_mode;
         cfg.claim_gate_mode = self.claim_gate_mode;

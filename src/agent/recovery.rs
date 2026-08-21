@@ -663,6 +663,16 @@ pub fn classify_error(msg: &str) -> ErrorKind {
         || lower.contains("quota exceeded")
         || lower.contains("code\":\"1308")   // Zhipu usage-cap error code
         || lower.contains("code\": \"1308")
+        // dirge-1lmm: HTTP 402 is a spent balance — the same wall as a usage
+        // cap, reached by a different route. Keyed on the STATUS, the way the
+        // 429 branch below is, rather than on billing vocabulary: bodies say
+        // "Payment required ... billing tab" (Cerebras) or "Insufficient
+        // Balance" (DeepSeek) with no shared wording, while an unrelated 400
+        // that merely mentions a payment field must stay an ordinary failure.
+        || lower.contains(" 402 ")
+        || lower.contains("error 402")
+        || lower.starts_with("402 ")
+        || lower.contains("payment_required")
     {
         return ErrorKind::UsageCap;
     }
@@ -1142,6 +1152,51 @@ mod tests {
     fn zhipu_usage_cap_1308_is_usage_cap_not_ratelimit() {
         let msg = r#"ProviderError: Invalid status code 429 Too Many Requests with message: {"error":{"code":"1308","message":"已达到 5 小时的使用上限。您的限额将在 2026-07-18 07:41:55 重置。"}}"#;
         assert_eq!(classify_error(msg), ErrorKind::UsageCap);
+    }
+
+    /// dirge-1lmm: HTTP 402 is a spent balance, which is a UsageCap — a
+    /// wall no retry can get through. It was landing in the catch-all
+    /// instead, because the wording list keyed on throttle vocabulary
+    /// ("usage limit", "quota exceeded") and a billing 402 says none of it.
+    ///
+    /// Two real bodies, from two providers, both observed 2026-08-19:
+    /// Cerebras says "Payment required ... Visit your billing tab", DeepSeek
+    /// says "Insufficient Balance". Neither contains a single word from the
+    /// existing list.
+    ///
+    /// It was landing in `Other`, which `should_retry` already declines to
+    /// retry — so this is NOT about wasted attempts. What it costs is the
+    /// two things that key off the classification: the user-facing headline
+    /// (a spent balance reported as a generic provider error, so the one
+    /// message that would say "top up" never appears), and the h7 smoke
+    /// tests, which fail instead of skipping because `provider_unavailable`
+    /// treats exactly `UsageCap | RateLimit | Auth | Network` as skippable.
+    #[test]
+    fn payment_required_402_is_usage_cap() {
+        let cerebras = r#"HttpError: Invalid status code 402 Payment Required with message: {"message":"Payment required to access this resource. Visit your billing tab.","type":"payment_required_error","param":"quota","code":"payment_required"}"#;
+        assert_eq!(classify_error(cerebras), ErrorKind::UsageCap);
+
+        let deepseek = r#"HttpError: Invalid status code 402 Payment Required with message: {"error":{"message":"Insufficient Balance","type":"unknown_error","param":null,"code":"invalid_request_error"}}"#;
+        assert_eq!(classify_error(deepseek), ErrorKind::UsageCap);
+    }
+
+    /// The must-not-fire half of `payment_required_402_is_usage_cap`. A 402
+    /// is a cap; a 400/401/403 is not, and the words "payment" or "balance"
+    /// appearing in some unrelated body must not promote an ordinary failure
+    /// into a silent skip. Without this the fix above could be written as a
+    /// bare substring match on "payment" and still look correct.
+    #[test]
+    fn payment_wording_alone_does_not_make_a_usage_cap() {
+        assert_ne!(
+            classify_error(
+                "HttpError: Invalid status code 400 Bad Request with message: {\"error\":\"payment field is malformed\"}"
+            ),
+            ErrorKind::UsageCap
+        );
+        assert_ne!(
+            classify_error("ToolError: could not parse the account balance column"),
+            ErrorKind::UsageCap
+        );
     }
 
     /// A rate-limit whose Retry-After exceeds our backoff ceiling is a

@@ -168,7 +168,14 @@ impl PortableTool for QuestionTool {
             .await
             .map_err(|_| ToolError::Msg("question system unavailable".to_string()))?;
 
-        match reply_rx.await {
+        // dirge-8cbm: asking the user IS this tool's work, and it has no
+        // idea how long they will take. Mark the wait so the dispatch
+        // watchdog does not cut the call out from under them.
+        let response = {
+            let _waiting = crate::human_wait::HumanWait::begin();
+            reply_rx.await
+        };
+        match response {
             Ok(QuestionResponse::Answered(answers)) => {
                 let mut output = String::new();
                 // Audit L13: zip(answers) silently dropped trailing
@@ -550,5 +557,63 @@ mod tests {
         ]]));
         let out = handle.await.unwrap().unwrap();
         assert!(out.contains("**A:** A, C"), "got: {out}");
+    }
+}
+
+#[cfg(test)]
+mod human_wait_tests {
+    use super::*;
+
+    /// dirge-8cbm: the wiring, not the mechanism. `HumanWait` is what
+    /// stops the dispatch watchdog cutting a call mid-prompt, and it is
+    /// worth nothing if the sites that actually wait forget to use it.
+    /// This tool exists to ask a person and wait; while it is waiting,
+    /// the count must say so.
+    #[tokio::test]
+    async fn asking_the_user_marks_the_call_as_waiting_on_a_person() {
+        let _gate = crate::human_wait::TEST_GATE.lock().await;
+        let (tx, mut rx) = mpsc::channel(1);
+        let tool = QuestionTool::new(tx);
+        let args = QuestionArgs {
+            questions: vec![QuestionItem {
+                question: "Ship it?".to_string(),
+                header: None,
+                options: vec![
+                    QuestionOption {
+                        label: "Yes".to_string(),
+                        description: "ship".to_string(),
+                    },
+                    QuestionOption {
+                        label: "No".to_string(),
+                        description: "hold".to_string(),
+                    },
+                ],
+                multi_select: None,
+                custom: false,
+            }],
+        };
+        assert!(
+            !crate::human_wait::anyone_waiting(),
+            "another test is mid-prompt: {}",
+            crate::human_wait::holders()
+        );
+
+        let handle = tokio::spawn(async move { tool.call(args).await });
+        let req = rx.recv().await.expect("the tool must ask");
+        // The request is out and unanswered — this is precisely the
+        // stretch the watchdog must not count.
+        assert!(
+            crate::human_wait::anyone_waiting(),
+            "the question tool waited on the user without marking it"
+        );
+
+        let _ = req
+            .reply
+            .send(QuestionResponse::Answered(vec![vec!["Yes".to_string()]]));
+        let _ = handle.await.expect("join");
+        assert!(
+            !crate::human_wait::anyone_waiting(),
+            "the mark must clear once the user answers"
+        );
     }
 }

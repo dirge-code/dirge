@@ -81,6 +81,20 @@ pub struct ProviderEntry {
     /// units / semantics as the top-level `stream_chunk_timeout_secs`
     /// but takes precedence for this specific provider.
     pub stream_chunk_timeout_secs: Option<u64>,
+    /// Context window (tokens) for this provider's model, overriding both
+    /// the built-in model table and the top-level `context_window`
+    /// (GH #772).
+    ///
+    /// The top-level key applies to every provider at once, so with more
+    /// than one configured there was no way to correct one model's window
+    /// without corrupting the others'. That matters more than it sounds:
+    /// this number is the denominator of every compaction tier, so a wrong
+    /// one folds a context with room to spare, or fails to fold one without.
+    ///
+    /// Set it for a local model, whose window is whatever the server was
+    /// started with (`llama-server -c 65536`) and which the table cannot
+    /// know — a local model is named by its file path.
+    pub context_window: Option<u64>,
     /// Per-provider model options. Free-form map; known keys are
     /// honored by the request builder, unknown keys are ignored.
     /// Currently honored: `temperature` (f64, overrides cfg/CLI for
@@ -493,11 +507,13 @@ pub struct TimeoutsConfig {
     pub stream_chunk_secs: Option<u64>,
     pub request_establish_secs: Option<u64>,
     pub tool_call_gap_secs: Option<u64>,
+    pub tool_call_secs: Option<u64>,
     pub mcp_call_secs: Option<u64>,
     pub mcp_init_secs: Option<u64>,
     pub lsp_request_secs: Option<u64>,
     pub lsp_initialize_secs: Option<u64>,
     pub bash_secs: Option<u64>,
+    pub bash_max_secs: Option<u64>,
 }
 
 /// Per-server LSP configuration. All fields optional — unspecified fields
@@ -821,7 +837,49 @@ pub struct Config {
     pub temperature: Option<f64>,
     pub no_tools: Option<bool>,
     pub no_context_files: Option<bool>,
+    /// Suppress on-disk skill discovery entirely: no preamble catalog and
+    /// nothing loadable through the `skill` tool.
+    ///
+    /// dirge-69oe.4: restate loaded skills' declared `anchor:` sections every
+    /// N turn boundaries. `0` (the default) is off.
+    ///
+    /// Preserving an anchor through a fold, which happens whenever a skill
+    /// declares one, keeps it from being lost. This is the other half: some
+    /// skills state that their anchor has to RECUR — J-Space asks for its
+    /// premise every third seam and its own verifier calls the verbatim
+    /// recurrence the mechanism rather than an optimisation. A skill that only
+    /// needed to survive a fold should not also pay a timer, so the rate is the
+    /// operator's to set and nothing fires unless it is.
+    pub skill_anchor_interval: Option<u32>,
+
+    /// dirge-a34y. `skill::discover_skills` spans the global tiers under
+    /// `$HOME` plus every project ancestor, and consults neither
+    /// `DIRGE_CONFIG_DIR` nor `DIRGE_DATA_DIR`. An A/B harness that
+    /// isolates those two therefore still inherits whatever skills the
+    /// machine happens to carry, in the cached prefix of every request.
+    /// Overriding `$HOME` would isolate it but break OAuth, whose
+    /// credentials live at `~/.codex/auth.json` and
+    /// `~/.claude/.credentials.json` — a context confound traded for an
+    /// auth failure. This flag is the safe lever, and it doubles as an
+    /// A/B arm for the skill dimension of first-turn composition.
+    pub no_skills: Option<bool>,
     pub context_window: Option<u64>,
+    /// Breadcrumb tool schemas for a small context window (dirge-tva8):
+    /// `auto` *(default)*, `on`, `off`.
+    ///
+    /// `auto` trims each tool's description to its first sentence when the
+    /// resolved window is at or below
+    /// [`compact_schema::SMALL_WINDOW_TOKENS`](crate::agent::agent_loop::compact_schema::SMALL_WINDOW_TOKENS).
+    /// Measured, the full tool surface is ~16k tokens with the built-ins alone
+    /// and ~32.6k with MCP servers loaded — the latter larger than a 32k window
+    /// in its entirety, so such a run could not take a single turn.
+    ///
+    /// Nothing structural is trimmed and no tool is dropped: the model keeps
+    /// everything it needs to form a well-formed call and loses the prose about
+    /// when to prefer one tool over another. `on` forces it for a large window
+    /// (worth trying if the tool surface is unusually big); `off` keeps full
+    /// descriptions on a small one.
+    pub compact_tool_schemas: Option<String>,
     pub reserve_tokens: Option<u64>,
     pub keep_recent_tokens: Option<u64>,
     pub max_agent_turns: Option<usize>,
@@ -1132,6 +1190,61 @@ pub struct Config {
     /// (see the harness in `scripts/`). Sibling of `dynamic_tool_search`;
     /// both trade a little prompt text for context-token savings.
     pub code_mode_rubric: Option<bool>,
+
+    /// dirge-e31n.2: move the volatile session facts (cwd, OS, shell, git
+    /// branch) out of the frozen system prompt and into a per-turn
+    /// `<turn_envelope>` block appended to the model-facing context.
+    ///
+    /// Those four facts are captured once, at agent construction, and never
+    /// refreshed — a `cd`, a `git switch`, or a worktree move leaves the
+    /// model reading a world that no longer exists, and the only correction
+    /// is `rebuild_agent`, which discards the whole cached prefix to update
+    /// four lines. Re-evaluating them per user turn and appending at the
+    /// tail costs nothing in cache churn.
+    ///
+    /// Default `true`. Measured on deepseek and glm at n=6 (scenario=denied):
+    /// 6/6 success on both models with no regression on any metric, and on the
+    /// model that was struggling it removed the blow-up runs entirely. On the
+    /// model that was coping it did nothing — which is the same shape
+    /// `capability.rs` is built on, help the failing run and leave the coping
+    /// run alone.
+    ///
+    /// The evidence base is ONE scenario at n=6, so this is a default worth
+    /// revisiting if a later scenario shows otherwise. Set `false` to restore
+    /// the frozen-preamble behaviour.
+    pub turn_envelope: Option<bool>,
+
+    /// dirge-e31n.3: replace the hand-written `Available tools:` list in the
+    /// system prompt with a projection rendered from the tools ACTUALLY
+    /// registered for the turn, minus what the active prompt's `deny_tools`
+    /// removes.
+    ///
+    /// The static list cannot see `deny_tools`, never mentions MCP or plugin
+    /// tools, and under `dynamic_tool_search` names tools that are not loaded
+    /// — so plan and review mode advertise `write`/`edit`/`apply_patch`/`bash`
+    /// while refusing all four (dirge-cw7w). A weak model plans against the
+    /// prompt, hits a refusal, and burns turns recovering.
+    ///
+    /// Default `true`, on the same evidence as `turn_envelope` and with the
+    /// same caveat: safe on both models tested, materially better only on the
+    /// one that was failing. Set `false` to restore the hand-written
+    /// `Available tools:` list.
+    pub capability_projection: Option<bool>,
+
+    /// dirge-e31n.6: detect a model that stops answering and starts reciting
+    /// its own system prompt back at the user.
+    ///
+    /// `off` | `advisory` | `blocking`. **`off` by default.** `advisory`
+    /// records the detection and tells the user, letting the turn finish;
+    /// `blocking` also stops consuming the stream, so the recitation is
+    /// truncated rather than run to the output cap.
+    ///
+    /// Nobody has yet observed this in dirge — the flag exists so it can be
+    /// measured before it is trusted, which is why `advisory` (detect and
+    /// report, change nothing) is a mode rather than an afterthought. The
+    /// detector is deliberately hard to trip: see `agent_loop::prompt_leak`
+    /// for the measured margin, which is smaller than it looks.
+    pub prompt_leak_detect: Option<String>,
 
     /// Phase 4 part 2 (`docs/AGENTIC_LOOP_PLAN.md`): consecutive-turn
     /// threshold for the context-depth reminder system. `None`
@@ -1485,6 +1598,11 @@ impl Config {
     /// tiering can only ever ADD messages, so it stays dark by default).
     /// An unrecognized non-empty value also resolves to `Off` but logs a
     /// warning, so a typo never silently arms the gate.
+    /// dirge-69oe.4: `skill_anchor_interval`, clamped to 0 when absent (off).
+    pub fn resolve_skill_anchor_interval(&self) -> u32 {
+        self.skill_anchor_interval.unwrap_or(0)
+    }
+
     pub fn resolve_verification_tiers_mode(&self) -> crate::agent::agent_loop::types::GateMode {
         use crate::agent::agent_loop::types::GateMode;
         let Some(raw) = self.verification_tiers.as_deref() else {
@@ -1707,11 +1825,66 @@ impl Config {
     ///
     /// `model` is the resolved model id (after CLI / config / default
     /// resolution). Passing an empty string falls through to (3).
+    /// Resolve the context window for a model reached through a named
+    /// provider (GH #772). Precedence:
+    ///   1. `providers[name].context_window`
+    ///   2. top-level `context_window`
+    ///   3. the per-model static table
+    ///   4. [`DEFAULT_CONTEXT_WINDOW`]
+    ///
+    /// An unknown or empty provider name falls through past (1), so this is
+    /// safe to call wherever the provider is not known.
+    pub fn resolve_context_window_for(&self, provider: &str, model: &str) -> u64 {
+        // Case-insensitive for the same reason every other per-provider
+        // override is: `--provider Qwen-Local` builds a client fine, and
+        // silently missing the override is the failure being fixed.
+        let lower = provider.to_ascii_lowercase();
+        if let Some(v) = self
+            .providers
+            .as_ref()
+            .and_then(|m| m.get(provider).or_else(|| m.get(&lower)))
+            .and_then(|p| p.context_window)
+        {
+            return v;
+        }
+        self.resolve_context_window(model)
+    }
+
+    /// The EXPLICITLY configured context window for `provider`, if any —
+    /// the per-provider key, else the top-level one. No table lookup and no
+    /// default.
+    ///
+    /// Separate from [`resolve_context_window_for`](Self::resolve_context_window_for)
+    /// because the loop's process-wide override must stay `None` when nothing
+    /// was configured: with `None` the loop re-resolves the window from the
+    /// model table on every run, so a mid-session `/model` switch tracks the
+    /// new model. Freezing a resolved number there would silently pin the
+    /// first model's window to every later one.
+    pub fn configured_context_window(&self, provider: &str) -> Option<u64> {
+        let lower = provider.to_ascii_lowercase();
+        self.providers
+            .as_ref()
+            .and_then(|m| m.get(provider).or_else(|| m.get(&lower)))
+            .and_then(|p| p.context_window)
+            .or(self.context_window)
+    }
+
     pub fn resolve_context_window(&self, model: &str) -> u64 {
         if let Some(v) = self.context_window {
             return v;
         }
-        context_window_for_model(model).unwrap_or(128_000)
+        context_window_for_model(model).unwrap_or_else(|| {
+            // dirge-sjxq: say so. Both sources are hand-maintained lists that
+            // lag model releases, so a miss is ordinary — but its consequence
+            // is not. This number is the denominator of every context tier
+            // (fold, aggressive fold, force-summary, turn-start), so guessing
+            // it wrong drives real folds and real force-ended turns on a model
+            // with room to spare, and the only symptom is a context meter that
+            // looks full. Warned once per process, at the one place the guess
+            // is made.
+            report_unknown_context_window(model, DEFAULT_CONTEXT_WINDOW);
+            DEFAULT_CONTEXT_WINDOW
+        })
     }
 
     pub fn resolve_reserve_tokens(&self) -> u64 {
@@ -1736,6 +1909,36 @@ impl Config {
     /// A/B harness can flip it per run.
     pub fn resolve_code_mode_rubric(&self) -> bool {
         self.code_mode_rubric.unwrap_or(false)
+    }
+
+    /// Per-turn context envelope (dirge-e31n.2). Default ON — see the field
+    /// doc for the measurement behind that and its limits.
+    pub fn resolve_turn_envelope(&self) -> bool {
+        self.turn_envelope.unwrap_or(true)
+    }
+
+    /// Capability projection (dirge-e31n.3). Default ON — the prompt's account
+    /// of the tool set is rendered from the live catalog rather than a literal.
+    pub fn resolve_capability_projection(&self) -> bool {
+        self.capability_projection.unwrap_or(true)
+    }
+
+    /// Prompt-recitation detector (dirge-e31n.6). Default OFF. An
+    /// unrecognised value warns and falls back to off rather than to a mode
+    /// that changes behaviour.
+    pub fn resolve_prompt_leak_detect(&self) -> crate::agent::agent_loop::types::GateMode {
+        use crate::agent::agent_loop::types::GateMode;
+        match self.prompt_leak_detect.as_deref() {
+            None => GateMode::Off,
+            Some(raw) => GateMode::from_wire(raw).unwrap_or_else(|| {
+                tracing::warn!(
+                    target: "dirge::config",
+                    value = %raw,
+                    "unrecognised prompt_leak_detect; falling back to off",
+                );
+                GateMode::Off
+            }),
+        }
     }
 
     /// Phased plan workflow opt-in (vix port). Default off — `/plan` is gated
@@ -1809,11 +2012,13 @@ impl Config {
             stream_chunk: or_default(c.stream_chunk_secs, d.stream_chunk),
             request_establish: or_default(c.request_establish_secs, d.request_establish),
             tool_call_gap: or_default(c.tool_call_gap_secs, d.tool_call_gap),
+            tool_call: or_default(c.tool_call_secs, d.tool_call),
             mcp_call: or_default(c.mcp_call_secs, d.mcp_call),
             mcp_init: or_default(c.mcp_init_secs, d.mcp_init),
             lsp_request: or_default(c.lsp_request_secs, d.lsp_request),
             lsp_initialize: or_default(c.lsp_initialize_secs, d.lsp_initialize),
             bash: or_default(c.bash_secs, d.bash),
+            bash_max: or_default(c.bash_max_secs, d.bash_max),
         }
     }
 
@@ -1931,16 +2136,50 @@ pub fn context_window_for_model(model: &str) -> Option<u64> {
     table_context_window(model).or_else(|| crate::llmtrim::context_window(model).map(u64::from))
 }
 
+/// The window assumed for a model neither lookup knows.
+pub const DEFAULT_CONTEXT_WINDOW: u64 = 128_000;
+
+/// Warn once per process that a model's window was guessed.
+///
+/// Split out and `pub(crate)`-testable so the "warned once" contract can be
+/// asserted without a subscriber: the flag is the mechanism, and a second
+/// caller getting `false` is what proves it.
+fn report_unknown_context_window(model: &str, assumed: u64) {
+    if model.is_empty() || !claim_unknown_window_warning() {
+        return;
+    }
+    tracing::warn!(
+        target: "dirge::config",
+        model = %model,
+        assumed_context_window = assumed,
+        "no context window known for this model — assuming {assumed}. Every \
+         compaction threshold is computed from this number, so if it is wrong \
+         the context meter and the fold behaviour will be too. Set \
+         `context_window` in config.json to the model's real window.",
+    );
+}
+
+/// True for the first caller only.
+fn claim_unknown_window_warning() -> bool {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
+}
+
 fn table_context_window(model: &str) -> Option<u64> {
     let m = model.to_lowercase();
     // Ordered: most-specific first.
     const TABLE: &[(&str, u64)] = &[
-        // DeepSeek
+        // DeepSeek. `deepseek-v4` and up are the 1M generation; the entry is a
+        // FAMILY prefix, not a point release, so v4.1 / v5 resolve without a
+        // table edit (dirge-sjxq).
         ("deepseek-v4", 1_000_000),
+        ("deepseek-v5", 1_000_000),
         ("deepseek-r1", 128_000),
         ("deepseek", 128_000),
-        // GLM / ZhipuAI
-        ("glm-5.2", 1_000_000),
+        // GLM / ZhipuAI. `glm-5` covers the whole 5.x line: `glm-5.3` used to
+        // match nothing here and fall to the 128k default, which drove folds
+        // and force-ended turns on a model with eight times that room.
+        ("glm-5", 1_000_000),
         ("glm-4.6", 200_000),
         ("glm-4.5", 128_000),
         ("glm-4", 128_000),
@@ -1982,8 +2221,14 @@ fn table_context_window(model: &str) -> Option<u64> {
         // Mistral
         ("mistral-large", 128_000),
         ("mistral", 32_000),
-        // Qwen
+        // Qwen. The `qwen` fallback is the ORIGINAL 32k line, and it is matched
+        // with `contains` against a name that for a local model is a file path
+        // — so `…/Qwen3.8-27B-Q8_0.gguf` resolved to 32000, which is smaller
+        // than dirge's own system prompt plus tool schemas. The qwen2.5+
+        // generations are listed ahead of it (dirge-sjxq).
         ("qwen2.5", 128_000),
+        ("qwen3", 128_000),
+        ("qwen4", 256_000),
         ("qwen", 32_000),
     ];
     for (key, window) in TABLE {
@@ -2249,6 +2494,35 @@ mod tests {
     /// form used `as u8`/`as u32` casts that silently wrapped — 256
     /// CPUs became 0. Out-of-range values must now be a clean
     /// deserialization error, and valid ones still parse.
+    /// dirge-e31n: both steering flags ship ON. Pinned because the value is a
+    /// PRODUCT decision resting on a specific, narrow measurement — deepseek
+    /// and glm, n=6, one scenario — and a silent flip in either direction
+    /// changes what every user's model is told without anyone re-running that
+    /// measurement. Flipping these should be a deliberate edit that fails this
+    /// test first.
+    #[test]
+    fn steering_flags_default_on() {
+        let cfg = Config::default();
+        assert!(cfg.resolve_turn_envelope(), "turn_envelope must default on");
+        assert!(
+            cfg.resolve_capability_projection(),
+            "capability_projection must default on"
+        );
+    }
+
+    /// And both remain overridable to off — the escape hatch is the reason
+    /// defaulting them on is a safe call rather than a bet.
+    #[test]
+    fn steering_flags_can_be_disabled() {
+        let cfg = Config {
+            turn_envelope: Some(false),
+            capability_projection: Some(false),
+            ..Config::default()
+        };
+        assert!(!cfg.resolve_turn_envelope());
+        assert!(!cfg.resolve_capability_projection());
+    }
+
     #[test]
     fn sandbox_legacy_nested_rejects_out_of_range_cpus() {
         let ok: SandboxConfig =
@@ -2823,6 +3097,8 @@ mod tests {
         assert_eq!(t.lsp_request, d.lsp_request);
         assert_eq!(t.mcp_init, d.mcp_init);
         assert_eq!(t.request_establish, d.request_establish);
+        // dirge-9tl3: the dispatch ceiling keeps its default when unset.
+        assert_eq!(t.tool_call, d.tool_call);
 
         // dirge-u44q: request_establish_secs is a first-class override.
         let cfg: Config =
@@ -2830,6 +3106,12 @@ mod tests {
         let t = cfg.resolve_timeouts();
         assert_eq!(t.request_establish, std::time::Duration::from_secs(90));
         assert_eq!(t.stream_chunk, d.stream_chunk);
+
+        // dirge-9tl3: tool_call_secs overrides the dispatch ceiling.
+        let cfg: Config =
+            serde_json::from_str(r#"{ "timeouts": { "tool_call_secs": 45 } }"#).unwrap();
+        let t = cfg.resolve_timeouts();
+        assert_eq!(t.tool_call, std::time::Duration::from_secs(45));
     }
 
     #[test]
@@ -3074,6 +3356,193 @@ mod model_context_tests {
     #[test]
     fn unknown_in_table_and_snapshot_returns_none() {
         assert!(context_window_for_model("totally-fictional-model-xyz").is_none());
+    }
+
+    /// dirge-sjxq: a POINT RELEASE of a family the table knows must resolve to
+    /// that family's window.
+    ///
+    /// `glm-5.3` matched nothing — `glm-5.2` is listed at 1M and
+    /// `"glm-5.3".contains("glm-5.2")` is false — so it fell to the 128k
+    /// default. That is not a cosmetic miss: every context tier (fold 0.75,
+    /// aggressive 0.78, force-summary 0.80, turn-start 0.90) divides by this
+    /// number, so a live session showed 226.9k against a 128k window, reported
+    /// "compaction soon" at 100%, and folded a context that was using a
+    /// quarter of its real room.
+    ///
+    /// A table keyed on exact point releases will always lag the next one, so
+    /// the family prefix is what has to match. The `4.6`/`4.5` entries stay
+    /// ahead of the `glm-4` fallback and are asserted here so a reordering
+    /// that shadowed them would fail.
+    #[test]
+    fn a_point_release_resolves_to_its_family_window() {
+        assert_eq!(context_window_for_model("glm-5.3"), Some(1_000_000));
+        assert_eq!(context_window_for_model("glm-5.9"), Some(1_000_000));
+        assert_eq!(context_window_for_model("glm-5"), Some(1_000_000));
+        // The more specific entries must still win over the family fallbacks.
+        assert_eq!(context_window_for_model("glm-4.6"), Some(200_000));
+        assert_eq!(context_window_for_model("glm-4.5"), Some(128_000));
+        assert_eq!(context_window_for_model("glm-4"), Some(128_000));
+        // ...and the same shape for the other families that version this way.
+        assert_eq!(context_window_for_model("deepseek-v4-pro"), Some(1_000_000));
+        assert_eq!(context_window_for_model("deepseek-v5"), Some(1_000_000));
+    }
+
+    /// dirge-sjxq: a modern local Qwen must not resolve to the 32k window the
+    /// original qwen shipped with.
+    ///
+    /// The entry is matched with `contains`, and a local model is named by its
+    /// FILE PATH, so `/Users/…/Qwen3.8-27B-Q8_0.gguf` matched `qwen` → 32000.
+    /// Measured consequence: dirge's own system prompt and tool schemas came to
+    /// 32554 tokens, so the ratio was over 1.0 on the first request of every
+    /// run and the context manager force-ended every turn.
+    #[test]
+    fn a_modern_qwen_does_not_inherit_the_original_32k_window() {
+        for model in [
+            "qwen3.8-27b",
+            "Qwen3.8-27B-Q8_0.gguf",
+            "/Users/x/src/models/Qwen3.8-27B-Q8_0.gguf",
+            "qwen3-32b",
+        ] {
+            let got = context_window_for_model(model);
+            assert!(
+                got.is_some_and(|w| w >= 128_000),
+                "{model} resolved to {got:?}; a qwen3-era model has at least a \
+                 128k window and 32k makes dirge's own prompt overflow it",
+            );
+        }
+        // The original 32k qwen entry is still reachable for what it names.
+        assert_eq!(context_window_for_model("qwen-7b"), Some(32_000));
+    }
+
+    /// dirge-sjxq: a guessed window is reported, and reported ONCE.
+    ///
+    /// Once matters: `resolve_context_window` is called per agent build and
+    /// per route change, and a warning on every one of them is a warning
+    /// people configure away. The paired assertion is what makes this a test
+    /// rather than a restatement — a mechanism that always returned `false`
+    /// would satisfy "does not warn twice" and never warn at all.
+    #[test]
+    fn a_guessed_context_window_is_reported_once() {
+        assert!(
+            claim_unknown_window_warning(),
+            "the first caller reports the guess"
+        );
+        assert!(
+            !claim_unknown_window_warning(),
+            "later callers must stay quiet"
+        );
+    }
+
+    /// An empty model id is the "nothing configured yet" path, not a model
+    /// whose window is unknown, so it must not produce a warning naming no
+    /// model. The window it resolves to is unchanged.
+    #[test]
+    fn an_empty_model_id_resolves_to_the_default_without_naming_a_model() {
+        let cfg = Config::default();
+        assert_eq!(cfg.resolve_context_window(""), DEFAULT_CONTEXT_WINDOW);
+    }
+
+    /// GH #772 / dirge-hwk9.1: a per-provider `context_window` beats the
+    /// top-level key, which beats the table, which beats the default.
+    ///
+    /// The top-level key applies to EVERY provider at once, so with more than
+    /// one configured — the common case — there was no way to correct one
+    /// model's window without corrupting the others'. Correcting a local
+    /// model's window this session needed a whole separate config directory
+    /// for exactly this reason.
+    ///
+    /// All four rungs are asserted from one config, because the bug this
+    /// guards against is a rung being skipped, and a test that exercises one
+    /// rung at a time cannot see that.
+    #[test]
+    fn a_per_provider_context_window_wins_over_the_top_level_key() {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "qwen-local".to_string(),
+            ProviderEntry {
+                context_window: Some(65_536),
+                ..Default::default()
+            },
+        );
+        // Configured, but says nothing about the window — must fall through
+        // rather than resolve to zero or to the other provider's value.
+        providers.insert("glm".to_string(), ProviderEntry::default());
+        let cfg = Config {
+            context_window: Some(200_000),
+            providers: Some(providers),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            cfg.resolve_context_window_for("qwen-local", "some-local.gguf"),
+            65_536,
+            "the provider's own window wins"
+        );
+        assert_eq!(
+            cfg.resolve_context_window_for("glm", "glm-5.3"),
+            200_000,
+            "a provider without one falls through to the top-level key"
+        );
+        assert_eq!(
+            cfg.resolve_context_window_for("", "glm-5.3"),
+            200_000,
+            "so does an unknown provider name"
+        );
+
+        // ...and with no top-level key the table and default still apply.
+        let cfg = Config {
+            providers: cfg.providers.clone(),
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.resolve_context_window_for("qwen-local", "some-local.gguf"),
+            65_536,
+            "the provider's window applies with no top-level key set"
+        );
+        assert_eq!(
+            cfg.resolve_context_window_for("glm", "glm-5.3"),
+            1_000_000,
+            "otherwise the model table"
+        );
+        assert_eq!(
+            cfg.resolve_context_window_for("glm", "who-knows"),
+            DEFAULT_CONTEXT_WINDOW,
+            "and finally the default"
+        );
+    }
+
+    /// Provider lookup is case-insensitive, matching every other per-provider
+    /// override — `--provider Qwen-Local` builds a client fine, and silently
+    /// missing the override is the failure mode that fix exists for.
+    #[test]
+    fn a_per_provider_window_is_found_case_insensitively() {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "qwen-local".to_string(),
+            ProviderEntry {
+                context_window: Some(65_536),
+                ..Default::default()
+            },
+        );
+        let cfg = Config {
+            providers: Some(providers),
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.resolve_context_window_for("Qwen-Local", "some-local.gguf"),
+            65_536
+        );
+    }
+
+    /// The old signature keeps working: it is the no-provider-known path, and
+    /// every existing caller reads it.
+    #[test]
+    fn the_model_only_resolver_still_honours_the_top_level_key() {
+        let cfg = Config {
+            context_window: Some(50_000),
+            ..Default::default()
+        };
+        assert_eq!(cfg.resolve_context_window("deepseek-v4-pro"), 50_000);
     }
 
     /// Match is case-insensitive — provider ids that uppercase
@@ -3414,5 +3883,108 @@ mod config_merge_tests {
         let mut base = json!({ "mcp_servers": { "exa": {} } });
         merge_json(&mut base, json!({ "mcp_servers": {} }));
         assert!(base["mcp_servers"]["exa"].as_object().is_some());
+    }
+}
+
+#[cfg(test)]
+mod config_docs_coverage {
+    /// Every configurable key is described in `docs/config.md`.
+    ///
+    /// A config key nobody can find is a feature nobody has. The struct and the
+    /// docs table are two lists with nothing tying them together, and the drift
+    /// is invisible from either side — checked at 0.22.0, six top-level keys had
+    /// shipped undocumented, `compact_tool_schemas` and the per-provider
+    /// `context_window` among them, both introduced by the release that was
+    /// meant to advertise them.
+    ///
+    /// Deliberately dumb: it looks for the key NAME in the doc, so a row that
+    /// mentions a key while describing something else satisfies it. That makes
+    /// it possible to fool and it still catches the mistake anyone actually
+    /// makes — adding a key and forgetting the row.
+    const DOCS: &str = include_str!("../../docs/config.md");
+
+    /// Field names that are deliberately absent from the reference table.
+    /// Each needs a reason, so "undocumented" stays a decision rather than an
+    /// oversight.
+    const NOT_IN_THE_TABLE: &[(&str, &str)] = &[];
+
+    fn fields_of(struct_name: &str) -> Vec<String> {
+        let src = include_str!("mod.rs");
+        let start = src
+            .find(&format!("pub struct {struct_name} {{"))
+            .unwrap_or_else(|| panic!("{struct_name} not found"));
+        let mut depth = 0usize;
+        let mut end = start;
+        for (i, c) in src[start..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = start + i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        src[start..end]
+            .lines()
+            .filter_map(|l| {
+                let l = l.trim();
+                let rest = l.strip_prefix("pub ")?;
+                let name = rest.split(':').next()?.trim();
+                (!name.is_empty()
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit()))
+                .then(|| name.to_string())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_config_key_is_documented() {
+        let mut missing = Vec::new();
+        for field in fields_of("Config") {
+            if NOT_IN_THE_TABLE.iter().any(|(f, _)| *f == field) {
+                continue;
+            }
+            if !DOCS.contains(&field) {
+                missing.push(field);
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "these config keys have no mention in docs/config.md: {missing:?} — \
+             document them, or add them to NOT_IN_THE_TABLE with a reason"
+        );
+    }
+
+    /// The provider entry has its own table, and a provider key can be
+    /// "documented" only by coincidence — `context_window` exists as a
+    /// top-level key too, so a whole-document search says it is covered while
+    /// the provider table has no such row. That is exactly what happened. Scope
+    /// the search to the provider table.
+    #[test]
+    fn every_provider_key_is_in_the_provider_table() {
+        let start = DOCS
+            .find("Each `providers` entry accepts:")
+            .expect("the provider entry section exists");
+        let table = &DOCS[start..];
+        let end = table.find("\n## ").unwrap_or(table.len());
+        let table = &table[..end];
+
+        let mut missing = Vec::new();
+        for field in fields_of("ProviderEntry") {
+            if !table.contains(&format!("`{field}`")) {
+                missing.push(field);
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "these provider keys are absent from the provider-entry table in \
+             docs/config.md: {missing:?}"
+        );
     }
 }

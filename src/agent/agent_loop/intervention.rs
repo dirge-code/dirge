@@ -51,6 +51,7 @@ pub const HARNESS_TAGS: &[&str] = &[
     super::run::OPEN_ISSUES_NUDGE_TAG,
     super::run::RESUME_NUDGE_TAG,
     super::run::TRACK_WORK_TAG,
+    super::run::SKILL_ANCHOR_TAG,
     super::verifier::VERIFY_TAG,
     super::critic::CRITIC_TAG,
     super::goal::GOAL_TAG,
@@ -78,6 +79,31 @@ pub const FINALIZATION_TAGS: &[&str] = &[
     super::run::RESUME_NUDGE_TAG,
     super::run::OPEN_ISSUES_NUDGE_TAG,
 ];
+
+/// Prefix on the `SystemNotice` that mirrors an intervention to consumers
+/// which never see the tagged message (dirge-hwk9.5).
+///
+/// Shared so the producer (`run::emit_harness_notices`) and the TUI, which
+/// must recognise its own mirror to avoid rendering the body twice, cannot
+/// drift — the same reason this module exists at all.
+pub const NOTICE_PREFIX: &str = "harness intervention: ";
+
+/// The summary line of an intervention notice, without the body.
+///
+/// The notice carries `"harness intervention: {summary}\n{body}"` because
+/// headless consumers see only it — `--print` renders `SystemNotice` and
+/// ignores `UserMessage` entirely. The TUI sees BOTH, and renders the body
+/// from the message (which is also the copy `dirge-m10x` guarantees survives
+/// the next turn's stream anchor), so showing the notice in full puts the
+/// instruction on screen twice with a summary above the first copy.
+///
+/// `None` for any notice that is not an intervention mirror — the max-turns
+/// cap and friends are shown in full.
+pub fn notice_summary(content: &str) -> Option<&str> {
+    content
+        .starts_with(NOTICE_PREFIX)
+        .then(|| content.split('\n').next().unwrap_or(content))
+}
 
 /// The harness tag `text` carries, if any.
 pub fn tag_of(text: &str) -> Option<&'static str> {
@@ -142,6 +168,9 @@ pub fn summary_for_user(tag: &str) -> &'static str {
         t if t == super::goal::GOAL_TAG => "restated the goal the run started from",
         t if t == super::run::TODO_NUDGE_TAG => "asked the model to close out its todo list",
         t if t == super::run::TRACK_WORK_TAG => "asked the model to track this work",
+        t if t == super::run::SKILL_ANCHOR_TAG => {
+            "restated a loaded skill's anchor so it stays in force"
+        }
         t if t == super::run::OPEN_ISSUES_NUDGE_TAG => "surfaced open issues before finishing",
         t if t == super::run::RESUME_NUDGE_TAG => "asked the model to resume the interrupted task",
         t if t == super::code_review::CODE_REVIEW_TAG => "code review found something to fix",

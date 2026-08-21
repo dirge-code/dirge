@@ -416,6 +416,8 @@ fn rewind_restores_files_to_pre_prompt_state() {
     snapshots::clear();
 
     let dir = std::env::temp_dir().join(format!("dirge-rewind-it-{}", std::process::id()));
+    // dirge-m1ni: clear first — the name is keyed on a recyclable process id.
+    let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let file = dir.join("work.txt");
     std::fs::write(&file, "original").unwrap();
@@ -734,6 +736,128 @@ fn mutating_commands_are_not_safe_during_agent() {
     assert!(!is_safe_during_agent("/undo"));
     assert!(!is_safe_during_agent("/retry"));
     assert!(!is_safe_during_agent("/allow bash rm *"));
+}
+
+/// Every slash command that changes the process working directory must be
+/// rejected while an agent is running.
+///
+/// R1 of the UI/agent runtime split (dirge-pge7). Process CWD is a process
+/// singleton — it cannot be given a lock — and ~20 sites on the agent side
+/// read it. Once the agent stops sharing the UI's thread, a `/cd` landing
+/// mid-run would let a tool resolve a path against a directory that changed
+/// underneath it. Nothing would crash; a file would just be read or written
+/// somewhere else.
+///
+/// What makes that impossible today is not a design, it is the accident that
+/// no CWD-mutating command appears in `is_safe_during_agent`'s allowlist.
+/// That is a hand-maintained list with nothing tying it to the mutation
+/// sites, which is the exact shape of drift this codebase keeps paying for.
+/// Pin it here, and pin the site list in the test below.
+#[test]
+fn no_cwd_mutating_command_is_safe_during_an_agent_run() {
+    for form in [
+        "/cd", // bare — goes home, still mutates
+        "/cd /tmp",
+        "/cd ~/src",
+        "/worktree",
+        "/worktree new feature-x",
+        "/worktree exit",
+        "/worktree merge",
+    ] {
+        assert!(
+            !is_safe_during_agent(form),
+            "{form:?} changes the process working directory, so it must not be \
+             allowed to run while an agent is executing tools against it"
+        );
+    }
+
+    // The discrimination half: the gate must not be rejecting everything,
+    // or the assertions above pass while testing nothing.
+    assert!(is_safe_during_agent("/help"));
+    assert!(is_safe_during_agent("/mode"));
+}
+
+/// The set of UI files that mutate the process CWD is fixed and known.
+///
+/// Companion to the test above, which can only check the commands it names.
+/// This one fails when a *new* site starts changing directories, so whoever
+/// adds it has to decide, deliberately, whether it is reachable while an
+/// agent is running — rather than finding out from a misplaced write months
+/// later.
+///
+/// The known three, and why each is safe today:
+///
+/// - `cd` — `/cd`, gated out of `is_safe_during_agent`.
+/// - `worktree` — `/worktree`, likewise gated.
+/// - `mod` — two deferred worktree outcomes (exit, post-merge). Both run
+///   under `is_running`, which is the same flag that would have to be free
+///   for an agent run to start, so they are mutually exclusive with one by
+///   construction.
+#[test]
+fn the_set_of_cwd_mutating_ui_files_has_not_grown() {
+    /// A source line that actually calls the function, as opposed to a
+    /// comment naming it. Without this the scan trips over prose — `/spec`
+    /// carries a comment about the bug where it read the process cwd instead
+    /// of `session.working_dir` (dirge-s5oh), which is a fix, not a mutation.
+    fn calls_it(src: &str) -> bool {
+        src.lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .any(|line| line.contains("set_current_dir"))
+    }
+
+    fn scan(dir: &std::path::Path, found: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir)
+            .expect("ui dir must be readable")
+            .flatten()
+        {
+            let path = entry.path();
+            let stem = path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            if path.is_dir() {
+                scan(&path, found);
+            } else if path.extension().is_some_and(|e| e == "rs")
+                // Test files name the function in their own assertions; scanning
+                // them would make this test match itself and pass forever.
+                && !stem.ends_with("_tests")
+                && std::fs::read_to_string(&path).map(|s| calls_it(&s)).unwrap_or(false)
+            {
+                found.push(stem);
+            }
+        }
+    }
+
+    let ui_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui");
+    let mut found = Vec::new();
+    scan(&ui_dir, &mut found);
+    found.sort();
+    found.dedup();
+
+    assert_eq!(
+        found,
+        vec!["cd".to_string(), "mod".to_string(), "worktree".to_string()],
+        "the set of UI files changing the process working directory changed. \
+         Each must be unreachable while an agent runs — see \
+         `no_cwd_mutating_command_is_safe_during_an_agent_run` — or the agent \
+         can observe the directory move mid-run."
+    );
+}
+
+/// The scan above must be able to see a real call, or it passes vacuously
+/// forever after a path typo or a filter that is too aggressive.
+#[test]
+fn the_cwd_scan_can_actually_see_a_call() {
+    let cd = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui/slash/cmd/cd.rs");
+    let src = std::fs::read_to_string(&cd).expect("/cd source must be readable");
+    assert!(
+        src.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .any(|l| l.contains("set_current_dir")),
+        "/cd no longer calls set_current_dir on a non-comment line; the scan \
+         in the previous test is now measuring nothing"
+    );
 }
 
 #[test]
@@ -1067,13 +1191,13 @@ use crossterm::event::KeyCode as KC;
 #[test]
 fn opt_multi_space_toggles_option() {
     // Space on an option row toggles its checkbox.
-    let a = option_select_action(KC::Char(' '), true, true, 0, 3, false);
+    let a = option_select_action(KC::Char(' '), KeyModifiers::NONE, true, true, 0, 3, false);
     assert_eq!(a, OptionAction::Toggle);
 }
 
 #[test]
 fn opt_multi_enter_on_option_confirms() {
-    let a = option_select_action(KC::Enter, true, true, 1, 3, false);
+    let a = option_select_action(KC::Enter, KeyModifiers::NONE, true, true, 1, 3, false);
     assert_eq!(a, OptionAction::Confirm);
 }
 
@@ -1082,7 +1206,7 @@ fn opt_multi_enter_on_option_confirms() {
 #[test]
 fn opt_multi_custom_row_enter_opens_editor_when_empty() {
     // No custom text yet: Enter starts typing.
-    let a = option_select_action(KC::Enter, true, true, 3, 3, false);
+    let a = option_select_action(KC::Enter, KeyModifiers::NONE, true, true, 3, 3, false);
     assert_eq!(a, OptionAction::OpenEntry);
 }
 
@@ -1090,7 +1214,7 @@ fn opt_multi_custom_row_enter_opens_editor_when_empty() {
 fn opt_multi_custom_row_enter_confirms_once_text_entered() {
     // The bug: after typing a custom answer, Enter must confirm — not
     // re-open the editor forever.
-    let a = option_select_action(KC::Enter, true, true, 3, 3, true);
+    let a = option_select_action(KC::Enter, KeyModifiers::NONE, true, true, 3, 3, true);
     assert_eq!(a, OptionAction::Confirm);
 }
 
@@ -1099,11 +1223,11 @@ fn opt_multi_custom_row_space_reopens_editor() {
     // Space on the custom row (re)opens the editor to edit the answer,
     // whether or not text already exists.
     assert_eq!(
-        option_select_action(KC::Char(' '), true, true, 3, 3, false),
+        option_select_action(KC::Char(' '), KeyModifiers::NONE, true, true, 3, 3, false),
         OptionAction::OpenEntry
     );
     assert_eq!(
-        option_select_action(KC::Char(' '), true, true, 3, 3, true),
+        option_select_action(KC::Char(' '), KeyModifiers::NONE, true, true, 3, 3, true),
         OptionAction::OpenEntry
     );
 }
@@ -1112,21 +1236,21 @@ fn opt_multi_custom_row_space_reopens_editor() {
 
 #[test]
 fn opt_single_enter_on_option_confirms() {
-    let a = option_select_action(KC::Enter, false, false, 2, 4, false);
+    let a = option_select_action(KC::Enter, KeyModifiers::NONE, false, false, 2, 4, false);
     assert_eq!(a, OptionAction::Confirm);
 }
 
 #[test]
 fn opt_single_space_on_option_confirms() {
     // Single-select has no checkboxes: Space picks the option like Enter.
-    let a = option_select_action(KC::Char(' '), false, false, 2, 4, false);
+    let a = option_select_action(KC::Char(' '), KeyModifiers::NONE, false, false, 2, 4, false);
     assert_eq!(a, OptionAction::Confirm);
 }
 
 #[test]
 fn opt_single_custom_row_enter_opens_editor() {
     // Single-select custom row always opens the editor (typing auto-submits).
-    let a = option_select_action(KC::Enter, false, true, 4, 4, false);
+    let a = option_select_action(KC::Enter, KeyModifiers::NONE, false, true, 4, 4, false);
     assert_eq!(a, OptionAction::OpenEntry);
 }
 
@@ -1135,19 +1259,19 @@ fn opt_single_custom_row_enter_opens_editor() {
 #[test]
 fn opt_arrow_and_vim_navigation() {
     assert_eq!(
-        option_select_action(KC::Up, true, true, 1, 3, false),
+        option_select_action(KC::Up, KeyModifiers::NONE, true, true, 1, 3, false),
         OptionAction::CursorUp
     );
     assert_eq!(
-        option_select_action(KC::Char('k'), true, true, 1, 3, false),
+        option_select_action(KC::Char('k'), KeyModifiers::NONE, true, true, 1, 3, false),
         OptionAction::CursorUp
     );
     assert_eq!(
-        option_select_action(KC::Down, true, true, 1, 3, false),
+        option_select_action(KC::Down, KeyModifiers::NONE, true, true, 1, 3, false),
         OptionAction::CursorDown
     );
     assert_eq!(
-        option_select_action(KC::Char('j'), true, true, 1, 3, false),
+        option_select_action(KC::Char('j'), KeyModifiers::NONE, true, true, 1, 3, false),
         OptionAction::CursorDown
     );
 }
@@ -1155,15 +1279,91 @@ fn opt_arrow_and_vim_navigation() {
 #[test]
 fn opt_esc_rejects() {
     assert_eq!(
-        option_select_action(KC::Esc, true, true, 0, 3, false),
+        option_select_action(KC::Esc, KeyModifiers::NONE, true, true, 0, 3, false),
         OptionAction::Reject
+    );
+}
+
+/// Every modal text field must ignore control chords rather than typing
+/// them (dirge-x2zf). Three fields take free text — plan-approval feedback,
+/// the question tool's custom answer, and the permission deny note — and
+/// two of them had carried the guard from the start. The third pushed the
+/// literal `c` of a Ctrl+C into the user's answer for as long as it had
+/// existed, which is how a key that cancels everywhere else came to corrupt
+/// text here.
+///
+/// A count, not a parse: crude enough to fool, strict enough to catch the
+/// mistake anyone actually makes — adding a fourth field and forgetting.
+#[test]
+fn every_modal_text_field_ignores_control_chords() {
+    let src = include_str!("mod.rs");
+    let lines: Vec<&str> = src.lines().collect();
+    let mut fields = 0;
+    for (i, line) in lines.iter().enumerate() {
+        if !line.contains(".push(c)") {
+            continue;
+        }
+        fields += 1;
+        // The guard rides on the `KeyCode::Char(c)` arm just above.
+        let window = lines[i.saturating_sub(6)..=i].join("\n");
+        assert!(
+            window.contains("KeyModifiers::CONTROL"),
+            "the text field at mod.rs:{} types control chords instead of \
+             ignoring them; guard `KeyCode::Char(c)` on `!CONTROL` as the \
+             other modal fields do",
+            i + 1,
+        );
+    }
+    assert!(
+        fields >= 3,
+        "expected the known text fields; found {fields} — has the shape changed?",
+    );
+}
+
+/// dirge-x2zf: Ctrl+C means "I want out" in every other modal — Permission
+/// denies, the dialogs cancel, plan approval bails. This one only listened
+/// for Esc, so the key a user actually reaches for did nothing.
+#[test]
+fn opt_ctrl_c_rejects_like_every_other_modal() {
+    assert_eq!(
+        option_select_action(
+            KC::Char('c'),
+            KeyModifiers::CONTROL,
+            false,
+            true,
+            0,
+            3,
+            false
+        ),
+        OptionAction::Reject,
+    );
+    assert_eq!(
+        option_select_action(KC::Char('d'), KeyModifiers::CONTROL, true, true, 3, 3, true),
+        OptionAction::Reject,
+    );
+}
+
+/// The discrimination half, and the reason the modifier is checked BEFORE
+/// the key code: a plain `c` is an ordinary keystroke in the option list
+/// (and `j`/`k` are navigation), so reading Ctrl+C off the code alone would
+/// have made the letter itself cancel the questionnaire.
+#[test]
+fn opt_a_plain_c_is_not_a_cancel() {
+    assert_eq!(
+        option_select_action(KC::Char('c'), KeyModifiers::NONE, false, true, 0, 3, false),
+        OptionAction::Ignore,
+    );
+    // And a modifier we do not act on leaves the key alone.
+    assert_eq!(
+        option_select_action(KC::Char('c'), KeyModifiers::ALT, false, true, 0, 3, false),
+        OptionAction::Ignore,
     );
 }
 
 #[test]
 fn opt_unhandled_key_is_ignored() {
     assert_eq!(
-        option_select_action(KC::Tab, true, true, 0, 3, false),
+        option_select_action(KC::Tab, KeyModifiers::NONE, true, true, 0, 3, false),
         OptionAction::Ignore
     );
 }
@@ -1171,7 +1371,7 @@ fn opt_unhandled_key_is_ignored() {
 #[test]
 fn opt_space_off_options_without_custom_is_ignored() {
     // No custom row and cursor somehow at num_options: Space does nothing.
-    let a = option_select_action(KC::Char(' '), true, false, 3, 3, false);
+    let a = option_select_action(KC::Char(' '), KeyModifiers::NONE, true, false, 3, 3, false);
     assert_eq!(a, OptionAction::Ignore);
 }
 
@@ -1199,4 +1399,97 @@ fn panel_refresh_due_past_interval_is_true() {
     let now = std::time::Instant::now();
     let past = now - PANEL_REFRESH_INTERVAL;
     assert!(panel_refresh_due(Some(past), now, PANEL_REFRESH_INTERVAL));
+}
+
+/// dirge-vpma.18: the resting face must never be painted where a runner was
+/// just installed.
+///
+/// `install_into` marks the run active; setting `AvatarState::Idle` right
+/// after it showed the idle face for the whole time-to-first-token while the
+/// status line said busy. Same class GH #621 fixed for the review phase, which
+/// is why `AvatarState::settled(is_running)` exists — these sites simply never
+/// adopted it. Encoded as a scan because the sites are a family (deferred
+/// prompt run, compaction Submit/Retry/Continue, plan kickoff) and the next
+/// one would otherwise be added the same way.
+#[test]
+fn no_runner_install_is_followed_by_the_idle_face() {
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui/mod.rs"),
+    )
+    .expect("ui/mod.rs must be readable");
+
+    let lines: Vec<&str> = src.lines().collect();
+    let mut offenders = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        if !line.contains("install_into(") {
+            continue;
+        }
+        // Look at the handful of statements that follow the install. A bare
+        // `Idle` there contradicts the state the install just established.
+        for probe in lines.iter().skip(i + 1).take(6) {
+            if probe.contains("AvatarState::Idle") {
+                offenders.push(i + 1);
+                break;
+            }
+            // Stop at the end of the block.
+            if probe.trim() == "}" {
+                break;
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "runner installed then the idle avatar painted at ui/mod.rs line(s) {offenders:?} \
+         — use AvatarState::settled(ui.is_running)",
+    );
+}
+
+/// The scan must be able to see a real install, or it passes vacuously the
+/// moment the call is renamed or the file moves.
+#[test]
+fn the_avatar_scan_can_actually_see_an_install() {
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui/mod.rs"),
+    )
+    .expect("ui/mod.rs must be readable");
+    assert!(
+        src.matches("install_into(").count() >= 3,
+        "the scan found no runner installs to check — did the call get renamed?",
+    );
+    assert!(
+        src.contains("AvatarState::settled(ui.is_running)"),
+        "no site uses the settled face; the scan would pass vacuously",
+    );
+}
+
+/// dirge-vpma.21: Ctrl+C must tear down a `!`/`!!` shell run, not just the
+/// agent runners.
+///
+/// Once the shell box is mounted keys route to the PTY, but during the
+/// ~120ms pre-mount grace window Ctrl+C reaches the busy-interrupt branch.
+/// That branch cleared `is_running` and dropped the queued messages while the
+/// child kept running — so the next typed prompt sailed through the busy gate
+/// and ran an agent turn alongside the live shell.
+#[test]
+fn the_interrupt_branch_tears_down_a_shell_session() {
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui/mod.rs"),
+    )
+    .expect("ui/mod.rs must be readable");
+    let branch_start = src
+        .find("dirge-vpma.21")
+        .expect("the interrupt branch must handle the shell session");
+    let branch = &src[branch_start..];
+    assert!(
+        branch.contains("ui.shell_session.take()"),
+        "the interrupt branch does not take the shell session",
+    );
+    // The kill must actually be requested, not just the handle dropped: a
+    // dropped handle leaves the child running under its own session leader.
+    let window = &branch[..branch.len().min(2000)];
+    assert!(
+        window.contains("s.interrupt.take()"),
+        "the shell child is never signalled — dropping the handle leaves the \
+         process group alive",
+    );
 }

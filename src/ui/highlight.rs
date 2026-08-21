@@ -6,7 +6,9 @@
 //!
 //! Coverage matches dirge's `semantic-*` feature set (TypeScript /
 //! Python / Bash / Clojure / Go / Ruby / Rust / Java / C / C++) plus
-//! JSON / YAML / Markdown / SQL / TOML / Shell. Unknown languages
+//! JSON / YAML / SQL / TOML / Shell. Markdown is NOT covered — the
+//! alias normalizes but no rules table backs it, so a markdown fence
+//! takes the fallback color (dirge-vpma.42). Unknown languages
 //! fall back to a uniform `tool()` color — same as the pre-highlight
 //! behavior — so adding a fenced block with `language: foo` never
 //! crashes, just declines to colorize.
@@ -82,11 +84,16 @@ fn normalize_lang(lang: &str) -> &str {
         "rs" | "rust" => "rust",
         "java" => "java",
         "c" | "h" => "c",
-        "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" | "c++" => "cpp",
+        "cpp" | "cc" | "cxx" | "ixx" | "hpp" | "hh" | "hxx" | "c++" => "cpp",
         "json" | "jsonc" => "json",
         "yaml" | "yml" => "yaml",
         "toml" => "toml",
         "sql" => "sql",
+        // dirge-vpma.42: no `"markdown"` arm exists in `rules_for`, so this
+        // alias resolved to None exactly as the unmapped string would — it was
+        // a no-op advertising coverage that was never written. Kept, because
+        // normalizing the spelling is still the right answer if markdown rules
+        // are ever added, but the module doc no longer claims the coverage.
         "md" | "markdown" => "markdown",
         "dfy" | "dafny" => "dafny",
         other => other,
@@ -109,6 +116,16 @@ struct Rules {
     /// tokenizer to NOT treat `#` as line-comment when this is true
     /// AND the next char is alphabetic.
     hash_directive: bool,
+    /// Extra characters this language allows INSIDE an identifier, beyond the
+    /// universal alphanumeric/`_`/`$` set (dirge-vpma.41).
+    ///
+    /// Only for languages where the character genuinely belongs to a name.
+    /// Clojure symbols really do contain `-?!*+<>=` (`if-not` is one symbol;
+    /// subtraction is `(- a b)`), and Ruby method names end in `?`/`!`. It is
+    /// NOT a place to force a multi-word keyword through: Java's `non-sealed`
+    /// cannot be spelled this way, because making `-` an identifier character
+    /// in Java would turn every unspaced `a-b` into one token.
+    ident_extra: &'static [char],
 }
 
 fn rules_for(lang: &str) -> Option<&'static Rules> {
@@ -356,11 +373,17 @@ fn is_ident_cont(c: char, rules: &Rules) -> bool {
     // unicode-named symbol (`naïve`, `日本語`) stays one token
     // instead of splitting at the first non-ASCII byte. ASCII path
     // unchanged. Review #4.
+    //
+    // dirge-vpma.41: the extra characters come from the language's own table.
+    // This used to read `rules.string_delims.is_empty() && c == '-'`, and no
+    // language has an empty delimiter set — so it was always false and every
+    // hyphenated or `?`-suffixed keyword in the tables was unreachable.
+    // `if-not` highlighted as keyword `if`, plain `-`, keyword `not`.
     c.is_ascii_alphanumeric()
         || c == '_'
         || c == '$'
         || (!c.is_ascii() && !c.is_control() && !c.is_whitespace())
-        || (rules.string_delims.is_empty() && c == '-')
+        || rules.ident_extra.contains(&c)
 }
 
 fn looks_like_type(word: &str, _rules: &Rules) -> bool {
@@ -468,6 +491,7 @@ static JS_RULES: Rules = Rules {
     block_comment: Some(("/*", "*/")),
     string_delims: &['"', '\'', '`'],
     hash_directive: false,
+    ident_extra: &[],
 };
 
 static PY_RULES: Rules = Rules {
@@ -484,6 +508,7 @@ static PY_RULES: Rules = Rules {
     block_comment: None,
     string_delims: &['"', '\''],
     hash_directive: false,
+    ident_extra: &[],
 };
 
 static BASH_RULES: Rules = Rules {
@@ -497,6 +522,7 @@ static BASH_RULES: Rules = Rules {
     block_comment: None,
     string_delims: &['"', '\''],
     hash_directive: false,
+    ident_extra: &[],
 };
 
 static CLJ_RULES: Rules = Rules {
@@ -555,6 +581,7 @@ static CLJ_RULES: Rules = Rules {
     block_comment: None,
     string_delims: &['"'],
     hash_directive: false,
+    ident_extra: &['-', '?', '!', '*', '+', '<', '>', '='],
 };
 
 static GO_RULES: Rules = Rules {
@@ -615,6 +642,7 @@ static GO_RULES: Rules = Rules {
     block_comment: Some(("/*", "*/")),
     string_delims: &['"', '\'', '`'],
     hash_directive: false,
+    ident_extra: &[],
 };
 
 static RUBY_RULES: Rules = Rules {
@@ -670,6 +698,7 @@ static RUBY_RULES: Rules = Rules {
     block_comment: None,
     string_delims: &['"', '\''],
     hash_directive: false,
+    ident_extra: &['?', '!'],
 };
 
 static RUST_RULES: Rules = Rules {
@@ -692,6 +721,7 @@ static RUST_RULES: Rules = Rules {
     block_comment: Some(("/*", "*/")),
     string_delims: &['"', '\''],
     hash_directive: false,
+    ident_extra: &[],
 };
 
 static DAFNY_RULES: Rules = Rules {
@@ -777,6 +807,7 @@ static DAFNY_RULES: Rules = Rules {
     block_comment: Some(("/*", "*/")),
     string_delims: &['"', '\''],
     hash_directive: false,
+    ident_extra: &[],
 };
 
 static JAVA_RULES: Rules = Rules {
@@ -838,7 +869,6 @@ static JAVA_RULES: Rules = Rules {
         "record",
         "sealed",
         "permits",
-        "non-sealed",
     ],
     types: &[
         "String", "Object", "Integer", "Long", "Double", "Boolean", "List", "Map", "Set",
@@ -847,6 +877,7 @@ static JAVA_RULES: Rules = Rules {
     block_comment: Some(("/*", "*/")),
     string_delims: &['"', '\''],
     hash_directive: false,
+    ident_extra: &[],
 };
 
 static C_RULES: Rules = Rules {
@@ -919,6 +950,7 @@ static C_RULES: Rules = Rules {
     block_comment: Some(("/*", "*/")),
     string_delims: &['"', '\''],
     hash_directive: true,
+    ident_extra: &[],
 };
 
 static CPP_RULES: Rules = Rules {
@@ -1033,6 +1065,7 @@ static CPP_RULES: Rules = Rules {
     block_comment: Some(("/*", "*/")),
     string_delims: &['"', '\''],
     hash_directive: true,
+    ident_extra: &[],
 };
 
 static JSON_RULES: Rules = Rules {
@@ -1042,6 +1075,7 @@ static JSON_RULES: Rules = Rules {
     block_comment: None,
     string_delims: &['"'],
     hash_directive: false,
+    ident_extra: &[],
 };
 
 static YAML_RULES: Rules = Rules {
@@ -1051,6 +1085,7 @@ static YAML_RULES: Rules = Rules {
     block_comment: None,
     string_delims: &['"', '\''],
     hash_directive: false,
+    ident_extra: &[],
 };
 
 static TOML_RULES: Rules = Rules {
@@ -1060,6 +1095,7 @@ static TOML_RULES: Rules = Rules {
     block_comment: None,
     string_delims: &['"', '\''],
     hash_directive: false,
+    ident_extra: &[],
 };
 
 static SQL_RULES: Rules = Rules {
@@ -1203,6 +1239,7 @@ static SQL_RULES: Rules = Rules {
     block_comment: Some(("/*", "*/")),
     string_delims: &['\''],
     hash_directive: false,
+    ident_extra: &[],
 };
 
 #[cfg(test)]
@@ -1235,6 +1272,67 @@ mod tests {
             .find(|s| s.text == "method")
             .expect("method span");
         assert_eq!(kw.color, theme::user());
+    }
+
+    /// dirge-vpma.41: a hyphenated keyword is ONE token.
+    ///
+    /// `is_ident_cont` gated `-` on `string_delims.is_empty()`, and no
+    /// language has an empty delimiter set, so the condition was always false
+    /// and every hyphenated entry in the tables was unreachable — `if-not`
+    /// rendered as keyword `if`, plain `-`, keyword `not`.
+    #[test]
+    fn clojure_hyphenated_keywords_are_one_token() {
+        for (code, word) in [
+            ("(if-not x 1 2)", "if-not"),
+            ("(defn- helper [] nil)", "defn-"),
+            ("(when-let [v x] v)", "when-let"),
+            ("(in-ns 'foo)", "in-ns"),
+        ] {
+            let lines = render(code, "clojure");
+            let row = &lines[0];
+            let kw = row
+                .iter()
+                .find(|s| s.text == word)
+                .unwrap_or_else(|| panic!("{word} not one span in {code}: {row:?}"));
+            assert_eq!(kw.color, theme::user(), "{word} not coloured as a keyword");
+        }
+    }
+
+    /// Ruby's `?`-suffixed names likewise.
+    #[test]
+    fn ruby_question_suffixed_keyword_is_one_token() {
+        let lines = render("defined? foo", "ruby");
+        let row = &lines[0];
+        let kw = row
+            .iter()
+            .find(|s| s.text == "defined?")
+            .unwrap_or_else(|| panic!("defined? not one span: {row:?}"));
+        assert_eq!(kw.color, theme::user());
+    }
+
+    /// The other half — the extra characters are per-language, so a language
+    /// that does NOT allow them must keep splitting. Java's `a-b` is
+    /// subtraction, which is exactly why `non-sealed` was dropped from its
+    /// table rather than forced through `ident_extra`.
+    #[test]
+    fn a_hyphen_still_separates_tokens_in_java() {
+        let lines = render("int c = a-b;", "java");
+        let row = &lines[0];
+        assert!(
+            !row.iter().any(|s| s.text.contains("a-b")),
+            "java glued a subtraction into one identifier: {row:?}"
+        );
+    }
+
+    /// dirge-vpma.42: the markdown alias normalizes but no rules table backs
+    /// it. The module doc used to claim Markdown coverage; this pins the real
+    /// answer so the claim and the code cannot drift apart again.
+    #[test]
+    fn markdown_is_not_actually_supported() {
+        assert!(
+            !supports("md") && !supports("markdown"),
+            "markdown reports as supported but has no rules table"
+        );
     }
 
     #[test]

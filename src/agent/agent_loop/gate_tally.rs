@@ -28,7 +28,9 @@
 //! It deliberately contains no rig/LLM types, so it stays unit-testable
 //! without a model.
 
+use crate::agent::agent_loop::tool_error_class::ErrorClass;
 use crate::agent::agent_loop::tool_input_repair::RepairStatsSnapshot;
+use crate::agent::agent_loop::tool_retry::RetryStatsSnapshot;
 
 /// Which finalization gate produced a run's follow-up. Mirrors the
 /// existing `FollowUpSource` in `run.rs`.
@@ -57,6 +59,9 @@ pub enum GateSource {
 /// today these are bare pushes in `run.rs` with no enum at all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BoundaryNudge {
+    /// dirge-69oe.4: a loaded skill's declared anchor, restated on the
+    /// interval the operator set. Off unless `skill_anchor_interval` > 0.
+    SkillAnchor,
     TrackWork,
     FastVerify,
     ProgressStall,
@@ -66,6 +71,12 @@ pub enum BoundaryNudge {
     ProgressPrologue,
     FileTouch,
     ReflectionCheckpoint,
+    /// dirge-e31n.6: a run of PERMISSION denials, which is a policy wall
+    /// rather than a mechanical failure. Split from `ReflectionCheckpoint`
+    /// because the two want opposite advice and, until now, were
+    /// indistinguishable on the emitted line — so nothing could tell a run
+    /// blocked by the user's rules from one fumbling its tool calls.
+    PermissionCheckpoint,
     SafeState,
     None,
 }
@@ -160,7 +171,8 @@ impl GateSource {
 impl BoundaryNudge {
     /// Every variant, in [`index`](Self::index) order. Same contract as
     /// [`GateSource::ALL`] — see its doc for why this exists.
-    pub const ALL: [BoundaryNudge; 9] = [
+    pub const ALL: [BoundaryNudge; 11] = [
+        BoundaryNudge::SkillAnchor,
         BoundaryNudge::TrackWork,
         BoundaryNudge::FastVerify,
         BoundaryNudge::ProgressStall,
@@ -168,6 +180,7 @@ impl BoundaryNudge {
         BoundaryNudge::ProgressPrologue,
         BoundaryNudge::FileTouch,
         BoundaryNudge::ReflectionCheckpoint,
+        BoundaryNudge::PermissionCheckpoint,
         BoundaryNudge::SafeState,
         BoundaryNudge::None,
     ];
@@ -184,6 +197,7 @@ impl BoundaryNudge {
     #[cfg(test)]
     pub fn field_name(self) -> Option<&'static str> {
         Some(match self {
+            BoundaryNudge::SkillAnchor => "nudge_skill_anchor",
             BoundaryNudge::TrackWork => "nudge_track_work",
             BoundaryNudge::FastVerify => "nudge_fast_verify",
             BoundaryNudge::ProgressStall => "nudge_progress_stall",
@@ -191,6 +205,7 @@ impl BoundaryNudge {
             BoundaryNudge::ProgressPrologue => "nudge_progress_prologue",
             BoundaryNudge::FileTouch => "nudge_file_touch",
             BoundaryNudge::ReflectionCheckpoint => "nudge_reflection_checkpoint",
+            BoundaryNudge::PermissionCheckpoint => "nudge_permission_checkpoint",
             BoundaryNudge::SafeState => "nudge_safe_state",
             BoundaryNudge::None => return Option::None,
         })
@@ -209,9 +224,22 @@ pub struct GateTally {
     nudges: [u32; BoundaryNudge::ALL.len()],
     turns: u32,
     tool_calls: u32,
-    errored_tool_calls: u32,
+    /// Errored calls split by recovery class, indexed by
+    /// [`ErrorClass::index`]. Sized off [`ErrorClass::ALL`] so the two cannot
+    /// disagree.
+    ///
+    /// There is deliberately NO separate `errored_tool_calls` field:
+    /// [`errored_tool_calls`](Self::errored_tool_calls) sums this instead. A
+    /// total kept alongside its own parts is a duplicate that drifts the
+    /// moment one call site increments one and not the other, which is the
+    /// failure this module's own history is made of (dirge-l8l7.1).
+    errored_by_class: [u32; ErrorClass::ALL.len()],
     final_verification: Option<crate::agent::agent_loop::verifier::VerificationStatus>,
     repairs: Option<RepairStatsSnapshot>,
+    /// dirge-61sv: per-run transient-tool-retry counts, latched at run end
+    /// from `LoopConfig::retry_stats` — the dispatch cannot reach the tally,
+    /// exactly as with `repairs`.
+    retries: Option<RetryStatsSnapshot>,
     /// dirge-5mtx.7: the capability tier the estimator settled on for this
     /// run. OBSERVATION ONLY — nothing reads it back to change behaviour. It
     /// exists so tier distributions across models and scenarios can be
@@ -219,9 +247,36 @@ pub struct GateTally {
     capability_tier: Option<super::capability::CapabilityTier>,
     scavenged_calls: u32,
     hallucinated_tool_names: u32,
+    /// dirge-e31n.8: calls written in EXPLICIT call syntax inside the model's
+    /// text whose tool name matched nothing, so the scavenger dropped them.
+    ///
+    /// Sibling of `hallucinated_tool_names`, and the reason both are needed:
+    /// that one counts a miss the model was TOLD about ("Tool X not found",
+    /// with a nearest-name hint), this one counts a miss nothing reported to
+    /// anyone. Dropping silently is deliberate — dirge-knt8 established that
+    /// erroring on scavenged text re-forces a continuation turn — so the
+    /// counter is how the cost of that choice becomes visible at all.
+    ///
+    /// OBSERVATION ONLY: not fed to the capability estimator. What one of
+    /// these is worth against an errored call is exactly what there is no
+    /// data on yet, and guessing a weight would bake the guess into the
+    /// tier before the first measurement.
+    dropped_unknown_names: u32,
+    /// dirge-e31n.8: calls whose name matched no tool but resolved to one by
+    /// alias, and so dispatched instead of failing.
+    ///
+    /// The third outcome for a name, and the mechanism gate for the alias
+    /// table: with this at zero the table did not fire, so any difference
+    /// between two arms came from somewhere else.
+    aliased_tool_names: u32,
     storm_suppressions: u32,
     /// Peak failure streak over the run.
     max_failure_streak: u32,
+    /// dirge-e31n.5: tool calls whose effect could not be confirmed. The
+    /// MECHANISM GATE for the unresolved-effect handoff: the handoff renders
+    /// only when this is non-zero, so an A/B reading zero in both arms
+    /// measured nothing however healthy the rest of the report looks.
+    unresolved_effects: u32,
     /// dirge-1elu.6: completed boundary co-occurrence events, in run order.
     /// Each event lists the gates and nudges that fired at one decision
     /// point. OBSERVATION ONLY — no loop logic reads this back.
@@ -329,10 +384,16 @@ impl GateTally {
         self.turns += 1;
     }
 
-    pub fn record_tool_call(&mut self, is_error: bool) {
+    /// Record one dispatched tool call. `error` is `None` for a success and
+    /// `Some(class)` for a failure, so the total and the per-class split are
+    /// written from ONE input at ONE site and cannot disagree — an errored
+    /// call with no class is unrepresentable rather than merely discouraged.
+    /// A failure the classifier declined to name is
+    /// [`ErrorClass::Unclassified`], which is a class like any other.
+    pub fn record_tool_call(&mut self, error: Option<ErrorClass>) {
         self.tool_calls += 1;
-        if is_error {
-            self.errored_tool_calls += 1;
+        if let Some(class) = error {
+            self.errored_by_class[class.index()] += 1;
         }
     }
 
@@ -355,19 +416,36 @@ impl GateTally {
         self.repairs = snapshot;
     }
 
+    /// Latch the per-run transient-retry snapshot (dirge-61sv). Observation
+    /// only, like every other counter here.
+    pub fn set_retries(&mut self, snapshot: Option<RetryStatsSnapshot>) {
+        self.retries = snapshot;
+    }
+
     /// The model emitted tool-call-shaped TEXT instead of a native tool
     /// call, and it was scavenged into a real call.
     pub fn record_scavenged_call(&mut self) {
         self.scavenged_calls += 1;
     }
 
-    /// A tool name had to be resolved by nearest-name match (suggest.rs).
-    /// Not wired yet: suggest.rs is called from several sites, so its
-    /// recording is scoped separately (dirge-5mtx.7). Remove this allow
-    /// when that wiring lands.
-    #[allow(dead_code)]
+    /// A dispatched call named a tool the run does not have. Recorded by
+    /// `run::record_tool_result_signals`, which re-derives the miss from the
+    /// batch's tool set — see its docs for why the classification lives
+    /// there rather than at the rejection site.
     pub fn record_hallucinated_tool_name(&mut self) {
         self.hallucinated_tool_names += 1;
+    }
+
+    /// A call written in explicit call syntax inside the model's text named a
+    /// tool the run does not have, so it was dropped without dispatch.
+    pub fn record_dropped_unknown_name(&mut self) {
+        self.dropped_unknown_names += 1;
+    }
+
+    /// A call named a tool by a name dirge does not use, and the alias table
+    /// placed it — so it dispatched rather than costing a turn or vanishing.
+    pub fn record_aliased_tool_name(&mut self) {
+        self.aliased_tool_names += 1;
     }
 
     /// A call was suppressed by the storm breaker as a repeat.
@@ -379,6 +457,11 @@ impl GateTally {
     /// streak seen this run, so it never decreases.
     pub fn record_failure_streak(&mut self, current: u32) {
         self.max_failure_streak = self.max_failure_streak.max(current);
+    }
+
+    /// A tool call's effect could not be confirmed (dirge-e31n.5).
+    pub fn record_unresolved_effect(&mut self) {
+        self.unresolved_effects += 1;
     }
 }
 
@@ -403,8 +486,17 @@ impl GateTally {
         self.tool_calls
     }
 
+    /// Total errored calls — DERIVED from the per-class split, never stored
+    /// beside it. See [`GateTally::errored_by_class`].
     pub fn errored_tool_calls(&self) -> u32 {
-        self.errored_tool_calls
+        self.errored_by_class.iter().sum()
+    }
+
+    /// Errored calls split by recovery class, indexed by
+    /// [`ErrorClass::index`]. Feeds [`super::capability::CapabilityCounters`],
+    /// which weights `MissingInfo` above the rest.
+    pub fn errored_by_class(&self) -> [u32; ErrorClass::ALL.len()] {
+        self.errored_by_class
     }
 
     pub fn scavenged_calls(&self) -> u32 {
@@ -415,8 +507,20 @@ impl GateTally {
         self.hallucinated_tool_names
     }
 
+    pub fn dropped_unknown_names(&self) -> u32 {
+        self.dropped_unknown_names
+    }
+
+    pub fn aliased_tool_names(&self) -> u32 {
+        self.aliased_tool_names
+    }
+
     pub fn storm_suppressions(&self) -> u32 {
         self.storm_suppressions
+    }
+
+    pub fn unresolved_effects(&self) -> u32 {
+        self.unresolved_effects
     }
 
     pub fn max_failure_streak(&self) -> u32 {
@@ -436,6 +540,7 @@ impl GateTally {
         // is absent (never set) emit zeros so the log line keeps a stable
         // shape a script can parse.
         let repairs = &self.repairs;
+        let retries = &self.retries;
         // Stable placeholder when unset, so the log line keeps one shape and
         // a scraper never has to cope with a missing field.
         let capability_tier = self.capability_tier.map_or("none", |t| t.as_str());
@@ -446,7 +551,19 @@ impl GateTally {
             boundaries = %boundaries,
             turns = self.turns,
             tool_calls = self.tool_calls,
-            errored_tool_calls = self.errored_tool_calls,
+            errored_tool_calls = self.errored_tool_calls(),
+            // dirge-s9ry: the class split, not just the total. The total alone
+            // is what let two runs at 24% and 27% error rates read as ordinary
+            // friction — the harness could see THAT calls failed but not that
+            // every one of them named something that wasn't there. Field names
+            // come from `ErrorClass::field_name` and are asserted against
+            // `ErrorClass::ALL` by
+            // `every_error_class_has_a_field_on_the_emitted_line`.
+            errored_misuse = self.errored_by_class[ErrorClass::Misuse.index()],
+            errored_missing_info = self.errored_by_class[ErrorClass::MissingInfo.index()],
+            errored_transient = self.errored_by_class[ErrorClass::Transient.index()],
+            errored_fatal = self.errored_by_class[ErrorClass::Fatal.index()],
+            errored_unclassified = self.errored_by_class[ErrorClass::Unclassified.index()],
             final_verification = %final_verification,
             gate_awaiting_user = self.gates[GateSource::AwaitingUser.index()],
             gate_hook = self.gates[GateSource::Hook.index()],
@@ -466,6 +583,7 @@ impl GateTally {
             gate_goal = self.gates[GateSource::Goal.index()],
             gate_todo = self.gates[GateSource::Todo.index()],
             gate_open_issues = self.gates[GateSource::OpenIssues.index()],
+            nudge_skill_anchor = self.nudges[BoundaryNudge::SkillAnchor.index()],
             nudge_track_work = self.nudges[BoundaryNudge::TrackWork.index()],
             nudge_fast_verify = self.nudges[BoundaryNudge::FastVerify.index()],
             nudge_progress_stall = self.nudges[BoundaryNudge::ProgressStall.index()],
@@ -473,11 +591,15 @@ impl GateTally {
             nudge_progress_prologue = self.nudges[BoundaryNudge::ProgressPrologue.index()],
             nudge_file_touch = self.nudges[BoundaryNudge::FileTouch.index()],
             nudge_reflection_checkpoint = self.nudges[BoundaryNudge::ReflectionCheckpoint.index()],
+            nudge_permission_checkpoint = self.nudges[BoundaryNudge::PermissionCheckpoint.index()],
             nudge_safe_state = self.nudges[BoundaryNudge::SafeState.index()],
             scavenged_calls = self.scavenged_calls,
             hallucinated_tool_names = self.hallucinated_tool_names,
+            dropped_unknown_names = self.dropped_unknown_names,
+            aliased_tool_names = self.aliased_tool_names,
             storm_suppressions = self.storm_suppressions,
             max_failure_streak = self.max_failure_streak,
+            unresolved_effects = self.unresolved_effects,
             repair_null_stripped = repairs.as_ref().map_or(0, |s| s.null_stripped),
             repair_json_string_to_array = repairs.as_ref().map_or(0, |s| s.json_string_to_array),
             repair_object_to_array = repairs.as_ref().map_or(0, |s| s.object_to_array),
@@ -486,6 +608,12 @@ impl GateTally {
             repair_truncation_fixed = repairs.as_ref().map_or(0, |s| s.truncation_fixed),
             repair_invalid = repairs.as_ref().map_or(0, |s| s.invalid),
             repair_total_successful = repairs.as_ref().map_or(0, |s| s.total_successful()),
+            // dirge-61sv. `attempted` is the mechanism gate: zero means no
+            // transient read failure ever occurred, so any comparison of runs
+            // with and without the retry measured nothing. `recovered` is
+            // whether it earned the latency it spent.
+            tool_retries_attempted = retries.as_ref().map_or(0, |s| s.attempted),
+            tool_retries_recovered = retries.as_ref().map_or(0, |s| s.recovered),
         );
     }
 }
@@ -725,11 +853,79 @@ pub(crate) mod tests {
     #[test]
     fn tool_call_errors_are_counted_separately() {
         let mut tally = GateTally::new();
-        tally.record_tool_call(false);
-        tally.record_tool_call(false);
-        tally.record_tool_call(true);
+        tally.record_tool_call(None);
+        tally.record_tool_call(None);
+        tally.record_tool_call(Some(ErrorClass::Unclassified));
         assert_eq!(tally.tool_calls(), 3);
         assert_eq!(tally.errored_tool_calls(), 1);
+    }
+
+    /// dirge-s9ry: the total is the SUM of the split, so no sequence of calls
+    /// can make the two disagree. `errored_tool_calls` used to be its own
+    /// field, which is the shape that drifts.
+    #[test]
+    fn the_errored_total_is_exactly_the_class_split() {
+        let mut tally = GateTally::new();
+        for class in ErrorClass::ALL {
+            tally.record_tool_call(Some(class));
+        }
+        tally.record_tool_call(Some(ErrorClass::MissingInfo));
+        tally.record_tool_call(None);
+
+        let split = tally.errored_by_class();
+        assert_eq!(
+            tally.errored_tool_calls(),
+            split.iter().sum::<u32>(),
+            "total and split disagree"
+        );
+        assert_eq!(tally.errored_tool_calls(), ErrorClass::ALL.len() as u32 + 1);
+        assert_eq!(split[ErrorClass::MissingInfo.index()], 2);
+        assert_eq!(split[ErrorClass::Fatal.index()], 1);
+        assert_eq!(
+            tally.tool_calls(),
+            ErrorClass::ALL.len() as u32 + 2,
+            "the success counts toward the denominator and nothing else"
+        );
+    }
+
+    /// The emitted line must carry every class, for the same reason the gate
+    /// and nudge lines must: a counter that is recorded and never reported is
+    /// a signal nobody can act on (dirge-l8l7.1).
+    #[test]
+    fn every_error_class_has_a_field_on_the_emitted_line() {
+        let line = capture_emit(&GateTally::new());
+        let present = emitted_field_names(&line);
+        let missing: Vec<&str> = ErrorClass::ALL
+            .into_iter()
+            .map(ErrorClass::field_name)
+            .filter(|name| !present.contains(name))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "ErrorClass variants recorded but never emitted: {missing:?}\nline: {line}"
+        );
+    }
+
+    /// ...and each field carries ITS OWN class's count. All five reading the
+    /// same slot would satisfy the presence test above and report nothing.
+    #[test]
+    fn each_class_field_carries_its_own_count() {
+        let mut tally = GateTally::new();
+        // Distinct counts, so a field wired to the wrong slot shows up as a
+        // wrong number rather than coincidentally matching.
+        for (i, class) in ErrorClass::ALL.into_iter().enumerate() {
+            for _ in 0..=i {
+                tally.record_tool_call(Some(class));
+            }
+        }
+        let line = capture_emit(&tally);
+        for (i, class) in ErrorClass::ALL.into_iter().enumerate() {
+            let want = format!("{}={}", class.field_name(), i + 1);
+            assert!(
+                line.split_whitespace().any(|tok| tok == want),
+                "expected `{want}` on the line: {line}"
+            );
+        }
     }
 
     #[test]
@@ -745,6 +941,30 @@ pub(crate) mod tests {
 
         tally.set_verification(None);
         assert!(tally.final_verification.is_none());
+    }
+
+    /// dirge-e31n.8. Both tool-name miss counters must reach the line, and
+    /// they must reach it SEPARATELY: they measure failures that behave
+    /// nothing alike — one the model was told about, one nobody was told
+    /// about — and a report that merged them could not tell an alias table
+    /// working from a model simply retrying.
+    #[test]
+    fn both_tool_name_miss_counters_reach_the_emitted_line() {
+        let mut tally = GateTally::new();
+        tally.record_hallucinated_tool_name();
+        tally.record_dropped_unknown_name();
+        tally.record_dropped_unknown_name();
+        let line = capture_emit(&tally);
+        let present = emitted_field_names(&line);
+        for field in ["hallucinated_tool_names", "dropped_unknown_names"] {
+            assert!(present.contains(field), "{field} not emitted\nline: {line}");
+        }
+        // Distinct values, so a line that emitted one counter twice — the
+        // copy-paste this whole family of bugs is made of — fails here.
+        assert!(
+            line.contains("hallucinated_tool_names=1") && line.contains("dropped_unknown_names=2"),
+            "counters crossed or miscounted\nline: {line}"
+        );
     }
 
     #[test]

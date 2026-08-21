@@ -230,6 +230,21 @@ impl MicrovmSandbox {
             self.config.ssh_port
         };
 
+        // Fail here rather than after the SSH timeout. A runner built without
+        // libkrun is a stub: spawning it succeeds, it prints an explanation and
+        // exits, and the boot we're about to wait on never happens
+        // (dirge-vadg). This binary and the runner come out of the same
+        // build-script run, so `krun_linked` describes the one we're about to
+        // spawn.
+        if !cfg!(krun_linked) {
+            anyhow::bail!(
+                "dirge-microvm-runner was built without libkrun and cannot boot a VM — \
+                 install libkrun and rebuild with --features sandbox-microvm \
+                 (macOS: brew tap libkrun/krun && brew trust libkrun/krun && \
+                 brew install libkrun libkrunfw), or use --sandbox bwrap"
+            );
+        }
+
         let binary = runner::find_runner_binary()?;
         #[cfg(target_os = "macos")]
         ensure_runner_signed(&binary)?;

@@ -231,6 +231,8 @@ fn test_poisoned_mutex_recovery_pattern() {
 fn test_filter_existing_dirs() {
     use std::path::PathBuf;
     let tmp = std::env::temp_dir().join(format!("dirge-plugin-test-{}", std::process::id()));
+    // dirge-m1ni: clear first — the name is keyed on a recyclable pid.
+    let _ = std::fs::remove_dir_all(&tmp);
     let _ = std::fs::create_dir_all(&tmp);
     let exists = tmp.clone();
     let missing = tmp.join("does-not-exist");
@@ -791,6 +793,55 @@ fn test_notify_default_level_is_info() {
     let pending = mgr.drain_notifications();
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].0, "info");
+}
+
+/// dirge-vpma.32: a multiline notification must arrive whole.
+///
+/// `harness/notify` wrote `level\tmsg\n` without escaping, unlike every other
+/// tab-separated harness blob. The drain splits on newlines and skips lines
+/// with no tab, so everything after the first newline was silently lost —
+/// "build failed:\nsee log" showed only "build failed:".
+#[cfg(feature = "plugin")]
+#[test]
+fn test_notify_keeps_a_multiline_message_whole() {
+    let mut mgr = PluginManager::try_new().unwrap();
+    mgr.eval("(harness/notify \"build failed:\\nsee log\" :error)")
+        .unwrap();
+    let pending = mgr.drain_notifications();
+    assert_eq!(
+        pending,
+        vec![("error".to_string(), "build failed:\nsee log".to_string())],
+        "the tail after the newline was dropped"
+    );
+}
+
+/// The other half, and the reason this is not cosmetic: an unescaped newline
+/// let a message forge a SECOND entry with a level of its choosing. A plugin
+/// reporting an :info could stamp an "error" into the host's notification
+/// stream, or a tool result echoed into a notify could.
+#[cfg(feature = "plugin")]
+#[test]
+fn test_notify_cannot_forge_a_second_entry_with_a_spoofed_level() {
+    let mut mgr = PluginManager::try_new().unwrap();
+    mgr.eval("(harness/notify \"benign\\nerror\\tdisk is on fire\" :info)")
+        .unwrap();
+    let pending = mgr.drain_notifications();
+    assert_eq!(pending.len(), 1, "payload minted an entry: {pending:?}");
+    assert_eq!(pending[0].0, "info", "payload chose its own level");
+    assert_eq!(pending[0].1, "benign\nerror\tdisk is on fire");
+}
+
+/// A tab inside a message must not split it into level and body either.
+#[cfg(feature = "plugin")]
+#[test]
+fn test_notify_keeps_an_embedded_tab() {
+    let mut mgr = PluginManager::try_new().unwrap();
+    mgr.eval("(harness/notify \"col1\\tcol2\" :warn)").unwrap();
+    let pending = mgr.drain_notifications();
+    assert_eq!(
+        pending,
+        vec![("warn".to_string(), "col1\tcol2".to_string())]
+    );
 }
 
 /// Non-string msg silently drops instead of crashing the plugin.
@@ -2582,10 +2633,60 @@ fn dispatch_dedupes_consecutive_identical_hook_errors() {
         combined.contains("always the same"),
         "msg dropped: {combined}",
     );
-    // The repeat-count summary must mention the number.
+    // dirge-vpma.33: 50 occurrences is ONE displayed banner plus 49
+    // coalesced, so the summary reads 49. This assertion used to demand "50",
+    // which was written down from the buggy output and made the off-by-one the
+    // contract — the Rust-side comment on the flush has always said 49.
     assert!(
-        combined.contains("repeated") && combined.contains("50"),
-        "expected repeat-count summary mentioning 50; got: {combined}",
+        combined.contains("(repeated 49 times)"),
+        "expected the 49 that were actually coalesced; got: {combined}",
+    );
+}
+
+/// dirge-vpma.33 in the small: the first occurrence is pushed and displayed,
+/// so the summary counts the ones that were NOT shown.
+///
+/// Three identical errors is one banner plus two suppressed. Three is chosen
+/// over two so an off-by-one cannot coincide with the total.
+#[test]
+fn hook_error_repeat_count_excludes_the_one_already_shown() {
+    let mut mgr = PluginManager::try_new().unwrap();
+    for _ in 0..3 {
+        mgr.eval(r#"(harness/push-hook-err "boom")"#).unwrap();
+    }
+    let pending = mgr.drain_notifications();
+    assert_eq!(
+        pending,
+        vec![
+            ("error".to_string(), "boom".to_string()),
+            ("error".to_string(), "boom (repeated 2 times)".to_string()),
+        ],
+        "3 occurrences = 1 shown + 2 coalesced"
+    );
+}
+
+/// A single occurrence must not produce a summary at all.
+#[test]
+fn a_lone_hook_error_gets_no_repeat_summary() {
+    let mut mgr = PluginManager::try_new().unwrap();
+    mgr.eval(r#"(harness/push-hook-err "once")"#).unwrap();
+    let pending = mgr.drain_notifications();
+    assert_eq!(pending, vec![("error".to_string(), "once".to_string())]);
+}
+
+/// dirge-vpma.32: hook errors share the notif blob, so they need the same
+/// escaping. A Windows path or a Rust debug string carries backslashes, and
+/// `sanitize-hook-err` only rewrites newlines and tabs — unescaping on drain
+/// without escaping on write would turn `C:\temp` into a tab.
+#[test]
+fn a_hook_error_keeps_its_backslashes() {
+    let mut mgr = PluginManager::try_new().unwrap();
+    mgr.eval(r#"(harness/push-hook-err "cannot open C:\temp\build")"#)
+        .unwrap();
+    let pending = mgr.drain_notifications();
+    assert_eq!(
+        pending,
+        vec![("error".to_string(), r"cannot open C:	empuild".to_string())]
     );
 }
 
@@ -2659,6 +2760,8 @@ fn dispatch_chat_surfaces_hook_errors_via_notification_queue() {
 #[test]
 fn load_plugin_supports_directory_of_files() {
     let dir = std::env::temp_dir().join(format!("dirge-multifile-{}", std::process::id()));
+    // dirge-m1ni: clear first — the name is keyed on a recyclable pid.
+    let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("00-state.janet"), r#"(var shared-counter 0)"#).unwrap();
     std::fs::write(
@@ -3041,4 +3144,259 @@ fn validate_all_plugins_compile() {
     }
 
     assert!(count >= 20, "expected at least 20 plugins, found {count}");
+}
+
+// ── dirge-8gdv.10 seam 4: hook timeout fail-open + two-plugin load ──────────
+
+// NOTE: the obvious test here — a hook running `(while true ...)`, asserting
+// the dispatch returns on the HOOK_TIMEOUT budget — is deliberately absent.
+// It hangs the suite. `eval_with_timeout` bounds the CALLER's wait, but a
+// tight Janet loop keeps the worker thread spinning forever, so every later
+// eval (including the drain this test would assert on) queues behind it and
+// never returns. That worker-lifecycle gap is dirge-ntjh, which is open and
+// deliberately deferred as permission-gate-adjacent; writing a test that
+// depends on recovery would just encode the broken behaviour. The two tests
+// below cover what the dispatch loop actually guarantees today: an erroring
+// plugin does not stop the ones after it, and two separately loaded plugins
+// both land on the hook.
+
+/// Two plugins LOADED from separate files both end up on the same hook.
+///
+/// Distinct from `dispatch_tool_hook_runs_all_when_no_block`, which registers
+/// by hand: this drives the loader's auto-discovery, the path where dirge-awwr
+/// found earlier plugins' bare hooks being re-registered under later stems.
+#[cfg(feature = "plugin")]
+#[test]
+fn two_loaded_plugins_both_register_on_the_same_hook() {
+    let first = tmpfile(
+        "seam4-a",
+        r#"(defn on-tool-start [ctx] (harness/notify "a-ran" :info))"#,
+    );
+    let second = tmpfile(
+        "seam4-b",
+        r#"(defn on-tool-start [ctx] (harness/notify "b-ran" :info))"#,
+    );
+    let mut mgr = PluginManager::try_new().unwrap();
+    super::load_plugin(&mut mgr, &first).unwrap();
+    super::load_plugin(&mut mgr, &second).unwrap();
+    let _ = std::fs::remove_file(&first);
+    let _ = std::fs::remove_file(&second);
+
+    let registered = mgr.hooks.get("on-tool-start").cloned().unwrap_or_default();
+    assert_eq!(
+        registered.len(),
+        2,
+        "both plugins must be on the hook, got {registered:?}",
+    );
+    mgr.dispatch_tool_hook("on-tool-start", "@{}").unwrap();
+    let msgs: Vec<String> = mgr
+        .drain_notifications()
+        .into_iter()
+        .map(|(_, m)| m)
+        .collect();
+    // The second file's definition shadows the first in one Janet env, so
+    // what matters here is that BOTH registrations fire a handler rather
+    // than one silently dropping out.
+    assert_eq!(msgs.len(), 2, "both registrations must run: {msgs:?}");
+}
+
+/// A throwing hook is caught, surfaced, and the next plugin still runs.
+#[cfg(feature = "plugin")]
+#[test]
+fn a_throwing_hook_does_not_prevent_the_next_plugin() {
+    let mut mgr = PluginManager::try_new().unwrap();
+    mgr.eval(r#"(defn boom [ctx] (error "kaboom"))"#).unwrap();
+    mgr.eval(r#"(defn fine [ctx] (harness/notify "still-ran" :info))"#)
+        .unwrap();
+    mgr.register("on-tool-start", "boom");
+    mgr.register("on-tool-start", "fine");
+
+    mgr.dispatch_tool_hook("on-tool-start", "@{}")
+        .expect("a throwing hook must not fail the dispatch");
+    let msgs: Vec<String> = mgr
+        .drain_notifications()
+        .into_iter()
+        .map(|(l, m)| format!("{l}:{m}"))
+        .collect();
+    assert!(
+        msgs.iter().any(|m| m.contains("still-ran")),
+        "the second plugin was skipped: {msgs:?}",
+    );
+    assert!(
+        msgs.iter().any(|m| m.contains("kaboom")),
+        "the error was swallowed instead of surfaced: {msgs:?}",
+    );
+}
+
+// --- notebook plugin, end to end (dirge-9xjg.4) -----------------------
+
+/// Load the real `plugins/notebook` directory into a fresh manager.
+#[cfg(feature = "plugin")]
+fn load_notebook_plugin() -> PluginManager {
+    let mut mgr = PluginManager::try_new().expect("plugin manager");
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins/notebook");
+    let loaded = super::load_plugin(&mut mgr, &dir).expect("load plugins/notebook");
+    assert!(
+        loaded.files.len() >= 3,
+        "expected the whole directory to load, got {:?}",
+        loaded.files
+    );
+    mgr
+}
+
+/// The headline behaviour, through the REAL path the model uses: two
+/// separate tool calls, and the second sees what the first defined.
+///
+/// Everything below it is unit-tested in isolation; this is the one test
+/// that proves the pieces are actually connected — plugin -> bridge cfn ->
+/// notebook VM -> session env -> capture -> back.
+#[test]
+#[cfg(feature = "plugin")]
+fn notebook_tool_state_persists_across_tool_calls() {
+    let mut mgr = load_notebook_plugin();
+    let session = "e2e-persist";
+    let _ = mgr.invoke_plugin_tool(
+        "notebook-reset-handler",
+        &format!(r#"{{"session":"{session}"}}"#),
+        "tc-reset",
+    );
+
+    let first = mgr
+        .invoke_plugin_tool(
+            "notebook-eval-handler",
+            &format!(r#"{{"code":"(def carried 41)","session":"{session}"}}"#),
+            "tc-1",
+        )
+        .expect("first cell");
+    assert!(first.contains("=> 41"), "unexpected: {first}");
+
+    let second = mgr
+        .invoke_plugin_tool(
+            "notebook-eval-handler",
+            &format!(r#"{{"code":"(+ carried 1)","session":"{session}"}}"#),
+            "tc-2",
+        )
+        .expect("second cell");
+    assert!(
+        second.contains("=> 42"),
+        "state did not survive between tool calls: {second}"
+    );
+}
+
+/// Printed output has to come back, or the notebook cannot be used the
+/// way the skill prompt tells the model to use it.
+#[test]
+#[cfg(feature = "plugin")]
+fn notebook_tool_returns_printed_output() {
+    let mut mgr = load_notebook_plugin();
+    let out = mgr
+        .invoke_plugin_tool(
+            "notebook-eval-handler",
+            r#"{"code":"(print \"intermediate\") :final","session":"e2e-print"}"#,
+            "tc-print",
+        )
+        .unwrap();
+    assert!(out.contains("intermediate"), "print output lost: {out}");
+    assert!(out.contains("=> :final"), "value lost: {out}");
+}
+
+/// Unbalanced delimiters are the commonest way an LLM-written cell fails,
+/// so they are repaired before eval and the repair is reported (silently
+/// changing the code the model wrote would be worse than the error).
+#[test]
+#[cfg(feature = "plugin")]
+fn notebook_tool_repairs_unbalanced_delimiters() {
+    let mut mgr = load_notebook_plugin();
+    let out = mgr
+        .invoke_plugin_tool(
+            "notebook-eval-handler",
+            r#"{"code":"(+ 1 2","session":"e2e-repair"}"#,
+            "tc-repair",
+        )
+        .unwrap();
+    assert!(
+        out.contains("=> 3"),
+        "repair did not produce valid code: {out}"
+    );
+    assert!(
+        out.contains("repaired unbalanced delimiters"),
+        "repair not reported: {out}"
+    );
+}
+
+/// A cell that raises must come back as a readable result, not as a tool
+/// error and not as a lost turn.
+#[test]
+#[cfg(feature = "plugin")]
+fn notebook_tool_reports_a_raising_cell_readably() {
+    let mut mgr = load_notebook_plugin();
+    let out = mgr
+        .invoke_plugin_tool(
+            "notebook-eval-handler",
+            r#"{"code":"(error \"cell blew up\")","session":"e2e-err"}"#,
+            "tc-err",
+        )
+        .expect("a raising cell is a result, not a host failure");
+    assert!(out.contains("ERROR:"), "{out}");
+    assert!(out.contains("cell blew up"), "{out}");
+}
+
+/// The agent's own recovery path. Without it a poisoned binding needs an
+/// operator, which the model cannot ask for mid-run.
+#[test]
+#[cfg(feature = "plugin")]
+fn notebook_tool_session_reset_clears_state() {
+    let mut mgr = load_notebook_plugin();
+    let session = "e2e-reset";
+    mgr.invoke_plugin_tool(
+        "notebook-eval-handler",
+        &format!(r#"{{"code":"(def poisoned :bad)","session":"{session}"}}"#),
+        "tc-a",
+    )
+    .unwrap();
+    let reset = mgr
+        .invoke_plugin_tool(
+            "notebook-reset-handler",
+            &format!(r#"{{"session":"{session}"}}"#),
+            "tc-b",
+        )
+        .unwrap();
+    assert!(reset.contains("cleared"), "{reset}");
+
+    let after = mgr
+        .invoke_plugin_tool(
+            "notebook-eval-handler",
+            &format!(r#"{{"code":"poisoned","session":"{session}"}}"#),
+            "tc-c",
+        )
+        .unwrap();
+    assert!(
+        after.contains("ERROR:"),
+        "state survived the reset: {after}"
+    );
+}
+
+/// The tools have to reach the model with the persistence contract in
+/// their description — the whole behavioural shift depends on the model
+/// reading it, so an empty or generic description is a silent failure.
+#[test]
+#[cfg(feature = "plugin")]
+fn notebook_tools_are_registered_with_a_persistence_contract() {
+    let mut mgr = load_notebook_plugin();
+    let tools = mgr.list_plugin_tools();
+    let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+    assert!(names.contains(&"notebook_eval"), "got {names:?}");
+    assert!(names.contains(&"notebook_reset"), "got {names:?}");
+
+    let eval = tools.iter().find(|t| t.name == "notebook_eval").unwrap();
+    assert!(
+        eval.description.contains("PERSISTENT") && eval.description.contains("survives"),
+        "description does not state that state persists: {}",
+        eval.description
+    );
+    assert!(
+        eval.description.contains("session"),
+        "description does not explain session scoping: {}",
+        eval.description
+    );
 }

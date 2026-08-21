@@ -116,6 +116,26 @@ fn language_for_path(path: &Path) -> Option<tree_sitter::Language> {
         #[cfg(feature = "semantic-bash")]
         "sh" | "bash" => Some(tree_sitter_bash::LANGUAGE.into()),
 
+        // GH #778. Registered here only after checking what this gate actually
+        // costs if the grammar is wrong: it is a write-time HARD block, so a
+        // grammar that reports valid code as ERROR leaves the agent unable to
+        // save it — the reason `.sql` is excluded below. `tree-sitter-swift`
+        // was measured against async/await, actors, generics with `where`,
+        // property wrappers, result builders, `@main`, multi-line strings,
+        // custom operators, subscripts and enums with associated values, and
+        // reported errors on none of them. See
+        // `the_swift_grammar_accepts_modern_swift`.
+        #[cfg(feature = "semantic-swift")]
+        "swift" => Some(tree_sitter_swift::LANGUAGE.into()),
+
+        // NOTE: `.mojo`/`.🔥` are deliberately NOT registered here despite
+        // the semantic-mojo adapter. Measured against 800 real files from the
+        // modular repo, the grammar false-errors on ~10% of them — see the
+        // `mojo`/`🔥` entries in GATE_EXCLUSIONS and
+        // `the_mojo_grammar_rejects_real_world_constructs`. Mojo writes still
+        // get the delimiter-balance scan via `lex_rules_for_path`, which
+        // shares Python's lexical rules.
+
         // NOTE: `.sql` is deliberately NOT registered here. This gate is a
         // write-time HARD block (`syntax_gate` → tool error on parse error),
         // and the generic tree-sitter-sequel grammar reports mainstream,
@@ -432,7 +452,11 @@ fn lex_rules_for_path(path: &Path) -> Option<&'static LexRules> {
         "c" | "h" | "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" => &RULES_C,
         "go" => &RULES_GO,
         "java" => &RULES_JAVA,
-        "py" | "pyi" => &RULES_PYTHON,
+        // Mojo's lexical grammar matches Python's here: `#` comments,
+        // the same string forms. For Mojo this is the PRIMARY write
+        // check — the tree-sitter grammar is kept off the hard gate
+        // (see the `mojo` GATE_EXCLUSIONS entry).
+        "py" | "pyi" | "mojo" | "🔥" => &RULES_PYTHON,
         // Clojure family + Fennel.
         "clj" | "cljs" | "cljc" | "cljd" | "edn" | "bb" | "fnl" => &RULES_LISP,
         // Janet + Janet Data Notation (`#` comments, backtick long-strings).
@@ -1711,6 +1735,328 @@ int main(void) {
         assert!(
             repair_delimiters(&path, src).is_some(),
             "an earlier nested column-1 opener is irrelevant to an EOF close"
+        );
+    }
+}
+
+/// Adapter extensions this gate deliberately does NOT block on, with the
+/// reason (GH #778, dirge-3cfq).
+///
+/// The gate keeps its own extension→grammar table, separate from the adapter
+/// registry, and there is no way to notice a language present in one and
+/// absent from the other — that is how `.swift` shipped with a semantic
+/// adapter and no gate coverage. Silence is not a decision, so anything
+/// omitted has to be named here.
+///
+/// Omission is often the RIGHT call: this gate is a hard write block, so a
+/// grammar that reports valid code as an error leaves the agent unable to save
+/// it. The bar for adding an extension is evidence that the grammar accepts
+/// real code in that language, not merely that a grammar exists.
+#[cfg(test)]
+const GATE_EXCLUSIONS: &[(&str, &str)] = &[
+    (
+        "sql",
+        "tree-sitter-sequel reports valid CREATE PROCEDURE and all of T-SQL as \
+         ERROR; blocking those writes leaves no recourse. Indexed by SqlAdapter, \
+         which tolerates parse errors instead.",
+    ),
+    (
+        "ex",
+        "not assessed — no measurement of the Elixir grammar's false-error rate \
+         on real code, and a hard block on a guess is worse than no block.",
+    ),
+    ("exs", "see .ex"),
+    (
+        "heex",
+        "see .ex — templating dialect, likelier still to false-error.",
+    ),
+    (
+        "dfy",
+        "not assessed — same reason as .ex. Dafny files are also verified by the \
+         language server, which reports proof failures the gate could not.",
+    ),
+    (
+        "h",
+        "contested between C and C++ — the C adapter claims it for indexing, but \
+         C++ in a .h is ordinary, and tree-sitter-c reports templates and classes \
+         as errors. On a hard write block that would refuse valid headers, so .h \
+         stays indexed-but-ungated. `.hpp`/`.hh`/`.hxx` ARE gated, via the C++ \
+         grammar.",
+    ),
+    (
+        "ixx",
+        "C++20 module interface unit, and tree-sitter-cpp 0.23 has no module \
+         grammar at all — `export module M;` and `import std;` parse as ERROR. \
+         Gating it would hard-block writes to every valid .ixx. Indexed by \
+         CppAdapter, which only warns on parse errors. See \
+         `the_cpp_grammar_does_not_understand_modules`; when the grammar gains \
+         module support that test fails and .ixx can move onto the gate.",
+    ),
+    (
+        "mojo",
+        "measured: tree-sitter-mojo false-errors on ~10% of 800 real files \
+         from the modular repo (`@__llvm_metadata` decorators, function-type \
+         parametrics with intersection types, `(var x) = …` patterns — all \
+         valid Mojo in production kernels and the stdlib test suite). On a \
+         hard write block that would refuse valid Mojo with no recourse. \
+         Indexed by MojoAdapter, which only warns on parse errors; writes get \
+         the Python-rules delimiter scan instead. See \
+         `the_mojo_grammar_rejects_real_world_constructs`.",
+    ),
+    ("🔥", "see .mojo"),
+];
+
+#[cfg(test)]
+mod gate_coverage {
+    use super::*;
+
+    /// Every extension a semantic adapter claims is either blocked by this gate
+    /// or listed in [`GATE_EXCLUSIONS`] with a reason. Derived from the adapter
+    /// registry, so a new language cannot be half-wired in silence.
+    #[test]
+    fn every_adapter_extension_is_gated_or_explicitly_excluded() {
+        let registry = crate::semantic::adapters::AdapterRegistry::new(
+            crate::semantic::adapters::default_adapters(),
+        );
+        for ext in registry.all_extensions() {
+            let probe = std::path::PathBuf::from(format!("probe.{ext}"));
+            if language_for_path(&probe).is_some() {
+                continue;
+            }
+            assert!(
+                GATE_EXCLUSIONS.iter().any(|(e, _)| *e == ext),
+                "{ext} has a semantic adapter but no syntax-gate grammar and no \
+                 entry in GATE_EXCLUSIONS — decide which it is and say why"
+            );
+        }
+    }
+
+    /// The exclusions list must not go stale in the other direction: an entry
+    /// for an extension no adapter claims is a note about nothing.
+    #[test]
+    fn every_exclusion_names_a_real_adapter_extension() {
+        let registry = crate::semantic::adapters::AdapterRegistry::new(
+            crate::semantic::adapters::default_adapters(),
+        );
+        let claimed = registry.all_extensions();
+        for (ext, _) in GATE_EXCLUSIONS {
+            assert!(
+                claimed.iter().any(|e| e == *ext),
+                "GATE_EXCLUSIONS lists {ext}, which no adapter claims"
+            );
+        }
+    }
+
+    /// The evidence behind registering `.swift` on a HARD block. If the grammar
+    /// ever regresses on one of these, the gate starts refusing valid Swift and
+    /// this says so before a user finds out.
+    #[cfg(feature = "semantic-swift")]
+    #[test]
+    fn the_swift_grammar_accepts_modern_swift() {
+        let cases: &[(&str, &str)] = &[
+            (
+                "async/await",
+                "func f() async throws -> Int { try await g() }",
+            ),
+            (
+                "generics with where",
+                "func f<T: Equatable>(_ a: T, b: T) -> Bool where T: Hashable { a == b }",
+            ),
+            (
+                "property wrappers",
+                "struct V { @State private var x = 0\n @Published var y: Int = 1 }",
+            ),
+            (
+                "result builder",
+                "@ViewBuilder func body() -> some View { Text(\"a\"); Text(\"b\") }",
+            ),
+            (
+                "actor",
+                "actor Counter { private var n = 0\n func inc() { n += 1 } }",
+            ),
+            (
+                "guard and optionals",
+                "func f(x: Int?) { guard let y = x else { return }\n print(y ?? 0) }",
+            ),
+            (
+                "closures",
+                "let f = { (a: Int) -> Int in a * 2 }\nlist.map { $0 + 1 }",
+            ),
+            (
+                "enum with associated values",
+                "enum E { case a(Int), b(String)\n var v: Int { switch self { case .a(let i): return i\n case .b: return 0 } } }",
+            ),
+            (
+                "constrained protocol extension",
+                "protocol P { associatedtype T }\nextension P where T == Int { func z() {} }",
+            ),
+            ("@main", "@main struct App { static func main() {} }"),
+            (
+                "string interpolation and multiline",
+                "let s = \"a \\(b) c\"\nlet m = \"\"\"\nmulti\n\"\"\"",
+            ),
+            (
+                "subscript and custom operator",
+                "struct M { subscript(i: Int) -> Int { 0 } }\ninfix operator <>: AdditionPrecedence",
+            ),
+        ];
+        let lang: tree_sitter::Language = tree_sitter_swift::LANGUAGE.into();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&lang).expect("swift grammar loads");
+        let mut rejected = Vec::new();
+        for (name, src) in cases {
+            let tree = parser.parse(src, None).expect("parses");
+            if tree.root_node().has_error() {
+                rejected.push(*name);
+            }
+        }
+        assert!(
+            rejected.is_empty(),
+            "the gate is a hard write block and the grammar rejects valid Swift: {rejected:?}"
+        );
+    }
+
+    /// Half the evidence behind keeping `.mojo`/`.🔥` OFF the gate (the
+    /// GATE_EXCLUSIONS entry): the grammar handles core Mojo 1.0 — so the
+    /// MojoAdapter's *indexing* is trustworthy — but "handles the basics" is
+    /// not the gate's bar. The other half is
+    /// `the_mojo_grammar_rejects_real_world_constructs` below: measured
+    /// against 800 real files from the modular repo it false-errors on ~10%,
+    /// and a hard write block that refuses one valid file in ten leaves the
+    /// agent with no recourse. If THIS test starts failing the adapter's
+    /// index quality is degrading, which is worth knowing even off the gate.
+    #[cfg(feature = "semantic-mojo")]
+    #[test]
+    fn the_mojo_grammar_accepts_core_mojo_1_0() {
+        let cases: &[(&str, &str)] = &[
+            (
+                "fn with parametrics and raises",
+                "fn add[T: Intable](a: T, b: T) raises -> Int:\n    return Int(a) + Int(b)\n",
+            ),
+            (
+                "struct with conformances and __init__(out self)",
+                "struct Pair(Copyable, Movable):\n    var first: Int\n    var second: Int\n\n    fn __init__(out self, first: Int, second: Int):\n        self.first = first\n        self.second = second\n",
+            ),
+            (
+                "trait with default method",
+                "trait Shape:\n    fn area(self) -> Float64:\n        ...\n",
+            ),
+            (
+                "comptime parameterized alias",
+                "comptime Vec[dt: DType, width: Int] = SIMD[dt, width]\n",
+            ),
+            ("bare comptime binding", "comptime block_size = 16\n"),
+            (
+                "decorated struct",
+                "@fieldwise_init\nstruct Point(Copyable):\n    var x: Int\n    var y: Int\n",
+            ),
+            (
+                "register_passable",
+                "@register_passable(\"trivial\")\nstruct Handle:\n    var id: Int\n",
+            ),
+            (
+                "generic fn with where clause",
+                "fn clamp[T: Comparable](x: T, lo: T, hi: T) -> T where conforms_to(T, Comparable):\n    return x\n",
+            ),
+            (
+                "mut and var argument conventions",
+                "fn bump(mut x: Int, var s: String) -> String:\n    x += 1\n    return s^\n",
+            ),
+            (
+                "ref return and origins",
+                "fn first[T: Copyable](ref xs: List[T]) -> ref [xs] T:\n    return xs[0]\n",
+            ),
+            (
+                "comptime if statement",
+                "fn pick[cond: Bool]() -> Int:\n    comptime if cond:\n        return 1\n    else:\n        return 2\n",
+            ),
+            (
+                "for loop and python-style def",
+                "def total(xs: List[Int]) -> Int:\n    var acc = 0\n    for x in xs:\n        acc += x\n    return acc\n",
+            ),
+            (
+                "imports",
+                "from collections import Dict\nimport math\nfrom python import Python as py\n",
+            ),
+            (
+                "extension",
+                "__extension List[T]:\n    fn total_len(self) -> Int:\n        return len(self)\n",
+            ),
+        ];
+        let lang: tree_sitter::Language = crate::semantic::mojo_grammar::LANGUAGE.into();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&lang).expect("mojo grammar loads");
+        let mut rejected = Vec::new();
+        for (name, src) in cases {
+            let tree = parser.parse(src, None).expect("parses");
+            if tree.root_node().has_error() {
+                rejected.push(*name);
+            }
+        }
+        assert!(
+            rejected.is_empty(),
+            "the Mojo grammar regressed on core Mojo 1.0 — MojoAdapter index \
+             quality is degrading: {rejected:?}"
+        );
+    }
+
+    /// The evidence behind keeping `.mojo`/`.🔥` OFF the gate, boiled down to
+    /// the constructs the grammar actually failed on in the modular repo
+    /// (each valid Mojo, in production kernels / the stdlib test suite). When
+    /// the grammar learns one of these this test fails — that is the signal
+    /// to re-measure the false-error rate on a real Mojo codebase and, if it
+    /// has fallen to ~zero, drop the `mojo`/`🔥` GATE_EXCLUSIONS entries and
+    /// register the grammar in `language_for_path`.
+    #[cfg(feature = "semantic-mojo")]
+    #[test]
+    fn the_mojo_grammar_rejects_real_world_constructs() {
+        let cases: &[(&str, &str)] = &[
+            (
+                "llvm_metadata decorator with backtick identifier",
+                "@__llvm_metadata(`rocdl.waves_per_eu`=SIMDLength(2))\nfn kernel():\n    pass\n",
+            ),
+            (
+                "function-type parameter with intersection type",
+                "fn apply[TileFn: ImplicitlyCopyable & (def[ws: Int, _r: Int](IndexList[_r]) -> None)]():\n    pass\n",
+            ),
+            (
+                "parenthesized var binding pattern",
+                "def f():\n    (var list) = [a + b for a, b in [(1, 2), (3, 4)]]\n",
+            ),
+        ];
+        let lang: tree_sitter::Language = crate::semantic::mojo_grammar::LANGUAGE.into();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&lang).expect("mojo grammar loads");
+        for (name, src) in cases {
+            let tree = parser.parse(src, None).expect("parses");
+            assert!(
+                tree.root_node().has_error(),
+                "tree-sitter-mojo now parses `{name}` — re-measure its \
+                 false-error rate on a real Mojo codebase; if it's ~zero, \
+                 move .mojo/.🔥 off GATE_EXCLUSIONS and onto the gate"
+            );
+        }
+    }
+
+    /// The evidence behind keeping `.ixx` OFF the gate. A module interface unit
+    /// is ordinary C++ except for the two declarations that make it one, and
+    /// tree-sitter-cpp 0.23 knows neither — so the gate would refuse every valid
+    /// `.ixx`. If a grammar bump makes this pass, drop the `ixx` entry from
+    /// [`GATE_EXCLUSIONS`] and let the gate have it.
+    #[cfg(feature = "semantic-cpp")]
+    #[test]
+    fn the_cpp_grammar_does_not_understand_modules() {
+        let lang: tree_sitter::Language = tree_sitter_cpp::LANGUAGE.into();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&lang).expect("cpp grammar loads");
+        let module_unit = "export module math;\n\
+                           import std;\n\
+                           export int add(int a, int b) { return a + b; }\n";
+        let tree = parser.parse(module_unit, None).expect("parses");
+        assert!(
+            tree.root_node().has_error(),
+            "tree-sitter-cpp now parses module declarations — .ixx no longer \
+             needs a GATE_EXCLUSIONS entry"
         );
     }
 }

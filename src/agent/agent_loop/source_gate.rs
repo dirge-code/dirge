@@ -221,7 +221,7 @@ fn has_exclusion(lower: &str) -> bool {
     // A reference to another file in the repo.
     const FILE_TOKENS: &[&str] = &[
         ".rs", ".md", ".toml", ".json", ".yaml", ".yml", ".txt", ".nix", ".sh", ".py", ".ts",
-        "src/", "docs/", "./", "../", "agends", "readme",
+        ".mojo", "src/", "docs/", "./", "../", "agends", "readme",
     ];
     FILE_TOKENS.iter().any(|t| lower.contains(t))
 }

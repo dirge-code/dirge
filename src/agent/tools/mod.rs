@@ -693,7 +693,14 @@ async fn handle_ask_inner(
         })
         .await
         .map_err(|_| ToolError::Msg("Permission system unavailable".to_string()))?;
-    match reply_rx.await {
+    // dirge-8cbm: this wait is inside `LoopTool::execute`, which the
+    // dispatch watchdog bounds. Mark it so the budget does not run while
+    // the user is reading the command they were asked to approve.
+    let decision = {
+        let _waiting = crate::human_wait::HumanWait::begin();
+        reply_rx.await
+    };
+    match decision {
         Ok(UserDecision::AllowOnce) => Ok(()),
         Ok(UserDecision::AllowAlways(pattern)) => {
             permission
@@ -1510,6 +1517,50 @@ mod tests {
     /// F2 (dirge-jlj): `enforce(write, ...)` MUST also consult the
     /// `edit` rules. A user writing `edit: { "**": "deny" }`
     /// blocks `write` AND `apply_patch` too — matching opencode's
+    /// dirge-8cbm: the WIRING, not the mechanism. `HumanWait` is what
+    /// stops the dispatch watchdog cutting a tool call while the user
+    /// reads the command they were asked to approve, and it is worth
+    /// nothing if the permission path forgets to use it. The prompt
+    /// here is live and unanswered — exactly the stretch the watchdog
+    /// must not count.
+    #[tokio::test]
+    async fn a_pending_permission_prompt_marks_the_call_as_waiting_on_a_person() {
+        let _gate = crate::human_wait::TEST_GATE.lock().await;
+        let config = PermissionConfig {
+            rules: vec![rule(OpSpec::Execute, "**", Action::Ask)],
+            ..Default::default()
+        };
+        let perm: PermCheck = Arc::new(Mutex::new(PermissionChecker::new(
+            &config,
+            SecurityMode::Standard,
+            Some(std::path::PathBuf::from("/tmp")),
+        )));
+        let (ask_tx, mut ask_rx) = tokio::sync::mpsc::channel(1);
+        assert!(
+            !crate::human_wait::anyone_waiting(),
+            "another test is mid-prompt: {}",
+            crate::human_wait::holders()
+        );
+
+        let asking = tokio::spawn(async move {
+            enforce(&Some(perm), &Some(ask_tx), "bash", Scope::Raw("rm -rf /")).await
+        });
+        let req = ask_rx.recv().await.expect("the tool must prompt");
+        assert!(
+            crate::human_wait::anyone_waiting(),
+            "the permission path waited on the user without marking it"
+        );
+
+        let _ = req
+            .reply
+            .send(crate::permission::ask::UserDecision::AllowOnce);
+        let _ = asking.await.expect("join");
+        assert!(
+            !crate::human_wait::anyone_waiting(),
+            "the mark must clear once the user decides"
+        );
+    }
+
     /// `EDIT_TOOLS` aliasing.
     #[tokio::test]
     async fn enforce_write_aliases_to_edit_deny() {

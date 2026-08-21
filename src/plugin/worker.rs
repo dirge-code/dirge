@@ -18,11 +18,27 @@ use std::cell::RefCell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
+
+/// dirge-2jtd: marks a value that is really an ev-path error.
+///
+/// Long and unlikely on purpose. A plugin that deliberately returned this exact
+/// prefix would be misreported as failing — accepted, because the alternative
+/// (a second round trip to read a status variable on every eval) taxes hook
+/// dispatch, which is on the hot path.
+///
+/// Its only use is in the `Cmd::Eval` handler, which is plugin-gated, so
+/// feature sets without `plugin` (windows-default among them) see it as dead —
+/// same treatment as the rest of this module.
+#[cfg_attr(not(feature = "plugin"), allow(dead_code))]
+const EV_ERROR_SENTINEL: &str = "__dirge_ev_error_9f3a__";
+
 #[cfg_attr(not(feature = "plugin"), allow(unused_imports))]
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use tokio::sync::mpsc as tmpsc;
+
+use super::interrupt::InterruptHandle;
 
 /// How long the init handshake waits for the worker to confirm Janet
 /// initialization before giving up. Worker init is normally well under
@@ -83,6 +99,18 @@ const INTERACTIVE_EVAL_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg_attr(not(feature = "plugin"), allow(dead_code))]
 const JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// How long `eval_with_timeout` waits for the worker to unwind after it
+/// raises a Janet interrupt (dirge-9xjg.1).
+///
+/// The interrupt is checked at backward jumps and call boundaries, so a
+/// Janet-level runaway loop reacts within microseconds; the grace exists so
+/// the caller can report the *real* Janet error ("interrupt") instead of a
+/// generic "worker is wedged". When it expires, the eval was almost
+/// certainly parked in a C syscall the interrupt cannot reach — that is a
+/// genuinely different failure and gets a different message.
+#[cfg_attr(not(feature = "plugin"), allow(dead_code))]
+const INTERRUPT_GRACE: Duration = Duration::from_secs(2);
+
 #[cfg(feature = "plugin")]
 use janetrs::client::JanetClient;
 #[cfg(feature = "plugin")]
@@ -96,17 +124,57 @@ use janetrs::env::CFunOptions;
 /// Kept as a single string so worker init does one `client.run` call.
 #[cfg(feature = "plugin")]
 const HARNESS_INIT: &str = r#"
-# Redirect Janet's stdout to a discard buffer BEFORE anything else
-# runs. The default `:out` is the real stdout — in dirge's
-# interactive (raw-mode) TUI, every `(print …)` from plugin code
-# corrupts the screen: bare `\n` produces staircase artifacts AND
-# bypasses ratatui's tracked buffer, leaving "ghost" cells that
-# the next diff doesn't clean up (this is what the user saw as
-# `[plugin] tool: list_dir` leaking under the alert dialog).
-# Plugin authors that need real logging should write to a file
-# via `file/open`/`file/write` — Janet's `(print …)` is silent.
-(setdyn :out @"")
-(setdyn :err @"")
+# NOTE: `:out`/`:err` are bound by CAPTURE_BOOTSTRAP, which runs BEFORE
+# this prelude. Do NOT rebind them here — the host mirrors those exact
+# buffer objects into Janet's top-level dyn table, and a second
+# `(setdyn :out @"")` would leave that mirror pointing at an orphan.
+
+# --- per-eval output capture (dirge-9xjg.3) ------------------------
+#
+# The notebook returns a cell's printed output to the agent, so the
+# discard buffers above double as capture buffers: reset before a cell,
+# read after it.
+#
+# BOTH helpers clear the buffers IN PLACE and never rebind them. The host
+# mirrors these exact buffer objects into Janet's TOP-LEVEL dyn table
+# (dirge-c8lh) so that compile errors and stack traces — which Janet
+# emits with no fiber active, and which therefore read `top_dyns` rather
+# than the fiber env — are captured instead of leaking to the real
+# terminal. A `(setdyn :out @"")` here would swap only the fiber-level
+# binding, leave `top_dyns` pointing at the orphaned buffer, and silently
+# put those traces back on the user's screen.
+# Clears in place only. There is deliberately NO rebinding fallback for a
+# non-buffer `:out`: CAPTURE_BOOTSTRAP guarantees a buffer, and a
+# `(setdyn :out @"")` here would strand the host's top-level mirror on the
+# old object — trading "this cell's output is not captured" for "every
+# later error trace prints on the user's screen".
+(defn harness/-capture-reset []
+  (def o (dyn :out))
+  (when (buffer? o) (buffer/clear o))
+  (def e (dyn :err))
+  (when (buffer? e) (buffer/clear e))
+  nil)
+
+# Read back what the last eval printed, capped at `limit` bytes per
+# stream. A cell that prints in a loop is truncated with a marker rather
+# than returned in full — the reader is a language model with a context
+# budget, and an unbounded paste is worse than a labelled elision.
+(defn harness/-capture-take [limit]
+  (defn- one [b label]
+    (if (and (buffer? b) (pos? (length b)))
+      (let [s (string b) n (length s)]
+        (if (> n limit)
+          (string (string/slice s 0 limit)
+                  "\n...[" label " truncated, " (- n limit) " more bytes]")
+          s))
+      ""))
+  (def o (one (dyn :out) "stdout"))
+  (def e (one (dyn :err) "stderr"))
+  (cond
+    (and (empty? o) (empty? e)) ""
+    (empty? e) o
+    (empty? o) (string "[stderr]\n" e)
+    (string o "\n[stderr]\n" e)))
 
 (var harness-pending nil)
 (var harness-response nil)
@@ -459,8 +527,12 @@ const HARNESS_INIT: &str = r#"
                   (or (= level :warn) (= level "warn")) "warn"
                   (or (= level :error) (= level "error")) "error"
                   "info")]
+        # dirge-vpma.32: escape like every other tab-separated harness blob.
+        # Raw newlines truncated the message at the first one (the drain skips
+        # lines with no tab), and a payload could mint a second entry with a
+        # level of its choosing.
         (set harness-notif-list
-             (string harness-notif-list lvl "\t" msg "\n"))))))
+             (string harness-notif-list lvl "\t" (harness/-escape msg) "\n"))))))
 
 # Hook-error dedup slots. `harness-last-hook-err-msg` is the most
 # recently pushed sanitized hook-error message; `harness-last-hook-err-count`
@@ -491,6 +563,28 @@ const HARNESS_INIT: &str = r#"
 # identical messages. The catch arm in dispatch calls this rather
 # than appending directly so a buggy on-message-update hook can't
 # flood the chat with thousands of identical banners.
+#
+# dirge-vpma.33: the summary reports how many were SUPPRESSED, i.e. the count
+# minus the one already pushed and displayed. The count starts at 1 for that
+# first push, so 50 occurrences is one banner plus "(repeated 49 times)" —
+# which is what the host-side comment has always described.
+#
+# The flush is a function rather than a copy at each call site because the host
+# runs it too, at drain, to collect a run of repeats that never saw a different
+# message follow it.
+(defn harness/-flush-hook-err []
+  (when (and harness-last-hook-err-msg
+             (> harness-last-hook-err-count 1))
+    (set harness-notif-list
+         (string harness-notif-list
+                 "error\t"
+                 (harness/-escape
+                   (string harness-last-hook-err-msg
+                           " (repeated "
+                           (- harness-last-hook-err-count 1)
+                           " times)"))
+                 "\n"))))
+
 (defn harness/push-hook-err [sanitized-msg]
   (if (= sanitized-msg harness-last-hook-err-msg)
     # Same as last — increment in place; do not push.
@@ -499,17 +593,12 @@ const HARNESS_INIT: &str = r#"
     # been repeated, flush its summary now; then push the new msg
     # and reset the dedup state.
     (do
-      (when (and harness-last-hook-err-msg
-                 (> harness-last-hook-err-count 1))
-        (set harness-notif-list
-             (string harness-notif-list
-                     "error\t"
-                     harness-last-hook-err-msg
-                     " (repeated "
-                     harness-last-hook-err-count
-                     " times)\n")))
+      (harness/-flush-hook-err)
+      # dirge-vpma.32: escaped like the rest of the blob. sanitize-hook-err
+      # rewrites newlines and tabs but leaves backslashes, so an unescaped
+      # `C:\temp` would come back through the drain's unescape as a tab.
       (set harness-notif-list
-           (string harness-notif-list "error\t" sanitized-msg "\n"))
+           (string harness-notif-list "error\t" (harness/-escape sanitized-msg) "\n"))
       (set harness-last-hook-err-msg sanitized-msg)
       (set harness-last-hook-err-count 1))))
 
@@ -747,12 +836,58 @@ const HARNESS_INIT: &str = r#"
   (when (and (string? json-str) (string? key))
     (harness/__json-extract json-str key)))
 
-# (harness/json-decode json-str) -> value | nil
-# Parses a JSON string into a Janet value. Objects become tables keyed by
-# string, arrays become tuples. Returns nil on invalid JSON.
+# (harness/json-decode json-str) -> table | array | string | number
+#                                 | boolean | :null | nil
+# Full recursive decode into native Janet data. Returns nil when the
+# input is not a string or is not valid JSON. JSON `null` decodes to the
+# :null KEYWORD, not nil, because putting nil into a Janet table deletes
+# the key — a null field would otherwise be indistinguishable from an
+# absent one.
 (defn harness/json-decode [json-str]
   (when (string? json-str)
     (harness/__json-decode json-str)))
+"#;
+
+/// The notebook bridge wrapper — installed on the **plugin VM only**.
+///
+/// Kept out of `HARNESS_INIT` because the notebook VM runs that same
+/// prelude and deliberately does NOT register `harness/__notebook` (a cell
+/// that could call the bridge would re-enter the notebook lock it is
+/// already holding). Janet resolves symbols at COMPILE time, so a
+/// `(dyn 'harness/__notebook)` runtime guard does not save a body that
+/// names the symbol — the whole prelude fails to compile. Separating the
+/// definition is the only thing that works, and it matches the intent:
+/// this function has no business existing on the notebook VM.
+#[cfg(feature = "plugin")]
+const HARNESS_NOTEBOOK_INIT: &str = r#"
+# (harness/notebook op session &opt code) -> @{:ok bool :value str :output str}
+# Ops: "eval", "reset", "sessions", "respawn".
+(defn harness/notebook [op session &opt code]
+  (harness/__notebook (string op) (string session) (string (or code ""))))
+"#;
+
+/// The `:out`/`:err` redirect. The **only** place these are bound.
+///
+/// Janet's default `:out` is the real stdout, and in dirge's raw-mode TUI
+/// every `(print …)` from plugin code corrupts the screen: a bare `\n`
+/// produces staircase artifacts AND bypasses ratatui's tracked buffer,
+/// leaving ghost cells the next diff never cleans up. Plugin authors who
+/// want real logging should write to a file via `file/open`/`file/write`.
+///
+/// Split out of `HARNESS_INIT` and run FIRST so the buffers exist, and are
+/// mirrored into `top_dyns`, before any prelude that could fail to
+/// compile — otherwise a syntax error in the harness prelude itself is the
+/// one error that still reaches the terminal (dirge-c8lh).
+///
+/// Nothing else may rebind these. The mirror captures the buffer OBJECTS,
+/// so a later `(setdyn :out @"")` anywhere would swap the fiber-level
+/// binding and silently strand `top_dyns` on the old buffer — putting
+/// error traces back on the user's screen. Clear in place instead
+/// (`harness/-capture-reset`).
+#[cfg(feature = "plugin")]
+const CAPTURE_BOOTSTRAP: &str = r#"
+(setdyn :out @"")
+(setdyn :err @"")
 "#;
 
 /// Janet-side aliases that defer the actual blocking work to the
@@ -966,6 +1101,141 @@ const HARNESS_SANDBOX: &str = r#"
   (def sym (symbol name))
   (when (get (curenv) sym)
     (put (curenv) sym @{:value (dirge-disabled-fn name)})))
+
+# --- subprocess output containment (dirge-v49u) --------------------
+#
+# A child process writes to dirge's REAL file descriptors. The
+# `(setdyn :out @"")` redirect is a Janet-level abstraction and does not
+# touch fds, so an unredirected `(os/execute …)` lands straight on the
+# raw-mode TUI — the same staircase/ghost-cell corruption as dirge-c8lh,
+# by a different route, and not fixed by it.
+#
+# Plugin authors could be expected to redirect. The model driving the
+# notebook cannot: `(os/execute ["ls"] :p)` is the obvious thing to write
+# and there is nothing in the language to warn it.
+#
+# So: fill in only the streams the caller did NOT specify. A caller
+# managing its own redirection is left alone, and one that redirects only
+# `:out` still gets its `:err` contained.
+(def- dirge-real-execute os/execute)
+(def- dirge-real-spawn os/spawn)
+
+# Cap on subprocess output folded into the capture buffer.
+(def- dirge-subprocess-cap 65536)
+
+# Returns [env temp-file-or-nil]. `file/temp` is tmpfile(), so the file
+# unlinks itself on close and there is nothing to clean up.
+(defn- dirge-contain-streams [env]
+  # `merge` (not `table/clone`) because callers pass struct literals like
+  # {:out f}, which are immutable and cannot be cloned as tables.
+  (def e (merge @{} (or env {})))
+  (var f nil)
+  (unless (and (get e :out) (get e :err)) (set f (file/temp)))
+  (unless (get e :out) (put e :out f))
+  (unless (get e :err) (put e :err f))
+  [e f])
+
+(defn- dirge-drain-streams [f]
+  (when f
+    (file/seek f :set 0)
+    (def content (file/read f :all))
+    (file/close f)
+    (def sink (dyn :out))
+    (when (and content (buffer? sink) (pos? (length content)))
+      (if (> (length content) dirge-subprocess-cap)
+        (do
+          (buffer/push-string sink (string/slice content 0 dirge-subprocess-cap))
+          (buffer/push-string sink "\n...[subprocess output truncated]\n"))
+        (buffer/push-string sink content)))))
+
+# NOTE: flags are passed through EXACTLY as given. Do not "helpfully"
+# default them to :p — that adds PATH lookup to a call that never asked
+# for it, which can resolve a name that stock Janet would have refused.
+# Janet requires a keyword here, hence (keyword "") for the no-flag case.
+(defn- dirge-execute [args &opt flags env]
+  (def [e f] (dirge-contain-streams env))
+  # `defer`, not a plain sequence: the :x flag raises on a non-zero exit,
+  # and what the child printed BEFORE failing is exactly what someone
+  # needs to see. Draining only on success would lose every failure.
+  (defer (dirge-drain-streams f)
+    (dirge-real-execute args (or flags (keyword "")) e)))
+
+# os/spawn is asynchronous, so nothing here knows when the child is done
+# and there is no correct moment to drain. Unrequested output is absorbed
+# by the temp file rather than leaked; a caller that wants it asks for
+# :pipe, which this leaves untouched.
+(defn- dirge-spawn [args &opt flags env]
+  (def [e _f] (dirge-contain-streams env))
+  (dirge-real-spawn args (or flags (keyword "")) e))
+
+(put (curenv) 'os/execute @{:value dirge-execute})
+(put (curenv) 'os/spawn @{:value dirge-spawn})
+"#;
+
+/// Janet installed on the **notebook** VM only (dirge-9xjg.2, dirge-9xjg.5).
+///
+/// The notebook runs on its own Janet VM with a fresh root env, so nothing
+/// here is visible to plugins and nothing a plugin defines is visible here.
+/// That is deliberate: agent-authored code that could redefine a hook, or
+/// shadow a `harness/` function out from under the permission gate, is a
+/// privilege-escalation path, and the "call plugin helpers from a cell"
+/// convenience is not worth it. Cross-VM access, if it is ever wanted,
+/// should be an explicit bridge rather than a shared symbol table.
+///
+/// # Per-session envs
+///
+/// dirge runs subagents CONCURRENTLY off one process-global plugin manager,
+/// so a single flat env would let two subagents' `(def results …)` clobber
+/// each other — racy, and near-impossible for a model to diagnose. Each
+/// session therefore evaluates into its own env, created with `make-env`
+/// off the notebook root: lookups fall through to the root (so all of
+/// Janet core is there), but every `def` lands in the session's own table.
+///
+/// Sharing then has to be *asked for*, through `notebook/shared`. Making
+/// the deliberate path explicit and the accidental path impossible is the
+/// only arrangement that keeps both halves of the design.
+#[cfg(feature = "plugin")]
+const NOTEBOOK_INIT: &str = r#"
+# Cross-session scratch space. The ONLY state visible from another
+# session — everything else a cell defines is private to its session.
+(def notebook/shared @{})
+
+# session-id -> env table
+(def notebook/-envs @{})
+
+(defn notebook/-env [sid]
+  (or (get notebook/-envs sid)
+      (let [e (make-env (curenv))]
+        (put notebook/-envs sid e)
+        e)))
+
+# Evaluate `code` in `sid`'s env and return [status value].
+#
+# The inner fiber carries the `:e` (error) mask so an ordinary Janet error
+# is reported as data rather than unwinding the whole eval. It does NOT
+# mask user signals, so a deadline interrupt — JANET_SIGNAL_INTERRUPT is
+# USER8 — passes straight through and still stops the cell.
+# Whether the last cell evaluated cleanly. Read back by the host in a
+# separate eval rather than encoded into the return value, so a cell whose
+# value happens to look like a status marker cannot be misread as one.
+(var notebook/-last-ok true)
+
+(defn notebook/-eval [sid code]
+  (def env (notebook/-env sid))
+  (def f (fiber/new (fn [] (eval-string code)) :e))
+  (fiber/setenv f env)
+  (def r (resume f))
+  (set notebook/-last-ok (not= (fiber/status f) :error))
+  r)
+
+# Forget one session's bindings. `notebook/shared` is untouched — a reset
+# is for recovering a poisoned scratch env, not for wiping what other
+# sessions deliberately published.
+(defn notebook/-reset [sid]
+  (put notebook/-envs sid nil)
+  :reset)
+
+(defn notebook/-sessions [] (sorted (keys notebook/-envs)))
 "#;
 
 /// A plugin LSP query, forwarded from the worker thread to the tokio-side
@@ -1174,12 +1444,46 @@ fn timeout_action(dialog_active: bool, elapsed: Duration, ceiling: Duration) -> 
     }
 }
 
+/// What a notebook cell produced: the value of its last form, plus
+/// whatever it printed on the way there (dirge-9xjg.3).
+///
+/// `client.run` returns only the last value, but printing intermediate
+/// results is how notebook work is actually done — a cell whose `(print …)`
+/// vanishes is not usable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(feature = "plugin"), allow(dead_code))]
+pub struct CellOutput {
+    /// Stringified value of the cell's last form, or the Janet error text
+    /// when `ok` is false.
+    pub value: String,
+    /// Captured stdout, with captured stderr appended under a `[stderr]`
+    /// marker. Empty when the cell printed nothing.
+    pub output: String,
+    /// Whether the cell evaluated without raising.
+    pub ok: bool,
+}
+
 #[cfg_attr(not(feature = "plugin"), allow(dead_code))]
 pub enum Cmd {
     /// Evaluate Janet code and return its stringified result.
     Eval {
         code: String,
         reply: mpsc::Sender<Result<String, String>>,
+    },
+    /// Evaluate a notebook cell: reset the capture buffers, evaluate, and
+    /// return the value together with anything printed. Unlike `Eval`, a
+    /// Janet-level error is reported *in* the [`CellOutput`] (`ok: false`)
+    /// rather than as `Err` — a cell that raises is a normal notebook
+    /// outcome the agent should see the output of, not a host failure.
+    /// `Err` stays reserved for the worker itself being unreachable.
+    EvalCell {
+        code: String,
+        /// Which notebook session's env to evaluate in (dirge-9xjg.5).
+        /// `None` evaluates in the VM's root env — used by the host for
+        /// its own bookkeeping, never for agent-authored code.
+        session: Option<String>,
+        out_limit: usize,
+        reply: mpsc::Sender<Result<CellOutput, String>>,
     },
     Shutdown,
 }
@@ -1203,6 +1507,12 @@ pub struct Worker {
     /// let the gated tool run while the dialog is unanswered (dirge-hwzs).
     #[cfg_attr(not(feature = "plugin"), allow(dead_code))]
     dialog_pending: Arc<AtomicUsize>,
+    /// Cross-thread cancellation for this worker's Janet VM. Used by
+    /// `eval_with_timeout` to stop a runaway eval WITHOUT tearing down the
+    /// thread, so VM state survives (dirge-9xjg.1). See
+    /// [`super::interrupt`] for the mechanism and its one blind spot.
+    #[cfg_attr(not(feature = "plugin"), allow(dead_code))]
+    interrupt: Arc<InterruptHandle>,
 }
 
 impl Worker {
@@ -1231,6 +1541,8 @@ impl Worker {
         let shutdown_clone = shutdown.clone();
         let dialog_pending = Arc::new(AtomicUsize::new(0));
         let dialog_pending_clone = dialog_pending.clone();
+        let interrupt = InterruptHandle::new();
+        let interrupt_clone = interrupt.clone();
 
         let join = thread::Builder::new()
             .name("dirge-janet".to_string())
@@ -1242,6 +1554,7 @@ impl Worker {
                     init_tx,
                     shutdown_clone,
                     dialog_pending_clone,
+                    interrupt_clone,
                 )
             })
             .map_err(|e| format!("spawn janet worker: {e}"))?;
@@ -1256,6 +1569,7 @@ impl Worker {
                     join: Some(join),
                     shutdown,
                     dialog_pending,
+                    interrupt,
                 },
                 dialog_rx,
                 lsp_rx,
@@ -1291,10 +1605,87 @@ impl Worker {
                 join: None,
                 shutdown: Arc::new(AtomicBool::new(false)),
                 dialog_pending: Arc::new(AtomicUsize::new(0)),
+                interrupt: InterruptHandle::new(),
             },
             dialog_rx,
             lsp_rx,
         ))
+    }
+
+    /// Spawn a **notebook** worker: a second Janet VM, with a fresh root
+    /// env and none of the host bridges (dirge-9xjg.2).
+    ///
+    /// # Why a second VM rather than sharing the plugin one
+    ///
+    /// Three reasons, only the first of which the interrupt already covers:
+    ///
+    /// 1. The interrupt breaks bytecode, not a thread parked in a C
+    ///    syscall. `(os/execute …)` on a hung subprocess still wedges its
+    ///    worker permanently. On the shared worker that takes every plugin,
+    ///    hook, slash command and — critically — the `harness/block`
+    ///    permission gate down with it for the rest of the session. Split
+    ///    out, the blast radius is the agent's own notebook, and the
+    ///    respawn that recovers it is cheap instead of state-destroying.
+    /// 2. Agent-authored code cannot redefine a hook or shadow a
+    ///    `harness/` function that the permission gate later calls. On a
+    ///    shared env that is a privilege-escalation path, not a nuisance.
+    /// 3. Plugin state survives a notebook reset and vice versa.
+    ///
+    /// This deliberately inverts dirge-ntjh, which proposed respawning the
+    /// single shared worker on a repeated timeout. That is the one recovery
+    /// a notebook cannot survive; splitting the VMs is what makes respawn
+    /// the right answer instead of the destructive one.
+    ///
+    /// # What is NOT installed
+    ///
+    /// No dialog bridge (`harness/confirm`/`harness/select`), no LSP, no
+    /// DAP, no computer-use exec. Each bridge widens what agent code can
+    /// reach, and the dialog bridge in particular is the permission gate's
+    /// own channel. `harness/json-extract` IS registered — it is pure
+    /// serde_json with no host reach, and cells need it.
+    ///
+    /// The sandbox prelude still runs, so `os/exit` and friends stay
+    /// neutered here exactly as they are for plugins.
+    #[cfg(feature = "plugin")]
+    #[cfg_attr(not(feature = "plugin"), allow(dead_code))]
+    pub fn try_spawn_notebook() -> Result<Self, String> {
+        let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
+        let (init_tx, init_rx) = mpsc::channel::<Result<(), String>>();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_clone = shutdown.clone();
+        let interrupt = InterruptHandle::new();
+        let interrupt_clone = interrupt.clone();
+
+        let join = thread::Builder::new()
+            .name("dirge-janet-notebook".to_string())
+            .spawn(move || notebook_worker_loop(cmd_rx, init_tx, shutdown_clone, interrupt_clone))
+            .map_err(|e| format!("spawn janet notebook worker: {e}"))?;
+
+        match init_rx.recv_timeout(INIT_TIMEOUT) {
+            Ok(Ok(())) => Ok(Self {
+                cmd_tx,
+                join: Some(join),
+                shutdown,
+                // The notebook has no dialog bridge, so nothing can ever
+                // raise this — a notebook cell must never be able to
+                // extend its own deadline by opening a dialog.
+                dialog_pending: Arc::new(AtomicUsize::new(0)),
+                interrupt,
+            }),
+            Ok(Err(e)) => Err(e),
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(format!(
+                "janet notebook worker did not init within {INIT_TIMEOUT:?}"
+            )),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Err("janet notebook worker exited during init".to_string())
+            }
+        }
+    }
+
+    #[cfg(not(feature = "plugin"))]
+    #[allow(dead_code)]
+    pub fn try_spawn_notebook() -> Result<Self, String> {
+        Err("notebook requires the `plugin` feature".to_string())
     }
 
     /// Send a Janet expression to the worker and block until it returns
@@ -1331,7 +1722,6 @@ impl Worker {
     /// [`timeout_action`], which is pure and unit-tested — see there for why
     /// it is not tested through this function.
     pub fn eval_with_timeout(&mut self, code: &str, timeout: Duration) -> Result<String, String> {
-        let effective = timeout.min(EVAL_TIMEOUT);
         let (reply, rx) = mpsc::channel();
         self.cmd_tx
             .send(Cmd::Eval {
@@ -1339,6 +1729,48 @@ impl Worker {
                 reply,
             })
             .map_err(|_| "janet worker disconnected".to_string())?;
+        self.await_reply(&rx, timeout)
+    }
+
+    /// Evaluate a notebook cell and return its value plus captured output.
+    ///
+    /// Shares the whole deadline/interrupt path with [`eval_with_timeout`]
+    /// — a runaway cell is stopped the same way, and the VM keeps its
+    /// state — but reports a Janet-level error as data rather than `Err`,
+    /// because for a notebook a raising cell is an ordinary result.
+    #[cfg_attr(not(feature = "plugin"), allow(dead_code))]
+    pub fn eval_cell(
+        &mut self,
+        code: &str,
+        session: Option<&str>,
+        out_limit: usize,
+        timeout: Duration,
+    ) -> Result<CellOutput, String> {
+        let (reply, rx) = mpsc::channel();
+        self.cmd_tx
+            .send(Cmd::EvalCell {
+                code: code.to_string(),
+                session: session.map(str::to_string),
+                out_limit,
+                reply,
+            })
+            .map_err(|_| "janet worker disconnected".to_string())?;
+        self.await_reply(&rx, timeout)
+    }
+
+    /// Wait for a worker reply, extending for an in-flight dialog and
+    /// interrupting a runaway eval at the deadline.
+    ///
+    /// Generic over the reply payload so `Eval` and `EvalCell` cannot
+    /// drift: the dialog extension here is what keeps the permission gate
+    /// from failing open, and a second hand-written copy of it is the kind
+    /// of duplicate that goes stale silently.
+    fn await_reply<T>(
+        &mut self,
+        rx: &mpsc::Receiver<Result<T, String>>,
+        timeout: Duration,
+    ) -> Result<T, String> {
+        let effective = timeout.min(EVAL_TIMEOUT);
 
         // dirge-hwzs: the base timeout is deliberately tight (5s per tool
         // hook) so a hook stuck in a loop or blocking syscall recovers
@@ -1371,14 +1803,87 @@ impl Worker {
                             continue;
                         }
                         TimeoutAction::GiveUp => {
-                            return Err(format!(
-                                "janet worker did not reply within {}s — plugin may be stuck in an infinite loop",
-                                start.elapsed().as_secs(),
-                            ));
+                            // dirge-9xjg.1: before reporting a wedge, ask
+                            // the interpreter to stop. Reaching here means
+                            // no dialog is in flight (or the ceiling is
+                            // blown), so nothing is legitimately waiting on
+                            // a human — `timeout_action` already made that
+                            // call and is deliberately left untouched,
+                            // because an interrupted `harness/confirm`
+                            // would fail the permission gate OPEN.
+                            //
+                            // Interrupting rather than abandoning the eval
+                            // is what lets VM state survive a runaway cell.
+                            if !self.interrupt.raise() {
+                                // No VM installed (worker still starting,
+                                // or a non-plugin build): nothing to
+                                // interrupt, so don't burn the grace slice.
+                                return Err(Self::wedged(start.elapsed(), false));
+                            }
+                            return Self::await_after_interrupt(rx, start);
                         }
                     }
                 }
             }
+        }
+    }
+
+    /// Wait out [`INTERRUPT_GRACE`] for a worker that has just been
+    /// interrupted, so the caller gets the interpreter's own error instead
+    /// of a generic wedge report.
+    ///
+    /// Split from `eval_with_timeout` because the two failures mean
+    /// different things and want different messages: a reply inside the
+    /// grace window is a Janet-level runaway that was cleanly stopped and
+    /// left the VM usable, while silence means the thread is parked
+    /// somewhere the interrupt cannot reach (a C syscall) and only a
+    /// respawn will recover it.
+    #[cfg_attr(not(feature = "plugin"), allow(dead_code))]
+    fn await_after_interrupt<T>(
+        rx: &mpsc::Receiver<Result<T, String>>,
+        start: std::time::Instant,
+    ) -> Result<T, String> {
+        let grace_deadline = std::time::Instant::now() + INTERRUPT_GRACE;
+        loop {
+            let remaining = grace_deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(Self::wedged(start.elapsed(), true));
+            }
+            match rx.recv_timeout(remaining.min(DIALOG_POLL)) {
+                // The eval unwound. A raced completion still returns its
+                // real value; an error is almost certainly OUR interrupt,
+                // and Janet reports that as a bare "Runtime VM error",
+                // which tells the reader nothing about what happened.
+                Ok(Ok(value)) => return Ok(value),
+                Ok(Err(janet_err)) => {
+                    return Err(format!(
+                        "eval exceeded its {}s deadline and was interrupted                          (janet: {janet_err})",
+                        start.elapsed().as_secs().max(1),
+                    ));
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err("janet worker dropped reply channel".to_string());
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            }
+        }
+    }
+
+    /// The give-up message. `interrupted` distinguishes the two cases the
+    /// operator has to act on differently — see
+    /// [`await_after_interrupt`](Self::await_after_interrupt).
+    #[cfg_attr(not(feature = "plugin"), allow(dead_code))]
+    fn wedged(elapsed: Duration, interrupted: bool) -> String {
+        if interrupted {
+            format!(
+                "janet worker did not reply within {}s and did not stop when interrupted —                  it is likely blocked in a system call (e.g. os/execute on a hung subprocess)                  rather than looping in Janet",
+                elapsed.as_secs(),
+            )
+        } else {
+            format!(
+                "janet worker did not reply within {}s — plugin may be stuck in an infinite loop",
+                elapsed.as_secs(),
+            )
         }
     }
 }
@@ -1427,6 +1932,7 @@ fn worker_loop(
     init_tx: mpsc::Sender<Result<(), String>>,
     shutdown: Arc<AtomicBool>,
     dialog_pending: Arc<AtomicUsize>,
+    interrupt: Arc<InterruptHandle>,
 ) {
     // Hand the dialog sender + shutdown flag to this thread's C functions
     // before we run any plugin code, otherwise harness/confirm/select
@@ -1444,6 +1950,11 @@ fn worker_loop(
         }
     };
 
+    // Publish this thread's VM so other threads can interrupt a runaway
+    // eval. MUST happen here: `janet_local_vm()` reads the *calling*
+    // thread's VM, and it must be live, so after init and on this thread.
+    interrupt.install_local_vm();
+
     // Install C functions backing harness/confirm and harness/select.
     // They must be registered before the Janet-side aliases reference
     // them; we register, then run the alias definitions.
@@ -1459,6 +1970,8 @@ fn worker_loop(
         env.add_c_fn(
             CFunOptions::new(c"__json-decode", janet_json_decode_cfn).namespace(c"harness"),
         );
+        // Notebook bridge. Plugin VM ONLY — see `janet_notebook_cfn`.
+        env.add_c_fn(CFunOptions::new(c"__notebook", janet_notebook_cfn).namespace(c"harness"));
         // Only register the LSP bridge when the lsp feature is compiled
         // in. The Janet `harness/lsp` wrappers (HARNESS_LSP_INIT) guard on
         // this symbol's existence and degrade to nil when it's absent.
@@ -1505,8 +2018,17 @@ fn worker_loop(
         crate::dap::janet_bindings::register_dap_cfns(&mut client);
     }
 
+    // Redirect and mirror BEFORE anything that can fail to compile, so a
+    // broken prelude reports through the buffers instead of the terminal.
+    let _ = client.run(CAPTURE_BOOTSTRAP);
+    mirror_capture_buffers_into_top_dyns(&client);
+
     if let Err(e) = client.run(HARNESS_INIT) {
         let _ = init_tx.send(Err(format!("harness init failed: {e}")));
+        return;
+    }
+    if let Err(e) = client.run(HARNESS_NOTEBOOK_INIT) {
+        let _ = init_tx.send(Err(format!("harness notebook init failed: {e}")));
         return;
     }
     if let Err(e) = client.run(HARNESS_DIALOG_INIT) {
@@ -1569,18 +2091,257 @@ fn worker_loop(
 
     let _ = init_tx.send(Ok(()));
 
+    run_command_loop(rx, &mut client, &interrupt);
+}
+
+/// The command loop, shared by the plugin VM and the notebook VM.
+///
+/// Deliberately one function rather than one per worker: the interrupt
+/// drain ordering and the capture reset are subtle enough that a second
+/// hand-maintained copy would drift, and the copy that drifted would be
+/// the one running agent-authored code.
+#[cfg(feature = "plugin")]
+fn run_command_loop(
+    rx: mpsc::Receiver<Cmd>,
+    client: &mut JanetClient,
+    interrupt: &Arc<InterruptHandle>,
+) {
     while let Ok(cmd) = rx.recv() {
         match cmd {
             Cmd::Eval { code, reply } => {
+                // Clear any interrupt raised while we were idle. It was
+                // aimed at an eval that had already finished (the raiser
+                // races the reply), and leaving it set would abort this
+                // eval instead — and leave `auto_suspend` non-zero forever.
+                interrupt.drain();
+                // dirge-lncv: reset before every eval, not just notebook
+                // cells. The buffers used to be written and never read, so
+                // they grew for the whole process lifetime — and now that
+                // compile errors and stack traces land in them too
+                // (dirge-c8lh) that growth would be faster, not slower.
+                let _ = client.run("(harness/-capture-reset)");
+                // dirge-2jtd: run the code inside a fiber and re-raise its
+                // error, instead of handing the raw string to janet_dobytes.
+                //
+                // janet_dobytes sets errflags only from the janet_continue it
+                // performs itself. A fiber that yields JANET_SIGNAL_EVENT is
+                // driven to completion by janet_loop, which prints a stack
+                // trace and moves on WITHOUT touching errflags — so the error
+                // VALUE came back as `ret` and janetrs mapped clear flags to
+                // Ok. Every ev-backed builtin takes that path (os/execute,
+                // os/spawn, ev/*, net/*), so a plugin hook that failed on one
+                // reported success with its error text as the return value.
+                //
+                // `resume` drives the fiber to completion across the event
+                // loop, so `fiber/status` is accurate for both paths; the
+                // re-raise then happens in the outer fiber, where errflags do
+                // get set. Same shape notebook/-eval already uses, which is
+                // where the accurate half was verified.
+                // The fiber MUST carry the caller's environment. A bare
+                // `fiber/new` gets a fresh one, so every `def` lands somewhere
+                // the next eval cannot see — and plugins define their hooks in
+                // one eval and are dispatched in another, so that breaks them
+                // in a way that reads as "the plugin didn't load".
+                //
+                // The verdict comes back IN THE VALUE rather than as a raised
+                // error. Re-raising was tried first and does not work: when the
+                // inner fiber yields to the event loop the OUTER fiber yields
+                // too, so the re-raise happens inside janet_loop and errflags
+                // stay clear — the very mechanism being worked around. Reading
+                // a status variable afterwards would work but costs a second
+                // round trip on every eval, and hook dispatch is on the hot
+                // path. A sentinel prefix keeps it at one.
+                let wrapped = format!(
+                    r#"(let [env (fiber/getenv (fiber/current)) f (fiber/new (fn [] (eval-string "{}")) :e)] (fiber/setenv f env) (let [r (resume f)] (if (= (fiber/status f) :error) (string "{}" (describe r)) r)))"#,
+                    super::escape_janet_string(&code),
+                    EV_ERROR_SENTINEL,
+                );
                 let r = client
-                    .run(&code)
+                    .run(&wrapped)
                     .map(|v| v.to_string())
-                    .map_err(|e| format!("Janet error: {e}"));
+                    .map_err(|e| format!("Janet error: {e}"))
+                    .and_then(|v| match v.strip_prefix(EV_ERROR_SENTINEL) {
+                        Some(msg) => Err(format!("Janet error: {}", msg.trim())),
+                        None => Ok(v),
+                    });
+                if r.is_err() {
+                    // A failed plugin eval used to announce itself by
+                    // corrupting the screen; now it is captured, so route
+                    // it somewhere an operator can actually read. Only on
+                    // the error path — hook dispatch is latency-critical
+                    // and the happy path should not pay for a second
+                    // round trip.
+                    if let Ok(out) = client.run("(harness/-capture-take 4096)") {
+                        let out = out.to_string();
+                        if !out.trim().is_empty() {
+                            tracing::warn!(
+                                target: "dirge::plugin",
+                                output = %out,
+                                "janet eval failed; captured output follows",
+                            );
+                        }
+                    }
+                }
+                // Clear the interrupt this eval consumed. Janet's
+                // `auto_suspend` is a counter, not a latch: until it
+                // returns to zero the VM refuses to run scheduled fibers,
+                // so skipping this would wedge the worker permanently —
+                // the exact failure the interrupt exists to prevent.
+                interrupt.drain();
                 let _ = reply.send(r);
+            }
+            Cmd::EvalCell {
+                code,
+                session,
+                out_limit,
+                reply,
+            } => {
+                interrupt.drain();
+                // Reset first so the capture holds THIS cell's output only.
+                let _ = client.run("(harness/-capture-reset)");
+                // A session cell is wrapped so it evaluates in that
+                // session's own env. The wrapping happens HERE rather than
+                // in the caller so there is exactly one place that decides
+                // how agent code is sandboxed into a session.
+                let to_run = match &session {
+                    Some(sid) => format!(
+                        r#"(notebook/-eval "{}" "{}")"#,
+                        super::escape_janet_string(sid),
+                        super::escape_janet_string(&code),
+                    ),
+                    None => code.clone(),
+                };
+                let outcome = client.run(&to_run);
+                // Read the buffers back BEFORE draining/replying, while
+                // they still hold this cell's output. `-capture-take`
+                // prints nothing itself, so it cannot contaminate them.
+                let captured = client
+                    .run(format!("(harness/-capture-take {out_limit})"))
+                    .map(|v| v.to_string())
+                    .unwrap_or_default();
+                interrupt.drain();
+                let cell = match outcome {
+                    Ok(v) => CellOutput {
+                        value: v.to_string(),
+                        output: captured,
+                        // A session cell catches its own errors inside the
+                        // fiber, so `client.run` succeeding says nothing
+                        // about whether the CELL succeeded — read the flag
+                        // the wrapper set. Trusting `Ok` here would report
+                        // every failing cell as a success.
+                        ok: match &session {
+                            None => true,
+                            Some(_) => client
+                                .run("notebook/-last-ok")
+                                .map(|v| v.to_string() == "true")
+                                .unwrap_or(false),
+                        },
+                    },
+                    Err(e) => CellOutput {
+                        value: format!("{e}"),
+                        output: captured,
+                        ok: false,
+                    },
+                };
+                let _ = reply.send(Ok(cell));
             }
             Cmd::Shutdown => break,
         }
     }
+}
+
+/// Point Janet's TOP-LEVEL dyn table at the same `:out`/`:err` buffers the
+/// harness prelude installed in the root env (dirge-c8lh).
+///
+/// `janet_dyn` consults `janet_vm.fiber->env` while a fiber is running and
+/// falls back to `janet_vm.top_dyns` when none is — and `janet_dobytes`
+/// prints compile errors and stack traces in exactly that second state,
+/// after `janet_continue` has returned. So the Janet-side redirect, which
+/// can only ever write the fiber env, does not cover them: a plugin with a
+/// syntax error wrote straight to the user's terminal, corrupting the
+/// raw-mode TUI.
+///
+/// Only Rust can fix it. `janet_setdyn` writes `top_dyns` precisely when no
+/// fiber is live, which is true here between `client.run` calls and false
+/// everywhere reachable from Janet code (including inside a cfn).
+#[cfg(feature = "plugin")]
+fn mirror_capture_buffers_into_top_dyns(client: &JanetClient) {
+    for (janet_name, c_name) in [("(dyn :out)", c"out"), ("(dyn :err)", c"err")] {
+        let Ok(buf) = client.run(janet_name) else {
+            continue;
+        };
+        let raw = janetrs::lowlevel::Janet::from(buf);
+        // SAFETY: `raw` is a live Janet value produced moments ago by this
+        // same VM on this thread. `janet_gcroot` keeps the buffer alive
+        // independently of the root-env entry, so a later rebinding of
+        // `:out` cannot leave `top_dyns` holding a collected pointer. The
+        // buffers are process-lifetime by design, so the permanent root is
+        // not a leak. No fiber is active here, so `janet_setdyn` writes
+        // `top_dyns` — which is the entire point.
+        unsafe {
+            janetrs::lowlevel::janet_gcroot(raw);
+            janetrs::lowlevel::janet_setdyn(c_name.as_ptr(), raw);
+        }
+    }
+}
+
+/// The notebook VM's thread (dirge-9xjg.2).
+///
+/// Same command protocol as [`worker_loop`], deliberately different init:
+/// only the pure `__json-extract` cfn is registered, so none of the host
+/// bridges exist on this VM at all. A cell cannot reach them even by
+/// name — there is no symbol to reach.
+#[cfg(feature = "plugin")]
+fn notebook_worker_loop(
+    rx: mpsc::Receiver<Cmd>,
+    init_tx: mpsc::Sender<Result<(), String>>,
+    shutdown: Arc<AtomicBool>,
+    interrupt: Arc<InterruptHandle>,
+) {
+    // Publish the shutdown flag so a long cell can still observe teardown.
+    // DIALOG_TX / LSP_TX are deliberately left unset on this thread: even
+    // if a `harness/__confirm` symbol somehow appeared, it would find no
+    // channel and no-op rather than reaching the permission UI.
+    SHUTDOWN.with(|cell| *cell.borrow_mut() = Some(shutdown));
+
+    let mut client = match JanetClient::init_with_default_env() {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = init_tx.send(Err(format!("Janet notebook init failed: {e}")));
+            return;
+        }
+    };
+
+    interrupt.install_local_vm();
+
+    if let Some(env) = client.env_mut() {
+        // Pure, host-free, and cells routinely need it. Nothing else.
+        env.add_c_fn(
+            CFunOptions::new(c"__json-extract", janet_json_extract_cfn).namespace(c"harness"),
+        );
+        env.add_c_fn(
+            CFunOptions::new(c"__json-decode", janet_json_decode_cfn).namespace(c"harness"),
+        );
+    }
+
+    let _ = client.run(CAPTURE_BOOTSTRAP);
+    mirror_capture_buffers_into_top_dyns(&client);
+
+    // Note: HARNESS_NOTEBOOK_INIT is deliberately absent — see its docs.
+    for (label, src) in [
+        ("harness", HARNESS_INIT),
+        ("sandbox", HARNESS_SANDBOX),
+        ("notebook", NOTEBOOK_INIT),
+    ] {
+        if let Err(e) = client.run(src) {
+            let _ = init_tx.send(Err(format!("notebook {label} init failed: {e}")));
+            return;
+        }
+    }
+
+    let _ = init_tx.send(Ok(()));
+
+    run_command_loop(rx, &mut client, &interrupt);
 }
 
 #[cfg(not(feature = "plugin"))]
@@ -1592,6 +2353,7 @@ fn worker_loop(
     _init_tx: mpsc::Sender<Result<(), String>>,
     _shutdown: Arc<AtomicBool>,
     _dialog_pending: Arc<AtomicUsize>,
+    _interrupt: Arc<InterruptHandle>,
 ) {
     unreachable!("worker_loop should never run without the plugin feature");
 }
@@ -1789,12 +2551,130 @@ unsafe fn json_extract_body(
     }
 }
 
+/// `(harness/__notebook op session code)` — the notebook bridge
+/// (dirge-9xjg.4).
+///
+/// Registered on the **plugin** VM only. It runs on the plugin worker
+/// thread and forwards to the notebook VM's thread, so the two never share
+/// an interpreter; registering it on the notebook VM as well would let a
+/// cell re-enter the notebook lock it is already holding and deadlock.
+///
+/// Returns a table `{:ok bool :value string :output string}` so the plugin
+/// side does not have to parse anything. Ops: `eval`, `reset`, `sessions`,
+/// `respawn`.
+#[cfg(feature = "plugin")]
+unsafe extern "C-unwind" fn janet_notebook_cfn(
+    argc: i32,
+    argv: *mut janetrs::lowlevel::Janet,
+) -> janetrs::lowlevel::Janet {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        notebook_body(argc, argv)
+    }));
+    match result {
+        Ok(j) => j,
+        Err(payload) => {
+            let msg = panic_payload_to_string(&payload);
+            tracing::error!(
+                target: "dirge::plugin",
+                cfn = "harness/notebook",
+                panic = %msg,
+                "FFI panic in notebook cfn — returning an error result",
+            );
+            unsafe { notebook_result(false, &format!("notebook bridge panicked: {msg}"), "") }
+        }
+    }
+}
+
+#[cfg(feature = "plugin")]
+unsafe fn notebook_body(
+    argc: i32,
+    argv: *mut janetrs::lowlevel::Janet,
+) -> janetrs::lowlevel::Janet {
+    use super::notebook;
+    if argc < 1 {
+        return unsafe { notebook_result(false, "notebook: missing op", "") };
+    }
+    let op = unsafe { read_string_arg(argv, 0) }.unwrap_or_default();
+    let session = if argc > 1 {
+        unsafe { read_string_arg(argv, 1) }.unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let code = if argc > 2 {
+        unsafe { read_string_arg(argv, 2) }.unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    match op.as_str() {
+        "eval" => match notebook::eval_cell(&session, &code) {
+            Ok(cell) => unsafe { notebook_result(cell.ok, &cell.value, &cell.output) },
+            Err(e) => unsafe { notebook_result(false, &e, "") },
+        },
+        "reset" => match notebook::reset_session(&session) {
+            Ok(v) => unsafe { notebook_result(true, &v, "") },
+            Err(e) => unsafe { notebook_result(false, &e, "") },
+        },
+        "sessions" => match notebook::sessions() {
+            Ok(v) => unsafe { notebook_result(true, &v, "") },
+            Err(e) => unsafe { notebook_result(false, &e, "") },
+        },
+        "respawn" => match notebook::respawn() {
+            Ok(()) => unsafe { notebook_result(true, "respawned", "") },
+            Err(e) => unsafe { notebook_result(false, &e, "") },
+        },
+        other => unsafe { notebook_result(false, &format!("notebook: unknown op {other:?}"), "") },
+    }
+}
+
+/// Build the `{:ok :value :output}` table the bridge returns.
+#[cfg(feature = "plugin")]
+unsafe fn notebook_result(ok: bool, value: &str, output: &str) -> janetrs::lowlevel::Janet {
+    use janetrs::lowlevel::*;
+    unsafe {
+        let tbl = janet_table(3);
+        janet_table_put(
+            tbl,
+            janet_ckeywordv(c"ok".as_ptr() as *const u8, 2),
+            janet_wrap_boolean(i32::from(ok)),
+        );
+        janet_table_put(
+            tbl,
+            janet_ckeywordv(c"value".as_ptr() as *const u8, 5),
+            wrap_string(value),
+        );
+        janet_table_put(
+            tbl,
+            janet_ckeywordv(c"output".as_ptr() as *const u8, 6),
+            wrap_string(output),
+        );
+        janet_wrap_table(tbl)
+    }
+}
+
+/// `(harness/json-decode json-str)` -> native Janet data | nil
+/// (dirge-9xjg.6).
+///
+/// `harness/json-extract` pulls ONE string value from a FLAT object, which
+/// is enough for a `{code: …}` tool payload and nothing else. Notebook work
+/// routinely parses an API response, a config file, or another tool's
+/// output, and without a real decoder every cell hand-rolls string
+/// munging — precisely the friction the notebook exists to remove.
+///
+/// Implemented host-side because the parser already exists here and
+/// because a pure-Janet decoder would be both slower and another thing to
+/// keep correct. Mapping: object -> table, array -> array, string ->
+/// string, number -> number, true/false -> boolean, null -> `:null`.
+///
+/// `null` maps to the `:null` keyword rather than `nil` on purpose: in
+/// Janet, putting `nil` into a table REMOVES the key, so a JSON `null`
+/// would silently erase the field it belongs to and become
+/// indistinguishable from a field that was never sent.
 #[cfg(feature = "plugin")]
 unsafe extern "C-unwind" fn janet_json_decode_cfn(
     argc: i32,
     argv: *mut janetrs::lowlevel::Janet,
 ) -> janetrs::lowlevel::Janet {
-    use janetrs::lowlevel::*;
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
         json_decode_body(argc, argv)
     }));
@@ -1808,7 +2688,7 @@ unsafe extern "C-unwind" fn janet_json_decode_cfn(
                 panic = %msg,
                 "FFI panic in json-decode cfn — returning nil",
             );
-            unsafe { janet_wrap_nil() }
+            unsafe { janetrs::lowlevel::janet_wrap_nil() }
         }
     }
 }
@@ -1822,13 +2702,62 @@ unsafe fn json_decode_body(
     if argc < 1 {
         return unsafe { janet_wrap_nil() };
     }
-    let json_str = match unsafe { read_string_arg(argv, 0) } {
-        Some(s) => s,
-        None => return unsafe { janet_wrap_nil() },
+    let Some(json_str) = (unsafe { read_string_arg(argv, 0) }) else {
+        return unsafe { janet_wrap_nil() };
     };
     match serde_json::from_str::<serde_json::Value>(&json_str) {
-        Ok(value) => vigil_bridge::json_to_janet(&value),
+        Ok(v) => unsafe { json_to_janet(&v) },
         Err(_) => unsafe { janet_wrap_nil() },
+    }
+}
+
+/// Recursively convert a `serde_json::Value` into Janet data.
+///
+/// Depth is bounded so a deeply nested document cannot overflow the Rust
+/// stack from inside a C callback, where an overflow is a hard crash of
+/// the host rather than a catchable error. serde_json itself caps nesting
+/// at 128 by default, so this is a belt-and-braces second bound.
+#[cfg(feature = "plugin")]
+unsafe fn json_to_janet(v: &serde_json::Value) -> janetrs::lowlevel::Janet {
+    unsafe { json_to_janet_depth(v, 0) }
+}
+
+/// Maximum nesting `harness/json-decode` will materialise.
+#[cfg(feature = "plugin")]
+const JSON_DECODE_MAX_DEPTH: usize = 64;
+
+#[cfg(feature = "plugin")]
+unsafe fn json_to_janet_depth(v: &serde_json::Value, depth: usize) -> janetrs::lowlevel::Janet {
+    use janetrs::lowlevel::*;
+    if depth > JSON_DECODE_MAX_DEPTH {
+        return unsafe { janet_wrap_nil() };
+    }
+    unsafe {
+        match v {
+            serde_json::Value::Null => {
+                // Not `nil` — see the cfn docs: nil erases table keys.
+                let kw = c"null";
+                janet_ckeywordv(kw.as_ptr() as *const u8, 4)
+            }
+            serde_json::Value::Bool(b) => janet_wrap_boolean(i32::from(*b)),
+            serde_json::Value::Number(n) => janet_wrap_number(n.as_f64().unwrap_or(f64::NAN)),
+            serde_json::Value::String(s) => wrap_string(s),
+            serde_json::Value::Array(items) => {
+                let arr = janet_array(items.len().min(i32::MAX as usize) as i32);
+                for item in items {
+                    janet_array_push(arr, json_to_janet_depth(item, depth + 1));
+                }
+                janet_wrap_array(arr)
+            }
+            serde_json::Value::Object(map) => {
+                let tbl = janet_table(map.len().min(i32::MAX as usize) as i32);
+                for (k, val) in map {
+                    let key = wrap_string(k);
+                    janet_table_put(tbl, key, json_to_janet_depth(val, depth + 1));
+                }
+                janet_wrap_table(tbl)
+            }
+        }
     }
 }
 
@@ -2765,6 +3694,498 @@ pub(crate) mod vigil_bridge {
 #[cfg(all(test, feature = "plugin"))]
 mod tests {
     use super::*;
+
+    /// dirge-9xjg.1: the whole point of interrupting rather than
+    /// abandoning a runaway eval — the worker recovers AND the bindings
+    /// made before it survive. Without the interrupt the second eval never
+    /// returns, because the `(while true)` still owns the worker thread.
+    #[test]
+    fn runaway_eval_is_interrupted_and_vm_state_survives() {
+        let (mut w, _d, _l) = Worker::try_spawn().expect("spawn");
+        assert_eq!(
+            w.eval("(def before-runaway 42) before-runaway").unwrap(),
+            "42"
+        );
+
+        let err = w
+            .eval_with_timeout("(while true (def spin 1))", Duration::from_millis(150))
+            .expect_err("a (while true) must not return a value");
+        assert!(
+            err.contains("interrupted") || err.contains("did not reply"),
+            "unexpected error text: {err}"
+        );
+
+        // The worker is usable again and kept everything defined before
+        // the runaway cell. Both halves matter: a respawn would give the
+        // first assertion and fail the second.
+        assert_eq!(w.eval("before-runaway").unwrap(), "42");
+        assert_eq!(w.eval("(+ 1 2)").unwrap(), "3");
+    }
+
+    /// Janet's `auto_suspend` is a counter the interpreter refuses to run
+    /// under, so an interrupt that is raised and never cleared bricks the
+    /// VM. Hammer the interrupt path and assert the worker still evaluates.
+    #[test]
+    fn repeated_interrupts_do_not_latch_the_vm() {
+        let (mut w, _d, _l) = Worker::try_spawn().expect("spawn");
+        for _ in 0..3 {
+            let _ = w.eval_with_timeout("(while true nil)", Duration::from_millis(120));
+        }
+        assert_eq!(w.eval("(+ 20 22)").unwrap(), "42");
+    }
+
+    /// A cell that wraps itself in `try` must still be interruptible:
+    /// `try` compiles to the error-only fiber mask and
+    /// `JANET_SIGNAL_INTERRUPT` is USER8, so it cannot be swallowed. If
+    /// this ever regresses, agent-authored code can opt out of the
+    /// deadline entirely.
+    #[test]
+    fn a_try_wrapped_runaway_is_still_interrupted() {
+        let (mut w, _d, _l) = Worker::try_spawn().expect("spawn");
+        let err = w
+            .eval_with_timeout(
+                "(try (while true nil) ([e] :swallowed))",
+                Duration::from_millis(150),
+            )
+            .expect_err("try must not be able to swallow the interrupt");
+        assert!(!err.contains("swallowed"), "interrupt was caught: {err}");
+        assert_eq!(w.eval("(+ 1 1)").unwrap(), "2");
+    }
+
+    /// dirge-9xjg.3: a cell's `(print …)` has to come back, or the
+    /// notebook is unusable — printing intermediate values is how notebook
+    /// work is done.
+    #[test]
+    fn eval_cell_returns_value_and_captured_output() {
+        let (mut w, _d, _l) = Worker::try_spawn().expect("spawn");
+        let cell = w
+            .eval_cell(
+                r#"(print "hello") (print "world") (+ 20 22)"#,
+                None,
+                4096,
+                Duration::from_secs(5),
+            )
+            .expect("worker reachable");
+        assert!(cell.ok, "cell should have evaluated: {cell:?}");
+        assert_eq!(cell.value, "42");
+        assert_eq!(cell.output, "hello\nworld\n");
+    }
+
+    /// Capture must not accumulate across cells — that was dirge-lncv
+    /// (the discard buffers grew for the whole process lifetime) and it
+    /// would also mean every cell replayed the previous one's output.
+    #[test]
+    fn cell_output_does_not_leak_into_the_next_cell() {
+        let (mut w, _d, _l) = Worker::try_spawn().expect("spawn");
+        let first = w
+            .eval_cell(r#"(print "first") :a"#, None, 4096, Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(first.output, "first\n");
+        let second = w
+            .eval_cell(r#":b"#, None, 4096, Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(second.output, "", "previous cell's output leaked");
+        // And the buffer really is emptied, not merely skipped.
+        assert_eq!(w.eval("(length (dyn :out))").unwrap(), "0");
+    }
+
+    /// An unbounded paste is worse for a context-limited reader than a
+    /// labelled elision, so a chatty cell is capped.
+    #[test]
+    fn cell_output_is_capped_and_marks_the_truncation() {
+        let (mut w, _d, _l) = Worker::try_spawn().expect("spawn");
+        let cell = w
+            .eval_cell(
+                r#"(for i 0 1000 (print "0123456789")) :done"#,
+                None,
+                64,
+                Duration::from_secs(5),
+            )
+            .unwrap();
+        assert_eq!(cell.value, ":done");
+        assert!(
+            cell.output.contains("[stdout truncated,"),
+            "expected a truncation marker, got {:?}",
+            cell.output
+        );
+        // Cap plus the marker — nowhere near the ~11k the cell printed.
+        assert!(
+            cell.output.len() < 200,
+            "cap not applied: {}",
+            cell.output.len()
+        );
+    }
+
+    /// A raising cell is an ordinary notebook outcome, not a host failure:
+    /// the agent needs the error text AND whatever printed before it.
+    #[test]
+    fn a_raising_cell_reports_ok_false_and_keeps_its_output() {
+        let (mut w, _d, _l) = Worker::try_spawn().expect("spawn");
+        let cell = w
+            .eval_cell(
+                r#"(print "before") (error "boom")"#,
+                None,
+                4096,
+                Duration::from_secs(5),
+            )
+            .expect("worker reachable — a Janet error is data, not Err");
+        assert!(!cell.ok, "expected the cell to report failure");
+        assert!(cell.output.contains("before"), "output lost: {cell:?}");
+    }
+
+    /// dirge-c8lh: Janet emits compile errors and stack traces with NO
+    /// fiber active, so they read `top_dyns` rather than the fiber env and
+    /// bypassed the `:out`/`:err` redirect entirely — straight onto the
+    /// user's terminal, corrupting the raw-mode TUI.
+    ///
+    /// Asserting the text is CAPTURED is the only way to prove it is not
+    /// leaking: a test can't observe the process's real stderr, but the
+    /// trace has to be in exactly one of the two places.
+    #[test]
+    fn compile_errors_are_captured_rather_than_printed_to_the_terminal() {
+        let (mut w, _d, _l) = Worker::try_spawn().expect("spawn");
+        let cell = w
+            .eval_cell(
+                "(this-symbol-does-not-exist)",
+                None,
+                4096,
+                Duration::from_secs(5),
+            )
+            .unwrap();
+        assert!(!cell.ok);
+        assert!(
+            cell.output.contains("this-symbol-does-not-exist"),
+            "compile error escaped capture (it went to the real stderr): {cell:?}"
+        );
+    }
+
+    /// The same, for a runtime error's stack trace.
+    #[test]
+    fn runtime_stack_traces_are_captured_rather_than_printed() {
+        let (mut w, _d, _l) = Worker::try_spawn().expect("spawn");
+        let cell = w
+            .eval_cell(r#"(error "trace-me")"#, None, 4096, Duration::from_secs(5))
+            .unwrap();
+        assert!(!cell.ok);
+        assert!(
+            cell.output.contains("trace-me"),
+            "stack trace escaped capture: {cell:?}"
+        );
+    }
+
+    /// dirge-9xjg.2: the notebook VM must be a genuinely separate world.
+    /// State is per-session, and neither session can see the other's defs.
+    #[test]
+    fn notebook_sessions_do_not_clobber_each_other() {
+        let mut nb = Worker::try_spawn_notebook().expect("spawn notebook");
+        let put_a = nb
+            .eval_cell(
+                r#"(notebook/-eval "a" "(def results :from-a) results")"#,
+                None,
+                4096,
+                Duration::from_secs(5),
+            )
+            .unwrap();
+        assert_eq!(put_a.value, ":from-a");
+
+        // Same name, other session — must NOT overwrite a's binding.
+        let put_b = nb
+            .eval_cell(
+                r#"(notebook/-eval "b" "(def results :from-b) results")"#,
+                None,
+                4096,
+                Duration::from_secs(5),
+            )
+            .unwrap();
+        assert_eq!(put_b.value, ":from-b");
+
+        let read_a = nb
+            .eval_cell(
+                r#"(notebook/-eval "a" "results")"#,
+                None,
+                4096,
+                Duration::from_secs(5),
+            )
+            .unwrap();
+        assert_eq!(read_a.value, ":from-a", "session b clobbered session a");
+    }
+
+    /// The other half of dirge-9xjg.5: isolation must not remove the
+    /// deliberate sharing that motivated the design.
+    #[test]
+    fn notebook_shared_table_crosses_sessions() {
+        let mut nb = Worker::try_spawn_notebook().expect("spawn notebook");
+        nb.eval_cell(
+            r#"(notebook/-eval "a" "(put notebook/shared :k :published)")"#,
+            None,
+            4096,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let seen = nb
+            .eval_cell(
+                r#"(notebook/-eval "b" "(get notebook/shared :k)")"#,
+                None,
+                4096,
+                Duration::from_secs(5),
+            )
+            .unwrap();
+        assert_eq!(seen.value, ":published");
+    }
+
+    /// The notebook VM must not carry the host bridges. `harness/confirm`
+    /// is the permission gate's own channel; a cell that could open a
+    /// dialog could also extend its own deadline indefinitely.
+    #[test]
+    fn notebook_vm_has_no_dialog_or_lsp_bridge() {
+        let mut nb = Worker::try_spawn_notebook().expect("spawn notebook");
+        for sym in [
+            "harness/confirm",
+            "harness/select",
+            "harness/__confirm",
+            "harness/__select",
+            "harness/lsp",
+            "harness/computer-use-exec",
+        ] {
+            let bound = nb
+                .eval(&format!("(if (dyn '{sym}) :bound :absent)"))
+                .unwrap();
+            assert_eq!(bound, ":absent", "{sym} is reachable from a notebook cell");
+        }
+        // But the sandbox still applies and json IS available.
+        assert_eq!(
+            nb.eval("(if (dyn 'harness/json-decode) :bound :absent)")
+                .unwrap(),
+            ":bound"
+        );
+    }
+
+    /// `os/exit` must stay neutered on the notebook VM: agent-authored
+    /// code reaches this VM, so it is the one that most needs the sandbox.
+    #[test]
+    fn notebook_vm_keeps_the_sandbox() {
+        let mut nb = Worker::try_spawn_notebook().expect("spawn notebook");
+        let cell = nb
+            .eval_cell(
+                r#"(notebook/-eval "a" "(os/exit 1)")"#,
+                None,
+                4096,
+                Duration::from_secs(5),
+            )
+            .expect("host must still be alive");
+        assert!(
+            cell.value.contains("disabled in dirge plugins"),
+            "os/exit was not neutered: {cell:?}"
+        );
+    }
+
+    /// A wedged notebook must not be able to take plugin state with it.
+    #[test]
+    fn a_runaway_notebook_cell_leaves_the_plugin_vm_untouched() {
+        let (mut plugins, _d, _l) = Worker::try_spawn().expect("spawn plugin vm");
+        let mut nb = Worker::try_spawn_notebook().expect("spawn notebook");
+        plugins.eval("(def plugin-state :intact)").unwrap();
+
+        let _ = nb.eval_with_timeout("(while true nil)", Duration::from_millis(150));
+
+        assert_eq!(plugins.eval("plugin-state").unwrap(), ":intact");
+        assert_eq!(plugins.eval("(+ 2 2)").unwrap(), "4");
+        // And the notebook itself recovered rather than needing a respawn.
+        assert_eq!(nb.eval("(+ 3 3)").unwrap(), "6");
+    }
+
+    /// dirge-9xjg.6: a flat single-key extract is not enough for notebook
+    /// work; nested documents have to come back as native Janet data.
+    #[test]
+    fn json_decode_handles_nested_documents() {
+        let (mut w, _d, _l) = Worker::try_spawn().expect("spawn");
+        let code = r#"
+          (let [d (harness/json-decode `{"a": {"b": [1, 2, {"c": "deep"}]}, "t": true, "n": null}`)]
+            (string (get-in d ["a" "b" 2 "c"]) "|"
+                    (get d "t") "|"
+                    (type (get d "n")) "|"
+                    (= :null (get d "n")) "|"
+                    (length (get-in d ["a" "b"]))))"#;
+        assert_eq!(w.eval(code).unwrap(), "deep|true|keyword|true|3");
+    }
+
+    /// JSON `null` must not decode to Janet `nil`: putting nil into a
+    /// table REMOVES the key, so a null field would be indistinguishable
+    /// from a field that was never sent.
+    #[test]
+    fn json_null_does_not_erase_its_key() {
+        let (mut w, _d, _l) = Worker::try_spawn().expect("spawn");
+        let out = w
+            .eval(r#"(let [d (harness/json-decode `{"present": null}`)] (length (keys d)))"#)
+            .unwrap();
+        assert_eq!(out, "1", "the null-valued key vanished from the table");
+    }
+
+    /// Malformed input is a normal outcome for a decoder handed arbitrary
+    /// tool output — it must return nil, not raise or crash the VM.
+    #[test]
+    fn json_decode_returns_nil_on_bad_input() {
+        let (mut w, _d, _l) = Worker::try_spawn().expect("spawn");
+        assert_eq!(
+            w.eval(r#"(harness/json-decode "{not json")"#).unwrap(),
+            "nil"
+        );
+        assert_eq!(w.eval("(harness/json-decode 42)").unwrap(), "nil");
+        assert_eq!(w.eval("(+ 1 1)").unwrap(), "2", "VM survived bad input");
+    }
+
+    /// The capture mirror holds buffer OBJECTS, so exactly one place may
+    /// bind `:out`/`:err`. A second `(setdyn :out @"")` anywhere swaps the
+    /// fiber-level binding, strands `top_dyns` on the orphaned buffer, and
+    /// silently puts Janet error traces back on the user's terminal — a
+    /// regression with no failing assertion anywhere near it.
+    ///
+    /// Encoded as a source scan rather than a behavioural test because the
+    /// hazard is *adding a site*, and a behavioural test only covers the
+    /// sites that already exist.
+    #[test]
+    fn only_the_bootstrap_binds_the_capture_buffers() {
+        // Scan the production half only: the assertions below name the
+        // very strings they forbid.
+        let src = include_str!("worker.rs");
+        let prod = src.split("#[cfg(test)]").next().expect("production half");
+        assert!(
+            prod.contains("const CAPTURE_BOOTSTRAP"),
+            "marker gone — this scan would pass vacuously"
+        );
+        // Comments discuss the rule at length; count CODE only.
+        let code: String = prod
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.starts_with('#')
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        for pattern in ["(setdyn :out", "(setdyn :err"] {
+            let hits = code.matches(pattern).count();
+            assert_eq!(
+                hits, 1,
+                "{pattern} appears {hits}x; only CAPTURE_BOOTSTRAP may bind it. \
+                 Clear in place with harness/-capture-reset instead."
+            );
+        }
+    }
+
+    /// dirge-v49u: a child process writes to the REAL fds, so the
+    /// `:out`/`:err` redirect — a Janet-level abstraction — does not
+    /// contain it. Unredirected subprocess output used to land straight on
+    /// the raw-mode TUI.
+    ///
+    /// Asserting the output is CAPTURED is what proves it is not leaking:
+    /// a test cannot observe the process's real stdout, but the bytes have
+    /// to be in exactly one of the two places.
+    #[test]
+    fn subprocess_output_is_captured_not_written_to_the_terminal() {
+        // Notebook VM: sessions live there, and it is the VM agent-authored
+        // code actually reaches. The containment itself is installed by
+        // HARNESS_SANDBOX, which both VMs run.
+        let mut w = Worker::try_spawn_notebook().expect("spawn notebook");
+        let cell = w
+            .eval_cell(
+                r#"(os/execute ["/bin/sh" "-c" "printf 'child-stdout\n'; printf 'child-stderr\n' >&2"] :p)"#,
+                Some("subprocess-basic"),
+                4096,
+                Duration::from_secs(10),
+            )
+            .unwrap();
+        assert!(cell.ok, "{cell:?}");
+        assert_eq!(cell.value, "0", "exit code not preserved: {cell:?}");
+        assert!(
+            cell.output.contains("child-stdout"),
+            "subprocess stdout escaped capture: {cell:?}"
+        );
+        assert!(
+            cell.output.contains("child-stderr"),
+            "subprocess stderr escaped capture: {cell:?}"
+        );
+    }
+
+    /// The `:x` flag raises on a non-zero exit. What the child printed
+    /// before failing is exactly what someone needs to read, so the drain
+    /// has to survive the raise.
+    #[test]
+    fn subprocess_output_is_captured_even_when_the_command_fails() {
+        let mut w = Worker::try_spawn_notebook().expect("spawn notebook");
+        // Through the SESSION path, which is how the agent reaches it.
+        // `ok` there comes from `fiber/status`, which is accurate even for
+        // errors raised on the event-loop path — unlike janetrs' errflags,
+        // see dirge-2jtd.
+        let cell = w
+            .eval_cell(
+                r#"(os/execute ["/bin/sh" "-c" "printf 'printed-before-failing\n'; exit 9"] :px)"#,
+                Some("subprocess-fail"),
+                4096,
+                Duration::from_secs(10),
+            )
+            .unwrap();
+        assert!(!cell.ok, "a :x non-zero exit should raise: {cell:?}");
+        assert!(
+            cell.output.contains("printed-before-failing"),
+            "output lost when the command failed: {cell:?}"
+        );
+    }
+
+    /// A caller that manages its own redirection must be left alone —
+    /// containment fills gaps, it does not seize the streams.
+    #[test]
+    fn caller_supplied_redirection_is_left_alone() {
+        let (mut w, _d, _l) = Worker::try_spawn().expect("spawn");
+        let out = w
+            .eval(
+                r#"(let [f (file/temp)]
+                     (os/execute ["/bin/sh" "-c" "printf 'to-my-own-file'"] :p {:out f :err f})
+                     (file/seek f :set 0)
+                     (def s (string (file/read f :all)))
+                     (file/close f)
+                     s)"#,
+            )
+            .unwrap();
+        assert_eq!(out, "to-my-own-file");
+    }
+
+    /// Only UNSPECIFIED streams are filled. plugins/k8s passes
+    /// `{:out :pipe}` and leaves `:err` alone; its pipe must survive while
+    /// its stderr still gets contained.
+    #[test]
+    fn only_unspecified_streams_are_filled() {
+        let (mut w, _d, _l) = Worker::try_spawn().expect("spawn");
+        let out = w
+            .eval(
+                r#"(let [p (os/spawn ["/bin/sh" "-c" "printf 'piped'; printf 'noise' >&2"] :p {:out :pipe})]
+                     (def s (string (ev/read (p :out) 64)))
+                     (os/proc-wait p)
+                     s)"#,
+            )
+            .unwrap();
+        assert_eq!(out, "piped", "caller's :out pipe was overridden");
+    }
+
+    /// Flags are passed through exactly. Injecting `:p` would add PATH
+    /// lookup to a call that never asked for it, resolving a bare name
+    /// that stock Janet refuses — a containment fix must not widen what
+    /// can be executed.
+    #[test]
+    fn containment_does_not_inject_path_lookup() {
+        let mut w = Worker::try_spawn_notebook().expect("spawn notebook");
+        let cell = w
+            .eval_cell(
+                r#"(try (os/execute ["sh" "-c" "printf 'resolved-via-path'"]) ([e] :refused))"#,
+                Some("subprocess-path"),
+                4096,
+                Duration::from_secs(10),
+            )
+            .unwrap();
+        assert!(
+            !cell.output.contains("resolved-via-path"),
+            "a bare name resolved without :p — PATH lookup was injected: {cell:?}"
+        );
+    }
 
     #[test]
     fn worker_round_trips_an_eval() {

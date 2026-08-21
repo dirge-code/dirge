@@ -54,12 +54,24 @@ const LANGUAGES: &[(&str, &str)] = &[
     ("h", "c"),
     ("cpp", "cpp"),
     ("cxx", "cpp"),
+    ("ixx", "cpp"),
     ("cc", "cpp"),
     ("hpp", "cpp"),
     ("hxx", "cpp"),
     ("hh", "cpp"),
+    // Objective-C / Objective-C++. `clangd` has claimed `.m`/`.mm` since the
+    // audit M5 additions, but there were no languageId entries — so every
+    // Objective-C file was opened as `plaintext` and clangd answered nothing,
+    // exactly the Swift failure and shipped for just as long. Found by
+    // `every_served_extension_has_a_language_id`, not by anyone using it.
+    ("m", "objective-c"),
+    ("mm", "objective-cpp"),
     ("java", "java"),
     ("rb", "ruby"),
+    // ruby-lsp also claims these two, and they had the same gap as `.m`/`.mm`.
+    // `Rakefile` and `.gemspec` are Ruby source; the languageId is `ruby`.
+    ("rake", "ruby"),
+    ("gemspec", "ruby"),
     ("sh", "shellscript"),
     ("bash", "shellscript"),
     ("zsh", "shellscript"),
@@ -76,6 +88,18 @@ const LANGUAGES: &[(&str, &str)] = &[
     ("zig", "zig"),
     ("dfy", "dafny"),
     ("cmake", "cmake"),
+    // GH #778. Without this the `didOpen` for a `.swift` file carried
+    // `languageId: "plaintext"`, so sourcekit-lsp accepted the document and
+    // then answered nothing — the server spawned, the request succeeded, and
+    // every query came back empty. See
+    // `every_served_extension_has_a_language_id`.
+    ("swift", "swift"),
+    // Mojo source uses `.mojo` or the fire emoji `.🔥` — both are first-class
+    // per the Modular docs, and `language_for_path`'s `to_lowercase()` is a
+    // no-op on the emoji so the lookup works unchanged. languageId "mojo"
+    // matches what the official VS Code extension sends.
+    ("mojo", "mojo"),
+    ("🔥", "mojo"),
 ];
 
 const FILENAMES: &[(&str, &str)] = &[
@@ -140,6 +164,15 @@ mod tests {
     }
 
     #[test]
+    fn mojo_extensions_including_fire_emoji() {
+        assert_eq!(lang("src/kernel.mojo"), "mojo");
+        assert_eq!(lang("Kernel.MOJO"), "mojo");
+        // The emoji extension is multi-byte and has no uppercase form; it must
+        // survive the lowercasing lookup path.
+        assert_eq!(lang("src/kernel.🔥"), "mojo");
+    }
+
+    #[test]
     fn unknown_extension_returns_plaintext() {
         assert_eq!(lang("a.unknown_ext_42"), "plaintext");
     }
@@ -165,5 +198,62 @@ mod tests {
     #[test]
     fn empty_path_returns_plaintext() {
         assert_eq!(lang(""), "plaintext");
+    }
+}
+
+#[cfg(test)]
+mod registry_agreement {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// Adding a language server takes entries in THREE tables that do not
+    /// reference each other: `builtin_servers()` (who claims the extension),
+    /// `default_commands()` (how to launch it), and `LANGUAGES` (the
+    /// `languageId` sent in `didOpen`). Miss the third and the failure is
+    /// SILENT in the worst way — the server spawns, accepts the document as
+    /// `plaintext`, answers every query with nothing, and no error is raised
+    /// anywhere.
+    ///
+    /// That is what shipped for Swift until GH #778 measured it against a real
+    /// sourcekit-lsp. This derives the check from the server registry, so the
+    /// next language cannot repeat it: claim an extension and you must say what
+    /// language it is.
+    #[test]
+    fn every_served_extension_has_a_language_id() {
+        for server in crate::lsp::server::builtin_servers() {
+            for ext in &server.extensions {
+                let probe = PathBuf::from(format!("a.{ext}"));
+                let lang = language_for_path(&probe);
+                assert_ne!(
+                    lang, "plaintext",
+                    "server {:?} claims .{ext} but LANGUAGES has no entry, so its \
+                     didOpen would say plaintext and the server would answer nothing",
+                    server.id
+                );
+            }
+            for name in &server.filenames {
+                let probe = PathBuf::from(name);
+                assert_ne!(
+                    language_for_path(&probe),
+                    "plaintext",
+                    "server {:?} claims {name:?} but LANGUAGES/FILENAMES has no entry",
+                    server.id
+                );
+            }
+        }
+    }
+
+    /// The other half of the same wiring: a server that claims extensions must
+    /// have a launch command, or it can never start.
+    #[test]
+    fn every_builtin_server_has_a_launch_command() {
+        let commands = crate::lsp::spawn::ProcessSpawner::default_commands();
+        for server in crate::lsp::server::builtin_servers() {
+            assert!(
+                commands.contains_key(server.id),
+                "server {:?} has no entry in default_commands()",
+                server.id
+            );
+        }
     }
 }

@@ -1017,9 +1017,26 @@ pub async fn run_interactive(
                                         entry.buf.pop();
                                         QStep::Stay
                                     }
-                                    KeyCode::Char(c) => {
+                                    // dirge-x2zf: unguarded, this pushed the
+                                    // literal 'c' of a Ctrl+C into the user's
+                                    // answer. `PlanApproval`'s entry has
+                                    // carried this guard all along; this one
+                                    // is the copy that never got it.
+                                    KeyCode::Char(c)
+                                        if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                    {
                                         entry.buf.push(c);
                                         QStep::Stay
+                                    }
+                                    // Ctrl+C bails from the answer field too,
+                                    // not just the option list.
+                                    _ if key.modifiers.contains(KeyModifiers::CONTROL)
+                                        && matches!(
+                                            key.code,
+                                            KeyCode::Char('c') | KeyCode::Char('d')
+                                        ) =>
+                                    {
+                                        QStep::Rejected
                                     }
                                     _ => QStep::Stay,
                                 }
@@ -1028,6 +1045,7 @@ pub async fn run_interactive(
                                 // this arm just applies it to the state.
                                 let action = option_select_action(
                                     key.code,
+                                    key.modifiers,
                                     multi,
                                     custom,
                                     q.cursor,
@@ -2107,6 +2125,34 @@ pub async fn run_interactive(
                                         if let Some(ph) = ui.wt_merge_phase.take() {
                                             ph.core.task.abort();
                                         }
+                                        // dirge-vpma.21: and a `!`/`!!` shell run.
+                                        //
+                                        // Once the shell box is mounted, keys route to
+                                        // the PTY and never reach here — but during the
+                                        // ~120ms pre-mount grace window they do. This
+                                        // branch then cleared `is_running`, printed
+                                        // "interrupted" and dropped the queued messages
+                                        // while the child kept running: a prompt typed
+                                        // next submitted immediately (the busy gate now
+                                        // sees an idle session) and ran an agent turn
+                                        // alongside the live shell, and on exit a
+                                        // Visible command still fed its output to the
+                                        // agent despite the interrupt. Kill the group
+                                        // and tear the session down, exactly as the Esc
+                                        // path does.
+                                        if let Some(mut s) = ui.shell_session.take() {
+                                            if let Some(tx) = s.interrupt.take() {
+                                                let _ = tx.send(());
+                                            }
+                                            drop(s.input_tx);
+                                            if let Some(j) = s.join {
+                                                j.abort();
+                                            }
+                                            ui.shell_box_visible = false;
+                                            ui.shell_mount_deadline = None;
+                                            ui.shell_parser = None;
+                                            renderer.clear_shell_overlay();
+                                        }
                                         // Cooperative cancel first: lets the
                                         // retry loop and rig stream observe
                                         // `signal.is_cancelled()` and exit
@@ -2693,11 +2739,29 @@ pub async fn run_interactive(
                                                 Some(mut mgr) => {
                                                     let result = mgr.invoke_command(&handler, &spec);
                                                     drop(mgr);
-                                                    if let Ok(Some(msg)) = result {
-                                                        renderer.write_line(
-                                                            &format!("[plugin] {}", sanitize_output(&msg)),
-                                                            theme::dim(),
-                                                        )?;
+                                                    // dirge-vpma.20: surface the Err,
+                                                    // as the slash path does. A Janet
+                                                    // handler's own exception reaches the
+                                                    // notification queue either way, but
+                                                    // an infra-level eval error was lost
+                                                    // only here: the keypress was
+                                                    // consumed and nothing rendered or
+                                                    // logged, so the shortcut looked
+                                                    // silently dead.
+                                                    match result {
+                                                        Ok(Some(msg)) => {
+                                                            renderer.write_line(
+                                                                &format!("[plugin] {}", sanitize_output(&msg)),
+                                                                theme::dim(),
+                                                            )?;
+                                                        }
+                                                        Ok(None) => {}
+                                                        Err(e) => {
+                                                            renderer.write_line(
+                                                                &format!("[plugin] {handler} failed: {e}"),
+                                                                c_error(),
+                                                            )?;
+                                                        }
                                                     }
                                                 }
                                                 None => {
@@ -3134,7 +3198,8 @@ pub async fn run_interactive(
                                                     );
                                                     runner.install_into(&mut ui.agent_rx, &mut ui.agent_abort, &mut ui.agent_interject, &mut ui.agent_cancel, &mut ui.is_running);
                                                     begin_snapshot_turn(session);
-                                                    renderer.set_avatar_state(avatar::AvatarState::Idle);
+                                                    // dirge-vpma.18: a run is active — do not paint the resting face.
+                                                    renderer.set_avatar_state(avatar::AvatarState::settled(ui.is_running));
                                                 }
                                             }
                                             Err(e) => {
@@ -3416,7 +3481,8 @@ pub async fn run_interactive(
                                     // output + "› interrupted" were logged above; `!!`
                                     // leaves no trace at all.
                                     drain_interjections!();
-                                    renderer.set_avatar_state(avatar::AvatarState::Idle);
+                                    // dirge-vpma.18: the drain may have just spawned a runner, so the face follows the resulting state.
+                                    renderer.set_avatar_state(avatar::AvatarState::settled(ui.is_running));
                                 }
                                 renderer.request_repaint();
                             }
@@ -3857,6 +3923,56 @@ pub async fn run_interactive(
                         }
                         renderer.request_repaint();
                     }
+                    // dirge-l31h: the run's task ended and never said so.
+                    //
+                    // Placed AFTER the event arm on purpose. `biased` polls
+                    // in order, so every buffered event — including the
+                    // terminal one the run's epitaph sends as it goes down —
+                    // is delivered first; a handled terminal event takes
+                    // `agent_abort`, which disables this arm. It therefore
+                    // fires only for an ending nothing else accounted for,
+                    // and the `is_running` guard keeps it off the paths that
+                    // deliberately keep a run alive past `Done` (the plugin
+                    // hook chain, `/plan` review).
+                    //
+                    // Without it the UI's run state depended on the run
+                    // CHOOSING to report itself: a task that died mid-run
+                    // left `is_running` true with no arm left to clear it,
+                    // which is a hang the user cannot tell from thinking.
+                    exit = async {
+                        match &mut ui.agent_abort {
+                            // `JoinHandle` is a future; a ready one always
+                            // wins its poll, so the handle this arm takes
+                            // below is never polled twice.
+                            Some(h) => run_handlers::ended::classify(h.await),
+                            None => std::future::pending().await,
+                        }
+                    }, if ui.is_running => {
+                        ui.agent_abort = None;
+                        tracing::warn!(
+                            target: "dirge::ui",
+                            exit = ?exit,
+                            "agent task ended without a terminal event",
+                        );
+                        let message = run_handlers::ended::describe(&exit);
+                        let mut ctx = make_run_ctx!();
+                        run_handlers::handle_error(
+                            &mut ctx,
+                            compact_str::CompactString::from(message),
+                            &mut ui.was_reasoning,
+                            &mut ui.is_running,
+                            &mut ui.last_token_render,
+                            &mut ui.agent_rx,
+                            &mut ui.agent_abort,
+                            &mut ui.agent_interject,
+                            &mut ui.agent_cancel,
+                            &ui.interjection_queue,
+                            #[cfg(feature = "plugin")]
+                            plugin_manager,
+                        )
+                        .await?;
+                        renderer.request_repaint();
+                    }
                     // Phased `/plan` explore→plan task events. Drained here so the forks
                     // run off the event loop (dirge-vuzz): progress lines paint as they
                     // arrive, `Ready` launches the implement run, `Aborted`/channel-close
@@ -3902,7 +4018,6 @@ pub async fn run_interactive(
                                 begin_snapshot_turn(session);
                                 ui.last_user_prompt.clone_from(&kickoff.impl_prompt);
                                 let history = crate::agent::runner::convert_history(session);
-                                renderer.set_avatar_state(avatar::AvatarState::Idle);
                                 let runner = agent.clone().spawn_runner(
                                     crate::provider::Prompt::text(crate::agent::tools::background::prepend_pending_notifications(&kickoff.impl_prompt, bg_store.as_ref())),
                                     history,
@@ -3910,6 +4025,11 @@ pub async fn run_interactive(
                                     Some(session.assets_dir()),
                                 );
                                 runner.install_into(&mut ui.agent_rx, &mut ui.agent_abort, &mut ui.agent_interject, &mut ui.agent_cancel, &mut ui.is_running);
+                                // dirge-vpma.18: AFTER the install, and chosen from the
+                                // run state it just set. Painting Idle first showed the
+                                // resting face for the whole time-to-first-token while
+                                // the status line said busy.
+                                renderer.set_avatar_state(avatar::AvatarState::settled(ui.is_running));
                                 ui.active_plan = Some(kickoff.active);
                             }
                             Some(PlanPhaseEvent::Aborted) | None => {
@@ -4214,7 +4334,8 @@ pub async fn run_interactive(
                                 runner.install_into(&mut ui.agent_rx, &mut ui.agent_abort, &mut ui.agent_interject, &mut ui.agent_cancel, &mut ui.is_running);
                                 session.add_message_with_images(MessageRole::User, &record_text, record_images);
                                 begin_snapshot_turn(session);
-                                renderer.set_avatar_state(avatar::AvatarState::Idle);
+                                // dirge-vpma.18: a run is active — do not paint the resting face.
+                                renderer.set_avatar_state(avatar::AvatarState::settled(ui.is_running));
                             }
                             Next::Retry { prompt } => {
                                 // Reactive overflow retry: the prompt is ALREADY in the
@@ -4236,7 +4357,8 @@ pub async fn run_interactive(
                                 runner.install_into(&mut ui.agent_rx, &mut ui.agent_abort, &mut ui.agent_interject, &mut ui.agent_cancel, &mut ui.is_running);
                                 ui.last_collapsed = None;
                                 renderer.write_line("  ↳ resumed run with compacted history", theme::dim())?;
-                                renderer.set_avatar_state(avatar::AvatarState::Idle);
+                                // dirge-vpma.18: a run is active — do not paint the resting face.
+                                renderer.set_avatar_state(avatar::AvatarState::settled(ui.is_running));
                             }
                             Next::Continue => {
                                 // dirge-b899: the failed turn's partial assistant message
@@ -4258,7 +4380,9 @@ pub async fn run_interactive(
                                 begin_snapshot_turn(session);
                                 ui.last_collapsed = None;
                                 renderer.write_line("  ↳ resumed task with compacted history", theme::dim())?;
-                                renderer.set_avatar_state(avatar::AvatarState::Idle);
+                                // dirge-vpma.18: a run is active — do not paint the
+                                // resting face.
+                                renderer.set_avatar_state(avatar::AvatarState::settled(ui.is_running));
                             }
                             Next::Finish { clear_queue } => {
                                 if clear_queue {
@@ -4282,7 +4406,8 @@ pub async fn run_interactive(
                                     // next turn (else it strands; only a runner drains).
                                     drain_interjections!();
                                 }
-                                renderer.set_avatar_state(avatar::AvatarState::Idle);
+                                // dirge-vpma.18: the drain may have just spawned a runner, so the face follows the resulting state.
+                                renderer.set_avatar_state(avatar::AvatarState::settled(ui.is_running));
                             }
                         }
                         renderer.request_repaint();
@@ -4381,7 +4506,8 @@ pub async fn run_interactive(
                         // Release the busy state set at spawn; a prompt typed during the
                         // query was queued, so drain it into the next turn.
                         drain_interjections!();
-                        renderer.set_avatar_state(avatar::AvatarState::Idle);
+                        // dirge-vpma.18: the drain may have just spawned a runner, so the face follows the resulting state.
+                        renderer.set_avatar_state(avatar::AvatarState::settled(ui.is_running));
                         renderer.request_repaint();
                     }
                     // dirge-iagk: the spawned `/wt-merge` git merge completes here. On a
@@ -5368,6 +5494,7 @@ fn panel_refresh_due(
 /// (re)opens the editor so the answer can be edited in place.
 fn option_select_action(
     key: KeyCode,
+    mods: KeyModifiers,
     multi: bool,
     custom: bool,
     cursor: usize,
@@ -5375,6 +5502,16 @@ fn option_select_action(
     has_custom_text: bool,
 ) -> OptionAction {
     let on_custom_row = custom && cursor == num_options;
+    // dirge-x2zf: Ctrl+C / Ctrl+D mean "I want out" everywhere else in this
+    // UI — Permission maps them to Deny, the dialogs cancel, plan approval
+    // bails. This modal only listened for Esc, so the key a user reaches for
+    // did nothing at all. Checked before the code match so `Char('c')`
+    // cannot be read as an option key.
+    if mods.contains(KeyModifiers::CONTROL)
+        && matches!(key, KeyCode::Char('c') | KeyCode::Char('d'))
+    {
+        return OptionAction::Reject;
+    }
     match key {
         KeyCode::Up | KeyCode::Char('k') => OptionAction::CursorUp,
         KeyCode::Down | KeyCode::Char('j') => OptionAction::CursorDown,

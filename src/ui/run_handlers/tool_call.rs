@@ -100,6 +100,7 @@ pub(crate) fn handle_tool_call(
         ctx.renderer.write_line("", Color::White)?;
         *ctx.agent_line_started = false;
     }
+    ctx.renderer.end_stream();
     ctx.response_buf.clear();
     *ctx.response_start_line = None;
     // Stash the thinking before the tool chamber takes over so Ctrl+O can

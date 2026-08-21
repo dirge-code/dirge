@@ -258,6 +258,21 @@ pub struct Session {
     pub total_tokens: u64,
     pub total_cost: f64,
     pub total_estimated_tokens: u64,
+    /// Prompt tokens the provider reported for the MOST RECENT request
+    /// (dirge-hwk9.2). `None` until the first response.
+    ///
+    /// This is the number the context manager divides by `effective_ctx_max`
+    /// to decide whether to fold, so it is the only honest numerator for a
+    /// context gauge. `total_estimated_tokens` is a different accounting over
+    /// a different message set — the full persisted transcript, tool results
+    /// at their original length — and a gauge built from it reported 100% and
+    /// "compaction soon" on a run whose requests were never close.
+    ///
+    /// Not persisted: it describes the last request, not the session, and a
+    /// resumed session's first gauge should come from the estimate until a
+    /// real response replaces it.
+    #[serde(skip)]
+    pub last_prompt_tokens: Option<u64>,
     /// Cumulative real input (prompt) tokens reported by the
     /// provider across this session's lifetime. Unlike
     /// `total_estimated_tokens` (a per-message heuristic), this is
@@ -289,6 +304,20 @@ pub struct Session {
     /// correct answer for pre-fix sessions (they saved the unresolved default).
     #[serde(default)]
     pub model_explicit: bool,
+    /// Fingerprint of the assembled system prompt this session ran under
+    /// (dirge-wxyw), from [`crate::agent::prompt::preamble_digest`].
+    ///
+    /// Diagnostic only — nothing branches on it. It exists because nothing
+    /// else identifies the instructions a session actually ran: the version
+    /// does not, since the preamble varies within a version by prompt mode,
+    /// AGENTS.md, project skills, memory, and model-family steering. When
+    /// behaviour changes and the prompt is a suspect, this separates "the
+    /// instructions differed" from "the model or config differed".
+    ///
+    /// `None` for sessions saved before the field existed, and for any path
+    /// that builds a session without an agent.
+    #[serde(default)]
+    pub preamble_digest: Option<CompactString>,
     pub provider: CompactString,
     pub working_dir: CompactString,
     #[serde(default)]
@@ -439,6 +468,7 @@ impl Session {
             total_cost: 0.0,
             cumulative_output_tokens: 0,
             total_estimated_tokens: 0,
+            last_prompt_tokens: None,
             cumulative_input_tokens: 0,
             cumulative_cached_input_tokens: 0,
             cumulative_cache_creation_tokens: 0,
@@ -447,6 +477,8 @@ impl Session {
             // Fresh sessions have their explicit signal stamped by the startup
             // resolver (dirge-ovjk follow-up); default false until then.
             model_explicit: false,
+            // Stamped once the agent is built (see main.rs).
+            preamble_digest: None,
             provider: CompactString::new(provider),
             working_dir: std::env::current_dir()
                 .map(|p| CompactString::new(p.to_string_lossy()))
@@ -476,6 +508,18 @@ impl Session {
         cache_creation_input_tokens: u64,
         output_tokens: u64,
     ) {
+        // dirge-hwk9.2: the context gauge needs the LAST request's prompt
+        // size, which the cumulative counters cannot answer.
+        //
+        // `input_tokens` ALONE, deliberately: this must be the same number
+        // `context_manager::decide_after_usage` divides by, and that reads
+        // `usage.input_tokens` and nothing else. Summing the cached and
+        // creation figures would be closer to the true prompt on Anthropic
+        // (which reports cached DISJOINT from input) and would double-count on
+        // DeepSeek/OpenAI (which report it as a SUBSET) — and either way it
+        // would put the gauge back to describing a fold that does not happen,
+        // which is the bug being fixed.
+        self.last_prompt_tokens = Some(input_tokens);
         self.cumulative_output_tokens = self.cumulative_output_tokens.saturating_add(output_tokens);
         self.cumulative_input_tokens = self.cumulative_input_tokens.saturating_add(input_tokens);
         self.cumulative_cached_input_tokens = self
@@ -508,16 +552,30 @@ impl Session {
         if self.cumulative_input_tokens == 0 && cached == 0 {
             return None;
         }
+        Some(cached as f64 / self.prompt_token_total() as f64)
+    }
+
+    /// Total prompt tokens billed this session, under whichever usage
+    /// convention the provider reports (see [`Session::cache_hit_ratio`]
+    /// for why the two differ).
+    ///
+    /// This is the denominator behind the hit ratio, so anything rendering
+    /// a `cached / total` fraction must use it rather than
+    /// `cumulative_input_tokens`: under the disjoint convention that field
+    /// is only the *uncached remainder*, and the fraction then reads as
+    /// nonsense ("20000 / 500") beside a correct percentage. See
+    /// dirge-ugah.1.
+    pub fn prompt_token_total(&self) -> u64 {
+        let cached = self.cumulative_cached_input_tokens;
         let disjoint =
             self.cumulative_cache_creation_tokens > 0 || cached > self.cumulative_input_tokens;
-        let total = if disjoint {
+        if disjoint {
             self.cumulative_input_tokens
                 .saturating_add(cached)
                 .saturating_add(self.cumulative_cache_creation_tokens)
         } else {
             self.cumulative_input_tokens
-        };
-        Some(cached as f64 / total as f64)
+        }
     }
 
     /// Populate `message_store` from `messages` for legacy session
