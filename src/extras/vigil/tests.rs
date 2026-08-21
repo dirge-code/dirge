@@ -248,7 +248,7 @@ async fn harbinger_commands_executes_resolved_command() {
         },
     );
 
-    let mut keeper = spawn_keeper(vec![VigilEntry {
+    let _keeper = spawn_keeper(vec![VigilEntry {
         name: "harb-exec".to_string(),
         trigger: VigilTrigger::Harbinger {
             address: "127.0.0.1:19192".to_string(),
