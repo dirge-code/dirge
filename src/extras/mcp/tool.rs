@@ -520,12 +520,12 @@ async fn try_call_with_reconnect(
 /// (surface as-is).
 struct CallErr {
     message: String,
-    service_error: Option<ServiceError>,
+    service_error: Option<Box<ServiceError>>,
 }
 
 impl CallErr {
     fn as_service_error(&self) -> Option<&ServiceError> {
-        self.service_error.as_ref()
+        self.service_error.as_ref().map(Box::as_ref)
     }
 }
 
@@ -547,7 +547,7 @@ async fn call_once(
             let msg = format!("MCP tool error ({server_name}::{tool_name}): {svc_err}");
             Err(CallErr {
                 message: msg,
-                service_error: Some(svc_err),
+                service_error: Some(Box::new(svc_err)),
             })
         }
         Err(_) => Err(CallErr {
@@ -555,7 +555,7 @@ async fn call_once(
                 "MCP tool {server_name}::{tool_name} timed out after {}s",
                 timeout.as_secs(),
             ),
-            service_error: Some(ServiceError::Timeout { timeout }),
+            service_error: Some(Box::new(ServiceError::Timeout { timeout })),
         }),
     }
 }
