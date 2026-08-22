@@ -5676,7 +5676,7 @@ fn is_safe_during_agent(text: &str) -> bool {
     let args = text.split_whitespace().nth(1).map(|s| s.to_string());
     let always_safe = matches!(
         head,
-        "/quit" | "/help" | "/reasoning" | "/tasks" | "/mode" | "/cache"
+        "/quit" | "/help" | "/reasoning" | "/tasks" | "/mode" | "/cache" | "/effort"
     );
     let safe_when_no_arg =
         matches!(head, "/sessions" | "/tree" | "/model" | "/prompt") && args.is_none();

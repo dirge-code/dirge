@@ -705,7 +705,11 @@ pub async fn build_agent(
     // and the next rebuild re-seeds from config, so this is the config-
     // default path. An unrecognized value fails soft: warn and leave the
     // loop default (`Off`) rather than aborting the build.
-    if let Some(entry) = cfg.providers_map().get(provider_name.as_str()) {
+    // Resolved through the same helper `resolve_model` / `resolve_temperature`
+    // use, so effort can't silently disagree with them: it adds a
+    // case-insensitive retry and a Default-role fallback that a raw
+    // `providers_map().get()` misses (`--provider GLM` vs a `glm` entry).
+    if let Some(entry) = cli.resolution_entry(cfg) {
         match entry.resolved_effort() {
             Ok(level) => {
                 agent = agent.with_reasoning(level);
@@ -716,7 +720,7 @@ pub async fn build_agent(
                     provider = %provider_name,
                     raw = %raw,
                     "unrecognized `effort` value on provider — ignoring (expected \
-                     off/minimal/low/medium/high/max)",
+                     off/minimal/low/medium/high/xhigh/max)",
                 );
             }
         }

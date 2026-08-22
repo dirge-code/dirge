@@ -95,9 +95,10 @@ pub struct ProviderEntry {
     pub context_window: Option<u64>,
     /// Default reasoning effort for this provider's model. Accepts the
     /// human/wire names `off` / `minimal` / `low` / `medium` / `high` /
-    /// `max` (where `max` is the friendly alias for the internal `xhigh`
-    /// tier GLM and DeepSeek expose). A `/effort` session override takes
-    /// precedence over this; `None` leaves thinking at the loop default.
+    /// `xhigh` / `max`. `xhigh` and `max` are distinct tiers, not aliases —
+    /// providers without an `xhigh` fold it to whichever of theirs is
+    /// nearest. A `/effort` session override takes precedence over this;
+    /// `None` leaves thinking at the loop default.
     /// An unrecognized value fails soft (warned at build time, ignored).
     pub effort: Option<String>,
     /// Per-provider model options. Free-form map; known keys are

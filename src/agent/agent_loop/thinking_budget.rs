@@ -72,10 +72,14 @@ use super::types::{ThinkingBudgets, ThinkingLevel};
 pub const OVERRUN_FACTOR: usize = 2;
 
 /// Cap used when the turn's thinking level is unknown — no level resolved, no
-/// budgets to read. Matches `OVERRUN_FACTOR` × the High grant, i.e. the most
+/// budgets to read. `OVERRUN_FACTOR` × the *Max* grant, i.e. the most
 /// permissive derived value, because guessing low here is what caused
 /// dirge-vzsy and a missed runaway is far cheaper than a truncated good turn.
-pub const FALLBACK_BUDGET_TOKENS: usize = 32768;
+///
+/// This has to stay >= every derived cap. When Max was added at a 32768 grant
+/// it started deriving 65536, which left the old 32768 fallback below a value
+/// a real turn could legitimately reach.
+pub const FALLBACK_BUDGET_TOKENS: usize = 65536;
 
 /// Floor under every derived cap.
 ///
@@ -361,11 +365,26 @@ mod tests {
     #[test]
     fn an_unknown_level_falls_back_to_the_widest_cap() {
         assert_eq!(budget_for_turn(None, None), FALLBACK_BUDGET_TOKENS);
+        // Max, not High: Max is the widest tier since the Xhigh/Max split,
+        // and the fallback has to stay >= every cap a real turn can derive.
         assert_eq!(
             FALLBACK_BUDGET_TOKENS,
-            budget_for_turn(Some(ThinkingLevel::High), None),
+            budget_for_turn(Some(ThinkingLevel::Max), None),
             "the fallback must match the widest derived cap"
         );
+        for level in [
+            ThinkingLevel::Minimal,
+            ThinkingLevel::Low,
+            ThinkingLevel::Medium,
+            ThinkingLevel::High,
+            ThinkingLevel::Xhigh,
+            ThinkingLevel::Max,
+        ] {
+            assert!(
+                budget_for_turn(Some(level), None) <= FALLBACK_BUDGET_TOKENS,
+                "{level:?} derives a cap above the fallback",
+            );
+        }
     }
 
     #[test]

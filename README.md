@@ -304,6 +304,7 @@ authorization, delete the `auth.json` file and log in again.
 | Command | Description |
 |---------|-------------|
 | `/edit` | Open the input buffer in `$EDITOR` (same as `Ctrl+G`) |
+| `/effort` | Set reasoning effort for the next turn: `off`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`, or `default` to clear |
 | `/model [name]` | Show or switch model |
 | `/prompt [name]` | List or activate prompts (`code`, `plan`, `review`, etc.) |
 | `/agent [name\|off]` | List or switch [agent profiles](docs/agents.md) — a named model + prompt + tool-policy bundle |

@@ -860,6 +860,10 @@ fn slash_commands() -> Vec<(&'static str, &'static str)> {
         #[cfg(unix)]
         ("/edit", "open the input buffer in $EDITOR"),
         (
+            "/effort",
+            "set reasoning effort: off/minimal/low/medium/high/xhigh/max",
+        ),
+        (
             "/fork",
             "fork the conversation at a message; restore the original prompt",
         ),
@@ -883,10 +887,6 @@ fn slash_commands() -> Vec<(&'static str, &'static str)> {
         ("/plugins", "list or load plugins"),
         ("/prompt", "list, switch, or reset the active prompt layer"),
         ("/quit", "quit dirge"),
-        (
-            "/effort",
-            "set reasoning effort: off/minimal/low/medium/high/xhigh/max",
-        ),
         ("/reasoning", "toggle reasoning visibility"),
         (
             "/regen-prompts",
@@ -1369,6 +1369,7 @@ mod tests {
             "/compact",
             "/compress",
             "/display",
+            "/effort",
             "/fork",
             "/graph",
             "/help",
@@ -1381,7 +1382,6 @@ mod tests {
             "/plugins",
             "/prompt",
             "/quit",
-            "/effort",
             "/reasoning",
             "/regen-prompts",
             "/retry",

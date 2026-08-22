@@ -16,9 +16,17 @@ use crate::agent::agent_loop::types::{ThinkingBudgets, ThinkingLevel};
 /// How a provider encodes reasoning EFFORT on a request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EffortWire {
-    /// Nested `{"reasoning":{"effort":"low"|"medium"|"high"}}` — OpenAI
-    /// Responses / openai-compat (openai, custom, openrouter).
+    /// Nested `{"reasoning":{"effort":"low"|"medium"|"high"|"xhigh"|"max"}}` —
+    /// OpenAI Responses, which accepts the full tier set.
     NestedEffort,
+    /// Nested `{"reasoning":{"effort":"low"|"medium"|"high"}}` — generic
+    /// OpenAI-compatible endpoints (custom, openrouter).
+    ///
+    /// Same shape as [`EffortWire::NestedEffort`] but clamped to the classic
+    /// three values. A self-hosted vLLM/llama.cpp/LM Studio backend validates
+    /// `effort` against that set and 400s on anything else, and we cannot know
+    /// what an arbitrary `custom` base URL is running.
+    NestedStandardEffort,
     /// Top-level `{"reasoning_effort":"low"|"medium"|"high"|"max"}` — hosted
     /// DeepSeek honors this (not the nested form) and supports the "max" tier.
     TopLevelEffort,
@@ -91,7 +99,7 @@ pub fn reasoning_profile(provider: Option<&str>) -> ReasoningProfile {
             disable: DisableWire::None,
         },
         Some("custom") | Some("openrouter") => ReasoningProfile {
-            effort: EffortWire::NestedEffort,
+            effort: EffortWire::NestedStandardEffort,
             disable: DisableWire::ChatTemplateKwargs,
         },
         Some("opencode") => ReasoningProfile {
@@ -135,6 +143,19 @@ fn thinking_level_to_openai_effort(level: ThinkingLevel) -> Option<&'static str>
         ThinkingLevel::High => Some("high"),
         ThinkingLevel::Xhigh => Some("xhigh"),
         ThinkingLevel::Max => Some("max"),
+    }
+}
+
+/// Map `ThinkingLevel` to the classic OpenAI `reasoning.effort` triple for
+/// generic OpenAI-compatible endpoints. `Xhigh`/`Max` clamp DOWN to `"high"`:
+/// unlike OpenAI proper, an arbitrary self-hosted backend validates against
+/// `low`/`medium`/`high` and rejects the extended tiers outright.
+fn thinking_level_to_openai_compat_effort(level: ThinkingLevel) -> Option<&'static str> {
+    match level {
+        ThinkingLevel::Off => None,
+        ThinkingLevel::Minimal | ThinkingLevel::Low => Some("low"),
+        ThinkingLevel::Medium => Some("medium"),
+        ThinkingLevel::High | ThinkingLevel::Xhigh | ThinkingLevel::Max => Some("high"),
     }
 }
 
@@ -195,9 +216,52 @@ pub(crate) fn budget_for_level(level: ThinkingLevel, budgets: Option<&ThinkingBu
         // as `xhigh` on an Anthropic/Gemini model. Xhigh keeps the legacy
         // 16384 default (long-horizon agentic thinking); Max gets a larger
         // "unconstrained capability" budget. Both are caller-overridable.
-        ThinkingLevel::Xhigh => budgets.and_then(|b| b.xhigh).unwrap_or(16384),
+        // Falls back to `high` before the literal: `xhigh` is new, and a
+        // caller that had tuned `high` was getting that value at this tier
+        // before the Xhigh/Max split. Ignoring it here would silently cut
+        // their budget back to the default.
+        ThinkingLevel::Xhigh => budgets.and_then(|b| b.xhigh.or(b.high)).unwrap_or(16384),
         ThinkingLevel::Max => budgets.and_then(|b| b.max).unwrap_or(32768),
     }
+}
+
+/// Room reserved for the visible answer on top of a thinking budget.
+///
+/// Anthropic's `max_tokens` covers thinking tokens AND output tokens, and the
+/// API rejects any request where `budget_tokens >= max_tokens`. So the ceiling
+/// has to be the budget plus enough left over for the turn to actually say
+/// something — a tool call plus its reasoning preamble sits comfortably here.
+pub const REASONING_OUTPUT_HEADROOM: u32 = 8_192;
+
+/// The `max_tokens` a request must carry to be able to spend `level`'s
+/// thinking budget, or `None` for providers that put no budget on the wire.
+///
+/// This exists because rig picks `max_tokens` for us when we leave it unset,
+/// and its Anthropic default is 2048 for any model id it doesn't recognise
+/// (`default_max_tokens_for_model` matches `claude-opus-4*` / `claude-sonnet-4*`
+/// / `claude-haiku-4-5*` only — every Claude 5 id falls through). 2048 is below
+/// every budget tier above `minimal`, so leaving it unset means the API rejects
+/// the request outright. Anything that emits `budget_tokens` must therefore
+/// also pin the ceiling above it.
+///
+/// Deliberately `None` for the effort-string providers: they send no budget, so
+/// forcing a ceiling would only override the model's own, larger default.
+pub fn max_tokens_for_reasoning(
+    provider: Option<&str>,
+    level: ThinkingLevel,
+    budgets: Option<&ThinkingBudgets>,
+) -> Option<u64> {
+    if !matches!(
+        reasoning_profile(provider).effort,
+        EffortWire::AnthropicBudget
+    ) {
+        return None;
+    }
+    let budget = budget_for_level(level, budgets);
+    if budget == 0 {
+        return None;
+    }
+    Some(u64::from(budget) + u64::from(REASONING_OUTPUT_HEADROOM))
 }
 
 /// Cerebras accepts `reasoning_effort` values `low` / `medium` / `high` /
@@ -228,6 +292,8 @@ impl ReasoningProfile {
     ) -> Option<serde_json::Value> {
         match self.effort {
             EffortWire::NestedEffort => thinking_level_to_openai_effort(level)
+                .map(|e| serde_json::json!({ "reasoning": { "effort": e } })),
+            EffortWire::NestedStandardEffort => thinking_level_to_openai_compat_effort(level)
                 .map(|e| serde_json::json!({ "reasoning": { "effort": e } })),
             EffortWire::TopLevelEffort => thinking_level_to_deepseek_effort(level)
                 .map(|e| serde_json::json!({ "reasoning_effort": e })),
@@ -303,12 +369,12 @@ mod tests {
             ("openai", EffortWire::NestedEffort, DisableWire::None),
             (
                 "custom",
-                EffortWire::NestedEffort,
+                EffortWire::NestedStandardEffort,
                 DisableWire::ChatTemplateKwargs,
             ),
             (
                 "openrouter",
-                EffortWire::NestedEffort,
+                EffortWire::NestedStandardEffort,
                 DisableWire::ChatTemplateKwargs,
             ),
             (
@@ -627,5 +693,84 @@ mod tests {
 
         assert_eq!(profile.effort_params(ThinkingLevel::Off, None), None);
         assert_eq!(profile.disable_params(), None);
+    }
+}
+
+#[cfg(test)]
+mod max_tokens_tests {
+    use super::*;
+
+    /// Anthropic rejects a request whose thinking budget is not strictly
+    /// below `max_tokens`. Every level that puts a budget on the wire must
+    /// therefore also carry a ceiling above it.
+    #[test]
+    fn anthropic_ceiling_clears_every_budget() {
+        for level in [
+            ThinkingLevel::Minimal,
+            ThinkingLevel::Low,
+            ThinkingLevel::Medium,
+            ThinkingLevel::High,
+            ThinkingLevel::Xhigh,
+            ThinkingLevel::Max,
+        ] {
+            let budget = u64::from(budget_for_level(level, None));
+            let ceiling = max_tokens_for_reasoning(Some("anthropic"), level, None)
+                .unwrap_or_else(|| panic!("{level:?} puts a budget on the wire but no ceiling"));
+            assert!(
+                ceiling > budget,
+                "{level:?}: max_tokens {ceiling} must exceed budget_tokens {budget}",
+            );
+        }
+    }
+
+    /// The whole bug: rig defaults Anthropic `max_tokens` to 2048 for any
+    /// model id it doesn't recognise, which includes every Claude 5 id. The
+    /// ceiling has to beat that default, not just the budget.
+    #[test]
+    fn anthropic_ceiling_beats_rigs_2048_fallback() {
+        let ceiling = max_tokens_for_reasoning(Some("anthropic"), ThinkingLevel::Max, None)
+            .expect("max is a budget level");
+        assert!(
+            ceiling > 2_048,
+            "must override rig's fallback, got {ceiling}"
+        );
+    }
+
+    #[test]
+    fn off_needs_no_ceiling() {
+        assert_eq!(
+            max_tokens_for_reasoning(Some("anthropic"), ThinkingLevel::Off, None),
+            None,
+        );
+    }
+
+    /// Only the budget-shaped wire needs this. Effort-string providers send
+    /// no budget, so forcing a ceiling on them would override the model's
+    /// own (larger) default for no reason.
+    #[test]
+    fn effort_string_providers_get_no_ceiling() {
+        for provider in ["openai", "deepseek", "glm", "cerebras", "custom"] {
+            assert_eq!(
+                max_tokens_for_reasoning(Some(provider), ThinkingLevel::Max, None),
+                None,
+                "{provider} sends an effort string, not a budget",
+            );
+        }
+    }
+
+    /// A caller-supplied budget has to move the ceiling with it.
+    #[test]
+    fn ceiling_tracks_a_custom_budget() {
+        let budgets = ThinkingBudgets {
+            max: Some(120_000),
+            ..Default::default()
+        };
+        let ceiling =
+            max_tokens_for_reasoning(Some("anthropic"), ThinkingLevel::Max, Some(&budgets))
+                .expect("max is a budget level");
+        assert!(
+            ceiling > 120_000,
+            "ceiling {ceiling} must clear the 120k budget"
+        );
     }
 }

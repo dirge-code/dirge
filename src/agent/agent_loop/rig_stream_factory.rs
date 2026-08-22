@@ -304,6 +304,20 @@ where
         if let Some(v) = additional {
             builder = builder.additional_params(v);
         }
+        // Pin `max_tokens` whenever a thinking BUDGET is on the wire. Anthropic
+        // counts thinking against max_tokens and rejects the request unless
+        // budget_tokens is strictly below it — and if we leave max_tokens unset
+        // rig picks 2048 for any model id it doesn't recognise, which is every
+        // Claude 5 id. That combination 400s every turn above `minimal`.
+        if let Some(level) = opts.reasoning
+            && let Some(ceiling) = crate::provider::adapter::max_tokens_for_reasoning(
+                provider,
+                level,
+                opts.thinking_budgets.as_ref(),
+            )
+        {
+            builder = builder.max_tokens(ceiling);
+        }
         let request = builder.build();
 
         // 4. Call model.stream, bounded by the request-establish deadline.

@@ -1664,7 +1664,7 @@ fn set_reasoning_round_trips_through_getter() {
     agent.set_reasoning(Some(ThinkingLevel::High));
     assert_eq!(agent.reasoning(), Some(ThinkingLevel::High));
 
-    // `/effort max` is the Xhigh tier.
+    // The Xhigh tier — distinct from Max since the tier split.
     agent.set_reasoning(Some(ThinkingLevel::Xhigh));
     assert_eq!(agent.reasoning(), Some(ThinkingLevel::Xhigh));
 

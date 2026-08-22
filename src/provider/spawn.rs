@@ -516,6 +516,10 @@ impl AnyAgent {
         cfg.tools = review_tools;
         cfg.provider_name = Some(provider_name_for_review);
         cfg.model_name = model_name_for_review;
+        // Forked runners inherit the agent's effort too. Without this a user
+        // who configures `effort` gets it on the main turn only, and every
+        // review/critic/curator pass silently runs with reasoning off.
+        cfg.reasoning = self.reasoning;
 
         let loop_runner = spawn_loop_runner(cfg);
         (loop_runner.into_agent_runner(), review_cache)
@@ -555,6 +559,7 @@ impl AnyAgent {
         cfg.system_prompt = system_prompt;
         cfg.tools = tools;
         cfg.provider_name = Some(provider);
+        cfg.reasoning = self.reasoning;
         cfg.model_name = match model_override {
             Some(model) => Some(model.name()),
             None => Self::model_name_opt(&self.model_name),
