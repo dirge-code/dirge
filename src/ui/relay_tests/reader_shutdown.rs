@@ -87,7 +87,8 @@ mod tests {
         let interval = Duration::from_micros(1000);
         let injector = std::thread::spawn(move || {
             let mut pri = primary;
-            for i in 0u64.. {
+            let mut i = 0u64;
+            loop {
                 if !injector_running2.load(Ordering::Relaxed) {
                     break;
                 }
@@ -98,6 +99,7 @@ mod tests {
                     injector_bytes2.fetch_add(1, Ordering::Relaxed);
                 }
                 std::thread::sleep(interval);
+                i += 1;
             }
         });
 
