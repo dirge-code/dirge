@@ -1578,3 +1578,97 @@ async fn cerebras_identity_survives_client_model_and_agent_construction() {
 
     assert_eq!(agent.provider_name(), "cerebras");
 }
+
+/// A per-provider `effort` config seeds `AnyAgent.reasoning`, which
+/// `spawn_runner` forwards to `LoopConfig.reasoning`. This is the config-
+/// default path; `/effort` overrides it live (see cmd_effort tests).
+#[tokio::test]
+async fn provider_effort_config_seeds_agent_reasoning() {
+    use clap::Parser;
+    use std::collections::HashMap;
+
+    use crate::agent::agent_loop::types::ThinkingLevel;
+    use crate::config::ProviderEntry;
+
+    let client = create_client_with_auth("glm", Some("test-glm-key"), &HashMap::new(), None)
+        .expect("GLM client should build without network access");
+    let model = client.completion_model(default_model_for("glm"));
+
+    let cli = crate::cli::Cli::parse_from(["dirge", "--provider", "glm", "--no-tools"]);
+    let mut providers = HashMap::new();
+    providers.insert(
+        "glm".to_string(),
+        ProviderEntry {
+            effort: Some("max".to_string()),
+            ..Default::default()
+        },
+    );
+    let cfg = crate::config::Config {
+        provider: Some("glm".to_string()),
+        providers: Some(providers),
+        no_tools: Some(true),
+        ..Default::default()
+    };
+    let context = crate::context::ContextFiles {
+        agents: None,
+        prompts: HashMap::new(),
+        agent_defs: Default::default(),
+        current_agent: None,
+        current_prompt: None,
+        current_prompt_name: None,
+        current_prompt_deny_tools: Vec::new(),
+        prompt_layer: None,
+        agent_layer: None,
+        route_before_agent: None,
+    };
+    let agent = build_agent(
+        model,
+        &cli,
+        &cfg,
+        &context,
+        None,
+        None,
+        None,
+        None,
+        None,
+        #[cfg(feature = "lsp")]
+        None,
+        crate::sandbox::Sandbox::new(crate::sandbox::SandboxMode::Off),
+        #[cfg(feature = "mcp")]
+        None,
+        #[cfg(feature = "semantic")]
+        None,
+        None,
+    )
+    .await;
+
+    // `max` is its own tier above `xhigh` now (OpenAI/Anthropic expose both).
+    assert_eq!(agent.reasoning(), Some(ThinkingLevel::Max));
+}
+
+/// `/effort` and `rebuild_agent_parts` both mutate the live agent via
+/// `set_reasoning`, and `/effort` (no args) reads `reasoning()`. Confirm
+/// the in-place setter round-trips through the getter — the contract the
+/// session override + sticky-rebuild logic rests on. Pure state on `AnyAgent`
+/// (seeded `None` by `AnyAgent::new`), so the lightweight offline fixture is
+/// enough — no provider build or network needed.
+#[test]
+fn set_reasoning_round_trips_through_getter() {
+    use crate::agent::agent_loop::types::ThinkingLevel;
+
+    let mut agent = build_openai_any_agent();
+
+    // No override yet.
+    assert_eq!(agent.reasoning(), None);
+
+    agent.set_reasoning(Some(ThinkingLevel::High));
+    assert_eq!(agent.reasoning(), Some(ThinkingLevel::High));
+
+    // The Xhigh tier — distinct from Max since the tier split.
+    agent.set_reasoning(Some(ThinkingLevel::Xhigh));
+    assert_eq!(agent.reasoning(), Some(ThinkingLevel::Xhigh));
+
+    // Clearing drops the override (no config effort on this agent).
+    agent.set_reasoning(None);
+    assert_eq!(agent.reasoning(), None);
+}

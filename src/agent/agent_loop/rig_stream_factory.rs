@@ -304,6 +304,20 @@ where
         if let Some(v) = additional {
             builder = builder.additional_params(v);
         }
+        // Pin `max_tokens` whenever a thinking BUDGET is on the wire. Anthropic
+        // counts thinking against max_tokens and rejects the request unless
+        // budget_tokens is strictly below it — and if we leave max_tokens unset
+        // rig picks 2048 for any model id it doesn't recognise, which is every
+        // Claude 5 id. That combination 400s every turn above `minimal`.
+        if let Some(level) = opts.reasoning
+            && let Some(ceiling) = crate::provider::adapter::max_tokens_for_reasoning(
+                provider,
+                level,
+                opts.thinking_budgets.as_ref(),
+            )
+        {
+            builder = builder.max_tokens(ceiling);
+        }
         let request = builder.build();
 
         // 4. Call model.stream, bounded by the request-establish deadline.
@@ -874,27 +888,34 @@ pub fn loop_tool_to_rig_definition(tool: &dyn LoopTool) -> ToolDefinition {
 ///
 /// **Provider mappings**:
 ///   - "anthropic": `{ "thinking": { "type": "enabled",
-///     "budget_tokens": N } }` for budget-based reasoning. Pi's
-///     adaptive-thinking effort mode (Opus 4.6+, Sonnet 4.6) is
-///     a follow-up — needs model-id sniffing.
+///     "budget_tokens": N } }` for budget-based reasoning. Xhigh and
+///     Max get distinct (increasing) budgets. Pi's adaptive-thinking
+///     effort mode (Opus 4.6+, Sonnet 4.6) is a follow-up — needs
+///     model-id sniffing.
 ///   - "deepseek": `{ "reasoning_effort": "low" | "medium" |
 ///     "high" | "max" }` — top-level string, not nested inside
-///     `reasoning`. DeepSeek's hosted API supports a "max" tier
-///     above "high".
+///     `reasoning`. DeepSeek has no "xhigh" tier, so Xhigh rounds up
+///     to "max" (same ceiling as Max).
 ///   - "cerebras": `{ "reasoning_effort": "low" | "medium" | "high" }`
-///     at the top level. `Minimal` clamps to `low`, `Xhigh` clamps to
-///     `high`, and `Off` omits the field.
-///   - "openai" / "glm" / "custom" (all openai-shaped):
-///     `{ "reasoning": { "effort": "low" | "medium" | "high" } }`
-///     per OpenAI Responses spec. Maps ThinkingLevel:
+///     at the top level. `Minimal` clamps to `low`, `Xhigh`/`Max`
+///     clamp to `high`, and `Off` omits the field.
+///   - "openai" / "custom" (openai-shaped): `{ "reasoning":
+///     { "effort": "low" | "medium" | "high" | "xhigh" | "max" } }`
+///     per OpenAI Responses spec — Xhigh and Max pass through
+///     distinctly. Maps ThinkingLevel:
 ///       - Off → omit reasoning
 ///       - Minimal / Low → "low"
 ///       - Medium → "medium"
-///       - High / Xhigh → "high"
+///       - High → "high"
+///       - Xhigh → "xhigh"
+///       - Max → "max"
+///   - "glm": `{ "reasoning_effort": "low" | "high" | "max" }`
+///     (top-level). GLM-5.3 has no "xhigh" tier, so Xhigh rounds up
+///     to "max"; Minimal/Low → "low", Medium/High → "high".
 ///   - "openrouter": same as openai (openrouter forwards
 ///     OpenAI-shape options to the upstream provider).
 ///   - "gemini": `{ "thinking_config": { "thinking_budget":
-///     N } }` (Gemini 2.x). Budget-based.
+///     N } }` (Gemini 2.x). Budget-based, distinct Xhigh/Max budgets.
 ///   - "ollama": no reasoning config — local models vary; pass
 ///     through generic `reasoning_level` key.
 ///   - None: generic `reasoning_level` key for debugging /
@@ -2024,6 +2045,8 @@ mod tests {
             (ThinkingLevel::Low, "low"),
             (ThinkingLevel::Medium, "medium"),
             (ThinkingLevel::High, "high"),
+            (ThinkingLevel::Xhigh, "xhigh"),
+            (ThinkingLevel::Max, "max"),
         ] {
             let opts = opts_with_reasoning(level);
             let v = build_provider_additional_params(Some("openai"), &opts).unwrap();
@@ -2035,7 +2058,8 @@ mod tests {
     }
 
     /// DeepSeek gets top-level `reasoning_effort` string (not
-    /// nested inside `reasoning`).
+    /// nested inside `reasoning`). DeepSeek has no "xhigh" tier, so
+    /// Xhigh and Max both fold up to "max".
     #[test]
     fn deepseek_reasoning_maps_to_top_level_effort() {
         for (level, expected) in [
@@ -2043,6 +2067,7 @@ mod tests {
             (ThinkingLevel::Medium, "medium"),
             (ThinkingLevel::High, "high"),
             (ThinkingLevel::Xhigh, "max"),
+            (ThinkingLevel::Max, "max"),
         ] {
             let opts = opts_with_reasoning(level);
             let v = build_provider_additional_params(Some("deepseek"), &opts).unwrap();
@@ -2064,7 +2089,9 @@ mod tests {
             (ThinkingLevel::Low, "low"),
             (ThinkingLevel::Medium, "medium"),
             (ThinkingLevel::High, "high"),
+            // No xhigh/max tier on Cerebras — both clamp to "high".
             (ThinkingLevel::Xhigh, "high"),
+            (ThinkingLevel::Max, "high"),
         ] {
             let opts = opts_with_reasoning(level);
             let params = build_provider_additional_params(Some("cerebras"), &opts)
@@ -2090,12 +2117,12 @@ mod tests {
         );
     }
 
-    /// GLM, Custom, OpenRouter share OpenAI's nested
-    /// effort-based reasoning shape (deepseek is separate).
+    /// Custom, OpenRouter share OpenAI's nested effort-based reasoning
+    /// shape (deepseek is separate; GLM uses top-level — see below).
     #[test]
     fn openai_compat_providers_share_effort_shape() {
         let opts = opts_with_reasoning(ThinkingLevel::Medium);
-        for provider in ["glm", "custom", "openrouter"] {
+        for provider in ["custom", "openrouter"] {
             let v = build_provider_additional_params(Some(provider), &opts).unwrap();
             assert_eq!(
                 v["reasoning"]["effort"], "medium",
@@ -2104,8 +2131,42 @@ mod tests {
         }
     }
 
-    /// Minimal clamps to "low"; Xhigh clamps to "high" (OpenAI
-    /// API only accepts 3 levels).
+    /// GLM (z.ai) uses top-level `reasoning_effort` (not OpenAI's nested
+    /// form) and, on GLM-5.3, accepts only `low`/`high`/`max` — so
+    /// `Medium` collapses to `"high"` (mirroring z.ai's own GLM-5.2
+    /// folding). There is no `xhigh` tier, so `Xhigh` and `Max` both
+    /// round up to `"max"`. See `glm_effort_top_level_with_max_and_collapse`
+    /// for the full mapping.
+    #[test]
+    fn glm_uses_top_level_reasoning_effort_not_nested() {
+        let opts = opts_with_reasoning(ThinkingLevel::Medium);
+        let v = build_provider_additional_params(Some("glm"), &opts).unwrap();
+        assert_eq!(
+            v["reasoning_effort"], "high",
+            "glm Medium should collapse to high"
+        );
+        assert!(
+            v.get("reasoning").is_none(),
+            "glm must not use the nested form"
+        );
+
+        // Xhigh and Max both fold up to "max" on the 3-tier GLM wire.
+        for level in [ThinkingLevel::Xhigh, ThinkingLevel::Max] {
+            let opts = opts_with_reasoning(level);
+            let v = build_provider_additional_params(Some("glm"), &opts).unwrap();
+            assert_eq!(
+                v["reasoning_effort"], "max",
+                "glm {level:?} should map to max"
+            );
+        }
+    }
+
+    /// Minimal clamps to "low" (dirge's Minimal and Low share the `low`
+    /// wire value). Xhigh and Max are NOT clamped on OpenAI — OpenAI's
+    /// `ReasoningEffort` Literal exposes both as distinct tiers, the
+    /// whole point of the Xhigh/Max split. The 3-tier providers that lack
+    /// `xhigh` (DeepSeek, GLM) fold Xhigh up to "max" in their own
+    /// mapping functions, not here.
     #[test]
     fn openai_clamps_unsupported_levels() {
         let opts_min = opts_with_reasoning(ThinkingLevel::Minimal);
@@ -2114,7 +2175,11 @@ mod tests {
 
         let opts_x = opts_with_reasoning(ThinkingLevel::Xhigh);
         let v = build_provider_additional_params(Some("openai"), &opts_x).unwrap();
-        assert_eq!(v["reasoning"]["effort"], "high");
+        assert_eq!(v["reasoning"]["effort"], "xhigh");
+
+        let opts_max = opts_with_reasoning(ThinkingLevel::Max);
+        let v = build_provider_additional_params(Some("openai"), &opts_max).unwrap();
+        assert_eq!(v["reasoning"]["effort"], "max");
     }
 
     /// OpenAI Off → omits the reasoning key entirely.

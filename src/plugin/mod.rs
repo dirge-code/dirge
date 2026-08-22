@@ -444,7 +444,7 @@ impl PluginManager {
     /// `prepareNextTurn` hook.
     ///
     /// Returns the raw string ("low" | "medium" | "high" |
-    /// "xhigh" | "off" | "minimal"); the caller maps it to
+    /// "xhigh" | "max" | "off" | "minimal"); the caller maps it to
     /// `ThinkingLevel`.
     pub fn take_pending_next_thinking_level(&mut self) -> Option<String> {
         self.take_string_slot("harness-next-thinking-level")

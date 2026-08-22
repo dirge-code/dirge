@@ -121,6 +121,122 @@ pub(crate) async fn cmd_reasoning(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> 
     Ok(())
 }
 
+/// What a `/effort <arg>` argument asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EffortArg {
+    /// Drop the session override and fall back to the provider config default.
+    Clear,
+    /// Pin an explicit level for the session. `Off` is one of these — it
+    /// disables reasoning, which is NOT the same as clearing the override.
+    Set(crate::agent::agent_loop::types::ThinkingLevel),
+    /// Not a level and not a clear word.
+    Unknown,
+}
+
+/// Classify a `/effort` argument.
+///
+/// `off` names a level, so it must set `ThinkingLevel::Off` rather than clear.
+/// It used to clear, which meant a provider with `effort` in config re-seeded
+/// that default on the way out and reasoning could never actually be turned
+/// off from the UI. Clearing is spelled `default` (or `clear`).
+///
+/// Lowercased up front so the clear words and the level names agree on case —
+/// `from_effort_str` lowercases internally, so a case-sensitive check here made
+/// `/effort OFF` and `/effort off` do opposite things.
+pub(crate) fn parse_effort_arg(raw: &str) -> EffortArg {
+    use crate::agent::agent_loop::types::ThinkingLevel;
+    let raw = raw.trim().to_ascii_lowercase();
+    if matches!(raw.as_str(), "default" | "clear") {
+        return EffortArg::Clear;
+    }
+    // `none` is a UI synonym for `off`, not a wire name — `from_effort_str`
+    // deliberately only knows the wire names. It used to be a clear word.
+    if raw == "none" {
+        return EffortArg::Set(ThinkingLevel::Off);
+    }
+    match ThinkingLevel::from_effort_str(&raw) {
+        Some(level) => EffortArg::Set(level),
+        None => EffortArg::Unknown,
+    }
+}
+
+/// `/effort [off|minimal|low|medium|high|xhigh|max|default]` — set the reasoning effort the
+/// next turn runs at. With no arg, reports the active level (the live
+/// override, else the per-provider config default, else the loop default
+/// `off`). The override is session-scoped (not persisted) and survives
+/// `/model` swaps and rebuilds. `off` disables reasoning; `default` clears the override. `xhigh` and `max`
+/// are distinct tiers on OpenAI and Anthropic; providers that lack `xhigh`
+/// (DeepSeek, GLM-5.3) fold `xhigh` up to `max`.
+pub(crate) async fn cmd_effort(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyhow::Result<()> {
+    use crate::agent::agent_loop::types::ThinkingLevel;
+
+    if parts.len() < 2 {
+        let active = ctx
+            .session
+            .effort_override
+            .or(ctx.agent.reasoning())
+            .unwrap_or(ThinkingLevel::Off);
+        let label = active.effort_label();
+        let source = if ctx.session.effort_override.is_some() {
+            "(session override)"
+        } else if ctx.agent.reasoning().is_some() {
+            "(provider config)"
+        } else {
+            "(default)"
+        };
+        ctx.renderer
+            .write_line(&format!("current effort: {label} {source}"), c_agent())?;
+        ctx.renderer.write_line(
+            "usage: /effort <off|minimal|low|medium|high|xhigh|max|default>",
+            c_result(),
+        )?;
+        return Ok(());
+    }
+
+    let level = match parse_effort_arg(parts[1]) {
+        // Re-resolve from config so the agent reflects the clear immediately
+        // (not only on the next rebuild). Keyed by the config ALIAS from the
+        // session, not `agent.provider_name()` — that returns the provider
+        // TYPE ("anthropic"), which misses any entry named anything else.
+        EffortArg::Clear => {
+            ctx.session.effort_override = None;
+            let config_default = ctx
+                .cfg
+                .providers_map()
+                .get(ctx.session.provider.as_str())
+                .and_then(|e| e.resolved_effort().ok().flatten());
+            ctx.agent.set_reasoning(config_default);
+            let now = config_default.unwrap_or(ThinkingLevel::Off).effort_label();
+            ctx.renderer
+                .write_line(&format!("effort override cleared — now {now}"), c_agent())?;
+            return Ok(());
+        }
+        EffortArg::Unknown => {
+            let raw = parts[1].trim();
+            ctx.renderer.write_line(
+                &format!(
+                    "unknown effort `{raw}` — expected \
+                     off/minimal/low/medium/high/xhigh/max, or `default` to clear"
+                ),
+                c_error(),
+            )?;
+            return Ok(());
+        }
+        EffortArg::Set(level) => level,
+    };
+
+    ctx.session.effort_override = Some(level);
+    ctx.agent.set_reasoning(Some(level));
+    ctx.renderer.write_line(
+        &format!(
+            "effort set to {} — applies on the next turn",
+            level.effort_label()
+        ),
+        c_agent(),
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,5 +290,80 @@ mod tests {
         let rows = configured_models(&providers, "m");
         assert!(rows.iter().all(|(_, _, active)| *active));
         assert_eq!(rows.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod effort_arg_tests {
+    use super::*;
+    use crate::agent::agent_loop::types::ThinkingLevel;
+
+    /// `off` is a real level, not a request to clear the override. With
+    /// `effort` set in provider config, clearing re-seeds that default —
+    /// so if `off` cleared, there would be no way to turn reasoning off.
+    #[test]
+    fn off_disables_rather_than_clearing() {
+        assert_eq!(
+            parse_effort_arg("off"),
+            EffortArg::Set(ThinkingLevel::Off),
+            "`off` must disable reasoning, not fall back to the config default",
+        );
+        assert_eq!(parse_effort_arg("none"), EffortArg::Set(ThinkingLevel::Off));
+    }
+
+    /// Only `default`/`clear` drop the session override.
+    #[test]
+    fn default_and_clear_drop_the_override() {
+        assert_eq!(parse_effort_arg("default"), EffortArg::Clear);
+        assert_eq!(parse_effort_arg("clear"), EffortArg::Clear);
+    }
+
+    /// `/effort OFF` and `/effort off` used to do opposite things: the
+    /// clear-check was case-sensitive while `from_effort_str` lowercases.
+    #[test]
+    fn case_does_not_change_meaning() {
+        for (upper, lower) in [
+            ("OFF", "off"),
+            ("Default", "default"),
+            ("HIGH", "high"),
+            ("XHigh", "xhigh"),
+            ("MAX", "max"),
+        ] {
+            assert_eq!(
+                parse_effort_arg(upper),
+                parse_effort_arg(lower),
+                "`{upper}` and `{lower}` must mean the same thing",
+            );
+        }
+    }
+
+    #[test]
+    fn surrounding_whitespace_is_ignored() {
+        assert_eq!(parse_effort_arg("  high  "), parse_effort_arg("high"));
+    }
+
+    #[test]
+    fn every_level_round_trips_through_its_label() {
+        for level in [
+            ThinkingLevel::Off,
+            ThinkingLevel::Minimal,
+            ThinkingLevel::Low,
+            ThinkingLevel::Medium,
+            ThinkingLevel::High,
+            ThinkingLevel::Xhigh,
+            ThinkingLevel::Max,
+        ] {
+            assert_eq!(
+                parse_effort_arg(level.effort_label()),
+                EffortArg::Set(level),
+                "{level:?} must survive a round trip through its own label",
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_values_are_rejected() {
+        assert_eq!(parse_effort_arg("turbo"), EffortArg::Unknown);
+        assert_eq!(parse_effort_arg(""), EffortArg::Unknown);
     }
 }

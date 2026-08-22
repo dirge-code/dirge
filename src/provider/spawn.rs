@@ -297,6 +297,11 @@ impl AnyAgent {
         // dirge-nqr: forward the per-run turn cap. `None` keeps the
         // legacy unlimited behavior.
         cfg.max_turns = self.max_turns;
+        // Forward the resolved default reasoning effort so it seeds
+        // `LoopConfig.reasoning` (the per-turn wire field). `None` keeps
+        // the loop default (`Off`). A `/effort` live override mutates
+        // `self.reasoning` before the next spawn, so this picks it up.
+        cfg.reasoning = self.reasoning;
         // dirge-9tfq: forward the BackgroundStore so the spawn pipeline
         // installs a `get_followup_messages` hook that drains pending
         // subagent completions at the outer-loop boundary. `None`
@@ -511,6 +516,10 @@ impl AnyAgent {
         cfg.tools = review_tools;
         cfg.provider_name = Some(provider_name_for_review);
         cfg.model_name = model_name_for_review;
+        // Forked runners inherit the agent's effort too. Without this a user
+        // who configures `effort` gets it on the main turn only, and every
+        // review/critic/curator pass silently runs with reasoning off.
+        cfg.reasoning = self.reasoning;
 
         let loop_runner = spawn_loop_runner(cfg);
         (loop_runner.into_agent_runner(), review_cache)
@@ -550,6 +559,7 @@ impl AnyAgent {
         cfg.system_prompt = system_prompt;
         cfg.tools = tools;
         cfg.provider_name = Some(provider);
+        cfg.reasoning = self.reasoning;
         cfg.model_name = match model_override {
             Some(model) => Some(model.name()),
             None => Self::model_name_opt(&self.model_name),

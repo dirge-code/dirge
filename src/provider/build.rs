@@ -700,6 +700,31 @@ pub async fn build_agent(
     // builder; this wires it through the agent_loop path so `run_print`
     // and the interactive flow both honor it.
     agent = agent.with_max_turns(Some(cli.resolve_max_agent_turns(cfg)));
+    // Seed default reasoning effort from the active provider's `effort`
+    // config. A live `/effort` override later mutates `agent.reasoning`
+    // and the next rebuild re-seeds from config, so this is the config-
+    // default path. An unrecognized value fails soft: warn and leave the
+    // loop default (`Off`) rather than aborting the build.
+    // Resolved through the same helper `resolve_model` / `resolve_temperature`
+    // use, so effort can't silently disagree with them: it adds a
+    // case-insensitive retry and a Default-role fallback that a raw
+    // `providers_map().get()` misses (`--provider GLM` vs a `glm` entry).
+    if let Some(entry) = cli.resolution_entry(cfg) {
+        match entry.resolved_effort() {
+            Ok(level) => {
+                agent = agent.with_reasoning(level);
+            }
+            Err(raw) => {
+                tracing::warn!(
+                    target: "dirge::config",
+                    provider = %provider_name,
+                    raw = %raw,
+                    "unrecognized `effort` value on provider — ignoring (expected \
+                     off/minimal/low/medium/high/xhigh/max)",
+                );
+            }
+        }
+    }
     // Goal gate stop condition. Off unless `--goal` is set (and a critic
     // provider is configured to judge it); harmless otherwise. Warn on the
     // misconfiguration where a goal is given but no judge resolves — the

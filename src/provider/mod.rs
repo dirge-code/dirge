@@ -225,6 +225,17 @@ pub struct AnyAgent {
     /// `with_max_turns`. Forwarded to `LoopSpawnConfig.max_turns`
     /// at spawn time. `None` = unlimited (legacy).
     max_turns: Option<usize>,
+    /// Default reasoning effort for this agent's model, resolved at
+    /// `build_agent` time from the per-provider `effort` config (see
+    /// `ProviderEntry::resolved_effort`) and overridable live by the
+    /// `/effort` command via [`with_reasoning`]. Forwarded to
+    /// `LoopSpawnConfig.reasoning` and seeded into `LoopConfig.reasoning`
+    /// at spawn time — the field the stream builder reads per turn to
+    /// shape the provider request. `None` leaves reasoning at the loop's
+    /// own default (`Off`).
+    ///
+    /// [`with_reasoning`]: AnyAgent::with_reasoning
+    reasoning: Option<crate::agent::agent_loop::types::ThinkingLevel>,
     /// dirge-z73i: alternate stream_fn for the background-review
     /// path. Built at `build_agent` time when `ConfigRole::Review`
     /// resolves to a different provider than `ConfigRole::Default`.
@@ -396,6 +407,7 @@ impl AnyAgent {
             progress_stall_threshold: None,
             progress_prologue_cap: None,
             max_turns: None,
+            reasoning: None,
             review_stream_fn: None,
             review_provider_name: None,
             review_model_name: None,
@@ -544,6 +556,32 @@ impl AnyAgent {
     pub fn with_max_turns(mut self, max_turns: Option<usize>) -> Self {
         self.max_turns = max_turns;
         self
+    }
+
+    /// Install / replace the agent's default reasoning effort. `None`
+    /// clears an override (falls back to the loop default). `/effort`
+    /// calls this live; `build_agent` calls it to seed from the
+    /// per-provider `effort` config. Forwarded to
+    /// `LoopSpawnConfig.reasoning` at spawn time.
+    pub fn with_reasoning(
+        mut self,
+        level: Option<crate::agent::agent_loop::types::ThinkingLevel>,
+    ) -> Self {
+        self.reasoning = level;
+        self
+    }
+
+    /// In-place variant of [`with_reasoning`] for callers holding a
+    /// `&mut AnyAgent` (e.g. `/effort`, `rebuild_agent_parts`) that can't
+    /// move the agent out (`AnyAgent` is not `Default`).
+    pub fn set_reasoning(&mut self, level: Option<crate::agent::agent_loop::types::ThinkingLevel>) {
+        self.reasoning = level;
+    }
+
+    /// The agent's current default reasoning effort, if any. `/effort`
+    /// (no args) reads this to report the active level.
+    pub fn reasoning(&self) -> Option<crate::agent::agent_loop::types::ThinkingLevel> {
+        self.reasoning
     }
 
     /// Phase 4 part 1: wire the dual-client escalation route.
