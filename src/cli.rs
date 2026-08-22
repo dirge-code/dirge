@@ -307,6 +307,48 @@ pub enum Command {
         #[arg(long = "sandbox")]
         sandbox: Option<String>,
     },
+    /// Manage vigils — list, add, remove, pause, resume, restart.
+    #[cfg(feature = "vigil")]
+    Vigil {
+        #[command(subcommand)]
+        action: VigilAction,
+    },
+}
+
+/// Vigil management subcommands.
+#[cfg(feature = "vigil")]
+#[derive(clap::Subcommand, Debug)]
+pub enum VigilAction {
+    /// List all configured vigils and their status.
+    List,
+    /// Add a new vigil trigger.
+    Add {
+        /// Vigil name.
+        name: String,
+        /// Trigger type: toll, watcher, or harbinger.
+        #[arg(value_enum)]
+        trigger: VigilAddTrigger,
+        /// Additional trigger args as key=value pairs.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Remove a vigil by name.
+    Remove { name: String },
+    /// Pause a running vigil.
+    Pause { name: String },
+    /// Resume a paused vigil.
+    Resume { name: String },
+    /// Restart a vigil (stop and re-create its trigger).
+    Rest { name: String },
+}
+
+/// Trigger type for `dirge vigil add`.
+#[cfg(feature = "vigil")]
+#[derive(clap::ValueEnum, Debug, Clone)]
+pub enum VigilAddTrigger {
+    Toll,
+    Watcher,
+    Harbinger,
 }
 
 #[derive(clap::Subcommand, Debug)]
