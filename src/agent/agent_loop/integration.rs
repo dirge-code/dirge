@@ -515,6 +515,13 @@ pub struct LoopSpawnConfig {
     /// `None` = unlimited. Forwarded to `LoopConfig.max_turns`.
     pub max_turns: Option<usize>,
 
+    /// Default reasoning effort, seeded from the agent's resolved
+    /// `effort` config (or a live `/effort` override) and forwarded to
+    /// `LoopConfig.reasoning` — the field the stream builder reads per
+    /// turn to shape the provider request. `None` keeps the loop's own
+    /// default (`ThinkingLevel::Off`).
+    pub reasoning: Option<super::types::ThinkingLevel>,
+
     /// dirge-9tfq: per-session background-task store. When `Some`,
     /// `spawn_loop_runner` installs a `get_followup_messages` hook
     /// that drains the store's pending notifications at every
@@ -583,6 +590,7 @@ impl LoopSpawnConfig {
             goal_fn: None,
             goal: None,
             max_turns: None,
+            reasoning: None,
             bg_store: None,
             memory_provider: None,
         }
@@ -631,7 +639,7 @@ pub fn spawn_loop_runner(cfg: LoopSpawnConfig) -> LoopRunner {
             std::sync::Arc::new(move || store.coordinator_generation_running())
                 as crate::agent::agent_loop::hooks::ShouldDeferFinalizationFn
         }),
-        reasoning: None,
+        reasoning: cfg.reasoning,
         thinking_budgets: None,
         headers: std::collections::HashMap::new(),
         metadata: std::collections::HashMap::new(),

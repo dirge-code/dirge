@@ -121,6 +121,77 @@ pub(crate) async fn cmd_reasoning(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> 
     Ok(())
 }
 
+/// `/effort [off|minimal|low|medium|high|xhigh|max]` — set the reasoning effort the
+/// next turn runs at. With no arg, reports the active level (the live
+/// override, else the per-provider config default, else the loop default
+/// `off`). The override is session-scoped (not persisted) and survives
+/// `/model` swaps and rebuilds. `off` clears reasoning. `xhigh` and `max`
+/// are distinct tiers on OpenAI and Anthropic; providers that lack `xhigh`
+/// (DeepSeek, GLM-5.3) fold `xhigh` up to `max`.
+pub(crate) async fn cmd_effort(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyhow::Result<()> {
+    use crate::agent::agent_loop::types::ThinkingLevel;
+
+    if parts.len() < 2 {
+        let active = ctx
+            .session
+            .effort_override
+            .or(ctx.agent.reasoning())
+            .unwrap_or(ThinkingLevel::Off);
+        let label = active.effort_label();
+        let source = if ctx.session.effort_override.is_some() {
+            "(session override)"
+        } else if ctx.agent.reasoning().is_some() {
+            "(provider config)"
+        } else {
+            "(default)"
+        };
+        ctx.renderer
+            .write_line(&format!("current effort: {label} {source}"), c_agent())?;
+        ctx.renderer.write_line(
+            "usage: /effort <off|minimal|low|medium|high|xhigh|max>",
+            c_result(),
+        )?;
+        return Ok(());
+    }
+
+    let raw = parts[1].trim();
+    // `off`/`none`/`default` clears the override and falls back to the
+    // per-provider config default. Re-resolve from config so the agent
+    // reflects the clear immediately (not only on the next rebuild).
+    if matches!(raw, "off" | "none" | "default") {
+        ctx.session.effort_override = None;
+        let config_default = ctx
+            .cfg
+            .providers_map()
+            .get(ctx.agent.provider_name())
+            .and_then(|e| e.resolved_effort().ok().flatten());
+        ctx.agent.set_reasoning(config_default);
+        let now = config_default.unwrap_or(ThinkingLevel::Off).effort_label();
+        ctx.renderer
+            .write_line(&format!("effort override cleared — now {now}"), c_agent())?;
+        return Ok(());
+    }
+
+    let Some(level) = ThinkingLevel::from_effort_str(raw) else {
+        ctx.renderer.write_line(
+            &format!("unknown effort `{raw}` — expected off/minimal/low/medium/high/xhigh/max"),
+            c_error(),
+        )?;
+        return Ok(());
+    };
+
+    ctx.session.effort_override = Some(level);
+    ctx.agent.set_reasoning(Some(level));
+    ctx.renderer.write_line(
+        &format!(
+            "effort set to {} — applies on the next turn",
+            level.effort_label()
+        ),
+        c_agent(),
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

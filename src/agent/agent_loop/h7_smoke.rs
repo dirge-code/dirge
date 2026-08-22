@@ -331,6 +331,7 @@ async fn h7_scenario_1_simple_text() {
         goal_fn: None,
         goal: None,
         max_turns: None,
+        reasoning: None,
         bg_store: None,
         memory_provider: None,
     };
@@ -432,6 +433,7 @@ async fn h7_scenario_2_turn_boundaries() {
         goal_fn: None,
         goal: None,
         max_turns: None,
+        reasoning: None,
         bg_store: None,
         memory_provider: None,
     };
@@ -567,6 +569,7 @@ async fn h7_scenario_5_auth_error_surfaces() {
         goal_fn: None,
         goal: None,
         max_turns: None,
+        reasoning: None,
         bg_store: None,
         memory_provider: None,
     };
@@ -755,6 +758,7 @@ async fn h7_scenario_3_tool_dispatch() {
         goal_fn: None,
         goal: None,
         max_turns: None,
+        reasoning: None,
         bg_store: None,
         memory_provider: None,
     };
@@ -904,6 +908,7 @@ async fn h7_glm_scenario_1_simple_text() {
         goal_fn: None,
         goal: None,
         max_turns: None,
+        reasoning: None,
         bg_store: None,
         memory_provider: None,
     };
@@ -1061,6 +1066,7 @@ async fn h7_glm_scenario_3_tool_dispatch() {
         goal_fn: None,
         goal: None,
         max_turns: None,
+        reasoning: None,
         bg_store: None,
         memory_provider: None,
     };
@@ -1170,6 +1176,7 @@ fn cerebras_spawn_config(
         goal_fn: None,
         goal: None,
         max_turns: None,
+        reasoning: None,
         bg_store: None,
         memory_provider: None,
     }

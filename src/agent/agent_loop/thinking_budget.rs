@@ -289,6 +289,7 @@ mod tests {
             ThinkingLevel::Medium,
             ThinkingLevel::High,
             ThinkingLevel::Xhigh,
+            ThinkingLevel::Max,
         ] {
             let granted = crate::provider::adapter::budget_for_level(level, None) as usize;
             let cap = budget_for_turn(Some(level), None);
@@ -301,11 +302,14 @@ mod tests {
     }
 
     /// Concretely: high effort is granted 16384, so the cap must clear it.
-    /// 0.21.15 shipped 8192 here.
+    /// 0.21.15 shipped 8192 here. Xhigh keeps the legacy 16384 grant (and
+    /// thus 32768 cap); Max gets a larger 32768 grant (so a 65536 cap) —
+    /// the split means Max genuinely earns a bigger envelope than Xhigh.
     #[test]
     fn high_effort_gets_a_cap_well_clear_of_its_grant() {
         assert_eq!(budget_for_turn(Some(ThinkingLevel::High), None), 32768);
         assert_eq!(budget_for_turn(Some(ThinkingLevel::Xhigh), None), 32768);
+        assert_eq!(budget_for_turn(Some(ThinkingLevel::Max), None), 65536);
     }
 
     /// The lower levels sit on the floor, not on 2× a number the provider was
@@ -335,6 +339,8 @@ mod tests {
             low: None,
             medium: None,
             high: Some(60_000),
+            xhigh: None,
+            max: None,
         };
         assert_eq!(
             budget_for_turn(Some(ThinkingLevel::High), Some(&budgets)),

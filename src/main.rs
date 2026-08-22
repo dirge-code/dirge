@@ -1246,6 +1246,7 @@ async fn main() -> anyhow::Result<()> {
                             // builder reads options from cfg/CLI.
                             api_key: None,
                             headers: None,
+                            effort: None,
                             options: None,
                         },
                     )

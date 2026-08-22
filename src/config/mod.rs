@@ -93,6 +93,13 @@ pub struct ProviderEntry {
     /// started with (`llama-server -c 65536`) and which the table cannot
     /// know — a local model is named by its file path.
     pub context_window: Option<u64>,
+    /// Default reasoning effort for this provider's model. Accepts the
+    /// human/wire names `off` / `minimal` / `low` / `medium` / `high` /
+    /// `max` (where `max` is the friendly alias for the internal `xhigh`
+    /// tier GLM and DeepSeek expose). A `/effort` session override takes
+    /// precedence over this; `None` leaves thinking at the loop default.
+    /// An unrecognized value fails soft (warned at build time, ignored).
+    pub effort: Option<String>,
     /// Per-provider model options. Free-form map; known keys are
     /// honored by the request builder, unknown keys are ignored.
     /// Currently honored: `temperature` (f64, overrides cfg/CLI for
@@ -151,6 +158,22 @@ impl ProviderEntry {
     /// integer, missing) return `None`.
     pub fn options_temperature(&self) -> Option<f64> {
         self.options.as_ref()?.get("temperature")?.as_f64()
+    }
+
+    /// Resolve this provider's configured default reasoning effort into a
+    /// `ThinkingLevel`. Returns `Ok(None)` when no `effort` is configured.
+    /// `Err(raw)` reports an unrecognized value so the caller can warn at
+    /// build time rather than silently swallowing a config typo.
+    pub fn resolved_effort(
+        &self,
+    ) -> Result<Option<crate::agent::agent_loop::types::ThinkingLevel>, String> {
+        let Some(raw) = self.effort.as_deref() else {
+            return Ok(None);
+        };
+        match crate::agent::agent_loop::types::ThinkingLevel::from_effort_str(raw) {
+            Some(level) => Ok(Some(level)),
+            None => Err(raw.to_string()),
+        }
     }
 }
 
@@ -213,6 +236,33 @@ mod provider_entry_tests {
         }))
         .unwrap();
         assert!(entry.resolved_headers().is_err());
+    }
+
+    #[test]
+    fn effort_field_parses_to_thinking_level() {
+        use crate::agent::agent_loop::types::ThinkingLevel;
+        // `max` is its own tier (distinct from `xhigh`) after the split.
+        let entry: ProviderEntry =
+            serde_json::from_value(serde_json::json!({ "effort": "max" })).unwrap();
+        assert_eq!(entry.resolved_effort().unwrap(), Some(ThinkingLevel::Max));
+        // `xhigh` resolves distinctly.
+        let entry: ProviderEntry =
+            serde_json::from_value(serde_json::json!({ "effort": "xhigh" })).unwrap();
+        assert_eq!(entry.resolved_effort().unwrap(), Some(ThinkingLevel::Xhigh));
+    }
+
+    #[test]
+    fn effort_field_absent_is_none() {
+        let entry: ProviderEntry = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(entry.resolved_effort().unwrap(), None);
+    }
+
+    #[test]
+    fn effort_field_unknown_reports_error() {
+        let entry: ProviderEntry =
+            serde_json::from_value(serde_json::json!({ "effort": "turbo" })).unwrap();
+        // Bad value is surfaced, not silently swallowed.
+        assert_eq!(entry.resolved_effort(), Err("turbo".to_string()));
     }
 }
 
