@@ -129,6 +129,7 @@ no-plugin = [
 # The release workflow builds the Windows target with this set.
 windows-default = ['no-plugin']
 loop = []
+vigil = []
 # Run dirge itself as an MCP server (`dirge mcp`) so another agent (e.g.
 # Claude Code) can delegate implementation tasks to dirge and review them.
 # Pulls rmcp's server side + stdio transport + the tool macros.
