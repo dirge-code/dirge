@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.24.1] - 2026-08-22
+
 ### Added
 - Mojo language support, end to end: `mojo-lsp-server` LSP integration
   (diagnostics + the `lsp` tool for `.mojo`/`.🔥`, project roots resolved via
@@ -18,6 +20,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   The grammar is vendored at `grammars/tree-sitter-mojo` and compiled by
   `build.rs`: it isn't published to crates.io, and a git dependency would make
   `cargo publish` reject the whole package.
+- Per-provider default reasoning effort via the `effort` config key, and a
+  `/effort` command to override it live for the session. Seven tiers
+  (`off`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`), normalized per provider
+  to whatever that provider actually accepts — `xhigh` rounds up to `max` where
+  there is no `xhigh` tier, and down to `high` on Cerebras and on generic
+  OpenAI-compatible endpoints, which reject anything outside the classic triple.
+  `default` clears the override; `off` is a real level that disables reasoning.
+  Thanks @chriselrod.
+
+### Fixed
+- Clippy is green again under rustc 1.98, which turned on three lints that fire
+  on existing code: `result_large_err` on the MCP `CallErr`, unbounded-range
+  `for` loops in the relay-test and pty injector threads, and a `map_or`
+  identity in the DAP config. CI resolves `stable` at run time, so this went red
+  without any commit changing. See `dirge-jpma` for pinning the toolchain, which
+  is also what `release.yml` assumes when it skips clippy at tag time.
+- Requests carrying an Anthropic thinking budget now set `max_tokens` alongside
+  it. Anthropic requires `budget_tokens` to be strictly below `max_tokens`, and
+  with it unset rig picks 2048 for any model id it doesn't recognise — every
+  Claude 5 id — so every effort tier above `minimal` would have been rejected.
 
 ## [0.24.0] - 2026-08-19
 
@@ -4083,7 +4105,8 @@ agent in Rust with:
   LSP integration, and a Janet plugin system.
 - Session save/load/resume with LLM-summarization compaction.
 
-[Unreleased]: https://github.com/dirge-code/dirge/compare/v0.24.0...HEAD
+[Unreleased]: https://github.com/dirge-code/dirge/compare/v0.24.1...HEAD
+[0.24.1]: https://github.com/dirge-code/dirge/compare/v0.24.0...v0.24.1
 [0.24.0]: https://github.com/dirge-code/dirge/compare/v0.23.0...v0.24.0
 [0.23.0]: https://github.com/dirge-code/dirge/compare/v0.22.0...v0.23.0
 [0.21.3]: https://github.com/dirge-code/dirge/compare/v0.21.2...v0.21.3
