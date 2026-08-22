@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
+#[cfg(feature = "vigil")]
+use serde::Serialize;
 
 use crate::session::storage;
 
@@ -1367,6 +1369,92 @@ pub struct Config {
     /// future expansion but are not honored today.
     #[cfg(feature = "acp")]
     pub acp_servers: Option<HashMap<String, AcpServerConfig>>,
+
+    /// Vigil definitions loaded from `config.toml` under `[vigils.<name>]`.
+    /// Only consulted when `--vigil` is active.
+    #[cfg(feature = "vigil")]
+    #[serde(default)]
+    pub vigils: Option<Vec<VigilEntry>>,
+}
+
+/// A single vigil definition from config.
+#[cfg(feature = "vigil")]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(default)]
+pub struct VigilEntry {
+    pub name: String,
+    pub trigger: VigilTrigger,
+    #[serde(default = "default_reap_interval")]
+    pub reap_interval_secs: u64,
+    #[serde(default)]
+    pub prompt: String,
+    /// Optional Janet script for per-observance procession.
+    #[serde(default)]
+    pub procession: Option<String>,
+    #[serde(default)]
+    pub rite: Option<VigilRite>,
+}
+
+#[cfg(feature = "vigil")]
+fn default_reap_interval() -> u64 {
+    30
+}
+
+/// What triggers a vigil to fire.
+#[cfg(feature = "vigil")]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum VigilTrigger {
+    /// Timer-based: fires every N seconds.
+    Toll { interval_secs: u64 },
+    /// Filesystem watcher: fires on changes under `path`.
+    Watcher { path: String },
+    /// Network socket: external process sends events to a TCP port.
+    Harbinger {
+        address: String,
+        #[serde(default)]
+        protocol: String,
+        /// `template` or `commands` — see `SocketMode`.
+        #[serde(default)]
+        socket_mode: SocketMode,
+        #[serde(default)]
+        commands: HashMap<String, VigilCommand>,
+    },
+}
+
+#[cfg(feature = "vigil")]
+impl Default for VigilTrigger {
+    fn default() -> Self {
+        VigilTrigger::Toll { interval_secs: 30 }
+    }
+}
+
+/// Harbinger socket mode.
+#[cfg(feature = "vigil")]
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum SocketMode {
+    #[default]
+    Template,
+    Commands,
+}
+
+/// A pre-registered command for `commands` socket mode.
+#[cfg(feature = "vigil")]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct VigilCommand {
+    pub tool: String,
+    #[serde(default)]
+    pub args: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Optional gate condition checked before an observance runs.
+#[cfg(feature = "vigil")]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct VigilRite {
+    pub cmd: Option<String>,
+    #[serde(default)]
+    pub git_dirty: bool,
 }
 
 impl Config {

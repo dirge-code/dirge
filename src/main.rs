@@ -573,6 +573,8 @@ async fn main() -> anyhow::Result<()> {
             cli::Command::Sandbox { .. } => {}
             #[cfg(feature = "mcp-server")]
             cli::Command::Mcp { .. } => {}
+            #[cfg(feature = "vigil")]
+            cli::Command::Vigil { .. } => {}
         }
     }
 
@@ -746,6 +748,11 @@ async fn main() -> anyhow::Result<()> {
             #[cfg(feature = "mcp-server")]
             cli::Command::Mcp { model, sandbox } => {
                 return extras::mcp_server::serve(&cli, &cfg, model.clone(), sandbox.clone()).await;
+            }
+            #[cfg(feature = "vigil")]
+            cli::Command::Vigil { action } => {
+                handle_vigil_command(action).await?;
+                return Ok(());
             }
         }
     }
@@ -2685,4 +2692,166 @@ mod resume_staleness_tests {
             "expected no warnings, got {warnings:?}"
         );
     }
+}
+
+/// Handle `dirge vigil add/list/remove/pause/resume/rest` subcommands.
+#[cfg(feature = "vigil")]
+async fn handle_vigil_command(action: &crate::cli::VigilAction) -> anyhow::Result<()> {
+    use crate::extras::dirge_paths::ProjectPaths;
+    use crate::extras::vigil_db::{VigilStatus, VigilStore};
+
+    let paths = ProjectPaths::new(
+        &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+    );
+
+    match action {
+        crate::cli::VigilAction::List => {
+            let vigils = config::load().vigils.unwrap_or_default();
+            println!("Vigils (from config):");
+            for v in &vigils {
+                let trigger = match &v.trigger {
+                    crate::config::VigilTrigger::Toll { interval_secs } => {
+                        format!("toll every {interval_secs}s")
+                    }
+                    crate::config::VigilTrigger::Watcher { path } => {
+                        format!("watcher on {path}")
+                    }
+                    crate::config::VigilTrigger::Harbinger {
+                        address, protocol, ..
+                    } => {
+                        let p = if protocol.is_empty() {
+                            "tcp"
+                        } else {
+                            protocol.as_str()
+                        };
+                        format!("harbinger {p}://{address}")
+                    }
+                };
+                let prompt = if v.prompt.is_empty() {
+                    "(default)".to_string()
+                } else {
+                    v.prompt.clone()
+                };
+                println!(
+                    "  {} - {trigger} - reap every {}s - prompt: {prompt}",
+                    v.name, v.reap_interval_secs
+                );
+            }
+            if vigils.is_empty() {
+                println!("  (none)");
+            }
+        }
+        crate::cli::VigilAction::Add {
+            name,
+            trigger,
+            args,
+        } => {
+            let store = VigilStore::open(&paths).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let entry = build_vigil_entry(name, trigger, args)?;
+            let json = serde_json::to_string(&entry)?;
+            store
+                .upsert(&entry.name, &json)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            println!(
+                "Added vigil '{}'. Run `dirge --vigil` to start the keeper.",
+                entry.name
+            );
+        }
+        crate::cli::VigilAction::Remove { name } => {
+            let store = VigilStore::open(&paths).map_err(|e| anyhow::anyhow!("{e}"))?;
+            match store.remove(name) {
+                Ok(()) => println!("Removed vigil '{name}'."),
+                Err(e) => eprintln!("{e}"),
+            }
+        }
+        crate::cli::VigilAction::Pause { name } => {
+            let store = VigilStore::open(&paths).map_err(|e| anyhow::anyhow!("{e}"))?;
+            match store.set_status(name, VigilStatus::Paused) {
+                Ok(()) => println!("Paused vigil '{name}'."),
+                Err(e) => eprintln!("{e}"),
+            }
+        }
+        crate::cli::VigilAction::Resume { name } => {
+            let store = VigilStore::open(&paths).map_err(|e| anyhow::anyhow!("{e}"))?;
+            match store.set_status(name, VigilStatus::Active) {
+                Ok(()) => println!("Resumed vigil '{name}'."),
+                Err(e) => eprintln!("{e}"),
+            }
+        }
+        crate::cli::VigilAction::Rest { name } => {
+            let store = VigilStore::open(&paths).map_err(|e| anyhow::anyhow!("{e}"))?;
+            match store.set_status(name, VigilStatus::Resting) {
+                Ok(()) => println!("vigil '{name}' resting (will sleep until next trigger)."),
+                Err(e) => eprintln!("{e}"),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Build a VigilEntry from CLI `vigil add` args.
+#[cfg(feature = "vigil")]
+fn build_vigil_entry(
+    name: &str,
+    trigger: &crate::cli::VigilAddTrigger,
+    args: &[String],
+) -> anyhow::Result<crate::config::VigilEntry> {
+    use crate::config::{VigilEntry, VigilRite, VigilTrigger};
+
+    let parsed: std::collections::HashMap<String, String> = args
+        .iter()
+        .filter_map(|a| a.split_once('='))
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+
+    let trigger = match trigger {
+        crate::cli::VigilAddTrigger::Toll => {
+            let secs = parsed
+                .get("interval_secs")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30);
+            VigilTrigger::Toll {
+                interval_secs: secs,
+            }
+        }
+        crate::cli::VigilAddTrigger::Watcher => {
+            let path = parsed
+                .get("path")
+                .cloned()
+                .unwrap_or_else(|| ".".to_string());
+            VigilTrigger::Watcher { path }
+        }
+        crate::cli::VigilAddTrigger::Harbinger => {
+            let address = parsed
+                .get("address")
+                .cloned()
+                .unwrap_or_else(|| "127.0.0.1:9000".to_string());
+            let protocol = parsed.get("protocol").cloned().unwrap_or_default();
+            VigilTrigger::Harbinger {
+                address,
+                protocol,
+                socket_mode: crate::config::SocketMode::Commands,
+                commands: std::collections::HashMap::new(),
+            }
+        }
+    };
+
+    let reap_interval_secs = parsed
+        .get("reap_interval_secs")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30);
+
+    let prompt = parsed.get("prompt").cloned().unwrap_or_default();
+
+    Ok(VigilEntry {
+        name: name.to_string(),
+        trigger,
+        reap_interval_secs,
+        prompt,
+        procession: None,
+        rite: Some(VigilRite {
+            cmd: None,
+            git_dirty: false,
+        }),
+    })
 }

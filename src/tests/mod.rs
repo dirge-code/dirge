@@ -10,6 +10,8 @@ mod learning_loop_tests;
 mod picker_tests;
 #[cfg(all(test, feature = "semantic"))]
 mod semantic_tests;
+#[cfg(all(test, feature = "vigil"))]
+mod vigil_tests;
 use ctor::ctor;
 // Install rustls ring crypto provider before any test runs.
 // Tests bypass main(), so the provider install in main() is not
