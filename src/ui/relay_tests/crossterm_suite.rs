@@ -147,12 +147,14 @@ mod tests {
                 .collect();
             let mut pri = primary.try_clone().expect("clone primary");
             let injector = std::thread::spawn(move || {
-                for i in 0u64.. {
+                let mut i = 0u64;
+                loop {
                     if !injector_running2.load(Ordering::Relaxed) {
                         break;
                     }
                     if injector_paused2.load(Ordering::Relaxed) {
                         std::thread::sleep(Duration::from_millis(1));
+                        i += 1;
                         continue;
                     }
                     let b = charset[i as usize % charset.len()];
@@ -162,6 +164,7 @@ mod tests {
                         injector_bytes2.fetch_add(1, Ordering::Relaxed);
                     }
                     std::thread::sleep(Duration::from_micros(1000));
+                    i += 1;
                 }
             });
 
