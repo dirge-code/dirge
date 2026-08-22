@@ -421,6 +421,13 @@ pub(crate) async fn rebuild_agent_parts(
         Some(session.id.to_string()),
     )
     .await;
+    // A live `/effort` override wins over the per-provider config default
+    // that build_agent just seeded, and must survive this rebuild (e.g. a
+    // `/model` swap). Re-applying it here keeps the override sticky across
+    // every agent rebuild for the session.
+    if let Some(level) = session.effort_override {
+        agent.set_reasoning(Some(level));
+    }
 }
 
 /// Why an about-to-be-installed `/compact` summary was refused.
@@ -674,6 +681,7 @@ pub async fn handle_slash(
         "/model" => cmd::model::cmd_model(&mut ctx, &parts).await?,
         "/sessions" => cmd::sessions::cmd_sessions(&mut ctx, &parts).await?,
         "/reasoning" => cmd::model::cmd_reasoning(&mut ctx).await?,
+        "/effort" => cmd::model::cmd_effort(&mut ctx, &parts).await?,
         "/mode" => cmd::mode::cmd_mode(&mut ctx, &parts).await?,
         #[cfg(feature = "mcp")]
         "/mcp" => cmd::mcp::cmd_mcp(&mut ctx, &parts).await?,
@@ -875,6 +883,10 @@ fn slash_commands() -> Vec<(&'static str, &'static str)> {
         ("/plugins", "list or load plugins"),
         ("/prompt", "list, switch, or reset the active prompt layer"),
         ("/quit", "quit dirge"),
+        (
+            "/effort",
+            "set reasoning effort: off/minimal/low/medium/high/xhigh/max",
+        ),
         ("/reasoning", "toggle reasoning visibility"),
         (
             "/regen-prompts",
@@ -1369,6 +1381,7 @@ mod tests {
             "/plugins",
             "/prompt",
             "/quit",
+            "/effort",
             "/reasoning",
             "/regen-prompts",
             "/retry",

@@ -59,7 +59,7 @@ pub enum QueueMode {
 ///
 /// Wire format is lowercase to match pi's literals exactly,
 /// including `"xhigh"` (one word, no separator).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ThinkingLevel {
     /// Reasoning disabled. Pi's `prepareNextTurn` snapshot maps
@@ -72,6 +72,48 @@ pub enum ThinkingLevel {
     Medium,
     High,
     Xhigh,
+    /// Absolute maximum capability, distinct from `Xhigh`. OpenAI's
+    /// `reasoning_effort` and Anthropic's `effort` both expose `xhigh`
+    /// and `max` as separate wire tiers (`xhigh` < `max`). Providers that
+    /// lack an `xhigh` tier — DeepSeek and GLM-5.3 (`low`/`high`/`max`
+    /// only), per the user's "rounds up" rule — fold `Xhigh` to `max`;
+    /// Cerebras (`low`/`medium`/`high` only) folds both to `high`.
+    Max,
+}
+
+impl ThinkingLevel {
+    /// Parse a human effort string into a `ThinkingLevel`. Accepts the
+    /// wire names `off` / `minimal` / `low` / `medium` / `high` / `xhigh`
+    /// / `max`. Case-insensitive. Returns `None` on an unknown value so a
+    /// bad config key or typo fails soft (keeps the default) rather than
+    /// aborting a build. `max` is its own tier above `xhigh` (OpenAI and
+    /// Anthropic expose both); it is NOT a friendly alias for `xhigh`.
+    pub fn from_effort_str(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "off" => Some(Self::Off),
+            "minimal" => Some(Self::Minimal),
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            "xhigh" => Some(Self::Xhigh),
+            "max" => Some(Self::Max),
+            _ => None,
+        }
+    }
+
+    /// The wire-level name (reverse of [`from_effort_str`]). `/effort`
+    /// reports the current level to the user using this label.
+    pub fn effort_label(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
 }
 
 /// Per-level token budgets for thinking/reasoning. Token-based
@@ -88,6 +130,8 @@ pub struct ThinkingBudgets {
     pub low: Option<u32>,
     pub medium: Option<u32>,
     pub high: Option<u32>,
+    pub xhigh: Option<u32>,
+    pub max: Option<u32>,
 }
 
 /// Conversation context passed to the loop and threaded through
@@ -1057,7 +1101,8 @@ mod tests {
 
     /// Every `ThinkingLevel` variant round-trips at its expected
     /// lowercase string. `"xhigh"` is one word, no separator — pi
-    /// uses this exact spelling and we must match it.
+    /// uses this exact spelling and we must match it. `max` is its
+    /// own tier (distinct from `xhigh`) for OpenAI/Anthropic.
     #[test]
     fn thinking_level_wire_format() {
         let pairs = [
@@ -1067,6 +1112,7 @@ mod tests {
             (ThinkingLevel::Medium, "\"medium\""),
             (ThinkingLevel::High, "\"high\""),
             (ThinkingLevel::Xhigh, "\"xhigh\""),
+            (ThinkingLevel::Max, "\"max\""),
         ];
         for (variant, wire) in pairs {
             let encoded = serde_json::to_string(&variant).unwrap();
@@ -1148,5 +1194,91 @@ mod tests {
         // as_str and from_wire are defined on GateMode.
         assert_eq!(CodeReviewMode::Advisory.as_str(), "advisory");
         assert_eq!(CodeReviewMode::from_wire("off"), Some(GateMode::Off));
+    }
+
+    #[test]
+    fn from_effort_str_parses_seven_levels_with_distinct_max() {
+        assert_eq!(
+            ThinkingLevel::from_effort_str("off"),
+            Some(ThinkingLevel::Off)
+        );
+        assert_eq!(
+            ThinkingLevel::from_effort_str("minimal"),
+            Some(ThinkingLevel::Minimal)
+        );
+        assert_eq!(
+            ThinkingLevel::from_effort_str("low"),
+            Some(ThinkingLevel::Low)
+        );
+        assert_eq!(
+            ThinkingLevel::from_effort_str("medium"),
+            Some(ThinkingLevel::Medium)
+        );
+        assert_eq!(
+            ThinkingLevel::from_effort_str("high"),
+            Some(ThinkingLevel::High)
+        );
+        assert_eq!(
+            ThinkingLevel::from_effort_str("xhigh"),
+            Some(ThinkingLevel::Xhigh)
+        );
+        // `max` is its OWN tier above `xhigh` (OpenAI and Anthropic expose both),
+        // not a friendly alias for `Xhigh`.
+        assert_eq!(
+            ThinkingLevel::from_effort_str("max"),
+            Some(ThinkingLevel::Max)
+        );
+        // case-insensitive + whitespace-tolerant.
+        assert_eq!(
+            ThinkingLevel::from_effort_str("  High "),
+            Some(ThinkingLevel::High)
+        );
+        assert_eq!(
+            ThinkingLevel::from_effort_str("MAX"),
+            Some(ThinkingLevel::Max)
+        );
+        // Xhigh and Max must not collapse — the core invariant of the split.
+        assert_ne!(
+            ThinkingLevel::from_effort_str("xhigh"),
+            ThinkingLevel::from_effort_str("max")
+        );
+        // unknown fails soft → None (config typo must not abort a build).
+        assert_eq!(ThinkingLevel::from_effort_str("turbo"), None);
+        assert_eq!(ThinkingLevel::from_effort_str(""), None);
+    }
+
+    #[test]
+    fn effort_label_round_trips_via_from_effort_str() {
+        for level in [
+            ThinkingLevel::Off,
+            ThinkingLevel::Minimal,
+            ThinkingLevel::Low,
+            ThinkingLevel::Medium,
+            ThinkingLevel::High,
+            ThinkingLevel::Xhigh,
+            ThinkingLevel::Max,
+        ] {
+            // Every level labels as its own wire name and round-trips through
+            // from_effort_str — including Xhigh ("xhigh") and Max ("max")
+            // distinctly.
+            let label = level.effort_label();
+            assert_eq!(ThinkingLevel::from_effort_str(label), Some(level));
+        }
+    }
+
+    /// The split's whole point: Xhigh and Max are ordered xhigh < max, so a
+    /// provider exposing both can keep them distinct while a 3-tier provider
+    /// can fold Xhigh up. Verifies the Ord derive putting Max above Xhigh.
+    #[test]
+    fn max_orders_above_xhigh() {
+        assert!(ThinkingLevel::Xhigh < ThinkingLevel::Max);
+        assert_eq!(
+            ThinkingLevel::from_effort_str("xhigh").unwrap(),
+            ThinkingLevel::Xhigh
+        );
+        assert_eq!(
+            ThinkingLevel::from_effort_str("max").unwrap(),
+            ThinkingLevel::Max
+        );
     }
 }

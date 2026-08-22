@@ -297,6 +297,11 @@ impl AnyAgent {
         // dirge-nqr: forward the per-run turn cap. `None` keeps the
         // legacy unlimited behavior.
         cfg.max_turns = self.max_turns;
+        // Forward the resolved default reasoning effort so it seeds
+        // `LoopConfig.reasoning` (the per-turn wire field). `None` keeps
+        // the loop default (`Off`). A `/effort` live override mutates
+        // `self.reasoning` before the next spawn, so this picks it up.
+        cfg.reasoning = self.reasoning;
         // dirge-9tfq: forward the BackgroundStore so the spawn pipeline
         // installs a `get_followup_messages` hook that drains pending
         // subagent completions at the outer-loop boundary. `None`

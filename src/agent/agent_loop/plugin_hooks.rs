@@ -606,7 +606,7 @@ pub fn compaction_hooks_from_plugin_manager(
 
 /// Parse a Janet-side level string into `ThinkingLevel`. Pi
 /// values: `"off"`, `"minimal"`, `"low"`, `"medium"`, `"high"`,
-/// `"xhigh"`. Unknown values produce None (plugin's typo is
+/// `"xhigh"`, `"max"`. Unknown values produce None (plugin's typo is
 /// silently ignored rather than crashing the run).
 fn parse_thinking_level(s: String) -> Option<ThinkingLevel> {
     match s.as_str() {
@@ -616,6 +616,7 @@ fn parse_thinking_level(s: String) -> Option<ThinkingLevel> {
         "medium" => Some(ThinkingLevel::Medium),
         "high" => Some(ThinkingLevel::High),
         "xhigh" => Some(ThinkingLevel::Xhigh),
+        "max" => Some(ThinkingLevel::Max),
         _ => None,
     }
 }

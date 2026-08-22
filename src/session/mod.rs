@@ -273,6 +273,13 @@ pub struct Session {
     /// real response replaces it.
     #[serde(skip)]
     pub last_prompt_tokens: Option<u64>,
+    /// Live `/effort` override for this session, applied on top of the
+    /// per-provider `effort` config default after every agent rebuild.
+    /// Not persisted (a restart reverts to the config default); `Some`
+    /// wins over config, `None` lets the config default stand. Set by
+    /// the `/effort` command, read by `rebuild_agent_parts`.
+    #[serde(skip)]
+    pub effort_override: Option<crate::agent::agent_loop::types::ThinkingLevel>,
     /// Cumulative real input (prompt) tokens reported by the
     /// provider across this session's lifetime. Unlike
     /// `total_estimated_tokens` (a per-message heuristic), this is
@@ -469,6 +476,7 @@ impl Session {
             cumulative_output_tokens: 0,
             total_estimated_tokens: 0,
             last_prompt_tokens: None,
+            effort_override: None,
             cumulative_input_tokens: 0,
             cumulative_cached_input_tokens: 0,
             cumulative_cache_creation_tokens: 0,
