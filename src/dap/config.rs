@@ -211,11 +211,11 @@ fn sort_adapters_for_launch(program: &Path, cwd: &Path, adapters: &mut [Resolved
         let left_rank = EXTENSIONLESS_DEBUGGER_ORDER
             .iter()
             .position(|n| *n == left.name)
-            .map_or(usize::MAX, |i| i);
+            .unwrap_or(usize::MAX);
         let right_rank = EXTENSIONLESS_DEBUGGER_ORDER
             .iter()
             .position(|n| *n == right.name)
-            .map_or(usize::MAX, |i| i);
+            .unwrap_or(usize::MAX);
         if left_rank != right_rank {
             return left_rank.cmp(&right_rank);
         }

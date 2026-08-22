@@ -104,11 +104,13 @@ impl KeystrokeDriver {
         let interval = std::time::Duration::from_secs_f64(1.0 / bytes_per_sec as f64);
         let mut primary = pair.primary;
         std::thread::spawn(move || {
-            for i in 0u64.. {
+            let mut i: u64 = 0;
+            loop {
                 let b = charset[i as usize % charset.len()];
                 let _ = std::io::Write::write_all(&mut primary, &[b]);
                 let _ = std::io::Write::flush(&mut primary);
                 std::thread::sleep(interval);
+                i = i.wrapping_add(1);
             }
         });
 

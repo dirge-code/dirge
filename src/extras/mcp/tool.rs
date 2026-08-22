@@ -435,11 +435,8 @@ async fn try_call_with_reconnect(
         Err(e) => e,
     };
 
-    // Non-transport error → surface as-is.
-    let Some(svc_err) = err.as_service_error() else {
-        return Err(err.message);
-    };
-    if !is_transport_failure(svc_err) {
+    // Non-transport error, or timeout → surface as-is.
+    if !err.is_transport_failure() {
         return Err(err.message);
     }
 
@@ -518,14 +515,21 @@ async fn try_call_with_reconnect(
 /// Tagged error for `try_call_with_reconnect` — distinguishes
 /// transport failures (worth retrying) from tool-level errors
 /// (surface as-is).
+///
+/// `service_error` is NOT stored: the only consumer is the
+/// `is_transport_failure` classifier (a single bit), and the full
+/// `ServiceError` is never surfaced — `message` already carries its
+/// `Display`. Keeping the ~104-byte `rmcp::ServiceError` in the
+/// `Err` variant tripped `clippy::result_large_err` (≥128 bytes), so
+/// we keep only the classification, not the value.
 struct CallErr {
     message: String,
-    service_error: Option<ServiceError>,
+    transport: bool,
 }
 
 impl CallErr {
-    fn as_service_error(&self) -> Option<&ServiceError> {
-        self.service_error.as_ref()
+    fn is_transport_failure(&self) -> bool {
+        self.transport
     }
 }
 
@@ -545,9 +549,12 @@ async fn call_once(
         Ok(Ok(r)) => Ok(r),
         Ok(Err(svc_err)) => {
             let msg = format!("MCP tool error ({server_name}::{tool_name}): {svc_err}");
+            // Classify transport vs tool-level NOW — `svc_err` (a ~104B
+            // `ServiceError`) is dropped; only the bit is retained, so the
+            // `Err` variant stays small. The full error's text lives in `msg`.
             Err(CallErr {
                 message: msg,
-                service_error: Some(svc_err),
+                transport: is_transport_failure(&svc_err),
             })
         }
         Err(_) => Err(CallErr {
@@ -555,7 +562,9 @@ async fn call_once(
                 "MCP tool {server_name}::{tool_name} timed out after {}s",
                 timeout.as_secs(),
             ),
-            service_error: Some(ServiceError::Timeout { timeout }),
+            // Timeout is a tool-level latency issue, not a transport failure
+            // — it surfaces as-is (matching the `is_transport_failure` matrix).
+            transport: false,
         }),
     }
 }
@@ -707,6 +716,41 @@ mod tests {
         assert!(!is_transport_failure(&ServiceError::Cancelled {
             reason: Some("user".into()),
         }));
+    }
+
+    /// `CallErr` is the `Err` variant of `call_once`'s `Result`. The
+    /// prior shape carried a ~104-byte `Option<ServiceError>` purely to
+    /// feed the `is_transport_failure` classifier, pushing the variant
+    /// to ≥128 bytes and tripping `clippy::result_large_err` under
+    /// `-D warnings`. Only the classification bit is needed (the full
+    /// error's text already lives in `message`), so the variant must
+    /// stay well under 128 bytes — pin it so a future field can't
+    /// silently re-introduce the lint.
+    #[test]
+    fn call_err_stays_small() {
+        let sz = std::mem::size_of::<CallErr>();
+        assert!(
+            sz < 128,
+            "CallErr is {sz} bytes; must stay < 128 to satisfy clippy::result_large_err",
+        );
+    }
+
+    /// The timeout path no longer constructs a synthetic
+    /// `ServiceError::Timeout` to feed the classifier; it carries the
+    /// classification bit directly. The behavior must be unchanged:
+    /// timeout is NOT a transport failure and must surface as-is.
+    #[test]
+    fn call_err_timeout_is_not_transport() {
+        let e = CallErr {
+            message: "timed out".into(),
+            transport: false,
+        };
+        assert!(!e.is_transport_failure());
+        let e = CallErr {
+            message: "gone".into(),
+            transport: true,
+        };
+        assert!(e.is_transport_failure());
     }
 
     /// The shared `Deadline` (which replaced the inline
