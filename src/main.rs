@@ -2056,6 +2056,211 @@ async fn main() -> anyhow::Result<()> {
         #[cfg(not(feature = "mcp"))]
         let mcp_wake_rx: Option<tokio::sync::mpsc::UnboundedReceiver<()>> = None;
 
+        // Vigil: start the vigil-keeper and wire its wake channel.
+        // The keeper owns the background reaper and trigger tasks; we hold
+        // onto it so it stays alive while the observance/hook receivers are
+        // handed to the headless --vigil-once driver below.
+        #[cfg(feature = "vigil")]
+        let (
+            mut _vigil_keeper,
+            _vigil_wake_rx,
+            mut vigil_observance_rx,
+            _vigil_ctl_tx,
+            mut vigil_hook_rx,
+        ) = {
+            if !cli.vigil_mode && !cli.vigil_once {
+                (None, None, None, None, None)
+            } else {
+                // Merge config vigils with --vigil-config file entries (if any).
+                let mut entries = if let Some(cfg_entries) = cfg.vigils.as_ref() {
+                    cfg_entries.clone()
+                } else {
+                    vec![]
+                };
+                if let Some(ref config_path) = cli.vigil_config {
+                    if config_path.exists() {
+                        match std::fs::read_to_string(config_path) {
+                            Ok(json_str) => {
+                                match serde_json::from_str::<Vec<crate::config::VigilEntry>>(
+                                    &json_str,
+                                ) {
+                                    Ok(file_entries) => {
+                                        for fe in file_entries {
+                                            if !entries.iter().any(|e| e.name == fe.name) {
+                                                entries.push(fe);
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        eprintln!(
+                                            "warning: --vigil-config file has invalid JSON: {e}"
+                                        );
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("warning: cannot read --vigil-config file: {e}");
+                            }
+                        }
+                    } else {
+                        eprintln!(
+                            "warning: --vigil-config file not found: {}",
+                            config_path.display()
+                        );
+                    }
+                }
+
+                let paused_names = {
+                    let paths = crate::extras::dirge_paths::ProjectPaths::new(
+                        &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+                    );
+                    let db_path = paths.session_db_path();
+                    if db_path.exists() {
+                        match crate::extras::vigil_db::VigilStore::open_at(&db_path) {
+                            Ok(store) => store
+                                .list_non_resting()
+                                .unwrap_or_default()
+                                .into_iter()
+                                .filter(|r| {
+                                    matches!(r.status, crate::extras::vigil_db::VigilStatus::Paused)
+                                })
+                                .map(|r| r.name)
+                                .collect::<std::collections::HashSet<_>>(),
+                            Err(_) => std::collections::HashSet::new(),
+                        }
+                    } else {
+                        std::collections::HashSet::new()
+                    }
+                };
+                match crate::extras::vigil::VigilKeeper::from_config_and_filesystem(
+                    entries.clone(),
+                    paused_names,
+                ) {
+                    Ok(mut keeper) => {
+                        if keeper.vigils.is_empty() {
+                            eprintln!("warning: --vigil set but no vigils configured");
+                            (None, None, None, None, None)
+                        } else {
+                            let n = keeper.vigils.len();
+                            eprintln!("info: vigil-keeper started with {n} vigil(s)");
+                            let wake = keeper.wake_rx.take();
+                            let obs = keeper.observance_rx.take();
+                            let ctl = keeper.ctl_tx.clone();
+                            let hook_rx = keeper.hook_rx.take();
+                            (Some(keeper), wake, obs, ctl, hook_rx)
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("warning: vigil-keeper failed to start: {e}");
+                        (None, None, None, None, None)
+                    }
+                }
+            }
+        };
+        // Headless vigil: wait for a single observance, run one agent turn
+        // on its prompt, dispatch on-vigil-observance, then exit. Mirrors the
+        // --loop headless driver but keyed off the vigil-keeper instead of a
+        // LOOP_PLAN iteration.
+        #[cfg(feature = "vigil")]
+        if cli.vigil_once {
+            let rx = vigil_observance_rx
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("--vigil-once requires an active vigil-keeper"))?;
+            // Run the named poll command now that the vigil bridge is live so
+            // its (vigil/emit ...) lands in the keeper's queue before we wait.
+            #[cfg(feature = "plugin")]
+            if let Some(cmd) = cli.vigil_once_command.as_deref()
+                && let Some(pm_arc) = plugin_manager.as_ref()
+            {
+                let cmd = cmd.to_string();
+                let pm = pm_arc.clone();
+                match tokio::task::spawn_blocking(move || {
+                    let mut mgr = pm.lock_ignore_poison();
+                    let handler = mgr
+                        .list_commands()
+                        .into_iter()
+                        .find(|(name, _)| name == &cmd)
+                        .map(|(_, handler)| handler)
+                        .unwrap_or_else(|| cmd.clone());
+                    mgr.invoke_command(&handler, "")
+                })
+                .await
+                {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => eprintln!("warning: vigil poll command failed: {e}"),
+                    Err(e) => eprintln!("warning: vigil poll command panicked: {e}"),
+                }
+            }
+            // Reap fires at the vigil's reap_interval boundary (up to 60s in
+            // the fixtures); allow several windows before declaring a timeout.
+            let obs = match tokio::time::timeout(std::time::Duration::from_secs(180), rx.recv())
+                .await
+            {
+                Ok(Some(obs)) => obs,
+                Ok(None) => {
+                    anyhow::bail!("vigil: observance channel closed before an observance arrived")
+                }
+                Err(_) => anyhow::bail!("vigil: timed out after 180s waiting for an observance"),
+            };
+            let prompt = if obs.prompt.is_empty() {
+                format!("[vigil] {} - {} event(s)", obs.vigil_name, obs.event_count)
+            } else {
+                obs.prompt.clone()
+            };
+            eprintln!(
+                "info: vigil observance for '{}' ({} event(s))",
+                obs.vigil_name, obs.event_count
+            );
+            let (response, _tool_calls, _usage) = agent
+                .run_print(
+                    &prompt,
+                    cli.resolve_max_agent_turns(&cfg),
+                    cli.output_format,
+                    Vec::new(),
+                )
+                .await?;
+            // Release the in-flight flag so a future reap isn't skipped if
+            // the keeper outlives this one-shot turn.
+            obs.running
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            #[cfg(feature = "plugin")]
+            if let Some(pm_arc) = plugin_manager.as_ref() {
+                let ctx = crate::extras::vigil::observance_context(
+                    &obs.vigil_name,
+                    obs.event_count,
+                    &response,
+                );
+                let pm = pm_arc.clone();
+                tokio::task::spawn_blocking(move || {
+                    pm.lock_ignore_poison()
+                        .dispatch_tool_hook("on-vigil-observance", &ctx)
+                })
+                .await
+                .ok();
+            }
+
+            // Deliver any queued on-vigil-event / on-vigil-reap hook
+            // requests. The interactive loop drains these every iteration;
+            // --vigil-once has no loop, so flush them once before exiting.
+            if let Some(ref mut hook_rx) = vigil_hook_rx {
+                while let Ok(req) = hook_rx.try_recv() {
+                    #[cfg(feature = "plugin")]
+                    if let Some(pm) = plugin_manager.as_ref() {
+                        let pm = pm.clone();
+                        let hook = req.hook_name;
+                        let ctx = req.context;
+                        tokio::task::spawn_blocking(move || {
+                            pm.lock_ignore_poison().dispatch_tool_hook(&hook, &ctx)
+                        })
+                        .await
+                        .ok();
+                    }
+                }
+            }
+            crate::agent::tools::bg_shell::global().kill_all();
+            return Ok(());
+        }
+
         ui::run_interactive(
             client,
             agent,
