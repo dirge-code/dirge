@@ -126,6 +126,13 @@ impl ProjectPaths {
         self.dirge_dir().join("skills")
     }
 
+    /// `.dirge/vigils/` — vigil definition files (one JSON file per vigil).
+    #[cfg(feature = "vigil")]
+    #[allow(dead_code)]
+    pub fn vigils_dir(&self) -> PathBuf {
+        self.dirge_dir().join("vigils")
+    }
+
     /// `.dirge/sessions/` — SQLite session database and transcripts.
     pub fn sessions_dir(&self) -> PathBuf {
         self.dirge_dir().join("sessions")
