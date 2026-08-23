@@ -254,6 +254,31 @@ pub struct Cli {
     )]
     pub loop_run: Option<String>,
 
+    #[cfg(feature = "vigil")]
+    #[arg(
+        long = "vigil",
+        help = "Run in vigil heartbeat/wakeup mode (requires vigils in config)"
+    )]
+    pub vigil_mode: bool,
+
+    #[cfg(feature = "vigil")]
+    #[arg(long = "vigil-config", help = "Path to a vigil JSON config file")]
+    pub vigil_config: Option<std::path::PathBuf>,
+
+    #[cfg(feature = "vigil")]
+    #[arg(
+        long = "vigil-once",
+        help = "Run vigil headlessly: wait for one observance, run one agent turn, then exit"
+    )]
+    pub vigil_once: bool,
+
+    #[cfg(feature = "vigil")]
+    #[arg(
+        long = "vigil-once-command",
+        help = "Invoke this registered plugin command (e.g. poll-jenkins) after the vigil bridge is live, before waiting for an observance"
+    )]
+    pub vigil_once_command: Option<String>,
+
     #[arg(
         long = "auto-confirm",
         value_enum,

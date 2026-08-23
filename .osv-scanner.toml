@@ -1,3 +1,7 @@
 [[IgnoredVulns]]
 id = "RUSTSEC-2025-0057"
 reason = "fxhash is a transitive dep of bm25; no maintained fork exists that preserves the required hash32/hash64 API"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0384"
+reason = "instant is a transitive dep of notify-types → notify (dirge's watch dep); unmaintained, no drop-in fork yet — notify maintainers are tracking web-time migration"
