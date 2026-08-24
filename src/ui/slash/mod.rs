@@ -109,6 +109,11 @@ pub(super) struct SlashCtx<'a> {
     pub user_tx: &'a tokio::sync::mpsc::UnboundedSender<crate::event::UserEvent>,
     #[cfg(feature = "loop")]
     pub loop_state: &'a mut Option<crate::extras::r#loop::LoopState>,
+    #[cfg(feature = "vigil")]
+    #[allow(dead_code)]
+    pub vigil_state: &'a mut Option<crate::extras::vigil::VigilState>,
+    #[cfg(feature = "vigil")]
+    pub vigil_ctl_tx: &'a Option<tokio::sync::mpsc::Sender<crate::extras::vigil::types::VigilCtl>>,
     #[cfg(feature = "mcp")]
     pub mcp_manager: Option<&'a McpClientManager>,
     #[cfg(feature = "semantic")]
@@ -636,6 +641,10 @@ pub async fn handle_slash(
     sandbox: &Sandbox,
     #[cfg(unix)] user_tx: &tokio::sync::mpsc::UnboundedSender<crate::event::UserEvent>,
     #[cfg(feature = "loop")] loop_state: &mut Option<crate::extras::r#loop::LoopState>,
+    #[cfg(feature = "vigil")] vigil_state: &mut Option<crate::extras::vigil::VigilState>,
+    #[cfg(feature = "vigil")] vigil_ctl_tx: &Option<
+        tokio::sync::mpsc::Sender<crate::extras::vigil::types::VigilCtl>,
+    >,
     #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
     #[cfg(feature = "semantic")] semantic_manager: Option<&SemanticManager>,
     // C8 (audit fix): every prior agent-rebuild path (/model,
@@ -669,6 +678,10 @@ pub async fn handle_slash(
         user_tx,
         #[cfg(feature = "loop")]
         loop_state,
+        #[cfg(feature = "vigil")]
+        vigil_state,
+        #[cfg(feature = "vigil")]
+        vigil_ctl_tx,
         #[cfg(feature = "mcp")]
         mcp_manager,
         #[cfg(feature = "semantic")]
@@ -717,6 +730,7 @@ pub async fn handle_slash(
         "/fork" => cmd::fork::cmd_fork(&mut ctx, &parts).await?,
         "/clone" => cmd::clone::cmd_clone(&mut ctx, &parts).await?,
         "/panel" => cmd::panel::cmd_panel(&mut ctx, &parts).await?,
+        "/vigil" => cmd::vigil_cmd::cmd_vigil(&mut ctx, &parts, text).await?,
         "/display" => cmd::panel::cmd_display(&mut ctx, &parts).await?,
         "/btw" => return cmd::btw::cmd_btw(&mut ctx, &parts).await,
         "/learn" => return cmd::learn::cmd_learn(&mut ctx, &parts).await,
@@ -926,6 +940,7 @@ fn slash_commands() -> Vec<(&'static str, &'static str)> {
     // (dirge-3p8j). The gated entry made it un-completable / "unknown" in
     // no-loop builds even though the arm handled it.
     cmds.push(("/loop", "start, stop, or show a background prompt loop"));
+    cmds.push(("/vigil", "manage vigil heartbeat/watch triggers"));
     #[cfg(feature = "dap")]
     cmds.push((
         "/debug",
