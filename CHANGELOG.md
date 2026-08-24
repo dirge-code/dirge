@@ -6,6 +6,52 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.25.0] - 2026-08-24
+
+### Added
+- `/memory` now lists what dirge has remembered, and `/memory edit` opens the
+  store in `$EDITOR`: reword a line to reword the memory, delete a block to
+  forget it, add a block to record something new. Memory is injected verbatim
+  into the system prompt of every session in the project — under global scope,
+  every project — so "you cannot read it" was a real gap; the only options were
+  to ask the agent to call the `memory` tool and hope, or open `sqlite3` and
+  risk desyncing the FTS index against the content. Each entry is anchored on
+  its id (rendered short, `[n7x4bhbp]`, resolved by prefix) rather than matched
+  back by text. That is the load-bearing part: a row carries uid lineage,
+  `created_at`, `use_count`, confidence, the supersession audit chain and the
+  procedural success/failure counters, all of which content-matching or
+  delete-then-recreate silently resets. Deleting a block tombstones rather than
+  destroys, so `restore` still works, and an unparseable document or an aborted
+  editor (`:cq`) leaves the store intact.
+- `memory.confirm_writes` (default off) puts a human in the loop before anything
+  is stored. dirge decides what is worth remembering on its own — the agent
+  writes mid-session, and the background review and memory curator write more
+  after an idle session — and nobody approved any of it, so a wrong or trivial
+  memory persisted silently while something the human knew mattered was never
+  recorded. With the gate on an `add` is queued instead of stored, and
+  `/memory review` opens the queue in `$EDITOR`. The file is the desired final
+  state of the batch rather than a diff, so reject (delete the block), reword
+  (edit the text) and record what the model missed (type a new one) are one
+  operation; accepted entries go in through the normal `add` path, so a memory
+  you typed is indistinguishable from one the model proposed. A queued entry
+  rides on `status = 'pending'`, which every read path already filters — the
+  prompt snapshot, `view`, and the FTS join in `search` — so a proposal is inert
+  with no new filtering and no migration, and it skips hot-tier compaction
+  rather than demoting an accepted memory before anyone agreed to keep it. Only
+  `add` is gated; `replace`/`supersede`/`remove` act on entries a human already
+  accepted.
+- Plugins can invoke dirge's own tools rather than reimplementing them. Three
+  Janet functions, modelled on the LSP bridge: `(harness/tools?)`,
+  `(harness/list-tools)` and `(harness/call-tool name args)`. A plugin that
+  wanted a tool's output previously had to reimplement it — and therefore
+  reimplement its permission checks — and could never reach MCP or semantic
+  tools at all. Permissions are unaffected: `check_perm*` runs inside each tool,
+  so dispatching straight to the tool keeps the gate. Two calls are refused
+  rather than attempted, both of which would hang: plugin-registered tools
+  (their handlers need the Janet worker, which is blocked awaiting the reply)
+  and `task` (subagents run isolated from plugin hooks). Hooks do not fire for
+  bridged calls, for the same re-entrancy reason.
+
 ## [0.24.1] - 2026-08-22
 
 ### Added
@@ -4105,7 +4151,8 @@ agent in Rust with:
   LSP integration, and a Janet plugin system.
 - Session save/load/resume with LLM-summarization compaction.
 
-[Unreleased]: https://github.com/dirge-code/dirge/compare/v0.24.1...HEAD
+[Unreleased]: https://github.com/dirge-code/dirge/compare/v0.25.0...HEAD
+[0.25.0]: https://github.com/dirge-code/dirge/compare/v0.24.1...v0.25.0
 [0.24.1]: https://github.com/dirge-code/dirge/compare/v0.24.0...v0.24.1
 [0.24.0]: https://github.com/dirge-code/dirge/compare/v0.23.0...v0.24.0
 [0.23.0]: https://github.com/dirge-code/dirge/compare/v0.22.0...v0.23.0
