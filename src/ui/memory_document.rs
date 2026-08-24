@@ -17,7 +17,9 @@
 //! still works — removing a line in an editor should not be more destructive
 //! than the tool's own removal.
 
-use crate::extras::memory_db::{BrowseEntry, SqliteMemoryStore};
+use crate::extras::memory_db::BrowseEntry;
+#[cfg(unix)]
+use crate::extras::memory_db::SqliteMemoryStore;
 
 /// How much of a uid to show. Stored uids are `urn:ump:<26 chars>`, which is
 /// far too wide to put in front of every line — the anchor would out-shout
