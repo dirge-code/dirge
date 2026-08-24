@@ -881,7 +881,7 @@ fn slash_commands() -> Vec<(&'static str, &'static str)> {
         ),
         (
             "/memory",
-            "show what is remembered; `edit` to change it, `reload` to refresh",
+            "show what is remembered; `edit` to change it, `review` to confirm queued writes, `reload` to refresh",
         ),
         ("/mode", "view or set the permission/security mode"),
         ("/model", "list configured models, or switch to one"),

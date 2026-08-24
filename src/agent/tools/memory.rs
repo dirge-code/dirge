@@ -26,6 +26,11 @@ pub struct MemoryTool {
     /// schema AND rejected at the call layer; the review runner gets a separate
     /// instance built with `true`.
     review_actions: bool,
+    /// `memory.confirm_writes`: route `add` to the review queue instead of
+    /// storing it. Set from config on every instance that can write —
+    /// including the background-review and curator forks, which is the
+    /// whole point: those are the writes nobody sees happen.
+    confirm_writes: bool,
 }
 
 impl MemoryTool {
@@ -40,7 +45,14 @@ impl MemoryTool {
             store,
             global_store: None,
             review_actions: false,
+            confirm_writes: false,
         }
+    }
+
+    /// Gate `add` behind human review (`memory.confirm_writes`).
+    pub fn with_confirm_writes(mut self, enabled: bool) -> Self {
+        self.confirm_writes = enabled;
+        self
     }
 
     /// Attach the global (cross-project) memory tier. `None` is a no-op.
@@ -269,10 +281,25 @@ impl PortableTool for MemoryTool {
                     "content",
                     "add",
                 )?;
-                let resp = store
-                    .add(target, content, args.kind.as_deref())
-                    .map_err(ToolError::Msg)?;
-                crate::agent::review::fire_memory_write(store.as_ref(), "add", target, content);
+                // dirge memory review: when the gate is on, an add becomes a
+                // proposal. Only `add` is gated — `replace`/`supersede` edit
+                // facts a human already accepted, and `supersede` usually
+                // fires because the user just contradicted something, so
+                // asking them to confirm their own correction is noise.
+                let resp = if self.confirm_writes {
+                    store
+                        .queue_for_review(target, content, args.kind.as_deref())
+                        .map_err(ToolError::Msg)?
+                } else {
+                    store
+                        .add(target, content, args.kind.as_deref())
+                        .map_err(ToolError::Msg)?
+                };
+                // The write hooks observe real writes only; a queued entry
+                // has not happened yet and must not look like it did.
+                if !self.confirm_writes {
+                    crate::agent::review::fire_memory_write(store.as_ref(), "add", target, content);
+                }
                 Ok(serde_json::to_string_pretty(&resp)
                     .unwrap_or_else(|_| r#"{"error":"serialization failed"}"#.to_string()))
             }

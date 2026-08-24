@@ -292,6 +292,46 @@ Reciprocal Rank Fusion. It needs an OpenAI-compatible embeddings endpoint.
 | `embed_model`       | string  | Embedding model id. Default `text-embedding-3-small` — set it when pointing at a non-OpenAI endpoint. |
 | `embed_api_key_env` | string  | Name of the env var holding the API key (the key itself is never stored in config). Omit for a keyless local endpoint. |
 | `verbatim_pre_recall` | boolean | Each turn, auto-search memory on the verbatim user message and inject the hits as a supplemental context note (separate from the frozen system-prompt snapshot — it never changes the cached prefix). Surfaces relevant memory the agent wouldn't think to look up. Works with BM25 or hybrid. Default `false`. |
+| `confirm_writes`    | boolean | Require human confirmation before any memory `add` is stored. See [Confirming memory writes](#confirming-memory-writes). Default `false`. |
+
+### Confirming memory writes
+
+dirge decides what is worth remembering on its own. The agent writes mid-session
+whenever it judges something memorable, and after an idle session the background
+review and memory curator — forked LLM runners — write more. All of it lands in
+the system prompt of every later session in the project, and under global scope,
+of every project.
+
+`confirm_writes` puts a human in that loop:
+
+```json
+{ "memory": { "confirm_writes": true } }
+```
+
+An `add` is then *queued* rather than stored. A queued entry is inert — it is not
+in the prompt snapshot, not in `memory view`, and not in `memory search` — and the
+model is told plainly that it is not yet stored, so it does not treat the fact as
+durable. Review them with:
+
+```
+/memory review
+```
+
+which opens the queue in `$EDITOR`. **The file is the desired final state**: delete
+a block to reject it, edit the text to reword it, or type a new block to record
+something the model never noticed. Saving stores exactly what is in the file;
+quitting without saving (`:cq`) leaves the queue untouched for next time. Accepted
+entries go in through the normal write path, so a memory you typed is
+indistinguishable from one the agent proposed.
+
+Only `add` is gated. `replace`, `supersede` and `remove` act on entries you already
+accepted, and `supersede` usually fires because you just corrected the agent —
+asking you to confirm your own correction would be noise.
+
+A notice appears when the queue is non-empty, both after the post-session passes
+and once at startup. Headless `-p` has no one to ask, so entries simply queue there
+and wait for your next interactive session; nothing is auto-accepted and nothing is
+lost.
 
 Safe by default and on failure: with `hybrid_retrieval` off, or the endpoint
 unset/unreachable/timed out, search silently falls back to BM25 — it never

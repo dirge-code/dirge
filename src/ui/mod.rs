@@ -20,6 +20,7 @@ pub(crate) mod input_reader;
 pub(crate) mod keymap;
 mod markdown;
 pub(crate) mod memory_document;
+pub(crate) mod memory_review;
 pub(crate) mod notifications;
 pub(crate) mod panel_data;
 mod panel_render;
@@ -333,6 +334,14 @@ pub async fn run_interactive(
     // Surface alias names in tab-completion + ghost suffix.
     #[cfg(feature = "slash-completion")]
     crate::ui::slash::register_alias_commands(aliases.names());
+    // A queue left over from a previous session would otherwise be
+    // invisible: the memories are not in the prompt and nothing else
+    // mentions them. Announce once at startup.
+    if let Ok(cwd) = std::env::current_dir() {
+        crate::ui::memory_review::notify_if_queued(&crate::extras::dirge_paths::ProjectPaths::new(
+            &cwd,
+        ));
+    }
     // Pending prefix of an in-progress emacs-style chord sequence (#234).
     // Empty unless the user has pressed the first key(s) of a multi-key
     // global binding (e.g. `ctrl-x` of `ctrl-x ctrl-s`); shown in the
