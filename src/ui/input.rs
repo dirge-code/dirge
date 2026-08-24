@@ -1085,9 +1085,6 @@ impl InputEditor {
     /// `terminal.rs`.
     #[cfg(unix)]
     pub(crate) fn open_in_external_editor(&mut self) -> Option<CompactString> {
-        use std::io::Write;
-        let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
-
         // Seed with the EXPANDED text (paste bodies inline, image markers
         // dropped) rather than the raw buffer: the raw buffer carries
         // invisible `\x01<idx>\x01` sentinel bytes that render as garbage in
@@ -1096,92 +1093,13 @@ impl InputEditor {
         // (dirge-vpma.5).
         let seed = self.editor_seed();
 
-        let path = std::env::temp_dir().join(format!("dirge-input-{}.md", std::process::id()));
-        // Clear any leftover from an interrupted prior edit, then create the
-        // file with O_EXCL (`create_new`): if an attacker pre-planted a symlink
-        // at this predictable path, the open fails safely instead of writing
-        // through it.
-        let _ = std::fs::remove_file(&path);
-        let write_result = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .and_then(|mut f| f.write_all(seed.as_bytes()));
-        if let Err(e) = write_result {
-            crate::ui::notifications::notify_send(crate::ui::notifications::Notification::Error(
-                format!("External editor: failed to write temp file: {e}"),
-            ));
-            return None;
-        }
-
-        // dirge redirects fd 1/2 to the log file for the TUI session; point
-        // them at /dev/tty for the child editor's lifetime so it draws on the
-        // real terminal, then restore. fd 0 (stdin) is already the terminal.
-        let saved: Option<(i32, i32, i32)> = unsafe {
-            let tty = libc::open(c"/dev/tty".as_ptr(), libc::O_RDWR);
-            if tty < 0 {
-                None
-            } else {
-                let so = libc::dup(1);
-                let se = libc::dup(2);
-                libc::dup2(tty, 1);
-                libc::dup2(tty, 2);
-                Some((tty, so, se))
-            }
-        };
-
-        // git-style invocation: pass the temp path as a positional arg ($1 via
-        // "$@") instead of interpolating it into the command string, so a path
-        // with spaces/metacharacters can't break the command. `$EDITOR` still
-        // word-splits (e.g. `EDITOR="code --wait"`).
-        let status = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(format!("{editor} \"$@\""))
-            .arg(&editor) // $0
-            .arg(&path) // $1 → "$@"
-            .status();
-
-        // Restore fd 1/2 to the log file and close the saved/tty fds (no leak).
-        if let Some((tty, so, se)) = saved {
-            unsafe {
-                libc::dup2(so, 1);
-                libc::dup2(se, 2);
-                libc::close(so);
-                libc::close(se);
-                libc::close(tty);
-            }
-        }
-
-        let content = match status {
-            Ok(s) if s.success() => std::fs::read_to_string(&path).unwrap_or_else(|_| seed.clone()),
-            Ok(s) => {
-                crate::ui::notifications::notify_send(
-                    crate::ui::notifications::Notification::Error(format!(
-                        "External editor exited with: {}",
-                        s.code()
-                            .map(|c| format!("code {c}"))
-                            .unwrap_or_else(|| "signal".into())
-                    )),
-                );
-                seed.clone()
-            }
-            Err(e) => {
-                crate::ui::notifications::notify_send(
-                    crate::ui::notifications::Notification::Error(format!(
-                        "External editor: failed to spawn {editor}: {e}"
-                    )),
-                );
-                seed.clone()
-            }
-        };
-
-        let _ = std::fs::remove_file(&path);
-
         // Compare against the seed, not the raw buffer — the seed is what the
         // editor was handed, so this correctly detects "no change" even though
-        // the raw buffer differs (markers expanded). On the error paths above
-        // `content == seed`, so nothing is applied.
-        if content != seed {
+        // the raw buffer differs (markers expanded). A failed or aborted edit
+        // yields `None` and applies nothing, as before.
+        if let Some(content) = crate::ui::external_editor::edit_text(&seed, "input")
+            && content != seed
+        {
             self.apply_editor_result(&content);
         }
 

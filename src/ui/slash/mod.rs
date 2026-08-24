@@ -879,7 +879,10 @@ fn slash_commands() -> Vec<(&'static str, &'static str)> {
             "/learn",
             "distill sources or this session into a reusable skill",
         ),
-        ("/memory", "reload the memory snapshot mid-session"),
+        (
+            "/memory",
+            "show what is remembered; `edit` to change it, `reload` to refresh",
+        ),
         ("/mode", "view or set the permission/security mode"),
         ("/model", "list configured models, or switch to one"),
         ("/panel", "toggle the side panels on or off"),
