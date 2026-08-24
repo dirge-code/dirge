@@ -204,6 +204,13 @@ pub async fn build_agent(
                 )
                 .await;
 
+            // Publish the tool set so `harness/call-tool` can reach it.
+            // Done on every build, not once: the agent is rebuilt at run
+            // boundaries and MCP tools can attach late, so a captured
+            // snapshot would quietly go stale.
+            #[cfg(feature = "plugin")]
+            crate::plugin::tool_bridge::publish_registry(&loop_tools);
+
             // Phase 4.5h-6: the new path passes the rig Agent's
             // preamble as Context.system_prompt. rig 0.41 made that
             // field private, so `build_agent_inner` hands it back.

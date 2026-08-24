@@ -1040,6 +1040,15 @@ pub async fn build_loop_tools(
             Ok(mut guard) => guard.list_plugin_tools(),
             Err(_) => Vec::new(),
         };
+        // Cache the names for the tool bridge. It must never take this lock
+        // itself: `harness/call-tool` runs while the hook dispatcher already
+        // holds the PluginManager, and the lock is not reentrant — asking for
+        // it from the Janet worker (or from the responder, which the worker is
+        // blocked on) deadlocks the whole agent. Publishing here, on the build
+        // path, keeps the bridge's refusal check lock-free.
+        crate::plugin::tool_bridge::publish_plugin_tool_names(
+            metas.iter().map(|m| m.name.clone()).collect(),
+        );
         for meta in metas {
             if shadows_builtin(&meta.name, "plugin") {
                 continue;

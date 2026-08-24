@@ -25,6 +25,12 @@ pub mod interrupt;
 pub mod loader;
 #[cfg(feature = "plugin")]
 pub mod notebook;
+
+// Gated as a whole: every item in it is reachable only through the Janet
+// C functions, so a no-plugin build would otherwise trip `-D warnings` on a
+// dozen dead statics.
+#[cfg(feature = "plugin")]
+pub mod tool_bridge;
 pub mod worker;
 
 /// Per-process sentinel the Rust host prepends to a plugin error string

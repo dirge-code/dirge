@@ -324,12 +324,34 @@ impl AnyAgent {
         // Plugin `on-prompt` dispatch. Headless modes (--print, --loop)
         // previously skipped this — plugins that mutate the user prompt
         // or block it never fired in CI/script contexts.
+        //
+        // Dispatched via `spawn_blocking`, matching the tool hooks
+        // (plugin_hooks.rs:231). This is not a style preference: the runtime
+        // is `flavor = "current_thread"`, so running the synchronous Janet
+        // dispatch inline pins its only thread. Any harness bridge that
+        // blocks on a reply from the runtime — `harness/call-tool`,
+        // `harness/lsp`, `harness/confirm` — could then never be answered,
+        // and the hook would hang until its own timeout. The TUI path
+        // already dispatches off-loop for the same reason (ui/state.rs).
         let effective_prompt: String = {
             #[cfg(feature = "plugin")]
             {
                 if let Some(pm_arc) = crate::plugin::hook::global() {
-                    let mut mgr = pm_arc.lock_ignore_poison();
-                    runner::resolve_prompt_with_hooks(prompt, &mut mgr)
+                    let owned = prompt.to_string();
+                    let fallback = owned.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let mut mgr = pm_arc.lock_ignore_poison();
+                        runner::resolve_prompt_with_hooks(&owned, &mut mgr)
+                    })
+                    .await
+                    .unwrap_or_else(|join_err| {
+                        tracing::warn!(
+                            target: "dirge::provider::run",
+                            error = %join_err,
+                            "on-prompt hook panicked; using the original prompt",
+                        );
+                        fallback
+                    })
                 } else {
                     prompt.to_string()
                 }
