@@ -308,6 +308,24 @@ fn truncate_for_error(s: &str) -> String {
 
 // ── Store ────────────────────────────────────────────────────────────
 
+/// One entry as `/memory` shows it.
+///
+/// Carries the uid because that is what `/memory edit` anchors on, and the
+/// cheap usefulness signals (`tier`, `use_count`) so a reader can tell an
+/// inlined fact the agent leans on from a breadcrumb it has never touched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowseEntry {
+    pub uid: String,
+    /// `"memory"` or `"pitfalls"`.
+    pub target: String,
+    pub kind: String,
+    pub content: String,
+    /// `"hot"` (inlined in the prompt) or `"breadcrumb"` (index only).
+    pub tier: String,
+    pub use_count: i64,
+    pub updated_at: String,
+}
+
 /// One active row, as the matching/eviction logic sees it.
 #[derive(Clone)]
 struct ActiveRow {
@@ -1222,6 +1240,29 @@ impl SqliteMemoryStore {
             .map_err(|e| format!("Failed to begin transaction: {e}"))?;
         let rows = Self::active_rows(&tx, target)?;
         let idx = find_unique_match(&rows, old_text)?;
+        Self::apply_replacement(&tx, target, &rows, idx, &new_entry, kind)?;
+        tx.commit().map_err(|e| format!("Failed to commit: {e}"))?;
+        Ok(())
+    }
+
+    /// The in-place half of a replace, once the target row is known.
+    ///
+    /// Split out so `replace_entry` (matched by substring) and
+    /// `replace_entry_by_uid` (matched by stable id, used by `/memory edit`)
+    /// share one definition of what replacing means. The distinction that
+    /// matters is preserved here: this UPDATEs the row, so uid, lineage,
+    /// `created_at`, `use_count` and `confidence` all survive. Only a
+    /// *re-classification* resets the outcome counters, and only because a
+    /// procedural entry re-kinded to semantic must not keep a track record
+    /// that no longer applies to it.
+    fn apply_replacement(
+        tx: &Connection,
+        target: &str,
+        rows: &[ActiveRow],
+        idx: usize,
+        new_entry: &str,
+        kind: Option<MemoryKind>,
+    ) -> Result<(), String> {
         let id = rows[idx].id;
 
         // dirge-catw: reject a replacement that duplicates a DIFFERENT active
@@ -1280,17 +1321,110 @@ impl SqliteMemoryStore {
             let effective_kind =
                 kind.unwrap_or_else(|| parse_kind(&rows[idx].kind).unwrap_or_default());
             let demoted = Self::make_room_in_hot(
-                &tx,
+                tx,
                 target,
                 0,
                 matches!(effective_kind, MemoryKind::Working),
             )?;
             if demoted > 0 {
-                Self::compact_breadcrumbs(&tx, target)?;
+                Self::compact_breadcrumbs(tx, target)?;
             }
         }
-        tx.commit().map_err(|e| format!("Failed to commit: {e}"))?;
         Ok(())
+    }
+
+    /// Every active entry across both targets, for `/memory` and
+    /// `/memory edit`. Ordered target-then-id so the rendering is stable
+    /// between runs — an editable document that reshuffles itself is
+    /// unreviewable.
+    pub fn list_all(&self) -> Result<Vec<BrowseEntry>, String> {
+        let conn = self.conn.lock_ignore_poison();
+        let mut stmt = conn
+            .prepare(
+                "SELECT uid, target, kind, content, tier, use_count, updated_at
+                 FROM memories WHERE status = 'active' ORDER BY target, id",
+            )
+            .map_err(|e| format!("Failed to read memories: {e}"))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(BrowseEntry {
+                    uid: row.get(0)?,
+                    target: row.get(1)?,
+                    kind: row.get(2)?,
+                    content: row.get(3)?,
+                    tier: row.get(4)?,
+                    use_count: row.get(5)?,
+                    updated_at: row.get(6)?,
+                })
+            })
+            .map_err(|e| format!("Failed to read memories: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to read memories: {e}"))?;
+        Ok(rows)
+    }
+
+    /// Reword an entry identified by its stable uid.
+    ///
+    /// The uid is what makes `/memory edit` safe: matching on content would
+    /// mean an edit could not find the row it just changed, and re-creating
+    /// the row would silently reset `use_count`, `confidence`, the procedural
+    /// outcome counters and the supersession chain. This is an UPDATE, so all
+    /// of that survives.
+    pub fn replace_entry_by_uid(
+        &self,
+        uid: &str,
+        new_entry: &str,
+        kind: Option<MemoryKind>,
+    ) -> Result<(), String> {
+        scan_for_threats(new_entry)?;
+        let trimmed = new_entry.trim();
+        if trimmed.is_empty() {
+            return Err("Cannot replace with empty entry".to_string());
+        }
+        let new_entry = redact_for_fts(trimmed);
+
+        let mut conn = self.conn.lock_ignore_poison();
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("Failed to begin transaction: {e}"))?;
+
+        for target in ["memory", "pitfalls"] {
+            let rows = Self::active_rows(&tx, target)?;
+            if let Some(idx) = rows.iter().position(|r| r.uid == uid) {
+                let char_limit = char_limit_for(target);
+                if new_entry.len() > char_limit {
+                    return Err(format!(
+                        "Entry is {} chars but the entire memory budget is {char_limit}; \
+                         split it into smaller entries.",
+                        new_entry.len(),
+                    ));
+                }
+                Self::apply_replacement(&tx, target, &rows, idx, &new_entry, kind)?;
+                tx.commit().map_err(|e| format!("Failed to commit: {e}"))?;
+                return Ok(());
+            }
+        }
+        Err(format!("No active memory with id {uid}"))
+    }
+
+    /// Tombstone an entry by uid. Archives rather than deletes, exactly like
+    /// `remove_entry`, so `restore` can still bring it back — deleting a
+    /// line in an editor should not be more destructive than the tool's own
+    /// removal.
+    pub fn remove_entry_by_uid(&self, uid: &str) -> Result<(), String> {
+        let mut conn = self.conn.lock_ignore_poison();
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("Failed to begin transaction: {e}"))?;
+        for target in ["memory", "pitfalls"] {
+            let rows = Self::active_rows(&tx, target)?;
+            if let Some(row) = rows.iter().find(|r| r.uid == uid) {
+                Self::tombstone_row(&tx, row.id)?;
+                tx.commit().map_err(|e| format!("Failed to commit: {e}"))?;
+                return Ok(());
+            }
+        }
+        Err(format!("No active memory with id {uid}"))
     }
 
     /// Supersede an active entry with a newer fact (dirge-fa10). Where
