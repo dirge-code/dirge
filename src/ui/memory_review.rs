@@ -17,8 +17,11 @@
 //! queue untouched. Half-applying a mangled review would lose memories with
 //! no way to tell which.
 
-use crate::extras::memory_db::{PendingEntry, SqliteMemoryStore};
+#[cfg(unix)]
+use crate::extras::memory_db::PendingEntry;
+use crate::extras::memory_db::SqliteMemoryStore;
 
+#[cfg(unix)]
 const HEADER: &str = "\
 # Memory review
 #
@@ -34,12 +37,14 @@ const HEADER: &str = "\
 
 /// Where an entry lives: which store, which target within it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(unix)]
 pub struct Section {
     pub global: bool,
     /// `"memory"` or `"pitfalls"`.
     pub target: &'static str,
 }
 
+#[cfg(unix)]
 impl Section {
     fn heading(&self) -> String {
         format!(
@@ -70,6 +75,7 @@ impl Section {
 
 /// One reviewed entry, as parsed back out of the document.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(unix)]
 pub struct ReviewedEntry {
     pub section: Section,
     pub kind: Option<String>,
@@ -77,6 +83,7 @@ pub struct ReviewedEntry {
 }
 
 /// Render the queue for editing. `entries` is `(section, pending)` pairs.
+#[cfg(unix)]
 pub fn render(entries: &[(Section, PendingEntry)]) -> String {
     let mut out = String::from(HEADER);
     let mut current: Option<Section> = None;
@@ -95,6 +102,7 @@ pub fn render(entries: &[(Section, PendingEntry)]) -> String {
 /// Errors rather than guessing: a block that appears before any heading has
 /// no home, and an unrecognized heading would silently swallow everything
 /// under it.
+#[cfg(unix)]
 pub fn parse(text: &str) -> Result<Vec<ReviewedEntry>, String> {
     let mut out: Vec<ReviewedEntry> = Vec::new();
     let mut section: Option<Section> = None;
@@ -151,11 +159,11 @@ pub fn parse(text: &str) -> Result<Vec<ReviewedEntry>, String> {
             continue;
         }
         // An indented line continues the block above it.
-        if line.starts_with(' ') || line.starts_with('\t') {
-            if let Some((_, lines)) = pending.as_mut() {
-                lines.push(trimmed.trim().to_string());
-                continue;
-            }
+        if (line.starts_with(' ') || line.starts_with('\t'))
+            && let Some((_, lines)) = pending.as_mut()
+        {
+            lines.push(trimmed.trim().to_string());
+            continue;
         }
         flush(&mut out, section, pending.take())?;
         let (kind, rest) = split_kind(trimmed.trim());
@@ -168,6 +176,7 @@ pub fn parse(text: &str) -> Result<Vec<ReviewedEntry>, String> {
 /// Split a leading `[kind]` marker off a block's first line. A block with no
 /// marker is accepted with `kind = None` so a human can type a bare line and
 /// let the store pick the default.
+#[cfg(unix)]
 fn split_kind(line: &str) -> (Option<String>, &str) {
     if let Some(rest) = line.strip_prefix('[')
         && let Some((kind, tail)) = rest.split_once(']')
@@ -179,6 +188,7 @@ fn split_kind(line: &str) -> (Option<String>, &str) {
 
 /// What an applied review did.
 #[derive(Debug, Default, PartialEq, Eq)]
+#[cfg(unix)]
 pub struct ApplyReport {
     pub stored: usize,
     pub rejected: usize,
@@ -187,6 +197,7 @@ pub struct ApplyReport {
     pub failures: Vec<String>,
 }
 
+#[cfg(unix)]
 impl ApplyReport {
     pub fn summary(&self) -> String {
         let mut s = format!("{} stored, {} rejected", self.stored, self.rejected);
@@ -203,6 +214,7 @@ impl ApplyReport {
 /// defaults, threat scanning and FTS indexing behave exactly as they do for
 /// an unreviewed write — an entry the human typed is indistinguishable from
 /// one the model proposed, which is the point.
+#[cfg(unix)]
 pub fn apply(
     project: &SqliteMemoryStore,
     global: Option<&SqliteMemoryStore>,
@@ -247,6 +259,7 @@ pub fn apply(
     report
 }
 
+#[cfg(unix)]
 fn truncate(s: &str) -> String {
     if s.chars().count() <= 48 {
         return s.to_string();
@@ -275,6 +288,7 @@ pub fn notify_if_queued(paths: &crate::extras::dirge_paths::ProjectPaths) {
 }
 
 /// Collect the queue from both stores, in a stable order.
+#[cfg(unix)]
 pub fn collect(
     project: &SqliteMemoryStore,
     global: Option<&SqliteMemoryStore>,
@@ -304,7 +318,7 @@ pub fn collect(
     out
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

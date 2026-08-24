@@ -333,6 +333,7 @@ pub struct BrowseEntry {
 /// re-inserts through `add_entry` and lets those be derived fresh.
 #[cfg(unix)]
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(unix)]
 pub struct PendingEntry {
     pub id: i64,
     /// `"memory"` or `"pitfalls"`.
@@ -1225,6 +1226,7 @@ impl SqliteMemoryStore {
     }
 
     /// Every queued entry across both targets, oldest first.
+    #[cfg(unix)]
     pub fn list_pending(&self) -> Result<Vec<PendingEntry>, String> {
         let conn = self.conn.lock_ignore_poison();
         let mut stmt = conn
@@ -1262,6 +1264,7 @@ impl SqliteMemoryStore {
     /// Drop the whole queue. Called after a review has been applied — the
     /// reviewed set is re-inserted through `add_entry`, so the queue rows
     /// have served their purpose whether accepted, edited or rejected.
+    #[cfg(unix)]
     pub fn clear_pending(&self) -> Result<usize, String> {
         let conn = self.conn.lock_ignore_poison();
         conn.execute("DELETE FROM memories WHERE status = 'pending'", [])
