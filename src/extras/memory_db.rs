@@ -1308,7 +1308,7 @@ impl SqliteMemoryStore {
             .map_err(|e| format!("Failed to reindex entry: {e}"))?;
         tx.execute(
             "INSERT INTO memories_fts(rowid, content) VALUES (?1, ?2)",
-            params![id, redact_for_fts(&new_entry)],
+            params![id, redact_for_fts(new_entry)],
         )
         .map_err(|e| format!("Failed to reindex entry: {e}"))?;
 
@@ -1370,6 +1370,8 @@ impl SqliteMemoryStore {
     /// the row would silently reset `use_count`, `confidence`, the procedural
     /// outcome counters and the supersession chain. This is an UPDATE, so all
     /// of that survives.
+    // Unix-only: reached solely from `/memory edit`, which needs $EDITOR.
+    #[cfg(unix)]
     pub fn replace_entry_by_uid(
         &self,
         uid: &str,
@@ -1411,6 +1413,8 @@ impl SqliteMemoryStore {
     /// `remove_entry`, so `restore` can still bring it back — deleting a
     /// line in an editor should not be more destructive than the tool's own
     /// removal.
+    // Unix-only: reached solely from `/memory edit`, which needs $EDITOR.
+    #[cfg(unix)]
     pub fn remove_entry_by_uid(&self, uid: &str) -> Result<(), String> {
         let mut conn = self.conn.lock_ignore_poison();
         let tx = conn

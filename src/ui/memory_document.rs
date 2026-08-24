@@ -34,6 +34,7 @@ fn short_uid(uid: &str) -> String {
 ///
 /// Ambiguity is an error rather than a guess: picking one of two candidates
 /// would edit the wrong memory, and the user would have no way to tell.
+#[cfg(unix)]
 fn resolve_uid<'a>(token: &str, stored: &'a [BrowseEntry]) -> Result<&'a BrowseEntry, String> {
     let matches: Vec<&BrowseEntry> = stored
         .iter()
@@ -49,6 +50,7 @@ fn resolve_uid<'a>(token: &str, stored: &'a [BrowseEntry]) -> Result<&'a BrowseE
     }
 }
 
+#[cfg(unix)]
 const HEADER: &str = "\
 # dirge memory
 #
@@ -63,6 +65,7 @@ const HEADER: &str = "\
 
 /// What a parsed document says should happen.
 #[derive(Debug, Default, PartialEq, Eq)]
+#[cfg(unix)]
 pub struct Plan {
     /// (uid, new content, kind) — reworded in place.
     pub updates: Vec<(String, String, Option<String>)>,
@@ -74,6 +77,7 @@ pub struct Plan {
     pub unchanged: usize,
 }
 
+#[cfg(unix)]
 fn section_heading(target: &str) -> String {
     format!("## {target}")
 }
@@ -81,6 +85,7 @@ fn section_heading(target: &str) -> String {
 /// Render the store. Grouped by target, uid-anchored, with the usage signal
 /// as a trailing comment so it survives a round trip without being parsed
 /// back — it is information for the reader, not an editable field.
+#[cfg(unix)]
 pub fn render(entries: &[BrowseEntry]) -> String {
     let mut out = String::from(HEADER);
     let mut current: Option<&str> = None;
@@ -152,6 +157,7 @@ fn one_line(content: &str) -> String {
 /// Errors rather than guessing: a block before any heading has no target, and
 /// an unknown uid means the anchor was mangled — applying that as a fresh
 /// insert would duplicate the memory it was meant to edit.
+#[cfg(unix)]
 pub fn parse(text: &str, stored: &[BrowseEntry]) -> Result<Plan, String> {
     let mut plan = Plan::default();
     let mut seen: Vec<String> = Vec::new();
@@ -230,6 +236,7 @@ pub fn parse(text: &str, stored: &[BrowseEntry]) -> Result<Plan, String> {
     Ok(plan)
 }
 
+#[cfg(unix)]
 fn parse_heading(line: &str) -> Result<String, String> {
     match line.strip_prefix("## ").map(str::trim) {
         Some("memory") => Ok("memory".to_string()),
@@ -243,6 +250,7 @@ fn parse_heading(line: &str) -> Result<String, String> {
 /// Strip a trailing ` # ...` annotation (the usage/tier hints `render` adds).
 /// Only after at least one non-space character, so a `#` opening the line is
 /// still a comment.
+#[cfg(unix)]
 fn strip_comment(line: &str) -> &str {
     match line.find("  # ") {
         Some(idx) if !line[..idx].trim().is_empty() => &line[..idx],
@@ -251,6 +259,7 @@ fn strip_comment(line: &str) -> &str {
 }
 
 /// Pull a leading `[token]` off a line.
+#[cfg(unix)]
 fn split_bracket(line: &str) -> (Option<String>, &str) {
     if let Some(rest) = line.strip_prefix('[')
         && let Some((token, tail)) = rest.split_once(']')
@@ -262,6 +271,7 @@ fn split_bracket(line: &str) -> (Option<String>, &str) {
 
 /// What applying a plan did.
 #[derive(Debug, Default, PartialEq, Eq)]
+#[cfg(unix)]
 pub struct ApplyReport {
     pub updated: usize,
     pub removed: usize,
@@ -270,6 +280,7 @@ pub struct ApplyReport {
     pub failures: Vec<String>,
 }
 
+#[cfg(unix)]
 impl ApplyReport {
     pub fn summary(&self) -> String {
         let mut parts = Vec::new();
@@ -297,6 +308,7 @@ impl ApplyReport {
 /// duplicate, something over budget) is reported and the rest still apply,
 /// because failing the whole edit would throw away every other correction the
 /// user just made.
+#[cfg(unix)]
 pub fn apply(store: &SqliteMemoryStore, plan: &Plan) -> ApplyReport {
     let mut report = ApplyReport {
         unchanged: plan.unchanged,
@@ -334,7 +346,7 @@ pub fn apply(store: &SqliteMemoryStore, plan: &Plan) -> ApplyReport {
     report
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
