@@ -2138,6 +2138,17 @@ async fn main() -> anyhow::Result<()> {
                             (None, None, None, None, None)
                         } else {
                             let n = keeper.vigils.len();
+                            #[cfg(feature = "plugin")]
+                            {
+                                if let Some(ref vig_tx) = keeper.vigil_plugin_tx {
+                                    crate::plugin::worker::vigil_bridge::install_vigil_tx(
+                                        vig_tx.clone(),
+                                    );
+                                }
+                                let names: Vec<String> =
+                                    keeper.vigils.iter().map(|v| v.name.clone()).collect();
+                                crate::plugin::worker::vigil_bridge::install_vigil_names(names);
+                            }
                             eprintln!("info: vigil-keeper started with {n} vigil(s)");
                             let wake = keeper.wake_rx.take();
                             let obs = keeper.observance_rx.take();
