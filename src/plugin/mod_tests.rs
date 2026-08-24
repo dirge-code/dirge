@@ -135,29 +135,75 @@ fn test_post_done_action() {
     // Plugin followup must take precedence over the loop iteration
     // so we never silently drop a queued prompt.
     let followup = Some("retry".to_string());
+    #[cfg(feature = "vigil")]
+    let vigil_off = false;
     assert_eq!(
-        decide_post_done_action(followup.clone(), true, false),
+        decide_post_done_action(
+            followup.clone(),
+            true,
+            false,
+            #[cfg(feature = "vigil")]
+            vigil_off
+        ),
         PostDoneAction::Followup("retry".into())
     );
     assert_eq!(
-        decide_post_done_action(followup.clone(), false, false),
+        decide_post_done_action(
+            followup.clone(),
+            false,
+            false,
+            #[cfg(feature = "vigil")]
+            vigil_off
+        ),
         PostDoneAction::Followup("retry".into())
     );
     // Loop iteration only when no followup.
     assert_eq!(
-        decide_post_done_action(None, true, false),
+        decide_post_done_action(
+            None,
+            true,
+            false,
+            #[cfg(feature = "vigil")]
+            vigil_off
+        ),
         PostDoneAction::LoopIter
     );
     // Loop stop only when no followup and should_stop.
     assert_eq!(
-        decide_post_done_action(None, true, true),
+        decide_post_done_action(
+            None,
+            true,
+            true,
+            #[cfg(feature = "vigil")]
+            vigil_off
+        ),
         PostDoneAction::LoopStop
     );
     // Idle: nothing to do.
     assert_eq!(
-        decide_post_done_action(None, false, false),
+        decide_post_done_action(
+            None,
+            false,
+            false,
+            #[cfg(feature = "vigil")]
+            vigil_off
+        ),
         PostDoneAction::Idle
     );
+
+    #[cfg(feature = "vigil")]
+    {
+        // VigilSleep: vigil active outranks loop.
+        assert_eq!(
+            decide_post_done_action(None, true, false, true),
+            PostDoneAction::VigilSleep
+        );
+        // Followup still beats vigil.
+        assert_eq!(
+            decide_post_done_action(followup.clone(), false, false, true),
+            PostDoneAction::Followup("retry".into())
+        );
+    }
 }
 
 #[test]

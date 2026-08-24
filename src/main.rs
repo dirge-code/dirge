@@ -2059,9 +2059,9 @@ async fn main() -> anyhow::Result<()> {
         #[cfg(feature = "vigil")]
         let (
             mut _vigil_keeper,
-            _vigil_wake_rx,
+            vigil_wake_rx,
             mut vigil_observance_rx,
-            _vigil_ctl_tx,
+            vigil_ctl_tx,
             mut vigil_hook_rx,
         ) = {
             if !cli.vigil_mode && !cli.vigil_once {
@@ -2288,6 +2288,14 @@ async fn main() -> anyhow::Result<()> {
             dialog_rx,
             subagent_chat_rx,
             sysload,
+            #[cfg(feature = "vigil")]
+            vigil_wake_rx,
+            #[cfg(feature = "vigil")]
+            vigil_observance_rx,
+            #[cfg(feature = "vigil")]
+            vigil_ctl_tx,
+            #[cfg(feature = "vigil")]
+            vigil_hook_rx,
         )
         .await?;
 
