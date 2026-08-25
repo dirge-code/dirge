@@ -1,0 +1,14 @@
+{
+  "name": "sanity-harbinger-template",
+  "trigger": {
+    "type": "harbinger",
+    "address": "127.0.0.1:9090",
+    "protocol": "tcp",
+    "socket_mode": "template"
+  },
+  "reap_interval_secs": 10,
+  "prompt": "Harbinger received: {harbinger_data}",
+  "rite": {
+    "cmd": "echo 'harbinger-template-ok'"
+  }
+}
