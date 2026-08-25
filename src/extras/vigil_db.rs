@@ -151,13 +151,26 @@ impl VigilStore {
     }
 
     pub fn list_non_resting(&self) -> Result<Vec<VigilRow>, String> {
+        self.query_rows(
+            "SELECT name, payload_json, status, created_at, updated_at
+             FROM vigils WHERE status != 'resting' ORDER BY name",
+        )
+    }
+
+    /// All rows, including resting vigils. `dirge vigil list` needs the
+    /// full picture so a vigil laid to rest still shows up with its status.
+    pub fn list_all(&self) -> Result<Vec<VigilRow>, String> {
+        self.query_rows(
+            "SELECT name, payload_json, status, created_at, updated_at
+             FROM vigils ORDER BY name",
+        )
+    }
+
+    fn query_rows(&self, sql: &str) -> Result<Vec<VigilRow>, String> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
-            .prepare(
-                "SELECT name, payload_json, status, created_at, updated_at
-                 FROM vigils WHERE status != 'resting' ORDER BY name",
-            )
-            .map_err(|e| format!("prepare list_non_resting: {e}"))?;
+            .prepare(sql)
+            .map_err(|e| format!("prepare vigil list: {e}"))?;
         let rows = stmt
             .query_map([], |row| {
                 Ok(VigilRow {
@@ -176,7 +189,7 @@ impl VigilStore {
                     updated_at: row.get(4)?,
                 })
             })
-            .map_err(|e| format!("list_non_resting: {e}"))?
+            .map_err(|e| format!("list vigils: {e}"))?
             .filter_map(|r| r.ok())
             .collect();
         Ok(rows)
@@ -234,6 +247,21 @@ mod tests {
             .map(|r| r.name)
             .collect();
         assert_eq!(names, vec!["a", "c"]);
+    }
+
+    #[test]
+    fn list_all_includes_resting() {
+        let (store, _dir) = temp_db();
+        store.upsert("a", "1").unwrap();
+        store.upsert("b", "2").unwrap();
+        store.set_status("b", VigilStatus::Resting).unwrap();
+        let names: Vec<String> = store
+            .list_all()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.name)
+            .collect();
+        assert_eq!(names, vec!["a", "b"]);
     }
 
     #[test]
