@@ -1,0 +1,12 @@
+{
+  "name": "sanity-watcher",
+  "trigger": {
+    "type": "watcher",
+    "path": "tests/fixtures/vigil/watch-dir"
+  },
+  "reap_interval_secs": 10,
+  "prompt": "Files changed: {files}. Events: {events}. Count: {event_count}",
+  "rite": {
+    "cmd": "echo 'watcher-ok'"
+  }
+}
