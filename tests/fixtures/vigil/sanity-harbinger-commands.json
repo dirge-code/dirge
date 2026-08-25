@@ -1,0 +1,29 @@
+{
+  "name": "sanity-harbinger-commands",
+  "trigger": {
+    "type": "harbinger",
+    "address": "127.0.0.1:9091",
+    "protocol": "tcp",
+    "socket_mode": "commands",
+    "commands": {
+      "echo": {
+        "tool": "bash",
+        "args": {
+          "command": "echo 'commands-ok: {message}'",
+          "description": "Echo back the message arg"
+        }
+      },
+      "ping": {
+        "tool": "bash",
+        "args": {
+          "command": "echo 'pong'"
+        }
+      }
+    }
+  },
+  "reap_interval_secs": 10,
+  "prompt": "",
+  "rite": {
+    "cmd": "echo 'harbinger-commands-ok'"
+  }
+}
