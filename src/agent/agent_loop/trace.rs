@@ -224,7 +224,7 @@ fn describe(evt: &LoopEvent) -> Option<(&'static str, Value)> {
                 .iter()
                 .map(|b| match b {
                     super::message::ContentBlock::Text { text }
-                    | super::message::ContentBlock::Thinking { text } => text.len(),
+                    | super::message::ContentBlock::Thinking { text, .. } => text.len(),
                     super::message::ContentBlock::ToolCall { arguments, .. } => {
                         arguments.to_string().len()
                     }

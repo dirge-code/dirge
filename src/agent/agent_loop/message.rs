@@ -58,6 +58,30 @@ pub enum ContentBlock {
     },
     Thinking {
         text: String,
+        /// Provider-issued cryptographic signature over the thinking text
+        /// (GH #821). Anthropic mints one per thinking block and requires
+        /// it echoed back verbatim when the block is replayed — a thinking
+        /// block without it is schema-rejected (`signature: Field
+        /// required`). `None` for providers that don't sign reasoning and
+        /// for blocks captured before this field existed; both serde
+        /// attributes keep the serialized shape byte-identical to the
+        /// legacy `{type, text}` form in that case, so existing saved
+        /// sessions round-trip unchanged.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+        /// The model that minted `signature` (GH #821). A signature is
+        /// only valid for the model that produced it — replaying it to a
+        /// different model is rejected (`Invalid signature in thinking
+        /// block`) — and dirge can switch models mid-session (`/model`,
+        /// escalation, subagents), so the replay path attaches the
+        /// signature only when this matches the request's model, and
+        /// drops the block otherwise.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            rename = "signatureModel"
+        )]
+        signature_model: Option<String>,
     },
     ToolCall {
         id: String,
@@ -777,6 +801,54 @@ impl LoopEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// GH #821 back-compat pin: `ContentBlock` is serde-serialized into
+    /// session storage, so the `Thinking` variant's new optional
+    /// signature fields must (a) deserialize legacy JSON that has no
+    /// such keys, and (b) serialize back to EXACTLY that legacy shape
+    /// when they are `None` — otherwise every saved session written
+    /// before (or without) the fields breaks on upgrade.
+    #[test]
+    fn legacy_thinking_block_json_round_trips_unchanged() {
+        let legacy = r#"{"type":"thinking","text":"pondering"}"#;
+        let block: ContentBlock = serde_json::from_str(legacy).expect("legacy JSON must parse");
+        assert_eq!(
+            block,
+            ContentBlock::Thinking {
+                text: "pondering".to_string(),
+                signature: None,
+                signature_model: None,
+            }
+        );
+        let reserialized = serde_json::to_string(&block).expect("must serialize");
+        assert_eq!(
+            reserialized, legacy,
+            "None signature fields must be omitted so the wire shape is byte-identical to pre-#821"
+        );
+    }
+
+    /// GH #821: a signed block round-trips both new fields (camelCase
+    /// `signatureModel`, matching the transcript key convention).
+    #[test]
+    fn signed_thinking_block_round_trips_signature_fields() {
+        let block = ContentBlock::Thinking {
+            text: "pondering".to_string(),
+            signature: Some("sig-abc".to_string()),
+            signature_model: Some("claude-opus-4-6".to_string()),
+        };
+        let json = serde_json::to_value(&block).expect("must serialize");
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "type": "thinking",
+                "text": "pondering",
+                "signature": "sig-abc",
+                "signatureModel": "claude-opus-4-6",
+            })
+        );
+        let back: ContentBlock = serde_json::from_value(json).expect("must deserialize");
+        assert_eq!(back, block);
+    }
 
     /// `DeltaPhase::is_content()` is the single source of truth for
     /// "has downstream output already been emitted?" — it gates both

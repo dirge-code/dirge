@@ -20,6 +20,8 @@ fn assistant_with_thinking(s: &str) -> AssistantMessage {
     AssistantMessage::new(
         vec![ContentBlock::Thinking {
             text: s.to_string(),
+            signature: None,
+            signature_model: None,
         }],
         StopReason::Stop,
     )
@@ -287,6 +289,8 @@ fn text_and_reasoning_tracked_independently() {
         message: AssistantMessage::new(
             vec![ContentBlock::Thinking {
                 text: "thinking".to_string(),
+                signature: None,
+                signature_model: None,
             }],
             StopReason::Stop,
         ),
@@ -298,6 +302,8 @@ fn text_and_reasoning_tracked_independently() {
             vec![
                 ContentBlock::Thinking {
                     text: "thinking".to_string(),
+                    signature: None,
+                    signature_model: None,
                 },
                 ContentBlock::Text {
                     text: "answer".to_string(),

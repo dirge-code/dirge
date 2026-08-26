@@ -360,7 +360,7 @@ where
                     let over_budget = reasoning_meter.record(&reasoning);
                     match current_thinking_idx {
                         Some(idx) => {
-                            if let Some(ContentBlock::Thinking { text }) =
+                            if let Some(ContentBlock::Thinking { text, .. }) =
                                 partial.content.get_mut(idx)
                             {
                                 text.push_str(&reasoning);
@@ -372,7 +372,11 @@ where
                         }
                         None => {
                             current_thinking_idx = Some(partial.content.len());
-                            partial.content.push(ContentBlock::Thinking { text: reasoning });
+                            partial.content.push(ContentBlock::Thinking {
+                                text: reasoning,
+                                signature: None,
+                                signature_model: None,
+                            });
                             current_text_idx = None;
                             yield StreamEvent::Delta {
                                 partial: partial.clone(),
@@ -420,6 +424,19 @@ where
                         })
                         .collect::<Vec<_>>()
                         .join("\n");
+                    // GH #821: capture the provider-issued signature the
+                    // complete block carries (Anthropic sends it via a
+                    // `signature_delta` that rig folds into the final
+                    // `ReasoningContent::Text`). It must be echoed back
+                    // verbatim when the block is replayed, so dropping it
+                    // here — the old `Text { text, .. }` did — 400s the
+                    // first tool-use continuation with reasoning on.
+                    let signature: Option<String> = r.content.iter().find_map(|c| match c {
+                        rig::completion::message::ReasoningContent::Text {
+                            signature, ..
+                        } => signature.clone(),
+                        _ => None,
+                    });
                     // dirge-zf35: mirror the H-7 ToolCall dedupe. Some
                     // providers stream `ReasoningDelta`s and THEN send a
                     // complete `Reasoning` for the same content. If a
@@ -444,17 +461,32 @@ where
                                 Some(ContentBlock::Thinking { .. })
                             ) =>
                         {
-                            if let Some(ContentBlock::Thinking { text: acc }) =
-                                partial.content.get_mut(idx)
+                            if let Some(ContentBlock::Thinking {
+                                text: acc,
+                                signature: acc_signature,
+                                ..
+                            }) = partial.content.get_mut(idx)
                             {
                                 if acc.is_empty() || text.starts_with(acc.as_str()) {
                                     *acc = text;
                                 } else {
                                     acc.push_str(&text);
                                 }
+                                // GH #821: the fold must carry the signature
+                                // too — in the Anthropic flow the text arrives
+                                // as deltas and the signature ONLY on this
+                                // complete block. Never clobber a previously
+                                // captured signature with `None`.
+                                if signature.is_some() {
+                                    *acc_signature = signature;
+                                }
                             }
                         }
-                        _ => partial.content.push(ContentBlock::Thinking { text }),
+                        _ => partial.content.push(ContentBlock::Thinking {
+                            text,
+                            signature,
+                            signature_model: None,
+                        }),
                     }
                     current_thinking_idx = None;
                     current_text_idx = None;
@@ -1153,7 +1185,7 @@ mod tests {
             .content
             .iter()
             .filter_map(|b| match b {
-                ContentBlock::Thinking { text } => Some(text.clone()),
+                ContentBlock::Thinking { text, .. } => Some(text.clone()),
                 _ => None,
             })
             .collect();
@@ -1207,7 +1239,7 @@ mod tests {
         );
         match events.last().unwrap() {
             StreamEvent::Done { message, .. } => {
-                if let ContentBlock::Thinking { text } = &message.content[0] {
+                if let ContentBlock::Thinking { text, .. } = &message.content[0] {
                     assert_eq!(text, "Let me think about this");
                 } else {
                     panic!("expected thinking");
@@ -1263,7 +1295,7 @@ mod tests {
                     .content
                     .iter()
                     .filter_map(|b| match b {
-                        ContentBlock::Thinking { text } => Some(text),
+                        ContentBlock::Thinking { text, .. } => Some(text),
                         _ => None,
                     })
                     .collect();
@@ -1274,6 +1306,103 @@ mod tests {
                 );
                 assert_eq!(thinking[0], "Let me think about this");
             }
+            _ => panic!("expected Done last"),
+        }
+    }
+
+    /// GH #821: a complete reasoning block's signature must be captured,
+    /// not discarded — Anthropic requires it echoed back verbatim when
+    /// the block is replayed (the tool-use continuation 400s without it).
+    #[tokio::test]
+    async fn complete_reasoning_signature_is_captured() {
+        let raw = raw_stream(vec![Ok(StreamedAssistantContent::Reasoning(
+            Reasoning::new_with_signature("All thinking", Some("sig-821".to_string())),
+        ))]);
+        let events = drain(wrap_streamed_assistant(raw, None, None)).await;
+        match events.last().unwrap() {
+            StreamEvent::Done { message, .. } => match &message.content[0] {
+                ContentBlock::Thinking {
+                    text, signature, ..
+                } => {
+                    assert_eq!(text, "All thinking");
+                    assert_eq!(signature.as_deref(), Some("sig-821"));
+                }
+                other => panic!("expected thinking, got {other:?}"),
+            },
+            _ => panic!("expected Done last"),
+        }
+    }
+
+    /// GH #821 + dirge-zf35: in the Anthropic flow the text arrives as
+    /// `ReasoningDelta`s and the signature ONLY on the trailing complete
+    /// `Reasoning`. The fold that merges the complete block into the open
+    /// delta-built block must carry the signature onto that block.
+    #[tokio::test]
+    async fn signature_survives_the_delta_fold() {
+        let raw = raw_stream(vec![
+            Ok(StreamedAssistantContent::ReasoningDelta {
+                id: None,
+                reasoning: "Let me think".to_string(),
+            }),
+            Ok(StreamedAssistantContent::ReasoningDelta {
+                id: None,
+                reasoning: " about this".to_string(),
+            }),
+            Ok(StreamedAssistantContent::Reasoning(
+                Reasoning::new_with_signature(
+                    "Let me think about this",
+                    Some("sig-821".to_string()),
+                ),
+            )),
+        ]);
+        let events = drain(wrap_streamed_assistant(raw, None, None)).await;
+        match events.last().unwrap() {
+            StreamEvent::Done { message, .. } => {
+                let blocks: Vec<_> = message
+                    .content
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::Thinking {
+                            text, signature, ..
+                        } => Some((text.as_str(), signature.as_deref())),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(
+                    blocks,
+                    vec![("Let me think about this", Some("sig-821"))],
+                    "fold must keep one block AND adopt the complete block's signature"
+                );
+            }
+            _ => panic!("expected Done last"),
+        }
+    }
+
+    /// GH #821, Gemini shape: when the complete `Reasoning` is only the
+    /// trailing chunk (append path of the dirge-zf35 fold), its signature
+    /// must still land on the accumulated block.
+    #[tokio::test]
+    async fn signature_survives_the_append_fold() {
+        let raw = raw_stream(vec![
+            Ok(StreamedAssistantContent::ReasoningDelta {
+                id: None,
+                reasoning: "chunk A".to_string(),
+            }),
+            Ok(StreamedAssistantContent::Reasoning(
+                Reasoning::new_with_signature("chunk Z", Some("sig-tail".to_string())),
+            )),
+        ]);
+        let events = drain(wrap_streamed_assistant(raw, None, None)).await;
+        match events.last().unwrap() {
+            StreamEvent::Done { message, .. } => match &message.content[0] {
+                ContentBlock::Thinking {
+                    text, signature, ..
+                } => {
+                    assert_eq!(text, "chunk Achunk Z");
+                    assert_eq!(signature.as_deref(), Some("sig-tail"));
+                }
+                other => panic!("expected thinking, got {other:?}"),
+            },
             _ => panic!("expected Done last"),
         }
     }
@@ -1305,7 +1434,7 @@ mod tests {
                     .content
                     .iter()
                     .filter_map(|b| match b {
-                        ContentBlock::Thinking { text } => Some(text),
+                        ContentBlock::Thinking { text, .. } => Some(text),
                         _ => None,
                     })
                     .collect();
@@ -1344,7 +1473,7 @@ mod tests {
                     .content
                     .iter()
                     .filter_map(|b| match b {
-                        ContentBlock::Thinking { text } => Some(text),
+                        ContentBlock::Thinking { text, .. } => Some(text),
                         _ => None,
                     })
                     .collect();
@@ -1413,7 +1542,7 @@ mod tests {
             .content
             .iter()
             .filter_map(|b| match b {
-                ContentBlock::Thinking { text } => Some(text.as_str()),
+                ContentBlock::Thinking { text, .. } => Some(text.as_str()),
                 _ => None,
             })
             .collect::<Vec<_>>()
@@ -1835,7 +1964,7 @@ mod tests {
         ));
         assert!(matches!(
             &final_msg.content[1],
-            ContentBlock::Thinking { text } if text == "thinking"
+            ContentBlock::Thinking { text, .. } if text == "thinking"
         ));
         assert!(matches!(
             &final_msg.content[2],
