@@ -302,6 +302,9 @@ impl AnyAgent {
         // the loop default (`Off`). A `/effort` live override mutates
         // `self.reasoning` before the next spawn, so this picks it up.
         cfg.reasoning = self.reasoning;
+        // GH #816: forward the resolved `max_tokens` so non-reasoning
+        // Anthropic requests carry the field rig 0.41 requires.
+        cfg.max_tokens = self.max_tokens;
         // dirge-9tfq: forward the BackgroundStore so the spawn pipeline
         // installs a `get_followup_messages` hook that drains pending
         // subagent completions at the outer-loop boundary. `None`
@@ -520,6 +523,9 @@ impl AnyAgent {
         // who configures `effort` gets it on the main turn only, and every
         // review/critic/curator pass silently runs with reasoning off.
         cfg.reasoning = self.reasoning;
+        // GH #816: forward the resolved `max_tokens` so non-reasoning
+        // Anthropic requests carry the field rig 0.41 requires.
+        cfg.max_tokens = self.max_tokens;
 
         let loop_runner = spawn_loop_runner(cfg);
         (loop_runner.into_agent_runner(), review_cache)
@@ -560,6 +566,9 @@ impl AnyAgent {
         cfg.tools = tools;
         cfg.provider_name = Some(provider);
         cfg.reasoning = self.reasoning;
+        // GH #816: forward the resolved `max_tokens` so non-reasoning
+        // Anthropic requests carry the field rig 0.41 requires.
+        cfg.max_tokens = self.max_tokens;
         cfg.model_name = match model_override {
             Some(model) => Some(model.name()),
             None => Self::model_name_opt(&self.model_name),

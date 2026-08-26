@@ -236,6 +236,19 @@ pub struct AnyAgent {
     ///
     /// [`with_reasoning`]: AnyAgent::with_reasoning
     reasoning: Option<crate::agent::agent_loop::types::ThinkingLevel>,
+    /// GH #816: `max_tokens` to pin on non-reasoning requests. Set by
+    /// `build_agent` via [`with_max_tokens`]: the user's explicitly
+    /// configured cap (CLI `--max-tokens` > config `max_tokens`), or
+    /// dirge's default only when rig has no per-model default for this
+    /// Anthropic model id. Forwarded to `LoopSpawnConfig.max_tokens` at
+    /// spawn time; the stream builder applies it to non-reasoning requests
+    /// on providers that require the field (Anthropic), and a reasoning
+    /// turn's budget ceiling wins over it. `None` (unconfigured on a
+    /// rig-recognised id, non-Anthropic backends, test agents) leaves
+    /// requests unset so rig's own per-model default keeps applying.
+    ///
+    /// [`with_max_tokens`]: AnyAgent::with_max_tokens
+    max_tokens: Option<u64>,
     /// dirge-z73i: alternate stream_fn for the background-review
     /// path. Built at `build_agent` time when `ConfigRole::Review`
     /// resolves to a different provider than `ConfigRole::Default`.
@@ -408,6 +421,7 @@ impl AnyAgent {
             progress_prologue_cap: None,
             max_turns: None,
             reasoning: None,
+            max_tokens: None,
             review_stream_fn: None,
             review_provider_name: None,
             review_model_name: None,
@@ -556,6 +570,39 @@ impl AnyAgent {
     pub fn with_max_turns(mut self, max_turns: Option<usize>) -> Self {
         self.max_turns = max_turns;
         self
+    }
+
+    /// GH #816: install the per-request output cap for non-reasoning
+    /// Anthropic turns. `build_agent` passes the user's explicitly
+    /// configured `max_tokens` (CLI > config), or dirge's default only when
+    /// [`anthropic_needs_max_tokens_fallback`] says rig has no per-model
+    /// default of its own. Forwarded to `LoopSpawnConfig.max_tokens` at
+    /// spawn time. `None` leaves requests unset so rig's own per-model
+    /// default keeps applying.
+    ///
+    /// [`anthropic_needs_max_tokens_fallback`]: AnyAgent::anthropic_needs_max_tokens_fallback
+    pub fn with_max_tokens(mut self, max_tokens: Option<u64>) -> Self {
+        self.max_tokens = max_tokens;
+        self
+    }
+
+    /// Whether dirge must invent a `max_tokens` for this agent's requests
+    /// because rig itself has none (GH #816). True only for the Anthropic
+    /// variants whose model id is outside rig's per-model default table
+    /// (`default_max_tokens_for_model` — every Claude 5 id as of rig 0.41):
+    /// those requests hard-error before the HTTP call unless a value is
+    /// pinned. For a recognised id rig fills its own, larger per-model
+    /// default (64k/128k), which an invented fallback must never silently
+    /// undercut; and non-Anthropic backends accept an absent `max_tokens`,
+    /// so they never need one invented. Reading rig's resolved
+    /// `default_max_tokens` off the model keeps this exact without
+    /// duplicating rig's model-prefix list, which would drift.
+    pub(crate) fn anthropic_needs_max_tokens_fallback(&self) -> bool {
+        match &self.inner {
+            AnyAgentInner::Anthropic(model) => model.default_max_tokens.is_none(),
+            AnyAgentInner::AnthropicOauth(model) => model.default_max_tokens.is_none(),
+            _ => false,
+        }
     }
 
     /// Install / replace the agent's default reasoning effort. `None`

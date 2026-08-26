@@ -461,6 +461,154 @@ async fn any_model_filtered_stream_fn_hides_unloaded_dynamic_tools() {
     assert!(!tool_names.contains(&"mcp_hidden"));
 }
 
+// ============================================================
+// GH #816: max_tokens fallback decision + no-config wire pin
+// ============================================================
+
+mod max_tokens_816_tests {
+    use super::*;
+    use crate::agent::agent_loop::stream::{LlmContext, StreamOptions};
+    use crate::agent::agent_loop::tool::AbortSignal;
+    use futures::StreamExt;
+    use rig::client::CompletionClient;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Offline Anthropic `AnyAgent` for the given model id — mirrors
+    /// `build_openai_any_agent` (no network until the first request).
+    fn build_anthropic_any_agent(model_id: &str) -> AnyAgent {
+        let client = rig::providers::anthropic::Client::builder()
+            .api_key("test-key")
+            .http_client(crate::provider::compressing_http::CompressingHttpClient::default())
+            .build()
+            .expect("anthropic client builds offline");
+        AnyAgent::new(
+            AnyAgentInner::Anthropic(client.completion_model(model_id)),
+            ToolCache::new(),
+            std::time::Duration::from_secs(300),
+            Vec::new(),
+            String::new(),
+            model_id.to_string(),
+        )
+    }
+
+    /// A rig-recognised Anthropic id has a per-model default (64k/128k), so
+    /// dirge must NOT invent one: an unconfigured user keeps rig's larger
+    /// cap instead of a silent cut to 8192.
+    #[test]
+    fn recognized_anthropic_ids_need_no_fallback() {
+        for id in ["claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5"] {
+            assert!(
+                !build_anthropic_any_agent(id).anthropic_needs_max_tokens_fallback(),
+                "{id}: rig has its own default — dirge must not invent one",
+            );
+        }
+    }
+
+    /// An id outside rig's table (every Claude 5 id) hard-errors without a
+    /// value, so dirge must supply one.
+    #[test]
+    fn unrecognized_anthropic_id_needs_fallback() {
+        assert!(build_anthropic_any_agent("claude-opus-5").anthropic_needs_max_tokens_fallback());
+    }
+
+    /// Non-Anthropic backends accept an absent `max_tokens`; no fallback.
+    #[test]
+    fn non_anthropic_agent_needs_no_fallback() {
+        assert!(!build_openai_any_agent().anthropic_needs_max_tokens_fallback());
+    }
+
+    /// The no-config regression pin, at the wire: an UNCONFIGURED
+    /// (`StreamOptions.max_tokens = None`) non-reasoning request on a
+    /// rig-recognised Anthropic id must carry rig's own per-model default —
+    /// read off the model, not hardcoded — and must NOT be capped at 8192.
+    #[tokio::test]
+    async fn unconfigured_recognized_anthropic_request_keeps_rigs_default() {
+        fn header_end(buf: &[u8]) -> Option<usize> {
+            buf.windows(4).position(|window| window == b"\r\n\r\n")
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let (body_tx, body_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let body_start = loop {
+                let mut chunk = [0u8; 1024];
+                let read = socket.read(&mut chunk).await.unwrap();
+                assert!(read > 0, "client closed before sending request headers");
+                buf.extend_from_slice(&chunk[..read]);
+                if let Some(end) = header_end(&buf) {
+                    break end + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&buf[..body_start]);
+            let content_length = headers
+                .lines()
+                .filter_map(|line| line.split_once(':'))
+                .find_map(|(name, value)| {
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap();
+            while buf.len() < body_start + content_length {
+                let mut chunk = [0u8; 1024];
+                let read = socket.read(&mut chunk).await.unwrap();
+                assert!(read > 0, "client closed before sending full request body");
+                buf.extend_from_slice(&chunk[..read]);
+            }
+            let body = serde_json::from_slice::<serde_json::Value>(
+                &buf[body_start..body_start + content_length],
+            )
+            .unwrap();
+            body_tx.send(body).ok();
+            socket
+                .write_all(
+                    b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        });
+
+        let client = rig::providers::anthropic::Client::builder()
+            .api_key("test-key")
+            .base_url(&base_url)
+            .http_client(crate::provider::compressing_http::CompressingHttpClient::default())
+            .build()
+            .unwrap();
+        let model = client.completion_model("claude-opus-4-6");
+        let expected = model
+            .default_max_tokens
+            .expect("rig must recognise claude-opus-4-6");
+        let stream_fn = AnyModel::Anthropic(model).build_stream_fn(
+            vec![],
+            std::time::Duration::from_secs(5),
+            Some("anthropic".to_string()),
+        );
+        // Unconfigured: `from_signal` leaves `max_tokens: None` and
+        // `reasoning: None` — the exact shape of an untouched config.
+        let mut stream = stream_fn(
+            LlmContext {
+                system_prompt: String::new(),
+                messages: vec![serde_json::json!({"role": "user", "content": "hi"})],
+                asset_dir: None,
+            },
+            StreamOptions::from_signal(AbortSignal::new()),
+        );
+        while stream.next().await.is_some() {}
+
+        let body = body_rx.await.unwrap();
+        server.await.unwrap();
+        let wire = body["max_tokens"].as_u64().expect("max_tokens on the wire");
+        assert_eq!(
+            wire, expected,
+            "unconfigured request must keep rig's per-model default",
+        );
+        assert_ne!(wire, 8192, "must not be silently cut to dirge's default");
+    }
+}
+
 mod cerebras_alias_stream_tests {
     use crate::agent::agent_loop::stream::{LlmContext, StreamOptions};
     use crate::agent::agent_loop::tool::AbortSignal;

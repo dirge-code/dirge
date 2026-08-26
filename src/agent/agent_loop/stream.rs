@@ -98,6 +98,13 @@ pub struct StreamOptions {
     pub api_key: Option<String>,
     pub reasoning: Option<super::types::ThinkingLevel>,
     pub thinking_budgets: Option<super::types::ThinkingBudgets>,
+    /// GH #816: `max_tokens` to pin on non-reasoning requests — the user's
+    /// explicitly configured cap, or dirge's default only for Anthropic
+    /// model ids rig has no per-model default for. Applied on providers
+    /// that require the field (Anthropic). `None` leaves the request field
+    /// unset so the provider's own (often larger) per-model default
+    /// applies — kept by tests and by any path with nothing configured.
+    pub max_tokens: Option<u64>,
     pub headers: std::collections::HashMap<String, String>,
     pub metadata: std::collections::HashMap<String, serde_json::Value>,
     /// dirge-e31n.6: per-request tool gating. `None` sends nothing and leaves
@@ -116,6 +123,7 @@ impl StreamOptions {
             api_key: None,
             reasoning: None,
             thinking_budgets: None,
+            max_tokens: None,
             headers: std::collections::HashMap::new(),
             metadata: std::collections::HashMap::new(),
             tool_choice: None,
@@ -204,6 +212,7 @@ pub async fn stream_assistant_response(
         api_key: resolved_api_key,
         reasoning: config.reasoning,
         thinking_budgets: config.thinking_budgets.clone(),
+        max_tokens: config.max_tokens,
         headers: config.headers.clone(),
         metadata: config.metadata.clone(),
         tool_choice,
@@ -581,6 +590,7 @@ mod tests {
             high: Some(8192),
             ..Default::default()
         });
+        config.max_tokens = Some(4096);
         config
             .headers
             .insert("X-Test".to_string(), "yes".to_string());
@@ -605,6 +615,7 @@ mod tests {
             opts.thinking_budgets.as_ref().and_then(|b| b.high),
             Some(8192)
         );
+        assert_eq!(opts.max_tokens, Some(4096));
         assert_eq!(opts.headers.get("X-Test").map(String::as_str), Some("yes"));
         assert_eq!(
             opts.metadata.get("user_id"),
