@@ -470,15 +470,20 @@ mod tests {
             .collect()
     }
 
-    /// The one path every test in this module shares, since the sink is set
-    /// once per process.
+    /// The path this test process's sink writes to. Under `cargo test` all
+    /// tests in the module share one process (and the `traced` lock below
+    /// serializes them), but nextest runs every test in its own process — two
+    /// processes can stamp the same nanosecond and truncate each other's file,
+    /// which is what made these tests flaky on macOS. The pid makes the path
+    /// unique per process regardless of clock granularity.
     fn sink_path() -> std::path::PathBuf {
         static FIRST: OnceLock<std::path::PathBuf> = OnceLock::new();
         FIRST
             .get_or_init(|| {
                 std::env::temp_dir().join(format!(
-                    "dirge-trace-test-{}.jsonl",
-                    crate::text::test_run_stamp()
+                    "dirge-trace-test-{}-{}.jsonl",
+                    crate::text::test_run_stamp(),
+                    std::process::id()
                 ))
             })
             .clone()
