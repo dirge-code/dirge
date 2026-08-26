@@ -990,13 +990,15 @@ mod tests {
         let msg = super::super::message::AssistantMessage::new(
             vec![ContentBlock::Thinking {
                 text: thought.to_string(),
+                signature: None,
+                signature_model: None,
             }],
             super::super::message::StopReason::ToolUse,
         );
         let out = absorb_text_calls(&msg, &[call("scav-1", "bash")], &tools(&["bash"]));
         match out.content.as_slice() {
             [
-                ContentBlock::Thinking { text },
+                ContentBlock::Thinking { text, .. },
                 ContentBlock::ToolCall { .. },
             ] => {
                 assert_eq!(text, thought)

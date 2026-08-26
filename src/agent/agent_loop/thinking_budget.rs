@@ -187,7 +187,7 @@ pub fn thinking_tokens(msg: &AssistantMessage) -> usize {
         .content
         .iter()
         .filter_map(|b| match b {
-            ContentBlock::Thinking { text } => Some(text.len()),
+            ContentBlock::Thinking { text, .. } => Some(text.len()),
             _ => None,
         })
         .sum();
@@ -272,6 +272,8 @@ mod tests {
         AssistantMessage {
             content: vec![ContentBlock::Thinking {
                 text: "x".repeat(thinking_chars),
+                signature: None,
+                signature_model: None,
             }],
             stop_reason: stop,
             error_message: None,
@@ -478,12 +480,16 @@ mod tests {
             content: vec![
                 ContentBlock::Thinking {
                     text: "a".repeat(CHARS_PER_TOKEN * 3),
+                    signature: None,
+                    signature_model: None,
                 },
                 ContentBlock::Text {
                     text: "ignored".repeat(100),
                 },
                 ContentBlock::Thinking {
                     text: "b".repeat(CHARS_PER_TOKEN * 2),
+                    signature: None,
+                    signature_model: None,
                 },
             ],
             stop_reason: StopReason::Stop,

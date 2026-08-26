@@ -60,7 +60,7 @@ use rig::completion::message::{
 use rig::completion::{CompletionModel, CompletionRequestBuilder, GetTokenUsage, ToolDefinition};
 use serde_json::Value;
 
-use super::message::StreamEvent;
+use super::message::{ContentBlock, StreamEvent};
 use super::rig_stream::wrap_rig_stream;
 use super::stream::{LlmContext, StreamFn};
 use super::tool::LoopTool;
@@ -215,10 +215,18 @@ where
     Box::pin(async_stream::stream! {
         // 1. Convert our messages to rig messages.
         let provider: Option<&str> = provider_name.as_ref().as_deref();
+        // GH #821: how a stored thinking block replays to THIS request —
+        // Anthropic schema-requires the block's original signature (minted
+        // per model), everyone else keeps the unsigned echo unchanged.
+        let thinking_replay = thinking_replay_for(
+            provider,
+            model_name.as_ref().as_deref(),
+            turn_reasoning_enabled(provider, &opts),
+        );
         let rig_messages: Vec<Message> = ctx
             .messages
             .iter()
-            .filter_map(|message| value_to_rig_message_for_provider(message, provider, ctx.asset_dir.as_deref()))
+            .filter_map(|message| value_to_rig_message_with_thinking_replay(message, provider, thinking_replay, ctx.asset_dir.as_deref()))
             .collect();
 
         // 2. Split: last is prompt; rest is chat_history.
@@ -346,6 +354,13 @@ where
                 );
                 use futures::stream::StreamExt;
                 while let Some(evt) = wrapped.next().await {
+                    // GH #821: a thinking-block signature is only valid for
+                    // the model that minted it, and the capture layer
+                    // (rig_stream) doesn't know which model it is streaming
+                    // from. Stamp it here — the one place that knows — so
+                    // the replay path can tell a same-model echo (attach)
+                    // from a cross-model one (drop).
+                    let evt = stamp_thinking_signature_model(evt, model_name.as_ref().as_deref());
                     yield evt;
                 }
             }
@@ -629,9 +644,29 @@ fn resolve_image(
 /// its tool call — see the call site in `value_to_rig_message_for_provider`.
 pub(crate) const EMPTY_TOOL_RESULT_PLACEHOLDER: &str = "(no output)";
 
+/// Legacy 2-knob entry point, kept so the existing tests (and
+/// `value_to_rig_message`) stay untouched: replays thinking blocks the way
+/// every provider other than Anthropic gets them — unsigned. Production goes
+/// through `value_to_rig_message_with_thinking_replay`, which the factory
+/// calls with the request's model + reasoning state (GH #821).
+#[cfg(test)]
 fn value_to_rig_message_for_provider(
     value: &Value,
     provider_name: Option<&str>,
+    asset_dir: Option<&std::path::Path>,
+) -> Option<Message> {
+    value_to_rig_message_with_thinking_replay(
+        value,
+        provider_name,
+        thinking_replay_for(provider_name, None, false),
+        asset_dir,
+    )
+}
+
+fn value_to_rig_message_with_thinking_replay(
+    value: &Value,
+    provider_name: Option<&str>,
+    thinking_replay: ThinkingReplay<'_>,
     asset_dir: Option<&std::path::Path>,
 ) -> Option<Message> {
     let role = value.get("role").and_then(|r| r.as_str())?;
@@ -682,7 +717,12 @@ fn value_to_rig_message_for_provider(
             let assistant_contents: Vec<AssistantContent> = blocks
                 .iter()
                 .filter_map(|block| {
-                    value_to_assistant_content(block, include_reasoning, synthesize_call_id)
+                    value_to_assistant_content(
+                        block,
+                        include_reasoning,
+                        synthesize_call_id,
+                        thinking_replay,
+                    )
                 })
                 .collect();
             // `OneOrMany::many` errors on empty input; rig
@@ -794,12 +834,88 @@ fn provider_requires_openai_call_ids(provider_name: Option<&str>) -> bool {
     matches!(provider_name, Some(provider) if provider.eq_ignore_ascii_case("openai"))
 }
 
+/// GH #821: how a stored thinking block replays to the current request.
+///
+/// Anthropic signs every thinking block it emits and schema-rejects a
+/// replayed block that lacks the signature (`thinking.signature: Field
+/// required`), so for that backend the choice is attach-or-drop — there is
+/// no unsigned echo. A signature is also only valid for the exact model
+/// that minted it (a foreign one is rejected with `Invalid signature in
+/// thinking block`), and dirge can replay one session's history to a
+/// different model (`/model`, escalation, subagent/review routes), so
+/// attaching is gated on the recorded `signatureModel` matching the
+/// request's model. Every other provider keeps today's unsigned echo,
+/// byte-identical on the wire.
+#[derive(Clone, Copy)]
+enum ThinkingReplay<'a> {
+    /// Replay as an unsigned `Reasoning` block — the pre-#821 behavior,
+    /// unchanged for every non-Anthropic provider.
+    Unsigned,
+    /// Anthropic: attach the stored signature when it was minted by
+    /// `model` and this turn has reasoning enabled; otherwise drop the
+    /// block (an unsigned or foreign-signed block would 400 either way,
+    /// and with reasoning off the echo is not required at all).
+    SignedOrDrop {
+        model: Option<&'a str>,
+        reasoning_enabled: bool,
+    },
+}
+
+/// Pick the [`ThinkingReplay`] policy for one request.
+fn thinking_replay_for<'a>(
+    provider_name: Option<&str>,
+    model: Option<&'a str>,
+    reasoning_enabled: bool,
+) -> ThinkingReplay<'a> {
+    let anthropic =
+        matches!(provider_name, Some(provider) if provider.eq_ignore_ascii_case("anthropic"));
+    if anthropic {
+        ThinkingReplay::SignedOrDrop {
+            model,
+            reasoning_enabled,
+        }
+    } else {
+        ThinkingReplay::Unsigned
+    }
+}
+
+/// GH #821: record which model minted each captured thinking-block
+/// signature. The capture layer (`rig_stream`) sees only the provider's
+/// stream, not the model identity, so the factory — which knows the model
+/// it was built for — stamps it on every event it forwards. Only blocks
+/// that carry a signature and haven't been stamped yet are touched, so
+/// everything else in the message is byte-identical.
+fn stamp_thinking_signature_model(mut evt: StreamEvent, model_name: Option<&str>) -> StreamEvent {
+    let Some(model) = model_name else {
+        return evt;
+    };
+    let message = match &mut evt {
+        StreamEvent::Start { partial } | StreamEvent::Delta { partial, .. } => partial,
+        StreamEvent::Done { message, .. } => message,
+        StreamEvent::Error { .. } | StreamEvent::Retry { .. } => return evt,
+    };
+    for block in &mut message.content {
+        if let ContentBlock::Thinking {
+            signature,
+            signature_model,
+            ..
+        } = block
+            && signature.is_some()
+            && signature_model.is_none()
+        {
+            *signature_model = Some(model.to_string());
+        }
+    }
+    evt
+}
+
 /// Convert one assistant content block to a rig `AssistantContent`.
 /// Recognizes `{type: "text"|"thinking"|"toolCall", ...}`.
 fn value_to_assistant_content(
     block: &Value,
     include_reasoning: bool,
     synthesize_call_id: bool,
+    thinking_replay: ThinkingReplay<'_>,
 ) -> Option<AssistantContent> {
     let obj = block.as_object()?;
     let kind = obj.get("type").and_then(|t| t.as_str())?;
@@ -826,7 +942,35 @@ fn value_to_assistant_content(
                 return None;
             }
             let text = obj.get("text").and_then(|t| t.as_str())?;
-            Some(AssistantContent::Reasoning(Reasoning::new(text)))
+            match thinking_replay {
+                ThinkingReplay::Unsigned => Some(AssistantContent::Reasoning(Reasoning::new(text))),
+                ThinkingReplay::SignedOrDrop {
+                    model,
+                    reasoning_enabled,
+                } => {
+                    // GH #821: attach the block's original signature only
+                    // when this request's model is the one that minted it
+                    // (recorded as `signatureModel` at capture time) and
+                    // reasoning is on this turn. Any other combination —
+                    // no signature (legacy/flattened history), a foreign
+                    // model's signature, or reasoning off — drops the
+                    // block, because Anthropic rejects both an unsigned
+                    // and a foreign-signed thinking block.
+                    let signature = obj.get("signature").and_then(|s| s.as_str());
+                    let signature_model = obj.get("signatureModel").and_then(|s| s.as_str());
+                    match (signature, signature_model, model) {
+                        (Some(signature), Some(minted_by), Some(current))
+                            if reasoning_enabled && minted_by == current =>
+                        {
+                            Some(AssistantContent::Reasoning(Reasoning::new_with_signature(
+                                text,
+                                Some(signature.to_string()),
+                            )))
+                        }
+                        _ => None,
+                    }
+                }
+            }
         }
         "toolCall" => {
             let id = obj.get("id").and_then(|t| t.as_str())?.to_string();
@@ -1384,6 +1528,191 @@ mod tests {
                 _ => panic!("expected Assistant"),
             }
         }
+    }
+
+    /// GH #821 helper: one assistant message with a signed thinking block
+    /// plus a text block, as `serialize_assistant` + the factory's stamp
+    /// write it.
+    fn signed_thinking_assistant() -> Value {
+        serde_json::json!({
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "thinking",
+                    "text": "let me think",
+                    "signature": "sig-821",
+                    "signatureModel": "claude-opus-4-6",
+                },
+                {"type": "text", "text": "the answer"},
+            ],
+        })
+    }
+
+    fn reasoning_signature(msg: &Message) -> Option<Option<String>> {
+        match msg {
+            Message::Assistant { content, .. } => content.iter().find_map(|c| match c {
+                AssistantContent::Reasoning(r) => Some(r.content.iter().find_map(|rc| match rc {
+                    rig::completion::message::ReasoningContent::Text { signature, .. } => {
+                        signature.clone()
+                    }
+                    _ => None,
+                })),
+                _ => None,
+            }),
+            _ => None,
+        }
+    }
+
+    /// GH #821: replaying a signed thinking block to Anthropic with the
+    /// SAME model that minted the signature (reasoning on) must attach
+    /// the signature verbatim — Anthropic schema-rejects the block
+    /// without it (`thinking.signature: Field required`).
+    #[test]
+    fn anthropic_same_model_replay_attaches_the_signature() {
+        let v = signed_thinking_assistant();
+        let replay = thinking_replay_for(Some("anthropic"), Some("claude-opus-4-6"), true);
+        let msg = value_to_rig_message_with_thinking_replay(&v, Some("anthropic"), replay, None)
+            .expect("must convert");
+        assert_eq!(
+            reasoning_signature(&msg),
+            Some(Some("sig-821".to_string())),
+            "the stored signature must ride the replayed Reasoning block"
+        );
+    }
+
+    /// GH #821: a signature is only valid for the model that minted it —
+    /// replaying it to a DIFFERENT model is rejected (`Invalid signature
+    /// in thinking block`) — and an unsigned block is schema-rejected, so
+    /// on a model mismatch (or a missing/unstamped signature, or reasoning
+    /// off) the whole thinking block must be dropped from the Anthropic
+    /// request. The rest of the message survives.
+    #[test]
+    fn anthropic_replay_drops_unattachable_thinking_blocks() {
+        let signed = signed_thinking_assistant();
+        let unsigned = serde_json::json!({
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "text": "let me think"},
+                {"type": "text", "text": "the answer"},
+            ],
+        });
+        let cases: Vec<(&Value, ThinkingReplay<'_>, &str)> = vec![
+            (
+                &signed,
+                thinking_replay_for(Some("anthropic"), Some("claude-fable-5"), true),
+                "foreign-model signature",
+            ),
+            (
+                &signed,
+                thinking_replay_for(Some("anthropic"), Some("claude-opus-4-6"), false),
+                "reasoning off this turn",
+            ),
+            (
+                &signed,
+                thinking_replay_for(Some("anthropic"), None, true),
+                "request model unknown",
+            ),
+            (
+                &unsigned,
+                thinking_replay_for(Some("anthropic"), Some("claude-opus-4-6"), true),
+                "legacy/flattened block with no signature",
+            ),
+        ];
+        for (v, replay, case) in cases {
+            let msg = value_to_rig_message_with_thinking_replay(v, Some("anthropic"), replay, None)
+                .unwrap_or_else(|| panic!("{case}: message with text must survive"));
+            match msg {
+                Message::Assistant { content, .. } => {
+                    assert!(
+                        !content
+                            .iter()
+                            .any(|c| matches!(c, AssistantContent::Reasoning(_))),
+                        "{case}: the thinking block must be dropped",
+                    );
+                    assert!(
+                        content
+                            .iter()
+                            .any(|c| matches!(c, AssistantContent::Text(_))),
+                        "{case}: the text block must survive",
+                    );
+                }
+                _ => panic!("expected Assistant"),
+            }
+        }
+    }
+
+    /// GH #821 non-regression: every non-Anthropic backend keeps the
+    /// pre-#821 unsigned echo, byte-identical — a stored signature must
+    /// neither attach nor drop the block there.
+    #[test]
+    fn non_anthropic_replay_of_a_signed_block_is_unchanged() {
+        let v = signed_thinking_assistant();
+        for provider in [Some("cerebras"), Some("deepseek"), Some("custom"), None] {
+            let replay = thinking_replay_for(provider, Some("claude-opus-4-6"), true);
+            assert!(matches!(replay, ThinkingReplay::Unsigned));
+            let msg = value_to_rig_message_with_thinking_replay(&v, provider, replay, None)
+                .unwrap_or_else(|| panic!("{provider:?} must keep the message"));
+            assert_eq!(
+                reasoning_signature(&msg),
+                Some(None),
+                "{provider:?}: reasoning must replay unsigned, exactly as before",
+            );
+        }
+    }
+
+    /// GH #821: the factory stamps the model that minted each captured
+    /// signature onto the block (the capture layer doesn't know the
+    /// model). Only signed, not-yet-stamped blocks are touched.
+    #[test]
+    fn stamp_records_the_minting_model_on_signed_blocks_only() {
+        use super::super::message::{AssistantMessage, StopReason};
+        let message = AssistantMessage::new(
+            vec![
+                ContentBlock::Thinking {
+                    text: "signed".to_string(),
+                    signature: Some("sig-a".to_string()),
+                    signature_model: None,
+                },
+                ContentBlock::Thinking {
+                    text: "unsigned".to_string(),
+                    signature: None,
+                    signature_model: None,
+                },
+                ContentBlock::Thinking {
+                    text: "already stamped".to_string(),
+                    signature: Some("sig-b".to_string()),
+                    signature_model: Some("other-model".to_string()),
+                },
+                ContentBlock::Text {
+                    text: "hi".to_string(),
+                },
+            ],
+            StopReason::Stop,
+        );
+        let evt = StreamEvent::Done {
+            reason: StopReason::Stop,
+            message,
+            usage: None,
+        };
+        let stamped = stamp_thinking_signature_model(evt, Some("claude-opus-4-6"));
+        let StreamEvent::Done { message, .. } = stamped else {
+            panic!("expected Done back");
+        };
+        let models: Vec<Option<&str>> = message
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Thinking {
+                    signature_model, ..
+                } => Some(signature_model.as_deref()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            models,
+            vec![Some("claude-opus-4-6"), None, Some("other-model")],
+            "stamp signed+unstamped; leave unsigned and already-stamped alone"
+        );
     }
 
     /// dirge-byun. A turn where the model emitted only reasoning (or nothing

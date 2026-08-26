@@ -4835,7 +4835,7 @@ pub(crate) fn build_scavenge_source(blocks: &[ContentBlock]) -> String {
     blocks
         .iter()
         .filter_map(|b| match b {
-            ContentBlock::Thinking { text } => Some(text.as_str()),
+            ContentBlock::Thinking { text, .. } => Some(text.as_str()),
             ContentBlock::Text { text } => Some(text.as_str()),
             _ => None,
         })

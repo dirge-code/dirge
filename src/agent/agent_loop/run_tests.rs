@@ -3215,6 +3215,8 @@ fn scavenge_source_concatenates_thinking_and_text() {
     let blocks = vec![
         ContentBlock::Thinking {
             text: "Plan: call list_dir.".to_string(),
+            signature: None,
+            signature_model: None,
         },
         ContentBlock::Text {
             text: "Acting now.".to_string(),
