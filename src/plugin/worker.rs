@@ -2794,17 +2794,25 @@ unsafe fn json_to_janet_depth(v: &serde_json::Value, depth: usize) -> janetrs::l
             serde_json::Value::String(s) => wrap_string(s),
             serde_json::Value::Array(items) => {
                 let arr = janet_array(items.len().min(i32::MAX as usize) as i32);
+                // Root the half-built array before the recursive calls allocate:
+                // a GC inside json_to_janet_depth would otherwise collect it mid-fill.
+                janet_gcroot(janet_wrap_array(arr));
                 for item in items {
                     janet_array_push(arr, json_to_janet_depth(item, depth + 1));
                 }
+                janet_gcunroot(janet_wrap_array(arr));
                 janet_wrap_array(arr)
             }
             serde_json::Value::Object(map) => {
                 let tbl = janet_table(map.len().min(i32::MAX as usize) as i32);
+                // Root the half-built table before wrap_string and the recursive
+                // calls allocate: a GC would otherwise collect it mid-fill.
+                janet_gcroot(janet_wrap_table(tbl));
                 for (k, val) in map {
                     let key = wrap_string(k);
                     janet_table_put(tbl, key, json_to_janet_depth(val, depth + 1));
                 }
+                janet_gcunroot(janet_wrap_table(tbl));
                 janet_wrap_table(tbl)
             }
         }
@@ -3782,6 +3790,9 @@ pub(crate) mod vigil_bridge {
         use janetrs::lowlevel::*;
         let names = VIGIL_NAMES.get().map(|v| v.as_slice()).unwrap_or(&[]);
         let tup = unsafe { janet_tuple_begin(names.len() as i32) };
+        // Root the half-built tuple before the loop allocates: janet_cstring can
+        // trigger GC, which would otherwise collect the unrooted tuple mid-fill.
+        unsafe { janet_gcroot(janet_wrap_tuple(tup)) };
         for (i, name) in names.iter().enumerate() {
             unsafe {
                 let c_str = std::ffi::CString::new(name.as_str()).unwrap();
@@ -3789,7 +3800,10 @@ pub(crate) mod vigil_bridge {
                 *tup.offset(i as isize) = s;
             }
         }
-        unsafe { janet_wrap_tuple(janet_tuple_end(tup)) }
+        unsafe {
+            janet_gcunroot(janet_wrap_tuple(tup));
+            janet_wrap_tuple(janet_tuple_end(tup))
+        }
     }
 
     /// (vigil/get name) — return a Janet table of state for the named vigil.
@@ -3881,22 +3895,34 @@ pub(crate) mod vigil_bridge {
             }
             serde_json::Value::Array(arr) => {
                 let tup = unsafe { janet_tuple_begin(arr.len() as i32) };
+                // Root the half-built tuple before the recursive json_to_janet
+                // calls allocate: a GC would otherwise collect it mid-fill.
+                unsafe { janet_gcroot(janet_wrap_tuple(tup)) };
                 for (i, v) in arr.iter().enumerate() {
                     unsafe {
                         *tup.offset(i as isize) = json_to_janet(v);
                     }
                 }
-                unsafe { janet_wrap_tuple(janet_tuple_end(tup)) }
+                unsafe {
+                    janet_gcunroot(janet_wrap_tuple(tup));
+                    janet_wrap_tuple(janet_tuple_end(tup))
+                }
             }
             serde_json::Value::Object(map) => {
                 let tab = unsafe { janet_table(map.len() as i32) };
+                // Root the half-built table before janet_cstring and the recursive
+                // json_to_janet calls allocate: a GC would otherwise collect it mid-fill.
+                unsafe { janet_gcroot(janet_wrap_table(tab)) };
                 for (k, v) in map {
                     let c_str = std::ffi::CString::new(k.as_str()).unwrap();
                     let key = unsafe { janet_wrap_string(janet_cstring(c_str.as_ptr())) };
                     let val = json_to_janet(v);
                     unsafe { janet_table_put(tab, key, val) };
                 }
-                unsafe { janet_wrap_table(tab) }
+                unsafe {
+                    janet_gcunroot(janet_wrap_table(tab));
+                    janet_wrap_table(tab)
+                }
             }
         }
     }
