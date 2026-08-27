@@ -362,6 +362,7 @@ mod tests {
             should_defer_finalization: None,
             reasoning: None,
             thinking_budgets: None,
+            max_tokens: None,
             headers: std::collections::HashMap::new(),
             metadata: std::collections::HashMap::new(),
             provider_name: None,

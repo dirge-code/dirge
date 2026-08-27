@@ -480,6 +480,15 @@ pub struct LoopConfig {
     /// Port of pi `SimpleStreamOptions.thinkingBudgets?`
     /// (types.ts:195).
     pub thinking_budgets: Option<ThinkingBudgets>,
+    /// GH #816: `max_tokens` to pin on non-reasoning requests — the user's
+    /// explicitly configured cap, or dirge's default only for Anthropic
+    /// model ids rig has no per-model default for. Seeded from the agent at
+    /// spawn time and forwarded to `StreamOptions.max_tokens` per call. The
+    /// stream factory applies it to non-reasoning requests on providers
+    /// that require the field (Anthropic); a reasoning turn's budget
+    /// ceiling always wins over it. `None` leaves the request field unset
+    /// so the provider's own default applies.
+    pub max_tokens: Option<u64>,
     /// Custom HTTP headers merged with provider defaults. Pi
     /// `StreamOptions.headers?` (types.ts:120). Some rig
     /// providers honor at request build time; others at client
@@ -860,6 +869,7 @@ impl std::fmt::Debug for LoopConfig {
             )
             .field("reasoning", &self.reasoning)
             .field("thinking_budgets", &self.thinking_budgets)
+            .field("max_tokens", &self.max_tokens)
             .field("headers", &self.headers)
             .field("metadata", &self.metadata)
             .field("provider_name", &self.provider_name)
@@ -936,6 +946,7 @@ impl Clone for LoopConfig {
             should_defer_finalization: self.should_defer_finalization.clone(),
             reasoning: self.reasoning,
             thinking_budgets: self.thinking_budgets.clone(),
+            max_tokens: self.max_tokens,
             headers: self.headers.clone(),
             metadata: self.metadata.clone(),
             provider_name: self.provider_name.clone(),
@@ -1004,6 +1015,7 @@ impl LoopConfig {
             should_defer_finalization: None,
             reasoning: None,
             thinking_budgets: None,
+            max_tokens: None,
             headers: std::collections::HashMap::new(),
             metadata: std::collections::HashMap::new(),
             provider_name: None,

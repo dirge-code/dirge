@@ -526,6 +526,15 @@ pub struct LoopSpawnConfig {
     /// default (`ThinkingLevel::Off`).
     pub reasoning: Option<super::types::ThinkingLevel>,
 
+    /// GH #816: `max_tokens` to pin on non-reasoning requests — the user's
+    /// explicitly configured cap, or dirge's default only for Anthropic
+    /// model ids rig has no per-model default for. Seeded from the agent
+    /// and forwarded to `LoopConfig.max_tokens` — the field the stream
+    /// builder reads per turn so non-reasoning Anthropic requests carry the
+    /// `max_tokens` rig 0.41 requires. `None` leaves requests unset so the
+    /// provider's own default applies (rig-recognised ids; tests).
+    pub max_tokens: Option<u64>,
+
     /// dirge-9tfq: per-session background-task store. When `Some`,
     /// `spawn_loop_runner` installs a `get_followup_messages` hook
     /// that drains the store's pending notifications at every
@@ -595,6 +604,7 @@ impl LoopSpawnConfig {
             goal: None,
             max_turns: None,
             reasoning: None,
+            max_tokens: None,
             bg_store: None,
             memory_provider: None,
         }
@@ -645,6 +655,7 @@ pub fn spawn_loop_runner(cfg: LoopSpawnConfig) -> LoopRunner {
         }),
         reasoning: cfg.reasoning,
         thinking_budgets: None,
+        max_tokens: cfg.max_tokens,
         headers: std::collections::HashMap::new(),
         metadata: std::collections::HashMap::new(),
         provider_name: cfg.provider_name.clone(),

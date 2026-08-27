@@ -312,19 +312,12 @@ where
         if let Some(v) = additional {
             builder = builder.additional_params(v);
         }
-        // Pin `max_tokens` whenever a thinking BUDGET is on the wire. Anthropic
-        // counts thinking against max_tokens and rejects the request unless
-        // budget_tokens is strictly below it — and if we leave max_tokens unset
-        // rig picks 2048 for any model id it doesn't recognise, which is every
-        // Claude 5 id. That combination 400s every turn above `minimal`.
-        if let Some(level) = opts.reasoning
-            && let Some(ceiling) = crate::provider::adapter::max_tokens_for_reasoning(
-                provider,
-                level,
-                opts.thinking_budgets.as_ref(),
-            )
-        {
-            builder = builder.max_tokens(ceiling);
+        // Pin `max_tokens` when this request needs one — the reasoning
+        // ceiling on thinking turns, the resolved `max_tokens` config on
+        // non-reasoning Anthropic turns (GH #816). The rules live in
+        // `request_max_tokens`.
+        if let Some(max_tokens) = request_max_tokens(provider, &opts) {
+            builder = builder.max_tokens(max_tokens);
         }
         let request = builder.build();
 
@@ -1168,6 +1161,47 @@ pub fn turn_reasoning_enabled(
     opts: &super::stream::StreamOptions,
 ) -> bool {
     reasoning_params(provider_name, opts).is_some()
+}
+
+/// The `max_tokens` to pin on this request, or `None` to leave the field
+/// unset (the provider's own default applies).
+///
+/// Two independent reasons to set one:
+///   - A turn that puts a thinking BUDGET on the wire carries the reasoning
+///     ceiling. Anthropic counts thinking against `max_tokens` and rejects
+///     the request unless `budget_tokens` is strictly below it — and if we
+///     leave `max_tokens` unset rig picks 2048 for any model id it doesn't
+///     recognise, which is every Claude 5 id. That combination 400s every
+///     turn above `minimal`. The ceiling always wins over the configured
+///     value: a user-configured 8192 must never undercut a 16384+ budget.
+///   - A NON-reasoning turn on an Anthropic-shaped provider carries the
+///     resolved `max_tokens` config (GH #816). rig 0.41 hard-errors with
+///     "`max_tokens` must be set for Anthropic" when the request has none
+///     and the model id is one it has no default for — again every Claude 5
+///     id — so with reasoning off every request failed before the HTTP call.
+///
+/// Every other case stays unset, byte-identical to before: effort-string
+/// providers send no budget, their backends accept an absent `max_tokens`,
+/// and forcing a cap on a reasoning turn there could strangle reasoning
+/// output (OpenAI counts reasoning tokens against the output limit).
+fn request_max_tokens(provider: Option<&str>, opts: &super::stream::StreamOptions) -> Option<u64> {
+    if let Some(level) = opts.reasoning
+        && let Some(ceiling) = crate::provider::adapter::max_tokens_for_reasoning(
+            provider,
+            level,
+            opts.thinking_budgets.as_ref(),
+        )
+    {
+        return Some(ceiling);
+    }
+    let anthropic_shaped = matches!(
+        crate::provider::adapter::reasoning_profile(provider).effort,
+        crate::provider::adapter::EffortWire::AnthropicBudget
+    );
+    if anthropic_shaped && !turn_reasoning_enabled(provider, opts) {
+        return opts.max_tokens;
+    }
+    None
 }
 
 /// Say so, once per process, when a request-override knob is set but has no
@@ -2334,6 +2368,90 @@ mod tests {
         let mut o = StreamOptions::from_signal(AbortSignal::new());
         o.reasoning = Some(level);
         o
+    }
+
+    // ============================================================
+    // request_max_tokens (GH #816)
+    // ============================================================
+
+    /// GH #816: with reasoning off, an Anthropic request must still carry
+    /// the resolved `max_tokens` — rig 0.41 hard-errors ("`max_tokens` must
+    /// be set for Anthropic") before the HTTP call when the field is unset
+    /// and the model id is one it has no default for (every Claude 5 id).
+    #[test]
+    fn non_reasoning_anthropic_request_carries_configured_max_tokens() {
+        let mut o = StreamOptions::from_signal(AbortSignal::new());
+        o.max_tokens = Some(8192);
+        assert_eq!(request_max_tokens(Some("anthropic"), &o), Some(8192));
+    }
+
+    /// `Some(Off)` puts no thinking params on the wire, so it is a
+    /// non-reasoning turn and gets the configured value too.
+    #[test]
+    fn reasoning_off_level_anthropic_request_carries_configured_max_tokens() {
+        let mut o = opts_with_reasoning(ThinkingLevel::Off);
+        o.max_tokens = Some(8192);
+        assert_eq!(request_max_tokens(Some("anthropic"), &o), Some(8192));
+    }
+
+    /// A reasoning turn keeps the budget ceiling, NOT the configured value:
+    /// Anthropic requires `budget_tokens` strictly below `max_tokens`, so a
+    /// configured 8192 must never undercut a level's budget + headroom
+    /// (the invariant `anthropic_ceiling_clears_every_budget` pins).
+    #[test]
+    fn reasoning_anthropic_request_keeps_ceiling_over_configured_value() {
+        let mut o = opts_with_reasoning(ThinkingLevel::High);
+        o.max_tokens = Some(8192);
+        let expected = crate::provider::adapter::max_tokens_for_reasoning(
+            Some("anthropic"),
+            ThinkingLevel::High,
+            None,
+        )
+        .expect("high puts a budget on the wire");
+        assert_eq!(request_max_tokens(Some("anthropic"), &o), Some(expected));
+        assert!(
+            expected > 8192,
+            "the ceiling must clear the configured value for this test to bite",
+        );
+    }
+
+    /// No resolved config (tests, paths built without one) leaves the
+    /// request unset — byte-identical to the pre-fix behaviour.
+    #[test]
+    fn non_reasoning_anthropic_request_without_config_stays_unset() {
+        let o = StreamOptions::from_signal(AbortSignal::new());
+        assert_eq!(request_max_tokens(Some("anthropic"), &o), None);
+    }
+
+    /// Effort-string providers never had a cap forced on them and still
+    /// don't — their backends accept an absent `max_tokens`, and capping an
+    /// OpenAI reasoning turn could strangle output (reasoning tokens count
+    /// against the output limit there).
+    #[test]
+    fn other_providers_stay_uncapped_with_and_without_reasoning() {
+        for provider in [
+            "openai",
+            "deepseek",
+            "glm",
+            "cerebras",
+            "custom",
+            "openrouter",
+        ] {
+            let mut off = StreamOptions::from_signal(AbortSignal::new());
+            off.max_tokens = Some(8192);
+            assert_eq!(
+                request_max_tokens(Some(provider), &off),
+                None,
+                "{provider}: non-reasoning turn must stay uncapped",
+            );
+            let mut on = opts_with_reasoning(ThinkingLevel::High);
+            on.max_tokens = Some(8192);
+            assert_eq!(
+                request_max_tokens(Some(provider), &on),
+                None,
+                "{provider}: reasoning turn must stay uncapped",
+            );
+        }
     }
 
     /// Anthropic gets `thinking: { type: "enabled", budget_tokens

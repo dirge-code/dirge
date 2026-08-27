@@ -707,6 +707,24 @@ pub async fn build_agent(
     // builder; this wires it through the agent_loop path so `run_print`
     // and the interactive flow both honor it.
     agent = agent.with_max_turns(Some(cli.resolve_max_agent_turns(cfg)));
+    // GH #816: with reasoning off nothing else sets `max_tokens` on the
+    // streamed request, and rig 0.41 rejects an Anthropic request without
+    // one before the HTTP call when the model id is outside its per-model
+    // default table — every Claude 5 id. Thread the cap the user explicitly
+    // configured (CLI `--max-tokens` > config `max_tokens`); when nothing
+    // is configured, invent `resolve_max_tokens`'s 8192 default ONLY where
+    // rig has no default of its own. For a recognised id (opus-4.x 128k,
+    // sonnet-4/haiku-4.5 64k) the request stays unset so rig's larger
+    // per-model default keeps applying instead of being silently cut to
+    // 8192 — an unconfigured user must never trade working long outputs
+    // for quiet truncation.
+    let configured_max_tokens = cli.max_tokens.or(cfg.max_tokens);
+    let max_tokens = configured_max_tokens.or_else(|| {
+        agent
+            .anthropic_needs_max_tokens_fallback()
+            .then(|| cli.resolve_max_tokens(cfg))
+    });
+    agent = agent.with_max_tokens(max_tokens);
     // Seed default reasoning effort from the active provider's `effort`
     // config. A live `/effort` override later mutates `agent.reasoning`
     // and the next rebuild re-seeds from config, so this is the config-
