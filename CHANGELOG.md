@@ -6,6 +6,28 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.25.1] - 2026-08-26
+
+### Fixed
+- Non-reasoning requests to Anthropic set `max_tokens` again. Only the
+  reasoning-ceiling branch ever wrote it, and rig 0.41 hard-errors before the
+  HTTP call for any model id outside its per-model default table — every
+  Claude 5 id — so every non-reasoning turn on such a model failed. The value
+  threaded through is the cap the user configured (`--max-tokens`, then config
+  `max_tokens`); with nothing configured, dirge's 8192 default applies only
+  where rig has no per-model default of its own, so an unconfigured user on a
+  rig-recognised id keeps rig's larger cap instead of a silent cut to 8192.
+  (#816)
+- Replayed Anthropic thinking blocks carry their signature. Anthropic signs
+  every extended-thinking block and schema-rejects a replayed block without
+  the signature (`400: thinking.signature: Field required`), so the tool-use
+  continuation failed on every reasoning-on turn that called a tool. The
+  signature is captured from the stream, stamped with the minting model, and
+  re-attached only when replaying to Anthropic with the same model and
+  reasoning on this turn; unsigned or foreign-signed blocks are dropped rather
+  than echoed. Legacy session JSON without the new fields round-trips
+  byte-identically. (#821)
+
 ## [0.25.0] - 2026-08-24
 
 ### Added
@@ -4151,7 +4173,8 @@ agent in Rust with:
   LSP integration, and a Janet plugin system.
 - Session save/load/resume with LLM-summarization compaction.
 
-[Unreleased]: https://github.com/dirge-code/dirge/compare/v0.25.0...HEAD
+[Unreleased]: https://github.com/dirge-code/dirge/compare/v0.25.1...HEAD
+[0.25.1]: https://github.com/dirge-code/dirge/compare/v0.25.0...v0.25.1
 [0.25.0]: https://github.com/dirge-code/dirge/compare/v0.24.1...v0.25.0
 [0.24.1]: https://github.com/dirge-code/dirge/compare/v0.24.0...v0.24.1
 [0.24.0]: https://github.com/dirge-code/dirge/compare/v0.23.0...v0.24.0
