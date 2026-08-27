@@ -472,13 +472,25 @@ mod tests {
 
     /// The one path every test in this module shares, since the sink is set
     /// once per process.
+    ///
+    /// The name carries the PID as well as the run stamp. `traced` selects
+    /// records by sequence number, and `SEQ` is a process-global counter that
+    /// starts at zero in every process — so the filter is only sound while a
+    /// file belongs to one process. Under a process-per-test runner the run
+    /// stamp alone is not enough to guarantee that: it is a `SystemTime`
+    /// reading taken as each process starts, and two processes launched in the
+    /// same clock tick read the same value, land on the same file, and then
+    /// read each other's records back through overlapping sequence ranges.
+    /// That surfaced as a macOS CI failure where `recs[0]` was another test's
+    /// record. The PID makes the file private to the process that writes it.
     fn sink_path() -> std::path::PathBuf {
         static FIRST: OnceLock<std::path::PathBuf> = OnceLock::new();
         FIRST
             .get_or_init(|| {
                 std::env::temp_dir().join(format!(
-                    "dirge-trace-test-{}.jsonl",
-                    crate::text::test_run_stamp()
+                    "dirge-trace-test-{}-{}.jsonl",
+                    crate::text::test_run_stamp(),
+                    std::process::id()
                 ))
             })
             .clone()
