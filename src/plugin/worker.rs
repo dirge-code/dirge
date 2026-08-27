@@ -1039,6 +1039,24 @@ const HARNESS_TOOL_INIT: &str = r#"
   (harness/__call-tool name payload))
 "#;
 
+/// Janet wrapper for the issue bridge, installed on the **plugin VM only**.
+///
+/// Kept out of `HARNESS_INIT` for the same reason as `HARNESS_NOTEBOOK_INIT`:
+/// the notebook VM runs that prelude but does NOT register `harness/__emit-issue`,
+/// so a `defn` body that names the symbol would fail to compile there.
+#[cfg(feature = "plugin")]
+const HARNESS_ISSUE_INIT: &str = r#"
+# (harness/emit-issue title &opt body priority) -> issue id string | nil
+# Files a durable, session-unscoped issue on the board and returns its id
+# (e.g. "drg-a1b2"). Returns nil when the issue bridge is not installed
+# (plugin tests, --no-session without the store) or the title is empty.
+(defn harness/emit-issue [title &opt body priority]
+  (harness/__emit-issue
+    (string title)
+    (if (nil? body) "" (string body))
+    (if (nil? priority) "" (string priority))))
+"#;
+
 /// Vigil Janet prelude — exposes vigil/emit, vigil/list, vigil/set-state,
 /// vigil/get, vigil/live? for plugins running inside a vigil-keeper.
 #[cfg(all(feature = "plugin", feature = "vigil"))]
@@ -2057,6 +2075,10 @@ fn worker_loop(
         env.add_c_fn(CFunOptions::new(c"__call-tool", janet_call_tool_cfn).namespace(c"harness"));
         env.add_c_fn(CFunOptions::new(c"__list-tools", janet_list_tools_cfn).namespace(c"harness"));
         env.add_c_fn(CFunOptions::new(c"__tools-live", janet_tools_live_cfn).namespace(c"harness"));
+        // Issue bridge: lets a plugin file a durable issue on the board.
+        env.add_c_fn(
+            CFunOptions::new(c"__emit-issue", issue_bridge::issue_emit_cfn).namespace(c"harness"),
+        );
     }
     // Register DAP C functions when both features are enabled.
     #[cfg(feature = "dap")]
@@ -2091,6 +2113,10 @@ fn worker_loop(
     }
     if let Err(e) = client.run(HARNESS_TOOL_INIT) {
         let _ = init_tx.send(Err(format!("harness tool-bridge init failed: {e}")));
+        return;
+    }
+    if let Err(e) = client.run(HARNESS_ISSUE_INIT) {
+        let _ = init_tx.send(Err(format!("harness issue-bridge init failed: {e}")));
         return;
     }
     // Vigil Janet prelude — defines (vigil/emit), (vigil/list),
@@ -3698,6 +3724,74 @@ unsafe fn get_dict_int_array(v: janetrs::lowlevel::Janet, key: &str) -> Option<V
         }
     }
     Some(out)
+}
+
+/// Bridge from the Janet worker thread to the durable issue board.
+///
+/// Exposes Janet function:
+/// - `harness/emit-issue` — (title [body] [priority]) -> issue id string or nil
+///
+/// Guarded by `plugin` only (issues are core, not vigil-gated): a flow plugin
+/// can file an issue in loop, vigil, or interactive mode. The issue is created
+/// session-unscoped (`session_id = None`); `assign_to_session` can pull it onto
+/// a conversation board later.
+#[cfg(feature = "plugin")]
+pub(crate) mod issue_bridge {
+    use super::{read_string_arg, wrap_string};
+    use crate::extras::issue_db::IssueStore;
+    use std::sync::Arc;
+
+    /// Process-global handle to the issue store, installed once at startup
+    /// and read from the Janet worker thread (mirrors `VIGIL_TX` /
+    /// `SANDBOX_EXEC_TX` — a thread-local would be invisible to the CFn).
+    static ISSUE_STORE: std::sync::OnceLock<Arc<IssueStore>> = std::sync::OnceLock::new();
+
+    /// Install the issue store for the bridge. Called from `main.rs` once at
+    /// plugin startup. No-op (warn) if already installed.
+    pub fn install_issue_store(store: Arc<IssueStore>) {
+        if ISSUE_STORE.set(store).is_err() {
+            tracing::warn!(target: "dirge::plugin", "issue bridge already installed");
+        }
+    }
+
+    /// (harness/emit-issue title [body] [priority]) -> issue id string or nil.
+    /// Files a durable, session-unscoped issue on the board and returns its id
+    /// (e.g. `drg-a1b2`), or nil when the store is absent / the title is empty.
+    pub unsafe extern "C-unwind" fn issue_emit_cfn(
+        argc: i32,
+        argv: *mut janetrs::lowlevel::Janet,
+    ) -> janetrs::lowlevel::Janet {
+        use janetrs::lowlevel::*;
+        if argc < 1 {
+            return unsafe { janet_wrap_nil() };
+        }
+        let Some(title) = (unsafe { read_string_arg(argv, 0) }) else {
+            return unsafe { janet_wrap_nil() };
+        };
+        let body = if argc > 1 {
+            unsafe { read_string_arg(argv, 1) }
+        } else {
+            None
+        };
+        let priority = if argc > 2 {
+            unsafe { read_string_arg(argv, 2) }
+        } else {
+            None
+        };
+        let Some(store) = ISSUE_STORE.get() else {
+            return unsafe { janet_wrap_nil() };
+        };
+        match store.create(
+            title.trim(),
+            body.as_deref().unwrap_or(""),
+            priority.as_deref(),
+            None,
+            None,
+        ) {
+            Ok(id) => unsafe { wrap_string(&id) },
+            Err(_) => unsafe { janet_wrap_nil() },
+        }
+    }
 }
 
 /// Bridge from the Janet worker thread to the vigil-keeper's event channel.
