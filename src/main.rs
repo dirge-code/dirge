@@ -1038,6 +1038,27 @@ async fn main() -> anyhow::Result<()> {
     if let Some(pm_arc) = plugin_manager.as_ref() {
         plugin::hook::init_global(pm_arc.clone());
     }
+    // Install the issue store for the Janet issue bridge (harness/emit-issue).
+    // Opened once here and shared with the worker thread; IssueStore is a
+    // Mutex<Connection> with a busy timeout, so concurrent session-persistence
+    // writes yield instead of erroring. Skipped when plugin support is off
+    // (the bridge CFn is never registered then, so the store would be unused).
+    #[cfg(feature = "plugin")]
+    if plugin_manager.is_some() {
+        let paths = crate::extras::dirge_paths::ProjectPaths::new(
+            &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+        );
+        match crate::extras::issue_db::IssueStore::open(&paths) {
+            Ok(store) => {
+                crate::plugin::worker::issue_bridge::install_issue_store(std::sync::Arc::new(
+                    store,
+                ));
+            }
+            Err(e) => {
+                eprintln!("warning: issue bridge disabled ({e})");
+            }
+        }
+    }
     // Pull the dialog-request receiver out of the PluginManager once,
     // here, so we can hand it to the UI loop. After this point, calling
     // take_dialog_rx again returns None — single owner by design. Always
