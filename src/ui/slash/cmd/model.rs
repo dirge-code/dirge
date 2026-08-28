@@ -89,8 +89,12 @@ pub(crate) async fn cmd_model(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyhow:
             .as_deref()
             .map(|a| format!("  ·  {a}"))
             .unwrap_or_default();
+        // GH #825: report the model the session actually landed on, not the
+        // raw argument — `/model <provider-alias>` resolves to the alias's
+        // pinned model, so echoing the argument would print the alias string
+        // as if it were a model id. Identical on every non-alias path.
         ctx.renderer.write_line(
-            &format!("switched to model: {new_model}{provider_note}"),
+            &format!("switched to model: {}{provider_note}", ctx.session.model),
             c_agent(),
         )?;
         let reserve = ctx.cfg.resolve_reserve_tokens();

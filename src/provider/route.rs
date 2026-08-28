@@ -109,6 +109,10 @@ pub fn resolve_model_route(cfg: &Config, active_provider: &str, model: &str) -> 
     match super::resolve_model_switch(&cfg.providers_map(), active_provider, &model) {
         ModelSwitch::Keep => ModelRoute::Active(model),
         ModelSwitch::Switch(alias) => ModelRoute::Provider { alias, model },
+        // GH #825: the id named a provider alias — the route must carry the
+        // alias's pinned model, NOT the alias string the user typed, or the
+        // session would land on a "model" no endpoint serves.
+        ModelSwitch::SwitchAlias { alias, model } => ModelRoute::Provider { alias, model },
         ModelSwitch::NoProviderForFamily(family) => ModelRoute::Unroutable { model, family },
     }
 }
@@ -465,5 +469,52 @@ mod tests {
             cfg.resolve_context_window("glm-5.2"),
             "the window must follow the model, not stay stale",
         );
+    }
+
+    /// GH #825: `/model <provider-alias>` lands the session on the alias's
+    /// PINNED model, not on the alias string — the failure mode where the
+    /// client switches but the session keeps the alias as its "model" would
+    /// 400 on the first turn just like the original bug.
+    #[test]
+    fn applying_an_alias_route_lands_on_the_pinned_model() {
+        let cfg = cfg();
+        let mut client = client(&cfg, "gpt-sol");
+        let mut session = session("gpt-sol", "gpt-5.5");
+
+        let switched = apply_model_route(
+            &cfg,
+            &mut client,
+            &mut session,
+            resolve_model_route(&cfg, "gpt-sol", "glm"),
+        )
+        .expect("a configured alias must be routable");
+
+        assert_eq!(switched.as_deref(), Some("glm"));
+        assert!(matches!(client, AnyClient::Glm(_)), "client must move");
+        assert_eq!(session.model, "glm-5.2", "the PINNED model, not `glm`");
+        assert_eq!(session.provider, "glm");
+    }
+
+    /// GH #825: naming the ACTIVE provider's own alias is a no-op — no client
+    /// rebuild, no spurious switch note, and the session model stays the
+    /// alias's pinned model rather than becoming the alias string.
+    #[test]
+    fn applying_the_active_alias_route_is_a_no_op() {
+        let cfg = cfg();
+        let mut client = client(&cfg, "gpt-sol");
+        let mut session = session("gpt-sol", "gpt-5.5");
+
+        let switched = apply_model_route(
+            &cfg,
+            &mut client,
+            &mut session,
+            resolve_model_route(&cfg, "gpt-sol", "gpt-sol"),
+        )
+        .unwrap();
+
+        assert_eq!(switched, None, "no client swap, so no switch note");
+        assert!(matches!(client, AnyClient::OpenAI(_)), "client untouched");
+        assert_eq!(session.model, "gpt-5.5");
+        assert_eq!(session.provider, "gpt-sol");
     }
 }
