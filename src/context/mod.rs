@@ -60,6 +60,14 @@ pub struct ContextFiles {
     /// leave the pre-agent model pointed at the profile's provider
     /// (dirge-fhr5). `None` when no agent is active.
     pub route_before_agent: Option<crate::provider::ModelRoute>,
+    /// The `session.effort_override` in force when an agent profile first
+    /// applied its `reasoning` frontmatter (GH #828), so `/agent off` can
+    /// restore it — the effort sibling of `route_before_agent`. Outer
+    /// `None` = nothing captured (no active profile has applied
+    /// `reasoning`); `Some(None)` = there was no override before the
+    /// profile (restore falls back to the provider config default on
+    /// rebuild).
+    pub effort_before_agent: Option<Option<crate::agent::agent_loop::types::ThinkingLevel>>,
 }
 
 /// The `/prompt`-selected layer: a named mode with a body and its own
@@ -191,6 +199,7 @@ pub fn load(no_context_files: bool) -> ContextFiles {
         prompt_layer: None,
         agent_layer: None,
         route_before_agent: None,
+        effort_before_agent: None,
     }
 }
 
@@ -306,6 +315,7 @@ mod composition_tests {
             prompt_layer: None,
             agent_layer: None,
             route_before_agent: None,
+            effort_before_agent: None,
         }
     }
 

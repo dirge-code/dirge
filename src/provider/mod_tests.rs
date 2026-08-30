@@ -1702,6 +1702,7 @@ async fn cerebras_identity_survives_client_model_and_agent_construction() {
         prompt_layer: None,
         agent_layer: None,
         route_before_agent: None,
+        effort_before_agent: None,
     };
     let agent = build_agent(
         model,
@@ -1768,6 +1769,7 @@ async fn provider_effort_config_seeds_agent_reasoning() {
         prompt_layer: None,
         agent_layer: None,
         route_before_agent: None,
+        effort_before_agent: None,
     };
     let agent = build_agent(
         model,

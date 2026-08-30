@@ -316,9 +316,17 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
     let max_turns = cli.resolve_max_agent_turns(cfg);
     builder = builder.default_max_turns(max_turns);
 
-    // Temperature: CLI > config > unset. Previously only `cli.temperature`
-    // was checked, so users couldn't set a default in config.json.
-    if let Some(temp) = cli.resolve_temperature(cfg) {
+    // Temperature: active agent profile > CLI > config > unset. Previously
+    // only `cli.temperature` was checked, so users couldn't set a default in
+    // config.json. The profile tier (GH #828) reads the `/agent` layer's
+    // `temperature` frontmatter — parsed since the key was introduced but
+    // never consumed. Consulting the layer HERE (rather than a runtime
+    // setter, which `AnyAgent` has none of for temperature) means `/agent
+    // <name>`'s rebuild picks it up and `/agent off`'s rebuild, with the
+    // layer cleared, falls straight back to CLI/config — no capture/restore
+    // needed. A profile omitting the key changes nothing.
+    let profile_temp = context.agent_layer.as_ref().and_then(|d| d.temperature);
+    if let Some(temp) = profile_temp.or_else(|| cli.resolve_temperature(cfg)) {
         let clamped = temp.clamp(0.0, 2.0);
         if (clamped - temp).abs() > f64::EPSILON {
             // Warn ONCE per process if the user's value was clamped

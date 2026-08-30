@@ -539,6 +539,7 @@ async fn build_agent_inner_emits_assembled_preamble() {
         prompt_layer: None,
         agent_layer: None,
         route_before_agent: None,
+        effort_before_agent: None,
     };
     // Real openai client/model — never called (no network until
     // first request). The builder only inspects type bounds and
@@ -687,6 +688,7 @@ async fn preamble_lists_global_tier_skills() {
         prompt_layer: None,
         agent_layer: None,
         route_before_agent: None,
+        effort_before_agent: None,
     };
     let client = openai::Client::new("test-key").expect("openai client builds");
     let model = client.completion_model("gpt-4o");
@@ -768,6 +770,7 @@ async fn no_skills_suppresses_the_preamble_catalog() {
         prompt_layer: None,
         agent_layer: None,
         route_before_agent: None,
+        effort_before_agent: None,
     };
     let client = openai::Client::new("test-key").expect("openai client builds");
     let model = client.completion_model("gpt-4o");
@@ -816,6 +819,7 @@ async fn steering_fragment_tracks_active_model_not_cli() {
         prompt_layer: None,
         agent_layer: None,
         route_before_agent: None,
+        effort_before_agent: None,
     };
     let client = openai::Client::new("test-key").expect("openai client builds");
 
