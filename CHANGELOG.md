@@ -6,6 +6,31 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.25.2] - 2026-08-29
+
+### Fixed
+- `/model <provider-alias>` switches to the model the alias pins instead of
+  renaming the session model to the alias string. `resolve_model_switch` fell
+  through to `Keep` for any id it could not classify, so `/model low` reported
+  success and left the session pointed at an id no endpoint serves. Aliases
+  that pin a model now resolve to both the alias and its pinned model, ranked
+  below the exact-pin and gateway rules so a same-named model pin still wins.
+  Only aliases that pin a model are affected — unknown non-alias ids keep
+  today's permissive behaviour — and `/model` now echoes the model the session
+  landed on rather than the argument you typed. (#825)
+- Agent profile `reasoning` and `temperature` frontmatter take effect. Both
+  keys were parsed and documented, but nothing read them, so a profile asking
+  for `high` reasoning or a fixed temperature silently ran at the session's own
+  settings. `reasoning` now applies on activation through the same override
+  `/effort` uses, so a rebuild keeps it sticky, and accepts all seven levels
+  rather than the three the table listed; `temperature` is read from the active
+  agent layer at build time, ahead of `--temperature` and the config default.
+  The profile wins over a live `/effort` at activation, a later `/effort`
+  overrides it, and `/agent off` restores what was there before — mirroring how
+  the model restore discards a mid-profile `/model`. An unrecognised
+  `reasoning` value warns and leaves effort untouched rather than failing the
+  switch. Subagents are unchanged (still model and prompt only). (#828)
+
 ## [0.25.1] - 2026-08-26
 
 ### Fixed
@@ -4173,7 +4198,8 @@ agent in Rust with:
   LSP integration, and a Janet plugin system.
 - Session save/load/resume with LLM-summarization compaction.
 
-[Unreleased]: https://github.com/dirge-code/dirge/compare/v0.25.1...HEAD
+[Unreleased]: https://github.com/dirge-code/dirge/compare/v0.25.2...HEAD
+[0.25.2]: https://github.com/dirge-code/dirge/compare/v0.25.1...v0.25.2
 [0.25.1]: https://github.com/dirge-code/dirge/compare/v0.25.0...v0.25.1
 [0.25.0]: https://github.com/dirge-code/dirge/compare/v0.24.1...v0.25.0
 [0.24.1]: https://github.com/dirge-code/dirge/compare/v0.24.0...v0.24.1
