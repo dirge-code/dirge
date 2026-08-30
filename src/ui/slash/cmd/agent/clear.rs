@@ -33,6 +33,20 @@ pub(crate) async fn cmd_agent_clear(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()
         ));
     }
 
+    // Restore the pre-profile effort override captured when a profile's
+    // `reasoning` frontmatter was applied (GH #828) — the effort sibling of
+    // the route restore above, and deliberately independent of it: a refused
+    // model restore must not leave the profile's reasoning behind. Restoring
+    // the pre-profile value also discards any `/effort` issued WHILE the
+    // profile was active, exactly as the route restore discards a mid-profile
+    // `/model`. Done before `rebuild_agent` so the rebuild installs the
+    // restored override (or, for `Some(None)`, re-seeds the provider config
+    // default) on the live agent.
+    restore_profile_reasoning(
+        &mut ctx.session.effort_override,
+        &mut ctx.context.effort_before_agent,
+    );
+
     rebuild_agent(ctx).await;
 
     if let Some(err) = restore_error {
@@ -46,4 +60,18 @@ pub(crate) async fn cmd_agent_clear(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()
     };
     ctx.renderer.write_line(&msg, c_agent())?;
     Ok(())
+}
+
+/// Put `session.effort_override` back to the value captured when an agent
+/// profile first applied its `reasoning` frontmatter (GH #828). A no-op
+/// when nothing was captured (no active profile ever set `reasoning`), so a
+/// profile without the key leaves the session's effort untouched in both
+/// directions.
+pub(crate) fn restore_profile_reasoning(
+    effort_override: &mut Option<crate::agent::agent_loop::types::ThinkingLevel>,
+    effort_before_agent: &mut Option<Option<crate::agent::agent_loop::types::ThinkingLevel>>,
+) {
+    if let Some(prior) = effort_before_agent.take() {
+        *effort_override = prior;
+    }
 }

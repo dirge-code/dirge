@@ -51,8 +51,8 @@ All frontmatter keys are optional:
 | `model` | A `providers` alias **or** a model name. Resolved to a model string for the current client (see *Model routing* below). Omit to keep the current model. |
 | `deny_tools` | Tools to deny while this profile is active (e.g. `[bash, write, edit, apply_patch]`). |
 | `allow_tools` | The complement: deny every built-in **not** listed. `deny_tools` wins if both are given. |
-| `reasoning` | Reasoning-effort hint (`low` / `medium` / `high`). |
-| `temperature` | Sampling temperature. |
+| `reasoning` | Reasoning effort applied on activation (`off` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max` — the same levels as `/effort`). Wins over any live `/effort` override at activation; a later `/effort` overrides it; `/agent off` restores the pre-profile effort. An unrecognised value warns and leaves the session's effort unchanged. |
+| `temperature` | Sampling temperature while the profile is active (clamped to `0.0..=2.0`). Wins over `--temperature` and the config default; `/agent off` falls back to those. |
 | `description` | One-line summary shown in `/agents`. |
 | `subagent_tools` | Opt this profile's `task(agent=…)` subagent into tools: `readonly` (read-only tool universe), `readwrite` (readonly + write/edit/bash — can edit the repo), or `toolless` (the default one-shot). See *Tooled subagents* below. |
 | `subagent_max_turns` | Cap the tooled subagent's loop (default `25`). |
@@ -155,7 +155,8 @@ Profiles are resolved into subagent routes once at startup. By default
 subagents are **tool-less** (a one-shot query — a profile's
 `deny_tools`/`allow_tools` doesn't apply, since the subagent has no tools),
 and the profile's `reasoning`/`temperature` aren't applied on the subagent
-path — only the model and system prompt are. Routing `/plan` phases to named
+path — only the model and system prompt are (the MAIN loop applies both when
+the profile is activated with `/agent <name>`; see the key table above). Routing `/plan` phases to named
 profiles, and cross-provider client switching, remain follow-ups.
 
 ### Tooled subagents (opt-in)
