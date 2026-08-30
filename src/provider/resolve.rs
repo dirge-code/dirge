@@ -175,6 +175,12 @@ pub(super) enum ModelSwitch {
     Keep,
     /// Rebuild the client against this configured provider alias, then rename.
     Switch(String),
+    /// GH #825: the id named a configured provider ALIAS that pins a `model`.
+    /// Unlike [`ModelSwitch::Switch`], the model the session must land on is
+    /// NOT the id the user typed — the alias name itself is a string no
+    /// endpoint serves — so this carries the alias's pinned model alongside
+    /// the alias, sparing the route layer from re-deriving the pin.
+    SwitchAlias { alias: String, model: String },
     /// The id's family maps to a provider kind with NO configured provider.
     /// Renaming on the active client would send it to the wrong endpoint, so
     /// the caller should warn instead. Carries the human family name.
@@ -188,7 +194,10 @@ pub(super) enum ModelSwitch {
 ///   1. A model explicitly pinned on the active provider, or the active
 ///      provider kind's built-in default, stays on the active client.
 ///   2. An exact pin on another provider's `model` switches to it.
-///   3. Otherwise infer the id's family ([`model_family`]):
+///   3. An id naming a configured provider alias that pins a `model` switches
+///      to that alias's pinned model (GH #825). Ranked below the exact-pin
+///      rules so an alias named like a real model id can't shadow the id.
+///   4. Otherwise infer the id's family ([`model_family`]):
 ///      - unclassifiable, or same kind as the active provider → `Keep` (the
 ///        active client already speaks this family; just rename).
 ///      - a different kind with a configured provider of that kind → switch to
@@ -236,6 +245,31 @@ pub(super) fn resolve_model_switch(
     // user declaring that alias serves this precise id.
     if model.contains('/') && speaks_vendor_prefixed_ids(providers, active) {
         return ModelSwitch::Keep;
+    }
+
+    // GH #825: `/model <provider-alias>` — the id names a configured provider
+    // alias rather than a model. This used to fall through to the family
+    // inference below, come back `Keep`, and rename the session model to the
+    // alias string itself — an id no endpoint serves, so the next turn 400'd.
+    // Resolve it to the alias's pinned model instead. Only an alias that PINS
+    // a model is resolvable this way; one relying on its provider default
+    // falls through unchanged. Placed after the exact-pin and gateway rules
+    // so an alias whose name collides with a real model id never shadows the
+    // id's own pin, and deliberately NOT a whitelist: a non-alias id keeps
+    // today's permissive `Keep`, which is what lets a brand-new model id work
+    // before dirge knows it.
+    if let Some((alias, entry)) = providers
+        .get_key_value(model)
+        .or_else(|| providers.get_key_value(&model.to_ascii_lowercase()))
+        && let Some(pinned) = entry.model.as_deref()
+    {
+        // The active provider's own alias also lands here: the route layer's
+        // already-live guard makes that a rename onto the pinned model with
+        // no client rebuild and no spurious switch note.
+        return ModelSwitch::SwitchAlias {
+            alias: alias.clone(),
+            model: pinned.to_string(),
+        };
     }
 
     let Some(family) = model_family(model) else {
@@ -1308,6 +1342,133 @@ mod resolve_model_switch_tests {
 
         assert_eq!(
             resolve_model_switch(&providers, "opencode", "gpt-oss-120b"),
+            ModelSwitch::Keep,
+        );
+    }
+
+    /// GH #825's shape: tier-style aliases, each pinning a model.
+    fn tiered_providers() -> HashMap<String, ProviderEntry> {
+        HashMap::from([
+            (
+                "low".to_string(),
+                typed_entry("anthropic", Some("claude-haiku-4-5")),
+            ),
+            (
+                "high".to_string(),
+                typed_entry("anthropic", Some("claude-opus-5")),
+            ),
+        ])
+    }
+
+    /// GH #825: `/model low` used to come back `Keep` and rename the session
+    /// model to the alias string itself — an id no endpoint serves. An alias
+    /// that pins a model now resolves to that alias and its pinned model.
+    #[test]
+    fn alias_resolves_to_its_pinned_model() {
+        assert_eq!(
+            resolve_model_switch(&tiered_providers(), "high", "low"),
+            ModelSwitch::SwitchAlias {
+                alias: "low".to_string(),
+                model: "claude-haiku-4-5".to_string(),
+            },
+        );
+    }
+
+    /// Alias lookup follows the same case convention as the rest of this file
+    /// (`get` then `get` on the lowercased name).
+    #[test]
+    fn alias_lookup_is_case_insensitive() {
+        assert_eq!(
+            resolve_model_switch(&tiered_providers(), "high", "LOW"),
+            ModelSwitch::SwitchAlias {
+                alias: "low".to_string(),
+                model: "claude-haiku-4-5".to_string(),
+            },
+        );
+    }
+
+    /// The active provider's own alias resolves to its own pinned model; the
+    /// route layer's already-live guard then makes applying it a no-op (no
+    /// client rebuild, no spurious switch note) — pinned at the route layer.
+    #[test]
+    fn own_alias_resolves_to_the_active_pin() {
+        assert_eq!(
+            resolve_model_switch(&tiered_providers(), "high", "high"),
+            ModelSwitch::SwitchAlias {
+                alias: "high".to_string(),
+                model: "claude-opus-5".to_string(),
+            },
+        );
+    }
+
+    /// An alias with NO pinned model has nothing to resolve to — inventing a
+    /// model string would be guessing. It falls through to the unchanged
+    /// pre-#825 behavior (here: unclassifiable name → keep).
+    #[test]
+    fn alias_without_a_pinned_model_falls_through() {
+        let providers = HashMap::from([
+            ("local".to_string(), typed_entry("ollama", None)),
+            (
+                "high".to_string(),
+                typed_entry("anthropic", Some("claude-opus-5")),
+            ),
+        ]);
+        assert_eq!(
+            resolve_model_switch(&providers, "high", "local"),
+            ModelSwitch::Keep,
+        );
+    }
+
+    /// GH #825 must not narrow the deliberate permissiveness: an id that is
+    /// neither an alias nor classifiable still keeps the active client, which
+    /// is what lets a brand-new model id work before dirge knows it.
+    #[test]
+    fn unknown_non_alias_id_still_keeps_the_active_client() {
+        assert_eq!(
+            resolve_model_switch(&tiered_providers(), "high", "banana"),
+            ModelSwitch::Keep,
+        );
+    }
+
+    /// An alias whose NAME collides with a real model id must not shadow the
+    /// id's own exact pin — the exact-pin rules stay ahead of the alias rule.
+    #[test]
+    fn exact_pin_wins_over_a_same_named_alias() {
+        let providers = HashMap::from([
+            // An alias unluckily named like a model id, pinning something else.
+            ("gpt-5.5".to_string(), typed_entry("glm", Some("glm-5.2"))),
+            // The provider that actually pins the id.
+            (
+                "azure-gpt".to_string(),
+                typed_entry("openai", Some("gpt-5.5")),
+            ),
+            (
+                "high".to_string(),
+                typed_entry("anthropic", Some("claude-opus-5")),
+            ),
+        ]);
+        assert_eq!(
+            resolve_model_switch(&providers, "high", "gpt-5.5"),
+            ModelSwitch::Switch("azure-gpt".to_string()),
+        );
+    }
+
+    /// The active provider's own pinned model stays rule 1 even when an alias
+    /// shares its name — `Keep` wins before the alias rule is reached.
+    #[test]
+    fn active_pin_wins_over_a_same_named_alias() {
+        let providers = HashMap::from([
+            (
+                "claude-opus-5".to_string(),
+                typed_entry("openai", Some("gpt-5.5")),
+            ),
+            (
+                "high".to_string(),
+                typed_entry("anthropic", Some("claude-opus-5")),
+            ),
+        ]);
+        assert_eq!(
+            resolve_model_switch(&providers, "high", "claude-opus-5"),
             ModelSwitch::Keep,
         );
     }
