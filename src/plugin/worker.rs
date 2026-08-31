@@ -2192,20 +2192,38 @@ fn run_command_loop(
 
 /// dirge-eona: `janet_vm` is `__thread` in evil-janet's janet.c (that is
 /// how the plugin and notebook VMs coexist on separate threads), and its
-/// layout is file-local to janet.c so the bindings cannot expose it. Only
-/// the first two fields are needed; `top_dyns` sits at offset 8 in
-/// `struct JanetVM`. Access goes through `janet_local_vm`, which returns
-/// the calling thread's copy of the VM.
+/// layout is file-local to janet.c — `janet.h` only forward-declares
+/// `struct JanetVM`, so bindgen renders it opaque (`_unused: [u8; 0]`) and
+/// the bindings cannot reach a field. Only the first two are needed;
+/// `top_dyns` sits at offset 8, right after the `void *user` slot
+/// (janet.c:172).
+///
+/// That offset is an assumption about a private C layout, and it has to hold
+/// across any `evil-janet` 1.x (`janetrs` depends on `"1"`, so a `cargo
+/// update` can move it). `top_dyns_offset_is_stable` in the plugin test
+/// module pins it, so an upstream field insertion fails a test rather than
+/// silently rooting whatever now sits at offset 8.
 #[cfg(feature = "plugin")]
 #[repr(C)]
 struct JanetVMPrefix {
+    #[allow(dead_code)]
     user: *mut core::ffi::c_void,
     top_dyns: *mut janetrs::lowlevel::JanetTable,
 }
 
+/// The calling thread's `janet_vm.top_dyns` — null until the first
+/// `janet_setdyn` on this thread creates it (janet.c:4657).
+///
+/// Reads through [`JanetVMPrefix`]; see there for the layout assumption.
 #[cfg(feature = "plugin")]
-unsafe extern "C" {
-    fn janet_local_vm() -> *mut JanetVMPrefix;
+pub(super) fn top_dyns_ptr() -> *mut janetrs::lowlevel::JanetTable {
+    // SAFETY: `janet_local_vm` returns `&janet_vm`, this thread's own
+    // thread-local VM, so it is never null once Janet is initialized on the
+    // thread — true for every caller, each of which holds a live
+    // `JanetClient`. The cast reinterprets the bindings' opaque `JanetVM` as
+    // its own leading fields, so reading `top_dyns` touches only bytes
+    // inside the real struct.
+    unsafe { (*(janetrs::lowlevel::janet_local_vm() as *mut JanetVMPrefix)).top_dyns }
 }
 
 /// Point Janet's TOP-LEVEL dyn table at the same `:out`/`:err` buffers the
@@ -2247,9 +2265,17 @@ fn mirror_capture_buffers_into_top_dyns(client: &JanetClient) {
     // collection frees it, and the next no-fiber `janet_dyn` (the stack
     // trace printer's `:err-color` lookup) reads the freed table and
     // segfaults the VM. Root the table itself, not just the buffers in it.
-    unsafe {
-        let top = (*janet_local_vm()).top_dyns;
-        if !top.is_null() {
+    // Janet roots `abstract_registry` the same way, for the same reason
+    // (janet.c:35577) — a VM-struct field is not a GC root on its own.
+    let top = top_dyns_ptr();
+    if !top.is_null() {
+        // SAFETY: `top` is the table `janet_setdyn` just created on this
+        // thread, so it is a live Janet object; `janet_wrap_table` only
+        // tags the pointer. Rooting is permanent by design and cannot leak
+        // past one entry per VM: both callers run once at thread init, and
+        // `top_dyns` is assigned nowhere but `janet_init`/`janet_deinit`
+        // (NULL) and this lazy create, so the root can never go stale.
+        unsafe {
             janetrs::lowlevel::janet_gcroot(janetrs::lowlevel::janet_wrap_table(top));
         }
     }

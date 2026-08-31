@@ -3519,3 +3519,88 @@ fn plugin_worker_uaf_stress() {
     }
     println!("stress completed without crashing: {turns} turns");
 }
+
+/// dirge-eona: pins the `JanetVMPrefix` layout assumption that the fix rests
+/// on. `top_dyns_ptr` reads offset 8 of a struct whose definition is private
+/// to janet.c, and `janetrs` depends on `evil-janet = "1"`, so a `cargo
+/// update` can move the field under us. A wrong offset would not fail the
+/// build — it would hand `janet_gcroot` whatever now lives there, which is
+/// far worse than the crash it replaced. The stress harness above cannot
+/// catch that: it is `#[ignore]`d and needs the user's plugin dir.
+///
+/// This runs in the normal suite instead. It owns a bare VM on its own
+/// thread (no default env, so nothing but this test writes a dyn), and leans
+/// on the fact that no fiber is live here: `janet_setdyn` therefore writes
+/// `top_dyns` (janet.c:4657), which is the same state the worker mirrors in.
+///
+/// The null-before assertion is what discriminates the field: every nearby
+/// `JanetTable *` in `struct JanetVM` behaves differently across these
+/// steps. `abstract_registry` is already non-null after `janet_init`
+/// (janet.c:35577), and `core_env` stays null and never gains entries from
+/// `janet_setdyn`.
+#[cfg(feature = "plugin")]
+#[test]
+fn top_dyns_offset_is_stable() {
+    use janetrs::lowlevel::{janet_equals, janet_setdyn, janet_table, janet_wrap_table};
+
+    let _client = janetrs::client::JanetClient::init().expect("bare VM on a fresh test thread");
+
+    assert!(
+        worker::top_dyns_ptr().is_null(),
+        "top_dyns must start null (janet_init sets it NULL, janet.c:35592); \
+         a non-null read here means offset 8 is no longer top_dyns"
+    );
+
+    // A table, not a number: `janet_wrap_integer` is a macro under some
+    // nanbox configs and is not exported from libjanet, so it does not link.
+    // SAFETY: the VM is initialized on this thread, so `janet_table`
+    // allocates on its heap and `janet_wrap_table` only tags the pointer.
+    // Nothing collects during this test, so the value stays live unrooted.
+    let probe = unsafe { janet_wrap_table(janet_table(0)) };
+    // SAFETY: VM live on this thread and no fiber is running, so
+    // `janet_setdyn` lazily creates `top_dyns` and writes into it.
+    unsafe { janet_setdyn(c"dirge-eona-probe".as_ptr(), probe) };
+
+    let top = worker::top_dyns_ptr();
+    assert!(
+        !top.is_null(),
+        "the first janet_setdyn must create top_dyns"
+    );
+    // SAFETY: `top` is the table janet_setdyn just created; reading `count`
+    // is an in-bounds field read on a live JanetTable.
+    assert_eq!(
+        unsafe { (*top).count },
+        1,
+        "the table at offset 8 must be the one janet_setdyn wrote to"
+    );
+
+    // A second key lands in the SAME table, and the pointer does not move.
+    // SAFETY: as above — VM live on this thread, still no fiber.
+    unsafe { janet_setdyn(c"dirge-eona-probe-2".as_ptr(), probe) };
+    assert_eq!(
+        worker::top_dyns_ptr(),
+        top,
+        "top_dyns is created once, then reused (janet.c:4657)"
+    );
+    // SAFETY: as above.
+    assert_eq!(
+        unsafe { (*top).count },
+        2,
+        "both dyns must be in this table"
+    );
+
+    // And it is the table the public reader consults: with no fiber live,
+    // `janet_dyn` reads `top_dyns` directly (janet.c:4645).
+    // SAFETY: VM live on this thread, and both operands are live Janet
+    // values — `probe` and whatever the dyn lookup returns for its key.
+    assert_eq!(
+        unsafe {
+            janet_equals(
+                janetrs::lowlevel::janet_dyn(c"dirge-eona-probe".as_ptr()),
+                probe,
+            )
+        },
+        1,
+        "janet_dyn must read back what janet_setdyn wrote"
+    );
+}
