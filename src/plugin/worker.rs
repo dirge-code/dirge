@@ -2190,6 +2190,24 @@ fn run_command_loop(
     }
 }
 
+/// dirge-eona: `janet_vm` is `__thread` in evil-janet's janet.c (that is
+/// how the plugin and notebook VMs coexist on separate threads), and its
+/// layout is file-local to janet.c so the bindings cannot expose it. Only
+/// the first two fields are needed; `top_dyns` sits at offset 8 in
+/// `struct JanetVM`. Access goes through `janet_local_vm`, which returns
+/// the calling thread's copy of the VM.
+#[cfg(feature = "plugin")]
+#[repr(C)]
+struct JanetVMPrefix {
+    user: *mut core::ffi::c_void,
+    top_dyns: *mut janetrs::lowlevel::JanetTable,
+}
+
+#[cfg(feature = "plugin")]
+unsafe extern "C" {
+    fn janet_local_vm() -> *mut JanetVMPrefix;
+}
+
 /// Point Janet's TOP-LEVEL dyn table at the same `:out`/`:err` buffers the
 /// harness prelude installed in the root env (dirge-c8lh).
 ///
@@ -2221,6 +2239,18 @@ fn mirror_capture_buffers_into_top_dyns(client: &JanetClient) {
         unsafe {
             janetrs::lowlevel::janet_gcroot(raw);
             janetrs::lowlevel::janet_setdyn(c_name.as_ptr(), raw);
+        }
+    }
+    // dirge-eona: `janet_setdyn` above created `janet_vm.top_dyns` (no
+    // fiber is live here), and Janet's collector never marks that table —
+    // it appears nowhere in the mark phase of janet.c. The first full
+    // collection frees it, and the next no-fiber `janet_dyn` (the stack
+    // trace printer's `:err-color` lookup) reads the freed table and
+    // segfaults the VM. Root the table itself, not just the buffers in it.
+    unsafe {
+        let top = (*janet_local_vm()).top_dyns;
+        if !top.is_null() {
+            janetrs::lowlevel::janet_gcroot(janetrs::lowlevel::janet_wrap_table(top));
         }
     }
 }

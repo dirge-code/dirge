@@ -3420,3 +3420,97 @@ fn call_tool_defaults_missing_args_to_empty_object() {
         Ok("nil".to_string())
     );
 }
+
+// --- dirge-eona stress harness --------------------------------------
+//
+// Not a correctness test — a repro driver for the Janet-heap
+// use-after-free that SIGSEGVs the plugin worker (dirge-eona). It
+// replays the workload that precedes the crash: hook dispatch across a
+// session with a response-capturing plugin loaded, then a slash-command
+// invocation, under explicit GC pressure. Ignored so the normal suite
+// never runs it; drive it explicitly:
+//
+//   cargo test --bin dirge plugin_worker_uaf_stress -- --ignored --nocapture
+//
+// and under lldb for a symbolicated backtrace at the fault.
+//
+// Knobs (env): DIRGE_STRESS_TURNS (default 200),
+// DIRGE_STRESS_UPDATES (25 per turn), DIRGE_STRESS_RESPONSE_BYTES
+// (20000), DIRGE_STRESS_USER_PLUGINS (1 = load ~/.config/dirge/plugins,
+// exactly the crashing session's env).
+#[cfg(feature = "plugin")]
+#[test]
+#[ignore]
+fn plugin_worker_uaf_stress() {
+    fn env_usize(name: &str, default: usize) -> usize {
+        std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    }
+    let turns = env_usize("DIRGE_STRESS_TURNS", 200);
+    let updates = env_usize("DIRGE_STRESS_UPDATES", 25);
+    let response_bytes = env_usize("DIRGE_STRESS_RESPONSE_BYTES", 20_000);
+    let load_user_plugins = std::env::var("DIRGE_STRESS_USER_PLUGINS")
+        .map(|v| v != "0")
+        .unwrap_or(true);
+
+    let mut mgr = PluginManager::try_new().unwrap();
+
+    // The crashing sessions had the user's whole plugin dir loaded
+    // (~38 entries, several of them response-capturing). Reproduce that
+    // env; per-plugin failures are not the point of the harness.
+    if load_user_plugins {
+        if let Ok(home) = std::env::var("HOME") {
+            let dir = std::path::PathBuf::from(home).join(".config/dirge/plugins");
+            if dir.is_dir() {
+                let mut entries: Vec<_> = std::fs::read_dir(&dir)
+                    .unwrap()
+                    .filter_map(|e| e.ok().map(|e| e.path()))
+                    .filter(|p| p.extension().is_some_and(|e| e == "janet") || p.is_dir())
+                    .collect();
+                entries.sort();
+                for path in entries {
+                    let _ = load_plugin(&mut mgr, &path);
+                }
+            }
+        }
+    }
+
+    // Realistic response material: markdown + code fences + quotes +
+    // backslashes + unicode, so the ctx escaper sees the same shape of
+    // text the crashing sessions carried.
+    let unit = "Some **markdown** with `code` and \"quotes\" and \\\\ paths — ünïcødé ✓\n```rust\nfn main() { println!(\"line\"); }\n```\n";
+    let big_response = unit.repeat(response_bytes / unit.len() + 1);
+
+    for turn in 0..turns {
+        mgr.dispatch("on-prompt", "@{:prompt \"stress turn\"}").unwrap();
+        mgr.dispatch("on-turn-start", "@{}").unwrap();
+        for u in 0..updates {
+            let partial_len = turn * 100 + u * 50;
+            let mut pend = partial_len.min(big_response.len());
+            while pend > 0 && !big_response.is_char_boundary(pend) {
+                pend -= 1;
+            }
+            let partial = &big_response[..pend];
+            let ctx = format!(
+                "@{{:index {} :partial \"{}\"}}",
+                u,
+                escape_janet_string(partial)
+            );
+            mgr.dispatch("on-message-update", &ctx).unwrap();
+        }
+        let mut rend = (response_bytes + turn * 10).min(big_response.len());
+        while rend > 0 && !big_response.is_char_boundary(rend) {
+            rend -= 1;
+        }
+        let response = &big_response[..rend];
+        let ctx = format!("@{{:response \"{}\"}}", escape_janet_string(response));
+        mgr.dispatch("on-response", &ctx).unwrap();
+        // Force collection every turn so freed slots get reused — the
+        // dirge-eona window. No-op turns: a normal, collected GC cycle.
+        mgr.eval("(gccollect)").unwrap();
+        let r = mgr.invoke_command("resp-clipboard-handler", "").unwrap();
+        if turn % 50 == 0 {
+            println!("turn {turn}: {:?}", r.map(|s| s.chars().take(60).collect::<String>()));
+        }
+    }
+    println!("stress completed without crashing: {turns} turns");
+}
