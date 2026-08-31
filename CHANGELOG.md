@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.25.3] - 2026-08-31
+
 ### Fixed
 - The agent no longer hard-crashes (SIGSEGV) on the plugin-worker thread,
   taking the whole TUI down with it. `mirror_capture_buffers_into_top_dyns`
@@ -4213,7 +4215,8 @@ agent in Rust with:
   LSP integration, and a Janet plugin system.
 - Session save/load/resume with LLM-summarization compaction.
 
-[Unreleased]: https://github.com/dirge-code/dirge/compare/v0.25.2...HEAD
+[Unreleased]: https://github.com/dirge-code/dirge/compare/v0.25.3...HEAD
+[0.25.3]: https://github.com/dirge-code/dirge/compare/v0.25.2...v0.25.3
 [0.25.2]: https://github.com/dirge-code/dirge/compare/v0.25.1...v0.25.2
 [0.25.1]: https://github.com/dirge-code/dirge/compare/v0.25.0...v0.25.1
 [0.25.0]: https://github.com/dirge-code/dirge/compare/v0.24.1...v0.25.0
