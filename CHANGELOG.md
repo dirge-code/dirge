@@ -6,6 +6,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- The agent no longer hard-crashes (SIGSEGV) on the plugin-worker thread,
+  taking the whole TUI down with it. `mirror_capture_buffers_into_top_dyns`
+  created Janet's top-level dyn table via `janet_setdyn` but rooted only the
+  buffers inside it, and Janet's collector never marks `janet_vm.top_dyns` —
+  the field appears in the dyn read, the lazy create and
+  `janet_init`/`janet_deinit`, and in no mark path at all. The first full
+  collection therefore freed the table, and the next no-fiber `janet_dyn`
+  (the `:err-color` lookup the stack-trace printer does) read freed memory
+  and faulted in `janet_dict_find` — which is why all three crash reports
+  hashed the same key. The table is now rooted itself, the way Janet roots
+  its own `abstract_registry`. It predates 0.24.1 and needed a
+  response-capturing plugin plus GC pressure to show up, so a plugin-heavy
+  session was the one that hit it. (dirge-eona)
+
 ## [0.25.2] - 2026-08-29
 
 ### Fixed
