@@ -3443,7 +3443,10 @@ fn call_tool_defaults_missing_args_to_empty_object() {
 #[ignore]
 fn plugin_worker_uaf_stress() {
     fn env_usize(name: &str, default: usize) -> usize {
-        std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
     }
     let turns = env_usize("DIRGE_STRESS_TURNS", 200);
     let updates = env_usize("DIRGE_STRESS_UPDATES", 25);
@@ -3457,19 +3460,17 @@ fn plugin_worker_uaf_stress() {
     // The crashing sessions had the user's whole plugin dir loaded
     // (~38 entries, several of them response-capturing). Reproduce that
     // env; per-plugin failures are not the point of the harness.
-    if load_user_plugins {
-        if let Ok(home) = std::env::var("HOME") {
-            let dir = std::path::PathBuf::from(home).join(".config/dirge/plugins");
-            if dir.is_dir() {
-                let mut entries: Vec<_> = std::fs::read_dir(&dir)
-                    .unwrap()
-                    .filter_map(|e| e.ok().map(|e| e.path()))
-                    .filter(|p| p.extension().is_some_and(|e| e == "janet") || p.is_dir())
-                    .collect();
-                entries.sort();
-                for path in entries {
-                    let _ = load_plugin(&mut mgr, &path);
-                }
+    if load_user_plugins && let Ok(home) = std::env::var("HOME") {
+        let dir = std::path::PathBuf::from(home).join(".config/dirge/plugins");
+        if dir.is_dir() {
+            let mut entries: Vec<_> = std::fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.extension().is_some_and(|e| e == "janet") || p.is_dir())
+                .collect();
+            entries.sort();
+            for path in entries {
+                let _ = load_plugin(&mut mgr, &path);
             }
         }
     }
@@ -3481,7 +3482,8 @@ fn plugin_worker_uaf_stress() {
     let big_response = unit.repeat(response_bytes / unit.len() + 1);
 
     for turn in 0..turns {
-        mgr.dispatch("on-prompt", "@{:prompt \"stress turn\"}").unwrap();
+        mgr.dispatch("on-prompt", "@{:prompt \"stress turn\"}")
+            .unwrap();
         mgr.dispatch("on-turn-start", "@{}").unwrap();
         for u in 0..updates {
             let partial_len = turn * 100 + u * 50;
@@ -3509,7 +3511,10 @@ fn plugin_worker_uaf_stress() {
         mgr.eval("(gccollect)").unwrap();
         let r = mgr.invoke_command("resp-clipboard-handler", "").unwrap();
         if turn % 50 == 0 {
-            println!("turn {turn}: {:?}", r.map(|s| s.chars().take(60).collect::<String>()));
+            println!(
+                "turn {turn}: {:?}",
+                r.map(|s| s.chars().take(60).collect::<String>())
+            );
         }
     }
     println!("stress completed without crashing: {turns} turns");
