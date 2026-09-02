@@ -1099,6 +1099,21 @@ pub fn build_provider_additional_params(
     // ----- reasoning per provider -----
     if let Some(m) = reasoning_params(provider_name, model_name, opts) {
         additional.extend(m);
+    } else if opts.reasoning == Some(super::types::ThinkingLevel::Off)
+        && let Some(serde_json::Value::Object(m)) =
+            crate::provider::adapter::reasoning_profile(provider_name, model_name).disable_params()
+    {
+        // GH #827: `off` is a level, not an absence. It used to send nothing —
+        // even for the providers that have carried a real disable wire all
+        // along for tool-less one-shots — and on a model that thinks
+        // adaptively when the parameter is missing (Sonnet 5, Opus 5) that
+        // left reasoning fully on.
+        //
+        // Deliberately NOT folded into `reasoning_params`: that function
+        // answers "does this turn REQUEST reasoning", which `turn_reasoning_
+        // enabled` and #816's `max_tokens` fallback both read, and `off` must
+        // stay `false` there.
+        additional.extend(m);
     }
 
     // ----- headers -----
@@ -2657,12 +2672,24 @@ mod tests {
         assert!(v.is_none());
     }
 
-    /// DeepSeek Off → no reasoning_effort key.
+    /// DeepSeek Off → no `reasoning_effort` key. GH #827: it now sends the
+    /// disable toggle instead of nothing at all — DeepSeek has carried that
+    /// shape all along for tool-less one-shots, and omitting the effort string
+    /// only means "provider default", which is not off.
     #[test]
-    fn deepseek_off_omits_reasoning_effort() {
+    fn deepseek_off_disables_rather_than_omitting_everything() {
         let opts = opts_with_reasoning(ThinkingLevel::Off);
-        let v = build_provider_additional_params(Some("deepseek"), None, &opts);
-        assert!(v.is_none());
+        let v = build_provider_additional_params(Some("deepseek"), None, &opts).unwrap();
+        assert!(v.get("reasoning_effort").is_none());
+        assert_eq!(v["thinking"]["type"], "disabled");
+    }
+
+    /// OpenAI has no safe disable knob, so `off` still sends nothing — the
+    /// routing added in #827 only reaches providers that have one.
+    #[test]
+    fn openai_off_still_sends_nothing() {
+        let opts = opts_with_reasoning(ThinkingLevel::Off);
+        assert!(build_provider_additional_params(Some("openai"), None, &opts).is_none());
     }
 
     /// OpenAI with High reasoning still returns the nested
@@ -2709,6 +2736,47 @@ mod tests {
                 .get("thinkingBudget")
                 .is_none(),
             "budget and level must never ship together: {v}",
+        );
+    }
+
+    /// GH #827: `off` is a level, not an absence. It used to send nothing, and
+    /// on a model that thinks adaptively when `thinking` is missing (Sonnet 5,
+    /// Opus 5) that left reasoning fully on — silently, on the one setting
+    /// whose whole purpose is opting out.
+    #[test]
+    fn effort_off_sends_the_providers_disable_wire() {
+        let opts = opts_with_reasoning(ThinkingLevel::Off);
+        let v = build_provider_additional_params(Some("anthropic"), Some("claude-sonnet-5"), &opts)
+            .expect("off must put the disable shape on the wire");
+        assert_eq!(v["thinking"]["type"], "disabled");
+        // Claude 4.6 keeps the omit — there, absence still means off, and the
+        // toggle would be a 400.
+        assert!(
+            build_provider_additional_params(Some("anthropic"), Some("claude-opus-4-6"), &opts)
+                .is_none(),
+        );
+        // GLM has carried this exact shape all along for tool-less one-shots;
+        // `off` simply reaches it now.
+        let glm = build_provider_additional_params(Some("glm"), None, &opts).unwrap();
+        assert_eq!(glm["thinking"]["type"], "disabled");
+    }
+
+    /// ...and `off` is still NOT a reasoning turn. #816's `max_tokens`
+    /// fallback on Anthropic reads `turn_reasoning_enabled`, so folding the
+    /// disable shape into `reasoning_params` would have flipped it true and
+    /// dropped the ceiling rig hard-errors without.
+    #[test]
+    fn effort_off_is_still_not_a_reasoning_turn() {
+        let mut opts = opts_with_reasoning(ThinkingLevel::Off);
+        opts.max_tokens = Some(8192);
+        assert!(!turn_reasoning_enabled(
+            Some("anthropic"),
+            Some("claude-sonnet-5"),
+            &opts
+        ));
+        assert_eq!(
+            request_max_tokens(Some("anthropic"), Some("claude-sonnet-5"), &opts),
+            Some(8192),
         );
     }
 

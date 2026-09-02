@@ -30,6 +30,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   dirge knows. It asserts recognition rather than validity: only the provider
   knows whether an id is servable, and the two come apart for a new-but-valid
   id. Same clause on the ACP `/model` path. (#831)
+- `/effort off` actually disables reasoning. The 0.24.1 changelog promised that
+  `off` is a real level that disables thinking; on current Anthropic models it
+  did not. Anthropic's profile carried `DisableWire::None` — "omit the
+  parameter" — which was a correct disable through Claude 4.6 and stopped being
+  one on the current generation: Sonnet 5 and Opus 5 think adaptively when
+  `thinking` is absent, so a user who explicitly opted out still paid the
+  latency and the reasoning tokens. The wire shape did not change; what omitting
+  it means did. `off` now routes through the provider's disable wire — five
+  providers had carried a real one all along for tool-less one-shots and `off`
+  simply never reached it — and Anthropic's is chosen per model: the documented
+  `{"thinking":{"type":"disabled"}}` on Claude 5, the omit on 4.6 and earlier
+  (where it is still correct and the toggle would be a 400), and nothing plus a
+  one-time note on Fable, whose reasoning is unconditional. The major version is
+  parsed rather than substring-matched, so `claude-haiku-4-5` is not mistaken
+  for a 5. `off` remains "not a reasoning turn" for #816's `max_tokens`
+  fallback. (#827)
 - Reasoning effort now seeds from the provider the session is actually on, and
   Gemini's reasoning payload goes where Gemini can read it. `build_agent`'s
   comment claimed the active provider's `effort`, but `cli.resolution_entry`

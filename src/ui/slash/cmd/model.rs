@@ -262,6 +262,28 @@ pub(crate) async fn cmd_effort(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyhow
         ),
         c_agent(),
     )?;
+    // GH #827: `off` is not deliverable on every model — Fable's reasoning is
+    // unconditional and it rejects the disable toggle outright. Say so where
+    // the level was asked for. Accepting it and quietly ignoring it is the bug
+    // this issue is about, one level down.
+    if level == ThinkingLevel::Off
+        && matches!(
+            crate::provider::adapter::reasoning_profile(
+                Some(ctx.agent.provider_name()),
+                Some(ctx.session.model.as_str()),
+            )
+            .disable,
+            crate::provider::adapter::DisableWire::AnthropicUnconditional,
+        )
+    {
+        ctx.renderer.write_line(
+            &format!(
+                "note: {} always reasons — `off` cannot be honoured on it",
+                ctx.session.model
+            ),
+            c_result(),
+        )?;
+    }
     Ok(())
 }
 
