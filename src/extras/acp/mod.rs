@@ -467,6 +467,7 @@ async fn run_prompt(
         // SessionSearchTool excludes the live session from its
         // own search results.
         Some(session_id.to_string()),
+        Some(provider_str.as_str()),
     )
     .await;
 

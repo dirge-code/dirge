@@ -7,6 +7,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Fixed
+- Reasoning effort now seeds from the provider the session is actually on, and
+  Gemini's reasoning payload goes where Gemini can read it. `build_agent`'s
+  comment claimed the active provider's `effort`, but `cli.resolution_entry`
+  answers for `--provider` else the config `Default` role, and never consults
+  the session — so "active" meant *active at launch*. After a cross-provider
+  `/model` switch the launch provider's level was applied to whatever provider
+  the session had moved to, silently and on every rebuild, and the switched-to
+  provider's own `effort` (or deliberate absence of one) was ignored. The seed
+  now keys on the session's alias, with a lookup mirroring `resolve_role` so a
+  built-in name with no entry reads as "configures no effort" rather than
+  falling through. Separately, the Gemini wire was flat: rig 0.41 claims exactly
+  the key `generationConfig` and flattens everything else into the request body,
+  so a top-level `thinking_config` was never a `generationConfig` field and
+  Gemini answered `Unknown name "thinking_config"`. It is now nested, and
+  model-aware — `thinkingBudget` on Gemini 2.5, `thinkingLevel` on Gemini 3,
+  which takes a depth instead and rejects a request carrying both. Gemini 3 gets
+  no disable knob at all, because Google documents that 3 Pro / Flash /
+  Flash-Lite cannot be fully turned off. (#832)
 - A run that spins on no-op shell commands is now caught by the repeat-loop
   guard. A model that had decided it needed a different tool but kept reaching
   for `bash` anyway issued a long run of `echo "ready"` / `echo done` / `true`

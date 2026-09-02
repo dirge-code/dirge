@@ -1722,6 +1722,7 @@ async fn cerebras_identity_survives_client_model_and_agent_construction() {
         #[cfg(feature = "semantic")]
         None,
         None,
+        None,
     )
     .await;
 
@@ -1787,6 +1788,7 @@ async fn provider_effort_config_seeds_agent_reasoning() {
         #[cfg(feature = "mcp")]
         None,
         #[cfg(feature = "semantic")]
+        None,
         None,
         None,
     )

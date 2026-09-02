@@ -215,13 +215,17 @@ where
     Box::pin(async_stream::stream! {
         // 1. Convert our messages to rig messages.
         let provider: Option<&str> = provider_name.as_ref().as_deref();
+        // GH #832: the reasoning wire is not uniform across a provider's own
+        // generations (Gemini 2.5 and Gemini 3 take mutually exclusive thinking
+        // knobs), so every reasoning decision below is keyed by the model too.
+        let model_id: Option<&str> = model_name.as_ref().as_deref();
         // GH #821: how a stored thinking block replays to THIS request —
         // Anthropic schema-requires the block's original signature (minted
         // per model), everyone else keeps the unsigned echo unchanged.
         let thinking_replay = thinking_replay_for(
             provider,
-            model_name.as_ref().as_deref(),
-            turn_reasoning_enabled(provider, &opts),
+            model_id,
+            turn_reasoning_enabled(provider, model_id, &opts),
         );
         let rig_messages: Vec<Message> = ctx
             .messages
@@ -279,7 +283,7 @@ where
         // additional_params is opaque so it forwards whatever
         // we give it. Computed before the builder moves `system_prompt` /
         // `outgoing_tools` so the wire dump below can read them.
-        let additional = build_provider_additional_params(provider, &opts);
+        let additional = build_provider_additional_params(provider, model_id, &opts);
         // dirge-wire: opt-in dump of the outgoing agent request (turn /
         // escalation / subagent / forked review), so secondary calls are
         // visible alongside the one-shot side-LLM dumps. No-op unless
@@ -298,7 +302,7 @@ where
                 // dirge-vpma.26: NOT `additional.is_some()` — a tool gate or a
                 // metadata map fills that too, and labelled turns with thinking
                 // off as reasoning-enabled.
-                turn_reasoning_enabled(provider, &opts),
+                turn_reasoning_enabled(provider, model_id, &opts),
             );
         }
 
@@ -316,7 +320,7 @@ where
         // ceiling on thinking turns, the resolved `max_tokens` config on
         // non-reasoning Anthropic turns (GH #816). The rules live in
         // `request_max_tokens`.
-        if let Some(max_tokens) = request_max_tokens(provider, &opts) {
+        if let Some(max_tokens) = request_max_tokens(provider, model_id, &opts) {
             builder = builder.max_tokens(max_tokens);
         }
         let request = builder.build();
@@ -1051,8 +1055,12 @@ pub fn loop_tool_to_rig_definition(tool: &dyn LoopTool) -> ToolDefinition {
 ///     to "max"; Minimal/Low → "low", Medium/High → "high".
 ///   - "openrouter": same as openai (openrouter forwards
 ///     OpenAI-shape options to the upstream provider).
-///   - "gemini": `{ "thinking_config": { "thinking_budget":
-///     N } }` (Gemini 2.x). Budget-based, distinct Xhigh/Max budgets.
+///   - "gemini": `{ "generationConfig": { "thinkingConfig": { … } } }` —
+///     `thinkingBudget: N` on Gemini 2.5 (distinct Xhigh/Max budgets),
+///     `thinkingLevel: "low"|"medium"|"high"` on Gemini 3, which takes a depth
+///     rather than a budget and rejects a request carrying both. The nesting
+///     is what rig's Gemini provider reads; a top-level `thinking_config` is
+///     flattened into the request body and rejected outright (GH #832).
 ///   - "ollama": no reasoning config — local models vary; pass
 ///     through generic `reasoning_level` key.
 ///   - None: generic `reasoning_level` key for debugging /
@@ -1069,6 +1077,7 @@ pub fn loop_tool_to_rig_definition(tool: &dyn LoopTool) -> ToolDefinition {
 /// endpoint as body content (dirge-vpma.25).
 pub fn build_provider_additional_params(
     provider_name: Option<&str>,
+    model_name: Option<&str>,
     opts: &super::stream::StreamOptions,
 ) -> Option<serde_json::Value> {
     let mut additional = serde_json::Map::new();
@@ -1088,7 +1097,7 @@ pub fn build_provider_additional_params(
     }
 
     // ----- reasoning per provider -----
-    if let Some(m) = reasoning_params(provider_name, opts) {
+    if let Some(m) = reasoning_params(provider_name, model_name, opts) {
         additional.extend(m);
     }
 
@@ -1143,10 +1152,11 @@ pub fn build_provider_additional_params(
 /// cannot disagree (dirge-vpma.26).
 fn reasoning_params(
     provider_name: Option<&str>,
+    model_name: Option<&str>,
     opts: &super::stream::StreamOptions,
 ) -> Option<serde_json::Map<String, serde_json::Value>> {
     let level = opts.reasoning?;
-    match crate::provider::adapter::reasoning_profile(provider_name)
+    match crate::provider::adapter::reasoning_profile(provider_name, model_name)
         .effort_params(level, opts.thinking_budgets.as_ref())
     {
         Some(serde_json::Value::Object(m)) => Some(m),
@@ -1158,9 +1168,10 @@ fn reasoning_params(
 /// [`reasoning_params`].
 pub fn turn_reasoning_enabled(
     provider_name: Option<&str>,
+    model_name: Option<&str>,
     opts: &super::stream::StreamOptions,
 ) -> bool {
-    reasoning_params(provider_name, opts).is_some()
+    reasoning_params(provider_name, model_name, opts).is_some()
 }
 
 /// The `max_tokens` to pin on this request, or `None` to leave the field
@@ -1184,10 +1195,15 @@ pub fn turn_reasoning_enabled(
 /// providers send no budget, their backends accept an absent `max_tokens`,
 /// and forcing a cap on a reasoning turn there could strangle reasoning
 /// output (OpenAI counts reasoning tokens against the output limit).
-fn request_max_tokens(provider: Option<&str>, opts: &super::stream::StreamOptions) -> Option<u64> {
+fn request_max_tokens(
+    provider: Option<&str>,
+    model: Option<&str>,
+    opts: &super::stream::StreamOptions,
+) -> Option<u64> {
     if let Some(level) = opts.reasoning
         && let Some(ceiling) = crate::provider::adapter::max_tokens_for_reasoning(
             provider,
+            model,
             level,
             opts.thinking_budgets.as_ref(),
         )
@@ -1195,10 +1211,10 @@ fn request_max_tokens(provider: Option<&str>, opts: &super::stream::StreamOption
         return Some(ceiling);
     }
     let anthropic_shaped = matches!(
-        crate::provider::adapter::reasoning_profile(provider).effort,
+        crate::provider::adapter::reasoning_profile(provider, model).effort,
         crate::provider::adapter::EffortWire::AnthropicBudget
     );
-    if anthropic_shaped && !turn_reasoning_enabled(provider, opts) {
+    if anthropic_shaped && !turn_reasoning_enabled(provider, model, opts) {
         return opts.max_tokens;
     }
     None
@@ -2382,7 +2398,7 @@ mod tests {
     fn non_reasoning_anthropic_request_carries_configured_max_tokens() {
         let mut o = StreamOptions::from_signal(AbortSignal::new());
         o.max_tokens = Some(8192);
-        assert_eq!(request_max_tokens(Some("anthropic"), &o), Some(8192));
+        assert_eq!(request_max_tokens(Some("anthropic"), None, &o), Some(8192));
     }
 
     /// `Some(Off)` puts no thinking params on the wire, so it is a
@@ -2391,7 +2407,7 @@ mod tests {
     fn reasoning_off_level_anthropic_request_carries_configured_max_tokens() {
         let mut o = opts_with_reasoning(ThinkingLevel::Off);
         o.max_tokens = Some(8192);
-        assert_eq!(request_max_tokens(Some("anthropic"), &o), Some(8192));
+        assert_eq!(request_max_tokens(Some("anthropic"), None, &o), Some(8192));
     }
 
     /// A reasoning turn keeps the budget ceiling, NOT the configured value:
@@ -2404,11 +2420,15 @@ mod tests {
         o.max_tokens = Some(8192);
         let expected = crate::provider::adapter::max_tokens_for_reasoning(
             Some("anthropic"),
+            None,
             ThinkingLevel::High,
             None,
         )
         .expect("high puts a budget on the wire");
-        assert_eq!(request_max_tokens(Some("anthropic"), &o), Some(expected));
+        assert_eq!(
+            request_max_tokens(Some("anthropic"), None, &o),
+            Some(expected)
+        );
         assert!(
             expected > 8192,
             "the ceiling must clear the configured value for this test to bite",
@@ -2420,7 +2440,7 @@ mod tests {
     #[test]
     fn non_reasoning_anthropic_request_without_config_stays_unset() {
         let o = StreamOptions::from_signal(AbortSignal::new());
-        assert_eq!(request_max_tokens(Some("anthropic"), &o), None);
+        assert_eq!(request_max_tokens(Some("anthropic"), None, &o), None);
     }
 
     /// Effort-string providers never had a cap forced on them and still
@@ -2440,14 +2460,14 @@ mod tests {
             let mut off = StreamOptions::from_signal(AbortSignal::new());
             off.max_tokens = Some(8192);
             assert_eq!(
-                request_max_tokens(Some(provider), &off),
+                request_max_tokens(Some(provider), None, &off),
                 None,
                 "{provider}: non-reasoning turn must stay uncapped",
             );
             let mut on = opts_with_reasoning(ThinkingLevel::High);
             on.max_tokens = Some(8192);
             assert_eq!(
-                request_max_tokens(Some(provider), &on),
+                request_max_tokens(Some(provider), None, &on),
                 None,
                 "{provider}: reasoning turn must stay uncapped",
             );
@@ -2459,7 +2479,7 @@ mod tests {
     #[test]
     fn anthropic_reasoning_maps_to_thinking_budget() {
         let opts = opts_with_reasoning(ThinkingLevel::Medium);
-        let v = build_provider_additional_params(Some("anthropic"), &opts).unwrap();
+        let v = build_provider_additional_params(Some("anthropic"), None, &opts).unwrap();
         assert_eq!(v["thinking"]["type"], "enabled");
         assert_eq!(v["thinking"]["budget_tokens"], 4096);
     }
@@ -2468,7 +2488,7 @@ mod tests {
     #[test]
     fn anthropic_off_omits_thinking_key() {
         let opts = opts_with_reasoning(ThinkingLevel::Off);
-        let v = build_provider_additional_params(Some("anthropic"), &opts);
+        let v = build_provider_additional_params(Some("anthropic"), None, &opts);
         assert!(v.is_none(), "Off should produce empty additional_params");
     }
 
@@ -2480,7 +2500,7 @@ mod tests {
             high: Some(32_000),
             ..Default::default()
         });
-        let v = build_provider_additional_params(Some("anthropic"), &opts).unwrap();
+        let v = build_provider_additional_params(Some("anthropic"), None, &opts).unwrap();
         assert_eq!(v["thinking"]["budget_tokens"], 32_000);
     }
 
@@ -2496,7 +2516,7 @@ mod tests {
             (ThinkingLevel::Max, "max"),
         ] {
             let opts = opts_with_reasoning(level);
-            let v = build_provider_additional_params(Some("openai"), &opts).unwrap();
+            let v = build_provider_additional_params(Some("openai"), None, &opts).unwrap();
             assert_eq!(
                 v["reasoning"]["effort"], expected,
                 "level {level:?} should map to {expected}"
@@ -2517,7 +2537,7 @@ mod tests {
             (ThinkingLevel::Max, "max"),
         ] {
             let opts = opts_with_reasoning(level);
-            let v = build_provider_additional_params(Some("deepseek"), &opts).unwrap();
+            let v = build_provider_additional_params(Some("deepseek"), None, &opts).unwrap();
             assert_eq!(
                 v["reasoning_effort"], expected,
                 "deepseek level {level:?} should map to top-level reasoning_effort={expected}"
@@ -2541,7 +2561,7 @@ mod tests {
             (ThinkingLevel::Max, "high"),
         ] {
             let opts = opts_with_reasoning(level);
-            let params = build_provider_additional_params(Some("cerebras"), &opts)
+            let params = build_provider_additional_params(Some("cerebras"), None, &opts)
                 .expect("Cerebras reasoning should produce request params");
 
             assert_eq!(
@@ -2559,7 +2579,7 @@ mod tests {
     fn cerebras_off_omits_all_reasoning_fields() {
         let opts = opts_with_reasoning(ThinkingLevel::Off);
         assert_eq!(
-            build_provider_additional_params(Some("cerebras"), &opts),
+            build_provider_additional_params(Some("cerebras"), None, &opts),
             None,
         );
     }
@@ -2570,7 +2590,7 @@ mod tests {
     fn openai_compat_providers_share_effort_shape() {
         let opts = opts_with_reasoning(ThinkingLevel::Medium);
         for provider in ["custom", "openrouter"] {
-            let v = build_provider_additional_params(Some(provider), &opts).unwrap();
+            let v = build_provider_additional_params(Some(provider), None, &opts).unwrap();
             assert_eq!(
                 v["reasoning"]["effort"], "medium",
                 "provider {provider} should use effort=medium"
@@ -2587,7 +2607,7 @@ mod tests {
     #[test]
     fn glm_uses_top_level_reasoning_effort_not_nested() {
         let opts = opts_with_reasoning(ThinkingLevel::Medium);
-        let v = build_provider_additional_params(Some("glm"), &opts).unwrap();
+        let v = build_provider_additional_params(Some("glm"), None, &opts).unwrap();
         assert_eq!(
             v["reasoning_effort"], "high",
             "glm Medium should collapse to high"
@@ -2600,7 +2620,7 @@ mod tests {
         // Xhigh and Max both fold up to "max" on the 3-tier GLM wire.
         for level in [ThinkingLevel::Xhigh, ThinkingLevel::Max] {
             let opts = opts_with_reasoning(level);
-            let v = build_provider_additional_params(Some("glm"), &opts).unwrap();
+            let v = build_provider_additional_params(Some("glm"), None, &opts).unwrap();
             assert_eq!(
                 v["reasoning_effort"], "max",
                 "glm {level:?} should map to max"
@@ -2617,15 +2637,15 @@ mod tests {
     #[test]
     fn openai_clamps_unsupported_levels() {
         let opts_min = opts_with_reasoning(ThinkingLevel::Minimal);
-        let v = build_provider_additional_params(Some("openai"), &opts_min).unwrap();
+        let v = build_provider_additional_params(Some("openai"), None, &opts_min).unwrap();
         assert_eq!(v["reasoning"]["effort"], "low");
 
         let opts_x = opts_with_reasoning(ThinkingLevel::Xhigh);
-        let v = build_provider_additional_params(Some("openai"), &opts_x).unwrap();
+        let v = build_provider_additional_params(Some("openai"), None, &opts_x).unwrap();
         assert_eq!(v["reasoning"]["effort"], "xhigh");
 
         let opts_max = opts_with_reasoning(ThinkingLevel::Max);
-        let v = build_provider_additional_params(Some("openai"), &opts_max).unwrap();
+        let v = build_provider_additional_params(Some("openai"), None, &opts_max).unwrap();
         assert_eq!(v["reasoning"]["effort"], "max");
     }
 
@@ -2633,7 +2653,7 @@ mod tests {
     #[test]
     fn openai_off_omits_reasoning_key() {
         let opts = opts_with_reasoning(ThinkingLevel::Off);
-        let v = build_provider_additional_params(Some("openai"), &opts);
+        let v = build_provider_additional_params(Some("openai"), None, &opts);
         assert!(v.is_none());
     }
 
@@ -2641,7 +2661,7 @@ mod tests {
     #[test]
     fn deepseek_off_omits_reasoning_effort() {
         let opts = opts_with_reasoning(ThinkingLevel::Off);
-        let v = build_provider_additional_params(Some("deepseek"), &opts);
+        let v = build_provider_additional_params(Some("deepseek"), None, &opts);
         assert!(v.is_none());
     }
 
@@ -2650,18 +2670,46 @@ mod tests {
     #[test]
     fn openai_high_still_uses_nested_reasoning_effort() {
         let opts = opts_with_reasoning(ThinkingLevel::High);
-        let v = build_provider_additional_params(Some("openai"), &opts).unwrap();
+        let v = build_provider_additional_params(Some("openai"), None, &opts).unwrap();
         assert_eq!(v["reasoning"]["effort"], "high");
         assert!(v.get("reasoning_effort").is_none());
     }
 
-    /// Gemini uses `thinking_config: { thinking_budget }`
-    /// (token-budget shape).
+    /// GH #832: Gemini's thinking config must sit inside `generationConfig`,
+    /// the only key rig's Gemini provider claims. A top-level `thinking_config`
+    /// was flattened into the request body and rejected with `Unknown name
+    /// "thinking_config"`. An unclassifiable id keeps the 2.5 budget wire.
     #[test]
-    fn gemini_reasoning_maps_to_thinking_config() {
+    fn gemini_reasoning_nests_under_generation_config() {
         let opts = opts_with_reasoning(ThinkingLevel::High);
-        let v = build_provider_additional_params(Some("gemini"), &opts).unwrap();
-        assert_eq!(v["thinking_config"]["thinking_budget"], 16384);
+        let v = build_provider_additional_params(Some("gemini"), None, &opts).unwrap();
+        assert_eq!(
+            v["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            16384
+        );
+        assert!(
+            v.get("thinking_config").is_none(),
+            "the rejected shape: {v}"
+        );
+    }
+
+    /// GH #832: and a Gemini 3 id takes the depth knob instead — the two are
+    /// mutually exclusive on the wire.
+    #[test]
+    fn gemini_3_reasoning_sends_a_thinking_level() {
+        let opts = opts_with_reasoning(ThinkingLevel::High);
+        let v = build_provider_additional_params(Some("gemini"), Some("gemini-3.6-flash"), &opts)
+            .unwrap();
+        assert_eq!(
+            v["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "high"
+        );
+        assert!(
+            v["generationConfig"]["thinkingConfig"]
+                .get("thinkingBudget")
+                .is_none(),
+            "budget and level must never ship together: {v}",
+        );
     }
 
     /// Metadata passes through under its conventional key regardless of
@@ -2672,7 +2720,7 @@ mod tests {
         opts.metadata
             .insert("user_id".to_string(), serde_json::json!("u-42"));
         for provider in ["anthropic", "openai", "gemini", "ollama", "unknown"] {
-            let v = build_provider_additional_params(Some(provider), &opts).unwrap();
+            let v = build_provider_additional_params(Some(provider), None, &opts).unwrap();
             assert_eq!(v["metadata"]["user_id"], "u-42", "provider {provider}");
         }
     }
@@ -2701,14 +2749,15 @@ mod tests {
 
         // Nothing else is set, so the whole params object must be absent.
         assert!(
-            build_provider_additional_params(Some("openai"), &opts).is_none(),
+            build_provider_additional_params(Some("openai"), None, &opts).is_none(),
             "api_key/headers must contribute nothing to the request body"
         );
 
         // And they must not ride along beside something that IS legitimate.
         opts.metadata
             .insert("user_id".to_string(), serde_json::json!("u-42"));
-        let v = build_provider_additional_params(Some("openai"), &opts).expect("metadata present");
+        let v = build_provider_additional_params(Some("openai"), None, &opts)
+            .expect("metadata present");
         let body = serde_json::to_string(&v).expect("serializable");
         assert!(body.contains("u-42"), "metadata should still pass: {body}");
         for leaked in [
@@ -2728,7 +2777,9 @@ mod tests {
     fn chatgpt_provider_auth_does_not_add_account_header_to_body() {
         let opts = StreamOptions::from_signal(AbortSignal::new());
 
-        assert!(build_provider_additional_params(Some("openai-chatgpt-test"), &opts).is_none());
+        assert!(
+            build_provider_additional_params(Some("openai-chatgpt-test"), None, &opts).is_none()
+        );
     }
 
     /// No reasoning, no headers, no metadata → None (caller
@@ -2736,8 +2787,8 @@ mod tests {
     #[test]
     fn empty_options_produces_none() {
         let opts = StreamOptions::from_signal(AbortSignal::new());
-        assert!(build_provider_additional_params(Some("anthropic"), &opts).is_none());
-        assert!(build_provider_additional_params(None, &opts).is_none());
+        assert!(build_provider_additional_params(Some("anthropic"), None, &opts).is_none());
+        assert!(build_provider_additional_params(None, None, &opts).is_none());
     }
 
     /// Unknown provider falls back to the generic
@@ -2746,7 +2797,7 @@ mod tests {
     #[test]
     fn unknown_provider_uses_generic_key() {
         let opts = opts_with_reasoning(ThinkingLevel::High);
-        let v = build_provider_additional_params(Some("future-provider"), &opts).unwrap();
+        let v = build_provider_additional_params(Some("future-provider"), None, &opts).unwrap();
         assert!(v.get("reasoning_level").is_some());
         assert!(v.get("reasoning").is_none());
         assert!(v.get("thinking").is_none());
@@ -3051,7 +3102,7 @@ mod tool_choice_tests {
     #[test]
     fn forbidding_tools_reaches_the_request_body() {
         let params =
-            build_provider_additional_params(Some("openai"), &opts(Some(ToolChoice::None)))
+            build_provider_additional_params(Some("openai"), None, &opts(Some(ToolChoice::None)))
                 .expect("params");
         assert_eq!(
             params.get("tool_choice").and_then(|v| v.as_str()),
@@ -3073,7 +3124,7 @@ mod tool_choice_tests {
         o.headers
             .insert("X-Custom".to_string(), "value".to_string());
 
-        let params = build_provider_additional_params(Some("openai"), &o);
+        let params = build_provider_additional_params(Some("openai"), None, &o);
 
         // Nothing at all is the expected shape here: `headers` was the only
         // thing these two knobs contributed.
@@ -3100,7 +3151,7 @@ mod tool_choice_tests {
     #[test]
     fn the_builder_still_emits_real_params() {
         let params =
-            build_provider_additional_params(Some("openai"), &opts(Some(ToolChoice::None)))
+            build_provider_additional_params(Some("openai"), None, &opts(Some(ToolChoice::None)))
                 .expect("tool_choice must still be emitted");
         assert!(params.get("tool_choice").is_some());
     }
@@ -3117,11 +3168,11 @@ mod tool_choice_tests {
     fn a_turn_carrying_only_a_tool_gate_is_not_a_reasoning_turn() {
         let opts = opts(Some(ToolChoice::None));
         assert!(
-            build_provider_additional_params(Some("openai"), &opts).is_some(),
+            build_provider_additional_params(Some("openai"), None, &opts).is_some(),
             "precondition: the gate alone fills additional_params"
         );
         assert!(
-            !turn_reasoning_enabled(Some("openai"), &opts),
+            !turn_reasoning_enabled(Some("openai"), None, &opts),
             "a tool gate was reported as reasoning"
         );
     }
@@ -3133,10 +3184,10 @@ mod tool_choice_tests {
         let mut o = opts(None);
         o.reasoning = Some(crate::agent::agent_loop::types::ThinkingLevel::High);
         assert!(
-            turn_reasoning_enabled(Some("deepseek"), &o),
+            turn_reasoning_enabled(Some("deepseek"), None, &o),
             "a thinking turn was not reported as reasoning"
         );
-        let params = build_provider_additional_params(Some("deepseek"), &o)
+        let params = build_provider_additional_params(Some("deepseek"), None, &o)
             .expect("reasoning params must reach the body");
         assert!(
             params.get("reasoning_effort").is_some(),
@@ -3151,7 +3202,7 @@ mod tool_choice_tests {
     /// This is also why there is no `ToolChoice::Auto` to send.
     #[test]
     fn an_unconstrained_turn_sends_nothing() {
-        let params = build_provider_additional_params(Some("openai"), &opts(None));
+        let params = build_provider_additional_params(Some("openai"), None, &opts(None));
         let has_key = params.as_ref().and_then(|p| p.get("tool_choice")).is_some();
         assert!(
             !has_key,
@@ -3171,9 +3222,12 @@ mod tool_choice_tests {
             "openrouter",
             "custom",
         ] {
-            let params =
-                build_provider_additional_params(Some(provider), &opts(Some(ToolChoice::None)))
-                    .unwrap_or_else(|| panic!("{provider} produced no params"));
+            let params = build_provider_additional_params(
+                Some(provider),
+                None,
+                &opts(Some(ToolChoice::None)),
+            )
+            .unwrap_or_else(|| panic!("{provider} produced no params"));
             assert_eq!(
                 params.get("tool_choice").and_then(|v| v.as_str()),
                 Some("none"),
