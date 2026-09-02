@@ -227,10 +227,23 @@ where
             model_id,
             turn_reasoning_enabled(provider, model_id, &opts),
         );
+        // GH #833: decided over the WHOLE history first, because a tool call
+        // that cannot be replayed takes its paired result with it — a decision
+        // no per-message pass can make.
+        let tool_call_replay = tool_call_replay_for(provider, model_name.as_ref().as_deref());
+        let dropped_tool_calls = unreplayable_tool_calls(&ctx.messages, tool_call_replay);
+        if !dropped_tool_calls.is_empty() {
+            tracing::warn!(
+                target: "dirge::provider",
+                model = %model_name.as_ref().as_deref().unwrap_or("default"),
+                pairs = dropped_tool_calls.len(),
+                "dropping tool calls (with their results) that carry no signature this model can replay",
+            );
+        }
         let rig_messages: Vec<Message> = ctx
             .messages
             .iter()
-            .filter_map(|message| value_to_rig_message_with_thinking_replay(message, provider, thinking_replay, ctx.asset_dir.as_deref()))
+            .filter_map(|message| value_to_rig_message_with_replay(message, provider, thinking_replay, tool_call_replay, &dropped_tool_calls, ctx.asset_dir.as_deref()))
             .collect();
 
         // 2. Split: last is prompt; rest is chat_history.
@@ -357,7 +370,7 @@ where
                     // from. Stamp it here — the one place that knows — so
                     // the replay path can tell a same-model echo (attach)
                     // from a cross-model one (drop).
-                    let evt = stamp_thinking_signature_model(evt, model_name.as_ref().as_deref());
+                    let evt = stamp_signature_models(evt, model_name.as_ref().as_deref());
                     yield evt;
                 }
             }
@@ -644,7 +657,7 @@ pub(crate) const EMPTY_TOOL_RESULT_PLACEHOLDER: &str = "(no output)";
 /// Legacy 2-knob entry point, kept so the existing tests (and
 /// `value_to_rig_message`) stay untouched: replays thinking blocks the way
 /// every provider other than Anthropic gets them — unsigned. Production goes
-/// through `value_to_rig_message_with_thinking_replay`, which the factory
+/// through `value_to_rig_message_with_replay`, which the factory
 /// calls with the request's model + reasoning state (GH #821).
 #[cfg(test)]
 fn value_to_rig_message_for_provider(
@@ -652,18 +665,22 @@ fn value_to_rig_message_for_provider(
     provider_name: Option<&str>,
     asset_dir: Option<&std::path::Path>,
 ) -> Option<Message> {
-    value_to_rig_message_with_thinking_replay(
+    value_to_rig_message_with_replay(
         value,
         provider_name,
         thinking_replay_for(provider_name, None, false),
+        tool_call_replay_for(provider_name, None),
+        &std::collections::HashSet::new(),
         asset_dir,
     )
 }
 
-fn value_to_rig_message_with_thinking_replay(
+fn value_to_rig_message_with_replay(
     value: &Value,
     provider_name: Option<&str>,
     thinking_replay: ThinkingReplay<'_>,
+    tool_call_replay: ToolCallReplay<'_>,
+    dropped_tool_calls: &std::collections::HashSet<String>,
     asset_dir: Option<&std::path::Path>,
 ) -> Option<Message> {
     let role = value.get("role").and_then(|r| r.as_str())?;
@@ -719,6 +736,7 @@ fn value_to_rig_message_with_thinking_replay(
                         include_reasoning,
                         synthesize_call_id,
                         thinking_replay,
+                        tool_call_replay,
                     )
                 })
                 .collect();
@@ -736,6 +754,12 @@ fn value_to_rig_message_with_thinking_replay(
                 .get("toolCallId")
                 .or_else(|| value.get("tool_call_id"))
                 .and_then(|c| c.as_str())?;
+            // GH #833: the call this result belongs to could not be replayed,
+            // so the result goes with it. Keeping it alone would orphan it —
+            // every backend rejects a result with no matching call.
+            if dropped_tool_calls.contains(tool_call_id) {
+                return None;
+            }
             // Content may be a plain string (legacy `tool` shape)
             // or an array of content blocks (loop `toolResult` shape).
             let text = value
@@ -876,13 +900,113 @@ fn thinking_replay_for<'a>(
     }
 }
 
+/// GH #833: how a stored tool call replays to the current request.
+///
+/// Gemini mints a `thought_signature` on every `functionCall` part and rejects
+/// a replayed call that lacks one ("Function call is missing a
+/// thought_signature in functionCall parts"), so for that backend the choice is
+/// attach-or-drop. A signature is only valid for the model that minted it, so
+/// attaching is gated on the recorded `signatureModel` matching the request's
+/// model — the same gate #821 built for thinking blocks, which stops being a
+/// single-provider guard here and becomes the cross-provider one it was for.
+///
+/// Every other provider keeps today's unsigned replay, byte-identical on the
+/// wire.
+#[derive(Clone, Copy)]
+enum ToolCallReplay<'a> {
+    /// Replay with no signature — the pre-#833 behavior, unchanged for every
+    /// provider that does not sign tool calls.
+    Unsigned,
+    /// Gemini: attach the stored signature when it was minted by `model`;
+    /// otherwise the call cannot be replayed at all.
+    SignedOrDrop { model: Option<&'a str> },
+}
+
+/// Pick the [`ToolCallReplay`] policy for one request.
+fn tool_call_replay_for<'a>(
+    provider_name: Option<&str>,
+    model: Option<&'a str>,
+) -> ToolCallReplay<'a> {
+    if matches!(provider_name, Some(provider) if provider.eq_ignore_ascii_case("gemini")) {
+        ToolCallReplay::SignedOrDrop { model }
+    } else {
+        ToolCallReplay::Unsigned
+    }
+}
+
+/// The signature a stored `toolCall` block replays with, or `None` when it
+/// cannot be replayed to this request at all.
+///
+/// `Some(None)` and `None` are different answers: the first is "replay it,
+/// unsigned", the second is "this call has to go".
+fn tool_call_replay_signature(
+    obj: &serde_json::Map<String, Value>,
+    replay: ToolCallReplay<'_>,
+) -> Option<Option<String>> {
+    match replay {
+        ToolCallReplay::Unsigned => Some(None),
+        ToolCallReplay::SignedOrDrop { model } => {
+            let signature = obj.get("signature").and_then(|s| s.as_str());
+            let minted_by = obj.get("signatureModel").and_then(|s| s.as_str());
+            match (signature, minted_by, model) {
+                (Some(signature), Some(minted_by), Some(current)) if minted_by == current => {
+                    Some(Some(signature.to_string()))
+                }
+                // No signature (a session saved before #833, or a provider that
+                // mints none), a foreign model's signature, or no model id to
+                // compare against. Sending it unsigned is the 400 this fixes.
+                _ => None,
+            }
+        }
+    }
+}
+
+/// GH #833: the ids of tool calls this request cannot replay.
+///
+/// A tool call cannot be dropped on its own — its paired `tool_result` would be
+/// orphaned, which Anthropic and OpenAI reject outright and which leaves the
+/// conversation malformed for Gemini too — so the pair goes together. That
+/// costs one step of history, against a turn that otherwise cannot be sent at
+/// all. Callers use the set to drop both halves in the same pass.
+fn unreplayable_tool_calls(
+    messages: &[Value],
+    replay: ToolCallReplay<'_>,
+) -> std::collections::HashSet<String> {
+    let mut dropped = std::collections::HashSet::new();
+    if matches!(replay, ToolCallReplay::Unsigned) {
+        return dropped;
+    }
+    for message in messages {
+        if message.get("role").and_then(|r| r.as_str()) != Some("assistant") {
+            continue;
+        }
+        let Some(blocks) = message.get("content").and_then(|c| c.as_array()) else {
+            continue;
+        };
+        for block in blocks {
+            let Some(obj) = block.as_object() else {
+                continue;
+            };
+            if obj.get("type").and_then(|t| t.as_str()) != Some("toolCall") {
+                continue;
+            }
+            if tool_call_replay_signature(obj, replay).is_none()
+                && let Some(id) = obj.get("id").and_then(|i| i.as_str())
+            {
+                dropped.insert(id.to_string());
+            }
+        }
+    }
+    dropped
+}
+
 /// GH #821: record which model minted each captured thinking-block
 /// signature. The capture layer (`rig_stream`) sees only the provider's
 /// stream, not the model identity, so the factory — which knows the model
 /// it was built for — stamps it on every event it forwards. Only blocks
 /// that carry a signature and haven't been stamped yet are touched, so
 /// everything else in the message is byte-identical.
-fn stamp_thinking_signature_model(mut evt: StreamEvent, model_name: Option<&str>) -> StreamEvent {
+fn stamp_signature_models(mut evt: StreamEvent, model_name: Option<&str>) -> StreamEvent {
     let Some(model) = model_name else {
         return evt;
     };
@@ -892,11 +1016,23 @@ fn stamp_thinking_signature_model(mut evt: StreamEvent, model_name: Option<&str>
         StreamEvent::Error { .. } | StreamEvent::Retry { .. } => return evt,
     };
     for block in &mut message.content {
-        if let ContentBlock::Thinking {
-            signature,
-            signature_model,
-            ..
-        } = block
+        // GH #833: tool calls carry a signature too (Gemini's
+        // `thought_signature`), and it needs the same stamp for the same
+        // reason — a signature is only valid for the model that minted it.
+        let stamp = match block {
+            ContentBlock::Thinking {
+                signature,
+                signature_model,
+                ..
+            }
+            | ContentBlock::ToolCall {
+                signature,
+                signature_model,
+                ..
+            } => Some((signature, signature_model)),
+            _ => None,
+        };
+        if let Some((signature, signature_model)) = stamp
             && signature.is_some()
             && signature_model.is_none()
         {
@@ -913,6 +1049,7 @@ fn value_to_assistant_content(
     include_reasoning: bool,
     synthesize_call_id: bool,
     thinking_replay: ThinkingReplay<'_>,
+    tool_call_replay: ToolCallReplay<'_>,
 ) -> Option<AssistantContent> {
     let obj = block.as_object()?;
     let kind = obj.get("type").and_then(|t| t.as_str())?;
@@ -973,11 +1110,17 @@ fn value_to_assistant_content(
             let id = obj.get("id").and_then(|t| t.as_str())?.to_string();
             let name = obj.get("name").and_then(|t| t.as_str())?.to_string();
             let arguments = obj.get("arguments").cloned().unwrap_or(Value::Null);
+            // GH #833: rig sends this straight back out as the `functionCall`
+            // part's `thought_signature`, which Gemini requires. `None` from
+            // the helper means the call cannot be replayed to this model at
+            // all; the caller has already put its id in the drop set, so its
+            // paired result goes too and the conversation stays well-formed.
+            let signature = tool_call_replay_signature(obj, tool_call_replay)?;
             Some(AssistantContent::ToolCall(ToolCall {
                 call_id: synthesize_call_id.then(|| id.clone()),
                 id,
                 function: ToolFunction { name, arguments },
-                signature: None,
+                signature,
                 additional_params: None,
             }))
         }
@@ -1628,6 +1771,130 @@ mod tests {
         }
     }
 
+    /// GH #833: an assistant turn carrying one tool call, and the result it
+    /// is paired with. `signature_model` is what the factory stamps at
+    /// capture; `None` reproduces a block that was never stamped.
+    fn tool_call_history(signature: Option<&str>, signature_model: Option<&str>) -> Vec<Value> {
+        let mut call = serde_json::json!({
+            "type": "toolCall",
+            "id": "call-1",
+            "name": "grep",
+            "arguments": {"pattern": "x"},
+        });
+        if let Some(signature) = signature {
+            call["signature"] = serde_json::json!(signature);
+        }
+        if let Some(model) = signature_model {
+            call["signatureModel"] = serde_json::json!(model);
+        }
+        vec![
+            serde_json::json!({"role": "user", "content": "find x"}),
+            serde_json::json!({"role": "assistant", "content": [call]}),
+            serde_json::json!({"role": "toolResult", "toolCallId": "call-1", "content": "found"}),
+        ]
+    }
+
+    fn tool_call_signature(msg: &Message) -> Option<Option<String>> {
+        match msg {
+            Message::Assistant { content, .. } => content.iter().find_map(|c| match c {
+                AssistantContent::ToolCall(call) => Some(call.signature.clone()),
+                _ => None,
+            }),
+            _ => None,
+        }
+    }
+
+    fn convert_all(
+        history: &[Value],
+        provider: Option<&str>,
+        replay: ToolCallReplay<'_>,
+        dropped: &std::collections::HashSet<String>,
+    ) -> Vec<Message> {
+        history
+            .iter()
+            .filter_map(|m| {
+                value_to_rig_message_with_replay(
+                    m,
+                    provider,
+                    ThinkingReplay::Unsigned,
+                    replay,
+                    dropped,
+                    None,
+                )
+            })
+            .collect()
+    }
+
+    /// GH #833: Gemini requires a `thought_signature` on every `functionCall`
+    /// part and rejects a replayed call without one, so the model that minted
+    /// it must get it back verbatim. rig sends it straight out again as the
+    /// part's `thought_signature`.
+    #[test]
+    fn gemini_same_model_replay_attaches_the_tool_call_signature() {
+        let history = tool_call_history(Some("thought-sig-833"), Some("gemini-3.6-flash"));
+        let replay = tool_call_replay_for(Some("gemini"), Some("gemini-3.6-flash"));
+        let dropped = unreplayable_tool_calls(&history, replay);
+        assert!(dropped.is_empty(), "a same-model signature is replayable");
+        let converted = convert_all(&history, Some("gemini"), replay, &dropped);
+        assert_eq!(converted.len(), 3, "nothing is dropped");
+        assert_eq!(
+            tool_call_signature(&converted[1]),
+            Some(Some("thought-sig-833".to_string())),
+        );
+    }
+
+    /// GH #833: with no usable signature the call cannot go out — and it
+    /// cannot go alone either, because its paired result would be orphaned,
+    /// which every backend rejects. The pair is dropped together: one lost
+    /// step of history against a turn that could not be sent at all.
+    #[test]
+    fn an_unreplayable_gemini_tool_call_takes_its_result_with_it() {
+        let cases = [
+            (
+                tool_call_history(Some("thought-sig-833"), Some("gemini-2.5-flash")),
+                "a signature minted by a different model",
+            ),
+            (
+                tool_call_history(Some("thought-sig-833"), None),
+                "a signature that was never stamped",
+            ),
+            (
+                tool_call_history(None, None),
+                "no signature at all — a session saved before #833",
+            ),
+        ];
+        for (history, why) in cases {
+            let replay = tool_call_replay_for(Some("gemini"), Some("gemini-3.6-flash"));
+            let dropped = unreplayable_tool_calls(&history, replay);
+            assert_eq!(dropped.len(), 1, "{why}");
+            let converted = convert_all(&history, Some("gemini"), replay, &dropped);
+            assert_eq!(
+                converted.len(),
+                1,
+                "only the user turn survives ({why}); an orphaned result is not an option",
+            );
+        }
+    }
+
+    /// GH #833: every other provider keeps today's unsigned replay,
+    /// byte-identical on the wire — and never drops anything.
+    #[test]
+    fn non_gemini_tool_calls_replay_unsigned_and_are_never_dropped() {
+        let history = tool_call_history(None, None);
+        for provider in [Some("anthropic"), Some("openai"), Some("glm"), None] {
+            let replay = tool_call_replay_for(provider, Some("some-model"));
+            let dropped = unreplayable_tool_calls(&history, replay);
+            assert!(dropped.is_empty(), "{provider:?}");
+            let converted = convert_all(&history, provider, replay, &dropped);
+            assert_eq!(converted.len(), 3, "{provider:?}");
+            assert_eq!(
+                tool_call_signature(&converted[1]),
+                Some(None),
+                "{provider:?}"
+            );
+        }
+    }
+
     /// GH #821: replaying a signed thinking block to Anthropic with the
     /// SAME model that minted the signature (reasoning on) must attach
     /// the signature verbatim — Anthropic schema-rejects the block
@@ -1636,8 +1903,15 @@ mod tests {
     fn anthropic_same_model_replay_attaches_the_signature() {
         let v = signed_thinking_assistant();
         let replay = thinking_replay_for(Some("anthropic"), Some("claude-opus-4-6"), true);
-        let msg = value_to_rig_message_with_thinking_replay(&v, Some("anthropic"), replay, None)
-            .expect("must convert");
+        let msg = value_to_rig_message_with_replay(
+            &v,
+            Some("anthropic"),
+            replay,
+            ToolCallReplay::Unsigned,
+            &Default::default(),
+            None,
+        )
+        .expect("must convert");
         assert_eq!(
             reasoning_signature(&msg),
             Some(Some("sig-821".to_string())),
@@ -1684,8 +1958,15 @@ mod tests {
             ),
         ];
         for (v, replay, case) in cases {
-            let msg = value_to_rig_message_with_thinking_replay(v, Some("anthropic"), replay, None)
-                .unwrap_or_else(|| panic!("{case}: message with text must survive"));
+            let msg = value_to_rig_message_with_replay(
+                v,
+                Some("anthropic"),
+                replay,
+                ToolCallReplay::Unsigned,
+                &Default::default(),
+                None,
+            )
+            .unwrap_or_else(|| panic!("{case}: message with text must survive"));
             match msg {
                 Message::Assistant { content, .. } => {
                     assert!(
@@ -1715,8 +1996,15 @@ mod tests {
         for provider in [Some("cerebras"), Some("deepseek"), Some("custom"), None] {
             let replay = thinking_replay_for(provider, Some("claude-opus-4-6"), true);
             assert!(matches!(replay, ThinkingReplay::Unsigned));
-            let msg = value_to_rig_message_with_thinking_replay(&v, provider, replay, None)
-                .unwrap_or_else(|| panic!("{provider:?} must keep the message"));
+            let msg = value_to_rig_message_with_replay(
+                &v,
+                provider,
+                replay,
+                ToolCallReplay::Unsigned,
+                &Default::default(),
+                None,
+            )
+            .unwrap_or_else(|| panic!("{provider:?} must keep the message"));
             assert_eq!(
                 reasoning_signature(&msg),
                 Some(None),
@@ -1759,7 +2047,7 @@ mod tests {
             message,
             usage: None,
         };
-        let stamped = stamp_thinking_signature_model(evt, Some("claude-opus-4-6"));
+        let stamped = stamp_signature_models(evt, Some("claude-opus-4-6"));
         let StreamEvent::Done { message, .. } = stamped else {
             panic!("expected Done back");
         };

@@ -521,6 +521,15 @@ where
                         id: tool_call.id.clone(),
                         name: tool_call.function.name.clone(),
                         arguments: tool_call.function.arguments.clone(),
+                        // GH #833: rig hands us Gemini's `thought_signature`
+                        // here and sends it back out as one on replay. This
+                        // used to be discarded, which is the whole bug: the
+                        // replayed call had no signature and Gemini rejected
+                        // the turn. The minting model is stamped by the
+                        // factory, which knows it; this layer sees only the
+                        // stream.
+                        signature: tool_call.signature.clone(),
+                        signature_model: None,
                     };
                     let was_existing =
                         tool_indices.contains_key(&internal_call_id);
@@ -574,6 +583,11 @@ where
                             id: id.clone(),
                             name: String::new(),
                             arguments: serde_json::Value::String(String::new()),
+                            // Deltas carry no signature; the authoritative
+                            // `Complete` event that closes the call replaces
+                            // this block wholesale and brings one with it.
+                            signature: None,
+                            signature_model: None,
                         });
                         tool_indices.insert(internal_call_id.clone(), i);
                         // Phase-1 #4: mark this call open so the
@@ -590,6 +604,7 @@ where
                         id: existing_id,
                         name,
                         arguments,
+                        ..
                     }) = partial.content.get_mut(idx)
                     {
                         apply_tool_call_delta(existing_id, name, arguments, &id, content);
@@ -885,6 +900,7 @@ mod tests {
                     id,
                     name,
                     arguments,
+                    ..
                 } = &message.content[0]
                 {
                     assert_eq!(id, "call_1");
@@ -936,6 +952,7 @@ mod tests {
                     id,
                     name,
                     arguments,
+                    ..
                 } = &message.content[0]
                 {
                     assert_eq!(id, "call_2");
@@ -1105,6 +1122,7 @@ mod tests {
             id,
             name,
             arguments,
+            ..
         } = &final_msg.content[0]
         {
             assert_eq!(id, "call_x");
@@ -1844,6 +1862,7 @@ mod tests {
                     id,
                     name,
                     arguments,
+                    ..
                 } => Some(crate::agent::agent_loop::tools::ToolCall {
                     id: id.clone(),
                     name: name.clone(),

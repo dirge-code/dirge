@@ -1670,6 +1670,8 @@ fn tool_use_response(id: &str, name: &str, args: Value) -> AssistantMessage {
             id: id.to_string(),
             name: name.to_string(),
             arguments: args,
+            signature: None,
+            signature_model: None,
         }],
         StopReason::ToolUse,
     )
@@ -3029,6 +3031,8 @@ fn build_critic_transcript_pins_the_exact_critic_facing_format() {
                     id: "c1".to_string(),
                     name: "read".to_string(),
                     arguments: serde_json::json!({"path": "/x"}),
+                    signature: None,
+                    signature_model: None,
                 },
             ],
             StopReason::Stop,
@@ -3239,6 +3243,8 @@ fn scavenge_source_skips_non_text_blocks() {
             id: "call_1".to_string(),
             name: "noop".to_string(),
             arguments: serde_json::json!({}),
+            signature: None,
+            signature_model: None,
         },
     ];
     let source = super::build_scavenge_source(&blocks);
@@ -3400,16 +3406,22 @@ async fn dirge_7bwx_end_to_end_storm_dedupes_after_truncation_repair() {
                 id: "tool-1".to_string(),
                 name: "echo".to_string(),
                 arguments: truncated(r#"{"v":1"#), // tight
+                signature: None,
+                signature_model: None,
             },
             ContentBlock::ToolCall {
                 id: "tool-2".to_string(),
                 name: "echo".to_string(),
                 arguments: truncated(r#"{"v": 1"#), // single space
+                signature: None,
+                signature_model: None,
             },
             ContentBlock::ToolCall {
                 id: "tool-3".to_string(),
                 name: "echo".to_string(),
                 arguments: truncated(r#"{"v":  1"#), // double space
+                signature: None,
+                signature_model: None,
             },
         ],
         StopReason::ToolUse,
@@ -3484,6 +3496,8 @@ async fn storm_terminal_emits_failure_narrative() {
                 id: format!("call-{i}"),
                 name: "echo".to_string(),
                 arguments: serde_json::json!({"v": 1}),
+                signature: None,
+                signature_model: None,
             }],
             StopReason::ToolUse,
         )
@@ -3780,6 +3794,8 @@ async fn native_call_invalid_args_still_errors() {
             id: "call_native_1".to_string(),
             name: "typed_path_tool".to_string(),
             arguments: serde_json::json!({"wrong_param": 1}),
+            signature: None,
+            signature_model: None,
         }],
         StopReason::ToolUse,
     );
@@ -6898,6 +6914,8 @@ fn assistant_calling(tool: &str) -> LoopMessage {
             id: "tc1".into(),
             name: tool.into(),
             arguments: serde_json::json!({}),
+            signature: None,
+            signature_model: None,
         }],
         StopReason::ToolUse,
     ))
@@ -6989,6 +7007,8 @@ fn awaiting_user_response_question_but_made_tool_calls_is_false() {
             id: "tc1".into(),
             name: "edit".into(),
             arguments: serde_json::json!({}),
+            signature: None,
+            signature_model: None,
         },
         ContentBlock::Text {
             text: "Which file should I edit next?".into(),
@@ -7348,6 +7368,8 @@ fn asst_with_tool(id: &str, name: &str, args: serde_json::Value) -> LoopMessage 
             id: id.to_string(),
             name: name.to_string(),
             arguments: args,
+            signature: None,
+            signature_model: None,
         }],
         crate::agent::agent_loop::message::StopReason::ToolUse,
     ))
@@ -7855,6 +7877,8 @@ fn boundary_emits_at_most_one_nudge() {
             id: "c1".into(),
             name: "edit".into(),
             arguments: serde_json::json!({"path": "src/f0.rs"}),
+            signature: None,
+            signature_model: None,
         }],
         StopReason::Stop,
     ))];
@@ -10138,6 +10162,8 @@ async fn a_native_call_is_not_recorded_twice_alongside_a_lifted_one() {
                     id: "native_1".to_string(),
                     name: "typed_path_tool".to_string(),
                     arguments: serde_json::json!({"path": "/tmp/a"}),
+                    signature: None,
+                    signature_model: None,
                 },
                 ContentBlock::Text {
                     text: lifted.to_string(),

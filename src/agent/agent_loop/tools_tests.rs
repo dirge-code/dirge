@@ -283,6 +283,8 @@ async fn test_handle_tool_calls_and_results() {
             id: "tool-1".to_string(),
             name: "echo".to_string(),
             arguments: serde_json::json!({"value": "hello"}),
+            signature: None,
+            signature_model: None,
         }],
         StopReason::ToolUse,
     );
@@ -347,6 +349,8 @@ async fn test_before_tool_call_mutates_args() {
             id: "tool-1".to_string(),
             name: "echo".to_string(),
             arguments: serde_json::json!({"value": "hello"}),
+            signature: None,
+            signature_model: None,
         }],
         StopReason::ToolUse,
     );
@@ -415,6 +419,8 @@ async fn test_prepare_arguments_shim() {
             id: "tool-1".to_string(),
             name: "edit".to_string(),
             arguments: serde_json::json!({"oldText": "before", "newText": "after"}),
+            signature: None,
+            signature_model: None,
         }],
         StopReason::ToolUse,
     );
@@ -460,6 +466,8 @@ async fn test_dispatcher_terminate_when_all_results_terminate() {
             id: "tool-1".to_string(),
             name: "echo".to_string(),
             arguments: serde_json::json!({}),
+            signature: None,
+            signature_model: None,
         }],
         StopReason::ToolUse,
     );
@@ -497,6 +505,8 @@ async fn test_after_tool_call_can_set_terminate() {
             id: "tool-1".to_string(),
             name: "echo".to_string(),
             arguments: serde_json::json!({}),
+            signature: None,
+            signature_model: None,
         }],
         StopReason::ToolUse,
     );
@@ -545,6 +555,8 @@ async fn test_tool_not_found_immediate_error() {
             id: "tool-1".to_string(),
             name: "nonexistent".to_string(),
             arguments: serde_json::json!({}),
+            signature: None,
+            signature_model: None,
         }],
         StopReason::ToolUse,
     );
@@ -586,6 +598,8 @@ async fn test_tool_not_found_suggests_closest() {
             id: "tool-1".to_string(),
             name: "ehco".to_string(), // typo of "echo"
             arguments: serde_json::json!({}),
+            signature: None,
+            signature_model: None,
         }],
         StopReason::ToolUse,
     );
@@ -623,6 +637,8 @@ async fn test_before_tool_call_block_with_reason() {
             id: "tool-1".to_string(),
             name: "echo".to_string(),
             arguments: serde_json::json!({}),
+            signature: None,
+            signature_model: None,
         }],
         StopReason::ToolUse,
     );
@@ -730,6 +746,8 @@ fn assistant_with_calls(calls: &[ToolCall]) -> AssistantMessage {
             id: c.id.clone(),
             name: c.name.clone(),
             arguments: c.arguments.clone(),
+            signature: None,
+            signature_model: None,
         })
         .collect();
     AssistantMessage::new(content, StopReason::ToolUse)
@@ -1155,6 +1173,8 @@ async fn aborted_tool_returns_aborted_error_promptly() {
                 id: c.id.clone(),
                 name: c.name.clone(),
                 arguments: c.arguments.clone(),
+                signature: None,
+                signature_model: None,
             })
             .collect(),
         StopReason::ToolUse,
@@ -1274,6 +1294,8 @@ async fn cancelled_tool_future_is_dropped_not_detached() {
                 id: c.id.clone(),
                 name: c.name.clone(),
                 arguments: c.arguments.clone(),
+                signature: None,
+                signature_model: None,
             })
             .collect(),
         StopReason::ToolUse,
@@ -1349,6 +1371,8 @@ async fn truncation_repair_end_to_end_through_dispatch() {
             id: "tool-1".to_string(),
             name: "echo".to_string(),
             arguments: serde_json::Value::String(truncated.to_string()),
+            signature: None,
+            signature_model: None,
         }],
         StopReason::ToolUse,
     );
@@ -1523,6 +1547,8 @@ async fn truncation_hard_fallback_does_not_fabricate_args() {
             id: "tool-1".to_string(),
             name: "strict".to_string(),
             arguments: serde_json::Value::String("}}}}}".to_string()),
+            signature: None,
+            signature_model: None,
         }],
         StopReason::ToolUse,
     );
@@ -1752,6 +1778,8 @@ async fn dispatch_one(tool: Arc<dyn LoopTool>, name: &str, config: &LoopConfig) 
             id: "tool-1".to_string(),
             name: name.to_string(),
             arguments: serde_json::json!({}),
+            signature: None,
+            signature_model: None,
         }],
         StopReason::ToolUse,
     );
@@ -1871,6 +1899,8 @@ async fn a_cancelled_call_is_not_retried() {
             id: "tool-1".to_string(),
             name: "read".to_string(),
             arguments: serde_json::json!({}),
+            signature: None,
+            signature_model: None,
         }],
         StopReason::ToolUse,
     );
@@ -1910,6 +1940,8 @@ async fn a_cancel_during_execution_stops_the_retry() {
             id: "tool-1".to_string(),
             name: "read".to_string(),
             arguments: serde_json::json!({}),
+            signature: None,
+            signature_model: None,
         }],
         StopReason::ToolUse,
     );
@@ -2134,6 +2166,8 @@ async fn a_budget_stopped_call_yields_a_result_and_the_batch_continues() {
                 id: c.id.clone(),
                 name: c.name.clone(),
                 arguments: c.arguments.clone(),
+                signature: None,
+                signature_model: None,
             })
             .collect(),
         StopReason::ToolUse,

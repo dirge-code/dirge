@@ -318,6 +318,8 @@ mod tests {
                         id: "call-1".to_string(),
                         name: "echo".to_string(),
                         arguments: serde_json::json!({}),
+                        signature: None,
+                        signature_model: None,
                     }],
                     StopReason::ToolUse,
                 )

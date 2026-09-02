@@ -258,6 +258,8 @@ pub fn rig_message_to_loop_messages(m: rig::completion::Message) -> Vec<LoopMess
                             id: tc.id,
                             name: tc.function.name,
                             arguments: tc.function.arguments,
+                            signature: None,
+                            signature_model: None,
                         });
                     }
                     AssistantContent::Reasoning(r) => {
@@ -1116,6 +1118,8 @@ mod tests {
                 id: id.to_string(),
                 name: name.to_string(),
                 arguments: args,
+                signature: None,
+                signature_model: None,
             }],
             StopReason::ToolUse,
         )
