@@ -255,6 +255,35 @@ pub struct TokenUsage {
     pub cache_creation_input_tokens: u64,
 }
 
+impl TokenUsage {
+    /// What this request's prompt actually cost, normalized across the two
+    /// provider conventions (dirge-qobx.6).
+    ///
+    /// `input_tokens` is not the prompt size on every backend, and the whole
+    /// context-budget ladder reads it as if it were. DeepSeek, OpenAI and
+    /// Gemini report `cached_input_tokens` as a SUBSET of `input_tokens`, so
+    /// `input_tokens` IS the prompt. Anthropic reports them DISJOINT:
+    /// `input_tokens` is the uncached remainder, so a warm prompt cache — the
+    /// normal case — leaves it a small fraction of what was sent. Read
+    /// directly there it under-reads the prompt by the entire cached prefix,
+    /// which is most of it: no fold at 0.75, none at 0.78, no exit-with-summary
+    /// at 0.80, and the first sign of trouble is the provider refusing the
+    /// request.
+    ///
+    /// The raw fields stay exactly as the provider reported them —
+    /// `Session::cache_hit_ratio` deliberately handles both conventions and
+    /// must keep seeing what came back.
+    pub fn prompt_total(&self, provider: Option<&str>) -> u64 {
+        if matches!(provider, Some(p) if p.eq_ignore_ascii_case("anthropic")) {
+            self.input_tokens
+                .saturating_add(self.cached_input_tokens)
+                .saturating_add(self.cache_creation_input_tokens)
+        } else {
+            self.input_tokens
+        }
+    }
+}
+
 /// Sub-discriminator for `StreamEvent::Delta`. Mirrors pi's nine
 /// individual variants in a compact form. The pi-faithful order
 /// (text → thinking → toolcall, each in start/delta/end order)
@@ -825,6 +854,38 @@ impl LoopEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// dirge-qobx.6: the two provider conventions, and why reading
+    /// `input_tokens` directly is not the prompt size.
+    #[test]
+    fn prompt_total_normalizes_both_usage_conventions() {
+        // Anthropic on a warm cache: the three counts are DISJOINT, and
+        // `input_tokens` alone is 2% of a request that nearly fills a 200k
+        // window. Read directly, the fold ladder sees 5k and does nothing.
+        let anthropic = TokenUsage {
+            input_tokens: 5_000,
+            output_tokens: 900,
+            cached_input_tokens: 190_000,
+            cache_creation_input_tokens: 1_000,
+        };
+        assert_eq!(anthropic.prompt_total(Some("anthropic")), 196_000);
+        assert_eq!(anthropic.prompt_total(Some("Anthropic")), 196_000);
+
+        // DeepSeek/OpenAI/Gemini report cached as a SUBSET, so the same sum
+        // would bill the cached prefix twice.
+        let deepseek = TokenUsage {
+            input_tokens: 196_000,
+            output_tokens: 900,
+            cached_input_tokens: 190_000,
+            cache_creation_input_tokens: 0,
+        };
+        assert_eq!(deepseek.prompt_total(Some("deepseek")), 196_000);
+        // Unknown or absent provider: assume the subset convention, which is
+        // what every backend but Anthropic uses.
+        assert_eq!(deepseek.prompt_total(None), 196_000);
+        // OpenRouter serving a Claude model still reports OpenAI-style.
+        assert_eq!(deepseek.prompt_total(Some("openrouter")), 196_000);
+    }
 
     /// GH #821 back-compat pin: `ContentBlock` is serde-serialized into
     /// session storage, so the `Thinking` variant's new optional

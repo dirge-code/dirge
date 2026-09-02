@@ -2679,6 +2679,23 @@ pub async fn run_loop(
     // (IMPROVEMENTS_PLAN #4). Reset after each post-usage decision.
     let mut snip_tokens_freed: u64 = 0;
 
+    // dirge-qobx.1: tokens the request carries that are NOT in
+    // `current_context.messages` — the system prompt and every tool schema,
+    // measured at ~16k for the built-in surface and ~33k with MCP servers
+    // (see `compact_schema`). Nothing local can count them, so they are
+    // derived after each response as (what the provider charged for the
+    // prompt) − (what the estimator made of the messages we sent), and added
+    // back at the two PRE-SEND tiers that compare an estimate against
+    // `ctx_max`. Without this the turn-start fold read 25% of the window on a
+    // request the provider charged 82% for, and never fired.
+    //
+    // Last observed, not a running maximum: the tool surface changes with
+    // `/model`, an MCP server connecting, or a prompt-layer swap, and the most
+    // recent request is the one that describes the next one. Zero until the
+    // first response, which is the same "no usage yet" fallback the panel
+    // gauge uses.
+    let mut fixed_overhead: u64 = 0;
+
     // dirge-5mtx.1: per-run gate/capability tally. Declared before the
     // initial steering poll so both steering-poll sites can record into it.
     let mut tally = GateTally::new();
@@ -2882,7 +2899,12 @@ pub async fn run_loop(
             if !folded_this_turn {
                 let rough_estimate =
                     crate::agent::compression::estimate_messages_tokens(&current_context.messages);
-                let estimate = context_manager::estimate_turn_start(rough_estimate, ctx_max);
+                // dirge-qobx.1: + the system prompt and tool schemas, which are
+                // in the request and not in `messages`.
+                let estimate = context_manager::estimate_turn_start(
+                    rough_estimate.saturating_add(fixed_overhead),
+                    ctx_max,
+                );
                 if estimate.ratio > context_manager::TURN_START_FOLD_THRESHOLD {
                     tracing::info!(
                         target: "dirge::agent_loop",
@@ -2992,7 +3014,13 @@ pub async fn run_loop(
             // the (reactive) post-response fold fires.
             let cap_estimate =
                 crate::agent::compression::estimate_messages_tokens(&current_context.messages);
-            let result_cap = crate::agent::compression::tiered_result_cap(cap_estimate, ctx_max);
+            // dirge-qobx.1: same correction as the turn-start tier — this cap
+            // tightens at 60% of the window, and 60% of the window is not 60%
+            // of the messages.
+            let result_cap = crate::agent::compression::tiered_result_cap(
+                cap_estimate.saturating_add(fixed_overhead),
+                ctx_max,
+            );
             // Counted variant (IMPROVEMENTS_PLAN #4): track how much the
             // snip freed so the post-response fold can be skipped if it
             // bought enough headroom.
@@ -3002,6 +3030,14 @@ pub async fn run_loop(
             );
             current_context.messages = capped;
             snip_tokens_freed = snip_tokens_freed.saturating_add(freed);
+
+            // dirge-qobx.1: the estimator's account of exactly what this
+            // request carries in `messages`, taken after every pre-send
+            // rewrite and before the call. Paired with the provider's own
+            // prompt count below, it is the only way to see the system prompt
+            // and tool schemas at all.
+            let sent_estimate =
+                crate::agent::compression::estimate_messages_tokens(&current_context.messages);
 
             // Pi lines 192-194: LLM call.
             // dirge-e31n.6: the permission checkpoint tells the model that
@@ -3024,6 +3060,24 @@ pub async fn run_loop(
                 turn_tool_choice,
             )
             .await;
+            // dirge-qobx.1: re-derive the fixed overhead from this response.
+            // `saturating_sub` is the whole error handling this needs: the
+            // estimator overshoots on prose as often as it undershoots on
+            // JSON, and an overshoot means "no visible overhead", not a
+            // negative one.
+            if let Some(prompt_tokens) =
+                token_usage.map(|u| u.prompt_total(config.provider_name.as_deref()))
+            {
+                fixed_overhead = prompt_tokens.saturating_sub(sent_estimate);
+                tracing::debug!(
+                    target: "dirge::agent_loop",
+                    prompt_tokens,
+                    sent_estimate,
+                    fixed_overhead,
+                    "context: prompt accounting for this request",
+                );
+            }
+
             // Where this turn's assistant message sits in each transcript, so
             // a call scavenged out of its text can be recorded ON it further
             // down (dirge-n00z). Both are appended to below, so neither index
@@ -3851,7 +3905,9 @@ pub async fn run_loop(
             // defaults to None (carry on).
             {
                 let decision = context_manager::decide_after_usage(
-                    token_usage.map(|u| u.input_tokens),
+                    // dirge-qobx.6: the prompt total, not Anthropic's uncached
+                    // remainder.
+                    token_usage.map(|u| u.prompt_total(config.provider_name.as_deref())),
                     ctx_max,
                     folded_this_turn,
                 );
@@ -3911,7 +3967,8 @@ pub async fn run_loop(
                             // Context compaction: prune old tool results and
                             // compress the middle section of the conversation.
                             // Port of Hermes's compression pass.
-                            if let Some(prompt_tokens) = token_usage.map(|u| u.input_tokens)
+                            if let Some(prompt_tokens) =
+                                token_usage.map(|u| u.prompt_total(config.provider_name.as_deref()))
                                 && crate::agent::compression::should_compress(
                                     prompt_tokens,
                                     ctx_max,

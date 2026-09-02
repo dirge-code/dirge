@@ -519,15 +519,31 @@ impl Session {
         // dirge-hwk9.2: the context gauge needs the LAST request's prompt
         // size, which the cumulative counters cannot answer.
         //
-        // `input_tokens` ALONE, deliberately: this must be the same number
-        // `context_manager::decide_after_usage` divides by, and that reads
-        // `usage.input_tokens` and nothing else. Summing the cached and
-        // creation figures would be closer to the true prompt on Anthropic
-        // (which reports cached DISJOINT from input) and would double-count on
-        // DeepSeek/OpenAI (which report it as a SUBSET) — and either way it
-        // would put the gauge back to describing a fold that does not happen,
-        // which is the bug being fixed.
-        self.last_prompt_tokens = Some(input_tokens);
+        // It must stay the same number `context_manager::decide_after_usage`
+        // divides by, or the gauge describes a fold that does not happen. That
+        // number used to be `input_tokens` alone; as of dirge-qobx.6 it is
+        // `TokenUsage::prompt_total`, which sums input + cached + creation on
+        // Anthropic (where the three are DISJOINT and `input_tokens` is only
+        // the uncached remainder) and keeps `input_tokens` everywhere else
+        // (where cached is a SUBSET and summing would double-count). Same
+        // convention here, so the two stay in lockstep.
+        //
+        // Keyed off `self.provider`, which is the resolved provider name — the
+        // canonical `"anthropic"` for the built-in and for OAuth. A user's own
+        // config alias pointing at Anthropic reads as the subset convention
+        // and under-reads the gauge; the LOOP gets it right regardless,
+        // because it keys off `AnyAgent::provider_name`. Erring toward the
+        // smaller number keeps a wrong alias from inventing headroom
+        // pressure that isn't there.
+        self.last_prompt_tokens = Some(
+            crate::agent::agent_loop::message::TokenUsage {
+                input_tokens,
+                output_tokens,
+                cached_input_tokens,
+                cache_creation_input_tokens,
+            }
+            .prompt_total(Some(self.provider.as_str())),
+        );
         self.cumulative_output_tokens = self.cumulative_output_tokens.saturating_add(output_tokens);
         self.cumulative_input_tokens = self.cumulative_input_tokens.saturating_add(input_tokens);
         self.cumulative_cached_input_tokens = self

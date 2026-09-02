@@ -49,12 +49,29 @@
 //!
 //!   - **pre-send** (turn-start fold, the per-result cap tier): the local
 //!     estimate, since the API hasn't been called yet;
-//!   - **post-response** ([`decide_after_usage`]): the API's exact
-//!     `prompt_tokens` from the usage response.
+//!   - **post-response** ([`decide_after_usage`]): the provider's own prompt
+//!     count from the usage response, normalized across the two usage
+//!     conventions by [`TokenUsage::prompt_total`] (on Anthropic the three
+//!     lanes are disjoint and `input_tokens` alone is just the uncached
+//!     remainder — dirge-qobx.6).
 //!
-//! These two numbers can legitimately disagree (the estimate is approximate);
-//! that's inherent to measuring before vs. after the call, not a duplicated
-//! estimator.
+//! These two numbers are approximations of the same quantity and will
+//! disagree at the margin; that is inherent to measuring before vs. after the
+//! call. What is NOT inherent — and was the bug in dirge-qobx.1 — is a
+//! disagreement about what is being measured. The estimator accounts
+//! `messages`; the provider charges for the system prompt and every tool
+//! schema too, ~16k tokens for the built-in surface and ~33k with MCP servers
+//! (see [`crate::agent::agent_loop::compact_schema`]). So the pre-send sites
+//! add a **fixed-overhead** term, re-derived after every response as
+//! `prompt_total − estimate(messages we sent)` and carried on the loop. Before
+//! that, a request the provider charged 82% of the window for read as 25% at
+//! the turn-start tier, and the 0.90 fold never fired on anything.
+//!
+//! The estimator also has to count everything that ships. Reasoning blocks
+//! are replayed to every provider but OpenAI and images are billed by area;
+//! both used to account as zero chars (dirge-qobx.1).
+//!
+//! [`TokenUsage::prompt_total`]: crate::agent::agent_loop::message::TokenUsage::prompt_total
 //!
 //! # The snip override
 //!

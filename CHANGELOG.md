@@ -7,6 +7,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Fixed
+- Auto-compaction now measures what it actually sends. The fold trigger reads
+  the provider's prompt count — system prompt, every tool schema, replayed
+  reasoning, images, the lot — while the fold's own accounting was `chars / 4`
+  over `messages`, counting only text and tool-call arguments. A live run
+  printed `context compacted: 63800 → 63479 tokens` against a request the
+  provider charged 204,320 for and then stopped mid-task, because nothing the
+  fold could see explained the ratio it was reacting to. Three terms were
+  invisible: a `thinking` block counted zero chars although reasoning is
+  echoed back to every provider but OpenAI and nothing strips a stale one; an
+  image counted zero because the transcript holds a reference rather than
+  bytes; and the system prompt plus tool schemas — ~16k tokens for the
+  built-in surface, ~33k with MCP servers — are not in `messages` at all, so
+  the pre-send tiers read 25% of the window on a request that filled 82% of
+  it and the turn-start fold never fired. Reasoning and images are now priced,
+  and the fixed overhead is re-derived after every response as what the
+  provider charged minus what the estimator made of the messages sent, then
+  added back at the two pre-send tiers. Separately, on Anthropic the ratio was
+  reading `input_tokens`, which there is only the UNCACHED remainder: with a
+  warm prompt cache the whole ladder under-read the prompt by the entire
+  cached prefix, so no tier fired and the first sign of trouble was the
+  provider refusing the request. Every decision site now reads a normalized
+  prompt total, and the context gauge reads the same number. (dirge-qobx.1,
+  dirge-qobx.6)
 - A provider usage cap now reads as one in the TUI instead of arriving as a raw
   provider blob. `classify_error` already routed GLM's `429` code `1308` to the
   non-retryable `UsageCap`, and `--print` already reported it in a sentence, but
