@@ -1155,6 +1155,18 @@ fn mode_reassert_payload_re_enables_mouse_paste_and_focus() {
         "must re-enable SGR mouse encoding"
     );
     assert!(s.contains("\x1b[?2004h"), "must re-enable bracketed paste");
+    // dirge-hn6e: NOT any-event tracking. `?1003h` reports every cell of
+    // pointer motion with no button held and nothing consumes it; `?1002h`
+    // already covers the wheel and the drag-selection. Re-arming it would
+    // put the program's only continuous input byte stream back.
+    assert!(
+        !s.contains("\x1b[?1003h"),
+        "must not re-enable any-event mouse tracking"
+    );
+    assert!(
+        s.contains("\x1b[?1002h"),
+        "must re-enable button-event mouse tracking"
+    );
     // The genuine fix (dirge-tc2q follow-up): focus reporting MUST be in the
     // periodic payload. The primary recovery is FocusGained →
     // force_terminal_reassert, but that event can't fire while focus
@@ -1263,6 +1275,11 @@ fn full_reassert_re_enters_alt_screen_synchronized() {
         "must re-enable SGR mouse encoding"
     );
     assert!(s.contains("\x1b[?2004h"), "must re-enable bracketed paste");
+    // dirge-hn6e: same exclusion as the periodic payload.
+    assert!(
+        !s.contains("\x1b[?1003h"),
+        "must not re-enable any-event mouse tracking"
+    );
     // dirge-ph60: focus reporting must be re-armed too, or the next
     // FocusGained-driven recovery never fires — the automatic self-heal
     // depends on the terminal continuing to report focus changes.
@@ -1354,7 +1371,7 @@ fn reassert_terminal_modes_arms_and_respects_throttle() {
 
 /// When the user is mid-drag selecting text, `reassert_terminal_modes` must
 /// not write to /dev/tty: re-sending mouse-tracking enable sequences
-/// (?1003h et al.) resets internal tracking state on some terminals,
+/// (?1002h et al.) resets internal tracking state on some terminals,
 /// dropping the drag so MouseUp never fires and copy_to_clipboard is never
 /// called.
 #[test]

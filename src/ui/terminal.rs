@@ -1,14 +1,13 @@
 use std::io::Write;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use crossterm::ExecutableCommand;
 use crossterm::cursor::Hide;
 use crossterm::event::{
-    EnableBracketedPaste, EnableFocusChange, EnableMouseCapture, KeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    EnableBracketedPaste, EnableFocusChange, KeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::terminal::{
     self, Clear, ClearType, EnterAlternateScreen, supports_keyboard_enhancement,
@@ -155,9 +154,32 @@ pub(crate) static EVENT_READER_SHUTDOWN: AtomicBool = AtomicBool::new(false);
 /// the common case (reader exits within a few ms).
 pub(crate) static EVENT_READER_EXITED: AtomicBool = AtomicBool::new(false);
 
+/// Which generation of input reader is the live one (dirge-xxo9).
+///
+/// `spawn_input_reader` bumps this and captures the new value; a reader
+/// whose captured generation no longer matches exits at its next tick.
+///
+/// The shutdown flag cannot carry that meaning on its own. The suspend path
+/// proceeds after 150ms even when the reader has not exited, and the resume
+/// path then clears the flag — so a stale reader woke to a `false` flag and
+/// kept reading fd 0 next to its replacement, and next to the stdin drains.
+/// Two consumers on one descriptor split escape sequences, and the tail of a
+/// split sequence parses as plain text: that is how terminal bytes ended up
+/// typed into the compose box.
+pub(crate) static READER_GENERATION: AtomicU64 = AtomicU64::new(0);
+
 /// Stored `JoinHandle` of the crossterm input-reader thread.
 /// Set by `spawn_input_reader`, consumed by `join_reader`.
 pub(crate) static READER_HANDLE: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(None);
+
+/// Mouse modes dirge actually uses: X10 button reporting (`?1000h`),
+/// button-event tracking so a held-button drag reports (`?1002h`), and the
+/// SGR encoding so coordinates past column 95 survive (`?1006h`).
+/// Deliberately NOT `?1003h` / `?1015h` — see the call site in
+/// `TerminalGuard::new` (dirge-hn6e). The teardown strings still clear
+/// `?1003l` / `?1015l`: a terminal may have them set from an older dirge or
+/// another program.
+const MOUSE_CAPTURE_ON: &[u8] = b"\x1b[?1000h\x1b[?1002h\x1b[?1006h";
 
 pub struct TerminalGuard {
     /// Original stdout (fd 1) saved before we redirected fd 1 to
@@ -212,7 +234,19 @@ impl TerminalGuard {
         // so native text selection requires the standard
         // bypass-modifier: Option/Alt+drag on macOS terminals, Shift
         // +drag on most Linux terminals.
-        tty_writer.execute(EnableMouseCapture)?;
+        //
+        // Written out rather than `EnableMouseCapture` because that also
+        // sets `?1003h` and `?1015h` (dirge-hn6e). `?1003h` is any-event
+        // tracking: the terminal reports every cell of pointer motion with
+        // no button held, and nothing consumes it — the reader maps wheel
+        // and left button down/drag/up and drops the rest, and
+        // `MouseEventKind::Moved` appears nowhere in the tree. `?1002h`
+        // (button-event tracking) already covers the wheel and the
+        // drag-selection. All it bought was the only continuous input byte
+        // stream in the program, which is what turns a one-off desync on
+        // fd 0 into a sustained flood of junk characters. `?1015h` is the
+        // urxvt encoding, which crossterm cannot parse at all.
+        tty_writer.write_all(MOUSE_CAPTURE_ON)?;
         // Focus reporting (`?1004h`): the terminal sends `\x1b[I` on
         // focus-in / `\x1b[O` on focus-out, which crossterm delivers as
         // FocusGained / FocusLost. dirge-ph60 uses FocusGained to
@@ -747,7 +781,7 @@ pub(crate) fn resume_tui_after_subprocess(
         // suspend path emitted `?1004l`, so re-arm it or FocusGained
         // recovery goes dark after any sandbox attach).
         let _ = tty.write_all(
-            b"\x1b[?1049h\x1b[2J\x1b[?25l\x1b[?2004h\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h\x1b[?1004h",
+            b"\x1b[?1049h\x1b[2J\x1b[?25l\x1b[?2004h\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?1004h",
         );
         let _ = tty.flush();
     }
