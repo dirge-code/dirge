@@ -529,6 +529,24 @@ pub fn usage_cap_reset_hint(msg: &str) -> Option<String> {
     })
 }
 
+/// The one-line headline a usage cap deserves, with the reset time when the
+/// provider named one.
+///
+/// A usage cap is not a failure to debug: the request was well-formed and the
+/// provider simply refused it until a quota rolls over. The raw text says none
+/// of that — Zhipu/GLM's is an `HttpError: Invalid status code 429` wrapper
+/// around a Chinese sentence and an error code (#818) — so every surface that
+/// reports one starts from this sentence and appends the cause verbatim, which
+/// keeps the provider's own wording available for bug reports.
+pub fn usage_cap_headline(msg: &str) -> String {
+    match usage_cap_reset_hint(msg) {
+        Some(reset) => format!("Provider usage cap reached — quota resets at {reset}"),
+        None => {
+            "Provider usage cap reached — quota won't reset within a retryable window".to_string()
+        }
+    }
+}
+
 /// Scan `msg` for a `Retry-After:` header whose value parses as an
 /// RFC 7231 HTTP-date (IMF-fixdate, RFC 850, or asctime form). Returns
 /// the time from now until that date, clamped to 0 if in the past.
@@ -1255,6 +1273,36 @@ mod tests {
         assert_eq!(
             usage_cap_reset_hint("plain error, no reset").as_deref(),
             None
+        );
+    }
+
+    /// #818: the GLM cap the interactive surface used to dump raw. The
+    /// headline names the wall and the reset instant; the caller appends the
+    /// provider's own text as the cause.
+    #[test]
+    fn usage_cap_headline_names_the_reset_when_the_provider_gave_one() {
+        let glm = "HttpError: Invalid status code 429 Too Many Requests with message: \
+                   {\"error\":{\"code\":\"1308\",\"message\":\"已达到 5 小时的使用上限。\
+                   您的限额将在 2026-08-25 07:41:44 重置。\"}}";
+        assert_eq!(
+            classify_error(glm),
+            ErrorKind::UsageCap,
+            "the 1308 cap must not be mistaken for a retryable throttle",
+        );
+        assert_eq!(
+            usage_cap_headline(glm),
+            "Provider usage cap reached — quota resets at 2026-08-25 07:41:44",
+        );
+    }
+
+    /// No parseable reset — the headline still has to say what happened, and
+    /// must not invent a time.
+    #[test]
+    fn usage_cap_headline_without_a_reset_says_so() {
+        let msg = "429 too many requests: usage limit reached";
+        assert_eq!(
+            usage_cap_headline(msg),
+            "Provider usage cap reached — quota won't reset within a retryable window",
         );
     }
 

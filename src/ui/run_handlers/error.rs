@@ -57,8 +57,34 @@ pub(crate) async fn handle_error(
         *last_token_render = None;
     }
     let safe = sanitize_output(&error);
-    ctx.renderer
-        .write_line(&format!("error: {}", safe), c_error())?;
+    // #818: a provider usage cap is not a failure to debug — the request was
+    // well-formed and the provider refused it until a quota rolls over. The raw
+    // text says none of that: GLM's is an `HttpError: Invalid status code 429`
+    // wrapper around a Chinese sentence and an error code, so the one thing the
+    // user needs (when it lifts, and that switching providers works now) is the
+    // one thing the line did not carry. Retries were already suppressed —
+    // `classify_error` routes a cap to the non-retryable `UsageCap` — so this
+    // changes what is SAID, not what is done. The cause is kept verbatim
+    // underneath for bug reports. `--print` reports the same headline
+    // (`provider::run`).
+    if matches!(
+        crate::agent::recovery::classify_error(&error),
+        crate::agent::recovery::ErrorKind::UsageCap
+    ) {
+        ctx.renderer.write_line(
+            &crate::agent::recovery::usage_cap_headline(&error),
+            c_error(),
+        )?;
+        ctx.renderer.write_line(
+            "  ↳ hint: wait for the reset, or /model to a provider that still has quota",
+            c_error(),
+        )?;
+        ctx.renderer
+            .write_line(&format!("  ↳ cause: {safe}"), c_error())?;
+    } else {
+        ctx.renderer
+            .write_line(&format!("error: {}", safe), c_error())?;
+    }
 
     // Persist the partial turn (whatever streamed before the error) so it's
     // searchable and the session records what went wrong.
