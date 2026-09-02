@@ -1696,12 +1696,29 @@ async fn drain(rx: &mut mpsc::Receiver<LoopEvent>) -> Vec<LoopEvent> {
 /// No summarizer is wired on purpose: the tier must end the turn even when
 /// the summarizer is absent/fails, which is the state the commit message
 /// describes as the dangerous one.
+///
+/// dirge-qobx.3 re-fixtured the context. The prompt has to be mostly HISTORY
+/// for this to be a test about the fold: against a near-empty transcript, all
+/// 110k of the reported prompt is fixed overhead, which no fold can reach —
+/// that case now warns and keeps working (the run is not out of window), and
+/// this factory hands out the same tool call forever, so the assertion below
+/// would never be reached. 20 messages of 4 KB each leave ~90k of overhead
+/// and ~20k the fold can see, which still cannot get under the 102,400
+/// threshold with no summarizer wired: the tier ends the turn, the run stops,
+/// and one stream call is what the model gets.
 #[tokio::test]
 async fn exit_with_summary_ends_the_turn() {
     use crate::agent::agent_loop::message::TokenUsage;
 
     let echo = std::sync::Arc::new(EchoTool::new());
     let mut ctx = empty_context();
+    for i in 0..20 {
+        let role = if i % 2 == 0 { "assistant" } else { "user" };
+        ctx.messages.push(serde_json::json!({
+            "role": role,
+            "content": format!("turn {i}: {}", "x".repeat(4_000)),
+        }));
+    }
     ctx.tools.push(echo.clone());
 
     let calls = std::sync::Arc::new(AtomicUsize::new(0));
@@ -9033,9 +9050,23 @@ fn over_budget_factory(responses: Vec<AssistantMessage>) -> (StreamFn, Arc<Atomi
 /// The pair below asserts the other half — that a fold which freed nothing
 /// still ends the run — because a fix that simply always continues would trade
 /// this bug for an unbounded loop against a context nothing can shrink.
+///
+/// dirge-qobx.3 re-fixtured this. The prompt has to be mostly HISTORY for the
+/// fold to be the thing that makes room: with a near-empty transcript, the
+/// tokens the provider reported were all fixed overhead, which is the
+/// unfoldable case now handled separately below. 26 messages of 4 KB each,
+/// against a reported 30k of a 32k window, leaves ~4k of overhead and ~26k
+/// the fold can reach.
 #[tokio::test]
 async fn a_force_ended_turn_continues_the_run_when_the_fold_made_room() {
-    let mut ctx = padded_ctx(20);
+    let mut ctx = empty_context();
+    for i in 0..26 {
+        let role = if i % 2 == 0 { "assistant" } else { "user" };
+        ctx.messages.push(serde_json::json!({
+            "role": role,
+            "content": format!("turn {i}: {}", "x".repeat(4_000)),
+        }));
+    }
     ctx.tools.push(Arc::new(RecBashTool::new()));
     let mut cfg = build_config();
     cfg.model_name = Some("qwen".to_string());
@@ -9044,11 +9075,17 @@ async fn a_force_ended_turn_continues_the_run_when_the_fold_made_room() {
     // failing assertion.
     cfg.max_turns = Some(6);
 
-    let (factory, calls) = over_budget_factory(vec![tool_use_response(
-        "call-1",
-        "bash",
-        serde_json::json!({"command": "ls"}),
-    )]);
+    // 30k of a 32k window on the first request, and 14k on the second: what a
+    // fold that actually freed 26k of history looks like from the provider's
+    // side.
+    let (factory, calls) = usage_factory(
+        vec![tool_use_response(
+            "call-1",
+            "bash",
+            serde_json::json!({"command": "ls"}),
+        )],
+        vec![30_000, 14_000],
+    );
     let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let summarize_fn = recording_summarizer(called.clone());
 
@@ -9128,6 +9165,225 @@ async fn a_force_ended_turn_ends_the_run_when_nothing_can_be_folded() {
         notices.iter().any(|n| n.contains("context")),
         "a run cut short because its context cannot be reduced must say so; \
          notices were {notices:?}"
+    );
+}
+
+// ── dirge-qobx.3: a policy threshold is not a stopping condition ─────
+
+/// As `over_budget_factory`, but the reported prompt size is a sequence: the
+/// n-th call reports `prompt_tokens[n]`, and the last entry repeats.
+///
+/// The distinctions in dirge-qobx.3 are all about WHERE the number sits
+/// relative to the threshold (0.8 x ctx_max) and the window itself — and a
+/// fold that works shows up as the NEXT request costing less, which a single
+/// constant cannot express. A constant is what makes a mock claim the prompt
+/// never shrank however much history was dropped.
+fn usage_factory(
+    responses: Vec<AssistantMessage>,
+    prompt_tokens: Vec<u64>,
+) -> (StreamFn, Arc<AtomicUsize>) {
+    assert!(!prompt_tokens.is_empty(), "need at least one usage figure");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let responses = Arc::new(responses);
+    let prompt_tokens = Arc::new(prompt_tokens);
+    let factory: StreamFn = {
+        let calls = calls.clone();
+        Arc::new(move |_ctx, _opts| {
+            let n = calls.fetch_add(1, Ordering::SeqCst);
+            let msg = responses
+                .get(n)
+                .cloned()
+                .unwrap_or_else(|| text_response("done"));
+            let input_tokens = *prompt_tokens
+                .get(n)
+                .unwrap_or_else(|| prompt_tokens.last().expect("non-empty"));
+            let reason = msg.stop_reason;
+            Box::pin(futures::stream::iter(vec![StreamEvent::Done {
+                reason,
+                message: msg,
+                usage: Some(crate::agent::agent_loop::message::TokenUsage {
+                    input_tokens,
+                    ..Default::default()
+                }),
+            }]))
+        })
+    };
+    (factory, calls)
+}
+
+/// A context whose bulk is in prunable tool results, each small enough that
+/// the pre-send per-result cap (3000 tokens) leaves it alone and large enough
+/// (>500 chars) that `prune_tool_outputs` collapses it to one line.
+///
+/// ~40 KB of text, so ~10k estimated tokens before the fold and a few hundred
+/// after — a prune-only pass with real savings, which is precisely the shape
+/// that used to end the run.
+fn ctx_with_prunable_results(n: usize) -> super::Context {
+    let mut ctx = empty_context();
+    ctx.messages
+        .push(serde_json::json!({"role": "user", "content": "initial task"}));
+    for i in 0..n {
+        ctx.messages.push(serde_json::json!({
+            "role": "assistant",
+            "content": [{
+                "type": "toolCall",
+                "id": format!("call-{i}"),
+                "name": "bash",
+                "arguments": {"command": "ls"},
+            }],
+        }));
+        ctx.messages.push(serde_json::json!({
+            "role": "toolResult",
+            "toolCallId": format!("call-{i}"),
+            "toolName": "bash",
+            "content": [{"type": "text", "text": "x".repeat(2_000)}],
+            "isError": false,
+        }));
+    }
+    ctx
+}
+
+/// A prune-only fold that clears the threshold continues the run.
+///
+/// `made_room` was `matches!(outcome, Succeeded(_))` — "did the summarizer
+/// replace a slice", not "will the next request fit". So a pass that pruned
+/// 9k tokens of stale tool output and brought the request back under the
+/// threshold reported no room, and the run ENDED mid-task with the budget no
+/// longer full. Observed live as a run that stopped one turn after printing
+/// `context compacted: 63800 -> 63479 tokens`.
+///
+/// No summarizer here on purpose: prune-only is the outcome under test.
+#[tokio::test]
+async fn a_prune_only_fold_that_clears_the_threshold_continues_the_run() {
+    let mut ctx = ctx_with_prunable_results(20);
+    ctx.tools.push(Arc::new(RecBashTool::new()));
+    let mut cfg = build_config();
+    // "qwen" is a 32k window: the force-summary threshold is 25,600.
+    cfg.model_name = Some("qwen".to_string());
+    cfg.max_turns = Some(4);
+
+    // 26k of prompt against ~10k of estimated messages: over the threshold,
+    // and ~16k of it is fixed overhead the fold cannot touch. The second
+    // request costs 12k, which is what pruning ~9k of stale tool output
+    // actually does to the next prompt.
+    let (factory, calls) = usage_factory(
+        vec![tool_use_response(
+            "call-1",
+            "bash",
+            serde_json::json!({"command": "ls"}),
+        )],
+        vec![26_000, 12_000],
+    );
+
+    let (tx, mut rx) = mpsc::channel::<LoopEvent>(512);
+    let _ = run_agent_loop(
+        vec![user("task")],
+        ctx,
+        cfg,
+        AbortSignal::new(),
+        &tx,
+        &factory,
+        None, // no summarizer: the pass can only prune
+        None,
+    )
+    .await;
+    drop(tx);
+
+    assert!(
+        calls.load(Ordering::SeqCst) >= 2,
+        "the prune freed ~9k tokens and the next request fits; the run must \
+         go on, but the model was called {} time(s)",
+        calls.load(Ordering::SeqCst)
+    );
+    let mut notices = Vec::new();
+    while let Ok(evt) = rx.try_recv() {
+        if let LoopEvent::SystemNotice { content } = evt {
+            notices.push(content);
+        }
+    }
+    assert!(
+        !notices.iter().any(|n| n.contains("Run stopped")),
+        "nothing was cut short here; notices were {notices:?}"
+    );
+}
+
+/// Fixed overhead over the threshold but under the window: say so once, and
+/// keep working.
+///
+/// This is the state a large tool surface puts every run in — the system
+/// prompt and schemas alone clear 80% of the budget, and no fold reaches
+/// either, because a fold rewrites `messages` and neither is in `messages`.
+/// The old code asked the fold for room, got none, and ended the run with
+/// most of the window unused. The requests still fit; what has run out is the
+/// fold's ability to help, and that is a warning, not a stop.
+#[tokio::test]
+async fn unfoldable_overhead_under_the_window_warns_once_and_carries_on() {
+    let mut ctx = empty_context();
+    ctx.messages
+        .push(serde_json::json!({"role": "user", "content": "task"}));
+    ctx.tools.push(Arc::new(RecBashTool::new()));
+    let mut cfg = build_config();
+    cfg.model_name = Some("qwen".to_string()); // 32k window, 25,600 threshold
+    cfg.max_turns = Some(4);
+
+    // 27k of prompt against a near-empty transcript: the overhead alone is
+    // over the threshold, and still 5k short of the window. Constant on
+    // purpose — this is the case where nothing the loop does can move the
+    // number, which is exactly what the latch is for.
+    let (factory, calls) = usage_factory(
+        vec![
+            tool_use_response("call-1", "bash", serde_json::json!({"command": "ls"})),
+            tool_use_response("call-2", "bash", serde_json::json!({"command": "ls"})),
+        ],
+        vec![27_000],
+    );
+    let summarizer_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let summarize_fn = recording_summarizer(summarizer_called.clone());
+
+    let (tx, mut rx) = mpsc::channel::<LoopEvent>(512);
+    let _ = run_agent_loop(
+        vec![user("task")],
+        ctx,
+        cfg,
+        AbortSignal::new(),
+        &tx,
+        &factory,
+        summarize_fn,
+        None,
+    )
+    .await;
+    drop(tx);
+
+    assert!(
+        calls.load(Ordering::SeqCst) >= 2,
+        "requests still fit — the run must continue; the model was called {} \
+         time(s)",
+        calls.load(Ordering::SeqCst)
+    );
+    assert!(
+        !summarizer_called.load(std::sync::atomic::Ordering::SeqCst),
+        "no fold can reduce fixed overhead, so no summarizer call should be \
+         spent trying"
+    );
+
+    let mut notices = Vec::new();
+    while let Ok(evt) = rx.try_recv() {
+        if let LoopEvent::SystemNotice { content } = evt {
+            notices.push(content);
+        }
+    }
+    let overhead_notices = notices
+        .iter()
+        .filter(|n| n.contains("tool schemas"))
+        .count();
+    assert_eq!(
+        overhead_notices, 1,
+        "the unfoldable-overhead warning is latched — once per run, not once \
+         per turn; notices were {notices:?}"
+    );
+    assert!(
+        !notices.iter().any(|n| n.contains("Run stopped")),
+        "the run was not out of window; notices were {notices:?}"
     );
 }
 

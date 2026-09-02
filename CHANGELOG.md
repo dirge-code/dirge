@@ -7,6 +7,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Fixed
+- A run is no longer ended by a compaction that had nothing left to summarize.
+  The force-summary tier asked the fold for room and read the answer as "did
+  the summarizer replace a slice" — so a pass that pruned thousands of tokens
+  of stale tool output and brought the next request comfortably back under the
+  threshold reported no room, and the run stopped mid-task with the budget no
+  longer full. It now projects what the next request will actually cost (the
+  messages the fold left, plus the fixed overhead that is not in them) and
+  carries on when that fits. And when the fixed overhead ALONE clears the
+  threshold — a large MCP tool surface will do it — no fold can ever help, so
+  the run says that once, names the two knobs that can (trim the tool surface,
+  raise `context_target`), stops spending summarizer calls on it, and keeps
+  working as long as requests still fit the window (the free tool-output prune
+  still runs each turn, so the history half stays bounded). Only when the unfoldable
+  part fills the whole window does the run stop, because then nothing fits.
+  The stop notice no longer claims the model's window was exceeded when what
+  was exceeded was dirge's own 80% budget threshold, and a fold that skips
+  summarization for want of a compress window now says so in the log instead
+  of leaving a healthy-looking `ContextCompacted` as the only trace.
+  (dirge-qobx.3, dirge-qobx.5)
 - Auto-compaction now measures what it actually sends. The fold trigger reads
   the provider's prompt count — system prompt, every tool schema, replayed
   reasoning, images, the lot — while the fold's own accounting was `chars / 4`
