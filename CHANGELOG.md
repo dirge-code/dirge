@@ -18,6 +18,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   reset instant when the provider gave one, and the provider's own text is kept
   verbatim as the cause. Nothing about the retry behaviour changes — a cap was
   already non-retryable. (#818)
+- `/model <id>` says when it does not recognise the id, instead of reporting a
+  clean switch onto a string no endpoint serves. `resolve_model_switch` ends in a
+  deliberate permissive fallthrough — an id matching no configured alias and no
+  known model family still applies, which is what lets `/model claude-opus-6`
+  work on release day — and that stays. But it is also what `/model off` got, and
+  reaching for `off` is a natural slip: it is a valid argument to both `/effort`
+  and `/agent`, and `/model` has no "go back". The switch now carries one clause,
+  `(unrecognised — your provider may not serve it)`, which never fires on a
+  configured alias, an exact pin, the gateway dialect, or an id whose family
+  dirge knows. It asserts recognition rather than validity: only the provider
+  knows whether an id is servable, and the two come apart for a new-but-valid
+  id. Same clause on the ACP `/model` path. (#831)
 - A run that spins on no-op shell commands is now caught by the repeat-loop
   guard. A model that had decided it needed a different tool but kept reaching
   for `bash` anyway issued a long run of `echo "ready"` / `echo done` / `true`

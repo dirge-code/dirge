@@ -33,7 +33,17 @@ use super::AnyClient;
 pub enum ModelRoute {
     /// Build on the ACTIVE client — the id belongs to the active provider's
     /// family, or carries no cross-provider signal.
-    Active(String),
+    Active {
+        model: String,
+        /// GH #831: false when the id matched no configured provider alias and
+        /// no model family dirge knows.
+        ///
+        /// The route still applies — dirge cannot know whether an id is valid,
+        /// only whether it RECOGNISES it, and those come apart for a
+        /// new-but-valid id — but a caller holding this can say so instead of
+        /// reporting a clean switch onto a string no endpoint serves.
+        recognized: bool,
+    },
     /// Build on `alias`'s client: the id's family differs from the active
     /// client's and a provider of that family is configured.
     Provider { alias: String, model: String },
@@ -47,7 +57,7 @@ impl ModelRoute {
     /// The model id this route carries, whatever the variant.
     pub fn model(&self) -> &str {
         match self {
-            ModelRoute::Active(model)
+            ModelRoute::Active { model, .. }
             | ModelRoute::Provider { model, .. }
             | ModelRoute::Unroutable { model, .. } => model,
         }
@@ -107,7 +117,16 @@ pub fn resolve_model_route(cfg: &Config, active_provider: &str, model: &str) -> 
     use super::ModelSwitch;
     let model = model.to_string();
     match super::resolve_model_switch(&cfg.providers_map(), active_provider, &model) {
-        ModelSwitch::Keep => ModelRoute::Active(model),
+        ModelSwitch::Keep => ModelRoute::Active {
+            model,
+            recognized: true,
+        },
+        // GH #831: applied like any other `Keep`, but the caller is told the id
+        // is one dirge does not recognise.
+        ModelSwitch::KeepUnrecognized => ModelRoute::Active {
+            model,
+            recognized: false,
+        },
         ModelSwitch::Switch(alias) => ModelRoute::Provider { alias, model },
         // GH #825: the id named a provider alias — the route must carry the
         // alias's pinned model, NOT the alias string the user typed, or the
@@ -145,7 +164,7 @@ pub fn swap_client_for_route(
     route: &ModelRoute,
 ) -> Result<Option<String>, RouteRefusal> {
     match route {
-        ModelRoute::Active(_) => Ok(None),
+        ModelRoute::Active { .. } => Ok(None),
         // Already on that provider — this is a rename, not a swap. Rebuilding
         // would be wasted work and can fail outright: the rebuild re-resolves
         // credentials from config/env, so a session launched with `--api-key`
@@ -249,7 +268,19 @@ mod tests {
         );
         assert_eq!(
             resolve_model_route(&cfg, "gpt-sol", "gpt-5.5-mini"),
-            ModelRoute::Active("gpt-5.5-mini".into()),
+            ModelRoute::Active {
+                model: "gpt-5.5-mini".into(),
+                recognized: true,
+            },
+        );
+        // GH #831: an id nothing classifies still routes to the active client,
+        // but carries the flag `/model` uses to say so.
+        assert_eq!(
+            resolve_model_route(&cfg, "gpt-sol", "off"),
+            ModelRoute::Active {
+                model: "off".into(),
+                recognized: false,
+            },
         );
         assert_eq!(
             resolve_model_route(&cfg, "gpt-sol", "claude-opus-4"),

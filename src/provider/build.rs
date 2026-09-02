@@ -1052,7 +1052,7 @@ pub fn resolve_profile_model(
     };
 
     match resolve_model_route(cfg, active_provider, &model) {
-        ModelRoute::Active(model) => Some(active_client.completion_model(model)),
+        ModelRoute::Active { model, .. } => Some(active_client.completion_model(model)),
         ModelRoute::Provider { alias, model } => {
             if !clients.contains_key(&alias) {
                 match build_route_client(cfg, &alias, &model) {

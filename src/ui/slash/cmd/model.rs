@@ -66,6 +66,18 @@ pub(crate) async fn cmd_model(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyhow:
         // Same-provider and unclassifiable ids keep the current client.
         let old_ctx = ctx.session.context_window;
         let route = resolve_model_route(ctx.cfg, ctx.session.provider.as_str(), new_model.as_str());
+        // GH #831: read before the route is consumed. An id matching no
+        // configured alias and no known model family still applies — that
+        // permissive fallthrough is what lets a brand-new model id work before
+        // dirge knows it — but `/model off` reporting a clean switch onto a
+        // string no endpoint serves is what the report is about.
+        let unrecognized = matches!(
+            route,
+            crate::provider::ModelRoute::Active {
+                recognized: false,
+                ..
+            }
+        );
         // A refusal leaves the session untouched: renaming onto a client that
         // can't serve the id would just point the session at a model that can't
         // work. Keep it functional and say how to make the id routable.
@@ -93,8 +105,20 @@ pub(crate) async fn cmd_model(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyhow:
         // raw argument — `/model <provider-alias>` resolves to the alias's
         // pinned model, so echoing the argument would print the alias string
         // as if it were a model id. Identical on every non-alias path.
+        // The clause asserts RECOGNITION, not validity: only the provider
+        // knows whether an id is servable, and the two come apart for a
+        // new-but-valid id (`claude-opus-6` on release day). So it says what
+        // dirge knows and leaves the consequence conditional.
+        let unknown_note = if unrecognized {
+            "  (unrecognised — your provider may not serve it)"
+        } else {
+            ""
+        };
         ctx.renderer.write_line(
-            &format!("switched to model: {}{provider_note}", ctx.session.model),
+            &format!(
+                "switched to model: {}{provider_note}{unknown_note}",
+                ctx.session.model
+            ),
             c_agent(),
         )?;
         let reserve = ctx.cfg.resolve_reserve_tokens();
