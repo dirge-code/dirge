@@ -30,6 +30,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   provider refusing the request. Every decision site now reads a normalized
   prompt total, and the context gauge reads the same number. (dirge-qobx.1,
   dirge-qobx.6)
+- Reasoning from an older assistant turn is no longer replayed to the model.
+  Every provider but OpenAI gets each stored `thinking` block echoed back in
+  the assistant turn on every later request, and nothing in the loop ever
+  removed one — the pruner only touches tool results, the per-result cap only
+  touches string results, and a fold only drops reasoning when it drops the
+  whole message. So a long agentic run re-sent the model's entire chain of
+  thought each turn, at full price, invisibly: the fold's estimator counted a
+  thinking block as zero. Only the live assistant turn — the one whose tool
+  calls produced the trailing results, which is the turn Anthropic requires
+  signed and DeepSeek wants echoed — keeps its reasoning now; earlier turns
+  ship their text and their tool calls without it. Anthropic already stripped
+  prior-turn thinking server-side, so this is the providers that do not
+  catching up. (dirge-qobx.2)
 - A provider usage cap now reads as one in the TUI instead of arriving as a raw
   provider blob. `classify_error` already routed GLM's `429` code `1308` to the
   non-retryable `UsageCap`, and `--print` already reported it in a sentence, but

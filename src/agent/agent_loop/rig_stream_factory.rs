@@ -240,10 +240,22 @@ where
                 "dropping tool calls (with their results) that carry no signature this model can replay",
             );
         }
+        // dirge-qobx.2: only the LIVE assistant turn replays its reasoning.
+        // Decided over the whole history, like the tool-call pass above, because
+        // "is this the last assistant message" is not a per-message question.
+        let live_assistant = last_assistant_index(&ctx.messages);
         let rig_messages: Vec<Message> = ctx
             .messages
             .iter()
-            .filter_map(|message| value_to_rig_message_with_replay(message, provider, thinking_replay, tool_call_replay, &dropped_tool_calls, ctx.asset_dir.as_deref()))
+            .enumerate()
+            .filter_map(|(idx, message)| {
+                let replay = if live_assistant == Some(idx) {
+                    thinking_replay
+                } else {
+                    ThinkingReplay::Stale
+                };
+                value_to_rig_message_with_replay(message, provider, replay, tool_call_replay, &dropped_tool_calls, ctx.asset_dir.as_deref())
+            })
             .collect();
 
         // 2. Split: last is prompt; rest is chat_history.
@@ -880,6 +892,31 @@ enum ThinkingReplay<'a> {
         model: Option<&'a str>,
         reasoning_enabled: bool,
     },
+    /// dirge-qobx.2: this assistant turn is not the live one, so its
+    /// reasoning is dropped whatever the provider would accept.
+    ///
+    /// Reasoning from an older turn buys nothing: the model has already acted
+    /// on it, and the tool results that followed record what came of it. It is
+    /// not free, though — for every provider but OpenAI the block is echoed
+    /// back in full on every subsequent request, and nothing else in the loop
+    /// ever removes one, so a long agentic run re-sends the model's entire
+    /// chain of thought every turn. Anthropic already strips prior-turn
+    /// thinking server-side; the providers that do not are the ones paying for
+    /// it.
+    Stale,
+}
+
+/// Index of the last assistant message in `messages` (dirge-qobx.2).
+///
+/// The "live" turn: the one the request is answering for. During a tool loop
+/// it is the assistant message whose calls produced the trailing results; when
+/// the last message is a fresh user prompt it is the previous turn, whose
+/// reasoning some chat templates still read. Every assistant message before it
+/// is history, and its reasoning is dropped on the way out.
+fn last_assistant_index(messages: &[Value]) -> Option<usize> {
+    messages
+        .iter()
+        .rposition(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"))
 }
 
 /// Pick the [`ThinkingReplay`] policy for one request.
@@ -1077,6 +1114,8 @@ fn value_to_assistant_content(
             }
             let text = obj.get("text").and_then(|t| t.as_str())?;
             match thinking_replay {
+                // dirge-qobx.2: an older turn's reasoning never ships.
+                ThinkingReplay::Stale => None,
                 ThinkingReplay::Unsigned => Some(AssistantContent::Reasoning(Reasoning::new(text))),
                 ThinkingReplay::SignedOrDrop {
                     model,
@@ -1736,6 +1775,99 @@ mod tests {
                 _ => panic!("expected Assistant"),
             }
         }
+    }
+
+    /// dirge-qobx.2: reasoning from an older assistant turn does not ship.
+    ///
+    /// The block is echoed back for every provider but OpenAI and nothing else
+    /// in the loop removes one, so before this a long agentic run re-sent the
+    /// model's whole chain of thought on every request — invisible to the fold,
+    /// which counted a `thinking` block as zero chars, and the single largest
+    /// term in the prompt on a reasoning-heavy run.
+    ///
+    /// Everything else on the stale turn survives: dropping the text or the
+    /// tool call would change what the model is looking at, and dropping a
+    /// tool_use would orphan its result.
+    #[test]
+    fn stale_reasoning_is_dropped_but_the_rest_of_the_turn_stays() {
+        let v = serde_json::json!({
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "text": "two turns ago I wondered about this"},
+                {"type": "text", "text": "the answer"},
+                {"type": "toolCall", "id": "c1", "name": "bash", "arguments": {"cmd": "ls"}},
+            ],
+        });
+        let msg = value_to_rig_message_with_replay(
+            &v,
+            Some("deepseek"),
+            ThinkingReplay::Stale,
+            ToolCallReplay::Unsigned,
+            &std::collections::HashSet::new(),
+            None,
+        )
+        .expect("the turn itself must survive");
+        match msg {
+            Message::Assistant { content, .. } => {
+                assert!(
+                    !content
+                        .iter()
+                        .any(|c| matches!(c, AssistantContent::Reasoning(_))),
+                    "a stale turn's reasoning must not be replayed",
+                );
+                assert!(
+                    content
+                        .iter()
+                        .any(|c| matches!(c, AssistantContent::Text(_))),
+                    "the turn's text must survive",
+                );
+                assert!(
+                    content
+                        .iter()
+                        .any(|c| matches!(c, AssistantContent::ToolCall(_))),
+                    "the turn's tool call must survive — its result is still in history",
+                );
+            }
+            other => panic!("expected Assistant, got {other:?}"),
+        }
+    }
+
+    /// dirge-qobx.2: the live turn is the LAST assistant message, whatever
+    /// follows it.
+    ///
+    /// Mid-tool-loop the trailing messages are results, and the assistant
+    /// message that called them is the one the request is answering for — the
+    /// turn whose thinking Anthropic requires and DeepSeek wants. After a
+    /// fresh user prompt it is the previous turn, which is harmless to keep and
+    /// which some chat templates read.
+    #[test]
+    fn last_assistant_index_finds_the_live_turn() {
+        let user = serde_json::json!({"role": "user", "content": "go"});
+        let assistant = serde_json::json!({"role": "assistant", "content": []});
+        let result = serde_json::json!({"role": "toolResult", "toolCallId": "c1", "content": []});
+
+        // Mid tool loop: assistant at 1, results after it.
+        let mid = vec![
+            user.clone(),
+            assistant.clone(),
+            result.clone(),
+            result.clone(),
+        ];
+        assert_eq!(last_assistant_index(&mid), Some(1));
+
+        // Several turns: the later assistant wins.
+        let many = vec![
+            user.clone(),
+            assistant.clone(),
+            result.clone(),
+            assistant.clone(),
+            user.clone(),
+        ];
+        assert_eq!(last_assistant_index(&many), Some(3));
+
+        // No assistant turn yet (the first request of a run).
+        assert_eq!(last_assistant_index(&[user]), None);
+        assert_eq!(last_assistant_index(&[]), None);
     }
 
     /// GH #821 helper: one assistant message with a signed thinking block
