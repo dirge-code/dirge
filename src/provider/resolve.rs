@@ -173,6 +173,16 @@ pub(super) enum ModelSwitch {
     /// Keep the current client — the id belongs to the active provider (or
     /// carries no cross-provider signal). Just rename the model.
     Keep,
+    /// GH #831: keep the current client, exactly like [`ModelSwitch::Keep`],
+    /// but the id matched no configured provider alias and no model family
+    /// [`model_family`] knows.
+    ///
+    /// It still applies. The permissive fallthrough is deliberate — it is what
+    /// lets `/model claude-opus-6` work on release day, before dirge has heard
+    /// of the id — and a whitelist would be the wrong fix. The distinction
+    /// exists so the caller can SAY the id is unrecognised rather than report a
+    /// clean switch onto a string like `off`.
+    KeepUnrecognized,
     /// Rebuild the client against this configured provider alias, then rename.
     Switch(String),
     /// GH #825: the id named a configured provider ALIAS that pins a `model`.
@@ -273,7 +283,10 @@ pub(super) fn resolve_model_switch(
     }
 
     let Some(family) = model_family(model) else {
-        return ModelSwitch::Keep;
+        // GH #831: nothing recognised this id — not a pin, not a gateway
+        // dialect, not an alias, not a family. Still `Keep` (see the variant's
+        // doc), but flagged so `/model` can say so.
+        return ModelSwitch::KeepUnrecognized;
     };
     if active_kind == Some(family) {
         return ModelSwitch::Keep;
@@ -1094,14 +1107,45 @@ mod resolve_model_switch_tests {
         );
     }
 
+    /// GH #831: no family signal → still keep the current client (unchanged
+    /// pre-fix behavior, so a local / alt same-provider id isn't disturbed),
+    /// but flagged as unrecognised so `/model` can say so rather than report a
+    /// clean switch onto a string no endpoint serves.
     #[test]
-    fn unclassifiable_id_keeps_current_client() {
+    fn unclassifiable_id_keeps_current_client_and_is_flagged() {
         let providers = user_like_providers();
-        // No family signal → keep current client (unchanged pre-fix behavior),
-        // so a local / alt same-provider id isn't disturbed.
         assert_eq!(
             resolve_model_switch(&providers, "deepseek", "some-local-model"),
-            ModelSwitch::Keep
+            ModelSwitch::KeepUnrecognized
+        );
+        // The reported slip: `off` is a valid argument to `/effort` and
+        // `/agent`, so reaching for `/model off` is natural.
+        assert_eq!(
+            resolve_model_switch(&providers, "deepseek", "off"),
+            ModelSwitch::KeepUnrecognized
+        );
+    }
+
+    /// The flag must NOT fire on the paths that DO recognise the id: a
+    /// same-family free-form id, an exact pin, a configured alias, or the
+    /// gateway dialect. Those all stay plain `Keep`/`Switch`.
+    #[test]
+    fn recognised_ids_are_not_flagged() {
+        let providers = user_like_providers();
+        assert_eq!(
+            resolve_model_switch(&providers, "glm", "glm-4.6"),
+            ModelSwitch::Keep,
+            "same family as the active provider",
+        );
+        assert_eq!(
+            resolve_model_switch(&providers, "deepseek", "deepseek-v4-pro"),
+            ModelSwitch::Keep,
+            "the active provider's own pin",
+        );
+        assert_eq!(
+            resolve_model_switch(&providers, "deepseek", "glm-5.2"),
+            ModelSwitch::Switch("glm".to_string()),
+            "an exact pin elsewhere",
         );
     }
 
@@ -1267,11 +1311,15 @@ mod resolve_model_switch_tests {
         );
     }
 
+    /// `gpt-oss-*` is deliberately unclassified (OpenAI authorship does not
+    /// imply an OpenAI endpoint), so it keeps the active client — flagged
+    /// unrecognised since GH #831, which changes what `/model` SAYS, not where
+    /// the id runs.
     #[test]
     fn cerebras_zero_config_gpt_oss_keeps_the_active_client() {
         assert_eq!(
             resolve_model_switch(&HashMap::new(), "cerebras", "gpt-oss-120b"),
-            ModelSwitch::Keep,
+            ModelSwitch::KeepUnrecognized,
         );
     }
 
@@ -1282,7 +1330,7 @@ mod resolve_model_switch_tests {
 
         assert_eq!(
             resolve_model_switch(&providers, "fast-cerebras", "gpt-oss-120b"),
-            ModelSwitch::Keep,
+            ModelSwitch::KeepUnrecognized,
         );
     }
 
@@ -1297,7 +1345,7 @@ mod resolve_model_switch_tests {
         }
         assert_eq!(
             resolve_model_switch(&HashMap::new(), "deepseek", "gpt-oss-120b"),
-            ModelSwitch::Keep,
+            ModelSwitch::KeepUnrecognized,
         );
     }
 
@@ -1415,18 +1463,19 @@ mod resolve_model_switch_tests {
         ]);
         assert_eq!(
             resolve_model_switch(&providers, "high", "local"),
-            ModelSwitch::Keep,
+            ModelSwitch::KeepUnrecognized,
         );
     }
 
     /// GH #825 must not narrow the deliberate permissiveness: an id that is
     /// neither an alias nor classifiable still keeps the active client, which
-    /// is what lets a brand-new model id work before dirge knows it.
+    /// is what lets a brand-new model id work before dirge knows it. GH #831
+    /// flags it so `/model` can say so — the routing is unchanged.
     #[test]
     fn unknown_non_alias_id_still_keeps_the_active_client() {
         assert_eq!(
             resolve_model_switch(&tiered_providers(), "high", "banana"),
-            ModelSwitch::Keep,
+            ModelSwitch::KeepUnrecognized,
         );
     }
 

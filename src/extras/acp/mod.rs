@@ -939,7 +939,17 @@ async fn acp_model(
             let refusal = RouteRefusal::NoProviderForFamily { model, family };
             return format!("{refusal} Keeping model '{current_model}' on '{current_provider}'.",);
         }
-        ModelRoute::Active(_) => (None, String::new()),
+        // GH #831: an id matching no configured alias and no known model family
+        // still applies (see `ModelSwitch::KeepUnrecognized`), but say so — the
+        // alternative is reporting a clean switch onto a string like `off`.
+        ModelRoute::Active { recognized, .. } => (
+            None,
+            if recognized {
+                String::new()
+            } else {
+                "  (unrecognised — your provider may not serve it)".to_string()
+            },
+        ),
     };
 
     let mut map = sessions.lock().await;
@@ -1693,9 +1703,11 @@ mod tests {
         assert!(list.contains("current model: current-x"), "got {list}");
 
         // `llama-3.1` has no recognized family → ModelRoute::Active → override
-        // set, provider left alone.
+        // set, provider left alone. GH #831: it still applies, and now says the
+        // id is one dirge does not recognise.
         let set = acp_model(&sessions, &cfg, id, "llama-3.1", "openrouter", "current-x").await;
         assert!(set.contains("switched to model: llama-3.1"), "got {set}");
+        assert!(set.contains("unrecognised"), "got {set}");
         let (model_ovr, provider_ovr, _) = session_overrides(&sessions, id).await;
         assert_eq!(model_ovr.as_deref(), Some("llama-3.1"));
         assert!(
