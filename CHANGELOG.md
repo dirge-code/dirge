@@ -7,6 +7,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Fixed
+- Compaction can now fold an autonomous stretch. Both cuts of the compress
+  window snapped to a *user* message, which guarantees no tool_use↔tool_result
+  pair is split — but one prompt followed by a hundred tool iterations, the
+  normal shape of agentic work, contains no user turn at all. The head cut
+  then walked to the end of the transcript, the window collapsed to nothing,
+  the summarizer never ran, and every fold in that stretch degraded to
+  pruning; the same collapse silently disabled the background-checkpoint fast
+  path. A user turn is a sufficient cut point, not a necessary one: what the
+  invariant needs is that the kept tail does not begin with an orphaned tool
+  result, so when no user boundary is available the cut now falls back to the
+  nearest message that is not itself a tool result. A transcript that folded
+  before folds identically — the user boundary is still preferred. (dirge-qobx.4)
 - A run is no longer ended by a compaction that had nothing left to summarize.
   The force-summary tier asked the fold for room and read the answer as "did
   the summarizer replace a slice" — so a pass that pruned thousands of tokens

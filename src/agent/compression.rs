@@ -1661,10 +1661,13 @@ pub fn apply_summary(
 /// Returns `Some((new_messages, first_kept_index))` on success, or `None`
 /// when reuse wouldn't be safe or useful:
 /// - `boundary` is 0 or past the end (nothing to fold, or stale),
-/// - the user-boundary snap collapses the cut to 0 (no whole turn to fold).
+/// - no safe cut exists at or before the boundary (no whole turn to fold).
 ///
-/// The cut snaps BACKWARD to a user-message boundary so the kept tail never
-/// begins with an orphaned tool_result (which would 400 the next request).
+/// The cut snaps BACKWARD so the kept tail never begins with an orphaned
+/// tool_result (which would 400 the next request): to a user message when one
+/// is available, else — dirge-qobx.4 — to the nearest message that is not
+/// itself a tool result, since an autonomous stretch has no user turn to snap
+/// to and this fast path would otherwise never fire during one.
 /// Snapping backward only ever keeps MORE verbatim than the summary covers
 /// — it never drops an un-summarized message — so it can't lose data; the
 /// few messages in `[cut..boundary]` are simply carried both in the summary
@@ -1678,7 +1681,10 @@ pub fn apply_checkpoint_summary(
     if boundary == 0 || boundary > n {
         return None;
     }
-    let cut = snap_backward_to_user(messages, boundary);
+    let cut = match snap_backward_to_user(messages, boundary) {
+        0 => snap_backward_to_safe_cut(messages, boundary),
+        at_user => at_user,
+    };
     if cut == 0 {
         return None;
     }
@@ -1719,10 +1725,72 @@ pub fn compute_compress_window(
     // (protects ≥ protect_tail); both only ever protect more, never less.
     let start = snap_forward_to_user(messages, raw_start);
     let end = snap_backward_to_user(messages, raw_end);
+    if start < end {
+        return (start, end);
+    }
+    // dirge-qobx.4: a user turn is a SUFFICIENT cut point, not a necessary
+    // one, and an autonomous stretch has none.
+    //
+    // One prompt and a hundred tool iterations is the normal shape of agentic
+    // work, and every message in it is `assistant` or `toolResult`. The snap
+    // above then walks the head cut to `messages.len()`, the window collapses
+    // to (0, 0), the summarizer never runs, and every fold in that stretch
+    // degrades to prune-only — which, before dirge-qobx.3, ended the run.
+    //
+    // What the invariant actually needs is that no cut splits a
+    // tool_use↔tool_result pair, and results follow their call immediately
+    // (`heal::fix_tool_call_pairing` repairs the transcript if they ever do
+    // not). So any index whose message is not itself a tool result is a safe
+    // cut: the kept tail cannot begin with an orphan, and the message before
+    // it cannot be an assistant turn holding calls whose results were dropped
+    // — those results would be at this index.
+    let start = snap_forward_to_safe_cut(messages, raw_start);
+    let end = snap_backward_to_safe_cut(messages, raw_end);
     if start >= end {
         return (0, 0);
     }
     (start, end)
+}
+
+/// True when `msg` is a tool result in either transcript shape — the loop's
+/// `toolResult` or the heal-on-load `tool`.
+fn is_tool_result_msg(msg: &Value) -> bool {
+    matches!(
+        msg.get("role").and_then(|r| r.as_str()),
+        Some("toolResult" | "tool")
+    )
+}
+
+/// True when the transcript can be cut at `idx` — keeping `messages[idx..]`
+/// on one side — without splitting a tool_use↔tool_result pair
+/// (dirge-qobx.4). See `compute_compress_window` for why "not a tool result"
+/// is the whole condition. An index past the end is vacuously safe.
+fn is_safe_cut(messages: &[Value], idx: usize) -> bool {
+    messages.get(idx).is_none_or(|m| !is_tool_result_msg(m))
+}
+
+/// Smallest index `>= idx` that [`is_safe_cut`], clamped to `messages.len()`.
+fn snap_forward_to_safe_cut(messages: &[Value], idx: usize) -> usize {
+    let n = messages.len();
+    let mut i = idx.min(n);
+    while i < n && !is_safe_cut(messages, i) {
+        i += 1;
+    }
+    i
+}
+
+/// Largest index `<= idx` that [`is_safe_cut`], or 0 when none is.
+fn snap_backward_to_safe_cut(messages: &[Value], idx: usize) -> usize {
+    let mut i = idx.min(messages.len().saturating_sub(1));
+    loop {
+        if is_safe_cut(messages, i) {
+            return i;
+        }
+        if i == 0 {
+            return 0;
+        }
+        i -= 1;
+    }
 }
 
 /// True when `msg` is a user-role turn.
@@ -3360,14 +3428,36 @@ mod tests {
         assert!(apply_checkpoint_summary(&msgs, "## Goal\nx", 99).is_none());
     }
 
+    /// dirge-qobx.4: no user turn at or before the boundary is no longer a
+    /// refusal — an autonomous stretch has none, and this fast path would
+    /// never fire during one. The cut falls back to the nearest message that
+    /// is not itself a tool result, which is all the pairing invariant needs.
     #[test]
-    fn checkpoint_reuse_rejects_when_snap_collapses_to_zero() {
-        // No user turn at/before the boundary → snap_backward returns 0 →
-        // None (nothing whole to fold).
+    fn checkpoint_reuse_falls_back_to_a_safe_cut_without_a_user_turn() {
         let msgs = vec![
             serde_json::json!({"role": "assistant", "content": "a0"}),
             serde_json::json!({"role": "assistant", "content": "a1"}),
             serde_json::json!({"role": "assistant", "content": "a2"}),
+        ];
+        let (out, cut) = apply_checkpoint_summary(&msgs, "## Goal\nx", 2)
+            .expect("an all-assistant stretch is foldable");
+        assert_eq!(cut, 2, "the boundary itself is a safe cut");
+        assert_eq!(
+            out.len(),
+            2,
+            "the summary replaces messages[..2] and the tail is kept: {out:?}"
+        );
+    }
+
+    /// ...but a cut that would orphan a tool result is still refused. Every
+    /// candidate here is a tool result, so there is no safe place to put the
+    /// summary and nothing whole to fold.
+    #[test]
+    fn checkpoint_reuse_still_rejects_when_every_cut_orphans_a_result() {
+        let msgs = vec![
+            serde_json::json!({"role": "toolResult", "toolCallId": "c0", "content": "t0"}),
+            serde_json::json!({"role": "toolResult", "toolCallId": "c1", "content": "t1"}),
+            serde_json::json!({"role": "toolResult", "toolCallId": "c2", "content": "t2"}),
         ];
         assert!(apply_checkpoint_summary(&msgs, "## Goal\nx", 2).is_none());
     }
@@ -3432,6 +3522,80 @@ mod tests {
             })
             .unwrap();
         assert!(out[summary_idx - 1]["tool_calls"].is_null());
+    }
+
+    /// dirge-qobx.4: one prompt, sixty tool iterations, no user turn in
+    /// sight — the normal shape of agentic work, and the shape that produced
+    /// an empty compress window.
+    ///
+    /// `snap_forward_to_user` walked the head cut to `messages.len()`, the
+    /// window collapsed to (0, 0), the summarizer never ran, and every fold
+    /// in the stretch degraded to prune-only. The fallback cuts on
+    /// tool-group boundaries instead, which is what the pairing invariant
+    /// actually requires.
+    #[test]
+    fn compute_window_folds_an_autonomous_stretch_with_no_user_turn() {
+        let mut msgs = vec![
+            serde_json::json!({"role": "system", "content": "s"}),
+            serde_json::json!({"role": "user", "content": "one prompt"}),
+        ];
+        for i in 0..60 {
+            msgs.push(serde_json::json!({
+                "role": "assistant",
+                "content": [{
+                    "type": "toolCall",
+                    "id": format!("c{i}"),
+                    "name": "bash",
+                    "arguments": {"command": "ls"},
+                }],
+            }));
+            msgs.push(serde_json::json!({
+                "role": "toolResult",
+                "toolCallId": format!("c{i}"),
+                "toolName": "bash",
+                "content": [{"type": "text", "text": "output"}],
+            }));
+        }
+
+        let (start, end) =
+            compute_compress_window(&msgs, PROTECT_HEAD_DEFAULT, PROTECT_TAIL_DEFAULT);
+        assert!(
+            start < end,
+            "an autonomous stretch must be foldable; got ({start}, {end})"
+        );
+        // Neither cut may land on a tool result, or the fold splits a pair.
+        assert_ne!(msgs[start]["role"].as_str(), Some("toolResult"));
+        assert_ne!(msgs[end]["role"].as_str(), Some("toolResult"));
+
+        // And the applied fold leaves every tool result behind its call.
+        let out = apply_summary(&msgs, "## Goal\nx", start, end);
+        for (i, m) in out.iter().enumerate() {
+            if m["role"].as_str() == Some("toolResult") {
+                assert_eq!(
+                    out[i - 1]["role"].as_str(),
+                    Some("assistant"),
+                    "toolResult at {i} must follow an assistant"
+                );
+            }
+        }
+    }
+
+    /// The fallback never fires when a user turn is available: the preferred
+    /// cut is unchanged, so every transcript that folded before folds the
+    /// same way.
+    #[test]
+    fn compute_window_still_prefers_a_user_boundary() {
+        let mut msgs: Vec<Value> = vec![
+            serde_json::json!({"role": "system", "content": "s"}),
+            serde_json::json!({"role": "assistant", "content": "a"}),
+        ];
+        for i in 0..8 {
+            msgs.push(serde_json::json!({"role": "user", "content": format!("u{i}")}));
+            msgs.push(serde_json::json!({"role": "assistant", "content": format!("a{i}")}));
+        }
+        let (start, end) = compute_compress_window(&msgs, 2, 2);
+        assert_eq!(msgs[start]["role"].as_str(), Some("user"));
+        assert_eq!(msgs[end]["role"].as_str(), Some("user"));
     }
 
     #[test]
