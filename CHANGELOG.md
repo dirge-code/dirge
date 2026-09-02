@@ -6,6 +6,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- A run that spins on no-op shell commands is now caught by the repeat-loop
+  guard. A model that had decided it needed a different tool but kept reaching
+  for `bash` anyway issued a long run of `echo "ready"` / `echo done` / `true`
+  / `echo ok`, narrating "I need to call the memory tool" between each one, and
+  every guard missed it: the storm breaker needs *identical* arguments and each
+  echoed string differed, the failure tracker needs errored results and every
+  echo succeeded, nothing was edited so the file-touch tracker saw nothing, and
+  the progress monitor only judges a turn boundary and caps itself at two
+  nudges. The run burned turns until the cap. Inert commands — ones that change
+  no state and return nothing the model did not already know — now share a
+  single storm signature, so a spin of *varied* no-ops counts as the one
+  repeated behaviour it is and trips the guard on the third. The intervention
+  it gets is its own message rather than the generic repeat one: it names the
+  emptiness and points at the tool list, because "study the earlier results"
+  is useless advice when the earlier result was `ok`. The classifier is
+  deliberately narrow (literal `echo`/`printf` and the null builtins, nothing
+  with a substitution, redirect, pipe, subshell or background), so ordinary
+  shell work is untouched. (#808)
+
 ## [0.25.3] - 2026-08-31
 
 ### Fixed

@@ -3374,6 +3374,10 @@ pub async fn run_loop(
             // are backfilled (below). None unless the terminal-stuck
             // branch fires.
             let mut storm_give_up_tools: Option<Vec<String>> = None;
+            // Whether that give-up was a spin of inert shell commands
+            // (#808) rather than an identical repeat, so the explanation
+            // the user reads matches what actually happened.
+            let mut storm_give_up_inert = false;
             if !tool_calls.is_empty() {
                 let original_count = tool_calls.len();
                 let (mut surviving_calls, storm_report) = guards.inspect_calls(&tool_calls);
@@ -3402,6 +3406,24 @@ pub async fn run_loop(
                         3. Propose 2-3 FUNDAMENTALLY different approaches — a different tool, a different entry point, or a different interpretation of the problem — and pick the most promising one.\n\
                         4. Proceed with that approach.\n\
                         If none of them can work with the tools available, say so plainly and report what you found instead of trying again.";
+                    // #808: the same reflect-then-pivot shape, but for a
+                    // spin of no-op shell commands the diagnosis has to
+                    // differ. The repeat message tells the model to study
+                    // "the earlier results" — for `echo ok` there are none
+                    // worth studying, and the observed failure was a model
+                    // that already KNEW it wanted a different tool and kept
+                    // reaching for the shell anyway. So this one names the
+                    // emptiness directly and points at the tool list.
+                    const INERT_LOOP_GUARD: &str = "[inert-loop guard] Your last several shell commands did nothing — they changed no state and told you nothing you didn't already know (`echo`, `true`, and the like). You're spinning. Do NOT run another one. Before doing anything else, work through these steps:\n\
+                        1. State plainly what you are actually trying to do right now.\n\
+                        2. If it needs a tool other than `bash`, call that tool directly — a shell command cannot invoke another tool, and narrating that you intend to call one does not call it. Check the tool list you were given for its exact name and argument schema.\n\
+                        3. If the tool you want does not exist, say so plainly and either do the job with the tools you have or stop and report what is blocking you.\n\
+                        4. Proceed. Your next action must be either a real tool call that does work or a message to the user — not another placeholder command.";
+                    let guard_head = if storm_report.all_inert() {
+                        INERT_LOOP_GUARD
+                    } else {
+                        REPEAT_LOOP_GUARD
+                    };
                     // F4: record each looped call as an abandoned approach,
                     // then append the running list so the model sees every
                     // dead end it has hit this run, not just this repeat.
@@ -3414,10 +3436,8 @@ pub async fn run_loop(
                         let sig = super::reflexion::approach_signature(&call.name, &args);
                         reflections.record(sig);
                     }
-                    let guard_text = format!(
-                        "{REPEAT_LOOP_GUARD}{}",
-                        reflections.block().unwrap_or_default()
-                    );
+                    let guard_text =
+                        format!("{guard_head}{}", reflections.block().unwrap_or_default());
                     let guard_blocks = vec![ContentBlock::Text {
                         text: guard_text.clone(),
                     }];
@@ -3448,6 +3468,7 @@ pub async fn run_loop(
                     // stop, synthesize a coherent assistant explanation
                     // (built after backfill, below).
                     storm_give_up_tools = Some(tool_calls.iter().map(|c| c.name.clone()).collect());
+                    storm_give_up_inert = storm_report.all_inert();
                 }
 
                 // dirge-1elu.1: publish-state guard — pre-dispatch, after the
@@ -3655,7 +3676,11 @@ pub async fn run_loop(
                 // the user sees a coherent reply instead of an empty turn
                 // and the model carries its own failure account forward.
                 if let Some(tools) = storm_give_up_tools.take() {
-                    let text = super::storm::failure_narrative(&tools);
+                    let text = if storm_give_up_inert {
+                        super::storm::inert_narrative()
+                    } else {
+                        super::storm::failure_narrative(&tools)
+                    };
                     let msg =
                         AssistantMessage::new(vec![ContentBlock::Text { text }], StopReason::Stop);
                     // Render it to the user (text flows via MessageUpdate).
