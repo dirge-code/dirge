@@ -76,7 +76,19 @@ pub enum DisableWire {
     /// no equivalent (Google documents that 3 Pro / Flash / Flash-Lite cannot
     /// be fully turned off), so it carries [`DisableWire::None`] instead.
     GeminiZeroBudget,
-    /// No safe disable knob — request left untouched (OpenAI, Anthropic, unknown).
+    /// `{"thinking":{"type":"disabled"}}` — Anthropic models that think
+    /// ADAPTIVELY when the parameter is absent (Sonnet 5, Opus 5).
+    ///
+    /// Anthropic's own documented shape, and the one dirge already sends to
+    /// GLM. It is a separate variant from [`DisableWire::ThinkingToggle`] only
+    /// because reaching it is model-dependent — see
+    /// [`anthropic_disable_wire`].
+    AnthropicToggle,
+    /// Nothing works: thinking is unconditional on this model and the toggle
+    /// above is rejected outright (Fable). Sends no key and says so once,
+    /// rather than accepting an `off` it cannot deliver.
+    AnthropicUnconditional,
+    /// No safe disable knob — request left untouched (OpenAI, unknown).
     None,
 }
 
@@ -103,7 +115,7 @@ pub fn reasoning_profile(provider: Option<&str>, model: Option<&str>) -> Reasoni
     match provider {
         Some("anthropic") => ReasoningProfile {
             effort: EffortWire::AnthropicBudget,
-            disable: DisableWire::None,
+            disable: anthropic_disable_wire(model),
         },
         Some("deepseek") => ReasoningProfile {
             effort: EffortWire::TopLevelEffort,
@@ -220,6 +232,67 @@ fn thinking_level_to_glm_effort(level: ThinkingLevel) -> Option<&'static str> {
         ThinkingLevel::Medium | ThinkingLevel::High => Some("high"),
         ThinkingLevel::Xhigh | ThinkingLevel::Max => Some("max"),
     }
+}
+
+/// How `off` reaches an Anthropic model.
+///
+/// Omitting `thinking` was a correct disable through Claude 4.6 and stopped
+/// being one on the current generation: Sonnet 5 and Opus 5 think adaptively
+/// when the parameter is absent, so `off` left thinking fully on — silently, on
+/// the one setting whose whole purpose is opting out (GH #827). The wire shape
+/// did not change; what omitting it means did.
+///
+/// - Claude 4.6 and earlier → omit. Still a correct disable there, and sending
+///   the toggle instead would trade this bug for 400s.
+/// - Claude 5 → `{"thinking":{"type":"disabled"}}`.
+/// - Fable → nothing. Its thinking is unconditional and it rejects the toggle.
+/// - An id we cannot classify → omit, which is the pre-#827 behaviour and the
+///   safe answer not knowing.
+///
+/// The major version is PARSED, not substring-matched, so `claude-haiku-4-5`
+/// reads as major 4 and keeps the omit. Both naming schemes are handled: the
+/// legacy `claude-3-5-sonnet-…` puts the version first, the current
+/// `claude-<family>-<major>…` puts the family first.
+fn anthropic_disable_wire(model: Option<&str>) -> DisableWire {
+    let Some(model) = model else {
+        return DisableWire::None;
+    };
+    let id = model.trim().to_ascii_lowercase();
+    let bare = id.rsplit('/').next().unwrap_or(id.as_str());
+    let Some(rest) = bare.strip_prefix("claude-") else {
+        return DisableWire::None;
+    };
+    if rest.starts_with("fable") {
+        return DisableWire::AnthropicUnconditional;
+    }
+    let mut segments = rest.split('-');
+    let Some(first) = segments.next() else {
+        return DisableWire::None;
+    };
+    let version = if first.starts_with(|c: char| c.is_ascii_digit()) {
+        first
+    } else {
+        segments.next().unwrap_or_default()
+    };
+    let major: String = version.chars().take_while(char::is_ascii_digit).collect();
+    match major.parse::<u32>() {
+        Ok(v) if v >= 5 => DisableWire::AnthropicToggle,
+        _ => DisableWire::None,
+    }
+}
+
+/// Say once that `off` cannot be honoured on this model. Silence is what the
+/// issue is about; accepting the level and quietly ignoring it would reproduce
+/// the same bug one level down.
+fn warn_thinking_not_disablable() {
+    use std::sync::Once;
+    static WARNED: Once = Once::new();
+    WARNED.call_once(|| {
+        tracing::warn!(
+            target: "dirge::provider",
+            "this model's reasoning cannot be disabled; `off` leaves it on",
+        );
+    });
 }
 
 /// Which thinking knob a Gemini model takes.
@@ -423,6 +496,16 @@ impl ReasoningProfile {
             DisableWire::GeminiZeroBudget => Some(gemini_generation_config(
                 serde_json::json!({ "thinkingBudget": 0 }),
             )),
+            DisableWire::AnthropicToggle => {
+                // Opus 5 accepts `disabled` only alongside effort `high` or
+                // below. That cannot arise here: the toggle is emitted only for
+                // `off`, which sends no effort at all.
+                Some(serde_json::json!({ "thinking": { "type": "disabled" } }))
+            }
+            DisableWire::AnthropicUnconditional => {
+                warn_thinking_not_disablable();
+                None
+            }
             DisableWire::None => None,
         }
     }
@@ -554,6 +637,69 @@ mod tests {
             }
             .disable_params(),
             None
+        );
+    }
+
+    /// GH #827: which shape `off` takes on Anthropic, per model. The major
+    /// version is parsed, not substring-matched — `claude-haiku-4-5` is the
+    /// trap a naive "-5" check falls into, and sending it the toggle would
+    /// trade a silent bug for a 400.
+    #[test]
+    fn anthropic_disable_wire_follows_the_model_generation() {
+        for id in [
+            "claude-sonnet-5",
+            "claude-opus-5",
+            "claude-opus-5-20260101",
+            "anthropic/claude-sonnet-5",
+            "  CLAUDE-OPUS-5  ",
+        ] {
+            assert_eq!(
+                anthropic_disable_wire(Some(id)),
+                DisableWire::AnthropicToggle,
+                "{id}",
+            );
+        }
+        for id in [
+            "claude-opus-4-6",
+            "claude-sonnet-4-6",
+            "claude-haiku-4-5",
+            "claude-opus-4-1",
+            "claude-3-5-sonnet-20241022",
+        ] {
+            assert_eq!(
+                anthropic_disable_wire(Some(id)),
+                DisableWire::None,
+                "omitting the parameter is still a correct disable on {id}",
+            );
+        }
+        assert_eq!(
+            anthropic_disable_wire(Some("claude-fable-5-1")),
+            DisableWire::AnthropicUnconditional,
+            "Fable's thinking is unconditional and it rejects the toggle",
+        );
+        // Not knowing means keeping the pre-#827 behaviour.
+        assert_eq!(anthropic_disable_wire(None), DisableWire::None);
+        assert_eq!(
+            anthropic_disable_wire(Some("some-proxy-alias")),
+            DisableWire::None,
+        );
+    }
+
+    /// And the profile turns that into the payload. `{"type":"disabled"}` is
+    /// Anthropic's own documented shape — the one dirge already sends to GLM.
+    #[test]
+    fn anthropic_profile_emits_the_documented_disable_shape() {
+        assert_eq!(
+            reasoning_profile(Some("anthropic"), Some("claude-sonnet-5")).disable_params(),
+            Some(serde_json::json!({ "thinking": { "type": "disabled" } })),
+        );
+        assert_eq!(
+            reasoning_profile(Some("anthropic"), Some("claude-opus-4-6")).disable_params(),
+            None,
+        );
+        assert_eq!(
+            reasoning_profile(Some("anthropic"), Some("claude-fable-5-1")).disable_params(),
+            None,
         );
     }
 
