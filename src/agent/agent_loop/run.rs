@@ -1862,6 +1862,22 @@ async fn run_compaction_pass_with_focus(
                     outcome = SummaryOutcome::Failed;
                 }
             }
+        } else if !reused {
+            // dirge-qobx.5: a skipped summarization used to be completely
+            // silent. `compute_compress_window` returns (0, 0) when the
+            // window collapses — most often because the stretch to fold
+            // contains no user turn to cut on (dirge-qobx.4) — and the
+            // outcome is then the same `Skipped` a healthy prune-only pass
+            // returns. The only surviving evidence was a ContextCompacted
+            // with a tiny delta, which reads as a successful compaction.
+            tracing::debug!(
+                target: "dirge::agent_loop",
+                messages = current_context.messages.len(),
+                protect_head = compression::PROTECT_HEAD_DEFAULT,
+                protect_tail = protect_tail.max(compression::PROTECT_TAIL_DEFAULT),
+                tokens = after_prune,
+                "compaction: no compress window — nothing between the protected head and tail to summarize",
+            );
         }
     }
 
@@ -2695,6 +2711,15 @@ pub async fn run_loop(
     // first response, which is the same "no usage yet" fallback the panel
     // gauge uses.
     let mut fixed_overhead: u64 = 0;
+
+    // dirge-qobx.3: whether this run has already said that its fixed overhead
+    // alone clears the force-summary threshold. Once it does, no fold can
+    // bring the ratio back under it — the fold rewrites `messages` and the
+    // overhead is not in `messages` — so the honest move is to say so once,
+    // stop spending summarizer calls on it, and let the run continue against
+    // a window that is not actually full. Latched, because the alternative is
+    // the same warning every turn for the rest of the run.
+    let mut overhead_is_unfoldable = false;
 
     // dirge-5mtx.1: per-run gate/capability tally. Declared before the
     // initial steering poll so both steering-poll sites can record into it.
@@ -4030,35 +4055,114 @@ pub async fn run_loop(
                         // still over the threshold and the next request could
                         // overflow or 400. Honoured below, after the
                         // checkpoint-schedule reset.
-                        // When context is critically over the threshold,
-                        // prune aggressively then run the structured-summary
-                        // pass if a summarizer is wired.
-                        let outcome = run_compaction_pass(
-                            &mut current_context,
-                            &summarize_fn,
-                            3, // protect only last 3
-                            compaction_failures,
-                            &memory_provider,
-                            config.compaction_hooks.as_ref(),
-                            emit,
-                            &checkpoint_slot,
-                            &mut checkpoint_generation,
-                            (ctx_max as f64 * context_manager::HISTORY_FOLD_THRESHOLD) as u64,
-                        )
-                        .await;
-                        // dirge-8s2v: `Succeeded` is the only outcome that
-                        // moved anything — `Failed` and `Skipped` both leave
-                        // the context exactly as it was.
-                        force_turn_end = Some((
-                            matches!(outcome, SummaryOutcome::Succeeded(_)),
-                            decision.prompt_tokens,
-                        ));
-                        if let SummaryOutcome::Succeeded(idx) = outcome {
-                            restore_working_files(&config, &mut current_context, idx, ctx_max)
-                                .await;
-                        }
-                        if !compaction_recorded_this_iter {
-                            record_compaction_outcome(&mut compaction_failures, outcome);
+                        // dirge-qobx.3: is there anything a fold could even
+                        // reach? The ratio that got us here counts the system
+                        // prompt and every tool schema; a fold rewrites
+                        // `messages`. When the overhead ALONE clears the
+                        // threshold, folding the history to nothing would leave
+                        // the ratio where it is — so say so once, stop spending
+                        // summarizer calls on it, and decide whether to go on
+                        // from whether requests still FIT, not from whether the
+                        // fold helped.
+                        let force_threshold =
+                            (ctx_max as f64 * context_manager::FORCE_SUMMARY_THRESHOLD) as u64;
+                        if fixed_overhead > force_threshold {
+                            if !overhead_is_unfoldable {
+                                overhead_is_unfoldable = true;
+                                let pct = fixed_overhead
+                                    .saturating_mul(100)
+                                    .checked_div(ctx_max)
+                                    .unwrap_or(0);
+                                tracing::warn!(
+                                    target: "dirge::agent_loop",
+                                    fixed_overhead,
+                                    ctx_max,
+                                    "context: fixed overhead alone is over the force-summary threshold — no fold can help",
+                                );
+                                let _ = emit
+                                    .send(LoopEvent::SystemNotice {
+                                        content: format!(
+                                            "The system prompt and tool schemas alone are \
+                                             {fixed_overhead} tokens — {pct}% of the {ctx_max}-token \
+                                             context budget. No compaction can reduce that, so the \
+                                             context manager will stop trying to. Trim the tool \
+                                             surface (fewer MCP servers) or raise `context_target` \
+                                             in config.json."
+                                        ),
+                                    })
+                                    .await;
+                            }
+                            // Pruning is free, so it still runs: it keeps the
+                            // history from growing into what little room the
+                            // overhead leaves, and a run in this state has no
+                            // other brake on it. Only the summarizer is
+                            // skipped — multi-second, and unable to move a
+                            // ratio the overhead dominates, which is the
+                            // every-turn runaway dirge-kq3a is about.
+                            current_context.messages =
+                                crate::agent::compression::prune_tool_outputs(
+                                    &current_context.messages,
+                                    3,
+                                );
+                            // Whether the RUN can go on is a different question
+                            // from whether a fold can help. If the unfoldable
+                            // part alone fills the window, every later request
+                            // is refused and stopping is the only honest
+                            // outcome. Under the window it still fits — the
+                            // budget is merely tighter than the policy wants,
+                            // and ending a task over that is the bug here.
+                            let requests_still_fit = fixed_overhead < ctx_max;
+                            force_turn_end = Some((requests_still_fit, decision.prompt_tokens));
+                        } else {
+                            // When context is critically over the threshold,
+                            // prune aggressively then run the structured-summary
+                            // pass if a summarizer is wired.
+                            let outcome = run_compaction_pass(
+                                &mut current_context,
+                                &summarize_fn,
+                                3, // protect only last 3
+                                compaction_failures,
+                                &memory_provider,
+                                config.compaction_hooks.as_ref(),
+                                emit,
+                                &checkpoint_slot,
+                                &mut checkpoint_generation,
+                                (ctx_max as f64 * context_manager::HISTORY_FOLD_THRESHOLD) as u64,
+                            )
+                            .await;
+                            // dirge-qobx.3: "made room" is a question about the
+                            // NEXT REQUEST, not about which code path the fold
+                            // took. It used to be `matches!(outcome,
+                            // Succeeded(_))` — so a prune-only pass that freed
+                            // real tokens and brought the request back under the
+                            // threshold ended the RUN, mid-task, with the budget
+                            // no longer full. Project what the next request will
+                            // cost instead: what the estimator makes of the
+                            // messages the fold left, plus the overhead that is
+                            // not in them.
+                            let projected = fixed_overhead.saturating_add(
+                                crate::agent::compression::estimate_messages_tokens(
+                                    &current_context.messages,
+                                ),
+                            );
+                            let made_room = projected <= force_threshold;
+                            if !made_room {
+                                tracing::warn!(
+                                    target: "dirge::agent_loop",
+                                    outcome = ?outcome,
+                                    projected,
+                                    force_threshold,
+                                    "context: the fold left the next request over the threshold",
+                                );
+                            }
+                            force_turn_end = Some((made_room, decision.prompt_tokens));
+                            if let SummaryOutcome::Succeeded(idx) = outcome {
+                                restore_working_files(&config, &mut current_context, idx, ctx_max)
+                                    .await;
+                            }
+                            if !compaction_recorded_this_iter {
+                                record_compaction_outcome(&mut compaction_failures, outcome);
+                            }
                         }
                     }
                     _ => {}
@@ -4124,19 +4228,40 @@ pub async fn run_loop(
                     continue 'outer;
                 }
                 if !made_room {
-                    let notice = format!(
-                        "Run stopped: the context is over the model's window \
-                         ({} of {} tokens) and compaction could not reduce it. \
-                         The task is unfinished. This usually means the system \
-                         prompt and tool schemas alone exceed the window — \
-                         check the model's context_window in config.",
-                        prompt_tokens, ctx_max,
-                    );
+                    // dirge-qobx.3 / dirge-qobx.5: name what was measured, and
+                    // which of the two states this is.
+                    //
+                    // One message used to cover both, and it said "over the
+                    // model's window" — false whenever the run was merely over
+                    // dirge's own force-summary threshold (80% of
+                    // `min(window, context_target)`) with the rest of the
+                    // window unused. It then guessed at the cause; that guess
+                    // is now a measurement.
+                    let notice = if overhead_is_unfoldable {
+                        format!(
+                            "Run stopped: the system prompt and tool schemas alone are \
+                             {fixed_overhead} tokens, at or over the whole {ctx_max}-token \
+                             context budget, so no request fits and no compaction can change \
+                             that. The task is unfinished. Trim the tool surface (fewer MCP \
+                             servers), or raise `context_target` / `context_window` in \
+                             config.json if the model's real window is larger."
+                        )
+                    } else {
+                        format!(
+                            "Run stopped: the context is at {prompt_tokens} of the \
+                             {ctx_max}-token context budget and compaction could not reduce it \
+                             further. The task is unfinished. Raise `context_target` in \
+                             config.json if the model's window is larger than the budget, or \
+                             start a fresh session to carry on."
+                        )
+                    };
                     tracing::warn!(
                         target: "dirge::agent_loop",
                         prompt_tokens = prompt_tokens,
                         ctx_max = ctx_max,
-                        "run truncated: context over window and nothing left to fold",
+                        fixed_overhead = fixed_overhead,
+                        unfoldable_overhead = overhead_is_unfoldable,
+                        "run truncated: nothing left to fold and the next request stays over the budget",
                     );
                     let _ = emit
                         .send(LoopEvent::SystemNotice {

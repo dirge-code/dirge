@@ -32,8 +32,17 @@
 //! ratio back under it, and without this guard the loop re-folds every turn
 //! forever (dirge-kq3a).
 //!
-//! Note this is a *no-progress* guard, not the minimum-savings guard this doc
-//! previously described: there was a `HISTORY_FOLD_MIN_SAVINGS_FRACTION = 0.30`
+//! As of dirge-qobx.3 the loop does more than decline to report that fold: at
+//! the force-summary tier it *measures* the fixed overhead (see the pre-send
+//! accounting below), and when the overhead alone clears the threshold it says
+//! so once, skips the summarizer for the rest of the run, and keeps going on
+//! the strength of whether requests still FIT the window — which is a
+//! different question from whether a fold can help. The run is only stopped
+//! when the unfoldable part fills the whole window, because then nothing fits.
+//!
+//! Note this no-rotation rule is a *no-progress* guard, not the
+//! minimum-savings guard this doc previously described: there was a
+//! `HISTORY_FOLD_MIN_SAVINGS_FRACTION = 0.30`
 //! constant, but it was `#[cfg(test)]` and referenced only by a compile-time
 //! assert, so no release build ever consulted it and no fold was ever skipped
 //! for saving too little. Skipping a *partially* useful fold is a real
