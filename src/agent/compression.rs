@@ -266,11 +266,26 @@ pub(crate) fn content_chars(content: Option<&Value>) -> usize {
     }
 }
 
+/// Rough token cost of one image block (dirge-qobx.1).
+///
+/// An image is a handful of bytes in the transcript (an asset id and a media
+/// type — the base64 is reified at the provider boundary) and between several
+/// hundred and a couple of thousand tokens in the request. Anthropic bills a
+/// full-window screenshot at roughly `(w × h) / 750`, which for the 1456×816
+/// shape dirge's own screenshots come out at is ~1.6k; OpenAI and Gemini land
+/// in the same order of magnitude.
+///
+/// The transcript records no dimensions, so this is one flat number rather than
+/// a computed one. It is deliberately a round 1.5k: the alternative in force
+/// until now was zero, and zero is wrong by 1.5k per image on a session that
+/// reads screenshots all day.
+pub(crate) const IMAGE_TOKENS_ESTIMATE: u64 = 1_500;
+
 /// Characters a single content block contributes to the request (dirge-tmex).
 ///
 /// Not the same question as [`text_of_block`], which asks "what text would the
 /// model READ". This asks "how much of the request does this block occupy",
-/// and a tool call answers differently to an image:
+/// and the block types answer differently:
 ///
 ///   * `text` — its text, obviously.
 ///   * `toolCall` — its ARGUMENTS, in full. Every byte is serialized into the
@@ -279,20 +294,29 @@ pub(crate) fn content_chars(content: Option<&Value>) -> usize {
 ///     blind to what is routinely the largest thing in the turn, which matters
 ///     because that estimate gates the turn-start fold and the tiered
 ///     result cap.
-///   * anything else — zero. An image really does reach the model as an opaque
-///     reference, and inflating every turn that carries one would be the
-///     opposite error.
+///   * `thinking` — its text (dirge-qobx.1). Reasoning is not a local artifact:
+///     it is echoed back in the assistant turn for every provider except
+///     OpenAI (`rig_stream_factory::provider_rejects_reasoning_echo`), nothing
+///     ever strips a stale block, and on a long reasoning-heavy run it is the
+///     largest single thing in the request. Counting it as zero is how a fold
+///     comes to report `63800 → 63479` against a request the provider charged
+///     204,320 for.
+///   * `image` — [`IMAGE_TOKENS_ESTIMATE`] worth of chars. The block itself is
+///     an opaque reference, which is why this was zero; what reaches the model
+///     is not.
+///   * anything else — zero.
 fn block_chars(block: &Value) -> usize {
     let Some(obj) = block.as_object() else {
         return 0;
     };
     match obj.get("type").and_then(|t| t.as_str()) {
-        Some("text") => obj.get("text").and_then(|t| t.as_str()).map_or(0, str::len),
+        Some("text" | "thinking") => obj.get("text").and_then(|t| t.as_str()).map_or(0, str::len),
         Some("toolCall") => {
             let args = obj.get("arguments").map_or(0, |a| a.to_string().len());
             let name = obj.get("name").and_then(|n| n.as_str()).map_or(0, str::len);
             args + name
         }
+        Some("image") => (IMAGE_TOKENS_ESTIMATE * CHARS_PER_TOKEN) as usize,
         _ => 0,
     }
 }
@@ -2567,21 +2591,36 @@ mod tests {
         assert_eq!(estimate_messages_tokens(&msgs), 10);
     }
 
-    /// Multi-block content sums across all text blocks; non-text
-    /// blocks (image, tool_use) contribute zero.
+    /// Multi-block content sums across all text blocks. A block type nobody
+    /// prices contributes zero; an image contributes its flat rate
+    /// (dirge-qobx.1 — it used to be zero, and a screenshot is not free).
     #[test]
-    fn estimate_tokens_sums_multi_block_skipping_non_text() {
+    fn estimate_tokens_sums_multi_block_content() {
         let msgs = vec![serde_json::json!({
             "role": "toolResult",
             "content": [
                 {"type": "text", "text": "a".repeat(20)},
-                {"type": "image", "source": "ignored"},
+                {"type": "video", "source": "unpriced"},
                 {"type": "text", "text": "b".repeat(20)},
             ],
             "toolName": "bash",
         })];
         // 40 chars / 4 = 10 tokens.
         assert_eq!(estimate_messages_tokens(&msgs), 10);
+
+        let with_image = vec![serde_json::json!({
+            "role": "toolResult",
+            "content": [
+                {"type": "text", "text": "a".repeat(20)},
+                {"type": "image", "assetId": "ignored"},
+                {"type": "text", "text": "b".repeat(20)},
+            ],
+            "toolName": "bash",
+        })];
+        assert_eq!(
+            estimate_messages_tokens(&with_image),
+            10 + IMAGE_TOKENS_ESTIMATE
+        );
     }
 
     /// Mix of string-content + block-content messages — both
@@ -2799,19 +2838,59 @@ mod tests {
         );
     }
 
-    /// The other side: a block that really IS an opaque reference must stay
-    /// uncounted, or the fix would inflate every turn carrying an image.
+    /// dirge-qobx.1: an image block is a few bytes in the transcript and
+    /// ~1.5k tokens in the request, and this test used to assert the former.
+    ///
+    /// The reversal is deliberate. "Opaque reference" describes the block,
+    /// not the cost: the reference is reified to base64 at the provider
+    /// boundary and billed by area. Counting it as zero was defensible when
+    /// an image was a rarity and indefensible for a session that reads
+    /// screenshots all day — twenty of them are 30k tokens of window that the
+    /// pre-send tiers could not see.
     #[test]
-    fn the_estimator_still_ignores_an_opaque_block() {
+    fn the_estimator_prices_an_image_block() {
         let msgs = vec![serde_json::json!({
             "role": "user",
             "content": [
                 {"type": "text", "text": "look at this"},
-                {"type": "image", "sha256": "a".repeat(64), "mime": "image/png"},
+                {"type": "image", "assetId": "a".repeat(36), "mediaType": "image/png"},
             ],
         })];
-        // Only "look at this" (12 chars) counts.
-        assert_eq!(estimate_messages_tokens(&msgs), 3);
+        // "look at this" is 12 chars → 3 tokens, plus the image's flat rate.
+        assert_eq!(estimate_messages_tokens(&msgs), 3 + IMAGE_TOKENS_ESTIMATE);
+        // A block type nobody prices still contributes nothing.
+        let unknown = vec![serde_json::json!({
+            "role": "assistant",
+            "content": [{"type": "audio", "assetId": "b".repeat(36)}],
+        })];
+        assert_eq!(estimate_messages_tokens(&unknown), 0);
+    }
+
+    /// dirge-qobx.1: the estimator must count reasoning, because the request
+    /// carries it.
+    ///
+    /// A `thinking` block is echoed back inside the assistant turn for every
+    /// provider except OpenAI, and nothing strips a stale one, so on a long
+    /// reasoning-heavy run it is the largest single term in the prompt. While
+    /// it counted zero, a fold could report `63800 → 63479` on a request the
+    /// provider charged 204,320 for — and the tiers that read the estimate
+    /// (turn-start fold, tiered result cap) never fired at all.
+    #[test]
+    fn the_estimator_counts_replayed_reasoning() {
+        let reasoning = "let me think about this step by step. ".repeat(1_000);
+        let msgs = vec![serde_json::json!({
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "text": reasoning},
+                {"type": "text", "text": "done"},
+            ],
+        })];
+
+        let got = estimate_messages_tokens(&msgs);
+        assert!(
+            got > 9_000,
+            "estimated {got} tokens for a turn carrying 38 KB of replayed              reasoning — the pre-send tiers read this number, and reasoning              is on the wire for every provider but OpenAI"
+        );
     }
 
     /// `SUMMARY_SECTIONS` is a hand-written copy of the template's headers,
