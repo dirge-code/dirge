@@ -41,8 +41,23 @@ pub enum EffortWire {
     TopLevelStandardEffort,
     /// `{"thinking":{"type":"enabled","budget_tokens":N}}` — Anthropic (budget).
     AnthropicBudget,
-    /// `{"thinking_config":{"thinking_budget":N}}` — Gemini (budget).
+    /// `{"generationConfig":{"thinkingConfig":{"thinkingBudget":N}}}` —
+    /// Gemini 2.5, which takes a token budget and rejects `thinkingLevel`.
+    ///
+    /// The nesting is not decoration. rig 0.41 deserializes
+    /// `additional_params` into `AdditionalParameters { generation_config,
+    /// #[serde(flatten)] additional_params }` with `rename_all = "camelCase"`,
+    /// so it claims exactly the key `generationConfig` and flattens everything
+    /// else into the request body at the TOP level. A bare `thinking_config`
+    /// was therefore never a `generationConfig` field — it went out top-level
+    /// and Gemini answered `Unknown name "thinking_config": Cannot find
+    /// field` (GH #832).
     GeminiBudget,
+    /// `{"generationConfig":{"thinkingConfig":{"thinkingLevel":"low"}}}` —
+    /// Gemini 3, which takes a depth level. It still accepts `thinkingBudget`
+    /// for back-compat but rejects a request carrying both, so the two are
+    /// mutually exclusive and the model id picks one.
+    GeminiLevel,
     /// Generic `{"reasoning_level":<level>}` passthrough — Ollama / unknown.
     GenericLevel,
 }
@@ -56,9 +71,24 @@ pub enum DisableWire {
     ChatTemplateKwargs,
     /// `{"think":false}` — Ollama.
     OllamaThink,
-    /// `{"thinking_config":{"thinking_budget":0}}` — Gemini.
+    /// `{"generationConfig":{"thinkingConfig":{"thinkingBudget":0}}}` —
+    /// Gemini 2.5, where a zero budget is a real "no thinking". Gemini 3 has
+    /// no equivalent (Google documents that 3 Pro / Flash / Flash-Lite cannot
+    /// be fully turned off), so it carries [`DisableWire::None`] instead.
     GeminiZeroBudget,
-    /// No safe disable knob — request left untouched (OpenAI, Anthropic, unknown).
+    /// `{"thinking":{"type":"disabled"}}` — Anthropic models that think
+    /// ADAPTIVELY when the parameter is absent (Sonnet 5, Opus 5).
+    ///
+    /// Anthropic's own documented shape, and the one dirge already sends to
+    /// GLM. It is a separate variant from [`DisableWire::ThinkingToggle`] only
+    /// because reaching it is model-dependent — see
+    /// [`anthropic_disable_wire`].
+    AnthropicToggle,
+    /// Nothing works: thinking is unconditional on this model and the toggle
+    /// above is rejected outright (Fable). Sends no key and says so once,
+    /// rather than accepting an `off` it cannot deliver.
+    AnthropicUnconditional,
+    /// No safe disable knob — request left untouched (OpenAI, unknown).
     None,
 }
 
@@ -75,12 +105,17 @@ pub struct ReasoningProfile {
 // ---------------------------------------------------------------------------
 
 /// Map a provider name (as used in `provider_name` / `oneshot_provider_kind`)
-/// to its reasoning wire profile.
-pub fn reasoning_profile(provider: Option<&str>) -> ReasoningProfile {
+/// and the concrete model id to their reasoning wire profile.
+///
+/// The model matters because a provider's shape is not always uniform across
+/// its own generations: Gemini 2.5 and Gemini 3 take mutually exclusive
+/// thinking knobs (GH #832). `None` for the model means "unknown id", and every
+/// arm answers with the shape that is safe not knowing.
+pub fn reasoning_profile(provider: Option<&str>, model: Option<&str>) -> ReasoningProfile {
     match provider {
         Some("anthropic") => ReasoningProfile {
             effort: EffortWire::AnthropicBudget,
-            disable: DisableWire::None,
+            disable: anthropic_disable_wire(model),
         },
         Some("deepseek") => ReasoningProfile {
             effort: EffortWire::TopLevelEffort,
@@ -106,9 +141,18 @@ pub fn reasoning_profile(provider: Option<&str>) -> ReasoningProfile {
             effort: EffortWire::TopLevelEffort,
             disable: DisableWire::ThinkingToggle,
         },
-        Some("gemini") => ReasoningProfile {
-            effort: EffortWire::GeminiBudget,
-            disable: DisableWire::GeminiZeroBudget,
+        Some("gemini") => match gemini_generation(model) {
+            GeminiGeneration::Level => ReasoningProfile {
+                effort: EffortWire::GeminiLevel,
+                // No knob: thinking is not fully disablable on Gemini 3, and
+                // emitting a level would be claiming an "off" that does not
+                // exist.
+                disable: DisableWire::None,
+            },
+            GeminiGeneration::Budget => ReasoningProfile {
+                effort: EffortWire::GeminiBudget,
+                disable: DisableWire::GeminiZeroBudget,
+            },
         },
         Some("ollama") => ReasoningProfile {
             effort: EffortWire::GenericLevel,
@@ -190,6 +234,123 @@ fn thinking_level_to_glm_effort(level: ThinkingLevel) -> Option<&'static str> {
     }
 }
 
+/// How `off` reaches an Anthropic model.
+///
+/// Omitting `thinking` was a correct disable through Claude 4.6 and stopped
+/// being one on the current generation: Sonnet 5 and Opus 5 think adaptively
+/// when the parameter is absent, so `off` left thinking fully on — silently, on
+/// the one setting whose whole purpose is opting out (GH #827). The wire shape
+/// did not change; what omitting it means did.
+///
+/// - Claude 4.6 and earlier → omit. Still a correct disable there, and sending
+///   the toggle instead would trade this bug for 400s.
+/// - Claude 5 → `{"thinking":{"type":"disabled"}}`.
+/// - Fable → nothing. Its thinking is unconditional and it rejects the toggle.
+/// - An id we cannot classify → omit, which is the pre-#827 behaviour and the
+///   safe answer not knowing.
+///
+/// The major version is PARSED, not substring-matched, so `claude-haiku-4-5`
+/// reads as major 4 and keeps the omit. Both naming schemes are handled: the
+/// legacy `claude-3-5-sonnet-…` puts the version first, the current
+/// `claude-<family>-<major>…` puts the family first.
+fn anthropic_disable_wire(model: Option<&str>) -> DisableWire {
+    let Some(model) = model else {
+        return DisableWire::None;
+    };
+    let id = model.trim().to_ascii_lowercase();
+    let bare = id.rsplit('/').next().unwrap_or(id.as_str());
+    let Some(rest) = bare.strip_prefix("claude-") else {
+        return DisableWire::None;
+    };
+    if rest.starts_with("fable") {
+        return DisableWire::AnthropicUnconditional;
+    }
+    let mut segments = rest.split('-');
+    let Some(first) = segments.next() else {
+        return DisableWire::None;
+    };
+    let version = if first.starts_with(|c: char| c.is_ascii_digit()) {
+        first
+    } else {
+        segments.next().unwrap_or_default()
+    };
+    let major: String = version.chars().take_while(char::is_ascii_digit).collect();
+    match major.parse::<u32>() {
+        Ok(v) if v >= 5 => DisableWire::AnthropicToggle,
+        _ => DisableWire::None,
+    }
+}
+
+/// Say once that `off` cannot be honoured on this model. Silence is what the
+/// issue is about; accepting the level and quietly ignoring it would reproduce
+/// the same bug one level down.
+fn warn_thinking_not_disablable() {
+    use std::sync::Once;
+    static WARNED: Once = Once::new();
+    WARNED.call_once(|| {
+        tracing::warn!(
+            target: "dirge::provider",
+            "this model's reasoning cannot be disabled; `off` leaves it on",
+        );
+    });
+}
+
+/// Which thinking knob a Gemini model takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GeminiGeneration {
+    /// Gemini 2.5 and earlier — `thinkingBudget`, a token count.
+    Budget,
+    /// Gemini 3 — `thinkingLevel`, a depth.
+    Level,
+}
+
+/// Classify a Gemini model id by which thinking knob it takes.
+///
+/// Gemini 2.5 accepts `thinkingBudget` and ignores/rejects `thinkingLevel`;
+/// Gemini 3 prefers `thinkingLevel` and rejects a request carrying both. An id
+/// we cannot classify keeps the budget: it is the shape every generation still
+/// accepts, so an unknown id degrades to today's behaviour rather than to a
+/// 400. An OpenRouter-style `vendor/` prefix is stripped first, matching
+/// [`crate::provider::model_family`].
+fn gemini_generation(model: Option<&str>) -> GeminiGeneration {
+    let Some(model) = model else {
+        return GeminiGeneration::Budget;
+    };
+    let id = model.trim().to_ascii_lowercase();
+    let bare = id.rsplit('/').next().unwrap_or(id.as_str());
+    let Some(rest) = bare.strip_prefix("gemini-") else {
+        return GeminiGeneration::Budget;
+    };
+    let major: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    match major.parse::<u32>() {
+        Ok(v) if v >= 3 => GeminiGeneration::Level,
+        _ => GeminiGeneration::Budget,
+    }
+}
+
+/// Map `ThinkingLevel` to a Gemini 3 `thinkingLevel`.
+///
+/// Only `low` / `medium` / `high` are emitted. Gemini 3 also has a `minimal`
+/// tier, but unevenly — 3.6-Flash has it and 3.7-Flash does not — so `Minimal`
+/// folds to `low`, which every 3.x model accepts and which is where `Minimal`
+/// already lands on most of dirge's other wires. `Xhigh`/`Max` fold to `high`,
+/// Gemini 3's ceiling. `Off` returns None: the caller reaches for the disable
+/// wire, which on Gemini 3 is deliberately nothing.
+fn thinking_level_to_gemini_level(level: ThinkingLevel) -> Option<&'static str> {
+    match level {
+        ThinkingLevel::Off => None,
+        ThinkingLevel::Minimal | ThinkingLevel::Low => Some("low"),
+        ThinkingLevel::Medium => Some("medium"),
+        ThinkingLevel::High | ThinkingLevel::Xhigh | ThinkingLevel::Max => Some("high"),
+    }
+}
+
+/// Wrap a `thinkingConfig` body where rig will actually find it — see
+/// [`EffortWire::GeminiBudget`] for why the nesting is load-bearing.
+fn gemini_generation_config(thinking: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({ "generationConfig": { "thinkingConfig": thinking } })
+}
+
 /// Token budget for a thinking level. Reads from the caller's
 /// `ThinkingBudgets` if provided, falling back to defaults
 /// reasonable for token-budget reasoning models (Anthropic
@@ -248,11 +409,12 @@ pub const REASONING_OUTPUT_HEADROOM: u32 = 8_192;
 /// forcing a ceiling would only override the model's own, larger default.
 pub fn max_tokens_for_reasoning(
     provider: Option<&str>,
+    model: Option<&str>,
     level: ThinkingLevel,
     budgets: Option<&ThinkingBudgets>,
 ) -> Option<u64> {
     if !matches!(
-        reasoning_profile(provider).effort,
+        reasoning_profile(provider, model).effort,
         EffortWire::AnthropicBudget
     ) {
         return None;
@@ -309,8 +471,11 @@ impl ReasoningProfile {
             }
             EffortWire::GeminiBudget => {
                 let b = budget_for_level(level, budgets);
-                (b > 0).then(|| serde_json::json!({ "thinking_config": { "thinking_budget": b } }))
+                (b > 0)
+                    .then(|| gemini_generation_config(serde_json::json!({ "thinkingBudget": b })))
             }
+            EffortWire::GeminiLevel => thinking_level_to_gemini_level(level)
+                .map(|l| gemini_generation_config(serde_json::json!({ "thinkingLevel": l }))),
             EffortWire::GenericLevel => Some(
                 serde_json::json!({ "reasoning_level": serde_json::to_value(level).unwrap_or(serde_json::Value::Null) }),
             ),
@@ -328,8 +493,18 @@ impl ReasoningProfile {
                 Some(serde_json::json!({ "chat_template_kwargs": { "thinking": false } }))
             }
             DisableWire::OllamaThink => Some(serde_json::json!({ "think": false })),
-            DisableWire::GeminiZeroBudget => {
-                Some(serde_json::json!({ "thinking_config": { "thinking_budget": 0 } }))
+            DisableWire::GeminiZeroBudget => Some(gemini_generation_config(
+                serde_json::json!({ "thinkingBudget": 0 }),
+            )),
+            DisableWire::AnthropicToggle => {
+                // Opus 5 accepts `disabled` only alongside effort `high` or
+                // below. That cannot arise here: the toggle is emitted only for
+                // `off`, which sends no effort at all.
+                Some(serde_json::json!({ "thinking": { "type": "disabled" } }))
+            }
+            DisableWire::AnthropicUnconditional => {
+                warn_thinking_not_disablable();
+                None
             }
             DisableWire::None => None,
         }
@@ -382,6 +557,10 @@ mod tests {
                 EffortWire::TopLevelEffort,
                 DisableWire::ThinkingToggle,
             ),
+            // Keyed by provider alone (model `None`), which is the
+            // unclassifiable case: the budget wire, accepted by every Gemini
+            // generation. The model-aware split is covered by
+            // `gemini_profile_follows_the_model_generation`.
             (
                 "gemini",
                 EffortWire::GeminiBudget,
@@ -390,7 +569,7 @@ mod tests {
             ("ollama", EffortWire::GenericLevel, DisableWire::OllamaThink),
         ];
         for &(name, effort, disable) in cases {
-            let p = reasoning_profile(Some(name));
+            let p = reasoning_profile(Some(name), None);
             assert_eq!(
                 (p.effort, p.disable),
                 (effort, disable),
@@ -401,12 +580,12 @@ mod tests {
 
     #[test]
     fn profile_table_none_and_unknown() {
-        let none = reasoning_profile(None);
+        let none = reasoning_profile(None, None);
         assert_eq!(
             (none.effort, none.disable),
             (EffortWire::GenericLevel, DisableWire::None)
         );
-        let unknown = reasoning_profile(Some("bogus"));
+        let unknown = reasoning_profile(Some("bogus"), None);
         assert_eq!(
             (unknown.effort, unknown.disable),
             (EffortWire::GenericLevel, DisableWire::None)
@@ -447,7 +626,9 @@ mod tests {
                 disable: DisableWire::GeminiZeroBudget
             }
             .disable_params(),
-            Some(serde_json::json!({ "thinking_config": { "thinking_budget": 0 } }))
+            Some(
+                serde_json::json!({ "generationConfig": { "thinkingConfig": { "thinkingBudget": 0 } } })
+            )
         );
         assert_eq!(
             ReasoningProfile {
@@ -456,6 +637,69 @@ mod tests {
             }
             .disable_params(),
             None
+        );
+    }
+
+    /// GH #827: which shape `off` takes on Anthropic, per model. The major
+    /// version is parsed, not substring-matched — `claude-haiku-4-5` is the
+    /// trap a naive "-5" check falls into, and sending it the toggle would
+    /// trade a silent bug for a 400.
+    #[test]
+    fn anthropic_disable_wire_follows_the_model_generation() {
+        for id in [
+            "claude-sonnet-5",
+            "claude-opus-5",
+            "claude-opus-5-20260101",
+            "anthropic/claude-sonnet-5",
+            "  CLAUDE-OPUS-5  ",
+        ] {
+            assert_eq!(
+                anthropic_disable_wire(Some(id)),
+                DisableWire::AnthropicToggle,
+                "{id}",
+            );
+        }
+        for id in [
+            "claude-opus-4-6",
+            "claude-sonnet-4-6",
+            "claude-haiku-4-5",
+            "claude-opus-4-1",
+            "claude-3-5-sonnet-20241022",
+        ] {
+            assert_eq!(
+                anthropic_disable_wire(Some(id)),
+                DisableWire::None,
+                "omitting the parameter is still a correct disable on {id}",
+            );
+        }
+        assert_eq!(
+            anthropic_disable_wire(Some("claude-fable-5-1")),
+            DisableWire::AnthropicUnconditional,
+            "Fable's thinking is unconditional and it rejects the toggle",
+        );
+        // Not knowing means keeping the pre-#827 behaviour.
+        assert_eq!(anthropic_disable_wire(None), DisableWire::None);
+        assert_eq!(
+            anthropic_disable_wire(Some("some-proxy-alias")),
+            DisableWire::None,
+        );
+    }
+
+    /// And the profile turns that into the payload. `{"type":"disabled"}` is
+    /// Anthropic's own documented shape — the one dirge already sends to GLM.
+    #[test]
+    fn anthropic_profile_emits_the_documented_disable_shape() {
+        assert_eq!(
+            reasoning_profile(Some("anthropic"), Some("claude-sonnet-5")).disable_params(),
+            Some(serde_json::json!({ "thinking": { "type": "disabled" } })),
+        );
+        assert_eq!(
+            reasoning_profile(Some("anthropic"), Some("claude-opus-4-6")).disable_params(),
+            None,
+        );
+        assert_eq!(
+            reasoning_profile(Some("anthropic"), Some("claude-fable-5-1")).disable_params(),
+            None,
         );
     }
 
@@ -480,7 +724,7 @@ mod tests {
     /// Xhigh/Max split is that these do NOT collapse on OpenAI/gpt-5.x.
     #[test]
     fn openai_effort_keeps_xhigh_and_max_distinct() {
-        let profile = reasoning_profile(Some("openai"));
+        let profile = reasoning_profile(Some("openai"), None);
         assert_eq!(profile.effort, EffortWire::NestedEffort);
         assert_eq!(
             profile.effort_params(ThinkingLevel::High, None),
@@ -533,7 +777,7 @@ mod tests {
     /// `High`→"high", `Xhigh`→"max". `Off` omits the key.
     #[test]
     fn glm_effort_top_level_with_max_and_collapse() {
-        let profile = reasoning_profile(Some("glm"));
+        let profile = reasoning_profile(Some("glm"), None);
         assert_eq!(profile.effort, EffortWire::TopLevelEffortGlm);
         assert_eq!(
             profile.effort_params(ThinkingLevel::Minimal, None),
@@ -618,6 +862,9 @@ mod tests {
         assert_eq!(p.effort_params(ThinkingLevel::Off, None), None);
     }
 
+    /// GH #832: the budget must land INSIDE `generationConfig`, which is the
+    /// only key rig's Gemini provider claims. A top-level `thinking_config` was
+    /// flattened into the request body and rejected outright.
     #[test]
     fn effort_gemini_budget_positive_and_zero() {
         let p = ReasoningProfile {
@@ -628,10 +875,97 @@ mod tests {
             .effort_params(ThinkingLevel::Low, None)
             .expect("low should produce budget");
         assert_eq!(
-            v["thinking_config"]["thinking_budget"],
+            v["generationConfig"]["thinkingConfig"]["thinkingBudget"],
             budget_for_level(ThinkingLevel::Low, None)
         );
+        assert!(
+            v.get("thinking_config").is_none(),
+            "the flat shape is what Gemini rejected: {v}",
+        );
         assert_eq!(p.effort_params(ThinkingLevel::Off, None), None);
+    }
+
+    /// GH #832: Gemini 3 takes a depth, not a budget, and rejects a request
+    /// carrying both — so the id picks exactly one knob.
+    #[test]
+    fn effort_gemini_level_emits_a_depth_not_a_budget() {
+        let p = ReasoningProfile {
+            effort: EffortWire::GeminiLevel,
+            disable: DisableWire::None,
+        };
+        let v = p
+            .effort_params(ThinkingLevel::Medium, None)
+            .expect("medium should produce a level");
+        assert_eq!(
+            v["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "medium"
+        );
+        assert!(
+            v["generationConfig"]["thinkingConfig"]
+                .get("thinkingBudget")
+                .is_none(),
+            "budget and level are mutually exclusive on the wire: {v}",
+        );
+        assert_eq!(p.effort_params(ThinkingLevel::Off, None), None);
+    }
+
+    /// `minimal` exists on Gemini 3.6-Flash and not on 3.7-Flash, so it is not
+    /// emitted: `Minimal` folds to `low`, the value every 3.x model accepts.
+    /// `Xhigh`/`Max` fold to `high`, Gemini 3's ceiling.
+    #[test]
+    fn gemini_level_folds_to_the_three_universal_tiers() {
+        for (level, want) in [
+            (ThinkingLevel::Minimal, "low"),
+            (ThinkingLevel::Low, "low"),
+            (ThinkingLevel::Medium, "medium"),
+            (ThinkingLevel::High, "high"),
+            (ThinkingLevel::Xhigh, "high"),
+            (ThinkingLevel::Max, "high"),
+        ] {
+            assert_eq!(thinking_level_to_gemini_level(level), Some(want));
+        }
+        assert_eq!(thinking_level_to_gemini_level(ThinkingLevel::Off), None);
+    }
+
+    /// GH #832: which knob a Gemini id takes. An id we cannot classify keeps
+    /// the budget — the shape every generation still accepts — so an unknown
+    /// id degrades to today's behaviour rather than to a 400.
+    #[test]
+    fn gemini_generation_picks_the_knob_by_major_version() {
+        for id in ["gemini-2.5-flash", "gemini-2.0-pro", "GEMINI-2.5-PRO"] {
+            assert_eq!(
+                gemini_generation(Some(id)),
+                GeminiGeneration::Budget,
+                "{id}"
+            );
+        }
+        for id in [
+            "gemini-3.6-flash",
+            "gemini-3.7-flash",
+            "google/gemini-3.6-flash",
+        ] {
+            assert_eq!(gemini_generation(Some(id)), GeminiGeneration::Level, "{id}");
+        }
+        assert_eq!(gemini_generation(None), GeminiGeneration::Budget);
+        assert_eq!(
+            gemini_generation(Some("some-proxy-alias")),
+            GeminiGeneration::Budget,
+        );
+    }
+
+    /// The profile follows the id: a Gemini 3 model gets the level wire and no
+    /// disable at all, because Google documents that 3 Pro / Flash / Flash-Lite
+    /// cannot be fully turned off. Emitting a level there would be claiming an
+    /// "off" that does not exist.
+    #[test]
+    fn gemini_profile_follows_the_model_generation() {
+        let two = reasoning_profile(Some("gemini"), Some("gemini-2.5-flash"));
+        assert_eq!(two.effort, EffortWire::GeminiBudget);
+        assert_eq!(two.disable, DisableWire::GeminiZeroBudget);
+        let three = reasoning_profile(Some("gemini"), Some("gemini-3.6-flash"));
+        assert_eq!(three.effort, EffortWire::GeminiLevel);
+        assert_eq!(three.disable, DisableWire::None);
+        assert_eq!(three.disable_params(), None);
     }
 
     // ----- moved helper tests -----
@@ -669,7 +1003,7 @@ mod tests {
 
     #[test]
     fn cerebras_uses_standard_top_level_effort_without_max_or_disable_knob() {
-        let profile = reasoning_profile(Some("cerebras"));
+        let profile = reasoning_profile(Some("cerebras"), None);
         for (level, expected) in [
             (ThinkingLevel::Minimal, "low"),
             (ThinkingLevel::Low, "low"),
@@ -714,7 +1048,7 @@ mod max_tokens_tests {
             ThinkingLevel::Max,
         ] {
             let budget = u64::from(budget_for_level(level, None));
-            let ceiling = max_tokens_for_reasoning(Some("anthropic"), level, None)
+            let ceiling = max_tokens_for_reasoning(Some("anthropic"), None, level, None)
                 .unwrap_or_else(|| panic!("{level:?} puts a budget on the wire but no ceiling"));
             assert!(
                 ceiling > budget,
@@ -728,7 +1062,7 @@ mod max_tokens_tests {
     /// ceiling has to beat that default, not just the budget.
     #[test]
     fn anthropic_ceiling_beats_rigs_2048_fallback() {
-        let ceiling = max_tokens_for_reasoning(Some("anthropic"), ThinkingLevel::Max, None)
+        let ceiling = max_tokens_for_reasoning(Some("anthropic"), None, ThinkingLevel::Max, None)
             .expect("max is a budget level");
         assert!(
             ceiling > 2_048,
@@ -739,7 +1073,7 @@ mod max_tokens_tests {
     #[test]
     fn off_needs_no_ceiling() {
         assert_eq!(
-            max_tokens_for_reasoning(Some("anthropic"), ThinkingLevel::Off, None),
+            max_tokens_for_reasoning(Some("anthropic"), None, ThinkingLevel::Off, None),
             None,
         );
     }
@@ -751,7 +1085,7 @@ mod max_tokens_tests {
     fn effort_string_providers_get_no_ceiling() {
         for provider in ["openai", "deepseek", "glm", "cerebras", "custom"] {
             assert_eq!(
-                max_tokens_for_reasoning(Some(provider), ThinkingLevel::Max, None),
+                max_tokens_for_reasoning(Some(provider), None, ThinkingLevel::Max, None),
                 None,
                 "{provider} sends an effort string, not a budget",
             );
@@ -766,7 +1100,7 @@ mod max_tokens_tests {
             ..Default::default()
         };
         let ceiling =
-            max_tokens_for_reasoning(Some("anthropic"), ThinkingLevel::Max, Some(&budgets))
+            max_tokens_for_reasoning(Some("anthropic"), None, ThinkingLevel::Max, Some(&budgets))
                 .expect("max is a budget level");
         assert!(
             ceiling > 120_000,

@@ -830,6 +830,7 @@ pub async fn run_interactive(
                                 #[cfg(feature = "semantic")]
                                 semantic_manager,
                                 Some(session.id.to_string()),
+                                Some(session.provider.as_str()),
                             )
                             .await;
                             let _ = reply.send(PlanSwitchResponse::Accepted);
@@ -2486,6 +2487,7 @@ pub async fn run_interactive(
                                         #[cfg(feature = "semantic")]
                                         semantic_manager,
                                         Some(session.id.to_string()),
+                                        Some(session.provider.as_str()),
                                     )
                                     .await;
                                     renderer.request_repaint();
@@ -4502,6 +4504,7 @@ pub async fn run_interactive(
                                                 #[cfg(feature = "mcp")] mcp_manager.as_ref(),
                                                 #[cfg(feature = "semantic")] semantic_manager,
                                                 Some(session.id.to_string()),
+                                                Some(session.provider.as_str()),
                                             ).await;
                                             render_session(&mut renderer, session, cli, cfg, context)?;
                                             renderer.write_line(&format!(

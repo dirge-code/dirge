@@ -93,6 +93,46 @@ fn create_role_client(
     create_client_with_auth(provider_name, None, providers, default_auth)
 }
 
+/// The provider entry reasoning effort seeds from.
+///
+/// `cli.resolution_entry` answers for `--provider`, else the config `Default`
+/// role. Neither consults the session, so it means "active AT LAUNCH" — and
+/// after any cross-provider `/model` switch the two diverge silently, on every
+/// rebuild. The launch provider's level was then applied to whatever provider
+/// the session had moved to (a hard 400 on Gemini, whose wire shape is
+/// different), and the switched-to provider's own `effort` — or its deliberate
+/// absence of one — was ignored (GH #832).
+///
+/// The lookup mirrors [`Config::resolve_role`] so the two agree: a configured
+/// entry (case-insensitively), else a synthesized default entry when the alias
+/// names a built-in provider, which is how "this provider configures no effort"
+/// is spelled. Only an alias resolving to neither — an ephemeral `--api-key`
+/// provider, say — falls back to the launch resolution, which is the old
+/// behaviour and the best answer available there.
+///
+/// At launch `session.provider` IS the launch resolution, so the common path is
+/// unchanged.
+fn effort_seed_entry(
+    cli: &Cli,
+    cfg: &Config,
+    active_provider: Option<&str>,
+) -> Option<ProviderEntry> {
+    if let Some(alias) = active_provider.map(str::trim).filter(|a| !a.is_empty()) {
+        let lowered = alias.to_ascii_lowercase();
+        if let Some(entry) = cfg
+            .providers
+            .as_ref()
+            .and_then(|map| map.get(alias).or_else(|| map.get(&lowered)))
+        {
+            return Some(entry.clone());
+        }
+        if crate::provider::parse_provider(&lowered).is_some() {
+            return Some(ProviderEntry::default());
+        }
+    }
+    cli.resolution_entry(cfg)
+}
+
 // Arity matches `build_agent_inner` — explicit DI signature kept
 // grep-able, refactoring into a struct is tracked separately.
 #[allow(clippy::too_many_arguments)]
@@ -113,6 +153,12 @@ pub async fn build_agent(
     // Live session id forwarded to SessionSearchTool so the model's
     // session_search calls exclude the current session. See dirge-502b.
     session_id: Option<String>,
+    // GH #832: the provider alias the SESSION is on RIGHT NOW, which after a
+    // cross-provider `/model` switch is not the alias the launch resolution
+    // names. Reasoning effort seeds from it — see `effort_seed_entry`. `None`
+    // means "no session to ask" (tests, and any caller with nothing better),
+    // which keeps the pre-#832 launch-resolution behaviour.
+    active_provider: Option<&str>,
 ) -> AnyAgent {
     let parent_model = model.clone();
     // Resolve the per-provider chunk timeout once here so every
@@ -730,11 +776,12 @@ pub async fn build_agent(
     // and the next rebuild re-seeds from config, so this is the config-
     // default path. An unrecognized value fails soft: warn and leave the
     // loop default (`Off`) rather than aborting the build.
-    // Resolved through the same helper `resolve_model` / `resolve_temperature`
-    // use, so effort can't silently disagree with them: it adds a
-    // case-insensitive retry and a Default-role fallback that a raw
-    // `providers_map().get()` misses (`--provider GLM` vs a `glm` entry).
-    if let Some(entry) = cli.resolution_entry(cfg) {
+    //
+    // GH #832: "active" means the provider the SESSION is on, not the one the
+    // launch resolution names. `effort_seed_entry` owns that distinction; this
+    // comment used to promise it while `cli.resolution_entry` alone quietly
+    // answered for the launch provider forever.
+    if let Some(entry) = effort_seed_entry(cli, cfg, active_provider) {
         match entry.resolved_effort() {
             Ok(level) => {
                 agent = agent.with_reasoning(level);
@@ -1148,6 +1195,105 @@ fn build_review_stream_fn(
         .collect();
     let stream_fn = model.build_stream_fn(tool_defs, chunk_timeout, Some(alias.to_string()));
     Ok((stream_fn, model_name))
+}
+
+/// GH #832: reasoning effort must seed from the provider the SESSION is on,
+/// not the one the launch resolution names.
+#[cfg(test)]
+mod effort_seed_tests {
+    use super::*;
+    use crate::agent::agent_loop::types::ThinkingLevel;
+    use clap::Parser;
+
+    fn cfg_json(json: &str) -> Config {
+        serde_json::from_str(json).expect("test config parses")
+    }
+
+    fn cli() -> Cli {
+        Cli::parse_from(["dirge", "--print"])
+    }
+
+    /// The reported shape: an Anthropic default carrying `effort: low`, plus a
+    /// Gemini entry that deliberately configures none. After `/model gemini`
+    /// the session is on Gemini, so `low` must NOT follow it across — that
+    /// stale level is what got mapped through Gemini's wire and 400'd.
+    #[test]
+    fn a_cross_provider_switch_seeds_from_the_provider_now_active() {
+        let cfg = cfg_json(
+            r#"{
+                "provider": "anthropic",
+                "providers": {
+                    "anthropic": { "model": "claude-sonnet-5", "effort": "low" },
+                    "gemini": { "provider_type": "gemini", "model": "gemini-2.5-flash" }
+                }
+            }"#,
+        );
+        let launch = effort_seed_entry(&cli(), &cfg, Some("anthropic"))
+            .expect("the launch provider resolves");
+        assert_eq!(launch.resolved_effort(), Ok(Some(ThinkingLevel::Low)));
+
+        let switched =
+            effort_seed_entry(&cli(), &cfg, Some("gemini")).expect("the gemini entry resolves");
+        assert_eq!(
+            switched.resolved_effort(),
+            Ok(None),
+            "the switched-to provider configures no effort, and that is an answer",
+        );
+    }
+
+    /// An alias naming a built-in provider with no `providers` entry is
+    /// "configured with no effort", the same as `resolve_role` treats it —
+    /// not a reason to fall back to the launch provider's level.
+    #[test]
+    fn a_builtin_alias_without_an_entry_seeds_nothing() {
+        let cfg = cfg_json(
+            r#"{
+                "provider": "anthropic",
+                "providers": { "anthropic": { "model": "claude-sonnet-5", "effort": "high" } }
+            }"#,
+        );
+        let entry = effort_seed_entry(&cli(), &cfg, Some("ollama"))
+            .expect("a built-in name synthesizes a default entry");
+        assert_eq!(entry.resolved_effort(), Ok(None));
+    }
+
+    /// Only an alias resolving to NEITHER a configured entry nor a built-in —
+    /// an ephemeral `--api-key` provider — falls back to the launch
+    /// resolution, which is the pre-#832 behaviour and the best answer there.
+    #[test]
+    fn an_unresolvable_alias_falls_back_to_the_launch_resolution() {
+        let cfg = cfg_json(
+            r#"{
+                "provider": "anthropic",
+                "providers": { "anthropic": { "model": "claude-sonnet-5", "effort": "high" } }
+            }"#,
+        );
+        for active in [None, Some("ephemeral-cli-provider"), Some("   ")] {
+            let entry = effort_seed_entry(&cli(), &cfg, active)
+                .expect("the launch resolution still answers");
+            assert_eq!(
+                entry.resolved_effort(),
+                Ok(Some(ThinkingLevel::High)),
+                "active = {active:?}",
+            );
+        }
+    }
+
+    /// Case-insensitive, matching `resolve_role` and `resolution_entry`.
+    #[test]
+    fn the_alias_lookup_is_case_insensitive() {
+        let cfg = cfg_json(
+            r#"{
+                "provider": "anthropic",
+                "providers": {
+                    "anthropic": { "model": "claude-sonnet-5", "effort": "high" },
+                    "glm": { "provider_type": "glm", "model": "glm-5.2", "effort": "max" }
+                }
+            }"#,
+        );
+        let entry = effort_seed_entry(&cli(), &cfg, Some("GLM")).expect("resolves");
+        assert_eq!(entry.resolved_effort(), Ok(Some(ThinkingLevel::Max)));
+    }
 }
 
 #[cfg(test)]

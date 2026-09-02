@@ -62,7 +62,7 @@ pub(crate) async fn oneshot_with_model(
     );
     // dirge-zt8p: disable extended reasoning for this one-shot (see
     // `reasoning_disable_for_kind`). Computed before the consuming match.
-    let disable = reasoning_disable_for_kind(model.provider_name());
+    let disable = reasoning_disable_for_kind(model.provider_name(), Some(model.name().as_str()));
     match model {
         super::AnyModel::OpenRouter(m) => run_oneshot(m, label, preamble, prompt, disable).await,
         super::AnyModel::OpenAI(m) => run_oneshot(m, label, preamble, prompt, disable).await,
@@ -85,8 +85,8 @@ pub(crate) async fn oneshot_with_model(
 
 /// dirge-zt8p: provider-specific params to disable extended reasoning
 /// for tool-less one-shots. Delegates to the consolidated adapter mapping.
-fn reasoning_disable_for_kind(kind: &str) -> Option<serde_json::Value> {
-    crate::provider::adapter::reasoning_profile(Some(kind)).disable_params()
+fn reasoning_disable_for_kind(kind: &str, model: Option<&str>) -> Option<serde_json::Value> {
+    crate::provider::adapter::reasoning_profile(Some(kind), model).disable_params()
 }
 
 /// Fallback prompt budget for a model whose context window we cannot look up.
@@ -415,7 +415,7 @@ mod tests {
         // Hosted DeepSeek / GLM / OpenCode: thinking:{type:"disabled"} toggle.
         for kind in ["deepseek", "glm", "opencode"] {
             assert_eq!(
-                reasoning_disable_for_kind(kind),
+                reasoning_disable_for_kind(kind, None),
                 Some(serde_json::json!({ "thinking": { "type": "disabled" } })),
                 "{kind} should disable thinking via thinking:{{type:disabled}}",
             );
@@ -423,24 +423,40 @@ mod tests {
         // Self-hosted vLLM / SGLang backends: chat_template_kwargs convention.
         for kind in ["custom", "openrouter"] {
             assert_eq!(
-                reasoning_disable_for_kind(kind),
+                reasoning_disable_for_kind(kind, None),
                 Some(serde_json::json!({ "chat_template_kwargs": { "thinking": false } })),
                 "{kind} should disable thinking via chat_template_kwargs",
             );
         }
         assert_eq!(
-            reasoning_disable_for_kind("ollama"),
+            reasoning_disable_for_kind("ollama", None),
             Some(serde_json::json!({ "think": false })),
         );
+        // GH #832: nested where rig's Gemini provider reads it. An
+        // unclassifiable id keeps the 2.5 budget wire.
         assert_eq!(
-            reasoning_disable_for_kind("gemini"),
-            Some(serde_json::json!({ "thinking_config": { "thinking_budget": 0 } })),
+            reasoning_disable_for_kind("gemini", None),
+            Some(
+                serde_json::json!({ "generationConfig": { "thinkingConfig": { "thinkingBudget": 0 } } })
+            ),
+        );
+        assert_eq!(
+            reasoning_disable_for_kind("gemini", Some("gemini-2.5-flash")),
+            Some(
+                serde_json::json!({ "generationConfig": { "thinkingConfig": { "thinkingBudget": 0 } } })
+            ),
+        );
+        // Gemini 3 cannot be fully turned off, so a one-shot sends no knob
+        // rather than a level pretending to be one.
+        assert_eq!(
+            reasoning_disable_for_kind("gemini", Some("gemini-3.6-flash")),
+            None,
         );
         // Anthropic defaults to no thinking; OpenAI has no safe "off" — both left
         // untouched.
-        assert_eq!(reasoning_disable_for_kind("anthropic"), None);
-        assert_eq!(reasoning_disable_for_kind("openai"), None);
-        assert_eq!(reasoning_disable_for_kind("cerebras"), None);
+        assert_eq!(reasoning_disable_for_kind("anthropic", None), None);
+        assert_eq!(reasoning_disable_for_kind("openai", None), None);
+        assert_eq!(reasoning_disable_for_kind("cerebras", None), None);
     }
 
     #[test]

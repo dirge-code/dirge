@@ -419,6 +419,7 @@ pub(crate) async fn rebuild_agent_parts(
         #[cfg(feature = "semantic")]
         semantic_manager,
         Some(session.id.to_string()),
+        Some(session.provider.as_str()),
     )
     .await;
     // A live `/effort` override wins over the per-provider config default
