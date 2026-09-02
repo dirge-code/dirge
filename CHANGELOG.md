@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.25.4] - 2026-09-02
+
 ### Fixed
 - Terminal reports no longer type themselves into the input box. A user
   watched text pour into the compose field on its own — "nonstop input, as if
@@ -4432,7 +4434,8 @@ agent in Rust with:
   LSP integration, and a Janet plugin system.
 - Session save/load/resume with LLM-summarization compaction.
 
-[Unreleased]: https://github.com/dirge-code/dirge/compare/v0.25.3...HEAD
+[Unreleased]: https://github.com/dirge-code/dirge/compare/v0.25.4...HEAD
+[0.25.4]: https://github.com/dirge-code/dirge/compare/v0.25.3...v0.25.4
 [0.25.3]: https://github.com/dirge-code/dirge/compare/v0.25.2...v0.25.3
 [0.25.2]: https://github.com/dirge-code/dirge/compare/v0.25.1...v0.25.2
 [0.25.1]: https://github.com/dirge-code/dirge/compare/v0.25.0...v0.25.1
