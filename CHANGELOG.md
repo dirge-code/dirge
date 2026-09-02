@@ -7,6 +7,47 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Fixed
+- Terminal reports no longer type themselves into the input box. A user
+  watched text pour into the compose field on its own — "nonstop input, as if
+  I had been holding something down". A terminal emits reports unprompted:
+  OSC 10/11/12 colour reports on a theme change or an alt-screen transition
+  (kitty, ghostty, foot, iTerm2), an OSC 52 clipboard reply, DCS XTGETTCAP /
+  DECRQSS replies, and in a multiplexer a reply to a query some other pane's
+  program made. crossterm has no parser for any of them: it reports the
+  introducer as an Alt-modified character, clears its buffer, and then parses
+  the whole payload as ordinary text — so `ESC ] 11 ; rgb:…  BEL` arrived as
+  Alt+`]` followed by twenty-one characters, every one of which the editor
+  inserted. dirge already drained that chatter at startup, at teardown and
+  around a suspended subprocess, but nothing stood between it and the editor
+  mid-session. The input reader now recognises an OSC / DCS / APC / SOS / PM
+  introducer and swallows the run through its terminator (BEL or ST, including
+  an ST split across two parses). It is conservative in the other direction
+  too: a run it cannot close — no terminator, a human-scale gap, or more than
+  4096 events — is released as ordinary keystrokes rather than dropped, so a
+  deliberate Alt+`]` is delayed by 25ms and never lost. An AltGr-composed `]`
+  (Ctrl+Alt on Windows layouts) is still typing. (dirge-v4xf)
+- A subprocess could leave two input readers running. `suspend_tui_for_
+  subprocess` gives the reader 150ms to exit and then proceeds anyway (it says
+  so on stderr); `resume_tui_after_subprocess` clears the shutdown flag and
+  starts a replacement. The loop never latched the flag, so a reader that had
+  not exited woke to a `false` flag and kept reading fd 0 next to its
+  replacement — and next to the stdin drains, and `EVENT_READER_EXITED` was
+  then set by whichever of them exited first, so the next suspend's barrier
+  could pass while a reader was still consuming keystrokes. Two consumers on
+  one descriptor split escape sequences, and the tail of a split sequence
+  parses as plain text: the same junk-in-the-compose-box symptom as above, by
+  a different route. Readers now carry a generation; claiming a new one
+  retires every older reader at its next tick, and only the live generation
+  may report that the reader is gone. (dirge-xxo9)
+- One error from the terminal no longer kills input for the session. Both
+  `event::poll` and `event::read` errors ended the reader thread, and nothing
+  outside the suspend/resume path restarts it — so a single transient failure
+  left dirge painting a healthy UI that accepted no keys, indistinguishable
+  from a hang, with the dead-tty watchdog quiet because the terminal was
+  alive. Errors are now logged and retried a few times before the thread
+  gives up; the dead-tty probe still owns the case that cannot recover.
+  (dirge-sp1x)
+
 - Compaction can now fold an autonomous stretch. Both cuts of the compress
   window snapped to a *user* message, which guarantees no tool_use↔tool_result
   pair is split — but one prompt followed by a hundred tool iterations, the
@@ -167,6 +208,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   deliberately narrow (literal `echo`/`printf` and the null builtins, nothing
   with a substitution, redirect, pipe, subshell or background), so ordinary
   shell work is untouched. (#808)
+
+### Changed
+- dirge no longer enables `?1003h` (any-event mouse tracking). It made the
+  terminal report every cell of pointer motion with no button held, and
+  nothing consumed it: the reader maps the wheel and left button
+  down/drag/up and drops the rest, and `MouseEventKind::Moved` appears
+  nowhere in the tree. `?1002h` (button-event tracking) already covers the
+  wheel and the drag-selection. All the mode bought was the only continuous
+  input byte stream in the program — a few KB/s parsed and thrown away
+  whenever the pointer crossed the window, and the fuel that turns a one-off
+  desync on fd 0 into a sustained flood rather than a single burst. `?1015h`
+  (the urxvt encoding, which crossterm cannot parse) is dropped with it. The
+  teardown and panic-reset strings still clear both, since another program —
+  or an older dirge — may have set them. (dirge-hn6e)
 
 ## [0.25.3] - 2026-08-31
 

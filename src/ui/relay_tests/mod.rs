@@ -60,3 +60,7 @@ mod poll_latency;
 #[cfg(test)]
 #[cfg(all(unix, feature = "sandbox-microvm"))]
 mod tty_hangup;
+
+#[cfg(test)]
+#[cfg(all(unix, feature = "sandbox-microvm"))]
+mod terminal_reports;

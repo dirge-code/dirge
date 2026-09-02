@@ -197,7 +197,7 @@ pub(crate) const PANEL_AUTO_MIN_COLS: u16 = 153;
 const SHELL_BOX_MAX_ROWS: u16 = 12;
 
 /// Global terminal modes dirge owns and must keep asserted for its whole
-/// session: SGR mouse capture (`?1000`/`?1002`/`?1003`/`?1006`) so wheel +
+/// session: SGR mouse capture (`?1000`/`?1002`/`?1006`) so wheel +
 /// click reach the app, bracketed paste (`?2004`), and focus reporting
 /// (`?1004`). These are set once at startup
 /// ([`crate::ui::terminal::TerminalGuard::new`]); this is the exact same
@@ -220,8 +220,7 @@ const SHELL_BOX_MAX_ROWS: u16 = 12;
 /// and shell-session children are detached via `setsid()` with no
 /// controlling terminal, so a `/dev/tty` open fails with ENXIO — see
 /// `bash::exec::detach_session` and the `dirge-tc2q` test.)
-const TERMINAL_MODE_REASSERT: &[u8] =
-    b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h\x1b[?2004h\x1b[?1004h";
+const TERMINAL_MODE_REASSERT: &[u8] = b"\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?2004h\x1b[?1004h";
 
 /// Full terminal re-assert (dirge-ph60, dirge-173j). Unlike
 /// [`TERMINAL_MODE_REASSERT`] this DOES re-enter the alternate screen
@@ -238,7 +237,7 @@ const TERMINAL_MODE_REASSERT: &[u8] =
 /// so the alt-screen re-entry only happens at discrete moments (focus /
 /// keypress), never per-second. Mirrors the mode set in
 /// [`crate::ui::terminal::resume_tui_after_subprocess`].
-const TERMINAL_FULL_REASSERT: &[u8] = b"\x1b[?2026h\x1b[?1049h\x1b[2J\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h\x1b[?2004h\x1b[?1004h\x1b[?2026l";
+const TERMINAL_FULL_REASSERT: &[u8] = b"\x1b[?2026h\x1b[?1049h\x1b[2J\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?2004h\x1b[?1004h\x1b[?2026l";
 
 /// How often [`tui_redraw`](Renderer::tui_redraw) re-asserts the terminal
 /// modes. Long enough that the extra `/dev/tty` write is negligible, short
@@ -2999,7 +2998,7 @@ impl Renderer {
     /// the mouse stays dead.
     pub fn reassert_terminal_modes(&mut self) {
         // Don't write to /dev/tty while the user is mid-drag selecting
-        // text: re-sending mouse-tracking enable sequences (?1003h et al.)
+        // text: re-sending mouse-tracking enable sequences (?1002h et al.)
         // resets internal tracking state on some terminals, dropping the
         // drag so MouseUp never fires and copy_to_clipboard is never called.
         if self.selection_active {
