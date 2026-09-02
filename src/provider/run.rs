@@ -513,14 +513,10 @@ impl AnyAgent {
                         let resume = format!(
                             "Session {session_id} saved; re-run (e.g. `dirge --continue`) once the quota resets to resume."
                         );
-                        match crate::agent::recovery::usage_cap_reset_hint(&err) {
-                            Some(reset) => eprintln!(
-                                "Provider usage cap reached — quota resets at {reset}. {resume}\n  ↳ cause: {err}"
-                            ),
-                            None => eprintln!(
-                                "Provider usage cap reached — quota won't reset within a retryable window. {resume}\n  ↳ cause: {err}"
-                            ),
-                        }
+                        // Same headline the interactive surface writes (#818),
+                        // so a cap reads identically wherever it is reported.
+                        let headline = crate::agent::recovery::usage_cap_headline(&err);
+                        eprintln!("{headline}. {resume}\n  ↳ cause: {err}");
                         break;
                     }
                     // No `eprintln!` here: the error is returned, and both

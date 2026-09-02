@@ -7,6 +7,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Fixed
+- A provider usage cap now reads as one in the TUI instead of arriving as a raw
+  provider blob. `classify_error` already routed GLM's `429` code `1308` to the
+  non-retryable `UsageCap`, and `--print` already reported it in a sentence, but
+  the interactive surface printed `error:` followed by whatever the provider
+  sent — for z.ai that is an `HttpError: Invalid status code 429` wrapper around
+  a Chinese sentence and an error code, so the two things the user needs (when
+  the quota lifts, and that `/model` works right now) were the two things the
+  line did not carry. Both surfaces now share one headline, which names the
+  reset instant when the provider gave one, and the provider's own text is kept
+  verbatim as the cause. Nothing about the retry behaviour changes — a cap was
+  already non-retryable. (#818)
 - A run that spins on no-op shell commands is now caught by the repeat-loop
   guard. A model that had decided it needed a different tool but kept reaching
   for `bash` anyway issued a long run of `echo "ready"` / `echo done` / `true`
