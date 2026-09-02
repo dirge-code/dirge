@@ -151,6 +151,8 @@ fn tool_use_response(id: &str, name: &str, args: Value) -> AssistantMessage {
             id: id.to_string(),
             name: name.to_string(),
             arguments: args,
+            signature: None,
+            signature_model: None,
         }],
         StopReason::ToolUse,
     )

@@ -1240,6 +1240,7 @@ pub fn extract_tool_calls(msg: &AssistantMessage) -> Vec<ToolCall> {
                 id,
                 name,
                 arguments,
+                ..
             } => Some(ToolCall {
                 id: id.clone(),
                 name: name.clone(),

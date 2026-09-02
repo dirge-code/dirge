@@ -1184,6 +1184,8 @@ mod tests {
                         id: "call-1".to_string(),
                         name: "read".to_string(),
                         arguments: serde_json::json!({"path": "x.rs"}),
+                        signature: None,
+                        signature_model: None,
                     },
                 ],
                 StopReason::ToolUse,

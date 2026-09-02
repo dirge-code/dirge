@@ -64,6 +64,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   which takes a depth instead and rejects a request carrying both. Gemini 3 gets
   no disable knob at all, because Google documents that 3 Pro / Flash /
   Flash-Lite cannot be fully turned off. (#832)
+- Gemini tool calls replay with the `thought_signature` Gemini requires, so a
+  tool-using turn works there at all. Same defect as #821, one field over, and
+  the gap #823 disclosed when it scoped itself to Anthropic thinking blocks.
+  Gemini mints a signature on every `functionCall` part and rejects a replayed
+  call without one ("Function call is missing a thought_signature in
+  functionCall parts"), so the first `grep` in any session failed on the replay.
+  rig hands the value over on capture and sends it straight back out again —
+  dirge discarded it at capture and hardcoded `None` at replay. `ContentBlock::
+  ToolCall` now carries `signature` / `signatureModel` (both skipped when
+  absent, so saved sessions round-trip unchanged), the factory stamps the
+  minting model the way it already did for thinking blocks, and replay attaches
+  the signature when the request's model is the one that minted it. When no
+  usable signature exists — a session saved before this change, or a
+  cross-model switch — the call and its paired result are dropped together and
+  the turn is logged: a tool call cannot be dropped alone without orphaning its
+  result, so the choice is one lost step of history against a turn that cannot
+  be sent at all. Every other provider keeps today's unsigned replay,
+  byte-identical on the wire. (#833)
 - A run that spins on no-op shell commands is now caught by the repeat-loop
   guard. A model that had decided it needed a different tool but kept reaching
   for `bash` anyway issued a long run of `echo "ready"` / `echo done` / `true`

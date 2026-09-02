@@ -137,6 +137,8 @@ fn tool_use_response(id: &str, name: &str, args: Value) -> AssistantMessage {
             id: id.to_string(),
             name: name.to_string(),
             arguments: args,
+            signature: None,
+            signature_model: None,
         }],
         StopReason::ToolUse,
     )
@@ -149,6 +151,8 @@ fn multi_tool_use_response(calls: Vec<(&str, &str, Value)>) -> AssistantMessage 
             id: id.to_string(),
             name: name.to_string(),
             arguments: args,
+            signature: None,
+            signature_model: None,
         })
         .collect();
     AssistantMessage::new(content, StopReason::ToolUse)

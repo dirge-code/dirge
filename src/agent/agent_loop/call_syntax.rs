@@ -411,6 +411,8 @@ pub fn absorb_text_calls(
         id: c.id.clone(),
         name: c.name.clone(),
         arguments: c.arguments.clone(),
+        signature: None,
+        signature_model: None,
     }));
     super::message::AssistantMessage {
         content,

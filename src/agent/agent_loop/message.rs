@@ -87,6 +87,29 @@ pub enum ContentBlock {
         id: String,
         name: String,
         arguments: Value,
+        /// Provider-issued signature over the tool call (GH #833). Gemini
+        /// mints a `thought_signature` on every `functionCall` part and
+        /// rejects a replayed call that lacks one ("Function call is missing
+        /// a thought_signature in functionCall parts"), so a tool-using turn
+        /// cannot be replayed without it. `None` for providers that do not
+        /// sign tool calls and for calls captured before this field existed;
+        /// both serde attributes keep the serialized shape byte-identical to
+        /// the legacy `{type, id, name, arguments}` form in that case, so
+        /// existing saved sessions round-trip unchanged.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+        /// The model that minted `signature` (GH #833, mirroring the same
+        /// field on [`ContentBlock::Thinking`] from #821). A signature is
+        /// only valid for the model that produced it, and dirge can switch
+        /// models mid-session (`/model`, escalation, subagents), so the
+        /// replay path attaches it only when this matches the request's
+        /// model.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            rename = "signatureModel"
+        )]
+        signature_model: Option<String>,
     },
 }
 
@@ -143,6 +166,7 @@ impl AssistantMessage {
                 id,
                 name,
                 arguments,
+                ..
             } => Some((id.as_str(), name.as_str(), arguments)),
             _ => None,
         })
@@ -1000,11 +1024,54 @@ mod tests {
             id: "call_1".to_string(),
             name: "read".to_string(),
             arguments: serde_json::json!({"path": "/tmp/x"}),
+            signature: None,
+            signature_model: None,
         };
         let encoded = serde_json::to_string(&tool).unwrap();
         assert!(encoded.contains("\"type\":\"toolCall\""), "got: {encoded}");
         assert!(encoded.contains("\"id\":\"call_1\""));
         assert!(encoded.contains("\"name\":\"read\""));
+    }
+
+    /// GH #833: the two added fields must not change the serialized shape of
+    /// a call that carries neither — saved sessions have to round-trip
+    /// unchanged, in both directions.
+    #[test]
+    fn an_unsigned_tool_call_keeps_the_legacy_wire_shape() {
+        let legacy_json = serde_json::json!({
+            "type": "toolCall",
+            "id": "call_1",
+            "name": "read",
+            "arguments": {"path": "/tmp/x"},
+        });
+        let block = ContentBlock::ToolCall {
+            id: "call_1".to_string(),
+            name: "read".to_string(),
+            arguments: serde_json::json!({"path": "/tmp/x"}),
+            signature: None,
+            signature_model: None,
+        };
+        assert_eq!(serde_json::to_value(&block).unwrap(), legacy_json);
+        let round_tripped: ContentBlock = serde_json::from_value(legacy_json).unwrap();
+        assert_eq!(round_tripped, block);
+    }
+
+    /// And a signed one carries both, under the camelCase key the thinking
+    /// block already uses for the same purpose.
+    #[test]
+    fn a_signed_tool_call_serializes_both_fields() {
+        let block = ContentBlock::ToolCall {
+            id: "call_1".to_string(),
+            name: "grep".to_string(),
+            arguments: serde_json::json!({}),
+            signature: Some("thought-sig-833".to_string()),
+            signature_model: Some("gemini-3.6-flash".to_string()),
+        };
+        let encoded = serde_json::to_value(&block).unwrap();
+        assert_eq!(encoded["signature"], "thought-sig-833");
+        assert_eq!(encoded["signatureModel"], "gemini-3.6-flash");
+        let round_tripped: ContentBlock = serde_json::from_value(encoded).unwrap();
+        assert_eq!(round_tripped, block);
     }
 
     /// `AssistantMessage::tool_calls()` filters the toolCall
@@ -1022,6 +1089,8 @@ mod tests {
                     id: "c1".to_string(),
                     name: "read".to_string(),
                     arguments: serde_json::json!({}),
+                    signature: None,
+                    signature_model: None,
                 },
                 ContentBlock::Text {
                     text: "more text".to_string(),
@@ -1030,6 +1099,8 @@ mod tests {
                     id: "c2".to_string(),
                     name: "write".to_string(),
                     arguments: serde_json::json!({"path": "x"}),
+                    signature: None,
+                    signature_model: None,
                 },
             ],
             StopReason::ToolUse,
