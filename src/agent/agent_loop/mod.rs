@@ -41,6 +41,7 @@ pub mod goal;
 mod h7_smoke;
 pub mod heal;
 pub mod hooks;
+pub mod inert;
 pub mod inflight;
 pub mod integration;
 #[cfg(test)]

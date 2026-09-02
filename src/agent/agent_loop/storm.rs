@@ -6,6 +6,14 @@
 //! call appears `threshold` times within `window_size` entries, the
 //! call is suppressed (the model is stuck in a loop).
 //!
+//! **Inert shell commands share one signature** (#808). A model spinning
+//! on `echo ok` / `true` / `echo done` is repeating one behaviour, not
+//! three calls, but the raw arguments differ every time so the identical-
+//! args rule never sees it. [`super::inert`] classifies those calls and
+//! this module keys them all on [`inert::INERT_ARGS`], which is what puts
+//! them back inside the window's reach. See that module for why the
+//! classifier is narrow.
+//!
 //! Mutating calls (write, edit, bash) clear prior read-only entries
 //! from the window so a post-edit verify-read isn't flagged as a
 //! repeat. Mutators still count amongst themselves — three identical
@@ -15,6 +23,7 @@
 //! the guard regardless of repetition count.
 
 use super::activity::Outcome;
+use super::inert;
 use super::tools::ToolCall;
 use std::collections::HashSet;
 
@@ -23,6 +32,13 @@ use std::collections::HashSet;
 pub struct StormVerdict {
     pub suppress: bool,
     pub reason: Option<String>,
+    /// The suppressed call was an inert shell command (#808) rather than
+    /// an identical repeat. Carried through to [`StormReport`] so the
+    /// loop can name the actual problem — "these commands did nothing" is
+    /// a different diagnosis from "you ran this twice", and the generic
+    /// repeat message would send the model looking for a result its
+    /// `echo` never produced.
+    pub inert: bool,
 }
 
 impl StormVerdict {
@@ -30,6 +46,7 @@ impl StormVerdict {
         Self {
             suppress: false,
             reason: None,
+            inert: false,
         }
     }
 
@@ -39,6 +56,18 @@ impl StormVerdict {
             reason: Some(format!(
                 "{name} called with identical args {count} times — repeat-loop guard tripped"
             )),
+            inert: false,
+        }
+    }
+
+    fn suppress_inert(name: &str, count: usize) -> Self {
+        Self {
+            suppress: true,
+            reason: Some(format!(
+                "{name} ran {count} commands with no effect (no state change, no new \
+                 information) — inert-loop guard tripped"
+            )),
+            inert: true,
         }
     }
 }
@@ -48,6 +77,9 @@ impl StormVerdict {
 pub struct StormReport {
     /// How many calls were suppressed.
     pub storms_broken: usize,
+    /// How many of `storms_broken` were inert shell commands (#808)
+    /// rather than identical repeats.
+    pub inert_broken: usize,
     /// Per-suppression reasons for diagnostics.
     pub notes: Vec<String>,
 }
@@ -56,6 +88,13 @@ impl StormReport {
     /// True when every call was suppressed and there was at least one.
     pub fn all_suppressed(&self, original_count: usize) -> bool {
         self.storms_broken > 0 && self.storms_broken == original_count && original_count > 0
+    }
+
+    /// True when every suppression this batch was an inert command — the
+    /// cue for the loop to use the inert diagnosis instead of the generic
+    /// repeat one.
+    pub fn all_inert(&self) -> bool {
+        self.storms_broken > 0 && self.inert_broken == self.storms_broken
     }
 }
 
@@ -121,6 +160,20 @@ impl StormBreaker {
         format!("{name}\u{0}{args}")
     }
 
+    /// The args half of a call's signature.
+    ///
+    /// Normally the canonical (key-sorted) JSON blob. An inert shell
+    /// command instead collapses onto [`inert::INERT_ARGS`] so a spin of
+    /// varied no-ops counts as the one repeated behaviour it is (#808).
+    /// Used by both `inspect` and `note_outcome` so the two can never
+    /// disagree about what "the same call" means.
+    fn args_key(call: &ToolCall) -> String {
+        if inert::is_inert_call(call) {
+            return inert::INERT_ARGS.to_string();
+        }
+        super::message::canonical_json(&call.arguments)
+    }
+
     /// Record the [`Outcome`] of a dispatched call. A `Timeout` marks the
     /// call's signature expensive so the next identical retry trips the
     /// breaker one occurrence sooner. Ok/Error are no-ops — ordinary
@@ -129,7 +182,7 @@ impl StormBreaker {
         if outcome != Outcome::Timeout {
             return;
         }
-        let args = super::message::canonical_json(&call.arguments);
+        let args = Self::args_key(call);
         self.expensive.insert(Self::signature(&call.name, &args));
     }
 
@@ -148,10 +201,16 @@ impl StormBreaker {
         // reprs (`1` ≡ `1.0`), so the repeat detector isn't silently dependent
         // on `serde_json`'s `preserve_order` feature staying off (dirge-ark9,
         // closing dirge-7bwx review-fix #6) and matches the scavenger's
-        // dedup exactly.
-        let args = super::message::canonical_json(&call.arguments);
+        // dedup exactly. Inert shell commands short-circuit to one shared
+        // key — see [`Self::args_key`].
+        let args = Self::args_key(call);
+        let is_inert = args == inert::INERT_ARGS;
 
-        let mutating = self.is_mutating.as_ref().map(|f| f(call)).unwrap_or(false);
+        // An inert command is `Execute` by permission operation but by
+        // definition changes nothing, so it must not clear the window's
+        // read-only entries — otherwise a read/echo/read/echo spin would
+        // launder the reads out of the guard's reach on every echo.
+        let mutating = !is_inert && self.is_mutating.as_ref().map(|f| f(call)).unwrap_or(false);
         let read_only = !mutating;
 
         if mutating {
@@ -187,7 +246,11 @@ impl StormBreaker {
         };
 
         if count >= effective.saturating_sub(1) {
-            return StormVerdict::suppress(name, count + 1);
+            return if is_inert {
+                StormVerdict::suppress_inert(name, count + 1)
+            } else {
+                StormVerdict::suppress(name, count + 1)
+            };
         }
 
         self.recent.push(RecentEntry {
@@ -219,6 +282,9 @@ impl StormBreaker {
             let verdict = self.inspect(call);
             if verdict.suppress {
                 report.storms_broken += 1;
+                if verdict.inert {
+                    report.inert_broken += 1;
+                }
                 if let Some(reason) = verdict.reason {
                     tracing::warn!("storm breaker: {reason}");
                     report.notes.push(reason);
@@ -278,6 +344,22 @@ pub fn failure_narrative(looped_tools: &[String]) -> String {
     )
 }
 
+/// The [`failure_narrative`] counterpart for a run that gave up on a spin
+/// of inert shell commands (#808).
+///
+/// Kept separate because the honest account differs: nothing was retried
+/// and nothing came back the same, so "I kept making the same call and
+/// getting the same result" would misdescribe what the user watched
+/// happen. Takes no tool list — by construction the loop was `bash`.
+pub fn inert_narrative() -> String {
+    "I've stopped here because I was spinning. I kept running shell commands that did \
+     nothing — `echo`, `true`, and the like — instead of taking a real next step, and \
+     running more of them wasn't going to get me any further.\n\n\
+     I wasn't able to finish what you asked. If you can confirm the goal or point me at \
+     the next concrete step, I'll pick it back up from there."
+        .to_string()
+}
+
 /// Built-in mutating tools: calls that change filesystem state or run
 /// external code. Derived from the canonical tool→[`Operation`] mapping
 /// (`Edit` = file mutation, `Execute` = shell) rather than a hand-kept
@@ -319,6 +401,10 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// The `is_mutating` predicate slot, spelled once so the inert-window
+    /// test can name it without repeating the full boxed-closure type.
+    type MutPred = Box<dyn Fn(&ToolCall) -> bool + Send + Sync>;
+
     fn call(name: &str, args: serde_json::Value) -> ToolCall {
         ToolCall {
             id: "call_1".to_string(),
@@ -332,6 +418,10 @@ mod tests {
             name,
             serde_json::from_str::<serde_json::Value>(args_json).unwrap_or(json!({})),
         )
+    }
+
+    fn bash(command: &str) -> ToolCall {
+        call("bash", json!({ "command": command }))
     }
 
     #[test]
@@ -390,6 +480,72 @@ mod tests {
         assert!(!sb.inspect(&c).suppress);
         assert!(!sb.inspect(&c).suppress);
         assert!(sb.inspect(&c).suppress, "back to threshold 3 after reset");
+    }
+
+    #[test]
+    fn varied_inert_shell_commands_trip_the_guard() {
+        // #808: the exact spin no guard could see. Three DIFFERENT no-op
+        // commands share one signature, so the third is suppressed.
+        let mut sb = StormBreaker::default();
+        assert!(!sb.inspect(&bash("echo done")).suppress);
+        assert!(!sb.inspect(&bash("echo ok")).suppress);
+        let verdict = sb.inspect(&bash("true"));
+        assert!(verdict.suppress, "3rd inert command should be suppressed");
+        assert!(verdict.inert, "and be reported as inert, not a repeat");
+        let reason = verdict.reason.unwrap_or_default();
+        assert!(
+            reason.contains("inert-loop guard"),
+            "reason must name the inert guard, got: {reason}"
+        );
+    }
+
+    #[test]
+    fn varied_real_commands_still_pass() {
+        // The counterpart guarantee: folding inert commands together must
+        // not fold ordinary shell work together.
+        let mut sb = StormBreaker::default();
+        for cmd in ["cargo build", "cargo test", "git status", "ls -la"] {
+            assert!(!sb.inspect(&bash(cmd)).suppress, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn an_inert_command_does_not_clear_read_only_window_entries() {
+        // An inert command is `Execute` by permission operation but
+        // mutates nothing, so it must not launder prior read-only entries
+        // out of the window the way a real mutator does. No exemption
+        // predicate here, so the read-only tool is actually tracked.
+        let mutating: MutPred = Box::new(default_mutating);
+        let mut sb = StormBreaker::new(6, 3, Some(mutating), None);
+        let r = call_json("read", r#"{"path":"a.rs"}"#);
+        assert!(!sb.inspect(&r).suppress);
+        assert!(!sb.inspect(&bash("echo a")).suppress);
+        assert!(!sb.inspect(&r).suppress);
+        assert!(sb.inspect(&r).suppress, "the reads must still add up");
+    }
+
+    #[test]
+    fn report_flags_an_all_inert_batch() {
+        let mut sb = StormBreaker::default();
+        sb.inspect(&bash("echo a"));
+        sb.inspect(&bash("echo b"));
+        let (surviving, report) = sb.filter_calls(&[bash("echo c")]);
+        assert!(surviving.is_empty());
+        assert_eq!(report.storms_broken, 1);
+        assert_eq!(report.inert_broken, 1);
+        assert!(report.all_inert());
+    }
+
+    #[test]
+    fn an_identical_repeat_is_not_reported_as_inert() {
+        let mut sb = StormBreaker::default();
+        let c = bash("cargo test");
+        sb.inspect(&c);
+        sb.inspect(&c);
+        let (_, report) = sb.filter_calls(&[c]);
+        assert_eq!(report.storms_broken, 1);
+        assert_eq!(report.inert_broken, 0);
+        assert!(!report.all_inert(), "must keep the generic repeat message");
     }
 
     #[test]
@@ -591,6 +747,16 @@ mod tests {
         ]);
         assert!(n.contains("`edit` and `bash`"), "got: {n}");
         assert_eq!(n.matches("`edit`").count(), 1, "edit listed once: {n}");
+    }
+
+    #[test]
+    fn inert_narrative_describes_the_spin_not_a_repeat() {
+        let n = inert_narrative();
+        assert!(n.starts_with("I've stopped"), "first-person: {n}");
+        // It must not claim the run repeated a call and got the same
+        // result — that is the other guard's story, and untrue here.
+        assert!(!n.contains("the same"), "must not read as a repeat: {n}");
+        assert!(n.contains("nothing"), "names the emptiness: {n}");
     }
 
     #[test]

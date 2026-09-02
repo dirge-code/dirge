@@ -125,6 +125,16 @@ The intervention is deliberately *not* a bare "don't repeat yourself". Research 
 
 This gives the model one structured shot to self-correct (`turn_self_corrected`). If it keeps producing only suppressed calls afterward, the inner loop exits rather than spinning. The outermost backstop is the `max_turns` cap (see [config.md](config.md)), which stops the run and surfaces a `<system>` notice.
 
+### Inert commands share one signature
+
+The identical-args rule has a blind spot: a model can spin without ever repeating itself exactly. The reported case ([#808](https://github.com/dirge-code/dirge/issues/808)) was a run that had decided it needed the `memory` tool, could not bring itself to emit that call, and instead issued `echo "ready"`, `echo done`, `true`, `echo ok`, `echo "switching to memory tool"` — narrating its intent between each one. Every guard missed it: the arguments all differed (storm), every command succeeded (failure tracker), nothing was edited (file-touch tracker), and the progress monitor only judges a turn boundary and caps itself at two nudges.
+
+`src/agent/agent_loop/inert.rs` classifies a shell command as **inert** when it can change no state and return no information the model did not already hold — literal `echo`/`printf`, the null builtins (`true`, `false`, `:`), and sequences of exactly those. The storm breaker keys every inert call on one shared signature, so a spin of *varied* no-ops counts as the single repeated behaviour it is and trips the guard on the third.
+
+The classifier is deliberately narrow, because a false positive costs real work: anything reaching outside the process — a substitution, a redirect, a pipe, a subshell, a backgrounded job — disqualifies the whole command, and the segment scan is quote-blind in the direction that can only turn an inert verdict into a non-inert one. An inert call also counts as non-mutating for the window, so it can't launder prior read-only entries out of the guard's reach.
+
+Suppression here carries its own intervention (`INERT_LOOP_GUARD` in `run.rs`) rather than the reflect-then-pivot text above. "Look at the earlier results" is useless advice when the earlier result was `ok`; the inert message names the emptiness and points the model at its tool list instead.
+
 ## Phased plan workflow (`/plan`)
 
 An opt-in, per-task workflow (ported from [vix](https://github.com/kirby88/vix)) that splits a complex request into separate, context-isolated phases instead of one long single-agent run. It is an **explicit command**, not a forced mode — regular chat is untouched, and the user decides which tasks warrant it. Gated by `phased_workflow_enabled` (default off; see [config.md](config.md)). The logic lives under `src/agent/plan/`: `workflow.rs` (phase prompts + verdict parsing + the shared `next_review_step` policy) and `runtime.rs` (the runner-drain glue + reviewer fork); the entry is `src/ui/slash/cmd_plan.rs` and the reviewer loop runs in `src/ui/run_handlers/plan_review.rs`.
