@@ -145,6 +145,12 @@ pub(crate) async fn apply_next_model(
         #[cfg(feature = "semantic")]
         deps.semantic_manager,
         Some(ctx.session.id.to_string()),
+        // GH #832: `ctx.session.provider` is only updated further down, after the
+        // rebuild, so read the swap's target here — seeding from the provider being
+        // LEFT is the very bug this fixes.
+        swapped_provider
+            .as_deref()
+            .or(Some(ctx.session.provider.as_str())),
     )
     .await;
     let old_model = ctx.session.model.clone();

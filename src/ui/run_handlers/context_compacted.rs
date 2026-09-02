@@ -212,6 +212,7 @@ pub(crate) async fn handle_context_compacted(
         #[cfg(feature = "semantic")]
         semantic_manager,
         Some(ctx.session.id.to_string()),
+        Some(ctx.session.provider.as_str()),
     )
     .await;
     // dirge-5gn6: fire on_session_switch only AFTER everything is

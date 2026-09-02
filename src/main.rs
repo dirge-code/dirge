@@ -1642,6 +1642,7 @@ async fn main() -> anyhow::Result<()> {
             #[cfg(feature = "semantic")]
             semantic_manager.as_ref(),
             session_id_for_print,
+            Some(session.provider.as_str()),
         )
         .await;
         let msg = cli.message.join(" ");
@@ -1791,6 +1792,7 @@ async fn main() -> anyhow::Result<()> {
                     // dirge-vpma.49: through the helper, so the --no-session
                     // policy lives in one place instead of three.
                     session_id_for_agent(&cli, &session),
+                    Some(session.provider.as_str()),
                 )
                 .await
             };
@@ -1846,6 +1848,7 @@ async fn main() -> anyhow::Result<()> {
                             semantic_manager.as_ref(),
                             // dirge-vpma.49: see above.
                             session_id_for_agent(&cli, &session),
+                            Some(session.provider.as_str()),
                         )
                         .await;
                     }
@@ -1918,6 +1921,7 @@ async fn main() -> anyhow::Result<()> {
             semantic_manager.as_ref(),
             // dirge-vpma.49: see above.
             session_id_for_agent(&cli, &session),
+            Some(session.provider.as_str()),
         )
         .await;
 
