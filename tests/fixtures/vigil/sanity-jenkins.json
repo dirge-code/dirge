@@ -1,0 +1,12 @@
+{
+  "name": "jenkins-remediate",
+  "trigger": {
+    "type": "toll",
+    "interval_secs": 60
+  },
+  "reap_interval_secs": 60,
+  "prompt": "Jenkins build failed.\n\nJob: {job}\nBuild: #{build_number}\nURL: {url}\nStatus: {status}\n\nInvestigate the failure and propose a fix.",
+  "rite": {
+    "cmd": "echo 'jenkins-rite-ok'"
+  }
+}

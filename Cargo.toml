@@ -443,3 +443,12 @@ debug = false
 [profile.dev]
 debug = 0
 
+# Vendor evil-janet to root `janet_vm.top_dyns` during the GC mark phase.
+# Upstream Janet never marks that table, so dirge — which populates it via
+# janet_setdyn() with no fiber active (the :out/:err capture mirror) — gets it
+# swept and then use-after-freed in janet_dyn("err-color") inside
+# janet_stacktrace_ext. The one-line fix lives in vendor/evil-janet/csrc/janet.c
+# (janet_collect). See drg-76a1.
+[patch.crates-io]
+evil-janet = { path = "vendor/evil-janet" }
+

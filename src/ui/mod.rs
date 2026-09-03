@@ -5373,12 +5373,19 @@ pub async fn run_interactive(
                     // successful observance. The vigils may be disabled
                     // at compile time; the `if vigil_wake_rx.is_some()`
                     // guard ensures the arm is inert when vigil is off.
+                    // Gate on `!ui.is_running` too: if an observance
+                    // lands mid-turn we must NOT consume its wake token,
+                    // or the prompt is stranded in the channel with no
+                    // re-delivery. Leaving the token queued lets this
+                    // arm re-fire once the agent goes idle and drain the
+                    // observance then — the "find an opportunity"
+                    // semantics.
                     _ = async {
                         match &mut vigil_wake_rx {
                             Some(rx) => rx.recv().await,
                             None => std::future::pending::<Option<()>>().await,
                         }
-                    }, if vigil_wake_rx.is_some() => {
+                    }, if vigil_wake_rx.is_some() && !ui.is_running => {
                         #[cfg(feature = "vigil")]
                         {
                             if !ui.is_running

@@ -1453,6 +1453,44 @@ fn emit_tool_progress_tags_entries_with_current_tool_call() {
     assert!(mgr.drain_tool_progress().is_empty());
 }
 
+/// `harness/emit-issue` files a durable, session-unscoped issue on the board
+/// and returns its id (e.g. `drg-a1b2`). The bridge reads the process-global
+/// store installed by `install_issue_store`; when absent it degrades to nil.
+#[cfg(feature = "plugin")]
+#[test]
+fn emit_issue_creates_board_issue_and_returns_id() {
+    use crate::extras::issue_db::IssueStore;
+    use crate::plugin::worker::issue_bridge;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "dirge-emit-issue-test-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed),
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db_path = dir.join("state.db");
+    let store = IssueStore::open_at(&db_path).unwrap();
+    issue_bridge::install_issue_store(std::sync::Arc::new(store));
+
+    let mut mgr = PluginManager::try_new().unwrap();
+    let id = mgr
+        .eval(r#"(harness/emit-issue "watch upstream" "upgrade to v2" "high")"#)
+        .unwrap();
+    let id = id.trim_matches('"');
+    assert!(id.starts_with("drg-"), "unexpected id: {id:?}");
+
+    // Re-open the same file to verify the row actually landed (the bridge
+    // owns the Arc'd store, so we can't read it back directly).
+    let reopened = IssueStore::open_at(&db_path).unwrap();
+    let issue = reopened.get(id).unwrap().expect("issue was persisted");
+    assert_eq!(issue.title, "watch upstream");
+    assert_eq!(issue.body, "upgrade to v2");
+    assert_eq!(issue.priority, "high");
+    assert_eq!(issue.status, "open");
+}
+
 // --- H3: register-tool prepare-arguments field ---------------------
 
 /// `(harness/register-tool ... :parallel "my-prep")` records the
