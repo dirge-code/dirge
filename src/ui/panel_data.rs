@@ -86,6 +86,21 @@ pub struct LeftPanelInfo {
     pub git: Option<GitSnapshot>,
 }
 
+/// A single row in a vigil-status panel display.
+#[cfg(feature = "vigil")]
+#[derive(Debug, Clone, Default)]
+pub struct VigilStatusRow {
+    pub name: String,
+    pub trigger: String,
+    pub interval_secs: u64,
+    pub running: bool,
+    pub paused: bool,
+    /// Number of events in the most recent reap window.
+    pub last_event_count: usize,
+    /// Human-readable age of the most recent reap (e.g. "3s", "12m").
+    pub last_event_age: Option<String>,
+}
+
 /// Build a compact, glanceable label for a tool call shown in the
 /// left-panel `[ACTIVITY]` ticker — `<verb> <concise target>`. The
 /// target is the basename for path tools, the command head for `bash`,
@@ -128,8 +143,23 @@ pub fn tool_call_label(name: &str, args: &serde_json::Value) -> String {
     }
 }
 
+/// Human-readable short duration like "3s", "12m", "2h".
+#[cfg(feature = "vigil")]
+pub fn format_duration_short(d: chrono::TimeDelta) -> String {
+    let secs = d.num_seconds();
+    if secs < 60 {
+        format!("{}s", secs.max(0))
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{}h", secs / 3600)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "vigil")]
+    use super::format_duration_short;
     use super::tool_call_label;
     use serde_json::json;
 
@@ -168,5 +198,24 @@ mod tests {
             "repo_overview"
         );
         assert_eq!(tool_call_label("read", &json!({})), "read");
+    }
+
+    #[cfg(feature = "vigil")]
+    #[test]
+    fn duration_short_formats_seconds_minutes_hours() {
+        let d = |secs: i64| chrono::TimeDelta::try_seconds(secs).unwrap();
+        assert_eq!(format_duration_short(d(0)), "0s");
+        assert_eq!(format_duration_short(d(45)), "45s");
+        assert_eq!(format_duration_short(d(60)), "1m");
+        assert_eq!(format_duration_short(d(3599)), "59m");
+        assert_eq!(format_duration_short(d(3600)), "1h");
+        assert_eq!(format_duration_short(d(7200)), "2h");
+    }
+
+    #[cfg(feature = "vigil")]
+    #[test]
+    fn duration_short_clamps_negative_to_zero() {
+        let d = chrono::TimeDelta::try_seconds(-10).unwrap();
+        assert_eq!(format_duration_short(d), "0s");
     }
 }
