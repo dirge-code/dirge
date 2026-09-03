@@ -573,6 +573,8 @@ async fn main() -> anyhow::Result<()> {
             cli::Command::Sandbox { .. } => {}
             #[cfg(feature = "mcp-server")]
             cli::Command::Mcp { .. } => {}
+            #[cfg(feature = "vigil")]
+            cli::Command::Vigil { .. } => {}
         }
     }
 
@@ -746,6 +748,11 @@ async fn main() -> anyhow::Result<()> {
             #[cfg(feature = "mcp-server")]
             cli::Command::Mcp { model, sandbox } => {
                 return extras::mcp_server::serve(&cli, &cfg, model.clone(), sandbox.clone()).await;
+            }
+            #[cfg(feature = "vigil")]
+            cli::Command::Vigil { action } => {
+                handle_vigil_command(action).await?;
+                return Ok(());
             }
         }
     }
@@ -2702,4 +2709,262 @@ mod resume_staleness_tests {
             "expected no warnings, got {warnings:?}"
         );
     }
+}
+
+/// Handle `dirge vigil add/list/remove/pause/resume/rest` subcommands.
+#[cfg(feature = "vigil")]
+async fn handle_vigil_command(action: &crate::cli::VigilAction) -> anyhow::Result<()> {
+    use crate::extras::dirge_paths::ProjectPaths;
+    use crate::extras::vigil_db::{VigilStatus, VigilStore};
+
+    let paths = ProjectPaths::new(
+        &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+    );
+
+    match action {
+        crate::cli::VigilAction::List => {
+            let vigils = collect_vigils_for_list(&paths, config::load().vigils.unwrap_or_default());
+            println!("Vigils:");
+            for (v, status) in &vigils {
+                let trigger = match &v.trigger {
+                    crate::config::VigilTrigger::Toll { interval_secs } => {
+                        format!("toll every {interval_secs}s")
+                    }
+                    crate::config::VigilTrigger::Watcher { path } => {
+                        format!("watcher on {path}")
+                    }
+                    crate::config::VigilTrigger::Harbinger {
+                        address, protocol, ..
+                    } => {
+                        let p = if protocol.is_empty() {
+                            "tcp"
+                        } else {
+                            protocol.as_str()
+                        };
+                        format!("harbinger {p}://{address}")
+                    }
+                };
+                let prompt = if v.prompt.is_empty() {
+                    "(default)".to_string()
+                } else {
+                    v.prompt.clone()
+                };
+                println!(
+                    "  {} - {trigger} - reap every {}s - {} - prompt: {prompt}",
+                    v.name,
+                    v.reap_interval_secs,
+                    status.as_str()
+                );
+            }
+            if vigils.is_empty() {
+                println!("  (none)");
+            }
+        }
+        crate::cli::VigilAction::Add {
+            name,
+            trigger,
+            args,
+        } => {
+            let store = VigilStore::open(&paths).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let entry = build_vigil_entry(name, trigger, args)?;
+            let json = serde_json::to_string(&entry)?;
+            store
+                .upsert(&entry.name, &json)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            println!(
+                "Added vigil '{}'. Run `dirge --vigil` to start the keeper.",
+                entry.name
+            );
+        }
+        crate::cli::VigilAction::Remove { name } => {
+            let store = VigilStore::open(&paths).map_err(|e| anyhow::anyhow!("{e}"))?;
+            store.remove(name).map_err(|e| anyhow::anyhow!("{e}"))?;
+            println!("Removed vigil '{name}'.");
+        }
+        crate::cli::VigilAction::Pause { name } => {
+            let store = VigilStore::open(&paths).map_err(|e| anyhow::anyhow!("{e}"))?;
+            store
+                .set_status(name, VigilStatus::Paused)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            println!("Paused vigil '{name}'.");
+        }
+        crate::cli::VigilAction::Resume { name } => {
+            let store = VigilStore::open(&paths).map_err(|e| anyhow::anyhow!("{e}"))?;
+            store
+                .set_status(name, VigilStatus::Active)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            println!("Resumed vigil '{name}'.");
+        }
+        crate::cli::VigilAction::Rest { name } => {
+            let store = VigilStore::open(&paths).map_err(|e| anyhow::anyhow!("{e}"))?;
+            store
+                .set_status(name, VigilStatus::Resting)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            println!("vigil '{name}' resting (will sleep until next trigger).");
+        }
+    }
+    Ok(())
+}
+
+/// Build a VigilEntry from CLI `vigil add` args.
+#[cfg(feature = "vigil")]
+fn build_vigil_entry(
+    name: &str,
+    trigger: &crate::cli::VigilAddTrigger,
+    args: &[String],
+) -> anyhow::Result<crate::config::VigilEntry> {
+    use crate::config::{SocketMode, VigilEntry, VigilRite, VigilTrigger};
+
+    // Parse key=value args strictly: a keyless arg is a typo, not a value.
+    let mut parsed: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for arg in args {
+        let (key, value) = arg
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("invalid vigil arg '{arg}': expected key=value"))?;
+        parsed.insert(key.to_string(), value.to_string());
+    }
+
+    let known: &[&str] = match trigger {
+        crate::cli::VigilAddTrigger::Toll => &["interval_secs", "reap_interval_secs", "prompt"],
+        crate::cli::VigilAddTrigger::Watcher => &["path", "reap_interval_secs", "prompt"],
+        crate::cli::VigilAddTrigger::Harbinger => &[
+            "address",
+            "protocol",
+            "socket_mode",
+            "reap_interval_secs",
+            "prompt",
+        ],
+    };
+    for key in parsed.keys() {
+        if !known.contains(&key.as_str()) {
+            anyhow::bail!("unknown vigil arg '{key}' for {trigger:?}");
+        }
+    }
+
+    let trigger = match trigger {
+        crate::cli::VigilAddTrigger::Toll => {
+            let interval_secs = parse_positive_secs(&parsed, "interval_secs", 30)?;
+            VigilTrigger::Toll { interval_secs }
+        }
+        crate::cli::VigilAddTrigger::Watcher => {
+            let path = parsed
+                .get("path")
+                .cloned()
+                .unwrap_or_else(|| ".".to_string());
+            VigilTrigger::Watcher { path }
+        }
+        crate::cli::VigilAddTrigger::Harbinger => {
+            let address = parsed
+                .get("address")
+                .cloned()
+                .unwrap_or_else(|| "127.0.0.1:9000".to_string());
+            let protocol = parsed.get("protocol").cloned().unwrap_or_default();
+            // The flat key=value CLI cannot express a commands map, so a
+            // CLI-added harbinger is template mode. Commands-mode harbingers
+            // must come from config or a .dirge/vigils/*.json file.
+            let socket_mode = match parsed.get("socket_mode").map(String::as_str) {
+                None | Some("template") => SocketMode::Template,
+                Some("commands") => anyhow::bail!(
+                    "commands-mode harbingers need a commands map; define '{name}' in config or a vigil JSON file instead"
+                ),
+                Some(other) => {
+                    anyhow::bail!("invalid socket_mode '{other}': expected template or commands")
+                }
+            };
+            VigilTrigger::Harbinger {
+                address,
+                protocol,
+                socket_mode,
+                commands: std::collections::HashMap::new(),
+            }
+        }
+    };
+
+    let reap_interval_secs = parse_positive_secs(&parsed, "reap_interval_secs", 30)?;
+
+    let prompt = parsed.get("prompt").cloned().unwrap_or_default();
+
+    Ok(VigilEntry {
+        name: name.to_string(),
+        trigger,
+        reap_interval_secs,
+        prompt,
+        procession: None,
+        rite: Some(VigilRite {
+            cmd: None,
+            git_dirty: false,
+        }),
+    })
+}
+
+/// Parse a positive-integer seconds arg, rejecting zero and non-numeric
+/// values. Zero trips tokio's non-zero interval assert (the trigger dies
+/// silently) and a zero reap interval tight-loops the reaper.
+#[cfg(feature = "vigil")]
+fn parse_positive_secs(
+    parsed: &std::collections::HashMap<String, String>,
+    key: &str,
+    default: u64,
+) -> anyhow::Result<u64> {
+    match parsed.get(key) {
+        None => Ok(default),
+        Some(raw) => {
+            let secs: u64 = raw
+                .parse()
+                .map_err(|_| anyhow::anyhow!("{key} must be a positive integer, got '{raw}'"))?;
+            if secs == 0 {
+                anyhow::bail!("{key} must be greater than zero");
+            }
+            Ok(secs)
+        }
+    }
+}
+
+/// Enumerate vigils for `dirge vigil list`, merged from config and the SQLite
+/// store by name. Config entries win on name collision; the store is
+/// authoritative for status, so a config vigil paused or rested via the CLI
+/// still shows its state. Entries only in the store (added via
+/// `dirge vigil add`) show up too.
+#[cfg(feature = "vigil")]
+fn collect_vigils_for_list(
+    paths: &crate::extras::dirge_paths::ProjectPaths,
+    config_vigils: Vec<crate::config::VigilEntry>,
+) -> Vec<(
+    crate::config::VigilEntry,
+    crate::extras::vigil_db::VigilStatus,
+)> {
+    use crate::config::VigilEntry;
+    use crate::extras::vigil_db::{VigilStatus, VigilStore};
+    use std::collections::HashMap;
+
+    let mut status_by_name: HashMap<String, VigilStatus> = HashMap::new();
+    let mut entry_by_name: HashMap<String, VigilEntry> = HashMap::new();
+
+    // Store first (lowest entry precedence; authoritative for status).
+    if let Ok(store) = VigilStore::open(paths) {
+        for row in store.list_all().unwrap_or_default() {
+            status_by_name.insert(row.name.clone(), row.status);
+            if let Ok(entry) = serde_json::from_str::<VigilEntry>(&row.payload_json) {
+                entry_by_name.insert(row.name.clone(), entry);
+            }
+        }
+    }
+
+    // Config wins over store on name collision.
+    for entry in config_vigils {
+        entry_by_name.insert(entry.name.clone(), entry);
+    }
+
+    let mut out: Vec<(VigilEntry, VigilStatus)> = entry_by_name
+        .into_iter()
+        .map(|(name, entry)| {
+            let status = status_by_name
+                .get(&name)
+                .copied()
+                .unwrap_or(VigilStatus::Active);
+            (entry, status)
+        })
+        .collect();
+    out.sort_by(|a, b| a.0.name.cmp(&b.0.name));
+    out
 }
