@@ -14,6 +14,10 @@
 (def here (string (os/cwd) "/plugins/compression"))
 (defn load-plugin [name] (dofile (string here "/" name) :env (curenv)))
 
+# The compressor files call harness/* at compile time; the host injects
+# these, so the standalone harness must stand them up first.
+(def harness/record-entity (fn [kind entity meta] nil))
+
 (load-plugin "00-regex.janet")
 (load-plugin "05-util.janet")
 (load-plugin "10-git.janet")
@@ -77,6 +81,29 @@
   (check "ls shows real entry names (not just a count)"
          (and (string/find "file0.txt" out) (string/find "file59.txt" out)))
   (check "ls marks hidden entries" (string/find "entries hidden" out)))
+
+# ── docker ps: a short row must not index past the end of the array ──
+#
+# `docker ps --format "{{.Names}} | {{.Status}} | {{.Image}}"` pads its
+# cells, so one row can split into 3 columns. The old compressor read
+# column 4 unconditionally and raised "expected integer key for array in
+# range [0, 3), got 3" out of the on-tool-end hook.
+
+(load-plugin "30-docker.janet")
+
+(defn outcome [f] (try (f) ([e] (string "ERROR: " e))))
+
+(let [out (outcome (fn [] (docker-compress "docker ps -a"
+                                           "NAMES   STATUS   IMAGE\nalpha   Up 2d    nginx\n")))]
+  (check "docker ps: 3-column row does not raise"
+         (not (string/has-prefix? "ERROR: " out)))
+  (check "docker ps: 3-column row keeps its content" (string/find "alpha" out)))
+
+(let [out (outcome (fn [] (docker-compress "docker ps -a"
+                                           (string "CONTAINER ID   IMAGE   COMMAND   CREATED   STATUS    PORTS   NAMES\n"
+                                                   "abc123   nginx   \"x\"   2d ago   Up 2d   80/tcp   web\n"))))]
+  (check "docker ps: default layout still reports name (image): status"
+         (string/find "web (nginx): Up 2d" out)))
 
 # ── curl: head+tail unchanged in spirit, shared marker ──────────────
 

@@ -35,14 +35,18 @@
   (var containers @[])
   (each line (tuple/slice lines 1)
     (def parts (filter (fn [p] (not (empty? p))) (string/split "  " line)))
-    (if (>= (length parts) 3)
+    (if (>= (length parts) 7)
       (let [name (string/trim (in parts (- (length parts) 1)))
             image (string/trim (in parts 1))
-            status (string/trim (in parts (if (>= (length parts) 7) 4 3)))]
+            status (string/trim (in parts 4))]
         (array/push containers (string name " (" image "): " status)))
-      (let [words (filter (fn [w] (not (empty? w))) (string/split " " line))]
-        (when (>= (length words) 2)
-          (array/push containers (string (in words 0) " (" (in words 1) ")"))))))
+      # A custom --format row has no fixed column positions — it can be
+      # as short as one column — so keep it verbatim rather than index
+      # past the end of the row or invent a name/image pair.
+      (do
+        (def t (string/trim line))
+        (when (not (empty? t))
+          (array/push containers t)))))
   (def result (if (empty? containers) "no containers" (string/join containers "\n")))
   # Record container entities for graph search (#393)
   (each c containers
