@@ -44,3 +44,6 @@ pub mod skills;
 pub mod spec_db;
 #[cfg(feature = "vigil")]
 pub mod vigil_db;
+
+#[cfg(feature = "vigil")]
+pub mod vigil;
