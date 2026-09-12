@@ -1,0 +1,12 @@
+{
+  "name": "airflow-remediate",
+  "trigger": {
+    "type": "toll",
+    "interval_secs": 60
+  },
+  "reap_interval_secs": 60,
+  "prompt": "Airflow DAG run failed.\n\nDAG: {dag_id}\nRun ID: {run_id}\nState: {state}\n\nInvestigate and fix the DAG.",
+  "rite": {
+    "cmd": "echo 'airflow-rite-ok'"
+  }
+}

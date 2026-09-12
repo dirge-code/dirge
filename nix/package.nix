@@ -23,6 +23,8 @@ let
       ../src
       ../prompts
       ../plugins
+      # Patched evil-janet (see the [patch.crates-io] entry in Cargo.toml).
+      ../vendor
     ];
   };
 in
