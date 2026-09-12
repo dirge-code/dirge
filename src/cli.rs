@@ -307,7 +307,7 @@ pub enum Command {
         #[arg(long = "sandbox")]
         sandbox: Option<String>,
     },
-    /// Manage vigils — list, add, remove, pause, resume, restart.
+    /// Manage vigils — list, add, remove, pause, resume, rest.
     #[cfg(feature = "vigil")]
     Vigil {
         #[command(subcommand)]
@@ -338,7 +338,7 @@ pub enum VigilAction {
     Pause { name: String },
     /// Resume a paused vigil.
     Resume { name: String },
-    /// Restart a vigil (stop and re-create its trigger).
+    /// Put a vigil to rest (it sleeps until the next trigger).
     Rest { name: String },
 }
 

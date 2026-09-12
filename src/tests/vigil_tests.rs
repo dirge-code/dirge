@@ -19,7 +19,7 @@ fn toll_entry_uses_defaults() {
     ));
     assert_eq!(entry.reap_interval_secs, 30);
     assert!(entry.prompt.is_empty());
-    assert!(entry.rite.is_some());
+    assert!(entry.rite.is_none());
 }
 
 #[test]
@@ -101,6 +101,23 @@ fn entry_rejects_unknown_arg() {
     let err = crate::build_vigil_entry("poll", &VigilAddTrigger::Toll, &args(&["interval_sec=60"]))
         .unwrap_err();
     assert!(err.to_string().contains("unknown vigil arg"), "{err}");
+}
+
+#[test]
+fn entry_rejects_empty_name() {
+    let err = crate::build_vigil_entry("", &VigilAddTrigger::Toll, &[]).unwrap_err();
+    assert!(err.to_string().contains("name must not be empty"), "{err}");
+}
+
+#[test]
+fn entry_rejects_duplicate_arg() {
+    let err = crate::build_vigil_entry(
+        "poll",
+        &VigilAddTrigger::Toll,
+        &args(&["interval_secs=60", "interval_secs=120"]),
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("duplicate vigil arg"), "{err}");
 }
 
 #[test]

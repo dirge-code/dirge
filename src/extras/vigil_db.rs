@@ -2,7 +2,6 @@
 //!
 //! Vigil entries live in the per-project session DB (`.dirge/sessions/state.db`).
 //! The store owns its schema via idempotent `CREATE TABLE IF NOT EXISTS` on open.
-#![allow(dead_code)]
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -25,6 +24,18 @@ impl VigilStatus {
             VigilStatus::Resting => "resting",
         }
     }
+
+    /// Decode the on-disk status column. Unknown values fall back to
+    /// `Active` rather than erroring, so a hand-edited row never breaks
+    /// the whole list.
+    fn from_db_str(s: &str) -> Self {
+        match s {
+            "active" => VigilStatus::Active,
+            "paused" => VigilStatus::Paused,
+            "resting" => VigilStatus::Resting,
+            _ => VigilStatus::Active,
+        }
+    }
 }
 
 /// A stored vigil row.
@@ -32,7 +43,11 @@ pub struct VigilRow {
     pub name: String,
     pub payload_json: String,
     pub status: VigilStatus,
+    // Read by the slice-2 keeper/TUI, not by this slice's CLI; kept here
+    // because the schema already tracks them.
+    #[allow(dead_code)]
     pub created_at: String,
+    #[allow(dead_code)]
     pub updated_at: String,
 }
 
@@ -48,7 +63,8 @@ impl VigilStore {
 
     pub fn open_at(path: &Path) -> Result<Self, String> {
         if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("create vigil db dir {}: {e}", parent.display()))?;
         }
         let conn = Connection::open_with_flags(
             path,
@@ -119,6 +135,9 @@ impl VigilStore {
         Ok(())
     }
 
+    /// Slice-2 keeper API: not yet called from this slice's CLI, so it would
+    /// be dead code under `-D warnings`. Landed early so slice 2 can use it.
+    #[allow(dead_code)]
     pub fn get(&self, name: &str) -> Result<Option<VigilRow>, String> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
@@ -134,12 +153,7 @@ impl VigilStore {
                     payload_json: row.get(1)?,
                     status: {
                         let s: String = row.get(2)?;
-                        match s.as_str() {
-                            "active" => VigilStatus::Active,
-                            "paused" => VigilStatus::Paused,
-                            "resting" => VigilStatus::Resting,
-                            _ => VigilStatus::Active,
-                        }
+                        VigilStatus::from_db_str(&s)
                     },
                     created_at: row.get(3)?,
                     updated_at: row.get(4)?,
@@ -150,6 +164,8 @@ impl VigilStore {
         Ok(row)
     }
 
+    /// Slice-2 keeper API; landed early. See `get` above.
+    #[allow(dead_code)]
     pub fn list_non_resting(&self) -> Result<Vec<VigilRow>, String> {
         self.query_rows(
             "SELECT name, payload_json, status, created_at, updated_at
@@ -171,27 +187,22 @@ impl VigilStore {
         let mut stmt = conn
             .prepare(sql)
             .map_err(|e| format!("prepare vigil list: {e}"))?;
-        let rows = stmt
+        let rows: Vec<VigilRow> = stmt
             .query_map([], |row| {
                 Ok(VigilRow {
                     name: row.get(0)?,
                     payload_json: row.get(1)?,
                     status: {
                         let s: String = row.get(2)?;
-                        match s.as_str() {
-                            "active" => VigilStatus::Active,
-                            "paused" => VigilStatus::Paused,
-                            "resting" => VigilStatus::Resting,
-                            _ => VigilStatus::Active,
-                        }
+                        VigilStatus::from_db_str(&s)
                     },
                     created_at: row.get(3)?,
                     updated_at: row.get(4)?,
                 })
             })
             .map_err(|e| format!("list vigils: {e}"))?
-            .filter_map(|r| r.ok())
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("read vigil row: {e}"))?;
         Ok(rows)
     }
 }
@@ -203,13 +214,23 @@ mod tests {
 
     static COUNTER: AtomicU32 = AtomicU32::new(0);
 
-    fn temp_db() -> (VigilStore, std::path::PathBuf) {
+    /// Owns the scratch dir and removes it on drop, so a failed test does not
+    /// leak temp directories.
+    struct TempDb(std::path::PathBuf);
+
+    impl Drop for TempDb {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn temp_db() -> (VigilStore, TempDb) {
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
         let dir =
             std::env::temp_dir().join(format!("dirge-vigildb-test-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let store = VigilStore::open_at(&dir.join("state.db")).unwrap();
-        (store, dir)
+        (store, TempDb(dir))
     }
 
     #[test]

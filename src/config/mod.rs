@@ -1376,8 +1376,8 @@ pub struct Config {
     #[cfg(feature = "acp")]
     pub acp_servers: Option<HashMap<String, AcpServerConfig>>,
 
-    /// Vigil definitions loaded from `config.toml` under `[vigils.<name>]`.
-    /// Only consulted when `--vigil` is active.
+    /// Vigil definitions loaded from `config.json` as a top-level `vigils`
+    /// array. Only consulted when `--vigil` is active.
     #[cfg(feature = "vigil")]
     #[serde(default)]
     pub vigils: Option<Vec<VigilEntry>>,
@@ -1386,7 +1386,6 @@ pub struct Config {
 /// A single vigil definition from config.
 #[cfg(feature = "vigil")]
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
-#[serde(default)]
 pub struct VigilEntry {
     pub name: String,
     pub trigger: VigilTrigger,

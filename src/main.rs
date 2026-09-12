@@ -751,7 +751,7 @@ async fn main() -> anyhow::Result<()> {
             }
             #[cfg(feature = "vigil")]
             cli::Command::Vigil { action } => {
-                handle_vigil_command(action).await?;
+                handle_vigil_command(action, &cfg)?;
                 return Ok(());
             }
         }
@@ -2713,7 +2713,10 @@ mod resume_staleness_tests {
 
 /// Handle `dirge vigil add/list/remove/pause/resume/rest` subcommands.
 #[cfg(feature = "vigil")]
-async fn handle_vigil_command(action: &crate::cli::VigilAction) -> anyhow::Result<()> {
+fn handle_vigil_command(
+    action: &crate::cli::VigilAction,
+    cfg: &config::Config,
+) -> anyhow::Result<()> {
     use crate::extras::dirge_paths::ProjectPaths;
     use crate::extras::vigil_db::{VigilStatus, VigilStore};
 
@@ -2723,7 +2726,7 @@ async fn handle_vigil_command(action: &crate::cli::VigilAction) -> anyhow::Resul
 
     match action {
         crate::cli::VigilAction::List => {
-            let vigils = collect_vigils_for_list(&paths, config::load().vigils.unwrap_or_default());
+            let vigils = collect_vigils_for_list(&paths, cfg.vigils.clone().unwrap_or_default());
             println!("Vigils:");
             for (v, status) in &vigils {
                 let trigger = match &v.trigger {
@@ -2813,15 +2816,22 @@ fn build_vigil_entry(
     trigger: &crate::cli::VigilAddTrigger,
     args: &[String],
 ) -> anyhow::Result<crate::config::VigilEntry> {
-    use crate::config::{SocketMode, VigilEntry, VigilRite, VigilTrigger};
+    use crate::config::{SocketMode, VigilEntry, VigilTrigger};
 
-    // Parse key=value args strictly: a keyless arg is a typo, not a value.
+    if name.trim().is_empty() {
+        anyhow::bail!("vigil name must not be empty");
+    }
+
+    // Parse key=value args strictly: a keyless arg is a typo, not a value,
+    // and a repeated key is an error rather than silent last-wins.
     let mut parsed: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for arg in args {
         let (key, value) = arg
             .split_once('=')
             .ok_or_else(|| anyhow::anyhow!("invalid vigil arg '{arg}': expected key=value"))?;
-        parsed.insert(key.to_string(), value.to_string());
+        if parsed.insert(key.to_string(), value.to_string()).is_some() {
+            anyhow::bail!("duplicate vigil arg '{key}'");
+        }
     }
 
     let known: &[&str] = match trigger {
@@ -2890,10 +2900,7 @@ fn build_vigil_entry(
         reap_interval_secs,
         prompt,
         procession: None,
-        rite: Some(VigilRite {
-            cmd: None,
-            git_dirty: false,
-        }),
+        rite: None,
     })
 }
 
@@ -2941,13 +2948,25 @@ fn collect_vigils_for_list(
     let mut entry_by_name: HashMap<String, VigilEntry> = HashMap::new();
 
     // Store first (lowest entry precedence; authoritative for status).
-    if let Ok(store) = VigilStore::open(paths) {
-        for row in store.list_all().unwrap_or_default() {
-            status_by_name.insert(row.name.clone(), row.status);
-            if let Ok(entry) = serde_json::from_str::<VigilEntry>(&row.payload_json) {
-                entry_by_name.insert(row.name.clone(), entry);
+    match VigilStore::open(paths) {
+        Ok(store) => match store.list_all() {
+            Ok(rows) => {
+                for row in rows {
+                    status_by_name.insert(row.name.clone(), row.status);
+                    match serde_json::from_str::<VigilEntry>(&row.payload_json) {
+                        Ok(entry) => {
+                            entry_by_name.insert(row.name.clone(), entry);
+                        }
+                        Err(e) => eprintln!(
+                            "warning: skipping vigil '{}': unreadable stored payload: {e}",
+                            row.name
+                        ),
+                    }
+                }
             }
-        }
+            Err(e) => eprintln!("warning: could not read stored vigils: {e}"),
+        },
+        Err(e) => eprintln!("warning: could not open the vigil store: {e}"),
     }
 
     // Config wins over store on name collision.
