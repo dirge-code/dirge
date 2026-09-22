@@ -374,22 +374,95 @@
 
 # ── minimal JSON value extractor ────────────────────────────────
 
+(defn- push-codepoint [buf cp]
+  "Append codepoint `cp` to buffer `buf` as UTF-8 bytes."
+  (cond
+    (< cp 128) (buffer/push-byte buf cp)
+    (< cp 2048) (do (buffer/push-byte buf (+ 192 (brshift cp 6)))
+                    (buffer/push-byte buf (+ 128 (band cp 63))))
+    (< cp 65536) (do (buffer/push-byte buf (+ 224 (brshift cp 12)))
+                     (buffer/push-byte buf (+ 128 (band (brshift cp 6) 63)))
+                     (buffer/push-byte buf (+ 128 (band cp 63))))
+    (do (buffer/push-byte buf (+ 240 (brshift cp 18)))
+        (buffer/push-byte buf (+ 128 (band (brshift cp 12) 63)))
+        (buffer/push-byte buf (+ 128 (band (brshift cp 6) 63)))
+        (buffer/push-byte buf (+ 128 (band cp 63))))))
+
+(defn- json-unescape [raw]
+  "Resolve the JSON string escapes in `raw` (the bytes between a value's
+  enclosing quotes): \\\" \\\\ \\/ \\n \\t \\r \\b \\f and \\uXXXX. A
+  backslash before any other byte is kept verbatim, so already-unescaped
+  code is not mangled."
+  (def out @"")
+  (var i 0)
+  (def len (length raw))
+  (while (< i len)
+    (def ch (get raw i))
+    (if (and (= ch backslash) (< (+ i 1) len))
+      (do
+        (def n (get raw (+ i 1)))
+        (cond
+          (= n doublequote) (buffer/push-byte out 34)   # \"
+          (= n backslash)   (buffer/push-byte out 92)   # \\
+          (= n 47)          (buffer/push-byte out 47)   # \/
+          (= n 110)         (buffer/push-byte out 10)   # \n
+          (= n 116)         (buffer/push-byte out 9)    # \t
+          (= n 114)         (buffer/push-byte out 13)   # \r
+          (= n 98)          (buffer/push-byte out 8)    # \b
+          (= n 102)         (buffer/push-byte out 12)   # \f
+          (= n 117)                                     # \uXXXX
+          (do
+            (var cp 0)
+            (var ok (<= (+ i 6) len))
+            (if ok
+              (for j 2 6
+                (def h (get raw (+ i j)))
+                (def d (cond
+                         (and (>= h 48) (<= h 57)) (- h 48)
+                         (and (>= h 97) (<= h 102)) (+ 10 (- h 97))
+                         (and (>= h 65) (<= h 70)) (+ 10 (- h 65))
+                         nil))
+                (if d (set cp (+ (* cp 16) d)) (set ok false))))
+            (if ok
+              (do (push-codepoint out cp) (set i (+ i 4)))  # +2 below = 6
+              # Malformed \u: keep the "\u" verbatim.
+              (do (buffer/push-byte out ch) (buffer/push-byte out n))))
+          # Unknown escape: keep the escaped byte verbatim.
+          (buffer/push-byte out n))
+        (set i (+ i 2)))
+      (do (buffer/push-byte out ch) (set i (+ i 1)))))
+  (string out))
+
+(defn- json-string-end [s pos]
+  "Index of the quote closing the JSON string that starts at `pos` (which
+  must be a quote), skipping backslash-escaped bytes. nil if unterminated."
+  (var i (+ pos 1))
+  (def len (length s))
+  (var end nil)
+  (while (and (nil? end) (< i len))
+    (def ch (get s i))
+    (cond
+      (= ch backslash) (set i (+ i 2))   # the next byte is escaped
+      (= ch doublequote) (set end i)
+      (set i (+ i 1))))
+  end)
+
 (defn- json-extract-string [s key]
   "Extract a string value for `key` from a flat JSON object string.
-  Returns nil if the key is not found."
+  Backslash-escaped quotes inside the value are skipped when locating the
+  closing quote and unescaped in the result, so a code payload such as
+  (str \\\"a\\\") survives instead of being cut at the first inner quote.
+  Returns nil if the key is missing or its value is not a string."
   (def search (string "\"" key "\""))
   (if-let [start (string/find search s)]
     (let [after-key (string/slice s (+ start (length search)))
           colon (string/find ":" after-key)]
       (if colon
-        (let [after-colon (string/trim (string/slice after-key (+ colon 1)))
-              b (get after-colon 0)]
-          (if (= b 34)  # '"'
-            (let [escaped-rest (string/slice after-colon 1)
-                  end-quote (string/find "\"" escaped-rest)]
-              (if end-quote
-                (string/slice escaped-rest 0 end-quote)
-                nil))
+        (let [after-colon (string/trim (string/slice after-key (+ colon 1)))]
+          (if (= (get after-colon 0) doublequote)
+            (if-let [end (json-string-end after-colon 0)]
+              (json-unescape (string/slice after-colon 1 end))
+              nil)
             nil))
         nil))
     nil))
