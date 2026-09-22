@@ -2987,6 +2987,39 @@ fn nrepl_plugin_reads_a_numeric_port_from_tool_args() {
     );
 }
 
+/// Regression (reported bug): a Clojure payload containing string literals
+/// arrives JSON-escaped — `{"code": "(str \"a\" \"b\")"}`. The old
+/// extractor cut the value at the FIRST inner quote, yielding `(str \`;
+/// paren-repair then appended `)`, so the model saw a nonsensical
+/// `(str \)` and its eval silently ran truncated code. The value must be
+/// taken up to the real closing quote and unescaped.
+#[cfg(feature = "plugin")]
+#[test]
+fn nrepl_plugin_extracts_string_args_with_escaped_quotes() {
+    let mut mgr = nrepl_state_env();
+    // Raw JSON exactly as the tool handler receives it.
+    let extracted = mgr
+        .eval(r#"(json-extract-string `{"code": "(str \"a\" \"b\")"}` "code")"#)
+        .unwrap();
+    assert_eq!(extracted, r#"(str "a" "b")"#);
+    // The truncated prefix must never come back.
+    assert_ne!(extracted, r#"(str \"#);
+
+    // Common escapes: newline, tab, backslash, slash.
+    assert_eq!(
+        mgr.eval(r#"(json-extract-string `{"code": "a\nb\tc\\d/e"}` "code")"#)
+            .unwrap(),
+        "a\nb\tc\\d/e"
+    );
+
+    // A non-string value stays "not a string", not a bogus slice.
+    assert_eq!(
+        mgr.eval(r#"(json-extract-string `{"port": 51208}` "port")"#)
+            .unwrap(),
+        "nil"
+    );
+}
+
 /// dirge-hli5 (the reported bug): the disconnected-eval message used to
 /// read "Use /nrepl-connect first". Slash commands are user-typed input —
 /// there is no `harness/*` call and no builtin tool that lets the agent
