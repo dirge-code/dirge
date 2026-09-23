@@ -6,6 +6,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.25.6] - 2026-09-23
+
+### Fixed
+- `nrepl_eval` no longer truncates evaluated code at the first escaped quote.
+  The tool receives the model's code as a JSON object and pulled the `code`
+  value out with a hand-rolled scanner, because the plugin runtime ships no
+  `json/decode`. That scanner found the value's closing quote by searching for
+  the next plain `"`, so any code containing a string literal was cut at the
+  first inner quote. `(str "a" "b")` arrived as `(str \`, paren-repair appended
+  the missing `)`, and the eval silently ran the truncated form with no error —
+  which made the tool unusable for one of the most common things to evaluate.
+  The scanner now skips backslash-escaped bytes when locating the closing quote
+  and resolves the JSON escapes `\" \\ \/ \n \t \r \b \f` plus `\uXXXX`,
+  keeping unknown or malformed escapes verbatim so already-unescaped code is
+  not mangled. (#850)
+
+### Security
+- Bumped rustls to 0.23.45 for RUSTSEC-2026-0285. rustls 0.23.42 accepted
+  TLS 1.3 handshake messages across encryption level boundaries; the fix also
+  pulls rustls-webpki 0.103.15. The same pass moved chacha20 and wnaf off
+  yanked versions, clearing the two yanked-dependency warnings that were
+  failing `cargo audit` on CI. (#851)
+
 ## [0.25.5] - 2026-09-10
 
 ### Fixed
@@ -4451,7 +4474,9 @@ agent in Rust with:
   LSP integration, and a Janet plugin system.
 - Session save/load/resume with LLM-summarization compaction.
 
-[Unreleased]: https://github.com/dirge-code/dirge/compare/v0.25.4...HEAD
+[Unreleased]: https://github.com/dirge-code/dirge/compare/v0.25.6...HEAD
+[0.25.6]: https://github.com/dirge-code/dirge/compare/v0.25.5...v0.25.6
+[0.25.5]: https://github.com/dirge-code/dirge/compare/v0.25.4...v0.25.5
 [0.25.4]: https://github.com/dirge-code/dirge/compare/v0.25.3...v0.25.4
 [0.25.3]: https://github.com/dirge-code/dirge/compare/v0.25.2...v0.25.3
 [0.25.2]: https://github.com/dirge-code/dirge/compare/v0.25.1...v0.25.2
