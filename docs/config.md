@@ -73,7 +73,7 @@ Accepted top-level keys:
 
 | Key                       | Type    | Description                                                                                                                                                                 |
 | ------------------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `provider`                | string  | Active provider alias. Built-ins are `openrouter`, `openai`, `anthropic`, `gemini`/`google`, `deepseek`, `glm`/`zhipu`, `cerebras`, `opencode`, `kimi`/`kimi-code`/`moonshot`, and `ollama`; any alias declared in `providers` is also accepted. Default: `openrouter`. See [Providers and roles](#providers-and-roles). |
+| `provider`                | string  | Active provider alias. Built-ins are `openrouter`, `openai`, `anthropic`, `gemini`/`google`, `deepseek`, `glm`/`zhipu`, `cerebras`, `opencode`, `kimi`/`kimi-code`/`moonshot`, `requesty`, and `ollama`; any alias declared in `providers` is also accepted. Default: `openrouter`. See [Providers and roles](#providers-and-roles). |
 | `auth`                    | string  | Default authentication source for providers that don't set their own `providers.<name>.auth`: `api-key` (the implicit default), `chatgpt` (Codex/OpenAI login tokens), `anthropic` / `claude-code` (Anthropic Claude Code OAuth), or `kimi` (Kimi Code device OAuth). See [Providers and roles](#providers-and-roles). |
 | `providers`               | object  | Map of provider alias → entry. The active model lives in `providers.<active-provider>.model`. Each role key below points at one of these aliases. See [Providers and roles](#providers-and-roles). |
 | `review_provider`         | string  | Provider alias for the background session-review pass. Falls back to `provider`. |
@@ -380,7 +380,7 @@ Each `providers` entry accepts:
 
 | Field | Description |
 |-------|-------------|
-| `provider_type` | Built-in backend to use: `openrouter`, `openai`, `openai-responses`, `anthropic`, `gemini`, `deepseek`, `glm`, `cerebras`, `opencode`, `kimi`, `ollama`, or `custom`. Optional — defaults to the entry's alias when that alias matches a built-in name. `openai` speaks the Chat Completions API (`/v1/chat/completions`); `openai-responses` speaks the Responses API (`/v1/responses`) — see below. |
+| `provider_type` | Built-in backend to use: `openrouter`, `openai`, `openai-responses`, `anthropic`, `gemini`, `deepseek`, `glm`, `cerebras`, `opencode`, `kimi`, `requesty`, `ollama`, or `custom`. Optional — defaults to the entry's alias when that alias matches a built-in name. `openai` speaks the Chat Completions API (`/v1/chat/completions`); `openai-responses` speaks the Responses API (`/v1/responses`) — see below. |
 | `base_url` | Endpoint base URL (for custom / self-hosted endpoints). |
 | `model` | Model name for this provider. |
 | `api_key` | Literal key or `${ENV_VAR}` interpolation. Takes precedence over `api_key_env`. |
@@ -519,6 +519,51 @@ accepts image input. It clamps lower and higher Dirge reasoning levels to that
 three-value set and omits the field when reasoning is off. Dirge treats
 `gpt-oss-120b` and `zai-glm-4.7` as text-only. This integration does not expose
 other Cerebras-specific request options.
+
+### Requesty
+
+[Requesty](https://docs.requesty.ai) is an OpenAI-compatible router that takes
+`vendor/model` ids, like OpenRouter. It needs no `providers` entry. Create a key
+at <https://app.requesty.ai/api-keys>, export it and select the built-in:
+
+```bash
+export REQUESTY_API_KEY="..."
+dirge --provider requesty  # defaults to openai/gpt-4o-mini
+```
+
+Requesty is never picked by key autodetection; select it with `--provider
+requesty` or `"provider": "requesty"`. To pin another model, add only the model
+override and keep the secret in `REQUESTY_API_KEY`:
+
+```json
+{
+  "provider": "requesty",
+  "providers": {
+    "requesty": {
+      "model": "anthropic/claude-sonnet-4-5"
+    }
+  }
+}
+```
+
+Requests go to `https://router.requesty.ai/v1`. Set
+`providers.requesty.base_url` to use the EU endpoint; Dirge does not read a
+separate `REQUESTY_BASE_URL` variable:
+
+```json
+{
+  "provider": "requesty",
+  "providers": {
+    "requesty": {
+      "base_url": "https://router.eu.requesty.ai/v1"
+    }
+  }
+}
+```
+
+Reasoning effort is sent as a top-level `reasoning_effort` (`low`, `medium`, or
+`high`), with lower and higher Dirge levels clamped to that set and the field
+omitted when reasoning is off.
 
 ### OpenAI browser / device-code auth
 
