@@ -49,6 +49,9 @@ pub enum AnyClient {
         >,
     ),
     Ollama(ollama::Client<super::compressing_http::CompressingHttpClient<reqwest::Client>>),
+    Requesty(
+        openai::CompletionsClient<super::compressing_http::CompressingHttpClient<reqwest::Client>>,
+    ),
     Custom(
         openai::CompletionsClient<super::compressing_http::CompressingHttpClient<reqwest::Client>>,
     ),
@@ -84,6 +87,7 @@ impl AnyClient {
             AnyClient::OpenCode(c) => AnyModel::OpenCode(c.completion_model(name)),
             AnyClient::Kimi(c) => AnyModel::Kimi(c.completion_model(name)),
             AnyClient::Ollama(c) => AnyModel::Ollama(c.completion_model(name)),
+            AnyClient::Requesty(c) => AnyModel::Requesty(c.completion_model(name)),
             AnyClient::Custom(c) => AnyModel::Custom(c.completion_model(name)),
         }
     }
@@ -361,6 +365,11 @@ pub enum AnyModel {
     Ollama(
         ollama::CompletionModel<super::compressing_http::CompressingHttpClient<reqwest::Client>>,
     ),
+    Requesty(
+        openai::completion::CompletionModel<
+            super::compressing_http::CompressingHttpClient<reqwest::Client>,
+        >,
+    ),
     Custom(
         openai::completion::CompletionModel<
             super::compressing_http::CompressingHttpClient<reqwest::Client>,
@@ -423,6 +432,7 @@ impl AnyModel {
             AnyModel::OpenCode(m) => one_shot!(m),
             AnyModel::Kimi(m) => one_shot!(m),
             AnyModel::Ollama(m) => one_shot!(m),
+            AnyModel::Requesty(m) => one_shot!(m),
             AnyModel::Custom(m) => one_shot!(m),
         }
     }
@@ -481,6 +491,7 @@ impl AnyModel {
             AnyModel::OpenCode(_) => "opencode",
             AnyModel::Kimi(_) => "kimi",
             AnyModel::Ollama(_) => "ollama",
+            AnyModel::Requesty(_) => "requesty",
             AnyModel::Custom(_) => "custom",
         }
     }
@@ -505,6 +516,7 @@ impl AnyModel {
             AnyModel::OpenCode(m) => m.model.clone(),
             AnyModel::Kimi(m) => m.model.clone(),
             AnyModel::Ollama(m) => m.model.clone(),
+            AnyModel::Requesty(m) => m.model.clone(),
             AnyModel::Custom(m) => m.model.clone(),
         }
     }

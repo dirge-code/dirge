@@ -17,7 +17,7 @@ use crate::extras::acp::config::AcpServerConfig;
 ///
 /// `provider_type` is optional: when the alias matches a built-in
 /// (anthropic, cerebras, deepseek, gemini, glm, kimi, ollama, openai, opencode,
-/// openrouter, or custom), it is inferred from the key. Set it only when aliasing
+/// openrouter, requesty, or custom), it is inferred from the key. Set it only when aliasing
 /// a built-in backend under a different name — e.g.
 /// `"ollama": { "provider_type": "openai", "base_url": "..." }`
 /// aliases the OpenAI-compatible backend under the alias `ollama`.
@@ -329,7 +329,7 @@ fn model_image_support(model: &str) -> ImageSupport {
 fn provider_type_supports_images(provider_type: Option<&str>) -> bool {
     matches!(
         provider_type.map(|s| s.to_ascii_lowercase()).as_deref(),
-        Some("anthropic") | Some("openai") | Some("gemini") | Some("openrouter")
+        Some("anthropic") | Some("openai") | Some("gemini") | Some("openrouter") | Some("requesty")
     )
 }
 
@@ -2346,7 +2346,7 @@ pub fn load() -> Config {
                     "error: provider {:?} has invalid provider_type {:?}.\n\
                      Either the alias must match a built-in (openrouter, openai,\n\
                      openai-responses, anthropic, gemini, deepseek, glm, cerebras,\n\
-                     opencode, ollama, custom) or set `provider_type` explicitly\n\
+                     opencode, ollama, requesty, custom) or set `provider_type` explicitly\n\
                      to one of those.",
                     name, ptype,
                 );
@@ -3602,6 +3602,18 @@ mod provider_role_tests {
             .expect("bare Cerebras built-in should resolve");
 
         assert_eq!(name, "cerebras");
+        assert!(entry.provider_type.is_none());
+        assert!(entry.model.is_none());
+    }
+
+    #[test]
+    fn requesty_bare_builtin_alias_resolves_without_provider_entry() {
+        let cfg = cfg_with_providers(r#"{ "provider": "requesty" }"#);
+        let (name, entry) = cfg
+            .resolve_role(ConfigRole::Default)
+            .expect("bare Requesty built-in should resolve");
+
+        assert_eq!(name, "requesty");
         assert!(entry.provider_type.is_none());
         assert!(entry.model.is_none());
     }
