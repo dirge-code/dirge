@@ -129,6 +129,12 @@ pub fn reasoning_profile(provider: Option<&str>, model: Option<&str>) -> Reasoni
             effort: EffortWire::TopLevelStandardEffort,
             disable: DisableWire::None,
         },
+        // Requesty reads the top-level `reasoning_effort` and ignores the nested
+        // `reasoning` object, so it does not share the openrouter shape.
+        Some("requesty") => ReasoningProfile {
+            effort: EffortWire::TopLevelStandardEffort,
+            disable: DisableWire::None,
+        },
         Some("openai") => ReasoningProfile {
             effort: EffortWire::NestedEffort,
             disable: DisableWire::None,
@@ -538,6 +544,11 @@ mod tests {
             ),
             (
                 "cerebras",
+                EffortWire::TopLevelStandardEffort,
+                DisableWire::None,
+            ),
+            (
+                "requesty",
                 EffortWire::TopLevelStandardEffort,
                 DisableWire::None,
             ),
@@ -1076,6 +1087,32 @@ mod max_tokens_tests {
             max_tokens_for_reasoning(Some("anthropic"), None, ThinkingLevel::Off, None),
             None,
         );
+    }
+
+    #[test]
+    fn requesty_uses_standard_top_level_effort_without_disable_knob() {
+        let profile = reasoning_profile(Some("requesty"), None);
+        for (level, expected) in [
+            (ThinkingLevel::Minimal, "low"),
+            (ThinkingLevel::Low, "low"),
+            (ThinkingLevel::Medium, "medium"),
+            (ThinkingLevel::High, "high"),
+            (ThinkingLevel::Xhigh, "high"),
+            (ThinkingLevel::Max, "high"),
+        ] {
+            let params = profile
+                .effort_params(level, None)
+                .expect("enabled Requesty reasoning should produce params");
+            assert_eq!(
+                params,
+                serde_json::json!({ "reasoning_effort": expected }),
+                "unexpected Requesty params for {level:?}",
+            );
+            assert!(params.get("reasoning").is_none());
+        }
+
+        assert_eq!(profile.effort_params(ThinkingLevel::Off, None), None);
+        assert_eq!(profile.disable_params(), None);
     }
 
     /// Only the budget-shaped wire needs this. Effort-string providers send

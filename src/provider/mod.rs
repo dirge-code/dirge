@@ -360,6 +360,11 @@ pub(crate) enum AnyAgentInner {
         >,
     ),
     Ollama(ollama::CompletionModel<compressing_http::CompressingHttpClient<reqwest::Client>>),
+    Requesty(
+        openai::completion::CompletionModel<
+            compressing_http::CompressingHttpClient<reqwest::Client>,
+        >,
+    ),
     Custom(
         openai::completion::CompletionModel<
             compressing_http::CompressingHttpClient<reqwest::Client>,
@@ -887,6 +892,7 @@ impl AnyAgent {
             AnyAgentInner::OpenCode(_) => "opencode",
             AnyAgentInner::Kimi(_) => "kimi",
             AnyAgentInner::Ollama(_) => "ollama",
+            AnyAgentInner::Requesty(_) => "requesty",
             AnyAgentInner::Custom(_) => "custom",
         }
     }

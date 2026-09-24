@@ -103,6 +103,7 @@ fn build_stream_fn() -> Option<crate::agent::agent_loop::StreamFn> {
         AnyModel::OpenCode(m) => rig_stream_fn_from_model(m, vec![], chunk_timeout),
         AnyModel::Kimi(m) => rig_stream_fn_from_model(m, vec![], chunk_timeout),
         AnyModel::Ollama(m) => rig_stream_fn_from_model(m, vec![], chunk_timeout),
+        AnyModel::Requesty(m) => rig_stream_fn_from_model(m, vec![], chunk_timeout),
         AnyModel::Custom(m) => rig_stream_fn_from_model(m, vec![], chunk_timeout),
     };
 
@@ -1343,6 +1344,128 @@ async fn h7_cerebras_tool_dispatch_completes_round_trip() {
     assert!(
         last_tool_result.is_some_and(|tr| done_pos.is_some_and(|done| tr < done)),
         "expected the final assistant turn to follow the completed tool result"
+    );
+}
+
+// =====================================================================
+// Requesty scenarios
+// =====================================================================
+
+fn requesty_model(model_name: &str) -> Option<crate::provider::AnyModel> {
+    use rig::client::CompletionClient;
+
+    let key = match std::env::var("REQUESTY_API_KEY") {
+        Ok(key) if !key.trim().is_empty() => key,
+        _ => {
+            eprintln!("[skipped] REQUESTY_API_KEY is unset");
+            return None;
+        }
+    };
+    let client = crate::provider::create_client(
+        "requesty",
+        Some(key.as_str()),
+        &std::collections::HashMap::new(),
+    )
+    .expect("Requesty client should build from REQUESTY_API_KEY");
+    Some(client.completion_model(model_name))
+}
+
+fn requesty_spawn_config(
+    stream_fn: crate::agent::agent_loop::StreamFn,
+    system_prompt: &str,
+    initial_prompt: &str,
+    tools: Vec<Arc<dyn crate::agent::agent_loop::LoopTool>>,
+    model_name: &str,
+) -> LoopSpawnConfig {
+    LoopSpawnConfig {
+        provider_name: Some("requesty".to_string()),
+        ..cerebras_spawn_config(stream_fn, system_prompt, initial_prompt, tools, model_name)
+    }
+}
+
+#[tokio::test]
+async fn h7_requesty_streaming_returns_non_empty_assistant_text() {
+    let model_name = crate::provider::default_model_for("requesty");
+    let Some(model) = requesty_model(model_name) else {
+        return;
+    };
+    assert_eq!(model.provider_name(), "requesty");
+    let inner = model.build_stream_fn(
+        Vec::new(),
+        std::time::Duration::from_secs(60),
+        Some("requesty".to_string()),
+    );
+    let stream_fn = retrying_stream_fn(inner, RecoveryPolicy::default());
+    let runner = spawn_loop_runner(requesty_spawn_config(
+        stream_fn,
+        "You are a concise assistant.",
+        "Reply with a short greeting.",
+        Vec::new(),
+        model_name,
+    ))
+    .into_agent_runner();
+    let (events, response) = drain_to_done(runner).await;
+    dump_events(&events);
+    if skip_if_provider_unavailable(&events) {
+        return;
+    }
+
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::Error(_))),
+        "Requesty streaming produced an error: {events:?}",
+    );
+    assert!(
+        !response.unwrap_or_default().trim().is_empty(),
+        "Requesty should return non-empty assistant text",
+    );
+}
+
+#[tokio::test]
+async fn h7_requesty_tool_dispatch_completes_round_trip() {
+    use crate::agent::agent_loop::loop_tool_to_rig_definition;
+
+    let model_name = crate::provider::default_model_for("requesty");
+    let Some(model) = requesty_model(model_name) else {
+        return;
+    };
+    assert_eq!(model.provider_name(), "requesty");
+    let tool: Arc<dyn crate::agent::agent_loop::LoopTool> = Arc::new(CerebrasEchoTool);
+    let tool_definition = loop_tool_to_rig_definition(tool.as_ref());
+    let inner = model.build_stream_fn(
+        vec![tool_definition],
+        std::time::Duration::from_secs(60),
+        Some("requesty".to_string()),
+    );
+    let stream_fn = retrying_stream_fn(inner, RecoveryPolicy::default());
+    let runner = spawn_loop_runner(requesty_spawn_config(
+        stream_fn,
+        "You have an echo_tool. When asked to echo text, you must call the tool, then confirm its result.",
+        "Use echo_tool to echo the word pineapple.",
+        vec![tool],
+        model_name,
+    ))
+    .into_agent_runner();
+    let (events, response) = drain_to_done(runner).await;
+    dump_events(&events);
+    if skip_if_provider_unavailable(&events) {
+        return;
+    }
+
+    let tool_calls = events
+        .iter()
+        .filter(|event| matches!(event, AgentEvent::ToolCall { .. }))
+        .count();
+    let tool_results = events
+        .iter()
+        .filter(|event| matches!(event, AgentEvent::ToolResult { .. }))
+        .count();
+    assert!(tool_calls >= 1, "expected a Requesty tool call");
+    assert_eq!(tool_calls, tool_results, "every tool call must complete");
+    assert!(
+        !response.unwrap_or_default().trim().is_empty(),
+        "expected a final assistant turn after the tool round trip"
     );
 }
 

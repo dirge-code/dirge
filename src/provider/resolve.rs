@@ -24,6 +24,7 @@ pub enum ProviderKind {
     Ollama,
     OpenCode,
     Kimi,
+    Requesty,
     Custom,
 }
 
@@ -44,6 +45,7 @@ pub fn default_model_for(provider_name: &str) -> &'static str {
         Some(ProviderKind::OpenCode) => "deepseek-v4-flash",
         Some(ProviderKind::Kimi) => "k3",
         Some(ProviderKind::Ollama) => "llama3",
+        Some(ProviderKind::Requesty) => "openai/gpt-4o-mini",
         // OpenRouter + Custom + unknown — keep the historical default
         // since OpenRouter wants the `vendor/model` form.
         _ => "deepseek/deepseek-v4-flash",
@@ -105,6 +107,7 @@ pub fn parse_provider(name: &str) -> Option<ProviderKind> {
         // the vendor name users reach for.
         "kimi" | "kimi-code" | "moonshot" => Some(ProviderKind::Kimi),
         "ollama" => Some(ProviderKind::Ollama),
+        "requesty" => Some(ProviderKind::Requesty),
         "custom" => Some(ProviderKind::Custom),
         _ => None,
     }
@@ -359,6 +362,7 @@ fn kind_label(kind: ProviderKind) -> &'static str {
         ProviderKind::Ollama => "ollama",
         ProviderKind::OpenCode => "opencode",
         ProviderKind::Kimi => "kimi",
+        ProviderKind::Requesty => "requesty",
         ProviderKind::Custom => "custom",
     }
 }
@@ -519,6 +523,7 @@ const BUILTIN_PROVIDER_NAMES: &[&str] = &[
     "moonshot",
     "ollama",
     "openrouter",
+    "requesty",
     "custom",
 ];
 
@@ -666,6 +671,7 @@ fn provider_env_var(kind: ProviderKind) -> &'static str {
         ProviderKind::Kimi => "KIMI_CODE_API_KEY",
         ProviderKind::Ollama => "OLLAMA_API_KEY",
         ProviderKind::OpenRouter => "OPENROUTER_API_KEY",
+        ProviderKind::Requesty => "REQUESTY_API_KEY",
         ProviderKind::Custom => "CUSTOM_API_KEY",
     }
 }
@@ -939,6 +945,34 @@ mod cerebras_identity_tests {
             );
         }
         assert_eq!(default_model_for("cerebras"), "gemma-4-31b");
+    }
+}
+
+#[cfg(test)]
+mod requesty_identity_tests {
+    use super::*;
+
+    #[test]
+    fn requesty_parses_case_insensitively_and_defaults_to_a_vendor_prefixed_model() {
+        for name in ["requesty", "REQUESTY", "ReQuEsTy"] {
+            assert_eq!(
+                parse_provider(name).map(kind_label),
+                Some("requesty"),
+                "provider name {name:?} should resolve canonically",
+            );
+        }
+        assert_eq!(default_model_for("requesty"), "openai/gpt-4o-mini");
+        assert_eq!(provider_env_var(ProviderKind::Requesty), "REQUESTY_API_KEY");
+    }
+
+    #[test]
+    fn requesty_is_not_autodetected() {
+        assert!(
+            PROVIDER_AUTODETECT_ORDER
+                .iter()
+                .all(|(_, provider)| *provider != "requesty"),
+            "Requesty must be selected explicitly",
+        );
     }
 }
 

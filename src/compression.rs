@@ -179,7 +179,7 @@ fn accepts_prompt_cache_key(kind: crate::provider::ProviderKind) -> bool {
         K::OpenRouter => true,
         K::Anthropic | K::Gemini => false,
         K::DeepSeek | K::Glm | K::Cerebras | K::Kimi => false,
-        K::Ollama | K::OpenCode | K::Custom => false,
+        K::Ollama | K::OpenCode | K::Requesty | K::Custom => false,
     }
 }
 
@@ -215,6 +215,7 @@ mod tests {
             ProviderKind::Kimi,
             ProviderKind::Ollama,
             ProviderKind::OpenCode,
+            ProviderKind::Requesty,
             ProviderKind::Custom,
         ] {
             assert!(

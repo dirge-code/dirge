@@ -1222,6 +1222,8 @@ pub fn loop_tool_to_rig_definition(tool: &dyn LoopTool) -> ToolDefinition {
 ///   - "cerebras": `{ "reasoning_effort": "low" | "medium" | "high" }`
 ///     at the top level. `Minimal` clamps to `low`, `Xhigh`/`Max`
 ///     clamp to `high`, and `Off` omits the field.
+///   - "requesty": same top-level shape and clamping as cerebras. Requesty
+///     ignores the nested `reasoning` object.
 ///   - "openai" / "custom" (openai-shaped): `{ "reasoning":
 ///     { "effort": "low" | "medium" | "high" | "xhigh" | "max" } }`
 ///     per OpenAI Responses spec — Xhigh and Max pass through
@@ -3015,6 +3017,30 @@ mod tests {
         let opts = opts_with_reasoning(ThinkingLevel::Off);
         assert_eq!(
             build_provider_additional_params(Some("cerebras"), None, &opts),
+            None,
+        );
+    }
+
+    #[test]
+    fn requesty_reasoning_maps_to_top_level_effort() {
+        for (level, expected) in [
+            (ThinkingLevel::Minimal, "low"),
+            (ThinkingLevel::Medium, "medium"),
+            (ThinkingLevel::Max, "high"),
+        ] {
+            let opts = opts_with_reasoning(level);
+            let params = build_provider_additional_params(Some("requesty"), None, &opts)
+                .expect("Requesty reasoning should produce request params");
+
+            assert_eq!(
+                params,
+                serde_json::json!({ "reasoning_effort": expected }),
+                "unexpected Requesty request params for {level:?}",
+            );
+        }
+        let opts = opts_with_reasoning(ThinkingLevel::Off);
+        assert_eq!(
+            build_provider_additional_params(Some("requesty"), None, &opts),
             None,
         );
     }

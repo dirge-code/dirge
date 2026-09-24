@@ -6,6 +6,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- Requesty as a built-in provider. Set `REQUESTY_API_KEY` and select it with
+  `--provider requesty` (or a `providers.requesty` entry); defaults to
+  `openai/gpt-4o-mini` against `https://router.requesty.ai/v1`. Reasoning effort
+  goes out as a top-level `reasoning_effort` clamped to `low`/`medium`/`high`.
+  It is not part of key autodetection.
+
 ## [0.25.6] - 2026-09-23
 
 ### Fixed

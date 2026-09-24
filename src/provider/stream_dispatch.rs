@@ -28,8 +28,8 @@ macro_rules! dispatch_stream_fn {
         use $crate::agent::agent_loop::rig_stream_fn_from_model_with_filter as __stream_fn;
         // Provider-specific wire adapters key off canonical backend names, not
         // configured aliases. OpenAI Responses needs canonical `openai` for
-        // reasoning/tool-call ID conversion; Cerebras needs canonical `cerebras`
-        // for its top-level reasoning_effort shape. These concrete dispatch arms
+        // reasoning/tool-call ID conversion; Cerebras and Requesty need their
+        // canonical names for the top-level reasoning_effort shape. These concrete dispatch arms
         // know the backend even when a role route was configured under an alias.
         // Other providers retain the passed identity until they need the same
         // canonicalization treatment.
@@ -116,6 +116,14 @@ macro_rules! dispatch_stream_fn {
             $enum::Ollama($bind) => {
                 __stream_fn($model, $tools, $timeout, $provider, $model_name, $filter)
             }
+            $enum::Requesty($bind) => __stream_fn(
+                $model,
+                $tools,
+                $timeout,
+                Some("requesty".to_string()),
+                $model_name,
+                $filter,
+            ),
             $enum::Custom($bind) => {
                 __stream_fn($model, $tools, $timeout, $provider, $model_name, $filter)
             }

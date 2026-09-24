@@ -79,6 +79,7 @@ pub(crate) async fn oneshot_with_model(
         super::AnyModel::OpenCode(m) => run_oneshot(m, label, preamble, prompt, disable).await,
         super::AnyModel::Kimi(m) => run_oneshot(m, label, preamble, prompt, disable).await,
         super::AnyModel::Ollama(m) => run_oneshot(m, label, preamble, prompt, disable).await,
+        super::AnyModel::Requesty(m) => run_oneshot(m, label, preamble, prompt, disable).await,
         super::AnyModel::Custom(m) => run_oneshot(m, label, preamble, prompt, disable).await,
     }
 }
@@ -457,6 +458,7 @@ mod tests {
         assert_eq!(reasoning_disable_for_kind("anthropic", None), None);
         assert_eq!(reasoning_disable_for_kind("openai", None), None);
         assert_eq!(reasoning_disable_for_kind("cerebras", None), None);
+        assert_eq!(reasoning_disable_for_kind("requesty", None), None);
     }
 
     #[test]

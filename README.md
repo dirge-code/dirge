@@ -257,6 +257,10 @@ dirge --provider glm       # defaults to glm-5.2
 export CEREBRAS_API_KEY="..."
 dirge --provider cerebras  # defaults to gemma-4-31b
 
+# Requesty routes vendor/model ids, like OpenRouter
+export REQUESTY_API_KEY="..."
+dirge --provider requesty  # defaults to openai/gpt-4o-mini
+
 # Verbose mode — debug-level dirge logs + warn-level plugin hook errors
 dirge --verbose
 ```
@@ -363,7 +367,7 @@ thereafter.)
 ## Supported providers
 
 OpenRouter (default), OpenAI, Anthropic, Gemini, DeepSeek, GLM (ZhipuAI),
-Cerebras, OpenCode, Ollama, and any custom OpenAI-compatible endpoint —
+Cerebras, OpenCode, Requesty, Ollama, and any custom OpenAI-compatible endpoint —
 including GitHub Copilot, which needs no dedicated provider type (see
 [docs/config.md](docs/config.md#github-copilot) for the recipe).
 
@@ -451,7 +455,7 @@ entirely unless you name one. Each value is an **alias** into `providers`.
 
 **Provider aliases.** Each `providers` entry is keyed by an alias you choose.
 `provider_type` is the actual backend (`openai`, `anthropic`, `cerebras`,
-`deepseek`, `gemini`, `glm`, `ollama`, `opencode`, `openrouter`, or `custom`).
+`deepseek`, `gemini`, `glm`, `ollama`, `opencode`, `openrouter`, `requesty`, or `custom`).
 It **defaults to the alias** when omitted, which
 is why `"deepseek": { "model": "…" }` needs no `provider_type` but the second
 DeepSeek route must spell it out as a distinct alias (`deepseek-flash`). Point an
