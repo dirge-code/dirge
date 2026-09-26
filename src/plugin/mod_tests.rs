@@ -135,29 +135,75 @@ fn test_post_done_action() {
     // Plugin followup must take precedence over the loop iteration
     // so we never silently drop a queued prompt.
     let followup = Some("retry".to_string());
+    #[cfg(feature = "vigil")]
+    let vigil_off = false;
     assert_eq!(
-        decide_post_done_action(followup.clone(), true, false),
+        decide_post_done_action(
+            followup.clone(),
+            true,
+            false,
+            #[cfg(feature = "vigil")]
+            vigil_off
+        ),
         PostDoneAction::Followup("retry".into())
     );
     assert_eq!(
-        decide_post_done_action(followup.clone(), false, false),
+        decide_post_done_action(
+            followup.clone(),
+            false,
+            false,
+            #[cfg(feature = "vigil")]
+            vigil_off
+        ),
         PostDoneAction::Followup("retry".into())
     );
     // Loop iteration only when no followup.
     assert_eq!(
-        decide_post_done_action(None, true, false),
+        decide_post_done_action(
+            None,
+            true,
+            false,
+            #[cfg(feature = "vigil")]
+            vigil_off
+        ),
         PostDoneAction::LoopIter
     );
     // Loop stop only when no followup and should_stop.
     assert_eq!(
-        decide_post_done_action(None, true, true),
+        decide_post_done_action(
+            None,
+            true,
+            true,
+            #[cfg(feature = "vigil")]
+            vigil_off
+        ),
         PostDoneAction::LoopStop
     );
     // Idle: nothing to do.
     assert_eq!(
-        decide_post_done_action(None, false, false),
+        decide_post_done_action(
+            None,
+            false,
+            false,
+            #[cfg(feature = "vigil")]
+            vigil_off
+        ),
         PostDoneAction::Idle
     );
+
+    #[cfg(feature = "vigil")]
+    {
+        // VigilSleep: vigil active outranks loop.
+        assert_eq!(
+            decide_post_done_action(None, true, false, true),
+            PostDoneAction::VigilSleep
+        );
+        // Followup still beats vigil.
+        assert_eq!(
+            decide_post_done_action(followup.clone(), false, false, true),
+            PostDoneAction::Followup("retry".into())
+        );
+    }
 }
 
 #[test]
@@ -1405,6 +1451,44 @@ fn emit_tool_progress_tags_entries_with_current_tool_call() {
 
     // Drain clears the queue.
     assert!(mgr.drain_tool_progress().is_empty());
+}
+
+/// `harness/emit-issue` files a durable, session-unscoped issue on the board
+/// and returns its id (e.g. `drg-a1b2`). The bridge reads the process-global
+/// store installed by `install_issue_store`; when absent it degrades to nil.
+#[cfg(feature = "plugin")]
+#[test]
+fn emit_issue_creates_board_issue_and_returns_id() {
+    use crate::extras::issue_db::IssueStore;
+    use crate::plugin::worker::issue_bridge;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "dirge-emit-issue-test-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed),
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db_path = dir.join("state.db");
+    let store = IssueStore::open_at(&db_path).unwrap();
+    issue_bridge::install_issue_store(std::sync::Arc::new(store));
+
+    let mut mgr = PluginManager::try_new().unwrap();
+    let id = mgr
+        .eval(r#"(harness/emit-issue "watch upstream" "upgrade to v2" "high")"#)
+        .unwrap();
+    let id = id.trim_matches('"');
+    assert!(id.starts_with("drg-"), "unexpected id: {id:?}");
+
+    // Re-open the same file to verify the row actually landed (the bridge
+    // owns the Arc'd store, so we can't read it back directly).
+    let reopened = IssueStore::open_at(&db_path).unwrap();
+    let issue = reopened.get(id).unwrap().expect("issue was persisted");
+    assert_eq!(issue.title, "watch upstream");
+    assert_eq!(issue.body, "upgrade to v2");
+    assert_eq!(issue.priority, "high");
+    assert_eq!(issue.status, "open");
 }
 
 // --- H3: register-tool prepare-arguments field ---------------------

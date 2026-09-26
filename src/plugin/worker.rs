@@ -1039,6 +1039,119 @@ const HARNESS_TOOL_INIT: &str = r#"
   (harness/__call-tool name payload))
 "#;
 
+/// Janet wrapper for the issue bridge, installed on the **plugin VM only**.
+///
+/// Kept out of `HARNESS_INIT` for the same reason as `HARNESS_NOTEBOOK_INIT`:
+/// the notebook VM runs that prelude but does NOT register `harness/__emit-issue`,
+/// so a `defn` body that names the symbol would fail to compile there.
+#[cfg(feature = "plugin")]
+const HARNESS_ISSUE_INIT: &str = r#"
+# (harness/emit-issue title &opt body priority) -> issue id string | nil
+# Files a durable, session-unscoped issue on the board and returns its id
+# (e.g. "drg-a1b2"). Returns nil when the issue bridge is not installed
+# (plugin tests, --no-session without the store) or the title is empty.
+(defn harness/emit-issue [title &opt body priority]
+  (harness/__emit-issue
+    (string title)
+    (if (nil? body) "" (string body))
+    (if (nil? priority) "" (string priority))))
+"#;
+
+/// Janet wrapper for the HTTP bridge, installed on the **plugin VM only**.
+///
+/// Kept out of `HARNESS_INIT` for the same reason as `HARNESS_NOTEBOOK_INIT`:
+/// the notebook VM runs that prelude but does NOT register `harness/__http-post`,
+/// so a `defn` body that names the symbol would fail to compile there.
+#[cfg(feature = "plugin")]
+const HARNESS_HTTP_INIT: &str = r#"
+# (harness/http-post url body &opt headers) -> response body string | nil
+# Blocking HTTP POST with Content-Type: application/json. `headers` is an
+# optional JSON object of string -> string pairs. Returns the raw response
+# body on a 2xx status, or nil on any error / non-2xx / timeout.
+(defn harness/http-post [url body &opt headers]
+  (harness/__http-post
+    (string url)
+    (string body)
+    (if (nil? headers) "" (string headers))))
+"#;
+
+/// Vigil Janet prelude — exposes vigil/emit, vigil/list, vigil/set-state,
+/// vigil/get, vigil/live? for plugins running inside a vigil-keeper.
+#[cfg(all(feature = "plugin", feature = "vigil"))]
+const HARNESS_VIGIL_INIT: &str = r#"
+(defn vigil/live?
+  "True when the vigil bridge is active. False on builds without the
+   vigil feature, and also when vigil is not running — so a true result
+   guarantees that vigil/emit will actually reach the keeper."
+  []
+  (if-let [entry (get (curenv) 'harness/__vigil-live)]
+    (truthy? ((entry :value)))
+    false))
+
+(defn- json-escape
+  "Escape a string for embedding inside a JSON string literal."
+  [s]
+  (->> s
+       (string/replace-all "\\" "\\\\")
+       (string/replace-all "\"" "\\\"")
+       (string/replace-all "\n" "\\n")
+       (string/replace-all "\r" "\\r")
+       (string/replace-all "\t" "\\t")))
+
+(defn- json-encode
+  "Serialize a Janet value to JSON. Handles strings, numbers, booleans,
+   nil, indexed arrays, and dictionaries (tables/structs)."
+  [x]
+  (cond
+    (string? x) (string "\"" (json-escape x) "\"")
+    (number? x) (string x)
+    (= x true) "true"
+    (= x false) "false"
+    (nil? x) "null"
+    (dictionary? x)
+      (string "{"
+              (string/join
+                (map (fn [[k v]]
+                       (string "\"" k "\":" (json-encode v)))
+                     (pairs x))
+                ",")
+              "}")
+    (indexed? x)
+      (string "["
+              (string/join (map json-encode x) ",")
+              "]")
+    (string x)))
+
+(defn vigil/emit
+  "Push an event into the vigil-keeper. `event-name` is a string key;
+   `data` is a dict or JSON string with event context."
+  [event-name &opt data]
+  (when (and (vigil/live?) (string? event-name))
+    (let [payload (if data
+                   (if (string? data) data (json-encode data))
+                   "")
+          msg (string event-name "\t" payload)]
+      (harness/__vigil-emit msg))))
+
+(defn vigil/list
+  "Return an array of all active vigil names."
+  []
+  (when (vigil/live?)
+    (harness/__vigil-list)))
+
+(defn vigil/set-state
+  "Set a state key for a named vigil. (vigil/set-state name key value)"
+  [name key value]
+  (when (and (vigil/live?) (string? name) (string? key))
+    (harness/__vigil-set-state name key (string value))))
+
+(defn vigil/get
+  "Get the state table for a named vigil. (vigil/get name)"
+  [name]
+  (when (and (vigil/live?) (string? name))
+    (harness/__vigil-get name)))
+"#;
+
 /// dirge-l6bf: neuter the Janet escape hatches that can terminate or
 /// destabilize the HOST process. Every hook / command / tool handler is
 /// already run inside a Janet `(try ...)` (see `mod.rs`), so an ordinary
@@ -1943,6 +2056,30 @@ fn worker_loop(
             env.add_c_fn(CFunOptions::new(c"__lsp", janet_lsp_cfn).namespace(c"harness"));
             env.add_c_fn(CFunOptions::new(c"__lsp-live", janet_lsp_live_cfn).namespace(c"harness"));
         }
+        // Vigil bridge: expose vigil/live? and vigil/emit C functions
+        // so Janet plugins can interact with the vigil-keeper at runtime.
+        #[cfg(all(feature = "plugin", feature = "vigil"))]
+        {
+            env.add_c_fn(
+                CFunOptions::new(c"__vigil-live", vigil_bridge::vigil_live_cfn)
+                    .namespace(c"harness"),
+            );
+            env.add_c_fn(
+                CFunOptions::new(c"__vigil-emit", vigil_bridge::vigil_emit_cfn)
+                    .namespace(c"harness"),
+            );
+            env.add_c_fn(
+                CFunOptions::new(c"__vigil-list", vigil_bridge::vigil_list_cfn)
+                    .namespace(c"harness"),
+            );
+            env.add_c_fn(
+                CFunOptions::new(c"__vigil-get", vigil_bridge::vigil_get_cfn).namespace(c"harness"),
+            );
+            env.add_c_fn(
+                CFunOptions::new(c"__vigil-set-state", vigil_bridge::vigil_set_state_cfn)
+                    .namespace(c"harness"),
+            );
+        }
         // Computer-use exec: forwards actions to the sandbox drainer.
         // The C function reads SANDBOX_EXEC_TX; if the channel wasn't
         // installed (e.g. --sandbox off), it returns nil gracefully.
@@ -1956,6 +2093,12 @@ fn worker_loop(
         env.add_c_fn(CFunOptions::new(c"__call-tool", janet_call_tool_cfn).namespace(c"harness"));
         env.add_c_fn(CFunOptions::new(c"__list-tools", janet_list_tools_cfn).namespace(c"harness"));
         env.add_c_fn(CFunOptions::new(c"__tools-live", janet_tools_live_cfn).namespace(c"harness"));
+        // Issue bridge: lets a plugin file a durable issue on the board.
+        env.add_c_fn(
+            CFunOptions::new(c"__emit-issue", issue_bridge::issue_emit_cfn).namespace(c"harness"),
+        );
+        // HTTP bridge: blocking POST for sidecar services (e.g. lev).
+        env.add_c_fn(CFunOptions::new(c"__http-post", janet_http_post_cfn).namespace(c"harness"));
     }
     // Register DAP C functions when both features are enabled.
     #[cfg(feature = "dap")]
@@ -1991,6 +2134,23 @@ fn worker_loop(
     if let Err(e) = client.run(HARNESS_TOOL_INIT) {
         let _ = init_tx.send(Err(format!("harness tool-bridge init failed: {e}")));
         return;
+    }
+    if let Err(e) = client.run(HARNESS_ISSUE_INIT) {
+        let _ = init_tx.send(Err(format!("harness issue-bridge init failed: {e}")));
+        return;
+    }
+    if let Err(e) = client.run(HARNESS_HTTP_INIT) {
+        let _ = init_tx.send(Err(format!("harness http-bridge init failed: {e}")));
+        return;
+    }
+    // Vigil Janet prelude — defines (vigil/emit), (vigil/list),
+    // (vigil/set-state), (vigil/get), (vigil/live?).
+    #[cfg(all(feature = "plugin", feature = "vigil"))]
+    {
+        if let Err(e) = client.run(HARNESS_VIGIL_INIT) {
+            let _ = init_tx.send(Err(format!("vigil init failed: {e}")));
+            return;
+        }
     }
     // dirge-l6bf: disable host-terminating Janet functions. MUST run after
     // the harness preludes and before any plugin loads, so plugin code
@@ -2740,20 +2900,117 @@ unsafe fn json_to_janet_depth(v: &serde_json::Value, depth: usize) -> janetrs::l
             serde_json::Value::String(s) => wrap_string(s),
             serde_json::Value::Array(items) => {
                 let arr = janet_array(items.len().min(i32::MAX as usize) as i32);
+                // Root the half-built array before the recursive calls allocate:
+                // a GC inside json_to_janet_depth would otherwise collect it mid-fill.
+                janet_gcroot(janet_wrap_array(arr));
                 for item in items {
                     janet_array_push(arr, json_to_janet_depth(item, depth + 1));
                 }
+                janet_gcunroot(janet_wrap_array(arr));
                 janet_wrap_array(arr)
             }
             serde_json::Value::Object(map) => {
                 let tbl = janet_table(map.len().min(i32::MAX as usize) as i32);
+                // Root the half-built table before wrap_string and the recursive
+                // calls allocate: a GC would otherwise collect it mid-fill.
+                janet_gcroot(janet_wrap_table(tbl));
                 for (k, val) in map {
                     let key = wrap_string(k);
                     janet_table_put(tbl, key, json_to_janet_depth(val, depth + 1));
                 }
+                janet_gcunroot(janet_wrap_table(tbl));
                 janet_wrap_table(tbl)
             }
         }
+    }
+}
+
+/// C-function backing `harness/__http-post`. Performs a blocking HTTP POST
+/// and returns the raw response body as a string on a 2xx status, or nil on
+/// any error / non-2xx / timeout. Uses reqwest's blocking client, which owns
+/// its own runtime, so it is safe to call from the Janet worker thread (which
+/// is not parked on the tokio runtime).
+#[cfg(feature = "plugin")]
+unsafe extern "C-unwind" fn janet_http_post_cfn(
+    argc: i32,
+    argv: *mut janetrs::lowlevel::Janet,
+) -> janetrs::lowlevel::Janet {
+    use janetrs::lowlevel::*;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        http_post_body(argc, argv)
+    }));
+    match result {
+        Ok(j) => j,
+        Err(payload) => {
+            let msg = panic_payload_to_string(&payload);
+            tracing::error!(
+                target: "dirge::plugin",
+                cfn = "harness/http-post",
+                panic = %msg,
+                "FFI panic in http-post cfn — returning nil",
+            );
+            unsafe { janet_wrap_nil() }
+        }
+    }
+}
+
+/// Upper bound on a single `harness/http-post` call. Like the LSP bridge, a
+/// hung sidecar must not pin the Janet worker thread — and thus every plugin
+/// hook — forever.
+#[cfg(feature = "plugin")]
+const HTTP_POST_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[cfg(feature = "plugin")]
+unsafe fn http_post_body(
+    argc: i32,
+    argv: *mut janetrs::lowlevel::Janet,
+) -> janetrs::lowlevel::Janet {
+    use janetrs::lowlevel::*;
+    if argc < 2 {
+        return unsafe { janet_wrap_nil() };
+    }
+    let Some(url) = (unsafe { read_string_arg(argv, 0) }) else {
+        return unsafe { janet_wrap_nil() };
+    };
+    let Some(body) = (unsafe { read_string_arg(argv, 1) }) else {
+        return unsafe { janet_wrap_nil() };
+    };
+    let headers_json = if argc >= 3 {
+        unsafe { read_string_arg(argv, 2) }.unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(HTTP_POST_TIMEOUT)
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return unsafe { janet_wrap_nil() },
+    };
+
+    let mut request = client
+        .post(url.as_str())
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body);
+
+    if !headers_json.is_empty()
+        && let Ok(map) =
+            serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&headers_json)
+    {
+        for (name, value) in map {
+            if let serde_json::Value::String(v) = value {
+                request = request.header(name, v);
+            }
+        }
+    }
+
+    match request.send() {
+        Ok(response) if response.status().is_success() => match response.text() {
+            Ok(text) => unsafe { wrap_string(&text) },
+            Err(_) => unsafe { janet_wrap_nil() },
+        },
+        _ => unsafe { janet_wrap_nil() },
     }
 }
 
@@ -3636,6 +3893,302 @@ unsafe fn get_dict_int_array(v: janetrs::lowlevel::Janet, key: &str) -> Option<V
         }
     }
     Some(out)
+}
+
+/// Bridge from the Janet worker thread to the durable issue board.
+///
+/// Exposes Janet function:
+/// - `harness/emit-issue` — (title [body] [priority]) -> issue id string or nil
+///
+/// Guarded by `plugin` only (issues are core, not vigil-gated): a flow plugin
+/// can file an issue in loop, vigil, or interactive mode. The issue is created
+/// session-unscoped (`session_id = None`); `assign_to_session` can pull it onto
+/// a conversation board later.
+#[cfg(feature = "plugin")]
+pub(crate) mod issue_bridge {
+    use super::{read_string_arg, wrap_string};
+    use crate::extras::issue_db::IssueStore;
+    use std::sync::Arc;
+
+    /// Process-global handle to the issue store, installed once at startup
+    /// and read from the Janet worker thread (mirrors `VIGIL_TX` /
+    /// `SANDBOX_EXEC_TX` — a thread-local would be invisible to the CFn).
+    static ISSUE_STORE: std::sync::OnceLock<Arc<IssueStore>> = std::sync::OnceLock::new();
+
+    /// Install the issue store for the bridge. Called from `main.rs` once at
+    /// plugin startup. No-op (warn) if already installed.
+    pub fn install_issue_store(store: Arc<IssueStore>) {
+        if ISSUE_STORE.set(store).is_err() {
+            tracing::warn!(target: "dirge::plugin", "issue bridge already installed");
+        }
+    }
+
+    /// (harness/emit-issue title [body] [priority]) -> issue id string or nil.
+    /// Files a durable, session-unscoped issue on the board and returns its id
+    /// (e.g. `drg-a1b2`), or nil when the store is absent / the title is empty.
+    pub unsafe extern "C-unwind" fn issue_emit_cfn(
+        argc: i32,
+        argv: *mut janetrs::lowlevel::Janet,
+    ) -> janetrs::lowlevel::Janet {
+        use janetrs::lowlevel::*;
+        if argc < 1 {
+            return unsafe { janet_wrap_nil() };
+        }
+        let Some(title) = (unsafe { read_string_arg(argv, 0) }) else {
+            return unsafe { janet_wrap_nil() };
+        };
+        let body = if argc > 1 {
+            unsafe { read_string_arg(argv, 1) }
+        } else {
+            None
+        };
+        let priority = if argc > 2 {
+            unsafe { read_string_arg(argv, 2) }
+        } else {
+            None
+        };
+        let Some(store) = ISSUE_STORE.get() else {
+            return unsafe { janet_wrap_nil() };
+        };
+        match store.create(
+            title.trim(),
+            body.as_deref().unwrap_or(""),
+            priority.as_deref(),
+            None,
+            None,
+        ) {
+            Ok(id) => unsafe { wrap_string(&id) },
+            Err(_) => unsafe { janet_wrap_nil() },
+        }
+    }
+}
+
+/// Bridge from the Janet worker thread to the vigil-keeper's event channel.
+/// Thread-local mpsc sender installed once at startup.
+///
+/// Exposes Janet functions:
+/// - `vigil/live` — true if the bridge has been installed (keeper is running)
+/// - `vigil/emit` — push a vigil event from Janet
+/// - `vigil/list` — list all active vigil names
+/// - `vigil/get` — get state for a named vigil
+/// - `vigil/set-state` — set key-value state on a named vigil
+///
+/// All functions are installed into the Janet environment by the plugin
+/// loader and are guarded by the `plugin` + `vigil` feature gates.
+#[cfg(all(feature = "plugin", feature = "vigil"))]
+pub(crate) mod vigil_bridge {
+    use super::read_string_arg;
+    use std::collections::HashMap;
+
+    // Process-global (not thread-local): install_* runs on the tokio
+    // runtime thread while the C functions read these on the Janet worker
+    // thread, so a thread_local value would never be visible where it's
+    // consumed (mirrors the SANDBOX_EXEC_TX OnceLock pattern above).
+    /// Sender to the vigil-keeper's event channel. Installed once at
+    /// keeper startup during `--vigil` mode.
+    static VIGIL_TX: std::sync::OnceLock<tokio::sync::mpsc::Sender<String>> =
+        std::sync::OnceLock::new();
+
+    /// Active vigil names, populated at keeper startup via install_vigil_names.
+    static VIGIL_NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+    /// Per-vigil state map (name → JSON value). Janet code can
+    /// read/write this via vigil/get and vigil/set-state. Lazy-initialized
+    /// because `HashMap::new` is not const.
+    static VIGIL_STATE: std::sync::OnceLock<std::sync::Mutex<HashMap<String, serde_json::Value>>> =
+        std::sync::OnceLock::new();
+
+    fn vigil_state() -> &'static std::sync::Mutex<HashMap<String, serde_json::Value>> {
+        VIGIL_STATE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+    }
+
+    /// Install the vigil bridge sender. Called from the tokio runtime
+    /// after the vigil-keeper is created. Panics if called twice.
+    pub fn install_vigil_tx(tx: tokio::sync::mpsc::Sender<String>) {
+        assert!(VIGIL_TX.set(tx).is_ok(), "vigil bridge already installed");
+    }
+
+    /// Install vigil names into the bridge. Called at keeper startup
+    /// after install_vigil_tx.
+    pub fn install_vigil_names(names: Vec<String>) {
+        let _ = VIGIL_NAMES.set(names);
+    }
+
+    /// Return a Janet boolean — true if the vigil bridge has been installed.
+    pub unsafe extern "C-unwind" fn vigil_live_cfn(
+        _argc: i32,
+        _argv: *mut janetrs::lowlevel::Janet,
+    ) -> janetrs::lowlevel::Janet {
+        use janetrs::lowlevel::*;
+        let live = VIGIL_TX.get().is_some();
+        unsafe { janet_wrap_boolean(if live { 1 } else { 0 }) }
+    }
+
+    /// Push a vigil event from Janet into the keeper. Takes one
+    /// string argument (the event payload).
+    pub unsafe extern "C-unwind" fn vigil_emit_cfn(
+        argc: i32,
+        argv: *mut janetrs::lowlevel::Janet,
+    ) -> janetrs::lowlevel::Janet {
+        use janetrs::lowlevel::*;
+        if argc < 1 {
+            return unsafe { janet_wrap_nil() };
+        }
+        let msg = match unsafe { read_string_arg(argv, 0) } {
+            Some(s) => s,
+            None => return unsafe { janet_wrap_nil() },
+        };
+        if let Some(tx) = VIGIL_TX.get() {
+            let _ = tx.try_send(msg);
+        }
+        unsafe { janet_wrap_nil() }
+    }
+
+    /// (vigil/list) — return a Janet array of all active vigil names.
+    #[allow(clippy::ptr_offset_with_cast)]
+    pub unsafe extern "C-unwind" fn vigil_list_cfn(
+        _argc: i32,
+        _argv: *mut janetrs::lowlevel::Janet,
+    ) -> janetrs::lowlevel::Janet {
+        use janetrs::lowlevel::*;
+        let names = VIGIL_NAMES.get().map(|v| v.as_slice()).unwrap_or(&[]);
+        let tup = unsafe { janet_tuple_begin(names.len() as i32) };
+        // Root the half-built tuple before the loop allocates: janet_cstring can
+        // trigger GC, which would otherwise collect the unrooted tuple mid-fill.
+        unsafe { janet_gcroot(janet_wrap_tuple(tup)) };
+        for (i, name) in names.iter().enumerate() {
+            unsafe {
+                let c_str = std::ffi::CString::new(name.as_str()).unwrap();
+                let s = janet_wrap_string(janet_cstring(c_str.as_ptr()));
+                *tup.offset(i as isize) = s;
+            }
+        }
+        unsafe {
+            janet_gcunroot(janet_wrap_tuple(tup));
+            janet_wrap_tuple(janet_tuple_end(tup))
+        }
+    }
+
+    /// (vigil/get name) — return a Janet table of state for the named vigil.
+    /// Returns nil if the vigil is not found.
+    pub unsafe extern "C-unwind" fn vigil_get_cfn(
+        argc: i32,
+        argv: *mut janetrs::lowlevel::Janet,
+    ) -> janetrs::lowlevel::Janet {
+        use janetrs::lowlevel::*;
+        if argc < 1 {
+            return unsafe { janet_wrap_nil() };
+        }
+        let name = match unsafe { read_string_arg(argv, 0) } {
+            Some(s) => s,
+            None => return unsafe { janet_wrap_nil() },
+        };
+        let state = vigil_state().lock().unwrap();
+        if let Some(value) = state.get(&name) {
+            json_to_janet(value)
+        } else {
+            let known = VIGIL_NAMES.get().is_some_and(|n| n.contains(&name));
+            if known {
+                // Vigil exists but has no state yet — return empty table.
+                let tab = unsafe { janet_table(0) };
+                unsafe { janet_wrap_table(tab) }
+            } else {
+                unsafe { janet_wrap_nil() }
+            }
+        }
+    }
+
+    /// (vigil/set-state name key value) — set a key-value pair on a vigil's
+    /// state. Returns the vigil name on success, nil on failure.
+    pub unsafe extern "C-unwind" fn vigil_set_state_cfn(
+        argc: i32,
+        argv: *mut janetrs::lowlevel::Janet,
+    ) -> janetrs::lowlevel::Janet {
+        use janetrs::lowlevel::*;
+        if argc < 3 {
+            return unsafe { janet_wrap_nil() };
+        }
+        let name = match unsafe { read_string_arg(argv, 0) } {
+            Some(s) => s,
+            None => return unsafe { janet_wrap_nil() },
+        };
+        let key = match unsafe { read_string_arg(argv, 1) } {
+            Some(s) => s,
+            None => return unsafe { janet_wrap_nil() },
+        };
+        let value_str = match unsafe { read_string_arg(argv, 2) } {
+            Some(s) => s,
+            None => return unsafe { janet_wrap_nil() },
+        };
+        // Parse as JSON — if the value looks like JSON, use it; otherwise
+        // treat it as a raw string.
+        let value: serde_json::Value =
+            serde_json::from_str(&value_str).unwrap_or(serde_json::Value::String(value_str));
+        let mut state = vigil_state().lock().unwrap();
+        let entry = state
+            .entry(name.clone())
+            .or_insert(serde_json::Value::Object(serde_json::Map::new()));
+        if let serde_json::Value::Object(map) = entry {
+            map.insert(key, value);
+        }
+        drop(state);
+        let c_str = std::ffi::CString::new(name.as_str()).unwrap();
+        unsafe { janet_wrap_string(janet_cstring(c_str.as_ptr())) }
+    }
+
+    /// Convert a serde_json::Value to a Janet value.
+    #[allow(clippy::ptr_offset_with_cast)]
+    pub(super) fn json_to_janet(value: &serde_json::Value) -> janetrs::lowlevel::Janet {
+        use janetrs::lowlevel::*;
+        match value {
+            serde_json::Value::Null => unsafe { janet_wrap_nil() },
+            serde_json::Value::Bool(b) => unsafe { janet_wrap_boolean(if *b { 1 } else { 0 }) },
+            serde_json::Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    unsafe { janet_wrap_number(i as f64) }
+                } else if let Some(f) = n.as_f64() {
+                    unsafe { janet_wrap_number(f) }
+                } else {
+                    unsafe { janet_wrap_nil() }
+                }
+            }
+            serde_json::Value::String(s) => {
+                let c_str = std::ffi::CString::new(s.as_str()).unwrap();
+                unsafe { janet_wrap_string(janet_cstring(c_str.as_ptr())) }
+            }
+            serde_json::Value::Array(arr) => {
+                let tup = unsafe { janet_tuple_begin(arr.len() as i32) };
+                // Root the half-built tuple before the recursive json_to_janet
+                // calls allocate: a GC would otherwise collect it mid-fill.
+                unsafe { janet_gcroot(janet_wrap_tuple(tup)) };
+                for (i, v) in arr.iter().enumerate() {
+                    unsafe {
+                        *tup.offset(i as isize) = json_to_janet(v);
+                    }
+                }
+                unsafe {
+                    janet_gcunroot(janet_wrap_tuple(tup));
+                    janet_wrap_tuple(janet_tuple_end(tup))
+                }
+            }
+            serde_json::Value::Object(map) => {
+                let tab = unsafe { janet_table(map.len() as i32) };
+                // Root the half-built table before janet_cstring and the recursive
+                // json_to_janet calls allocate: a GC would otherwise collect it mid-fill.
+                unsafe { janet_gcroot(janet_wrap_table(tab)) };
+                for (k, v) in map {
+                    let c_str = std::ffi::CString::new(k.as_str()).unwrap();
+                    let key = unsafe { janet_wrap_string(janet_cstring(c_str.as_ptr())) };
+                    let val = json_to_janet(v);
+                    unsafe { janet_table_put(tab, key, val) };
+                }
+                unsafe {
+                    janet_gcunroot(janet_wrap_table(tab));
+                    janet_wrap_table(tab)
+                }
+            }
+        }
+    }
 }
 
 #[cfg(all(test, feature = "plugin"))]
@@ -4767,5 +5320,227 @@ mod tests {
         assert!(r.contains("漢字"), "lost CJK: {r:?}");
         assert!(r.contains("Привет"), "lost Cyrillic: {r:?}");
         helper.join().unwrap();
+    }
+
+    /// vigil/emit uses json-encode to serialize event data. Verify
+    /// the Janet dict → JSON round-trip produces valid JSON that
+    /// serde_json can parse back into structured fields — the keeper
+    /// path at src/extras/vigil/mod.rs:171.
+    #[cfg(feature = "vigil")]
+    #[test]
+    fn json_encode_produces_valid_json_for_vigil_emit() {
+        let (mut worker, _dialog_rx, _lsp_rx) = Worker::try_spawn().unwrap();
+        let json_str = worker
+            .eval(
+                r#"(json-encode {:job "my-pipeline"
+                             :build_number "42"
+                             :url "http://jenkins:8080/job/my-pipeline/42"
+                             :status "FAILURE"})"#,
+            )
+            .unwrap();
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json_str).expect("json-encode must produce valid JSON");
+
+        assert_eq!(parsed["job"], "my-pipeline");
+        assert_eq!(parsed["build_number"], "42");
+        assert_eq!(parsed["url"], "http://jenkins:8080/job/my-pipeline/42");
+        assert_eq!(parsed["status"], "FAILURE");
+    }
+
+    /// Regression: verify that the full vigil/emit message format
+    /// (name\tjson) can be split and parsed by the keeper router.
+    #[cfg(feature = "vigil")]
+    #[test]
+    fn vigil_emit_message_format_is_parseable_by_keeper() {
+        let (mut worker, _dialog_rx, _lsp_rx) = Worker::try_spawn().unwrap();
+
+        // Simulate what (vigil/emit "jenkins-remediate" {...}) sends
+        // through harness/__vigil-emit. We can't call vigil/emit directly
+        // (vigil/live? is false in tests), so we call json-encode and
+        // format the message manually.
+        let payload = worker
+            .eval(
+                r#"(json-encode {:job "my-pipeline"
+                             :build_number "42"
+                             :url "http://jenkins:8080/job/my-pipeline/42"
+                             :status "FAILURE"})"#,
+            )
+            .unwrap();
+        let msg = format!("jenkins-remediate\t{payload}");
+
+        // Simulate the keeper router (src/extras/vigil/mod.rs:167-173)
+        let (name, payload_str) = msg.split_once('\t').expect("tab-separated message");
+        assert_eq!(name, "jenkins-remediate");
+
+        let context: serde_json::Value =
+            serde_json::from_str(payload_str).expect("payload must be valid JSON");
+
+        assert_eq!(context["job"], "my-pipeline");
+        assert_eq!(context["build_number"], "42");
+        assert_eq!(context["url"], "http://jenkins:8080/job/my-pipeline/42");
+        assert_eq!(context["status"], "FAILURE");
+    }
+
+    /// harness/json-decode parses nested JSON into a Janet table keyed by
+    /// string (not keyword) — the poller fixtures rely on this to read
+    /// `jobs[0].lastBuild.result` from a Jenkins API response.
+    #[cfg(feature = "vigil")]
+    #[test]
+    fn json_decode_parses_nested_json_with_string_keys() {
+        let (mut worker, _dialog_rx, _lsp_rx) = Worker::try_spawn().unwrap();
+        let r = worker
+            .eval(
+                r#"(let [d (harness/json-decode "{\"jobs\":[{\"name\":\"test-pipeline\",\"lastBuild\":{\"number\":1,\"result\":\"FAILURE\"}}]}")]
+                 (let [job (get (get d "jobs") 0)]
+                   (string (get job "name") "|" (get-in job ["lastBuild" "result"]))))"#,
+            )
+            .unwrap();
+        assert!(r.contains("test-pipeline"), "got {r:?}");
+        assert!(r.contains("FAILURE"), "got {r:?}");
+    }
+
+    /// harness/json-decode returns nil (not a panic) for malformed JSON.
+    #[cfg(feature = "vigil")]
+    #[test]
+    fn json_decode_returns_nil_on_invalid_json() {
+        let (mut worker, _dialog_rx, _lsp_rx) = Worker::try_spawn().unwrap();
+        let r = worker.eval(r#"(harness/json-decode "not json")"#).unwrap();
+        assert_eq!(r, "nil");
+    }
+
+    /// Regression: the vigil bridge sender installed on one thread must be
+    /// visible to `vigil_emit_cfn` running on the Janet worker thread. The
+    /// original `thread_local!` bridge wrote VIGIL_TX on the tokio runtime
+    /// thread and read it on the worker thread, so (vigil/emit ...) was a
+    /// silent no-op. This pins the cross-thread contract with a real worker.
+    #[cfg(feature = "vigil")]
+    #[test]
+    fn vigil_bridge_delivers_emit_across_threads() {
+        // Install on the TEST thread; the worker evaluates on its own thread.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(16);
+        vigil_bridge::install_vigil_tx(tx);
+
+        let (mut worker, _dialog_rx, _lsp_rx) = Worker::try_spawn().unwrap();
+        let r = worker
+            .eval(r#"(vigil/emit "test-vigil" {:job "my-pipeline"})"#)
+            .unwrap();
+        assert_eq!(r, "nil");
+
+        let msg = rx
+            .blocking_recv()
+            .expect("vigil/emit must reach the bridge tx across threads");
+        let (name, payload) = msg.split_once('\t').expect("name\tpayload");
+        assert_eq!(name, "test-vigil");
+        let context: serde_json::Value =
+            serde_json::from_str(payload).expect("payload must be valid JSON");
+        assert_eq!(context["job"], "my-pipeline");
+    }
+
+    /// Minimal single-threaded HTTP server for the HTTP-bridge and lev-gate
+    /// tests. Binds an ephemeral localhost port and answers every request with
+    /// `response_body`, then returns the base URL (`http://127.0.0.1:<port>`).
+    #[cfg(feature = "vigil")]
+    fn spawn_mock_lev(response_body: &'static str) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock lev");
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                // Read through the request head so the client finishes sending
+                // before we write the response (the body is small and arrives
+                // with the head in one write).
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 1024];
+                loop {
+                    match stream.read(&mut tmp) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            buf.extend_from_slice(&tmp[..n]);
+                            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// harness/http-post returns the raw body on 2xx and nil on error, without
+    /// panicking at the FFI boundary.
+    #[cfg(feature = "vigil")]
+    #[test]
+    fn http_post_returns_body_and_nil_on_error() {
+        let url = spawn_mock_lev(r#"{"answers":{"judgment":{"noul":0.42}}}"#);
+        let (mut worker, _dialog_rx, _lsp_rx) = Worker::try_spawn().unwrap();
+
+        let r = worker
+            .eval(&format!(
+                r#"(harness/http-post "{url}/v1/systemone" "{{}}")"#
+            ))
+            .unwrap();
+        assert!(r.contains("noul"), "2xx must return the body, got {r:?}");
+
+        let r = worker
+            .eval(r#"(harness/http-post "http://127.0.0.1:1/" "{}")"#)
+            .unwrap();
+        assert_eq!(r, "nil");
+    }
+
+    /// The lev gate blocks (returns a reason) when lev's noul probability is
+    /// below the configured threshold.
+    #[cfg(feature = "vigil")]
+    #[test]
+    fn lev_rite_gate_blocks_below_threshold() {
+        let url = spawn_mock_lev(r#"{"answers":{"judgment":{"noul":0.42}}}"#);
+        let src = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/plugins/vigil_lev.janet"
+        ))
+        .expect("lev plugin source must exist");
+        let (mut worker, _dialog_rx, _lsp_rx) = Worker::try_spawn().unwrap();
+        worker.eval(&src).unwrap();
+
+        let r = worker
+            .eval(&format!(
+                r#"(lev-verdict @{{:vigil "v" :trigger :toll :event_count 1 :payload "{{}}"}}
+             @{{:endpoint "{url}" :threshold 0.8}})"#
+            ))
+            .unwrap();
+        assert!(r.contains("below threshold 0.8"), "block reason, got {r:?}");
+    }
+
+    /// The lev gate passes (returns nil) when lev's noul probability is at or
+    /// above the configured threshold.
+    #[cfg(feature = "vigil")]
+    #[test]
+    fn lev_rite_gate_passes_above_threshold() {
+        let url = spawn_mock_lev(r#"{"answers":{"judgment":{"noul":0.95}}}"#);
+        let src = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/plugins/vigil_lev.janet"
+        ))
+        .expect("lev plugin source must exist");
+        let (mut worker, _dialog_rx, _lsp_rx) = Worker::try_spawn().unwrap();
+        worker.eval(&src).unwrap();
+
+        let r = worker
+            .eval(&format!(
+                r#"(lev-verdict @{{:vigil "v" :trigger :toll :event_count 1 :payload "{{}}"}}
+             @{{:endpoint "{url}" :threshold 0.8}})"#
+            ))
+            .unwrap();
+        assert_eq!(r, "nil");
     }
 }

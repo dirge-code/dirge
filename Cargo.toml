@@ -129,6 +129,7 @@ no-plugin = [
 # The release workflow builds the Windows target with this set.
 windows-default = ['no-plugin']
 loop = []
+vigil = ["dep:notify"]
 # Run dirge itself as an MCP server (`dirge mcp`) so another agent (e.g.
 # Claude Code) can delegate implementation tasks to dirge and review them.
 # Pulls rmcp's server side + stdio transport + the tool macros.
@@ -296,7 +297,7 @@ thiserror = "2"
 futures = "0.3"
 # ring-based rustls TLS for reqwest. Faster cold build vs aws-lc-rs
 # (~15s vs 76s native C compile). See plans/compile-time-improvements.md
-reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "charset", "http2", "system-proxy"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "charset", "http2", "system-proxy", "blocking"] }
 # Explicit deps to pin rustls to ring backend instead of aws-lc-rs.
 # Required because reqwest/rustls-no-provider enables the deps but
 # doesn't specify a crypto backend; cargo would fall back to their
@@ -342,6 +343,7 @@ lsp-types = { version = "0.97", optional = true }
 tree-sitter-elixir = { version = "0.3.5", optional = true }
 tree-sitter-sequel = { version = "0.3", optional = true }
 tree-sitter-dafny = { version = "0.1", optional = true }
+notify = { version = "7", optional = true, default-features = false, features = ["macos_kqueue"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 # DAP (Debug Adapter Protocol) — optional feature for driving
 # debuggers (lldb-dap, dlv, debugpy, node) to fix crashes instead
@@ -440,4 +442,13 @@ debug = false
 # in a dev backtrace, set `debug = "line-tables-only"`.
 [profile.dev]
 debug = 0
+
+# Vendor evil-janet to root `janet_vm.top_dyns` during the GC mark phase.
+# Upstream Janet never marks that table, so dirge — which populates it via
+# janet_setdyn() with no fiber active (the :out/:err capture mirror) — gets it
+# swept and then use-after-freed in janet_dyn("err-color") inside
+# janet_stacktrace_ext. The one-line fix lives in vendor/evil-janet/csrc/janet.c
+# (janet_collect). See drg-76a1.
+[patch.crates-io]
+evil-janet = { path = "vendor/evil-janet" }
 
