@@ -19,7 +19,11 @@ use super::frame::{ChatBotFrame, TopFrame};
 use super::layout::{
     LEFT_PANEL_MIN_W, Layout, MAX_INPUT_ROWS, RIGHT_PANEL_MIN_W, overlay_max_rows,
 };
+#[cfg(feature = "vigil")]
+use super::panels::VigilLeftPanel;
 use super::panels::{LeftPanel, RightPanel};
+#[cfg(feature = "vigil")]
+use crate::ui::renderer::VigilStatusRow;
 use crate::ui::renderer::{
     LeftPanelInfo, LineEntry, PanelData, PanelMode, SelectionRange, SubagentStatusRow,
 };
@@ -50,6 +54,13 @@ pub struct Scene<'a> {
     /// Current right-panel mode — determines whether to show the debug panel
     /// or the normal system-info panel on the right side.
     pub right_panel_mode: PanelMode,
+    /// Current left-panel mode — determines whether to show vigil status
+    /// or the normal idle card on the left side.
+    #[cfg_attr(not(feature = "vigil"), allow(dead_code))]
+    pub left_panel_mode: PanelMode,
+    /// Vigil status rows for the left panel when left_panel_mode is Vigil.
+    #[cfg(feature = "vigil")]
+    pub vigil_data: &'a [VigilStatusRow],
     /// dirge-b11: how many entries to skip from the *top* of the
     /// MODIFIED list (most-recent-first). Carried in Scene so the
     /// renderer can paint the scrolled view; persisted across
@@ -117,12 +128,29 @@ pub fn render_frame(scene: &Scene, f: &mut Frame<'_>) {
     // Top frame (full width, across left panel + chat + right panel).
     f.render_widget(TopFrame::new(&layout).style(frame_style), area);
 
-    // Left panel — idle card or subagent list. Skip on narrow terminals.
+    // Left panel — idle card, subagent list, or vigil status. Skip on narrow terminals.
     if scene.show_left_panel && layout.left_panel.width >= LEFT_PANEL_MIN_W {
-        f.render_widget(
-            LeftPanel::new(scene.left_info, scene.subagents).border_style(frame_style),
-            layout.left_panel,
-        );
+        #[cfg(feature = "vigil")]
+        {
+            if scene.left_panel_mode == PanelMode::Vigil {
+                f.render_widget(
+                    VigilLeftPanel::new(scene.vigil_data).border_style(frame_style),
+                    layout.left_panel,
+                );
+            } else {
+                f.render_widget(
+                    LeftPanel::new(scene.left_info, scene.subagents).border_style(frame_style),
+                    layout.left_panel,
+                );
+            }
+        }
+        #[cfg(not(feature = "vigil"))]
+        {
+            f.render_widget(
+                LeftPanel::new(scene.left_info, scene.subagents).border_style(frame_style),
+                layout.left_panel,
+            );
+        }
     }
 
     // Chat region (content + │ verticals).
@@ -365,6 +393,9 @@ pub fn empty_scene<'a>(
         #[cfg(feature = "dap")]
         debug_panel_data: None,
         right_panel_mode: PanelMode::Auto,
+        left_panel_mode: PanelMode::Auto,
+        #[cfg(feature = "vigil")]
+        vigil_data: &[],
         modified_offset: 0,
         left_info,
         subagents,
@@ -619,6 +650,9 @@ mod tests {
             #[cfg(feature = "dap")]
             debug_panel_data: None,
             right_panel_mode: PanelMode::Auto,
+            left_panel_mode: PanelMode::Auto,
+            #[cfg(feature = "vigil")]
+            vigil_data: &[],
             modified_offset: 0,
             left_info: &info,
             subagents: &subs,
@@ -987,6 +1021,9 @@ mod tests {
             #[cfg(feature = "dap")]
             debug_panel_data: None,
             right_panel_mode: PanelMode::Auto,
+            left_panel_mode: PanelMode::Auto,
+            #[cfg(feature = "vigil")]
+            vigil_data: &[],
             modified_offset: 0,
             left_info: &info,
             subagents: &subs,
@@ -1021,6 +1058,9 @@ mod tests {
             #[cfg(feature = "dap")]
             debug_panel_data: None,
             right_panel_mode: PanelMode::Auto,
+            left_panel_mode: PanelMode::Auto,
+            #[cfg(feature = "vigil")]
+            vigil_data: &[],
             modified_offset: 0,
             left_info: &info,
             subagents: &subs,

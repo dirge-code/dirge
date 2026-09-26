@@ -11,9 +11,13 @@ pub(crate) async fn cmd_panel(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyhow:
         "off" => Some(PanelMode::Off),
         "auto" => Some(PanelMode::Auto),
         "debug" => Some(PanelMode::Debug),
+        "vigils" => Some(PanelMode::Vigil),
         other => {
             ctx.renderer.write_line(
-                &format!("unknown /panel mode '{}' (use on|off|auto|debug)", other),
+                &format!(
+                    "unknown /panel mode '{}' (use on|off|auto|debug|vigils)",
+                    other
+                ),
                 c_error(),
             )?;
             return Ok(());
@@ -22,6 +26,8 @@ pub(crate) async fn cmd_panel(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyhow:
     if let Some(mode) = new_mode {
         if mode == PanelMode::Debug {
             ctx.renderer.set_right_panel_mode(mode);
+        } else if mode == PanelMode::Vigil {
+            ctx.renderer.set_left_panel_mode(mode);
         } else {
             ctx.renderer.set_panel_mode(mode);
         }

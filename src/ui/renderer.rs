@@ -370,6 +370,8 @@ pub enum PanelMode {
     /// Show debug panel instead of system info (gated on ≥100 cols).
     /// Only meaningful when a DAP session is active.
     Debug,
+    /// Show vigil status in the left panel instead of vitals.
+    Vigil,
 }
 
 /// Which side panels a `/display` spec (or the `display` config value)
@@ -424,6 +426,8 @@ pub fn parse_display_spec(spec: &str) -> Result<PaneVisibility, String> {
 }
 
 // Re-exported from submodules so existing imports don't break.
+#[cfg(feature = "vigil")]
+pub use crate::ui::panel_data::VigilStatusRow;
 pub use crate::ui::panel_data::{LeftPanelInfo, PanelData, SubagentStatusRow};
 /// Normalized selection range — `start <= end` in row-major order.
 /// Coordinates are `(buffer_line_idx, char_offset_in_line)`. Used by
@@ -589,6 +593,9 @@ pub struct Renderer {
     /// ui-redesign: idle-state info for the left panel. Painted when
     /// `subagent_status` is empty so the gutter never looks dead.
     left_panel_info: LeftPanelInfo,
+    /// Live vigil status rows for the left panel when in Vigil mode.
+    #[cfg(feature = "vigil")]
+    vigil_status: Vec<VigilStatusRow>,
     /// DAP debug panel snapshot — updated each UI tick when a
     /// DAP session is active and panel mode is Debug.
     #[cfg(feature = "dap")]
@@ -745,6 +752,8 @@ impl Renderer {
             panel_data: PanelData::default(),
             subagent_status: Vec::new(),
             left_panel_info: LeftPanelInfo::default(),
+            #[cfg(feature = "vigil")]
+            vigil_status: Vec::new(),
             #[cfg(feature = "dap")]
             debug_panel_data: None,
             alert_overlay: None,
@@ -911,6 +920,7 @@ impl Renderer {
             selection_start,
             selection_end,
             right_panel_mode,
+            left_panel_mode,
             ..
         } = self;
 
@@ -1111,6 +1121,9 @@ impl Renderer {
             input_bg: crate::ui::theme::input_bg(),
             picker: picker_overlay.as_ref(),
             right_panel_mode: *right_panel_mode,
+            left_panel_mode: *left_panel_mode,
+            #[cfg(feature = "vigil")]
+            vigil_data: &self.vigil_status,
             tooltip,
             #[cfg(feature = "dap")]
             debug_panel_data: self.debug_panel_data.as_ref(),
@@ -1389,6 +1402,17 @@ impl Renderer {
         self.right_panel_mode = mode;
     }
 
+    /// Set only the left panel mode (used by `/panel vigils`).
+    pub fn set_left_panel_mode(&mut self, mode: PanelMode) {
+        self.left_panel_mode = mode;
+    }
+
+    /// Replace the vigil status snapshot in the left panel.
+    #[cfg(feature = "vigil")]
+    pub fn set_vigil_status(&mut self, rows: Vec<VigilStatusRow>) {
+        self.vigil_status = rows;
+    }
+
     /// Apply a parsed `/display` selection (or the `display` config
     /// value): each listed side panel is forced on, each omitted one
     /// forced off — an explicit user choice, so `On`/`Off` rather than
@@ -1610,6 +1634,7 @@ impl Renderer {
             PanelMode::On => self.content_indent() >= 15,
             PanelMode::Auto => cols >= PANEL_AUTO_MIN_COLS && self.content_indent() >= 15,
             PanelMode::Debug => cols >= PANEL_AUTO_MIN_COLS && self.content_indent() >= 15,
+            PanelMode::Vigil => cols >= PANEL_AUTO_MIN_COLS && self.content_indent() >= 15,
         }
     }
 
