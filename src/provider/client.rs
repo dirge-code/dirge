@@ -316,7 +316,12 @@ where
         .map(ProviderEntry::resolved_headers)
         .transpose()?
         .unwrap_or_default();
-    add_opencode_session_header(&mut headers, info.kind, session_id)?;
+    add_opencode_session_header(
+        &mut headers,
+        info.kind,
+        info.base_url.as_deref(),
+        session_id,
+    )?;
 
     // dirge-ro8g: for the anthropic provider, a present OAuth login — a
     // stored `dirge auth anthropic` creds file OR an exported
@@ -676,9 +681,10 @@ where
 fn add_opencode_session_header(
     headers: &mut HeaderMap,
     kind: ProviderKind,
+    base_url: Option<&str>,
     session_id: Option<&str>,
 ) -> anyhow::Result<()> {
-    if kind == ProviderKind::OpenCode
+    if is_opencode_endpoint(kind, base_url)
         && let Some(session_id) = session_id.filter(|id| !id.trim().is_empty())
     {
         headers.insert(
@@ -687,6 +693,14 @@ fn add_opencode_session_header(
         );
     }
     Ok(())
+}
+
+fn is_opencode_endpoint(kind: ProviderKind, base_url: Option<&str>) -> bool {
+    kind == ProviderKind::OpenCode
+        || base_url
+            .and_then(|url| url::Url::parse(url).ok())
+            .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+            .is_some_and(|host| host == "opencode.ai" || host.ends_with(".opencode.ai"))
 }
 
 #[cfg(test)]
@@ -1104,6 +1118,7 @@ mod tests {
         add_opencode_session_header(
             &mut headers,
             ProviderKind::OpenCode,
+            None,
             Some("conversation-123"),
         )
         .unwrap();
@@ -1118,15 +1133,32 @@ mod tests {
         add_opencode_session_header(
             &mut other_provider_headers,
             ProviderKind::OpenAI,
+            Some("https://api.openai.com/v1"),
             Some("conversation-123"),
         )
         .unwrap();
         assert!(other_provider_headers.get("x-opencode-session").is_none());
 
+        let mut opencode_go_headers = HeaderMap::new();
+        add_opencode_session_header(
+            &mut opencode_go_headers,
+            ProviderKind::OpenAI,
+            Some("https://opencode.ai/zen/go/v1"),
+            Some("conversation-123"),
+        )
+        .unwrap();
+        assert_eq!(
+            opencode_go_headers
+                .get("x-opencode-session")
+                .and_then(|value| value.to_str().ok()),
+            Some("conversation-123"),
+        );
+
         let mut empty_session_headers = HeaderMap::new();
         add_opencode_session_header(
             &mut empty_session_headers,
             ProviderKind::OpenCode,
+            None,
             Some(" "),
         )
         .unwrap();
