@@ -85,12 +85,37 @@ pub fn create_client_with_auth(
     client::create_client_with_auth(provider_name, api_key, providers, default_auth)
 }
 
+/// Build a provider client with the active conversation's stable session id.
+/// OpenCode uses this to key request routing and prompt caching across turns.
+pub fn create_client_with_auth_for_session(
+    provider_name: &str,
+    api_key: Option<&str>,
+    providers: &HashMap<String, ProviderEntry>,
+    default_auth: Option<crate::config::ProviderAuth>,
+    session_id: &str,
+) -> anyhow::Result<AnyClient> {
+    client::create_client_with_auth_for_session(
+        provider_name,
+        api_key,
+        providers,
+        default_auth,
+        Some(session_id),
+    )
+}
+
 fn create_role_client(
     provider_name: &str,
     providers: &HashMap<String, ProviderEntry>,
     default_auth: Option<ProviderAuth>,
+    session_id: Option<&str>,
 ) -> anyhow::Result<AnyClient> {
-    create_client_with_auth(provider_name, None, providers, default_auth)
+    client::create_client_with_auth_for_session(
+        provider_name,
+        None,
+        providers,
+        default_auth,
+        session_id,
+    )
 }
 
 /// The provider entry reasoning effort seeds from.
@@ -177,7 +202,7 @@ pub async fn build_agent(
     // route) this is its model; otherwise the main model. Only the
     // `TaskTool` in `build_loop_tools` consumes `parent_model`, so routing
     // here is sufficient. A `task(agent=…)` profile model still overrides.
-    let subagent_model = resolve_subagent_model(cfg);
+    let subagent_model = resolve_subagent_model(cfg, session_id.as_deref());
     let loop_task_model = subagent_model.unwrap_or_else(|| parent_model.clone());
 
     macro_rules! build_inner {
@@ -398,7 +423,8 @@ pub async fn build_agent(
     // model. Either way adapts `summarize_with_model` (AnyModel + prompt →
     // summary) to the `SummarizeFn` shape.
     {
-        let summarize_fn = build_summarize_fn(cfg, parent_model.clone());
+        let summarize_fn =
+            build_summarize_fn_for_session(cfg, parent_model.clone(), session_id.as_deref());
         agent = agent.with_summarizer(summarize_fn);
     }
 
@@ -442,6 +468,7 @@ pub async fn build_agent(
                         cfg.auth,
                         chunk_timeout,
                         agent.loop_tools(),
+                        session_id.as_deref(),
                     ) {
                         Ok(stream_fn) => {
                             agent = agent.with_escalation(stream_fn, escalation_alias.clone());
@@ -526,7 +553,7 @@ pub async fn build_agent(
                         None => std::sync::Arc::from(cfg.resolve_critic_preamble()),
                     };
                 let providers = cfg.providers_map();
-                match create_role_client(&alias, &providers, cfg.auth) {
+                match create_role_client(&alias, &providers, cfg.auth, session_id.as_deref()) {
                     Ok(raw_client) => {
                         let client = std::sync::Arc::new(raw_client);
                         let model_name = resolve_entry_model_name(&client, &alias, &entry);
@@ -656,7 +683,7 @@ pub async fn build_agent(
     // dirge-lavc GAP 1: artifact-scope sourcing gate (off by default — opt-in).
     agent = agent.with_source_gate_mode(cfg.resolve_source_gate_mode());
     agent = agent.with_safe_state_abort_mode(cfg.resolve_safe_state_abort_mode());
-    agent = agent.with_session_id(session_id);
+    agent = agent.with_session_id(session_id.clone());
 
     // dirge-9tfq — install the BackgroundStore on the agent so
     // `spawn_runner` can thread it into `LoopSpawnConfig.bg_store`,
@@ -698,6 +725,7 @@ pub async fn build_agent(
                         cfg.auth,
                         chunk_timeout,
                         agent.loop_tools(),
+                        session_id.as_deref(),
                     ) {
                         Ok((stream_fn, model_name)) => {
                             agent = agent.with_review_route(
@@ -837,10 +865,11 @@ fn build_escalation_stream_fn(
     default_auth: Option<ProviderAuth>,
     chunk_timeout: std::time::Duration,
     loop_tools: &[std::sync::Arc<dyn crate::agent::agent_loop::LoopTool>],
+    session_id: Option<&str>,
 ) -> anyhow::Result<crate::agent::agent_loop::StreamFn> {
     use crate::agent::agent_loop::{loop_tool_to_rig_definition, retrying_stream_fn};
     use crate::agent::recovery::RecoveryPolicy;
-    let client = create_role_client(alias, providers, default_auth)?;
+    let client = create_role_client(alias, providers, default_auth, session_id)?;
     let model_name = resolve_entry_model_name(&client, alias, entry);
     let model = client.completion_model(model_name);
     let tool_defs: Vec<rig::completion::ToolDefinition> = loop_tools
@@ -933,14 +962,25 @@ fn build_judge_fn(
 /// configured provider falls back to the main model only when that fallback is
 /// safe; Anthropic OAuth fallback is refused so compaction side calls do not
 /// trip the Claude-Code classifier.
+#[cfg(test)]
 pub(crate) fn build_compaction_model(
     cfg: &Config,
     main_client: &AnyClient,
     main_model_name: &str,
 ) -> anyhow::Result<AnyModel> {
+    build_compaction_model_for_session(cfg, main_client, main_model_name, None)
+}
+
+pub(crate) fn build_compaction_model_for_session(
+    cfg: &Config,
+    main_client: &AnyClient,
+    main_model_name: &str,
+    session_id: Option<&str>,
+) -> anyhow::Result<AnyModel> {
     resolve_summarization_model(
         cfg,
         main_client.completion_model(main_model_name.to_string()),
+        session_id,
     )
 }
 
@@ -960,6 +1000,7 @@ pub(crate) fn build_compaction_model(
 pub(crate) fn resolve_summarization_model(
     cfg: &Config,
     fallback: AnyModel,
+    session_id: Option<&str>,
 ) -> anyhow::Result<AnyModel> {
     if cfg.summarization_provider.is_some() {
         let default_role = cfg.resolve_role(crate::config::ConfigRole::Default);
@@ -967,7 +1008,7 @@ pub(crate) fn resolve_summarization_model(
         if let (Some((default_alias, _)), Some((alias, entry))) = (default_role, summ_role)
             && !default_alias.eq_ignore_ascii_case(&alias)
         {
-            match create_role_client(&alias, &cfg.providers_map(), cfg.auth) {
+            match create_role_client(&alias, &cfg.providers_map(), cfg.auth, session_id) {
                 Ok(client) => {
                     if matches!(&client, AnyClient::AnthropicOauth(_)) {
                         anyhow::bail!(ANTHROPIC_OAUTH_COMPACTION_DISABLED);
@@ -1006,9 +1047,18 @@ fn anthropic_oauth_compaction_disabled_fn() -> crate::agent::compression::Summar
 /// Uses the same summarization-provider routing and Anthropic OAuth guard as
 /// [`build_compaction_model`], but adapts the resolved model into the
 /// `SummarizeFn` callback consumed by the agent loop.
+#[cfg(test)]
 pub(crate) fn build_summarize_fn(
     cfg: &Config,
     main_model: AnyModel,
+) -> crate::agent::compression::SummarizeFn {
+    build_summarize_fn_for_session(cfg, main_model, None)
+}
+
+pub(crate) fn build_summarize_fn_for_session(
+    cfg: &Config,
+    main_model: AnyModel,
+    session_id: Option<&str>,
 ) -> crate::agent::compression::SummarizeFn {
     let from_model = |model: AnyModel| -> crate::agent::compression::SummarizeFn {
         std::sync::Arc::new(move |prompt: String| {
@@ -1021,7 +1071,7 @@ pub(crate) fn build_summarize_fn(
     // resolver; the OAuth-disabled error is adapted into the disabled-fn shape
     // the loop expects (an Err-returning SummarizeFn), instead of a
     // separately-maintained copy of the routing that had drifted.
-    match resolve_summarization_model(cfg, main_model) {
+    match resolve_summarization_model(cfg, main_model, session_id) {
         Ok(model) => from_model(model),
         Err(_) => anthropic_oauth_compaction_disabled_fn(),
     }
@@ -1033,14 +1083,14 @@ pub(crate) fn build_summarize_fn(
 /// route; otherwise `None` (the caller keeps the main model). A profile
 /// route on a specific `task(agent=…)` call still overrides this — it is
 /// the fallback default, matching `task.rs`'s `route_model.unwrap_or`.
-fn resolve_subagent_model(cfg: &Config) -> Option<AnyModel> {
+fn resolve_subagent_model(cfg: &Config, session_id: Option<&str>) -> Option<AnyModel> {
     cfg.subagent_provider.as_ref()?;
     let (default_alias, _) = cfg.resolve_role(crate::config::ConfigRole::Default)?;
     let (alias, entry) = cfg.resolve_role(crate::config::ConfigRole::Subagent)?;
     if default_alias.eq_ignore_ascii_case(&alias) {
         return None;
     }
-    match create_role_client(&alias, &cfg.providers_map(), cfg.auth) {
+    match create_role_client(&alias, &cfg.providers_map(), cfg.auth, session_id) {
         Ok(client) => {
             let model_name = resolve_entry_model_name(&client, &alias, &entry);
             tracing::info!(
@@ -1077,6 +1127,7 @@ fn resolve_subagent_model(cfg: &Config) -> Option<AnyModel> {
 /// Unlike the interactive commands, a refusal here degrades to the active client
 /// with a warning instead of refusing: this runs at startup with no user to
 /// answer, and the pre-#711 behavior was to use the active client anyway.
+#[cfg(test)]
 pub fn resolve_profile_model(
     cfg: &Config,
     active_client: &AnyClient,
@@ -1085,7 +1136,27 @@ pub fn resolve_profile_model(
     model: Option<&str>,
     clients: &mut HashMap<String, AnyClient>,
 ) -> Option<AnyModel> {
-    use super::{ModelRoute, RouteRefusal, build_route_client, resolve_model_route};
+    resolve_profile_model_for_session(
+        cfg,
+        active_client,
+        active_provider,
+        profile,
+        model,
+        clients,
+        None,
+    )
+}
+
+pub fn resolve_profile_model_for_session(
+    cfg: &Config,
+    active_client: &AnyClient,
+    active_provider: &str,
+    profile: &str,
+    model: Option<&str>,
+    clients: &mut HashMap<String, AnyClient>,
+    session_id: Option<&str>,
+) -> Option<AnyModel> {
+    use super::{ModelRoute, RouteRefusal, build_route_client_for_session, resolve_model_route};
 
     // A profile's `model` may name a `providers` alias rather than a model id;
     // resolve that to the id first, then route the id.
@@ -1102,7 +1173,7 @@ pub fn resolve_profile_model(
         ModelRoute::Active { model, .. } => Some(active_client.completion_model(model)),
         ModelRoute::Provider { alias, model } => {
             if !clients.contains_key(&alias) {
-                match build_route_client(cfg, &alias, &model) {
+                match build_route_client_for_session(cfg, &alias, &model, session_id) {
                     Ok(client) => {
                         clients.insert(alias.clone(), client);
                     }
@@ -1144,7 +1215,7 @@ pub fn build_approval_fn(
         ApprovalDecision, ApprovalRequest, EVALUATOR_PREAMBLE, build_evaluator_prompt,
         parse_decision,
     };
-    let client = std::sync::Arc::new(create_role_client(alias, providers, default_auth)?);
+    let client = std::sync::Arc::new(create_role_client(alias, providers, default_auth, None)?);
     let model_name = resolve_entry_model_name(&client, alias, entry);
     Ok(std::sync::Arc::new(move |req: ApprovalRequest| {
         let client = client.clone();
@@ -1177,9 +1248,10 @@ fn build_review_stream_fn(
     default_auth: Option<ProviderAuth>,
     chunk_timeout: std::time::Duration,
     loop_tools: &[std::sync::Arc<dyn crate::agent::agent_loop::LoopTool>],
+    session_id: Option<&str>,
 ) -> anyhow::Result<(crate::agent::agent_loop::StreamFn, String)> {
     use crate::agent::agent_loop::loop_tool_to_rig_definition;
-    let client = create_role_client(alias, providers, default_auth)?;
+    let client = create_role_client(alias, providers, default_auth, session_id)?;
     let model_name = resolve_entry_model_name(&client, alias, entry);
     let model = client.completion_model(model_name.clone());
     // Review path uses ONLY memory + skill — match what
@@ -1372,7 +1444,7 @@ mod nw25_tests {
         let cfg = Config::default();
         assert!(cfg.subagent_provider.is_none());
         assert!(
-            resolve_subagent_model(&cfg).is_none(),
+            resolve_subagent_model(&cfg, None).is_none(),
             "unset subagent_provider must yield no override model"
         );
     }
@@ -1392,7 +1464,7 @@ mod nw25_tests {
     fn profile_model_builds_against_its_family_provider() {
         let cfg = issue_711_config();
         let providers = cfg.providers_map();
-        let active = create_role_client("gpt-sol", &providers, None).unwrap();
+        let active = create_role_client("gpt-sol", &providers, None, None).unwrap();
         let mut clients = HashMap::new();
 
         let model = resolve_profile_model(
@@ -1415,7 +1487,7 @@ mod nw25_tests {
     fn profile_model_naming_an_alias_resolves_then_cross_routes() {
         let cfg = issue_711_config();
         let providers = cfg.providers_map();
-        let active = create_role_client("gpt-sol", &providers, None).unwrap();
+        let active = create_role_client("gpt-sol", &providers, None, None).unwrap();
         let mut clients = HashMap::new();
 
         let model = resolve_profile_model(
@@ -1438,7 +1510,7 @@ mod nw25_tests {
     fn profile_model_in_the_active_family_uses_the_active_client() {
         let cfg = issue_711_config();
         let providers = cfg.providers_map();
-        let active = create_role_client("gpt-sol", &providers, None).unwrap();
+        let active = create_role_client("gpt-sol", &providers, None, None).unwrap();
         let mut clients = HashMap::new();
 
         let model = resolve_profile_model(
@@ -1461,7 +1533,7 @@ mod nw25_tests {
     fn cross_routed_clients_are_built_once_per_alias() {
         let cfg = issue_711_config();
         let providers = cfg.providers_map();
-        let active = create_role_client("gpt-sol", &providers, None).unwrap();
+        let active = create_role_client("gpt-sol", &providers, None, None).unwrap();
         let mut clients = HashMap::new();
 
         for profile in ["researcher", "implementer", "reviewer"] {
@@ -1485,7 +1557,7 @@ mod nw25_tests {
     fn profile_without_a_model_yields_no_route_model() {
         let cfg = issue_711_config();
         let providers = cfg.providers_map();
-        let active = create_role_client("gpt-sol", &providers, None).unwrap();
+        let active = create_role_client("gpt-sol", &providers, None, None).unwrap();
         let mut clients = HashMap::new();
 
         assert!(
@@ -1500,7 +1572,7 @@ mod nw25_tests {
     fn unroutable_family_falls_back_to_the_active_client() {
         let cfg = issue_711_config();
         let providers = cfg.providers_map();
-        let active = create_role_client("gpt-sol", &providers, None).unwrap();
+        let active = create_role_client("gpt-sol", &providers, None, None).unwrap();
         let mut clients = HashMap::new();
 
         let model = resolve_profile_model(
@@ -1560,7 +1632,8 @@ mod nw25_tests {
         let _account = EnvGuard::remove("CHATGPT_ACCOUNT_ID");
 
         let client =
-            create_role_client("openai", &HashMap::new(), Some(ProviderAuth::ChatGpt)).unwrap();
+            create_role_client("openai", &HashMap::new(), Some(ProviderAuth::ChatGpt), None)
+                .unwrap();
 
         assert!(matches!(client, AnyClient::ChatGptOpenAI(_)));
     }

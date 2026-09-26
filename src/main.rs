@@ -104,12 +104,13 @@ struct Channels {
 /// `None` so the tool doesn't try to exclude a row that will never
 /// land in the session DB. Otherwise the live session id is
 /// returned so the model can't recall its own in-progress
-/// prompt-response pair.
+/// prompt-response pair. Use the origin id: compaction rotates `Session.id`,
+/// but the origin remains stable for the lifetime of a conversation.
 fn session_id_for_agent(cli: &cli::Cli, session: &session::Session) -> Option<String> {
     if cli.no_session {
         None
     } else {
-        Some(session.id.to_string())
+        Some(session.effective_origin().to_string())
     }
 }
 
@@ -1296,11 +1297,12 @@ async fn main() -> anyhow::Result<()> {
     };
     cli.resolved_api_key = resolved_key.clone();
 
-    let client = provider::create_client_with_auth(
+    let client = provider::create_client_with_auth_for_session(
         &provider,
         resolved_key.as_deref(),
         &cfg.providers_map(),
         cfg.auth,
+        session.effective_origin(),
     )?;
 
     // dirge-ovjk (+ resume follow-ups): now that the client is built we know
@@ -1375,13 +1377,14 @@ async fn main() -> anyhow::Result<()> {
             .agent_defs
             .iter()
             .map(|def| {
-                let model = provider::resolve_profile_model(
+                let model = provider::resolve_profile_model_for_session(
                     &cfg,
                     &client,
                     &provider,
                     &def.name,
                     def.model.as_deref(),
                     &mut route_clients,
+                    Some(session.effective_origin()),
                 );
                 // Resolve the profile's subagent tool policy into the exact
                 // allow-list for a tooled fork. `None` (tool-less profile) →
@@ -2294,8 +2297,21 @@ mod session_id_tests {
         let got = session_id_for_agent(&cli, &session);
         assert_eq!(
             got.as_deref(),
-            Some(session.id.as_str()),
+            Some(session.effective_origin()),
             "sessioned --print must propagate the live session id"
+        );
+    }
+
+    #[test]
+    fn session_id_for_agent_uses_stable_conversation_origin() {
+        let cli = cli::Cli::parse_from(["dirge", "--print"]);
+        let mut session = fresh_session();
+        session.origin_id = Some(compact_str::CompactString::from("conversation-origin"));
+        session.id = compact_str::CompactString::from("rotated-session-id");
+
+        assert_eq!(
+            session_id_for_agent(&cli, &session).as_deref(),
+            Some("conversation-origin"),
         );
     }
 
@@ -2325,7 +2341,9 @@ mod session_id_tests {
             "scan lost the production half — the cut marker moved",
         );
         // Exactly one occurrence is legitimate: the helper's own return.
-        let inlined = production.matches("Some(session.id.to_string())").count();
+        let inlined = production
+            .matches("Some(session.effective_origin().to_string())")
+            .count();
         assert_eq!(
             inlined, 1,
             "expected the id to be built only inside session_id_for_agent, but \
@@ -2350,7 +2368,7 @@ mod session_id_tests {
         let cli = cli::Cli::parse_from(["dirge"]);
         let session = fresh_session();
         let got = session_id_for_agent(&cli, &session);
-        assert_eq!(got.as_deref(), Some(session.id.as_str()));
+        assert_eq!(got.as_deref(), Some(session.effective_origin()));
     }
 
     #[test]

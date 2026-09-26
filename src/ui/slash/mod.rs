@@ -366,7 +366,12 @@ pub(crate) fn prepare_compaction(
         augmented_instructions.as_deref(),
     )?;
     let tokens_before = tokens_before_cut(session, cut_idx);
-    let model = crate::provider::build_compaction_model(cfg, client, &session.model)?;
+    let model = crate::provider::build_compaction_model_for_session(
+        cfg,
+        client,
+        &session.model,
+        Some(session.effective_origin()),
+    )?;
 
     Ok(CompactionDecision::Ready(Box::new(CompactionRequest {
         model,

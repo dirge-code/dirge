@@ -84,7 +84,13 @@ pub(crate) fn prepare_next_model_client(
     // the CLIENT half is applied here: the session's model/provider move later
     // in `apply_next_model`, after the hook chain resolves.
     let route = crate::provider::resolve_model_route(cfg, session.provider.as_str(), trimmed);
-    match crate::provider::swap_client_for_route(cfg, client, session.provider.as_str(), &route) {
+    match crate::provider::swap_client_for_route_in_session(
+        cfg,
+        client,
+        session.provider.as_str(),
+        &route,
+        Some(session.effective_origin()),
+    ) {
         Ok(swapped_provider) => Ok(NextModelAction::Apply { swapped_provider }),
         Err(refusal) => {
             renderer.write_line(

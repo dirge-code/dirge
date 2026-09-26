@@ -417,7 +417,7 @@ async fn run_prompt(
         return Ok(());
     }
 
-    let client = create_acp_client(&provider_str, &state.cfg)
+    let client = create_acp_client(&provider_str, &state.cfg, Some(&session_id.to_string()))
         .map_err(|e| agent_client_protocol::Error::new(-32603, e.to_string()))?;
 
     // dirge-ovjk: apply the Codex-default substitution only for a defaulted
@@ -1021,8 +1021,23 @@ async fn session_overrides(
 fn create_acp_client(
     provider_str: &str,
     cfg: &Config,
+    session_id: Option<&str>,
 ) -> anyhow::Result<crate::provider::AnyClient> {
-    crate::provider::create_client_with_auth(provider_str, None, &cfg.providers_map(), cfg.auth)
+    match session_id {
+        Some(session_id) => crate::provider::create_client_with_auth_for_session(
+            provider_str,
+            None,
+            &cfg.providers_map(),
+            cfg.auth,
+            session_id,
+        ),
+        None => crate::provider::create_client_with_auth(
+            provider_str,
+            None,
+            &cfg.providers_map(),
+            cfg.auth,
+        ),
+    }
 }
 
 fn build_acp_permission(
@@ -1218,7 +1233,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = create_acp_client("openai", &cfg);
+        let result = create_acp_client("openai", &cfg, None);
         let err = match result {
             Ok(_) => panic!("ACP client should attempt ChatGPT auth"),
             Err(err) => err.to_string(),

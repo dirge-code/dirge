@@ -92,12 +92,23 @@ pub(crate) fn create_client_with_auth(
     providers: &HashMap<String, ProviderEntry>,
     default_auth: Option<ProviderAuth>,
 ) -> anyhow::Result<AnyClient> {
+    create_client_with_auth_for_session(provider_name, api_key, providers, default_auth, None)
+}
+
+pub(crate) fn create_client_with_auth_for_session(
+    provider_name: &str,
+    api_key: Option<&str>,
+    providers: &HashMap<String, ProviderEntry>,
+    default_auth: Option<ProviderAuth>,
+    session_id: Option<&str>,
+) -> anyhow::Result<AnyClient> {
     create_client_with_resolved_auth(
         provider_name,
         api_key,
         providers,
         default_auth,
         None,
+        session_id,
         |name| std::env::var(name).ok(),
         load_fresh_openai_oauth,
     )
@@ -273,6 +284,7 @@ where
         providers,
         None,
         None,
+        None,
         env,
         load_openai_oauth,
     )
@@ -284,6 +296,7 @@ fn create_client_with_resolved_auth<F, G>(
     providers: &HashMap<String, ProviderEntry>,
     default_auth: Option<ProviderAuth>,
     resolved_auth_headers: Option<ProviderAuthHeaders>,
+    session_id: Option<&str>,
     env: F,
     load_openai_oauth: G,
 ) -> anyhow::Result<AnyClient>
@@ -303,6 +316,7 @@ where
         .map(ProviderEntry::resolved_headers)
         .transpose()?
         .unwrap_or_default();
+    add_opencode_session_header(&mut headers, info.kind, session_id)?;
 
     // dirge-ro8g: for the anthropic provider, a present OAuth login — a
     // stored `dirge auth anthropic` creds file OR an exported
@@ -659,6 +673,22 @@ where
     }
 }
 
+fn add_opencode_session_header(
+    headers: &mut HeaderMap,
+    kind: ProviderKind,
+    session_id: Option<&str>,
+) -> anyhow::Result<()> {
+    if kind == ProviderKind::OpenCode
+        && let Some(session_id) = session_id.filter(|id| !id.trim().is_empty())
+    {
+        headers.insert(
+            http::HeaderName::from_static("x-opencode-session"),
+            http::HeaderValue::from_str(session_id)?,
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 fn create_client_with_chatgpt_auth_headers(
     provider_name: &str,
@@ -671,6 +701,7 @@ fn create_client_with_chatgpt_auth_headers(
         providers,
         Some(ProviderAuth::ChatGpt),
         Some(headers),
+        None,
         |name| std::env::var(name).ok(),
         load_fresh_openai_oauth,
     )
@@ -688,6 +719,7 @@ fn create_client_with_anthropic_auth_headers(
         providers,
         Some(ProviderAuth::Anthropic),
         Some(headers),
+        None,
         |name| std::env::var(name).ok(),
         load_fresh_openai_oauth,
     )
@@ -1064,6 +1096,41 @@ mod tests {
 
     fn no_env(_: &str) -> Option<String> {
         None
+    }
+
+    #[test]
+    fn opencode_session_header_is_scoped_and_stable() {
+        let mut headers = HeaderMap::new();
+        add_opencode_session_header(
+            &mut headers,
+            ProviderKind::OpenCode,
+            Some("conversation-123"),
+        )
+        .unwrap();
+        assert_eq!(
+            headers
+                .get("x-opencode-session")
+                .and_then(|value| value.to_str().ok()),
+            Some("conversation-123"),
+        );
+
+        let mut other_provider_headers = HeaderMap::new();
+        add_opencode_session_header(
+            &mut other_provider_headers,
+            ProviderKind::OpenAI,
+            Some("conversation-123"),
+        )
+        .unwrap();
+        assert!(other_provider_headers.get("x-opencode-session").is_none());
+
+        let mut empty_session_headers = HeaderMap::new();
+        add_opencode_session_header(
+            &mut empty_session_headers,
+            ProviderKind::OpenCode,
+            Some(" "),
+        )
+        .unwrap();
+        assert!(empty_session_headers.get("x-opencode-session").is_none());
     }
 
     // ── dirge-ro8g: anthropic-OAuth presence implies Anthropic auth ──
@@ -2260,6 +2327,7 @@ mod tests {
             &providers,
             Some(ProviderAuth::Kimi),
             None,
+            None,
             no_env,
             || Ok(None),
         ) {
@@ -2298,6 +2366,7 @@ mod tests {
                 None,
                 &providers,
                 Some(ProviderAuth::Kimi),
+                None,
                 None,
                 no_env,
                 || Ok(None),

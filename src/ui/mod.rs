@@ -1583,7 +1583,12 @@ pub async fn run_interactive(
     // compaction actually does. Side-effect-free in the common case (no
     // `summarization_provider` set → no client is built).
     if matches!(
-        crate::provider::build_compaction_model(cfg, &client, &session.model),
+        crate::provider::build_compaction_model_for_session(
+            cfg,
+            &client,
+            &session.model,
+            Some(session.effective_origin()),
+        ),
         Err(ref e) if crate::provider::is_anthropic_oauth_compaction_disabled_error(e)
     ) {
         renderer.write_line(

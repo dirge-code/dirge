@@ -153,6 +153,29 @@ pub fn build_route_client(
     })
 }
 
+pub(crate) fn build_route_client_for_session(
+    cfg: &Config,
+    alias: &str,
+    model: &str,
+    session_id: Option<&str>,
+) -> Result<AnyClient, RouteRefusal> {
+    let result = match session_id {
+        Some(session_id) => super::create_client_with_auth_for_session(
+            alias,
+            None,
+            &cfg.providers_map(),
+            cfg.auth,
+            session_id,
+        ),
+        None => return build_route_client(cfg, alias, model),
+    };
+    result.map_err(|e| RouteRefusal::ProviderBuildFailed {
+        alias: alias.to_string(),
+        model: model.to_string(),
+        error: e.to_string(),
+    })
+}
+
 /// Point the live `client` at `route`'s provider, given the alias it is
 /// currently on. `Ok(Some(alias))` when the client was rebuilt, `Ok(None)` when
 /// the active client already serves the route. The client is left untouched on
@@ -162,6 +185,31 @@ pub fn swap_client_for_route(
     client: &mut AnyClient,
     active_provider: &str,
     route: &ModelRoute,
+) -> Result<Option<String>, RouteRefusal> {
+    swap_client_for_route_impl(cfg, client, active_provider, route, None)
+}
+
+/// Session-aware variant of [`swap_client_for_route`]. New OpenCode clients
+/// inherit the conversation id so a model switch keeps routing/cache identity.
+pub fn swap_client_for_route_in_session(
+    cfg: &Config,
+    client: &mut AnyClient,
+    active_provider: &str,
+    route: &ModelRoute,
+    session_id: Option<&str>,
+) -> Result<Option<String>, RouteRefusal> {
+    if session_id.is_none() {
+        return swap_client_for_route(cfg, client, active_provider, route);
+    }
+    swap_client_for_route_impl(cfg, client, active_provider, route, session_id)
+}
+
+fn swap_client_for_route_impl(
+    cfg: &Config,
+    client: &mut AnyClient,
+    active_provider: &str,
+    route: &ModelRoute,
+    session_id: Option<&str>,
 ) -> Result<Option<String>, RouteRefusal> {
     match route {
         ModelRoute::Active { .. } => Ok(None),
@@ -176,7 +224,7 @@ pub fn swap_client_for_route(
         ModelRoute::Provider { alias, model } => {
             // Build BEFORE installing: a failed build must leave the live
             // client exactly as it was.
-            let built = build_route_client(cfg, alias, model)?;
+            let built = build_route_client_for_session(cfg, alias, model, session_id)?;
             *client = built;
             tracing::info!(
                 target: "dirge::provider",
@@ -206,7 +254,13 @@ pub fn apply_model_route(
     session: &mut Session,
     route: ModelRoute,
 ) -> Result<Option<String>, RouteRefusal> {
-    let switched_to = swap_client_for_route(cfg, client, session.provider.as_str(), &route)?;
+    let switched_to = swap_client_for_route_in_session(
+        cfg,
+        client,
+        session.provider.as_str(),
+        &route,
+        Some(session.effective_origin()),
+    )?;
     session.model = compact_str::CompactString::new(route.model());
     // Only follow the client when it actually moved. A same-client rename must
     // leave `provider` alone: overwriting it (with the CLI/config default, say)
