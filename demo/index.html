@@ -48,6 +48,18 @@
   <button id="agent_send" disabled>Run agent</button>
   <pre id="agent_output"></pre>
 
+  <h2>Session store</h2>
+  <p class="muted">
+    Pared-down in-memory session persistence (<code>SessionStore</code>):
+    create a session, append messages, then list what's stored. A JSON-backed
+    mirror of the terminal's save/load/delete/list contract.
+  </p>
+  <input id="session_name" type="text" placeholder="session name" />
+  <button id="session_create" disabled>New session</button>
+  <button id="session_append" disabled>Append "hello"</button>
+  <button id="session_list" disabled>List sessions</button>
+  <pre id="session_output"></pre>
+
   <h2>Janet VM</h2>
   <p class="muted">
     A pared-down Janet interpreter compiled to wasm runs right in the page.
@@ -62,7 +74,7 @@
   <script src="../wasm-janet/dist/janet.js"></script>
 
   <script type="module">
-    import init, { token_count, chat, AgentHandle } from '../pkg-web/dirge_agent.js';
+    import init, { token_count, chat, AgentHandle, SessionStore } from '../pkg-web/dirge_agent.js';
 
     const apiKey = document.getElementById('api_key');
     const prompt = document.getElementById('prompt');
@@ -73,6 +85,13 @@
     const agentPrompt = document.getElementById('agent_prompt');
     const agentSend = document.getElementById('agent_send');
     const agentOutput = document.getElementById('agent_output');
+    const sessionName = document.getElementById('session_name');
+    const sessionCreate = document.getElementById('session_create');
+    const sessionAppend = document.getElementById('session_append');
+    const sessionList = document.getElementById('session_list');
+    const sessionOutput = document.getElementById('session_output');
+    let sessionStore = null;
+    let sessionId = null;
 
     prompt.addEventListener('input', () => {
       tokens.textContent = token_count(prompt.value);
@@ -123,11 +142,33 @@
       }
     });
 
+    sessionCreate.addEventListener('click', () => {
+      sessionId = sessionStore.create(sessionName.value || 'session');
+      sessionOutput.textContent = 'created ' + sessionId;
+    });
+
+    sessionAppend.addEventListener('click', () => {
+      if (!sessionId) {
+        sessionOutput.textContent = 'create a session first';
+        return;
+      }
+      sessionStore.append_message(sessionId, 'user', 'hello');
+      sessionOutput.textContent = JSON.stringify(JSON.parse(sessionStore.get(sessionId)), null, 2);
+    });
+
+    sessionList.addEventListener('click', () => {
+      sessionOutput.textContent = JSON.stringify(JSON.parse(sessionStore.list()), null, 2);
+    });
+
     try {
       await init();
       tokens.textContent = token_count(prompt.value);
       send.disabled = false;
       agentSend.disabled = false;
+      sessionStore = new SessionStore();
+      sessionCreate.disabled = false;
+      sessionAppend.disabled = false;
+      sessionList.disabled = false;
       status.textContent = 'wasm loaded';
     } catch (err) {
       status.textContent = 'failed to load wasm: ' + err;

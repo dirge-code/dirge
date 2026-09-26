@@ -21,6 +21,11 @@ pub mod llmtrim;
 // the DeepSeek-backed export below.
 pub mod agent_core;
 
+// Pared-down, JSON-serializable session persistence (see its module docs).
+// Pure Rust so its tests run natively via `cargo test --lib`; the wasm-bindgen
+// wrapper below exposes it to the browser/Node slice.
+pub mod session_core;
+
 // JS interop for the browser/Node build. Enabled only by the `wasm` feature
 // on a wasm target, so native builds and `--all-features` native checks never
 // see the `wasm_bindgen` macros.
@@ -265,5 +270,58 @@ impl AgentHandle {
             agent = agent.with_tool(tool.clone());
         }
         agent.run(prompt).await.map_err(|e| JsValue::from_str(&e))
+    }
+}
+
+/// In-memory session store exposed to JS. A pared-down, JSON-backed mirror of
+/// the terminal session persistence: create a session, append messages, then
+/// load / list / delete. Backed by [`crate::session_core::MemorySessionStore`].
+#[cfg(all(feature = "wasm", target_arch = "wasm32"))]
+#[wasm_bindgen]
+pub struct SessionStore {
+    inner: crate::session_core::MemorySessionStore,
+}
+
+#[cfg(all(feature = "wasm", target_arch = "wasm32"))]
+#[wasm_bindgen]
+impl SessionStore {
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> Self {
+        Self {
+            inner: crate::session_core::MemorySessionStore::new(),
+        }
+    }
+
+    /// Create a new session and return its id.
+    pub fn create(&self, name: String) -> String {
+        self.inner.create(&name)
+    }
+
+    /// Append a message to a session. `role` is "user" | "assistant" | "system".
+    pub fn append_message(&self, id: String, role: String, content: String) -> Result<(), JsValue> {
+        self.inner
+            .append_message(&id, &role, &content)
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    /// Load one session, returned as a JSON object string.
+    pub fn get(&self, id: String) -> Result<String, JsValue> {
+        let session = self
+            .inner
+            .get(&id)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        serde_json::to_string(&session).map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    /// List all sessions as a JSON array string, newest first.
+    pub fn list(&self) -> String {
+        serde_json::to_string(&self.inner.list()).unwrap_or_else(|_| "[]".to_string())
+    }
+
+    /// Delete a session (idempotent).
+    pub fn delete(&self, id: String) -> Result<(), JsValue> {
+        self.inner
+            .delete(&id)
+            .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 }
