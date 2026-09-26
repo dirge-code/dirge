@@ -79,11 +79,15 @@ pub struct VigilStatusInfo {
 }
 
 /// Request to dispatch a plugin hook from a background task (trigger producers
-/// or reaper). The UI loop drains the hook channel and dispatches via PluginManager.
-#[derive(Debug, Clone)]
+/// or reaper). A dedicated drainer task consumes the hook channel and
+/// dispatches via PluginManager.
+#[derive(Debug)]
 pub struct HookDispatchRequest {
     pub hook_name: String,
     pub context: String,
+    /// Optional oneshot answered by the drainer with the hook's block verdict:
+    /// `Some(reason)` = blocked, `None` = passed. `None` = fire-and-forget.
+    pub respond_to: Option<tokio::sync::oneshot::Sender<Option<String>>>,
 }
 
 /// Control messages for the vigil-keeper / reaper.

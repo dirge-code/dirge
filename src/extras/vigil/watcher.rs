@@ -76,6 +76,7 @@ pub fn spawn_watcher(
                     let _ = hook_tx.try_send(HookDispatchRequest {
                         hook_name: "on-vigil-event".into(),
                         context: hook_ctx,
+                        respond_to: None,
                     });
                     // Flush pending events before pushing the new batch.
                     while let Some(ev) = pending.pop_front() {
@@ -114,6 +115,7 @@ pub fn spawn_watcher(
                         let _ = hook_tx.try_send(HookDispatchRequest {
                             hook_name: "on-vigil-event".into(),
                             context: hook_ctx,
+                            respond_to: None,
                         });
                         // Flush pending before timeout-flush event.
                         while let Some(ev) = pending.pop_front() {

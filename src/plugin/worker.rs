@@ -1057,6 +1057,24 @@ const HARNESS_ISSUE_INIT: &str = r#"
     (if (nil? priority) "" (string priority))))
 "#;
 
+/// Janet wrapper for the HTTP bridge, installed on the **plugin VM only**.
+///
+/// Kept out of `HARNESS_INIT` for the same reason as `HARNESS_NOTEBOOK_INIT`:
+/// the notebook VM runs that prelude but does NOT register `harness/__http-post`,
+/// so a `defn` body that names the symbol would fail to compile there.
+#[cfg(feature = "plugin")]
+const HARNESS_HTTP_INIT: &str = r#"
+# (harness/http-post url body &opt headers) -> response body string | nil
+# Blocking HTTP POST with Content-Type: application/json. `headers` is an
+# optional JSON object of string -> string pairs. Returns the raw response
+# body on a 2xx status, or nil on any error / non-2xx / timeout.
+(defn harness/http-post [url body &opt headers]
+  (harness/__http-post
+    (string url)
+    (string body)
+    (if (nil? headers) "" (string headers))))
+"#;
+
 /// Vigil Janet prelude — exposes vigil/emit, vigil/list, vigil/set-state,
 /// vigil/get, vigil/live? for plugins running inside a vigil-keeper.
 #[cfg(all(feature = "plugin", feature = "vigil"))]
@@ -2079,6 +2097,8 @@ fn worker_loop(
         env.add_c_fn(
             CFunOptions::new(c"__emit-issue", issue_bridge::issue_emit_cfn).namespace(c"harness"),
         );
+        // HTTP bridge: blocking POST for sidecar services (e.g. lev).
+        env.add_c_fn(CFunOptions::new(c"__http-post", janet_http_post_cfn).namespace(c"harness"));
     }
     // Register DAP C functions when both features are enabled.
     #[cfg(feature = "dap")]
@@ -2117,6 +2137,10 @@ fn worker_loop(
     }
     if let Err(e) = client.run(HARNESS_ISSUE_INIT) {
         let _ = init_tx.send(Err(format!("harness issue-bridge init failed: {e}")));
+        return;
+    }
+    if let Err(e) = client.run(HARNESS_HTTP_INIT) {
+        let _ = init_tx.send(Err(format!("harness http-bridge init failed: {e}")));
         return;
     }
     // Vigil Janet prelude — defines (vigil/emit), (vigil/list),
@@ -2842,6 +2866,95 @@ unsafe fn json_to_janet_depth(v: &serde_json::Value, depth: usize) -> janetrs::l
                 janet_wrap_table(tbl)
             }
         }
+    }
+}
+
+/// C-function backing `harness/__http-post`. Performs a blocking HTTP POST
+/// and returns the raw response body as a string on a 2xx status, or nil on
+/// any error / non-2xx / timeout. Uses reqwest's blocking client, which owns
+/// its own runtime, so it is safe to call from the Janet worker thread (which
+/// is not parked on the tokio runtime).
+#[cfg(feature = "plugin")]
+unsafe extern "C-unwind" fn janet_http_post_cfn(
+    argc: i32,
+    argv: *mut janetrs::lowlevel::Janet,
+) -> janetrs::lowlevel::Janet {
+    use janetrs::lowlevel::*;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        http_post_body(argc, argv)
+    }));
+    match result {
+        Ok(j) => j,
+        Err(payload) => {
+            let msg = panic_payload_to_string(&payload);
+            tracing::error!(
+                target: "dirge::plugin",
+                cfn = "harness/http-post",
+                panic = %msg,
+                "FFI panic in http-post cfn — returning nil",
+            );
+            unsafe { janet_wrap_nil() }
+        }
+    }
+}
+
+/// Upper bound on a single `harness/http-post` call. Like the LSP bridge, a
+/// hung sidecar must not pin the Janet worker thread — and thus every plugin
+/// hook — forever.
+#[cfg(feature = "plugin")]
+const HTTP_POST_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[cfg(feature = "plugin")]
+unsafe fn http_post_body(
+    argc: i32,
+    argv: *mut janetrs::lowlevel::Janet,
+) -> janetrs::lowlevel::Janet {
+    use janetrs::lowlevel::*;
+    if argc < 2 {
+        return unsafe { janet_wrap_nil() };
+    }
+    let Some(url) = (unsafe { read_string_arg(argv, 0) }) else {
+        return unsafe { janet_wrap_nil() };
+    };
+    let Some(body) = (unsafe { read_string_arg(argv, 1) }) else {
+        return unsafe { janet_wrap_nil() };
+    };
+    let headers_json = if argc >= 3 {
+        unsafe { read_string_arg(argv, 2) }.unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(HTTP_POST_TIMEOUT)
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return unsafe { janet_wrap_nil() },
+    };
+
+    let mut request = client
+        .post(url.as_str())
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body);
+
+    if !headers_json.is_empty()
+        && let Ok(map) =
+            serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&headers_json)
+    {
+        for (name, value) in map {
+            if let serde_json::Value::String(v) = value {
+                request = request.header(name, v);
+            }
+        }
+    }
+
+    match request.send() {
+        Ok(response) if response.status().is_success() => match response.text() {
+            Ok(text) => unsafe { wrap_string(&text) },
+            Err(_) => unsafe { janet_wrap_nil() },
+        },
+        _ => unsafe { janet_wrap_nil() },
     }
 }
 
@@ -5266,5 +5379,112 @@ mod tests {
         let context: serde_json::Value =
             serde_json::from_str(payload).expect("payload must be valid JSON");
         assert_eq!(context["job"], "my-pipeline");
+    }
+
+    /// Minimal single-threaded HTTP server for the HTTP-bridge and lev-gate
+    /// tests. Binds an ephemeral localhost port and answers every request with
+    /// `response_body`, then returns the base URL (`http://127.0.0.1:<port>`).
+    #[cfg(feature = "vigil")]
+    fn spawn_mock_lev(response_body: &'static str) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock lev");
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                // Read through the request head so the client finishes sending
+                // before we write the response (the body is small and arrives
+                // with the head in one write).
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 1024];
+                loop {
+                    match stream.read(&mut tmp) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            buf.extend_from_slice(&tmp[..n]);
+                            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// harness/http-post returns the raw body on 2xx and nil on error, without
+    /// panicking at the FFI boundary.
+    #[cfg(feature = "vigil")]
+    #[test]
+    fn http_post_returns_body_and_nil_on_error() {
+        let url = spawn_mock_lev(r#"{"answers":{"judgment":{"noul":0.42}}}"#);
+        let (mut worker, _dialog_rx, _lsp_rx) = Worker::try_spawn().unwrap();
+
+        let r = worker
+            .eval(&format!(
+                r#"(harness/http-post "{url}/v1/systemone" "{{}}")"#
+            ))
+            .unwrap();
+        assert!(r.contains("noul"), "2xx must return the body, got {r:?}");
+
+        let r = worker
+            .eval(r#"(harness/http-post "http://127.0.0.1:1/" "{}")"#)
+            .unwrap();
+        assert_eq!(r, "nil");
+    }
+
+    /// The lev gate blocks (returns a reason) when lev's noul probability is
+    /// below the configured threshold.
+    #[cfg(feature = "vigil")]
+    #[test]
+    fn lev_rite_gate_blocks_below_threshold() {
+        let url = spawn_mock_lev(r#"{"answers":{"judgment":{"noul":0.42}}}"#);
+        let src = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/plugins/vigil_lev.janet"
+        ))
+        .expect("lev plugin source must exist");
+        let (mut worker, _dialog_rx, _lsp_rx) = Worker::try_spawn().unwrap();
+        worker.eval(&src).unwrap();
+
+        let r = worker
+            .eval(&format!(
+                r#"(lev-verdict @{{:vigil "v" :trigger :toll :event_count 1 :payload "{{}}"}}
+             @{{:endpoint "{url}" :threshold 0.8}})"#
+            ))
+            .unwrap();
+        assert!(r.contains("below threshold 0.8"), "block reason, got {r:?}");
+    }
+
+    /// The lev gate passes (returns nil) when lev's noul probability is at or
+    /// above the configured threshold.
+    #[cfg(feature = "vigil")]
+    #[test]
+    fn lev_rite_gate_passes_above_threshold() {
+        let url = spawn_mock_lev(r#"{"answers":{"judgment":{"noul":0.95}}}"#);
+        let src = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/plugins/vigil_lev.janet"
+        ))
+        .expect("lev plugin source must exist");
+        let (mut worker, _dialog_rx, _lsp_rx) = Worker::try_spawn().unwrap();
+        worker.eval(&src).unwrap();
+
+        let r = worker
+            .eval(&format!(
+                r#"(lev-verdict @{{:vigil "v" :trigger :toll :event_count 1 :payload "{{}}"}}
+             @{{:endpoint "{url}" :threshold 0.8}})"#
+            ))
+            .unwrap();
+        assert_eq!(r, "nil");
     }
 }

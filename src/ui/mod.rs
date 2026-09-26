@@ -290,9 +290,6 @@ pub async fn run_interactive(
     #[cfg(feature = "vigil")] vigil_ctl_tx: Option<
         tokio::sync::mpsc::Sender<crate::extras::vigil::types::VigilCtl>,
     >,
-    #[cfg(feature = "vigil")] mut vigil_hook_rx: Option<
-        tokio::sync::mpsc::Receiver<crate::extras::vigil::types::HookDispatchRequest>,
-    >,
 ) -> anyhow::Result<()> {
     let _guard = TerminalGuard::new(cfg.keyboard_enhancement.unwrap_or(true))?;
 
@@ -1821,28 +1818,6 @@ pub async fn run_interactive(
                 // keeps the same model — reset_to_new / switch_session
                 // preserve it — so no agent rebuild is needed here.
                 render_session(&mut renderer, session, cli, cfg, context)?;
-            }
-        }
-
-        // Drain vigil plugin hook dispatch requests (on-vigil-event,
-        // on-vigil-reap) every iteration rather than only after a
-        // successful observance wake. Rite failures, paused vigils, and
-        // commands-mode dispatches never wake the loop, so their hooks
-        // would otherwise sit undelivered.
-        #[cfg(feature = "vigil")]
-        if let Some(ref mut hook_rx) = vigil_hook_rx {
-            while let Ok(req) = hook_rx.try_recv() {
-                #[cfg(feature = "plugin")]
-                if let Some(pm) = plugin_manager {
-                    let pm = pm.clone();
-                    let hook = req.hook_name;
-                    let ctx = req.context;
-                    tokio::task::spawn_blocking(move || {
-                        pm.lock_ignore_poison().dispatch_tool_hook(&hook, &ctx)
-                    })
-                    .await
-                    .ok();
-                }
             }
         }
 

@@ -2078,15 +2078,9 @@ async fn main() -> anyhow::Result<()> {
         // onto it so it stays alive while the observance/hook receivers are
         // handed to the headless --vigil-once driver below.
         #[cfg(feature = "vigil")]
-        let (
-            mut _vigil_keeper,
-            vigil_wake_rx,
-            mut vigil_observance_rx,
-            vigil_ctl_tx,
-            mut vigil_hook_rx,
-        ) = {
+        let (mut _vigil_keeper, vigil_wake_rx, mut vigil_observance_rx, vigil_ctl_tx) = {
             if !cli.vigil_mode && !cli.vigil_once {
-                (None, None, None, None, None)
+                (None, None, None, None)
             } else {
                 // Merge config vigils with --vigil-config file entries (if any).
                 let mut entries = if let Some(cfg_entries) = cfg.vigils.as_ref() {
@@ -2156,7 +2150,7 @@ async fn main() -> anyhow::Result<()> {
                     Ok(mut keeper) => {
                         if keeper.vigils.is_empty() {
                             eprintln!("warning: --vigil set but no vigils configured");
-                            (None, None, None, None, None)
+                            (None, None, None, None)
                         } else {
                             let n = keeper.vigils.len();
                             #[cfg(feature = "plugin")]
@@ -2169,18 +2163,42 @@ async fn main() -> anyhow::Result<()> {
                                 let names: Vec<String> =
                                     keeper.vigils.iter().map(|v| v.name.clone()).collect();
                                 crate::plugin::worker::vigil_bridge::install_vigil_names(names);
+                                // Enable the synchronous rite gate only when a
+                                // plugin registered `on-vigil-rite`.
+                                if let Some(pm_arc) = plugin_manager.as_ref()
+                                    && pm_arc.lock_ignore_poison().has_hook("on-vigil-rite")
+                                {
+                                    keeper
+                                        .rite_gate_enabled
+                                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                                }
                             }
                             eprintln!("info: vigil-keeper started with {n} vigil(s)");
                             let wake = keeper.wake_rx.take();
                             let obs = keeper.observance_rx.take();
                             let ctl = keeper.ctl_tx.clone();
-                            let hook_rx = keeper.hook_rx.take();
-                            (Some(keeper), wake, obs, ctl, hook_rx)
+                            // Spawn the dedicated hook drainer so hook dispatch
+                            // (including the synchronous on-vigil-rite gate) is
+                            // decoupled from the UI loop and works headless.
+                            if let Some(hook_rx) = keeper.hook_rx.take() {
+                                #[cfg(feature = "plugin")]
+                                {
+                                    crate::extras::vigil::spawn_hook_drainer(
+                                        hook_rx,
+                                        plugin_manager.clone(),
+                                    );
+                                }
+                                #[cfg(not(feature = "plugin"))]
+                                {
+                                    crate::extras::vigil::spawn_hook_drainer(hook_rx);
+                                }
+                            }
+                            (Some(keeper), wake, obs, ctl)
                         }
                     }
                     Err(e) => {
                         eprintln!("warning: vigil-keeper failed to start: {e}");
-                        (None, None, None, None, None)
+                        (None, None, None, None)
                     }
                 }
             }
@@ -2267,24 +2285,6 @@ async fn main() -> anyhow::Result<()> {
                 .ok();
             }
 
-            // Deliver any queued on-vigil-event / on-vigil-reap hook
-            // requests. The interactive loop drains these every iteration;
-            // --vigil-once has no loop, so flush them once before exiting.
-            if let Some(ref mut hook_rx) = vigil_hook_rx {
-                while let Ok(req) = hook_rx.try_recv() {
-                    #[cfg(feature = "plugin")]
-                    if let Some(pm) = plugin_manager.as_ref() {
-                        let pm = pm.clone();
-                        let hook = req.hook_name;
-                        let ctx = req.context;
-                        tokio::task::spawn_blocking(move || {
-                            pm.lock_ignore_poison().dispatch_tool_hook(&hook, &ctx)
-                        })
-                        .await
-                        .ok();
-                    }
-                }
-            }
             crate::agent::tools::bg_shell::global().kill_all();
             return Ok(());
         }
@@ -2326,8 +2326,6 @@ async fn main() -> anyhow::Result<()> {
             vigil_observance_rx,
             #[cfg(feature = "vigil")]
             vigil_ctl_tx,
-            #[cfg(feature = "vigil")]
-            vigil_hook_rx,
         )
         .await?;
 

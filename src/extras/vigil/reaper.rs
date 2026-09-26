@@ -32,6 +32,7 @@ pub struct Observance {
 /// Run the reaper loop. Drains events from all active vigils, coalesces them
 /// per reap window, runs rite gates, and produces `Observance`s.
 /// Observances are sent to `observance_tx` for the vigil-keeper to dispatch.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_reaper(
     vigils: Vec<VigilReapInput>,
     observance_tx: mpsc::Sender<Observance>,
@@ -40,6 +41,7 @@ pub async fn run_reaper(
     senders: HashMap<String, mpsc::Sender<VigilEvent>>,
     hook_tx: mpsc::Sender<super::types::HookDispatchRequest>,
     initial_paused: std::collections::HashSet<String>,
+    rite_gate_enabled: Arc<AtomicBool>,
 ) {
     type ReapTask = tokio::task::JoinHandle<(String, Vec<VigilEvent>, mpsc::Receiver<VigilEvent>)>;
     let mut reap_tasks: FuturesUnordered<ReapTask> = FuturesUnordered::new();
@@ -207,6 +209,7 @@ pub async fn run_reaper(
                             super::types::HookDispatchRequest {
                                 hook_name: "on-vigil-reap".into(),
                                 context: reap_ctx,
+                                respond_to: None,
                             },
                         );
 
@@ -225,6 +228,42 @@ pub async fn run_reaper(
                             } else {
                                 (None, None)
                             };
+
+                        // System-1 rite gate — a synchronous plugin predicate
+                        // (e.g. the lev sidecar). Only runs when a plugin has
+                        // registered `on-vigil-rite`; fail-open otherwise.
+                        if rite_gate_enabled.load(Ordering::Relaxed) {
+                            let rite_ctx = rite_context(&vigil_name, trigger, &events);
+                            let (gate_tx, gate_rx) =
+                                tokio::sync::oneshot::channel::<Option<String>>();
+                            let gate_req = super::types::HookDispatchRequest {
+                                hook_name: "on-vigil-rite".into(),
+                                context: rite_ctx,
+                                respond_to: Some(gate_tx),
+                            };
+                            if hook_tx.send(gate_req).await.is_err() {
+                                warn!(%vigil_name, "on-vigil-rite drainer gone; proceeding (fail-open)");
+                            } else {
+                                match tokio::time::timeout(
+                                    std::time::Duration::from_secs(10),
+                                    gate_rx,
+                                )
+                                .await
+                                {
+                                    Ok(Ok(Some(reason))) => {
+                                        warn!(%vigil_name, %reason, "on-vigil-rite gate blocked, skipping observance");
+                                        continue;
+                                    }
+                                    Ok(Ok(None)) => {}
+                                    Ok(Err(_)) => {
+                                        warn!(%vigil_name, "on-vigil-rite responder dropped; proceeding (fail-open)");
+                                    }
+                                    Err(_) => {
+                                        warn!(%vigil_name, "on-vigil-rite gate timed out; proceeding (fail-open)");
+                                    }
+                                }
+                            }
+                        }
 
                         // Commands-mode harbinger: execute the resolved shell
                         // command directly — no agent turn, no LLM cost. The rite
@@ -403,6 +442,23 @@ fn coalesce_events(events: &[VigilEvent]) -> serde_json::Value {
         "files": files,
         "event_count": events.len(),
     })
+}
+
+/// Build the Janet context string for the `on-vigil-rite` hook. Carries the
+/// coalesced event payload as a JSON string so a gate plugin (e.g. lev) can
+/// judge the full observance state.
+fn rite_context(vigil_name: &str, trigger: TriggerKind, events: &[VigilEvent]) -> String {
+    let payload =
+        serde_json::to_string(&coalesce_events(events)).unwrap_or_else(|_| "{}".to_string());
+    let escaped_name = vigil_name.replace('\\', "\\\\").replace('"', "\\\"");
+    let escaped_payload = payload.replace('\\', "\\\\").replace('"', "\\\"");
+    format!(
+        "@{{:vigil \"{}\" :trigger :{} :event_count {} :payload \"{}\"}}",
+        escaped_name,
+        trigger.as_str(),
+        events.len(),
+        escaped_payload,
+    )
 }
 
 /// Extract the resolved shell commands from a commands-mode harbinger batch.

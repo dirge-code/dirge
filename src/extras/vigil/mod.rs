@@ -66,6 +66,53 @@ pub fn observance_context(vigil_name: &str, event_count: usize, response: &str) 
     )
 }
 
+/// Spawn a background drainer that consumes hook-dispatch requests and runs
+/// them through the plugin manager. A synchronous `on-vigil-rite` request
+/// carries a oneshot, which the drainer answers with the hook's block verdict
+/// (`Some(reason)` = blocked, `None` = passed). Running this in both
+/// interactive and headless (`--vigil-once`) modes means the synchronous rite
+/// gate never deadlocks waiting on the UI loop to drain the channel.
+pub fn spawn_hook_drainer(
+    hook_rx: mpsc::Receiver<HookDispatchRequest>,
+    #[cfg(feature = "plugin")] plugin_manager: Option<
+        Arc<std::sync::Mutex<crate::plugin::PluginManager>>,
+    >,
+) {
+    tokio::spawn(async move {
+        let mut hook_rx = hook_rx;
+        while let Some(req) = hook_rx.recv().await {
+            let respond_to = req.respond_to;
+
+            // Dispatch through the plugin manager when present; otherwise the
+            // verdict is "pass" (None). `Some(reason)` = a plugin blocked.
+            #[cfg(feature = "plugin")]
+            let block: Option<String> = match plugin_manager.as_ref() {
+                Some(pm) => {
+                    let pm = pm.clone();
+                    let hook = req.hook_name.clone();
+                    let ctx = req.context.clone();
+                    tokio::task::spawn_blocking(move || {
+                        use crate::sync_util::LockExt;
+                        pm.lock_ignore_poison()
+                            .dispatch_tool_hook(&hook, &ctx)
+                            .ok()
+                            .and_then(|r| r.block)
+                    })
+                    .await
+                    .unwrap_or(None)
+                }
+                None => None,
+            };
+            #[cfg(not(feature = "plugin"))]
+            let block: Option<String> = None;
+
+            if let Some(tx) = respond_to {
+                let _ = tx.send(block);
+            }
+        }
+    });
+}
+
 /// The vigil-keeper — owns all active vigils, starts triggers, runs the reaper.
 pub struct VigilKeeper {
     pub vigils: Vec<VigilInstance>,
@@ -76,13 +123,17 @@ pub struct VigilKeeper {
     /// (which can't cfg-gate arms) can wake and drain the typed receiver.
     pub wake_rx: Option<mpsc::UnboundedReceiver<()>>,
     /// Hook dispatch channel — trigger producers and reaper send hook requests;
-    /// the UI loop drains them.
+    /// a dedicated drainer task consumes them.
     pub hook_rx: Option<mpsc::Receiver<HookDispatchRequest>>,
     /// Janet plugin event sender — installed into the plugin bridge at startup.
     /// Plugins call `(vigil/emit name data)` and the keeper routes events to
     /// the correct vigil's event queue.
     #[allow(dead_code)]
     pub vigil_plugin_tx: Option<mpsc::Sender<String>>,
+    /// Whether a plugin registered `on-vigil-rite`; when true the reaper runs
+    /// the synchronous System-1 gate before each observance. Set by the host
+    /// after plugins load (default false).
+    pub rite_gate_enabled: Arc<AtomicBool>,
 }
 
 impl VigilKeeper {
@@ -96,6 +147,7 @@ impl VigilKeeper {
         let (obs_tx, obs_rx) = mpsc::channel::<Observance>(64);
         let (wake_tx, wake_rx) = mpsc::unbounded_channel::<()>();
         let (hook_tx, hook_rx) = mpsc::channel::<HookDispatchRequest>(64);
+        let rite_gate_enabled = Arc::new(AtomicBool::new(false));
 
         let mut vigils = Vec::new();
         let mut reap_inputs: Vec<VigilReapInput> = Vec::new();
@@ -249,6 +301,7 @@ impl VigilKeeper {
         // Launch the reaper in a background task.
         let reaper_wake_tx = wake_tx;
         let reaper_hook_tx = hook_tx;
+        let reaper_gate_flag = rite_gate_enabled.clone();
         tokio::spawn(async move {
             let paused = paused_names;
             reaper::run_reaper(
@@ -259,6 +312,7 @@ impl VigilKeeper {
                 senders,
                 reaper_hook_tx,
                 paused,
+                reaper_gate_flag,
             )
             .await;
         });
@@ -270,6 +324,7 @@ impl VigilKeeper {
             wake_rx: Some(wake_rx),
             hook_rx: Some(hook_rx),
             vigil_plugin_tx: Some(vigil_plugin_tx),
+            rite_gate_enabled,
         })
     }
 

@@ -297,7 +297,7 @@ thiserror = "2"
 futures = "0.3"
 # ring-based rustls TLS for reqwest. Faster cold build vs aws-lc-rs
 # (~15s vs 76s native C compile). See plans/compile-time-improvements.md
-reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "charset", "http2", "system-proxy"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "charset", "http2", "system-proxy", "blocking"] }
 # Explicit deps to pin rustls to ring backend instead of aws-lc-rs.
 # Required because reqwest/rustls-no-provider enables the deps but
 # doesn't specify a crypto backend; cargo would fall back to their

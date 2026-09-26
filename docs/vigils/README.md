@@ -65,3 +65,5 @@ dirge --vigil
   Jenkins/Prefect/Airflow remediation, and custom Janet plugins
 - [vs. Loop & MCP](vs-loop-mcp.md) — when to use vigil, loop, or MCP; how they
   differ; why you might prefer one over the others
+- [lev](../lev/README.md) — the System One sidecar rite gate; how lev plugs into
+  `on-vigil-rite`, and the [runbook](../lev/runbook.md) for running it

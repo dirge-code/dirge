@@ -592,3 +592,69 @@ async fn toll_prompt_substitutes_name_and_events() {
 
     assert_eq!(obs.prompt, "name=pv events=toll");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn on_vigil_rite_block_skips_observance() {
+    let mut keeper = spawn_keeper(vec![toll_entry("rite-gate", 1, 1, "x", None)]);
+    keeper
+        .rite_gate_enabled
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+
+    // The reaper should emit the synchronous on-vigil-rite request with the
+    // vigil name, trigger, event count, and a coalesced JSON payload.
+    let req = recv_hook(&mut keeper, "on-vigil-rite", Duration::from_secs(8))
+        .await
+        .expect("on-vigil-rite hook");
+    assert_eq!(req.hook_name, "on-vigil-rite");
+    assert!(
+        req.context.contains("rite-gate"),
+        "context = {}",
+        req.context
+    );
+    assert!(
+        req.context.contains(":trigger :toll"),
+        "context = {}",
+        req.context
+    );
+    assert!(
+        req.context.contains(":payload"),
+        "context = {}",
+        req.context
+    );
+
+    // Block the rite gate; the reaper must skip the observance.
+    req.respond_to
+        .expect("rite gate carries a responder")
+        .send(Some("lev: low confidence".to_string()))
+        .expect("send block verdict");
+
+    assert!(
+        recv_observance_from(&mut keeper, "rite-gate", Duration::from_secs(4))
+            .await
+            .is_none(),
+        "a blocked on-vigil-rite gate must skip the observance"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn on_vigil_rite_pass_allows_observance() {
+    let mut keeper = spawn_keeper(vec![toll_entry("rite-pass", 1, 1, "x", None)]);
+    keeper
+        .rite_gate_enabled
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+
+    let req = recv_hook(&mut keeper, "on-vigil-rite", Duration::from_secs(8))
+        .await
+        .expect("on-vigil-rite hook");
+
+    // A pass verdict lets the observance proceed.
+    req.respond_to
+        .expect("rite gate carries a responder")
+        .send(None)
+        .expect("send pass verdict");
+
+    let obs = recv_observance_from(&mut keeper, "rite-pass", Duration::from_secs(8))
+        .await
+        .expect("rite-pass observance");
+    assert_eq!(obs.vigil_name, "rite-pass");
+}

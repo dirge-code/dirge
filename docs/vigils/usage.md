@@ -242,11 +242,13 @@ reacting to a condition — and the queue is the contract.
                    :status "FAILURE"}))))
 ```
 
-Three lifecycle hooks are available:
+Four lifecycle hooks are available:
 
 - `on-vigil-event` — fired as an event enters the queue (return a table to
   enrich the context)
 - `on-vigil-reap` — fired when the reaper drains a vigil
+- `on-vigil-rite` — fired pre-observance as a synchronous gate; `harness/block`
+  skips the agent turn, anything else passes (fail-open)
 - `on-vigil-observance` — fired after the agent turn completes
 
 ```janet

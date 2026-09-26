@@ -40,6 +40,7 @@ pub const HOOK_NAMES: &[&str] = &[
     // --- vigil hooks (dirge-vigil) ---
     "on-vigil-event",
     "on-vigil-reap",
+    "on-vigil-rite",
     "on-vigil-observance",
 ];
 
