@@ -174,7 +174,20 @@ pub async fn run_reaper(
                         if let Some(ref flag) = run_flag
                             && flag.load(Ordering::SeqCst)
                         {
-                            warn!(%vigil_name, "skipping reap — observance in flight");
+                            // The agent is still handling the previous observance, so
+                            // don't drop these events: send them back into this
+                            // vigil's own queue for the next reap window. Without
+                            // this, a failure that arrives mid-turn is silently lost
+                            // rather than queued.
+                            warn!(%vigil_name, "observance in flight — re-queueing {} event(s)", events.len());
+                            if let Some(back) = senders.get(&vigil_name) {
+                                for event in events {
+                                    if back.try_send(event).is_err() {
+                                        warn!(%vigil_name, "re-queue dropped — event queue full");
+                                        break;
+                                    }
+                                }
+                            }
                             continue;
                         }
 

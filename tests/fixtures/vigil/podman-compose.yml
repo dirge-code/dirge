@@ -1,0 +1,57 @@
+version: "3.8"
+
+# Workflow engines for vigil functional testing.
+# Start:  podman-compose -f tests/fixtures/vigil/podman-compose.yml up -d
+# Stop:   podman-compose -f tests/fixtures/vigil/podman-compose.yml down
+
+services:
+  jenkins:
+    image: docker.io/jenkins/jenkins:lts-jdk17
+    container_name: vigil-jenkins
+    ports:
+      - "8080:8080"
+      - "50000:50000"
+    volumes:
+      - jenkins_home:/var/jenkins_home
+    environment:
+      JAVA_OPTS: "-Djenkins.install.runSetupWizard=false"
+    restart: unless-stopped
+
+  prefect:
+    image: docker.io/prefecthq/prefect:3-latest
+    container_name: vigil-prefect
+    command: prefect server start
+    ports:
+      - "4200:4200"
+    environment:
+      PREFECT_SERVER_API_HOST: "0.0.0.0"
+      PREFECT_API_URL: "http://localhost:4200/api"
+    volumes:
+      - prefect_data:/root/.prefect
+    restart: unless-stopped
+
+  airflow:
+    image: docker.io/apache/airflow:2.10.5
+    container_name: vigil-airflow
+    ports:
+      - "8081:8080"
+    environment:
+      AIRFLOW__CORE__EXECUTOR: SequentialExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: sqlite:////opt/airflow/airflow.db
+      AIRFLOW__WEBSERVER__SECRET_KEY: vigil-test-key-do-not-use-in-production
+      AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth
+    volumes:
+      - airflow_data:/opt/airflow
+    command: >
+      bash -c "
+      airflow db init &&
+      airflow users create -u admin -p admin -f Admin -l User -r Admin -e admin@example.com &&
+      airflow standalone
+      "
+    restart: unless-stopped
+
+volumes:
+  jenkins_home:
+  prefect_data:
+  airflow_data:
