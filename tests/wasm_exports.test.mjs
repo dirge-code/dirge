@@ -12,7 +12,7 @@ import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
-const { token_count, chat } = require('../pkg/dirge_agent.js');
+const { token_count, chat, agent_chat } = require('../pkg/dirge_agent.js');
 
 test('token_count is a function', () => {
   assert.equal(typeof token_count, 'function');
@@ -56,4 +56,17 @@ test('chat round-trips with a real key', { skip: !process.env.DEEPSEEK_API_KEY }
   const text = await chat(process.env.DEEPSEEK_API_KEY, 'Reply with exactly: ok');
   assert.equal(typeof text, 'string');
   assert.ok(text.length > 0, 'assistant reply should be non-empty');
+});
+
+test('agent_chat is a function returning a Promise', () => {
+  assert.equal(typeof agent_chat, 'function');
+  const p = agent_chat('dummy-key', 'hi');
+  assert.ok(p instanceof Promise, 'agent_chat() should return a Promise');
+  p.catch(() => {}); // swallow the eventual rejection so it never becomes unhandled
+});
+
+test('agent_chat round-trips with a real key', { skip: !process.env.DEEPSEEK_API_KEY }, async () => {
+  const text = await agent_chat(process.env.DEEPSEEK_API_KEY, 'Say exactly: hello from the agent');
+  assert.equal(typeof text, 'string');
+  assert.ok(text.length > 0, 'agent reply should be non-empty');
 });
