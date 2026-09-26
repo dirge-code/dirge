@@ -37,6 +37,17 @@
   <h2>Response</h2>
   <pre id="output"></pre>
 
+  <h2>Agent with a JS tool</h2>
+  <p class="muted">
+    Runs the tool-calling agent loop (<code>AgentHandle</code>) with a
+    JS-registered <code>word_count</code> tool. Ask
+    <em>“How many words are in: the quick brown fox?”</em> and the model calls
+    the tool, then answers from its result.
+  </p>
+  <textarea id="agent_prompt" placeholder="How many words are in: the quick brown fox?"></textarea>
+  <button id="agent_send" disabled>Run agent</button>
+  <pre id="agent_output"></pre>
+
   <h2>Janet VM</h2>
   <p class="muted">
     A pared-down Janet interpreter compiled to wasm runs right in the page.
@@ -51,7 +62,7 @@
   <script src="../wasm-janet/dist/janet.js"></script>
 
   <script type="module">
-    import init, { token_count, chat } from '../pkg-web/dirge_agent.js';
+    import init, { token_count, chat, AgentHandle } from '../pkg-web/dirge_agent.js';
 
     const apiKey = document.getElementById('api_key');
     const prompt = document.getElementById('prompt');
@@ -59,6 +70,9 @@
     const send = document.getElementById('send');
     const status = document.getElementById('status');
     const output = document.getElementById('output');
+    const agentPrompt = document.getElementById('agent_prompt');
+    const agentSend = document.getElementById('agent_send');
+    const agentOutput = document.getElementById('agent_output');
 
     prompt.addEventListener('input', () => {
       tokens.textContent = token_count(prompt.value);
@@ -79,10 +93,41 @@
       }
     });
 
+    agentSend.addEventListener('click', async () => {
+      agentSend.disabled = true;
+      agentOutput.textContent = '';
+      status.textContent = 'running agent...';
+      try {
+        const handle = new AgentHandle(apiKey.value);
+        handle.add_js_tool(
+          'word_count',
+          'Count the whitespace-separated words in the given text',
+          JSON.stringify({
+            type: 'object',
+            properties: { text: { type: 'string' } },
+            required: ['text'],
+          }),
+          (argsJson) => {
+            const { text } = JSON.parse(argsJson);
+            return String((text || '').trim().split(/\s+/).filter(Boolean).length);
+          }
+        );
+        const text = await handle.run(agentPrompt.value);
+        agentOutput.textContent = text;
+        status.textContent = 'done';
+      } catch (err) {
+        agentOutput.textContent = '';
+        status.textContent = 'error: ' + err;
+      } finally {
+        agentSend.disabled = false;
+      }
+    });
+
     try {
       await init();
       tokens.textContent = token_count(prompt.value);
       send.disabled = false;
+      agentSend.disabled = false;
       status.textContent = 'wasm loaded';
     } catch (err) {
       status.textContent = 'failed to load wasm: ' + err;

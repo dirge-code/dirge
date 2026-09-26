@@ -1344,6 +1344,7 @@ dependencies = [
  "include_dir",
  "indexmap 2.14.0",
  "janetrs",
+ "js-sys",
  "jsonschema",
  "libc",
  "libkrun-sys",

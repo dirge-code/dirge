@@ -25,6 +25,8 @@ pub mod agent_core;
 // on a wasm target, so native builds and `--all-features` native checks never
 // see the `wasm_bindgen` macros.
 #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
+use std::sync::Arc;
+#[cfg(all(feature = "wasm", target_arch = "wasm32"))]
 use wasm_bindgen::prelude::*;
 
 /// Approximate token count for a text string, using dirge's llmtrim
@@ -141,4 +143,127 @@ pub async fn agent_chat(api_key: String, prompt: String) -> Result<String, JsVal
     let agent =
         crate::agent_core::Agent::new(completer).with_tool(Arc::new(crate::agent_core::EchoTool));
     agent.run(prompt).await.map_err(|e| JsValue::from_str(&e))
+}
+
+/// A [`crate::agent_core::Tool`] whose implementation lives in JS. The host
+/// supplies a function `(argsJson: string) => string | Promise<string>`; the
+/// loop calls it exactly like a native tool, so shell/fs/process shims can be
+/// registered from the browser/Node side with no Rust changes.
+#[cfg(all(feature = "wasm", target_arch = "wasm32"))]
+struct JsTool {
+    name: String,
+    description: String,
+    parameters: serde_json::Value,
+    func: js_sys::Function,
+}
+
+#[cfg(all(feature = "wasm", target_arch = "wasm32"))]
+impl crate::agent_core::Tool for JsTool {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn description(&self) -> &str {
+        &self.description
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        self.parameters.clone()
+    }
+
+    fn call(
+        &self,
+        args: serde_json::Value,
+    ) -> rig::wasm_compat::WasmBoxedFuture<'_, Result<String, String>> {
+        let func = self.func.clone();
+        let args_json = args.to_string();
+        Box::pin(async move {
+            let arg = JsValue::from_str(&args_json);
+            let result = func
+                .call1(&JsValue::NULL, &arg)
+                .map_err(|e| format!("tool invocation failed: {e:?}"))?;
+            // Promise::resolve adopts a thenable, so this also awaits the
+            // result when the host function returns a plain string.
+            let resolved = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::resolve(&result))
+                .await
+                .map_err(|e| format!("tool rejected: {e:?}"))?;
+            Ok(resolved
+                .as_string()
+                .unwrap_or_else(|| format!("{resolved:?}")))
+        })
+    }
+}
+
+/// A stateful wasm agent the host extends with JS-implemented tools. Build one,
+/// register tools with `add_js_tool`, then `run` a prompt; the DeepSeek-backed
+/// loop dispatches to whichever tools the model calls.
+#[cfg(all(feature = "wasm", target_arch = "wasm32"))]
+#[wasm_bindgen]
+pub struct AgentHandle {
+    api_key: String,
+    tools: Vec<Arc<dyn crate::agent_core::Tool>>,
+}
+
+#[cfg(all(feature = "wasm", target_arch = "wasm32"))]
+#[wasm_bindgen]
+impl AgentHandle {
+    #[wasm_bindgen(constructor)]
+    pub fn new(api_key: String) -> Self {
+        Self {
+            api_key,
+            tools: Vec::new(),
+        }
+    }
+
+    /// Register the built-in `EchoTool` so the agent has a tool without the
+    /// host supplying any JS.
+    pub fn add_echo_tool(&mut self) {
+        self.tools.push(Arc::new(crate::agent_core::EchoTool));
+    }
+
+    /// Register a JS-implemented tool. `parameters` is a JSON Schema string;
+    /// `func` is `(argsJson: string) => string | Promise<string>`.
+    pub fn add_js_tool(
+        &mut self,
+        name: String,
+        description: String,
+        parameters: String,
+        func: js_sys::Function,
+    ) -> Result<(), JsValue> {
+        let parameters: serde_json::Value = serde_json::from_str(&parameters)
+            .map_err(|e| JsValue::from_str(&format!("invalid tool schema: {e}")))?;
+        self.tools.push(Arc::new(JsTool {
+            name,
+            description,
+            parameters,
+            func,
+        }));
+        Ok(())
+    }
+
+    /// Dispatch a registered tool directly (without the model). Exposes the JS
+    /// tool round-trip for tests and host-side use.
+    pub async fn call_tool(&self, name: String, args: String) -> Result<String, JsValue> {
+        let args: serde_json::Value = serde_json::from_str(&args)
+            .map_err(|e| JsValue::from_str(&format!("invalid tool args: {e}")))?;
+        for tool in &self.tools {
+            if tool.name() == name {
+                return tool.call(args).await.map_err(|e| JsValue::from_str(&e));
+            }
+        }
+        Err(JsValue::from_str(&format!("unknown tool: {name}")))
+    }
+
+    /// Run one user turn with the current tool set over DeepSeek, returning the
+    /// final assistant text.
+    pub async fn run(&self, prompt: String) -> Result<String, JsValue> {
+        let completer = Arc::new(
+            DeepSeekCompleter::new(self.api_key.clone()).map_err(|e| JsValue::from_str(&e))?,
+        );
+        let mut agent = crate::agent_core::Agent::new(completer);
+        for tool in &self.tools {
+            agent = agent.with_tool(tool.clone());
+        }
+        agent.run(prompt).await.map_err(|e| JsValue::from_str(&e))
+    }
 }

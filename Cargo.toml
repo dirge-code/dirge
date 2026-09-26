@@ -188,7 +188,7 @@ experimental-graph-search = []
 # process/fs/signal, ring/rustls) are target-gated below and never enter the
 # wasm dependency graph:
 #   cargo build --lib --target wasm32-unknown-unknown --no-default-features --features wasm
-wasm = ["dep:wasm-bindgen", "dep:wasm-bindgen-futures"]
+wasm = ["dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:js-sys"]
 
 # The inlined llmtrim engine (src/llmtrim) carries upstream
 # `#[cfg(feature = "skeleton"/"tiktoken"/"multimodal")]` blocks whose
@@ -318,6 +318,7 @@ rmcp = { version = "3.1", optional = true, default-features = false, features = 
 # JS interop for the browser build; enabled only by the `wasm` feature.
 wasm-bindgen = { version = "0.2", optional = true }
 wasm-bindgen-futures = { version = "0.4", optional = true }
+js-sys = { version = "0.3", optional = true }
 clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision"] }
