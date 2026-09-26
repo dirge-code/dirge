@@ -36,6 +36,12 @@ enum ProviderCredential {
     },
 }
 
+#[derive(Default)]
+struct ClientRequestContext<'a> {
+    resolved_auth_headers: Option<ProviderAuthHeaders>,
+    session_id: Option<&'a str>,
+}
+
 impl fmt::Debug for ProviderCredential {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -107,8 +113,10 @@ pub(crate) fn create_client_with_auth_for_session(
         api_key,
         providers,
         default_auth,
-        None,
-        session_id,
+        ClientRequestContext {
+            session_id,
+            ..Default::default()
+        },
         |name| std::env::var(name).ok(),
         load_fresh_openai_oauth,
     )
@@ -283,8 +291,7 @@ where
         api_key,
         providers,
         None,
-        None,
-        None,
+        ClientRequestContext::default(),
         env,
         load_openai_oauth,
     )
@@ -295,8 +302,7 @@ fn create_client_with_resolved_auth<F, G>(
     api_key: Option<&str>,
     providers: &HashMap<String, ProviderEntry>,
     default_auth: Option<ProviderAuth>,
-    resolved_auth_headers: Option<ProviderAuthHeaders>,
-    session_id: Option<&str>,
+    request_context: ClientRequestContext<'_>,
     env: F,
     load_openai_oauth: G,
 ) -> anyhow::Result<AnyClient>
@@ -304,6 +310,10 @@ where
     F: Fn(&str) -> Option<String>,
     G: FnOnce() -> anyhow::Result<Option<OpenAiOAuthCredential>>,
 {
+    let ClientRequestContext {
+        resolved_auth_headers,
+        session_id,
+    } = request_context;
     let info = resolve_provider_info(provider_name, providers).ok_or_else(|| {
         anyhow::anyhow!(
             "Unknown provider: {}. Supported providers: openrouter, openai, anthropic, gemini, deepseek, glm, cerebras, opencode, kimi, ollama, custom",
@@ -714,8 +724,10 @@ fn create_client_with_chatgpt_auth_headers(
         None,
         providers,
         Some(ProviderAuth::ChatGpt),
-        Some(headers),
-        None,
+        ClientRequestContext {
+            resolved_auth_headers: Some(headers),
+            session_id: None,
+        },
         |name| std::env::var(name).ok(),
         load_fresh_openai_oauth,
     )
@@ -732,8 +744,10 @@ fn create_client_with_anthropic_auth_headers(
         None,
         providers,
         Some(ProviderAuth::Anthropic),
-        Some(headers),
-        None,
+        ClientRequestContext {
+            resolved_auth_headers: Some(headers),
+            session_id: None,
+        },
         |name| std::env::var(name).ok(),
         load_fresh_openai_oauth,
     )
@@ -1237,9 +1251,9 @@ mod tests {
 
         let headers = headers_rx.await.unwrap();
         assert!(
-            headers.lines().any(|line| {
-                line.to_ascii_lowercase() == "x-opencode-session: conversation-123"
-            }),
+            headers
+                .lines()
+                .any(|line| { line.eq_ignore_ascii_case("x-opencode-session: conversation-123") }),
             "Responses request omitted its OpenCode session header: {headers}"
         );
         server.await.unwrap();
@@ -2438,8 +2452,7 @@ mod tests {
             None,
             &providers,
             Some(ProviderAuth::Kimi),
-            None,
-            None,
+            ClientRequestContext::default(),
             no_env,
             || Ok(None),
         ) {
@@ -2478,8 +2491,7 @@ mod tests {
                 None,
                 &providers,
                 Some(ProviderAuth::Kimi),
-                None,
-                None,
+                ClientRequestContext::default(),
                 no_env,
                 || Ok(None),
             ) {
