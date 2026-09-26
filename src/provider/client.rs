@@ -1165,6 +1165,86 @@ mod tests {
         assert!(empty_session_headers.get("x-opencode-session").is_none());
     }
 
+    #[tokio::test]
+    async fn openai_responses_transport_preserves_opencode_session_header() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let (headers_tx, headers_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let header_end = loop {
+                let mut chunk = [0; 1024];
+                let read = socket.read(&mut chunk).await.unwrap();
+                assert!(read > 0, "client closed before sending request headers");
+                request.extend_from_slice(&chunk[..read]);
+                if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break end + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]).to_string();
+            let content_length = headers
+                .lines()
+                .filter_map(|line| line.split_once(':'))
+                .find_map(|(name, value)| {
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            while request.len() < header_end + content_length {
+                let mut chunk = [0; 1024];
+                let read = socket.read(&mut chunk).await.unwrap();
+                assert!(read > 0, "client closed before sending the full body");
+                request.extend_from_slice(&chunk[..read]);
+            }
+            headers_tx.send(headers).unwrap();
+            let body = br#"{"error":{"message":"test response"}}"#;
+            let response = format!(
+                "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            socket.write_all(body).await.unwrap();
+        });
+
+        let providers = HashMap::from([(
+            "opencode-go".to_string(),
+            ProviderEntry {
+                provider_type: Some("openai-responses".to_string()),
+                base_url: Some(base_url),
+                api_key: Some("test-key".to_string()),
+                allow_insecure: true,
+                headers: Some(HashMap::from([(
+                    "x-opencode-session".to_string(),
+                    "conversation-123".to_string(),
+                )])),
+                ..Default::default()
+            },
+        )]);
+        let client = create_client_with_auth_for_session(
+            "opencode-go",
+            None,
+            &providers,
+            None,
+            Some("conversation-123"),
+        )
+        .unwrap();
+        let model = client.completion_model("gpt-6-luna");
+        assert!(model.btw_query("test request".to_string()).await.is_err());
+
+        let headers = headers_rx.await.unwrap();
+        assert!(
+            headers.lines().any(|line| {
+                line.to_ascii_lowercase() == "x-opencode-session: conversation-123"
+            }),
+            "Responses request omitted its OpenCode session header: {headers}"
+        );
+        server.await.unwrap();
+    }
+
     // ── dirge-ro8g: anthropic-OAuth presence implies Anthropic auth ──
 
     #[test]
